@@ -1766,7 +1766,7 @@ fn fake_container_runtime(
     write_shell_executable(
         &engine,
         &format!(
-            "if [ \"${{1:-}}\" = image ] && [ \"${{2:-}}\" = inspect ]; then\n  image=\"${{3:-}}\"\n  digest=\"${{image##*@}}\"\n  printf '[\"fixture@%s\"]\\n' \"$digest\"\n  exit 0\nfi\nif [ \"${{1:-}}\" = inspect ]; then\n  if [ \"{candidate_active}\" != true ]; then exit 1; fi\n  if [ \"$#\" -gt 2 ]; then printf '%s\\n' '{candidate_commit}'; fi\n  exit 0\nfi\nexit 0"
+            "if [ \"${{1:-}}\" = image ] && [ \"${{2:-}}\" = inspect ]; then\n  image=\"${{3:-}}\"\n  digest=\"${{image##*@}}\"\n  printf '[\"fixture@%s\"]\\n' \"$digest\"\n  exit 0\nfi\nif [ \"${{1:-}}\" = inspect ]; then\n  if [ \"{candidate_active}\" != true ]; then exit 1; fi\n  if [ \"$#\" -gt 2 ]; then printf '%s\\n' '{candidate_commit}'; fi\n  exit 0\nfi\ncat >/dev/null\nexit 0"
         ),
     );
     engine

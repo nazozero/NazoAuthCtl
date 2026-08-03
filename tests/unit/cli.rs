@@ -511,7 +511,7 @@ fn coordination_commands_require_explicit_deployment_evidence_and_confirmation()
     assert!(matches!(
         cli.command,
         Command::TransactionEvidence { file, yes: true }
-            if file == PathBuf::from("/run/evidence.json")
+            if file == std::path::Path::new("/run/evidence.json")
     ));
     assert!(matches!(
         parse(&[
