@@ -387,7 +387,7 @@ fn pull_image_executes_the_selected_engine_without_secret_arguments() {
         &format!("printf '%s\\n' \"$@\" > '{}'", argv.display()),
     );
     config.runtime.backend = RuntimeBackendKind::Podman;
-    config.runtime.backend_command_override = Some(engine);
+    config.runtime.backend_command_override = Some(engine.clone());
     let image = "ghcr.io/nazozero/nazoauth@sha256:aaaaaaaa";
 
     Runtime::new(&config).pull_image(image).unwrap();
@@ -424,7 +424,7 @@ fn image_digest_rejects_unpinned_invalid_and_unretained_references() {
     let engine = work.path().join("fake-engine");
     write_shell_executable(&engine, "printf '%s\\n' '[]'");
     config.runtime.backend = RuntimeBackendKind::Podman;
-    config.runtime.backend_command_override = Some(engine);
+    config.runtime.backend_command_override = Some(engine.clone());
     let runtime = Runtime::new(&config);
 
     for (image, expected) in [
