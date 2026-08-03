@@ -4,6 +4,7 @@ mod cli;
 mod deployment;
 mod discovery;
 mod filesystem;
+mod governance;
 mod install;
 mod model;
 mod operator;
@@ -62,6 +63,9 @@ Start here:
   nazoauthctl adopt --target BACKEND:OBJECT --plan
   nazoauthctl adopt --target BACKEND:OBJECT --yes
   nazoauthctl deployments list
+  nazoauthctl --deployment ID permissions set --capability runtime=delegated --yes
+  nazoauthctl --deployment ID relinquish --capability runtime --yes
+  nazoauthctl --deployment ID reconcile
   nazoauthctl install --public-url https://auth.example
   nazoauthctl [--config PATH] bootstrap-admin
   nazoauthctl [--config PATH] status
@@ -73,6 +77,9 @@ Commands:
   discover      Read-only local Podman, Docker, systemd and process discovery
   adopt         Verify and transactionally register an explicitly selected target
   deployments   List registered deployment control domains
+  permissions   Transactionally change explicitly selected capability grants
+  relinquish    Return capabilities to external ownership without deleting resources
+  reconcile     Report external drift and fail closed on managed drift
   install       Fresh Podman, Docker, or host installation
   bootstrap-admin  Securely create the first administrator
   status        Machine-readable deployment and identity state

@@ -199,6 +199,23 @@ fn build_plan(
             "external Valkey cannot be adopted without provider-specific evidence".to_owned(),
         );
     }
+    if options.capabilities.runtime.responsibility == Responsibility::Managed {
+        blockers.push(
+            "a discovered external runtime cannot become managed until an explicit ownership-label transition is implemented"
+                .to_owned(),
+        );
+    }
+    if options
+        .capabilities
+        .operator_tasks
+        .responsibility
+        .permits_mutation()
+    {
+        blockers.push(
+            "operator-task authority requires a separately verified server-side controller enrollment"
+                .to_owned(),
+        );
+    }
     let resulting_trust = if blockers.is_empty() {
         TrustState::Adopted
     } else {
@@ -302,7 +319,12 @@ fn execute(
         &serde_json::to_vec_pretty(candidate)?,
         0o600,
     )?;
-    let record = deployment_record(candidate, plan, options.alias.clone())?;
+    let record = deployment_record(
+        candidate,
+        plan,
+        options.alias.clone(),
+        &identities.controller_key_id,
+    )?;
     let manifest = verified_release(candidate, &plan.release)?.manifest;
     let receipt = AdoptionReceipt {
         schema: CONTROL_DISCOVERY_SCHEMA,
@@ -489,6 +511,7 @@ fn deployment_record(
     candidate: &DiscoveredDeployment,
     plan: &AdoptionPlan,
     alias: Option<String>,
+    control_authority: &str,
 ) -> anyhow::Result<DeploymentRecord> {
     let resources = BTreeMap::from([
         ("database".to_owned(), SafeReference::NotObserved),
@@ -511,6 +534,7 @@ fn deployment_record(
     let record = DeploymentRecord {
         schema: DEPLOYMENT_SCHEMA,
         deployment_id: plan.deployment_id.clone(),
+        control_authority: control_authority.to_owned(),
         alias,
         issuer: plan.issuer.clone(),
         trust: plan.resulting_trust,
@@ -550,6 +574,7 @@ fn deployment_record(
 }
 
 struct Identities {
+    controller_key_id: String,
     receipt_key_id: String,
     receipt: SigningKey,
     audit: SigningKey,
@@ -571,6 +596,7 @@ fn create_identities(store: &DeploymentStore, deployment_id: &str) -> anyhow::Re
         bail!("deployment identities are not distinct");
     }
     Ok(Identities {
+        controller_key_id: controller.0,
         receipt_key_id: receipt.0,
         receipt: receipt.1,
         audit: audit.1,

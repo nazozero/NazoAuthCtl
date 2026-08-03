@@ -13,6 +13,7 @@ fn record(deployment_id: &str, alias: &str) -> DeploymentRecord {
     DeploymentRecord {
         schema: DEPLOYMENT_SCHEMA,
         deployment_id: deployment_id.to_owned(),
+        control_authority: format!("controller-{deployment_id}"),
         alias: Some(alias.to_owned()),
         issuer: format!("https://{alias}.example"),
         trust: TrustState::Adopted,
@@ -65,6 +66,18 @@ fn observed_state_cannot_smuggle_mutation_capabilities() {
     observed.capabilities = CapabilityGrants::observed();
     observed.validate().unwrap();
     assert!(observed.require_mutation(&[Capability::Runtime]).is_err());
+}
+
+#[test]
+fn immutable_security_identity_is_not_an_alias_or_runtime_name() {
+    let mut deployment = record("deployment-a", "alpha");
+    deployment.alias = Some(deployment.runtime_instances[0].object_reference.clone());
+    deployment.validate().unwrap();
+    assert_ne!(deployment.deployment_id, deployment.alias.unwrap());
+
+    deployment = record("deployment-a", "alpha");
+    deployment.control_authority.clear();
+    assert!(deployment.validate().is_err());
 }
 
 #[test]

@@ -5,7 +5,7 @@ use anyhow::{Context, bail};
 use crate::model::semantic_tag;
 use crate::{
     adoption::AdoptionOptions,
-    deployment::{Capability, CapabilityGrants, ResourceScope, Responsibility},
+    deployment::{Capability, CapabilityGrant, CapabilityGrants, ResourceScope, Responsibility},
 };
 
 pub(crate) const DEFAULT_CONFIG: &str = "/etc/nazoauth/update.json";
@@ -66,6 +66,9 @@ pub(crate) enum Command {
     Discover,
     Adopt(AdoptionOptions),
     DeploymentsList,
+    PermissionsSet(PermissionOptions),
+    Relinquish(RelinquishOptions),
+    Reconcile,
     Install(Box<InstallOptions>),
     BootstrapAdmin(BootstrapAdminOptions),
     Status,
@@ -113,6 +116,18 @@ pub(crate) enum Command {
     SelfRollback {
         yes: bool,
     },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PermissionOptions {
+    pub(crate) changes: Vec<(Capability, CapabilityGrant)>,
+    pub(crate) yes: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RelinquishOptions {
+    pub(crate) capabilities: Vec<Capability>,
+    pub(crate) yes: bool,
 }
 
 #[derive(Debug)]
@@ -260,6 +275,15 @@ impl Cli {
             }
             "adopt" => Command::Adopt(parse_adoption(values)?),
             "deployments" if values == ["list"] => Command::DeploymentsList,
+            "permissions" if values.first().is_some_and(|value| value == "set") => {
+                values.remove(0);
+                Command::PermissionsSet(parse_permission_options(values)?)
+            }
+            "relinquish" => Command::Relinquish(parse_relinquish_options(values)?),
+            "reconcile" => {
+                no_arguments(&values, "reconcile")?;
+                Command::Reconcile
+            }
             "install" => Command::Install(Box::new(parse_install(values)?)),
             "bootstrap-admin" => Command::BootstrapAdmin(parse_bootstrap_admin(values)?),
             "status" => {
@@ -724,6 +748,12 @@ fn parse_adoption(values: Vec<String>) -> anyhow::Result<AdoptionOptions> {
 }
 
 fn apply_capability(capabilities: &mut CapabilityGrants, value: &str) -> anyhow::Result<()> {
+    let (capability, parsed) = parse_capability(value)?;
+    *capabilities.grant_mut(capability) = parsed;
+    Ok(())
+}
+
+fn parse_capability(value: &str) -> anyhow::Result<(Capability, CapabilityGrant)> {
     let (name, grant) = value
         .split_once('=')
         .context("--capability must be NAME=external|delegated|managed[:deployment|shared]")?;
@@ -754,10 +784,58 @@ fn apply_capability(capabilities: &mut CapabilityGrants, value: &str) -> anyhow:
         "shared" => ResourceScope::Shared,
         _ => bail!("invalid capability resource scope"),
     };
-    let grant = capabilities.grant_mut(capability);
-    grant.responsibility = responsibility;
-    grant.scope = scope;
-    Ok(())
+    Ok((
+        capability,
+        CapabilityGrant {
+            responsibility,
+            scope,
+        },
+    ))
+}
+
+fn parse_permission_options(values: Vec<String>) -> anyhow::Result<PermissionOptions> {
+    let (mut values, yes) = take_yes(values)?;
+    let mut changes = Vec::new();
+    while !values.is_empty() {
+        if values.first().is_none_or(|value| value != "--capability") || values.len() < 2 {
+            bail!("permissions set accepts repeated --capability NAME=GRANT and --yes");
+        }
+        let value = values.remove(1);
+        values.remove(0);
+        let change = parse_capability(&value)?;
+        if changes
+            .iter()
+            .any(|(capability, _)| *capability == change.0)
+        {
+            bail!("a capability may be changed only once per transaction");
+        }
+        changes.push(change);
+    }
+    if changes.is_empty() {
+        bail!("permissions set requires at least one --capability");
+    }
+    Ok(PermissionOptions { changes, yes })
+}
+
+fn parse_relinquish_options(values: Vec<String>) -> anyhow::Result<RelinquishOptions> {
+    let (mut values, yes) = take_yes(values)?;
+    let mut capabilities = Vec::new();
+    while !values.is_empty() {
+        if values.first().is_none_or(|value| value != "--capability") || values.len() < 2 {
+            bail!("relinquish accepts repeated --capability NAME and --yes");
+        }
+        let value = values.remove(1);
+        values.remove(0);
+        let (capability, _) = parse_capability(&format!("{value}=external"))?;
+        if capabilities.contains(&capability) {
+            bail!("a capability may be relinquished only once per transaction");
+        }
+        capabilities.push(capability);
+    }
+    if capabilities.is_empty() {
+        bail!("relinquish requires at least one --capability");
+    }
+    Ok(RelinquishOptions { capabilities, yes })
 }
 
 fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOptions> {

@@ -253,6 +253,20 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             crate::adoption::run(options)
         }
         Command::DeploymentsList => list_deployments(),
+        Command::PermissionsSet(options) => {
+            require_root()?;
+            require_confirmation(options.yes, "change deployment capability grants")?;
+            crate::governance::set_permissions(cli.deployment.as_deref(), &options.changes)
+        }
+        Command::Relinquish(options) => {
+            require_root()?;
+            require_confirmation(
+                options.yes,
+                "relinquish deployment capabilities without deleting resources",
+            )?;
+            crate::governance::relinquish(cli.deployment.as_deref(), &options.capabilities)
+        }
+        Command::Reconcile => crate::governance::reconcile(cli.deployment.as_deref()),
         Command::Install(options) => install(cli.config, *options),
         Command::Status => {
             if crate::deployment::DeploymentStore::system()
@@ -1556,6 +1570,7 @@ fn command_is_read_only(command: &Command) -> bool {
     match command {
         Command::Discover
         | Command::DeploymentsList
+        | Command::Reconcile
         | Command::Status
         | Command::Doctor
         | Command::Check(_)
@@ -2152,7 +2167,12 @@ fn recovery_action(_journal: &UpdateJournal, _target_is_active: bool) -> UpdateR
 
 pub(crate) fn uses_legacy_lock(command: &Command) -> bool {
     match command {
-        Command::Discover | Command::Adopt(_) | Command::DeploymentsList => false,
+        Command::Discover
+        | Command::Adopt(_)
+        | Command::DeploymentsList
+        | Command::PermissionsSet(_)
+        | Command::Relinquish(_)
+        | Command::Reconcile => false,
         Command::Status | Command::Doctor
             if crate::deployment::DeploymentStore::system()
                 .registry_path()

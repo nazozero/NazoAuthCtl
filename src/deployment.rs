@@ -265,6 +265,7 @@ pub(crate) struct RecoveryAssessment {
 pub(crate) struct DeploymentRecord {
     pub(crate) schema: u32,
     pub(crate) deployment_id: String,
+    pub(crate) control_authority: String,
     pub(crate) alias: Option<String>,
     pub(crate) issuer: String,
     pub(crate) trust: TrustState,
@@ -316,6 +317,7 @@ impl DeploymentRecord {
             bail!("unsupported deployment declaration schema");
         }
         validate_identifier(&self.deployment_id, "deployment ID")?;
+        validate_identifier(&self.control_authority, "control authority")?;
         if let Some(alias) = &self.alias {
             validate_identifier(alias, "deployment alias")?;
         }

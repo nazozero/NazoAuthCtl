@@ -494,6 +494,80 @@ fn parses_exact_candidate_migration_target() {
 }
 
 #[test]
+fn parses_capability_transitions_without_collapsing_ownership_or_scope() {
+    let command = parse(&[
+        "nazoauthctl",
+        "--deployment",
+        "deployment-a",
+        "permissions",
+        "set",
+        "--capability",
+        "runtime=delegated:deployment",
+        "--capability",
+        "database=external:shared",
+        "--yes",
+    ])
+    .unwrap()
+    .unwrap();
+    assert_eq!(command.deployment.as_deref(), Some("deployment-a"));
+    let Command::PermissionsSet(options) = command.command else {
+        panic!("expected permissions set");
+    };
+    assert!(options.yes);
+    assert_eq!(options.changes.len(), 2);
+    assert_eq!(options.changes[0].0, crate::deployment::Capability::Runtime);
+    assert_eq!(
+        options.changes[0].1.responsibility,
+        crate::deployment::Responsibility::Delegated
+    );
+    assert_eq!(
+        options.changes[1].1.scope,
+        crate::deployment::ResourceScope::Shared
+    );
+
+    let command = parse(&[
+        "nazoauthctl",
+        "--deployment",
+        "deployment-a",
+        "relinquish",
+        "--capability",
+        "runtime",
+        "--yes",
+    ])
+    .unwrap()
+    .unwrap()
+    .command;
+    assert!(matches!(
+        command,
+        Command::Relinquish(RelinquishOptions { yes: true, .. })
+    ));
+    assert!(matches!(
+        parse(&["nazoauthctl", "--deployment", "deployment-a", "reconcile"])
+            .unwrap()
+            .unwrap()
+            .command,
+        Command::Reconcile
+    ));
+
+    for arguments in [
+        &["nazoauthctl", "permissions", "set", "--yes"][..],
+        &[
+            "nazoauthctl",
+            "permissions",
+            "set",
+            "--capability",
+            "runtime=managed",
+            "--capability",
+            "runtime=delegated",
+            "--yes",
+        ][..],
+        &["nazoauthctl", "relinquish", "--yes"][..],
+    ] {
+        assert!(parse(arguments).is_err(), "accepted {arguments:?}");
+    }
+}
+
+#[test]
 fn parses_key_mutations_identity_rotation_and_break_glass() {
     let command = parse(&[
         "nazoauthctl",
