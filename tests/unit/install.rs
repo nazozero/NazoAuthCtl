@@ -136,6 +136,8 @@ fn host_service_unit_exposes_only_runtime_state() {
     .replace('\\', "/");
 
     assert!(unit.contains("User=nazoauth\nGroup=nazoauth"));
+    assert!(unit.contains("Environment=DATA_DIR=/var/lib/nazoauth/app"));
+    assert!(unit.contains("Environment=INSTANCE_IDENTITY_DIR=/var/lib/nazoauth/app/instance"));
     assert!(unit.contains(
         "ReadWritePaths=/var/lib/nazoauth/app/keys /var/lib/nazoauth/app/avatars /var/lib/nazoauth/app/secrets /var/lib/nazoauth/app/bootstrap /var/lib/nazoauth/app/instance /var/lib/nazoauth/ui-releases"
     ));

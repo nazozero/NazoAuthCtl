@@ -12,6 +12,7 @@ use crate::deployment::{ArtifactReference, ResourceScope, Responsibility, Runtim
 pub(crate) use docker::DockerBackend;
 pub(crate) use podman::PodmanBackend;
 pub(crate) use systemd::SystemdBackend;
+#[cfg(test)]
 pub(crate) use systemd::{parse_systemd_version, render_host_service_unit};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

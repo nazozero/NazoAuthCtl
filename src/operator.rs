@@ -28,8 +28,6 @@ use crate::{
 };
 
 #[cfg(debug_assertions)]
-use crate::process::Process;
-
 #[derive(Clone, Debug)]
 pub(crate) struct ExpectedReleaseTarget {
     pub(crate) embedded: EmbeddedIdentity,

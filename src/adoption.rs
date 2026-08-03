@@ -21,7 +21,7 @@ use crate::{
         DeploymentStore, MountReference, RecoveryAssessment, RecoveryConclusion, Responsibility,
         RuntimeInstance, SafeReference, TrustState,
     },
-    discovery::{DiscoveredDeployment, discover, select},
+    discovery::{DiscoveredDeployment, deployment_statement_path, discover, select},
     filesystem::{atomic_write, copy_atomic, sha256},
     release::VerifiedRelease,
 };
@@ -403,7 +403,7 @@ fn execute(
             .iter()
             .filter_map(|candidate| candidate.instance_key_id.clone())
             .collect(),
-        resource_references: receipt_resource_references(primary),
+        resource_references: receipt_resource_references(candidates),
         capabilities: receipt_capabilities(&plan.capabilities),
         recovery_proven: plan.recovery.conclusion == RecoveryConclusion::Proven,
         recovery_evidence,
@@ -625,12 +625,7 @@ fn deployment_record(
                 networks: candidate.runtime.networks.clone(),
                 mounts,
                 instance_key_id: candidate.instance_key_id.clone(),
-                deployment_statement: candidate.runtime.mounts.iter().find_map(|mount| {
-                    let destination = mount.destination.join("instance/deployment-statement.jws");
-                    destination
-                        .is_absolute()
-                        .then(|| mount.source.join("instance/deployment-statement.jws"))
-                }),
+                deployment_statement: deployment_statement_path(candidate),
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -673,10 +668,19 @@ fn create_identities(store: &DeploymentStore, deployment_id: &str) -> anyhow::Re
     let controller = create_identity(&active, "controller")?;
     let receipt = create_identity(&active, "receipt")?;
     let audit = create_identity(&active, "audit")?;
-    let _break_glass = create_identity(&break_glass, "break-glass")?;
-    if [controller.0.as_str(), receipt.0.as_str(), audit.0.as_str()]
-        .windows(2)
-        .any(|pair| pair[0] == pair[1])
+    let break_glass_identity = create_identity(&break_glass, "break-glass")?;
+    let identity_ids = [
+        controller.0.as_str(),
+        receipt.0.as_str(),
+        audit.0.as_str(),
+        break_glass_identity.0.as_str(),
+    ];
+    if identity_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != identity_ids.len()
     {
         bail!("deployment identities are not distinct");
     }
@@ -784,11 +788,24 @@ fn initialize_audit(
     )
 }
 
-fn receipt_resource_references(candidate: &DiscoveredDeployment) -> BTreeMap<String, String> {
+fn receipt_resource_references(candidates: &[DiscoveredDeployment]) -> BTreeMap<String, String> {
     let mut references = BTreeMap::new();
-    for (index, mount) in candidate.runtime.mounts.iter().enumerate() {
-        if !mount.source.to_string_lossy().contains("redacted") {
-            references.insert(format!("mount-{index}"), mount.source.display().to_string());
+    for (runtime_index, candidate) in candidates.iter().enumerate() {
+        references.insert(
+            format!("runtime-{runtime_index}-object"),
+            format!(
+                "{}:{}",
+                backend_name(candidate.runtime.backend),
+                candidate.runtime.object_reference
+            ),
+        );
+        for (mount_index, mount) in candidate.runtime.mounts.iter().enumerate() {
+            if !mount.source.to_string_lossy().contains("redacted") {
+                references.insert(
+                    format!("runtime-{runtime_index}-mount-{mount_index}"),
+                    mount.source.display().to_string(),
+                );
+            }
         }
     }
     references
@@ -822,3 +839,7 @@ fn hex_sha256(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/adoption.rs"]
+mod tests;

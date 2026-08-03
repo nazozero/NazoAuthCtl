@@ -18,7 +18,7 @@ use super::{
     BlobAttestationVerification, HostServiceInstall, ManagedDependencies, ManagedDependencyBackup,
     ManagedNetwork, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore,
     OneShotTask, RuntimeBackend, RuntimeDatabasePrivilegeProbe, RuntimeObservation,
-    RuntimeReplacement,
+    RuntimeReplacement, safe_environment,
 };
 
 pub(crate) struct SystemdBackend;
@@ -82,7 +82,7 @@ impl RuntimeBackend for SystemdBackend {
                 "show",
                 object_reference,
                 "--no-pager",
-                "--property=Id,LoadState,ActiveState,FragmentPath,ExecStart,EnvironmentFiles",
+                "--property=Id,LoadState,ActiveState,FragmentPath,ExecStart,Environment,EnvironmentFiles",
             ])
             .stdout()?;
         let properties = parse_properties(&output);
@@ -100,6 +100,12 @@ impl RuntimeBackend for SystemdBackend {
         if matches!(artifact, ArtifactReference::Unknown) {
             missing.push("host binary digest could not be resolved".to_owned());
         }
+        let environment = properties
+            .get("Environment")
+            .into_iter()
+            .flat_map(|value| value.split_whitespace())
+            .map(|value| serde_json::Value::String(value.trim_matches('"').to_owned()))
+            .collect::<Vec<_>>();
         Ok(RuntimeObservation {
             backend: self.kind(),
             object_reference: object_reference.to_owned(),
@@ -115,7 +121,7 @@ impl RuntimeBackend for SystemdBackend {
             ports: Vec::new(),
             networks: Vec::new(),
             mounts: Vec::new(),
-            safe_environment: BTreeMap::new(),
+            safe_environment: safe_environment(&environment),
             labels: BTreeMap::new(),
             evidence: vec!["systemd ExecStart identifies nazoauth server".to_owned()],
             missing,
@@ -357,6 +363,8 @@ pub(crate) fn render_host_service_unit(install: &HostServiceInstall) -> String {
          Group={user}\n\
          WorkingDirectory={working}\n\
          ExecStart={binary} server\n\
+         Environment=DATA_DIR={app_root}\n\
+         Environment=INSTANCE_IDENTITY_DIR={instance_dir}\n\
          Restart=on-failure\n\
          RestartSec=2\n\
          NoNewPrivileges=true\n\
@@ -378,6 +386,8 @@ pub(crate) fn render_host_service_unit(install: &HostServiceInstall) -> String {
         user = install.service_user,
         working = install.working_directory.display(),
         binary = install.binary.display(),
+        app_root = install.app_root.display(),
+        instance_dir = install.app_root.join("instance").display(),
         keys = install.app_root.join("keys").display(),
         avatars = install.app_root.join("avatars").display(),
         secrets = install.app_root.join("secrets").display(),

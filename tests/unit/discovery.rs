@@ -44,6 +44,7 @@ fn candidate(target: &str, deployment_id: &str, runtime_instance_id: &str) -> Di
         recovery_conclusion: RecoveryConclusion::Unproven,
         evidence: Vec::new(),
         missing: Vec::new(),
+        sensitive_mount_sources: std::collections::BTreeMap::new(),
     }
 }
 
@@ -85,4 +86,53 @@ fn secret_mount_sources_are_redacted_without_changing_neutral_mount_authority() 
     );
     assert_eq!(runtime.mounts[0].ownership, Responsibility::External);
     assert_eq!(runtime.mounts[0].scope, ResourceScope::Shared);
+}
+
+#[test]
+fn offline_statement_path_uses_the_declared_data_mount_not_mount_order() {
+    let mut discovered = candidate("podman:runtime-a", "deployment-a", "runtime-a");
+    discovered
+        .runtime
+        .safe_environment
+        .insert("DATA_DIR".to_owned(), "/var/lib/nazo_oauth".to_owned());
+    discovered.runtime.mounts = vec![
+        NeutralMount {
+            source: PathBuf::from("/etc/nazoauth/.env.yaml"),
+            destination: PathBuf::from("/app/.env.yaml"),
+            read_only: true,
+            selinux_relabel: true,
+            ownership: Responsibility::External,
+            scope: ResourceScope::Deployment,
+        },
+        NeutralMount {
+            source: PathBuf::from("/srv/nazoauth-a/data"),
+            destination: PathBuf::from("/var/lib/nazo_oauth"),
+            read_only: false,
+            selinux_relabel: true,
+            ownership: Responsibility::External,
+            scope: ResourceScope::Deployment,
+        },
+    ];
+    assert_eq!(
+        deployment_statement_path(&discovered),
+        Some(PathBuf::from(
+            "/srv/nazoauth-a/data/instance/deployment-statement.jws"
+        ))
+    );
+}
+
+#[test]
+fn stopped_systemd_identity_uses_signed_statement_at_declared_host_data_dir() {
+    let mut discovered = candidate("systemd:custom.service", "deployment-host", "runtime-host");
+    discovered.runtime.backend = RuntimeBackendKind::Systemd;
+    discovered.runtime.safe_environment.insert(
+        "INSTANCE_IDENTITY_DIR".to_owned(),
+        "/srv/custom/identity".to_owned(),
+    );
+    assert_eq!(
+        deployment_statement_path(&discovered),
+        Some(PathBuf::from(
+            "/srv/custom/identity/deployment-statement.jws"
+        ))
+    );
 }

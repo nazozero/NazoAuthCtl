@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -51,14 +52,17 @@ pub(crate) struct DiscoveredDeployment {
     pub(crate) recovery_conclusion: RecoveryConclusion,
     pub(crate) evidence: Vec<String>,
     pub(crate) missing: Vec<String>,
+    #[serde(skip)]
+    pub(crate) sensitive_mount_sources: BTreeMap<PathBuf, PathBuf>,
 }
 
 pub(crate) fn discover() -> anyhow::Result<DiscoveryReport> {
     let mut candidates = Vec::new();
     for backend in installed_backends() {
-        for mut runtime in backend.discover()? {
-            redact_secret_mount_sources(&mut runtime);
-            candidates.push(enrich(runtime));
+        for runtime in backend.discover()? {
+            let mut candidate = enrich(runtime);
+            candidate.sensitive_mount_sources = redact_secret_mount_sources(&mut candidate.runtime);
+            candidates.push(candidate);
         }
     }
     Ok(finalize_report(candidates))
@@ -210,6 +214,7 @@ fn enrich(runtime: RuntimeObservation) -> DiscoveredDeployment {
         recovery_conclusion,
         evidence,
         missing,
+        sensitive_mount_sources: BTreeMap::new(),
     }
 }
 
@@ -355,10 +360,41 @@ fn offline_statement(runtime: &RuntimeObservation) -> anyhow::Result<Option<Depl
 }
 
 fn map_runtime_path(runtime: &RuntimeObservation, runtime_path: &Path) -> Option<PathBuf> {
+    if runtime.backend == RuntimeBackendKind::Systemd {
+        return Some(runtime_path.to_owned());
+    }
     runtime.mounts.iter().find_map(|mount| {
         let relative = runtime_path.strip_prefix(&mount.destination).ok()?;
         Some(mount.source.join(relative))
     })
+}
+
+pub(crate) fn deployment_statement_path(candidate: &DiscoveredDeployment) -> Option<PathBuf> {
+    let data_dir = candidate
+        .runtime
+        .safe_environment
+        .get("DATA_DIR")
+        .map(PathBuf::from);
+    let identity_dir = candidate
+        .runtime
+        .safe_environment
+        .get("INSTANCE_IDENTITY_DIR")
+        .map(PathBuf::from)
+        .or_else(|| data_dir.map(|path| path.join("instance")))?;
+    if candidate.runtime.backend == RuntimeBackendKind::Systemd {
+        return Some(identity_dir.join("deployment-statement.jws"));
+    }
+    candidate
+        .sensitive_mount_sources
+        .iter()
+        .find_map(|(destination, source)| {
+            let relative = identity_dir.strip_prefix(destination).ok()?;
+            Some(source.join(relative).join("deployment-statement.jws"))
+        })
+        .or_else(|| {
+            map_runtime_path(&candidate.runtime, &identity_dir)
+                .map(|path| path.join("deployment-statement.jws"))
+        })
 }
 
 fn read_bounded(path: &Path, maximum: u64) -> anyhow::Result<String> {
@@ -415,16 +451,19 @@ fn probe_public_service(issuer: &str) -> anyhow::Result<(bool, bool)> {
     Ok((issuer_matches, ready))
 }
 
-fn redact_secret_mount_sources(runtime: &mut RuntimeObservation) {
+fn redact_secret_mount_sources(runtime: &mut RuntimeObservation) -> BTreeMap<PathBuf, PathBuf> {
+    let mut sensitive = BTreeMap::new();
     for mount in &mut runtime.mounts {
         let destination = mount.destination.to_string_lossy().to_ascii_lowercase();
         if ["secret", "credential", "token", "private", "identity.key"]
             .iter()
             .any(|marker| destination.contains(marker))
         {
+            sensitive.insert(mount.destination.clone(), mount.source.clone());
             mount.source = PathBuf::from("<redacted-secret-source>");
         }
     }
+    sensitive
 }
 
 fn backend_name(backend: RuntimeBackendKind) -> &'static str {
