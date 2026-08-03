@@ -1942,6 +1942,21 @@ fn pending_pre_migration_update_restores_previous_artifact_and_closes_the_journa
 fn pending_active_candidate_restores_previous_release_and_closes_the_journal() {
     let work = PrivateTempDir::new("nazoauth-recover-active-unwind").unwrap();
     let mut config = config(&work);
+    config.dependencies.migration_database_url_file =
+        work.path().join("secrets/database-migration-url");
+    fs::create_dir_all(
+        config
+            .dependencies
+            .migration_database_url_file
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &config.dependencies.migration_database_url_file,
+        "postgresql://migrator:recovery-test@database.invalid/oauth",
+    )
+    .unwrap();
     let mut value = journal(&config, UpdatePhase::CandidateActive);
     config.runtime.backend = RuntimeBackendKind::Podman;
     config.runtime.backend_command_override = Some(fake_container_runtime(
