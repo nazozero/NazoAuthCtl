@@ -344,6 +344,31 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             crate::adoption::run(options)
         }
         Command::DeploymentsList => list_deployments(),
+        Command::TransactionShow => {
+            let store = DeploymentStore::system();
+            let record = store.resolve(selector.as_deref(), false)?;
+            let transaction = crate::coordination::show(&store, &record)?;
+            println!("{}", serde_json::to_string_pretty(&transaction)?);
+            Ok(())
+        }
+        Command::TransactionEvidence { file, yes } => {
+            require_root()?;
+            require_confirmation(yes, "accept deployment-bound external step evidence")?;
+            let store = DeploymentStore::system();
+            let record = store.resolve(selector.as_deref(), true)?;
+            let transaction = crate::coordination::submit_evidence(&store, &record, &file)?;
+            println!("{}", serde_json::to_string_pretty(&transaction)?);
+            Ok(())
+        }
+        Command::TransactionResume { yes } => {
+            require_root()?;
+            require_confirmation(yes, "resume the deployment-bound update transaction")?;
+            let store = DeploymentStore::system();
+            let record = store.resolve(selector.as_deref(), true)?;
+            let transaction = crate::coordination::resume(&store, &record)?;
+            println!("{}", serde_json::to_string_pretty(&transaction)?);
+            Ok(())
+        }
         Command::PermissionsSet(options) => {
             require_root()?;
             require_confirmation(options.yes, "change deployment capability grants")?;
@@ -429,9 +454,19 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             )
         }
         Command::Update(options) => {
-            if options.plan && DeploymentStore::system().registry_path().exists() {
-                let record = DeploymentStore::system().resolve(selector.as_deref(), false)?;
-                registered_update_plan(&record, &options)
+            if DeploymentStore::system().registry_path().exists() {
+                let store = DeploymentStore::system();
+                let record = store.resolve(selector.as_deref(), !options.plan)?;
+                if options.plan {
+                    registered_update_plan(&record, &options)
+                } else {
+                    require_root()?;
+                    require_confirmation(
+                        options.yes,
+                        "prepare a deployment-bound update transaction",
+                    )?;
+                    registered_update_prepare(&store, &record, &options)
+                }
             } else {
                 require_root()?;
                 let required = [
@@ -1845,6 +1880,7 @@ fn command_is_read_only(command: &Command) -> bool {
     match command {
         Command::Discover
         | Command::DeploymentsList
+        | Command::TransactionShow
         | Command::Reconcile
         | Command::Status
         | Command::Doctor
@@ -2644,6 +2680,9 @@ pub(crate) fn uses_legacy_lock(command: &Command) -> bool {
         Command::Discover
             | Command::Adopt(_)
             | Command::DeploymentsList
+            | Command::TransactionShow
+            | Command::TransactionEvidence { .. }
+            | Command::TransactionResume { .. }
             | Command::PermissionsSet(_)
             | Command::Relinquish(_)
             | Command::Reconcile
@@ -3054,6 +3093,34 @@ fn registered_update_plan(
     )?;
     let plan = build_registered_update_plan(record, &release.manifest)?;
     println!("{}", serde_json::to_string_pretty(&plan)?);
+    Ok(())
+}
+
+fn registered_update_prepare(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    options: &UpdateOptions,
+) -> anyhow::Result<()> {
+    const SERVER_REPOSITORY: &str = "nazozero/NazoAuth";
+
+    let container_engine = record
+        .runtime_instances
+        .iter()
+        .find_map(|runtime| runtime.backend.container_command());
+    let release = VerifiedRelease::fetch(
+        SERVER_REPOSITORY,
+        options.version.as_deref(),
+        container_engine,
+    )?;
+    let plan = build_registered_update_plan(record, &release.manifest)?;
+    let evidence_root = store
+        .deployment_state_dir(&record.deployment_id)
+        .join("recovery")
+        .join("trusted-releases")
+        .join(&release.manifest.version);
+    release.persist_verification_evidence(&evidence_root)?;
+    let transaction = crate::coordination::prepare_update(store, record, &plan)?;
+    println!("{}", serde_json::to_string_pretty(&transaction)?);
     Ok(())
 }
 

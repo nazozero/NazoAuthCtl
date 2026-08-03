@@ -1,6 +1,7 @@
 mod adoption;
 mod backup;
 mod cli;
+mod coordination;
 mod deployment;
 mod discovery;
 mod filesystem;
@@ -63,6 +64,9 @@ Start here:
   nazoauthctl adopt --target BACKEND:OBJECT --plan
   nazoauthctl adopt --target BACKEND:OBJECT --yes
   nazoauthctl deployments list
+  nazoauthctl --deployment ID transaction show
+  nazoauthctl --deployment ID transaction evidence --file PATH --yes
+  nazoauthctl --deployment ID transaction resume --yes
   nazoauthctl --deployment ID permissions set --capability runtime=delegated --yes
   nazoauthctl --deployment ID relinquish --capability runtime --yes
   nazoauthctl --deployment ID reconcile
@@ -77,6 +81,7 @@ Commands:
   discover      Read-only local Podman, Docker, systemd and process discovery
   adopt         Verify and transactionally register an explicitly selected target
   deployments   List registered deployment control domains
+  transaction   Inspect, provide evidence to, or resume a deployment-bound transaction
   permissions   Transactionally change explicitly selected capability grants
   relinquish    Return capabilities to external ownership without deleting resources
   reconcile     Report external drift and fail closed on managed drift

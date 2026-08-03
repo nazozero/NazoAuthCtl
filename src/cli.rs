@@ -66,6 +66,14 @@ pub(crate) enum Command {
     Discover,
     Adopt(AdoptionOptions),
     DeploymentsList,
+    TransactionShow,
+    TransactionEvidence {
+        file: PathBuf,
+        yes: bool,
+    },
+    TransactionResume {
+        yes: bool,
+    },
     PermissionsSet(PermissionOptions),
     Relinquish(RelinquishOptions),
     Reconcile,
@@ -275,6 +283,18 @@ impl Cli {
             }
             "adopt" => Command::Adopt(parse_adoption(values)?),
             "deployments" if values == ["list"] => Command::DeploymentsList,
+            "transaction" if values == ["show"] => Command::TransactionShow,
+            "transaction" if values.first().is_some_and(|value| value == "evidence") => {
+                values.remove(0);
+                let (file, yes) = parse_transaction_evidence(values)?;
+                Command::TransactionEvidence { file, yes }
+            }
+            "transaction" if values.first().is_some_and(|value| value == "resume") => {
+                values.remove(0);
+                Command::TransactionResume {
+                    yes: parse_yes(values, "transaction resume")?,
+                }
+            }
             "permissions" if values.first().is_some_and(|value| value == "set") => {
                 values.remove(0);
                 Command::PermissionsSet(parse_permission_options(values)?)
@@ -673,6 +693,37 @@ fn parse_update_options(values: Vec<String>) -> anyhow::Result<UpdateOptions> {
         yes,
         accept_migration_barrier,
     })
+}
+
+fn parse_transaction_evidence(values: Vec<String>) -> anyhow::Result<(PathBuf, bool)> {
+    let mut file = None;
+    let mut yes = false;
+    let mut index = 0;
+    while index < values.len() {
+        match values[index].as_str() {
+            "--yes" => {
+                if yes {
+                    bail!("transaction evidence --yes may be specified only once");
+                }
+                yes = true;
+                index += 1;
+            }
+            "--file" => {
+                let value = values
+                    .get(index + 1)
+                    .context("transaction evidence --file requires PATH")?;
+                if file.replace(PathBuf::from(value)).is_some() {
+                    bail!("transaction evidence --file may be specified only once");
+                }
+                index += 2;
+            }
+            other => bail!("unknown transaction evidence option {other}"),
+        }
+    }
+    Ok((
+        file.context("transaction evidence requires --file PATH")?,
+        yes,
+    ))
 }
 
 fn parse_yes(values: Vec<String>, command: &str) -> anyhow::Result<bool> {

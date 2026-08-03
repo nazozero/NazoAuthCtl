@@ -494,6 +494,44 @@ fn parses_exact_candidate_migration_target() {
 }
 
 #[test]
+fn coordination_commands_require_explicit_deployment_evidence_and_confirmation() {
+    let cli = parse(&[
+        "nazoauthctl",
+        "--deployment",
+        "deployment-a",
+        "transaction",
+        "evidence",
+        "--file",
+        "/run/evidence.json",
+        "--yes",
+    ])
+    .unwrap()
+    .unwrap();
+    assert_eq!(cli.deployment.as_deref(), Some("deployment-a"));
+    assert!(matches!(
+        cli.command,
+        Command::TransactionEvidence { file, yes: true }
+            if file == PathBuf::from("/run/evidence.json")
+    ));
+    assert!(matches!(
+        parse(&[
+            "nazoauthctl",
+            "--deployment",
+            "deployment-a",
+            "transaction",
+            "resume",
+            "--yes",
+        ])
+        .unwrap()
+        .unwrap()
+        .command,
+        Command::TransactionResume { yes: true }
+    ));
+    assert!(parse(&["nazoauthctl", "transaction", "evidence"]).is_err());
+    assert!(parse(&["nazoauthctl", "transaction", "show", "extra"]).is_err());
+}
+
+#[test]
 fn parses_capability_transitions_without_collapsing_ownership_or_scope() {
     let command = parse(&[
         "nazoauthctl",
