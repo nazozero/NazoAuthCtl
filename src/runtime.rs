@@ -334,7 +334,7 @@ impl<'a> Runtime<'a> {
     }
 
     pub(crate) fn container_exists(&self) -> bool {
-        self.backend_kind().is_ok_and(|_| {
+        self.backend_kind().is_ok_and(|kind| {
             kind != RuntimeBackendKind::Systemd
                 && self.backend().is_ok_and(|backend| {
                     backend.inspect(&self.config.runtime.container_name).is_ok()
@@ -532,7 +532,7 @@ impl<'a> Runtime<'a> {
     }
 
     fn container_has_authorized_labels(&self) -> bool {
-        self.backend_kind().is_ok_and(|kind| {
+        self.backend_kind().is_ok_and(|_| {
             self.backend().is_ok_and(|backend| {
                 backend
                     .verify_ownership(
