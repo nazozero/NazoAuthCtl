@@ -118,6 +118,10 @@ impl RuntimeBackend for SystemdBackend {
             .run_quiet()
     }
 
+    fn remove(&self, _object_reference: &str) -> anyhow::Result<()> {
+        bail!("systemd unit removal is not an implicit runtime operation")
+    }
+
     fn replace(&self, _replacement: &RuntimeReplacement) -> anyhow::Result<()> {
         bail!(
             "systemd artifact replacement requires an explicit staged binary transaction and is not inferred from a unit name"
@@ -125,39 +129,11 @@ impl RuntimeBackend for SystemdBackend {
     }
 
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String> {
-        let ArtifactReference::HostBinary {
-            path,
-            sha256: expected,
-        } = &task.artifact
-        else {
-            bail!("systemd one-shot task requires a digest-bound host binary");
-        };
-        if sha256(path)? != *expected {
-            bail!("host one-shot binary does not match the authorized digest");
-        }
-        let unit = format!("nazoauthctl-task-{}", uuid::Uuid::now_v7());
-        let mut command = Process::new("systemd-run")
-            .args([
-                "--quiet",
-                "--wait",
-                "--pipe",
-                "--collect",
-                "--service-type=exec",
-                "--property=NoNewPrivileges=yes",
-                "--property=PrivateTmp=yes",
-                "--property=ProtectSystem=strict",
-                "--property=ProtectHome=yes",
-            ])
-            .arg(format!("--unit={unit}"));
-        for mount in &task.mounts {
-            let property = if mount.read_only {
-                "ReadOnlyPaths"
-            } else {
-                "ReadWritePaths"
-            };
-            command = command.arg(format!("--property={property}={}", mount.source.display()));
-        }
-        command.arg(path).args(&task.command).stdout()
+        systemd_one_shot_process(task)?.stdin_stdout(&task.stdin)
+    }
+
+    fn run_one_shot_authorization_probe(&self, task: &OneShotTask) -> anyhow::Result<bool> {
+        systemd_one_shot_process(task)?.stdin_authorization_rejected(&task.stdin)
     }
 
     fn resolve_image_digest(&self, _image_reference: &str) -> anyhow::Result<String> {
@@ -166,12 +142,78 @@ impl RuntimeBackend for SystemdBackend {
 
     fn read_build_identity(
         &self,
-        _observation: &RuntimeObservation,
+        artifact: &ArtifactReference,
     ) -> anyhow::Result<Option<nazo_operator_protocol::EmbeddedIdentity>> {
-        // Executing a discovered binary would violate read-only discovery and
-        // would trust the very artifact that still needs verification.
-        Ok(None)
+        let ArtifactReference::HostBinary {
+            path,
+            sha256: expected,
+        } = artifact
+        else {
+            bail!("systemd build identity requires a digest-bound host binary");
+        };
+        if sha256(path)? != *expected {
+            bail!("host binary no longer matches its trusted digest");
+        }
+        let output = Process::new(path).arg("build-identity").stdout()?;
+        Ok(Some(serde_json::from_str(output.trim()).context(
+            "host binary returned an invalid build identity",
+        )?))
     }
+}
+
+fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
+    let ArtifactReference::HostBinary {
+        path,
+        sha256: expected,
+    } = &task.artifact
+    else {
+        bail!("systemd one-shot task requires a digest-bound host binary");
+    };
+    if sha256(path)? != *expected {
+        bail!("host one-shot binary does not match the authorized digest");
+    }
+    let unit = format!("nazoauthctl-task-{}", uuid::Uuid::now_v7());
+    let mut process = Process::new("systemd-run")
+        .timeout(std::time::Duration::from_secs(300))
+        .args([
+            "--quiet",
+            "--wait",
+            "--pipe",
+            "--collect",
+            "--service-type=exec",
+            "--property=NoNewPrivileges=yes",
+            "--property=PrivateTmp=yes",
+            "--property=ProtectSystem=strict",
+            "--property=ProtectHome=yes",
+        ])
+        .arg(format!("--unit={unit}"));
+    if task.network.is_none() {
+        process = process.arg("--property=RestrictAddressFamilies=AF_UNIX");
+    }
+    if let Some(directory) = &task.working_directory {
+        process = process.arg(format!("--working-directory={}", directory.display()));
+    }
+    if let Some(user) = &task.service_user {
+        process = process
+            .arg(format!("--uid={user}"))
+            .arg(format!("--gid={user}"));
+    }
+    for (name, value) in &task.environment {
+        process = process.arg(format!("--setenv={name}={value}"));
+    }
+    for mount in &task.mounts {
+        let property = if mount.read_only {
+            "BindReadOnlyPaths"
+        } else {
+            "BindPaths"
+        };
+        process = process.arg(format!(
+            "--property={property}={}:{}",
+            mount.source.display(),
+            mount.destination.display()
+        ));
+    }
+    Ok(process.arg(path).args(&task.command))
 }
 
 fn discover_unmanaged_processes() -> anyhow::Result<Vec<RuntimeObservation>> {

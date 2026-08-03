@@ -72,8 +72,9 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
         },
         dependencies: Dependencies::default(),
         runtime: RuntimeConfig {
-            engine: "host".to_owned(),
-            dependency_engine: String::new(),
+            backend: RuntimeBackendKind::Systemd,
+            dependency_backend: None,
+            backend_command_override: None,
             container_name: "nazoauth".to_owned(),
             runtime_instance_id: "runtime-test".to_owned(),
             network: "nazoauth".to_owned(),
@@ -1076,7 +1077,7 @@ fn release_target_policy_and_operation_names_are_explicit() {
         expected_release_target(&config, embedded.clone(), String::new(), "short".to_owned())
             .is_err()
     );
-    config.runtime.engine = "podman".to_owned();
+    config.runtime.backend = RuntimeBackendKind::Podman;
     expected_release_target(&config, embedded, "image".to_owned(), "short".to_owned()).unwrap();
 
     assert_eq!(
@@ -1152,7 +1153,7 @@ fn canonical_manifest_hashes_only_the_closed_non_secret_configuration() {
     assert_eq!(manifest.entries["operation"], "migrate-apply");
     assert_eq!(manifest.entries["deployment_id"], "deployment-test");
 
-    config.runtime.engine = "podman".to_owned();
+    config.runtime.backend = RuntimeBackendKind::Podman;
     config.runtime.mounts.clear();
     assert!(canonical_manifest(&config, &TaskOperation::KeysList).is_err());
     config.runtime.mounts.push(crate::model::Mount {

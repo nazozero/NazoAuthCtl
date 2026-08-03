@@ -13,6 +13,7 @@ use nazo_operator_protocol::{EmbeddedIdentity, TaskOperation};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::deployment::{Capability, DeploymentRecord, DeploymentStore, FileLock, SafeReference};
 use crate::{
     backup::Backup,
     cli::{
@@ -27,6 +28,89 @@ use crate::{
     release::{VerifiedRelease, commit_release_trust, compare_versions, enforce_release_trust},
     runtime::Runtime,
 };
+
+struct ControlConfig {
+    path: PathBuf,
+    config: UpdateConfig,
+    _deployment_lock: Option<FileLock>,
+}
+
+fn control_config(
+    config_path: &Path,
+    selector: Option<&str>,
+    capabilities: &[Capability],
+    application_task: bool,
+    core_recovery: bool,
+    unsettled: bool,
+) -> anyhow::Result<ControlConfig> {
+    let store = DeploymentStore::system();
+    if !store.registry_path().exists() {
+        let config = if unsettled {
+            load_config_unsettled(config_path)?
+        } else {
+            load_config(config_path)?
+        };
+        return Ok(ControlConfig {
+            path: config_path.to_path_buf(),
+            config,
+            _deployment_lock: None,
+        });
+    }
+
+    let destructive = !capabilities.is_empty() || core_recovery;
+    let resolved = store.resolve(selector, destructive)?;
+    let deployment_lock = destructive
+        .then(|| store.deployment_lock(&resolved.deployment_id))
+        .transpose()?;
+    let record = store.load(&resolved.deployment_id)?;
+    if !capabilities.is_empty() {
+        record.require_mutation(capabilities)?;
+    }
+    if core_recovery && !record.core_recovery_is_proven() {
+        bail!(
+            "deployment {} has no proven controller-independent recovery package",
+            record.deployment_id
+        );
+    }
+    if application_task
+        && !record
+            .operator_protocol_versions
+            .contains(&nazo_operator_protocol::PROTOCOL_VERSION)
+    {
+        bail!(
+            "deployment {} does not support operator protocol {}; application task refused",
+            record.deployment_id,
+            nazo_operator_protocol::PROTOCOL_VERSION
+        );
+    }
+    let path = match record.resources.get("controller_config") {
+        Some(SafeReference::File { path }) => path.clone(),
+        _ => bail!(
+            "deployment {} has no verified controller configuration; create and approve a lifecycle plan before mutation",
+            record.deployment_id
+        ),
+    };
+    let config = if unsettled {
+        load_config_unsettled(&path)?
+    } else {
+        load_config(&path)?
+    };
+    verify_control_binding(&record, &config)?;
+    Ok(ControlConfig {
+        path,
+        config,
+        _deployment_lock: deployment_lock,
+    })
+}
+
+fn verify_control_binding(record: &DeploymentRecord, config: &UpdateConfig) -> anyhow::Result<()> {
+    if config.operator.deployment_id != record.deployment_id
+        || config.operator.controller_key_id != record.control_authority
+    {
+        bail!("controller configuration is bound to a different deployment authority");
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -244,6 +328,8 @@ fn conformance_operation(command: ConformanceLeaseCommand) -> anyhow::Result<Tas
 }
 
 pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
+    let configured_path = cli.config.clone();
+    let selector = cli.deployment.clone();
     match cli.command {
         Command::Discover => {
             let report = crate::discovery::discover()?;
@@ -296,15 +382,29 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::BootstrapAdmin(options) => {
             require_root()?;
-            let config = load_config(&cli.config)?;
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[Capability::OperatorTasks],
+                true,
+                false,
+                false,
+            )?;
             require_confirmation(options.yes, "create the first NazoAuth administrator")?;
-            bootstrap_admin(&config, options)
+            bootstrap_admin(&context.config, options)
         }
         Command::Check(version) => {
-            let config = load_config(&cli.config)?;
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[],
+                false,
+                false,
+                false,
+            )?;
             update(
-                &cli.config,
-                &config,
+                &context.path,
+                &context.config,
                 UpdateOptions {
                     version,
                     plan: true,
@@ -315,34 +415,86 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Update(options) => {
             require_root()?;
-            let config = load_config(&cli.config)?;
-            update(&cli.config, &config, options)
+            let required = if options.plan {
+                &[][..]
+            } else {
+                &[
+                    Capability::Runtime,
+                    Capability::Artifact,
+                    Capability::ServerConfig,
+                    Capability::Database,
+                    Capability::Valkey,
+                    Capability::Backups,
+                ][..]
+            };
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                required,
+                false,
+                false,
+                false,
+            )?;
+            update(&context.path, &context.config, options)
         }
         Command::Rollback { yes } => {
             require_root()?;
-            let config = load_config(&cli.config)?;
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[Capability::Runtime, Capability::Artifact],
+                false,
+                false,
+                false,
+            )?;
             require_confirmation(
                 yes,
                 "rollback the application artifact without restoring the database",
             )?;
-            public_rollback(&config)
+            public_rollback(&context.config)
         }
         Command::Recover { yes } => {
             require_root()?;
-            let config = load_config(&cli.config)?;
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[
+                    Capability::Runtime,
+                    Capability::Artifact,
+                    Capability::Database,
+                    Capability::Valkey,
+                    Capability::Backups,
+                ],
+                false,
+                true,
+                false,
+            )?;
             require_confirmation(
                 yes,
                 "restore the declared database backup and previous application artifact",
             )?;
-            recover_from_backup(&config)
+            recover_from_backup(&context.config)
         }
         Command::RecoverUpdate { yes } => {
             require_root()?;
-            let config = load_config_unsettled(&cli.config)?;
-            if crate::operator::identity_recovery_required(&config)? {
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[
+                    Capability::Runtime,
+                    Capability::Artifact,
+                    Capability::Database,
+                    Capability::Valkey,
+                    Capability::Backups,
+                ],
+                false,
+                true,
+                true,
+            )?;
+            if crate::operator::identity_recovery_required(&context.config)? {
                 bail!("identity recovery is pending; run nazoauthctl recover-identity --yes first");
             }
-            let journal = load_update_journal(&config)?
+            let journal = load_update_journal(&context.config)?
                 .context("no interrupted update transaction requires recovery")?;
             require_confirmation(
                 yes,
@@ -351,39 +503,60 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                     journal.transaction_id, journal.phase
                 ),
             )?;
-            recover_pending_update(&cli.config, &config)?;
-            load_config(&cli.config).map(|_| ())
+            recover_pending_update(&context.path, &context.config)?;
+            load_config(&context.path).map(|_| ())
         }
         Command::RecoverIdentity { yes } => {
             require_root()?;
-            let mut config = load_config_unsettled(&cli.config)?;
-            ensure_no_pending_update(&config)?;
-            if !crate::operator::identity_recovery_required(&config)? {
+            let mut context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[Capability::OperatorTasks],
+                true,
+                false,
+                true,
+            )?;
+            ensure_no_pending_update(&context.config)?;
+            if !crate::operator::identity_recovery_required(&context.config)? {
                 bail!("no interrupted identity transition requires recovery");
             }
             require_confirmation(yes, "recover the interrupted identity transition")?;
-            crate::operator::recover_pending_rotation(&cli.config, &mut config)?;
-            load_config(&cli.config).map(|_| ())
+            crate::operator::recover_pending_rotation(&context.path, &mut context.config)?;
+            load_config(&context.path).map(|_| ())
         }
         Command::Migrate { yes, candidate } => {
             require_root()?;
-            let config = load_config(&cli.config)?;
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[Capability::Database, Capability::OperatorTasks],
+                true,
+                false,
+                false,
+            )?;
             require_confirmation(yes, "apply pending database migrations")?;
             if let Some(candidate) = candidate.as_ref() {
-                candidate_app_command(&config, TaskOperation::MigrateApply, candidate)?;
-                install::grant_runtime_database(&config)
+                candidate_app_command(&context.config, TaskOperation::MigrateApply, candidate)?;
+                install::grant_runtime_database(&context.config)
             } else {
-                app_command(&config, TaskOperation::MigrateApply, None)
+                app_command(&context.config, TaskOperation::MigrateApply, None)
             }
         }
         Command::Keys(command) => {
             require_root()?;
-            let config = load_config(&cli.config)?;
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[Capability::OperatorTasks],
+                true,
+                false,
+                false,
+            )?;
             let (operation, public_jwk) = match command {
                 KeysCommand::List => (TaskOperation::KeysList, None),
                 KeysCommand::Validate => (TaskOperation::KeysValidate, None),
                 KeysCommand::ExportOpenid4vcTrust { output } => {
-                    return export_openid4vc_trust(&config, &output);
+                    return export_openid4vc_trust(&context.config, &output);
                 }
                 KeysCommand::GenerateLocal { alg, purposes, yes } => {
                     require_confirmation(yes, "mutate the application signing keyset")?;
@@ -409,29 +582,61 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                     )
                 }
             };
-            app_command(&config, operation, public_jwk.as_deref())
+            app_command(&context.config, operation, public_jwk.as_deref())
         }
         Command::Conformance(command) => {
             require_root()?;
-            let config = load_config(&cli.config)?;
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[Capability::OperatorTasks],
+                true,
+                false,
+                false,
+            )?;
             let operation = conformance_operation(command.lease)?;
-            conformance_app_command(&config, operation, command.candidate.as_ref())
+            conformance_app_command(&context.config, operation, command.candidate.as_ref())
         }
         Command::AuditVerify => {
-            let config = load_config(&cli.config)?;
-            crate::operator::verify_audit(&config)
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[],
+                false,
+                false,
+                false,
+            )?;
+            crate::operator::verify_audit(&context.config)
         }
         Command::AuditShow { request_id } => {
-            let config = load_config(&cli.config)?;
-            crate::operator::show_audit(&config, request_id.as_deref())
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[],
+                false,
+                false,
+                false,
+            )?;
+            crate::operator::show_audit(&context.config, request_id.as_deref())
         }
         Command::IdentityRotate { yes } => {
             require_root()?;
-            let config = load_config(&cli.config)?;
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[Capability::OperatorTasks],
+                true,
+                false,
+                false,
+            )?;
             require_confirmation(yes, "rotate the controller identity")?;
-            let rotation =
-                crate::operator::rotate_controller(&cli.config, &config, false, "normal")?;
-            let current = load_config(&cli.config)?;
+            let rotation = crate::operator::rotate_controller(
+                &context.path,
+                &context.config,
+                false,
+                "normal",
+            )?;
+            let current = load_config(&context.path)?;
             let release = load_active_release(&current)?;
             let expected = expected_target(&current, &release)?;
             crate::operator::verify_retired_controller_probe(
@@ -443,18 +648,33 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::BreakGlassControllerAvailability => {
             require_root()?;
-            let config = load_config(&cli.config)?;
-            crate::operator::report_controller_availability(&config).map(|_| ())
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[],
+                false,
+                false,
+                false,
+            )?;
+            crate::operator::report_controller_availability(&context.config).map(|_| ())
         }
         Command::BreakGlassRehearseControllerLoss { yes } => {
             require_root()?;
-            let config = load_config(&cli.config)?;
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[Capability::OperatorTasks],
+                true,
+                false,
+                false,
+            )?;
             require_confirmation(
                 yes,
                 "rehearse controller-key loss with a simulated unavailable file provider",
             )?;
-            let rotation = crate::operator::rehearse_controller_loss(&cli.config, &config)?;
-            let current = load_config(&cli.config)?;
+            let rotation =
+                crate::operator::rehearse_controller_loss(&context.path, &context.config)?;
+            let current = load_config(&context.path)?;
             let release = load_active_release(&current)?;
             crate::operator::append_management_event(
                 &current,
@@ -472,14 +692,21 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::BreakGlassRecover { yes, reason } => {
             require_root()?;
-            let config = load_config(&cli.config)?;
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[Capability::OperatorTasks],
+                true,
+                false,
+                false,
+            )?;
             require_confirmation(yes, "perform break-glass controller recovery")?;
             let rotation = crate::operator::recover_controller_without_controller_key(
-                &cli.config,
-                &config,
+                &context.path,
+                &context.config,
                 &reason,
             )?;
-            let current = load_config(&cli.config)?;
+            let current = load_config(&context.path)?;
             let release = load_active_release(&current)?;
             if reason == "lost" {
                 crate::operator::append_management_event(
@@ -505,20 +732,41 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             )
         }
         Command::SelfCheck(version) => {
-            let config = load_config(&cli.config)?;
-            controller_check(&config, version.as_deref())
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[],
+                false,
+                false,
+                false,
+            )?;
+            controller_check(&context.config, version.as_deref())
         }
         Command::SelfUpdate { version, yes } => {
             require_root()?;
-            let config = load_config(&cli.config)?;
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[],
+                false,
+                false,
+                false,
+            )?;
             require_confirmation(yes, "replace nazoauthctl with a signed controller Release")?;
-            controller_update(&config, version.as_deref())
+            controller_update(&context.config, version.as_deref())
         }
         Command::SelfRollback { yes } => {
             require_root()?;
-            let config = load_config(&cli.config)?;
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[],
+                false,
+                false,
+                false,
+            )?;
             require_confirmation(yes, "restore the previous signed nazoauthctl binary")?;
-            controller_rollback(&config)
+            controller_rollback(&context.config)
         }
     }
 }
@@ -713,7 +961,7 @@ fn export_openid4vc_trust(config: &UpdateConfig, output: &Path) -> anyhow::Resul
 }
 
 fn managed_openid4vc_bundle_path(config: &UpdateConfig) -> anyhow::Result<PathBuf> {
-    let key_directories = if config.runtime.engine == "host" {
+    let key_directories = if config.runtime.backend == RuntimeBackendKind::Systemd {
         config
             .runtime
             .snapshot_paths
@@ -1337,7 +1585,7 @@ fn bootstrap_token_path(
         .filter(|mount| mount.target == target)
         .map(|mount| mount.source.clone())
         .collect::<Vec<_>>();
-    if config.runtime.engine == "host" && sources.is_empty() {
+    if config.runtime.backend == RuntimeBackendKind::Systemd && sources.is_empty() {
         sources.extend(
             config
                 .runtime
@@ -1388,7 +1636,7 @@ fn read_bootstrap_token(path: &Path, expected_owner_uid: Option<u32>) -> anyhow:
 }
 
 fn bootstrap_state_owner_uid(config: &UpdateConfig) -> anyhow::Result<u32> {
-    if config.runtime.engine != "host" {
+    if config.runtime.backend != RuntimeBackendKind::Systemd {
         return Ok(10_001);
     }
     Process::new("id")
@@ -1499,7 +1747,11 @@ fn registered_status(
         .runtime_instances
         .iter()
         .map(|runtime| {
-            let observation = backend(runtime.backend).inspect(&runtime.object_reference);
+            let runtime_backend = backend(runtime.backend);
+            let described_mounts = runtime_backend
+                .describe_mounts(&runtime.object_reference)
+                .map(|mounts| mounts.len());
+            let observation = runtime_backend.inspect(&runtime.object_reference);
             match observation {
                 Ok(observation) => {
                     let artifact_matches = match (&runtime.artifact, &observation.artifact) {
@@ -1524,6 +1776,8 @@ fn registered_status(
                         "present": true,
                         "running": observation.running,
                         "artifact_matches_declaration": artifact_matches,
+                        "mounts_verified": described_mounts.is_ok(),
+                        "mount_count": described_mounts.unwrap_or_default(),
                     })
                 }
                 Err(_) => serde_json::json!({
@@ -1533,6 +1787,8 @@ fn registered_status(
                     "present": false,
                     "running": false,
                     "artifact_matches_declaration": false,
+                    "mounts_verified": false,
+                    "mount_count": 0,
                 }),
             }
         })
@@ -1689,7 +1945,7 @@ fn install_transaction(
     release.persist_verification_evidence(&release_cache_dir(config, &release.manifest))?;
     let backup = Backup::create(config_path, config, &release.manifest.version)?;
 
-    if config.runtime.engine == "host" {
+    if config.runtime.backend == RuntimeBackendKind::Systemd {
         let binary = release.artifact("binary", &config.repository)?;
         let candidate = install_host_candidate(config, &release, &binary)?;
         cache_trusted_runtime(
@@ -1842,13 +2098,8 @@ fn register_installed_deployment(
     };
     use std::collections::{BTreeMap, BTreeSet};
 
-    let backend = match config.runtime.engine.as_str() {
-        "podman" => RuntimeBackendKind::Podman,
-        "docker" => RuntimeBackendKind::Docker,
-        "host" => RuntimeBackendKind::Systemd,
-        _ => bail!("unsupported installed runtime backend"),
-    };
-    let artifact = if backend.is_systemd() {
+    let backend = config.runtime.backend;
+    let artifact = if backend == RuntimeBackendKind::Systemd {
         ArtifactReference::HostBinary {
             path: config.runtime.binary_path.clone(),
             sha256: manifest
@@ -1864,7 +2115,7 @@ fn register_installed_deployment(
             digest: manifest.runtime_oci_digest()?.to_owned(),
         }
     };
-    let object_reference = if backend.is_systemd() {
+    let object_reference = if backend == RuntimeBackendKind::Systemd {
         config.runtime.service_name.clone()
     } else {
         config.runtime.container_name.clone()
@@ -2051,7 +2302,7 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
         &release.manifest.version,
         recovery_boundary_name(release.manifest.rollback.database_restore),
     )?;
-    let runtime_artifact = if config.runtime.engine == "host" {
+    let runtime_artifact = if config.runtime.backend == RuntimeBackendKind::Systemd {
         Some(release.artifact("binary", &config.repository)?)
     } else {
         None
@@ -2063,7 +2314,7 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
             .releases_root
             .join(&previous_manifest.frontend.artifact.sha256),
     );
-    let previous_runtime = if config.runtime.engine == "host" {
+    let previous_runtime = if config.runtime.backend == RuntimeBackendKind::Systemd {
         std::fs::canonicalize(&config.runtime.binary_path)
             .context("failed to resolve previous host binary")?
             .to_string_lossy()
@@ -2073,7 +2324,7 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
     };
     cache_trusted_runtime(config, &previous_manifest, &previous_runtime)?;
 
-    let candidate = if config.runtime.engine == "host" {
+    let candidate = if config.runtime.backend == RuntimeBackendKind::Systemd {
         install_host_candidate(
             config,
             &release,
@@ -2290,7 +2541,7 @@ fn validate_update_journal(config: &UpdateConfig, journal: &UpdateJournal) -> an
             bail!("update transaction previous UI does not match the active Release");
         }
     }
-    if config.runtime.engine == "host" {
+    if config.runtime.backend == RuntimeBackendKind::Systemd {
         let expected_previous_runtime = config
             .runtime
             .binary_releases
@@ -2348,7 +2599,7 @@ fn journal_backup(config: &UpdateConfig, journal: &UpdateJournal) -> anyhow::Res
 
 fn target_is_active(config: &UpdateConfig, journal: &UpdateJournal) -> bool {
     let runtime = Runtime::new(config);
-    if config.runtime.engine != "host" && !runtime.container_exists() {
+    if config.runtime.backend != RuntimeBackendKind::Systemd && !runtime.container_exists() {
         return false;
     }
     runtime
@@ -2364,6 +2615,12 @@ fn recovery_action(_journal: &UpdateJournal, _target_is_active: bool) -> UpdateR
 }
 
 pub(crate) fn uses_legacy_lock(command: &Command) -> bool {
+    if DeploymentStore::system().registry_path().exists() {
+        return matches!(
+            command,
+            Command::Install(_) | Command::SelfUpdate { .. } | Command::SelfRollback { .. }
+        );
+    }
     match command {
         Command::Discover
         | Command::Adopt(_)
@@ -2371,13 +2628,6 @@ pub(crate) fn uses_legacy_lock(command: &Command) -> bool {
         | Command::PermissionsSet(_)
         | Command::Relinquish(_)
         | Command::Reconcile => false,
-        Command::Status | Command::Doctor
-            if crate::deployment::DeploymentStore::system()
-                .registry_path()
-                .exists() =>
-        {
-            false
-        }
         _ => true,
     }
 }
@@ -2391,7 +2641,7 @@ fn recover_pending_update(config_path: &Path, config: &UpdateConfig) -> anyhow::
         journal.transaction_id, journal.phase
     );
     let _ = config_path;
-    match recovery_action(&journal, candidate_is_active(config, &journal)) {
+    match recovery_action(&journal, target_is_active(config, &journal)) {
         UpdateRecoveryAction::RestorePrevious => restore_previous_transaction(config, &journal)?,
     }
     append_update_management_event(
@@ -2424,7 +2674,7 @@ fn restore_previous_transaction(
         rotate_bootstrap_recovery_epoch(config)
             .context("failed to invalidate bootstrap receipts before update recovery")?;
         let runtime = Runtime::new(config);
-        if config.runtime.engine == "host" {
+        if config.runtime.backend == RuntimeBackendKind::Systemd {
             runtime.stop_service().ok();
         } else if runtime.container_exists() {
             runtime.remove_container().ok();
@@ -2432,7 +2682,7 @@ fn restore_previous_transaction(
         backup.restore_databases(config)?;
         backup.restore_snapshots()?;
         install::grant_runtime_database(config)?;
-        if config.runtime.engine == "host" {
+        if config.runtime.backend == RuntimeBackendKind::Systemd {
             symlink_atomic(
                 Path::new(&journal.previous_runtime),
                 &config.runtime.binary_path,
@@ -2444,12 +2694,12 @@ fn restore_previous_transaction(
         wait_ready(config)?;
     } else {
         let runtime = Runtime::new(config);
-        if config.runtime.engine == "host" {
+        if config.runtime.backend == RuntimeBackendKind::Systemd {
             runtime.stop_service().ok();
         } else if runtime.container_exists() {
             runtime.remove_container()?;
         }
-        if config.runtime.engine == "host" {
+        if config.runtime.backend == RuntimeBackendKind::Systemd {
             symlink_atomic(
                 Path::new(&journal.previous_runtime),
                 &config.runtime.binary_path,
@@ -2534,14 +2784,14 @@ fn activate_candidate(
     journal: &UpdateJournal,
 ) -> anyhow::Result<()> {
     if target_is_active(config, journal) {
-        if config.runtime.engine == "host" {
+        if config.runtime.backend == RuntimeBackendKind::Systemd {
             runtime.start_service()?;
         } else {
             runtime.restart()?;
         }
         return Ok(());
     }
-    if config.runtime.engine == "host" {
+    if config.runtime.backend == RuntimeBackendKind::Systemd {
         runtime.stop_service().ok();
         symlink_atomic(
             Path::new(&journal.candidate_runtime),
@@ -2625,7 +2875,7 @@ fn encode_transaction_id() -> String {
 }
 
 fn stop_active_runtime(config: &UpdateConfig, runtime: &Runtime<'_>) -> anyhow::Result<()> {
-    if config.runtime.engine == "host" {
+    if config.runtime.backend == RuntimeBackendKind::Systemd {
         runtime.stop_service()
     } else if runtime.container_exists() {
         runtime.remove_container()
@@ -2641,14 +2891,14 @@ fn rollback(
     backup: &Backup,
 ) -> anyhow::Result<()> {
     let runtime = Runtime::new(config);
-    if config.runtime.engine == "host" {
+    if config.runtime.backend == RuntimeBackendKind::Systemd {
         runtime.stop_service().ok();
     } else if runtime.container_exists() {
         runtime.remove_container().ok();
     }
     let _ = previous_ui;
     backup.restore_snapshots()?;
-    if config.runtime.engine == "host" {
+    if config.runtime.backend == RuntimeBackendKind::Systemd {
         symlink_atomic(Path::new(previous_runtime), &config.runtime.binary_path)?;
         runtime.start_service()?;
     } else {
@@ -2734,7 +2984,7 @@ fn recover_from_backup(config: &UpdateConfig) -> anyhow::Result<()> {
     rotate_bootstrap_recovery_epoch(config)
         .context("failed to invalidate bootstrap receipts before database recovery")?;
     let runtime = Runtime::new(config);
-    if config.runtime.engine == "host" {
+    if config.runtime.backend == RuntimeBackendKind::Systemd {
         runtime.stop_service()?;
     } else if runtime.container_exists() {
         runtime.remove_container()?;
@@ -2742,7 +2992,7 @@ fn recover_from_backup(config: &UpdateConfig) -> anyhow::Result<()> {
     backup.restore_databases(config)?;
     backup.restore_snapshots()?;
     install::grant_runtime_database(config)?;
-    if config.runtime.engine == "host" {
+    if config.runtime.backend == RuntimeBackendKind::Systemd {
         symlink_atomic(
             Path::new(&state.previous_runtime),
             &config.runtime.binary_path,
@@ -2829,7 +3079,7 @@ fn app_command(
 ) -> anyhow::Result<()> {
     let migration = matches!(operation, TaskOperation::MigrateApply);
     let runtime = Runtime::new(config);
-    let target = if config.runtime.engine == "host" {
+    let target = if config.runtime.backend == RuntimeBackendKind::Systemd {
         config.runtime.binary_path.to_string_lossy().into_owned()
     } else {
         runtime.active_image()?
@@ -2849,7 +3099,7 @@ fn conformance_app_command(
     candidate: Option<&CandidateTarget>,
 ) -> anyhow::Result<()> {
     let runtime = Runtime::new(config);
-    let target = if config.runtime.engine == "host" {
+    let target = if config.runtime.backend == RuntimeBackendKind::Systemd {
         config.runtime.binary_path.to_string_lossy().into_owned()
     } else {
         runtime.active_image()?
@@ -2881,7 +3131,7 @@ fn candidate_expected_target(
     config: &UpdateConfig,
     candidate: &CandidateTarget,
 ) -> anyhow::Result<ExpectedReleaseTarget> {
-    if config.runtime.engine == "host" {
+    if config.runtime.backend == RuntimeBackendKind::Systemd {
         bail!("candidate targets require an OCI runtime");
     }
     operator::expected_release_target(
@@ -2938,7 +3188,7 @@ fn expected_target(
     operator::expected_release_target(
         config,
         manifest.embedded.clone(),
-        if config.runtime.engine == "host" {
+        if config.runtime.backend == RuntimeBackendKind::Systemd {
             manifest.image_oci_digest()
         } else {
             manifest.runtime_oci_digest()?
@@ -2977,7 +3227,7 @@ fn cache_trusted_runtime(
         &serde_json::to_vec_pretty(manifest)?,
         0o400,
     )?;
-    if config.runtime.engine == "host" {
+    if config.runtime.backend == RuntimeBackendKind::Systemd {
         let expected = &manifest
             .artifacts
             .get("binary")
@@ -3010,7 +3260,7 @@ fn ensure_trusted_runtime_available(
     if &cached != manifest {
         bail!("trusted recovery manifest differs from the persisted rollback state");
     }
-    if config.runtime.engine == "host" {
+    if config.runtime.backend == RuntimeBackendKind::Systemd {
         let expected = &manifest
             .artifacts
             .get("binary")
@@ -3126,7 +3376,7 @@ fn status(config: &UpdateConfig) -> anyhow::Result<()> {
     let runtime = Runtime::new(config);
     let revision = runtime.active_revision()?;
     let release = load_active_release(config)?;
-    let (target, runtime_name) = if config.runtime.engine == "host" {
+    let (target, runtime_name) = if config.runtime.backend == RuntimeBackendKind::Systemd {
         let path = fs::canonicalize(&config.runtime.binary_path)?;
         let target = json!({
             "kind": "host-binary",
@@ -3149,7 +3399,7 @@ fn status(config: &UpdateConfig) -> anyhow::Result<()> {
     let actual_embedded = runtime.embedded_identity(&runtime_name)?;
     let embedded_identity_matches_release = actual_embedded == release.embedded;
     let value = json!({
-        "engine": config.runtime.engine,
+        "backend": config.runtime.backend,
         "revision": revision,
         "release": release.version,
         "release_identity": release.release_identity,
@@ -3166,7 +3416,7 @@ fn status(config: &UpdateConfig) -> anyhow::Result<()> {
 fn doctor(config: &UpdateConfig) -> anyhow::Result<()> {
     let runtime = Runtime::new(config);
     let release = load_active_release(config)?;
-    let target = if config.runtime.engine == "host" {
+    let target = if config.runtime.backend == RuntimeBackendKind::Systemd {
         nazo_operator_protocol::RuntimeTargetClaim::HostBinary {
             path: fs::canonicalize(&config.runtime.binary_path)?
                 .display()
@@ -3379,7 +3629,7 @@ fn write_record(
         "frontend_commit": release.frontend_commit(),
         "frontend_version": release.frontend.version,
         "frontend_artifact_sha256": release.frontend.artifact.sha256,
-        "engine": config.runtime.engine,
+        "backend": config.runtime.backend,
         "backup": backup.map(|path| path.display().to_string()),
         "recorded_at": Utc::now().to_rfc3339(),
     });
@@ -3407,7 +3657,7 @@ fn write_update_record(
         "frontend_commit": journal.to_release.frontend_commit(),
         "frontend_version": journal.to_release.frontend.version,
         "frontend_artifact_sha256": journal.to_release.frontend.artifact.sha256,
-        "engine": config.runtime.engine,
+        "backend": config.runtime.backend,
         "backup": backup.map(|path| path.display().to_string()),
         "recorded_at": journal.started_at,
     });

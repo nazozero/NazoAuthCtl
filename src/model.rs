@@ -94,9 +94,16 @@ impl Default for Dependencies {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Runtime {
-    pub(crate) engine: String,
-    #[serde(default)]
-    pub(crate) dependency_engine: String,
+    #[serde(alias = "engine")]
+    pub(crate) backend: crate::deployment::RuntimeBackendKind,
+    #[serde(
+        default,
+        alias = "dependency_engine",
+        deserialize_with = "deserialize_optional_backend"
+    )]
+    pub(crate) dependency_backend: Option<crate::deployment::RuntimeBackendKind>,
+    #[serde(skip)]
+    pub(crate) backend_command_override: Option<PathBuf>,
     pub(crate) container_name: String,
     pub(crate) runtime_instance_id: String,
     pub(crate) network: String,
@@ -125,6 +132,25 @@ pub(crate) struct Runtime {
     pub(crate) binary_releases: PathBuf,
     #[serde(default)]
     pub(crate) working_directory: PathBuf,
+}
+
+fn deserialize_optional_backend<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::deployment::RuntimeBackendKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value.as_deref() {
+        None | Some("") => Ok(None),
+        Some("podman") => Ok(Some(crate::deployment::RuntimeBackendKind::Podman)),
+        Some("docker") => Ok(Some(crate::deployment::RuntimeBackendKind::Docker)),
+        Some("systemd" | "host") => Ok(Some(crate::deployment::RuntimeBackendKind::Systemd)),
+        Some(value) => Err(D::Error::custom(format!(
+            "unsupported dependency runtime backend {value}"
+        ))),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -214,18 +240,17 @@ impl UpdateConfig {
         {
             bail!("repository must be a safe owner/name pair");
         }
-        if !matches!(self.runtime.engine.as_str(), "podman" | "docker" | "host") {
-            bail!("runtime engine must be podman, docker, or host");
-        }
         if !matches!(self.dependencies.mode.as_str(), "managed" | "external") {
             bail!("dependency mode must be managed or external");
         }
-        for name in [
-            &self.runtime.container_name,
-            &self.runtime.network,
-            &self.postgres.container_name,
-            &self.valkey.container_name,
-        ] {
+        let mut runtime_names = Vec::new();
+        if self.runtime.backend != crate::deployment::RuntimeBackendKind::Systemd {
+            runtime_names.extend([&self.runtime.container_name, &self.runtime.network]);
+        }
+        if self.dependencies.mode == "managed" {
+            runtime_names.extend([&self.postgres.container_name, &self.valkey.container_name]);
+        }
+        for name in runtime_names {
             if !safe_identifier(name) {
                 bail!("runtime object name is unsafe: {name}");
             }
@@ -271,7 +296,7 @@ impl UpdateConfig {
                 bail!("operator identity is unsafe");
             }
         }
-        if self.runtime.engine == "host" {
+        if self.runtime.backend == crate::deployment::RuntimeBackendKind::Systemd {
             for path in [
                 &self.runtime.binary_path,
                 &self.runtime.binary_releases,
@@ -313,11 +338,12 @@ impl UpdateConfig {
     }
 
     pub(crate) fn container_engine(&self) -> Option<&str> {
-        if self.runtime.engine == "host" {
-            (!self.runtime.dependency_engine.is_empty())
-                .then_some(self.runtime.dependency_engine.as_str())
+        if self.runtime.backend == crate::deployment::RuntimeBackendKind::Systemd {
+            self.runtime
+                .dependency_backend
+                .and_then(crate::deployment::RuntimeBackendKind::container_command)
         } else {
-            Some(self.runtime.engine.as_str())
+            self.runtime.backend.container_command()
         }
     }
 }

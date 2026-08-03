@@ -182,8 +182,9 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
         },
         dependencies: Dependencies::default(),
         runtime: Runtime {
-            engine: "host".to_owned(),
-            dependency_engine: String::new(),
+            backend: crate::deployment::RuntimeBackendKind::Systemd,
+            dependency_backend: None,
+            backend_command_override: None,
             container_name: "nazoauth".to_owned(),
             runtime_instance_id: "runtime-test".to_owned(),
             network: "nazoauth".to_owned(),

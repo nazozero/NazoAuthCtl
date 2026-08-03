@@ -74,8 +74,22 @@ fn transition(
     let store = DeploymentStore::system();
     let resolved = store.resolve(selector, true)?;
     let _registry_lock = store.registry_lock()?;
-    let _deployment_lock = store.deployment_lock(&resolved.deployment_id)?;
     let record = store.load(&resolved.deployment_id)?;
+    let mut shared_resources = changes
+        .iter()
+        .filter(|(capability, grant)| {
+            grant.scope == ResourceScope::Shared
+                || record.capabilities.grant(*capability).scope == ResourceScope::Shared
+        })
+        .map(|(capability, _)| capability.name())
+        .collect::<Vec<_>>();
+    shared_resources.sort_unstable();
+    shared_resources.dedup();
+    let _shared_locks = shared_resources
+        .into_iter()
+        .map(|resource| store.shared_resource_lock(resource))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let _deployment_lock = store.deployment_lock(&resolved.deployment_id)?;
     if record.trust != TrustState::Adopted {
         bail!("capabilities cannot change until the deployment is adopted");
     }

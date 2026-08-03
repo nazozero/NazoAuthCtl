@@ -35,8 +35,9 @@ fn valid_config() -> UpdateConfig {
         },
         dependencies: Dependencies::default(),
         runtime: Runtime {
-            engine: "host".to_owned(),
-            dependency_engine: "podman".to_owned(),
+            backend: crate::deployment::RuntimeBackendKind::Systemd,
+            dependency_backend: Some(crate::deployment::RuntimeBackendKind::Podman),
+            backend_command_override: None,
             container_name: "nazoauth".to_owned(),
             runtime_instance_id: "runtime-test".to_owned(),
             network: "nazoauth-net".to_owned(),
@@ -190,12 +191,10 @@ fn update_config_accepts_only_closed_safe_runtime_boundaries() {
     invalid.repository = "unsafe".to_owned();
     assert!(invalid.validate().is_err());
     let mut invalid = config.clone();
-    invalid.runtime.engine = "shell".to_owned();
-    assert!(invalid.validate().is_err());
-    let mut invalid = config.clone();
     invalid.dependencies.mode = "shared".to_owned();
     assert!(invalid.validate().is_err());
     let mut invalid = config.clone();
+    invalid.runtime.backend = crate::deployment::RuntimeBackendKind::Podman;
     invalid.runtime.container_name = "bad/name".to_owned();
     assert!(invalid.validate().is_err());
     let mut invalid = config.clone();
@@ -222,7 +221,7 @@ fn update_config_accepts_only_closed_safe_runtime_boundaries() {
 #[test]
 fn external_and_container_dependency_modes_resolve_explicitly() {
     let mut config = valid_config();
-    config.runtime.engine = "docker".to_owned();
+    config.runtime.backend = crate::deployment::RuntimeBackendKind::Docker;
     config.runtime.service_name.clear();
     config.runtime.service_user.clear();
     config.dependencies.mode = "external".to_owned();

@@ -13,6 +13,7 @@ use url::Url;
 
 use crate::{
     cli::{InstallOptions, StandardsProfileSecrets},
+    deployment::RuntimeBackendKind,
     filesystem::{atomic_write, generate_secret, set_mode},
     model::{
         Dependencies, Mount, Operator, Postgres, Runtime, Ui, UpdateConfig, Valkey, safe_absolute,
@@ -78,7 +79,8 @@ pub(crate) fn prepare(
     validate_public_url(&options.public_url)?;
     normalize_external_dependencies(&mut options)?;
     normalize_profile_secrets(&mut options)?;
-    let (runtime_engine, dependency_engine) = select_runtime(&options)?;
+    let (runtime_backend, dependency_backend) = select_runtime(&options)?;
+    let runtime_engine = runtime_backend.container_command();
     let config_dir = config_path
         .parent()
         .context("update config path has no parent")?;
@@ -95,12 +97,12 @@ pub(crate) fn prepare(
         operator_config(config_dir, &options.control_root, &options.recovery_root)?;
     let name_suffix = object_name_suffix(&bootstrap_operator.deployment_id);
     let network_name = format!("nazoauth-{name_suffix}-network");
-    if runtime_engine == "host" && options.network_subnet.is_some() {
+    if runtime_backend == RuntimeBackendKind::Systemd && options.network_subnet.is_some() {
         bail!("container network options are unavailable with the selected host runtime");
     }
-    if runtime_engine != "host" {
+    if runtime_backend != RuntimeBackendKind::Systemd {
         ensure_network(
-            &runtime_engine,
+            runtime_engine.context("container backend has no command")?,
             &network_name,
             options.network_subnet.as_deref(),
             &bootstrap_operator.deployment_id,
@@ -108,10 +110,13 @@ pub(crate) fn prepare(
         )?;
     }
     let trusted_proxy_cidr = if options.profile == "standards-full" {
-        if runtime_engine == "host" {
+        if runtime_backend == RuntimeBackendKind::Systemd {
             Some("127.0.0.1/32".to_owned())
         } else {
-            Some(host_cidr(network_gateway(&runtime_engine, &network_name)?))
+            Some(host_cidr(network_gateway(
+                runtime_engine.context("container backend has no command")?,
+                &network_name,
+            )?))
         }
     } else {
         None
@@ -149,7 +154,7 @@ pub(crate) fn prepare(
     write_server_config(
         config_dir,
         &options,
-        &runtime_engine,
+        runtime_backend,
         &options.data_root,
         trusted_proxy_cidr.as_deref(),
         profile.as_deref(),
@@ -157,8 +162,8 @@ pub(crate) fn prepare(
     let config = build_config(
         config_path,
         &options,
-        &runtime_engine,
-        &dependency_engine,
+        runtime_backend,
+        dependency_backend,
         &dependency_mode,
     )?;
     configure_runtime_permissions(&config)?;
@@ -173,7 +178,7 @@ fn configure_runtime_permissions(config: &UpdateConfig) -> anyhow::Result<()> {
     if test_mode() {
         return Ok(());
     }
-    if config.runtime.engine == "host" {
+    if config.runtime.backend == RuntimeBackendKind::Systemd {
         return Ok(());
     }
     let app_root = config
@@ -367,7 +372,7 @@ pub(crate) fn start_managed_dependencies(config: &UpdateConfig) -> anyhow::Resul
 }
 
 pub(crate) fn install_systemd(config: &UpdateConfig) -> anyhow::Result<()> {
-    if config.runtime.engine != "host" {
+    if config.runtime.backend != RuntimeBackendKind::Systemd {
         return Ok(());
     }
     if !Process::new("id")
@@ -748,25 +753,23 @@ fn validate_profile_secret_value(name: &str, value: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn select_runtime(options: &InstallOptions) -> anyhow::Result<(String, String)> {
+fn select_runtime(
+    options: &InstallOptions,
+) -> anyhow::Result<(RuntimeBackendKind, Option<RuntimeBackendKind>)> {
     let runtime = match options.runtime.as_str() {
-        "auto" => {
-            if command_exists("podman") {
-                "podman"
-            } else if command_exists("docker") {
-                "docker"
-            } else {
-                bail!("auto runtime requires Podman or Docker");
-            }
+        "auto" if command_exists("podman") => RuntimeBackendKind::Podman,
+        "auto" if command_exists("docker") => RuntimeBackendKind::Docker,
+        "auto" => bail!("auto runtime requires Podman or Docker"),
+        "podman" => RuntimeBackendKind::Podman,
+        "docker" => RuntimeBackendKind::Docker,
+        "host" | "systemd" => RuntimeBackendKind::Systemd,
+        value => bail!("unsupported runtime backend {value}"),
+    };
+    if let Some(command) = runtime.container_command() {
+        if !command_exists(command) {
+            bail!("required command is missing: {command}");
         }
-        explicit => explicit,
-    }
-    .to_owned();
-    if matches!(runtime.as_str(), "podman" | "docker") {
-        if !command_exists(&runtime) {
-            bail!("required command is missing: {runtime}");
-        }
-        return Ok((runtime.clone(), runtime));
+        return Ok((runtime, Some(runtime)));
     }
     for command in ["systemctl", "systemd-run", "systemd"] {
         if !command_exists(command) {
@@ -780,16 +783,16 @@ fn select_runtime(options: &InstallOptions) -> anyhow::Result<(String, String)> 
         }
     }
     if options.database_url.is_some() {
-        return Ok((runtime, String::new()));
+        return Ok((runtime, None));
     }
-    let engine = if command_exists("podman") {
-        "podman"
+    let dependency_backend = if command_exists("podman") {
+        RuntimeBackendKind::Podman
     } else if command_exists("docker") {
-        "docker"
+        RuntimeBackendKind::Docker
     } else {
         bail!("host runtime requires Podman or Docker for managed dependencies");
     };
-    Ok((runtime, engine.to_owned()))
+    Ok((runtime, Some(dependency_backend)))
 }
 
 fn write_external_urls(secrets: &Path, options: &InstallOptions) -> anyhow::Result<String> {
@@ -866,7 +869,7 @@ fn write_managed_secrets(
 fn write_server_config(
     config_dir: &Path,
     options: &InstallOptions,
-    runtime: &str,
+    runtime: RuntimeBackendKind,
     data_root: &Path,
     trusted_proxy_cidr: Option<&str>,
     profile: Option<&str>,
@@ -881,7 +884,7 @@ fn write_server_config(
         }
         return Ok(());
     }
-    let (bind, data_dir, ui_dir, dependency_files) = if runtime == "host" {
+    let (bind, data_dir, ui_dir, dependency_files) = if runtime == RuntimeBackendKind::Systemd {
         (
             format!("127.0.0.1:{}", options.port),
             data_root.join("app").display().to_string(),
@@ -900,12 +903,12 @@ fn write_server_config(
             String::new(),
         )
     };
-    let profile_secret_root = if runtime == "host" {
+    let profile_secret_root = if runtime == RuntimeBackendKind::Systemd {
         config_dir.join("secrets").display().to_string()
     } else {
         "/run/nazoauth-secrets".to_owned()
     };
-    let profile_app_root = if runtime == "host" {
+    let profile_app_root = if runtime == RuntimeBackendKind::Systemd {
         data_root.join("app").display().to_string()
     } else {
         "/var/lib/nazo_oauth".to_owned()
@@ -1216,8 +1219,8 @@ fn host_cidr(address: std::net::IpAddr) -> String {
 fn build_config(
     config_path: &Path,
     options: &InstallOptions,
-    runtime_engine: &str,
-    dependency_engine: &str,
+    runtime_backend: RuntimeBackendKind,
+    dependency_backend: Option<RuntimeBackendKind>,
     dependency_mode: &str,
 ) -> anyhow::Result<UpdateConfig> {
     let config_dir = config_path.parent().context("config has no parent")?;
@@ -1232,7 +1235,7 @@ fn build_config(
     let releases = env::var_os("NAZOAUTH_BINARY_RELEASES")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/opt/nazoauth/releases"));
-    let container = runtime_engine != "host";
+    let container = runtime_backend != RuntimeBackendKind::Systemd;
     let mut mounts = if container {
         vec![
             mount(config_dir.join(".env.yaml"), "/app/.env.yaml", "ro,Z"),
@@ -1334,8 +1337,9 @@ fn build_config(
             valkey_url_file: secrets.join("valkey-url"),
         },
         runtime: Runtime {
-            engine: runtime_engine.to_owned(),
-            dependency_engine: dependency_engine.to_owned(),
+            backend: runtime_backend,
+            dependency_backend,
+            backend_command_override: None,
             container_name: format!("nazoauth-{name_suffix}-server"),
             runtime_instance_id: uuid::Uuid::now_v7().to_string(),
             network: format!("nazoauth-{name_suffix}-network"),

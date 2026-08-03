@@ -55,8 +55,9 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
             valkey_url_file: secrets.join("valkey-url"),
         },
         runtime: RuntimeConfig {
-            engine: "podman".to_owned(),
-            dependency_engine: "podman".to_owned(),
+            backend: RuntimeBackendKind::Podman,
+            dependency_backend: Some(RuntimeBackendKind::Podman),
+            backend_command_override: None,
             container_name: "nazo-oauth-server".to_owned(),
             runtime_instance_id: "runtime-test".to_owned(),
             network: "nazo_oauth_net".to_owned(),
@@ -203,9 +204,6 @@ fn privileged_task_fails_closed_without_required_config_mount() {
 #[test]
 fn retirement_probe_accepts_only_the_closed_runtime_authorization_marker() {
     let work = PrivateTempDir::new("runtime-retirement-probe").unwrap();
-    let cleanup = work.path().join("cleanup");
-    write_shell_executable(&cleanup, "exit 0");
-
     let target = RuntimeTargetClaim::HostBinary {
         path: work.path().join("nazoauth").display().to_string(),
         sha256: "a".repeat(64),
@@ -216,12 +214,22 @@ fn retirement_probe_accepts_only_the_closed_runtime_authorization_marker() {
         "cat >/dev/null; echo nazoauth-operator-rejection=authorization >&2; exit 1",
     );
     let prepared = PreparedAppTask {
-        process: Process::new(rejected),
-        target: target.clone(),
-        cleanup: TaskCleanup::Container {
-            engine: cleanup.display().to_string(),
-            name: "test-probe".to_owned(),
+        backend: RuntimeBackendKind::Podman,
+        command_override: Some(rejected.into_os_string()),
+        task: OneShotTask {
+            artifact: ArtifactReference::Oci {
+                image_reference: "fixture.invalid/nazoauth".to_owned(),
+                digest: format!("sha256:{}", "a".repeat(64)),
+            },
+            command: vec!["nazoauth".to_owned(), "operator-task".to_owned()],
+            network: None,
+            mounts: Vec::new(),
+            environment: BTreeMap::new(),
+            working_directory: None,
+            service_user: None,
+            stdin: Vec::new(),
         },
+        target: target.clone(),
     };
     prepared
         .expect_authorization_rejection("signed-envelope")
@@ -237,12 +245,22 @@ fn retirement_probe_accepts_only_the_closed_runtime_authorization_marker() {
         let executable = work.path().join(name);
         write_shell_executable(&executable, body);
         let prepared = PreparedAppTask {
-            process: Process::new(executable),
-            target: target.clone(),
-            cleanup: TaskCleanup::Container {
-                engine: cleanup.display().to_string(),
-                name: format!("test-probe-{name}"),
+            backend: RuntimeBackendKind::Podman,
+            command_override: Some(executable.into_os_string()),
+            task: OneShotTask {
+                artifact: ArtifactReference::Oci {
+                    image_reference: "fixture.invalid/nazoauth".to_owned(),
+                    digest: format!("sha256:{}", "a".repeat(64)),
+                },
+                command: vec!["nazoauth".to_owned(), "operator-task".to_owned()],
+                network: None,
+                mounts: Vec::new(),
+                environment: BTreeMap::new(),
+                working_directory: None,
+                service_user: None,
+                stdin: Vec::new(),
             },
+            target: target.clone(),
         };
         assert!(
             prepared
@@ -263,7 +281,8 @@ fn application_container_command_uses_hardening_and_secret_file_references() {
         &engine,
         &format!("printf '%s\\n' \"$@\" > '{}'", argv.display()),
     );
-    config.runtime.engine = engine.to_string_lossy().into_owned();
+    config.runtime.backend = RuntimeBackendKind::Podman;
+    config.runtime.backend_command_override = Some(engine);
     let raw_secret = "secret-canary-that-must-not-enter-argv";
     fs::create_dir_all(config.dependencies.database_url_file.parent().unwrap()).unwrap();
     fs::write(&config.dependencies.database_url_file, raw_secret).unwrap();
@@ -309,7 +328,8 @@ fn pull_image_executes_the_selected_engine_without_secret_arguments() {
         &engine,
         &format!("printf '%s\\n' \"$@\" > '{}'", argv.display()),
     );
-    config.runtime.engine = engine.to_string_lossy().into_owned();
+    config.runtime.backend = RuntimeBackendKind::Podman;
+    config.runtime.backend_command_override = Some(engine);
     let image = "ghcr.io/nazozero/nazoauth@sha256:aaaaaaaa";
 
     Runtime::new(&config).pull_image(image).unwrap();
@@ -331,7 +351,8 @@ fn image_digest_accepts_an_exact_repo_digest() {
         &engine,
         &format!("printf '%s\\n' '[\"ghcr.io/nazozero/nazoauth@{digest}\"]'"),
     );
-    config.runtime.engine = engine.to_string_lossy().into_owned();
+    config.runtime.backend = RuntimeBackendKind::Podman;
+    config.runtime.backend_command_override = Some(engine);
     let image = format!("ghcr.io/nazozero/nazoauth@{digest}");
 
     assert_eq!(Runtime::new(&config).image_digest(&image).unwrap(), digest);
@@ -344,7 +365,8 @@ fn image_digest_rejects_unpinned_invalid_and_unretained_references() {
     let mut config = config(&work);
     let engine = work.path().join("fake-engine");
     write_shell_executable(&engine, "printf '%s\\n' '[]'");
-    config.runtime.engine = engine.to_string_lossy().into_owned();
+    config.runtime.backend = RuntimeBackendKind::Podman;
+    config.runtime.backend_command_override = Some(engine);
     let runtime = Runtime::new(&config);
 
     for (image, expected) in [
@@ -394,7 +416,7 @@ fn podman_image_digest_uses_the_engine_digest_fallback() {
     if std::env::var_os(CHILD).is_some() {
         let work = PrivateTempDir::new("runtime-podman-digest-child").unwrap();
         let mut config = config(&work);
-        config.runtime.engine = "podman".to_owned();
+        config.runtime.backend = RuntimeBackendKind::Podman;
         let image = format!("ghcr.io/nazozero/nazoauth@{digest}");
         assert_eq!(Runtime::new(&config).image_digest(&image).unwrap(), digest);
         return;
@@ -436,7 +458,7 @@ fn podman_image_digest_rejects_a_mismatched_fallback_digest() {
     if std::env::var_os(CHILD).is_some() {
         let work = PrivateTempDir::new("runtime-podman-mismatch-child").unwrap();
         let mut config = config(&work);
-        config.runtime.engine = "podman".to_owned();
+        config.runtime.backend = RuntimeBackendKind::Podman;
         assert_eq!(
             Runtime::new(&config)
                 .image_digest(&image)
@@ -491,7 +513,7 @@ fn embedded_identity_json() -> String {
 fn embedded_identity_executes_host_binary_directly() {
     let work = PrivateTempDir::new("runtime-host-identity").unwrap();
     let mut config = config(&work);
-    config.runtime.engine = "host".to_owned();
+    config.runtime.backend = RuntimeBackendKind::Systemd;
     let binary = work.path().join("nazoauth");
     let argv = work.path().join("argv.txt");
     write_shell_executable(
@@ -526,7 +548,8 @@ fn embedded_identity_container_is_networkless_and_hardened() {
             embedded_identity_json()
         ),
     );
-    config.runtime.engine = engine.to_string_lossy().into_owned();
+    config.runtime.backend = RuntimeBackendKind::Podman;
+    config.runtime.backend_command_override = Some(engine);
     let image = "ghcr.io/nazozero/nazoauth@sha256:ffffffff";
 
     let identity = Runtime::new(&config).embedded_identity(image).unwrap();
@@ -555,7 +578,7 @@ fn embedded_identity_container_is_networkless_and_hardened() {
 fn embedded_identity_rejects_invalid_application_output() {
     let work = PrivateTempDir::new("runtime-invalid-identity").unwrap();
     let mut config = config(&work);
-    config.runtime.engine = "host".to_owned();
+    config.runtime.backend = RuntimeBackendKind::Systemd;
     let binary = work.path().join("nazoauth");
     write_shell_executable(&binary, "printf '%s\\n' 'not-json'");
 

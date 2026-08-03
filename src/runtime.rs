@@ -1,34 +1,29 @@
-use std::{ffi::OsString, fs, path::Path, time::Duration};
+use std::{collections::BTreeMap, ffi::OsString, fs, path::Path};
 
 use anyhow::{Context, bail};
 use nazo_operator_protocol::{RuntimeTargetClaim, TaskOperation};
 
 use crate::{
+    deployment::{ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind},
     filesystem::{atomic_write, sha256},
     model::{Mount, UpdateConfig},
     process::Process,
+    runtime_backend::{self, NeutralMount, OneShotTask},
 };
 
 #[derive(Debug)]
 pub(crate) struct PreparedAppTask {
-    process: Process,
+    backend: RuntimeBackendKind,
+    command_override: Option<OsString>,
+    task: OneShotTask,
     pub(crate) target: RuntimeTargetClaim,
-    cleanup: TaskCleanup,
-}
-
-#[derive(Debug)]
-enum TaskCleanup {
-    Container { engine: String, name: String },
-    SystemdUnit(String),
 }
 
 impl PreparedAppTask {
     pub(crate) fn execute(&self, compact_envelope: &str) -> anyhow::Result<String> {
-        let result = self.process.stdin_stdout(compact_envelope.as_bytes());
-        if result.is_err() {
-            self.cleanup();
-        }
-        result
+        let mut task = self.task.clone();
+        task.stdin = compact_envelope.as_bytes().to_vec();
+        selected_backend(self.backend, self.command_override.as_deref()).run_one_shot(&task)
     }
 
     /// Starts the already prepared task and accepts only the runtime's closed
@@ -38,34 +33,15 @@ impl PreparedAppTask {
         &self,
         compact_envelope: &str,
     ) -> anyhow::Result<()> {
-        let result = self
-            .process
-            .stdin_authorization_rejected(compact_envelope.as_bytes());
-        self.cleanup();
-        match result? {
+        let mut task = self.task.clone();
+        task.stdin = compact_envelope.as_bytes().to_vec();
+        match selected_backend(self.backend, self.command_override.as_deref())
+            .run_one_shot_authorization_probe(&task)?
+        {
             true => Ok(()),
             false => bail!(
                 "prepared runtime task did not reject retired controller at authorization boundary"
             ),
-        }
-    }
-
-    fn cleanup(&self) {
-        match &self.cleanup {
-            TaskCleanup::Container { engine, name } => {
-                Process::new(engine)
-                    .args(["rm", "-f", name])
-                    .timeout(Duration::from_secs(30))
-                    .run_quiet()
-                    .ok();
-            }
-            TaskCleanup::SystemdUnit(unit) => {
-                Process::new("systemctl")
-                    .args(["stop", unit])
-                    .timeout(Duration::from_secs(30))
-                    .run_quiet()
-                    .ok();
-            }
         }
     }
 }
@@ -80,7 +56,8 @@ impl<'a> Runtime<'a> {
     }
 
     pub(crate) fn active_revision(&self) -> anyhow::Result<String> {
-        if self.config.runtime.engine == "host" {
+        let kind = self.backend_kind()?;
+        if kind == RuntimeBackendKind::Systemd {
             let target = std::fs::canonicalize(&self.config.runtime.binary_path)
                 .context("failed to resolve active host binary")?;
             return target
@@ -89,36 +66,28 @@ impl<'a> Runtime<'a> {
                 .map(|name| name.to_string_lossy().into_owned())
                 .context("active host binary does not have a release directory");
         }
-        self.inspect_container("{{index .Config.Labels \"org.opencontainers.image.revision\"}}")
+        self.backend()?
+            .inspect(self.object_reference(kind))?
+            .labels
+            .remove("org.opencontainers.image.revision")
+            .context("runtime image has no revision label")
     }
 
     pub(crate) fn active_image(&self) -> anyhow::Result<String> {
-        if self.config.runtime.engine == "host" {
+        let kind = self.backend_kind()?;
+        if kind == RuntimeBackendKind::Systemd {
             bail!("host runtime does not have an active image");
         }
-        let format = if self.config.runtime.engine == "docker" {
-            "{{.Config.Image}}"
-        } else {
-            "{{.ImageName}}"
-        };
-        self.inspect_container(format)
-    }
-
-    fn inspect_container(&self, format: &str) -> anyhow::Result<String> {
-        let engine = self
-            .config
-            .container_engine()
-            .context("container engine is unavailable")?;
-        Ok(Process::new(engine)
-            .args([
-                OsString::from("inspect"),
-                self.config.runtime.container_name.clone().into(),
-                OsString::from("--format"),
-                OsString::from(format),
-            ])
-            .stdout()?
-            .trim()
-            .to_owned())
+        match self
+            .backend()?
+            .inspect(self.object_reference(kind))?
+            .artifact
+        {
+            ArtifactReference::Oci {
+                image_reference, ..
+            } => Ok(image_reference),
+            _ => bail!("runtime object does not expose an OCI artifact"),
+        }
     }
 
     pub(crate) fn prepare_app_task(
@@ -129,314 +98,271 @@ impl<'a> Runtime<'a> {
         config_manifest: &[u8],
     ) -> anyhow::Result<PreparedAppTask> {
         self.write_task_context(config_manifest)?;
-        if self.config.runtime.engine == "host" {
-            let unit = format!("nazoauth-operator-task-{}", std::process::id());
-            let target =
-                fs::canonicalize(image_or_binary).context("failed to resolve host task binary")?;
-            let digest = sha256(&target)?;
-            let key_directory = self
-                .config
-                .runtime
-                .snapshot_paths
-                .first()
-                .context("application key state directory is unavailable")?;
-            let app_root = key_directory
-                .parent()
-                .context("application data root is unavailable")?;
-            let ui_releases = app_root
-                .parent()
-                .context("deployment data root is unavailable")?
-                .join("ui-releases");
-            let mut command = Process::new("systemd-run")
-                .timeout(Duration::from_secs(300))
-                .current_dir(&self.config.runtime.working_directory)
-                .args([
-                    "--quiet",
-                    "--wait",
-                    "--pipe",
-                    "--collect",
-                    "--service-type=exec",
-                ])
-                .arg(format!("--unit={unit}"))
-                .arg(format!("--uid={}", self.config.runtime.service_user))
-                .arg(format!("--gid={}", self.config.runtime.service_user))
-                .arg(format!(
-                    "--working-directory={}",
-                    self.config.runtime.working_directory.display()
-                ))
-                .args([
-                    "--property=NoNewPrivileges=yes",
-                    "--property=PrivateTmp=yes",
-                    "--property=PrivateDevices=yes",
-                    "--property=PrivateMounts=yes",
-                    "--property=ProtectSystem=strict",
-                    "--property=ProtectHome=yes",
-                    "--property=ProtectKernelTunables=yes",
-                    "--property=ProtectKernelModules=yes",
-                    "--property=ProtectControlGroups=yes",
-                    "--property=RestrictSUIDSGID=yes",
-                    "--property=LockPersonality=yes",
-                    "--property=CapabilityBoundingSet=",
-                    "--property=AmbientCapabilities=",
-                ])
-                .arg(format!(
-                    "--property=ReadWritePaths={}",
-                    self.config.operator.state_directory.display()
-                ))
-                .arg(format!(
-                    "--setenv=NAZOAUTH_OPERATOR_CONTEXT_FILE={}",
-                    self.config
-                        .operator
-                        .controller_public_key
-                        .parent()
-                        .context("operator directory is unavailable")?
-                        .join("context.json")
-                        .display()
-                ))
-                .arg(format!(
-                    "--setenv=NAZOAUTH_OPERATOR_CONTROLLER_PUBLIC_KEY_FILE={}",
-                    self.config.operator.controller_public_key.display()
-                ))
-                .arg(format!(
-                    "--property=LoadCredential=operator-receipt-key:{}",
-                    self.config.operator.receipt_private_key.display()
-                ))
-                .arg("--setenv=NAZOAUTH_OPERATOR_RECEIPT_PRIVATE_KEY_FILE=%d/operator-receipt-key")
-                .arg(format!(
-                    "--setenv=NAZOAUTH_OPERATOR_STATE_DIRECTORY={}",
-                    self.config.operator.state_directory.display()
-                ))
-                .arg(format!(
-                    "--setenv=NAZOAUTH_OPERATOR_CONFIG_MANIFEST_FILE={}",
-                    self.config
-                        .operator
-                        .controller_public_key
-                        .parent()
-                        .context("operator directory is unavailable")?
-                        .join("config-manifest.json")
-                        .display()
-                ))
-                .arg(format!(
-                    "--setenv=NAZOAUTH_SERVER_CONFIG_FILE={}",
-                    self.config
-                        .runtime
-                        .working_directory
-                        .join(".env.yaml")
-                        .display()
-                ));
-            command = if operation_uses_database(operation) {
-                let database_url_file = operation_database_url_file(self.config, operation);
-                command
-                    .arg("--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6")
-                    .arg(format!(
-                        "--property=LoadCredential=operator-database-url:{}",
-                        database_url_file.display()
-                    ))
-                    .arg(format!(
-                        "--property=InaccessiblePaths={}",
-                        key_directory.display()
-                    ))
-                    .arg(format!(
-                        "--property=InaccessiblePaths={} {} {} {}",
-                        app_root.join("avatars").display(),
-                        app_root.join("secrets").display(),
-                        app_root.join("bootstrap").display(),
-                        ui_releases.display()
-                    ))
-                    .arg("--setenv=DATABASE_URL_FILE=%d/operator-database-url")
-            } else {
-                let mut command = command
-                    .arg("--property=RestrictAddressFamilies=AF_UNIX")
-                    .arg(format!(
-                        "--property=ReadWritePaths={}",
-                        key_directory.display()
-                    ))
-                    .arg(format!(
-                        "--property=InaccessiblePaths={} {} {} {} {}",
-                        self.config
-                            .dependencies
-                            .migration_database_url_file
-                            .parent()
-                            .context("dependency secret directory is unavailable")?
-                            .display(),
-                        app_root.join("avatars").display(),
-                        app_root.join("secrets").display(),
-                        app_root.join("bootstrap").display(),
-                        ui_releases.display()
-                    ));
-                if let Some(path) = public_jwk {
-                    command = command
-                        .arg(format!("--property=ReadOnlyPaths={}", path.display()))
-                        .arg(format!(
-                            "--setenv=NAZOAUTH_OPERATOR_PUBLIC_JWK_FILE={}",
-                            path.display()
-                        ));
+        let backend = self.backend_kind()?;
+        let artifact = match backend {
+            RuntimeBackendKind::Systemd => {
+                let path = fs::canonicalize(image_or_binary)
+                    .context("failed to resolve host task binary")?;
+                ArtifactReference::HostBinary {
+                    sha256: sha256(&path)?,
+                    path,
                 }
-                command
-            };
-            command = command.arg(target.as_os_str()).arg("operator-task");
-            return Ok(PreparedAppTask {
-                process: command,
-                target: RuntimeTargetClaim::HostBinary {
-                    path: target.display().to_string(),
-                    sha256: digest,
-                },
-                cleanup: TaskCleanup::SystemdUnit(unit),
-            });
-        }
-        let engine = self
-            .config
-            .container_engine()
-            .context("container engine is unavailable")?;
-        let task_name = format!(
-            "{}-task-{}",
-            self.config.runtime.container_name,
-            std::process::id()
-        );
-        let mut command = container_task_process(engine)
-            .arg("--name")
-            .arg(&task_name)
-            .args([
-                "--cap-drop",
-                "ALL",
-                "--security-opt",
-                "no-new-privileges",
-                "--read-only",
-                "--pids-limit",
-                "128",
-                "--memory",
-                "512m",
-                "--cpus",
-                "1",
-                "--tmpfs",
-                "/tmp:rw,noexec,nosuid,nodev,size=16m",
-            ]);
-        command = if operation_uses_database(operation) {
-            command.arg("--network").arg(&self.config.runtime.network)
-        } else {
-            command.args(["--network", "none"])
+            }
+            RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => ArtifactReference::Oci {
+                image_reference: image_or_binary.to_owned(),
+                digest: self.backend()?.resolve_image_digest(image_or_binary)?,
+            },
         };
-        command = self.append_task_mounts(command, operation, public_jwk)?;
-        command = command
-            .arg(image_or_binary)
-            .args(["nazoauth", "operator-task"]);
-        let digest = self.image_digest(image_or_binary)?;
+        let target = match &artifact {
+            ArtifactReference::Oci {
+                image_reference,
+                digest,
+            } => RuntimeTargetClaim::OciImage {
+                image_ref: image_reference.clone(),
+                image_digest: digest.clone(),
+            },
+            ArtifactReference::HostBinary { path, sha256 } => RuntimeTargetClaim::HostBinary {
+                path: path.display().to_string(),
+                sha256: sha256.clone(),
+            },
+            ArtifactReference::Unknown => bail!("operator task artifact is not verified"),
+        };
+        let task = self.one_shot_task(artifact, operation, public_jwk)?;
         Ok(PreparedAppTask {
-            process: command,
-            target: RuntimeTargetClaim::OciImage {
-                image_ref: image_or_binary.to_owned(),
-                image_digest: digest,
+            backend,
+            command_override: self.command_override(),
+            task,
+            target,
+        })
+    }
+
+    fn backend_kind(&self) -> anyhow::Result<RuntimeBackendKind> {
+        Ok(self.config.runtime.backend)
+    }
+
+    fn command_override(&self) -> Option<OsString> {
+        self.config
+            .runtime
+            .backend_command_override
+            .as_ref()
+            .map(|path| path.as_os_str().to_os_string())
+    }
+
+    fn backend(&self) -> anyhow::Result<Box<dyn runtime_backend::RuntimeBackend>> {
+        Ok(selected_backend(
+            self.backend_kind()?,
+            self.command_override().as_deref(),
+        ))
+    }
+
+    fn one_shot_task(
+        &self,
+        artifact: ArtifactReference,
+        operation: &TaskOperation,
+        public_jwk: Option<&Path>,
+    ) -> anyhow::Result<OneShotTask> {
+        let mut mounts = Vec::new();
+        let mut environment = BTreeMap::from([
+            (
+                "NAZOAUTH_OPERATOR_CONTEXT_FILE".to_owned(),
+                "/run/nazoauth-operator/context.json".to_owned(),
+            ),
+            (
+                "NAZOAUTH_OPERATOR_CONTROLLER_PUBLIC_KEY_FILE".to_owned(),
+                "/run/nazoauth-operator/controller.pub".to_owned(),
+            ),
+            (
+                "NAZOAUTH_OPERATOR_RECEIPT_PRIVATE_KEY_FILE".to_owned(),
+                "/run/nazoauth-operator/receipt.key".to_owned(),
+            ),
+            (
+                "NAZOAUTH_OPERATOR_STATE_DIRECTORY".to_owned(),
+                "/var/lib/nazoauth/operator-state".to_owned(),
+            ),
+            (
+                "NAZOAUTH_OPERATOR_CONFIG_MANIFEST_FILE".to_owned(),
+                "/run/nazoauth-operator/config-manifest.json".to_owned(),
+            ),
+            (
+                "NAZOAUTH_SERVER_CONFIG_FILE".to_owned(),
+                "/app/.env.yaml".to_owned(),
+            ),
+        ]);
+        let config_mount = self.required_mount("/app/.env.yaml")?;
+        mounts.push(neutral_mount(config_mount));
+
+        if operation_uses_database(operation) {
+            mounts.push(task_mount(
+                operation_database_url_file(self.config, operation),
+                Path::new("/run/nazoauth-secrets/database-url"),
+                true,
+            ));
+            environment.insert(
+                "DATABASE_URL_FILE".to_owned(),
+                "/run/nazoauth-secrets/database-url".to_owned(),
+            );
+        } else {
+            mounts.push(neutral_mount(
+                self.required_mount("/var/lib/nazo_oauth/keys")?,
+            ));
+        }
+
+        let operator_directory = self
+            .config
+            .operator
+            .controller_public_key
+            .parent()
+            .context("operator directory is unavailable")?;
+        let manifest_path = operator_directory.join("config-manifest.json");
+        let context_path = operator_directory.join("context.json");
+        for (source, target, read_only) in [
+            (
+                self.config.operator.controller_public_key.as_path(),
+                Path::new("/run/nazoauth-operator/controller.pub"),
+                true,
+            ),
+            (
+                manifest_path.as_path(),
+                Path::new("/run/nazoauth-operator/config-manifest.json"),
+                true,
+            ),
+            (
+                self.config.operator.receipt_private_key.as_path(),
+                Path::new("/run/nazoauth-operator/receipt.key"),
+                true,
+            ),
+            (
+                context_path.as_path(),
+                Path::new("/run/nazoauth-operator/context.json"),
+                true,
+            ),
+            (
+                self.config.operator.state_directory.as_path(),
+                Path::new("/var/lib/nazoauth/operator-state"),
+                false,
+            ),
+        ] {
+            mounts.push(task_mount(source, target, read_only));
+        }
+        if let Some(path) = public_jwk {
+            mounts.push(task_mount(
+                path,
+                Path::new("/run/nazoauth-operator/public.jwk"),
+                true,
+            ));
+            environment.insert(
+                "NAZOAUTH_OPERATOR_PUBLIC_JWK_FILE".to_owned(),
+                "/run/nazoauth-operator/public.jwk".to_owned(),
+            );
+        }
+        Ok(OneShotTask {
+            artifact,
+            command: match self.backend_kind()? {
+                RuntimeBackendKind::Systemd => vec!["operator-task".to_owned()],
+                RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
+                    vec!["nazoauth".to_owned(), "operator-task".to_owned()]
+                }
             },
-            cleanup: TaskCleanup::Container {
-                engine: engine.to_owned(),
-                name: task_name,
-            },
+            network: operation_uses_database(operation)
+                .then(|| self.config.runtime.network.clone()),
+            mounts,
+            environment,
+            working_directory: (self.backend_kind()? == RuntimeBackendKind::Systemd)
+                .then(|| self.config.runtime.working_directory.clone()),
+            service_user: (self.backend_kind()? == RuntimeBackendKind::Systemd)
+                .then(|| self.config.runtime.service_user.clone()),
+            stdin: Vec::new(),
         })
     }
 
     pub(crate) fn start_container(&self, image: &str) -> anyhow::Result<()> {
-        let engine = self
-            .config
-            .container_engine()
-            .context("container engine is unavailable")?;
-        let mut command = Process::new(engine)
-            .args(["run", "-d", "--name"])
-            .arg(&self.config.runtime.container_name)
-            .arg("--label")
-            .arg(format!(
-                "io.nazoauth.deployment-id={}",
-                self.config.operator.deployment_id
-            ))
-            .arg("--label")
-            .arg(format!(
-                "io.nazoauth.runtime-instance-id={}",
-                self.config.runtime.runtime_instance_id
-            ))
-            .arg("--label")
-            .arg(format!(
-                "io.nazoauth.control-authority={}",
-                self.config.operator.controller_key_id
-            ))
-            .args(["--restart", "unless-stopped"])
-            .args([
-                "--cap-drop",
-                "ALL",
-                "--security-opt",
-                "no-new-privileges",
-                "--read-only",
-                "--pids-limit",
-                "512",
-                "--memory",
-                "1g",
-                "--cpus",
-                "2",
-                "--tmpfs",
-                "/tmp:rw,noexec,nosuid,nodev,size=64m",
-            ])
-            .arg("--network")
-            .arg(&self.config.runtime.network);
-        if !self.config.runtime.ip_address.is_empty() {
-            command = command.args(["--ip", self.config.runtime.ip_address.as_str()]);
+        let backend_kind = self.backend_kind()?;
+        if backend_kind == RuntimeBackendKind::Systemd {
+            bail!("systemd runtime requires an explicit staged binary transaction");
         }
-        if !self.config.runtime.publish_address.is_empty() {
-            command = command.args(["-p", self.config.runtime.publish_address.as_str()]);
-        }
-        command = self.append_environment_and_mounts(command);
-        command.arg(image).args(["nazoauth", "server"]).run_quiet()
+        let backend = self.backend()?;
+        let replacement = runtime_backend::RuntimeReplacement {
+            object_reference: self.config.runtime.container_name.clone(),
+            artifact: ArtifactReference::Oci {
+                image_reference: image.to_owned(),
+                digest: backend.resolve_image_digest(image)?,
+            },
+            command: vec!["nazoauth".to_owned(), "server".to_owned()],
+            mounts: self
+                .config
+                .runtime
+                .mounts
+                .iter()
+                .map(neutral_mount)
+                .collect(),
+            environment: self.config.runtime.environment.clone(),
+            networks: (!self.config.runtime.network.is_empty())
+                .then(|| self.config.runtime.network.clone())
+                .into_iter()
+                .collect(),
+            ip_address: (!self.config.runtime.ip_address.is_empty())
+                .then(|| self.config.runtime.ip_address.clone()),
+            ports: (!self.config.runtime.publish_address.is_empty())
+                .then(|| self.config.runtime.publish_address.clone())
+                .into_iter()
+                .collect(),
+            labels: BTreeMap::from([
+                (
+                    "io.nazoauth.deployment-id".to_owned(),
+                    self.config.operator.deployment_id.clone(),
+                ),
+                (
+                    "io.nazoauth.runtime-instance-id".to_owned(),
+                    self.config.runtime.runtime_instance_id.clone(),
+                ),
+                (
+                    "io.nazoauth.control-authority".to_owned(),
+                    self.config.operator.controller_key_id.clone(),
+                ),
+            ]),
+        };
+        backend.replace(&replacement)
     }
-
     pub(crate) fn remove_container(&self) -> anyhow::Result<()> {
-        let engine = self
-            .config
-            .container_engine()
-            .context("container engine is unavailable")?;
         if self.config.capabilities.runtime.responsibility
             == crate::deployment::Responsibility::Managed
             && !self.container_has_authorized_labels()
         {
             bail!("refusing to replace an unlabelled application container");
         }
-        Process::new(engine)
-            .args(["rm", "-f", self.config.runtime.container_name.as_str()])
-            .run_quiet()
+        let backend = self.backend_kind()?;
+        self.backend()?.remove(&self.config.runtime.container_name)
     }
 
     pub(crate) fn container_exists(&self) -> bool {
-        if self.config.runtime.engine == "host" {
-            return false;
-        }
-        self.config.container_engine().is_some_and(|engine| {
-            Process::new(engine)
-                .args(["inspect", self.config.runtime.container_name.as_str()])
-                .succeeds()
+        self.backend_kind().is_ok_and(|kind| {
+            kind != RuntimeBackendKind::Systemd
+                && self.backend().is_ok_and(|backend| {
+                    backend.inspect(&self.config.runtime.container_name).is_ok()
+                })
         })
     }
 
     pub(crate) fn restart(&self) -> anyhow::Result<()> {
-        if self.config.runtime.engine == "host" {
-            return Process::new("systemctl")
-                .args(["restart", self.config.runtime.service_name.as_str()])
-                .run_quiet();
-        }
-        Process::new(
-            self.config
-                .container_engine()
-                .context("container engine is unavailable")?,
-        )
-        .args(["restart", self.config.runtime.container_name.as_str()])
-        .run_quiet()
+        let kind = self.backend_kind()?;
+        self.backend()?.restart(self.object_reference(kind))
     }
 
     pub(crate) fn start_service(&self) -> anyhow::Result<()> {
-        Process::new("systemctl")
-            .args(["start", self.config.runtime.service_name.as_str()])
-            .run_quiet()
+        self.backend()?.start(&self.config.runtime.service_name)
     }
 
     pub(crate) fn stop_service(&self) -> anyhow::Result<()> {
-        Process::new("systemctl")
-            .args(["stop", self.config.runtime.service_name.as_str()])
-            .run_quiet()
+        self.backend()?.stop(&self.config.runtime.service_name)
+    }
+
+    fn object_reference(&self, kind: RuntimeBackendKind) -> &str {
+        match kind {
+            RuntimeBackendKind::Systemd => &self.config.runtime.service_name,
+            RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
+                &self.config.runtime.container_name
+            }
+        }
     }
 
     pub(crate) fn pull_image(&self, image: &str) -> anyhow::Result<()> {
@@ -495,20 +421,7 @@ impl<'a> Runtime<'a> {
     }
 
     pub(crate) fn image_revision(&self, image: &str) -> anyhow::Result<String> {
-        let format = if self.config.runtime.engine == "docker" {
-            "{{index .Config.Labels \"org.opencontainers.image.revision\"}}"
-        } else {
-            "{{index .Labels \"org.opencontainers.image.revision\"}}"
-        };
-        Ok(Process::new(
-            self.config
-                .container_engine()
-                .context("container engine is unavailable")?,
-        )
-        .args(["image", "inspect", image, "--format", format])
-        .stdout()?
-        .trim()
-        .to_owned())
+        Ok(self.embedded_identity(image)?.revision)
     }
 
     pub(crate) fn image_digest(&self, image: &str) -> anyhow::Result<String> {
@@ -523,74 +436,36 @@ impl<'a> Runtime<'a> {
         {
             bail!("managed OCI image reference has an invalid digest");
         }
-        let engine = self
-            .config
-            .container_engine()
-            .context("container engine is unavailable")?;
-        let repo_digests = Process::new(engine)
-            .args([
-                "image",
-                "inspect",
-                image,
-                "--format",
-                "{{json .RepoDigests}}",
-            ])
-            .stdout()?;
-        let repo_digests = serde_json::from_str::<Vec<String>>(repo_digests.trim());
-        if repo_digests.is_ok_and(|values| {
-            values.iter().any(|value| {
-                value
-                    .rsplit_once('@')
-                    .is_some_and(|(_, digest)| digest == expected_digest)
-            })
-        }) {
-            return Ok(expected_digest.to_ascii_lowercase());
+        let actual = self.backend()?.resolve_image_digest(image)?;
+        if actual != expected_digest.to_ascii_lowercase() {
+            bail!("container engine retained a different OCI digest");
         }
-        if self.config.runtime.engine == "podman" {
-            let digest = Process::new(engine)
-                .args(["image", "inspect", image, "--format", "{{.Digest}}"])
-                .stdout()?;
-            if digest.trim() == expected_digest {
-                return Ok(expected_digest.to_ascii_lowercase());
-            }
-        }
-        bail!("container engine did not retain the signed OCI digest")
+        Ok(actual)
     }
 
     pub(crate) fn embedded_identity(
         &self,
         image_or_binary: &str,
     ) -> anyhow::Result<nazo_operator_protocol::EmbeddedIdentity> {
-        let output = if self.config.runtime.engine == "host" {
-            Process::new(image_or_binary)
-                .arg("build-identity")
-                .stdout()?
-        } else {
-            Process::new(
-                self.config
-                    .container_engine()
-                    .context("container engine is unavailable")?,
-            )
-            .args([
-                "run",
-                "--rm",
-                "--network",
-                "none",
-                "--cap-drop",
-                "ALL",
-                "--security-opt",
-                "no-new-privileges",
-                "--read-only",
-                "--pids-limit",
-                "32",
-            ])
-            .arg(image_or_binary)
-            .args(["nazoauth", "build-identity"])
-            .stdout()?
+        let kind = self.backend_kind()?;
+        let artifact = match kind {
+            RuntimeBackendKind::Systemd => {
+                let path = fs::canonicalize(image_or_binary)
+                    .context("failed to resolve host binary for build identity")?;
+                ArtifactReference::HostBinary {
+                    sha256: sha256(&path)?,
+                    path,
+                }
+            }
+            RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => ArtifactReference::Oci {
+                image_reference: image_or_binary.to_owned(),
+                digest: self.image_digest(image_or_binary)?,
+            },
         };
-        serde_json::from_str(&output).context("runtime embedded build identity is invalid")
+        self.backend()?
+            .read_build_identity(&artifact)?
+            .context("runtime backend returned no build identity")
     }
-
     pub(crate) fn verify_prepared_target(
         &self,
         expected: &RuntimeTargetClaim,
@@ -633,95 +508,6 @@ impl<'a> Runtime<'a> {
         )
     }
 
-    fn append_task_mounts(
-        &self,
-        mut command: Process,
-        operation: &TaskOperation,
-        public_jwk: Option<&Path>,
-    ) -> anyhow::Result<Process> {
-        let config_mount = self.required_mount("/app/.env.yaml")?;
-        command = append_mount(command, config_mount);
-        match operation {
-            TaskOperation::MigrateApply
-            | TaskOperation::ConformanceLeaseCreate { .. }
-            | TaskOperation::ConformanceLeaseList
-            | TaskOperation::ConformanceLeaseRevoke { .. }
-            | TaskOperation::ConformanceLeaseCleanup => {
-                let database_url_file = operation_database_url_file(self.config, operation);
-                command = command
-                    .args(["-e", "DATABASE_URL_FILE=/run/nazoauth-secrets/database-url"])
-                    .arg("-v")
-                    .arg(mount_argument(
-                        database_url_file,
-                        Path::new("/run/nazoauth-secrets/database-url"),
-                        true,
-                        true,
-                    ));
-            }
-            TaskOperation::KeysList
-            | TaskOperation::KeysValidate
-            | TaskOperation::KeysGenerateLocal { .. }
-            | TaskOperation::KeysRegisterExternal { .. } => {
-                command = append_mount(command, self.required_mount("/var/lib/nazo_oauth/keys")?);
-            }
-        }
-        for (source, target, mode) in [
-            (
-                &self.config.operator.controller_public_key,
-                "/run/nazoauth-operator/controller.pub",
-                "ro,Z",
-            ),
-            (
-                &self
-                    .config
-                    .operator
-                    .controller_public_key
-                    .parent()
-                    .context("operator directory is unavailable")?
-                    .join("config-manifest.json"),
-                "/run/nazoauth-operator/config-manifest.json",
-                "ro,Z",
-            ),
-            (
-                &self.config.operator.receipt_private_key,
-                "/run/nazoauth-operator/receipt.key",
-                "ro,Z",
-            ),
-            (
-                &self
-                    .config
-                    .operator
-                    .controller_public_key
-                    .parent()
-                    .context("operator directory is unavailable")?
-                    .join("context.json"),
-                "/run/nazoauth-operator/context.json",
-                "ro,Z",
-            ),
-            (
-                &self.config.operator.state_directory,
-                "/var/lib/nazoauth/operator-state",
-                "rw,Z",
-            ),
-        ] {
-            command = command.arg("-v").arg(mount_argument(
-                source,
-                Path::new(target),
-                mode.starts_with("ro"),
-                mode.ends_with(",Z"),
-            ));
-        }
-        if let Some(path) = public_jwk {
-            command = command.arg("-v").arg(mount_argument(
-                path,
-                Path::new("/run/nazoauth-operator/public.jwk"),
-                true,
-                true,
-            ));
-        }
-        Ok(command)
-    }
-
     fn required_mount(&self, target: &str) -> anyhow::Result<&Mount> {
         self.config
             .runtime
@@ -747,46 +533,44 @@ impl<'a> Runtime<'a> {
     }
 
     fn container_has_authorized_labels(&self) -> bool {
-        let Some(engine) = self.config.container_engine() else {
-            return false;
-        };
-        for (label, expected) in [
-            (
-                "io.nazoauth.deployment-id",
-                self.config.operator.deployment_id.as_str(),
-            ),
-            (
-                "io.nazoauth.runtime-instance-id",
-                self.config.runtime.runtime_instance_id.as_str(),
-            ),
-            (
-                "io.nazoauth.control-authority",
-                self.config.operator.controller_key_id.as_str(),
-            ),
-        ] {
-            let mut matched = false;
-            for format in [
-                format!("{{{{index .Config.Labels \"{label}\"}}}}"),
-                format!("{{{{index .Labels \"{label}\"}}}}"),
-            ] {
-                let value = Process::new(engine)
-                    .args([
-                        "inspect",
-                        self.config.runtime.container_name.as_str(),
-                        "--format",
-                    ])
-                    .arg(format)
-                    .stdout();
-                if value.is_ok_and(|value| value.trim() == expected) {
-                    matched = true;
-                    break;
-                }
-            }
-            if !matched {
-                return false;
-            }
-        }
-        true
+        self.backend_kind().is_ok_and(|kind| {
+            self.backend().is_ok_and(|backend| {
+                backend
+                    .verify_ownership(
+                        &self.config.runtime.container_name,
+                        &self.config.operator.deployment_id,
+                        &self.config.operator.controller_key_id,
+                    )
+                    .is_ok()
+            })
+        })
+    }
+}
+
+fn selected_backend(
+    kind: RuntimeBackendKind,
+    command_override: Option<&std::ffi::OsStr>,
+) -> Box<dyn runtime_backend::RuntimeBackend> {
+    #[cfg(test)]
+    if let Some(command) = command_override {
+        return runtime_backend::backend_with_command(kind, command.to_os_string());
+    }
+    let _ = command_override;
+    runtime_backend::backend(kind)
+}
+
+fn neutral_mount(mount: &Mount) -> NeutralMount {
+    task_mount(&mount.source, &mount.target, mount.read_only)
+}
+
+fn task_mount(source: &Path, destination: &Path, read_only: bool) -> NeutralMount {
+    NeutralMount {
+        source: source.to_path_buf(),
+        destination: destination.to_path_buf(),
+        read_only,
+        selinux_relabel: true,
+        ownership: Responsibility::Managed,
+        scope: ResourceScope::Deployment,
     }
 }
 
@@ -812,15 +596,6 @@ fn operation_database_url_file<'a>(
     }
 }
 
-fn container_task_process(engine: &str) -> Process {
-    Process::new(engine)
-        .timeout(Duration::from_secs(300))
-        // Container engines attach stdin only when interactive input is
-        // explicitly enabled. The signed operator envelope is delivered on
-        // stdin, so omitting this flag gives the task an empty envelope.
-        .args(["run", "--rm", "--interactive"])
-}
-
 fn mount_argument(
     source: &Path,
     target: &Path,
@@ -836,15 +611,6 @@ fn mount_argument(
         value.push(",Z");
     }
     value
-}
-
-fn append_mount(command: Process, mount: &Mount) -> Process {
-    command.arg("-v").arg(mount_argument(
-        &mount.source,
-        &mount.target,
-        mount.read_only,
-        mount.selinux_relabel,
-    ))
 }
 
 #[cfg(test)]

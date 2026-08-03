@@ -198,6 +198,12 @@ impl RuntimeBackend for DockerBackend {
             .run_quiet()
     }
 
+    fn remove(&self, object_reference: &str) -> anyhow::Result<()> {
+        Process::new("docker")
+            .args(["rm", "--force", object_reference])
+            .run_quiet()
+    }
+
     fn replace(&self, replacement: &RuntimeReplacement) -> anyhow::Result<()> {
         let ArtifactReference::Oci {
             image_reference,
@@ -213,18 +219,44 @@ impl RuntimeBackend for DockerBackend {
         );
         let mut command = Process::new("docker")
             .args(["run", "-d", "--name"])
-            .arg(&replacement.object_reference);
+            .arg(&replacement.object_reference)
+            .args([
+                "--restart",
+                "unless-stopped",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--read-only",
+                "--pids-limit",
+                "512",
+                "--memory",
+                "1g",
+                "--cpus",
+                "2",
+                "--tmpfs",
+                "/tmp:rw,noexec,nosuid,nodev,size=64m",
+            ]);
         for (name, value) in &replacement.labels {
             command = command.arg("--label").arg(format!("{name}={value}"));
         }
-        for env_file in &replacement.environment_files {
-            command = command.arg("--env-file").arg(env_file);
+        for (name, value) in &replacement.environment {
+            command = command.arg("--env").arg(format!("{name}={value}"));
+        }
+        for network in &replacement.networks {
+            command = command.arg("--network").arg(network);
+        }
+        if let Some(ip_address) = &replacement.ip_address {
+            command = command.arg("--ip").arg(ip_address);
+        }
+        for port in &replacement.ports {
+            command = command.arg("--publish").arg(port);
         }
         for mount in &replacement.mounts {
             let access = if mount.read_only { "ro" } else { "rw" };
             let relabel = if mount.selinux_relabel { ",Z" } else { "" };
-            command = command.arg("--mount").arg(format!(
-                "type=bind,src={},dst={},{}{}",
+            command = command.arg("--volume").arg(format!(
+                "{}:{}:{}{}",
                 mount.source.display(),
                 mount.destination.display(),
                 access,
@@ -235,43 +267,11 @@ impl RuntimeBackend for DockerBackend {
     }
 
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String> {
-        let ArtifactReference::Oci {
-            image_reference,
-            digest,
-        } = &task.artifact
-        else {
-            bail!("Docker one-shot task requires a digest-bound OCI artifact");
-        };
-        let image = format!(
-            "{}@{}",
-            image_reference.split('@').next().unwrap_or(image_reference),
-            digest
-        );
-        let mut command = Process::new("docker").args([
-            "run",
-            "--rm",
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--network",
-            if task.network_enabled {
-                "bridge"
-            } else {
-                "none"
-            },
-        ]);
-        for mount in &task.mounts {
-            let access = if mount.read_only { "ro" } else { "rw" };
-            command = command.arg("--mount").arg(format!(
-                "type=bind,src={},dst={},{}",
-                mount.source.display(),
-                mount.destination.display(),
-                access
-            ));
-        }
-        command.arg(image).args(&task.command).stdout()
+        docker_one_shot_process(task)?.stdin_stdout(&task.stdin)
+    }
+
+    fn run_one_shot_authorization_probe(&self, task: &OneShotTask) -> anyhow::Result<bool> {
+        docker_one_shot_process(task)?.stdin_authorization_rejected(&task.stdin)
     }
 
     fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String> {
@@ -296,12 +296,89 @@ impl RuntimeBackend for DockerBackend {
 
     fn read_build_identity(
         &self,
-        _observation: &RuntimeObservation,
+        artifact: &ArtifactReference,
     ) -> anyhow::Result<Option<nazo_operator_protocol::EmbeddedIdentity>> {
-        // Discovery is strictly read-only: never start a helper container merely
-        // to ask an untrusted image what it contains.
-        Ok(None)
+        let ArtifactReference::Oci {
+            image_reference,
+            digest,
+        } = artifact
+        else {
+            bail!("Docker build identity requires a digest-bound OCI artifact");
+        };
+        let image = format!(
+            "{}@{}",
+            image_reference.split('@').next().unwrap_or(image_reference),
+            digest
+        );
+        let output = Process::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--read-only",
+            ])
+            .arg(image)
+            .args(["nazoauth", "build-identity"])
+            .stdout()?;
+        Ok(Some(serde_json::from_str(output.trim()).context(
+            "Docker image returned an invalid build identity",
+        )?))
     }
+}
+
+fn docker_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
+    let ArtifactReference::Oci {
+        image_reference,
+        digest,
+    } = &task.artifact
+    else {
+        bail!("Docker one-shot task requires a digest-bound OCI artifact");
+    };
+    let image = format!(
+        "{}@{}",
+        image_reference.split('@').next().unwrap_or(image_reference),
+        digest
+    );
+    let mut process = Process::new("docker")
+        .timeout(std::time::Duration::from_secs(300))
+        .args([
+            "run",
+            "--rm",
+            "--interactive",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--network",
+            task.network.as_deref().unwrap_or("none"),
+        ]);
+    if let Some(directory) = &task.working_directory {
+        process = process.arg("--workdir").arg(directory);
+    }
+    if let Some(user) = &task.service_user {
+        process = process.arg("--user").arg(user);
+    }
+    for (name, value) in &task.environment {
+        process = process.arg("--env").arg(format!("{name}={value}"));
+    }
+    for mount in &task.mounts {
+        let access = if mount.read_only { "ro" } else { "rw" };
+        let relabel = if mount.selinux_relabel { ",Z" } else { "" };
+        process = process.arg("--volume").arg(format!(
+            "{}:{}:{}{}",
+            mount.source.display(),
+            mount.destination.display(),
+            access,
+            relabel
+        ));
+    }
+    Ok(process.arg(image).args(&task.command))
 }
 
 fn valid_digest(value: &str) -> bool {

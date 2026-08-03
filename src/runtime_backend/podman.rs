@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::{Context as _, bail};
 
@@ -12,7 +12,26 @@ use super::{
     safe_environment, server_command_verified,
 };
 
-pub(crate) struct PodmanBackend;
+pub(crate) struct PodmanBackend {
+    command: OsString,
+}
+
+impl Default for PodmanBackend {
+    fn default() -> Self {
+        Self {
+            command: OsString::from("podman"),
+        }
+    }
+}
+
+impl PodmanBackend {
+    #[cfg(test)]
+    pub(crate) fn with_command(command: impl Into<OsString>) -> Self {
+        Self {
+            command: command.into(),
+        }
+    }
+}
 
 impl RuntimeBackend for PodmanBackend {
     fn kind(&self) -> RuntimeBackendKind {
@@ -20,13 +39,13 @@ impl RuntimeBackend for PodmanBackend {
     }
 
     fn available(&self) -> bool {
-        Process::new("podman")
+        Process::new(&self.command)
             .args(["info", "--format", "json"])
             .succeeds()
     }
 
     fn discover(&self) -> anyhow::Result<Vec<RuntimeObservation>> {
-        let ids = Process::new("podman")
+        let ids = Process::new(&self.command)
             .args(["container", "ls", "-a", "--no-trunc", "--format", "{{.ID}}"])
             .stdout()?;
         ids.lines()
@@ -42,7 +61,7 @@ impl RuntimeBackend for PodmanBackend {
     }
 
     fn inspect(&self, object_reference: &str) -> anyhow::Result<RuntimeObservation> {
-        let output = Process::new("podman")
+        let output = Process::new(&self.command)
             .args(["container", "inspect", object_reference])
             .stdout()?;
         let values: Vec<serde_json::Value> =
@@ -182,20 +201,26 @@ impl RuntimeBackend for PodmanBackend {
     }
 
     fn start(&self, object_reference: &str) -> anyhow::Result<()> {
-        Process::new("podman")
+        Process::new(&self.command)
             .args(["start", object_reference])
             .run_quiet()
     }
 
     fn stop(&self, object_reference: &str) -> anyhow::Result<()> {
-        Process::new("podman")
+        Process::new(&self.command)
             .args(["stop", object_reference])
             .run_quiet()
     }
 
     fn restart(&self, object_reference: &str) -> anyhow::Result<()> {
-        Process::new("podman")
+        Process::new(&self.command)
             .args(["restart", object_reference])
+            .run_quiet()
+    }
+
+    fn remove(&self, object_reference: &str) -> anyhow::Result<()> {
+        Process::new(&self.command)
+            .args(["rm", "--force", object_reference])
             .run_quiet()
     }
 
@@ -212,55 +237,55 @@ impl RuntimeBackend for PodmanBackend {
             image_reference.split('@').next().unwrap_or(image_reference),
             digest
         );
-        let mut command = Process::new("podman")
+        let mut command = Process::new(&self.command)
             .args(["run", "-d", "--name"])
-            .arg(&replacement.object_reference);
+            .arg(&replacement.object_reference)
+            .args([
+                "--restart",
+                "unless-stopped",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--read-only",
+                "--pids-limit",
+                "512",
+                "--memory",
+                "1g",
+                "--cpus",
+                "2",
+                "--tmpfs",
+                "/tmp:rw,noexec,nosuid,nodev,size=64m",
+            ]);
         for (name, value) in &replacement.labels {
             command = command.arg("--label").arg(format!("{name}={value}"));
         }
-        for env_file in &replacement.environment_files {
-            command = command.arg("--env-file").arg(env_file);
+        for (name, value) in &replacement.environment {
+            command = command.arg("--env").arg(format!("{name}={value}"));
+        }
+        for network in &replacement.networks {
+            command = command.arg("--network").arg(network);
+        }
+        if let Some(ip_address) = &replacement.ip_address {
+            command = command.arg("--ip").arg(ip_address);
+        }
+        for port in &replacement.ports {
+            command = command.arg("--publish").arg(port);
         }
         command = append_mounts(command, &replacement.mounts);
         command.arg(image).args(&replacement.command).run_quiet()
     }
 
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String> {
-        let ArtifactReference::Oci {
-            image_reference,
-            digest,
-        } = &task.artifact
-        else {
-            bail!("Podman one-shot task requires a digest-bound OCI artifact");
-        };
-        let image = format!(
-            "{}@{}",
-            image_reference.split('@').next().unwrap_or(image_reference),
-            digest
-        );
-        let command = Process::new("podman").args([
-            "run",
-            "--rm",
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--network",
-            if task.network_enabled {
-                "bridge"
-            } else {
-                "none"
-            },
-        ]);
-        append_mounts(command, &task.mounts)
-            .arg(image)
-            .args(&task.command)
-            .stdout()
+        podman_one_shot_process(&self.command, task)?.stdin_stdout(&task.stdin)
+    }
+
+    fn run_one_shot_authorization_probe(&self, task: &OneShotTask) -> anyhow::Result<bool> {
+        podman_one_shot_process(&self.command, task)?.stdin_authorization_rejected(&task.stdin)
     }
 
     fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String> {
-        let digest = Process::new("podman")
+        let digest = Process::new(&self.command)
             .args([
                 "image",
                 "inspect",
@@ -278,10 +303,83 @@ impl RuntimeBackend for PodmanBackend {
 
     fn read_build_identity(
         &self,
-        _observation: &RuntimeObservation,
+        artifact: &ArtifactReference,
     ) -> anyhow::Result<Option<nazo_operator_protocol::EmbeddedIdentity>> {
-        Ok(None)
+        let ArtifactReference::Oci {
+            image_reference,
+            digest,
+        } = artifact
+        else {
+            bail!("Podman build identity requires a digest-bound OCI artifact");
+        };
+        let image = format!(
+            "{}@{}",
+            image_reference.split('@').next().unwrap_or(image_reference),
+            digest
+        );
+        let output = Process::new(&self.command)
+            .args([
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--read-only",
+            ])
+            .arg(image)
+            .args(["nazoauth", "build-identity"])
+            .stdout()?;
+        Ok(Some(serde_json::from_str(output.trim()).context(
+            "Podman image returned an invalid build identity",
+        )?))
     }
+}
+
+fn podman_one_shot_process(
+    command: &std::ffi::OsStr,
+    task: &OneShotTask,
+) -> anyhow::Result<Process> {
+    let ArtifactReference::Oci {
+        image_reference,
+        digest,
+    } = &task.artifact
+    else {
+        bail!("Podman one-shot task requires a digest-bound OCI artifact");
+    };
+    let image = format!(
+        "{}@{}",
+        image_reference.split('@').next().unwrap_or(image_reference),
+        digest
+    );
+    let mut process = Process::new(command)
+        .timeout(std::time::Duration::from_secs(300))
+        .args([
+            "run",
+            "--rm",
+            "--interactive",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--network",
+            task.network.as_deref().unwrap_or("none"),
+        ]);
+    if let Some(directory) = &task.working_directory {
+        process = process.arg("--workdir").arg(directory);
+    }
+    if let Some(user) = &task.service_user {
+        process = process.arg("--user").arg(user);
+    }
+    for (name, value) in &task.environment {
+        process = process.arg("--env").arg(format!("{name}={value}"));
+    }
+    Ok(append_mounts(process, &task.mounts)
+        .arg(image)
+        .args(&task.command))
 }
 
 fn append_mounts(mut command: Process, mounts: &[NeutralMount]) -> Process {

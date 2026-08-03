@@ -48,7 +48,10 @@ pub(crate) struct RuntimeReplacement {
     pub(crate) artifact: ArtifactReference,
     pub(crate) command: Vec<String>,
     pub(crate) mounts: Vec<NeutralMount>,
-    pub(crate) environment_files: Vec<PathBuf>,
+    pub(crate) environment: BTreeMap<String, String>,
+    pub(crate) networks: Vec<String>,
+    pub(crate) ip_address: Option<String>,
+    pub(crate) ports: Vec<String>,
     pub(crate) labels: BTreeMap<String, String>,
 }
 
@@ -56,8 +59,12 @@ pub(crate) struct RuntimeReplacement {
 pub(crate) struct OneShotTask {
     pub(crate) artifact: ArtifactReference,
     pub(crate) command: Vec<String>,
-    pub(crate) network_enabled: bool,
+    pub(crate) network: Option<String>,
     pub(crate) mounts: Vec<NeutralMount>,
+    pub(crate) environment: BTreeMap<String, String>,
+    pub(crate) working_directory: Option<PathBuf>,
+    pub(crate) service_user: Option<String>,
+    pub(crate) stdin: Vec<u8>,
 }
 
 pub(crate) trait RuntimeBackend {
@@ -68,12 +75,14 @@ pub(crate) trait RuntimeBackend {
     fn start(&self, object_reference: &str) -> anyhow::Result<()>;
     fn stop(&self, object_reference: &str) -> anyhow::Result<()>;
     fn restart(&self, object_reference: &str) -> anyhow::Result<()>;
+    fn remove(&self, object_reference: &str) -> anyhow::Result<()>;
     fn replace(&self, replacement: &RuntimeReplacement) -> anyhow::Result<()>;
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String>;
+    fn run_one_shot_authorization_probe(&self, task: &OneShotTask) -> anyhow::Result<bool>;
     fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String>;
     fn read_build_identity(
         &self,
-        observation: &RuntimeObservation,
+        artifact: &ArtifactReference,
     ) -> anyhow::Result<Option<nazo_operator_protocol::EmbeddedIdentity>>;
     fn describe_mounts(&self, object_reference: &str) -> anyhow::Result<Vec<NeutralMount>> {
         Ok(self.inspect(object_reference)?.mounts)
@@ -102,7 +111,7 @@ pub(crate) trait RuntimeBackend {
 
 pub(crate) fn installed_backends() -> Vec<Box<dyn RuntimeBackend>> {
     let backends: Vec<Box<dyn RuntimeBackend>> = vec![
-        Box::new(PodmanBackend),
+        Box::new(PodmanBackend::default()),
         Box::new(DockerBackend),
         Box::new(SystemdBackend),
     ];
@@ -114,9 +123,20 @@ pub(crate) fn installed_backends() -> Vec<Box<dyn RuntimeBackend>> {
 
 pub(crate) fn backend(kind: RuntimeBackendKind) -> Box<dyn RuntimeBackend> {
     match kind {
-        RuntimeBackendKind::Podman => Box::new(PodmanBackend),
+        RuntimeBackendKind::Podman => Box::new(PodmanBackend::default()),
         RuntimeBackendKind::Docker => Box::new(DockerBackend),
         RuntimeBackendKind::Systemd => Box::new(SystemdBackend),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn backend_with_command(
+    kind: RuntimeBackendKind,
+    command: impl Into<std::ffi::OsString>,
+) -> Box<dyn RuntimeBackend> {
+    match kind {
+        RuntimeBackendKind::Podman => Box::new(PodmanBackend::with_command(command)),
+        RuntimeBackendKind::Docker | RuntimeBackendKind::Systemd => backend(kind),
     }
 }
 

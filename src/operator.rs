@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
+    deployment::RuntimeBackendKind,
     filesystem::{atomic_write, sha256},
     model::UpdateConfig,
     runtime::Runtime,
@@ -438,7 +439,7 @@ fn execute_test_task(
             bail!("test task adapter does not implement conformance lease operations")
         }
     };
-    if config.runtime.engine == "host" {
+    if config.runtime.backend == RuntimeBackendKind::Systemd {
         Process::new(target).args(arguments).run_quiet()?;
     } else {
         Process::new(
@@ -482,7 +483,7 @@ fn canonical_manifest(
     config: &UpdateConfig,
     operation: &TaskOperation,
 ) -> anyhow::Result<CanonicalConfigManifest> {
-    let server_config = if config.runtime.engine == "host" {
+    let server_config = if config.runtime.backend == RuntimeBackendKind::Systemd {
         config.runtime.working_directory.join(".env.yaml")
     } else {
         config
@@ -587,7 +588,7 @@ pub(crate) fn expected_release_target(
     if embedded.protocol != nazo_operator_protocol::PROTOCOL_VERSION {
         bail!("Release operator protocol version is unsupported");
     }
-    if config.runtime.engine == "host" && binary_digest.len() != 64 {
+    if config.runtime.backend == RuntimeBackendKind::Systemd && binary_digest.len() != 64 {
         bail!("Release binary digest is invalid");
     }
     Ok(ExpectedReleaseTarget {
@@ -1992,7 +1993,7 @@ pub(crate) fn verify_retired_controller_probe(
         let manifest = canonical_manifest(config, &operation)?;
         let manifest_bytes = serde_json::to_vec(&manifest)?;
         let runtime = Runtime::new(config);
-        let target = if config.runtime.engine == "host" {
+        let target = if config.runtime.backend == RuntimeBackendKind::Systemd {
             config.runtime.binary_path.to_string_lossy().into_owned()
         } else {
             runtime.active_image()?

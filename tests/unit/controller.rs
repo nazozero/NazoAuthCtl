@@ -145,8 +145,9 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
         },
         dependencies: Dependencies::default(),
         runtime: RuntimeConfig {
-            engine: "host".to_owned(),
-            dependency_engine: String::new(),
+            backend: RuntimeBackendKind::Systemd,
+            dependency_backend: None,
+            backend_command_override: None,
             container_name: "nazoauth".to_owned(),
             runtime_instance_id: "runtime-test".to_owned(),
             network: "nazoauth".to_owned(),
@@ -323,7 +324,7 @@ fn openid4vc_trust_export_uses_only_the_managed_key_directory() {
         .push(work.path().join("other/keys"));
     assert!(managed_openid4vc_bundle_path(&value).is_err());
 
-    value.runtime.engine = "podman".to_owned();
+    value.runtime.backend = RuntimeBackendKind::Podman;
     value.runtime.snapshot_paths.clear();
     value.runtime.mounts = vec![crate::model::Mount {
         source: keys.clone(),
@@ -461,7 +462,7 @@ fn write_bootstrap_fixture(
     let token_path = directory.join(BOOTSTRAP_TOKEN_FILE);
     fs::write(&token_path, token).unwrap();
     fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
-    config.runtime.engine = "docker".to_owned();
+    config.runtime.backend = RuntimeBackendKind::Docker;
     config.runtime.mounts = vec![crate::model::Mount {
         source: directory,
         target: PathBuf::from(BOOTSTRAP_MOUNT_TARGET),
@@ -651,7 +652,7 @@ fn bootstrap_owner_policy_matches_real_container_and_host_runtime_identities() {
     );
     assert!(bootstrap_token_path(&config, Some(actual_uid.wrapping_add(1))).is_err());
 
-    config.runtime.engine = "host".to_owned();
+    config.runtime.backend = RuntimeBackendKind::Systemd;
     config.runtime.service_user = Process::new("id")
         .arg("-un")
         .stdout()
@@ -926,7 +927,7 @@ fn migration_faults_always_unwind_without_the_faulting_server() {
 fn container_target_binds_the_platform_manifest_not_the_index() {
     let work = PrivateTempDir::new("nazoauth-platform-target").unwrap();
     let mut config = config(&work);
-    config.runtime.engine = "docker".to_owned();
+    config.runtime.backend = RuntimeBackendKind::Docker;
     let manifest = manifest("v0.2.0", 'e');
 
     assert_eq!(
@@ -1159,7 +1160,7 @@ fn journal_validation_is_closed_over_headers_manifests_and_every_managed_path() 
 fn container_journal_binds_both_runtime_images_to_the_signed_platform_digest() {
     let work = PrivateTempDir::new("nazoauth-update-container-journal").unwrap();
     let mut config = config(&work);
-    config.runtime.engine = "podman".to_owned();
+    config.runtime.backend = RuntimeBackendKind::Podman;
     let mut value = journal(&config, UpdatePhase::Prepared);
     value.previous_runtime = value.from_release.image_ref().unwrap();
     value.candidate_runtime = value.to_release.image_ref().unwrap();
@@ -1904,9 +1905,12 @@ fn pending_pre_migration_update_restores_previous_artifact_and_closes_the_journa
     let work = PrivateTempDir::new("nazoauth-recover-previous").unwrap();
     let mut config = config(&work);
     let mut value = journal(&config, UpdatePhase::WriterStopped);
-    config.runtime.engine = fake_container_runtime(&work, &value.to_release.backend_commit, false)
-        .display()
-        .to_string();
+    config.runtime.backend = RuntimeBackendKind::Podman;
+    config.runtime.backend_command_override = Some(fake_container_runtime(
+        &work,
+        &value.to_release.backend_commit,
+        false,
+    ));
     value.previous_runtime = value.from_release.image_ref().unwrap();
     value.candidate_runtime = value.to_release.image_ref().unwrap();
     fs::create_dir_all(&config.deployment_root).unwrap();
@@ -1934,9 +1938,12 @@ fn pending_active_candidate_restores_previous_release_and_closes_the_journal() {
     let work = PrivateTempDir::new("nazoauth-recover-active-unwind").unwrap();
     let mut config = config(&work);
     let mut value = journal(&config, UpdatePhase::CandidateActive);
-    config.runtime.engine = fake_container_runtime(&work, &value.to_release.backend_commit, true)
-        .display()
-        .to_string();
+    config.runtime.backend = RuntimeBackendKind::Podman;
+    config.runtime.backend_command_override = Some(fake_container_runtime(
+        &work,
+        &value.to_release.backend_commit,
+        true,
+    ));
     value.previous_runtime = value.from_release.image_ref().unwrap();
     value.candidate_runtime = value.to_release.image_ref().unwrap();
     fs::create_dir_all(&config.deployment_root).unwrap();
@@ -2026,7 +2033,7 @@ fn candidate_target_is_oci_only_and_keeps_exact_embedded_identity() {
     };
     assert!(candidate_expected_target(&config, &candidate).is_err());
 
-    config.runtime.engine = "podman".to_owned();
+    config.runtime.backend = RuntimeBackendKind::Podman;
     let expected = candidate_expected_target(&config, &candidate).unwrap();
     assert_eq!(expected.embedded.release, candidate.release);
     assert_eq!(expected.embedded.revision, candidate.revision);

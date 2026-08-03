@@ -47,7 +47,18 @@ pub(crate) enum ResourceScope {
 pub(crate) enum RuntimeBackendKind {
     Podman,
     Docker,
+    #[serde(alias = "host")]
     Systemd,
+}
+
+impl RuntimeBackendKind {
+    pub(crate) fn container_command(self) -> Option<&'static str> {
+        match self {
+            Self::Podman => Some("podman"),
+            Self::Docker => Some("docker"),
+            Self::Systemd => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
