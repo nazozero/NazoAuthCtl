@@ -1,4 +1,4 @@
-use std::{ffi::OsString, path::PathBuf};
+use std::{ffi::OsString, path::PathBuf, thread, time::Duration};
 
 use anyhow::{Context as _, bail};
 
@@ -8,13 +8,87 @@ use crate::{
 };
 
 use super::{
-    BlobAttestationVerification, ManagedPostgresCommand, ManagedPostgresRestore,
-    ManagedValkeyRestore, NeutralMount, OneShotTask, RuntimeBackend, RuntimeObservation,
-    RuntimeReplacement, labels, safe_environment, server_command_verified,
+    BlobAttestationVerification, ManagedDependencyBackup, ManagedPostgresCommand,
+    ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount, OneShotTask, RuntimeBackend,
+    RuntimeObservation, RuntimeReplacement, labels, safe_environment, server_command_verified,
 };
 
 pub(crate) struct PodmanBackend {
     command: OsString,
+}
+
+fn backup_managed_dependencies(
+    command: &std::ffi::OsStr,
+    backup: &ManagedDependencyBackup,
+    selinux_relabel: bool,
+) -> anyhow::Result<()> {
+    let postgres = backup.destination.join("postgresql.dump");
+    Process::new(command)
+        .args(["exec", backup.postgres_object.as_str(), "pg_dump"])
+        .args([
+            "--format=custom",
+            "--no-owner",
+            "--no-privileges",
+            "-U",
+            backup.postgres_user.as_str(),
+            backup.postgres_database.as_str(),
+        ])
+        .stdout_file(&postgres)?;
+    let mount = if selinux_relabel {
+        format!("{}:/backup:ro,Z", backup.destination.display())
+    } else {
+        format!("{}:/backup:ro", backup.destination.display())
+    };
+    Process::new(command)
+        .args(["run", "--rm", "-v"])
+        .arg(mount)
+        .arg(&backup.postgres_validation_image)
+        .args(["pg_restore", "--list", "/backup/postgresql.dump"])
+        .run_quiet()?;
+    let output = |arguments: &[&str]| -> anyhow::Result<String> {
+        if let Some(password_file) = &backup.valkey_password_file {
+            return Process::new(command)
+                .args(["exec", backup.valkey_object.as_str(), "sh", "-eu", "-c"])
+                .arg("VALKEYCLI_AUTH=$(cat \"$1\"); export VALKEYCLI_AUTH; shift; exec valkey-cli \"$@\"")
+                .arg("_")
+                .arg(password_file)
+                .args(arguments)
+                .stdout();
+        }
+        Process::new(command)
+            .args(["exec", backup.valkey_object.as_str(), "valkey-cli"])
+            .args(arguments)
+            .stdout()
+    };
+    let previous = output(&["LASTSAVE"])?
+        .trim()
+        .parse::<u64>()
+        .context("Valkey LASTSAVE is not numeric")?;
+    output(&["BGSAVE"])?;
+    let mut completed = false;
+    for _ in 0..60 {
+        if output(&["LASTSAVE"])?
+            .trim()
+            .parse::<u64>()
+            .context("Valkey LASTSAVE is not numeric")?
+            > previous
+        {
+            completed = true;
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    if !completed {
+        bail!("Valkey BGSAVE did not complete");
+    }
+    Process::new(command)
+        .args(["cp"])
+        .arg(format!(
+            "{}:{}",
+            backup.valkey_object, backup.valkey_rdb_path
+        ))
+        .arg(backup.destination.join("valkey-dump.rdb"))
+        .run_quiet()
 }
 
 impl Default for PodmanBackend {
@@ -402,6 +476,10 @@ impl RuntimeBackend for PodmanBackend {
             .arg(&command.database)
             .stdin_stdout(&command.stdin)
             .map(|_| ())
+    }
+
+    fn backup_managed_dependencies(&self, backup: &ManagedDependencyBackup) -> anyhow::Result<()> {
+        backup_managed_dependencies(&self.command, backup, true)
     }
 
     fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String> {

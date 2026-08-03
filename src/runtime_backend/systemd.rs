@@ -9,8 +9,9 @@ use crate::{
 };
 
 use super::{
-    BlobAttestationVerification, ManagedPostgresCommand, ManagedPostgresRestore,
-    ManagedValkeyRestore, OneShotTask, RuntimeBackend, RuntimeObservation, RuntimeReplacement,
+    BlobAttestationVerification, ManagedDependencyBackup, ManagedPostgresCommand,
+    ManagedPostgresRestore, ManagedValkeyRestore, OneShotTask, RuntimeBackend, RuntimeObservation,
+    RuntimeReplacement,
 };
 
 pub(crate) struct SystemdBackend;
@@ -172,6 +173,10 @@ impl RuntimeBackend for SystemdBackend {
 
     fn execute_managed_postgres(&self, _command: &ManagedPostgresCommand) -> anyhow::Result<()> {
         bail!("systemd backend does not manage containerized PostgreSQL")
+    }
+
+    fn backup_managed_dependencies(&self, _backup: &ManagedDependencyBackup) -> anyhow::Result<()> {
+        bail!("systemd does not manage container dependency backups")
     }
 
     fn resolve_image_digest(&self, _image_reference: &str) -> anyhow::Result<String> {

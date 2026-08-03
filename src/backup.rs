@@ -2,14 +2,10 @@ use std::{
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
-    thread,
-    time::Duration,
 };
 
 use anyhow::{Context, bail};
 
-const AUTHENTICATED_VALKEY_COMMAND: &str =
-    "password_file=\"$1\"; shift; cat \"$password_file\" | valkey-cli --askpass \"$@\"";
 use chrono::Utc;
 use tar::{Archive, Builder};
 
@@ -18,6 +14,7 @@ use crate::{
     model::UpdateConfig,
     process::{Process, command_exists},
     runtime::Runtime,
+    runtime_backend::{ManagedDependencyBackup, backend},
     secret_provider::{PostgresProvider, ValkeyProvider},
 };
 
@@ -191,56 +188,20 @@ impl Backup {
     }
 
     fn managed_dependencies(&self, config: &UpdateConfig) -> anyhow::Result<()> {
-        let engine = config
-            .container_engine()
-            .context("managed dependencies require a container engine")?;
-        let postgres = self.path.join("postgresql.dump");
-        Process::new(engine)
-            .args(["exec", config.postgres.container_name.as_str(), "pg_dump"])
-            .args([
-                "--format=custom",
-                "--no-owner",
-                "--no-privileges",
-                "-U",
-                config.postgres.user.as_str(),
-                config.postgres.database.as_str(),
-            ])
-            .stdout_file(&postgres)?;
-        Process::new(engine)
-            .args(["run", "--rm", "-v"])
-            .arg(format!("{}:/backup:ro", self.path.display()))
-            .arg(&config.postgres.validation_image)
-            .args(["pg_restore", "--list", "/backup/postgresql.dump"])
-            .run_quiet()?;
-
-        let last_save = valkey(config, &["LASTSAVE"])?
-            .trim()
-            .parse::<u64>()
-            .context("Valkey LASTSAVE is not numeric")?;
-        valkey(config, &["BGSAVE"])?;
-        let mut completed = false;
-        for _ in 0..60 {
-            let next = valkey(config, &["LASTSAVE"])?
-                .trim()
-                .parse::<u64>()
-                .context("Valkey LASTSAVE is not numeric")?;
-            if next > last_save {
-                completed = true;
-                break;
-            }
-            thread::sleep(Duration::from_secs(1));
-        }
-        if !completed {
-            bail!("Valkey BGSAVE did not complete");
-        }
-        Process::new(engine)
-            .args(["cp"])
-            .arg(format!(
-                "{}:{}",
-                config.valkey.container_name, config.valkey.rdb_path
-            ))
-            .arg(self.path.join("valkey-dump.rdb"))
-            .run_quiet()
+        let kind = config
+            .container_backend()
+            .context("managed dependencies require a container backend")?;
+        backend(kind).backup_managed_dependencies(&ManagedDependencyBackup {
+            destination: self.path.clone(),
+            postgres_object: config.postgres.container_name.clone(),
+            postgres_user: config.postgres.user.clone(),
+            postgres_database: config.postgres.database.clone(),
+            postgres_validation_image: config.postgres.validation_image.clone(),
+            valkey_object: config.valkey.container_name.clone(),
+            valkey_rdb_path: config.valkey.rdb_path.clone(),
+            valkey_password_file: (!config.valkey.password_file.as_os_str().is_empty())
+                .then(|| config.valkey.password_file.clone()),
+        })
     }
 
     fn snapshots(&self, config: &UpdateConfig) -> anyhow::Result<()> {
@@ -336,31 +297,6 @@ fn validate_secret(path: &Path) -> anyhow::Result<()> {
         bail!("secret file is empty or multiline: {}", path.display());
     }
     Ok(())
-}
-
-fn valkey(config: &UpdateConfig, arguments: &[&str]) -> anyhow::Result<String> {
-    let engine = config
-        .container_engine()
-        .context("managed dependencies require a container engine")?;
-    if config.valkey.password_file.as_os_str().is_empty() {
-        return Process::new(engine)
-            .args(["exec", config.valkey.container_name.as_str(), "valkey-cli"])
-            .args(arguments)
-            .stdout();
-    }
-    let mut command = Process::new(engine)
-        .args([
-            "exec",
-            config.valkey.container_name.as_str(),
-            "sh",
-            "-eu",
-            "-c",
-            AUTHENTICATED_VALKEY_COMMAND,
-            "_",
-        ])
-        .arg(&config.valkey.password_file);
-    command = command.args(arguments);
-    command.stdout()
 }
 
 #[cfg(all(test, unix))]

@@ -98,6 +98,18 @@ pub(crate) struct ManagedPostgresCommand {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct ManagedDependencyBackup {
+    pub(crate) destination: PathBuf,
+    pub(crate) postgres_object: String,
+    pub(crate) postgres_user: String,
+    pub(crate) postgres_database: String,
+    pub(crate) postgres_validation_image: String,
+    pub(crate) valkey_object: String,
+    pub(crate) valkey_rdb_path: String,
+    pub(crate) valkey_password_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct BlobAttestationVerification {
     pub(crate) work: PathBuf,
     pub(crate) bundle: String,
@@ -125,6 +137,7 @@ pub(crate) trait RuntimeBackend {
     fn restore_managed_postgres(&self, restore: &ManagedPostgresRestore) -> anyhow::Result<()>;
     fn restore_managed_valkey(&self, restore: &ManagedValkeyRestore) -> anyhow::Result<()>;
     fn execute_managed_postgres(&self, command: &ManagedPostgresCommand) -> anyhow::Result<()>;
+    fn backup_managed_dependencies(&self, backup: &ManagedDependencyBackup) -> anyhow::Result<()>;
     fn verify_blob_attestation(
         &self,
         verification: &BlobAttestationVerification,
