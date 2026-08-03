@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
 
@@ -97,7 +97,7 @@ impl RuntimeBackend for DockerBackend {
                             .as_array()
                             .into_iter()
                             .flatten()
-                            .filter_map(|binding| {
+                            .filter_map(move |binding| {
                                 let host_ip = binding.get("HostIp")?.as_str()?;
                                 let host_port = binding.get("HostPort")?.as_str()?;
                                 Some(format!("{host_ip}:{host_port}->{container_port}"))

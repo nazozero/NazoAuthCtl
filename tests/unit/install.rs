@@ -52,7 +52,10 @@ fn managed_dependency_credentials_are_outside_runtime_secret_directory() {
     let secrets = work.path().join("secrets");
     fs::create_dir(&secrets).unwrap();
 
-    assert_eq!(write_managed_secrets(&secrets).unwrap(), "managed");
+    assert_eq!(
+        write_managed_secrets(&secrets, "example-postgres", "example-valkey").unwrap(),
+        "managed"
+    );
 
     let dependencies = secrets.join("dependencies");
     #[cfg(unix)]
@@ -80,6 +83,12 @@ fn managed_dependency_credentials_are_outside_runtime_secret_directory() {
     let migration_url = fs::read_to_string(secrets.join("database-migration-url")).unwrap();
     assert!(runtime_url.contains("nazoauth_runtime"));
     assert!(migration_url.contains("nazoauth_migrator"));
+    assert!(runtime_url.contains("example-postgres"));
+    assert!(
+        fs::read_to_string(secrets.join("valkey-url"))
+            .unwrap()
+            .contains("example-valkey")
+    );
     assert_ne!(runtime_url, migration_url);
 }
 

@@ -99,7 +99,7 @@ impl RuntimeBackend for PodmanBackend {
                             .as_array()
                             .into_iter()
                             .flatten()
-                            .filter_map(|binding| {
+                            .filter_map(move |binding| {
                                 let host_ip = binding.get("HostIp")?.as_str()?;
                                 let host_port = binding.get("HostPort")?.as_str()?;
                                 Some(format!("{host_ip}:{host_port}->{container_port}"))

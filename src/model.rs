@@ -443,9 +443,6 @@ impl ReleaseManifest {
         {
             bail!("signed release manifest failed policy validation");
         }
-        if self.trust != TrustState::Adopted {
-            bail!("mutable update configuration requires an adopted deployment");
-        }
         match (self.schema, &self.operator_protocol) {
             (4, None) => {}
             (5, Some(protocol)) if protocol.version == self.embedded.protocol => {}

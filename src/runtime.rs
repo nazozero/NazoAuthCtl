@@ -654,7 +654,8 @@ impl<'a> Runtime<'a> {
                     .arg(mount_argument(
                         database_url_file,
                         Path::new("/run/nazoauth-secrets/database-url"),
-                        "ro,Z",
+                        true,
+                        true,
                     ));
             }
             TaskOperation::KeysList
@@ -703,15 +704,19 @@ impl<'a> Runtime<'a> {
                 "rw,Z",
             ),
         ] {
-            command = command
-                .arg("-v")
-                .arg(mount_argument(source, Path::new(target), mode));
+            command = command.arg("-v").arg(mount_argument(
+                source,
+                Path::new(target),
+                mode.starts_with("ro"),
+                mode.ends_with(",Z"),
+            ));
         }
         if let Some(path) = public_jwk {
             command = command.arg("-v").arg(mount_argument(
                 path,
                 Path::new("/run/nazoauth-operator/public.jwk"),
-                "ro,Z",
+                true,
+                true,
             ));
         }
         Ok(command)

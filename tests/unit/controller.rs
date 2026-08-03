@@ -217,9 +217,6 @@ fn journal(config: &UpdateConfig, phase: UpdatePhase) -> UpdateJournal {
             .display()
             .to_string(),
         candidate_ui: config.ui.releases_root.join("f".repeat(64)),
-        staged_updater: config
-            .deployment_root
-            .join(format!("candidate-nazoauthctl-{}", "e".repeat(40))),
         backup: (phase >= UpdatePhase::BackupCreated)
             .then(|| config.backup_root.join("v0.2.0-test")),
     }
@@ -913,7 +910,7 @@ fn every_pre_migration_fault_window_restores_the_previous_runtime() {
 }
 
 #[test]
-fn migration_faults_obey_the_signed_schema_boundary() {
+fn migration_faults_always_unwind_without_the_faulting_server() {
     let work = PrivateTempDir::new("nazoauth-update-migration").unwrap();
     let config = config(&work);
     let compatible = journal(&config, UpdatePhase::MigrationRunning);
@@ -927,7 +924,7 @@ fn migration_faults_obey_the_signed_schema_boundary() {
     barrier.to_release.rollback.irreversible_migration = true;
     assert_eq!(
         recovery_action(&barrier, false),
-        UpdateRecoveryAction::ContinueForward
+        UpdateRecoveryAction::RestorePrevious
     );
 }
 
@@ -954,7 +951,7 @@ fn container_target_binds_the_platform_manifest_not_the_index() {
 }
 
 #[test]
-fn an_activated_target_always_finishes_state_trust_and_audit_commit() {
+fn an_activated_target_is_unwound_during_recovery() {
     let work = PrivateTempDir::new("nazoauth-update-active").unwrap();
     let config = config(&work);
     for phase in [
@@ -975,14 +972,14 @@ fn an_activated_target_always_finishes_state_trust_and_audit_commit() {
     ] {
         assert_eq!(
             recovery_action(&journal(&config, phase), true),
-            UpdateRecoveryAction::ContinueForward,
+            UpdateRecoveryAction::RestorePrevious,
             "phase {phase:?}"
         );
     }
 }
 
 #[test]
-fn a_persisted_candidate_active_phase_finishes_even_if_runtime_inspection_is_unavailable() {
+fn a_persisted_candidate_active_phase_is_unwound_without_runtime_inspection() {
     let work = PrivateTempDir::new("nazoauth-update-persisted-active").unwrap();
     let config = config(&work);
     for phase in [
@@ -1000,7 +997,7 @@ fn a_persisted_candidate_active_phase_finishes_even_if_runtime_inspection_is_una
     ] {
         assert_eq!(
             recovery_action(&journal(&config, phase), false),
-            UpdateRecoveryAction::ContinueForward,
+            UpdateRecoveryAction::RestorePrevious,
             "phase {phase:?}"
         );
     }
@@ -1142,10 +1139,6 @@ fn journal_validation_is_closed_over_headers_manifests_and_every_managed_path() 
 
     let mut value = baseline.clone();
     value.candidate_ui = work.path().join("wrong-candidate-ui");
-    assert_invalid_journal(&config, &value, "candidate artifacts do not match");
-
-    let mut value = baseline.clone();
-    value.staged_updater = work.path().join("wrong-updater");
     assert_invalid_journal(&config, &value, "candidate artifacts do not match");
 
     let mut value = baseline.clone();
@@ -1521,18 +1514,16 @@ fn early_update_faults_leave_the_last_durable_phase_for_restart() {
 }
 
 #[test]
-fn finishing_a_transaction_durably_removes_only_its_journal_and_staged_updater() {
+fn finishing_a_transaction_durably_removes_only_its_journal() {
     let work = PrivateTempDir::new("nazoauth-update-finish").unwrap();
     let config = config(&work);
     fs::create_dir_all(&config.deployment_root).unwrap();
     let value = journal(&config, UpdatePhase::AuditCommitted);
-    fs::write(&value.staged_updater, b"updater").unwrap();
     write_update_journal(&config, &value).unwrap();
     let unrelated = config.deployment_root.join("keep.json");
     fs::write(&unrelated, b"keep").unwrap();
 
     finish_update_journal(&config, &value).unwrap();
-    assert!(!value.staged_updater.exists());
     assert!(!update_journal_path(&config).exists());
     assert!(unrelated.exists());
     finish_update_journal(&config, &value).unwrap();
@@ -1915,7 +1906,6 @@ fn pending_pre_migration_update_restores_previous_artifact_and_closes_the_journa
     value.previous_runtime = value.from_release.image_ref().unwrap();
     value.candidate_runtime = value.to_release.image_ref().unwrap();
     fs::create_dir_all(&config.deployment_root).unwrap();
-    fs::write(&value.staged_updater, b"staged-updater").unwrap();
     materialize_candidate_ui(&value);
     install_audit_key(&config);
     let (issuer, server) = public_server(3);
@@ -1930,14 +1920,13 @@ fn pending_pre_migration_update_restores_previous_artifact_and_closes_the_journa
         value.from_release.version
     );
     assert!(!update_journal_path(&config).exists());
-    assert!(!value.staged_updater.exists());
     crate::operator::verify_audit(&config).unwrap();
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn pending_active_candidate_continues_all_commits_and_closes_the_journal() {
-    let work = PrivateTempDir::new("nazoauth-recover-forward").unwrap();
+fn pending_active_candidate_restores_previous_release_and_closes_the_journal() {
+    let work = PrivateTempDir::new("nazoauth-recover-active-unwind").unwrap();
     let mut config = config(&work);
     let mut value = journal(&config, UpdatePhase::CandidateActive);
     config.runtime.engine = fake_container_runtime(&work, &value.to_release.backend_commit, true)
@@ -1946,11 +1935,10 @@ fn pending_active_candidate_continues_all_commits_and_closes_the_journal() {
     value.previous_runtime = value.from_release.image_ref().unwrap();
     value.candidate_runtime = value.to_release.image_ref().unwrap();
     fs::create_dir_all(&config.deployment_root).unwrap();
-    fs::write(&value.staged_updater, b"staged-updater").unwrap();
     materialize_candidate_ui(&value);
     materialize_verified_backup(&config, value.backup.as_deref().unwrap());
     install_audit_key(&config);
-    let (issuer, server) = public_server(5);
+    let (issuer, server) = public_server(3);
     configure_public_checks(&mut config, &issuer);
     write_update_journal(&config, &value).unwrap();
 
@@ -1959,14 +1947,9 @@ fn pending_active_candidate_continues_all_commits_and_closes_the_journal() {
     server.join().unwrap();
     assert_eq!(
         load_active_release(&config).unwrap().version,
-        value.to_release.version
-    );
-    assert_eq!(
-        fs::read(&config.updater_install_path).unwrap(),
-        b"staged-updater"
+        value.from_release.version
     );
     assert!(!update_journal_path(&config).exists());
-    assert!(!value.staged_updater.exists());
     crate::operator::verify_audit(&config).unwrap();
 }
 

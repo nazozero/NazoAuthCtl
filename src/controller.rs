@@ -2165,7 +2165,7 @@ pub(crate) fn uses_legacy_lock(command: &Command) -> bool {
 }
 
 fn recover_pending_update(config_path: &Path, config: &UpdateConfig) -> anyhow::Result<()> {
-    let Some(mut journal) = load_update_journal(config)? else {
+    let Some(journal) = load_update_journal(config)? else {
         return Ok(());
     };
     eprintln!(
