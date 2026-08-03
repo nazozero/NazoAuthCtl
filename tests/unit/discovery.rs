@@ -41,7 +41,7 @@ fn candidate(target: &str, deployment_id: &str, runtime_instance_id: &str) -> Di
         readiness_observed: false,
         external_database: true,
         external_valkey: true,
-        recovery_conclusion: RecoveryConclusion::Unknown,
+        recovery_conclusion: RecoveryConclusion::Unproven,
         evidence: Vec::new(),
         missing: Vec::new(),
     }

@@ -14,7 +14,6 @@ use base64::Engine as _;
 use nazo_operator_protocol::EmbeddedIdentity;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::path::Path;
 
 fn manifest(version: &str) -> ReleaseManifest {
     let target = release_target().unwrap().to_owned();
