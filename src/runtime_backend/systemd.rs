@@ -9,8 +9,8 @@ use crate::{
 };
 
 use super::{
-    ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore, OneShotTask,
-    RuntimeBackend, RuntimeObservation, RuntimeReplacement,
+    BlobAttestationVerification, ManagedPostgresCommand, ManagedPostgresRestore,
+    ManagedValkeyRestore, OneShotTask, RuntimeBackend, RuntimeObservation, RuntimeReplacement,
 };
 
 pub(crate) struct SystemdBackend;
@@ -24,6 +24,13 @@ impl RuntimeBackend for SystemdBackend {
         Process::new("systemctl")
             .args(["show", "--property=Version", "--value"])
             .succeeds()
+    }
+
+    fn verify_blob_attestation(
+        &self,
+        _verification: &BlobAttestationVerification,
+    ) -> anyhow::Result<()> {
+        bail!("systemd cannot provide a containerized Cosign fallback")
     }
 
     fn discover(&self) -> anyhow::Result<Vec<RuntimeObservation>> {

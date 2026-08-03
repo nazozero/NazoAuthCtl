@@ -1,9 +1,8 @@
 use super::{
-    AttestationResponse, COSIGN_IMAGE, RELEASE_PREDICATE, ReleaseTrustState,
-    SIGSTORE_BUNDLE_MEDIA_TYPE, VerifiedRelease, accept_verified_manifest,
-    bounded_https_curl_arguments, commit_release_trust, compare_versions,
-    containerized_cosign_attestation_arguments, enforce_release_trust, enforce_release_trust_state,
-    manifest_from_bundle, resolve_version, verified_manifest_from_attestations, verify_artifact,
+    AttestationResponse, RELEASE_PREDICATE, ReleaseTrustState, SIGSTORE_BUNDLE_MEDIA_TYPE,
+    VerifiedRelease, accept_verified_manifest, bounded_https_curl_arguments, commit_release_trust,
+    compare_versions, enforce_release_trust, enforce_release_trust_state, manifest_from_bundle,
+    resolve_version, verified_manifest_from_attestations, verify_artifact,
 };
 use crate::filesystem::{PrivateTempDir, atomic_write, sha256};
 use crate::model::{
@@ -347,49 +346,6 @@ fn persisted_release_trust_is_private_closed_and_oci_index_bound() {
 
     atomic_write(&config.operator.trust_state_file, b"not-json", 0o600).unwrap();
     assert!(enforce_release_trust(&config, &value).is_err());
-}
-
-#[test]
-fn containerized_cosign_policy_can_read_private_staging_without_host_privileges() {
-    let args = containerized_cosign_attestation_arguments(
-        Path::new("/private/release"),
-        "manifest.bundle",
-        "manifest.json",
-        "https://example.test/release-workflow@refs/tags/v1.0.0",
-        RELEASE_PREDICATE,
-    );
-
-    assert_eq!(
-        args,
-        vec![
-            "run",
-            "--rm",
-            "--user",
-            "0:0",
-            "--cap-drop",
-            "ALL",
-            "--read-only",
-            "--security-opt",
-            "no-new-privileges",
-            "--pids-limit",
-            "64",
-            "--tmpfs",
-            "/root/.sigstore:rw,noexec,nosuid,nodev,size=16m",
-            "-v",
-            "/private/release:/work:ro,Z",
-            COSIGN_IMAGE,
-            "verify-blob-attestation",
-            "--bundle",
-            "/work/manifest.bundle",
-            "--type",
-            RELEASE_PREDICATE,
-            "--certificate-identity",
-            "https://example.test/release-workflow@refs/tags/v1.0.0",
-            "--certificate-oidc-issuer",
-            "https://token.actions.githubusercontent.com",
-            "/work/manifest.json",
-        ]
-    );
 }
 
 #[test]

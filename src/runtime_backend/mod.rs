@@ -97,6 +97,16 @@ pub(crate) struct ManagedPostgresCommand {
     pub(crate) stdin: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct BlobAttestationVerification {
+    pub(crate) work: PathBuf,
+    pub(crate) bundle: String,
+    pub(crate) blob: String,
+    pub(crate) certificate_identity: String,
+    pub(crate) predicate_type: String,
+    pub(crate) cosign_image: String,
+}
+
 pub(crate) trait RuntimeBackend {
     fn kind(&self) -> RuntimeBackendKind;
     fn available(&self) -> bool;
@@ -115,6 +125,10 @@ pub(crate) trait RuntimeBackend {
     fn restore_managed_postgres(&self, restore: &ManagedPostgresRestore) -> anyhow::Result<()>;
     fn restore_managed_valkey(&self, restore: &ManagedValkeyRestore) -> anyhow::Result<()>;
     fn execute_managed_postgres(&self, command: &ManagedPostgresCommand) -> anyhow::Result<()>;
+    fn verify_blob_attestation(
+        &self,
+        verification: &BlobAttestationVerification,
+    ) -> anyhow::Result<()>;
     fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String>;
     fn read_build_identity(
         &self,

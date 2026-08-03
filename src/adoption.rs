@@ -437,12 +437,9 @@ fn verified_release(
     candidate: &DiscoveredDeployment,
     release: &str,
 ) -> anyhow::Result<VerifiedRelease> {
-    let engine = match candidate.runtime.backend {
-        crate::deployment::RuntimeBackendKind::Podman => Some("podman"),
-        crate::deployment::RuntimeBackendKind::Docker => Some("docker"),
-        crate::deployment::RuntimeBackendKind::Systemd => None,
-    };
-    VerifiedRelease::fetch(SERVER_REPOSITORY, Some(release), engine)
+    let backend = (candidate.runtime.backend != crate::deployment::RuntimeBackendKind::Systemd)
+        .then_some(candidate.runtime.backend);
+    VerifiedRelease::fetch(SERVER_REPOSITORY, Some(release), backend)
 }
 
 fn verify_artifact(

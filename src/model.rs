@@ -351,6 +351,15 @@ impl UpdateConfig {
             self.runtime.backend.container_command()
         }
     }
+
+    pub(crate) fn container_backend(&self) -> Option<crate::deployment::RuntimeBackendKind> {
+        if self.runtime.backend == crate::deployment::RuntimeBackendKind::Systemd {
+            self.runtime.dependency_backend
+        } else {
+            Some(self.runtime.backend)
+        }
+        .filter(|backend| *backend != crate::deployment::RuntimeBackendKind::Systemd)
+    }
 }
 
 pub(crate) fn safe_absolute(path: &std::path::Path) -> anyhow::Result<()> {

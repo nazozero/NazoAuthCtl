@@ -828,7 +828,7 @@ fn controller_state_directory(config: &UpdateConfig) -> PathBuf {
 
 fn controller_check(config: &UpdateConfig, version: Option<&str>) -> anyhow::Result<()> {
     let release =
-        crate::release::VerifiedControllerRelease::fetch(version, config.container_engine())?;
+        crate::release::VerifiedControllerRelease::fetch(version, config.container_backend())?;
     enforce_controller_trust(config, &release.version, &release.sha256)?;
     println!(
         "{}",
@@ -844,7 +844,7 @@ fn controller_check(config: &UpdateConfig, version: Option<&str>) -> anyhow::Res
 
 fn controller_update(config: &UpdateConfig, version: Option<&str>) -> anyhow::Result<()> {
     let release =
-        crate::release::VerifiedControllerRelease::fetch(version, config.container_engine())?;
+        crate::release::VerifiedControllerRelease::fetch(version, config.container_backend())?;
     enforce_controller_trust(config, &release.version, &release.sha256)?;
     let directory = controller_state_directory(config);
     fs::create_dir_all(&directory)?;
@@ -1993,7 +1993,7 @@ fn install_transaction(
 ) -> anyhow::Result<()> {
     crate::operator::append_management_event(config, "install-intent", "pending", "backup")?;
     install::start_managed_dependencies(config)?;
-    let release = VerifiedRelease::fetch(&config.repository, version, config.container_engine())?;
+    let release = VerifiedRelease::fetch(&config.repository, version, config.container_backend())?;
     enforce_release_trust(config, &release.manifest)?;
     release.persist_verification_evidence(&release_cache_dir(config, &release.manifest))?;
     let backup = Backup::create(config_path, config, &release.manifest.version)?;
@@ -2318,7 +2318,7 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
     let release = VerifiedRelease::fetch(
         &config.repository,
         options.version.as_deref(),
-        config.container_engine(),
+        config.container_backend(),
     )?;
     enforce_release_trust(config, &release.manifest)?;
     release.persist_verification_evidence(&release_cache_dir(config, &release.manifest))?;
@@ -3082,14 +3082,15 @@ fn registered_update_plan(
 ) -> anyhow::Result<()> {
     const SERVER_REPOSITORY: &str = "nazozero/NazoAuth";
 
-    let container_engine = record
+    let container_backend = record
         .runtime_instances
         .iter()
-        .find_map(|runtime| runtime.backend.container_command());
+        .map(|runtime| runtime.backend)
+        .find(|backend| *backend != RuntimeBackendKind::Systemd);
     let release = VerifiedRelease::fetch(
         SERVER_REPOSITORY,
         options.version.as_deref(),
-        container_engine,
+        container_backend,
     )?;
     let plan = build_registered_update_plan(record, &release.manifest)?;
     println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -3103,14 +3104,15 @@ fn registered_update_prepare(
 ) -> anyhow::Result<()> {
     const SERVER_REPOSITORY: &str = "nazozero/NazoAuth";
 
-    let container_engine = record
+    let container_backend = record
         .runtime_instances
         .iter()
-        .find_map(|runtime| runtime.backend.container_command());
+        .map(|runtime| runtime.backend)
+        .find(|backend| *backend != RuntimeBackendKind::Systemd);
     let release = VerifiedRelease::fetch(
         SERVER_REPOSITORY,
         options.version.as_deref(),
-        container_engine,
+        container_backend,
     )?;
     let plan = build_registered_update_plan(record, &release.manifest)?;
     let evidence_root = store

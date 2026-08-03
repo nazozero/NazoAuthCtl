@@ -8,9 +8,9 @@ use crate::{
 };
 
 use super::{
-    ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount,
-    OneShotTask, RuntimeBackend, RuntimeObservation, RuntimeReplacement, labels, safe_environment,
-    server_command_verified,
+    BlobAttestationVerification, ManagedPostgresCommand, ManagedPostgresRestore,
+    ManagedValkeyRestore, NeutralMount, OneShotTask, RuntimeBackend, RuntimeObservation,
+    RuntimeReplacement, labels, safe_environment, server_command_verified,
 };
 
 pub(crate) struct PodmanBackend {
@@ -43,6 +43,31 @@ impl RuntimeBackend for PodmanBackend {
         Process::new(&self.command)
             .args(["info", "--format", "json"])
             .succeeds()
+    }
+
+    fn verify_blob_attestation(
+        &self,
+        verification: &BlobAttestationVerification,
+    ) -> anyhow::Result<()> {
+        Process::new(&self.command)
+            .args(["run", "--rm", "--user", "0:0", "--cap-drop", "ALL"])
+            .args(["--read-only", "--security-opt", "no-new-privileges"])
+            .args(["--pids-limit", "64", "--tmpfs"])
+            .arg("/root/.sigstore:rw,noexec,nosuid,nodev,size=16m")
+            .arg("-v")
+            .arg(format!("{}:/work:ro,Z", verification.work.display()))
+            .arg(&verification.cosign_image)
+            .args(["verify-blob-attestation", "--bundle"])
+            .arg(format!("/work/{}", verification.bundle))
+            .args(["--type", verification.predicate_type.as_str()])
+            .args([
+                "--certificate-identity",
+                verification.certificate_identity.as_str(),
+                "--certificate-oidc-issuer",
+                "https://token.actions.githubusercontent.com",
+            ])
+            .arg(format!("/work/{}", verification.blob))
+            .run_quiet()
     }
 
     fn discover(&self) -> anyhow::Result<Vec<RuntimeObservation>> {

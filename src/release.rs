@@ -9,10 +9,12 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    deployment::RuntimeBackendKind,
     filesystem::atomic_write,
     filesystem::{PrivateTempDir, sha256},
     model::{Artifact, ReleaseManifest, release_target, semantic_tag},
     process::{Process, command_exists},
+    runtime_backend::{BlobAttestationVerification, backend},
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -154,7 +156,7 @@ impl VerifiedRelease {
     pub(crate) fn fetch(
         repository: &str,
         requested_version: Option<&str>,
-        container_engine: Option<&str>,
+        container_backend: Option<RuntimeBackendKind>,
     ) -> anyhow::Result<Self> {
         let version = resolve_version(repository, requested_version)?;
         let work = PrivateTempDir::new("nazoauth-release")?;
@@ -182,7 +184,7 @@ impl VerifiedRelease {
             work.path(),
             &binary,
             &identity,
-            container_engine,
+            container_backend,
         )
         .or_else(|binary_error| {
             if !matches!(version.as_str(), "v0.1.18" | "v0.1.19") {
@@ -201,7 +203,7 @@ impl VerifiedRelease {
                 work.path(),
                 &updater,
                 &identity,
-                container_engine,
+                container_backend,
             )
         })?;
         manifest.validate(&version, &identity)?;
@@ -262,7 +264,7 @@ impl VerifiedRelease {
 impl VerifiedControllerRelease {
     pub(crate) fn fetch(
         requested_version: Option<&str>,
-        container_engine: Option<&str>,
+        container_backend: Option<RuntimeBackendKind>,
     ) -> anyhow::Result<Self> {
         let version = resolve_version(CONTROLLER_REPOSITORY, requested_version)?;
         let target = release_target().context("this platform has no official controller target")?;
@@ -345,7 +347,7 @@ impl VerifiedControllerRelease {
                 &artifact_name,
                 &identity,
                 CONTROLLER_PROVENANCE_PREDICATE,
-                container_engine,
+                container_backend,
             )?;
             accepted += 1;
         }
@@ -408,7 +410,7 @@ fn verified_attested_manifest(
     work: &Path,
     blob: &str,
     identity: &str,
-    container_engine: Option<&str>,
+    container_backend: Option<RuntimeBackendKind>,
 ) -> anyhow::Result<ReleaseManifest> {
     let digest = sha256(&work.join(blob))?;
     let response = Process::new("curl")
@@ -441,7 +443,7 @@ fn verified_attested_manifest(
                 blob,
                 identity,
                 RELEASE_PREDICATE,
-                container_engine,
+                container_backend,
             )
         },
     )
@@ -614,7 +616,7 @@ fn verify_blob_attestation(
     blob: &str,
     identity: &str,
     predicate: &str,
-    container_engine: Option<&str>,
+    container_backend: Option<RuntimeBackendKind>,
 ) -> anyhow::Result<()> {
     if command_exists("cosign") {
         return Process::new("cosign")
@@ -631,49 +633,15 @@ fn verify_blob_attestation(
             .arg(work.join(blob))
             .run_quiet();
     }
-    let engine = container_engine.context("Cosign is required when no container engine exists")?;
-    Process::new(engine)
-        .args(containerized_cosign_attestation_arguments(
-            work, bundle, blob, identity, predicate,
-        ))
-        .run_quiet()
-}
-
-fn containerized_cosign_attestation_arguments(
-    work: &Path,
-    bundle: &str,
-    blob: &str,
-    identity: &str,
-    predicate: &str,
-) -> Vec<String> {
-    vec![
-        "run".to_owned(),
-        "--rm".to_owned(),
-        "--user".to_owned(),
-        "0:0".to_owned(),
-        "--cap-drop".to_owned(),
-        "ALL".to_owned(),
-        "--read-only".to_owned(),
-        "--security-opt".to_owned(),
-        "no-new-privileges".to_owned(),
-        "--pids-limit".to_owned(),
-        "64".to_owned(),
-        "--tmpfs".to_owned(),
-        "/root/.sigstore:rw,noexec,nosuid,nodev,size=16m".to_owned(),
-        "-v".to_owned(),
-        format!("{}:/work:ro,Z", work.display()),
-        COSIGN_IMAGE.to_owned(),
-        "verify-blob-attestation".to_owned(),
-        "--bundle".to_owned(),
-        format!("/work/{bundle}"),
-        "--type".to_owned(),
-        predicate.to_owned(),
-        "--certificate-identity".to_owned(),
-        identity.to_owned(),
-        "--certificate-oidc-issuer".to_owned(),
-        "https://token.actions.githubusercontent.com".to_owned(),
-        format!("/work/{blob}"),
-    ]
+    let kind = container_backend.context("Cosign is required when no container backend exists")?;
+    backend(kind).verify_blob_attestation(&BlobAttestationVerification {
+        work: work.to_path_buf(),
+        bundle: bundle.to_owned(),
+        blob: blob.to_owned(),
+        certificate_identity: identity.to_owned(),
+        predicate_type: predicate.to_owned(),
+        cosign_image: COSIGN_IMAGE.to_owned(),
+    })
 }
 
 fn verify_artifact(path: &Path, artifact: &Artifact) -> anyhow::Result<()> {
