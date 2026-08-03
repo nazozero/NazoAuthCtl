@@ -47,6 +47,7 @@ pub(crate) struct AdoptionPlan {
     pub(crate) runtime_instance_id: String,
     pub(crate) issuer: String,
     pub(crate) release: String,
+    pub(crate) active_release: nazo_operator_protocol::EmbeddedIdentity,
     pub(crate) artifact_identity: String,
     pub(crate) resulting_trust: TrustState,
     pub(crate) capabilities: CapabilityGrants,
@@ -259,6 +260,7 @@ fn build_plan(
         runtime_instance_id,
         issuer,
         release: release_name,
+        active_release: verified.manifest.embedded.clone(),
         artifact_identity,
         resulting_trust,
         capabilities: options.capabilities.clone(),
@@ -554,6 +556,7 @@ fn deployment_record(
         control_authority: control_authority.to_owned(),
         alias,
         issuer: plan.issuer.clone(),
+        active_release: plan.active_release.clone(),
         trust: plan.resulting_trust,
         capabilities: plan.capabilities.clone(),
         runtime_instances: vec![RuntimeInstance {

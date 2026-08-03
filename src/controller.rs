@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::deployment::{
-    Capability, DeploymentRecord, DeploymentStore, FileLock, RuntimeBackendKind, SafeReference,
+    Capability, CapabilityGrant, DeploymentRecord, DeploymentStore, FileLock, RecoveryConclusion,
+    Responsibility, RuntimeBackendKind, SafeReference,
 };
 use crate::{
     backup::Backup,
@@ -396,6 +397,18 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             bootstrap_admin(&context.config, options)
         }
         Command::Check(version) => {
+            if DeploymentStore::system().registry_path().exists() {
+                let record = DeploymentStore::system().resolve(selector.as_deref(), false)?;
+                return registered_update_plan(
+                    &record,
+                    &UpdateOptions {
+                        version,
+                        plan: true,
+                        yes: false,
+                        accept_migration_barrier: false,
+                    },
+                );
+            }
             let context = control_config(
                 &configured_path,
                 selector.as_deref(),
@@ -416,28 +429,29 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             )
         }
         Command::Update(options) => {
-            require_root()?;
-            let required = if options.plan {
-                &[][..]
+            if options.plan && DeploymentStore::system().registry_path().exists() {
+                let record = DeploymentStore::system().resolve(selector.as_deref(), false)?;
+                registered_update_plan(&record, &options)
             } else {
-                &[
+                require_root()?;
+                let required = [
                     Capability::Runtime,
                     Capability::Artifact,
                     Capability::ServerConfig,
                     Capability::Database,
                     Capability::Valkey,
                     Capability::Backups,
-                ][..]
-            };
-            let context = control_config(
-                &configured_path,
-                selector.as_deref(),
-                required,
-                false,
-                false,
-                false,
-            )?;
-            update(&context.path, &context.config, options)
+                ];
+                let context = control_config(
+                    &configured_path,
+                    selector.as_deref(),
+                    &required,
+                    false,
+                    false,
+                    false,
+                )?;
+                update(&context.path, &context.config, options)
+            }
         }
         Command::Rollback { yes } => {
             require_root()?;
@@ -1812,6 +1826,7 @@ fn registered_status(
         "deployment_id": record.deployment_id,
         "alias": record.alias,
         "issuer": record.issuer,
+        "active_release": record.active_release,
         "trust": record.trust,
         "capabilities": record.capabilities,
         "core_recovery_proven": record.core_recovery_is_proven(),
@@ -2189,6 +2204,7 @@ fn register_installed_deployment(
         control_authority: config.operator.controller_key_id.clone(),
         alias: None,
         issuer: config.runtime.expected_issuer.clone(),
+        active_release: manifest.embedded.clone(),
         trust: TrustState::Adopted,
         capabilities: config.capabilities.clone(),
         runtime_instances: vec![RuntimeInstance {
@@ -3019,6 +3035,180 @@ fn recover_from_backup(config: &UpdateConfig) -> anyhow::Result<()> {
         state.from_release.version
     );
     Ok(())
+}
+
+fn registered_update_plan(
+    record: &DeploymentRecord,
+    options: &UpdateOptions,
+) -> anyhow::Result<()> {
+    const SERVER_REPOSITORY: &str = "nazozero/NazoAuth";
+
+    let container_engine = record
+        .runtime_instances
+        .iter()
+        .find_map(|runtime| runtime.backend.container_command());
+    let release = VerifiedRelease::fetch(
+        SERVER_REPOSITORY,
+        options.version.as_deref(),
+        container_engine,
+    )?;
+    let plan = build_registered_update_plan(record, &release.manifest)?;
+    println!("{}", serde_json::to_string_pretty(&plan)?);
+    Ok(())
+}
+
+fn build_registered_update_plan(
+    record: &DeploymentRecord,
+    target: &ReleaseManifest,
+) -> anyhow::Result<serde_json::Value> {
+    let minimum = format!("v{}", target.rollback.minimum_supported_version);
+    let mut blockers = Vec::new();
+    if record.trust != crate::deployment::TrustState::Adopted {
+        blockers.push("deployment is observed; mutation remains forbidden".to_owned());
+    }
+    if compare_versions(&record.active_release.release, &minimum)? == std::cmp::Ordering::Less {
+        blockers.push(format!(
+            "active Release {} is below target minimum supported {}",
+            record.active_release.release, minimum
+        ));
+    }
+    if record.recovery.conclusion != RecoveryConclusion::Proven
+        && [
+            Capability::Runtime,
+            Capability::Artifact,
+            Capability::Database,
+            Capability::Backups,
+        ]
+        .iter()
+        .any(|capability| {
+            record
+                .capabilities
+                .grant(*capability)
+                .responsibility
+                .permits_mutation()
+        })
+    {
+        blockers.push("controller mutation is forbidden until recovery is proven".to_owned());
+    }
+    if !record.resources.contains_key("controller_config")
+        && Capability::ALL.iter().any(|capability| {
+            record
+                .capabilities
+                .grant(*capability)
+                .responsibility
+                .permits_mutation()
+        })
+    {
+        blockers.push(
+            "controller-owned steps require an explicitly approved lifecycle configuration"
+                .to_owned(),
+        );
+    }
+    let operator_compatible = record
+        .operator_protocol_versions
+        .contains(&nazo_operator_protocol::PROTOCOL_VERSION);
+    if !operator_compatible
+        && record
+            .capabilities
+            .operator_tasks
+            .responsibility
+            .permits_mutation()
+    {
+        blockers.push(format!(
+            "application migration requires operator protocol {}; core artifact recovery remains available",
+            nazo_operator_protocol::PROTOCOL_VERSION
+        ));
+    }
+
+    let owner = |capability: Capability, resource: &str| {
+        update_step_owner(record, record.capabilities.grant(capability), resource)
+    };
+    let mut steps = vec![json!({
+        "id": "verify-release",
+        "owner": "ctl-owned",
+        "capability": "artifact",
+        "action": "verify signed Release, attestation, compatibility, and exact OCI or binary identity",
+        "evidence_required": true,
+    })];
+    steps.push(json!({
+        "id": "recovery-point",
+        "owner": owner(Capability::Backups, "backups"),
+        "capability": "backups",
+        "action": "create and verify a deployment-bound recovery point before writer shutdown",
+        "evidence_required": true,
+    }));
+    steps.push(json!({
+        "id": "database-migration",
+        "owner": owner(Capability::Database, "database"),
+        "capability": "database",
+        "action": if operator_compatible {
+            "apply the Release migration under the granted database and operator-task boundaries"
+        } else {
+            "blocked application task; do not infer migration compatibility"
+        },
+        "evidence_required": true,
+    }));
+    for runtime in &record.runtime_instances {
+        steps.push(json!({
+            "id": format!("runtime-replace-{}", runtime.runtime_instance_id),
+            "owner": owner(Capability::Runtime, "runtime"),
+            "capability": "runtime",
+            "runtime_instance_id": runtime.runtime_instance_id,
+            "backend": runtime.backend,
+            "object_reference": runtime.object_reference,
+            "action": "replace this runtime instance with the digest-bound candidate and retain the previous trusted artifact",
+            "evidence_required": true,
+        }));
+    }
+    steps.push(json!({
+        "id": "proxy-cutover",
+        "owner": owner(Capability::ProxyTls, "proxy_tls"),
+        "capability": "proxy_tls",
+        "action": "switch or verify the external routing and TLS boundary",
+        "evidence_required": true,
+    }));
+    steps.push(json!({
+        "id": "acceptance",
+        "owner": "ctl-owned",
+        "capability": "artifact",
+        "action": "verify issuer, readiness, embedded build identity, and per-replica artifact digest before commit",
+        "evidence_required": true,
+    }));
+
+    Ok(json!({
+        "schema": 1,
+        "operation": "update",
+        "deployment_id": record.deployment_id,
+        "active_release": &record.active_release,
+        "target_release": &target.embedded,
+        "target_oci_digest": target.image_oci_digest(),
+        "capabilities": &record.capabilities,
+        "recovery": &record.recovery,
+        "operator_protocol_compatible": operator_compatible,
+        "core_recovery_requires_operator_task": false,
+        "steps": steps,
+        "blockers": blockers,
+    }))
+}
+
+fn update_step_owner(
+    record: &DeploymentRecord,
+    grant: &CapabilityGrant,
+    resource: &str,
+) -> &'static str {
+    match grant.responsibility {
+        Responsibility::Managed | Responsibility::Delegated => "ctl-owned",
+        Responsibility::External => {
+            if matches!(
+                record.resources.get(resource),
+                Some(SafeReference::Provider { .. })
+            ) {
+                "provider-owned"
+            } else {
+                "user-required"
+            }
+        }
+    }
 }
 
 fn print_update_plan(

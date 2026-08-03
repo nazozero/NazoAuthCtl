@@ -16,6 +16,12 @@ fn record(deployment_id: &str, alias: &str) -> DeploymentRecord {
         control_authority: format!("controller-{deployment_id}"),
         alias: Some(alias.to_owned()),
         issuer: format!("https://{alias}.example"),
+        active_release: nazo_operator_protocol::EmbeddedIdentity {
+            release: "v0.1.19".to_owned(),
+            revision: "a".repeat(40),
+            protocol: nazo_operator_protocol::PROTOCOL_VERSION,
+            build_id: "build:test".to_owned(),
+        },
         trust: TrustState::Adopted,
         capabilities: CapabilityGrants::controller_installed(),
         runtime_instances: vec![RuntimeInstance {

@@ -265,6 +265,7 @@ pub(crate) struct DeploymentRecord {
     pub(crate) control_authority: String,
     pub(crate) alias: Option<String>,
     pub(crate) issuer: String,
+    pub(crate) active_release: nazo_operator_protocol::EmbeddedIdentity,
     pub(crate) trust: TrustState,
     pub(crate) capabilities: CapabilityGrants,
     pub(crate) runtime_instances: Vec<RuntimeInstance>,
@@ -318,7 +319,13 @@ impl DeploymentRecord {
         if let Some(alias) = &self.alias {
             validate_identifier(alias, "deployment alias")?;
         }
-        if self.issuer.is_empty() || self.runtime_instances.is_empty() {
+        if self.issuer.is_empty()
+            || self.active_release.release.is_empty()
+            || self.active_release.revision.is_empty()
+            || self.active_release.build_id.is_empty()
+            || self.active_release.protocol == 0
+            || self.runtime_instances.is_empty()
+        {
             bail!("deployment declaration is incomplete");
         }
         let mut runtime_ids = BTreeSet::new();

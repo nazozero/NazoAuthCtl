@@ -2011,6 +2011,94 @@ fn update_deployment_record_is_idempotent_for_a_transaction() {
 }
 
 #[test]
+fn registered_update_plan_preserves_mixed_ownership_and_replica_identity() {
+    let active = manifest("v0.1.19", 'a');
+    let target = manifest("v0.2.0", 'b');
+    let mut capabilities = crate::deployment::CapabilityGrants::observed();
+    capabilities.runtime = CapabilityGrant {
+        responsibility: Responsibility::Delegated,
+        scope: crate::deployment::ResourceScope::Deployment,
+    };
+    capabilities.artifact = CapabilityGrant {
+        responsibility: Responsibility::Managed,
+        scope: crate::deployment::ResourceScope::Deployment,
+    };
+    let runtime =
+        |runtime_instance_id: &str, object_reference: &str| crate::deployment::RuntimeInstance {
+            runtime_instance_id: runtime_instance_id.to_owned(),
+            backend: RuntimeBackendKind::Podman,
+            object_reference: object_reference.to_owned(),
+            artifact: crate::deployment::ArtifactReference::Oci {
+                image_reference: "ghcr.io/nazozero/nazoauth".to_owned(),
+                digest: active.runtime_oci_digest().unwrap().to_owned(),
+            },
+            ports: Vec::new(),
+            networks: vec!["shared-network".to_owned()],
+            mounts: Vec::new(),
+            instance_key_id: None,
+            deployment_statement: None,
+        };
+    let record = DeploymentRecord {
+        schema: crate::deployment::DEPLOYMENT_SCHEMA,
+        deployment_id: "deployment-mixed".to_owned(),
+        control_authority: "controller-mixed".to_owned(),
+        alias: Some("mixed".to_owned()),
+        issuer: "https://mixed.example".to_owned(),
+        active_release: active.embedded.clone(),
+        trust: crate::deployment::TrustState::Adopted,
+        capabilities,
+        runtime_instances: vec![
+            runtime("runtime-a", "manual-a"),
+            runtime("runtime-b", "manual-b"),
+        ],
+        resources: BTreeMap::from([(
+            "database".to_owned(),
+            SafeReference::Provider {
+                provider: "external-database".to_owned(),
+                key: "deployment-mixed".to_owned(),
+            },
+        )]),
+        recovery: crate::deployment::RecoveryAssessment {
+            conclusion: RecoveryConclusion::Proven,
+            evidence: vec!["recovery-package-sha256".to_owned()],
+            off_host_package_required_for_machine_loss: true,
+        },
+        operator_protocol_versions: std::collections::BTreeSet::from([
+            nazo_operator_protocol::PROTOCOL_VERSION,
+        ]),
+        control_protocol_versions: std::collections::BTreeSet::from([1]),
+        declaration_revision: 1,
+    };
+
+    let plan = build_registered_update_plan(&record, &target).unwrap();
+    let steps = plan["steps"].as_array().unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| {
+                step["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("runtime-replace-"))
+            })
+            .count(),
+        2
+    );
+    assert_eq!(
+        steps
+            .iter()
+            .find(|step| step["id"] == "database-migration")
+            .unwrap()["owner"],
+        "provider-owned"
+    );
+    assert!(plan["blockers"].as_array().unwrap().iter().any(|blocker| {
+        blocker
+            .as_str()
+            .is_some_and(|value| value.contains("lifecycle configuration"))
+    }));
+    assert_eq!(plan["core_recovery_requires_operator_task"], false);
+}
+
+#[test]
 fn frontend_cache_marker_must_exactly_match_the_signed_release() {
     let work = PrivateTempDir::new("nazoauth-frontend-marker").unwrap();
     let config = config(&work);
