@@ -2391,7 +2391,9 @@ fn recover_pending_update(config_path: &Path, config: &UpdateConfig) -> anyhow::
         journal.transaction_id, journal.phase
     );
     let _ = config_path;
-    restore_previous_transaction(config, &journal)?;
+    match recovery_action(&journal, candidate_is_active(config, &journal)) {
+        UpdateRecoveryAction::RestorePrevious => restore_previous_transaction(config, &journal)?,
+    }
     append_update_management_event(
         config,
         &journal,

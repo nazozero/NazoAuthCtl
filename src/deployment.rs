@@ -50,20 +50,6 @@ pub(crate) enum RuntimeBackendKind {
     Systemd,
 }
 
-impl RuntimeBackendKind {
-    pub(crate) fn command(self) -> Option<&'static str> {
-        match self {
-            Self::Podman => Some("podman"),
-            Self::Docker => Some("docker"),
-            Self::Systemd => None,
-        }
-    }
-
-    pub(crate) fn is_systemd(self) -> bool {
-        self == Self::Systemd
-    }
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Capability {
@@ -555,6 +541,7 @@ impl FileLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)
             .with_context(|| format!("failed to open lock {}", path.display()))?;
         file.try_lock_exclusive()

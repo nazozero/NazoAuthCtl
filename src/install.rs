@@ -117,9 +117,7 @@ pub(crate) fn prepare(
         None
     };
     create_directory(&secrets_dir, 0o700)?;
-    for path in [options.data_root.join("ui-releases")] {
-        create_directory(&path, 0o755)?;
-    }
+    create_directory(&options.data_root.join("ui-releases"), 0o755)?;
     for path in [
         options.control_root.join("backups"),
         options.control_root.join("deployments"),

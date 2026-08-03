@@ -58,13 +58,13 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Resu
         .parent()
         .context("atomic-write target has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            bail!(
-                "atomic-write target is not a regular file: {}",
-                path.display()
-            );
-        }
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        bail!(
+            "atomic-write target is not a regular file: {}",
+            path.display()
+        );
     }
     let temporary = path.with_extension(format!(
         "tmp-{}-{}",

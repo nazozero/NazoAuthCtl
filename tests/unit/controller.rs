@@ -1715,7 +1715,7 @@ fn health_server() -> (String, std::thread::JoinHandle<()>) {
     (format!("http://{address}/ready"), handle)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn public_server(requests: usize) -> (String, std::thread::JoinHandle<()>) {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
@@ -1750,7 +1750,7 @@ fn public_server(requests: usize) -> (String, std::thread::JoinHandle<()>) {
     (issuer, handle)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn fake_container_runtime(
     work: &PrivateTempDir,
     candidate_commit: &str,
@@ -1800,7 +1800,7 @@ fn install_audit_key(config: &UpdateConfig) {
     .unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn configure_public_checks(config: &mut UpdateConfig, issuer: &str) {
     config.runtime.health_url = format!("{issuer}/ready");
     config.runtime.public_discovery_url = format!("{issuer}/.well-known/openid-configuration");
@@ -1825,7 +1825,7 @@ fn materialize_candidate_ui(value: &UpdateJournal) {
     .unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn materialize_verified_backup(config: &UpdateConfig, path: &std::path::Path) {
     fs::create_dir_all(&config.backup_root).unwrap();
     fs::create_dir(path).unwrap();
