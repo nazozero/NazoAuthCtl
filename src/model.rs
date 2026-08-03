@@ -342,16 +342,6 @@ impl UpdateConfig {
         Ok(())
     }
 
-    pub(crate) fn container_engine(&self) -> Option<&str> {
-        if self.runtime.backend == crate::deployment::RuntimeBackendKind::Systemd {
-            self.runtime
-                .dependency_backend
-                .and_then(crate::deployment::RuntimeBackendKind::container_command)
-        } else {
-            self.runtime.backend.container_command()
-        }
-    }
-
     pub(crate) fn container_backend(&self) -> Option<crate::deployment::RuntimeBackendKind> {
         if self.runtime.backend == crate::deployment::RuntimeBackendKind::Systemd {
             self.runtime.dependency_backend

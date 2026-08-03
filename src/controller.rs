@@ -2197,12 +2197,7 @@ fn register_installed_deployment(
             if config.dependencies.mode == "managed" {
                 SafeReference::RuntimeObject {
                     backend: config
-                        .container_engine()
-                        .and_then(|engine| match engine {
-                            "podman" => Some(RuntimeBackendKind::Podman),
-                            "docker" => Some(RuntimeBackendKind::Docker),
-                            _ => None,
-                        })
+                        .container_backend()
                         .context("managed database has no typed container backend")?,
                     object_reference: config.postgres.container_name.clone(),
                 }
@@ -2217,12 +2212,7 @@ fn register_installed_deployment(
             if config.dependencies.mode == "managed" {
                 SafeReference::RuntimeObject {
                     backend: config
-                        .container_engine()
-                        .and_then(|engine| match engine {
-                            "podman" => Some(RuntimeBackendKind::Podman),
-                            "docker" => Some(RuntimeBackendKind::Docker),
-                            _ => None,
-                        })
+                        .container_backend()
                         .context("managed Valkey has no typed container backend")?,
                     object_reference: config.valkey.container_name.clone(),
                 }

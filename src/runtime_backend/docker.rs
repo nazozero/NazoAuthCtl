@@ -7,10 +7,13 @@ use crate::{
     process::Process,
 };
 
+#[cfg(debug_assertions)]
+use super::DebugArtifactTask;
 use super::{
-    BlobAttestationVerification, ManagedDependencyBackup, ManagedPostgresCommand,
-    ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount, OneShotTask, RuntimeBackend,
-    RuntimeObservation, RuntimeReplacement, labels, safe_environment, server_command_verified,
+    BlobAttestationVerification, HostServiceInstall, ManagedDependencies, ManagedDependencyBackup,
+    ManagedNetwork, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore,
+    NeutralMount, OneShotTask, RuntimeBackend, RuntimeDatabasePrivilegeProbe, RuntimeObservation,
+    RuntimeReplacement, labels, safe_environment, server_command_verified,
 };
 
 pub(crate) struct DockerBackend {
@@ -86,6 +89,102 @@ fn backup_managed_dependencies(
         ))
         .arg(backup.destination.join("valkey-dump.rdb"))
         .run_quiet()
+}
+
+fn assert_control_labels(
+    command: &std::ffi::OsStr,
+    arguments: &[&str],
+    deployment_id: &str,
+    control_authority: &str,
+) -> anyhow::Result<()> {
+    for (label, expected) in [
+        ("io.nazoauth.deployment-id", deployment_id),
+        ("io.nazoauth.control-authority", control_authority),
+    ] {
+        let mut matched = false;
+        for format in [
+            format!("{{{{index .Config.Labels \"{label}\"}}}}"),
+            format!("{{{{index .Labels \"{label}\"}}}}"),
+        ] {
+            if Process::new(command)
+                .args(arguments)
+                .arg("--format")
+                .arg(format)
+                .stdout()
+                .is_ok_and(|value| value.trim() == expected)
+            {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            bail!("refusing to manage a Docker object outside this deployment authority");
+        }
+    }
+    Ok(())
+}
+
+fn network_gateway(document: &serde_json::Value) -> Option<std::net::IpAddr> {
+    match document {
+        serde_json::Value::Object(object) => object.iter().find_map(|(key, value)| {
+            if key.eq_ignore_ascii_case("gateway") {
+                value.as_str().and_then(|value| value.parse().ok())
+            } else {
+                network_gateway(value)
+            }
+        }),
+        serde_json::Value::Array(values) => values.iter().find_map(network_gateway),
+        _ => None,
+    }
+}
+
+fn ensure_volume(
+    command: &std::ffi::OsStr,
+    name: &str,
+    network: &ManagedNetwork,
+) -> anyhow::Result<()> {
+    if Process::new(command)
+        .args(["volume", "inspect", name])
+        .succeeds()
+    {
+        return assert_control_labels(
+            command,
+            &["volume", "inspect", name],
+            &network.deployment_id,
+            &network.control_authority,
+        );
+    }
+    Process::new(command)
+        .args(["volume", "create", "--label"])
+        .arg(format!(
+            "io.nazoauth.deployment-id={}",
+            network.deployment_id
+        ))
+        .arg("--label")
+        .arg(format!(
+            "io.nazoauth.control-authority={}",
+            network.control_authority
+        ))
+        .arg(name)
+        .run_quiet()
+}
+
+fn ensure_container(
+    command: &std::ffi::OsStr,
+    name: &str,
+    network: &ManagedNetwork,
+    create: Process,
+) -> anyhow::Result<()> {
+    if Process::new(command).args(["inspect", name]).succeeds() {
+        assert_control_labels(
+            command,
+            &["inspect", name],
+            &network.deployment_id,
+            &network.control_authority,
+        )?;
+        return Process::new(command).args(["start", name]).run_quiet();
+    }
+    create.run_quiet()
 }
 
 impl Default for DockerBackend {
@@ -486,6 +585,221 @@ impl RuntimeBackend for DockerBackend {
 
     fn backup_managed_dependencies(&self, backup: &ManagedDependencyBackup) -> anyhow::Result<()> {
         backup_managed_dependencies(&self.command, backup)
+    }
+
+    fn ensure_managed_network(&self, network: &ManagedNetwork) -> anyhow::Result<std::net::IpAddr> {
+        if Process::new(&self.command)
+            .args(["network", "inspect", network.name.as_str()])
+            .succeeds()
+        {
+            assert_control_labels(
+                &self.command,
+                &["network", "inspect", network.name.as_str()],
+                &network.deployment_id,
+                &network.control_authority,
+            )?;
+        } else {
+            let mut create = Process::new(&self.command)
+                .args(["network", "create", "--label"])
+                .arg(format!(
+                    "io.nazoauth.deployment-id={}",
+                    network.deployment_id
+                ))
+                .arg("--label")
+                .arg(format!(
+                    "io.nazoauth.control-authority={}",
+                    network.control_authority
+                ));
+            if let Some(subnet) = &network.subnet {
+                create = create.args(["--subnet", subnet]);
+            }
+            create.arg(&network.name).run_quiet()?;
+        }
+        let document: serde_json::Value = serde_json::from_str(
+            &Process::new(&self.command)
+                .args(["network", "inspect", network.name.as_str()])
+                .stdout()?,
+        )
+        .context("Docker network inspection is not valid JSON")?;
+        network_gateway(&document).context("Docker network has no inspectable gateway")
+    }
+
+    fn ensure_managed_dependencies(
+        &self,
+        dependencies: &ManagedDependencies,
+    ) -> anyhow::Result<()> {
+        self.ensure_managed_network(&dependencies.network)?;
+        for volume in [
+            dependencies.postgres_volume.as_str(),
+            dependencies.valkey_volume.as_str(),
+        ] {
+            ensure_volume(&self.command, volume, &dependencies.network)?;
+        }
+        let postgres = Process::new(&self.command)
+            .args(["run", "-d", "--name", dependencies.postgres_object.as_str()])
+            .arg("--label")
+            .arg(format!(
+                "io.nazoauth.deployment-id={}",
+                dependencies.network.deployment_id
+            ))
+            .arg("--label")
+            .arg(format!(
+                "io.nazoauth.control-authority={}",
+                dependencies.network.control_authority
+            ))
+            .arg("--label")
+            .arg(format!(
+                "io.nazoauth.runtime-instance-id={}-postgres",
+                dependencies.runtime_instance_id
+            ))
+            .args(["--restart", "unless-stopped", "--network"])
+            .arg(&dependencies.network.name)
+            .arg("--env")
+            .arg(format!("POSTGRES_DB={}", dependencies.postgres_database))
+            .arg("--env")
+            .arg(format!("POSTGRES_USER={}", dependencies.postgres_user))
+            .args([
+                "--env",
+                "POSTGRES_PASSWORD_FILE=/run/nazoauth-secrets/postgres-password",
+                "--volume",
+            ])
+            .arg(format!(
+                "{}:/var/lib/postgresql",
+                dependencies.postgres_volume
+            ))
+            .arg("--volume")
+            .arg(format!(
+                "{}:/run/nazoauth-secrets/postgres-password:ro",
+                dependencies.postgres_password_file.display()
+            ))
+            .arg(&dependencies.postgres_image);
+        ensure_container(
+            &self.command,
+            &dependencies.postgres_object,
+            &dependencies.network,
+            postgres,
+        )?;
+
+        let valkey = Process::new(&self.command)
+            .args(["run", "-d", "--name", dependencies.valkey_object.as_str()])
+            .arg("--label")
+            .arg(format!(
+                "io.nazoauth.deployment-id={}",
+                dependencies.network.deployment_id
+            ))
+            .arg("--label")
+            .arg(format!(
+                "io.nazoauth.control-authority={}",
+                dependencies.network.control_authority
+            ))
+            .arg("--label")
+            .arg(format!(
+                "io.nazoauth.runtime-instance-id={}-valkey",
+                dependencies.runtime_instance_id
+            ))
+            .args(["--restart", "unless-stopped", "--network"])
+            .arg(&dependencies.network.name)
+            .arg("--volume")
+            .arg(format!("{}:/data", dependencies.valkey_volume))
+            .arg("--volume")
+            .arg(format!(
+                "{}:/run/nazoauth-secrets/valkey-password:ro",
+                dependencies.valkey_password_file.display()
+            ))
+            .arg("--volume")
+            .arg(format!(
+                "{}:/run/nazoauth-secrets/valkey.acl:ro",
+                dependencies.valkey_acl_file.display()
+            ))
+            .arg(&dependencies.valkey_image)
+            .args([
+                "valkey-server",
+                "--aclfile",
+                "/run/nazoauth-secrets/valkey.acl",
+                "--appendonly",
+                "yes",
+                "--dir",
+                "/data",
+            ]);
+        ensure_container(
+            &self.command,
+            &dependencies.valkey_object,
+            &dependencies.network,
+            valkey,
+        )?;
+
+        for _ in 0..60 {
+            let postgres_ready = Process::new(&self.command)
+                .args([
+                    "exec",
+                    dependencies.postgres_object.as_str(),
+                    "pg_isready",
+                    "-h",
+                    "127.0.0.1",
+                    "-U",
+                ])
+                .arg(&dependencies.postgres_user)
+                .arg("-d")
+                .arg(&dependencies.postgres_database)
+                .succeeds();
+            let valkey_ready = Process::new(&self.command)
+                .args([
+                    "exec",
+                    dependencies.valkey_object.as_str(),
+                    "sh",
+                    "-eu",
+                    "-c",
+                ])
+                .arg("cat /run/nazoauth-secrets/valkey-password | valkey-cli --askpass PING")
+                .succeeds();
+            if postgres_ready && valkey_ready {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        bail!("managed PostgreSQL or Valkey did not become ready through Docker")
+    }
+
+    fn verify_runtime_database_privileges(
+        &self,
+        probe: &RuntimeDatabasePrivilegeProbe,
+    ) -> anyhow::Result<()> {
+        Process::new(&self.command)
+            .args(["run", "--rm", "--network"])
+            .arg(&probe.network)
+            .args([
+                "--env",
+                "PGSERVICEFILE=/run/nazoauth-secrets/pg_service.conf",
+                "--env",
+                "PGPASSFILE=/run/nazoauth-secrets/pgpass",
+                "--mount",
+            ])
+            .arg(format!(
+                "type=bind,src={},dst=/run/nazoauth-secrets/pg_service.conf,readonly",
+                probe.service_file.display()
+            ))
+            .arg("--mount")
+            .arg(format!(
+                "type=bind,src={},dst=/run/nazoauth-secrets/pgpass,readonly",
+                probe.password_file.display()
+            ))
+            .arg(&probe.image)
+            .args(["sh", "-eu", "-c", "if psql --no-psqlrc --dbname='service=nazoauth' --set ON_ERROR_STOP=1 --command='BEGIN; CREATE TABLE nazoauth_runtime_ddl_probe(id integer); ROLLBACK;'; then echo 'runtime role unexpectedly has persistent DDL permission' >&2; exit 1; fi; if psql --no-psqlrc --dbname='service=nazoauth' --set ON_ERROR_STOP=1 --command='BEGIN; CREATE TEMPORARY TABLE nazoauth_runtime_temp_probe(id integer); ROLLBACK;'; then echo 'runtime role unexpectedly has temporary DDL permission' >&2; exit 1; fi; exit 0"])
+            .run_quiet()
+    }
+
+    fn install_host_service(&self, _install: &HostServiceInstall) -> anyhow::Result<()> {
+        bail!("Docker does not install systemd host services")
+    }
+
+    #[cfg(debug_assertions)]
+    fn run_debug_artifact_task(&self, task: &DebugArtifactTask) -> anyhow::Result<()> {
+        Process::new(&self.command)
+            .args(["run", "--rm"])
+            .arg(&task.target)
+            .arg("nazoauth")
+            .args(&task.arguments)
+            .run_quiet()
     }
 
     fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String> {

@@ -439,20 +439,12 @@ fn execute_test_task(
             bail!("test task adapter does not implement conformance lease operations")
         }
     };
-    if config.runtime.backend == RuntimeBackendKind::Systemd {
-        Process::new(target).args(arguments).run_quiet()?;
-    } else {
-        Process::new(
-            config
-                .container_engine()
-                .context("test task requires a container engine")?,
-        )
-        .args(["run", "--rm"])
-        .arg(target)
-        .arg("nazoauth")
-        .args(arguments)
-        .run_quiet()?;
-    }
+    crate::runtime_backend::backend(config.runtime.backend).run_debug_artifact_task(
+        &crate::runtime_backend::DebugArtifactTask {
+            target: target.to_owned(),
+            arguments,
+        },
+    )?;
     let request_id = format!("request-test-{}", encode_hex(&rand::random::<[u8; 8]>()));
     let directory = config.operator.audit_directory.join("test-receipts");
     fs::create_dir_all(&directory)?;

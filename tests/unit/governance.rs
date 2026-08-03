@@ -74,3 +74,32 @@ fn relinquish_is_a_monotonic_permission_reduction() {
             < responsibility_rank(Responsibility::Managed)
     );
 }
+
+#[test]
+fn controller_modules_do_not_encode_runtime_backend_command_syntax() {
+    let controller_modules = [
+        ("install", include_str!("../../src/install.rs")),
+        ("controller", include_str!("../../src/controller.rs")),
+        ("operator", include_str!("../../src/operator.rs")),
+        ("backup", include_str!("../../src/backup.rs")),
+        ("release", include_str!("../../src/release.rs")),
+    ];
+    let forbidden = [
+        "container_engine(",
+        "container_command(",
+        "Process::new(engine)",
+        "systemctl",
+        "systemd-run",
+        "useradd",
+        "--network",
+        ":ro,Z",
+    ];
+    for (module, source) in controller_modules {
+        for token in forbidden {
+            assert!(
+                !source.contains(token),
+                "{module} must delegate backend command token {token:?} to RuntimeBackend"
+            );
+        }
+    }
+}

@@ -1,16 +1,23 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context as _, bail};
 
 use crate::{
     deployment::{ArtifactReference, RuntimeBackendKind},
-    filesystem::sha256,
+    filesystem::{atomic_write, set_mode, sha256},
     process::Process,
 };
 
+#[cfg(debug_assertions)]
+use super::DebugArtifactTask;
 use super::{
-    BlobAttestationVerification, ManagedDependencyBackup, ManagedPostgresCommand,
-    ManagedPostgresRestore, ManagedValkeyRestore, OneShotTask, RuntimeBackend, RuntimeObservation,
+    BlobAttestationVerification, HostServiceInstall, ManagedDependencies, ManagedDependencyBackup,
+    ManagedNetwork, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore,
+    OneShotTask, RuntimeBackend, RuntimeDatabasePrivilegeProbe, RuntimeObservation,
     RuntimeReplacement,
 };
 
@@ -25,6 +32,13 @@ impl RuntimeBackend for SystemdBackend {
         Process::new("systemctl")
             .args(["show", "--property=Version", "--value"])
             .succeeds()
+            && Process::new("systemd-run").arg("--version").succeeds()
+            && Process::new("systemd")
+                .arg("--version")
+                .stdout()
+                .ok()
+                .and_then(|output| parse_systemd_version(&output).ok())
+                .is_some_and(|version| version >= 247)
     }
 
     fn verify_blob_attestation(
@@ -179,6 +193,132 @@ impl RuntimeBackend for SystemdBackend {
         bail!("systemd does not manage container dependency backups")
     }
 
+    fn ensure_managed_network(
+        &self,
+        _network: &ManagedNetwork,
+    ) -> anyhow::Result<std::net::IpAddr> {
+        bail!("systemd does not manage container networks")
+    }
+
+    fn ensure_managed_dependencies(
+        &self,
+        _dependencies: &ManagedDependencies,
+    ) -> anyhow::Result<()> {
+        bail!("systemd does not manage container dependencies")
+    }
+
+    fn verify_runtime_database_privileges(
+        &self,
+        _probe: &RuntimeDatabasePrivilegeProbe,
+    ) -> anyhow::Result<()> {
+        bail!("systemd does not run container database privilege probes")
+    }
+
+    fn install_host_service(&self, install: &HostServiceInstall) -> anyhow::Result<()> {
+        if !Process::new("id")
+            .args(["-u", install.service_user.as_str()])
+            .succeeds()
+        {
+            Process::new("useradd")
+                .args(["--system", "--home"])
+                .arg(&install.working_directory)
+                .args([
+                    "--shell",
+                    "/usr/sbin/nologin",
+                    install.service_user.as_str(),
+                ])
+                .run_quiet()?;
+        }
+        let secrets_directory = install.working_directory.join("secrets");
+        Process::new("chown")
+            .arg(format!("root:{}", install.service_user))
+            .arg(&install.working_directory)
+            .arg(install.working_directory.join(".env.yaml"))
+            .arg(&secrets_directory)
+            .run_quiet()?;
+        set_mode(&install.working_directory, 0o750)?;
+        set_mode(&secrets_directory, 0o750)?;
+        set_mode(&install.working_directory.join(".env.yaml"), 0o440)?;
+        Process::new("chown")
+            .arg(format!("root:{}", install.service_user))
+            .arg(&install.operator_directory)
+            .run_quiet()?;
+        set_mode(&install.operator_directory, 0o750)?;
+        for entry in fs::read_dir(&secrets_directory)? {
+            let path = entry?.path();
+            if path.file_name().is_some_and(|name| name == "dependencies") {
+                Process::new("chown")
+                    .arg("root:root")
+                    .arg(&path)
+                    .run_quiet()?;
+                set_mode(&path, 0o700)?;
+                continue;
+            }
+            let runtime_readable =
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        install
+                            .runtime_readable_secret_names
+                            .iter()
+                            .any(|allowed| allowed == name)
+                    });
+            Process::new("chown")
+                .arg(if runtime_readable {
+                    format!("root:{}", install.service_user)
+                } else {
+                    "root:root".to_owned()
+                })
+                .arg(&path)
+                .run_quiet()?;
+            set_mode(&path, if runtime_readable { 0o440 } else { 0o600 })?;
+        }
+        Process::new("chown")
+            .arg("root:root")
+            .arg(&install.receipt_private_key)
+            .run_quiet()?;
+        set_mode(&install.receipt_private_key, 0o600)?;
+        for path in [&install.app_root, &install.ui_releases] {
+            Process::new("chown")
+                .arg("-R")
+                .arg(format!("{}:{}", install.service_user, install.service_user))
+                .arg(path)
+                .run_quiet()?;
+        }
+        let unit_directory = env::var_os("NAZOAUTH_SYSTEMD_UNIT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/etc/systemd/system"));
+        crate::model::safe_absolute(&unit_directory)?;
+        if unit_directory.is_symlink() {
+            bail!("systemd unit directory must not be a symlink");
+        }
+        fs::create_dir_all(&unit_directory)?;
+        set_mode(&unit_directory, 0o755)?;
+        let unit_path = unit_directory.join(&install.service_name);
+        if unit_path.exists()
+            && !fs::read_to_string(&unit_path)?.starts_with("# Managed by nazoauthctl\n")
+        {
+            bail!(
+                "refusing to replace an unmanaged systemd unit: {}",
+                unit_path.display()
+            );
+        }
+        atomic_write(
+            &unit_path,
+            render_host_service_unit(install).as_bytes(),
+            0o644,
+        )?;
+        Process::new("systemctl").arg("daemon-reload").run_quiet()?;
+        Process::new("systemctl")
+            .args(["enable", install.service_name.as_str()])
+            .run_quiet()
+    }
+
+    #[cfg(debug_assertions)]
+    fn run_debug_artifact_task(&self, task: &DebugArtifactTask) -> anyhow::Result<()> {
+        Process::new(&task.target).args(&task.arguments).run_quiet()
+    }
+
     fn resolve_image_digest(&self, _image_reference: &str) -> anyhow::Result<String> {
         bail!("systemd backend does not manage OCI images")
     }
@@ -202,6 +342,65 @@ impl RuntimeBackend for SystemdBackend {
             "host binary returned an invalid build identity",
         )?))
     }
+}
+
+pub(crate) fn render_host_service_unit(install: &HostServiceInstall) -> String {
+    format!(
+        "# Managed by nazoauthctl\n\
+         [Unit]\n\
+         Description=NazoAuth authorization server\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\n\
+         [Service]\n\
+         Type=simple\n\
+         User={user}\n\
+         Group={user}\n\
+         WorkingDirectory={working}\n\
+         ExecStart={binary} server\n\
+         Restart=on-failure\n\
+         RestartSec=2\n\
+         NoNewPrivileges=true\n\
+         PrivateTmp=true\n\
+         PrivateDevices=true\n\
+         ProtectSystem=strict\n\
+         ProtectHome=true\n\
+         ProtectKernelTunables=true\n\
+         ProtectKernelModules=true\n\
+         ProtectControlGroups=true\n\
+         RestrictSUIDSGID=true\n\
+         LockPersonality=true\n\
+         CapabilityBoundingSet=\n\
+         AmbientCapabilities=\n\
+         ReadWritePaths={keys} {avatars} {secrets} {bootstrap} {instance} {ui_releases}\n\
+         InaccessiblePaths={operator_state} {operator_dir} {recovery_dir} {migration_url}\n\n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        user = install.service_user,
+        working = install.working_directory.display(),
+        binary = install.binary.display(),
+        keys = install.app_root.join("keys").display(),
+        avatars = install.app_root.join("avatars").display(),
+        secrets = install.app_root.join("secrets").display(),
+        bootstrap = install.app_root.join("bootstrap").display(),
+        instance = install.app_root.join("instance").display(),
+        ui_releases = install.ui_releases.display(),
+        operator_state = install.operator_state.display(),
+        operator_dir = install.operator_directory.display(),
+        recovery_dir = install.recovery_directory.display(),
+        migration_url = install.migration_url.display(),
+    )
+}
+
+pub(crate) fn parse_systemd_version(output: &str) -> anyhow::Result<u32> {
+    let mut fields = output.lines().next().unwrap_or_default().split_whitespace();
+    if fields.next() != Some("systemd") {
+        bail!("systemd returned an invalid version banner");
+    }
+    fields
+        .next()
+        .context("systemd version is unavailable")?
+        .parse()
+        .context("systemd version is invalid")
 }
 
 fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {

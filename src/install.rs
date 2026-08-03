@@ -3,8 +3,6 @@ use std::{
     env, fs,
     io::Read as _,
     path::{Path, PathBuf},
-    thread,
-    time::Duration,
 };
 
 use anyhow::{Context, bail};
@@ -19,7 +17,11 @@ use crate::{
         Dependencies, Mount, Operator, Postgres, Runtime, Ui, UpdateConfig, Valkey, safe_absolute,
     },
     operator,
-    process::{Process, command_exists},
+    process::Process,
+    runtime_backend::{
+        self, HostServiceInstall, ManagedDependencies, ManagedNetwork,
+        RuntimeDatabasePrivilegeProbe,
+    },
     secret_provider::PostgresProvider,
 };
 
@@ -80,7 +82,6 @@ pub(crate) fn prepare(
     normalize_external_dependencies(&mut options)?;
     normalize_profile_secrets(&mut options)?;
     let (runtime_backend, dependency_backend) = select_runtime(&options)?;
-    let runtime_engine = runtime_backend.container_command();
     let config_dir = config_path
         .parent()
         .context("update config path has no parent")?;
@@ -100,23 +101,25 @@ pub(crate) fn prepare(
     if runtime_backend == RuntimeBackendKind::Systemd && options.network_subnet.is_some() {
         bail!("container network options are unavailable with the selected host runtime");
     }
-    if runtime_backend != RuntimeBackendKind::Systemd {
-        ensure_network(
-            runtime_engine.context("container backend has no command")?,
-            &network_name,
-            options.network_subnet.as_deref(),
-            &bootstrap_operator.deployment_id,
-            &bootstrap_operator.controller_key_id,
-        )?;
-    }
+    let network_gateway = if runtime_backend != RuntimeBackendKind::Systemd {
+        Some(
+            runtime_backend::backend(runtime_backend).ensure_managed_network(&ManagedNetwork {
+                name: network_name.clone(),
+                subnet: options.network_subnet.clone(),
+                deployment_id: bootstrap_operator.deployment_id.clone(),
+                control_authority: bootstrap_operator.controller_key_id.clone(),
+            })?,
+        )
+    } else {
+        None
+    };
     let trusted_proxy_cidr = if options.profile == "standards-full" {
         if runtime_backend == RuntimeBackendKind::Systemd {
             Some("127.0.0.1/32".to_owned())
         } else {
-            Some(host_cidr(network_gateway(
-                runtime_engine.context("container backend has no command")?,
-                &network_name,
-            )?))
+            Some(host_cidr(
+                network_gateway.context("container network gateway was not established")?,
+            ))
         }
     } else {
         None
@@ -241,131 +244,36 @@ pub(crate) fn start_managed_dependencies(config: &UpdateConfig) -> anyhow::Resul
     if config.dependencies.mode != "managed" {
         return Ok(());
     }
-    let engine = config
-        .container_engine()
+    let backend = config
+        .container_backend()
         .context("managed dependencies require Podman or Docker")?;
-    ensure_network(
-        engine,
-        &config.runtime.network,
-        None,
-        &config.operator.deployment_id,
-        &config.operator.controller_key_id,
-    )?;
     let postgres_volume = format!("{}-data", config.postgres.container_name);
-    for volume in [&postgres_volume, &config.valkey.data_volume] {
-        ensure_volume(
-            engine,
-            volume,
-            &config.operator.deployment_id,
-            &config.operator.controller_key_id,
-        )?;
-    }
     let secrets = config
         .dependencies
         .database_url_file
         .parent()
         .context("dependency secret path has no parent")?
         .join("dependencies");
-    ensure_dependency_container(
-        engine,
-        &config.postgres.container_name,
-        &config.operator.deployment_id,
-        &config.operator.controller_key_id,
-        Process::new(engine)
-            .args([
-                "run",
-                "-d",
-                "--name",
-                config.postgres.container_name.as_str(),
-            ])
-            .arg("--label")
-            .arg(format!(
-                "io.nazoauth.deployment-id={}",
-                config.operator.deployment_id
-            ))
-            .arg("--label")
-            .arg(format!(
-                "io.nazoauth.control-authority={}",
-                config.operator.controller_key_id
-            ))
-            .arg("--label")
-            .arg(format!(
-                "io.nazoauth.runtime-instance-id={}-postgres",
-                config.runtime.runtime_instance_id
-            ))
-            .args([
-                "--restart",
-                "unless-stopped",
-                "--network",
-                config.runtime.network.as_str(),
-                "-e",
-                "POSTGRES_DB=oauth",
-                "-e",
-                "POSTGRES_USER=nazoauth_migrator",
-                "-e",
-                "POSTGRES_PASSWORD_FILE=/run/nazoauth-secrets/postgres-password",
-            ])
-            .arg("-v")
-            .arg(format!("{postgres_volume}:/var/lib/postgresql"))
-            .arg("-v")
-            .arg(format!(
-                "{}:/run/nazoauth-secrets/postgres-password:ro,Z",
-                secrets.join("postgres-password").display()
-            ))
-            .arg(&config.postgres.image),
-    )?;
-    ensure_dependency_container(
-        engine,
-        &config.valkey.container_name,
-        &config.operator.deployment_id,
-        &config.operator.controller_key_id,
-        Process::new(engine)
-            .args(["run", "-d", "--name", config.valkey.container_name.as_str()])
-            .arg("--label")
-            .arg(format!(
-                "io.nazoauth.deployment-id={}",
-                config.operator.deployment_id
-            ))
-            .arg("--label")
-            .arg(format!(
-                "io.nazoauth.control-authority={}",
-                config.operator.controller_key_id
-            ))
-            .arg("--label")
-            .arg(format!(
-                "io.nazoauth.runtime-instance-id={}-valkey",
-                config.runtime.runtime_instance_id
-            ))
-            .args([
-                "--restart",
-                "unless-stopped",
-                "--network",
-                config.runtime.network.as_str(),
-            ])
-            .arg("-v")
-            .arg(format!("{}:/data", config.valkey.data_volume))
-            .arg("-v")
-            .arg(format!(
-                "{}:/run/nazoauth-secrets/valkey-password:ro,Z",
-                secrets.join("valkey-password").display()
-            ))
-            .arg("-v")
-            .arg(format!(
-                "{}:/run/nazoauth-secrets/valkey.acl:ro,Z",
-                secrets.join("valkey.acl").display()
-            ))
-            .arg(&config.valkey.image)
-            .args([
-                "valkey-server",
-                "--aclfile",
-                "/run/nazoauth-secrets/valkey.acl",
-                "--appendonly",
-                "yes",
-                "--dir",
-                "/data",
-            ]),
-    )?;
-    wait_dependencies(config)?;
+    runtime_backend::backend(backend).ensure_managed_dependencies(&ManagedDependencies {
+        network: ManagedNetwork {
+            name: config.runtime.network.clone(),
+            subnet: None,
+            deployment_id: config.operator.deployment_id.clone(),
+            control_authority: config.operator.controller_key_id.clone(),
+        },
+        runtime_instance_id: config.runtime.runtime_instance_id.clone(),
+        postgres_object: config.postgres.container_name.clone(),
+        postgres_volume,
+        postgres_image: config.postgres.image.clone(),
+        postgres_database: config.postgres.database.clone(),
+        postgres_user: config.postgres.user.clone(),
+        postgres_password_file: secrets.join("postgres-password"),
+        valkey_object: config.valkey.container_name.clone(),
+        valkey_volume: config.valkey.data_volume.clone(),
+        valkey_image: config.valkey.image.clone(),
+        valkey_password_file: secrets.join("valkey-password"),
+        valkey_acl_file: secrets.join("valkey.acl"),
+    })?;
     configure_managed_database_roles(config)
         .context("failed to configure managed PostgreSQL roles after final readiness")
 }
@@ -373,118 +281,6 @@ pub(crate) fn start_managed_dependencies(config: &UpdateConfig) -> anyhow::Resul
 pub(crate) fn install_systemd(config: &UpdateConfig) -> anyhow::Result<()> {
     if config.runtime.backend != RuntimeBackendKind::Systemd {
         return Ok(());
-    }
-    if !Process::new("id")
-        .args(["-u", config.runtime.service_user.as_str()])
-        .succeeds()
-    {
-        Process::new("useradd")
-            .args([
-                "--system",
-                "--home",
-                config.runtime.working_directory.to_string_lossy().as_ref(),
-                "--shell",
-                "/usr/sbin/nologin",
-                config.runtime.service_user.as_str(),
-            ])
-            .run_quiet()?;
-    }
-    let config_dir = &config.runtime.working_directory;
-    let secrets_dir = config_dir.join("secrets");
-    Process::new("chown")
-        .arg(format!("root:{}", config.runtime.service_user))
-        .arg(config_dir)
-        .arg(config_dir.join(".env.yaml"))
-        .arg(&secrets_dir)
-        .run_quiet()?;
-    set_mode(config_dir, 0o750)?;
-    set_mode(&secrets_dir, 0o750)?;
-    set_mode(&config_dir.join(".env.yaml"), 0o440)?;
-    let operator_dir = config
-        .operator
-        .controller_public_key
-        .parent()
-        .context("operator directory is unavailable")?;
-    Process::new("chown")
-        .arg(format!("root:{}", config.runtime.service_user))
-        .arg(operator_dir)
-        .run_quiet()?;
-    set_mode(operator_dir, 0o750)?;
-    for entry in fs::read_dir(&secrets_dir)? {
-        let path = entry?.path();
-        if path.file_name().is_some_and(|name| name == "dependencies") {
-            Process::new("chown")
-                .arg("root:root")
-                .arg(&path)
-                .run_quiet()?;
-            set_mode(&path, 0o700)?;
-            continue;
-        }
-        Process::new("chown")
-            .arg(format!("root:{}", config.runtime.service_user))
-            .arg(&path)
-            .run_quiet()?;
-        let runtime_readable =
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    matches!(name, "database-url" | "valkey-url")
-                        || STANDARDS_PROFILE_SECRET_NAMES.contains(&name)
-                });
-        if !runtime_readable {
-            Process::new("chown")
-                .arg("root:root")
-                .arg(&path)
-                .run_quiet()?;
-        }
-        set_mode(&path, if runtime_readable { 0o440 } else { 0o600 })?;
-    }
-    Process::new("chown")
-        .arg("root:root")
-        .arg(&config.operator.receipt_private_key)
-        .run_quiet()?;
-    set_mode(&config.operator.receipt_private_key, 0o600)?;
-    if let Some(app_root) = config
-        .runtime
-        .snapshot_paths
-        .first()
-        .and_then(|path| path.parent())
-    {
-        Process::new("chown")
-            .arg("-R")
-            .arg(format!(
-                "{}:{}",
-                config.runtime.service_user, config.runtime.service_user
-            ))
-            .arg(app_root)
-            .run_quiet()?;
-        let ui_releases = app_root
-            .parent()
-            .context("deployment data root is unavailable")?
-            .join("ui-releases");
-        Process::new("chown")
-            .arg("-R")
-            .arg(format!(
-                "{}:{}",
-                config.runtime.service_user, config.runtime.service_user
-            ))
-            .arg(ui_releases)
-            .run_quiet()?;
-    }
-    let unit_dir = env::var_os("NAZOAUTH_SYSTEMD_UNIT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/etc/systemd/system"));
-    safe_absolute(&unit_dir)?;
-    create_directory(&unit_dir, 0o755)?;
-    let unit_path = unit_dir.join(&config.runtime.service_name);
-    if unit_path.exists() {
-        let current = fs::read_to_string(&unit_path)?;
-        if !current.starts_with("# Managed by nazoauthctl\n") {
-            bail!(
-                "refusing to replace an unmanaged systemd unit: {}",
-                unit_path.display()
-            );
-        }
     }
     let app_root = config
         .runtime
@@ -500,88 +296,31 @@ pub(crate) fn install_systemd(config: &UpdateConfig) -> anyhow::Result<()> {
         .controller_public_key
         .parent()
         .context("host runtime has no operator directory")?;
-    let unit = HostSystemdUnit {
-        user: &config.runtime.service_user,
-        working: &config.runtime.working_directory,
-        binary: &config.runtime.binary_path,
-        app_root,
-        ui_releases: &data_root.join("ui-releases"),
-        operator_state: &config.operator.state_directory,
-        operator_dir,
-        recovery_dir: config
-            .operator
-            .break_glass_private_key
-            .parent()
-            .context("host runtime has no recovery directory")?,
-        migration_url: &config.dependencies.migration_database_url_file,
-    }
-    .render();
-    atomic_write(&unit_path, unit.as_bytes(), 0o644)?;
-    Process::new("systemctl").arg("daemon-reload").run_quiet()?;
-    Process::new("systemctl")
-        .args(["enable", config.runtime.service_name.as_str()])
-        .run_quiet()
-}
-
-struct HostSystemdUnit<'a> {
-    user: &'a str,
-    working: &'a Path,
-    binary: &'a Path,
-    app_root: &'a Path,
-    ui_releases: &'a Path,
-    operator_state: &'a Path,
-    operator_dir: &'a Path,
-    recovery_dir: &'a Path,
-    migration_url: &'a Path,
-}
-
-impl HostSystemdUnit<'_> {
-    fn render(&self) -> String {
-        format!(
-            "# Managed by nazoauthctl\n\
-         [Unit]\n\
-         Description=NazoAuth authorization server\n\
-         After=network-online.target\n\
-         Wants=network-online.target\n\n\
-         [Service]\n\
-         Type=simple\n\
-         User={user}\n\
-         Group={user}\n\
-         WorkingDirectory={working}\n\
-         ExecStart={binary} server\n\
-         Restart=on-failure\n\
-         RestartSec=2\n\
-         NoNewPrivileges=true\n\
-         PrivateTmp=true\n\
-         PrivateDevices=true\n\
-         ProtectSystem=strict\n\
-         ProtectHome=true\n\
-         ProtectKernelTunables=true\n\
-         ProtectKernelModules=true\n\
-         ProtectControlGroups=true\n\
-         RestrictSUIDSGID=true\n\
-         LockPersonality=true\n\
-         CapabilityBoundingSet=\n\
-         AmbientCapabilities=\n\
-         ReadWritePaths={keys} {avatars} {secrets} {bootstrap} {instance} {ui_releases}\n\
-         InaccessiblePaths={operator_state} {operator_dir} {recovery_dir} {migration_url}\n\n\
-         [Install]\n\
-         WantedBy=multi-user.target\n",
-            user = self.user,
-            working = self.working.display(),
-            binary = self.binary.display(),
-            keys = self.app_root.join("keys").display(),
-            avatars = self.app_root.join("avatars").display(),
-            secrets = self.app_root.join("secrets").display(),
-            bootstrap = self.app_root.join("bootstrap").display(),
-            instance = self.app_root.join("instance").display(),
-            ui_releases = self.ui_releases.display(),
-            operator_state = self.operator_state.display(),
-            operator_dir = self.operator_dir.display(),
-            recovery_dir = self.recovery_dir.display(),
-            migration_url = self.migration_url.display(),
-        )
-    }
+    runtime_backend::backend(RuntimeBackendKind::Systemd).install_host_service(
+        &HostServiceInstall {
+            service_name: config.runtime.service_name.clone(),
+            service_user: config.runtime.service_user.clone(),
+            working_directory: config.runtime.working_directory.clone(),
+            binary: config.runtime.binary_path.clone(),
+            app_root: app_root.to_owned(),
+            ui_releases: data_root.join("ui-releases"),
+            operator_state: config.operator.state_directory.clone(),
+            operator_directory: operator_dir.to_owned(),
+            recovery_directory: config
+                .operator
+                .break_glass_private_key
+                .parent()
+                .context("host runtime has no recovery directory")?
+                .to_owned(),
+            migration_url: config.dependencies.migration_database_url_file.clone(),
+            receipt_private_key: config.operator.receipt_private_key.clone(),
+            runtime_readable_secret_names: ["database-url", "valkey-url"]
+                .into_iter()
+                .chain(STANDARDS_PROFILE_SECRET_NAMES.iter().copied())
+                .map(ToOwned::to_owned)
+                .collect(),
+        },
+    )
 }
 
 fn normalize_external_dependencies(options: &mut InstallOptions) -> anyhow::Result<()> {
@@ -756,37 +495,33 @@ fn select_runtime(
     options: &InstallOptions,
 ) -> anyhow::Result<(RuntimeBackendKind, Option<RuntimeBackendKind>)> {
     let runtime = match options.runtime.as_str() {
-        "auto" if command_exists("podman") => RuntimeBackendKind::Podman,
-        "auto" if command_exists("docker") => RuntimeBackendKind::Docker,
+        "auto" if runtime_backend::backend(RuntimeBackendKind::Podman).available() => {
+            RuntimeBackendKind::Podman
+        }
+        "auto" if runtime_backend::backend(RuntimeBackendKind::Docker).available() => {
+            RuntimeBackendKind::Docker
+        }
         "auto" => bail!("auto runtime requires Podman or Docker"),
         "podman" => RuntimeBackendKind::Podman,
         "docker" => RuntimeBackendKind::Docker,
         "host" | "systemd" => RuntimeBackendKind::Systemd,
         value => bail!("unsupported runtime backend {value}"),
     };
-    if let Some(command) = runtime.container_command() {
-        if !command_exists(command) {
-            bail!("required command is missing: {command}");
+    if runtime != RuntimeBackendKind::Systemd {
+        if !runtime_backend::backend(runtime).available() {
+            bail!("selected container runtime is unavailable");
         }
         return Ok((runtime, Some(runtime)));
     }
-    for command in ["systemctl", "systemd-run", "systemd"] {
-        if !command_exists(command) {
-            bail!("required command is missing: {command}");
-        }
-    }
-    if !test_mode() {
-        let version = parse_systemd_version(&Process::new("systemd").arg("--version").stdout()?)?;
-        if version < 247 {
-            bail!("host runtime requires systemd 247 or newer for transient credentials");
-        }
+    if !runtime_backend::backend(RuntimeBackendKind::Systemd).available() {
+        bail!("host runtime requires an available systemd 247 or newer backend");
     }
     if options.database_url.is_some() {
         return Ok((runtime, None));
     }
-    let dependency_backend = if command_exists("podman") {
+    let dependency_backend = if runtime_backend::backend(RuntimeBackendKind::Podman).available() {
         RuntimeBackendKind::Podman
-    } else if command_exists("docker") {
+    } else if runtime_backend::backend(RuntimeBackendKind::Docker).available() {
         RuntimeBackendKind::Docker
     } else {
         bail!("host runtime requires Podman or Docker for managed dependencies");
@@ -1185,29 +920,6 @@ fn validate_public_jwks(value: &serde_json::Value, label: &str) -> anyhow::Resul
     Ok(())
 }
 
-fn network_gateway(engine: &str, network: &str) -> anyhow::Result<std::net::IpAddr> {
-    let document: serde_json::Value = serde_json::from_str(
-        &Process::new(engine)
-            .args(["network", "inspect", network])
-            .stdout()?,
-    )
-    .context("container network inspection is not valid JSON")?;
-    fn find(value: &serde_json::Value) -> Option<std::net::IpAddr> {
-        match value {
-            serde_json::Value::Object(object) => object.iter().find_map(|(key, value)| {
-                if key.eq_ignore_ascii_case("gateway") {
-                    value.as_str().and_then(|value| value.parse().ok())
-                } else {
-                    find(value)
-                }
-            }),
-            serde_json::Value::Array(values) => values.iter().find_map(find),
-            _ => None,
-        }
-    }
-    find(&document).context("container network has no inspectable gateway")
-}
-
 fn host_cidr(address: std::net::IpAddr) -> String {
     match address {
         std::net::IpAddr::V4(address) => format!("{address}/32"),
@@ -1440,161 +1152,7 @@ fn mount(source: PathBuf, target: &str, mode: &str) -> Mount {
     }
 }
 
-fn ensure_network(
-    engine: &str,
-    name: &str,
-    subnet: Option<&str>,
-    deployment_id: &str,
-    control_authority: &str,
-) -> anyhow::Result<()> {
-    if Process::new(engine)
-        .args(["network", "inspect", name])
-        .succeeds()
-    {
-        assert_control_labels(
-            engine,
-            &["network", "inspect", name],
-            deployment_id,
-            control_authority,
-        )?;
-        return Ok(());
-    }
-    let mut command = Process::new(engine)
-        .args(["network", "create", "--label"])
-        .arg(format!("io.nazoauth.deployment-id={deployment_id}"))
-        .arg("--label")
-        .arg(format!("io.nazoauth.control-authority={control_authority}"));
-    if let Some(subnet) = subnet {
-        command = command.args(["--subnet", subnet]);
-    }
-    command.arg(name).run_quiet()
-}
-
-fn ensure_volume(
-    engine: &str,
-    name: &str,
-    deployment_id: &str,
-    control_authority: &str,
-) -> anyhow::Result<()> {
-    if Process::new(engine)
-        .args(["volume", "inspect", name])
-        .succeeds()
-    {
-        assert_control_labels(
-            engine,
-            &["volume", "inspect", name],
-            deployment_id,
-            control_authority,
-        )?;
-        return Ok(());
-    }
-    Process::new(engine)
-        .args(["volume", "create", "--label"])
-        .arg(format!("io.nazoauth.deployment-id={deployment_id}"))
-        .arg("--label")
-        .arg(format!("io.nazoauth.control-authority={control_authority}"))
-        .arg(name)
-        .run_quiet()
-}
-
-fn assert_control_labels(
-    engine: &str,
-    prefix: &[&str],
-    deployment_id: &str,
-    control_authority: &str,
-) -> anyhow::Result<()> {
-    for (label, expected) in [
-        ("io.nazoauth.deployment-id", deployment_id),
-        ("io.nazoauth.control-authority", control_authority),
-    ] {
-        let mut matched = false;
-        for format in [
-            format!("{{{{index .Config.Labels \"{label}\"}}}}"),
-            format!("{{{{index .Labels \"{label}\"}}}}"),
-        ] {
-            let value = Process::new(engine)
-                .args(prefix)
-                .arg("--format")
-                .arg(format)
-                .stdout();
-            if value.is_ok_and(|value| value.trim() == expected) {
-                matched = true;
-                break;
-            }
-        }
-        if !matched {
-            bail!("refusing to manage a runtime object outside this deployment authority");
-        }
-    }
-    Ok(())
-}
-
-fn ensure_dependency_container(
-    engine: &str,
-    name: &str,
-    deployment_id: &str,
-    control_authority: &str,
-    create: Process,
-) -> anyhow::Result<()> {
-    if Process::new(engine).args(["inspect", name]).succeeds() {
-        assert_control_labels(engine, &["inspect", name], deployment_id, control_authority)?;
-        return Process::new(engine).args(["start", name]).run_quiet();
-    }
-    create.run_quiet()
-}
-
-fn postgres_readiness_arguments<'a>(
-    container: &'a str,
-    user: &'a str,
-    database: &'a str,
-) -> [&'a str; 9] {
-    [
-        "exec",
-        container,
-        "pg_isready",
-        "-h",
-        "127.0.0.1",
-        "-U",
-        user,
-        "-d",
-        database,
-    ]
-}
-
-fn wait_dependencies(config: &UpdateConfig) -> anyhow::Result<()> {
-    let engine = config
-        .container_engine()
-        .context("managed dependencies require a container engine")?;
-    for _ in 0..60 {
-        let postgres = Process::new(engine)
-            .args(postgres_readiness_arguments(
-                config.postgres.container_name.as_str(),
-                config.postgres.user.as_str(),
-                config.postgres.database.as_str(),
-            ))
-            .succeeds();
-        let valkey = Process::new(engine)
-            .args([
-                "exec",
-                config.valkey.container_name.as_str(),
-                "sh",
-                "-eu",
-                "-c",
-                "cat /run/nazoauth-secrets/valkey-password | valkey-cli --askpass PING",
-            ])
-            .succeeds();
-        if postgres && valkey {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-    bail!("managed PostgreSQL or Valkey did not become ready")
-}
-
 fn configure_managed_database_roles(config: &UpdateConfig) -> anyhow::Result<()> {
-    let engine = config
-        .container_engine()
-        .context("managed PostgreSQL requires a container engine")?;
     let password_path = config
         .dependencies
         .database_url_file
@@ -1621,22 +1179,7 @@ fn configure_managed_database_roles(config: &UpdateConfig) -> anyhow::Result<()>
          REVOKE CREATE ON SCHEMA public FROM PUBLIC;\n\
          REVOKE TEMPORARY ON DATABASE oauth FROM PUBLIC;\n"
     );
-    Process::new(engine)
-        .args([
-            "exec",
-            "-i",
-            config.postgres.container_name.as_str(),
-            "psql",
-            "--no-psqlrc",
-            "--set",
-            "ON_ERROR_STOP=1",
-            "-U",
-            config.postgres.user.as_str(),
-            "-d",
-            config.postgres.database.as_str(),
-        ])
-        .stdin_stdout(sql.as_bytes())?;
-    Ok(())
+    crate::runtime::Runtime::new(config).execute_managed_postgres(sql.as_bytes())
 }
 
 pub(crate) fn grant_runtime_database(config: &UpdateConfig) -> anyhow::Result<()> {
@@ -1667,39 +1210,18 @@ pub(crate) fn verify_runtime_no_ddl(config: &UpdateConfig) -> anyhow::Result<()>
         );
         return Ok(());
     }
-    let engine = config
-        .container_engine()
-        .context("managed PostgreSQL requires a container engine")?;
     let postgres = PostgresProvider::from_url_file(&config.dependencies.database_url_file)?;
-    Process::new(engine)
-        .args([
-            "run",
-            "--rm",
-            "--network",
-            config.runtime.network.as_str(),
-            "-e",
-            "PGSERVICEFILE=/run/nazoauth-secrets/pg_service.conf",
-            "-e",
-            "PGPASSFILE=/run/nazoauth-secrets/pgpass",
-            "-v",
-        ])
-        .arg(format!(
-            "{}:/run/nazoauth-secrets/pg_service.conf:ro,Z",
-            postgres.service_file().display()
-        ))
-        .arg("-v")
-        .arg(format!(
-            "{}:/run/nazoauth-secrets/pgpass:ro,Z",
-            postgres.password_file().display()
-        ))
-        .arg(&config.postgres.validation_image)
-        .args([
-            "sh",
-            "-eu",
-            "-c",
-            "if psql --no-psqlrc --dbname='service=nazoauth' --set ON_ERROR_STOP=1 --command='BEGIN; CREATE TABLE nazoauth_runtime_ddl_probe(id integer); ROLLBACK;'; then echo 'runtime role unexpectedly has persistent DDL permission' >&2; exit 1; fi; if psql --no-psqlrc --dbname='service=nazoauth' --set ON_ERROR_STOP=1 --command='BEGIN; CREATE TEMPORARY TABLE nazoauth_runtime_temp_probe(id integer); ROLLBACK;'; then echo 'runtime role unexpectedly has temporary DDL permission' >&2; exit 1; fi; exit 0",
-        ])
-        .run_quiet()
+    runtime_backend::backend(
+        config
+            .container_backend()
+            .context("managed PostgreSQL requires a container backend")?,
+    )
+    .verify_runtime_database_privileges(&RuntimeDatabasePrivilegeProbe {
+        network: config.runtime.network.clone(),
+        service_file: postgres.service_file().to_owned(),
+        password_file: postgres.password_file().to_owned(),
+        image: config.postgres.validation_image.clone(),
+    })
 }
 
 fn validate_public_url(value: &str) -> anyhow::Result<()> {
@@ -1736,18 +1258,6 @@ fn validate_dependency_url(value: &str, schemes: &[&str], name: &str) -> anyhow:
         bail!("{name} URL has an unsupported scheme or no host");
     }
     Ok(())
-}
-
-fn parse_systemd_version(output: &str) -> anyhow::Result<u32> {
-    let mut fields = output.lines().next().unwrap_or_default().split_whitespace();
-    if fields.next() != Some("systemd") {
-        bail!("systemd returned an invalid version banner");
-    }
-    fields
-        .next()
-        .context("systemd version is unavailable")?
-        .parse()
-        .context("systemd version is invalid")
 }
 
 fn create_directory(path: &Path, mode: u32) -> anyhow::Result<()> {

@@ -12,6 +12,7 @@ use crate::deployment::{ArtifactReference, ResourceScope, Responsibility, Runtim
 pub(crate) use docker::DockerBackend;
 pub(crate) use podman::PodmanBackend;
 pub(crate) use systemd::SystemdBackend;
+pub(crate) use systemd::{parse_systemd_version, render_host_service_unit};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -110,6 +111,62 @@ pub(crate) struct ManagedDependencyBackup {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct ManagedNetwork {
+    pub(crate) name: String,
+    pub(crate) subnet: Option<String>,
+    pub(crate) deployment_id: String,
+    pub(crate) control_authority: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedDependencies {
+    pub(crate) network: ManagedNetwork,
+    pub(crate) runtime_instance_id: String,
+    pub(crate) postgres_object: String,
+    pub(crate) postgres_volume: String,
+    pub(crate) postgres_image: String,
+    pub(crate) postgres_database: String,
+    pub(crate) postgres_user: String,
+    pub(crate) postgres_password_file: PathBuf,
+    pub(crate) valkey_object: String,
+    pub(crate) valkey_volume: String,
+    pub(crate) valkey_image: String,
+    pub(crate) valkey_password_file: PathBuf,
+    pub(crate) valkey_acl_file: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeDatabasePrivilegeProbe {
+    pub(crate) network: String,
+    pub(crate) service_file: PathBuf,
+    pub(crate) password_file: PathBuf,
+    pub(crate) image: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HostServiceInstall {
+    pub(crate) service_name: String,
+    pub(crate) service_user: String,
+    pub(crate) working_directory: PathBuf,
+    pub(crate) binary: PathBuf,
+    pub(crate) app_root: PathBuf,
+    pub(crate) ui_releases: PathBuf,
+    pub(crate) operator_state: PathBuf,
+    pub(crate) operator_directory: PathBuf,
+    pub(crate) recovery_directory: PathBuf,
+    pub(crate) migration_url: PathBuf,
+    pub(crate) receipt_private_key: PathBuf,
+    pub(crate) runtime_readable_secret_names: Vec<String>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Debug)]
+pub(crate) struct DebugArtifactTask {
+    pub(crate) target: String,
+    pub(crate) arguments: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct BlobAttestationVerification {
     pub(crate) work: PathBuf,
     pub(crate) bundle: String,
@@ -138,6 +195,16 @@ pub(crate) trait RuntimeBackend {
     fn restore_managed_valkey(&self, restore: &ManagedValkeyRestore) -> anyhow::Result<()>;
     fn execute_managed_postgres(&self, command: &ManagedPostgresCommand) -> anyhow::Result<()>;
     fn backup_managed_dependencies(&self, backup: &ManagedDependencyBackup) -> anyhow::Result<()>;
+    fn ensure_managed_network(&self, network: &ManagedNetwork) -> anyhow::Result<std::net::IpAddr>;
+    fn ensure_managed_dependencies(&self, dependencies: &ManagedDependencies)
+    -> anyhow::Result<()>;
+    fn verify_runtime_database_privileges(
+        &self,
+        probe: &RuntimeDatabasePrivilegeProbe,
+    ) -> anyhow::Result<()>;
+    fn install_host_service(&self, install: &HostServiceInstall) -> anyhow::Result<()>;
+    #[cfg(debug_assertions)]
+    fn run_debug_artifact_task(&self, task: &DebugArtifactTask) -> anyhow::Result<()>;
     fn verify_blob_attestation(
         &self,
         verification: &BlobAttestationVerification,

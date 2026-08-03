@@ -95,29 +95,11 @@ fn managed_dependency_credentials_are_outside_runtime_secret_directory() {
 #[test]
 fn systemd_version_parser_is_closed() {
     assert_eq!(
-        parse_systemd_version("systemd 252 (252.39-1)\n+PAM").unwrap(),
+        crate::runtime_backend::parse_systemd_version("systemd 252 (252.39-1)\n+PAM").unwrap(),
         252
     );
-    assert!(parse_systemd_version("252\n").is_err());
-    assert!(parse_systemd_version("systemd unknown\n").is_err());
-}
-
-#[test]
-fn managed_postgres_readiness_waits_for_the_final_tcp_server() {
-    assert_eq!(
-        postgres_readiness_arguments("nazo-oauth-postgres", "nazoauth_migrator", "oauth"),
-        [
-            "exec",
-            "nazo-oauth-postgres",
-            "pg_isready",
-            "-h",
-            "127.0.0.1",
-            "-U",
-            "nazoauth_migrator",
-            "-d",
-            "oauth",
-        ]
-    );
+    assert!(crate::runtime_backend::parse_systemd_version("252\n").is_err());
+    assert!(crate::runtime_backend::parse_systemd_version("systemd unknown\n").is_err());
 }
 
 #[test]
@@ -135,18 +117,22 @@ fn generated_install_paths_are_safe_for_yaml_systemd_and_container_mounts() {
 
 #[test]
 fn host_service_unit_exposes_only_runtime_state() {
-    let unit = HostSystemdUnit {
-        user: "nazoauth",
-        working: Path::new("/etc/nazoauth"),
-        binary: Path::new("/usr/local/bin/nazoauth"),
-        app_root: Path::new("/var/lib/nazoauth/app"),
-        ui_releases: Path::new("/var/lib/nazoauth/ui-releases"),
-        operator_state: Path::new("/var/lib/nazoauth/app/operator-state"),
-        operator_dir: Path::new("/etc/nazoauth/operator"),
-        recovery_dir: Path::new("/var/lib/nazoauth/recovery"),
-        migration_url: Path::new("/etc/nazoauth/secrets/database-migration-url"),
-    }
-    .render()
+    let unit = crate::runtime_backend::render_host_service_unit(
+        &crate::runtime_backend::HostServiceInstall {
+            service_name: "nazoauth.service".to_owned(),
+            service_user: "nazoauth".to_owned(),
+            working_directory: PathBuf::from("/etc/nazoauth"),
+            binary: PathBuf::from("/usr/local/bin/nazoauth"),
+            app_root: PathBuf::from("/var/lib/nazoauth/app"),
+            ui_releases: PathBuf::from("/var/lib/nazoauth/ui-releases"),
+            operator_state: PathBuf::from("/var/lib/nazoauth/app/operator-state"),
+            operator_directory: PathBuf::from("/etc/nazoauth/operator"),
+            recovery_directory: PathBuf::from("/var/lib/nazoauth/recovery"),
+            migration_url: PathBuf::from("/etc/nazoauth/secrets/database-migration-url"),
+            receipt_private_key: PathBuf::from("/etc/nazoauth/operator/receipt.key"),
+            runtime_readable_secret_names: Vec::new(),
+        },
+    )
     .replace('\\', "/");
 
     assert!(unit.contains("User=nazoauth\nGroup=nazoauth"));

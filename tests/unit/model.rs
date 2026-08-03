@@ -179,7 +179,10 @@ fn runtime_environment_cannot_carry_secret_values() {
 fn update_config_accepts_only_closed_safe_runtime_boundaries() {
     let config = valid_config();
     config.validate().unwrap();
-    assert_eq!(config.container_engine(), Some("podman"));
+    assert_eq!(
+        config.container_backend(),
+        Some(crate::deployment::RuntimeBackendKind::Podman)
+    );
     UpdateConfig::parse(&serde_json::to_vec(&config).unwrap()).unwrap();
 
     let mut invalid = config.clone();
@@ -231,7 +234,10 @@ fn external_and_container_dependency_modes_resolve_explicitly() {
     config.dependencies.migration_database_url_file = root.join("migration-database-url");
     config.dependencies.valkey_url_file = root.join("valkey-url");
     config.validate().unwrap();
-    assert_eq!(config.container_engine(), Some("docker"));
+    assert_eq!(
+        config.container_backend(),
+        Some(crate::deployment::RuntimeBackendKind::Docker)
+    );
 
     config.dependencies.database_url_file = "relative".into();
     assert!(config.validate().is_err());
