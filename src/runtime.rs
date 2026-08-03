@@ -330,12 +330,11 @@ impl<'a> Runtime<'a> {
         {
             bail!("refusing to replace an unlabelled application container");
         }
-        let backend = self.backend_kind()?;
         self.backend()?.remove(&self.config.runtime.container_name)
     }
 
     pub(crate) fn container_exists(&self) -> bool {
-        self.backend_kind().is_ok_and(|kind| {
+        self.backend_kind().is_ok_and(|_| {
             kind != RuntimeBackendKind::Systemd
                 && self.backend().is_ok_and(|backend| {
                     backend.inspect(&self.config.runtime.container_name).is_ok()

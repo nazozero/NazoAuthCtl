@@ -580,7 +580,14 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
         .unwrap();
     options.profile = "standards-full".to_owned();
     let config_path = config_dir.join("update.json");
-    let config = build_config(&config_path, &options, "podman", "podman", "external").unwrap();
+    let config = build_config(
+        &config_path,
+        &options,
+        RuntimeBackendKind::Podman,
+        Some(RuntimeBackendKind::Podman),
+        "external",
+    )
+    .unwrap();
     let rendered = serde_json::to_string(&config).unwrap();
 
     assert_eq!(config.runtime.publish_address, "127.0.0.1:8000:8000");
@@ -623,18 +630,18 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
     assert!(!rendered.contains("postgresql://"));
     assert!(!rendered.contains("redis://"));
 
-    let error = build_config(
+    let host_config = build_config(
         &config_path,
         &options,
-        "unsupported-runtime",
-        "podman",
+        RuntimeBackendKind::Systemd,
+        Some(RuntimeBackendKind::Podman),
         "external",
     )
-    .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("runtime engine must be podman, docker, or host")
+    .unwrap();
+    assert_eq!(host_config.runtime.backend, RuntimeBackendKind::Systemd);
+    assert_eq!(
+        host_config.runtime.dependency_backend,
+        Some(RuntimeBackendKind::Podman)
     );
 }
 

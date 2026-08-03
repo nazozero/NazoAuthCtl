@@ -136,47 +136,98 @@ fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
     let work = PrivateTempDir::new("runtime-task-mounts").unwrap();
     let config = config(&work);
     let runtime = Runtime::new(&config);
+    let artifact = ArtifactReference::Oci {
+        image_reference: "fixture.invalid/nazoauth".to_owned(),
+        digest: format!("sha256:{}", "a".repeat(64)),
+    };
     let migration = runtime
-        .append_task_mounts(Process::new("podman"), &TaskOperation::MigrateApply, None)
+        .one_shot_task(artifact.clone(), &TaskOperation::MigrateApply, None)
         .unwrap();
-    let migration = format!("{migration:?}").replace("\\\\", "\\");
 
-    assert!(migration.contains("DATABASE_URL_FILE=/run/nazoauth-secrets/database-url"));
-    assert!(migration.contains("database-migration-url"));
-    assert!(!migration.contains("/var/lib/nazo_oauth/keys"));
-    assert!(!migration.contains("postgresql://"));
+    assert_eq!(
+        migration.environment.get("DATABASE_URL_FILE"),
+        Some(&"/run/nazoauth-secrets/database-url".to_owned())
+    );
+    assert!(migration.mounts.iter().any(|mount| {
+        mount.source == config.dependencies.migration_database_url_file
+            && mount.destination == Path::new("/run/nazoauth-secrets/database-url")
+    }));
+    assert!(
+        !migration
+            .mounts
+            .iter()
+            .any(|mount| mount.destination == Path::new("/var/lib/nazo_oauth/keys"))
+    );
 
     let conformance = runtime
-        .append_task_mounts(
-            Process::new("podman"),
+        .one_shot_task(
+            artifact.clone(),
             &TaskOperation::ConformanceLeaseCleanup,
             None,
         )
         .unwrap();
-    let conformance = format!("{conformance:?}").replace("\\\\", "\\");
-    assert!(conformance.contains("database-url"));
-    assert!(!conformance.contains("database-migration-url"));
-    assert!(!conformance.contains("/var/lib/nazo_oauth/keys"));
+    assert!(conformance.mounts.iter().any(|mount| {
+        mount.source == config.dependencies.database_url_file
+            && mount.destination == Path::new("/run/nazoauth-secrets/database-url")
+    }));
+    assert!(
+        !conformance
+            .mounts
+            .iter()
+            .any(|mount| mount.source == config.dependencies.migration_database_url_file)
+    );
+    assert!(
+        !conformance
+            .mounts
+            .iter()
+            .any(|mount| mount.destination == Path::new("/var/lib/nazo_oauth/keys"))
+    );
 
     let public_jwk = work.path().join("public.jwk");
     let keys = runtime
-        .append_task_mounts(
-            Process::new("podman"),
-            &TaskOperation::KeysValidate,
-            Some(&public_jwk),
-        )
+        .one_shot_task(artifact, &TaskOperation::KeysValidate, Some(&public_jwk))
         .unwrap();
-    let keys = format!("{keys:?}").replace("\\\\", "\\");
 
-    assert!(keys.contains("/var/lib/nazo_oauth/keys"));
-    assert!(keys.contains("/run/nazoauth-operator/public.jwk"));
-    assert!(!keys.contains("database-migration-url"));
-    assert!(!keys.contains("DATABASE_URL="));
+    assert!(
+        keys.mounts
+            .iter()
+            .any(|mount| mount.destination == Path::new("/var/lib/nazo_oauth/keys"))
+    );
+    assert!(
+        keys.mounts
+            .iter()
+            .any(|mount| mount.destination == Path::new("/run/nazoauth-operator/public.jwk"))
+    );
+    assert!(!keys.environment.contains_key("DATABASE_URL"));
 }
 
+#[cfg(unix)]
 #[test]
 fn privileged_container_task_attaches_the_signed_envelope_stdin() {
-    let command = format!("{:?}", container_task_process("podman"));
+    let work = PrivateTempDir::new("runtime-task-stdin").unwrap();
+    let engine = work.path().join("fake-engine");
+    let argv = work.path().join("argv.txt");
+    write_shell_executable(
+        &engine,
+        &format!("printf '%s\\n' \"$@\" > '{}'", argv.display()),
+    );
+    let task = OneShotTask {
+        artifact: ArtifactReference::Oci {
+            image_reference: "fixture.invalid/nazoauth".to_owned(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+        },
+        command: vec!["nazoauth".to_owned(), "operator-task".to_owned()],
+        network: None,
+        mounts: Vec::new(),
+        environment: BTreeMap::new(),
+        working_directory: None,
+        service_user: None,
+        stdin: b"signed-envelope".to_vec(),
+    };
+    runtime_backend::backend_with_command(RuntimeBackendKind::Podman, engine)
+        .run_one_shot(&task)
+        .unwrap();
+    let command = fs::read_to_string(argv).unwrap();
 
     assert!(command.contains("--interactive"));
 }
@@ -191,7 +242,14 @@ fn privileged_task_fails_closed_without_required_config_mount() {
         .retain(|mount| mount.target != Path::new("/app/.env.yaml"));
 
     let error = Runtime::new(&config)
-        .append_task_mounts(Process::new("podman"), &TaskOperation::KeysList, None)
+        .one_shot_task(
+            ArtifactReference::Oci {
+                image_reference: "fixture.invalid/nazoauth".to_owned(),
+                digest: format!("sha256:{}", "a".repeat(64)),
+            },
+            &TaskOperation::KeysList,
+            None,
+        )
         .unwrap_err();
     assert!(
         error
@@ -282,7 +340,7 @@ fn application_container_command_uses_hardening_and_secret_file_references() {
         &format!("printf '%s\\n' \"$@\" > '{}'", argv.display()),
     );
     config.runtime.backend = RuntimeBackendKind::Podman;
-    config.runtime.backend_command_override = Some(engine);
+    config.runtime.backend_command_override = Some(engine.clone());
     let raw_secret = "secret-canary-that-must-not-enter-argv";
     fs::create_dir_all(config.dependencies.database_url_file.parent().unwrap()).unwrap();
     fs::write(&config.dependencies.database_url_file, raw_secret).unwrap();
