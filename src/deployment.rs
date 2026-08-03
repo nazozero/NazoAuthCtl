@@ -295,6 +295,10 @@ impl DeploymentRecord {
     pub(crate) fn core_recovery_is_proven(&self) -> bool {
         self.trust == TrustState::Adopted
             && self.recovery.conclusion == RecoveryConclusion::Proven
+            && matches!(
+                self.resources.get("controller_config"),
+                Some(SafeReference::File { .. })
+            )
             && self.capabilities.runtime.responsibility.permits_mutation()
             && self.capabilities.artifact.responsibility.permits_mutation()
             && self.capabilities.backups.responsibility.permits_mutation()

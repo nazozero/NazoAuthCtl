@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::*;
 use crate::deployment::{
     ArtifactReference, CapabilityGrants, DEPLOYMENT_SCHEMA, RecoveryAssessment, RuntimeBackendKind,
-    RuntimeInstance,
+    RuntimeInstance, SafeReference,
 };
 
 fn record() -> DeploymentRecord {
@@ -102,4 +102,27 @@ fn controller_modules_do_not_encode_runtime_backend_command_syntax() {
             );
         }
     }
+}
+
+#[test]
+fn integrity_evidence_without_an_executable_controller_config_is_not_core_recovery() {
+    let mut deployment = record();
+    deployment.trust = TrustState::Adopted;
+    deployment.recovery.conclusion = RecoveryConclusion::Proven;
+    for capability in [
+        Capability::Runtime,
+        Capability::Artifact,
+        Capability::Backups,
+    ] {
+        deployment.capabilities.grant_mut(capability).responsibility = Responsibility::Delegated;
+    }
+    assert!(!deployment.core_recovery_is_proven());
+
+    deployment.resources.insert(
+        "controller_config".to_owned(),
+        SafeReference::File {
+            path: std::path::PathBuf::from("/etc/nazoauthctl/deployment-test.json"),
+        },
+    );
+    assert!(deployment.core_recovery_is_proven());
 }

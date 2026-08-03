@@ -51,6 +51,7 @@ pub(crate) struct AdoptionPlan {
     pub(crate) artifact_identity: String,
     pub(crate) runtime_instances: Vec<AdoptedRuntimeIdentity>,
     pub(crate) resulting_trust: TrustState,
+    pub(crate) requested_capabilities: CapabilityGrants,
     pub(crate) capabilities: CapabilityGrants,
     pub(crate) recovery: RecoveryAssessment,
     pub(crate) steps: Vec<AdoptionStep>,
@@ -130,8 +131,8 @@ pub(crate) fn run(options: AdoptionOptions) -> anyhow::Result<()> {
         return Ok(());
     }
     if !plan.blockers.is_empty() {
-        bail!(
-            "adoption plan is blocked and remains observed: {}",
+        eprintln!(
+            "nazoauthctl: mutation adoption is blocked; persisting verified observed state only: {}",
             plan.blockers.join("; ")
         );
     }
@@ -231,10 +232,15 @@ fn build_plan(
             .responsibility
             .permits_mutation()
     });
+    if recovery.conclusion != RecoveryConclusion::Proven {
+        blockers.push(
+            "recovery executability is not proven; the deployment can only be recorded as observed"
+                .to_owned(),
+        );
+    }
     if mutation_requested && recovery.conclusion != RecoveryConclusion::Proven {
         blockers.push(
-            "mutation capabilities require a verified recovery package or provider evidence"
-                .to_owned(),
+            "requested mutation capabilities remain external until recovery is proven".to_owned(),
         );
     }
     if options
@@ -281,6 +287,11 @@ fn build_plan(
     } else {
         TrustState::Observed
     };
+    let capabilities = if resulting_trust == TrustState::Observed {
+        CapabilityGrants::observed()
+    } else {
+        options.capabilities.clone()
+    };
     let mut steps = vec![
         AdoptionStep {
             owner: StepOwner::Controller,
@@ -323,7 +334,8 @@ fn build_plan(
         artifact_identity,
         runtime_instances,
         resulting_trust,
-        capabilities: options.capabilities.clone(),
+        requested_capabilities: options.capabilities.clone(),
+        capabilities,
         recovery,
         steps,
         blockers,
@@ -481,7 +493,9 @@ fn recovery_assessment(
         for (name, artifact) in recovery_artifacts(&manifest) {
             proof.push(format!("{name}-sha256:{}", artifact.sha256));
         }
-        RecoveryConclusion::Proven
+        // Integrity and off-host placement are necessary but do not prove that
+        // database, data, artifact, and provider recovery steps are executable.
+        RecoveryConclusion::RequiresUserEvidence
     } else {
         candidate.recovery_conclusion.clone()
     };
@@ -763,7 +777,12 @@ fn initialize_audit(
             kind: ActorKind::LocalRoot,
             id: "uid:0".to_owned(),
         },
-        operation: "adopt".to_owned(),
+        operation: if record.trust == TrustState::Adopted {
+            "adopt"
+        } else {
+            "observe"
+        }
+        .to_owned(),
         release: record
             .runtime_instances
             .first()

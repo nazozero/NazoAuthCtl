@@ -37,7 +37,12 @@ deployment-locked transaction which:
 
 It does not restart, replace, rename, delete, or relabel the manual runtime.
 Adoption records only the capability grants explicitly supplied by the user.
-Unable-to-prove recovery is not upgraded to adopted mutation authority.
+The schema-1 recovery evidence manifest proves bounded files, hashes, Release
+binding, and off-host placement; it does not prove restore executability. Such
+evidence is persisted as `observed`, with every effective capability forced to
+`external`, even when broader capabilities were requested. The requested grants
+remain visible in the plan. A future executable provider/restore contract is
+required before a manual deployment can become `adopted` with mutation authority.
 
 ## Replicas and shared resources
 

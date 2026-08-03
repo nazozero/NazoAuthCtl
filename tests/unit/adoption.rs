@@ -82,6 +82,7 @@ fn plan(candidates: &[DiscoveredDeployment]) -> AdoptionPlan {
             })
             .collect(),
         resulting_trust: TrustState::Adopted,
+        requested_capabilities: CapabilityGrants::observed(),
         capabilities: CapabilityGrants::observed(),
         recovery: RecoveryAssessment {
             conclusion: RecoveryConclusion::RequiresUserEvidence,
@@ -156,6 +157,17 @@ fn recovery_evidence_is_bound_to_deployment_release_off_host_and_content() {
     .unwrap();
 
     verify_recovery_evidence(&manifest_path, "deployment-test", "v0.1.19").unwrap();
+    let assessment = recovery_assessment(
+        &candidate("podman:object-a", "runtime-a", "/srv/a"),
+        "deployment-test",
+        "v0.1.19",
+        Some(&manifest_path),
+    )
+    .unwrap();
+    assert_eq!(
+        assessment.conclusion,
+        RecoveryConclusion::RequiresUserEvidence
+    );
     assert!(verify_recovery_evidence(&manifest_path, "another-deployment", "v0.1.19").is_err());
     fs::write(&artifacts[0].path, b"tampered").unwrap();
     assert!(verify_recovery_evidence(&manifest_path, "deployment-test", "v0.1.19").is_err());
