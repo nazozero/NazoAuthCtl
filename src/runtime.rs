@@ -161,6 +161,9 @@ impl<'a> Runtime<'a> {
         operation: &TaskOperation,
         public_jwk: Option<&Path>,
     ) -> anyhow::Result<OneShotTask> {
+        if self.backend_kind()? == RuntimeBackendKind::Systemd {
+            return self.systemd_one_shot_task(artifact, operation, public_jwk);
+        }
         let mut mounts = Vec::new();
         let mut environment = BTreeMap::from([
             (
@@ -271,6 +274,134 @@ impl<'a> Runtime<'a> {
                 .then(|| self.config.runtime.working_directory.clone()),
             service_user: (self.backend_kind()? == RuntimeBackendKind::Systemd)
                 .then(|| self.config.runtime.service_user.clone()),
+            transient_credentials: BTreeMap::new(),
+            read_only_paths: Vec::new(),
+            read_write_paths: Vec::new(),
+            inaccessible_paths: Vec::new(),
+            private_mounts: false,
+            stdin: Vec::new(),
+        })
+    }
+
+    fn systemd_one_shot_task(
+        &self,
+        artifact: ArtifactReference,
+        operation: &TaskOperation,
+        public_jwk: Option<&Path>,
+    ) -> anyhow::Result<OneShotTask> {
+        let key_directory = self
+            .config
+            .runtime
+            .snapshot_paths
+            .first()
+            .context("application key state directory is unavailable")?;
+        let app_root = key_directory
+            .parent()
+            .context("application data root is unavailable")?;
+        let ui_releases = app_root
+            .parent()
+            .context("deployment data root is unavailable")?
+            .join("ui-releases");
+        let operator_directory = self
+            .config
+            .operator
+            .controller_public_key
+            .parent()
+            .context("operator directory is unavailable")?;
+        let mut environment = BTreeMap::from([
+            (
+                "NAZOAUTH_OPERATOR_CONTEXT_FILE".to_owned(),
+                operator_directory
+                    .join("context.json")
+                    .display()
+                    .to_string(),
+            ),
+            (
+                "NAZOAUTH_OPERATOR_CONTROLLER_PUBLIC_KEY_FILE".to_owned(),
+                self.config
+                    .operator
+                    .controller_public_key
+                    .display()
+                    .to_string(),
+            ),
+            (
+                "NAZOAUTH_OPERATOR_RECEIPT_PRIVATE_KEY_FILE".to_owned(),
+                "%d/operator-receipt-key".to_owned(),
+            ),
+            (
+                "NAZOAUTH_OPERATOR_STATE_DIRECTORY".to_owned(),
+                self.config.operator.state_directory.display().to_string(),
+            ),
+            (
+                "NAZOAUTH_OPERATOR_CONFIG_MANIFEST_FILE".to_owned(),
+                operator_directory
+                    .join("config-manifest.json")
+                    .display()
+                    .to_string(),
+            ),
+            (
+                "NAZOAUTH_SERVER_CONFIG_FILE".to_owned(),
+                self.config
+                    .runtime
+                    .working_directory
+                    .join(".env.yaml")
+                    .display()
+                    .to_string(),
+            ),
+        ]);
+        let mut transient_credentials = BTreeMap::from([(
+            "operator-receipt-key".to_owned(),
+            self.config.operator.receipt_private_key.clone(),
+        )]);
+        let mut read_only_paths = Vec::new();
+        let mut read_write_paths = vec![self.config.operator.state_directory.clone()];
+        let mut inaccessible_paths = vec![
+            app_root.join("avatars"),
+            app_root.join("secrets"),
+            app_root.join("bootstrap"),
+            ui_releases,
+        ];
+        if operation_uses_database(operation) {
+            transient_credentials.insert(
+                "operator-database-url".to_owned(),
+                operation_database_url_file(self.config, operation).to_path_buf(),
+            );
+            environment.insert(
+                "DATABASE_URL_FILE".to_owned(),
+                "%d/operator-database-url".to_owned(),
+            );
+            inaccessible_paths.push(key_directory.clone());
+        } else {
+            read_write_paths.push(key_directory.clone());
+            inaccessible_paths.push(
+                self.config
+                    .dependencies
+                    .migration_database_url_file
+                    .parent()
+                    .context("dependency secret directory is unavailable")?
+                    .to_path_buf(),
+            );
+            if let Some(path) = public_jwk {
+                read_only_paths.push(path.to_path_buf());
+                environment.insert(
+                    "NAZOAUTH_OPERATOR_PUBLIC_JWK_FILE".to_owned(),
+                    path.display().to_string(),
+                );
+            }
+        }
+        Ok(OneShotTask {
+            artifact,
+            command: vec!["operator-task".to_owned()],
+            network: operation_uses_database(operation).then(String::new),
+            mounts: Vec::new(),
+            environment,
+            working_directory: Some(self.config.runtime.working_directory.clone()),
+            service_user: Some(self.config.runtime.service_user.clone()),
+            transient_credentials,
+            read_only_paths,
+            read_write_paths,
+            inaccessible_paths,
+            private_mounts: true,
             stdin: Vec::new(),
         })
     }
@@ -365,20 +496,10 @@ impl<'a> Runtime<'a> {
     }
 
     pub(crate) fn pull_image(&self, image: &str) -> anyhow::Result<()> {
-        Process::new(
-            self.config
-                .container_engine()
-                .context("container engine is unavailable")?,
-        )
-        .args(["pull", image])
-        .run_quiet()
+        self.backend()?.pull_image(image)
     }
 
     pub(crate) fn export_image(&self, image: &str, archive: &Path) -> anyhow::Result<()> {
-        let engine = self
-            .config
-            .container_engine()
-            .context("container engine is unavailable")?;
         let parent = archive
             .parent()
             .context("OCI recovery archive has no parent")?;
@@ -387,11 +508,7 @@ impl<'a> Runtime<'a> {
         if temporary.exists() {
             fs::remove_file(&temporary)?;
         }
-        Process::new(engine)
-            .args(["image", "save", "--output"])
-            .arg(&temporary)
-            .arg(image)
-            .run_quiet()?;
+        self.backend()?.export_image(image, &temporary)?;
         let metadata = fs::symlink_metadata(&temporary)
             .context("container engine did not create the OCI recovery archive")?;
         if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
@@ -407,14 +524,7 @@ impl<'a> Runtime<'a> {
         if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
             bail!("trusted OCI recovery archive is invalid");
         }
-        let engine = self
-            .config
-            .container_engine()
-            .context("container engine is unavailable")?;
-        Process::new(engine)
-            .args(["image", "load", "--input"])
-            .arg(archive)
-            .run_quiet()?;
+        self.backend()?.import_image(archive)?;
         self.image_digest(expected_image)?;
         Ok(())
     }
@@ -462,7 +572,8 @@ impl<'a> Runtime<'a> {
             },
         };
         self.backend()?
-            .read_build_identity(&artifact)?
+            .read_build_identity(&artifact)
+            .context("runtime embedded build identity is invalid")?
             .context("runtime backend returned no build identity")
     }
     pub(crate) fn verify_prepared_target(

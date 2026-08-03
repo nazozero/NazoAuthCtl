@@ -498,18 +498,20 @@ fn host_task_uses_transient_credentials_and_hides_unrelated_state() {
         .unwrap();
     let joined = format!("{prepared:?}").replace("\\\\", "\\");
 
-    assert!(joined.contains("--property=PrivateMounts=yes"));
-    assert!(joined.contains("--property=LoadCredential=operator-receipt-key:"));
-    assert!(joined.contains(&format!(
-        "--property=LoadCredential=operator-database-url:{}",
-        config.dependencies.migration_database_url_file.display()
-    )));
+    assert!(joined.contains("private_mounts: true"));
+    assert!(joined.contains("operator-receipt-key"));
+    assert!(joined.contains("operator-database-url"));
     assert!(
         joined.contains(
-            "--setenv=NAZOAUTH_OPERATOR_RECEIPT_PRIVATE_KEY_FILE=%d/operator-receipt-key"
+            &config
+                .dependencies
+                .migration_database_url_file
+                .display()
+                .to_string()
         )
     );
-    assert!(joined.contains("--setenv=DATABASE_URL_FILE=%d/operator-database-url"));
+    assert!(joined.contains("%d/operator-receipt-key"));
+    assert!(joined.contains("%d/operator-database-url"));
     assert!(joined.contains(&app.join("avatars").display().to_string()));
     assert!(joined.contains(&app.join("secrets").display().to_string()));
     assert!(joined.contains(&app.join("bootstrap").display().to_string()));
@@ -525,11 +527,9 @@ fn host_task_uses_transient_credentials_and_hides_unrelated_state() {
         )
         .unwrap();
     let joined = format!("{prepared:?}").replace("\\\\", "\\");
-    assert!(joined.contains(&format!(
-        "--property=LoadCredential=operator-database-url:{}",
-        config.dependencies.database_url_file.display()
-    )));
-    assert!(joined.contains("--setenv=DATABASE_URL_FILE=%d/operator-database-url"));
+    assert!(joined.contains("operator-database-url"));
+    assert!(joined.contains(&config.dependencies.database_url_file.display().to_string()));
+    assert!(joined.contains("%d/operator-database-url"));
     assert!(!joined.contains("postgresql://runtime.invalid/db"));
     assert!(
         !joined.contains(

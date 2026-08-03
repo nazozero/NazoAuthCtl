@@ -1780,6 +1780,11 @@ fn materialize_trusted_recovery_release(config: &UpdateConfig, release: &Release
         serde_json::to_vec_pretty(release).unwrap(),
     )
     .unwrap();
+    fs::write(
+        directory.join("server-image.tar"),
+        b"trusted OCI recovery archive",
+    )
+    .unwrap();
 }
 
 #[cfg(unix)]

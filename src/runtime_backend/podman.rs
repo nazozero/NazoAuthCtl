@@ -284,7 +284,54 @@ impl RuntimeBackend for PodmanBackend {
         podman_one_shot_process(&self.command, task)?.stdin_authorization_rejected(&task.stdin)
     }
 
+    fn pull_image(&self, image_reference: &str) -> anyhow::Result<()> {
+        Process::new(&self.command)
+            .args(["pull", image_reference])
+            .run_quiet()
+    }
+
+    fn export_image(&self, image_reference: &str, archive: &std::path::Path) -> anyhow::Result<()> {
+        Process::new(&self.command)
+            .args(["image", "save", "--output"])
+            .arg(archive)
+            .arg(image_reference)
+            .run_quiet()
+    }
+
+    fn import_image(&self, archive: &std::path::Path) -> anyhow::Result<()> {
+        Process::new(&self.command)
+            .args(["image", "load", "--input"])
+            .arg(archive)
+            .run_quiet()
+    }
+
     fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String> {
+        let repo_digests = Process::new(&self.command)
+            .args([
+                "image",
+                "inspect",
+                image_reference,
+                "--format",
+                "{{json .RepoDigests}}",
+            ])
+            .stdout()?;
+        if let Ok(values) = serde_json::from_str::<Vec<String>>(repo_digests.trim()) {
+            let expected = image_reference.rsplit_once('@').map(|(_, digest)| digest);
+            if let Some(digest) = values
+                .iter()
+                .filter_map(|value| value.rsplit_once('@').map(|(_, digest)| digest))
+                .find(|digest| Some(*digest) == expected && valid_digest(digest))
+            {
+                return Ok(digest.to_ascii_lowercase());
+            }
+            if let Some(digest) = values
+                .iter()
+                .filter_map(|value| value.rsplit_once('@').map(|(_, digest)| digest))
+                .find(|digest| valid_digest(digest))
+            {
+                return Ok(digest.to_ascii_lowercase());
+            }
+        }
         let digest = Process::new(&self.command)
             .args([
                 "image",
@@ -296,7 +343,7 @@ impl RuntimeBackend for PodmanBackend {
             .stdout()?;
         let digest = digest.trim();
         if !valid_digest(digest) {
-            bail!("Podman image has no immutable sha256 digest");
+            bail!("container engine did not retain the signed OCI digest");
         }
         Ok(digest.to_ascii_lowercase())
     }

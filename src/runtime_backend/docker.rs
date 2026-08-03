@@ -274,6 +274,27 @@ impl RuntimeBackend for DockerBackend {
         docker_one_shot_process(task)?.stdin_authorization_rejected(&task.stdin)
     }
 
+    fn pull_image(&self, image_reference: &str) -> anyhow::Result<()> {
+        Process::new("docker")
+            .args(["pull", image_reference])
+            .run_quiet()
+    }
+
+    fn export_image(&self, image_reference: &str, archive: &std::path::Path) -> anyhow::Result<()> {
+        Process::new("docker")
+            .args(["image", "save", "--output"])
+            .arg(archive)
+            .arg(image_reference)
+            .run_quiet()
+    }
+
+    fn import_image(&self, archive: &std::path::Path) -> anyhow::Result<()> {
+        Process::new("docker")
+            .args(["image", "load", "--input"])
+            .arg(archive)
+            .run_quiet()
+    }
+
     fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String> {
         let output = Process::new("docker")
             .args([

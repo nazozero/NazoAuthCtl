@@ -64,6 +64,11 @@ pub(crate) struct OneShotTask {
     pub(crate) environment: BTreeMap<String, String>,
     pub(crate) working_directory: Option<PathBuf>,
     pub(crate) service_user: Option<String>,
+    pub(crate) transient_credentials: BTreeMap<String, PathBuf>,
+    pub(crate) read_only_paths: Vec<PathBuf>,
+    pub(crate) read_write_paths: Vec<PathBuf>,
+    pub(crate) inaccessible_paths: Vec<PathBuf>,
+    pub(crate) private_mounts: bool,
     pub(crate) stdin: Vec<u8>,
 }
 
@@ -79,6 +84,9 @@ pub(crate) trait RuntimeBackend {
     fn replace(&self, replacement: &RuntimeReplacement) -> anyhow::Result<()>;
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String>;
     fn run_one_shot_authorization_probe(&self, task: &OneShotTask) -> anyhow::Result<bool>;
+    fn pull_image(&self, image_reference: &str) -> anyhow::Result<()>;
+    fn export_image(&self, image_reference: &str, archive: &std::path::Path) -> anyhow::Result<()>;
+    fn import_image(&self, archive: &std::path::Path) -> anyhow::Result<()>;
     fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String>;
     fn read_build_identity(
         &self,

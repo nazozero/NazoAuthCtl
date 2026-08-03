@@ -136,6 +136,22 @@ impl RuntimeBackend for SystemdBackend {
         systemd_one_shot_process(task)?.stdin_authorization_rejected(&task.stdin)
     }
 
+    fn pull_image(&self, _image_reference: &str) -> anyhow::Result<()> {
+        bail!("systemd backend does not manage OCI images")
+    }
+
+    fn export_image(
+        &self,
+        _image_reference: &str,
+        _archive: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        bail!("systemd backend does not manage OCI images")
+    }
+
+    fn import_image(&self, _archive: &std::path::Path) -> anyhow::Result<()> {
+        bail!("systemd backend does not manage OCI images")
+    }
+
     fn resolve_image_digest(&self, _image_reference: &str) -> anyhow::Result<String> {
         bail!("systemd backend does not manage OCI images")
     }
@@ -183,10 +199,21 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
             "--service-type=exec",
             "--property=NoNewPrivileges=yes",
             "--property=PrivateTmp=yes",
+            "--property=PrivateDevices=yes",
             "--property=ProtectSystem=strict",
             "--property=ProtectHome=yes",
+            "--property=ProtectKernelTunables=yes",
+            "--property=ProtectKernelModules=yes",
+            "--property=ProtectControlGroups=yes",
+            "--property=RestrictSUIDSGID=yes",
+            "--property=LockPersonality=yes",
+            "--property=CapabilityBoundingSet=",
+            "--property=AmbientCapabilities=",
         ])
         .arg(format!("--unit={unit}"));
+    if task.private_mounts {
+        process = process.arg("--property=PrivateMounts=yes");
+    }
     if task.network.is_none() {
         process = process.arg("--property=RestrictAddressFamilies=AF_UNIX");
     }
@@ -200,6 +227,28 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
     }
     for (name, value) in &task.environment {
         process = process.arg(format!("--setenv={name}={value}"));
+    }
+    for (name, source) in &task.transient_credentials {
+        process = process.arg(format!(
+            "--property=LoadCredential={name}:{}",
+            source.display()
+        ));
+    }
+    for path in &task.read_only_paths {
+        process = process.arg(format!("--property=ReadOnlyPaths={}", path.display()));
+    }
+    for path in &task.read_write_paths {
+        process = process.arg(format!("--property=ReadWritePaths={}", path.display()));
+    }
+    if !task.inaccessible_paths.is_empty() {
+        process = process.arg(format!(
+            "--property=InaccessiblePaths={}",
+            task.inaccessible_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
     }
     for mount in &task.mounts {
         let property = if mount.read_only {

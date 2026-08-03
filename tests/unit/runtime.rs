@@ -222,6 +222,11 @@ fn privileged_container_task_attaches_the_signed_envelope_stdin() {
         environment: BTreeMap::new(),
         working_directory: None,
         service_user: None,
+        transient_credentials: BTreeMap::new(),
+        read_only_paths: Vec::new(),
+        read_write_paths: Vec::new(),
+        inaccessible_paths: Vec::new(),
+        private_mounts: false,
         stdin: b"signed-envelope".to_vec(),
     };
     runtime_backend::backend_with_command(RuntimeBackendKind::Podman, engine)
@@ -285,6 +290,11 @@ fn retirement_probe_accepts_only_the_closed_runtime_authorization_marker() {
             environment: BTreeMap::new(),
             working_directory: None,
             service_user: None,
+            transient_credentials: BTreeMap::new(),
+            read_only_paths: Vec::new(),
+            read_write_paths: Vec::new(),
+            inaccessible_paths: Vec::new(),
+            private_mounts: false,
             stdin: Vec::new(),
         },
         target: target.clone(),
@@ -316,6 +326,11 @@ fn retirement_probe_accepts_only_the_closed_runtime_authorization_marker() {
                 environment: BTreeMap::new(),
                 working_directory: None,
                 service_user: None,
+                transient_credentials: BTreeMap::new(),
+                read_only_paths: Vec::new(),
+                read_write_paths: Vec::new(),
+                inaccessible_paths: Vec::new(),
+                private_mounts: false,
                 stdin: Vec::new(),
             },
             target: target.clone(),
@@ -335,9 +350,14 @@ fn application_container_command_uses_hardening_and_secret_file_references() {
     let mut config = config(&work);
     let engine = work.path().join("fake-container-engine");
     let argv = work.path().join("argv.txt");
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let image = format!("ghcr.io/nazozero/nazoauth@{digest}");
     write_shell_executable(
         &engine,
-        &format!("printf '%s\\n' \"$@\" > '{}'", argv.display()),
+        &format!(
+            "case \"$*\" in\n  *'image inspect'*) printf '%s\\n' '[\"{image}\"]' ;;\n  *) printf '%s\\n' \"$@\" > '{}' ;;\nesac",
+            argv.display()
+        ),
     );
     config.runtime.backend = RuntimeBackendKind::Podman;
     config.runtime.backend_command_override = Some(engine.clone());
@@ -345,9 +365,7 @@ fn application_container_command_uses_hardening_and_secret_file_references() {
     fs::create_dir_all(config.dependencies.database_url_file.parent().unwrap()).unwrap();
     fs::write(&config.dependencies.database_url_file, raw_secret).unwrap();
 
-    Runtime::new(&config)
-        .start_container("ghcr.io/nazozero/nazoauth@sha256:aaaaaaaa")
-        .unwrap();
+    Runtime::new(&config).start_container(&image).unwrap();
     let arguments = fs::read_to_string(argv).unwrap();
 
     for expected in [
@@ -364,7 +382,7 @@ fn application_container_command_uses_hardening_and_secret_file_references() {
         "127.0.0.1:8000:8000",
         "DATABASE_URL_FILE=/run/nazoauth-secrets/database-url",
         "VALKEY_URL_FILE=/run/nazoauth-secrets/valkey-url",
-        "ghcr.io/nazozero/nazoauth@sha256:aaaaaaaa",
+        image.as_str(),
         "nazoauth",
         "server",
     ] {
@@ -522,7 +540,7 @@ fn podman_image_digest_rejects_a_mismatched_fallback_digest() {
                 .image_digest(&image)
                 .unwrap_err()
                 .to_string(),
-            "container engine did not retain the signed OCI digest"
+            "container engine retained a different OCI digest"
         );
         return;
     }
@@ -598,19 +616,19 @@ fn embedded_identity_container_is_networkless_and_hardened() {
     let mut config = config(&work);
     let engine = work.path().join("fake-engine");
     let argv = work.path().join("argv.txt");
+    let digest = format!("sha256:{}", "f".repeat(64));
+    let image = format!("ghcr.io/nazozero/nazoauth@{digest}");
     write_shell_executable(
         &engine,
         &format!(
-            "printf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{}'",
+            "case \"$*\" in\n  *'image inspect'*) printf '%s\\n' '[\"{image}\"]' ;;\n  *) printf '%s\\n' \"$@\" > '{}'; printf '%s\\n' '{}' ;;\nesac",
             argv.display(),
             embedded_identity_json()
         ),
     );
     config.runtime.backend = RuntimeBackendKind::Podman;
     config.runtime.backend_command_override = Some(engine);
-    let image = "ghcr.io/nazozero/nazoauth@sha256:ffffffff";
-
-    let identity = Runtime::new(&config).embedded_identity(image).unwrap();
+    let identity = Runtime::new(&config).embedded_identity(&image).unwrap();
     let arguments = fs::read_to_string(argv).unwrap();
 
     assert_eq!(identity.release, "v0.2.0");
@@ -623,7 +641,7 @@ fn embedded_identity_container_is_networkless_and_hardened() {
         "ALL",
         "no-new-privileges",
         "--read-only",
-        image,
+        image.as_str(),
         "nazoauth",
         "build-identity",
     ] {
