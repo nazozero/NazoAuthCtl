@@ -7,7 +7,6 @@ use crate::{
     deployment::{ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind},
     filesystem::{atomic_write, sha256},
     model::{Mount, UpdateConfig},
-    process::Process,
     runtime_backend::{
         self, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount,
         OneShotTask,

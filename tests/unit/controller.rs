@@ -2030,7 +2030,7 @@ fn registered_update_plan_preserves_mixed_ownership_and_replica_identity() {
             object_reference: object_reference.to_owned(),
             artifact: crate::deployment::ArtifactReference::Oci {
                 image_reference: "ghcr.io/nazozero/nazoauth".to_owned(),
-                digest: active.runtime_oci_digest().unwrap().to_owned(),
+                digest: format!("sha256:{}", "a".repeat(64)),
             },
             ports: Vec::new(),
             networks: vec!["shared-network".to_owned()],
