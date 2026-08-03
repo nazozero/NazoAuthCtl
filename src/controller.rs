@@ -92,6 +92,8 @@ struct InstallCompletion {
     backend_commit: String,
     management_event_file: String,
     management_event_sha256: String,
+    #[serde(default)]
+    recovery_backup: PathBuf,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1637,6 +1639,16 @@ fn install(config_path: PathBuf, options: crate::cli::InstallOptions) -> anyhow:
             if !health_ready(&config) {
                 bail!("managed installation is complete but not healthy; run nazoauthctl doctor");
             }
+            let completion = load_install_completion(&config)?;
+            if !completion.recovery_backup.as_os_str().is_empty() {
+                let active = load_active_release(&config)?;
+                register_installed_deployment(
+                    &config_path,
+                    &config,
+                    &active,
+                    &completion.recovery_backup,
+                )?;
+            }
             println!(
                 "NazoAuth is already installed and ready; use nazoauthctl update for releases"
             );
@@ -1675,7 +1687,7 @@ fn install_transaction(
     let release = VerifiedRelease::fetch(&config.repository, version, config.container_engine())?;
     enforce_release_trust(config, &release.manifest)?;
     release.persist_verification_evidence(&release_cache_dir(config, &release.manifest))?;
-    let _backup = Backup::create(config_path, config, &release.manifest.version)?;
+    let backup = Backup::create(config_path, config, &release.manifest.version)?;
 
     if config.runtime.engine == "host" {
         let binary = release.artifact("binary", &config.repository)?;
@@ -1737,14 +1749,16 @@ fn install_transaction(
     atomic_write(
         &install_completion_path(config),
         &serde_json::to_vec_pretty(&InstallCompletion {
-            schema: 1,
+            schema: 2,
             version: release.manifest.version.clone(),
             backend_commit: release.manifest.backend_commit.clone(),
             management_event_file,
             management_event_sha256: crate::filesystem::sha256(&management_event)?,
+            recovery_backup: backup.path().to_owned(),
         })?,
         0o600,
     )?;
+    register_installed_deployment(config_path, config, &release.manifest, backup.path())?;
     println!(
         "NazoAuth installed at {} ({})",
         release.manifest.version, release.manifest.backend_commit
@@ -1787,9 +1801,8 @@ fn install_is_complete(config: &UpdateConfig) -> anyhow::Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
-    let completion: InstallCompletion = serde_json::from_slice(&fs::read(&path)?)
-        .context("managed installation completion marker is invalid")?;
-    if completion.schema != 1 {
+    let completion = load_install_completion(config)?;
+    if !matches!(completion.schema, 1 | 2) {
         bail!("unsupported managed installation completion marker");
     }
     let active = load_active_release(config)?;
@@ -1809,6 +1822,191 @@ fn install_is_complete(config: &UpdateConfig) -> anyhow::Result<bool> {
         bail!("managed installation completion audit event is inconsistent");
     }
     Ok(true)
+}
+
+fn load_install_completion(config: &UpdateConfig) -> anyhow::Result<InstallCompletion> {
+    serde_json::from_slice(&fs::read(install_completion_path(config))?)
+        .context("managed installation completion marker is invalid")
+}
+
+fn register_installed_deployment(
+    config_path: &Path,
+    config: &UpdateConfig,
+    manifest: &ReleaseManifest,
+    backup: &Path,
+) -> anyhow::Result<()> {
+    use crate::deployment::{
+        ArtifactReference, DEPLOYMENT_SCHEMA, DeploymentRecord, DeploymentStore, MountReference,
+        RecoveryAssessment, RecoveryConclusion, ResourceScope, Responsibility, RuntimeBackendKind,
+        RuntimeInstance, SafeReference, TrustState,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let backend = match config.runtime.engine.as_str() {
+        "podman" => RuntimeBackendKind::Podman,
+        "docker" => RuntimeBackendKind::Docker,
+        "host" => RuntimeBackendKind::Systemd,
+        _ => bail!("unsupported installed runtime backend"),
+    };
+    let artifact = if backend.is_systemd() {
+        ArtifactReference::HostBinary {
+            path: config.runtime.binary_path.clone(),
+            sha256: manifest
+                .artifacts
+                .get("binary")
+                .context("server Release has no host binary")?
+                .sha256
+                .clone(),
+        }
+    } else {
+        ArtifactReference::Oci {
+            image_reference: manifest.image_ref()?,
+            digest: manifest.runtime_oci_digest()?.to_owned(),
+        }
+    };
+    let object_reference = if backend.is_systemd() {
+        config.runtime.service_name.clone()
+    } else {
+        config.runtime.container_name.clone()
+    };
+    let resources = BTreeMap::from([
+        (
+            "controller_config".to_owned(),
+            SafeReference::File {
+                path: config_path.to_owned(),
+            },
+        ),
+        (
+            "audit_private_key".to_owned(),
+            SafeReference::File {
+                path: config.operator.audit_private_key.clone(),
+            },
+        ),
+        (
+            "break_glass_private_key".to_owned(),
+            SafeReference::File {
+                path: config.operator.break_glass_private_key.clone(),
+            },
+        ),
+        (
+            "database".to_owned(),
+            if config.dependencies.mode == "managed" {
+                SafeReference::RuntimeObject {
+                    backend: config
+                        .container_engine()
+                        .and_then(|engine| match engine {
+                            "podman" => Some(RuntimeBackendKind::Podman),
+                            "docker" => Some(RuntimeBackendKind::Docker),
+                            _ => None,
+                        })
+                        .context("managed database has no typed container backend")?,
+                    object_reference: config.postgres.container_name.clone(),
+                }
+            } else {
+                SafeReference::File {
+                    path: config.dependencies.database_url_file.clone(),
+                }
+            },
+        ),
+        (
+            "valkey".to_owned(),
+            if config.dependencies.mode == "managed" {
+                SafeReference::RuntimeObject {
+                    backend: config
+                        .container_engine()
+                        .and_then(|engine| match engine {
+                            "podman" => Some(RuntimeBackendKind::Podman),
+                            "docker" => Some(RuntimeBackendKind::Docker),
+                            _ => None,
+                        })
+                        .context("managed Valkey has no typed container backend")?,
+                    object_reference: config.valkey.container_name.clone(),
+                }
+            } else {
+                SafeReference::File {
+                    path: config.dependencies.valkey_url_file.clone(),
+                }
+            },
+        ),
+        ("proxy_tls".to_owned(), SafeReference::NotObserved),
+    ]);
+    let record = DeploymentRecord {
+        schema: DEPLOYMENT_SCHEMA,
+        deployment_id: config.operator.deployment_id.clone(),
+        control_authority: config.operator.controller_key_id.clone(),
+        alias: None,
+        issuer: config.runtime.expected_issuer.clone(),
+        trust: TrustState::Adopted,
+        capabilities: config.capabilities.clone(),
+        runtime_instances: vec![RuntimeInstance {
+            runtime_instance_id: config.runtime.runtime_instance_id.clone(),
+            backend,
+            object_reference,
+            artifact,
+            ports: vec![config.runtime.publish_address.clone()],
+            networks: (!config.runtime.network.is_empty())
+                .then(|| config.runtime.network.clone())
+                .into_iter()
+                .collect(),
+            mounts: config
+                .runtime
+                .mounts
+                .iter()
+                .map(|mount| MountReference {
+                    source: mount.source.clone(),
+                    destination: mount.target.clone(),
+                    read_only: mount.read_only,
+                    selinux_relabel: mount.selinux_relabel,
+                    scope: ResourceScope::Deployment,
+                    ownership: Responsibility::Managed,
+                })
+                .collect(),
+            instance_key_id: None,
+            deployment_statement: config.runtime.mounts.iter().find_map(|mount| {
+                (mount.target == Path::new("/var/lib/nazo_oauth/instance"))
+                    .then(|| mount.source.join("deployment-statement.jws"))
+            }),
+        }],
+        resources,
+        recovery: RecoveryAssessment {
+            conclusion: RecoveryConclusion::Proven,
+            evidence: vec![
+                format!("backup:{}", backup.display()),
+                format!(
+                    "release-cache:{}",
+                    release_cache_dir(config, manifest).display()
+                ),
+            ],
+            off_host_package_required_for_machine_loss: true,
+        },
+        operator_protocol_versions: BTreeSet::from([nazo_operator_protocol::PROTOCOL_VERSION]),
+        control_protocol_versions: BTreeSet::from([1]),
+        declaration_revision: 1,
+    };
+    let store = DeploymentStore::system();
+    if store.declaration_path(&record.deployment_id).exists() {
+        let existing = store.load(&record.deployment_id)?;
+        if existing.control_authority != record.control_authority
+            || existing.issuer != record.issuer
+            || existing.runtime_instances.first().map(|runtime| {
+                (
+                    &runtime.runtime_instance_id,
+                    runtime.backend,
+                    &runtime.object_reference,
+                )
+            }) != record.runtime_instances.first().map(|runtime| {
+                (
+                    &runtime.runtime_instance_id,
+                    runtime.backend,
+                    &runtime.object_reference,
+                )
+            })
+        {
+            bail!("installed deployment registry identity differs from the completed installation");
+        }
+        return Ok(());
+    }
+    store.persist(&record)
 }
 
 fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> anyhow::Result<()> {

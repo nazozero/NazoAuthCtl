@@ -514,6 +514,23 @@ fn deployment_record(
     control_authority: &str,
 ) -> anyhow::Result<DeploymentRecord> {
     let resources = BTreeMap::from([
+        (
+            "audit_private_key".to_owned(),
+            SafeReference::File {
+                path: DeploymentStore::system()
+                    .deployment_state_dir(&plan.deployment_id)
+                    .join("identities")
+                    .join("audit.key"),
+            },
+        ),
+        (
+            "break_glass_private_key".to_owned(),
+            SafeReference::File {
+                path: DeploymentStore::system()
+                    .break_glass_dir(&plan.deployment_id)
+                    .join("break-glass.key"),
+            },
+        ),
         ("database".to_owned(), SafeReference::NotObserved),
         ("valkey".to_owned(), SafeReference::NotObserved),
         ("proxy_tls".to_owned(), SafeReference::NotObserved),

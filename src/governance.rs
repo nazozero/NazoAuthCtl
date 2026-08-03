@@ -217,11 +217,15 @@ fn append_audit_idempotent(
     store: &DeploymentStore,
     transaction: &CapabilityTransition,
 ) -> anyhow::Result<()> {
-    let identity_dir = store
-        .deployment_state_dir(&transaction.target.deployment_id)
-        .join("identities");
+    let private_path = match transaction.target.resources.get("audit_private_key") {
+        Some(crate::deployment::SafeReference::File { path }) => path.clone(),
+        _ => store
+            .deployment_state_dir(&transaction.target.deployment_id)
+            .join("identities")
+            .join("audit.key"),
+    };
     let private = URL_SAFE_NO_PAD
-        .decode(fs::read_to_string(identity_dir.join("audit.key"))?.trim())
+        .decode(fs::read_to_string(private_path)?.trim())
         .context("audit private key is invalid")?;
     let private: [u8; 32] = private
         .try_into()
