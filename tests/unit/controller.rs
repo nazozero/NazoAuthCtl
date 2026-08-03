@@ -10,8 +10,8 @@ use crate::test_support::write_shell_executable;
 use crate::{
     filesystem::PrivateTempDir,
     model::{
-        Artifact, DatabaseRestore, Dependencies, FrontendRelease, OciRelease, Operator, Postgres,
-        Rollback, Runtime as RuntimeConfig, Ui, Valkey,
+        Artifact, DatabaseRestore, Dependencies, FrontendRelease, OciRelease, Operator,
+        OperatorProtocolCompatibility, Postgres, Rollback, Runtime as RuntimeConfig, Ui, Valkey,
     },
 };
 
@@ -59,7 +59,7 @@ fn manifest(version: &str, revision: char) -> ReleaseManifest {
         size: 1,
     };
     ReleaseManifest {
-        schema: 4,
+        schema: 5,
         version: version.to_owned(),
         target: target.clone(),
         backend_commit: revision.to_string().repeat(40),
@@ -72,19 +72,12 @@ fn manifest(version: &str, revision: char) -> ReleaseManifest {
             protocol: nazo_operator_protocol::PROTOCOL_VERSION,
             build_id: format!("build:{version}"),
         },
-        operator_protocol: None,
-        artifacts: BTreeMap::from([
-            ("binary".to_owned(), binary),
-            (
-                "updater".to_owned(),
-                Artifact {
-                    repository: "nazozero/NazoAuth".to_owned(),
-                    name: format!("nazoauthctl-{target}{suffix}"),
-                    sha256: "e".repeat(64),
-                    size: 1,
-                },
-            ),
-        ]),
+        operator_protocol: Some(OperatorProtocolCompatibility {
+            version: nazo_operator_protocol::PROTOCOL_VERSION,
+            minimum_ctl_version: "0.1.19".to_owned(),
+            maximum_ctl_version_exclusive: "0.2.0".to_owned(),
+        }),
+        artifacts: BTreeMap::from([("binary".to_owned(), binary)]),
         frontend: FrontendRelease {
             repository: "nazozero/NazoAuthWeb".to_owned(),
             version: "v0.2.0".to_owned(),

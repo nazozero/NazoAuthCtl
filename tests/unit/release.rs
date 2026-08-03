@@ -7,8 +7,9 @@ use super::{
 };
 use crate::filesystem::{PrivateTempDir, atomic_write, sha256};
 use crate::model::{
-    Artifact, DatabaseRestore, Dependencies, FrontendRelease, OciRelease, Operator, Postgres,
-    ReleaseManifest, Rollback, Runtime, Ui, UpdateConfig, Valkey, release_target,
+    Artifact, DatabaseRestore, Dependencies, FrontendRelease, OciRelease, Operator,
+    OperatorProtocolCompatibility, Postgres, ReleaseManifest, Rollback, Runtime, Ui, UpdateConfig,
+    Valkey, release_target,
 };
 use base64::Engine as _;
 use nazo_operator_protocol::EmbeddedIdentity;
@@ -30,7 +31,7 @@ fn manifest(version: &str) -> ReleaseManifest {
         size: 1,
     };
     ReleaseManifest {
-        schema: 4,
+        schema: 5,
         version: version.to_owned(),
         target: target.clone(),
         backend_commit: "b".repeat(40),
@@ -43,7 +44,11 @@ fn manifest(version: &str) -> ReleaseManifest {
             protocol: 1,
             build_id: "build".to_owned(),
         },
-        operator_protocol: None,
+        operator_protocol: Some(OperatorProtocolCompatibility {
+            version: nazo_operator_protocol::PROTOCOL_VERSION,
+            minimum_ctl_version: "0.1.19".to_owned(),
+            maximum_ctl_version_exclusive: "0.2.0".to_owned(),
+        }),
         rollback: Rollback {
             artifact: true,
             schema_compatible: true,
@@ -53,18 +58,7 @@ fn manifest(version: &str) -> ReleaseManifest {
             migration_floor: "20260801000100".to_owned(),
             rationale: "test recovery policy".to_owned(),
         },
-        artifacts: BTreeMap::from([
-            ("binary".to_owned(), binary),
-            (
-                "updater".to_owned(),
-                Artifact {
-                    repository: "nazozero/NazoAuth".to_owned(),
-                    name: format!("nazoauthctl-{target}{suffix}"),
-                    sha256: "e".repeat(64),
-                    size: 1,
-                },
-            ),
-        ]),
+        artifacts: BTreeMap::from([("binary".to_owned(), binary)]),
         frontend: FrontendRelease {
             repository: "nazozero/NazoAuthWeb".to_owned(),
             version: "v0.2.0".to_owned(),
@@ -145,10 +139,10 @@ fn attestation_response(attestations: Vec<serde_json::Value>) -> String {
 fn prepared_attestation() -> (PrivateTempDir, String, String, ReleaseManifest, String) {
     let work = PrivateTempDir::new("release-attestation-test").unwrap();
     let mut value = manifest("v1.2.3");
-    let blob = value.artifacts["updater"].name.clone();
+    let blob = value.artifacts["binary"].name.clone();
     atomic_write(&work.path().join(&blob), b"x", 0o600).unwrap();
     let digest = sha256(&work.path().join(&blob)).unwrap();
-    value.artifacts.get_mut("updater").unwrap().sha256 = digest.clone();
+    value.artifacts.get_mut("binary").unwrap().sha256 = digest.clone();
     let identity = value.release_identity.clone();
     (work, blob, digest, value, identity)
 }
@@ -507,14 +501,14 @@ fn repeated_identical_attestations_are_idempotent_but_conflicts_fail() {
 }
 
 #[test]
-fn dsse_statement_must_bind_the_updater_subject_and_custom_predicate() {
+fn dsse_statement_must_bind_the_server_binary_subject_and_custom_predicate() {
     let value = manifest("v1.2.3");
-    let updater = &value.artifacts["updater"];
+    let binary = &value.artifacts["binary"];
     let statement = serde_json::json!({
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [{
-            "name": updater.name,
-            "digest": {"sha256": updater.sha256},
+            "name": binary.name,
+            "digest": {"sha256": binary.sha256},
         }],
         "predicateType": RELEASE_PREDICATE,
         "predicate": value,
@@ -527,25 +521,25 @@ fn dsse_statement_must_bind_the_updater_subject_and_custom_predicate() {
         }
     });
     assert_eq!(
-        manifest_from_bundle(&bundle, &updater.name, &updater.sha256)
+        manifest_from_bundle(&bundle, &binary.name, &binary.sha256)
             .unwrap()
             .unwrap(),
         value
     );
-    assert!(manifest_from_bundle(&bundle, "wrong-updater", &updater.sha256).is_err());
+    assert!(manifest_from_bundle(&bundle, "wrong-binary", &binary.sha256).is_err());
 }
 
 #[test]
 fn dsse_statement_parser_fails_closed_for_malformed_or_unrelated_payloads() {
     let value = manifest("v1.2.3");
-    let updater = &value.artifacts["updater"];
+    let binary = &value.artifacts["binary"];
 
-    assert!(manifest_from_bundle(&serde_json::json!({}), &updater.name, &updater.sha256).is_err());
+    assert!(manifest_from_bundle(&serde_json::json!({}), &binary.name, &binary.sha256).is_err());
     assert!(
         manifest_from_bundle(
             &serde_json::json!({"dsseEnvelope": {"payload": "%%%"}}),
-            &updater.name,
-            &updater.sha256,
+            &binary.name,
+            &binary.sha256,
         )
         .is_err()
     );
@@ -554,37 +548,37 @@ fn dsse_statement_parser_fails_closed_for_malformed_or_unrelated_payloads() {
             "payload": base64::engine::general_purpose::STANDARD.encode(b"not-json")
         }
     });
-    assert!(manifest_from_bundle(&invalid_json, &updater.name, &updater.sha256).is_err());
+    assert!(manifest_from_bundle(&invalid_json, &binary.name, &binary.sha256).is_err());
 
-    let mut unrelated = statement(&value, &updater.name, &updater.sha256);
+    let mut unrelated = statement(&value, &binary.name, &binary.sha256);
     unrelated["_type"] = serde_json::json!("https://in-toto.io/Statement/v0.1");
     assert!(
-        manifest_from_bundle(&bundle(&unrelated), &updater.name, &updater.sha256)
+        manifest_from_bundle(&bundle(&unrelated), &binary.name, &binary.sha256)
             .unwrap()
             .is_none()
     );
-    let mut unrelated = statement(&value, &updater.name, &updater.sha256);
+    let mut unrelated = statement(&value, &binary.name, &binary.sha256);
     unrelated["predicateType"] = serde_json::json!("https://example.test/other-predicate");
     assert!(
-        manifest_from_bundle(&bundle(&unrelated), &updater.name, &updater.sha256)
+        manifest_from_bundle(&bundle(&unrelated), &binary.name, &binary.sha256)
             .unwrap()
             .is_none()
     );
 
     for digest in [
         serde_json::json!({"sha256": "0".repeat(64)}),
-        serde_json::json!({"sha512": updater.sha256}),
+        serde_json::json!({"sha512": binary.sha256}),
         serde_json::json!({}),
     ] {
-        let mut unbound = statement(&value, &updater.name, &updater.sha256);
+        let mut unbound = statement(&value, &binary.name, &binary.sha256);
         unbound["subject"][0]["digest"] = digest;
-        assert!(manifest_from_bundle(&bundle(&unbound), &updater.name, &updater.sha256).is_err());
+        assert!(manifest_from_bundle(&bundle(&unbound), &binary.name, &binary.sha256).is_err());
     }
 
-    let mut invalid_predicate = statement(&value, &updater.name, &updater.sha256);
+    let mut invalid_predicate = statement(&value, &binary.name, &binary.sha256);
     invalid_predicate["predicate"] = serde_json::json!({"schema": 4});
     assert!(
-        manifest_from_bundle(&bundle(&invalid_predicate), &updater.name, &updater.sha256,).is_err()
+        manifest_from_bundle(&bundle(&invalid_predicate), &binary.name, &binary.sha256,).is_err()
     );
 }
 
@@ -689,7 +683,7 @@ fn attestation_set_skips_unrelated_release_claims_before_signature_verification(
 }
 
 #[test]
-fn attestation_set_propagates_signature_manifest_updater_and_conflict_failures() {
+fn attestation_set_propagates_signature_manifest_subject_and_conflict_failures() {
     let (work, blob, digest, value, identity) = prepared_attestation();
     let valid = attestation(bundle(&statement(&value, &blob, &digest)));
     let response = attestation_response(vec![valid.clone()]);
@@ -727,7 +721,7 @@ fn attestation_set_propagates_signature_manifest_updater_and_conflict_failures()
     );
 
     let mut size_substitution = value.clone();
-    size_substitution.artifacts.get_mut("updater").unwrap().size = 2;
+    size_substitution.artifacts.get_mut("binary").unwrap().size = 2;
     let response = attestation_response(vec![attestation(bundle(&statement(
         &size_substitution,
         &blob,
@@ -749,7 +743,7 @@ fn attestation_set_propagates_signature_manifest_updater_and_conflict_failures()
     let mut digest_substitution = value.clone();
     digest_substitution
         .artifacts
-        .get_mut("updater")
+        .get_mut("binary")
         .unwrap()
         .sha256 = "9".repeat(64);
     let response = attestation_response(vec![attestation(bundle(&statement(
@@ -820,26 +814,26 @@ fn requested_versions_and_artifact_bytes_fail_closed() {
 fn verified_release_exposes_only_existing_policy_repository_artifacts() {
     let work = PrivateTempDir::new("verified-release-artifact-test").unwrap();
     let mut value = manifest("v1.2.3");
-    let updater = value.artifacts["updater"].clone();
-    let path = work.path().join(&updater.name);
+    let binary = value.artifacts["binary"].clone();
+    let path = work.path().join(&binary.name);
     atomic_write(&path, b"x", 0o600).unwrap();
-    value.artifacts.get_mut("updater").unwrap().sha256 = sha256(&path).unwrap();
+    value.artifacts.get_mut("binary").unwrap().sha256 = sha256(&path).unwrap();
     let release = VerifiedRelease {
         work,
         manifest: value,
     };
 
     assert!(release.artifact("missing", "nazozero/NazoAuth").is_err());
-    assert!(release.artifact("updater", "attacker/NazoAuth").is_err());
+    assert!(release.artifact("binary", "attacker/NazoAuth").is_err());
     assert_eq!(
         release
-            .artifact("updater", "nazozero/NazoAuth")
+            .artifact("binary", "nazozero/NazoAuth")
             .unwrap()
             .file_name()
             .unwrap(),
-        updater.name.as_str()
+        binary.name.as_str()
     );
 
     atomic_write(&path, b"y", 0o600).unwrap();
-    assert!(release.artifact("updater", "nazozero/NazoAuth").is_err());
+    assert!(release.artifact("binary", "nazozero/NazoAuth").is_err());
 }

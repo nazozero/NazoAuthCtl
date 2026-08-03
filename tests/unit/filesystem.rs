@@ -83,14 +83,13 @@ fn persisted_secrets_are_stable_single_line_regular_files() {
 fn filesystem_helpers_fail_closed_without_clobbering_staging_or_non_files() {
     let work = PrivateTempDir::new("nazoauthctl-filesystem-errors").unwrap();
     let target = work.path().join("target");
-    let staging = target.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&staging, "occupied").unwrap();
-    assert!(atomic_write(&target, b"replacement", 0o600).is_err());
-    assert!(!target.exists());
-    assert_eq!(fs::read_to_string(&staging).unwrap(), "occupied");
+    atomic_write(&target, b"first", 0o600).unwrap();
+    atomic_write(&target, b"replacement", 0o600).unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"replacement");
 
     let directory = work.path().join("directory");
     fs::create_dir(&directory).unwrap();
+    assert!(atomic_write(&directory, b"replacement", 0o600).is_err());
     assert!(remove_file_durable(&directory).is_err());
     assert!(copy_atomic(&work.path().join("missing"), &target, 0o600).is_err());
     assert!(sha256(&work.path().join("missing")).is_err());

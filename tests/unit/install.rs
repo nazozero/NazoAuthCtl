@@ -151,7 +151,7 @@ fn host_service_unit_exposes_only_runtime_state() {
 
     assert!(unit.contains("User=nazoauth\nGroup=nazoauth"));
     assert!(unit.contains(
-        "ReadWritePaths=/var/lib/nazoauth/app/keys /var/lib/nazoauth/app/avatars /var/lib/nazoauth/app/secrets /var/lib/nazoauth/app/bootstrap /var/lib/nazoauth/ui-releases"
+        "ReadWritePaths=/var/lib/nazoauth/app/keys /var/lib/nazoauth/app/avatars /var/lib/nazoauth/app/secrets /var/lib/nazoauth/app/bootstrap /var/lib/nazoauth/app/instance /var/lib/nazoauth/ui-releases"
     ));
     assert!(!unit.contains("ReadOnlyPaths=/var/lib/nazoauth/ui-releases"));
     assert!(unit.contains(

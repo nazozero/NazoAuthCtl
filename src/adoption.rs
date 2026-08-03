@@ -91,6 +91,21 @@ struct RecoveryArtifact {
     sha256: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AdoptionTransaction {
+    schema: u32,
+    state: AdoptionTransactionState,
+    plan_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum AdoptionTransactionState {
+    Prepared,
+    Committed,
+}
+
 pub(crate) fn run(options: AdoptionOptions) -> anyhow::Result<()> {
     if options.plan == options.yes {
         bail!("adopt requires exactly one of --plan or --yes");
@@ -249,15 +264,30 @@ fn execute(
         .join("transactions");
     fs::create_dir_all(&transaction_dir)?;
     let transaction_path = transaction_dir.join("adoption.json");
-    atomic_write(
-        &transaction_path,
-        &serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": 1,
-            "state": "prepared",
-            "plan": plan,
-        }))?,
-        0o600,
-    )?;
+    let plan_sha256 = hex_sha256(&serde_json::to_vec(plan)?);
+    if transaction_path.exists() {
+        let transaction: AdoptionTransaction =
+            serde_json::from_slice(&fs::read(&transaction_path)?)
+                .context("adoption transaction is invalid")?;
+        if transaction.schema != 1 || transaction.plan_sha256 != plan_sha256 {
+            bail!("an existing adoption transaction is bound to a different plan");
+        }
+        if transaction.state == AdoptionTransactionState::Committed {
+            let record = store.load(&plan.deployment_id)?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+            return Ok(());
+        }
+    } else {
+        atomic_write(
+            &transaction_path,
+            &serde_json::to_vec_pretty(&AdoptionTransaction {
+                schema: 1,
+                state: AdoptionTransactionState::Prepared,
+                plan_sha256: plan_sha256.clone(),
+            })?,
+            0o600,
+        )?;
+    }
     let identities = create_identities(&store, &plan.deployment_id)?;
     let recovery_evidence = if let Some(source) = &options.recovery_evidence {
         persist_recovery_evidence(&store, plan, source)?
@@ -273,8 +303,6 @@ fn execute(
         0o600,
     )?;
     let record = deployment_record(candidate, plan, options.alias.clone())?;
-    let plan_bytes = serde_json::to_vec(plan)?;
-    let plan_sha256 = hex_sha256(&plan_bytes);
     let manifest = verified_release(candidate, &plan.release)?.manifest;
     let receipt = AdoptionReceipt {
         schema: CONTROL_DISCOVERY_SCHEMA,
@@ -293,7 +321,7 @@ fn execute(
         capabilities: receipt_capabilities(&plan.capabilities),
         recovery_proven: plan.recovery.conclusion == RecoveryConclusion::Proven,
         recovery_evidence,
-        plan_sha256,
+        plan_sha256: plan_sha256.clone(),
         adopted_at: Utc::now().timestamp(),
     };
     let compact = sign_adoption_receipt(&receipt, &identities.receipt_key_id, &identities.receipt)?;
@@ -308,11 +336,11 @@ fn execute(
     store.persist_locked(&record)?;
     atomic_write(
         &transaction_path,
-        &serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": 1,
-            "state": "committed",
-            "plan_sha256": receipt.plan_sha256,
-        }))?,
+        &serde_json::to_vec_pretty(&AdoptionTransaction {
+            schema: 1,
+            state: AdoptionTransactionState::Committed,
+            plan_sha256,
+        })?,
         0o600,
     )?;
     println!("{}", serde_json::to_string_pretty(&record)?);
@@ -552,10 +580,31 @@ fn create_identities(store: &DeploymentStore, deployment_id: &str) -> anyhow::Re
 fn create_identity(directory: &Path, name: &str) -> anyhow::Result<(String, SigningKey)> {
     let private_path = directory.join(format!("{name}.key"));
     let public_path = directory.join(format!("{name}.pub"));
-    if private_path.exists() || public_path.exists() {
-        bail!(
-            "identity {name} already exists; resume the adoption transaction instead of replacing keys"
+    if private_path.exists() {
+        let private = URL_SAFE_NO_PAD
+            .decode(fs::read_to_string(&private_path)?.trim())
+            .context("stored identity private key is invalid")?;
+        let private: [u8; 32] = private
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("stored identity private key has an invalid length"))?;
+        let signing = SigningKey::from_bytes(&private);
+        let public = URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
+        if public_path.exists() {
+            if fs::read_to_string(&public_path)?.trim() != public {
+                bail!("stored identity public key does not match its private key");
+            }
+        } else {
+            atomic_write(&public_path, public.as_bytes(), 0o640)?;
+        }
+        let key_id = nazo_operator_protocol::instance_key_id(&signing.verifying_key()).replacen(
+            "instance-",
+            &format!("{name}-"),
+            1,
         );
+        return Ok((key_id, signing));
+    }
+    if public_path.exists() {
+        bail!("stored identity has a public key but no private key");
     }
     let signing = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
     let key_id = nazo_operator_protocol::instance_key_id(&signing.verifying_key()).replacen(

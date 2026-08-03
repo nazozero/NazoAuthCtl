@@ -98,7 +98,7 @@ fn valid_manifest() -> ReleaseManifest {
         size: 1,
     };
     ReleaseManifest {
-        schema: 4,
+        schema: 5,
         version: "v0.2.0".to_owned(),
         target: target.clone(),
         backend_commit: "b".repeat(40),
@@ -109,17 +109,15 @@ fn valid_manifest() -> ReleaseManifest {
             protocol: nazo_operator_protocol::PROTOCOL_VERSION,
             build_id: "build:test".to_owned(),
         },
-        operator_protocol: None,
-        artifacts: BTreeMap::from([
-            (
-                "binary".to_owned(),
-                artifact(format!("nazoauth-{target}{suffix}")),
-            ),
-            (
-                "updater".to_owned(),
-                artifact(format!("nazoauthctl-{target}{suffix}")),
-            ),
-        ]),
+        operator_protocol: Some(OperatorProtocolCompatibility {
+            version: nazo_operator_protocol::PROTOCOL_VERSION,
+            minimum_ctl_version: "0.1.19".to_owned(),
+            maximum_ctl_version_exclusive: "0.2.0".to_owned(),
+        }),
+        artifacts: BTreeMap::from([(
+            "binary".to_owned(),
+            artifact(format!("nazoauth-{target}{suffix}")),
+        )]),
         frontend: FrontendRelease {
             repository: "nazozero/NazoAuthWeb".to_owned(),
             version: "v0.2.0".to_owned(),
@@ -271,7 +269,15 @@ fn release_manifest_binds_every_binary_frontend_and_oci_identity() {
     invalid.rollback.artifact = false;
     assert!(invalid.validate("v0.2.0", "release-identity").is_err());
     let mut invalid = manifest.clone();
-    invalid.artifacts.remove("updater");
+    invalid.artifacts.insert(
+        "updater".to_owned(),
+        Artifact {
+            repository: "nazozero/NazoAuth".to_owned(),
+            name: "nazoauthctl-unexpected".to_owned(),
+            sha256: "a".repeat(64),
+            size: 1,
+        },
+    );
     assert!(invalid.validate("v0.2.0", "release-identity").is_err());
     let mut invalid = manifest.clone();
     invalid.artifacts.get_mut("binary").unwrap().name = "nazoauth-wrong-target".to_owned();
