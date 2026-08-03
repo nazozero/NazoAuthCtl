@@ -8,8 +8,9 @@ use crate::{
 };
 
 use super::{
-    NeutralMount, OneShotTask, RuntimeBackend, RuntimeObservation, RuntimeReplacement, labels,
-    safe_environment, server_command_verified,
+    ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount,
+    OneShotTask, RuntimeBackend, RuntimeObservation, RuntimeReplacement, labels, safe_environment,
+    server_command_verified,
 };
 
 pub(crate) struct PodmanBackend {
@@ -303,6 +304,79 @@ impl RuntimeBackend for PodmanBackend {
             .args(["image", "load", "--input"])
             .arg(archive)
             .run_quiet()
+    }
+
+    fn restore_managed_postgres(&self, restore: &ManagedPostgresRestore) -> anyhow::Result<()> {
+        Process::new(&self.command)
+            .args(["run", "--rm", "--network"])
+            .arg(&restore.network)
+            .args([
+                "-e",
+                "PGSERVICEFILE=/run/nazoauth-secrets/pg_service.conf",
+                "-e",
+                "PGPASSFILE=/run/nazoauth-secrets/pgpass",
+                "-v",
+            ])
+            .arg(format!(
+                "{}:/backup:ro,Z",
+                restore.backup_directory.display()
+            ))
+            .arg("-v")
+            .arg(format!(
+                "{}:/run/nazoauth-secrets/pg_service.conf:ro,Z",
+                restore.service_file.display()
+            ))
+            .arg("-v")
+            .arg(format!(
+                "{}:/run/nazoauth-secrets/pgpass:ro,Z",
+                restore.password_file.display()
+            ))
+            .arg(&restore.image)
+            .args([
+                "pg_restore",
+                "--clean",
+                "--if-exists",
+                "--no-owner",
+                "--no-privileges",
+                "--dbname=service=nazoauth",
+                "/backup/postgresql.dump",
+            ])
+            .run_quiet()
+    }
+
+    fn restore_managed_valkey(&self, restore: &ManagedValkeyRestore) -> anyhow::Result<()> {
+        self.stop(&restore.object_reference)?;
+        let restored = Process::new(&self.command)
+            .args(["run", "--rm", "-v"])
+            .arg(format!("{}:/data", restore.data_volume))
+            .arg("-v")
+            .arg(format!(
+                "{}:/backup:ro,Z",
+                restore.backup_directory.display()
+            ))
+            .arg(&restore.image)
+            .args([
+                "sh",
+                "-eu",
+                "-c",
+                "test -s /backup/valkey-dump.rdb; rm -rf -- /data/appendonlydir; install -m 600 /backup/valkey-dump.rdb /data/dump.rdb",
+            ])
+            .run_quiet();
+        let restarted = self.start(&restore.object_reference);
+        restored?;
+        restarted
+    }
+
+    fn execute_managed_postgres(&self, command: &ManagedPostgresCommand) -> anyhow::Result<()> {
+        Process::new(&self.command)
+            .args(["exec", "-i"])
+            .arg(&command.object_reference)
+            .args(["psql", "--no-psqlrc", "--set", "ON_ERROR_STOP=1", "-U"])
+            .arg(&command.user)
+            .arg("-d")
+            .arg(&command.database)
+            .stdin_stdout(&command.stdin)
+            .map(|_| ())
     }
 
     fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String> {

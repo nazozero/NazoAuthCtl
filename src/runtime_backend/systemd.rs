@@ -8,7 +8,10 @@ use crate::{
     process::Process,
 };
 
-use super::{OneShotTask, RuntimeBackend, RuntimeObservation, RuntimeReplacement};
+use super::{
+    ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore, OneShotTask,
+    RuntimeBackend, RuntimeObservation, RuntimeReplacement,
+};
 
 pub(crate) struct SystemdBackend;
 
@@ -150,6 +153,18 @@ impl RuntimeBackend for SystemdBackend {
 
     fn import_image(&self, _archive: &std::path::Path) -> anyhow::Result<()> {
         bail!("systemd backend does not manage OCI images")
+    }
+
+    fn restore_managed_postgres(&self, _restore: &ManagedPostgresRestore) -> anyhow::Result<()> {
+        bail!("systemd backend does not manage containerized PostgreSQL")
+    }
+
+    fn restore_managed_valkey(&self, _restore: &ManagedValkeyRestore) -> anyhow::Result<()> {
+        bail!("systemd backend does not manage containerized Valkey")
+    }
+
+    fn execute_managed_postgres(&self, _command: &ManagedPostgresCommand) -> anyhow::Result<()> {
+        bail!("systemd backend does not manage containerized PostgreSQL")
     }
 
     fn resolve_image_digest(&self, _image_reference: &str) -> anyhow::Result<String> {

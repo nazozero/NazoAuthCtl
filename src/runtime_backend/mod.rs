@@ -72,6 +72,31 @@ pub(crate) struct OneShotTask {
     pub(crate) stdin: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedPostgresRestore {
+    pub(crate) network: String,
+    pub(crate) backup_directory: PathBuf,
+    pub(crate) service_file: PathBuf,
+    pub(crate) password_file: PathBuf,
+    pub(crate) image: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedValkeyRestore {
+    pub(crate) object_reference: String,
+    pub(crate) data_volume: String,
+    pub(crate) backup_directory: PathBuf,
+    pub(crate) image: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedPostgresCommand {
+    pub(crate) object_reference: String,
+    pub(crate) database: String,
+    pub(crate) user: String,
+    pub(crate) stdin: Vec<u8>,
+}
+
 pub(crate) trait RuntimeBackend {
     fn kind(&self) -> RuntimeBackendKind;
     fn available(&self) -> bool;
@@ -87,6 +112,9 @@ pub(crate) trait RuntimeBackend {
     fn pull_image(&self, image_reference: &str) -> anyhow::Result<()>;
     fn export_image(&self, image_reference: &str, archive: &std::path::Path) -> anyhow::Result<()>;
     fn import_image(&self, archive: &std::path::Path) -> anyhow::Result<()>;
+    fn restore_managed_postgres(&self, restore: &ManagedPostgresRestore) -> anyhow::Result<()>;
+    fn restore_managed_valkey(&self, restore: &ManagedValkeyRestore) -> anyhow::Result<()>;
+    fn execute_managed_postgres(&self, command: &ManagedPostgresCommand) -> anyhow::Result<()>;
     fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String>;
     fn read_build_identity(
         &self,
@@ -120,7 +148,7 @@ pub(crate) trait RuntimeBackend {
 pub(crate) fn installed_backends() -> Vec<Box<dyn RuntimeBackend>> {
     let backends: Vec<Box<dyn RuntimeBackend>> = vec![
         Box::new(PodmanBackend::default()),
-        Box::new(DockerBackend),
+        Box::new(DockerBackend::default()),
         Box::new(SystemdBackend),
     ];
     backends
@@ -132,7 +160,7 @@ pub(crate) fn installed_backends() -> Vec<Box<dyn RuntimeBackend>> {
 pub(crate) fn backend(kind: RuntimeBackendKind) -> Box<dyn RuntimeBackend> {
     match kind {
         RuntimeBackendKind::Podman => Box::new(PodmanBackend::default()),
-        RuntimeBackendKind::Docker => Box::new(DockerBackend),
+        RuntimeBackendKind::Docker => Box::new(DockerBackend::default()),
         RuntimeBackendKind::Systemd => Box::new(SystemdBackend),
     }
 }
@@ -144,7 +172,8 @@ pub(crate) fn backend_with_command(
 ) -> Box<dyn RuntimeBackend> {
     match kind {
         RuntimeBackendKind::Podman => Box::new(PodmanBackend::with_command(command)),
-        RuntimeBackendKind::Docker | RuntimeBackendKind::Systemd => backend(kind),
+        RuntimeBackendKind::Docker => Box::new(DockerBackend::with_command(command)),
+        RuntimeBackendKind::Systemd => backend(kind),
     }
 }
 

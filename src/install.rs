@@ -252,8 +252,7 @@ pub(crate) fn start_managed_dependencies(config: &UpdateConfig) -> anyhow::Resul
         &config.operator.controller_key_id,
     )?;
     let postgres_volume = format!("{}-data", config.postgres.container_name);
-    let valkey_volume = format!("{}-data", config.valkey.container_name);
-    for volume in [&postgres_volume, &valkey_volume] {
+    for volume in [&postgres_volume, &config.valkey.data_volume] {
         ensure_volume(
             engine,
             volume,
@@ -344,7 +343,7 @@ pub(crate) fn start_managed_dependencies(config: &UpdateConfig) -> anyhow::Resul
                 config.runtime.network.as_str(),
             ])
             .arg("-v")
-            .arg(format!("{valkey_volume}:/data"))
+            .arg(format!("{}:/data", config.valkey.data_volume))
             .arg("-v")
             .arg(format!(
                 "{}:/run/nazoauth-secrets/valkey-password:ro,Z",
@@ -1376,6 +1375,7 @@ fn build_config(
         },
         valkey: Valkey {
             container_name: format!("nazoauth-{name_suffix}-valkey"),
+            data_volume: format!("nazoauth-{name_suffix}-valkey-data"),
             image: VALKEY_IMAGE.to_owned(),
             rdb_path: "/data/dump.rdb".to_owned(),
             password_file: valkey_password_file,
@@ -1646,9 +1646,6 @@ pub(crate) fn grant_runtime_database(config: &UpdateConfig) -> anyhow::Result<()
     if config.dependencies.mode != "managed" {
         return Ok(());
     }
-    let engine = config
-        .container_engine()
-        .context("managed PostgreSQL requires a container engine")?;
     let sql = b"GRANT CONNECT ON DATABASE oauth TO nazoauth_runtime;\n\
         GRANT USAGE ON SCHEMA public TO nazoauth_runtime;\n\
         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO nazoauth_runtime;\n\
@@ -1657,22 +1654,7 @@ pub(crate) fn grant_runtime_database(config: &UpdateConfig) -> anyhow::Result<()
         ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO nazoauth_runtime;\n\
         ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO nazoauth_runtime;\n\
         ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO nazoauth_runtime;\n";
-    Process::new(engine)
-        .args([
-            "exec",
-            "-i",
-            config.postgres.container_name.as_str(),
-            "psql",
-            "--no-psqlrc",
-            "--set",
-            "ON_ERROR_STOP=1",
-            "-U",
-            config.postgres.user.as_str(),
-            "-d",
-            config.postgres.database.as_str(),
-        ])
-        .stdin_stdout(sql)?;
-    Ok(())
+    crate::runtime::Runtime::new(config).execute_managed_postgres(sql)
 }
 
 pub(crate) fn verify_runtime_no_ddl(config: &UpdateConfig) -> anyhow::Result<()> {

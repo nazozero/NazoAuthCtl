@@ -121,6 +121,7 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
         },
         valkey: Valkey {
             container_name: "nazo-oauth-valkey".to_owned(),
+            data_volume: "nazo-oauth-valkey-data".to_owned(),
             image: "valkey-image".to_owned(),
             rdb_path: "/data/dump.rdb".to_owned(),
             password_file: PathBuf::new(),

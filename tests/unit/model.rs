@@ -75,6 +75,7 @@ fn valid_config() -> UpdateConfig {
         },
         valkey: Valkey {
             container_name: "nazoauth-valkey".to_owned(),
+            data_volume: "nazoauth-valkey-data".to_owned(),
             image: "valkey:test".to_owned(),
             rdb_path: "/data/dump.rdb".to_owned(),
             password_file: root.join("secrets/valkey-password"),

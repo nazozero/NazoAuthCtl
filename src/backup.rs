@@ -17,6 +17,7 @@ use crate::{
     filesystem::{set_mode, sha256},
     model::UpdateConfig,
     process::{Process, command_exists},
+    runtime::Runtime,
     secret_provider::{PostgresProvider, ValkeyProvider},
 };
 
@@ -132,66 +133,13 @@ impl Backup {
                 "automatic external database recovery is unavailable; use the provider's documented PostgreSQL and Valkey recovery procedures"
             );
         }
-        let engine = config
-            .container_engine()
-            .context("managed recovery requires a container engine")?;
         let postgres =
             PostgresProvider::from_url_file(&config.dependencies.migration_database_url_file)?;
-        Process::new(engine)
-            .args([
-                "run",
-                "--rm",
-                "--network",
-                config.runtime.network.as_str(),
-                "-e",
-                "PGSERVICEFILE=/run/nazoauth-secrets/pg_service.conf",
-                "-e",
-                "PGPASSFILE=/run/nazoauth-secrets/pgpass",
-                "-v",
-            ])
-            .arg(format!("{}:/backup:ro,Z", self.path.display()))
-            .arg("-v")
-            .arg(format!(
-                "{}:/run/nazoauth-secrets/pg_service.conf:ro,Z",
-                postgres.service_file().display()
-            ))
-            .arg("-v")
-            .arg(format!(
-                "{}:/run/nazoauth-secrets/pgpass:ro,Z",
-                postgres.password_file().display()
-            ))
-            .arg(&config.postgres.validation_image)
-            .args([
-                "pg_restore",
-                "--clean",
-                "--if-exists",
-                "--no-owner",
-                "--no-privileges",
-                "--dbname=service=nazoauth",
-                "/backup/postgresql.dump",
-            ])
-            .run_quiet()?;
-        Process::new(engine)
-            .args(["stop", config.valkey.container_name.as_str()])
-            .run_quiet()?;
-        let restore = Process::new(engine)
-            .args(["run", "--rm", "-v"])
-            .arg(format!("{}-data:/data", config.valkey.container_name))
-            .arg("-v")
-            .arg(format!("{}:/backup:ro,Z", self.path.display()))
-            .arg(&config.valkey.image)
-            .args([
-                "sh",
-                "-eu",
-                "-c",
-                "test -s /backup/valkey-dump.rdb; rm -rf -- /data/appendonlydir; install -m 600 /backup/valkey-dump.rdb /data/dump.rdb",
-            ])
-            .run_quiet();
-        let restart = Process::new(engine)
-            .args(["start", config.valkey.container_name.as_str()])
-            .run_quiet();
-        restore?;
-        restart
+        Runtime::new(config).restore_managed_dependencies(
+            &self.path,
+            &postgres.service_file(),
+            &postgres.password_file(),
+        )
     }
 
     fn external_dependencies(&self, config: &UpdateConfig) -> anyhow::Result<()> {

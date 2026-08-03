@@ -177,6 +177,7 @@ pub(crate) struct Postgres {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Valkey {
     pub(crate) container_name: String,
+    pub(crate) data_volume: String,
     #[serde(default)]
     pub(crate) image: String,
     pub(crate) rdb_path: String,
@@ -248,7 +249,11 @@ impl UpdateConfig {
             runtime_names.extend([&self.runtime.container_name, &self.runtime.network]);
         }
         if self.dependencies.mode == "managed" {
-            runtime_names.extend([&self.postgres.container_name, &self.valkey.container_name]);
+            runtime_names.extend([
+                &self.postgres.container_name,
+                &self.valkey.container_name,
+                &self.valkey.data_volume,
+            ]);
         }
         for name in runtime_names {
             if !safe_identifier(name) {

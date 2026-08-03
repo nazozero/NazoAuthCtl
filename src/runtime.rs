@@ -8,7 +8,10 @@ use crate::{
     filesystem::{atomic_write, sha256},
     model::{Mount, UpdateConfig},
     process::Process,
-    runtime_backend::{self, NeutralMount, OneShotTask},
+    runtime_backend::{
+        self, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount,
+        OneShotTask,
+    },
 };
 
 #[derive(Debug)]
@@ -529,6 +532,38 @@ impl<'a> Runtime<'a> {
         Ok(())
     }
 
+    pub(crate) fn restore_managed_dependencies(
+        &self,
+        backup_directory: &Path,
+        postgres_service_file: &Path,
+        postgres_password_file: &Path,
+    ) -> anyhow::Result<()> {
+        let backend = self.backend()?;
+        backend.restore_managed_postgres(&ManagedPostgresRestore {
+            network: self.config.runtime.network.clone(),
+            backup_directory: backup_directory.to_path_buf(),
+            service_file: postgres_service_file.to_path_buf(),
+            password_file: postgres_password_file.to_path_buf(),
+            image: self.config.postgres.validation_image.clone(),
+        })?;
+        backend.restore_managed_valkey(&ManagedValkeyRestore {
+            object_reference: self.config.valkey.container_name.clone(),
+            data_volume: self.config.valkey.data_volume.clone(),
+            backup_directory: backup_directory.to_path_buf(),
+            image: self.config.valkey.image.clone(),
+        })
+    }
+
+    pub(crate) fn execute_managed_postgres(&self, sql: &[u8]) -> anyhow::Result<()> {
+        self.backend()?
+            .execute_managed_postgres(&ManagedPostgresCommand {
+                object_reference: self.config.postgres.container_name.clone(),
+                database: self.config.postgres.database.clone(),
+                user: self.config.postgres.user.clone(),
+                stdin: sql.to_vec(),
+            })
+    }
+
     pub(crate) fn image_revision(&self, image: &str) -> anyhow::Result<String> {
         Ok(self.embedded_identity(image)?.revision)
     }
@@ -627,21 +662,6 @@ impl<'a> Runtime<'a> {
             .with_context(|| format!("runtime mount {target} is unavailable"))
     }
 
-    fn append_environment_and_mounts(&self, mut command: Process) -> Process {
-        for (key, value) in &self.config.runtime.environment {
-            command = command.args(["-e", &format!("{key}={value}")]);
-        }
-        for mount in &self.config.runtime.mounts {
-            command = command.arg("-v").arg(mount_argument(
-                &mount.source,
-                &mount.target,
-                mount.read_only,
-                mount.selinux_relabel,
-            ));
-        }
-        command
-    }
-
     fn container_has_authorized_labels(&self) -> bool {
         self.backend_kind().is_ok_and(|_| {
             self.backend().is_ok_and(|backend| {
@@ -704,23 +724,6 @@ fn operation_database_url_file<'a>(
     } else {
         &config.dependencies.database_url_file
     }
-}
-
-fn mount_argument(
-    source: &Path,
-    target: &Path,
-    read_only: bool,
-    selinux_relabel: bool,
-) -> OsString {
-    let mut value = source.as_os_str().to_os_string();
-    value.push(":");
-    value.push(target);
-    value.push(":");
-    value.push(if read_only { "ro" } else { "rw" });
-    if selinux_relabel {
-        value.push(",Z");
-    }
-    value
 }
 
 #[cfg(test)]

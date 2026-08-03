@@ -177,6 +177,7 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
         },
         valkey: Valkey {
             container_name: "valkey".to_owned(),
+            data_volume: "valkey-data".to_owned(),
             image: "valkey".to_owned(),
             rdb_path: "/data/dump.rdb".to_owned(),
             password_file: PathBuf::new(),

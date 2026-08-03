@@ -19,7 +19,6 @@ pub(crate) struct Process {
     program: OsString,
     args: Vec<OsString>,
     environment: Vec<(OsString, OsString)>,
-    current_dir: Option<std::path::PathBuf>,
     timeout: Duration,
 }
 
@@ -29,7 +28,6 @@ impl Process {
             program: program.into(),
             args: Vec::new(),
             environment: Vec::new(),
-            current_dir: None,
             timeout: DEFAULT_TIMEOUT,
         }
     }
@@ -45,11 +43,6 @@ impl Process {
         S: Into<OsString>,
     {
         self.args.extend(values.into_iter().map(Into::into));
-        self
-    }
-
-    pub(crate) fn current_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.current_dir = Some(path.into());
         self
     }
 
@@ -84,9 +77,6 @@ impl Process {
             }
         }
         command.args(&self.args).envs(self.environment.clone());
-        if let Some(path) = &self.current_dir {
-            command.current_dir(path);
-        }
         command
     }
 
@@ -133,9 +123,6 @@ impl Process {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(path) = &self.current_dir {
-            command.current_dir(path);
-        }
         let child = command
             .spawn()
             .with_context(|| format!("failed to execute {}", self.display_name()))?;
@@ -162,9 +149,6 @@ impl Process {
             // are discarded below and never cross the process boundary.
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(path) = &self.current_dir {
-            command.current_dir(path);
-        }
         let child = command
             .spawn()
             .with_context(|| format!("failed to execute {}", self.display_name()))?;
@@ -201,9 +185,6 @@ impl Process {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some(path) = &self.current_dir {
-            command.current_dir(path);
-        }
         let Ok(mut child) = command.spawn() else {
             return false;
         };

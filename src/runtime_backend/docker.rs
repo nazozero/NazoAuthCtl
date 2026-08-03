@@ -8,11 +8,31 @@ use crate::{
 };
 
 use super::{
-    NeutralMount, OneShotTask, RuntimeBackend, RuntimeObservation, RuntimeReplacement, labels,
-    safe_environment, server_command_verified,
+    ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount,
+    OneShotTask, RuntimeBackend, RuntimeObservation, RuntimeReplacement, labels, safe_environment,
+    server_command_verified,
 };
 
-pub(crate) struct DockerBackend;
+pub(crate) struct DockerBackend {
+    command: std::ffi::OsString,
+}
+
+impl Default for DockerBackend {
+    fn default() -> Self {
+        Self {
+            command: "docker".into(),
+        }
+    }
+}
+
+impl DockerBackend {
+    #[cfg(test)]
+    pub(crate) fn with_command(command: impl Into<std::ffi::OsString>) -> Self {
+        Self {
+            command: command.into(),
+        }
+    }
+}
 
 impl RuntimeBackend for DockerBackend {
     fn kind(&self) -> RuntimeBackendKind {
@@ -20,13 +40,13 @@ impl RuntimeBackend for DockerBackend {
     }
 
     fn available(&self) -> bool {
-        Process::new("docker")
+        Process::new(&self.command)
             .args(["info", "--format", "{{.ServerVersion}}"])
             .succeeds()
     }
 
     fn discover(&self) -> anyhow::Result<Vec<RuntimeObservation>> {
-        let ids = Process::new("docker")
+        let ids = Process::new(&self.command)
             .args(["container", "ls", "-a", "--no-trunc", "--format", "{{.ID}}"])
             .stdout()?;
         ids.lines()
@@ -42,7 +62,7 @@ impl RuntimeBackend for DockerBackend {
     }
 
     fn inspect(&self, object_reference: &str) -> anyhow::Result<RuntimeObservation> {
-        let output = Process::new("docker")
+        let output = Process::new(&self.command)
             .args(["container", "inspect", object_reference])
             .stdout()?;
         let values: Vec<serde_json::Value> =
@@ -181,25 +201,25 @@ impl RuntimeBackend for DockerBackend {
     }
 
     fn start(&self, object_reference: &str) -> anyhow::Result<()> {
-        Process::new("docker")
+        Process::new(&self.command)
             .args(["start", object_reference])
             .run_quiet()
     }
 
     fn stop(&self, object_reference: &str) -> anyhow::Result<()> {
-        Process::new("docker")
+        Process::new(&self.command)
             .args(["stop", object_reference])
             .run_quiet()
     }
 
     fn restart(&self, object_reference: &str) -> anyhow::Result<()> {
-        Process::new("docker")
+        Process::new(&self.command)
             .args(["restart", object_reference])
             .run_quiet()
     }
 
     fn remove(&self, object_reference: &str) -> anyhow::Result<()> {
-        Process::new("docker")
+        Process::new(&self.command)
             .args(["rm", "--force", object_reference])
             .run_quiet()
     }
@@ -217,7 +237,7 @@ impl RuntimeBackend for DockerBackend {
             image_reference.split('@').next().unwrap_or(image_reference),
             digest
         );
-        let mut command = Process::new("docker")
+        let mut command = Process::new(&self.command)
             .args(["run", "-d", "--name"])
             .arg(&replacement.object_reference)
             .args([
@@ -267,21 +287,21 @@ impl RuntimeBackend for DockerBackend {
     }
 
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String> {
-        docker_one_shot_process(task)?.stdin_stdout(&task.stdin)
+        docker_one_shot_process(&self.command, task)?.stdin_stdout(&task.stdin)
     }
 
     fn run_one_shot_authorization_probe(&self, task: &OneShotTask) -> anyhow::Result<bool> {
-        docker_one_shot_process(task)?.stdin_authorization_rejected(&task.stdin)
+        docker_one_shot_process(&self.command, task)?.stdin_authorization_rejected(&task.stdin)
     }
 
     fn pull_image(&self, image_reference: &str) -> anyhow::Result<()> {
-        Process::new("docker")
+        Process::new(&self.command)
             .args(["pull", image_reference])
             .run_quiet()
     }
 
     fn export_image(&self, image_reference: &str, archive: &std::path::Path) -> anyhow::Result<()> {
-        Process::new("docker")
+        Process::new(&self.command)
             .args(["image", "save", "--output"])
             .arg(archive)
             .arg(image_reference)
@@ -289,14 +309,84 @@ impl RuntimeBackend for DockerBackend {
     }
 
     fn import_image(&self, archive: &std::path::Path) -> anyhow::Result<()> {
-        Process::new("docker")
+        Process::new(&self.command)
             .args(["image", "load", "--input"])
             .arg(archive)
             .run_quiet()
     }
 
+    fn restore_managed_postgres(&self, restore: &ManagedPostgresRestore) -> anyhow::Result<()> {
+        Process::new(&self.command)
+            .args(["run", "--rm", "--network"])
+            .arg(&restore.network)
+            .args([
+                "-e",
+                "PGSERVICEFILE=/run/nazoauth-secrets/pg_service.conf",
+                "-e",
+                "PGPASSFILE=/run/nazoauth-secrets/pgpass",
+                "-v",
+            ])
+            .arg(format!("{}:/backup:ro", restore.backup_directory.display()))
+            .arg("-v")
+            .arg(format!(
+                "{}:/run/nazoauth-secrets/pg_service.conf:ro",
+                restore.service_file.display()
+            ))
+            .arg("-v")
+            .arg(format!(
+                "{}:/run/nazoauth-secrets/pgpass:ro",
+                restore.password_file.display()
+            ))
+            .arg(&restore.image)
+            .args([
+                "pg_restore",
+                "--clean",
+                "--if-exists",
+                "--no-owner",
+                "--no-privileges",
+                "--dbname=service=nazoauth",
+                "/backup/postgresql.dump",
+            ])
+            .run_quiet()
+    }
+
+    fn restore_managed_valkey(&self, restore: &ManagedValkeyRestore) -> anyhow::Result<()> {
+        self.stop(&restore.object_reference)?;
+        let restored = Process::new(&self.command)
+            .args(["run", "--rm", "-v"])
+            .arg(format!("{}:/data", restore.data_volume))
+            .arg("-v")
+            .arg(format!(
+                "{}:/backup:ro",
+                restore.backup_directory.display()
+            ))
+            .arg(&restore.image)
+            .args([
+                "sh",
+                "-eu",
+                "-c",
+                "test -s /backup/valkey-dump.rdb; rm -rf -- /data/appendonlydir; install -m 600 /backup/valkey-dump.rdb /data/dump.rdb",
+            ])
+            .run_quiet();
+        let restarted = self.start(&restore.object_reference);
+        restored?;
+        restarted
+    }
+
+    fn execute_managed_postgres(&self, command: &ManagedPostgresCommand) -> anyhow::Result<()> {
+        Process::new(&self.command)
+            .args(["exec", "-i"])
+            .arg(&command.object_reference)
+            .args(["psql", "--no-psqlrc", "--set", "ON_ERROR_STOP=1", "-U"])
+            .arg(&command.user)
+            .arg("-d")
+            .arg(&command.database)
+            .stdin_stdout(&command.stdin)
+            .map(|_| ())
+    }
+
     fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String> {
-        let output = Process::new("docker")
+        let output = Process::new(&self.command)
             .args([
                 "image",
                 "inspect",
@@ -331,7 +421,7 @@ impl RuntimeBackend for DockerBackend {
             image_reference.split('@').next().unwrap_or(image_reference),
             digest
         );
-        let output = Process::new("docker")
+        let output = Process::new(&self.command)
             .args([
                 "run",
                 "--rm",
@@ -352,7 +442,10 @@ impl RuntimeBackend for DockerBackend {
     }
 }
 
-fn docker_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
+fn docker_one_shot_process(
+    command: &std::ffi::OsStr,
+    task: &OneShotTask,
+) -> anyhow::Result<Process> {
     let ArtifactReference::Oci {
         image_reference,
         digest,
@@ -365,7 +458,7 @@ fn docker_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
         image_reference.split('@').next().unwrap_or(image_reference),
         digest
     );
-    let mut process = Process::new("docker")
+    let mut process = Process::new(command)
         .timeout(std::time::Duration::from_secs(300))
         .args([
             "run",

@@ -2623,15 +2623,15 @@ pub(crate) fn uses_legacy_lock(command: &Command) -> bool {
             Command::Install(_) | Command::SelfUpdate { .. } | Command::SelfRollback { .. }
         );
     }
-    match command {
+    !matches!(
+        command,
         Command::Discover
-        | Command::Adopt(_)
-        | Command::DeploymentsList
-        | Command::PermissionsSet(_)
-        | Command::Relinquish(_)
-        | Command::Reconcile => false,
-        _ => true,
-    }
+            | Command::Adopt(_)
+            | Command::DeploymentsList
+            | Command::PermissionsSet(_)
+            | Command::Relinquish(_)
+            | Command::Reconcile
+    )
 }
 
 fn recover_pending_update(config_path: &Path, config: &UpdateConfig) -> anyhow::Result<()> {
