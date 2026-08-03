@@ -49,6 +49,7 @@ pub(crate) struct AdoptionPlan {
     pub(crate) release: String,
     pub(crate) active_release: nazo_operator_protocol::EmbeddedIdentity,
     pub(crate) artifact_identity: String,
+    pub(crate) runtime_instances: Vec<AdoptedRuntimeIdentity>,
     pub(crate) resulting_trust: TrustState,
     pub(crate) capabilities: CapabilityGrants,
     pub(crate) recovery: RecoveryAssessment,
@@ -113,7 +114,17 @@ pub(crate) fn run(options: AdoptionOptions) -> anyhow::Result<()> {
     }
     let report = discover()?;
     let candidate = select(&report, &options.target)?;
-    let plan = build_plan(&candidate, &options)?;
+    let deployment_id = candidate
+        .deployment_id
+        .as_deref()
+        .context("target has no verified NazoAuth deployment identity")?;
+    let replicas = report
+        .candidates
+        .iter()
+        .filter(|entry| entry.deployment_id.as_deref() == Some(deployment_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let plan = build_plan(&candidate, &replicas, &options)?;
     if options.plan {
         println!("{}", serde_json::to_string_pretty(&plan)?);
         return Ok(());
@@ -124,11 +135,12 @@ pub(crate) fn run(options: AdoptionOptions) -> anyhow::Result<()> {
             plan.blockers.join("; ")
         );
     }
-    execute(&candidate, &plan, &options)
+    execute(&replicas, &plan, &options)
 }
 
 fn build_plan(
     candidate: &DiscoveredDeployment,
+    replicas: &[DiscoveredDeployment],
     options: &AdoptionOptions,
 ) -> anyhow::Result<AdoptionPlan> {
     let deployment_id = candidate
@@ -159,6 +171,53 @@ fn build_plan(
         bail!("signed instance build identity does not match the trusted Release");
     }
     let mut blockers = Vec::new();
+    let mut runtime_instances = Vec::new();
+    let mut runtime_ids = std::collections::BTreeSet::new();
+    for replica in replicas {
+        let Some(replica_id) = replica.runtime_instance_id.clone() else {
+            blockers.push(format!(
+                "replica {} has no verified runtime identity",
+                replica.target
+            ));
+            continue;
+        };
+        if !runtime_ids.insert(replica_id.clone()) {
+            blockers.push(format!(
+                "runtime instance identity {replica_id} is duplicated"
+            ));
+            continue;
+        }
+        if replica.issuer.as_deref() != Some(issuer.as_str())
+            || replica.online_statement.is_none() && replica.offline_statement.is_none()
+        {
+            blockers.push(format!(
+                "replica {} does not prove the selected deployment issuer",
+                replica.target
+            ));
+            continue;
+        }
+        let artifact = if replica.release.as_deref() == Some(&release_name)
+            && replica.revision.as_deref() == Some(verified.manifest.embedded.revision.as_str())
+            && replica.build_id.as_deref() == Some(verified.manifest.embedded.build_id.as_str())
+        {
+            verify_artifact(replica, &verified)?
+        } else {
+            blockers.push(format!(
+                "replica {} runs a different or untrusted Release identity",
+                replica.target
+            ));
+            "unverified-mixed-release".to_owned()
+        };
+        runtime_instances.push(AdoptedRuntimeIdentity {
+            runtime_instance_id: replica_id,
+            backend: backend_name(replica.runtime.backend).to_owned(),
+            object_reference: replica.runtime.object_reference.clone(),
+            artifact_identity: artifact,
+        });
+    }
+    if runtime_instances.is_empty() {
+        blockers.push("deployment has no independently verified runtime instances".to_owned());
+    }
     let recovery = recovery_assessment(
         candidate,
         &deployment_id,
@@ -262,6 +321,7 @@ fn build_plan(
         release: release_name,
         active_release: verified.manifest.embedded.clone(),
         artifact_identity,
+        runtime_instances,
         resulting_trust,
         capabilities: options.capabilities.clone(),
         recovery,
@@ -271,7 +331,7 @@ fn build_plan(
 }
 
 fn execute(
-    candidate: &DiscoveredDeployment,
+    candidates: &[DiscoveredDeployment],
     plan: &AdoptionPlan,
     options: &AdoptionOptions,
 ) -> anyhow::Result<()> {
@@ -318,30 +378,32 @@ fn execute(
         .join("observed-state.json");
     atomic_write(
         &observed_state,
-        &serde_json::to_vec_pretty(candidate)?,
+        &serde_json::to_vec_pretty(candidates)?,
         0o600,
     )?;
     let record = deployment_record(
-        candidate,
+        candidates,
         plan,
         options.alias.clone(),
         &identities.controller_key_id,
     )?;
-    let manifest = verified_release(candidate, &plan.release)?.manifest;
+    let primary = candidates
+        .iter()
+        .find(|candidate| candidate.target == plan.target)
+        .context("selected adoption target disappeared from the replica set")?;
+    let manifest = verified_release(primary, &plan.release)?.manifest;
     let receipt = AdoptionReceipt {
         schema: CONTROL_DISCOVERY_SCHEMA,
         deployment_id: plan.deployment_id.clone(),
         issuer: plan.issuer.clone(),
-        runtime_instances: vec![AdoptedRuntimeIdentity {
-            runtime_instance_id: plan.runtime_instance_id.clone(),
-            backend: backend_name(candidate.runtime.backend).to_owned(),
-            object_reference: candidate.runtime.object_reference.clone(),
-            artifact_identity: plan.artifact_identity.clone(),
-        }],
+        runtime_instances: plan.runtime_instances.clone(),
         verified_release: plan.release.clone(),
         release_manifest_sha256: hex_sha256(&serde_json::to_vec(&manifest)?),
-        instance_key_ids: candidate.instance_key_id.clone().into_iter().collect(),
-        resource_references: receipt_resource_references(candidate),
+        instance_key_ids: candidates
+            .iter()
+            .filter_map(|candidate| candidate.instance_key_id.clone())
+            .collect(),
+        resource_references: receipt_resource_references(primary),
         capabilities: receipt_capabilities(&plan.capabilities),
         recovery_proven: plan.recovery.conclusion == RecoveryConclusion::Proven,
         recovery_evidence,
@@ -510,7 +572,7 @@ fn persist_recovery_evidence(
 }
 
 fn deployment_record(
-    candidate: &DiscoveredDeployment,
+    candidates: &[DiscoveredDeployment],
     plan: &AdoptionPlan,
     alias: Option<String>,
     control_authority: &str,
@@ -537,19 +599,48 @@ fn deployment_record(
         ("valkey".to_owned(), SafeReference::NotObserved),
         ("proxy_tls".to_owned(), SafeReference::NotObserved),
     ]);
-    let mounts = candidate
-        .runtime
-        .mounts
+    let runtime_instances = candidates
         .iter()
-        .map(|mount| MountReference {
-            source: mount.source.clone(),
-            destination: mount.destination.clone(),
-            read_only: mount.read_only,
-            selinux_relabel: mount.selinux_relabel,
-            scope: mount.scope,
-            ownership: mount.ownership,
+        .map(|candidate| {
+            let runtime_instance_id = candidate
+                .runtime_instance_id
+                .clone()
+                .context("adopted replica has no runtime instance identity")?;
+            let mounts = candidate
+                .runtime
+                .mounts
+                .iter()
+                .map(|mount| MountReference {
+                    source: mount.source.clone(),
+                    destination: mount.destination.clone(),
+                    read_only: mount.read_only,
+                    selinux_relabel: mount.selinux_relabel,
+                    scope: mount.scope,
+                    ownership: mount.ownership,
+                })
+                .collect();
+            Ok(RuntimeInstance {
+                runtime_instance_id,
+                backend: candidate.runtime.backend,
+                object_reference: candidate.runtime.object_reference.clone(),
+                artifact: candidate.runtime.artifact.clone(),
+                ports: candidate.runtime.ports.clone(),
+                networks: candidate.runtime.networks.clone(),
+                mounts,
+                instance_key_id: candidate.instance_key_id.clone(),
+                deployment_statement: candidate.runtime.mounts.iter().find_map(|mount| {
+                    let destination = mount.destination.join("instance/deployment-statement.jws");
+                    destination
+                        .is_absolute()
+                        .then(|| mount.source.join("instance/deployment-statement.jws"))
+                }),
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let primary = candidates
+        .iter()
+        .find(|candidate| candidate.target == plan.target)
+        .context("selected adoption target is not present")?;
     let record = DeploymentRecord {
         schema: DEPLOYMENT_SCHEMA,
         deployment_id: plan.deployment_id.clone(),
@@ -559,34 +650,11 @@ fn deployment_record(
         active_release: plan.active_release.clone(),
         trust: plan.resulting_trust,
         capabilities: plan.capabilities.clone(),
-        runtime_instances: vec![RuntimeInstance {
-            runtime_instance_id: plan.runtime_instance_id.clone(),
-            backend: candidate.runtime.backend,
-            object_reference: candidate.runtime.object_reference.clone(),
-            artifact: candidate.runtime.artifact.clone(),
-            ports: candidate.runtime.ports.clone(),
-            networks: candidate.runtime.networks.clone(),
-            mounts,
-            instance_key_id: candidate.instance_key_id.clone(),
-            deployment_statement: candidate.runtime.mounts.iter().find_map(|mount| {
-                let destination = mount.destination.join("instance/deployment-statement.jws");
-                destination
-                    .is_absolute()
-                    .then(|| mount.source.join("instance/deployment-statement.jws"))
-            }),
-        }],
+        runtime_instances,
         resources,
         recovery: plan.recovery.clone(),
-        operator_protocol_versions: candidate
-            .operator_protocol_versions
-            .iter()
-            .copied()
-            .collect(),
-        control_protocol_versions: candidate
-            .control_protocol_versions
-            .iter()
-            .copied()
-            .collect(),
+        operator_protocol_versions: primary.operator_protocol_versions.iter().copied().collect(),
+        control_protocol_versions: primary.control_protocol_versions.iter().copied().collect(),
         declaration_revision: 1,
     };
     record.validate()?;

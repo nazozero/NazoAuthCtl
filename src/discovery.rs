@@ -61,21 +61,18 @@ pub(crate) fn discover() -> anyhow::Result<DiscoveryReport> {
             candidates.push(enrich(runtime));
         }
     }
+    Ok(finalize_report(candidates))
+}
+
+fn finalize_report(mut candidates: Vec<DiscoveredDeployment>) -> DiscoveryReport {
     candidates.sort_by(|left, right| left.target.cmp(&right.target));
-    let identities = candidates
-        .iter()
-        .filter_map(|candidate| candidate.deployment_id.as_ref())
-        .collect::<std::collections::BTreeSet<_>>();
-    let unidentified = candidates
-        .iter()
-        .filter(|candidate| candidate.deployment_id.is_none())
-        .count();
-    Ok(DiscoveryReport {
+    let ambiguous = candidates.len() > 1;
+    DiscoveryReport {
         schema: 1,
         read_only: true,
-        ambiguous: identities.len() + unidentified > 1,
+        ambiguous,
         candidates,
-    })
+    }
 }
 
 pub(crate) fn select(
@@ -437,3 +434,7 @@ fn backend_name(backend: RuntimeBackendKind) -> &'static str {
         RuntimeBackendKind::Systemd => "systemd",
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/discovery.rs"]
+mod tests;

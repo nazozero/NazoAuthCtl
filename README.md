@@ -25,7 +25,36 @@ NazoAuth commit and an exact package version.
   requires a separately stored, encrypted off-host recovery package.
 
 See [architecture](docs/architecture.md), [recovery boundaries](docs/recovery.md),
-and [compatibility](docs/compatibility.md).
+[discovery and adoption](docs/discovery-adoption.md), and
+[compatibility](docs/compatibility.md).
+
+## Existing deployments
+
+Discovery is read-only and does not require a controller registry:
+
+```sh
+nazoauthctl discover
+nazoauthctl adopt --target podman:actual-object-name --plan
+nazoauthctl adopt --target podman:actual-object-name --yes
+nazoauthctl deployments list
+nazoauthctl --deployment DEPLOYMENT_ID status
+```
+
+Adoption records trust; it does not silently take ownership. Runtime, artifact,
+configuration, database, Valkey, operator-task, backup, and proxy/TLS authority
+are granted separately as `external`, `delegated`, or `managed`. Mixed updates
+persist their plan and pause at external steps:
+
+```sh
+nazoauthctl --deployment DEPLOYMENT_ID update --yes
+nazoauthctl --deployment DEPLOYMENT_ID transaction show
+nazoauthctl --deployment DEPLOYMENT_ID transaction evidence --file evidence.json --yes
+nazoauthctl --deployment DEPLOYMENT_ID transaction resume --yes
+```
+
+Accepted evidence is digest-bound coordination input. It does not by itself
+claim that an external operation is semantically complete; final acceptance
+must still observe the declared issuer, artifact, readiness, and replica state.
 
 ## Development
 
@@ -35,8 +64,8 @@ server.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
 ```
 
 No independent controller Release is created by this extraction PR.

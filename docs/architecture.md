@@ -12,6 +12,52 @@
 | Controller Release and self rollback | no | publishes and consumes |
 | Controller journals and audit chain | no | yes |
 
+## Deployment state model
+
+Discovery, trust, and authority are separate facts:
+
+- `discovered` is ephemeral read-only evidence and creates no registry state;
+- `observed` is a persisted, verified deployment which remains read-only;
+- `adopted` binds the immutable deployment identity to a controller authority;
+  it does not imply that any resource is managed.
+
+Each capability has an independent responsibility (`external`, `delegated`, or
+`managed`) and scope (`deployment` or `shared`). The deployment ID, not a
+container name, port, path, unit name, alias, or discovery order, is the security
+identity. Runtime instance IDs identify replicas inside that deployment.
+
+Registry and declaration state live under `/etc/nazoauthctl`. Mutable state is
+partitioned below `/var/lib/nazoauthctl/deployments/<deployment-id>`. Controller,
+receipt, audit, and break-glass identities are generated per deployment; the
+break-glass private identity uses a separate root. Registry, deployment, and
+shared-resource locks have different scopes, so independent deployments do not
+share one global mutation lock.
+
+## Runtime adapters
+
+Podman, Docker, and systemd implement the same typed runtime boundary for
+discovery, inspection, lifecycle, replacement, one-shot execution, digest
+resolution, build identity, mounts, and ownership checks. Deployment records
+store neutral mount semantics such as `read_only` and `selinux_relabel`; backend
+command syntax is not part of the declaration. Manually adopted objects keep
+their real names. Controller-created names are derived from the deployment ID,
+but labels and signed deployment identity remain authoritative.
+
+## Mixed-ownership transactions
+
+An update plan assigns every step to `ctl-owned`, `user-required`, or
+`provider-owned`. The plan, target Release, declaration revision, and steps are
+persisted below the selected deployment's `transactions` directory. External
+steps pause the transaction. Evidence is closed JSON bound to the deployment,
+transaction, step, opaque reference, and SHA-256; stored evidence is re-hashed
+on resume. A different deployment, a changed declaration revision, a conflicting
+plan, or modified evidence fails closed.
+
+Evidence acceptance is deliberately not a completion assertion. A controller
+step remains pending until the controller executes it, and final acceptance must
+independently observe the expected result. This permits external operators and
+providers to coordinate without granting ctl authority over their resources.
+
 `nazo-operator-protocol` remains in `nazozero/NazoAuth`. `Cargo.toml` pins both
 the package version and a full Git revision. A protocol change therefore requires
 an explicit dependency update and compatibility review; Cargo cannot silently

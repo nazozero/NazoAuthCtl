@@ -14,6 +14,18 @@ The recommended production layout uses distinct ownership and storage boundaries
 The break-glass private key must never be included in a NazoAuth mount or OCI
 secret. It must not share the active controller key's storage failure domain.
 
+Every deployment has an independent controller identity, receipt identity,
+audit identity, break-glass identity, transaction directory, recovery metadata,
+lock, and backup policy. Recovery resolves the immutable deployment ID before
+opening any backup or key. An alias is only a selector. When multiple deployments
+exist, a destructive command without `--deployment` fails and lists candidates.
+
+Resources record both responsibility and scope. An `external` resource is never
+mutated. A `shared` database, Valkey, network, volume, proxy, or Release cache is
+never deleted as a side effect of recovering or relinquishing one deployment.
+Until a provider-specific shared database lifecycle can be proven safe, it stays
+`external/shared`.
+
 ## Command dependency contract
 
 | Command | HTTP | current server | current OCI | operator-task | previous trusted cache |
@@ -36,6 +48,13 @@ Before activation, the controller retains the previous trusted server manifest,
 verification bundles, host binary or OCI archive, frontend material, and backup
 metadata. OCI recovery imports the retained archive when the engine no longer has
 the previous image. No network lookup is part of the recovery path.
+
+The signed offline deployment statement identifies a stopped replica from its
+persistent mount. It is not sufficient artifact trust: ctl also verifies the
+cached Release and the retained OCI digest or host-binary SHA-256. An unsupported
+operator protocol blocks application tasks only. It does not block stopping the
+failed runtime, importing the previous trusted artifact, restoring a declared
+snapshot, unwinding an interrupted update, or starting the previous version.
 
 ## Machine loss
 
