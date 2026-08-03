@@ -1764,10 +1764,21 @@ fn fake_container_runtime(
     write_shell_executable(
         &engine,
         &format!(
-            "if [ \"${{1:-}}\" = inspect ]; then\n  if [ \"{candidate_active}\" != true ]; then exit 1; fi\n  if [ \"$#\" -gt 2 ]; then printf '%s\\n' '{candidate_commit}'; fi\n  exit 0\nfi\nexit 0"
+            "if [ \"${{1:-}}\" = image ] && [ \"${{2:-}}\" = inspect ]; then\n  image=\"${{3:-}}\"\n  digest=\"${{image##*@}}\"\n  printf '[\"fixture@%s\"]\\n' \"$digest\"\n  exit 0\nfi\nif [ \"${{1:-}}\" = inspect ]; then\n  if [ \"{candidate_active}\" != true ]; then exit 1; fi\n  if [ \"$#\" -gt 2 ]; then printf '%s\\n' '{candidate_commit}'; fi\n  exit 0\nfi\nexit 0"
         ),
     );
     engine
+}
+
+#[cfg(target_os = "linux")]
+fn materialize_trusted_recovery_release(config: &UpdateConfig, release: &ReleaseManifest) {
+    let directory = release_cache_dir(config, release);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join("server-release-manifest.json"),
+        serde_json::to_vec_pretty(release).unwrap(),
+    )
+    .unwrap();
 }
 
 #[cfg(unix)]
@@ -1899,6 +1910,7 @@ fn pending_pre_migration_update_restores_previous_artifact_and_closes_the_journa
     value.previous_runtime = value.from_release.image_ref().unwrap();
     value.candidate_runtime = value.to_release.image_ref().unwrap();
     fs::create_dir_all(&config.deployment_root).unwrap();
+    materialize_trusted_recovery_release(&config, &value.from_release);
     materialize_candidate_ui(&value);
     install_audit_key(&config);
     let (issuer, server) = public_server(3);
@@ -1928,6 +1940,7 @@ fn pending_active_candidate_restores_previous_release_and_closes_the_journal() {
     value.previous_runtime = value.from_release.image_ref().unwrap();
     value.candidate_runtime = value.to_release.image_ref().unwrap();
     fs::create_dir_all(&config.deployment_root).unwrap();
+    materialize_trusted_recovery_release(&config, &value.from_release);
     materialize_candidate_ui(&value);
     materialize_verified_backup(&config, value.backup.as_deref().unwrap());
     install_audit_key(&config);
