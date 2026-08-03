@@ -208,9 +208,14 @@ fn privileged_container_task_attaches_the_signed_envelope_stdin() {
     let work = PrivateTempDir::new("runtime-task-stdin").unwrap();
     let engine = work.path().join("fake-engine");
     let argv = work.path().join("argv.txt");
+    let stdin = work.path().join("stdin.txt");
     write_shell_executable(
         &engine,
-        &format!("printf '%s\\n' \"$@\" > '{}'", argv.display()),
+        &format!(
+            "cat > '{}'\nprintf '%s\\n' \"$@\" > '{}'",
+            stdin.display(),
+            argv.display()
+        ),
     );
     let task = OneShotTask {
         artifact: ArtifactReference::Oci {
@@ -236,6 +241,7 @@ fn privileged_container_task_attaches_the_signed_envelope_stdin() {
     let command = fs::read_to_string(argv).unwrap();
 
     assert!(command.contains("--interactive"));
+    assert_eq!(fs::read(stdin).unwrap(), b"signed-envelope");
 }
 
 #[test]
