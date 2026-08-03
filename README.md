@@ -45,6 +45,13 @@ configuration, database, Valkey, operator-task, backup, and proxy/TLS authority
 are granted separately as `external`, `delegated`, or `managed`. Mixed updates
 persist their plan and pause at external steps:
 
+At this extraction head, schema-1 recovery evidence proves integrity and
+off-host binding but not executable restoration of an arbitrary manual
+deployment. Such an adoption is deliberately persisted as `observed` with all
+effective capabilities `external`; mutation and core recovery fail closed. The
+provider-specific restore contract and approved lifecycle configuration needed
+for mutation-capable adoption remain a draft completion boundary.
+
 ```sh
 nazoauthctl --deployment DEPLOYMENT_ID update --yes
 nazoauthctl --deployment DEPLOYMENT_ID transaction show
