@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fmt::Write as _, fs, path::Path};
 
 use anyhow::{Context, bail};
 use chrono::Utc;
@@ -375,7 +375,12 @@ fn validate_identifier(value: &str, label: &str) -> anyhow::Result<()> {
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 fn transaction_path(store: &DeploymentStore, deployment_id: &str) -> std::path::PathBuf {
