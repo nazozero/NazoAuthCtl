@@ -92,7 +92,8 @@ fn controller_modules_do_not_encode_runtime_backend_command_syntax() {
         "systemd-run",
         "useradd",
         "--network",
-        ":ro,Z",
+        "ro,Z",
+        "rw,Z",
     ];
     for (module, source) in controller_modules {
         for token in forbidden {

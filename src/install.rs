@@ -949,30 +949,49 @@ fn build_config(
     let container = runtime_backend != RuntimeBackendKind::Systemd;
     let mut mounts = if container {
         vec![
-            mount(config_dir.join(".env.yaml"), "/app/.env.yaml", "ro,Z"),
-            mount(app.join("keys"), "/var/lib/nazo_oauth/keys", "rw,Z"),
-            mount(app.join("avatars"), "/var/lib/nazo_oauth/avatars", "rw,Z"),
-            mount(app.join("secrets"), "/var/lib/nazo_oauth/secrets", "rw,Z"),
-            mount(app.join("instance"), "/var/lib/nazo_oauth/instance", "rw,Z"),
+            mount(config_dir.join(".env.yaml"), "/app/.env.yaml", true, true),
+            mount(app.join("keys"), "/var/lib/nazo_oauth/keys", false, true),
+            mount(
+                app.join("avatars"),
+                "/var/lib/nazo_oauth/avatars",
+                false,
+                true,
+            ),
+            mount(
+                app.join("secrets"),
+                "/var/lib/nazo_oauth/secrets",
+                false,
+                true,
+            ),
+            mount(
+                app.join("instance"),
+                "/var/lib/nazo_oauth/instance",
+                false,
+                true,
+            ),
             mount(
                 app.join("bootstrap"),
                 "/var/lib/nazo_oauth/bootstrap",
-                "rw,Z",
+                false,
+                true,
             ),
             mount(
                 options.data_root.join("ui-releases"),
                 "/var/lib/nazo_oauth/ui-releases",
-                "rw,Z",
+                false,
+                true,
             ),
             mount(
                 secrets.join("database-url"),
                 "/run/nazoauth-secrets/database-url",
-                "ro,Z",
+                true,
+                true,
             ),
             mount(
                 secrets.join("valkey-url"),
                 "/run/nazoauth-secrets/valkey-url",
-                "ro,Z",
+                true,
+                true,
             ),
         ]
     } else {
@@ -983,7 +1002,8 @@ fn build_config(
             mount(
                 secrets.join(name),
                 &format!("/run/nazoauth-secrets/{name}"),
-                "ro,Z",
+                true,
+                true,
             )
         }));
     }
@@ -1143,12 +1163,12 @@ fn object_name_suffix(deployment_id: &str) -> String {
         .collect()
 }
 
-fn mount(source: PathBuf, target: &str, mode: &str) -> Mount {
+fn mount(source: PathBuf, target: &str, read_only: bool, selinux_relabel: bool) -> Mount {
     Mount {
         source,
         target: PathBuf::from(target),
-        read_only: mode.starts_with("ro"),
-        selinux_relabel: mode.split(',').any(|value| matches!(value, "z" | "Z")),
+        read_only,
+        selinux_relabel,
     }
 }
 
