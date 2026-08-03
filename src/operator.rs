@@ -27,7 +27,6 @@ use crate::{
     runtime::Runtime,
 };
 
-#[cfg(debug_assertions)]
 #[derive(Clone, Debug)]
 pub(crate) struct ExpectedReleaseTarget {
     pub(crate) embedded: EmbeddedIdentity,
