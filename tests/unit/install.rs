@@ -103,6 +103,15 @@ fn systemd_version_parser_is_closed() {
 }
 
 #[test]
+fn managed_object_locators_hash_the_complete_deployment_identity() {
+    let first = object_name_suffix("019a-identical-prefix-deployment-a");
+    let second = object_name_suffix("019a-identical-prefix-deployment-b");
+    assert_eq!(first.len(), 16);
+    assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_ne!(first, second);
+}
+
+#[test]
 fn generated_install_paths_are_safe_for_yaml_systemd_and_container_mounts() {
     validate_install_path(Path::new("/var/lib/nazoauth-0.2/app_data"), "data root").unwrap();
     for path in [

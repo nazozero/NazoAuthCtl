@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use crate::{
@@ -1156,11 +1157,10 @@ fn operator_config(
 }
 
 fn object_name_suffix(deployment_id: &str) -> String {
-    deployment_id
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .take(16)
-        .collect()
+    let digest = Sha256::digest(deployment_id.as_bytes());
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    format!("{:016x}", u64::from_be_bytes(prefix))
 }
 
 fn mount(source: PathBuf, target: &str, read_only: bool, selinux_relabel: bool) -> Mount {
