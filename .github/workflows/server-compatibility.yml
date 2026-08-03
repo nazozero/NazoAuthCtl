@@ -1,0 +1,51 @@
+name: signed-server-compatibility
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  attestations: read
+  packages: read
+  id-token: none
+
+jobs:
+  signed-server:
+    name: ctl current / server ${{ matrix.server }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        server: [v0.1.18, v0.1.19]
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test only the controller
+        run: cargo test --all-targets --all-features
+      - name: Download the already-built server
+        run: gh release download "${{ matrix.server }}" --repo nazozero/NazoAuth --pattern nazoauth-x86_64-unknown-linux-gnu --dir signed-server
+      - name: Verify server provenance and identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          server=signed-server/nazoauth-x86_64-unknown-linux-gnu
+          gh attestation verify "$server" \
+            --repo nazozero/NazoAuth \
+            --signer-workflow nazozero/NazoAuth/.github/workflows/release-security.yml \
+            --source-ref "refs/tags/${{ matrix.server }}" \
+            --deny-self-hosted-runners
+          chmod +x "$server"
+          identity="$($server build-identity)"
+          jq -e --arg release "${{ matrix.server }}" \
+            '.release == $release and .protocol == 1 and (.revision | test("^[0-9a-f]{40}$"))' \
+            <<<"$identity"
+      - name: Verify signed OCI without building it
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/nazozero/nazoauth:${{ matrix.server }}"
+          cosign verify "$image" \
+            --certificate-identity "https://github.com/nazozero/NazoAuth/.github/workflows/release-security.yml@refs/tags/${{ matrix.server }}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com

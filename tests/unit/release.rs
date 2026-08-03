@@ -43,6 +43,7 @@ fn manifest(version: &str) -> ReleaseManifest {
             protocol: 1,
             build_id: "build".to_owned(),
         },
+        operator_protocol: None,
         rollback: Rollback {
             artifact: true,
             schema_compatible: true,
@@ -156,7 +157,8 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
     let path = |name: &str| work.path().join(name);
     UpdateConfig {
         schema: 2,
-        managed_install: true,
+        trust: crate::deployment::TrustState::Adopted,
+        capabilities: crate::deployment::CapabilityGrants::controller_installed(),
         install_profile: "baseline".to_owned(),
         repository: "nazozero/NazoAuth".to_owned(),
         updater_install_path: path("nazoauthctl"),
@@ -189,6 +191,7 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
             engine: "host".to_owned(),
             dependency_engine: String::new(),
             container_name: "nazoauth".to_owned(),
+            runtime_instance_id: "runtime-test".to_owned(),
             network: "nazoauth".to_owned(),
             ip_address: String::new(),
             publish_address: String::new(),
@@ -357,6 +360,7 @@ fn containerized_cosign_policy_can_read_private_staging_without_host_privileges(
         "manifest.bundle",
         "manifest.json",
         "https://example.test/release-workflow@refs/tags/v1.0.0",
+        RELEASE_PREDICATE,
     );
 
     assert_eq!(

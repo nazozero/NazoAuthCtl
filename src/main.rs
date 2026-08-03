@@ -1,5 +1,8 @@
+mod adoption;
 mod backup;
 mod cli;
+mod deployment;
+mod discovery;
 mod filesystem;
 mod install;
 mod model;
@@ -7,6 +10,7 @@ mod operator;
 mod process;
 mod release;
 mod runtime;
+mod runtime_backend;
 mod secret_provider;
 
 #[cfg(all(test, unix))]
@@ -30,7 +34,11 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let result = controller::acquire_lock(&cli.command).and_then(|_lock| controller::run(cli));
+    let result = if controller::uses_legacy_lock(&cli.command) {
+        controller::acquire_lock(&cli.command).and_then(|_lock| controller::run(cli))
+    } else {
+        controller::run(cli)
+    };
     if let Err(error) = result {
         eprintln!("nazoauthctl: {error:#}");
         std::process::exit(1);
@@ -47,9 +55,13 @@ fn help_text(topic: cli::HelpTopic) -> &'static str {
             "nazoauthctl — install and safely operate NazoAuth
 
 Usage:
-  nazoauthctl [--config PATH] <command> [options]
+  nazoauthctl [--deployment ID_OR_ALIAS] [--config PATH] <command> [options]
 
 Start here:
+  nazoauthctl discover
+  nazoauthctl adopt --target BACKEND:OBJECT --plan
+  nazoauthctl adopt --target BACKEND:OBJECT --yes
+  nazoauthctl deployments list
   nazoauthctl install --public-url https://auth.example
   nazoauthctl [--config PATH] bootstrap-admin
   nazoauthctl [--config PATH] status
@@ -58,6 +70,9 @@ Start here:
   nazoauthctl [--config PATH] update --yes
 
 Commands:
+  discover      Read-only local Podman, Docker, systemd and process discovery
+  adopt         Verify and transactionally register an explicitly selected target
+  deployments   List registered deployment control domains
   install       Fresh Podman, Docker, or host installation
   bootstrap-admin  Securely create the first administrator
   status        Machine-readable deployment and identity state
@@ -74,6 +89,7 @@ Commands:
   audit         Show or verify the management audit chain
   identity      Rotate controller and audit identities
   break-glass   Recover after controller-key loss or suspected theft
+  self          Independently check, update, or roll back nazoauthctl
 
 Run `nazoauthctl <command> --help` for exact options."
         }
@@ -87,6 +103,8 @@ Options:
   --profile baseline|standards-full   Default: baseline
   --profile-material PATH             Required only for standards-full
   --data-root PATH                    Default: /var/lib/nazoauth
+  --control-root PATH                 Default: /var/lib/nazoauthctl
+  --recovery-root PATH                Default: /var/lib/nazoauth-recovery; use a separate mount
   --port PORT                         Default: 8000
   --network-subnet CIDR               Optional fixed container subnet; requires --runtime-ip
   --runtime-ip ADDRESS                Optional fixed application IP; requires --network-subnet
@@ -197,6 +215,16 @@ it does not claim to prove a key was not copied. `rehearse-controller-loss` perf
 the real recovery transition while forbidding controller signing reads after its
 in-memory probe key is prepared; it proves simulated provider unavailability, not
 physical key loss or non-copy."
+        }
+        cli::HelpTopic::Controller => {
+            "Usage:
+  nazoauthctl [--config PATH] self check [--to VERSION]
+  nazoauthctl [--config PATH] self update [--to VERSION] --yes
+  nazoauthctl [--config PATH] self rollback --yes
+
+Controller updates consume only signed NazoAuthCtl Release binaries and provenance.
+They use a controller-local transaction and rollback slot; a NazoAuth server Release
+cannot replace the controller."
         }
     }
 }

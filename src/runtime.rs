@@ -342,12 +342,22 @@ impl<'a> Runtime<'a> {
         let mut command = Process::new(engine)
             .args(["run", "-d", "--name"])
             .arg(&self.config.runtime.container_name)
-            .args([
-                "--label",
-                "io.nazoauth.managed=true",
-                "--restart",
-                "unless-stopped",
-            ])
+            .arg("--label")
+            .arg(format!(
+                "io.nazoauth.deployment-id={}",
+                self.config.operator.deployment_id
+            ))
+            .arg("--label")
+            .arg(format!(
+                "io.nazoauth.runtime-instance-id={}",
+                self.config.runtime.runtime_instance_id
+            ))
+            .arg("--label")
+            .arg(format!(
+                "io.nazoauth.control-authority={}",
+                self.config.operator.controller_key_id
+            ))
+            .args(["--restart", "unless-stopped"])
             .args([
                 "--cap-drop",
                 "ALL",
@@ -380,7 +390,10 @@ impl<'a> Runtime<'a> {
             .config
             .container_engine()
             .context("container engine is unavailable")?;
-        if self.config.managed_install && !self.container_has_managed_label() {
+        if self.config.capabilities.runtime.responsibility
+            == crate::deployment::Responsibility::Managed
+            && !self.container_has_authorized_labels()
+        {
             bail!("refusing to replace an unlabelled application container");
         }
         Process::new(engine)
@@ -434,6 +447,51 @@ impl<'a> Runtime<'a> {
         )
         .args(["pull", image])
         .run_quiet()
+    }
+
+    pub(crate) fn export_image(&self, image: &str, archive: &Path) -> anyhow::Result<()> {
+        let engine = self
+            .config
+            .container_engine()
+            .context("container engine is unavailable")?;
+        let parent = archive
+            .parent()
+            .context("OCI recovery archive has no parent")?;
+        fs::create_dir_all(parent)?;
+        let temporary = archive.with_extension("oci-archive.tmp");
+        if temporary.exists() {
+            fs::remove_file(&temporary)?;
+        }
+        Process::new(engine)
+            .args(["image", "save", "--output"])
+            .arg(&temporary)
+            .arg(image)
+            .run_quiet()?;
+        let metadata = fs::symlink_metadata(&temporary)
+            .context("container engine did not create the OCI recovery archive")?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+            bail!("container engine created an invalid OCI recovery archive");
+        }
+        fs::rename(&temporary, archive)?;
+        Ok(())
+    }
+
+    pub(crate) fn import_image(&self, archive: &Path, expected_image: &str) -> anyhow::Result<()> {
+        let metadata =
+            fs::symlink_metadata(archive).context("trusted OCI recovery archive is unavailable")?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+            bail!("trusted OCI recovery archive is invalid");
+        }
+        let engine = self
+            .config
+            .container_engine()
+            .context("container engine is unavailable")?;
+        Process::new(engine)
+            .args(["image", "load", "--input"])
+            .arg(archive)
+            .run_quiet()?;
+        self.image_digest(expected_image)?;
+        Ok(())
     }
 
     pub(crate) fn image_revision(&self, image: &str) -> anyhow::Result<String> {
@@ -673,35 +731,57 @@ impl<'a> Runtime<'a> {
             command = command.args(["-e", &format!("{key}={value}")]);
         }
         for mount in &self.config.runtime.mounts {
-            command =
-                command
-                    .arg("-v")
-                    .arg(mount_argument(&mount.source, &mount.target, &mount.mode));
+            command = command.arg("-v").arg(mount_argument(
+                &mount.source,
+                &mount.target,
+                mount.read_only,
+                mount.selinux_relabel,
+            ));
         }
         command
     }
 
-    fn container_has_managed_label(&self) -> bool {
+    fn container_has_authorized_labels(&self) -> bool {
         let Some(engine) = self.config.container_engine() else {
             return false;
         };
-        for format in [
-            "{{index .Config.Labels \"io.nazoauth.managed\"}}",
-            "{{index .Labels \"io.nazoauth.managed\"}}",
+        for (label, expected) in [
+            (
+                "io.nazoauth.deployment-id",
+                self.config.operator.deployment_id.as_str(),
+            ),
+            (
+                "io.nazoauth.runtime-instance-id",
+                self.config.runtime.runtime_instance_id.as_str(),
+            ),
+            (
+                "io.nazoauth.control-authority",
+                self.config.operator.controller_key_id.as_str(),
+            ),
         ] {
-            let value = Process::new(engine)
-                .args([
-                    "inspect",
-                    self.config.runtime.container_name.as_str(),
-                    "--format",
-                    format,
-                ])
-                .stdout();
-            if value.is_ok_and(|value| value.trim() == "true") {
-                return true;
+            let mut matched = false;
+            for format in [
+                format!("{{{{index .Config.Labels \"{label}\"}}}}"),
+                format!("{{{{index .Labels \"{label}\"}}}}"),
+            ] {
+                let value = Process::new(engine)
+                    .args([
+                        "inspect",
+                        self.config.runtime.container_name.as_str(),
+                        "--format",
+                    ])
+                    .arg(format)
+                    .stdout();
+                if value.is_ok_and(|value| value.trim() == expected) {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                return false;
             }
         }
-        false
+        true
     }
 }
 
@@ -736,19 +816,30 @@ fn container_task_process(engine: &str) -> Process {
         .args(["run", "--rm", "--interactive"])
 }
 
-fn mount_argument(source: &Path, target: &Path, mode: &str) -> OsString {
+fn mount_argument(
+    source: &Path,
+    target: &Path,
+    read_only: bool,
+    selinux_relabel: bool,
+) -> OsString {
     let mut value = source.as_os_str().to_os_string();
     value.push(":");
     value.push(target);
     value.push(":");
-    value.push(mode);
+    value.push(if read_only { "ro" } else { "rw" });
+    if selinux_relabel {
+        value.push(",Z");
+    }
     value
 }
 
 fn append_mount(command: Process, mount: &Mount) -> Process {
-    command
-        .arg("-v")
-        .arg(mount_argument(&mount.source, &mount.target, &mount.mode))
+    command.arg("-v").arg(mount_argument(
+        &mount.source,
+        &mount.target,
+        mount.read_only,
+        mount.selinux_relabel,
+    ))
 }
 
 #[cfg(test)]

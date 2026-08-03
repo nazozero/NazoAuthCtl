@@ -58,7 +58,11 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Resu
         .parent()
         .context("atomic-write target has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        hex(&rand::random::<[u8; 8]>())
+    ));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     let mut file = options
@@ -69,8 +73,27 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Resu
         .with_context(|| format!("failed to write {}", temporary.display()))?;
     file.sync_all()
         .with_context(|| format!("failed to persist {}", temporary.display()))?;
-    fs::rename(&temporary, path)
-        .with_context(|| format!("failed to activate {}", path.display()))?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        if !path.exists() {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).with_context(|| format!("failed to activate {}", path.display()));
+        }
+        let previous = path.with_extension(format!(
+            "previous-{}-{}",
+            std::process::id(),
+            hex(&rand::random::<[u8; 8]>())
+        ));
+        fs::rename(path, &previous)
+            .with_context(|| format!("failed to preserve previous {}", path.display()))?;
+        if let Err(activation_error) = fs::rename(&temporary, path) {
+            let _ = fs::rename(&previous, path);
+            let _ = fs::remove_file(&temporary);
+            return Err(activation_error)
+                .with_context(|| format!("failed to activate {}", path.display()));
+        }
+        fs::remove_file(&previous)
+            .with_context(|| format!("failed to retire previous {}", path.display()))?;
+    }
     sync_parent(path)?;
     Ok(())
 }

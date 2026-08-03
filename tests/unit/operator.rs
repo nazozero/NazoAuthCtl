@@ -41,7 +41,8 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
     fs::write(&secret_revision_file, "secret-test").unwrap();
     UpdateConfig {
         schema: 2,
-        managed_install: true,
+        trust: crate::deployment::TrustState::Adopted,
+        capabilities: crate::deployment::CapabilityGrants::controller_installed(),
         install_profile: "baseline".to_owned(),
         repository: "nazozero/NazoAuth".to_owned(),
         updater_install_path: work.path().join("nazoauthctl"),
@@ -74,6 +75,7 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
             engine: "host".to_owned(),
             dependency_engine: String::new(),
             container_name: "nazoauth".to_owned(),
+            runtime_instance_id: "runtime-test".to_owned(),
             network: "nazoauth".to_owned(),
             ip_address: String::new(),
             publish_address: String::new(),
@@ -1156,7 +1158,8 @@ fn canonical_manifest_hashes_only_the_closed_non_secret_configuration() {
     config.runtime.mounts.push(crate::model::Mount {
         source: server_config.clone(),
         target: "/app/.env.yaml".into(),
-        mode: "ro".to_owned(),
+        read_only: true,
+        selinux_relabel: false,
     });
     assert_eq!(
         canonical_manifest(&config, &TaskOperation::KeysList)

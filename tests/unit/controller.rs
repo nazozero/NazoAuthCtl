@@ -72,6 +72,7 @@ fn manifest(version: &str, revision: char) -> ReleaseManifest {
             protocol: nazo_operator_protocol::PROTOCOL_VERSION,
             build_id: format!("build:{version}"),
         },
+        operator_protocol: None,
         artifacts: BTreeMap::from([
             ("binary".to_owned(), binary),
             (
@@ -120,7 +121,8 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
     let absolute = |name: &str| work.path().join(name);
     UpdateConfig {
         schema: 2,
-        managed_install: true,
+        trust: crate::deployment::TrustState::Adopted,
+        capabilities: crate::deployment::CapabilityGrants::controller_installed(),
         install_profile: "baseline".to_owned(),
         repository: "nazozero/NazoAuth".to_owned(),
         updater_install_path: absolute("installed-nazoauthctl"),
@@ -153,6 +155,7 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
             engine: "host".to_owned(),
             dependency_engine: String::new(),
             container_name: "nazoauth".to_owned(),
+            runtime_instance_id: "runtime-test".to_owned(),
             network: "nazoauth".to_owned(),
             ip_address: String::new(),
             publish_address: String::new(),
@@ -335,13 +338,14 @@ fn openid4vc_trust_export_uses_only_the_managed_key_directory() {
     value.runtime.mounts = vec![crate::model::Mount {
         source: keys.clone(),
         target: PathBuf::from(OPENID4VC_KEYS_MOUNT),
-        mode: "rw,Z".to_owned(),
+        read_only: false,
+        selinux_relabel: true,
     }];
     assert_eq!(
         managed_openid4vc_bundle_path(&value).unwrap(),
         keys.join(OPENID4VC_CERTIFICATE_BUNDLE)
     );
-    value.runtime.mounts[0].mode = "ro,Z".to_owned();
+    value.runtime.mounts[0].read_only = true;
     assert!(managed_openid4vc_bundle_path(&value).is_err());
 }
 
@@ -471,7 +475,8 @@ fn write_bootstrap_fixture(
     config.runtime.mounts = vec![crate::model::Mount {
         source: directory,
         target: PathBuf::from(BOOTSTRAP_MOUNT_TARGET),
-        mode: "rw,Z".to_owned(),
+        read_only: false,
+        selinux_relabel: true,
     }];
     token_path
 }
@@ -1355,6 +1360,7 @@ fn public_command_dispatch_fails_closed_before_every_confirmed_mutation() {
     let invoke = |command| {
         run(Cli {
             config: config_path.clone(),
+            deployment: None,
             command,
         })
     };

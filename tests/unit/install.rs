@@ -4,12 +4,16 @@ use super::*;
 use crate::filesystem::PrivateTempDir;
 
 fn install_options(data_root: PathBuf) -> InstallOptions {
+    let control_root = data_root.with_file_name("control");
+    let recovery_root = data_root.with_file_name("recovery");
     InstallOptions {
         runtime: "podman".to_owned(),
         public_url: "https://auth.example".to_owned(),
         profile: "baseline".to_owned(),
         profile_material: None,
         data_root,
+        control_root,
+        recovery_root,
         port: 8000,
         network_subnet: None,
         runtime_ip: None,
@@ -174,6 +178,8 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
         profile: "standards-full".to_owned(),
         profile_material: Some(material),
         data_root: work.path().join("data"),
+        control_root: work.path().join("control"),
+        recovery_root: work.path().join("recovery"),
         port: 8000,
         network_subnet: None,
         runtime_ip: None,
@@ -561,11 +567,8 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
     let work = PrivateTempDir::new("container-config-boundary").unwrap();
     let config_dir = work.path().join("config");
     let mut options = install_options(work.path().join("data"));
-    operator::initialize_identity_generation(
-        &config_dir.join("operator"),
-        &options.data_root.join("recovery"),
-    )
-    .unwrap();
+    operator::initialize_identity_generation(&config_dir.join("operator"), &options.recovery_root)
+        .unwrap();
     options.profile = "standards-full".to_owned();
     let config_path = config_dir.join("update.json");
     let config = build_config(&config_path, &options, "podman", "podman", "external").unwrap();
@@ -581,7 +584,9 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
         Some(&"/run/nazoauth-secrets/valkey-url".to_owned())
     );
     assert!(config.runtime.mounts.iter().any(|mount| {
-        mount.target == Path::new("/run/nazoauth-secrets/database-url") && mount.mode == "ro,Z"
+        mount.target == Path::new("/run/nazoauth-secrets/database-url")
+            && mount.read_only
+            && mount.selinux_relabel
     }));
     assert!(!config.runtime.mounts.iter().any(|mount| {
         mount.target == Path::new("/run/nazoauth-secrets/database-migration-url")
@@ -589,11 +594,9 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
     for name in STANDARDS_PROFILE_SECRET_NAMES {
         let expected = PathBuf::from(format!("/run/nazoauth-secrets/{name}"));
         assert!(
-            config
-                .runtime
-                .mounts
-                .iter()
-                .any(|mount| { mount.target == expected && mount.mode == "ro,Z" })
+            config.runtime.mounts.iter().any(|mount| {
+                mount.target == expected && mount.read_only && mount.selinux_relabel
+            })
         );
     }
     assert!(
@@ -606,7 +609,7 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
         !config
             .runtime
             .snapshot_paths
-            .contains(&options.data_root.join("recovery"))
+            .contains(&options.recovery_root)
     );
     assert!(!rendered.contains("postgresql://"));
     assert!(!rendered.contains("redis://"));

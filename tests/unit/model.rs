@@ -4,7 +4,8 @@ fn valid_config() -> UpdateConfig {
     let root = std::env::temp_dir().join("nazoauthctl-model-test");
     UpdateConfig {
         schema: 2,
-        managed_install: true,
+        trust: crate::deployment::TrustState::Adopted,
+        capabilities: crate::deployment::CapabilityGrants::controller_installed(),
         install_profile: "baseline".to_owned(),
         repository: "nazozero/NazoAuth".to_owned(),
         updater_install_path: root.join("bin/nazoauthctl"),
@@ -37,6 +38,7 @@ fn valid_config() -> UpdateConfig {
             engine: "host".to_owned(),
             dependency_engine: "podman".to_owned(),
             container_name: "nazoauth".to_owned(),
+            runtime_instance_id: "runtime-test".to_owned(),
             network: "nazoauth-net".to_owned(),
             ip_address: String::new(),
             publish_address: "127.0.0.1:8000".to_owned(),
@@ -49,7 +51,8 @@ fn valid_config() -> UpdateConfig {
             mounts: vec![Mount {
                 source: root.join("config/.env.yaml"),
                 target: root.join("mounted/.env.yaml"),
-                mode: "ro".to_owned(),
+                read_only: true,
+                selinux_relabel: false,
             }],
             snapshot_paths: vec![root.join("keys")],
             environment: BTreeMap::from([(
@@ -106,6 +109,7 @@ fn valid_manifest() -> ReleaseManifest {
             protocol: nazo_operator_protocol::PROTOCOL_VERSION,
             build_id: "build:test".to_owned(),
         },
+        operator_protocol: None,
         artifacts: BTreeMap::from([
             (
                 "binary".to_owned(),
@@ -207,9 +211,6 @@ fn update_config_accepts_only_closed_safe_runtime_boundaries() {
     assert!(invalid.validate().is_err());
     let mut invalid = config.clone();
     invalid.runtime.readiness_attempts = 0;
-    assert!(invalid.validate().is_err());
-    let mut invalid = config.clone();
-    invalid.runtime.mounts[0].mode = "private".to_owned();
     assert!(invalid.validate().is_err());
     let mut invalid = config.clone();
     invalid.runtime.environment = BTreeMap::from([(

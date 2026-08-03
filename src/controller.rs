@@ -76,14 +76,12 @@ struct UpdateJournal {
     previous_ui: Option<PathBuf>,
     candidate_runtime: String,
     candidate_ui: PathBuf,
-    staged_updater: PathBuf,
     backup: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UpdateRecoveryAction {
     RestorePrevious,
-    ContinueForward,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -94,6 +92,34 @@ struct InstallCompletion {
     backend_commit: String,
     management_event_file: String,
     management_event_sha256: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ControllerTrustState {
+    schema: u32,
+    version: String,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ControllerRollbackState {
+    schema: u32,
+    version: String,
+    sha256: String,
+    artifact: PathBuf,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ControllerUpdateJournal {
+    schema: u32,
+    from_version: String,
+    from_sha256: String,
+    to_version: String,
+    to_sha256: String,
+    staged_artifact: PathBuf,
 }
 
 const BOOTSTRAP_MOUNT_TARGET: &str = "/var/lib/nazo_oauth/bootstrap";
@@ -217,12 +243,38 @@ fn conformance_operation(command: ConformanceLeaseCommand) -> anyhow::Result<Tas
 
 pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
+        Command::Discover => {
+            let report = crate::discovery::discover()?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::Adopt(options) => {
+            require_root()?;
+            crate::adoption::run(options)
+        }
+        Command::DeploymentsList => list_deployments(),
         Command::Install(options) => install(cli.config, *options),
         Command::Status => {
+            if crate::deployment::DeploymentStore::system()
+                .registry_path()
+                .exists()
+            {
+                let record = crate::deployment::DeploymentStore::system()
+                    .resolve(cli.deployment.as_deref(), false)?;
+                return registered_status(&record, false);
+            }
             let config = load_config(&cli.config)?;
             status(&config)
         }
         Command::Doctor => {
+            if crate::deployment::DeploymentStore::system()
+                .registry_path()
+                .exists()
+            {
+                let record = crate::deployment::DeploymentStore::system()
+                    .resolve(cli.deployment.as_deref(), false)?;
+                return registered_status(&record, true);
+            }
             let config = load_config(&cli.config)?;
             doctor(&config)
         }
@@ -436,7 +488,174 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 &expected,
             )
         }
+        Command::SelfCheck(version) => {
+            let config = load_config(&cli.config)?;
+            controller_check(&config, version.as_deref())
+        }
+        Command::SelfUpdate { version, yes } => {
+            require_root()?;
+            let config = load_config(&cli.config)?;
+            require_confirmation(yes, "replace nazoauthctl with a signed controller Release")?;
+            controller_update(&config, version.as_deref())
+        }
+        Command::SelfRollback { yes } => {
+            require_root()?;
+            let config = load_config(&cli.config)?;
+            require_confirmation(yes, "restore the previous signed nazoauthctl binary")?;
+            controller_rollback(&config)
+        }
     }
+}
+
+fn controller_state_directory(config: &UpdateConfig) -> PathBuf {
+    config.deployment_root.join("controller-self")
+}
+
+fn controller_check(config: &UpdateConfig, version: Option<&str>) -> anyhow::Result<()> {
+    let release =
+        crate::release::VerifiedControllerRelease::fetch(version, config.container_engine())?;
+    enforce_controller_trust(config, &release.version, &release.sha256)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "installed": env!("CARGO_PKG_VERSION"),
+            "candidate": release.version,
+            "sha256": release.sha256,
+            "repository": "nazozero/NazoAuthCtl",
+        }))?
+    );
+    Ok(())
+}
+
+fn controller_update(config: &UpdateConfig, version: Option<&str>) -> anyhow::Result<()> {
+    let release =
+        crate::release::VerifiedControllerRelease::fetch(version, config.container_engine())?;
+    enforce_controller_trust(config, &release.version, &release.sha256)?;
+    let directory = controller_state_directory(config);
+    fs::create_dir_all(&directory)?;
+    let current = std::env::current_exe().context("failed to resolve the running controller")?;
+    let previous_sha256 = crate::filesystem::sha256(&current)?;
+    let previous_version = controller_trust_state(config)?
+        .map(|state| state.version)
+        .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
+    let rollback_artifact = directory.join(format!("rollback-{previous_sha256}"));
+    copy_atomic(&current, &rollback_artifact, 0o500)?;
+    let staged = directory.join(format!("candidate-{}", release.sha256));
+    copy_atomic(&release.artifact(), &staged, 0o500)?;
+    Process::new(&staged).arg("--help").run_quiet()?;
+    release.persist_evidence(&directory.join("evidence").join(&release.version))?;
+    atomic_write(
+        &directory.join("update-transaction.json"),
+        &serde_json::to_vec_pretty(&ControllerUpdateJournal {
+            schema: 1,
+            from_version: previous_version.clone(),
+            from_sha256: previous_sha256.clone(),
+            to_version: release.version.clone(),
+            to_sha256: release.sha256.clone(),
+            staged_artifact: staged.clone(),
+        })?,
+        0o600,
+    )?;
+    copy_atomic(&staged, &config.updater_install_path, 0o755)?;
+    if crate::filesystem::sha256(&config.updater_install_path)? != release.sha256 {
+        bail!("installed controller digest differs from the verified candidate");
+    }
+    atomic_write(
+        &directory.join("rollback.json"),
+        &serde_json::to_vec_pretty(&ControllerRollbackState {
+            schema: 1,
+            version: previous_version,
+            sha256: previous_sha256,
+            artifact: rollback_artifact,
+        })?,
+        0o600,
+    )?;
+    write_controller_trust(config, &release.version, &release.sha256)?;
+    remove_file_durable(&directory.join("update-transaction.json"))?;
+    remove_file_durable(&staged)?;
+    crate::operator::append_management_event(
+        config,
+        "controller-update",
+        &release.version,
+        "controller-local-rollback",
+    )?;
+    println!("nazoauthctl updated independently to {}", release.version);
+    Ok(())
+}
+
+fn controller_rollback(config: &UpdateConfig) -> anyhow::Result<()> {
+    let directory = controller_state_directory(config);
+    let state: ControllerRollbackState = serde_json::from_slice(
+        &fs::read(directory.join("rollback.json"))
+            .context("controller rollback state is unavailable")?,
+    )
+    .context("controller rollback state is invalid")?;
+    if state.schema != 1 || crate::filesystem::sha256(&state.artifact)? != state.sha256 {
+        bail!("controller rollback artifact is not the persisted trusted binary");
+    }
+    copy_atomic(&state.artifact, &config.updater_install_path, 0o755)?;
+    if crate::filesystem::sha256(&config.updater_install_path)? != state.sha256 {
+        bail!("restored controller digest differs from rollback state");
+    }
+    write_controller_trust(config, &state.version, &state.sha256)?;
+    crate::operator::append_management_event(
+        config,
+        "controller-rollback",
+        &state.version,
+        "controller-local-rollback",
+    )?;
+    println!("nazoauthctl rolled back independently to {}", state.version);
+    Ok(())
+}
+
+fn controller_trust_state(config: &UpdateConfig) -> anyhow::Result<Option<ControllerTrustState>> {
+    let path = controller_state_directory(config).join("trust.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let state: ControllerTrustState =
+        serde_json::from_slice(&fs::read(path)?).context("controller trust state is invalid")?;
+    if state.schema != 1 || state.sha256.len() != 64 {
+        bail!("controller trust state has an unsupported schema");
+    }
+    Ok(Some(state))
+}
+
+fn enforce_controller_trust(
+    config: &UpdateConfig,
+    version: &str,
+    sha256: &str,
+) -> anyhow::Result<()> {
+    let Some(state) = controller_trust_state(config)? else {
+        return Ok(());
+    };
+    match compare_versions(version, &state.version)? {
+        std::cmp::Ordering::Less => {
+            bail!("controller anti-downgrade policy requires explicit self rollback")
+        }
+        std::cmp::Ordering::Equal if state.sha256 != sha256 => {
+            bail!("immutable controller Release changed for an already trusted version")
+        }
+        _ => Ok(()),
+    }
+}
+
+fn write_controller_trust(
+    config: &UpdateConfig,
+    version: &str,
+    sha256: &str,
+) -> anyhow::Result<()> {
+    let directory = controller_state_directory(config);
+    fs::create_dir_all(&directory)?;
+    atomic_write(
+        &directory.join("trust.json"),
+        &serde_json::to_vec_pretty(&ControllerTrustState {
+            schema: 1,
+            version: version.to_owned(),
+            sha256: sha256.to_owned(),
+        })?,
+        0o600,
+    )
 }
 
 const OPENID4VC_CERTIFICATE_BUNDLE: &str = "openid4vc-certificate-bundle.pem";
@@ -492,7 +711,7 @@ fn managed_openid4vc_bundle_path(config: &UpdateConfig) -> anyhow::Result<PathBu
             .iter()
             .filter(|mount| {
                 mount.target == Path::new(OPENID4VC_KEYS_MOUNT)
-                    && mount.mode.starts_with("rw")
+                    && !mount.read_only
                     && mount.source.file_name().is_some_and(|name| name == "keys")
             })
             .map(|mount| &mount.source)
@@ -1235,9 +1454,109 @@ fn validate_same_file(_before: &fs::Metadata, _opened: &fs::Metadata) -> anyhow:
     Ok(())
 }
 
+fn list_deployments() -> anyhow::Result<()> {
+    let store = crate::deployment::DeploymentStore::system();
+    let registry = store.load_registry()?;
+    let deployments = registry
+        .deployments
+        .keys()
+        .map(|deployment_id| store.load(deployment_id))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": 1,
+            "deployments": deployments,
+        }))?
+    );
+    Ok(())
+}
+
+fn registered_status(
+    record: &crate::deployment::DeploymentRecord,
+    doctor: bool,
+) -> anyhow::Result<()> {
+    use crate::deployment::{ArtifactReference, Responsibility};
+    use crate::runtime_backend::backend;
+
+    let observations = record
+        .runtime_instances
+        .iter()
+        .map(|runtime| {
+            let observation = backend(runtime.backend).inspect(&runtime.object_reference);
+            match observation {
+                Ok(observation) => {
+                    let artifact_matches = match (&runtime.artifact, &observation.artifact) {
+                        (
+                            ArtifactReference::Oci {
+                                digest: expected, ..
+                            },
+                            ArtifactReference::Oci { digest: actual, .. },
+                        ) => expected == actual,
+                        (
+                            ArtifactReference::HostBinary {
+                                sha256: expected, ..
+                            },
+                            ArtifactReference::HostBinary { sha256: actual, .. },
+                        ) => expected == actual,
+                        _ => false,
+                    };
+                    serde_json::json!({
+                        "runtime_instance_id": runtime.runtime_instance_id,
+                        "backend": runtime.backend,
+                        "object_reference": runtime.object_reference,
+                        "present": true,
+                        "running": observation.running,
+                        "artifact_matches_declaration": artifact_matches,
+                    })
+                }
+                Err(_) => serde_json::json!({
+                    "runtime_instance_id": runtime.runtime_instance_id,
+                    "backend": runtime.backend,
+                    "object_reference": runtime.object_reference,
+                    "present": false,
+                    "running": false,
+                    "artifact_matches_declaration": false,
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+    let managed_runtime_drift = record.capabilities.runtime.responsibility
+        == Responsibility::Managed
+        && observations.iter().any(|observation| {
+            !observation
+                .get("present")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                || !observation
+                    .get("artifact_matches_declaration")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+        });
+    let report = serde_json::json!({
+        "schema": 1,
+        "deployment_id": record.deployment_id,
+        "alias": record.alias,
+        "issuer": record.issuer,
+        "trust": record.trust,
+        "capabilities": record.capabilities,
+        "core_recovery_proven": record.core_recovery_is_proven(),
+        "machine_loss_requires_off_host_package": true,
+        "managed_runtime_drift": managed_runtime_drift,
+        "runtime_instances": observations,
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if doctor && managed_runtime_drift {
+        bail!("managed runtime drift requires explicit re-verification; no state was overwritten");
+    }
+    Ok(())
+}
+
 fn command_is_read_only(command: &Command) -> bool {
     match command {
-        Command::Status
+        Command::Discover
+        | Command::DeploymentsList
+        | Command::Status
         | Command::Doctor
         | Command::Check(_)
         | Command::AuditVerify
@@ -1298,9 +1617,7 @@ fn install(config_path: PathBuf, options: crate::cli::InstallOptions) -> anyhow:
     require_root()?;
     if config_path.exists() {
         let config = load_config(&config_path)?;
-        if !config.managed_install {
-            bail!("refusing to take ownership of an existing unmanaged deployment");
-        }
+        config.require_managed_lifecycle()?;
         if install_is_complete(&config)? {
             if !health_ready(&config) {
                 bail!("managed installation is complete but not healthy; run nazoauthctl doctor");
@@ -1342,12 +1659,17 @@ fn install_transaction(
     install::start_managed_dependencies(config)?;
     let release = VerifiedRelease::fetch(&config.repository, version, config.container_engine())?;
     enforce_release_trust(config, &release.manifest)?;
-    let updater = release.artifact("updater", &config.repository)?;
+    release.persist_verification_evidence(&release_cache_dir(config, &release.manifest))?;
     let _backup = Backup::create(config_path, config, &release.manifest.version)?;
 
     if config.runtime.engine == "host" {
         let binary = release.artifact("binary", &config.repository)?;
         let candidate = install_host_candidate(config, &release, &binary)?;
+        cache_trusted_runtime(
+            config,
+            &release.manifest,
+            candidate.to_string_lossy().as_ref(),
+        )?;
         install::install_systemd(config)?;
         execute_release_task(
             config,
@@ -1366,6 +1688,7 @@ fn install_transaction(
         if runtime.image_revision(&image_ref)? != release.manifest.backend_commit {
             bail!("pulled image revision does not match signed manifest");
         }
+        cache_trusted_runtime(config, &release.manifest, &image_ref)?;
         execute_release_task(
             config,
             &release,
@@ -1384,7 +1707,6 @@ fn install_transaction(
     verify_ui(config, &release.manifest)?;
     write_active_release(config, &release.manifest)?;
     commit_release_trust(config, &release.manifest)?;
-    copy_atomic(&updater, &config.updater_install_path, 0o755)?;
     write_record(config, &release.manifest, "install-success", None)?;
     let management_event = crate::operator::append_management_event(
         config,
@@ -1481,6 +1803,7 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
         config.container_engine(),
     )?;
     enforce_release_trust(config, &release.manifest)?;
+    release.persist_verification_evidence(&release_cache_dir(config, &release.manifest))?;
     let runtime = Runtime::new(config);
     let current = runtime.active_revision()?;
     let active = load_active_release(config)?;
@@ -1520,7 +1843,6 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
     } else {
         None
     };
-    let updater = release.artifact("updater", &config.repository)?;
     let previous_manifest = load_active_release(config)?;
     let previous_ui = Some(
         config
@@ -1536,6 +1858,7 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
     } else {
         previous_manifest.image_ref()?
     };
+    cache_trusted_runtime(config, &previous_manifest, &previous_runtime)?;
 
     let candidate = if config.runtime.engine == "host" {
         install_host_candidate(
@@ -1560,11 +1883,6 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
         .releases_root
         .join(&release.manifest.frontend.artifact.sha256);
     fs::create_dir_all(&config.deployment_root)?;
-    let staged_updater = config.deployment_root.join(format!(
-        "candidate-nazoauthctl-{}",
-        release.manifest.backend_commit
-    ));
-    copy_atomic(&updater, &staged_updater, 0o500)?;
     let mut journal = UpdateJournal {
         schema: 1,
         transaction_id: format!("update-{}", encode_transaction_id()),
@@ -1576,7 +1894,6 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
         previous_ui,
         candidate_runtime: candidate,
         candidate_ui,
-        staged_updater,
         backup: None,
     };
     write_update_journal(config, &journal)?;
@@ -1656,7 +1973,6 @@ fn advance_update_transaction(
         set_update_phase(config, journal, UpdatePhase::StateCommitting)?;
         let backup = journal_backup(config, journal)?;
         write_active_release(config, &journal.to_release)?;
-        copy_atomic(&journal.staged_updater, &config.updater_install_path, 0o755)?;
         write_rollback_state(
             config,
             RollbackState {
@@ -1749,11 +2065,7 @@ fn validate_update_journal(config: &UpdateConfig, journal: &UpdateJournal) -> an
         .ui
         .releases_root
         .join(&journal.to_release.frontend.artifact.sha256);
-    let expected_updater = config.deployment_root.join(format!(
-        "candidate-nazoauthctl-{}",
-        journal.to_release.backend_commit
-    ));
-    if journal.candidate_ui != expected_candidate_ui || journal.staged_updater != expected_updater {
+    if journal.candidate_ui != expected_candidate_ui {
         bail!("update transaction candidate artifacts do not match the signed Release");
     }
     if let Some(previous_ui) = &journal.previous_ui {
@@ -1831,18 +2143,24 @@ fn target_is_active(config: &UpdateConfig, journal: &UpdateJournal) -> bool {
         .is_ok_and(|revision| revision == journal.to_release.backend_commit)
 }
 
-fn recovery_action(journal: &UpdateJournal, target_is_active: bool) -> UpdateRecoveryAction {
-    if target_is_active || journal.phase >= UpdatePhase::CandidateActive {
-        return UpdateRecoveryAction::ContinueForward;
-    }
-    if journal.phase < UpdatePhase::MigrationRunning
-        || (journal.to_release.rollback.artifact
-            && journal.to_release.rollback.schema_compatible
-            && !journal.to_release.rollback.irreversible_migration)
-    {
-        UpdateRecoveryAction::RestorePrevious
-    } else {
-        UpdateRecoveryAction::ContinueForward
+fn recovery_action(_journal: &UpdateJournal, _target_is_active: bool) -> UpdateRecoveryAction {
+    // Recovery is deliberately an unwind operation. Continuing forward could
+    // require the current broken server artifact to execute operator-task,
+    // which would make recovery depend on the failure it is meant to contain.
+    UpdateRecoveryAction::RestorePrevious
+}
+
+pub(crate) fn uses_legacy_lock(command: &Command) -> bool {
+    match command {
+        Command::Discover | Command::Adopt(_) | Command::DeploymentsList => false,
+        Command::Status | Command::Doctor
+            if crate::deployment::DeploymentStore::system()
+                .registry_path()
+                .exists() =>
+        {
+            false
+        }
+        _ => true,
     }
 }
 
@@ -1854,31 +2172,25 @@ fn recover_pending_update(config_path: &Path, config: &UpdateConfig) -> anyhow::
         "nazoauthctl: recovering update transaction {} at phase {:?}",
         journal.transaction_id, journal.phase
     );
-    match recovery_action(&journal, target_is_active(config, &journal)) {
-        UpdateRecoveryAction::ContinueForward => {
-            advance_update_transaction(config_path, config, &mut journal)?;
-            eprintln!(
-                "nazoauthctl: update transaction {} completed at {}",
-                journal.transaction_id, journal.to_release.version
-            );
-        }
-        UpdateRecoveryAction::RestorePrevious => {
-            restore_previous_transaction(config, &journal)?;
-            append_update_management_event(
-                config,
-                &journal,
-                "artifact-restored",
-                "update-artifact-restored",
-                &journal.from_release.version,
-                "schema-compatible",
-            )?;
-            finish_update_journal(config, &journal)?;
-            eprintln!(
-                "nazoauthctl: interrupted update transaction {} restored {}",
-                journal.transaction_id, journal.from_release.version
-            );
-        }
-    }
+    let _ = config_path;
+    restore_previous_transaction(config, &journal)?;
+    append_update_management_event(
+        config,
+        &journal,
+        "artifact-restored",
+        "update-recovered-to-previous",
+        &journal.from_release.version,
+        if journal.phase >= UpdatePhase::MigrationRunning {
+            "database-backup"
+        } else {
+            "artifact-only"
+        },
+    )?;
+    finish_update_journal(config, &journal)?;
+    eprintln!(
+        "nazoauthctl: interrupted update transaction {} restored {}",
+        journal.transaction_id, journal.from_release.version
+    );
     Ok(())
 }
 
@@ -1886,14 +2198,30 @@ fn restore_previous_transaction(
     config: &UpdateConfig,
     journal: &UpdateJournal,
 ) -> anyhow::Result<()> {
+    ensure_trusted_runtime_available(config, &journal.from_release, &journal.previous_runtime)?;
     if journal.phase >= UpdatePhase::MigrationRunning {
         let backup = journal_backup(config, journal)?;
-        rollback(
-            config,
-            &journal.previous_runtime,
-            journal.previous_ui.as_deref(),
-            &backup,
-        )?;
+        rotate_bootstrap_recovery_epoch(config)
+            .context("failed to invalidate bootstrap receipts before update recovery")?;
+        let runtime = Runtime::new(config);
+        if config.runtime.engine == "host" {
+            runtime.stop_service().ok();
+        } else if runtime.container_exists() {
+            runtime.remove_container().ok();
+        }
+        backup.restore_databases(config)?;
+        backup.restore_snapshots()?;
+        install::grant_runtime_database(config)?;
+        if config.runtime.engine == "host" {
+            symlink_atomic(
+                Path::new(&journal.previous_runtime),
+                &config.runtime.binary_path,
+            )?;
+            runtime.start_service()?;
+        } else {
+            runtime.start_container(&journal.previous_runtime)?;
+        }
+        wait_ready(config)?;
     } else {
         let runtime = Runtime::new(config);
         if config.runtime.engine == "host" {
@@ -1922,10 +2250,8 @@ fn handle_update_failure(
     journal: &UpdateJournal,
     error: anyhow::Error,
 ) -> anyhow::Result<()> {
-    if recovery_action(journal, target_is_active(config, journal))
-        == UpdateRecoveryAction::ContinueForward
-        && (!journal.to_release.rollback.schema_compatible
-            || journal.to_release.rollback.irreversible_migration)
+    if !journal.to_release.rollback.schema_compatible
+        || journal.to_release.rollback.irreversible_migration
     {
         write_record(
             config,
@@ -2048,7 +2374,7 @@ fn target_ui_is_active(journal: &UpdateJournal) -> bool {
 }
 
 fn finish_update_journal(config: &UpdateConfig, journal: &UpdateJournal) -> anyhow::Result<()> {
-    remove_file_durable(&journal.staged_updater)?;
+    let _ = journal;
     remove_file_durable(&update_journal_path(config))
 }
 
@@ -2140,6 +2466,7 @@ fn public_rollback(config: &UpdateConfig) -> anyhow::Result<()> {
         );
     }
     let backup = Backup::open_existing(config, &state.backup)?;
+    ensure_trusted_runtime_available(config, &state.from_release, &state.previous_runtime)?;
     crate::operator::append_management_event(
         config,
         "artifact-rollback-intent",
@@ -2177,6 +2504,7 @@ fn recover_from_backup(config: &UpdateConfig) -> anyhow::Result<()> {
         bail!("the signed Release does not declare backup-based database recovery");
     }
     let backup = Backup::open_existing(config, &state.backup)?;
+    ensure_trusted_runtime_available(config, &state.from_release, &state.previous_runtime)?;
     crate::operator::append_management_event(
         config,
         "backup-recovery-intent",
@@ -2409,6 +2737,94 @@ fn active_release_path(config: &UpdateConfig) -> PathBuf {
     config.deployment_root.join("active-release.json")
 }
 
+fn release_cache_dir(config: &UpdateConfig, manifest: &ReleaseManifest) -> PathBuf {
+    config
+        .deployment_root
+        .join("trusted-release-cache")
+        .join(&manifest.version)
+        .join(&manifest.target)
+}
+
+fn cache_trusted_runtime(
+    config: &UpdateConfig,
+    manifest: &ReleaseManifest,
+    runtime_target: &str,
+) -> anyhow::Result<()> {
+    let directory = release_cache_dir(config, manifest);
+    fs::create_dir_all(&directory)?;
+    atomic_write(
+        &directory.join("server-release-manifest.json"),
+        &serde_json::to_vec_pretty(manifest)?,
+        0o400,
+    )?;
+    if config.runtime.engine == "host" {
+        let expected = &manifest
+            .artifacts
+            .get("binary")
+            .context("Release manifest has no server binary")?
+            .sha256;
+        if crate::filesystem::sha256(Path::new(runtime_target))? != *expected {
+            bail!("trusted host recovery binary differs from the signed Release");
+        }
+        copy_atomic(
+            Path::new(runtime_target),
+            &directory.join("nazoauth"),
+            0o500,
+        )
+    } else {
+        Runtime::new(config).export_image(runtime_target, &directory.join("server-image.tar"))
+    }
+}
+
+fn ensure_trusted_runtime_available(
+    config: &UpdateConfig,
+    manifest: &ReleaseManifest,
+    runtime_target: &str,
+) -> anyhow::Result<()> {
+    let directory = release_cache_dir(config, manifest);
+    let cached: ReleaseManifest = serde_json::from_slice(
+        &fs::read(directory.join("server-release-manifest.json"))
+            .context("trusted recovery manifest is unavailable")?,
+    )
+    .context("trusted recovery manifest is invalid")?;
+    if &cached != manifest {
+        bail!("trusted recovery manifest differs from the persisted rollback state");
+    }
+    if config.runtime.engine == "host" {
+        let expected = &manifest
+            .artifacts
+            .get("binary")
+            .context("Release manifest has no server binary")?
+            .sha256;
+        if Path::new(runtime_target).is_file()
+            && crate::filesystem::sha256(Path::new(runtime_target))
+                .is_ok_and(|value| &value == expected)
+        {
+            return Ok(());
+        }
+        let cached_binary = directory.join("nazoauth");
+        if crate::filesystem::sha256(&cached_binary)? != *expected {
+            bail!("cached host recovery binary differs from the signed Release");
+        }
+        fs::create_dir_all(
+            Path::new(runtime_target)
+                .parent()
+                .context("host recovery target has no parent")?,
+        )?;
+        copy_atomic(&cached_binary, Path::new(runtime_target), 0o500)
+    } else {
+        let runtime = Runtime::new(config);
+        if runtime.image_digest(runtime_target).is_ok() {
+            return Ok(());
+        }
+        runtime.import_image(&directory.join("server-image.tar"), runtime_target)?;
+        if runtime.image_digest(runtime_target)? != manifest.runtime_oci_digest()? {
+            bail!("imported recovery image differs from the signed Release");
+        }
+        Ok(())
+    }
+}
+
 fn write_active_release(config: &UpdateConfig, manifest: &ReleaseManifest) -> anyhow::Result<()> {
     atomic_write(
         &active_release_path(config),
@@ -2425,6 +2841,7 @@ fn load_active_release(config: &UpdateConfig) -> anyhow::Result<ReleaseManifest>
         config.repository, manifest.version
     );
     manifest.validate(&manifest.version, &identity)?;
+    manifest.validate_controller_compatibility()?;
     Ok(manifest)
 }
 

@@ -175,7 +175,9 @@ impl Backup {
             .args(["stop", config.valkey.container_name.as_str()])
             .run_quiet()?;
         let restore = Process::new(engine)
-            .args(["run", "--rm", "-v", "nazo_oauth_valkey:/data", "-v"])
+            .args(["run", "--rm", "-v"])
+            .arg(format!("{}-data:/data", config.valkey.container_name))
+            .arg("-v")
             .arg(format!("{}:/backup:ro,Z", self.path.display()))
             .arg(&config.valkey.image)
             .args([

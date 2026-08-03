@@ -3,6 +3,7 @@ use std::{
     path::PathBuf,
 };
 
+use crate::deployment::{CapabilityGrants, TrustState};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
@@ -10,8 +11,8 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub(crate) struct UpdateConfig {
     pub(crate) schema: u32,
-    #[serde(default)]
-    pub(crate) managed_install: bool,
+    pub(crate) trust: TrustState,
+    pub(crate) capabilities: CapabilityGrants,
     #[serde(default = "baseline_install_profile")]
     pub(crate) install_profile: String,
     pub(crate) repository: String,
@@ -97,6 +98,7 @@ pub(crate) struct Runtime {
     #[serde(default)]
     pub(crate) dependency_engine: String,
     pub(crate) container_name: String,
+    pub(crate) runtime_instance_id: String,
     pub(crate) network: String,
     #[serde(default)]
     pub(crate) ip_address: String,
@@ -130,7 +132,8 @@ pub(crate) struct Runtime {
 pub(crate) struct Mount {
     pub(crate) source: PathBuf,
     pub(crate) target: PathBuf,
-    pub(crate) mode: String,
+    pub(crate) read_only: bool,
+    pub(crate) selinux_relabel: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -162,6 +165,36 @@ pub(crate) struct Ui {
 }
 
 impl UpdateConfig {
+    pub(crate) fn require_managed_lifecycle(&self) -> anyhow::Result<()> {
+        use crate::deployment::Capability;
+
+        if self.trust != TrustState::Adopted {
+            bail!("deployment is not adopted");
+        }
+        let denied = [
+            Capability::Runtime,
+            Capability::Artifact,
+            Capability::Backups,
+        ]
+        .into_iter()
+        .filter(|capability| {
+            !self
+                .capabilities
+                .grant(*capability)
+                .responsibility
+                .permits_mutation()
+        })
+        .map(Capability::name)
+        .collect::<Vec<_>>();
+        if !denied.is_empty() {
+            bail!(
+                "lifecycle operation exceeds granted capabilities: {}",
+                denied.join(", ")
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
         let config: Self =
             serde_json::from_slice(bytes).context("update configuration is not valid JSON")?;
@@ -228,6 +261,7 @@ impl UpdateConfig {
         }
         for identifier in [
             &self.operator.deployment_id,
+            &self.runtime.runtime_instance_id,
             &self.operator.controller_key_id,
             &self.operator.receipt_key_id,
             &self.operator.audit_key_id,
@@ -265,12 +299,6 @@ impl UpdateConfig {
         for mount in &self.runtime.mounts {
             safe_absolute(&mount.source)?;
             safe_absolute(&mount.target)?;
-            if !matches!(
-                mount.mode.as_str(),
-                "ro" | "rw" | "ro,z" | "rw,z" | "ro,Z" | "rw,Z"
-            ) {
-                bail!("unsupported mount mode {}", mount.mode);
-            }
         }
         for path in &self.runtime.snapshot_paths {
             safe_absolute(path)?;
@@ -337,10 +365,20 @@ pub(crate) struct ReleaseManifest {
     pub(crate) backend_commit: String,
     pub(crate) release_identity: String,
     pub(crate) embedded: nazo_operator_protocol::EmbeddedIdentity,
+    #[serde(default)]
+    pub(crate) operator_protocol: Option<OperatorProtocolCompatibility>,
     pub(crate) artifacts: BTreeMap<String, Artifact>,
     pub(crate) frontend: FrontendRelease,
     pub(crate) oci: OciRelease,
     pub(crate) rollback: Rollback,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperatorProtocolCompatibility {
+    pub(crate) version: u32,
+    pub(crate) minimum_ctl_version: String,
+    pub(crate) maximum_ctl_version_exclusive: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -393,7 +431,7 @@ pub(crate) enum DatabaseRestore {
 impl ReleaseManifest {
     pub(crate) fn validate(&self, version: &str, expected_identity: &str) -> anyhow::Result<()> {
         let target = release_target().context("this platform has no official Release target")?;
-        if self.schema != 4
+        if !matches!(self.schema, 4 | 5)
             || self.version != version
             || self.target != target
             || self.release_identity != expected_identity
@@ -404,6 +442,14 @@ impl ReleaseManifest {
             || !is_lower_hex(&self.backend_commit, 40)
         {
             bail!("signed release manifest failed policy validation");
+        }
+        if self.trust != TrustState::Adopted {
+            bail!("mutable update configuration requires an adopted deployment");
+        }
+        match (self.schema, &self.operator_protocol) {
+            (4, None) => {}
+            (5, Some(protocol)) if protocol.version == self.embedded.protocol => {}
+            _ => bail!("signed release manifest has an invalid operator protocol contract"),
         }
         if self.rollback.rationale.trim().is_empty()
             || !semantic_tag(&format!("v{}", self.rollback.minimum_supported_version))
@@ -421,17 +467,24 @@ impl ReleaseManifest {
         if self.rollback.schema_compatible && !self.rollback.artifact {
             bail!("schema-compatible rollback requires a retained artifact");
         }
-        let expected = BTreeSet::from(["binary".to_owned(), "updater".to_owned()]);
+        let expected = if self.schema == 4 {
+            BTreeSet::from(["binary".to_owned(), "updater".to_owned()])
+        } else {
+            BTreeSet::from(["binary".to_owned()])
+        };
         if self.artifacts.keys().cloned().collect::<BTreeSet<_>>() != expected {
             bail!("signed release manifest has an unexpected artifact set");
         }
         let executable_suffix = executable_suffix(&self.target);
         let expected_binary = format!("nazoauth-{}{executable_suffix}", self.target);
-        let expected_updater = format!("nazoauthctl-{}{executable_suffix}", self.target);
-        if self.artifacts["binary"].name != expected_binary
-            || self.artifacts["updater"].name != expected_updater
-        {
+        if self.artifacts["binary"].name != expected_binary {
             bail!("signed release manifest artifact does not match its target");
+        }
+        if self.schema == 4 {
+            let expected_updater = format!("nazoauthctl-{}{executable_suffix}", self.target);
+            if self.artifacts["updater"].name != expected_updater {
+                bail!("signed release manifest artifact does not match its target");
+            }
         }
         for artifact in self.artifacts.values() {
             if artifact.size == 0
@@ -444,6 +497,33 @@ impl ReleaseManifest {
         }
         self.validate_frontend()?;
         self.validate_oci()?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_controller_compatibility(&self) -> anyhow::Result<()> {
+        if self.schema == 4 {
+            if !matches!(self.version.as_str(), "v0.1.18" | "v0.1.19")
+                || self.embedded.protocol != nazo_operator_protocol::PROTOCOL_VERSION
+            {
+                bail!("legacy server Release is outside the closed extraction baseline");
+            }
+            return Ok(());
+        }
+        let protocol = self
+            .operator_protocol
+            .as_ref()
+            .context("server Release has no operator protocol compatibility contract")?;
+        if protocol.version != nazo_operator_protocol::PROTOCOL_VERSION {
+            bail!("server Release operator protocol version is unsupported");
+        }
+        let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))?;
+        let minimum = semver::Version::parse(&protocol.minimum_ctl_version)
+            .context("server Release minimum ctl version is invalid")?;
+        let maximum = semver::Version::parse(&protocol.maximum_ctl_version_exclusive)
+            .context("server Release maximum ctl version is invalid")?;
+        if minimum >= maximum || current < minimum || current >= maximum {
+            bail!("controller version is outside the server Release compatibility range");
+        }
         Ok(())
     }
 

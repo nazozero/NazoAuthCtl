@@ -48,34 +48,37 @@ pub(crate) fn prepare(
     require_root()?;
     safe_absolute(config_path)?;
     safe_absolute(&options.data_root)?;
+    safe_absolute(&options.control_root)?;
+    safe_absolute(&options.recovery_root)?;
     validate_install_path(config_path, "configuration path")?;
     validate_install_path(&options.data_root, "data root")?;
+    validate_install_path(&options.control_root, "controller root")?;
+    validate_install_path(&options.recovery_root, "recovery root")?;
+    for (left, right, label) in [
+        (
+            &options.data_root,
+            &options.control_root,
+            "application and controller roots",
+        ),
+        (
+            &options.data_root,
+            &options.recovery_root,
+            "application and recovery roots",
+        ),
+        (
+            &options.control_root,
+            &options.recovery_root,
+            "controller and recovery roots",
+        ),
+    ] {
+        if left.starts_with(right) || right.starts_with(left) {
+            bail!("{label} must be distinct non-nested failure domains");
+        }
+    }
     validate_public_url(&options.public_url)?;
     normalize_external_dependencies(&mut options)?;
     normalize_profile_secrets(&mut options)?;
     let (runtime_engine, dependency_engine) = select_runtime(&options)?;
-    if runtime_engine == "host" && options.network_subnet.is_some() {
-        bail!("container network options are unavailable with the selected host runtime");
-    }
-    if runtime_engine != "host" {
-        ensure_network(
-            &runtime_engine,
-            "nazo_oauth_net",
-            options.network_subnet.as_deref(),
-        )?;
-    }
-    let trusted_proxy_cidr = if options.profile == "standards-full" {
-        if runtime_engine == "host" {
-            Some("127.0.0.1/32".to_owned())
-        } else {
-            Some(host_cidr(network_gateway(
-                &runtime_engine,
-                "nazo_oauth_net",
-            )?))
-        }
-    } else {
-        None
-    };
     let config_dir = config_path
         .parent()
         .context("update config path has no parent")?;
@@ -83,35 +86,67 @@ pub(crate) fn prepare(
     let app_root = options.data_root.join("app");
     create_directory(config_dir, 0o755)?;
     create_directory(&options.data_root, 0o755)?;
+    create_directory(&options.control_root, 0o700)?;
+    create_directory(&options.recovery_root, 0o700)?;
+    let operator_dir = config_dir.join("operator");
+    create_directory(&operator_dir, 0o700)?;
+    operator::initialize_identity_generation(&operator_dir, &options.recovery_root)?;
+    let bootstrap_operator =
+        operator_config(config_dir, &options.control_root, &options.recovery_root)?;
+    let name_suffix = object_name_suffix(&bootstrap_operator.deployment_id);
+    let network_name = format!("nazoauth-{name_suffix}-network");
+    if runtime_engine == "host" && options.network_subnet.is_some() {
+        bail!("container network options are unavailable with the selected host runtime");
+    }
+    if runtime_engine != "host" {
+        ensure_network(
+            &runtime_engine,
+            &network_name,
+            options.network_subnet.as_deref(),
+            &bootstrap_operator.deployment_id,
+            &bootstrap_operator.controller_key_id,
+        )?;
+    }
+    let trusted_proxy_cidr = if options.profile == "standards-full" {
+        if runtime_engine == "host" {
+            Some("127.0.0.1/32".to_owned())
+        } else {
+            Some(host_cidr(network_gateway(&runtime_engine, &network_name)?))
+        }
+    } else {
+        None
+    };
     create_directory(&secrets_dir, 0o700)?;
-    for path in [
-        options.data_root.join("backups"),
-        options.data_root.join("deployments"),
-        options.data_root.join("ui-releases"),
-    ] {
+    for path in [options.data_root.join("ui-releases")] {
         create_directory(&path, 0o755)?;
+    }
+    for path in [
+        options.control_root.join("backups"),
+        options.control_root.join("deployments"),
+        options.control_root.join("audit"),
+        options.control_root.join("operator-state"),
+    ] {
+        create_directory(&path, 0o700)?;
     }
     for path in [
         app_root.join("keys"),
         app_root.join("avatars"),
         app_root.join("secrets"),
         app_root.join("bootstrap"),
-        app_root.join("operator-state"),
+        app_root.join("instance"),
     ] {
         create_directory(&path, 0o700)?;
     }
-    let operator_dir = config_dir.join("operator");
-    create_directory(&operator_dir, 0o700)?;
-    let recovery_dir = options.data_root.join("recovery");
-    create_directory(&recovery_dir, 0o700)?;
-    create_directory(&options.data_root.join("audit"), 0o700)?;
-    operator::initialize_identity_generation(&operator_dir, &recovery_dir)?;
     let profile = write_install_profile(config_dir, &options)?;
 
     let dependency_mode = if options.database_url.is_some() {
         write_external_urls(&secrets_dir, &options)?
     } else {
-        write_managed_secrets(&secrets_dir)?
+        write_managed_secrets(
+            &secrets_dir,
+            &format!("nazoauth-{name_suffix}-postgres"),
+            &format!("nazoauth-{name_suffix}-valkey"),
+        )?
     };
     write_server_config(
         config_dir,
@@ -206,9 +241,22 @@ pub(crate) fn start_managed_dependencies(config: &UpdateConfig) -> anyhow::Resul
     let engine = config
         .container_engine()
         .context("managed dependencies require Podman or Docker")?;
-    ensure_network(engine, &config.runtime.network, None)?;
-    for volume in ["nazo_oauth_postgres", "nazo_oauth_valkey"] {
-        ensure_volume(engine, volume)?;
+    ensure_network(
+        engine,
+        &config.runtime.network,
+        None,
+        &config.operator.deployment_id,
+        &config.operator.controller_key_id,
+    )?;
+    let postgres_volume = format!("{}-data", config.postgres.container_name);
+    let valkey_volume = format!("{}-data", config.valkey.container_name);
+    for volume in [&postgres_volume, &valkey_volume] {
+        ensure_volume(
+            engine,
+            volume,
+            &config.operator.deployment_id,
+            &config.operator.controller_key_id,
+        )?;
     }
     let secrets = config
         .dependencies
@@ -219,6 +267,8 @@ pub(crate) fn start_managed_dependencies(config: &UpdateConfig) -> anyhow::Resul
     ensure_dependency_container(
         engine,
         &config.postgres.container_name,
+        &config.operator.deployment_id,
+        &config.operator.controller_key_id,
         Process::new(engine)
             .args([
                 "run",
@@ -226,9 +276,22 @@ pub(crate) fn start_managed_dependencies(config: &UpdateConfig) -> anyhow::Resul
                 "--name",
                 config.postgres.container_name.as_str(),
             ])
+            .arg("--label")
+            .arg(format!(
+                "io.nazoauth.deployment-id={}",
+                config.operator.deployment_id
+            ))
+            .arg("--label")
+            .arg(format!(
+                "io.nazoauth.control-authority={}",
+                config.operator.controller_key_id
+            ))
+            .arg("--label")
+            .arg(format!(
+                "io.nazoauth.runtime-instance-id={}-postgres",
+                config.runtime.runtime_instance_id
+            ))
             .args([
-                "--label",
-                "io.nazoauth.managed=true",
                 "--restart",
                 "unless-stopped",
                 "--network",
@@ -239,10 +302,10 @@ pub(crate) fn start_managed_dependencies(config: &UpdateConfig) -> anyhow::Resul
                 "POSTGRES_USER=nazoauth_migrator",
                 "-e",
                 "POSTGRES_PASSWORD_FILE=/run/nazoauth-secrets/postgres-password",
-                "-v",
-                "nazo_oauth_postgres:/var/lib/postgresql",
-                "-v",
             ])
+            .arg("-v")
+            .arg(format!("{postgres_volume}:/var/lib/postgresql"))
+            .arg("-v")
             .arg(format!(
                 "{}:/run/nazoauth-secrets/postgres-password:ro,Z",
                 secrets.join("postgres-password").display()
@@ -252,19 +315,34 @@ pub(crate) fn start_managed_dependencies(config: &UpdateConfig) -> anyhow::Resul
     ensure_dependency_container(
         engine,
         &config.valkey.container_name,
+        &config.operator.deployment_id,
+        &config.operator.controller_key_id,
         Process::new(engine)
             .args(["run", "-d", "--name", config.valkey.container_name.as_str()])
+            .arg("--label")
+            .arg(format!(
+                "io.nazoauth.deployment-id={}",
+                config.operator.deployment_id
+            ))
+            .arg("--label")
+            .arg(format!(
+                "io.nazoauth.control-authority={}",
+                config.operator.controller_key_id
+            ))
+            .arg("--label")
+            .arg(format!(
+                "io.nazoauth.runtime-instance-id={}-valkey",
+                config.runtime.runtime_instance_id
+            ))
             .args([
-                "--label",
-                "io.nazoauth.managed=true",
                 "--restart",
                 "unless-stopped",
                 "--network",
                 config.runtime.network.as_str(),
-                "-v",
-                "nazo_oauth_valkey:/data",
-                "-v",
             ])
+            .arg("-v")
+            .arg(format!("{valkey_volume}:/data"))
+            .arg("-v")
             .arg(format!(
                 "{}:/run/nazoauth-secrets/valkey-password:ro,Z",
                 secrets.join("valkey-password").display()
@@ -483,7 +561,7 @@ impl HostSystemdUnit<'_> {
          LockPersonality=true\n\
          CapabilityBoundingSet=\n\
          AmbientCapabilities=\n\
-         ReadWritePaths={keys} {avatars} {secrets} {bootstrap} {ui_releases}\n\
+         ReadWritePaths={keys} {avatars} {secrets} {bootstrap} {instance} {ui_releases}\n\
          InaccessiblePaths={operator_state} {operator_dir} {recovery_dir} {migration_url}\n\n\
          [Install]\n\
          WantedBy=multi-user.target\n",
@@ -494,6 +572,7 @@ impl HostSystemdUnit<'_> {
             avatars = self.app_root.join("avatars").display(),
             secrets = self.app_root.join("secrets").display(),
             bootstrap = self.app_root.join("bootstrap").display(),
+            instance = self.app_root.join("instance").display(),
             ui_releases = self.ui_releases.display(),
             operator_state = self.operator_state.display(),
             operator_dir = self.operator_dir.display(),
@@ -746,7 +825,11 @@ fn write_external_urls(secrets: &Path, options: &InstallOptions) -> anyhow::Resu
     Ok("external".to_owned())
 }
 
-fn write_managed_secrets(secrets: &Path) -> anyhow::Result<String> {
+fn write_managed_secrets(
+    secrets: &Path,
+    postgres_container: &str,
+    valkey_container: &str,
+) -> anyhow::Result<String> {
     let dependencies = secrets.join("dependencies");
     create_directory(&dependencies, 0o700)?;
     let postgres = generate_secret(&dependencies.join("postgres-password"))?;
@@ -759,19 +842,19 @@ fn write_managed_secrets(secrets: &Path) -> anyhow::Result<String> {
     set_mode(&dependencies.join("valkey-password"), 0o444)?;
     atomic_write(
         &secrets.join("database-url"),
-        format!("postgresql://nazoauth_runtime:{runtime_postgres}@nazo-oauth-postgres:5432/oauth")
+        format!("postgresql://nazoauth_runtime:{runtime_postgres}@{postgres_container}:5432/oauth")
             .as_bytes(),
         0o440,
     )?;
     atomic_write(
         &secrets.join("database-migration-url"),
-        format!("postgresql://nazoauth_migrator:{postgres}@nazo-oauth-postgres:5432/oauth")
+        format!("postgresql://nazoauth_migrator:{postgres}@{postgres_container}:5432/oauth")
             .as_bytes(),
         0o440,
     )?;
     atomic_write(
         &secrets.join("valkey-url"),
-        format!("redis://default:{valkey}@nazo-oauth-valkey:6379/0").as_bytes(),
+        format!("redis://default:{valkey}@{valkey_container}:6379/0").as_bytes(),
         0o440,
     )?;
     atomic_write(
@@ -1158,6 +1241,7 @@ fn build_config(
             mount(app.join("keys"), "/var/lib/nazo_oauth/keys", "rw,Z"),
             mount(app.join("avatars"), "/var/lib/nazo_oauth/avatars", "rw,Z"),
             mount(app.join("secrets"), "/var/lib/nazo_oauth/secrets", "rw,Z"),
+            mount(app.join("instance"), "/var/lib/nazo_oauth/instance", "rw,Z"),
             mount(
                 app.join("bootstrap"),
                 "/var/lib/nazo_oauth/bootstrap",
@@ -1210,6 +1294,8 @@ fn build_config(
     } else {
         String::new()
     };
+    let operator = operator_config(config_dir, &options.control_root, &options.recovery_root)?;
+    let name_suffix = object_name_suffix(&operator.deployment_id);
     let (service_name, service_user, binary_path, binary_releases, working_directory) = if container
     {
         (
@@ -1221,8 +1307,8 @@ fn build_config(
         )
     } else {
         (
-            "nazoauth.service".to_owned(),
-            "nazoauth".to_owned(),
+            format!("nazoauth-{name_suffix}.service"),
+            format!("nazoauth-{name_suffix}"),
             binary,
             releases,
             config_dir.to_owned(),
@@ -1235,13 +1321,14 @@ fn build_config(
     };
     let config = UpdateConfig {
         schema: 2,
-        managed_install: true,
+        trust: crate::deployment::TrustState::Adopted,
+        capabilities: crate::deployment::CapabilityGrants::controller_installed(),
         install_profile: options.profile.clone(),
         repository: "nazozero/NazoAuth".to_owned(),
         updater_install_path: updater,
-        backup_root: options.data_root.join("backups"),
-        deployment_root: options.data_root.join("deployments"),
-        operator: operator_config(config_dir, &options.data_root)?,
+        backup_root: options.control_root.join("backups"),
+        deployment_root: options.control_root.join("deployments"),
+        operator,
         dependencies: Dependencies {
             mode: dependency_mode.to_owned(),
             database_url_file: secrets.join("database-url"),
@@ -1251,8 +1338,9 @@ fn build_config(
         runtime: Runtime {
             engine: runtime_engine.to_owned(),
             dependency_engine: dependency_engine.to_owned(),
-            container_name: "nazo-oauth-server".to_owned(),
-            network: "nazo_oauth_net".to_owned(),
+            container_name: format!("nazoauth-{name_suffix}-server"),
+            runtime_instance_id: uuid::Uuid::now_v7().to_string(),
+            network: format!("nazoauth-{name_suffix}-network"),
             ip_address: options.runtime_ip.clone().unwrap_or_default(),
             publish_address,
             health_url: format!("http://127.0.0.1:{}/ready", options.port),
@@ -1264,7 +1352,12 @@ fn build_config(
             ),
             expected_issuer: options.public_url.trim_end_matches('/').to_owned(),
             mounts,
-            snapshot_paths: vec![app.join("keys"), app.join("secrets"), app.join("bootstrap")],
+            snapshot_paths: vec![
+                app.join("keys"),
+                app.join("secrets"),
+                app.join("bootstrap"),
+                app.join("instance"),
+            ],
             environment,
             service_name,
             service_user,
@@ -1273,14 +1366,14 @@ fn build_config(
             working_directory,
         },
         postgres: Postgres {
-            container_name: "nazo-oauth-postgres".to_owned(),
+            container_name: format!("nazoauth-{name_suffix}-postgres"),
             database: "oauth".to_owned(),
             user: "nazoauth_migrator".to_owned(),
             image: POSTGRES_IMAGE.to_owned(),
             validation_image: POSTGRES_IMAGE.to_owned(),
         },
         valkey: Valkey {
-            container_name: "nazo-oauth-valkey".to_owned(),
+            container_name: format!("nazoauth-{name_suffix}-valkey"),
             image: VALKEY_IMAGE.to_owned(),
             rdb_path: "/data/dump.rdb".to_owned(),
             password_file: valkey_password_file,
@@ -1293,15 +1386,17 @@ fn build_config(
     Ok(config)
 }
 
-fn operator_config(config_dir: &Path, data_root: &Path) -> anyhow::Result<Operator> {
+fn operator_config(
+    config_dir: &Path,
+    control_root: &Path,
+    recovery_root: &Path,
+) -> anyhow::Result<Operator> {
     let directory = config_dir.join("operator");
     let deployment_id = fs::read_to_string(directory.join("deployment-id"))?;
     let active = operator::read_active_identity(&directory.join("active-generation.json"))?;
     let receipt_key_id = fs::read_to_string(directory.join("receipt.kid"))?;
     let generation = directory.join("generations").join(&active.generation);
-    let recovery_generation = data_root
-        .join("recovery/generations")
-        .join(&active.generation);
+    let recovery_generation = recovery_root.join("generations").join(&active.generation);
     Ok(Operator {
         deployment_id,
         controller_key_id: active.controller_key_id,
@@ -1318,76 +1413,129 @@ fn operator_config(config_dir: &Path, data_root: &Path) -> anyhow::Result<Operat
         break_glass_public_key: generation.join("break-glass.pub"),
         active_identity_file: directory.join("active-generation.json"),
         identity_generations_directory: directory.join("generations"),
-        recovery_generations_directory: data_root.join("recovery/generations"),
+        recovery_generations_directory: recovery_root.join("generations"),
         secret_revision_file: directory.join("secret-revision"),
-        state_directory: data_root.join("app/operator-state"),
-        audit_directory: data_root.join("audit"),
+        state_directory: control_root.join("operator-state"),
+        audit_directory: control_root.join("audit"),
         trust_state_file: directory.join("release-trust.json"),
     })
+}
+
+fn object_name_suffix(deployment_id: &str) -> String {
+    deployment_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(16)
+        .collect()
 }
 
 fn mount(source: PathBuf, target: &str, mode: &str) -> Mount {
     Mount {
         source,
         target: PathBuf::from(target),
-        mode: mode.to_owned(),
+        read_only: mode.starts_with("ro"),
+        selinux_relabel: mode.split(',').any(|value| matches!(value, "z" | "Z")),
     }
 }
 
-fn ensure_network(engine: &str, name: &str, subnet: Option<&str>) -> anyhow::Result<()> {
+fn ensure_network(
+    engine: &str,
+    name: &str,
+    subnet: Option<&str>,
+    deployment_id: &str,
+    control_authority: &str,
+) -> anyhow::Result<()> {
     if Process::new(engine)
         .args(["network", "inspect", name])
         .succeeds()
     {
-        assert_managed_label(engine, &["network", "inspect", name])?;
+        assert_control_labels(
+            engine,
+            &["network", "inspect", name],
+            deployment_id,
+            control_authority,
+        )?;
         return Ok(());
     }
-    let mut command =
-        Process::new(engine).args(["network", "create", "--label", "io.nazoauth.managed=true"]);
+    let mut command = Process::new(engine)
+        .args(["network", "create", "--label"])
+        .arg(format!("io.nazoauth.deployment-id={deployment_id}"))
+        .arg("--label")
+        .arg(format!("io.nazoauth.control-authority={control_authority}"));
     if let Some(subnet) = subnet {
         command = command.args(["--subnet", subnet]);
     }
     command.arg(name).run_quiet()
 }
 
-fn ensure_volume(engine: &str, name: &str) -> anyhow::Result<()> {
+fn ensure_volume(
+    engine: &str,
+    name: &str,
+    deployment_id: &str,
+    control_authority: &str,
+) -> anyhow::Result<()> {
     if Process::new(engine)
         .args(["volume", "inspect", name])
         .succeeds()
     {
-        assert_managed_label(engine, &["volume", "inspect", name])?;
+        assert_control_labels(
+            engine,
+            &["volume", "inspect", name],
+            deployment_id,
+            control_authority,
+        )?;
         return Ok(());
     }
     Process::new(engine)
-        .args([
-            "volume",
-            "create",
-            "--label",
-            "io.nazoauth.managed=true",
-            name,
-        ])
+        .args(["volume", "create", "--label"])
+        .arg(format!("io.nazoauth.deployment-id={deployment_id}"))
+        .arg("--label")
+        .arg(format!("io.nazoauth.control-authority={control_authority}"))
+        .arg(name)
         .run_quiet()
 }
 
-fn assert_managed_label(engine: &str, prefix: &[&str]) -> anyhow::Result<()> {
-    for format in [
-        "{{index .Config.Labels \"io.nazoauth.managed\"}}",
-        "{{index .Labels \"io.nazoauth.managed\"}}",
+fn assert_control_labels(
+    engine: &str,
+    prefix: &[&str],
+    deployment_id: &str,
+    control_authority: &str,
+) -> anyhow::Result<()> {
+    for (label, expected) in [
+        ("io.nazoauth.deployment-id", deployment_id),
+        ("io.nazoauth.control-authority", control_authority),
     ] {
-        let value = Process::new(engine)
-            .args(prefix)
-            .args(["--format", format])
-            .stdout();
-        if value.is_ok_and(|value| value.trim() == "true") {
-            return Ok(());
+        let mut matched = false;
+        for format in [
+            format!("{{{{index .Config.Labels \"{label}\"}}}}"),
+            format!("{{{{index .Labels \"{label}\"}}}}"),
+        ] {
+            let value = Process::new(engine)
+                .args(prefix)
+                .arg("--format")
+                .arg(format)
+                .stdout();
+            if value.is_ok_and(|value| value.trim() == expected) {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            bail!("refusing to manage a runtime object outside this deployment authority");
         }
     }
-    bail!("refusing to manage an unlabelled existing runtime object")
+    Ok(())
 }
 
-fn ensure_dependency_container(engine: &str, name: &str, create: Process) -> anyhow::Result<()> {
+fn ensure_dependency_container(
+    engine: &str,
+    name: &str,
+    deployment_id: &str,
+    control_authority: &str,
+    create: Process,
+) -> anyhow::Result<()> {
     if Process::new(engine).args(["inspect", name]).succeeds() {
-        assert_managed_label(engine, &["inspect", name])?;
+        assert_control_labels(engine, &["inspect", name], deployment_id, control_authority)?;
         return Process::new(engine).args(["start", name]).run_quiet();
     }
     create.run_quiet()

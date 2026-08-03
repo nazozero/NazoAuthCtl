@@ -3,6 +3,10 @@ use std::{env, path::PathBuf};
 use anyhow::{Context, bail};
 
 use crate::model::semantic_tag;
+use crate::{
+    adoption::AdoptionOptions,
+    deployment::{Capability, CapabilityGrants, ResourceScope, Responsibility},
+};
 
 pub(crate) const DEFAULT_CONFIG: &str = "/etc/nazoauth/update.json";
 
@@ -17,6 +21,7 @@ pub(crate) enum HelpTopic {
     Audit,
     Identity,
     BreakGlass,
+    Controller,
 }
 
 pub(crate) fn help_topic(args: &[String]) -> Option<HelpTopic> {
@@ -46,16 +51,21 @@ pub(crate) fn help_topic(args: &[String]) -> Option<HelpTopic> {
         Some("audit") => HelpTopic::Audit,
         Some("identity") => HelpTopic::Identity,
         Some("break-glass") => HelpTopic::BreakGlass,
+        Some("self") => HelpTopic::Controller,
         _ => HelpTopic::TopLevel,
     })
 }
 
 pub(crate) struct Cli {
     pub(crate) config: PathBuf,
+    pub(crate) deployment: Option<String>,
     pub(crate) command: Command,
 }
 
 pub(crate) enum Command {
+    Discover,
+    Adopt(AdoptionOptions),
+    DeploymentsList,
     Install(Box<InstallOptions>),
     BootstrapAdmin(BootstrapAdminOptions),
     Status,
@@ -94,6 +104,14 @@ pub(crate) enum Command {
     BreakGlassRecover {
         yes: bool,
         reason: String,
+    },
+    SelfCheck(Option<String>),
+    SelfUpdate {
+        version: Option<String>,
+        yes: bool,
+    },
+    SelfRollback {
+        yes: bool,
     },
 }
 
@@ -164,6 +182,8 @@ pub(crate) struct InstallOptions {
     pub(crate) profile: String,
     pub(crate) profile_material: Option<PathBuf>,
     pub(crate) data_root: PathBuf,
+    pub(crate) control_root: PathBuf,
+    pub(crate) recovery_root: PathBuf,
     pub(crate) port: u16,
     pub(crate) network_subnet: Option<String>,
     pub(crate) runtime_ip: Option<String>,
@@ -212,16 +232,34 @@ impl Cli {
         let mut config = env::var_os("NAZOAUTH_UPDATE_CONFIG")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG));
-        if values.first().is_some_and(|value| value == "--config") {
+        let mut deployment = None;
+        while values
+            .first()
+            .is_some_and(|value| matches!(value.as_str(), "--config" | "--deployment"))
+        {
             if values.len() < 2 {
-                bail!("--config requires a path");
+                bail!("{} requires a value", values[0]);
             }
-            config = PathBuf::from(values.remove(1));
-            values.remove(0);
+            let value = values.remove(1);
+            match values.remove(0).as_str() {
+                "--config" => config = PathBuf::from(value),
+                "--deployment" => {
+                    if deployment.replace(value).is_some() {
+                        bail!("--deployment may be specified only once");
+                    }
+                }
+                _ => unreachable!(),
+            }
         }
         let command = values.first().cloned().context("a command is required")?;
         values.remove(0);
         let command = match command.as_str() {
+            "discover" => {
+                no_arguments(&values, "discover")?;
+                Command::Discover
+            }
+            "adopt" => Command::Adopt(parse_adoption(values)?),
+            "deployments" if values == ["list"] => Command::DeploymentsList,
             "install" => Command::Install(Box::new(parse_install(values)?)),
             "bootstrap-admin" => Command::BootstrapAdmin(parse_bootstrap_admin(values)?),
             "status" => {
@@ -335,9 +373,31 @@ impl Cli {
                 }
                 Command::BreakGlassRecover { yes, reason }
             }
+            "self" if values.first().is_some_and(|value| value == "check") => {
+                values.remove(0);
+                Command::SelfCheck(parse_version_option(values)?)
+            }
+            "self" if values.first().is_some_and(|value| value == "update") => {
+                values.remove(0);
+                let (values, yes) = take_yes(values)?;
+                Command::SelfUpdate {
+                    version: parse_version_option(values)?,
+                    yes,
+                }
+            }
+            "self" if values.first().is_some_and(|value| value == "rollback") => {
+                values.remove(0);
+                Command::SelfRollback {
+                    yes: parse_yes(values, "self rollback")?,
+                }
+            }
             other => bail!("unknown command {other}"),
         };
-        Ok(Some(Self { config, command }))
+        Ok(Some(Self {
+            config,
+            deployment,
+            command,
+        }))
     }
 }
 
@@ -601,12 +661,113 @@ fn parse_yes(values: Vec<String>, command: &str) -> anyhow::Result<bool> {
     bail!("{command} accepts only --yes")
 }
 
+fn parse_adoption(values: Vec<String>) -> anyhow::Result<AdoptionOptions> {
+    let mut target = None;
+    let mut alias = None;
+    let mut capabilities = CapabilityGrants::observed();
+    let mut recovery_evidence = None;
+    let mut plan = false;
+    let mut yes = false;
+    let mut index = 0;
+    while index < values.len() {
+        match values[index].as_str() {
+            "--plan" => {
+                plan = true;
+                index += 1;
+            }
+            "--yes" => {
+                yes = true;
+                index += 1;
+            }
+            flag @ ("--target" | "--alias" | "--capability" | "--recovery-evidence") => {
+                let value = values
+                    .get(index + 1)
+                    .with_context(|| format!("{flag} requires a value"))?
+                    .clone();
+                match flag {
+                    "--target" => {
+                        if target.replace(value).is_some() {
+                            bail!("--target may be specified only once");
+                        }
+                    }
+                    "--alias" => {
+                        nazo_operator_protocol::validate_file_identifier_value(&value)
+                            .context("deployment alias is invalid")?;
+                        if alias.replace(value).is_some() {
+                            bail!("--alias may be specified only once");
+                        }
+                    }
+                    "--capability" => apply_capability(&mut capabilities, &value)?,
+                    "--recovery-evidence" => {
+                        if recovery_evidence.replace(PathBuf::from(value)).is_some() {
+                            bail!("--recovery-evidence may be specified only once");
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                index += 2;
+            }
+            other => bail!("unknown adopt option {other}"),
+        }
+    }
+    if plan == yes {
+        bail!("adopt requires exactly one of --plan or --yes");
+    }
+    Ok(AdoptionOptions {
+        target: target.context("adopt requires --target BACKEND:OBJECT")?,
+        alias,
+        capabilities,
+        recovery_evidence,
+        plan,
+        yes,
+    })
+}
+
+fn apply_capability(capabilities: &mut CapabilityGrants, value: &str) -> anyhow::Result<()> {
+    let (name, grant) = value
+        .split_once('=')
+        .context("--capability must be NAME=external|delegated|managed[:deployment|shared]")?;
+    let (responsibility, scope) = grant
+        .split_once(':')
+        .map_or((grant, "deployment"), |(responsibility, scope)| {
+            (responsibility, scope)
+        });
+    let capability = match name {
+        "runtime" => Capability::Runtime,
+        "artifact" => Capability::Artifact,
+        "server_config" => Capability::ServerConfig,
+        "database" => Capability::Database,
+        "valkey" => Capability::Valkey,
+        "operator_tasks" => Capability::OperatorTasks,
+        "backups" => Capability::Backups,
+        "proxy_tls" => Capability::ProxyTls,
+        _ => bail!("unknown deployment capability {name}"),
+    };
+    let responsibility = match responsibility {
+        "external" => Responsibility::External,
+        "delegated" => Responsibility::Delegated,
+        "managed" => Responsibility::Managed,
+        _ => bail!("invalid capability responsibility"),
+    };
+    let scope = match scope {
+        "deployment" => ResourceScope::Deployment,
+        "shared" => ResourceScope::Shared,
+        _ => bail!("invalid capability resource scope"),
+    };
+    let grant = capabilities.grant_mut(capability);
+    grant.responsibility = responsibility;
+    grant.scope = scope;
+    Ok(())
+}
+
 fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOptions> {
     let mut runtime = "auto".to_owned();
     let mut public_url = "http://127.0.0.1:8000".to_owned();
     let mut profile = "baseline".to_owned();
     let mut profile_material = None;
     let mut data_root = PathBuf::from("/var/lib/nazoauth");
+    let mut control_root = PathBuf::from("/var/lib/nazoauthctl");
+    let mut recovery_root = PathBuf::from("/var/lib/nazoauth-recovery");
     let mut port = 8000;
     let mut network_subnet = None;
     let mut runtime_ip = None;
@@ -653,6 +814,8 @@ fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOptions> {
             "--profile" => profile = value,
             "--profile-material" => profile_material = Some(PathBuf::from(value)),
             "--data-root" => data_root = PathBuf::from(value),
+            "--control-root" => control_root = PathBuf::from(value),
+            "--recovery-root" => recovery_root = PathBuf::from(value),
             "--port" => {
                 port = value
                     .parse()
@@ -721,6 +884,8 @@ fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOptions> {
         profile,
         profile_material,
         data_root,
+        control_root,
+        recovery_root,
         port,
         network_subnet,
         runtime_ip,

@@ -19,7 +19,8 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
     let secrets = config_dir.join("secrets");
     UpdateConfig {
         schema: 2,
-        managed_install: true,
+        trust: crate::deployment::TrustState::Adopted,
+        capabilities: crate::deployment::CapabilityGrants::controller_installed(),
         install_profile: "baseline".to_owned(),
         repository: "nazozero/NazoAuth".to_owned(),
         updater_install_path: work.path().join("bin/nazoauthctl"),
@@ -57,6 +58,7 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
             engine: "podman".to_owned(),
             dependency_engine: "podman".to_owned(),
             container_name: "nazo-oauth-server".to_owned(),
+            runtime_instance_id: "runtime-test".to_owned(),
             network: "nazo_oauth_net".to_owned(),
             ip_address: "10.89.0.20".to_owned(),
             publish_address: "127.0.0.1:8000:8000".to_owned(),
@@ -70,22 +72,26 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
                 Mount {
                     source: config_dir.join(".env.yaml"),
                     target: PathBuf::from("/app/.env.yaml"),
-                    mode: "ro,Z".to_owned(),
+                    read_only: true,
+                    selinux_relabel: true,
                 },
                 Mount {
                     source: app.join("keys"),
                     target: PathBuf::from("/var/lib/nazo_oauth/keys"),
-                    mode: "rw,Z".to_owned(),
+                    read_only: false,
+                    selinux_relabel: true,
                 },
                 Mount {
                     source: secrets.join("database-url"),
                     target: PathBuf::from("/run/nazoauth-secrets/database-url"),
-                    mode: "ro,Z".to_owned(),
+                    read_only: true,
+                    selinux_relabel: true,
                 },
                 Mount {
                     source: secrets.join("valkey-url"),
                     target: PathBuf::from("/run/nazoauth-secrets/valkey-url"),
-                    mode: "ro,Z".to_owned(),
+                    read_only: true,
+                    selinux_relabel: true,
                 },
             ],
             snapshot_paths: vec![app.join("keys"), app.join("secrets"), app.join("bootstrap")],
