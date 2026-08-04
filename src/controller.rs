@@ -1174,7 +1174,7 @@ fn verify_controller_self_audit() -> anyhow::Result<(u64, String)> {
             .verify(&serde_json::to_vec(&record.event)?, &signature)
             .map_err(|_| anyhow::anyhow!("controller self-audit signature verification failed"))?;
         sequence = record.event.sequence;
-        previous = format!("{:x}", Sha256::digest(&bytes));
+        previous = encode_controller_digest(&Sha256::digest(&bytes));
     }
     let head_path = directory.join("head.json");
     if sequence == 0 {
@@ -1230,10 +1230,14 @@ fn append_controller_self_audit(
         &serde_json::to_vec_pretty(&ControllerSelfAuditHead {
             schema: 1,
             sequence: sequence + 1,
-            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            sha256: encode_controller_digest(&Sha256::digest(&bytes)),
         })?,
         0o600,
     )
+}
+
+fn encode_controller_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 const OPENID4VC_CERTIFICATE_BUNDLE: &str = "openid4vc-certificate-bundle.pem";
