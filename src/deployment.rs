@@ -610,6 +610,10 @@ impl DeploymentStore {
                 .join(format!("shared-{resource_id}.lock")),
         )
     }
+
+    pub(crate) fn controller_self_lock(&self) -> anyhow::Result<FileLock> {
+        FileLock::acquire(&self.state_root.join("locks").join("controller-self.lock"))
+    }
 }
 
 pub(crate) struct FileLock {
