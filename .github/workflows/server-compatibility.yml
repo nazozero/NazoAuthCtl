@@ -118,6 +118,7 @@ jobs:
             --deny-self-hosted-runners
           chmod 0755 controller/nazoauthctl signed-server/nazoauth-x86_64-unknown-linux-gnu
           signed-server/nazoauth-x86_64-unknown-linux-gnu build-identity \
+            | tee host-identity.json \
             | jq -e '.release == "v0.1.19" and .protocol == 1'
       - name: Verify and retain signed current and previous OCI artifacts
         run: |
@@ -200,11 +201,194 @@ jobs:
             echo "unsigned identity-less object was unexpectedly adoptable" >&2
             exit 1
           fi
+      - name: Recover after deleting the current container and engine image
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/nazoauthctl-real-backends"
+          config_root="$root/controller-config"
+          state_root="$root/controller-state"
+          break_glass_root="$root/controller-break-glass"
+          deployment_id=deployment-ci-recovery
+          runtime_id=runtime-ci-recovery
+          image=ghcr.io/nazozero/nazoauth:v0.1.19
+          network=nazoauthctl-recovery-net
+          postgres=nazoauthctl-recovery-postgres
+          valkey=nazoauthctl-recovery-valkey
+          docker rm --force manual-auth-same-name
+          docker network create "$network"
+          docker run -d --name "$postgres" --network "$network" \
+            -e "POSTGRES_PASSWORD=$SECRET_MARKER" -e POSTGRES_DB=oauth postgres:18-alpine
+          docker run -d --name "$valkey" --network "$network" valkey/valkey:8-alpine
+          ready=false
+          for _ in $(seq 1 60); do
+            if docker run --rm --network "$network" -e "PGPASSWORD=$SECRET_MARKER" \
+              postgres:18-alpine pg_isready -h "$postgres" -U postgres -d oauth; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+          mkdir -p "$root/docker-live-data" "$root/docker-live-config" \
+            "$config_root/deployments/$deployment_id" \
+            "$state_root/deployments/$deployment_id/identities" \
+            "$state_root/deployments/$deployment_id/audit" \
+            "$state_root/deployments/$deployment_id/transactions" \
+            "$state_root/deployments/$deployment_id/recovery/trusted-runtime/v0.1.19/$runtime_id" \
+            "$break_glass_root"
+          cat >"$root/docker-live-config/.env.yaml" <<YAML
+          BIND: "0.0.0.0:8000"
+          DATA_DIR: "/var/lib/nazo_oauth"
+          DATABASE_URL: "postgresql://postgres:${SECRET_MARKER}@${postgres}:5432/oauth"
+          VALKEY_URL: "redis://${valkey}:6379/0"
+          ISSUER: "http://127.0.0.1:19081"
+          FRONTEND_BASE_URL: "http://127.0.0.1:19081"
+          CORS_ALLOWED_ORIGINS: ["http://127.0.0.1:19081"]
+          DEFAULT_AUDIENCE: "resource://default"
+          COOKIE_SECURE: false
+          SUBJECT_TYPE: "public"
+          PAIRWISE_SUBJECT_SECRET: ""
+          TRUSTED_PROXY_CIDRS: ""
+          CLIENT_IP_HEADER_MODE: "none"
+          EMAIL_DELIVERY: "smtp"
+          EMAIL_SMTP_HOST: "127.0.0.1"
+          EMAIL_SMTP_PORT: 2525
+          EMAIL_SMTP_TLS: "none"
+          EMAIL_SMTP_USERNAME: ""
+          EMAIL_SMTP_PASSWORD: ""
+          EMAIL_FROM: "NazoAuth <no-reply@example.invalid>"
+          AVATAR_STORAGE_DIR: "/var/lib/nazo_oauth/avatars"
+          JWK_KEYS_DIR: "/var/lib/nazo_oauth/keys"
+          YAML
+          docker run -d --name manual-auth-same-name --network "$network" \
+            --publish 127.0.0.1:19081:8000 \
+            --env DATA_DIR=/var/lib/nazo_oauth \
+            --mount "type=bind,src=$root/docker-live-config/.env.yaml,dst=/app/.env.yaml,readonly" \
+            --mount "type=bind,src=$root/docker-live-data,dst=/var/lib/nazo_oauth" \
+            "$image" nazoauth server
+          ready=false
+          for _ in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:19081/ready >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+
+          digest="$(docker image inspect "$image" --format '{{index .RepoDigests 0}}' | sed 's/.*@//')"
+          archive="$state_root/deployments/$deployment_id/recovery/trusted-runtime/v0.1.19/$runtime_id/image.tar"
+          docker image save --output "$archive" "$image@$digest"
+          archive_sha="$(sha256sum "$archive" | cut -d' ' -f1)"
+          recovery_manifest="$state_root/deployments/$deployment_id/recovery/manual-manifest.json"
+          printf '%s' '{"schema":1,"fixture":"external resources remain external"}' >"$recovery_manifest"
+          recovery_sha="$(sha256sum "$recovery_manifest" | cut -d' ' -f1)"
+          driver="$root/recovery-driver.py"
+          cat >"$driver" <<'PY'
+          #!/usr/bin/env python3
+          import json, sys, time
+          request = json.load(sys.stdin)
+          json.dump({
+              "schema": request["schema"],
+              "request_id": request["request_id"],
+              "deployment_id": request["deployment_id"],
+              "release": request["release"],
+              "operation": request["operation"],
+              "lifecycle_sha256": request["lifecycle_sha256"],
+              "recovery_manifest_sha256": request["recovery_manifest_sha256"],
+              "status": "succeeded",
+              "components": ["artifact", "verification"],
+              "issued_at": int(time.time())
+          }, sys.stdout, separators=(",", ":"))
+          PY
+          chmod 0500 "$driver"
+          driver_sha="$(sha256sum "$driver" | cut -d' ' -f1)"
+          lifecycle="$state_root/deployments/$deployment_id/recovery/lifecycle.json"
+          jq -n \
+            --arg deployment "$deployment_id" --arg runtime "$runtime_id" \
+            --arg object manual-auth-same-name --arg data "$root/docker-live-data" \
+            --arg config "$root/docker-live-config/.env.yaml" --arg network "$network" \
+            --arg driver "$driver" --arg driver_sha "$driver_sha" --arg rehearsal "$root/rehearsal" \
+            '{schema:1,deployment_id:$deployment,runtimes:[{
+              runtime_instance_id:$runtime,backend:"docker",object_reference:$object,
+              command:["nazoauth","server"],mounts:[
+                {source:$config,destination:"/app/.env.yaml",read_only:true,selinux_relabel:false,ownership:"external",scope:"deployment"},
+                {source:$data,destination:"/var/lib/nazo_oauth",read_only:false,selinux_relabel:false,ownership:"external",scope:"deployment"}
+              ],environment:{DATA_DIR:"/var/lib/nazo_oauth"},networks:[$network],ip_address:null,
+              ports:["127.0.0.1:19081:8000"]
+            }],recovery_driver:{program:$driver,program_sha256:$driver_sha,arguments:[],rehearsal_workspace:$rehearsal,credentials:{}}}' \
+            >"$lifecycle"
+          identity="$(cat host-identity.json)"
+          declaration="$config_root/deployments/$deployment_id/deployment.json"
+          audit_key="$state_root/deployments/$deployment_id/identities/audit.key"
+          head -c 32 /dev/urandom | base64 -w0 | tr '+/' '-_' | tr -d '=' >"$audit_key"
+          chmod 0600 "$audit_key"
+          jq -n \
+            --arg deployment "$deployment_id" --arg runtime "$runtime_id" \
+            --arg image "$image" --arg digest "$digest" --arg data "$root/docker-live-data" \
+            --arg config "$root/docker-live-config/.env.yaml" --arg network "$network" \
+            --arg lifecycle "$lifecycle" --arg audit "$audit_key" --argjson identity "$identity" \
+            '{schema:1,deployment_id:$deployment,control_authority:"controller-ci-recovery",alias:"ci-recovery",
+              issuer:"http://127.0.0.1:19081",active_release:$identity,trust:"adopted",
+              capabilities:{
+                runtime:{responsibility:"delegated",scope:"deployment"},artifact:{responsibility:"delegated",scope:"deployment"},
+                server_config:{responsibility:"external",scope:"deployment"},database:{responsibility:"external",scope:"shared"},
+                valkey:{responsibility:"external",scope:"shared"},operator_tasks:{responsibility:"external",scope:"deployment"},
+                backups:{responsibility:"delegated",scope:"deployment"},proxy_tls:{responsibility:"external",scope:"shared"}},
+              runtime_instances:[{runtime_instance_id:$runtime,backend:"docker",object_reference:"manual-auth-same-name",
+                artifact:{kind:"oci",image_reference:$image,digest:$digest},ports:["127.0.0.1:19081->8000/tcp"],networks:[$network],
+                mounts:[
+                  {source:$config,destination:"/app/.env.yaml",read_only:true,selinux_relabel:false,scope:"deployment",ownership:"external"},
+                  {source:$data,destination:"/var/lib/nazo_oauth",read_only:false,selinux_relabel:false,scope:"deployment",ownership:"external"}],
+                instance_key_id:null,deployment_statement:null}],
+              resources:{audit_private_key:{kind:"file",path:$audit},lifecycle_contract:{kind:"file",path:$lifecycle},
+                database:{kind:"provider",provider:"external-postgres",key:"ci-recovery"},
+                valkey:{kind:"provider",provider:"external-valkey",key:"ci-recovery"}},
+              recovery:{conclusion:"proven",evidence:["ci-offline-cache"],off_host_package_required_for_machine_loss:true},
+              operator_protocol_versions:[1],control_protocol_versions:[1],declaration_revision:1}' >"$declaration"
+          jq -n --arg declaration "$declaration" \
+            '{schema:1,deployments:{"deployment-ci-recovery":{alias:"ci-recovery",declaration:$declaration}}}' \
+            >"$config_root/registry.json"
+          jq -n --arg deployment "$deployment_id" --argjson identity "$identity" \
+            --arg runtime "$runtime_id" --arg image "$image" --arg digest "$digest" \
+            --arg archive "$archive" --arg archive_sha "$archive_sha" \
+            '{schema:1,deployment_id:$deployment,release:$identity,runtimes:{($runtime):{
+              kind:"oci-archive",image_reference:$image,digest:$digest,archive:$archive,archive_sha256:$archive_sha}}}' \
+            >"$(dirname "$archive")/../cache.json"
+          jq -n --arg deployment "$deployment_id" --argjson identity "$identity" \
+            --arg manifest "$recovery_manifest" --arg manifest_sha "$recovery_sha" \
+            '{schema:1,deployment_id:$deployment,trusted_release:$identity,recovery_manifest:$manifest,recovery_manifest_sha256:$manifest_sha}' \
+            >"$state_root/deployments/$deployment_id/recovery/rollback-slot.json"
+
+          docker rm --force manual-auth-same-name
+          docker image rm "$image"
+          ! docker image inspect "$image" >/dev/null 2>&1
+          sudo env \
+            "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
+            "NAZOAUTHCTL_STATE_ROOT=$state_root" \
+            "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
+            "$GITHUB_WORKSPACE/controller/nazoauthctl" --deployment "$deployment_id" recover --yes
+          ready=false
+          for _ in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:19081/ready >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+          test "$(docker inspect manual-auth-same-name --format '{{index .Config.Labels "io.nazoauth.deployment-id"}}')" = "$deployment_id"
+          docker image inspect "$image" >/dev/null
+          test -f "$state_root/deployments/$deployment_id/transactions/recovery-"*.json
+          test -f "$state_root/deployments/$deployment_id/audit/00000000000000000001.jws"
       - name: Remove only the exact test objects
         if: always()
         shell: bash
         run: |
           docker rm --force manual-auth-same-name manual-auth-previous manual-auth-unsigned 2>/dev/null || true
+          docker rm --force nazoauthctl-recovery-postgres nazoauthctl-recovery-valkey 2>/dev/null || true
+          docker network rm nazoauthctl-recovery-net 2>/dev/null || true
           podman rm --force manual-auth-same-name 2>/dev/null || true
           sudo systemctl stop manual-auth-unusual.service 2>/dev/null || true
           sudo rm -f /etc/systemd/system/manual-auth-unusual.service

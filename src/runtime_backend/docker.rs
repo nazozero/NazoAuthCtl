@@ -383,7 +383,7 @@ impl RuntimeBackend for DockerBackend {
         }
         Ok(RuntimeObservation {
             backend: self.kind(),
-            object_reference: id,
+            object_reference: display_name.clone(),
             display_name,
             running,
             server_command_verified,
@@ -393,7 +393,10 @@ impl RuntimeBackend for DockerBackend {
             mounts,
             safe_environment,
             labels,
-            evidence: vec!["runtime command identifies nazoauth server".to_owned()],
+            evidence: vec![
+                "runtime command identifies nazoauth server".to_owned(),
+                format!("Docker immutable container ID observed: {id}"),
+            ],
             missing,
         })
     }

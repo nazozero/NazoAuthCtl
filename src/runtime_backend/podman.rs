@@ -373,6 +373,7 @@ impl RuntimeBackend for PodmanBackend {
             .get("Name")
             .and_then(serde_json::Value::as_str)
             .unwrap_or(&id)
+            .trim_start_matches('/')
             .to_owned();
         let running = value
             .pointer("/State/Running")
@@ -384,7 +385,7 @@ impl RuntimeBackend for PodmanBackend {
         }
         Ok(RuntimeObservation {
             backend: self.kind(),
-            object_reference: id,
+            object_reference: display_name.clone(),
             display_name,
             running,
             server_command_verified,
@@ -394,7 +395,10 @@ impl RuntimeBackend for PodmanBackend {
             mounts,
             safe_environment,
             labels,
-            evidence: vec!["runtime command identifies nazoauth server".to_owned()],
+            evidence: vec![
+                "runtime command identifies nazoauth server".to_owned(),
+                format!("Podman immutable container ID observed: {id}"),
+            ],
             missing,
         })
     }

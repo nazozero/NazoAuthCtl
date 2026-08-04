@@ -287,10 +287,10 @@ impl LifecycleManifest {
             {
                 bail!("systemd lifecycle command must use an absolute binary path");
             }
-            validate_environment(&runtime.environment)?;
+            validate_environment(runtime.backend, &runtime.environment)?;
             for mount in &runtime.mounts {
                 validate_absolute_path(&mount.source, "runtime mount source")?;
-                if !mount.destination.is_absolute() {
+                if !runtime_path_is_absolute(runtime.backend, &mount.destination) {
                     bail!("runtime mount destination must be absolute");
                 }
             }
@@ -1576,7 +1576,10 @@ fn validate_server_command(command: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_environment(environment: &BTreeMap<String, String>) -> anyhow::Result<()> {
+fn validate_environment(
+    backend: RuntimeBackendKind,
+    environment: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
     const ALLOWED: &[&str] = &[
         "CONFIG_PATH",
         "DATABASE_URL_FILE",
@@ -1600,11 +1603,20 @@ fn validate_environment(environment: &BTreeMap<String, String>) -> anyhow::Resul
         {
             bail!("runtime lifecycle environment contains an unsafe entry");
         }
-        if name.ends_with("_FILE") && !Path::new(value).is_absolute() {
+        if name.ends_with("_FILE") && !runtime_path_is_absolute(backend, Path::new(value)) {
             bail!("runtime secret file reference must be absolute");
         }
     }
     Ok(())
+}
+
+fn runtime_path_is_absolute(backend: RuntimeBackendKind, path: &Path) -> bool {
+    match backend {
+        RuntimeBackendKind::Docker | RuntimeBackendKind::Podman => path
+            .to_str()
+            .is_some_and(|value| value.starts_with('/') && !value.starts_with("//")),
+        RuntimeBackendKind::Systemd => path.is_absolute(),
+    }
 }
 
 fn validate_absolute_path(path: &Path, label: &str) -> anyhow::Result<()> {

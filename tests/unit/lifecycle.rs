@@ -245,3 +245,55 @@ fn checkpoint_receipt_requires_a_digest_bound_regular_recovery_manifest() {
         .is_err()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn recovery_driver_process_receipt_is_bound_to_the_closed_request() {
+    let work = PrivateTempDir::new("nazoauth-lifecycle-driver-process").unwrap();
+    let driver = work.path().join("recovery-driver.py");
+    fs::write(
+        &driver,
+        r#"#!/usr/bin/env python3
+import json, sys, time
+request = json.load(sys.stdin)
+receipt = {
+    "schema": request["schema"],
+    "request_id": request["request_id"],
+    "deployment_id": request["deployment_id"],
+    "release": request["release"],
+    "operation": request["operation"],
+    "lifecycle_sha256": request["lifecycle_sha256"],
+    "recovery_manifest_sha256": request["recovery_manifest_sha256"],
+    "status": "succeeded",
+    "components": ["artifact", "verification"],
+    "issued_at": int(time.time())
+}
+json.dump(receipt, sys.stdout, separators=(",", ":"))
+"#,
+    )
+    .unwrap();
+    set_mode(&driver, 0o500).unwrap();
+    let credential = work.path().join("database-credential");
+    fs::write(&credential, b"not passed as an environment value").unwrap();
+    let manifest_path = work.path().join("lifecycle.json");
+    let recovery_manifest = work.path().join("recovery.json");
+    fs::write(&recovery_manifest, b"{\"schema\":1}").unwrap();
+    let mut value = lifecycle(&work);
+    value.recovery_driver.program = driver.clone();
+    value.recovery_driver.program_sha256 = sha256(&driver).unwrap();
+    value.recovery_driver.arguments.clear();
+    fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let receipt = invoke_recovery_driver(
+        &manifest_path,
+        &value,
+        &recovery_manifest,
+        "v0.1.19",
+        RecoveryOperation::Rehearse,
+        &CapabilityGrants::observed(),
+    )
+    .unwrap();
+    assert_eq!(receipt.operation, RecoveryOperation::Rehearse);
+    assert_eq!(receipt.deployment_id, "deployment-test");
+    assert_eq!(receipt.release, "v0.1.19");
+}
