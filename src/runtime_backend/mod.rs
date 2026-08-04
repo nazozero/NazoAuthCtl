@@ -184,6 +184,7 @@ pub(crate) trait RuntimeBackend {
     fn inspect(&self, object_reference: &str) -> anyhow::Result<RuntimeObservation>;
     fn start(&self, object_reference: &str) -> anyhow::Result<()>;
     fn stop(&self, object_reference: &str) -> anyhow::Result<()>;
+    fn quiesce_for_recovery(&self, object_reference: &str) -> anyhow::Result<()>;
     fn restart(&self, object_reference: &str) -> anyhow::Result<()>;
     fn remove(&self, object_reference: &str) -> anyhow::Result<()>;
     fn replace(&self, replacement: &RuntimeReplacement) -> anyhow::Result<()>;

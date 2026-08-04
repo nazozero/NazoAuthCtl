@@ -137,6 +137,7 @@ jobs:
           set -euo pipefail
           root="$RUNNER_TEMP/nazoauthctl-real-backends"
           mkdir -p "$root/docker-data" "$root/docker-previous-data" "$root/podman-data" "$root/systemd-data"
+          install -m 0555 "$GITHUB_WORKSPACE/signed-server/nazoauth-x86_64-unknown-linux-gnu" "$root/nazoauth"
           docker create --name manual-auth-same-name --publish 127.0.0.1:19081:8000 \
             --env DATA_DIR=/var/lib/nazo_oauth \
             --env "DATABASE_URL=postgresql://${SECRET_MARKER}@invalid/docker" \
@@ -161,7 +162,7 @@ jobs:
           WorkingDirectory=$root
           Environment=DATA_DIR=$root/systemd-data
           Environment=DATABASE_URL=postgresql://${SECRET_MARKER}@invalid/systemd
-          ExecStart=$GITHUB_WORKSPACE/signed-server/nazoauth-x86_64-unknown-linux-gnu server
+          ExecStart=$root/nazoauth server
           UNIT
           sudo systemctl daemon-reload
       - name: Prove discovery is read-only, multi-backend, ambiguous, and secret-safe

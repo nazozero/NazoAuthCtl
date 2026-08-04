@@ -415,6 +415,29 @@ impl RuntimeBackend for PodmanBackend {
             .run_quiet()
     }
 
+    fn quiesce_for_recovery(&self, object_reference: &str) -> anyhow::Result<()> {
+        let output = Process::new(&self.command)
+            .args(["inspect", "--type", "container", object_reference])
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+            if stderr.contains("no such object")
+                || stderr.contains("no such container")
+                || stderr.contains("no container with name or id")
+            {
+                return Ok(());
+            }
+            bail!("Podman could not prove the recovery runtime is stopped or absent");
+        }
+        if self.inspect(object_reference)?.running {
+            self.stop(object_reference)?;
+        }
+        if self.inspect(object_reference)?.running {
+            bail!("Podman recovery runtime remained active after stop");
+        }
+        Ok(())
+    }
+
     fn restart(&self, object_reference: &str) -> anyhow::Result<()> {
         Process::new(&self.command)
             .args(["restart", object_reference])

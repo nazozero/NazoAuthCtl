@@ -66,6 +66,7 @@ enum CachedRuntimeArtifact {
 #[serde(rename_all = "kebab-case")]
 enum RecoveryTransactionState {
     Prepared,
+    RuntimesQuiesced,
     ProviderRestored,
     RuntimesRestored,
     Committed,
@@ -80,6 +81,7 @@ struct RecoveryTransaction {
     release: String,
     lifecycle_sha256: String,
     cache_sha256: String,
+    recovery_manifest_sha256: String,
     state: RecoveryTransactionState,
     completed_runtimes: BTreeSet<String>,
     updated_at: i64,
@@ -882,6 +884,7 @@ pub(crate) fn recover_registered(
             || transaction.release != slot.trusted_release.release
             || transaction.lifecycle_sha256 != lifecycle_sha256
             || transaction.cache_sha256 != cache_sha256
+            || transaction.recovery_manifest_sha256 != slot.recovery_manifest_sha256
         {
             bail!("recovery transaction binding changed after preparation");
         }
@@ -894,12 +897,21 @@ pub(crate) fn recover_registered(
             release: slot.trusted_release.release.clone(),
             lifecycle_sha256,
             cache_sha256,
+            recovery_manifest_sha256: slot.recovery_manifest_sha256.clone(),
             state: RecoveryTransactionState::Prepared,
             completed_runtimes: BTreeSet::new(),
             updated_at: Utc::now().timestamp(),
         }
     };
     persist_recovery_transaction(&transaction_path, &transaction)?;
+    if transaction.state < RecoveryTransactionState::RuntimesQuiesced {
+        for runtime in &lifecycle.runtimes {
+            backend(runtime.backend).quiesce_for_recovery(&runtime.object_reference)?;
+        }
+        transaction.state = RecoveryTransactionState::RuntimesQuiesced;
+        transaction.updated_at = Utc::now().timestamp();
+        persist_recovery_transaction(&transaction_path, &transaction)?;
+    }
     if transaction.state < RecoveryTransactionState::ProviderRestored {
         let receipt = invoke_recovery_driver(
             lifecycle_path,

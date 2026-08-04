@@ -147,6 +147,34 @@ impl RuntimeBackend for SystemdBackend {
             .run_quiet()
     }
 
+    fn quiesce_for_recovery(&self, object_reference: &str) -> anyhow::Result<()> {
+        if object_reference.starts_with("process:") {
+            if self.inspect(object_reference).is_ok() {
+                bail!("an unmanaged host process cannot be stopped by the recovery controller");
+            }
+            return Ok(());
+        }
+        validate_mutable_unit(object_reference)?;
+        let output = Process::new("systemctl")
+            .args(["show", object_reference, "--property=LoadState", "--value"])
+            .output()?;
+        if !output.status.success() {
+            bail!("systemd could not prove the recovery unit is stopped or absent");
+        }
+        let load_state = String::from_utf8(output.stdout)
+            .context("systemd returned a non-UTF-8 unit load state")?;
+        if load_state.trim() == "not-found" {
+            return Ok(());
+        }
+        if self.inspect(object_reference)?.running {
+            self.stop(object_reference)?;
+        }
+        if self.inspect(object_reference)?.running {
+            bail!("systemd recovery unit remained active after stop");
+        }
+        Ok(())
+    }
+
     fn restart(&self, object_reference: &str) -> anyhow::Result<()> {
         validate_mutable_unit(object_reference)?;
         Process::new("systemctl")
