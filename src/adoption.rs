@@ -709,28 +709,25 @@ pub(crate) fn persist_bound_recovery_package(
     directory: &Path,
 ) -> anyhow::Result<Vec<String>> {
     let mut manifest = verify_recovery_evidence(manifest_path, deployment_id, release)?;
-    fs::create_dir_all(&directory)?;
-    let mut evidence = Vec::new();
-    evidence.push(persist_recovery_artifact(
-        &directory,
-        "data-snapshot",
-        &mut manifest.data_snapshot,
-    )?);
-    evidence.push(persist_recovery_artifact(
-        &directory,
-        "database-restore",
-        &mut manifest.database_restore,
-    )?);
-    evidence.push(persist_recovery_artifact(
-        &directory,
-        "last-trusted-artifact",
-        &mut manifest.last_trusted_artifact,
-    )?);
-    evidence.push(persist_recovery_artifact(
-        &directory,
-        "verification-material",
-        &mut manifest.verification_material,
-    )?);
+    fs::create_dir_all(directory)?;
+    let evidence = vec![
+        persist_recovery_artifact(directory, "data-snapshot", &mut manifest.data_snapshot)?,
+        persist_recovery_artifact(
+            directory,
+            "database-restore",
+            &mut manifest.database_restore,
+        )?,
+        persist_recovery_artifact(
+            directory,
+            "last-trusted-artifact",
+            &mut manifest.last_trusted_artifact,
+        )?,
+        persist_recovery_artifact(
+            directory,
+            "verification-material",
+            &mut manifest.verification_material,
+        )?,
+    ];
     atomic_write(
         &directory.join("manifest.json"),
         &serde_json::to_vec_pretty(&manifest)?,

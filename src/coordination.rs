@@ -300,6 +300,7 @@ pub(crate) fn resume(
     Ok(transaction)
 }
 
+#[cfg(test)]
 pub(crate) fn complete_controller_step(
     store: &DeploymentStore,
     record: &DeploymentRecord,
@@ -358,6 +359,7 @@ pub(crate) fn complete_controller_step_locked(
     Ok(transaction)
 }
 
+#[cfg(test)]
 pub(crate) fn commit_controller_update(
     store: &DeploymentStore,
     current: &DeploymentRecord,
