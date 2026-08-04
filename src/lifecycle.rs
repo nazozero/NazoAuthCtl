@@ -231,9 +231,11 @@ impl LifecycleManifest {
                 candidate.runtime_instance_id.as_ref().map(|runtime_id| {
                     (
                         runtime_id.as_str(),
-                        candidate.runtime.backend,
-                        candidate.runtime.object_reference.as_str(),
-                        &candidate.runtime.mounts,
+                        (
+                            candidate.runtime.backend,
+                            candidate.runtime.object_reference.as_str(),
+                            &candidate.runtime.mounts,
+                        ),
                     )
                 })
             })
