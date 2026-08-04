@@ -231,13 +231,14 @@ physical key loss or non-copy."
         }
         cli::HelpTopic::Controller => {
             "Usage:
-  nazoauthctl [--config PATH] self check [--to VERSION]
-  nazoauthctl [--config PATH] self update [--to VERSION] --yes
-  nazoauthctl [--config PATH] self rollback --yes
+  nazoauthctl self check [--to VERSION]
+  nazoauthctl self update [--to VERSION] --yes
+  nazoauthctl self rollback --yes
 
 Controller updates consume only signed NazoAuthCtl Release binaries and provenance.
-They use a controller-local transaction and rollback slot; a NazoAuth server Release
-cannot replace the controller."
+They use a global controller lock, transaction, signed audit chain, and rollback slot;
+they do not select or borrow keys or state from a NazoAuth deployment. A NazoAuth
+server Release cannot replace the controller."
         }
     }
 }

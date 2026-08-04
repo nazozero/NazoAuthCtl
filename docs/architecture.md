@@ -73,7 +73,10 @@ policy.
 The controller Release manifest is signed by the NazoAuthCtl release workflow.
 It binds only controller binaries and the controller's own rollback floor. A
 server update cannot replace the running controller. Controller self-update is a
-separate transaction with a separate journal and rollback slot.
+separate transaction with a global controller lock, journal, signed audit chain,
+trust record, and rollback slot under the controller state root. It does not
+select or borrow configuration, keys, or mutable state from any NazoAuth
+deployment.
 
 ## Operator-task boundary
 
