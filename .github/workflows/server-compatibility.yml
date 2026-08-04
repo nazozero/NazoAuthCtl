@@ -34,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ctl: [current, previous-v0.1.21]
+        ctl: [current, previous-v0.1.22]
         server: [v0.1.19, v0.1.20]
     env:
       GH_TOKEN: ${{ github.token }}
@@ -46,15 +46,15 @@ jobs:
           name: current-controller
           path: controller
       - name: Download previous signed controller
-        if: matrix.ctl == 'previous-v0.1.21'
-        run: gh release download v0.1.21 --repo nazozero/NazoAuthCtl --pattern nazoauthctl-x86_64-unknown-linux-gnu --dir controller
+        if: matrix.ctl == 'previous-v0.1.22'
+        run: gh release download v0.1.22 --repo nazozero/NazoAuthCtl --pattern nazoauthctl-x86_64-unknown-linux-gnu --dir controller
       - name: Verify previous controller provenance
-        if: matrix.ctl == 'previous-v0.1.21'
+        if: matrix.ctl == 'previous-v0.1.22'
         run: |
           gh attestation verify controller/nazoauthctl-x86_64-unknown-linux-gnu \
             --repo nazozero/NazoAuthCtl \
             --signer-workflow nazozero/NazoAuthCtl/.github/workflows/release.yml \
-            --source-ref refs/tags/v0.1.21 \
+            --source-ref refs/tags/v0.1.22 \
             --deny-self-hosted-runners
       - name: Select controller artifact
         shell: bash
