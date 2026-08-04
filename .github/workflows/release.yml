@@ -9,8 +9,32 @@ permissions:
   contents: read
 
 jobs:
+  policy:
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate immutable controller release input
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          expected = f"v{manifest['package']['version']}"
+          actual = os.environ["RELEASE_TAG"]
+          if actual != expected:
+              raise SystemExit(f"release tag {actual!r} does not match Cargo package version {expected!r}")
+          PY
+
   build:
     if: github.ref_type == 'tag'
+    needs: policy
     strategy:
       fail-fast: false
       matrix:
