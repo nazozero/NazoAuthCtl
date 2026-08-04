@@ -496,7 +496,7 @@ jobs:
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
             "$GITHUB_WORKSPACE/controller/nazoauthctl" --deployment "$deployment_id" \
               relinquish --capability database --yes >"$root/relinquish.json"
-          jq -e '.capabilities.database.responsibility == "external"' \
+          sudo jq -e '.capabilities.database.responsibility == "external"' \
             "$config_root/deployments/$deployment_id/deployment.json"
           test "$(systemctl show "$unit" --property=ActiveState --value)" = active
           sudo systemctl stop "$unit"
