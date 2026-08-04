@@ -256,6 +256,7 @@ jobs:
             "$state_root/deployments/$deployment_id/transactions" \
             "$state_root/deployments/$deployment_id/recovery/trusted-runtime/v0.1.19/$runtime_id" \
             "$break_glass_root"
+          sudo chown -R 10001:10001 "$root/docker-live-data"
           cat >"$root/docker-live-config/.env.yaml" <<YAML
           BIND: "0.0.0.0:8000"
           PUBLIC_BASE_URL: "http://127.0.0.1:19081"
