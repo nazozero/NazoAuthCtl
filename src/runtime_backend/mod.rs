@@ -24,6 +24,10 @@ pub(crate) struct RuntimeObservation {
     pub(crate) running: bool,
     pub(crate) server_command_verified: bool,
     pub(crate) artifact: ArtifactReference,
+    /// Backend-native immutable content identity. This is evidence for a
+    /// locally cached artifact and is not a substitute for a signed Release
+    /// digest during discovery or adoption.
+    pub(crate) local_artifact_id: Option<String>,
     pub(crate) ports: Vec<String>,
     pub(crate) networks: Vec<String>,
     pub(crate) mounts: Vec<NeutralMount>,
@@ -48,6 +52,7 @@ pub(crate) struct NeutralMount {
 pub(crate) struct RuntimeReplacement {
     pub(crate) object_reference: String,
     pub(crate) artifact: ArtifactReference,
+    pub(crate) local_artifact_id: Option<String>,
     pub(crate) command: Vec<String>,
     pub(crate) mounts: Vec<NeutralMount>,
     pub(crate) environment: BTreeMap<String, String>,
@@ -212,9 +217,11 @@ pub(crate) trait RuntimeBackend {
         verification: &BlobAttestationVerification,
     ) -> anyhow::Result<()>;
     fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String>;
+    fn resolve_local_image_id(&self, image_reference: &str) -> anyhow::Result<String>;
     fn read_build_identity(
         &self,
         artifact: &ArtifactReference,
+        local_artifact_id: Option<&str>,
     ) -> anyhow::Result<Option<nazo_operator_protocol::EmbeddedIdentity>>;
     fn describe_mounts(&self, object_reference: &str) -> anyhow::Result<Vec<NeutralMount>> {
         Ok(self.inspect(object_reference)?.mounts)

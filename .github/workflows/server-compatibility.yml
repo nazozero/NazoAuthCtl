@@ -283,6 +283,7 @@ jobs:
           test "$ready" = true
 
           digest="$(docker image inspect "$image" --format '{{index .RepoDigests 0}}' | sed 's/.*@//')"
+          local_image_id="$(docker image inspect "$image" --format '{{.Id}}')"
           archive="$state_root/deployments/$deployment_id/recovery/trusted-runtime/v0.1.19/$runtime_id/image.tar"
           docker image save --output "$archive" "$image@$digest"
           archive_sha="$(sha256sum "$archive" | cut -d' ' -f1)"
@@ -357,9 +358,10 @@ jobs:
             >"$config_root/registry.json"
           jq -n --arg deployment "$deployment_id" --argjson identity "$identity" \
             --arg runtime "$runtime_id" --arg image "$image" --arg digest "$digest" \
+            --arg local_image_id "$local_image_id" \
             --arg archive "$archive" --arg archive_sha "$archive_sha" \
-            '{schema:1,deployment_id:$deployment,release:$identity,runtimes:{($runtime):{
-              kind:"oci-archive",image_reference:$image,digest:$digest,archive:$archive,archive_sha256:$archive_sha}}}' \
+            '{schema:2,deployment_id:$deployment,release:$identity,runtimes:{($runtime):{
+              kind:"oci-archive",image_reference:$image,digest:$digest,local_image_id:$local_image_id,archive:$archive,archive_sha256:$archive_sha}}}' \
             >"$(dirname "$archive")/../cache.json"
           jq -n --arg deployment "$deployment_id" --argjson identity "$identity" \
             --arg manifest "$recovery_manifest" --arg manifest_sha "$recovery_sha" \
@@ -384,7 +386,8 @@ jobs:
           done
           test "$ready" = true
           test "$(docker inspect manual-auth-same-name --format '{{index .Config.Labels "io.nazoauth.deployment-id"}}')" = "$deployment_id"
-          docker image inspect "$image" >/dev/null
+          test "$(docker inspect manual-auth-same-name --format '{{.Image}}')" = "$local_image_id"
+          docker image inspect "$local_image_id" >/dev/null
           test -f "$state_root/deployments/$deployment_id/transactions/recovery-"*.json
           test -f "$state_root/deployments/$deployment_id/audit/00000000000000000001.jws"
       - name: Remove only the exact test objects

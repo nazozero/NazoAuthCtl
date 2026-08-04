@@ -47,7 +47,13 @@ ambiguous update phases fail closed.
 Before activation, the controller retains the previous trusted server manifest,
 verification bundles, host binary or OCI archive, frontend material, and backup
 metadata. OCI recovery imports the retained archive when the engine no longer has
-the previous image. No network lookup is part of the recovery path.
+the previous image. The cache binds the signed registry digest to the backend's
+immutable local image ID and the archive SHA-256 before export. After import,
+activation and acceptance use that same immutable local ID because Docker-format
+archives do not reliably retain registry digest metadata. The deployment
+declaration continues to record the signed Release digest as artifact identity;
+the local ID is only the offline content link. No network lookup is part of the
+recovery path.
 
 For an adopted manual deployment, the lifecycle contract is the executable
 offline boundary. It records every real object reference and an exact neutral

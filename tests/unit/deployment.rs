@@ -32,6 +32,7 @@ fn record(deployment_id: &str, alias: &str) -> DeploymentRecord {
                 image_reference: "ghcr.io/nazozero/nazoauth".to_owned(),
                 digest: format!("sha256:{}", "a".repeat(64)),
             },
+            local_artifact_id: None,
             ports: vec![format!("127.0.0.1:8000->8000/tcp")],
             networks: vec![format!("network-{alias}")],
             mounts: Vec::new(),

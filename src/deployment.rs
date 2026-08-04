@@ -196,6 +196,8 @@ pub(crate) struct RuntimeInstance {
     pub(crate) backend: RuntimeBackendKind,
     pub(crate) object_reference: String,
     pub(crate) artifact: ArtifactReference,
+    #[serde(default)]
+    pub(crate) local_artifact_id: Option<String>,
     pub(crate) ports: Vec<String>,
     pub(crate) networks: Vec<String>,
     pub(crate) mounts: Vec<MountReference>,
@@ -333,6 +335,18 @@ impl DeploymentRecord {
             }
             if runtime.object_reference.is_empty() {
                 bail!("runtime object reference is empty");
+            }
+            if let Some(local_id) = &runtime.local_artifact_id {
+                let Some(digest) = local_id.strip_prefix("sha256:") else {
+                    bail!("runtime local artifact identity is invalid");
+                };
+                if digest.len() != 64
+                    || !digest
+                        .chars()
+                        .all(|character| character.is_ascii_hexdigit())
+                {
+                    bail!("runtime local artifact identity is invalid");
+                }
             }
         }
         if self.trust == TrustState::Observed

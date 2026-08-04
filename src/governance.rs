@@ -348,7 +348,11 @@ pub(crate) fn reconcile(selector: Option<&str>) -> anyhow::Result<()> {
     let mut drift = Vec::new();
     for runtime in &record.runtime_instances {
         let observation = backend(runtime.backend).inspect(&runtime.object_reference)?;
-        if observation.artifact != runtime.artifact {
+        let artifact_matches = runtime.local_artifact_id.as_ref().map_or_else(
+            || observation.artifact == runtime.artifact,
+            |expected| observation.local_artifact_id.as_ref() == Some(expected),
+        );
+        if !artifact_matches {
             drift.push(format!("{}:artifact", runtime.runtime_instance_id));
         }
         if sorted(&observation.ports) != sorted(&runtime.ports) {

@@ -27,6 +27,7 @@ fn candidate(target: &str, deployment_id: &str, runtime_instance_id: &str) -> Di
                 image_reference: "ghcr.io/nazozero/nazoauth".to_owned(),
                 digest: format!("sha256:{}", "b".repeat(64)),
             },
+            local_artifact_id: Some(format!("sha256:{}", "c".repeat(64))),
             ports: Vec::new(),
             networks: Vec::new(),
             mounts: Vec::new(),

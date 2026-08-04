@@ -26,6 +26,7 @@ fn candidate(target: &str, runtime_id: &str, data_root: &str) -> DiscoveredDeplo
             running: false,
             server_command_verified: true,
             artifact: ArtifactReference::Unknown,
+            local_artifact_id: None,
             ports: Vec::new(),
             networks: vec!["external-network".to_owned()],
             mounts: vec![NeutralMount {

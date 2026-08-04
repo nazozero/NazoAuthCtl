@@ -105,6 +105,10 @@ impl RuntimeBackend for SystemdBackend {
         if matches!(artifact, ArtifactReference::Unknown) {
             missing.push("host binary digest could not be resolved".to_owned());
         }
+        let local_artifact_id = match &artifact {
+            ArtifactReference::HostBinary { sha256, .. } => Some(format!("sha256:{sha256}")),
+            _ => None,
+        };
         let environment = properties
             .get("Environment")
             .into_iter()
@@ -123,6 +127,7 @@ impl RuntimeBackend for SystemdBackend {
                 .is_some_and(|state| state == "active"),
             server_command_verified,
             artifact,
+            local_artifact_id,
             ports: Vec::new(),
             networks: Vec::new(),
             mounts: Vec::new(),
@@ -390,9 +395,14 @@ impl RuntimeBackend for SystemdBackend {
         bail!("systemd backend does not manage OCI images")
     }
 
+    fn resolve_local_image_id(&self, _image_reference: &str) -> anyhow::Result<String> {
+        bail!("systemd backend does not manage OCI images")
+    }
+
     fn read_build_identity(
         &self,
         artifact: &ArtifactReference,
+        _local_artifact_id: Option<&str>,
     ) -> anyhow::Result<Option<nazo_operator_protocol::EmbeddedIdentity>> {
         let ArtifactReference::HostBinary {
             path,
@@ -574,6 +584,10 @@ fn discover_unmanaged_processes() -> anyhow::Result<Vec<RuntimeObservation>> {
             let executable = command.split_whitespace().next()?;
             let artifact =
                 host_artifact(Path::new(executable)).unwrap_or(ArtifactReference::Unknown);
+            let local_artifact_id = match &artifact {
+                ArtifactReference::HostBinary { sha256, .. } => Some(format!("sha256:{sha256}")),
+                _ => None,
+            };
             Some(RuntimeObservation {
                 backend: RuntimeBackendKind::Systemd,
                 object_reference: format!("process:{pid}"),
@@ -581,6 +595,7 @@ fn discover_unmanaged_processes() -> anyhow::Result<Vec<RuntimeObservation>> {
                 running: true,
                 server_command_verified: true,
                 artifact,
+                local_artifact_id,
                 ports: Vec::new(),
                 networks: Vec::new(),
                 mounts: Vec::new(),

@@ -27,6 +27,7 @@ fn record() -> DeploymentRecord {
             backend: RuntimeBackendKind::Systemd,
             object_reference: "nazoauth-test.service".to_owned(),
             artifact: ArtifactReference::Unknown,
+            local_artifact_id: None,
             ports: Vec::new(),
             networks: Vec::new(),
             mounts: Vec::new(),

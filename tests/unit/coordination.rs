@@ -40,6 +40,7 @@ fn record(deployment_id: &str) -> DeploymentRecord {
                 path: "/usr/local/bin/nazoauth".into(),
                 sha256: "f".repeat(64),
             },
+            local_artifact_id: None,
             ports: Vec::new(),
             networks: Vec::new(),
             mounts: Vec::new(),

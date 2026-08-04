@@ -41,6 +41,7 @@ fn candidate(root: &Path, runtime_id: &str) -> DiscoveredDeployment {
             running: false,
             server_command_verified: true,
             artifact: ArtifactReference::Unknown,
+            local_artifact_id: None,
             ports: vec!["127.0.0.1:19000:8000".to_owned()],
             networks: vec!["manual-network".to_owned()],
             mounts: vec![mount],

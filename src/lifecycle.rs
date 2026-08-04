@@ -22,6 +22,7 @@ use crate::{
 
 const LIFECYCLE_SCHEMA: u32 = 1;
 const RECOVERY_DRIVER_SCHEMA: u32 = 1;
+const TRUSTED_RUNTIME_CACHE_SCHEMA: u32 = 2;
 const MAX_LIFECYCLE_BYTES: u64 = 256 * 1024;
 const MAX_DRIVER_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_RUNTIME_INSTANCES: usize = 128;
@@ -53,6 +54,7 @@ enum CachedRuntimeArtifact {
     OciArchive {
         image_reference: String,
         digest: String,
+        local_image_id: String,
         archive: PathBuf,
         archive_sha256: String,
     },
@@ -349,31 +351,37 @@ pub(crate) fn cache_trusted_runtime(
                 digest,
             } => {
                 validate_oci_digest(digest)?;
-                let archive = artifact_directory.join("image.tar");
-                if !archive.exists() {
-                    let temporary = artifact_directory.join("image.partial.tar");
-                    if temporary.exists() {
-                        fs::remove_file(&temporary)?;
-                    }
-                    backend(runtime.backend).export_image(
-                        &format!(
-                            "{}@{digest}",
-                            image_reference.split('@').next().unwrap_or(image_reference)
-                        ),
-                        &temporary,
-                    )?;
-                    let metadata = fs::symlink_metadata(&temporary)?;
-                    if metadata.file_type().is_symlink()
-                        || !metadata.is_file()
-                        || metadata.len() == 0
-                    {
-                        bail!("runtime backend exported an invalid OCI recovery archive");
-                    }
-                    fs::rename(&temporary, &archive)?;
+                let runtime_backend = backend(runtime.backend);
+                if runtime_backend.resolve_image_digest(image_reference)? != *digest {
+                    bail!("runtime OCI artifact no longer matches its signed Release digest");
                 }
+                let local_image_id = runtime_backend.resolve_local_image_id(image_reference)?;
+                let archive = artifact_directory.join("image.tar");
+                let temporary = artifact_directory.join("image.partial.tar");
+                for stale in [&temporary, &archive] {
+                    if stale.exists() {
+                        fs::remove_file(stale)?;
+                    }
+                }
+                runtime_backend.export_image(
+                    &format!(
+                        "{}@{digest}",
+                        image_reference.split('@').next().unwrap_or(image_reference)
+                    ),
+                    &temporary,
+                )?;
+                if runtime_backend.resolve_local_image_id(image_reference)? != local_image_id {
+                    bail!("runtime OCI artifact changed while entering the recovery cache");
+                }
+                let metadata = fs::symlink_metadata(&temporary)?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+                    bail!("runtime backend exported an invalid OCI recovery archive");
+                }
+                fs::rename(&temporary, &archive)?;
                 CachedRuntimeArtifact::OciArchive {
                     image_reference: image_reference.clone(),
                     digest: digest.clone(),
+                    local_image_id,
                     archive_sha256: sha256(&archive)?,
                     archive,
                 }
@@ -408,7 +416,7 @@ pub(crate) fn cache_trusted_runtime(
         runtimes.insert(runtime.runtime_instance_id.clone(), cached);
     }
     let cache = TrustedRuntimeCache {
-        schema: 1,
+        schema: TRUSTED_RUNTIME_CACHE_SCHEMA,
         deployment_id: record.deployment_id.clone(),
         release: record.active_release.clone(),
         runtimes,
@@ -489,10 +497,13 @@ pub(crate) fn stage_update_release(
             if runtime_backend.resolve_image_digest(&image_reference)? != digest {
                 bail!("staged OCI Release does not match the signed runtime digest");
             }
+            let local_image_id = runtime_backend.resolve_local_image_id(&image_reference)?;
             let archive = artifact_directory.join("image.tar");
             let temporary = artifact_directory.join("image.partial.tar");
-            if temporary.exists() {
-                fs::remove_file(&temporary)?;
+            for stale in [&temporary, &archive] {
+                if stale.exists() {
+                    fs::remove_file(stale)?;
+                }
             }
             runtime_backend.export_image(
                 &format!(
@@ -504,6 +515,9 @@ pub(crate) fn stage_update_release(
                 ),
                 &temporary,
             )?;
+            if runtime_backend.resolve_local_image_id(&image_reference)? != local_image_id {
+                bail!("staged OCI artifact changed while entering the recovery cache");
+            }
             let metadata = fs::symlink_metadata(&temporary)?;
             if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
                 bail!("runtime backend exported an invalid staged OCI archive");
@@ -512,6 +526,7 @@ pub(crate) fn stage_update_release(
             CachedRuntimeArtifact::OciArchive {
                 image_reference,
                 digest,
+                local_image_id,
                 archive_sha256: sha256(&archive)?,
                 archive,
             }
@@ -519,7 +534,7 @@ pub(crate) fn stage_update_release(
         runtimes.insert(runtime.runtime_instance_id.clone(), cached);
     }
     let cache = TrustedRuntimeCache {
-        schema: 1,
+        schema: TRUSTED_RUNTIME_CACHE_SCHEMA,
         deployment_id: record.deployment_id.clone(),
         release: release.manifest.embedded.clone(),
         runtimes,
@@ -753,6 +768,7 @@ pub(crate) fn execute_coordinated_update(
                 .get(&declared.runtime_instance_id)
                 .context("target cache lost a declared runtime during update commit")?;
             declared.artifact = activated_artifact_reference(runtime, cached)?;
+            declared.local_artifact_id = cached_local_artifact_id(cached);
         }
         updated.declaration_revision += 1;
         current = crate::coordination::commit_controller_update_locked(
@@ -825,6 +841,7 @@ pub(crate) fn rollback_registered(
             .get(&declared.runtime_instance_id)
             .context("rollback cache lost a declared runtime")?;
         declared.artifact = activated_artifact_reference(runtime, cached)?;
+        declared.local_artifact_id = cached_local_artifact_id(cached);
     }
     if rolled_back != *record {
         rolled_back.declaration_revision += 1;
@@ -967,6 +984,7 @@ pub(crate) fn recover_registered(
             .get(&runtime.runtime_instance_id)
             .context("recovery cache lost a declared runtime")?;
         runtime.artifact = activated_artifact_reference(lifecycle_runtime, cached)?;
+        runtime.local_artifact_id = cached_local_artifact_id(cached);
     }
     if recovered != *record {
         recovered.declaration_revision += 1;
@@ -995,10 +1013,12 @@ fn activate_cached_runtime(
     cached: &CachedRuntimeArtifact,
 ) -> anyhow::Result<()> {
     let backend = backend(runtime.backend);
+    let mut trusted_local_artifact_id = None;
     let artifact = match cached {
         CachedRuntimeArtifact::OciArchive {
             image_reference,
             digest,
+            local_image_id,
             archive,
             archive_sha256,
         } => {
@@ -1006,10 +1026,11 @@ fn activate_cached_runtime(
                 bail!("cached OCI recovery archive changed before activation");
             }
             backend.import_image(archive)?;
-            let resolved = backend.resolve_image_digest(image_reference)?;
-            if resolved != *digest {
-                bail!("imported OCI recovery artifact does not match its trusted digest");
+            let resolved = backend.resolve_local_image_id(local_image_id)?;
+            if resolved != *local_image_id {
+                bail!("imported OCI recovery artifact does not match its trusted local identity");
             }
+            trusted_local_artifact_id = Some(local_image_id.clone());
             ArtifactReference::Oci {
                 image_reference: image_reference.clone(),
                 digest: digest.clone(),
@@ -1026,7 +1047,7 @@ fn activate_cached_runtime(
         }
     };
     let embedded = backend
-        .read_build_identity(&artifact)?
+        .read_build_identity(&artifact, trusted_local_artifact_id.as_deref())?
         .context("trusted recovery artifact exposes no embedded build identity")?;
     if embedded != *expected_release {
         bail!("trusted recovery artifact embedded identity changed before activation");
@@ -1042,6 +1063,7 @@ fn activate_cached_runtime(
     let replacement = RuntimeReplacement {
         object_reference: runtime.object_reference.clone(),
         artifact: artifact.clone(),
+        local_artifact_id: trusted_local_artifact_id.clone(),
         command: runtime.command.clone(),
         mounts: runtime.mounts.clone(),
         environment: runtime.environment.clone(),
@@ -1065,7 +1087,11 @@ fn activate_cached_runtime(
     };
     backend.replace(&replacement)?;
     let observation = backend.inspect(&runtime.object_reference)?;
-    if !observation.running || !artifact_identity_matches(&observation.artifact, &artifact) {
+    let artifact_matches = trusted_local_artifact_id.as_ref().map_or_else(
+        || artifact_identity_matches(&observation.artifact, &artifact),
+        |expected| observation.local_artifact_id.as_ref() == Some(expected),
+    );
+    if !observation.running || !artifact_matches {
         bail!("restored runtime did not retain the trusted artifact identity");
     }
     if record.capabilities.runtime.responsibility == Responsibility::Managed {
@@ -1123,14 +1149,21 @@ fn verify_active_runtime(
     cached: &CachedRuntimeArtifact,
 ) -> anyhow::Result<()> {
     let expected_artifact = activated_artifact_reference(runtime, cached)?;
+    let expected_local_artifact_id = match cached {
+        CachedRuntimeArtifact::OciArchive { local_image_id, .. } => Some(local_image_id.as_str()),
+        CachedRuntimeArtifact::HostBinary { .. } => None,
+    };
     let runtime_backend = backend(runtime.backend);
     let observation = runtime_backend.inspect(&runtime.object_reference)?;
-    if !observation.running || !artifact_identity_matches(&observation.artifact, &expected_artifact)
-    {
+    let artifact_matches = expected_local_artifact_id.map_or_else(
+        || artifact_identity_matches(&observation.artifact, &expected_artifact),
+        |expected| observation.local_artifact_id.as_deref() == Some(expected),
+    );
+    if !observation.running || !artifact_matches {
         bail!("runtime does not expose the expected active artifact identity");
     }
     let embedded = runtime_backend
-        .read_build_identity(&expected_artifact)?
+        .read_build_identity(&expected_artifact, expected_local_artifact_id)?
         .context("active runtime artifact exposes no embedded build identity")?;
     if embedded != *expected_release {
         bail!("active runtime artifact exposes a different Release identity");
@@ -1146,7 +1179,7 @@ fn load_cache(path: &Path, record: &DeploymentRecord) -> anyhow::Result<TrustedR
     }
     let cache: TrustedRuntimeCache =
         serde_json::from_slice(&fs::read(path)?).context("trusted runtime cache is invalid")?;
-    if cache.schema != 1
+    if cache.schema != TRUSTED_RUNTIME_CACHE_SCHEMA
         || cache.deployment_id != record.deployment_id
         || cache.release != record.active_release
         || cache.runtimes.len() != record.runtime_instances.len()
@@ -1161,11 +1194,13 @@ fn validate_cached_artifacts(cache: &TrustedRuntimeCache) -> anyhow::Result<()> 
         match artifact {
             CachedRuntimeArtifact::OciArchive {
                 digest,
+                local_image_id,
                 archive,
                 archive_sha256,
                 ..
             } => {
                 validate_oci_digest(digest)?;
+                validate_oci_digest(local_image_id)?;
                 validate_lower_hex(archive_sha256)?;
                 validate_regular_artifact(archive, "trusted OCI recovery archive")?;
                 if sha256(archive)? != *archive_sha256 {
@@ -1211,6 +1246,13 @@ fn artifact_identity_matches(left: &ArtifactReference, right: &ArtifactReference
             ArtifactReference::HostBinary { sha256: right, .. },
         ) => left == right,
         _ => false,
+    }
+}
+
+fn cached_local_artifact_id(cached: &CachedRuntimeArtifact) -> Option<String> {
+    match cached {
+        CachedRuntimeArtifact::OciArchive { local_image_id, .. } => Some(local_image_id.clone()),
+        CachedRuntimeArtifact::HostBinary { .. } => None,
     }
 }
 

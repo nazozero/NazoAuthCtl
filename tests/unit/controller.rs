@@ -2032,6 +2032,7 @@ fn registered_update_plan_preserves_mixed_ownership_and_replica_identity() {
                 image_reference: "ghcr.io/nazozero/nazoauth".to_owned(),
                 digest: format!("sha256:{}", "a".repeat(64)),
             },
+            local_artifact_id: None,
             ports: Vec::new(),
             networks: vec!["shared-network".to_owned()],
             mounts: Vec::new(),

@@ -1854,21 +1854,24 @@ fn registered_status(
             let observation = runtime_backend.inspect(&runtime.object_reference);
             match observation {
                 Ok(observation) => {
-                    let artifact_matches = match (&runtime.artifact, &observation.artifact) {
-                        (
-                            ArtifactReference::Oci {
-                                digest: expected, ..
-                            },
-                            ArtifactReference::Oci { digest: actual, .. },
-                        ) => expected == actual,
-                        (
-                            ArtifactReference::HostBinary {
-                                sha256: expected, ..
-                            },
-                            ArtifactReference::HostBinary { sha256: actual, .. },
-                        ) => expected == actual,
-                        _ => false,
-                    };
+                    let artifact_matches = runtime.local_artifact_id.as_ref().map_or_else(
+                        || match (&runtime.artifact, &observation.artifact) {
+                            (
+                                ArtifactReference::Oci {
+                                    digest: expected, ..
+                                },
+                                ArtifactReference::Oci { digest: actual, .. },
+                            ) => expected == actual,
+                            (
+                                ArtifactReference::HostBinary {
+                                    sha256: expected, ..
+                                },
+                                ArtifactReference::HostBinary { sha256: actual, .. },
+                            ) => expected == actual,
+                            _ => false,
+                        },
+                        |expected| observation.local_artifact_id.as_ref() == Some(expected),
+                    );
                     serde_json::json!({
                         "runtime_instance_id": runtime.runtime_instance_id,
                         "backend": runtime.backend,
@@ -2287,6 +2290,7 @@ fn register_installed_deployment(
             backend,
             object_reference,
             artifact,
+            local_artifact_id: None,
             ports: vec![config.runtime.publish_address.clone()],
             networks: (!config.runtime.network.is_empty())
                 .then(|| config.runtime.network.clone())

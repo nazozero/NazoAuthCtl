@@ -804,6 +804,7 @@ fn deployment_record(
                 backend: candidate.runtime.backend,
                 object_reference: candidate.runtime.object_reference.clone(),
                 artifact: candidate.runtime.artifact.clone(),
+                local_artifact_id: candidate.runtime.local_artifact_id.clone(),
                 ports: candidate.runtime.ports.clone(),
                 networks: candidate.runtime.networks.clone(),
                 mounts,

@@ -420,6 +420,7 @@ impl<'a> Runtime<'a> {
                 image_reference: image.to_owned(),
                 digest: backend.resolve_image_digest(image)?,
             },
+            local_artifact_id: None,
             command: vec!["nazoauth".to_owned(), "server".to_owned()],
             mounts: self
                 .config
@@ -606,7 +607,7 @@ impl<'a> Runtime<'a> {
             },
         };
         self.backend()?
-            .read_build_identity(&artifact)
+            .read_build_identity(&artifact, None)
             .context("runtime embedded build identity is invalid")?
             .context("runtime backend returned no build identity")
     }

@@ -293,6 +293,10 @@ impl RuntimeBackend for PodmanBackend {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        let local_artifact_id = value
+            .get("Image")
+            .and_then(serde_json::Value::as_str)
+            .and_then(normalize_local_image_id);
         let (artifact, artifact_missing) = match self.resolve_image_digest(&image_reference) {
             Ok(digest) => (
                 ArtifactReference::Oci {
@@ -390,6 +394,7 @@ impl RuntimeBackend for PodmanBackend {
             running,
             server_command_verified,
             artifact,
+            local_artifact_id,
             ports,
             networks,
             mounts,
@@ -458,11 +463,13 @@ impl RuntimeBackend for PodmanBackend {
         else {
             bail!("Podman replacement requires a digest-bound OCI artifact");
         };
-        let image = format!(
-            "{}@{}",
-            image_reference.split('@').next().unwrap_or(image_reference),
-            digest
-        );
+        let image = replacement.local_artifact_id.clone().unwrap_or_else(|| {
+            format!(
+                "{}@{}",
+                image_reference.split('@').next().unwrap_or(image_reference),
+                digest
+            )
+        });
         let mut command = Process::new(&self.command)
             .args(["run", "-d", "--name"])
             .arg(&replacement.object_reference)
@@ -866,9 +873,18 @@ impl RuntimeBackend for PodmanBackend {
         Ok(digest.to_ascii_lowercase())
     }
 
+    fn resolve_local_image_id(&self, image_reference: &str) -> anyhow::Result<String> {
+        let output = Process::new(&self.command)
+            .args(["image", "inspect", image_reference, "--format", "{{.Id}}"])
+            .stdout()?;
+        normalize_local_image_id(output.trim())
+            .context("Podman image has no immutable local content identity")
+    }
+
     fn read_build_identity(
         &self,
         artifact: &ArtifactReference,
+        local_artifact_id: Option<&str>,
     ) -> anyhow::Result<Option<nazo_operator_protocol::EmbeddedIdentity>> {
         let ArtifactReference::Oci {
             image_reference,
@@ -877,11 +893,13 @@ impl RuntimeBackend for PodmanBackend {
         else {
             bail!("Podman build identity requires a digest-bound OCI artifact");
         };
-        let image = format!(
-            "{}@{}",
-            image_reference.split('@').next().unwrap_or(image_reference),
-            digest
-        );
+        let image = local_artifact_id.map(ToOwned::to_owned).unwrap_or_else(|| {
+            format!(
+                "{}@{}",
+                image_reference.split('@').next().unwrap_or(image_reference),
+                digest
+            )
+        });
         let output = Process::new(&self.command)
             .args([
                 "run",
@@ -967,4 +985,13 @@ fn valid_digest(value: &str) -> bool {
                 .chars()
                 .all(|character| character.is_ascii_hexdigit())
     })
+}
+
+fn normalize_local_image_id(value: &str) -> Option<String> {
+    let digest = value.strip_prefix("sha256:").unwrap_or(value);
+    (digest.len() == 64
+        && digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()))
+    .then(|| format!("sha256:{}", digest.to_ascii_lowercase()))
 }

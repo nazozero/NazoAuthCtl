@@ -291,6 +291,10 @@ impl RuntimeBackend for DockerBackend {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        let local_artifact_id = value
+            .get("Image")
+            .and_then(serde_json::Value::as_str)
+            .and_then(normalize_local_image_id);
         let (artifact, artifact_missing) = match self.resolve_image_digest(&image_reference) {
             Ok(digest) => (
                 ArtifactReference::Oci {
@@ -388,6 +392,7 @@ impl RuntimeBackend for DockerBackend {
             running,
             server_command_verified,
             artifact,
+            local_artifact_id,
             ports,
             networks,
             mounts,
@@ -453,11 +458,13 @@ impl RuntimeBackend for DockerBackend {
         else {
             bail!("Docker replacement requires a digest-bound OCI artifact");
         };
-        let image = format!(
-            "{}@{}",
-            image_reference.split('@').next().unwrap_or(image_reference),
-            digest
-        );
+        let image = replacement.local_artifact_id.clone().unwrap_or_else(|| {
+            format!(
+                "{}@{}",
+                image_reference.split('@').next().unwrap_or(image_reference),
+                digest
+            )
+        });
         let mut command = Process::new(&self.command)
             .args(["run", "-d", "--name"])
             .arg(&replacement.object_reference)
@@ -845,9 +852,18 @@ impl RuntimeBackend for DockerBackend {
         Ok(digest.to_ascii_lowercase())
     }
 
+    fn resolve_local_image_id(&self, image_reference: &str) -> anyhow::Result<String> {
+        let output = Process::new(&self.command)
+            .args(["image", "inspect", image_reference, "--format", "{{.Id}}"])
+            .stdout()?;
+        normalize_local_image_id(output.trim())
+            .context("Docker image has no immutable local content identity")
+    }
+
     fn read_build_identity(
         &self,
         artifact: &ArtifactReference,
+        local_artifact_id: Option<&str>,
     ) -> anyhow::Result<Option<nazo_operator_protocol::EmbeddedIdentity>> {
         let ArtifactReference::Oci {
             image_reference,
@@ -856,11 +872,13 @@ impl RuntimeBackend for DockerBackend {
         else {
             bail!("Docker build identity requires a digest-bound OCI artifact");
         };
-        let image = format!(
-            "{}@{}",
-            image_reference.split('@').next().unwrap_or(image_reference),
-            digest
-        );
+        let image = local_artifact_id.map(ToOwned::to_owned).unwrap_or_else(|| {
+            format!(
+                "{}@{}",
+                image_reference.split('@').next().unwrap_or(image_reference),
+                digest
+            )
+        });
         let output = Process::new(&self.command)
             .args([
                 "run",
@@ -942,4 +960,9 @@ fn valid_digest(value: &str) -> bool {
                 .chars()
                 .all(|character| character.is_ascii_hexdigit())
     })
+}
+
+fn normalize_local_image_id(value: &str) -> Option<String> {
+    let normalized = value.to_ascii_lowercase();
+    valid_digest(&normalized).then_some(normalized)
 }
