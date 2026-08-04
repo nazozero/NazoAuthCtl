@@ -1091,8 +1091,16 @@ fn activate_cached_runtime(
         || artifact_identity_matches(&observation.artifact, &artifact),
         |expected| observation.local_artifact_id.as_ref() == Some(expected),
     );
-    if !observation.running || !artifact_matches {
-        bail!("restored runtime did not retain the trusted artifact identity");
+    if !observation.running {
+        bail!("restored runtime did not remain active after replacement");
+    }
+    if !artifact_matches {
+        bail!(
+            "restored runtime artifact identity mismatch: expected local identity {:?}, observed local identity {:?}, observed artifact {:?}",
+            trusted_local_artifact_id,
+            observation.local_artifact_id,
+            observation.artifact
+        );
     }
     if record.capabilities.runtime.responsibility == Responsibility::Managed {
         backend.verify_ownership(
