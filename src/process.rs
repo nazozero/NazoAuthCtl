@@ -66,7 +66,14 @@ impl Process {
                 "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             );
             #[cfg(unix)]
-            command.env("HOME", "/root");
+            command.env(
+                "HOME",
+                std::env::var_os("HOME").unwrap_or_else(|| "/root".into()),
+            );
+            #[cfg(unix)]
+            if let Some(value) = std::env::var_os("XDG_RUNTIME_DIR") {
+                command.env("XDG_RUNTIME_DIR", value);
+            }
             #[cfg(unix)]
             command.env("LC_ALL", "C");
             #[cfg(windows)]
