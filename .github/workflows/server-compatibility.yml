@@ -619,7 +619,13 @@ jobs:
             fi
             sleep 2
           done
-          test "$ready" = true
+          if [ "$ready" != true ]; then
+            sudo podman inspect "$object" --format \
+              'state={{json .State}} image={{.Image}} path={{.Path}} args={{json .Args}} working_dir={{.Config.WorkingDir}} user={{.Config.User}}'
+            sudo podman inspect "$object" --format '{{json .Mounts}}' \
+              | jq '[.[] | {Type, Source, Destination, Driver, Mode, RW, Propagation}]'
+            exit 1
+          fi
           test "$(sudo podman inspect "$object" --format '{{index .Config.Labels "io.nazoauth.deployment-id"}}')" = "$deployment_id"
           restored_id="$(sudo podman inspect "$object" --format '{{.Image}}')"
           test "sha256:${restored_id#sha256:}" = "$local_image_id"
