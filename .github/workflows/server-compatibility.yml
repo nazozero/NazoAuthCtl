@@ -327,13 +327,15 @@ jobs:
             --arg object manual-auth-same-name --arg data "$root/docker-live-data" \
             --arg config "$root/docker-live-config/.env.yaml" --arg network "$network" \
             --arg driver "$driver" --arg driver_sha "$driver_sha" --arg rehearsal "$root/rehearsal" \
-            '{schema:1,deployment_id:$deployment,runtimes:[{
+            '{schema:2,deployment_id:$deployment,runtimes:[{
               runtime_instance_id:$runtime,backend:"docker",object_reference:$object,
               command:["nazoauth","server"],mounts:[
                 {source:$config,destination:"/app/.env.yaml",read_only:true,selinux_relabel:false,ownership:"external",scope:"deployment"},
                 {source:$data,destination:"/var/lib/nazo_oauth",read_only:false,selinux_relabel:false,ownership:"external",scope:"deployment"}
               ],environment:{DATA_DIR:"/var/lib/nazo_oauth"},networks:[$network],ip_address:null,
-              ports:["127.0.0.1:19081:8000"]
+              ports:["127.0.0.1:19081:8000"],container_policy:{restart:"no",read_only_root:false,
+                no_new_privileges:false,drop_all_capabilities:false,pids_limit:null,memory_limit_bytes:null,
+                cpu_limit_millis:null,tmpfs:[]}
             }],recovery_driver:{program:$driver,program_sha256:$driver_sha,arguments:[],rehearsal_workspace:$rehearsal,credentials:{}}}' \
             >"$lifecycle"
           identity="$(cat host-identity.json)"
@@ -398,6 +400,10 @@ jobs:
           test "$ready" = true
           test "$(docker inspect manual-auth-same-name --format '{{index .Config.Labels "io.nazoauth.deployment-id"}}')" = "$deployment_id"
           test "$(docker inspect manual-auth-same-name --format '{{.Image}}')" = "$local_image_id"
+          docker inspect manual-auth-same-name | jq -e '.[0].HostConfig |
+            (.ReadonlyRootfs == false) and (.RestartPolicy.Name == "no") and
+            ((.CapDrop // []) == []) and (.Memory == 0) and (.NanoCpus == 0) and
+            ((.PidsLimit // 0) == 0) and ((.Tmpfs // {}) == {})'
           docker image inspect "$local_image_id" >/dev/null
           test -f "$state_root/deployments/$deployment_id/transactions/recovery-"*.json
           test -f "$state_root/deployments/$deployment_id/audit/00000000000000000001.jws"
@@ -461,7 +467,7 @@ jobs:
               release:$release,alias:$alias,issuer:$issuer,identity_file:$identity,config_root:$config_root,
               state_root:$state_root,break_glass_root:$break_glass_root,
               artifact:{kind:"host",target_path:$target,cached_binary:$cached,sha256:$sha},
-              runtime:{command:[$target,"server"],mounts:[],environment:{},networks:[],ip_address:null,ports:[]},
+              runtime:{command:[$target,"server"],mounts:[],environment:{},networks:[],ip_address:null,ports:[],container_policy:null},
               declared_ports:[],operator_protocol_versions:[999],operator_tasks_responsibility:"delegated",
               database_responsibility:"delegated"}' >"$root/spec.json"
           python3 "$GITHUB_WORKSPACE/.github/scripts/write_recovery_fixture.py" "$root/spec.json"
@@ -623,7 +629,9 @@ jobs:
               runtime:{command:["nazoauth","server"],mounts:[
                 {source:$config,destination:"/app/.env.yaml",read_only:true,selinux_relabel:false,ownership:"external",scope:"deployment"},
                 {source:$data,destination:"/var/lib/nazo_oauth",read_only:false,selinux_relabel:false,ownership:"external",scope:"deployment"}],
-                environment:{DATA_DIR:"/var/lib/nazo_oauth"},networks:["host"],ip_address:null,ports:[]},declared_ports:[]}' \
+                environment:{DATA_DIR:"/var/lib/nazo_oauth"},networks:["host"],ip_address:null,ports:[],
+                container_policy:{restart:"no",read_only_root:false,no_new_privileges:false,
+                  drop_all_capabilities:false,pids_limit:null,memory_limit_bytes:null,cpu_limit_millis:null,tmpfs:[]}},declared_ports:[]}' \
             >"$root/spec.json"
           python3 "$GITHUB_WORKSPACE/.github/scripts/write_recovery_fixture.py" "$root/spec.json"
 
@@ -664,6 +672,11 @@ jobs:
           test "$(sudo podman inspect "$object" --format '{{index .Config.Labels "io.nazoauth.deployment-id"}}')" = "$deployment_id"
           restored_id="$(sudo podman inspect "$object" --format '{{.Image}}')"
           test "sha256:${restored_id#sha256:}" = "$local_image_id"
+          sudo podman inspect "$object" | jq -e '.[0].HostConfig |
+            (.ReadonlyRootfs == false) and (.RestartPolicy.Name == "no") and
+            ((.CapDrop // []) == []) and ((.Memory // 0) == 0) and
+            ((.NanoCpus // 0) == 0) and ((.PidsLimit // 0) == 0) and
+            ((.Tmpfs // {}) == {})'
           test -f "$state_root/deployments/$deployment_id/transactions/recovery-"*.json
           test -f "$state_root/deployments/$deployment_id/audit/00000000000000000001.jws"
       - name: Remove only the exact test objects

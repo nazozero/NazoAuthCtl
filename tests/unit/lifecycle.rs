@@ -11,7 +11,7 @@ use crate::{
         RuntimeBackendKind,
     },
     filesystem::{PrivateTempDir, sha256},
-    runtime_backend::RuntimeObservation,
+    runtime_backend::{ContainerRestartPolicy, ContainerRuntimePolicy, RuntimeObservation},
 };
 
 fn candidate(root: &Path, runtime_id: &str) -> DiscoveredDeployment {
@@ -88,6 +88,16 @@ fn lifecycle(work: &PrivateTempDir) -> LifecycleManifest {
             networks: vec!["manual-network".to_owned()],
             ip_address: None,
             ports: vec!["127.0.0.1:19000:8000".to_owned()],
+            container_policy: Some(ContainerRuntimePolicy {
+                restart: ContainerRestartPolicy::No,
+                read_only_root: false,
+                no_new_privileges: false,
+                drop_all_capabilities: false,
+                pids_limit: None,
+                memory_limit_bytes: None,
+                cpu_limit_millis: None,
+                tmpfs: Vec::new(),
+            }),
         }],
         recovery_driver: RecoveryDriver {
             program_sha256: sha256(&driver).unwrap(),
@@ -143,6 +153,27 @@ fn lifecycle_rejects_inline_secret_environment_and_rehearsal_mount_overlap() {
 
     let mut value = lifecycle(&work);
     value.runtimes[0].mounts[0].source = DeploymentStore::system().state_root;
+    assert!(value.validate().is_err());
+
+    let mut value = lifecycle(&work);
+    value.runtimes[0].container_policy = None;
+    assert!(value.validate().is_err());
+
+    let mut value = lifecycle(&work);
+    value.runtimes[0].backend = RuntimeBackendKind::Systemd;
+    value.runtimes[0].command[0] = work.path().join("nazoauth").display().to_string();
+    assert!(value.validate().is_err());
+
+    let mut value = lifecycle(&work);
+    value.runtimes[0]
+        .container_policy
+        .as_mut()
+        .unwrap()
+        .pids_limit = Some(0);
+    assert!(value.validate().is_err());
+
+    let mut value = lifecycle(&work);
+    value.schema = 1;
     assert!(value.validate().is_err());
 }
 

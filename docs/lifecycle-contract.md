@@ -1,13 +1,13 @@
 # Manual deployment lifecycle contract
 
-`adopt --lifecycle` accepts strict schema-1 JSON. The file is an explicit grant
+`adopt --lifecycle` accepts strict schema-2 JSON. The file is an explicit grant
 to operate only the listed runtime objects and recovery capabilities; names are
 locators, while `deployment_id`, `runtime_instance_id`, signed instance identity,
 and verified artifact identity are the security binding.
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "deployment_id": "01JDEPLOYMENTID",
   "runtimes": [
     {
@@ -31,7 +31,17 @@ and verified artifact identity are the security binding.
       },
       "networks": ["actual-network"],
       "ip_address": null,
-      "ports": ["127.0.0.1:19000:8000"]
+      "ports": ["127.0.0.1:19000:8000"],
+      "container_policy": {
+        "restart": "no",
+        "read_only_root": false,
+        "no_new_privileges": false,
+        "drop_all_capabilities": false,
+        "pids_limit": null,
+        "memory_limit_bytes": null,
+        "cpu_limit_millis": null,
+        "tmpfs": []
+      }
     }
   ],
   "recovery_driver": {
@@ -49,10 +59,14 @@ and verified artifact identity are the security binding.
 }
 ```
 
-Mounts are backend-neutral. `read_only`, `selinux_relabel`, ownership, and scope
-are translated only by the selected runtime adapter; strings such as `rw,Z` are
-not accepted as controller configuration. Systemd entries use an absolute binary
-path as the first command argument. Container entries use the server entrypoint.
+Mounts and container policy are backend-neutral. `read_only`, `selinux_relabel`,
+restart, root-filesystem mutability, privilege policy, limits, and tmpfs semantics
+are translated only by the selected runtime adapter; strings such as `rw,Z` or
+engine CLI arguments are not accepted as controller configuration. Container
+entries must declare every policy field. Omitting policy fails closed instead of
+silently adding managed-install hardening to a manually deployed runtime. Systemd
+entries must set `container_policy` to `null` and use an absolute binary path as
+the first command argument. Container entries use the server entrypoint.
 
 The driver reads one JSON request from standard input and writes one JSON receipt
 to standard output. It must implement `rehearse`, `checkpoint`, and `restore`.

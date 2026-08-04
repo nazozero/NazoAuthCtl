@@ -10,14 +10,63 @@ use crate::{
 #[cfg(debug_assertions)]
 use super::DebugArtifactTask;
 use super::{
-    BlobAttestationVerification, HostServiceInstall, ManagedDependencies, ManagedDependencyBackup,
-    ManagedNetwork, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore,
-    NeutralMount, OneShotTask, RuntimeBackend, RuntimeDatabasePrivilegeProbe, RuntimeObservation,
+    BlobAttestationVerification, ContainerRestartPolicy, ContainerRuntimePolicy,
+    HostServiceInstall, ManagedDependencies, ManagedDependencyBackup, ManagedNetwork,
+    ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount,
+    OneShotTask, RuntimeBackend, RuntimeDatabasePrivilegeProbe, RuntimeObservation,
     RuntimeReplacement, labels, safe_environment, server_command_verified,
 };
 
 pub(crate) struct DockerBackend {
     command: std::ffi::OsString,
+}
+
+fn append_container_policy(mut command: Process, policy: &ContainerRuntimePolicy) -> Process {
+    command = match policy.restart {
+        ContainerRestartPolicy::No => command,
+        ContainerRestartPolicy::OnFailure => command.args(["--restart", "on-failure"]),
+        ContainerRestartPolicy::Always => command.args(["--restart", "always"]),
+        ContainerRestartPolicy::UnlessStopped => command.args(["--restart", "unless-stopped"]),
+    };
+    if policy.drop_all_capabilities {
+        command = command.args(["--cap-drop", "ALL"]);
+    }
+    if policy.no_new_privileges {
+        command = command.args(["--security-opt", "no-new-privileges"]);
+    }
+    if policy.read_only_root {
+        command = command.arg("--read-only");
+    }
+    if let Some(value) = policy.pids_limit {
+        command = command.arg("--pids-limit").arg(value.to_string());
+    }
+    if let Some(value) = policy.memory_limit_bytes {
+        command = command.arg("--memory").arg(value.to_string());
+    }
+    if let Some(value) = policy.cpu_limit_millis {
+        command = command
+            .arg("--cpus")
+            .arg(format!("{}.{:03}", value / 1000, value % 1000));
+    }
+    for tmpfs in &policy.tmpfs {
+        let mut options = vec![if tmpfs.read_only { "ro" } else { "rw" }];
+        if tmpfs.no_exec {
+            options.push("noexec");
+        }
+        if tmpfs.no_suid {
+            options.push("nosuid");
+        }
+        if tmpfs.no_device {
+            options.push("nodev");
+        }
+        command = command.arg("--tmpfs").arg(format!(
+            "{}:{},size={}",
+            tmpfs.destination.display(),
+            options.join(","),
+            tmpfs.size_bytes
+        ));
+    }
+    command
 }
 
 fn backup_managed_dependencies(
@@ -465,26 +514,16 @@ impl RuntimeBackend for DockerBackend {
                 digest
             )
         });
-        let mut command = Process::new(&self.command)
-            .args(["run", "-d", "--name"])
-            .arg(&replacement.object_reference)
-            .args([
-                "--restart",
-                "unless-stopped",
-                "--cap-drop",
-                "ALL",
-                "--security-opt",
-                "no-new-privileges",
-                "--read-only",
-                "--pids-limit",
-                "512",
-                "--memory",
-                "1g",
-                "--cpus",
-                "2",
-                "--tmpfs",
-                "/tmp:rw,noexec,nosuid,nodev,size=64m",
-            ]);
+        let policy = replacement
+            .container_policy
+            .as_ref()
+            .context("Docker replacement has no explicit container policy")?;
+        let mut command = append_container_policy(
+            Process::new(&self.command)
+                .args(["run", "-d", "--name"])
+                .arg(&replacement.object_reference),
+            policy,
+        );
         for (name, value) in &replacement.labels {
             command = command.arg("--label").arg(format!("{name}={value}"));
         }

@@ -17,10 +17,10 @@ use crate::{
     filesystem::{atomic_write, copy_atomic, remove_file_durable, set_mode, sha256},
     process::Process,
     release::VerifiedRelease,
-    runtime_backend::{NeutralMount, RuntimeReplacement, backend},
+    runtime_backend::{ContainerRuntimePolicy, NeutralMount, RuntimeReplacement, backend},
 };
 
-const LIFECYCLE_SCHEMA: u32 = 1;
+const LIFECYCLE_SCHEMA: u32 = 2;
 const RECOVERY_DRIVER_SCHEMA: u32 = 1;
 const TRUSTED_RUNTIME_CACHE_SCHEMA: u32 = 2;
 const MAX_LIFECYCLE_BYTES: u64 = 256 * 1024;
@@ -28,6 +28,10 @@ const MAX_DRIVER_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_RUNTIME_INSTANCES: usize = 128;
 const MAX_ARGUMENTS: usize = 64;
 const MAX_ARGUMENT_BYTES: usize = 4096;
+const MAX_TMPFS_MOUNTS: usize = 16;
+const MAX_PIDS_LIMIT: u32 = 1_000_000;
+const MAX_MEMORY_LIMIT_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+const MAX_CPU_LIMIT_MILLIS: u32 = 256_000;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -137,6 +141,7 @@ pub(crate) struct RuntimeLifecycle {
     pub(crate) networks: Vec<String>,
     pub(crate) ip_address: Option<String>,
     pub(crate) ports: Vec<String>,
+    pub(crate) container_policy: Option<ContainerRuntimePolicy>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -291,6 +296,7 @@ impl LifecycleManifest {
             {
                 bail!("systemd lifecycle command must use an absolute binary path");
             }
+            validate_container_policy(runtime.backend, runtime.container_policy.as_ref())?;
             validate_environment(runtime.backend, &runtime.environment)?;
             for mount in &runtime.mounts {
                 validate_absolute_path(&mount.source, "runtime mount source")?;
@@ -1084,6 +1090,7 @@ fn activate_cached_runtime(
                 record.control_authority.clone(),
             ),
         ]),
+        container_policy: runtime.container_policy.clone(),
     };
     backend.replace(&replacement)?;
     let observation = backend.inspect(&runtime.object_reference)?;
@@ -1381,6 +1388,54 @@ fn validate_oci_digest(value: &str) -> anyhow::Result<()> {
         .strip_prefix("sha256:")
         .context("OCI recovery artifact has no sha256 digest")?;
     validate_lower_hex(digest)
+}
+
+fn validate_container_policy(
+    backend: RuntimeBackendKind,
+    policy: Option<&ContainerRuntimePolicy>,
+) -> anyhow::Result<()> {
+    match (backend, policy) {
+        (RuntimeBackendKind::Systemd, Some(_)) => {
+            bail!("systemd lifecycle runtime cannot declare a container policy")
+        }
+        (RuntimeBackendKind::Systemd, None) => return Ok(()),
+        (RuntimeBackendKind::Docker | RuntimeBackendKind::Podman, None) => {
+            bail!("container lifecycle runtime requires an explicit container policy")
+        }
+        (RuntimeBackendKind::Docker | RuntimeBackendKind::Podman, Some(policy)) => {
+            if policy
+                .pids_limit
+                .is_some_and(|value| value == 0 || value > MAX_PIDS_LIMIT)
+            {
+                bail!("container lifecycle pids limit is outside the supported boundary");
+            }
+            if policy
+                .memory_limit_bytes
+                .is_some_and(|value| value == 0 || value > MAX_MEMORY_LIMIT_BYTES)
+            {
+                bail!("container lifecycle memory limit is outside the supported boundary");
+            }
+            if policy
+                .cpu_limit_millis
+                .is_some_and(|value| value == 0 || value > MAX_CPU_LIMIT_MILLIS)
+            {
+                bail!("container lifecycle CPU limit is outside the supported boundary");
+            }
+            if policy.tmpfs.len() > MAX_TMPFS_MOUNTS {
+                bail!("container lifecycle declares too many tmpfs mounts");
+            }
+            let mut destinations = BTreeSet::new();
+            for tmpfs in &policy.tmpfs {
+                if !runtime_path_is_absolute(backend, &tmpfs.destination) || tmpfs.size_bytes == 0 {
+                    bail!("container lifecycle tmpfs declaration is invalid");
+                }
+                if !destinations.insert(&tmpfs.destination) {
+                    bail!("container lifecycle contains a duplicate tmpfs destination");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl RecoveryDriver {

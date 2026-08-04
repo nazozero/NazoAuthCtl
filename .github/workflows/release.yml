@@ -129,12 +129,12 @@ jobs:
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
-            "$binary" self check --version v0.1.21
+            "$binary" self check --to v0.1.21
           sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
-            "$binary" self update --version v0.1.21 --yes
+            "$binary" self update --to v0.1.21 --yes
           test "$(sha256sum "$binary" | cut -d' ' -f1)" = "$candidate_sha"
 
           record="$(sudo find "$state_root/controller-self/audit/records" -type f -name '*.json' | sort | head -n 1)"
@@ -162,4 +162,4 @@ jobs:
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
-            "$binary" self check --version v0.1.20
+            "$binary" self check --to v0.1.20

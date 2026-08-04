@@ -57,7 +57,9 @@ recovery path.
 
 For an adopted manual deployment, the lifecycle contract is the executable
 offline boundary. It records every real object reference and an exact neutral
-replacement specification. Its recovery driver is bound by absolute path and
+replacement specification, including an explicit backend-neutral container
+runtime policy. Recovery preserves that declared policy; adapters do not inject
+managed-install hardening or infer policy from object names. Its recovery driver is bound by absolute path and
 SHA-256 and can only receive file/provider credential references. Adoption first
 executes `rehearse`; an update executes `checkpoint`; full recovery executes
 `restore`. Every receipt is bound to deployment, request, Release, lifecycle,

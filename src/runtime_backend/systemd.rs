@@ -192,6 +192,9 @@ impl RuntimeBackend for SystemdBackend {
     }
 
     fn replace(&self, replacement: &RuntimeReplacement) -> anyhow::Result<()> {
+        if replacement.container_policy.is_some() {
+            bail!("systemd replacement cannot carry a container policy");
+        }
         validate_mutable_unit(&replacement.object_reference)?;
         let ArtifactReference::HostBinary {
             path: source,

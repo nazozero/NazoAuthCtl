@@ -112,7 +112,7 @@ json.dump({
     os.chmod(driver, 0o500)
 
     lifecycle = {
-        "schema": 1,
+        "schema": 2,
         "deployment_id": deployment_id,
         "runtimes": [
             {

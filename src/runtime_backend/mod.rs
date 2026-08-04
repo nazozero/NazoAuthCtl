@@ -60,6 +60,62 @@ pub(crate) struct RuntimeReplacement {
     pub(crate) ip_address: Option<String>,
     pub(crate) ports: Vec<String>,
     pub(crate) labels: BTreeMap<String, String>,
+    pub(crate) container_policy: Option<ContainerRuntimePolicy>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ContainerRestartPolicy {
+    No,
+    OnFailure,
+    Always,
+    UnlessStopped,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NeutralTmpfs {
+    pub(crate) destination: PathBuf,
+    pub(crate) read_only: bool,
+    pub(crate) no_exec: bool,
+    pub(crate) no_suid: bool,
+    pub(crate) no_device: bool,
+    pub(crate) size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContainerRuntimePolicy {
+    pub(crate) restart: ContainerRestartPolicy,
+    pub(crate) read_only_root: bool,
+    pub(crate) no_new_privileges: bool,
+    pub(crate) drop_all_capabilities: bool,
+    pub(crate) pids_limit: Option<u32>,
+    pub(crate) memory_limit_bytes: Option<u64>,
+    pub(crate) cpu_limit_millis: Option<u32>,
+    pub(crate) tmpfs: Vec<NeutralTmpfs>,
+}
+
+impl ContainerRuntimePolicy {
+    pub(crate) fn managed_default() -> Self {
+        Self {
+            restart: ContainerRestartPolicy::UnlessStopped,
+            read_only_root: true,
+            no_new_privileges: true,
+            drop_all_capabilities: true,
+            pids_limit: Some(512),
+            memory_limit_bytes: Some(1024 * 1024 * 1024),
+            cpu_limit_millis: Some(2000),
+            tmpfs: vec![NeutralTmpfs {
+                destination: PathBuf::from("/tmp"),
+                read_only: false,
+                no_exec: true,
+                no_suid: true,
+                no_device: true,
+                size_bytes: 64 * 1024 * 1024,
+            }],
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

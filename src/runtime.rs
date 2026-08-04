@@ -454,6 +454,7 @@ impl<'a> Runtime<'a> {
                     self.config.operator.controller_key_id.clone(),
                 ),
             ]),
+            container_policy: Some(runtime_backend::ContainerRuntimePolicy::managed_default()),
         };
         backend.replace(&replacement)
     }
