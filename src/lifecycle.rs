@@ -303,6 +303,21 @@ impl LifecycleManifest {
                     .context("runtime lifecycle IP address is invalid")?;
             }
         }
+        let store = DeploymentStore::system();
+        store.validate_failure_domains()?;
+        for runtime in &self.runtimes {
+            for mount in &runtime.mounts {
+                for protected in [
+                    &store.config_root,
+                    &store.state_root,
+                    &store.break_glass_root,
+                ] {
+                    if paths_overlap(&mount.source, protected) {
+                        bail!("runtime lifecycle mount overlaps controller or break-glass state");
+                    }
+                }
+            }
+        }
         self.recovery_driver.validate(&self.runtimes)
     }
 }
@@ -1309,6 +1324,13 @@ fn validate_oci_digest(value: &str) -> anyhow::Result<()> {
 impl RecoveryDriver {
     fn validate(&self, runtimes: &[RuntimeLifecycle]) -> anyhow::Result<()> {
         validate_absolute_path(&self.program, "recovery driver program")?;
+        for runtime in runtimes {
+            for mount in &runtime.mounts {
+                if paths_overlap(&self.program, &mount.source) {
+                    bail!("recovery driver program is inside the application failure domain");
+                }
+            }
+        }
         let metadata = fs::symlink_metadata(&self.program).with_context(|| {
             format!(
                 "failed to inspect recovery driver {}",
@@ -1346,6 +1368,14 @@ impl RecoveryDriver {
             match reference {
                 CredentialReference::File { path } => {
                     validate_absolute_path(path, "recovery credential file")?;
+                    if runtimes.iter().any(|runtime| {
+                        runtime
+                            .mounts
+                            .iter()
+                            .any(|mount| paths_overlap(path, &mount.source))
+                    }) {
+                        bail!("recovery credential is inside the application failure domain");
+                    }
                     let metadata = fs::symlink_metadata(path).with_context(|| {
                         format!("failed to inspect recovery credential {}", path.display())
                     })?;

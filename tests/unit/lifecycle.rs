@@ -139,6 +139,10 @@ fn lifecycle_rejects_inline_secret_environment_and_rehearsal_mount_overlap() {
     let mut value = lifecycle(&work);
     value.recovery_driver.rehearsal_workspace = work.path().join("application-data/rehearsal");
     assert!(value.validate().is_err());
+
+    let mut value = lifecycle(&work);
+    value.runtimes[0].mounts[0].source = DeploymentStore::system().state_root;
+    assert!(value.validate().is_err());
 }
 
 #[test]

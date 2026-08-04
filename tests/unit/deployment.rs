@@ -96,6 +96,14 @@ fn deployment_state_and_break_glass_roots_are_separate() {
     assert!(state.join("transactions").is_dir());
     assert!(state.join("recovery").is_dir());
     assert!(!store.break_glass_dir("deployment-a").starts_with(&state));
+
+    let invalid = DeploymentStore {
+        config_root: work.path().join("etc-invalid"),
+        state_root: work.path().join("controller"),
+        break_glass_root: work.path().join("controller/break-glass"),
+    };
+    assert!(invalid.validate_failure_domains().is_err());
+    store.validate_failure_domains().unwrap();
 }
 
 #[test]

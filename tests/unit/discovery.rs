@@ -136,3 +136,40 @@ fn stopped_systemd_identity_uses_signed_statement_at_declared_host_data_dir() {
         ))
     );
 }
+
+#[test]
+fn online_identity_cannot_override_a_conflicting_offline_statement() {
+    let online = DiscoveryStatement {
+        schema: CONTROL_DISCOVERY_SCHEMA,
+        product: nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT.to_owned(),
+        deployment_id: "deployment-a".to_owned(),
+        runtime_instance_id: "runtime-a".to_owned(),
+        issuer: "https://issuer.example".to_owned(),
+        release: "v0.1.19".to_owned(),
+        revision: "a".repeat(40),
+        build_id: "build:test".to_owned(),
+        control_protocol_versions: vec![CONTROL_DISCOVERY_SCHEMA],
+        operator_protocol_versions: vec![nazo_operator_protocol::PROTOCOL_VERSION],
+        instance_key_id: "instance-a".to_owned(),
+        nonce: URL_SAFE_NO_PAD.encode([3; 32]),
+        issued_at: 1,
+        expires_at: 2,
+    };
+    let mut offline = DeploymentStatement {
+        schema: online.schema,
+        product: online.product.clone(),
+        deployment_id: online.deployment_id.clone(),
+        runtime_instance_id: online.runtime_instance_id.clone(),
+        issuer: online.issuer.clone(),
+        release: online.release.clone(),
+        revision: online.revision.clone(),
+        build_id: online.build_id.clone(),
+        control_protocol_versions: online.control_protocol_versions.clone(),
+        operator_protocol_versions: online.operator_protocol_versions.clone(),
+        instance_key_id: online.instance_key_id.clone(),
+        issued_at: 1,
+    };
+    assert!(statements_match(&online, &offline));
+    offline.deployment_id = "deployment-b".to_owned();
+    assert!(!statements_match(&online, &offline));
+}

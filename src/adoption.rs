@@ -121,6 +121,7 @@ pub(crate) fn run(options: AdoptionOptions) -> anyhow::Result<()> {
     if options.plan == options.yes {
         bail!("adopt requires exactly one of --plan or --yes");
     }
+    DeploymentStore::system().validate_failure_domains()?;
     let report = discover()?;
     let candidate = select(&report, &options.target)?;
     let deployment_id = candidate

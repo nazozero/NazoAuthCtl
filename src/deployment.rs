@@ -371,18 +371,56 @@ pub(crate) struct DeploymentStore {
 
 impl DeploymentStore {
     pub(crate) fn system() -> Self {
-        Self {
-            config_root: root_from_env("NAZOAUTHCTL_CONFIG_ROOT", "/etc/nazoauthctl"),
-            state_root: root_from_env("NAZOAUTHCTL_STATE_ROOT", "/var/lib/nazoauthctl"),
-            break_glass_root: root_from_env(
-                "NAZOAUTHCTL_BREAK_GLASS_ROOT",
+        let (config_default, state_default, break_glass_default) = if cfg!(windows) {
+            (
+                r"C:\ProgramData\NazoAuthCtl\config",
+                r"C:\ProgramData\NazoAuthCtl\state",
+                r"C:\ProgramData\NazoAuthCtl-BreakGlass",
+            )
+        } else {
+            (
+                "/etc/nazoauthctl",
+                "/var/lib/nazoauthctl",
                 "/var/lib/nazoauthctl-break-glass",
-            ),
+            )
+        };
+        Self {
+            config_root: root_from_env("NAZOAUTHCTL_CONFIG_ROOT", config_default),
+            state_root: root_from_env("NAZOAUTHCTL_STATE_ROOT", state_default),
+            break_glass_root: root_from_env("NAZOAUTHCTL_BREAK_GLASS_ROOT", break_glass_default),
         }
     }
 
     pub(crate) fn registry_path(&self) -> PathBuf {
         self.config_root.join("registry.json")
+    }
+
+    pub(crate) fn validate_failure_domains(&self) -> anyhow::Result<()> {
+        for (label, path) in [
+            ("controller configuration root", &self.config_root),
+            ("controller state root", &self.state_root),
+            ("break-glass root", &self.break_glass_root),
+        ] {
+            if !path.is_absolute()
+                || path.parent().is_none()
+                || path.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    )
+                })
+            {
+                bail!("{label} must be a normalized absolute non-root path");
+            }
+        }
+        if self.break_glass_root.starts_with(&self.state_root)
+            || self.state_root.starts_with(&self.break_glass_root)
+            || self.break_glass_root.starts_with(&self.config_root)
+            || self.config_root.starts_with(&self.break_glass_root)
+        {
+            bail!("break-glass material must use a separate storage failure domain");
+        }
+        Ok(())
     }
 
     pub(crate) fn declaration_path(&self, deployment_id: &str) -> PathBuf {

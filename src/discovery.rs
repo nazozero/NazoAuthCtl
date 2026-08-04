@@ -104,10 +104,18 @@ fn enrich(runtime: RuntimeObservation) -> DiscoveredDeployment {
     );
     let online = online_statement(&runtime).ok().flatten();
     let offline = offline_statement(&runtime).ok().flatten();
-    let identity = online
-        .as_ref()
-        .map(IdentityStatement::Online)
-        .or_else(|| offline.as_ref().map(IdentityStatement::Offline));
+    let statements_consistent = match (online.as_ref(), offline.as_ref()) {
+        (Some(online), Some(offline)) => statements_match(online, offline),
+        _ => true,
+    };
+    let identity = statements_consistent
+        .then(|| {
+            online
+                .as_ref()
+                .map(IdentityStatement::Online)
+                .or_else(|| offline.as_ref().map(IdentityStatement::Offline))
+        })
+        .flatten();
     let mut evidence = runtime.evidence.clone();
     let mut missing = runtime.missing.clone();
     if online.is_some() {
@@ -122,6 +130,9 @@ fn enrich(runtime: RuntimeObservation) -> DiscoveredDeployment {
         );
     } else {
         missing.push("offline signed deployment statement was not found".to_owned());
+    }
+    if !statements_consistent {
+        missing.push("online and offline deployment identities conflict".to_owned());
     }
     let issuer = identity.as_ref().map(IdentityStatement::issuer);
     let (oidc_discovery_verified, readiness_observed) = issuer
@@ -216,6 +227,20 @@ fn enrich(runtime: RuntimeObservation) -> DiscoveredDeployment {
         missing,
         sensitive_mount_sources: BTreeMap::new(),
     }
+}
+
+fn statements_match(online: &DiscoveryStatement, offline: &DeploymentStatement) -> bool {
+    online.schema == offline.schema
+        && online.product == offline.product
+        && online.deployment_id == offline.deployment_id
+        && online.runtime_instance_id == offline.runtime_instance_id
+        && online.issuer == offline.issuer
+        && online.release == offline.release
+        && online.revision == offline.revision
+        && online.build_id == offline.build_id
+        && online.control_protocol_versions == offline.control_protocol_versions
+        && online.operator_protocol_versions == offline.operator_protocol_versions
+        && online.instance_key_id == offline.instance_key_id
 }
 
 enum IdentityStatement<'a> {
