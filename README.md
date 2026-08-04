@@ -26,7 +26,8 @@ NazoAuth commit and an exact package version.
 
 See [architecture](docs/architecture.md), [recovery boundaries](docs/recovery.md),
 [discovery and adoption](docs/discovery-adoption.md), and
-[compatibility](docs/compatibility.md).
+[compatibility](docs/compatibility.md). The strict manual-deployment input is
+documented in the [lifecycle contract](docs/lifecycle-contract.md).
 
 ## Existing deployments
 
@@ -34,8 +35,8 @@ Discovery is read-only and does not require a controller registry:
 
 ```sh
 nazoauthctl discover
-nazoauthctl adopt --target podman:actual-object-name --plan
-nazoauthctl adopt --target podman:actual-object-name --yes
+nazoauthctl adopt --target podman:actual-object-name --lifecycle /secure/deployment-lifecycle.json --plan
+nazoauthctl adopt --target podman:actual-object-name --lifecycle /secure/deployment-lifecycle.json --yes
 nazoauthctl deployments list
 nazoauthctl --deployment DEPLOYMENT_ID status
 ```
@@ -45,12 +46,12 @@ configuration, database, Valkey, operator-task, backup, and proxy/TLS authority
 are granted separately as `external`, `delegated`, or `managed`. Mixed updates
 persist their plan and pause at external steps:
 
-At this extraction head, schema-1 recovery evidence proves integrity and
-off-host binding but not executable restoration of an arbitrary manual
-deployment. Such an adoption is deliberately persisted as `observed` with all
-effective capabilities `external`; mutation and core recovery fail closed. The
-provider-specific restore contract and approved lifecycle configuration needed
-for mutation-capable adoption remain a draft completion boundary.
+Manual deployments remain `observed` unless a deployment-bound lifecycle
+contract and recovery package pass an isolated restore rehearsal. The contract
+contains exact runtime replacement specifications and a digest-bound recovery
+driver; it contains credential references, never credential values. A successful
+rehearsal creates an adoption receipt and an offline trusted-runtime cache before
+the requested capability grants become active.
 
 ```sh
 nazoauthctl --deployment DEPLOYMENT_ID update --yes
@@ -62,6 +63,11 @@ nazoauthctl --deployment DEPLOYMENT_ID transaction resume --yes
 Accepted evidence is digest-bound coordination input. It does not by itself
 claim that an external operation is semantically complete; final acceptance
 must still observe the declared issuer, artifact, readiness, and replica state.
+Controller-owned steps create a recovery checkpoint, activate each replica from
+the staged exact-digest cache, persist progress after every replica, verify the
+embedded Release identity, and atomically commit the new declaration. `rollback`
+only activates the previous artifact. `recover` also invokes the declared data
+restore. `recover-update` resumes the interrupted update journal.
 
 ## Development
 

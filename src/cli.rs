@@ -741,6 +741,7 @@ fn parse_adoption(values: Vec<String>) -> anyhow::Result<AdoptionOptions> {
     let mut alias = None;
     let mut capabilities = CapabilityGrants::observed();
     let mut recovery_evidence = None;
+    let mut lifecycle_contract = None;
     let mut plan = false;
     let mut yes = false;
     let mut index = 0;
@@ -754,7 +755,11 @@ fn parse_adoption(values: Vec<String>) -> anyhow::Result<AdoptionOptions> {
                 yes = true;
                 index += 1;
             }
-            flag @ ("--target" | "--alias" | "--capability" | "--recovery-evidence") => {
+            flag @ ("--target"
+            | "--alias"
+            | "--capability"
+            | "--recovery-evidence"
+            | "--lifecycle") => {
                 let value = values
                     .get(index + 1)
                     .with_context(|| format!("{flag} requires a value"))?
@@ -778,6 +783,11 @@ fn parse_adoption(values: Vec<String>) -> anyhow::Result<AdoptionOptions> {
                             bail!("--recovery-evidence may be specified only once");
                         }
                     }
+                    "--lifecycle" => {
+                        if lifecycle_contract.replace(PathBuf::from(value)).is_some() {
+                            bail!("--lifecycle may be specified only once");
+                        }
+                    }
                     _ => unreachable!(),
                 }
                 index += 2;
@@ -793,6 +803,7 @@ fn parse_adoption(values: Vec<String>) -> anyhow::Result<AdoptionOptions> {
         alias,
         capabilities,
         recovery_evidence,
+        lifecycle_contract,
         plan,
         yes,
     })

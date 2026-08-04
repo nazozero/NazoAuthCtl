@@ -8,7 +8,7 @@ use anyhow::{Context as _, bail};
 
 use crate::{
     deployment::{ArtifactReference, RuntimeBackendKind},
-    filesystem::{atomic_write, set_mode, sha256},
+    filesystem::{atomic_write, copy_atomic, set_mode, sha256},
     process::Process,
 };
 
@@ -153,10 +153,38 @@ impl RuntimeBackend for SystemdBackend {
         bail!("systemd unit removal is not an implicit runtime operation")
     }
 
-    fn replace(&self, _replacement: &RuntimeReplacement) -> anyhow::Result<()> {
-        bail!(
-            "systemd artifact replacement requires an explicit staged binary transaction and is not inferred from a unit name"
-        )
+    fn replace(&self, replacement: &RuntimeReplacement) -> anyhow::Result<()> {
+        validate_mutable_unit(&replacement.object_reference)?;
+        let ArtifactReference::HostBinary {
+            path: source,
+            sha256: expected,
+        } = &replacement.artifact
+        else {
+            bail!("systemd replacement requires a digest-bound host binary");
+        };
+        let target = replacement
+            .command
+            .first()
+            .map(PathBuf::from)
+            .context("systemd replacement has no executable path")?;
+        if !target.is_absolute()
+            || !target
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| matches!(value, "nazoauth" | "nazoauth.exe"))
+            || replacement.command.get(1).map(String::as_str) != Some("server")
+        {
+            bail!("systemd replacement command is not an absolute nazoauth server command");
+        }
+        if sha256(source)? != *expected {
+            bail!("systemd replacement source digest changed before activation");
+        }
+        self.stop(&replacement.object_reference)?;
+        copy_atomic(source, &target, 0o755)?;
+        if sha256(&target)? != *expected {
+            bail!("systemd replacement target digest changed during activation");
+        }
+        self.start(&replacement.object_reference)
     }
 
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String> {

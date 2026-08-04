@@ -49,6 +49,22 @@ verification bundles, host binary or OCI archive, frontend material, and backup
 metadata. OCI recovery imports the retained archive when the engine no longer has
 the previous image. No network lookup is part of the recovery path.
 
+For an adopted manual deployment, the lifecycle contract is the executable
+offline boundary. It records every real object reference and an exact neutral
+replacement specification. Its recovery driver is bound by absolute path and
+SHA-256 and can only receive file/provider credential references. Adoption first
+executes `rehearse`; an update executes `checkpoint`; full recovery executes
+`restore`. Every receipt is bound to deployment, request, Release, lifecycle,
+recovery manifest, operation, component set, and freshness window.
+
+The update journal is deployment-local and resumable. External or provider steps
+pause until deployment- and transaction-bound evidence is supplied. ctl-owned
+runtime replacements are recorded after each replica. The declaration changes
+only after every target artifact and embedded build identity is observed. The
+pre-update checkpoint and old trusted runtime become the rollback slot before
+that atomic commit. Artifact-only rollback never restores provider data; full
+recovery does.
+
 The signed offline deployment statement identifies a stopped replica from its
 persistent mount. It is not sufficient artifact trust: ctl also verifies the
 cached Release and the retained OCI digest or host-binary SHA-256. An unsupported

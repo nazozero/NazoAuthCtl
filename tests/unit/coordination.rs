@@ -72,6 +72,12 @@ fn plan(deployment_id: &str) -> Value {
                 "owner": "ctl-owned",
                 "capability": "runtime",
                 "action": "replace runtime"
+            },
+            {
+                "id": "acceptance",
+                "owner": "ctl-owned",
+                "capability": "artifact",
+                "action": "accept runtime"
             }
         ],
         "blockers": []
@@ -162,4 +168,44 @@ fn declaration_drift_and_conflicting_update_plans_fail_closed() {
     let mut drifted = record;
     drifted.declaration_revision += 1;
     assert!(resume(&store, &drifted).is_err());
+}
+
+#[test]
+fn controller_steps_commit_the_new_declaration_only_after_final_acceptance() {
+    let work = PrivateTempDir::new("nazoauthctl-coordination-commit").unwrap();
+    let store = store(&work);
+    let current = record("deployment-a");
+    store.persist(&current).unwrap();
+    let prepared = prepare_update(&store, &current, &plan("deployment-a")).unwrap();
+    let input = work.path().join("evidence.json");
+    fs::write(
+        &input,
+        serde_json::to_vec(&evidence(&prepared, "deployment-a")).unwrap(),
+    )
+    .unwrap();
+    submit_evidence(&store, &current, &input).unwrap();
+    let after_runtime = complete_controller_step(
+        &store,
+        &current,
+        &prepared.transaction_id,
+        "replace-runtime",
+        &"d".repeat(64),
+    )
+    .unwrap();
+    assert_eq!(after_runtime.state, CoordinationState::ReadyForController);
+
+    let mut updated = current.clone();
+    updated.active_release = prepared.target_release;
+    updated.declaration_revision += 1;
+    let committed = commit_controller_update(
+        &store,
+        &current,
+        &updated,
+        &prepared.transaction_id,
+        "acceptance",
+        &"e".repeat(64),
+    )
+    .unwrap();
+    assert_eq!(committed.state, CoordinationState::Committed);
+    assert_eq!(store.load("deployment-a").unwrap(), updated);
 }

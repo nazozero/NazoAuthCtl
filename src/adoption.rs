@@ -23,10 +23,17 @@ use crate::{
     },
     discovery::{DiscoveredDeployment, deployment_statement_path, discover, select},
     filesystem::{atomic_write, copy_atomic, sha256},
+    lifecycle::{
+        LifecycleManifest, RecoveryDriverReceipt, RecoveryOperation, invoke_recovery_driver,
+    },
     release::VerifiedRelease,
 };
 
 const SERVER_REPOSITORY: &str = "nazozero/NazoAuth";
+const RECOVERY_UNPROVEN_BLOCKER: &str =
+    "recovery executability is not proven; the deployment can only be recorded as observed";
+const RECOVERY_CAPABILITY_BLOCKER: &str =
+    "requested mutation capabilities remain external until recovery is proven";
 
 #[derive(Clone, Debug)]
 pub(crate) struct AdoptionOptions {
@@ -34,6 +41,7 @@ pub(crate) struct AdoptionOptions {
     pub(crate) alias: Option<String>,
     pub(crate) capabilities: CapabilityGrants,
     pub(crate) recovery_evidence: Option<PathBuf>,
+    pub(crate) lifecycle_contract: Option<PathBuf>,
     pub(crate) plan: bool,
     pub(crate) yes: bool,
 }
@@ -125,18 +133,46 @@ pub(crate) fn run(options: AdoptionOptions) -> anyhow::Result<()> {
         .filter(|entry| entry.deployment_id.as_deref() == Some(deployment_id))
         .cloned()
         .collect::<Vec<_>>();
-    let plan = build_plan(&candidate, &replicas, &options)?;
+    let mut plan = build_plan(&candidate, &replicas, &options)?;
     if options.plan {
         println!("{}", serde_json::to_string_pretty(&plan)?);
         return Ok(());
     }
+    let rehearsal_receipt = match (
+        options.lifecycle_contract.as_deref(),
+        options.recovery_evidence.as_deref(),
+    ) {
+        (Some(lifecycle_path), Some(recovery_manifest)) => {
+            let lifecycle = LifecycleManifest::load(lifecycle_path)?;
+            lifecycle.validate_for_adoption(&replicas, &options.capabilities)?;
+            let store = DeploymentStore::system();
+            let _deployment_lock = store.deployment_lock(&plan.deployment_id)?;
+            let _ = persist_recovery_evidence(&store, &plan, recovery_manifest)?;
+            let normalized_recovery_manifest = store
+                .deployment_state_dir(&plan.deployment_id)
+                .join("recovery")
+                .join("adoption")
+                .join("manifest.json");
+            let receipt = invoke_recovery_driver(
+                lifecycle_path,
+                &lifecycle,
+                &normalized_recovery_manifest,
+                &plan.release,
+                RecoveryOperation::Rehearse,
+                &options.capabilities,
+            )?;
+            apply_recovery_rehearsal(&mut plan, &receipt)?;
+            Some(receipt)
+        }
+        _ => None,
+    };
     if !plan.blockers.is_empty() {
         eprintln!(
             "nazoauthctl: mutation adoption is blocked; persisting verified observed state only: {}",
             plan.blockers.join("; ")
         );
     }
-    execute(&replicas, &plan, &options)
+    execute(&replicas, &plan, &options, rehearsal_receipt.as_ref())
 }
 
 fn build_plan(
@@ -225,6 +261,16 @@ fn build_plan(
         &release_name,
         options.recovery_evidence.as_deref(),
     )?;
+    if let Some(lifecycle_path) = options.lifecycle_contract.as_deref() {
+        let lifecycle = LifecycleManifest::load(lifecycle_path)?;
+        if lifecycle.deployment_id != deployment_id {
+            bail!("lifecycle contract is bound to a different deployment");
+        }
+        lifecycle.validate_for_adoption(replicas, &options.capabilities)?;
+        if options.recovery_evidence.is_none() {
+            blockers.push("lifecycle recovery rehearsal requires --recovery-evidence".to_owned());
+        }
+    }
     let mutation_requested = Capability::ALL.iter().any(|capability| {
         options
             .capabilities
@@ -233,15 +279,10 @@ fn build_plan(
             .permits_mutation()
     });
     if recovery.conclusion != RecoveryConclusion::Proven {
-        blockers.push(
-            "recovery executability is not proven; the deployment can only be recorded as observed"
-                .to_owned(),
-        );
+        blockers.push(RECOVERY_UNPROVEN_BLOCKER.to_owned());
     }
     if mutation_requested && recovery.conclusion != RecoveryConclusion::Proven {
-        blockers.push(
-            "requested mutation capabilities remain external until recovery is proven".to_owned(),
-        );
+        blockers.push(RECOVERY_CAPABILITY_BLOCKER.to_owned());
     }
     if options
         .capabilities
@@ -342,10 +383,72 @@ fn build_plan(
     })
 }
 
+fn apply_recovery_rehearsal(
+    plan: &mut AdoptionPlan,
+    receipt: &RecoveryDriverReceipt,
+) -> anyhow::Result<()> {
+    if receipt.operation != RecoveryOperation::Rehearse
+        || receipt.deployment_id != plan.deployment_id
+        || receipt.release != plan.release
+    {
+        bail!("recovery rehearsal receipt is bound to a different adoption plan");
+    }
+    let digest = hex_sha256(&serde_json::to_vec(receipt)?);
+    plan.recovery.conclusion = RecoveryConclusion::Proven;
+    plan.recovery
+        .evidence
+        .push(format!("recovery-rehearsal-receipt-sha256:{digest}"));
+    plan.blockers.retain(|blocker| {
+        blocker != RECOVERY_UNPROVEN_BLOCKER && blocker != RECOVERY_CAPABILITY_BLOCKER
+    });
+    if plan.blockers.is_empty() {
+        plan.resulting_trust = TrustState::Adopted;
+        plan.capabilities = plan.requested_capabilities.clone();
+    }
+    Ok(())
+}
+
+fn persist_lifecycle_contract(
+    store: &DeploymentStore,
+    plan: &AdoptionPlan,
+    source: Option<&Path>,
+    rehearsal_receipt: Option<&RecoveryDriverReceipt>,
+    recovery_evidence: &mut Vec<String>,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(source) = source else {
+        if rehearsal_receipt.is_some() {
+            bail!("recovery rehearsal has no lifecycle contract");
+        }
+        return Ok(None);
+    };
+    let directory = store
+        .deployment_state_dir(&plan.deployment_id)
+        .join("recovery")
+        .join("adoption");
+    fs::create_dir_all(&directory)?;
+    let target = directory.join("lifecycle.json");
+    copy_atomic(source, &target, 0o600)?;
+    let lifecycle_digest = sha256(&target)?;
+    if lifecycle_digest != LifecycleManifest::digest(source)? {
+        bail!("persisted lifecycle contract changed during adoption");
+    }
+    recovery_evidence.push(format!("lifecycle-sha256:{lifecycle_digest}"));
+    if let Some(receipt) = rehearsal_receipt {
+        let receipt_path = directory.join("recovery-rehearsal-receipt.json");
+        atomic_write(&receipt_path, &serde_json::to_vec_pretty(receipt)?, 0o600)?;
+        recovery_evidence.push(format!(
+            "recovery-rehearsal-receipt-sha256:{}",
+            sha256(&receipt_path)?
+        ));
+    }
+    Ok(Some(target))
+}
+
 fn execute(
     candidates: &[DiscoveredDeployment],
     plan: &AdoptionPlan,
     options: &AdoptionOptions,
+    rehearsal_receipt: Option<&RecoveryDriverReceipt>,
 ) -> anyhow::Result<()> {
     let store = DeploymentStore::system();
     let _registry_lock = store.registry_lock()?;
@@ -380,11 +483,18 @@ fn execute(
         )?;
     }
     let identities = create_identities(&store, &plan.deployment_id)?;
-    let recovery_evidence = if let Some(source) = &options.recovery_evidence {
+    let mut recovery_evidence = if let Some(source) = &options.recovery_evidence {
         persist_recovery_evidence(&store, plan, source)?
     } else {
         Vec::new()
     };
+    let lifecycle_path = persist_lifecycle_contract(
+        &store,
+        plan,
+        options.lifecycle_contract.as_deref(),
+        rehearsal_receipt,
+        &mut recovery_evidence,
+    )?;
     let observed_state = store
         .deployment_state_dir(&plan.deployment_id)
         .join("observed-state.json");
@@ -393,17 +503,34 @@ fn execute(
         &serde_json::to_vec_pretty(candidates)?,
         0o600,
     )?;
-    let record = deployment_record(
+    let mut record = deployment_record(
         candidates,
         plan,
         options.alias.clone(),
         &identities.controller_key_id,
     )?;
+    if let Some(path) = lifecycle_path {
+        record.resources.insert(
+            "lifecycle_contract".to_owned(),
+            SafeReference::File { path },
+        );
+        record.validate()?;
+    }
     let primary = candidates
         .iter()
         .find(|candidate| candidate.target == plan.target)
         .context("selected adoption target disappeared from the replica set")?;
-    let manifest = verified_release(primary, &plan.release)?.manifest;
+    let verified = verified_release(primary, &plan.release)?;
+    let release_evidence = store
+        .deployment_state_dir(&plan.deployment_id)
+        .join("recovery")
+        .join("trusted-releases")
+        .join(&plan.release);
+    verified.persist_verification_evidence(&release_evidence)?;
+    if record.trust == TrustState::Adopted && record.resources.contains_key("lifecycle_contract") {
+        crate::lifecycle::cache_trusted_runtime(&store, &record)?;
+    }
+    let manifest = verified.manifest;
     let receipt = AdoptionReceipt {
         schema: CONTROL_DISCOVERY_SCHEMA,
         deployment_id: plan.deployment_id.clone(),
@@ -562,24 +689,68 @@ fn persist_recovery_evidence(
     plan: &AdoptionPlan,
     manifest_path: &Path,
 ) -> anyhow::Result<Vec<String>> {
-    let manifest = verify_recovery_evidence(manifest_path, &plan.deployment_id, &plan.release)?;
     let directory = store
         .deployment_state_dir(&plan.deployment_id)
         .join("recovery")
         .join("adoption");
+    persist_bound_recovery_package(
+        manifest_path,
+        &plan.deployment_id,
+        &plan.release,
+        &directory,
+    )
+}
+
+pub(crate) fn persist_bound_recovery_package(
+    manifest_path: &Path,
+    deployment_id: &str,
+    release: &str,
+    directory: &Path,
+) -> anyhow::Result<Vec<String>> {
+    let mut manifest = verify_recovery_evidence(manifest_path, deployment_id, release)?;
     fs::create_dir_all(&directory)?;
     let mut evidence = Vec::new();
-    for (name, artifact) in recovery_artifacts(&manifest) {
-        let target = directory.join(name);
-        copy_atomic(&artifact.path, &target, 0o600)?;
-        let actual = sha256(&target)?;
-        if actual != artifact.sha256 {
-            bail!("persisted recovery artifact changed during adoption");
-        }
-        evidence.push(format!("{name}-sha256:{actual}"));
-    }
-    copy_atomic(manifest_path, &directory.join("manifest.json"), 0o600)?;
+    evidence.push(persist_recovery_artifact(
+        &directory,
+        "data-snapshot",
+        &mut manifest.data_snapshot,
+    )?);
+    evidence.push(persist_recovery_artifact(
+        &directory,
+        "database-restore",
+        &mut manifest.database_restore,
+    )?);
+    evidence.push(persist_recovery_artifact(
+        &directory,
+        "last-trusted-artifact",
+        &mut manifest.last_trusted_artifact,
+    )?);
+    evidence.push(persist_recovery_artifact(
+        &directory,
+        "verification-material",
+        &mut manifest.verification_material,
+    )?);
+    atomic_write(
+        &directory.join("manifest.json"),
+        &serde_json::to_vec_pretty(&manifest)?,
+        0o600,
+    )?;
     Ok(evidence)
+}
+
+fn persist_recovery_artifact(
+    directory: &Path,
+    name: &str,
+    artifact: &mut RecoveryArtifact,
+) -> anyhow::Result<String> {
+    let target = directory.join(name);
+    copy_atomic(&artifact.path, &target, 0o600)?;
+    let actual = sha256(&target)?;
+    if actual != artifact.sha256 {
+        bail!("persisted recovery artifact changed during adoption");
+    }
+    artifact.path = target;
+    Ok(format!("{name}-sha256:{actual}"))
 }
 
 fn deployment_record(

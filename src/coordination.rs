@@ -27,7 +27,7 @@ pub(crate) enum CoordinationState {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-enum StepOwner {
+pub(crate) enum StepOwner {
     CtlOwned,
     UserRequired,
     ProviderOwned,
@@ -41,7 +41,7 @@ impl StepOwner {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-enum StepState {
+pub(crate) enum StepState {
     Pending,
     EvidenceAccepted,
     ControllerCompleted,
@@ -49,12 +49,12 @@ enum StepState {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct CoordinationStep {
-    id: String,
-    owner: StepOwner,
-    capability: String,
+pub(crate) struct CoordinationStep {
+    pub(crate) id: String,
+    pub(crate) owner: StepOwner,
+    pub(crate) capability: String,
     action: String,
-    state: StepState,
+    pub(crate) state: StepState,
     evidence_sha256: Option<String>,
 }
 
@@ -67,10 +67,10 @@ pub(crate) struct UpdateCoordination {
     operation: String,
     declaration_revision: u64,
     plan_sha256: String,
-    target_release: nazo_operator_protocol::EmbeddedIdentity,
+    pub(crate) target_release: nazo_operator_protocol::EmbeddedIdentity,
     pub(crate) state: CoordinationState,
     blockers: Vec<String>,
-    steps: Vec<CoordinationStep>,
+    pub(crate) steps: Vec<CoordinationStep>,
     created_at: i64,
     updated_at: i64,
 }
@@ -300,6 +300,128 @@ pub(crate) fn resume(
     Ok(transaction)
 }
 
+pub(crate) fn complete_controller_step(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    transaction_id: &str,
+    step_id: &str,
+    evidence_sha256: &str,
+) -> anyhow::Result<UpdateCoordination> {
+    let _lock = store.deployment_lock(&record.deployment_id)?;
+    complete_controller_step_locked(store, record, transaction_id, step_id, evidence_sha256)
+}
+
+pub(crate) fn complete_controller_step_locked(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    transaction_id: &str,
+    step_id: &str,
+    evidence_sha256: &str,
+) -> anyhow::Result<UpdateCoordination> {
+    let mut transaction = load_path(&transaction_path(store, &record.deployment_id))?;
+    validate_binding(&transaction, record)?;
+    if transaction.transaction_id != transaction_id {
+        bail!("controller step is bound to a different update transaction");
+    }
+    if transaction.state != CoordinationState::ReadyForController {
+        bail!("update transaction is not ready for controller execution");
+    }
+    if evidence_sha256.len() != 64
+        || !evidence_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("controller step evidence digest is invalid");
+    }
+    let step = transaction
+        .steps
+        .iter_mut()
+        .find(|step| step.id == step_id)
+        .context("controller update step does not exist")?;
+    if step.owner != StepOwner::CtlOwned {
+        bail!("external update steps cannot be completed by the controller");
+    }
+    if step.state == StepState::ControllerCompleted {
+        if step.evidence_sha256.as_deref() != Some(evidence_sha256) {
+            bail!("controller update step was already completed with different evidence");
+        }
+        return Ok(transaction);
+    }
+    if step.state != StepState::Pending {
+        bail!("controller update step is not pending execution");
+    }
+    step.state = StepState::ControllerCompleted;
+    step.evidence_sha256 = Some(evidence_sha256.to_owned());
+    transaction.updated_at = Utc::now().timestamp();
+    transaction.state = next_state(&transaction);
+    persist(store, &transaction)?;
+    Ok(transaction)
+}
+
+pub(crate) fn commit_controller_update(
+    store: &DeploymentStore,
+    current: &DeploymentRecord,
+    updated: &DeploymentRecord,
+    transaction_id: &str,
+    step_id: &str,
+    evidence_sha256: &str,
+) -> anyhow::Result<UpdateCoordination> {
+    let _deployment_lock = store.deployment_lock(&current.deployment_id)?;
+    commit_controller_update_locked(
+        store,
+        current,
+        updated,
+        transaction_id,
+        step_id,
+        evidence_sha256,
+    )
+}
+
+pub(crate) fn commit_controller_update_locked(
+    store: &DeploymentStore,
+    current: &DeploymentRecord,
+    updated: &DeploymentRecord,
+    transaction_id: &str,
+    step_id: &str,
+    evidence_sha256: &str,
+) -> anyhow::Result<UpdateCoordination> {
+    let mut transaction = load_path(&transaction_path(store, &current.deployment_id))?;
+    validate_binding(&transaction, current)?;
+    if transaction.transaction_id != transaction_id
+        || updated.deployment_id != current.deployment_id
+        || updated.declaration_revision != current.declaration_revision + 1
+    {
+        bail!("committed update is not bound to the active deployment transaction");
+    }
+    let step = transaction
+        .steps
+        .iter_mut()
+        .find(|step| step.id == step_id)
+        .context("final controller update step does not exist")?;
+    if step.owner != StepOwner::CtlOwned || step.state != StepState::Pending {
+        bail!("final controller update step is not pending controller execution");
+    }
+    if evidence_sha256.len() != 64
+        || !evidence_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("final controller evidence digest is invalid");
+    }
+    step.state = StepState::ControllerCompleted;
+    step.evidence_sha256 = Some(evidence_sha256.to_owned());
+    transaction.state = next_state(&transaction);
+    if transaction.state != CoordinationState::Committed {
+        bail!("controller update still has incomplete or blocked steps");
+    }
+    updated.validate()?;
+    store.persist_declaration_locked(updated)?;
+    transaction.declaration_revision = updated.declaration_revision;
+    transaction.updated_at = Utc::now().timestamp();
+    persist(store, &transaction)?;
+    Ok(transaction)
+}
+
 fn next_state(transaction: &UpdateCoordination) -> CoordinationState {
     if transaction.steps.iter().any(|step| {
         step.owner.requires_external_evidence() && step.state != StepState::EvidenceAccepted
@@ -307,8 +429,12 @@ fn next_state(transaction: &UpdateCoordination) -> CoordinationState {
         CoordinationState::WaitingForEvidence
     } else if !transaction.blockers.is_empty() {
         CoordinationState::Blocked
-    } else {
+    } else if transaction.steps.iter().any(|step| {
+        step.owner == StepOwner::CtlOwned && step.state != StepState::ControllerCompleted
+    }) {
         CoordinationState::ReadyForController
+    } else {
+        CoordinationState::Committed
     }
 }
 

@@ -366,6 +366,14 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             let store = DeploymentStore::system();
             let record = store.resolve(selector.as_deref(), true)?;
             let transaction = crate::coordination::resume(&store, &record)?;
+            if transaction.state == crate::coordination::CoordinationState::ReadyForController
+                && record.resources.contains_key("lifecycle_contract")
+            {
+                let transaction =
+                    crate::lifecycle::execute_coordinated_update(&store, &record, &transaction)?;
+                println!("{}", serde_json::to_string_pretty(&transaction)?);
+                return Ok(());
+            }
             println!("{}", serde_json::to_string_pretty(&transaction)?);
             Ok(())
         }
@@ -490,6 +498,17 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Rollback { yes } => {
             require_root()?;
+            if DeploymentStore::system().registry_path().exists() {
+                let store = DeploymentStore::system();
+                let record = store.resolve(selector.as_deref(), true)?;
+                if record.resources.contains_key("lifecycle_contract") {
+                    require_confirmation(
+                        yes,
+                        "rollback the deployment runtimes to the cached previous trusted Release without restoring provider data",
+                    )?;
+                    return crate::lifecycle::rollback_registered(&store, &record);
+                }
+            }
             let context = control_config(
                 &configured_path,
                 selector.as_deref(),
@@ -506,6 +525,18 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Recover { yes } => {
             require_root()?;
+            if DeploymentStore::system().registry_path().exists() {
+                let store = DeploymentStore::system();
+                let record = store.resolve(selector.as_deref(), true)?;
+                if record.resources.contains_key("lifecycle_contract") {
+                    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
+                    require_confirmation(
+                        yes,
+                        "execute the deployment-bound offline recovery contract and activate the cached trusted runtime",
+                    )?;
+                    return crate::lifecycle::recover_registered(&store, &record);
+                }
+            }
             let context = control_config(
                 &configured_path,
                 selector.as_deref(),
@@ -528,6 +559,24 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::RecoverUpdate { yes } => {
             require_root()?;
+            if DeploymentStore::system().registry_path().exists() {
+                let store = DeploymentStore::system();
+                let record = store.resolve(selector.as_deref(), true)?;
+                if record.resources.contains_key("lifecycle_contract") {
+                    require_confirmation(
+                        yes,
+                        "resume the deployment-bound interrupted update transaction",
+                    )?;
+                    let transaction = crate::coordination::resume(&store, &record)?;
+                    let transaction = crate::lifecycle::execute_coordinated_update(
+                        &store,
+                        &record,
+                        &transaction,
+                    )?;
+                    println!("{}", serde_json::to_string_pretty(&transaction)?);
+                    return Ok(());
+                }
+            }
             let context = control_config(
                 &configured_path,
                 selector.as_deref(),
@@ -3111,6 +3160,9 @@ fn registered_update_prepare(
         .join("trusted-releases")
         .join(&release.manifest.version);
     release.persist_verification_evidence(&evidence_root)?;
+    if record.resources.contains_key("lifecycle_contract") {
+        crate::lifecycle::stage_update_release(store, record, &release)?;
+    }
     let transaction = crate::coordination::prepare_update(store, record, &plan)?;
     println!("{}", serde_json::to_string_pretty(&transaction)?);
     Ok(())
@@ -3150,6 +3202,7 @@ fn build_registered_update_plan(
         blockers.push("controller mutation is forbidden until recovery is proven".to_owned());
     }
     if !record.resources.contains_key("controller_config")
+        && !record.resources.contains_key("lifecycle_contract")
         && Capability::ALL.iter().any(|capability| {
             record
                 .capabilities
@@ -3177,6 +3230,18 @@ fn build_registered_update_plan(
             "application migration requires operator protocol {}; core artifact recovery remains available",
             nazo_operator_protocol::PROTOCOL_VERSION
         ));
+    }
+    if record.resources.contains_key("lifecycle_contract")
+        && record
+            .capabilities
+            .database
+            .responsibility
+            .permits_mutation()
+    {
+        blockers.push(
+            "application migration is not authorized by the offline lifecycle contract; provide the database step as external evidence or enroll a separate operator-task authority"
+                .to_owned(),
+        );
     }
 
     let owner = |capability: Capability, resource: &str| {

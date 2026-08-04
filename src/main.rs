@@ -7,6 +7,7 @@ mod discovery;
 mod filesystem;
 mod governance;
 mod install;
+mod lifecycle;
 mod model;
 mod operator;
 mod process;
@@ -61,8 +62,8 @@ Usage:
 
 Start here:
   nazoauthctl discover
-  nazoauthctl adopt --target BACKEND:OBJECT --plan
-  nazoauthctl adopt --target BACKEND:OBJECT --yes
+  nazoauthctl adopt --target BACKEND:OBJECT [--lifecycle PATH] --plan
+  nazoauthctl adopt --target BACKEND:OBJECT [--lifecycle PATH] --yes
   nazoauthctl deployments list
   nazoauthctl --deployment ID transaction show
   nazoauthctl --deployment ID transaction evidence --file PATH --yes

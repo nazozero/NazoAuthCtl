@@ -295,10 +295,13 @@ impl DeploymentRecord {
     pub(crate) fn core_recovery_is_proven(&self) -> bool {
         self.trust == TrustState::Adopted
             && self.recovery.conclusion == RecoveryConclusion::Proven
-            && matches!(
+            && (matches!(
                 self.resources.get("controller_config"),
                 Some(SafeReference::File { .. })
-            )
+            ) || matches!(
+                self.resources.get("lifecycle_contract"),
+                Some(SafeReference::File { .. })
+            ))
             && self.capabilities.runtime.responsibility.permits_mutation()
             && self.capabilities.artifact.responsibility.permits_mutation()
             && self.capabilities.backups.responsibility.permits_mutation()
@@ -514,6 +517,22 @@ impl DeploymentStore {
             )?;
         }
         Ok(())
+    }
+
+    pub(crate) fn persist_declaration_locked(
+        &self,
+        record: &DeploymentRecord,
+    ) -> anyhow::Result<()> {
+        record.validate()?;
+        let registry = self.load_registry()?;
+        if !registry.deployments.contains_key(&record.deployment_id) {
+            bail!("deployment declaration is not registered");
+        }
+        atomic_write(
+            &self.declaration_path(&record.deployment_id),
+            &serde_json::to_vec_pretty(record)?,
+            0o640,
+        )
     }
 
     pub(crate) fn registry_lock(&self) -> anyhow::Result<FileLock> {

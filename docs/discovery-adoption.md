@@ -31,18 +31,28 @@ deployment-locked transaction which:
 1. binds online and offline identity evidence to issuer and build identity;
 2. verifies the Release and local artifact;
 3. classifies database, Valkey, configuration, runtime, backups, and proxy/TLS;
-4. proves a deployment-bound recovery point or remains `observed`;
+4. rehearses the digest-bound recovery driver in its isolated workspace and
+   proves a deployment-bound recovery point, or remains `observed`;
 5. creates isolated controller, receipt, audit, and break-glass identities;
 6. atomically writes the declaration, receipt, registry, and audit state.
 
 It does not restart, replace, rename, delete, or relabel the manual runtime.
 Adoption records only the capability grants explicitly supplied by the user.
 The schema-1 recovery evidence manifest proves bounded files, hashes, Release
-binding, and off-host placement; it does not prove restore executability. Such
-evidence is persisted as `observed`, with every effective capability forced to
-`external`, even when broader capabilities were requested. The requested grants
-remain visible in the plan. A future executable provider/restore contract is
-required before a manual deployment can become `adopted` with mutation authority.
+binding, and off-host placement. Mutation-capable adoption additionally requires
+`--lifecycle PATH`. That strict JSON contract binds every discovered runtime by
+immutable runtime instance ID and actual object reference, describes neutral
+mount/network/port semantics, and names an absolute recovery-driver program plus
+its SHA-256. The driver receives a closed request on standard input and returns a
+request-bound receipt. It is executed directly, never through a shell. Inline
+secrets, unknown environment keys, symlinks, mount overlap with the rehearsal
+workspace, incomplete replica sets, and changed driver bytes fail closed.
+
+The rehearsal result must cover every mutable data capability. Only then does ctl
+persist controller-owned copies of the recovery package, exact trusted OCI
+archives or host binaries, lifecycle contract, adoption receipt, and independent
+deployment identities. Failure before this promotion leaves the runtime
+unchanged and the deployment `observed`.
 
 ## Replicas and shared resources
 
