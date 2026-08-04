@@ -606,11 +606,17 @@ jobs:
           fi
           test ! -e "$state_root/deployments/$deployment_id/recovery/driver-invocations"
           cp "$archive.good" "$archive"
-          sudo env \
+          if ! sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
-            "$GITHUB_WORKSPACE/controller/nazoauthctl" --deployment "$deployment_id" recover --yes
+            "$GITHUB_WORKSPACE/controller/nazoauthctl" --deployment "$deployment_id" recover --yes; then
+            sudo podman inspect "$object" --format \
+              'state={{json .State}} image={{.Image}} path={{.Path}} args={{json .Args}} working_dir={{.Config.WorkingDir}} user={{.Config.User}}'
+            sudo podman inspect "$object" --format '{{json .Mounts}}' \
+              | jq '[.[] | {Type, Source, Destination, Driver, Mode, RW, Propagation}]'
+            exit 1
+          fi
           ready=false
           for _ in $(seq 1 90); do
             if curl --fail --silent http://127.0.0.1:19083/ready >/dev/null; then

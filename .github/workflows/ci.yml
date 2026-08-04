@@ -24,6 +24,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Verify formatting
         run: cargo fmt --all -- --check
+      - name: Verify Linux installer syntax
+        if: runner.os == 'Linux'
+        run: sh -n scripts/install_nazoauthctl.sh
+      - name: Reject ambiguous controller installation inputs
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          trap 'rm -rf -- "$work"' EXIT
+          touch "$work/existing"
+          ln -s "$work/existing" "$work/controller"
+          if sudo sh scripts/install_nazoauthctl.sh \
+            --version v0.1.20.invalid --install-path "$work/plain"; then
+            echo "installer accepted a non-release version" >&2
+            exit 1
+          fi
+          if sudo sh scripts/install_nazoauthctl.sh \
+            --version v0.1.20 --install-path "$work/controller"; then
+            echo "installer accepted a symlink target" >&2
+            exit 1
+          fi
       - name: Test controller
         run: cargo test --locked --all-targets --all-features
       - name: Lint controller

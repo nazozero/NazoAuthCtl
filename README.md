@@ -29,6 +29,16 @@ See [architecture](docs/architecture.md), [recovery boundaries](docs/recovery.md
 [compatibility](docs/compatibility.md). The strict manual-deployment input is
 documented in the [lifecycle contract](docs/lifecycle-contract.md).
 
+On Linux, install an independently attested Release with GitHub CLI available:
+
+```sh
+sudo ./scripts/install_nazoauthctl.sh --version v0.1.20
+```
+
+The installer verifies the exact tag, repository, hosted release workflow, and
+GitHub build-provenance attestation before atomically replacing a regular
+install target. Other platforms use the corresponding attested Release asset.
+
 ## Existing deployments
 
 Discovery is read-only and does not require a controller registry:
@@ -81,4 +91,6 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 ```
 
-No independent controller Release is created by this extraction PR.
+Controller Releases are built, tested, attested, and published only from this
+repository. A workflow dispatch performs the same six-platform build without
+publishing; only an exact version tag can create a Release.
