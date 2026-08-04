@@ -292,6 +292,9 @@ jobs:
             sleep 2
           done
           test "$ready" = true
+          docker inspect manual-auth-same-name | jq -S '.[0].HostConfig | {
+            ReadonlyRootfs, RestartPolicy, CapDrop, Memory, NanoCpus, PidsLimit, Tmpfs
+          }' >"$root/docker-policy-before.json"
 
           digest="$(docker image inspect "$image" --format '{{index .RepoDigests 0}}' | sed 's/.*@//')"
           local_image_id="$(docker image inspect "$image" --format '{{.Id}}')"
@@ -400,10 +403,10 @@ jobs:
           test "$ready" = true
           test "$(docker inspect manual-auth-same-name --format '{{index .Config.Labels "io.nazoauth.deployment-id"}}')" = "$deployment_id"
           test "$(docker inspect manual-auth-same-name --format '{{.Image}}')" = "$local_image_id"
-          docker inspect manual-auth-same-name | jq -e '.[0].HostConfig |
-            (.ReadonlyRootfs == false) and (.RestartPolicy.Name == "no") and
-            ((.CapDrop // []) == []) and (.Memory == 0) and (.NanoCpus == 0) and
-            ((.PidsLimit // 0) == 0) and ((.Tmpfs // {}) == {})'
+          docker inspect manual-auth-same-name | jq -S '.[0].HostConfig | {
+            ReadonlyRootfs, RestartPolicy, CapDrop, Memory, NanoCpus, PidsLimit, Tmpfs
+          }' >"$root/docker-policy-after.json"
+          diff -u "$root/docker-policy-before.json" "$root/docker-policy-after.json"
           docker image inspect "$local_image_id" >/dev/null
           test -f "$state_root/deployments/$deployment_id/transactions/recovery-"*.json
           test -f "$state_root/deployments/$deployment_id/audit/00000000000000000001.jws"
@@ -605,6 +608,9 @@ jobs:
             sleep 2
           done
           test "$ready" = true
+          sudo podman inspect "$object" | jq -S '.[0].HostConfig | {
+            ReadonlyRootfs, RestartPolicy, CapDrop, Memory, NanoCpus, PidsLimit, Tmpfs
+          }' >"$root/podman-policy-before.json"
 
           digest="$(sudo podman image inspect "$image" --format '{{.Digest}}')"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -672,11 +678,10 @@ jobs:
           test "$(sudo podman inspect "$object" --format '{{index .Config.Labels "io.nazoauth.deployment-id"}}')" = "$deployment_id"
           restored_id="$(sudo podman inspect "$object" --format '{{.Image}}')"
           test "sha256:${restored_id#sha256:}" = "$local_image_id"
-          sudo podman inspect "$object" | jq -e '.[0].HostConfig |
-            (.ReadonlyRootfs == false) and (.RestartPolicy.Name == "no") and
-            ((.CapDrop // []) == []) and ((.Memory // 0) == 0) and
-            ((.NanoCpus // 0) == 0) and ((.PidsLimit // 0) == 0) and
-            ((.Tmpfs // {}) == {})'
+          sudo podman inspect "$object" | jq -S '.[0].HostConfig | {
+            ReadonlyRootfs, RestartPolicy, CapDrop, Memory, NanoCpus, PidsLimit, Tmpfs
+          }' >"$root/podman-policy-after.json"
+          diff -u "$root/podman-policy-before.json" "$root/podman-policy-after.json"
           test -f "$state_root/deployments/$deployment_id/transactions/recovery-"*.json
           test -f "$state_root/deployments/$deployment_id/audit/00000000000000000001.jws"
       - name: Remove only the exact test objects
