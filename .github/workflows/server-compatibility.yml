@@ -36,6 +36,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: matrix.ctl == 'current'
         with:
@@ -114,6 +117,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes podman
+      - name: Validate the closed recovery fixture generator
+        run: python3 -c 'compile(open(".github/scripts/write_recovery_fixture.py", encoding="utf-8").read(), "write_recovery_fixture.py", "exec")'
       - name: Download and verify the already-built host server
         run: |
           set -euo pipefail
@@ -229,8 +234,10 @@ jobs:
           docker rm --force manual-auth-same-name
           docker network create "$network"
           docker run -d --name "$postgres" --network "$network" \
+            --publish 127.0.0.1:15432:5432 \
             -e "POSTGRES_PASSWORD=$SECRET_MARKER" -e POSTGRES_DB=oauth postgres:18-alpine
-          docker run -d --name "$valkey" --network "$network" valkey/valkey:8-alpine
+          docker run -d --name "$valkey" --network "$network" \
+            --publish 127.0.0.1:16379:6379 valkey/valkey:8-alpine
           ready=false
           for _ in $(seq 1 60); do
             if docker run --rm --network "$network" -e "PGPASSWORD=$SECRET_MARKER" \
@@ -390,6 +397,221 @@ jobs:
           docker image inspect "$local_image_id" >/dev/null
           test -f "$state_root/deployments/$deployment_id/transactions/recovery-"*.json
           test -f "$state_root/deployments/$deployment_id/audit/00000000000000000001.jws"
+      - name: Recover a deleted systemd binary despite unsupported operator protocol
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/nazoauthctl-systemd-recovery"
+          config_root="$root/controller-config"
+          state_root="$root/controller-state"
+          break_glass_root="$root/controller-break-glass"
+          deployment_id=deployment-ci-systemd-recovery
+          runtime_id=runtime-ci-systemd-recovery
+          unit=manual-auth-recovery.service
+          target="$root/live/nazoauth"
+          cached="$root/cache/nazoauth"
+          mkdir -p "$root/live" "$root/cache" "$root/live-data" "$root/live-config" "$break_glass_root"
+          install -m 0755 "$GITHUB_WORKSPACE/signed-server/nazoauth-x86_64-unknown-linux-gnu" "$target"
+          install -m 0500 "$target" "$cached"
+          cat >"$root/live-config/.env.yaml" <<YAML
+          BIND: "127.0.0.1:19084"
+          PUBLIC_BASE_URL: "http://127.0.0.1:19084"
+          DATA_DIR: "$root/live-data"
+          DATABASE_URL: "postgresql://postgres:${SECRET_MARKER}@127.0.0.1:15432/oauth"
+          DATABASE_MAX_CONNECTIONS: 8
+          VALKEY_URL: "redis://127.0.0.1:16379/0"
+          RUST_LOG: "warn"
+          YAML
+          sudo tee "/etc/systemd/system/$unit" >/dev/null <<UNIT
+          [Unit]
+          Description=Manual NazoAuth systemd recovery fixture
+          After=network-online.target
+          [Service]
+          Type=simple
+          WorkingDirectory=$root/live-config
+          Environment=DATA_DIR=$root/live-data
+          ExecStart=$target server
+          Restart=no
+          UNIT
+          sudo systemctl daemon-reload
+          sudo systemctl start "$unit"
+          ready=false
+          for _ in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:19084/ready >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+
+          binary_sha="$(sha256sum "$cached" | cut -d' ' -f1)"
+          jq -n \
+            --arg backend systemd --arg deployment "$deployment_id" --arg runtime "$runtime_id" \
+            --arg object "$unit" --arg release v0.1.19 --arg alias ci-systemd-recovery \
+            --arg issuer http://127.0.0.1:19084 --arg identity "$GITHUB_WORKSPACE/host-identity.json" \
+            --arg config_root "$config_root" --arg state_root "$state_root" \
+            --arg break_glass_root "$break_glass_root" --arg target "$target" \
+            --arg cached "$cached" --arg sha "$binary_sha" \
+            '{backend:$backend,deployment_id:$deployment,runtime_id:$runtime,object_reference:$object,
+              release:$release,alias:$alias,issuer:$issuer,identity_file:$identity,config_root:$config_root,
+              state_root:$state_root,break_glass_root:$break_glass_root,
+              artifact:{kind:"host",target_path:$target,cached_binary:$cached,sha256:$sha},
+              runtime:{command:[$target,"server"],mounts:[],environment:{},networks:[],ip_address:null,ports:[]},
+              declared_ports:[],operator_protocol_versions:[999],operator_tasks_responsibility:"delegated",
+              database_responsibility:"delegated"}' >"$root/spec.json"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/write_recovery_fixture.py" "$root/spec.json"
+
+          jq '.deployments["deployment-ci-decoy"]={alias:"ci-decoy",declaration:.deployments["deployment-ci-systemd-recovery"].declaration}' \
+            "$config_root/registry.json" >"$config_root/registry.multi.json"
+          mv "$config_root/registry.multi.json" "$config_root/registry.json"
+          if sudo env \
+            "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
+            "NAZOAUTHCTL_STATE_ROOT=$state_root" \
+            "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
+            "$GITHUB_WORKSPACE/controller/nazoauthctl" recover --yes \
+            >"$root/ambiguous.out" 2>"$root/ambiguous.err"; then
+            echo "ambiguous destructive deployment selection unexpectedly succeeded" >&2
+            exit 1
+          fi
+          grep -F "multiple deployments" "$root/ambiguous.err"
+          test "$(systemctl show "$unit" --property=ActiveState --value)" = active
+          jq 'del(.deployments["deployment-ci-decoy"])' "$config_root/registry.json" \
+            >"$config_root/registry.single.json"
+          mv "$config_root/registry.single.json" "$config_root/registry.json"
+
+          if sudo env \
+            "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
+            "NAZOAUTHCTL_STATE_ROOT=$state_root" \
+            "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
+            "$GITHUB_WORKSPACE/controller/nazoauthctl" --deployment "$deployment_id" migrate --yes \
+            >"$root/migrate.out" 2>"$root/migrate.err"; then
+            echo "unsupported operator protocol unexpectedly allowed migration" >&2
+            exit 1
+          fi
+          grep -F "does not support operator protocol" "$root/migrate.err"
+          sudo systemctl stop "$unit"
+          rm "$target"
+          test ! -e "$target"
+          sudo env \
+            "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
+            "NAZOAUTHCTL_STATE_ROOT=$state_root" \
+            "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
+            "$GITHUB_WORKSPACE/controller/nazoauthctl" --deployment "$deployment_id" recover --yes
+          ready=false
+          for _ in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:19084/ready >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+          test "$(sha256sum "$target" | cut -d' ' -f1)" = "$binary_sha"
+          test "$(systemctl show "$unit" --property=ActiveState --value)" = active
+          docker inspect nazoauthctl-recovery-postgres >/dev/null
+          docker inspect nazoauthctl-recovery-valkey >/dev/null
+          test -f "$state_root/deployments/$deployment_id/transactions/recovery-"*.json
+          test -f "$state_root/deployments/$deployment_id/audit/00000000000000000001.jws"
+      - name: Reject tampered cache then recover a deleted Podman runtime offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/nazoauthctl-podman-recovery"
+          config_root="$root/controller-config"
+          state_root="$root/controller-state"
+          break_glass_root="$root/controller-break-glass"
+          deployment_id=deployment-ci-podman-recovery
+          runtime_id=runtime-ci-podman-recovery
+          object=manual-auth-podman-recovery
+          image=ghcr.io/nazozero/nazoauth:v0.1.19
+          mkdir -p "$root/live-data" "$root/live-config" "$root/cache" "$break_glass_root"
+          sudo chown -R 10001:10001 "$root/live-data"
+          cat >"$root/live-config/.env.yaml" <<YAML
+          BIND: "127.0.0.1:19083"
+          PUBLIC_BASE_URL: "http://127.0.0.1:19083"
+          DATA_DIR: "/var/lib/nazo_oauth"
+          DATABASE_URL: "postgresql://postgres:${SECRET_MARKER}@127.0.0.1:15432/oauth"
+          DATABASE_MAX_CONNECTIONS: 8
+          VALKEY_URL: "redis://127.0.0.1:16379/0"
+          RUST_LOG: "warn"
+          YAML
+          sudo podman pull "$image"
+          sudo podman run -d --name "$object" --network host \
+            --env DATA_DIR=/var/lib/nazo_oauth \
+            --mount "type=bind,src=$root/live-config/.env.yaml,dst=/app/.env.yaml,readonly" \
+            --mount "type=bind,src=$root/live-data,dst=/var/lib/nazo_oauth" \
+            "$image" nazoauth server
+          ready=false
+          for _ in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:19083/ready >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+
+          digest="$(sudo podman image inspect "$image" --format '{{.Digest}}')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          local_image_id="$(sudo podman image inspect "$image" --format '{{.Id}}')"
+          local_image_id="sha256:${local_image_id#sha256:}"
+          archive="$root/cache/image.tar"
+          sudo podman image save --output "$archive" "$image@$digest"
+          sudo chown "$(id -u):$(id -g)" "$archive"
+          cp "$archive" "$archive.good"
+          jq -n \
+            --arg backend podman --arg deployment "$deployment_id" --arg runtime "$runtime_id" \
+            --arg object "$object" --arg release v0.1.19 --arg alias ci-podman-recovery \
+            --arg issuer http://127.0.0.1:19083 --arg identity "$GITHUB_WORKSPACE/host-identity.json" \
+            --arg config_root "$config_root" --arg state_root "$state_root" \
+            --arg break_glass_root "$break_glass_root" --arg image "$image" \
+            --arg digest "$digest" --arg local_image_id "$local_image_id" --arg archive "$archive" \
+            --arg config "$root/live-config/.env.yaml" --arg data "$root/live-data" \
+            '{backend:$backend,deployment_id:$deployment,runtime_id:$runtime,object_reference:$object,
+              release:$release,alias:$alias,issuer:$issuer,identity_file:$identity,config_root:$config_root,
+              state_root:$state_root,break_glass_root:$break_glass_root,
+              artifact:{kind:"oci",image_reference:$image,digest:$digest,local_image_id:$local_image_id,archive:$archive},
+              runtime:{command:["nazoauth","server"],mounts:[
+                {source:$config,destination:"/app/.env.yaml",read_only:true,selinux_relabel:false,ownership:"external",scope:"deployment"},
+                {source:$data,destination:"/var/lib/nazo_oauth",read_only:false,selinux_relabel:false,ownership:"external",scope:"deployment"}],
+                environment:{DATA_DIR:"/var/lib/nazo_oauth"},networks:["host"],ip_address:null,ports:[]},declared_ports:[]}' \
+            >"$root/spec.json"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/write_recovery_fixture.py" "$root/spec.json"
+
+          sudo podman rm --force "$object"
+          sudo podman image rm "$image"
+          ! sudo podman image exists "$image"
+          printf 'tampered' >>"$archive"
+          if sudo env \
+            "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
+            "NAZOAUTHCTL_STATE_ROOT=$state_root" \
+            "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
+            "$GITHUB_WORKSPACE/controller/nazoauthctl" --deployment "$deployment_id" recover --yes; then
+            echo "tampered Podman recovery cache was unexpectedly accepted" >&2
+            exit 1
+          fi
+          test ! -e "$state_root/deployments/$deployment_id/recovery/driver-invocations"
+          cp "$archive.good" "$archive"
+          sudo env \
+            "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
+            "NAZOAUTHCTL_STATE_ROOT=$state_root" \
+            "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
+            "$GITHUB_WORKSPACE/controller/nazoauthctl" --deployment "$deployment_id" recover --yes
+          ready=false
+          for _ in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:19083/ready >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+          test "$(sudo podman inspect "$object" --format '{{index .Config.Labels "io.nazoauth.deployment-id"}}')" = "$deployment_id"
+          restored_id="$(sudo podman inspect "$object" --format '{{.Image}}')"
+          test "sha256:${restored_id#sha256:}" = "$local_image_id"
+          test -f "$state_root/deployments/$deployment_id/transactions/recovery-"*.json
+          test -f "$state_root/deployments/$deployment_id/audit/00000000000000000001.jws"
       - name: Remove only the exact test objects
         if: always()
         shell: bash
@@ -398,6 +620,9 @@ jobs:
           docker rm --force nazoauthctl-recovery-postgres nazoauthctl-recovery-valkey 2>/dev/null || true
           docker network rm nazoauthctl-recovery-net 2>/dev/null || true
           podman rm --force manual-auth-same-name 2>/dev/null || true
+          sudo podman rm --force manual-auth-podman-recovery 2>/dev/null || true
           sudo systemctl stop manual-auth-unusual.service 2>/dev/null || true
-          sudo rm -f /etc/systemd/system/manual-auth-unusual.service
+          sudo systemctl stop manual-auth-recovery.service 2>/dev/null || true
+          sudo rm -f /etc/systemd/system/manual-auth-unusual.service \
+            /etc/systemd/system/manual-auth-recovery.service
           sudo systemctl daemon-reload
