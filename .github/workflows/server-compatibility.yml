@@ -35,7 +35,7 @@ jobs:
       fail-fast: false
       matrix:
         ctl: [current, previous-v0.1.19]
-        server: [v0.1.18, v0.1.19]
+        server: [v0.1.19, v0.1.20]
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -113,7 +113,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6.0.2
         with:
           repository: nazozero/NazoAuth
-          ref: a7b06b36dca0c54c49d7f1429f8e8fe34bd9e38c
+          ref: 94e23222b3573a04c82704812495d1bbba20e186
           path: server-baseline
           persist-credentials: false
           sparse-checkout: migrations
@@ -126,28 +126,28 @@ jobs:
       - name: Download and verify the already-built host server
         run: |
           set -euo pipefail
-          gh release download v0.1.19 --repo nazozero/NazoAuth \
+          gh release download v0.1.20 --repo nazozero/NazoAuth \
             --pattern nazoauth-x86_64-unknown-linux-gnu --dir signed-server
           gh attestation verify signed-server/nazoauth-x86_64-unknown-linux-gnu \
             --repo nazozero/NazoAuth \
             --signer-workflow nazozero/NazoAuth/.github/workflows/release-security.yml \
-            --source-ref refs/tags/v0.1.19 \
+            --source-ref refs/tags/v0.1.20 \
             --deny-self-hosted-runners
           chmod 0755 controller/nazoauthctl signed-server/nazoauth-x86_64-unknown-linux-gnu
           signed-server/nazoauth-x86_64-unknown-linux-gnu build-identity \
             | tee host-identity.json \
-            | jq -e '.release == "v0.1.19" and .protocol == 1'
+            | jq -e '.release == "v0.1.20" and .protocol == 1'
       - name: Verify and retain signed current and previous OCI artifacts
         run: |
           set -euo pipefail
-          for release in v0.1.18 v0.1.19; do
+          for release in v0.1.19 v0.1.20; do
             image="ghcr.io/nazozero/nazoauth:${release}"
             cosign verify "$image" \
               --certificate-identity "https://github.com/nazozero/NazoAuth/.github/workflows/release-security.yml@refs/tags/${release}" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com
             docker pull "$image"
           done
-          podman pull ghcr.io/nazozero/nazoauth:v0.1.19
+          podman pull ghcr.io/nazozero/nazoauth:v0.1.20
       - name: Create manual non-default backend objects
         shell: bash
         run: |
@@ -159,16 +159,16 @@ jobs:
             --env DATA_DIR=/var/lib/nazo_oauth \
             --env "DATABASE_URL=postgresql://${SECRET_MARKER}@invalid/docker" \
             --mount "type=bind,src=$root/docker-data,dst=/var/lib/nazo_oauth" \
-            ghcr.io/nazozero/nazoauth:v0.1.19 nazoauth server
+            ghcr.io/nazozero/nazoauth:v0.1.20 nazoauth server
           docker create --name manual-auth-previous --publish 127.0.0.1:19082:8000 \
             --env DATA_DIR=/var/lib/nazo_oauth \
             --mount "type=bind,src=$root/docker-previous-data,dst=/var/lib/nazo_oauth" \
-            ghcr.io/nazozero/nazoauth:v0.1.18 nazoauth server
+            ghcr.io/nazozero/nazoauth:v0.1.19 nazoauth server
           podman create --name manual-auth-same-name --publish 127.0.0.1:19083:8000 \
             --env DATA_DIR=/var/lib/nazo_oauth \
             --env "DATABASE_URL=postgresql://${SECRET_MARKER}@invalid/podman" \
             --mount "type=bind,src=$root/podman-data,dst=/var/lib/nazo_oauth" \
-            ghcr.io/nazozero/nazoauth:v0.1.19 nazoauth server
+            ghcr.io/nazozero/nazoauth:v0.1.20 nazoauth server
           docker pull alpine:3.22
           docker create --name manual-auth-unsigned alpine:3.22 nazoauth server
           sudo tee /etc/systemd/system/manual-auth-unusual.service >/dev/null <<UNIT
@@ -231,7 +231,7 @@ jobs:
           break_glass_root="$root/controller-break-glass"
           deployment_id=deployment-ci-recovery
           runtime_id=runtime-ci-recovery
-          image=ghcr.io/nazozero/nazoauth:v0.1.19
+          image=ghcr.io/nazozero/nazoauth:v0.1.20
           network=nazoauthctl-recovery-net
           postgres=nazoauthctl-recovery-postgres
           valkey=nazoauthctl-recovery-valkey
@@ -265,7 +265,7 @@ jobs:
             "$state_root/deployments/$deployment_id/identities" \
             "$state_root/deployments/$deployment_id/audit" \
             "$state_root/deployments/$deployment_id/transactions" \
-            "$state_root/deployments/$deployment_id/recovery/trusted-runtime/v0.1.19/$runtime_id" \
+            "$state_root/deployments/$deployment_id/recovery/trusted-runtime/v0.1.20/$runtime_id" \
             "$break_glass_root"
           sudo chown -R 10001:10001 "$root/docker-live-data"
           cat >"$root/docker-live-config/.env.yaml" <<YAML
@@ -295,7 +295,7 @@ jobs:
 
           digest="$(docker image inspect "$image" --format '{{index .RepoDigests 0}}' | sed 's/.*@//')"
           local_image_id="$(docker image inspect "$image" --format '{{.Id}}')"
-          archive="$state_root/deployments/$deployment_id/recovery/trusted-runtime/v0.1.19/$runtime_id/image.tar"
+          archive="$state_root/deployments/$deployment_id/recovery/trusted-runtime/v0.1.20/$runtime_id/image.tar"
           docker image save --output "$archive" "$image@$digest"
           archive_sha="$(sha256sum "$archive" | cut -d' ' -f1)"
           recovery_manifest="$state_root/deployments/$deployment_id/recovery/manual-manifest.json"
@@ -452,7 +452,7 @@ jobs:
           binary_sha="$(sha256sum "$cached" | cut -d' ' -f1)"
           jq -n \
             --arg backend systemd --arg deployment "$deployment_id" --arg runtime "$runtime_id" \
-            --arg object "$unit" --arg release v0.1.19 --arg alias ci-systemd-recovery \
+            --arg object "$unit" --arg release v0.1.20 --arg alias ci-systemd-recovery \
             --arg issuer http://127.0.0.1:19084 --arg identity "$GITHUB_WORKSPACE/host-identity.json" \
             --arg config_root "$config_root" --arg state_root "$state_root" \
             --arg break_glass_root "$break_glass_root" --arg target "$target" \
@@ -537,7 +537,37 @@ jobs:
           deployment_id=deployment-ci-podman-recovery
           runtime_id=runtime-ci-podman-recovery
           object=manual-auth-podman-recovery
-          image=ghcr.io/nazozero/nazoauth:v0.1.19
+          image=ghcr.io/nazozero/nazoauth:v0.1.20
+          diagnose_podman() {
+            sudo podman inspect "$object" --format \
+              'state={{json .State}} image={{.Image}} path={{.Path}} args={{json .Args}} working_dir={{.Config.WorkingDir}} user={{.Config.User}}'
+            sudo podman inspect "$object" --format '{{json .Mounts}}' \
+              | jq '[.[] | {Type, Source, Destination, Driver, Mode, RW, Propagation}]'
+            log="$root/podman-runtime.log"
+            sudo podman logs "$object" >"$log" 2>&1 || true
+            printf 'runtime_log_sha256=%s\n' "$(sha256sum "$log" | cut -d' ' -f1)"
+            if grep --fixed-strings --quiet "$SECRET_MARKER" "$log"; then
+              echo 'runtime_log_category=secret-marker-present'
+              return
+            fi
+            while IFS='|' read -r category pattern; do
+              if grep --ignore-case --quiet -- "$pattern" "$log"; then
+                printf 'runtime_log_category=%s\n' "$category"
+              fi
+            done <<'PATTERNS'
+          read-only|read-only file system
+          permission|permission denied
+          address-in-use|address already in use
+          connection-refused|connection refused
+          missing-file|no such file
+          operation-not-permitted|operation not permitted
+          database|database
+          valkey|valkey
+          migration|migration
+          configuration|config
+          identity|identity
+          PATTERNS
+          }
           mkdir -p "$root/live-data" "$root/live-config" "$root/cache" "$break_glass_root"
           sudo chown -R 10001:10001 "$root/live-data"
           cat >"$root/live-config/.env.yaml" <<YAML
@@ -575,7 +605,7 @@ jobs:
           cp "$archive" "$archive.good"
           jq -n \
             --arg backend podman --arg deployment "$deployment_id" --arg runtime "$runtime_id" \
-            --arg object "$object" --arg release v0.1.19 --arg alias ci-podman-recovery \
+            --arg object "$object" --arg release v0.1.20 --arg alias ci-podman-recovery \
             --arg issuer http://127.0.0.1:19083 --arg identity "$GITHUB_WORKSPACE/host-identity.json" \
             --arg config_root "$config_root" --arg state_root "$state_root" \
             --arg break_glass_root "$break_glass_root" --arg image "$image" \
@@ -611,10 +641,7 @@ jobs:
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
             "$GITHUB_WORKSPACE/controller/nazoauthctl" --deployment "$deployment_id" recover --yes; then
-            sudo podman inspect "$object" --format \
-              'state={{json .State}} image={{.Image}} path={{.Path}} args={{json .Args}} working_dir={{.Config.WorkingDir}} user={{.Config.User}}'
-            sudo podman inspect "$object" --format '{{json .Mounts}}' \
-              | jq '[.[] | {Type, Source, Destination, Driver, Mode, RW, Propagation}]'
+            diagnose_podman
             exit 1
           fi
           ready=false
@@ -626,10 +653,7 @@ jobs:
             sleep 2
           done
           if [ "$ready" != true ]; then
-            sudo podman inspect "$object" --format \
-              'state={{json .State}} image={{.Image}} path={{.Path}} args={{json .Args}} working_dir={{.Config.WorkingDir}} user={{.Config.User}}'
-            sudo podman inspect "$object" --format '{{json .Mounts}}' \
-              | jq '[.[] | {Type, Source, Destination, Driver, Mode, RW, Propagation}]'
+            diagnose_podman
             exit 1
           fi
           test "$(sudo podman inspect "$object" --format '{{index .Config.Labels "io.nazoauth.deployment-id"}}')" = "$deployment_id"
