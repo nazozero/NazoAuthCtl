@@ -85,7 +85,7 @@ jobs:
         run: gh release create "${{ github.ref_name }}" release/nazoauthctl-* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
 
   self-update-rollback:
-    if: github.ref_type == 'tag' && github.ref_name == 'v0.1.21'
+    if: github.ref_type == 'tag' && github.ref_name == 'v0.1.22'
     needs: attest
     runs-on: ubuntu-24.04
     permissions:
@@ -99,13 +99,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p previous candidate
-          gh release download v0.1.20 --repo "$GITHUB_REPOSITORY" \
-            --pattern nazoauthctl-x86_64-unknown-linux-gnu --dir previous
           gh release download v0.1.21 --repo "$GITHUB_REPOSITORY" \
+            --pattern nazoauthctl-x86_64-unknown-linux-gnu --dir previous
+          gh release download v0.1.22 --repo "$GITHUB_REPOSITORY" \
             --pattern nazoauthctl-x86_64-unknown-linux-gnu --dir candidate
-          for version in v0.1.20 v0.1.21; do
+          for version in v0.1.21 v0.1.22; do
             directory=previous
-            [ "$version" = v0.1.20 ] || directory=candidate
+            [ "$version" = v0.1.21 ] || directory=candidate
             gh attestation verify "$directory/nazoauthctl-x86_64-unknown-linux-gnu" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
@@ -126,15 +126,17 @@ jobs:
           previous_sha="$(sha256sum "$binary" | cut -d' ' -f1)"
           candidate_sha="$(sha256sum candidate/nazoauthctl-x86_64-unknown-linux-gnu | cut -d' ' -f1)"
           sudo env \
+            "PATH=$PATH" \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
-            "$binary" self check --to v0.1.21
+            "$binary" self check --to v0.1.22
           sudo env \
+            "PATH=$PATH" \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
-            "$binary" self update --to v0.1.21 --yes
+            "$binary" self update --to v0.1.22 --yes
           test "$(sha256sum "$binary" | cut -d' ' -f1)" = "$candidate_sha"
 
           record="$(sudo find "$state_root/controller-self/audit/records" -type f -name '*.json' | sort | head -n 1)"
@@ -143,6 +145,7 @@ jobs:
           sudo chown "$(id -u):$(id -g)" "$root/audit-record.good"
           printf 'tampered' | sudo tee -a "$record" >/dev/null
           if sudo env \
+            "PATH=$PATH" \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
@@ -153,13 +156,15 @@ jobs:
           test "$(sha256sum "$binary" | cut -d' ' -f1)" = "$candidate_sha"
           sudo cp "$root/audit-record.good" "$record"
           sudo env \
+            "PATH=$PATH" \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
             "$binary" self rollback --yes
           test "$(sha256sum "$binary" | cut -d' ' -f1)" = "$previous_sha"
           sudo env \
+            "PATH=$PATH" \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
-            "$binary" self check --to v0.1.20
+            "$binary" self check --to v0.1.21
