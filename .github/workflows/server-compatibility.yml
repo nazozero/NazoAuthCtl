@@ -102,6 +102,14 @@ jobs:
         with:
           name: current-controller
           path: controller
+      - name: Check out only the exact baseline migration inputs
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6.0.2
+        with:
+          repository: nazozero/NazoAuth
+          ref: a7b06b36dca0c54c49d7f1429f8e8fe34bd9e38c
+          path: server-baseline
+          persist-credentials: false
+          sparse-checkout: migrations
       - name: Install independent Podman adapter dependency
         run: |
           sudo apt-get update
@@ -233,6 +241,14 @@ jobs:
             sleep 2
           done
           test "$ready" = true
+          for migration in "$GITHUB_WORKSPACE"/server-baseline/migrations/*/up.sql; do
+            relative="${migration#"$GITHUB_WORKSPACE/server-baseline/migrations/"}"
+            docker run --rm --network "$network" \
+              -e "PGPASSWORD=$SECRET_MARKER" \
+              --mount "type=bind,src=$GITHUB_WORKSPACE/server-baseline/migrations,dst=/migrations,readonly" \
+              postgres:18-alpine psql --host "$postgres" --username postgres --dbname oauth \
+              --set ON_ERROR_STOP=1 --single-transaction --file "/migrations/$relative" >/dev/null
+          done
           mkdir -p "$root/docker-live-data" "$root/docker-live-config" \
             "$config_root/deployments/$deployment_id" \
             "$state_root/deployments/$deployment_id/identities" \
