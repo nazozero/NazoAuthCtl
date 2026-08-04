@@ -550,6 +550,11 @@ jobs:
               echo 'runtime_log_category=secret-marker-present'
               return
             fi
+            sed -E \
+              -e 's#(postgres(ql)?://)[^@[:space:]]+@#\1[REDACTED]@#g' \
+              -e 's#(redis(s)?://)[^@[:space:]]+@#\1[REDACTED]@#g' \
+              "$log" | head -c 4096
+            printf '\n'
             while IFS='|' read -r category pattern; do
               if grep --ignore-case --quiet -- "$pattern" "$log"; then
                 printf 'runtime_log_category=%s\n' "$category"
