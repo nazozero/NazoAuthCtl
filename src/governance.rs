@@ -231,10 +231,26 @@ fn append_audit_idempotent(
     store: &DeploymentStore,
     transaction: &CapabilityTransition,
 ) -> anyhow::Result<()> {
-    let private_path = match transaction.target.resources.get("audit_private_key") {
+    append_management_audit(
+        store,
+        &transaction.target,
+        &transaction.request_id,
+        &transaction.operation,
+        "controller-state",
+    )
+}
+
+pub(crate) fn append_management_audit(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    request_id: &str,
+    operation: &str,
+    release: &str,
+) -> anyhow::Result<()> {
+    let private_path = match record.resources.get("audit_private_key") {
         Some(crate::deployment::SafeReference::File { path }) => path.clone(),
         _ => store
-            .deployment_state_dir(&transaction.target.deployment_id)
+            .deployment_state_dir(&record.deployment_id)
             .join("identities")
             .join("audit.key"),
     };
@@ -251,7 +267,7 @@ fn append_audit_idempotent(
         1,
     );
     let audit_dir = store
-        .deployment_state_dir(&transaction.target.deployment_id)
+        .deployment_state_dir(&record.deployment_id)
         .join("audit");
     fs::create_dir_all(&audit_dir)?;
     let mut entries = fs::read_dir(&audit_dir)?
@@ -262,7 +278,10 @@ fn append_audit_idempotent(
     for entry in &entries {
         let compact = fs::read_to_string(entry.path())?;
         let event = verify_management_event(compact.trim(), &key_id, &signing.verifying_key())?;
-        if event.request_id == transaction.request_id {
+        if event.request_id == request_id {
+            if event.operation != operation || event.release != release {
+                bail!("management audit request ID was reused with different content");
+            }
             return Ok(());
         }
     }
@@ -275,18 +294,18 @@ fn append_audit_idempotent(
     };
     let event = ManagementAuditEvent {
         ver: PROTOCOL_VERSION,
-        deployment_id: transaction.target.deployment_id.clone(),
+        deployment_id: record.deployment_id.clone(),
         sequence,
         previous_sha256,
-        request_id: transaction.request_id.clone(),
+        request_id: request_id.to_owned(),
         issued_at: Utc::now().timestamp(),
         actor: Actor {
             kind: ActorKind::LocalRoot,
             id: "uid:0".to_owned(),
         },
-        operation: transaction.operation.clone(),
-        release: "controller-state".to_owned(),
-        recovery_boundary: match transaction.target.recovery.conclusion {
+        operation: operation.to_owned(),
+        release: release.to_owned(),
+        recovery_boundary: match record.recovery.conclusion {
             RecoveryConclusion::Proven => "recovery:proven",
             RecoveryConclusion::RequiresUserEvidence => "recovery:user-required",
             RecoveryConclusion::Unproven => "recovery:unproven",

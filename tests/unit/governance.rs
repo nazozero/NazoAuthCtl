@@ -5,6 +5,7 @@ use crate::deployment::{
     ArtifactReference, CapabilityGrants, DEPLOYMENT_SCHEMA, RecoveryAssessment, RuntimeBackendKind,
     RuntimeInstance, SafeReference,
 };
+use crate::filesystem::PrivateTempDir;
 
 fn record() -> DeploymentRecord {
     DeploymentRecord {
@@ -126,4 +127,60 @@ fn integrity_evidence_without_an_executable_controller_config_is_not_core_recove
         },
     );
     assert!(deployment.core_recovery_is_proven());
+}
+
+#[test]
+fn lifecycle_management_audit_is_chained_and_idempotent() {
+    let work = PrivateTempDir::new("nazoauthctl-management-audit").unwrap();
+    let store = DeploymentStore {
+        config_root: work.path().join("etc"),
+        state_root: work.path().join("state"),
+        break_glass_root: work.path().join("break-glass"),
+    };
+    let mut deployment = record();
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let key_path = store
+        .deployment_state_dir(&deployment.deployment_id)
+        .join("identities/audit.key");
+    fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+    fs::write(&key_path, URL_SAFE_NO_PAD.encode(key.to_bytes())).unwrap();
+    deployment.resources.insert(
+        "audit_private_key".to_owned(),
+        SafeReference::File { path: key_path },
+    );
+
+    append_management_audit(
+        &store,
+        &deployment,
+        "request-a",
+        "lifecycle-recover",
+        "v0.1.19",
+    )
+    .unwrap();
+    append_management_audit(
+        &store,
+        &deployment,
+        "request-a",
+        "lifecycle-recover",
+        "v0.1.19",
+    )
+    .unwrap();
+    let entries = fs::read_dir(
+        store
+            .deployment_state_dir(&deployment.deployment_id)
+            .join("audit"),
+    )
+    .unwrap()
+    .count();
+    assert_eq!(entries, 1);
+    assert!(
+        append_management_audit(
+            &store,
+            &deployment,
+            "request-a",
+            "lifecycle-rollback",
+            "v0.1.19",
+        )
+        .is_err()
+    );
 }

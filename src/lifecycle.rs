@@ -14,7 +14,7 @@ use crate::{
         Responsibility, RuntimeBackendKind, SafeReference,
     },
     discovery::DiscoveredDeployment,
-    filesystem::{atomic_write, copy_atomic, set_mode, sha256},
+    filesystem::{atomic_write, copy_atomic, remove_file_durable, set_mode, sha256},
     process::Process,
     release::VerifiedRelease,
     runtime_backend::{NeutralMount, RuntimeReplacement, backend},
@@ -318,6 +318,7 @@ pub(crate) fn cache_trusted_runtime(
     if manifest_path.exists() {
         let cache = load_cache(&manifest_path, record)?;
         validate_cached_artifacts(&cache)?;
+        ensure_adoption_recovery_slot(store, record)?;
         return Ok(());
     }
     fs::create_dir_all(&directory)?;
@@ -397,6 +398,13 @@ pub(crate) fn cache_trusted_runtime(
     };
     atomic_write(&manifest_path, &serde_json::to_vec_pretty(&cache)?, 0o600)?;
     validate_cached_artifacts(&load_cache(&manifest_path, record)?)?;
+    ensure_adoption_recovery_slot(store, record)
+}
+
+fn ensure_adoption_recovery_slot(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+) -> anyhow::Result<()> {
     let adoption_manifest = store
         .deployment_state_dir(&record.deployment_id)
         .join("recovery")
@@ -514,6 +522,15 @@ pub(crate) fn execute_coordinated_update(
         bail!("update transaction is bound to a different deployment");
     }
     if transaction.state == CoordinationState::Committed {
+        crate::governance::append_management_audit(
+            store,
+            record,
+            &transaction.transaction_id,
+            "lifecycle-update",
+            &transaction.target_release.release,
+        )?;
+        crate::coordination::finalize_committed_locked(store, record, &transaction.transaction_id)?;
+        archive_update_execution(store, &record.deployment_id, &transaction.transaction_id)?;
         return Ok(transaction.clone());
     }
     if transaction.state != CoordinationState::ReadyForController {
@@ -732,6 +749,19 @@ pub(crate) fn execute_coordinated_update(
         execution.state = UpdateExecutionState::Committed;
         execution.updated_at = Utc::now().timestamp();
         persist_update_execution(&execution_path, &execution)?;
+        crate::governance::append_management_audit(
+            store,
+            &updated,
+            &transaction.transaction_id,
+            "lifecycle-update",
+            &transaction.target_release.release,
+        )?;
+        crate::coordination::finalize_committed_locked(
+            store,
+            &updated,
+            &transaction.transaction_id,
+        )?;
+        archive_update_execution(store, &record.deployment_id, &transaction.transaction_id)?;
     }
     Ok(current)
 }
@@ -783,6 +813,13 @@ pub(crate) fn rollback_registered(
         rolled_back.declaration_revision += 1;
         store.persist_declaration_locked(&rolled_back)?;
     }
+    crate::governance::append_management_audit(
+        store,
+        &rolled_back,
+        &format!("rollback-{:020}", record.declaration_revision),
+        "lifecycle-rollback",
+        &rolled_back.active_release.release,
+    )?;
     Ok(())
 }
 
@@ -910,7 +947,18 @@ pub(crate) fn recover_registered(
     }
     transaction.state = RecoveryTransactionState::Committed;
     transaction.updated_at = Utc::now().timestamp();
-    persist_recovery_transaction(&transaction_path, &transaction)
+    persist_recovery_transaction(&transaction_path, &transaction)?;
+    crate::governance::append_management_audit(
+        store,
+        &recovered,
+        &transaction.transaction_id,
+        "lifecycle-recover",
+        &recovered.active_release.release,
+    )?;
+    let history =
+        transaction_path.with_file_name(format!("recovery-{}.json", transaction.transaction_id));
+    atomic_write(&history, &serde_json::to_vec_pretty(&transaction)?, 0o600)?;
+    remove_file_durable(&transaction_path)
 }
 
 fn activate_cached_runtime(
@@ -1092,6 +1140,7 @@ fn validate_cached_artifacts(cache: &TrustedRuntimeCache) -> anyhow::Result<()> 
             } => {
                 validate_oci_digest(digest)?;
                 validate_lower_hex(archive_sha256)?;
+                validate_regular_artifact(archive, "trusted OCI recovery archive")?;
                 if sha256(archive)? != *archive_sha256 {
                     bail!("trusted OCI recovery archive digest is invalid");
                 }
@@ -1101,6 +1150,7 @@ fn validate_cached_artifacts(cache: &TrustedRuntimeCache) -> anyhow::Result<()> 
                 sha256: digest,
             } => {
                 validate_lower_hex(digest)?;
+                validate_regular_artifact(binary, "trusted host recovery binary")?;
                 if sha256(binary)? != *digest {
                     bail!("trusted host recovery binary digest is invalid");
                 }
@@ -1194,6 +1244,7 @@ fn load_recovery_slot(
     }
     validate_file_identifier(&slot.trusted_release.release, "recovery slot Release")?;
     validate_lower_hex(&slot.recovery_manifest_sha256)?;
+    validate_regular_artifact(&slot.recovery_manifest, "deployment recovery manifest")?;
     if sha256(&slot.recovery_manifest)? != slot.recovery_manifest_sha256 {
         bail!("deployment recovery manifest changed after slot commit");
     }
@@ -1207,6 +1258,15 @@ fn persist_recovery_transaction(
     atomic_write(path, &serde_json::to_vec_pretty(transaction)?, 0o600)
 }
 
+fn validate_regular_artifact(path: &Path, label: &str) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+        bail!("{label} is not a non-empty regular file");
+    }
+    Ok(())
+}
+
 fn update_execution_path(store: &DeploymentStore, deployment_id: &str) -> PathBuf {
     store
         .deployment_state_dir(deployment_id)
@@ -1216,6 +1276,27 @@ fn update_execution_path(store: &DeploymentStore, deployment_id: &str) -> PathBu
 
 fn persist_update_execution(path: &Path, execution: &UpdateExecution) -> anyhow::Result<()> {
     atomic_write(path, &serde_json::to_vec_pretty(execution)?, 0o600)
+}
+
+fn archive_update_execution(
+    store: &DeploymentStore,
+    deployment_id: &str,
+    transaction_id: &str,
+) -> anyhow::Result<()> {
+    let active = update_execution_path(store, deployment_id);
+    if !active.exists() {
+        return Ok(());
+    }
+    let execution: UpdateExecution = serde_json::from_slice(&fs::read(&active)?)
+        .context("lifecycle update execution journal is invalid")?;
+    if execution.transaction_id != transaction_id
+        || execution.state != UpdateExecutionState::Committed
+    {
+        bail!("lifecycle update execution cannot be archived before commit");
+    }
+    let history = active.with_file_name(format!("lifecycle-update-{transaction_id}.json"));
+    atomic_write(&history, &serde_json::to_vec_pretty(&execution)?, 0o600)?;
+    remove_file_durable(&active)
 }
 
 fn validate_oci_digest(value: &str) -> anyhow::Result<()> {

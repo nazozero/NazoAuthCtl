@@ -63,8 +63,13 @@ impl RuntimeBackend for SystemdBackend {
             .filter_map(|line| line.split_whitespace().next())
             .filter(|unit| unit.ends_with(".service"))
         {
-            let observation = self.inspect(unit)?;
-            if observation.server_command_verified {
+            // A host commonly contains stale aliases or generated units that
+            // disappear between list-unit-files and show. They are outside the
+            // NazoAuth candidate set and must not make the whole read-only scan
+            // unavailable.
+            if let Ok(observation) = self.inspect(unit)
+                && observation.server_command_verified
+            {
                 observations.push(observation);
             }
         }

@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     deployment::{DeploymentRecord, DeploymentStore},
-    filesystem::{atomic_write, sha256},
+    filesystem::{atomic_write, remove_file_durable, sha256},
 };
 
 const TRANSACTION_SCHEMA: u32 = 1;
@@ -420,6 +420,24 @@ pub(crate) fn commit_controller_update_locked(
     transaction.updated_at = Utc::now().timestamp();
     persist(store, &transaction)?;
     Ok(transaction)
+}
+
+pub(crate) fn finalize_committed_locked(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    transaction_id: &str,
+) -> anyhow::Result<()> {
+    let active = transaction_path(store, &record.deployment_id);
+    let transaction = load_path(&active)?;
+    validate_binding(&transaction, record)?;
+    if transaction.transaction_id != transaction_id
+        || transaction.state != CoordinationState::Committed
+    {
+        bail!("only the committed active update transaction can be finalized");
+    }
+    let history = active.with_file_name(format!("update-{transaction_id}.json"));
+    atomic_write(&history, &serde_json::to_vec_pretty(&transaction)?, 0o600)?;
+    remove_file_durable(&active)
 }
 
 fn next_state(transaction: &UpdateCoordination) -> CoordinationState {

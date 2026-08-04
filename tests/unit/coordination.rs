@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
     deployment::{
-        CapabilityGrants, DEPLOYMENT_SCHEMA, DeploymentRecord, RecoveryAssessment,
-        RecoveryConclusion, TrustState,
+        ArtifactReference, CapabilityGrants, DEPLOYMENT_SCHEMA, DeploymentRecord,
+        RecoveryAssessment, RecoveryConclusion, RuntimeBackendKind, RuntimeInstance, TrustState,
     },
     filesystem::PrivateTempDir,
 };
@@ -32,7 +32,20 @@ fn record(deployment_id: &str) -> DeploymentRecord {
         },
         trust: TrustState::Adopted,
         capabilities: CapabilityGrants::controller_installed(),
-        runtime_instances: Vec::new(),
+        runtime_instances: vec![RuntimeInstance {
+            runtime_instance_id: "runtime-a".to_owned(),
+            backend: RuntimeBackendKind::Systemd,
+            object_reference: "nazoauth-a.service".to_owned(),
+            artifact: ArtifactReference::HostBinary {
+                path: "/usr/local/bin/nazoauth".into(),
+                sha256: "f".repeat(64),
+            },
+            ports: Vec::new(),
+            networks: Vec::new(),
+            mounts: Vec::new(),
+            instance_key_id: None,
+            deployment_statement: None,
+        }],
         resources: BTreeMap::new(),
         recovery: RecoveryAssessment {
             conclusion: RecoveryConclusion::Proven,
@@ -208,4 +221,20 @@ fn controller_steps_commit_the_new_declaration_only_after_final_acceptance() {
     .unwrap();
     assert_eq!(committed.state, CoordinationState::Committed);
     assert_eq!(store.load("deployment-a").unwrap(), updated);
+    finalize_committed_locked(
+        &store,
+        &store.load("deployment-a").unwrap(),
+        &prepared.transaction_id,
+    )
+    .unwrap();
+    assert!(show(&store, &updated).is_err());
+    assert!(
+        store
+            .deployment_state_dir("deployment-a")
+            .join(format!(
+                "transactions/update-{}.json",
+                prepared.transaction_id
+            ))
+            .is_file()
+    );
 }
