@@ -187,14 +187,16 @@ jobs:
           diff -u before-docker.sha256 after-docker.sha256
           diff -u before-podman.sha256 after-podman.sha256
           diff -u before-systemd.sha256 after-systemd.sha256
-          jq -e '
-            .read_only == true and .ambiguous == true and
-            ([.candidates[].runtime.backend] | index("docker") != null) and
-            ([.candidates[].runtime.backend] | index("podman") != null) and
-            ([.candidates[].runtime.backend] | index("systemd") != null) and
-            ([.candidates[].runtime.display_name] | map(select(. == "manual-auth-same-name")) | length) == 2 and
-            ([.candidates[].runtime.artifact.digest] | unique | length) >= 2
-          ' discover-first.json
+          jq '{
+            read_only: (.read_only == true),
+            ambiguous: (.ambiguous == true),
+            docker: ([.candidates[].runtime.backend] | index("docker") != null),
+            podman: ([.candidates[].runtime.backend] | index("podman") != null),
+            systemd: ([.candidates[].runtime.backend] | index("systemd") != null),
+            same_name_across_engines: (([.candidates[].runtime.display_name] | map(select(. == "manual-auth-same-name")) | length) == 2),
+            multiple_artifact_digests: (([.candidates[].runtime.artifact.digest] | unique | length) >= 2)
+          }' discover-first.json | tee discovery-assertions.json
+          jq -e 'to_entries | all(.value == true)' discovery-assertions.json
           ! grep --fixed-strings --quiet "$SECRET_MARKER" discover-first.json
           unsigned_target="$(jq -r '.candidates[] | select(.runtime.display_name == "manual-auth-unsigned") | .target' discover-first.json)"
           test -n "$unsigned_target"

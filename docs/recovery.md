@@ -57,6 +57,13 @@ executes `rehearse`; an update executes `checkpoint`; full recovery executes
 `restore`. Every receipt is bound to deployment, request, Release, lifecycle,
 recovery manifest, operation, component set, and freshness window.
 
+Full recovery first asks each selected backend to prove that every declared
+runtime is stopped or absent. An unavailable backend or an indeterminate object
+state fails before the recovery driver may restore application data or provider
+state. The deployment-local recovery journal records that quiescence boundary
+and binds the lifecycle, trusted runtime cache, and recovery-manifest digests so
+an interrupted recovery cannot resume against substituted input.
+
 The update journal is deployment-local and resumable. External or provider steps
 pause until deployment- and transaction-bound evidence is supplied. ctl-owned
 runtime replacements are recorded after each replica. The declaration changes
