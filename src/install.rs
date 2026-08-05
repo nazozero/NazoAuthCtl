@@ -1653,10 +1653,17 @@ fn require_root() -> anyhow::Result<()> {
     if test_mode() {
         return Ok(());
     }
-    if Process::new("id").arg("-u").stdout()?.trim() != "0" {
-        bail!("install and update require root");
+    #[cfg(not(unix))]
+    {
+        bail!("install and update require root on a Unix host");
     }
-    Ok(())
+    #[cfg(unix)]
+    {
+        if Process::new("id").arg("-u").stdout()?.trim() != "0" {
+            bail!("install and update require root");
+        }
+        Ok(())
+    }
 }
 
 fn test_mode() -> bool {

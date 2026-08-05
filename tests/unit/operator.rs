@@ -1094,6 +1094,8 @@ fn release_target_policy_and_operation_names_are_explicit() {
             profile: "oidf-full".to_owned(),
             material_sha256: "a".repeat(64),
             public_material: None,
+            dynamic_registration_initial_access_token_sha256: None,
+            ciba_automated_decision_token_sha256: None,
             ttl_seconds: 3_600,
         }),
         "conformance-lease-create"

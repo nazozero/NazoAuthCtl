@@ -317,11 +317,37 @@ fn conformance_operation(command: ConformanceLeaseCommand) -> anyhow::Result<Tas
         ConformanceLeaseCommand::Create {
             profile,
             material,
+            dynamic_registration_token_file,
+            ciba_automated_decision_token_file,
             ttl_seconds,
             yes,
         } => {
             require_confirmation(yes, "create a temporary conformance lease")?;
             let material_sha256 = crate::filesystem::sha256(&material)?;
+            let dynamic_registration_initial_access_token_sha256 = if let Some(path) =
+                dynamic_registration_token_file
+            {
+                if profile != "oidc-fapi-ciba" {
+                    bail!(
+                        "--dynamic-registration-token-file is supported only for the oidc-fapi-ciba profile"
+                    );
+                }
+                Some(read_conformance_token_sha256(&path)?)
+            } else {
+                None
+            };
+            let ciba_automated_decision_token_sha256 = if let Some(path) =
+                ciba_automated_decision_token_file
+            {
+                if profile != "oidc-fapi-ciba" {
+                    bail!(
+                        "--ciba-automated-decision-token-file is supported only for the oidc-fapi-ciba profile"
+                    );
+                }
+                Some(read_conformance_token_sha256(&path)?)
+            } else {
+                None
+            };
             let public_material = if profile == "openid4vc" {
                 let metadata = fs::symlink_metadata(&material)
                     .context("failed to inspect OpenID4VC conformance material")?;
@@ -347,6 +373,8 @@ fn conformance_operation(command: ConformanceLeaseCommand) -> anyhow::Result<Tas
                 profile,
                 material_sha256,
                 public_material,
+                dynamic_registration_initial_access_token_sha256,
+                ciba_automated_decision_token_sha256,
                 ttl_seconds,
             }
         }
@@ -363,6 +391,78 @@ fn conformance_operation(command: ConformanceLeaseCommand) -> anyhow::Result<Tas
             TaskOperation::ConformanceLeaseCleanup
         }
     })
+}
+
+const MAX_CONFORMANCE_TOKEN_FILE_BYTES: u64 = 4096;
+
+fn read_conformance_token_sha256(path: &Path) -> anyhow::Result<String> {
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to inspect conformance token file {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "conformance token file must be a regular non-symlink file: {}",
+            path.display()
+        );
+    }
+    validate_conformance_token_metadata(&metadata)?;
+
+    let file = File::open(path)
+        .with_context(|| format!("failed to open conformance token file {}", path.display()))?;
+    let opened_metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect opened conformance token file {}",
+            path.display()
+        )
+    })?;
+    validate_same_file(&metadata, &opened_metadata, "conformance token file")?;
+    validate_conformance_token_metadata(&opened_metadata)?;
+
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    file.take(MAX_CONFORMANCE_TOKEN_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read conformance token file {}", path.display()))?;
+    if bytes.is_empty() {
+        bail!("conformance token file must not be empty");
+    }
+    if bytes.len() as u64 > MAX_CONFORMANCE_TOKEN_FILE_BYTES {
+        bail!(
+            "conformance token file exceeds the {} byte limit",
+            MAX_CONFORMANCE_TOKEN_FILE_BYTES
+        );
+    }
+    Ok(encode_controller_digest(&Sha256::digest(bytes.as_slice())))
+}
+
+#[cfg(unix)]
+fn validate_conformance_token_metadata(metadata: &fs::Metadata) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let current_uid = Process::new("id")
+        .arg("-u")
+        .stdout()?
+        .trim()
+        .parse::<u32>()
+        .context("current process has no valid numeric UID")?;
+    if metadata.uid() != 0 && metadata.uid() != current_uid {
+        bail!("conformance token file has an unexpected owner");
+    }
+    if metadata.nlink() != 1 {
+        bail!("conformance token file must have exactly one hard link");
+    }
+    let mode = metadata.mode() & 0o7777;
+    if mode & !0o600 != 0 || mode & 0o400 == 0 {
+        bail!("conformance token file permissions must be 0400 or 0600");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_conformance_token_metadata(_metadata: &fs::Metadata) -> anyhow::Result<()> {
+    Ok(())
 }
 
 pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
@@ -1932,7 +2032,7 @@ fn read_bootstrap_token(path: &Path, expected_owner_uid: Option<u32>) -> anyhow:
     let opened_metadata = file
         .metadata()
         .context("failed to inspect opened initial administrator token")?;
-    validate_same_file(&metadata, &opened_metadata)?;
+    validate_same_file(&metadata, &opened_metadata, "initial administrator token")?;
     let mut bytes = Vec::new();
     file.take(MAX_BOOTSTRAP_TOKEN_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -2022,17 +2122,25 @@ fn validate_bootstrap_secret_metadata(
 }
 
 #[cfg(unix)]
-fn validate_same_file(before: &fs::Metadata, opened: &fs::Metadata) -> anyhow::Result<()> {
+fn validate_same_file(
+    before: &fs::Metadata,
+    opened: &fs::Metadata,
+    description: &str,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
 
     if before.dev() != opened.dev() || before.ino() != opened.ino() {
-        bail!("initial administrator token changed while it was being opened");
+        bail!("{description} changed while it was being opened");
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn validate_same_file(_before: &fs::Metadata, _opened: &fs::Metadata) -> anyhow::Result<()> {
+fn validate_same_file(
+    _before: &fs::Metadata,
+    _opened: &fs::Metadata,
+    _description: &str,
+) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -4230,10 +4338,17 @@ fn require_root() -> anyhow::Result<()> {
     if test_mode() {
         return Ok(());
     }
-    if Process::new("id").arg("-u").stdout()?.trim() != "0" {
-        bail!("this command requires root");
+    #[cfg(not(unix))]
+    {
+        bail!("this command requires root on a Unix host");
     }
-    Ok(())
+    #[cfg(unix)]
+    {
+        if Process::new("id").arg("-u").stdout()?.trim() != "0" {
+            bail!("this command requires root");
+        }
+        Ok(())
+    }
 }
 
 fn test_mode() -> bool {

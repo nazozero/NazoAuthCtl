@@ -178,6 +178,8 @@ pub(crate) enum ConformanceLeaseCommand {
     Create {
         profile: String,
         material: PathBuf,
+        dynamic_registration_token_file: Option<PathBuf>,
+        ciba_automated_decision_token_file: Option<PathBuf>,
         ttl_seconds: u64,
         yes: bool,
     },
@@ -524,9 +526,13 @@ fn parse_conformance(mut values: Vec<String>) -> anyhow::Result<ConformanceComma
         }
         "create" => {
             let (values, yes) = take_yes(values)?;
-            let values = parse_named_options_for(
+            let values = parse_named_options_for_with_optional(
                 values,
                 &["--profile", "--material", "--ttl-seconds"],
+                &[
+                    "--dynamic-registration-token-file",
+                    "--ciba-automated-decision-token-file",
+                ],
                 "conformance lease create",
             )?;
             let ttl_seconds = values["--ttl-seconds"]
@@ -538,6 +544,12 @@ fn parse_conformance(mut values: Vec<String>) -> anyhow::Result<ConformanceComma
             ConformanceLeaseCommand::Create {
                 profile: values["--profile"].clone(),
                 material: PathBuf::from(&values["--material"]),
+                dynamic_registration_token_file: values
+                    .get("--dynamic-registration-token-file")
+                    .map(PathBuf::from),
+                ciba_automated_decision_token_file: values
+                    .get("--ciba-automated-decision-token-file")
+                    .map(PathBuf::from),
                 ttl_seconds,
                 yes,
             }
@@ -639,7 +651,19 @@ fn parse_named_options_for(
     expected: &[&str],
     command: &str,
 ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
-    if values.len() != expected.len() * 2 {
+    parse_named_options_for_with_optional(values, expected, &[], command)
+}
+
+fn parse_named_options_for_with_optional(
+    values: Vec<String>,
+    required: &[&str],
+    optional: &[&str],
+    command: &str,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    if !values.len().is_multiple_of(2)
+        || values.len() < required.len() * 2
+        || values.len() > (required.len() + optional.len()) * 2
+    {
         bail!("{command} has missing or unexpected options");
     }
     let mut parsed = std::collections::BTreeMap::new();
@@ -648,9 +672,14 @@ fn parse_named_options_for(
         let value = values
             .next()
             .with_context(|| format!("{command} option has no value"))?;
-        if !expected.contains(&key.as_str()) || parsed.insert(key, value).is_some() {
+        if (!required.contains(&key.as_str()) && !optional.contains(&key.as_str()))
+            || parsed.insert(key, value).is_some()
+        {
             bail!("{command} has duplicate or unexpected options");
         }
+    }
+    if required.iter().any(|key| !parsed.contains_key(*key)) {
+        bail!("{command} has missing or unexpected options");
     }
     Ok(parsed)
 }
