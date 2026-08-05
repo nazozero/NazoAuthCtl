@@ -905,6 +905,29 @@ fn every_pre_migration_fault_window_restores_the_previous_runtime() {
 }
 
 #[test]
+fn mfa_totp_runtime_upgrade_keeps_inline_key_sources_unmounted() {
+    let work = PrivateTempDir::new("nazoauth-mfa-totp-inline-upgrade").unwrap();
+    let config_path = work.path().join("config/update.json");
+    let config_dir = config_path.parent().unwrap();
+    fs::create_dir_all(config_dir).unwrap();
+    fs::write(
+        config_dir.join(".env.yaml"),
+        "MFA_TOTP_ENCRYPTION_KEY: \"inline-key\"\n",
+    )
+    .unwrap();
+    let mut value = config(&work);
+
+    persist_mfa_totp_runtime_upgrade(&config_path, &mut value).unwrap();
+
+    let server_config = fs::read_to_string(config_dir.join(".env.yaml")).unwrap();
+    assert!(server_config.contains("MFA_TOTP_ENCRYPTION_KEY: \"inline-key\"\n"));
+    assert!(server_config.contains("MFA_TOTP_ENCRYPTION_KEY_ID: \"nazoauth-mfa-totp-v1\"\n"));
+    assert!(value.runtime.snapshot_paths.is_empty());
+    assert!(value.runtime.mounts.is_empty());
+    assert!(!config_path.exists());
+}
+
+#[test]
 fn migration_faults_always_unwind_without_the_faulting_server() {
     let work = PrivateTempDir::new("nazoauth-update-migration").unwrap();
     let config = config(&work);

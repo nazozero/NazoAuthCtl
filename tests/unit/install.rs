@@ -154,6 +154,7 @@ fn host_service_unit_exposes_only_runtime_state() {
     assert!(unit.contains(
         "InaccessiblePaths=/var/lib/nazoauth/app/operator-state /etc/nazoauth/operator /var/lib/nazoauth/recovery /etc/nazoauth/secrets/database-migration-url"
     ));
+    assert!(!unit.contains("ReadWritePaths=/etc/nazoauth/secrets"));
     assert!(!unit.contains("ReadWritePaths=/var/lib/nazoauth/app\n"));
 }
 
@@ -587,6 +588,30 @@ fn fresh_server_config_persists_bootstrap_deployment_identity_without_rewriting_
     let target = config_dir.join(".env.yaml");
     let rendered = fs::read_to_string(&target).unwrap();
     assert!(rendered.contains("DEPLOYMENT_ID: \"deployment-bootstrap\"\n"));
+    assert!(rendered.contains(
+        "MFA_TOTP_ENCRYPTION_KEY_FILE: \"/run/nazoauth-secrets/mfa-totp-encryption-key\"\n"
+    ));
+    assert!(rendered.contains("MFA_TOTP_ENCRYPTION_KEY_ID: \"nazoauth-mfa-totp-v1\"\n"));
+
+    let host_config_dir = work.path().join("host-config");
+    fs::create_dir(&host_config_dir).unwrap();
+    let host_data_root = work.path().join("host-data");
+    write_server_config(
+        &host_config_dir,
+        &options,
+        "deployment-bootstrap",
+        RuntimeBackendKind::Systemd,
+        &host_data_root,
+        None,
+        None,
+    )
+    .unwrap();
+    let host_rendered = fs::read_to_string(host_config_dir.join(".env.yaml")).unwrap();
+    assert!(host_rendered.contains(&format!(
+        "MFA_TOTP_ENCRYPTION_KEY_FILE: \"{}\"\n",
+        mfa_totp_key_path(&host_config_dir).display()
+    )));
+    assert!(managed_mfa_totp_source(&host_config_dir, RuntimeBackendKind::Systemd).unwrap());
 
     fs::write(&target, "DEPLOYMENT_ID: existing\n").unwrap();
     write_server_config(
@@ -605,6 +630,89 @@ fn fresh_server_config_persists_bootstrap_deployment_identity_without_rewriting_
     );
 }
 
+#[test]
+fn mfa_totp_key_is_32_byte_base64url_and_idempotent() {
+    let work = PrivateTempDir::new("mfa-totp-key").unwrap();
+    let key_path = mfa_totp_key_path(&work.path().join("config"));
+
+    ensure_mfa_totp_key(&key_path).unwrap();
+    let first = fs::read_to_string(&key_path).unwrap();
+    assert_eq!(URL_SAFE_NO_PAD.decode(first.trim()).unwrap().len(), 32);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o440
+        );
+    }
+    ensure_mfa_totp_key(&key_path).unwrap();
+    assert_eq!(fs::read_to_string(key_path).unwrap(), first);
+}
+
+#[test]
+fn mfa_totp_upgrade_fills_missing_config_without_replacing_existing_key_sources() {
+    let work = PrivateTempDir::new("mfa-totp-upgrade").unwrap();
+    let config_dir = work.path().join("config");
+    fs::create_dir(&config_dir).unwrap();
+    let target = config_dir.join(".env.yaml");
+    fs::write(&target, "PUBLIC_BASE_URL: \"https://auth.example\"\n").unwrap();
+
+    ensure_mfa_totp_configuration(&config_dir, RuntimeBackendKind::Podman).unwrap();
+    let first = fs::read_to_string(&target).unwrap();
+    assert!(first.contains(
+        "MFA_TOTP_ENCRYPTION_KEY_FILE: \"/run/nazoauth-secrets/mfa-totp-encryption-key\"\n"
+    ));
+    assert!(first.contains("MFA_TOTP_ENCRYPTION_KEY_ID: \"nazoauth-mfa-totp-v1\"\n"));
+    let key_path = mfa_totp_key_path(&config_dir);
+    let key = fs::read_to_string(&key_path).unwrap();
+    assert_eq!(URL_SAFE_NO_PAD.decode(key.trim()).unwrap().len(), 32);
+
+    ensure_mfa_totp_configuration(&config_dir, RuntimeBackendKind::Podman).unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), first);
+    assert_eq!(fs::read_to_string(&key_path).unwrap(), key);
+
+    let inline_dir = work.path().join("inline-config");
+    fs::create_dir(&inline_dir).unwrap();
+    fs::write(
+        inline_dir.join(".env.yaml"),
+        "MFA_TOTP_ENCRYPTION_KEY: \"existing-inline-key\"\n",
+    )
+    .unwrap();
+    ensure_mfa_totp_configuration(&inline_dir, RuntimeBackendKind::Podman).unwrap();
+    let inline = fs::read_to_string(inline_dir.join(".env.yaml")).unwrap();
+    assert!(inline.contains("MFA_TOTP_ENCRYPTION_KEY: \"existing-inline-key\"\n"));
+    assert!(inline.contains("MFA_TOTP_ENCRYPTION_KEY_ID: \"nazoauth-mfa-totp-v1\"\n"));
+    assert!(!mfa_totp_key_path(&inline_dir).exists());
+    assert!(!managed_mfa_totp_source(&inline_dir, RuntimeBackendKind::Podman).unwrap());
+
+    let file_dir = work.path().join("file-config");
+    fs::create_dir(&file_dir).unwrap();
+    let existing_file = file_dir.join("existing-mfa.key");
+    fs::write(&existing_file, "external-file-key").unwrap();
+    fs::write(
+        file_dir.join(".env.yaml"),
+        format!(
+            "MFA_TOTP_ENCRYPTION_KEY_FILE: \"{}\"\n",
+            existing_file.display()
+        ),
+    )
+    .unwrap();
+    ensure_mfa_totp_configuration(&file_dir, RuntimeBackendKind::Podman).unwrap();
+    let file_config = fs::read_to_string(file_dir.join(".env.yaml")).unwrap();
+    assert!(file_config.contains(&format!(
+        "MFA_TOTP_ENCRYPTION_KEY_FILE: \"{}\"\n",
+        existing_file.display()
+    )));
+    assert!(file_config.contains("MFA_TOTP_ENCRYPTION_KEY_ID: \"nazoauth-mfa-totp-v1\"\n"));
+    assert_eq!(
+        fs::read_to_string(existing_file).unwrap(),
+        "external-file-key"
+    );
+    assert!(!mfa_totp_key_path(&file_dir).exists());
+    assert!(!managed_mfa_totp_source(&file_dir, RuntimeBackendKind::Podman).unwrap());
+}
+
 #[cfg(unix)]
 #[test]
 fn generated_container_config_exposes_secret_files_but_not_secret_values() {
@@ -613,9 +721,19 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
     let mut options = install_options(work.path().join("data"));
     operator::initialize_identity_generation(&config_dir.join("operator"), &options.recovery_root)
         .unwrap();
+    let secret_dir = config_dir.join("secrets");
+    fs::create_dir(&secret_dir).unwrap();
+    set_mode(&secret_dir, 0o750).unwrap();
+    let mfa_key = mfa_totp_key_path(&config_dir);
+    ensure_mfa_totp_key(&mfa_key).unwrap();
+    fs::write(
+        config_dir.join(".env.yaml"),
+        "MFA_TOTP_ENCRYPTION_KEY_FILE: \"/run/nazoauth-secrets/mfa-totp-encryption-key\"\nMFA_TOTP_ENCRYPTION_KEY_ID: \"nazoauth-mfa-totp-v1\"\n",
+    )
+    .unwrap();
     options.profile = "standards-full".to_owned();
     let config_path = config_dir.join("update.json");
-    let config = build_config(
+    let mut config = build_config(
         &config_path,
         &options,
         RuntimeBackendKind::Podman,
@@ -658,11 +776,69 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
             && mount.selinux_relabel
     }));
     assert!(config.runtime.snapshot_paths.contains(&instance));
+    assert!(config.runtime.mounts.iter().any(|mount| {
+        mount.source == mfa_key
+            && mount.target == Path::new(MFA_TOTP_CONTAINER_KEY_PATH)
+            && mount.read_only
+            && mount.selinux_relabel
+    }));
     assert!(
-        !config
+        config
             .runtime
             .snapshot_paths
-            .contains(&config_dir.join("secrets"))
+            .contains(&options.data_root.join("app/secrets"))
+    );
+    assert!(config.runtime.snapshot_paths.contains(&secret_dir));
+    assert_eq!(mfa_key.parent(), Some(secret_dir.as_path()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(&secret_dir).unwrap().permissions().mode() & 0o022,
+            0
+        );
+    }
+
+    let mut stale = config.clone();
+    stale
+        .runtime
+        .mounts
+        .retain(|mount| mount.target != Path::new(MFA_TOTP_CONTAINER_KEY_PATH));
+    stale
+        .runtime
+        .snapshot_paths
+        .retain(|path| path != &secret_dir);
+    assert!(ensure_mfa_totp_runtime(&config_dir, &mut stale).unwrap());
+    assert!(stale.runtime.mounts.iter().any(|mount| {
+        mount.source == mfa_key
+            && mount.target == Path::new(MFA_TOTP_CONTAINER_KEY_PATH)
+            && mount.read_only
+            && mount.selinux_relabel
+    }));
+    assert!(stale.runtime.snapshot_paths.contains(&secret_dir));
+    assert!(!ensure_mfa_totp_runtime(&config_dir, &mut stale).unwrap());
+
+    let mut conflict = stale.clone();
+    conflict
+        .runtime
+        .mounts
+        .iter_mut()
+        .find(|mount| mount.target == Path::new(MFA_TOTP_CONTAINER_KEY_PATH))
+        .unwrap()
+        .source = options.data_root.join("app/secrets/old-mfa.key");
+    assert!(
+        ensure_mfa_totp_runtime(&config_dir, &mut conflict)
+            .unwrap_err()
+            .to_string()
+            .contains("managed MFA TOTP mount conflicts")
+    );
+
+    fs::remove_file(&mfa_key).unwrap();
+    assert!(
+        ensure_mfa_totp_runtime(&config_dir, &mut stale)
+            .unwrap_err()
+            .to_string()
+            .contains("restore")
     );
     assert!(
         !config

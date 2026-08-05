@@ -2576,16 +2576,16 @@ fn register_installed_deployment(
 }
 
 fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> anyhow::Result<()> {
+    let mut config = config.clone();
     let release = VerifiedRelease::fetch(
         &config.repository,
         options.version.as_deref(),
         config.container_backend(),
     )?;
-    enforce_release_trust(config, &release.manifest)?;
-    release.persist_verification_evidence(&release_cache_dir(config, &release.manifest))?;
-    let runtime = Runtime::new(config);
-    let current = runtime.active_revision()?;
-    let active = load_active_release(config)?;
+    enforce_release_trust(&config, &release.manifest)?;
+    release.persist_verification_evidence(&release_cache_dir(&config, &release.manifest))?;
+    let current = Runtime::new(&config).active_revision()?;
+    let active = load_active_release(&config)?;
     let minimum = format!("v{}", release.manifest.rollback.minimum_supported_version);
     if compare_versions(&active.version, &minimum)? == std::cmp::Ordering::Less {
         bail!(
@@ -2595,7 +2595,7 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
         );
     }
     if options.plan {
-        print_update_plan(config, &active.version, &current, &release.manifest)?;
+        print_update_plan(&config, &active.version, &current, &release.manifest)?;
         return Ok(());
     }
     if current == release.manifest.backend_commit {
@@ -2611,8 +2611,12 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
             "this Release crosses an irreversible migration barrier; inspect update --plan and repeat with --accept-migration-barrier --yes"
         );
     }
+    // Complete legacy MFA configuration before the update journal and its
+    // recovery backup are created. The backup must include the durable key.
+    persist_mfa_totp_runtime_upgrade(config_path, &mut config)?;
+    let runtime = Runtime::new(&config);
     crate::operator::append_management_event(
-        config,
+        &config,
         "update-intent",
         &release.manifest.version,
         recovery_boundary_name(release.manifest.rollback.database_restore),
@@ -2622,7 +2626,7 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
     } else {
         None
     };
-    let previous_manifest = load_active_release(config)?;
+    let previous_manifest = load_active_release(&config)?;
     let previous_ui = Some(
         config
             .ui
@@ -2637,11 +2641,11 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
     } else {
         previous_manifest.image_ref()?
     };
-    cache_trusted_runtime(config, &previous_manifest, &previous_runtime)?;
+    cache_trusted_runtime(&config, &previous_manifest, &previous_runtime)?;
 
     let candidate = if config.runtime.backend == RuntimeBackendKind::Systemd {
         install_host_candidate(
-            config,
+            &config,
             &release,
             runtime_artifact
                 .as_deref()
@@ -2675,14 +2679,28 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
         candidate_ui,
         backup: None,
     };
-    write_update_journal(config, &journal)?;
-    if let Err(error) = advance_update_transaction(config_path, config, &mut journal) {
-        return handle_update_failure(config, &journal, error);
+    write_update_journal(&config, &journal)?;
+    if let Err(error) = advance_update_transaction(config_path, &config, &mut journal) {
+        return handle_update_failure(&config, &journal, error);
     }
     println!(
         "NazoAuth updated to {} ({})",
         release.manifest.version, release.manifest.backend_commit
     );
+    Ok(())
+}
+
+fn persist_mfa_totp_runtime_upgrade(
+    config_path: &Path,
+    config: &mut UpdateConfig,
+) -> anyhow::Result<()> {
+    let config_dir = config_path
+        .parent()
+        .context("update config path has no parent directory")?;
+    if !install::ensure_mfa_totp_runtime(config_dir, config)? {
+        return Ok(());
+    }
+    atomic_write(config_path, &serde_json::to_vec_pretty(config)?, 0o600)?;
     Ok(())
 }
 
