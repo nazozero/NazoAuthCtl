@@ -567,6 +567,44 @@ fn external_urls_are_persisted_only_as_private_secret_files() {
     }
 }
 
+#[test]
+fn fresh_server_config_persists_bootstrap_deployment_identity_without_rewriting_existing() {
+    let work = PrivateTempDir::new("server-config-deployment-identity").unwrap();
+    let config_dir = work.path().join("config");
+    fs::create_dir(&config_dir).unwrap();
+    let options = install_options(work.path().join("data"));
+
+    write_server_config(
+        &config_dir,
+        &options,
+        "deployment-bootstrap",
+        RuntimeBackendKind::Podman,
+        &options.data_root,
+        None,
+        None,
+    )
+    .unwrap();
+    let target = config_dir.join(".env.yaml");
+    let rendered = fs::read_to_string(&target).unwrap();
+    assert!(rendered.contains("DEPLOYMENT_ID: \"deployment-bootstrap\"\n"));
+
+    fs::write(&target, "DEPLOYMENT_ID: existing\n").unwrap();
+    write_server_config(
+        &config_dir,
+        &options,
+        "deployment-replacement",
+        RuntimeBackendKind::Podman,
+        &options.data_root,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(target).unwrap(),
+        "DEPLOYMENT_ID: existing\n"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn generated_container_config_exposes_secret_files_but_not_secret_values() {
@@ -612,6 +650,14 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
             })
         );
     }
+    let instance = options.data_root.join("app/instance");
+    assert!(config.runtime.mounts.iter().any(|mount| {
+        mount.source == instance
+            && mount.target == Path::new("/var/lib/nazo_oauth/instance")
+            && !mount.read_only
+            && mount.selinux_relabel
+    }));
+    assert!(config.runtime.snapshot_paths.contains(&instance));
     assert!(
         !config
             .runtime
