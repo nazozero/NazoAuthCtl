@@ -688,6 +688,61 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
     );
 }
 
+#[test]
+fn managed_runtime_database_grants_keep_the_audit_ledger_api_least_privileged() {
+    let sql = std::str::from_utf8(MANAGED_RUNTIME_DATABASE_GRANT_SQL)
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(sql.contains(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO nazoauth_runtime;"
+    ));
+    assert!(sql.contains(
+        "REVOKE ALL ON TABLE public.security_audit_chain_state, public.security_audit_events, public.security_audit_event_outbox FROM nazoauth_runtime;"
+    ));
+    assert!(sql.contains(
+        "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO nazoauth_runtime;"
+    ));
+    assert!(sql.contains("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO nazoauth_runtime;"));
+
+    assert!(sql.contains(
+        "REVOKE ALL ON FUNCTION public.nazo_reject_security_audit_event_mutation(), public.nazo_claim_security_audit_events(BIGINT, INTEGER), public.nazo_ack_security_audit_event(UUID, INTEGER), public.nazo_reschedule_security_audit_event(UUID, INTEGER, TIMESTAMPTZ, TEXT), public.nazo_security_audit_anchor_health() FROM nazoauth_runtime;"
+    ));
+    assert!(sql.contains(
+        "GRANT EXECUTE ON FUNCTION public.nazo_security_audit_privilege_preflight(BOOLEAN, BOOLEAN, BOOLEAN), public.nazo_security_audit_chain_head_for_update(), public.nazo_append_security_audit_event(UUID, TEXT, TEXT, JSONB, TIMESTAMPTZ, BYTEA, BYTEA), public.nazo_security_audit_anchor_freshness() TO nazoauth_runtime;"
+    ));
+
+    for revoke in [
+        "ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public REVOKE ALL ON TABLES FROM nazoauth_runtime;",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public REVOKE ALL ON SEQUENCES FROM nazoauth_runtime;",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM nazoauth_runtime;",
+    ] {
+        assert!(
+            sql.contains(revoke),
+            "missing default-privilege revoke: {revoke}"
+        );
+    }
+    assert!(
+        !sql.contains("ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public GRANT")
+    );
+
+    assert!(
+        sql.find("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES")
+            .unwrap()
+            < sql
+                .find("REVOKE ALL ON TABLE public.security_audit_chain_state")
+                .unwrap()
+    );
+    assert!(
+        sql.find("GRANT EXECUTE ON ALL FUNCTIONS").unwrap()
+            < sql
+                .find("REVOKE ALL ON FUNCTION public.nazo_reject_security_audit_event_mutation")
+                .unwrap()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn managed_directory_rejects_symlink_targets() {

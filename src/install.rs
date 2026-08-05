@@ -1212,16 +1212,39 @@ pub(crate) fn grant_runtime_database(config: &UpdateConfig) -> anyhow::Result<()
     if config.dependencies.mode != "managed" {
         return Ok(());
     }
-    let sql = b"GRANT CONNECT ON DATABASE oauth TO nazoauth_runtime;\n\
-        GRANT USAGE ON SCHEMA public TO nazoauth_runtime;\n\
-        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO nazoauth_runtime;\n\
-        GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO nazoauth_runtime;\n\
-        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO nazoauth_runtime;\n\
-        ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO nazoauth_runtime;\n\
-        ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO nazoauth_runtime;\n\
-        ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO nazoauth_runtime;\n";
-    crate::runtime::Runtime::new(config).execute_managed_postgres(sql)
+    crate::runtime::Runtime::new(config)
+        .execute_managed_postgres(MANAGED_RUNTIME_DATABASE_GRANT_SQL)
 }
+
+const MANAGED_RUNTIME_DATABASE_GRANT_SQL: &[u8] = b"GRANT CONNECT ON DATABASE oauth TO nazoauth_runtime;\n\
+    GRANT USAGE ON SCHEMA public TO nazoauth_runtime;\n\
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO nazoauth_runtime;\n\
+    REVOKE ALL ON TABLE\n\
+        public.security_audit_chain_state,\n\
+        public.security_audit_events,\n\
+        public.security_audit_event_outbox\n\
+    FROM nazoauth_runtime;\n\
+    GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO nazoauth_runtime;\n\
+    GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO nazoauth_runtime;\n\
+    REVOKE ALL ON FUNCTION\n\
+        public.nazo_reject_security_audit_event_mutation(),\n\
+        public.nazo_claim_security_audit_events(BIGINT, INTEGER),\n\
+        public.nazo_ack_security_audit_event(UUID, INTEGER),\n\
+        public.nazo_reschedule_security_audit_event(UUID, INTEGER, TIMESTAMPTZ, TEXT),\n\
+        public.nazo_security_audit_anchor_health()\n\
+    FROM nazoauth_runtime;\n\
+    GRANT EXECUTE ON FUNCTION\n\
+        public.nazo_security_audit_privilege_preflight(BOOLEAN, BOOLEAN, BOOLEAN),\n\
+        public.nazo_security_audit_chain_head_for_update(),\n\
+        public.nazo_append_security_audit_event(UUID, TEXT, TEXT, JSONB, TIMESTAMPTZ, BYTEA, BYTEA),\n\
+        public.nazo_security_audit_anchor_freshness()\n\
+    TO nazoauth_runtime;\n\
+    ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public\n\
+        REVOKE ALL ON TABLES FROM nazoauth_runtime;\n\
+    ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public\n\
+        REVOKE ALL ON SEQUENCES FROM nazoauth_runtime;\n\
+    ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public\n\
+        REVOKE ALL ON FUNCTIONS FROM nazoauth_runtime;\n";
 
 pub(crate) fn verify_runtime_no_ddl(config: &UpdateConfig) -> anyhow::Result<()> {
     if test_mode() {
