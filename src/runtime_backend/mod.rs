@@ -209,6 +209,9 @@ pub(crate) struct RuntimeDatabasePrivilegeProbe {
 #[derive(Clone, Debug)]
 pub(crate) struct HostServiceInstall {
     pub(crate) service_name: String,
+    pub(crate) deployment_id: String,
+    pub(crate) runtime_instance_id: String,
+    pub(crate) control_authority: String,
     pub(crate) service_user: String,
     pub(crate) working_directory: PathBuf,
     pub(crate) binary: PathBuf,
@@ -244,6 +247,15 @@ pub(crate) trait RuntimeBackend {
     fn available(&self) -> bool;
     fn discover(&self) -> anyhow::Result<Vec<RuntimeObservation>>;
     fn inspect(&self, object_reference: &str) -> anyhow::Result<RuntimeObservation>;
+    /// Inspect a locator when it may legitimately be absent. Backends must
+    /// distinguish a confirmed not-found result from an inspection failure;
+    /// callers use this before destructive replacement.
+    fn inspect_optional(
+        &self,
+        object_reference: &str,
+    ) -> anyhow::Result<Option<RuntimeObservation>> {
+        self.inspect(object_reference).map(Some)
+    }
     fn start(&self, object_reference: &str) -> anyhow::Result<()>;
     fn stop(&self, object_reference: &str) -> anyhow::Result<()>;
     fn quiesce_for_recovery(&self, object_reference: &str) -> anyhow::Result<()>;
@@ -287,6 +299,7 @@ pub(crate) trait RuntimeBackend {
         &self,
         object_reference: &str,
         deployment_id: &str,
+        runtime_instance_id: &str,
         control_authority: &str,
     ) -> anyhow::Result<()> {
         let observation = self.inspect(object_reference)?;
@@ -298,8 +311,12 @@ pub(crate) trait RuntimeBackend {
             .labels
             .get("io.nazoauth.control-authority")
             .is_some_and(|value| value == control_authority);
-        if !deployment_matches || !authority_matches {
-            bail!("runtime ownership labels do not match the authorized deployment")
+        let runtime_matches = observation
+            .labels
+            .get("io.nazoauth.runtime-instance-id")
+            .is_some_and(|value| value == runtime_instance_id);
+        if !deployment_matches || !runtime_matches || !authority_matches {
+            bail!("runtime ownership labels do not match the authorized deployment and runtime")
         }
         Ok(())
     }
@@ -338,12 +355,13 @@ pub(crate) fn backend_with_command(
 }
 
 pub(super) fn safe_environment(values: &[serde_json::Value]) -> BTreeMap<String, String> {
-    const ALLOWED: [&str; 6] = [
+    const ALLOWED: [&str; 7] = [
         "ISSUER",
         "PUBLIC_BASE_URL",
         "DATA_DIR",
         "DEPLOYMENT_ID",
         "RUNTIME_INSTANCE_ID",
+        "CONTROL_AUTHORITY",
         "INSTANCE_IDENTITY_DIR",
     ];
     values

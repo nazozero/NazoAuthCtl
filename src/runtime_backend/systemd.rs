@@ -138,6 +138,51 @@ impl RuntimeBackend for SystemdBackend {
         })
     }
 
+    fn verify_ownership(
+        &self,
+        object_reference: &str,
+        deployment_id: &str,
+        runtime_instance_id: &str,
+        control_authority: &str,
+    ) -> anyhow::Result<()> {
+        validate_mutable_unit(object_reference)?;
+        let observation = self.inspect(object_reference)?;
+        if !observation.server_command_verified
+            || !observation
+                .safe_environment
+                .get("DEPLOYMENT_ID")
+                .is_some_and(|value| value == deployment_id)
+            || !observation
+                .safe_environment
+                .get("RUNTIME_INSTANCE_ID")
+                .is_some_and(|value| value == runtime_instance_id)
+            || !observation
+                .safe_environment
+                .get("CONTROL_AUTHORITY")
+                .is_some_and(|value| value == control_authority)
+        {
+            bail!("systemd unit identity does not match the authorized runtime");
+        }
+        let fragment_path = Process::new("systemctl")
+            .args([
+                "show",
+                object_reference,
+                "--property=FragmentPath",
+                "--value",
+            ])
+            .stdout()?
+            .trim()
+            .to_owned();
+        let metadata = fs::symlink_metadata(&fragment_path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || !fs::read_to_string(&fragment_path)?.starts_with("# Managed by nazoauthctl\n")
+        {
+            bail!("systemd unit is not an authorized nazoauthctl-managed file");
+        }
+        Ok(())
+    }
+
     fn start(&self, object_reference: &str) -> anyhow::Result<()> {
         validate_mutable_unit(object_reference)?;
         Process::new("systemctl")
@@ -437,6 +482,9 @@ pub(crate) fn render_host_service_unit(install: &HostServiceInstall) -> String {
          Group={user}\n\
          WorkingDirectory={working}\n\
          ExecStart={binary} server\n\
+         Environment=DEPLOYMENT_ID={deployment_id}\n\
+         Environment=RUNTIME_INSTANCE_ID={runtime_instance_id}\n\
+         Environment=CONTROL_AUTHORITY={control_authority}\n\
          Environment=DATA_DIR={app_root}\n\
          Environment=INSTANCE_IDENTITY_DIR={instance_dir}\n\
          Restart=on-failure\n\
@@ -458,6 +506,9 @@ pub(crate) fn render_host_service_unit(install: &HostServiceInstall) -> String {
          [Install]\n\
          WantedBy=multi-user.target\n",
         user = install.service_user,
+        deployment_id = install.deployment_id,
+        runtime_instance_id = install.runtime_instance_id,
+        control_authority = install.control_authority,
         working = install.working_directory.display(),
         binary = install.binary.display(),
         app_root = install.app_root.display(),

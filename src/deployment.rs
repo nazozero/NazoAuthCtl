@@ -173,6 +173,26 @@ impl CapabilityGrants {
             Capability::ProxyTls => &mut self.proxy_tls,
         }
     }
+
+    /// Validate the capability lattice at every persistence boundary.
+    ///
+    /// A shared resource may be delegated or left external, but it cannot be
+    /// declared controller-managed: the controller has no exclusive ownership
+    /// or deletion proof for a resource shared with another deployment.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        for capability in Capability::ALL {
+            let grant = self.grant(capability);
+            if grant.scope == ResourceScope::Shared
+                && grant.responsibility == Responsibility::Managed
+            {
+                bail!(
+                    "capability {} cannot be managed when its resource scope is shared",
+                    capability.name()
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -221,6 +241,10 @@ pub(crate) struct MountReference {
 pub(crate) enum SafeReference {
     File {
         path: PathBuf,
+    },
+    DigestBoundFile {
+        path: PathBuf,
+        sha256: String,
     },
     Provider {
         provider: String,
@@ -302,7 +326,7 @@ impl DeploymentRecord {
                 Some(SafeReference::File { .. })
             ) || matches!(
                 self.resources.get("lifecycle_contract"),
-                Some(SafeReference::File { .. })
+                Some(SafeReference::DigestBoundFile { .. })
             ))
             && self.capabilities.runtime.responsibility.permits_mutation()
             && self.capabilities.artifact.responsibility.permits_mutation()
@@ -313,6 +337,7 @@ impl DeploymentRecord {
         if self.schema != DEPLOYMENT_SCHEMA {
             bail!("unsupported deployment declaration schema");
         }
+        self.capabilities.validate()?;
         validate_identifier(&self.deployment_id, "deployment ID")?;
         validate_identifier(&self.control_authority, "control authority")?;
         if let Some(alias) = &self.alias {
@@ -326,6 +351,16 @@ impl DeploymentRecord {
             || self.runtime_instances.is_empty()
         {
             bail!("deployment declaration is incomplete");
+        }
+        for reference in self.resources.values() {
+            if let SafeReference::DigestBoundFile { sha256, .. } = reference
+                && (sha256.len() != 64
+                    || !sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+            {
+                bail!("digest-bound resource has an invalid SHA-256 digest");
+            }
         }
         let mut runtime_ids = BTreeSet::new();
         for runtime in &self.runtime_instances {

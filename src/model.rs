@@ -351,9 +351,17 @@ impl UpdateConfig {
 }
 
 pub(crate) fn safe_absolute(path: &std::path::Path) -> anyhow::Result<()> {
-    if !path.is_absolute() || path.parent().is_none() {
+    if !path.is_absolute()
+        || path.parent().is_none()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
         bail!(
-            "path must be absolute and must not be the filesystem root: {}",
+            "path must be a normalized absolute non-root path: {}",
             path.display()
         );
     }

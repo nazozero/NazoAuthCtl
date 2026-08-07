@@ -12,10 +12,7 @@ pub(crate) fn recover_registered(
     if !record.core_recovery_is_proven() {
         bail!("deployment has no proven controller-independent recovery contract");
     }
-    let lifecycle_path = match record.resources.get("lifecycle_contract") {
-        Some(SafeReference::File { path }) => path,
-        _ => bail!("deployment has no executable lifecycle contract"),
-    };
+    let lifecycle_path = lifecycle_path(record)?;
     let lifecycle = LifecycleManifest::load(lifecycle_path)?;
     validate_lifecycle_record_binding(&lifecycle, record)?;
     let slot = load_recovery_slot(store, record)?;
@@ -66,6 +63,12 @@ pub(crate) fn recover_registered(
     persist_recovery_transaction(&transaction_path, &transaction)?;
     if transaction.state < RecoveryTransactionState::RuntimesQuiesced {
         for runtime in &lifecycle.runtimes {
+            backend(runtime.backend).verify_ownership(
+                &runtime.object_reference,
+                &record.deployment_id,
+                &runtime.runtime_instance_id,
+                &record.control_authority,
+            )?;
             backend(runtime.backend).quiesce_for_recovery(&runtime.object_reference)?;
         }
         transaction.state = RecoveryTransactionState::RuntimesQuiesced;

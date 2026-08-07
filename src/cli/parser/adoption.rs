@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use anyhow::{Context, bail};
 
@@ -14,6 +14,7 @@ pub(super) fn parse_adoption(values: Vec<String>) -> anyhow::Result<AdoptionOpti
     let mut target = None;
     let mut alias = None;
     let mut capabilities = CapabilityGrants::observed();
+    let mut seen_capabilities = BTreeSet::new();
     let mut recovery_evidence = None;
     let mut lifecycle_contract = None;
     let mut plan = false;
@@ -51,7 +52,12 @@ pub(super) fn parse_adoption(values: Vec<String>) -> anyhow::Result<AdoptionOpti
                             bail!("--alias may be specified only once");
                         }
                     }
-                    "--capability" => apply_capability(&mut capabilities, &value)?,
+                    "--capability" => {
+                        let capability = apply_capability(&mut capabilities, &value)?;
+                        if !seen_capabilities.insert(capability) {
+                            bail!("--capability may be specified only once per capability");
+                        }
+                    }
                     "--recovery-evidence" => {
                         if recovery_evidence.replace(PathBuf::from(value)).is_some() {
                             bail!("--recovery-evidence may be specified only once");
@@ -83,10 +89,13 @@ pub(super) fn parse_adoption(values: Vec<String>) -> anyhow::Result<AdoptionOpti
     })
 }
 
-fn apply_capability(capabilities: &mut CapabilityGrants, value: &str) -> anyhow::Result<()> {
+fn apply_capability(
+    capabilities: &mut CapabilityGrants,
+    value: &str,
+) -> anyhow::Result<Capability> {
     let (capability, parsed) = parse_capability(value)?;
     *capabilities.grant_mut(capability) = parsed;
-    Ok(())
+    Ok(capability)
 }
 
 fn parse_capability(value: &str) -> anyhow::Result<(Capability, CapabilityGrant)> {

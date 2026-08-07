@@ -51,11 +51,19 @@ pub(super) fn execute(
     fs::create_dir_all(&transaction_dir)?;
     let transaction_path = transaction_dir.join("adoption.json");
     let plan_sha256 = hex_sha256(&serde_json::to_vec(plan)?);
+    let lifecycle_sha256 = options
+        .lifecycle_contract
+        .as_deref()
+        .map(LifecycleManifest::digest)
+        .transpose()?;
     if transaction_path.exists() {
         let transaction: AdoptionTransaction =
             serde_json::from_slice(&fs::read(&transaction_path)?)
                 .context("adoption transaction is invalid")?;
-        if transaction.schema != 1 || transaction.plan_sha256 != plan_sha256 {
+        if transaction.schema != 1
+            || transaction.plan_sha256 != plan_sha256
+            || transaction.lifecycle_sha256 != lifecycle_sha256
+        {
             bail!("an existing adoption transaction is bound to a different plan");
         }
         if transaction.state == AdoptionTransactionState::Committed {
@@ -70,6 +78,7 @@ pub(super) fn execute(
                 schema: 1,
                 state: AdoptionTransactionState::Prepared,
                 plan_sha256: plan_sha256.clone(),
+                lifecycle_sha256: lifecycle_sha256.clone(),
             })?,
             0o600,
         )?;
@@ -102,9 +111,13 @@ pub(super) fn execute(
         &identities.controller_key_id,
     )?;
     if let Some(path) = lifecycle_path {
+        let lifecycle_sha256 = sha256(&path)?;
         record.resources.insert(
             "lifecycle_contract".to_owned(),
-            SafeReference::File { path },
+            SafeReference::DigestBoundFile {
+                path,
+                sha256: lifecycle_sha256,
+            },
         );
         record.validate()?;
     }
@@ -157,6 +170,7 @@ pub(super) fn execute(
             schema: 1,
             state: AdoptionTransactionState::Committed,
             plan_sha256,
+            lifecycle_sha256,
         })?,
         0o600,
     )?;

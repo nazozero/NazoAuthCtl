@@ -129,6 +129,9 @@ fn host_service_unit_exposes_only_runtime_state() {
     let unit = crate::runtime_backend::render_host_service_unit(
         &crate::runtime_backend::HostServiceInstall {
             service_name: "nazoauth.service".to_owned(),
+            deployment_id: "deployment-test".to_owned(),
+            runtime_instance_id: "runtime-test".to_owned(),
+            control_authority: "authority-test".to_owned(),
             service_user: "nazoauth".to_owned(),
             working_directory: PathBuf::from("/etc/nazoauth"),
             binary: PathBuf::from("/usr/local/bin/nazoauth"),

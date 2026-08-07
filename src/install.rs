@@ -322,6 +322,9 @@ pub(crate) fn install_systemd(config: &UpdateConfig) -> anyhow::Result<()> {
     runtime_backend::backend(RuntimeBackendKind::Systemd).install_host_service(
         &HostServiceInstall {
             service_name: config.runtime.service_name.clone(),
+            deployment_id: config.operator.deployment_id.clone(),
+            runtime_instance_id: config.runtime.runtime_instance_id.clone(),
+            control_authority: config.operator.controller_key_id.clone(),
             service_user: config.runtime.service_user.clone(),
             working_directory: config.runtime.working_directory.clone(),
             binary: config.runtime.binary_path.clone(),

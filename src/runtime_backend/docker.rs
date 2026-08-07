@@ -61,6 +61,13 @@ impl RuntimeBackend for DockerBackend {
         discovery::inspect(&self.command, object_reference)
     }
 
+    fn inspect_optional(
+        &self,
+        object_reference: &str,
+    ) -> anyhow::Result<Option<RuntimeObservation>> {
+        discovery::inspect_optional(&self.command, object_reference)
+    }
+
     fn start(&self, object_reference: &str) -> anyhow::Result<()> {
         operations::start(&self.command, object_reference)
     }

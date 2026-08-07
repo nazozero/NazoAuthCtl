@@ -242,6 +242,8 @@ fn external_and_container_dependency_modes_resolve_explicitly() {
     assert!(config.validate().is_err());
     assert!(safe_absolute(std::path::Path::new("relative")).is_err());
     assert!(safe_absolute(std::path::Path::new(&std::path::MAIN_SEPARATOR.to_string())).is_err());
+    assert!(safe_absolute(std::path::Path::new("/var/lib/../nazoauthctl")).is_err());
+    assert!(safe_absolute(std::path::Path::new("/var/lib/./nazoauthctl")).is_err());
 }
 
 #[test]

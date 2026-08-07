@@ -5,6 +5,7 @@ pub(super) fn build_plan(
     replicas: &[DiscoveredDeployment],
     options: &AdoptionOptions,
 ) -> anyhow::Result<AdoptionPlan> {
+    options.capabilities.validate()?;
     let deployment_id = candidate
         .deployment_id
         .clone()
@@ -131,9 +132,14 @@ pub(super) fn build_plan(
             "external Valkey cannot be adopted without provider-specific evidence".to_owned(),
         );
     }
-    if options.capabilities.runtime.responsibility == Responsibility::Managed {
+    if options
+        .capabilities
+        .runtime
+        .responsibility
+        .permits_mutation()
+    {
         blockers.push(
-            "a discovered external runtime cannot become managed until an explicit ownership-label transition is implemented"
+            "mutable runtime authority requires exact deployment, runtime-instance, and control-authority ownership evidence"
                 .to_owned(),
         );
     }

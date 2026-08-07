@@ -4,6 +4,7 @@ pub(crate) fn validate_lifecycle_record_binding(
     lifecycle: &LifecycleManifest,
     record: &DeploymentRecord,
 ) -> anyhow::Result<()> {
+    lifecycle.validate_mutation_scope(&record.capabilities)?;
     if lifecycle.deployment_id != record.deployment_id
         || lifecycle.runtimes.len() != record.runtime_instances.len()
     {
@@ -23,7 +24,15 @@ pub(crate) fn validate_lifecycle_record_binding(
 
 pub(crate) fn lifecycle_path(record: &DeploymentRecord) -> anyhow::Result<&Path> {
     match record.resources.get("lifecycle_contract") {
-        Some(SafeReference::File { path }) => Ok(path),
+        Some(SafeReference::DigestBoundFile {
+            path,
+            sha256: expected,
+        }) => {
+            if sha256(path)? != *expected {
+                bail!("lifecycle contract changed after explicit approval");
+            }
+            Ok(path)
+        }
         _ => bail!("deployment has no executable lifecycle contract"),
     }
 }

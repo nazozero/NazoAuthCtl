@@ -46,7 +46,20 @@ pub(crate) fn activate_cached_runtime(
     if embedded != *expected_release {
         bail!("trusted recovery artifact embedded identity changed before activation");
     }
-    if let Ok(observation) = backend.inspect(&runtime.object_reference) {
+    if let Some(observation) = backend.inspect_optional(&runtime.object_reference)? {
+        if record
+            .capabilities
+            .runtime
+            .responsibility
+            .permits_mutation()
+        {
+            backend.verify_ownership(
+                &runtime.object_reference,
+                &record.deployment_id,
+                &runtime.runtime_instance_id,
+                &record.control_authority,
+            )?;
+        }
         if observation.running {
             backend.stop(&runtime.object_reference)?;
         }
@@ -97,10 +110,16 @@ pub(crate) fn activate_cached_runtime(
             observation.artifact
         );
     }
-    if record.capabilities.runtime.responsibility == Responsibility::Managed {
+    if record
+        .capabilities
+        .runtime
+        .responsibility
+        .permits_mutation()
+    {
         backend.verify_ownership(
             &runtime.object_reference,
             &record.deployment_id,
+            &runtime.runtime_instance_id,
             &record.control_authority,
         )?;
     }

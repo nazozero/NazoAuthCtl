@@ -180,6 +180,26 @@ pub(super) fn inspect(
     })
 }
 
+pub(super) fn inspect_optional(
+    command: &OsStr,
+    object_reference: &str,
+) -> anyhow::Result<Option<RuntimeObservation>> {
+    let output = Process::new(command)
+        .args(["container", "inspect", object_reference])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        if stderr.contains("no such object")
+            || stderr.contains("no such container")
+            || stderr.contains("no container with name or id")
+        {
+            return Ok(None);
+        }
+        bail!("Podman container inspection failed: {}", stderr.trim());
+    }
+    Ok(Some(inspect(command, object_reference)?))
+}
+
 pub(super) fn resolve_image_digest(
     command: &OsStr,
     image_reference: &str,

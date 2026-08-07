@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     deployment::{
         ArtifactReference, Capability, CapabilityGrants, DeploymentRecord, DeploymentStore,
-        Responsibility, RuntimeBackendKind, SafeReference,
+        RuntimeBackendKind, SafeReference,
     },
     discovery::DiscoveredDeployment,
     filesystem::{atomic_write, copy_atomic, remove_file_durable, set_mode, sha256},
@@ -240,42 +240,87 @@ impl LifecycleManifest {
     pub(crate) fn validate_for_adoption(
         &self,
         candidates: &[DiscoveredDeployment],
-        _capabilities: &CapabilityGrants,
+        capabilities: &CapabilityGrants,
     ) -> anyhow::Result<()> {
+        capabilities.validate()?;
         self.validate()?;
         let discovered = candidates
             .iter()
             .filter_map(|candidate| {
-                candidate.runtime_instance_id.as_ref().map(|runtime_id| {
-                    (
-                        runtime_id.as_str(),
-                        (
-                            candidate.runtime.backend,
-                            candidate.runtime.object_reference.as_str(),
-                            &candidate.runtime.mounts,
-                        ),
-                    )
-                })
+                candidate
+                    .runtime_instance_id
+                    .as_ref()
+                    .map(|runtime_id| (runtime_id.as_str(), candidate))
             })
             .collect::<BTreeMap<_, _>>();
         if discovered.len() != candidates.len() || discovered.len() != self.runtimes.len() {
             bail!("lifecycle contract must describe every discovered runtime exactly once");
         }
         for runtime in &self.runtimes {
-            let Some((backend, object_reference, mounts)) = discovered
+            let Some(candidate) = discovered
                 .get(runtime.runtime_instance_id.as_str())
                 .copied()
             else {
                 bail!("lifecycle contract contains an unknown runtime instance");
             };
-            if runtime.backend != backend || runtime.object_reference != object_reference {
+            if runtime.backend != candidate.runtime.backend
+                || runtime.object_reference != candidate.runtime.object_reference
+            {
                 bail!("lifecycle runtime binding differs from discovered runtime identity");
             }
-            for observed in mounts {
-                if !runtime.mounts.iter().any(|declared| declared == observed) {
-                    bail!("lifecycle contract omits a discovered runtime mount");
+            if runtime.networks.iter().collect::<BTreeSet<_>>()
+                != candidate.runtime.networks.iter().collect::<BTreeSet<_>>()
+                || runtime.ports.iter().collect::<BTreeSet<_>>()
+                    != candidate.runtime.ports.iter().collect::<BTreeSet<_>>()
+            {
+                bail!("lifecycle runtime network or port bindings differ from discovery");
+            }
+            for (name, value) in &candidate.runtime.safe_environment {
+                if runtime.environment.get(name) != Some(value) {
+                    bail!("lifecycle runtime environment differs from discovery");
                 }
             }
+            let mut matched = vec![false; runtime.mounts.len()];
+            for observed in &candidate.runtime.mounts {
+                let Some(index) =
+                    runtime
+                        .mounts
+                        .iter()
+                        .enumerate()
+                        .position(|(index, declared)| {
+                            !matched[index]
+                                && mount_matches(
+                                    declared,
+                                    observed,
+                                    candidate.sensitive_mount_sources.get(&observed.destination),
+                                )
+                        })
+                else {
+                    bail!("lifecycle contract does not exactly match discovered runtime mounts");
+                };
+                matched[index] = true;
+            }
+            if matched.iter().any(|matched| !matched) {
+                bail!("lifecycle contract declares an undiscovered runtime mount");
+            }
+        }
+        self.validate_mutation_scope(capabilities)
+    }
+
+    pub(crate) fn validate_mutation_scope(
+        &self,
+        capabilities: &CapabilityGrants,
+    ) -> anyhow::Result<()> {
+        if capabilities.runtime.responsibility.permits_mutation()
+            && self
+                .runtimes
+                .iter()
+                .flat_map(|runtime| runtime.mounts.iter())
+                .any(|mount| mount.scope == crate::deployment::ResourceScope::Shared)
+        {
+            bail!(
+                "mutable lifecycle runtime cannot use a shared mount without provider-specific locking and deletion evidence"
+            );
         }
         Ok(())
     }
@@ -307,14 +352,22 @@ impl LifecycleManifest {
             }
             validate_container_policy(runtime.backend, runtime.container_policy.as_ref())?;
             validate_environment(runtime.backend, &runtime.environment)?;
+            let mut mount_destinations = BTreeSet::new();
             for mount in &runtime.mounts {
                 validate_absolute_path(&mount.source, "runtime mount source")?;
                 if !runtime_path_is_absolute(runtime.backend, &mount.destination) {
                     bail!("runtime mount destination must be absolute");
                 }
+                if !mount_destinations.insert(&mount.destination) {
+                    bail!("lifecycle runtime contains duplicate mount destinations");
+                }
             }
+            let mut network_and_ports = BTreeSet::new();
             for value in runtime.networks.iter().chain(runtime.ports.iter()) {
                 validate_boundary(value, "runtime network or port")?;
+                if !network_and_ports.insert(value) {
+                    bail!("lifecycle runtime contains duplicate network or port bindings");
+                }
             }
             if let Some(ip_address) = &runtime.ip_address {
                 ip_address
@@ -339,6 +392,20 @@ impl LifecycleManifest {
         }
         self.recovery_driver.validate(&self.runtimes)
     }
+}
+
+fn mount_matches(
+    declared: &NeutralMount,
+    observed: &NeutralMount,
+    sensitive_source: Option<&PathBuf>,
+) -> bool {
+    let observed_source = sensitive_source.unwrap_or(&observed.source);
+    declared.source == *observed_source
+        && declared.destination == observed.destination
+        && declared.read_only == observed.read_only
+        && declared.selinux_relabel == observed.selinux_relabel
+        && declared.ownership == observed.ownership
+        && declared.scope == observed.scope
 }
 
 #[cfg(test)]

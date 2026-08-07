@@ -201,19 +201,20 @@ fn validate_grant_transition(
         bail!("capability expansion requires a proven recovery package");
     }
     if capability == Capability::Runtime
-        && grant.responsibility == Responsibility::Managed
+        && grant.responsibility.permits_mutation()
         && record.runtime_instances.iter().any(|runtime| {
             backend(runtime.backend)
                 .verify_ownership(
                     &runtime.object_reference,
                     &record.deployment_id,
+                    &runtime.runtime_instance_id,
                     &record.control_authority,
                 )
                 .is_err()
         })
     {
         bail!(
-            "runtime cannot become managed without exact deployment and control-authority labels"
+            "runtime cannot become mutable without exact deployment, runtime-instance, and control-authority labels"
         );
     }
     Ok(())

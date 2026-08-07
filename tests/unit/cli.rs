@@ -91,6 +91,21 @@ fn bootstrap_admin_accepts_only_explicit_secret_input_modes() {
     ] {
         assert!(parse(arguments).is_err(), "accepted {arguments:?}");
     }
+
+    assert!(
+        parse(&[
+            "nazoauthctl",
+            "adopt",
+            "--target",
+            "podman:manual-runtime-a",
+            "--capability",
+            "runtime=delegated",
+            "--capability",
+            "runtime=external",
+            "--plan",
+        ])
+        .is_err()
+    );
 }
 
 #[test]

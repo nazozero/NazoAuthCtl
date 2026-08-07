@@ -116,6 +116,8 @@ struct AdoptionTransaction {
     schema: u32,
     state: AdoptionTransactionState,
     plan_sha256: String,
+    #[serde(default)]
+    lifecycle_sha256: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

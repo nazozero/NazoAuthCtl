@@ -139,6 +139,50 @@ fn lifecycle_is_bound_to_every_discovered_runtime_without_secret_values() {
 }
 
 #[test]
+fn lifecycle_mounts_must_be_an_exact_match_and_support_redacted_sources() {
+    let work = PrivateTempDir::new("nazoauth-lifecycle-mount-boundary-test").unwrap();
+    let value = lifecycle(&work);
+    let mut discovered = candidate(work.path(), "runtime-a");
+    let actual_source = discovered.runtime.mounts[0].source.clone();
+    discovered.runtime.mounts[0].source = PathBuf::from("<redacted-secret-source>");
+    discovered.sensitive_mount_sources.insert(
+        discovered.runtime.mounts[0].destination.clone(),
+        actual_source,
+    );
+
+    value
+        .validate_for_adoption(&[discovered.clone()], &CapabilityGrants::observed())
+        .unwrap();
+
+    let mut extra = value.clone();
+    extra.runtimes[0].mounts.push(NeutralMount {
+        source: work.path().join("extra"),
+        destination: PathBuf::from("/var/lib/extra"),
+        read_only: true,
+        selinux_relabel: false,
+        ownership: Responsibility::External,
+        scope: ResourceScope::Deployment,
+    });
+    assert!(
+        extra
+            .validate_for_adoption(&[discovered], &CapabilityGrants::observed())
+            .is_err()
+    );
+
+    let mut shared = value;
+    shared.runtimes[0].mounts[0].scope = ResourceScope::Shared;
+    let mut discovered_shared = candidate(work.path(), "runtime-a");
+    discovered_shared.runtime.mounts[0].scope = ResourceScope::Shared;
+    let mut mutable_capabilities = CapabilityGrants::observed();
+    mutable_capabilities.runtime.responsibility = Responsibility::Delegated;
+    assert!(
+        shared
+            .validate_for_adoption(&[discovered_shared], &mutable_capabilities,)
+            .is_err()
+    );
+}
+
+#[test]
 fn lifecycle_rejects_inline_secret_environment_and_rehearsal_mount_overlap() {
     let work = PrivateTempDir::new("nazoauth-lifecycle-invalid-test").unwrap();
     let mut value = lifecycle(&work);

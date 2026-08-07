@@ -414,6 +414,17 @@ impl<'a> Runtime<'a> {
             bail!("systemd runtime requires an explicit staged binary transaction");
         }
         let backend = self.backend()?;
+        if backend
+            .inspect_optional(&self.config.runtime.container_name)?
+            .is_some()
+        {
+            backend.verify_ownership(
+                &self.config.runtime.container_name,
+                &self.config.operator.deployment_id,
+                &self.config.runtime.runtime_instance_id,
+                &self.config.operator.controller_key_id,
+            )?;
+        }
         let replacement = runtime_backend::RuntimeReplacement {
             object_reference: self.config.runtime.container_name.clone(),
             artifact: ArtifactReference::Oci {
@@ -459,13 +470,22 @@ impl<'a> Runtime<'a> {
         backend.replace(&replacement)
     }
     pub(crate) fn remove_container(&self) -> anyhow::Result<()> {
-        if self.config.capabilities.runtime.responsibility
-            == crate::deployment::Responsibility::Managed
-            && !self.container_has_authorized_labels()
+        let backend = self.backend()?;
+        if self
+            .config
+            .capabilities
+            .runtime
+            .responsibility
+            .permits_mutation()
         {
-            bail!("refusing to replace an unlabelled application container");
+            backend.verify_ownership(
+                &self.config.runtime.container_name,
+                &self.config.operator.deployment_id,
+                &self.config.runtime.runtime_instance_id,
+                &self.config.operator.controller_key_id,
+            )?;
         }
-        self.backend()?.remove(&self.config.runtime.container_name)
+        backend.remove(&self.config.runtime.container_name)
     }
 
     pub(crate) fn container_exists(&self) -> bool {
@@ -479,15 +499,37 @@ impl<'a> Runtime<'a> {
 
     pub(crate) fn restart(&self) -> anyhow::Result<()> {
         let kind = self.backend_kind()?;
-        self.backend()?.restart(self.object_reference(kind))
+        let backend = self.backend()?;
+        let object_reference = self.object_reference(kind);
+        backend.verify_ownership(
+            object_reference,
+            &self.config.operator.deployment_id,
+            &self.config.runtime.runtime_instance_id,
+            &self.config.operator.controller_key_id,
+        )?;
+        backend.restart(object_reference)
     }
 
     pub(crate) fn start_service(&self) -> anyhow::Result<()> {
-        self.backend()?.start(&self.config.runtime.service_name)
+        let backend = self.backend()?;
+        backend.verify_ownership(
+            &self.config.runtime.service_name,
+            &self.config.operator.deployment_id,
+            &self.config.runtime.runtime_instance_id,
+            &self.config.operator.controller_key_id,
+        )?;
+        backend.start(&self.config.runtime.service_name)
     }
 
     pub(crate) fn stop_service(&self) -> anyhow::Result<()> {
-        self.backend()?.stop(&self.config.runtime.service_name)
+        let backend = self.backend()?;
+        backend.verify_ownership(
+            &self.config.runtime.service_name,
+            &self.config.operator.deployment_id,
+            &self.config.runtime.runtime_instance_id,
+            &self.config.operator.controller_key_id,
+        )?;
+        backend.stop(&self.config.runtime.service_name)
     }
 
     fn object_reference(&self, kind: RuntimeBackendKind) -> &str {
@@ -661,20 +703,6 @@ impl<'a> Runtime<'a> {
             .iter()
             .find(|mount| mount.target == Path::new(target))
             .with_context(|| format!("runtime mount {target} is unavailable"))
-    }
-
-    fn container_has_authorized_labels(&self) -> bool {
-        self.backend_kind().is_ok_and(|_| {
-            self.backend().is_ok_and(|backend| {
-                backend
-                    .verify_ownership(
-                        &self.config.runtime.container_name,
-                        &self.config.operator.deployment_id,
-                        &self.config.operator.controller_key_id,
-                    )
-                    .is_ok()
-            })
-        })
     }
 }
 

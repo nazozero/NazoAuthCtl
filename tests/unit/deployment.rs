@@ -76,6 +76,14 @@ fn observed_state_cannot_smuggle_mutation_capabilities() {
 }
 
 #[test]
+fn shared_capability_cannot_be_declared_managed() {
+    let mut deployment = record("deployment-a", "alpha");
+    deployment.capabilities.database.scope = ResourceScope::Shared;
+    deployment.capabilities.database.responsibility = Responsibility::Managed;
+    assert!(deployment.validate().is_err());
+}
+
+#[test]
 fn immutable_security_identity_is_not_an_alias_or_runtime_name() {
     let mut deployment = record("deployment-a", "alpha");
     deployment.alias = Some(deployment.runtime_instances[0].object_reference.clone());
