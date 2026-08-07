@@ -16,7 +16,6 @@ pub(crate) struct UpdateConfig {
     #[serde(default = "baseline_install_profile")]
     pub(crate) install_profile: String,
     pub(crate) repository: String,
-    pub(crate) updater_install_path: PathBuf,
     pub(crate) backup_root: PathBuf,
     pub(crate) deployment_root: PathBuf,
     pub(crate) operator: Operator,
@@ -261,7 +260,6 @@ impl UpdateConfig {
             }
         }
         for path in [
-            &self.updater_install_path,
             &self.backup_root,
             &self.deployment_root,
             &self.ui.releases_root,

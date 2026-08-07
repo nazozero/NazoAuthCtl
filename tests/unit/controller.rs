@@ -118,7 +118,6 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
         capabilities: crate::deployment::CapabilityGrants::controller_installed(),
         install_profile: "baseline".to_owned(),
         repository: "nazozero/NazoAuth".to_owned(),
-        updater_install_path: absolute("installed-nazoauthctl"),
         backup_root: absolute("backups"),
         deployment_root: absolute("deployments"),
         operator: Operator {

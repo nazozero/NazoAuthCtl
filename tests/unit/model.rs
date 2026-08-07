@@ -8,7 +8,6 @@ fn valid_config() -> UpdateConfig {
         capabilities: crate::deployment::CapabilityGrants::controller_installed(),
         install_profile: "baseline".to_owned(),
         repository: "nazozero/NazoAuth".to_owned(),
-        updater_install_path: root.join("bin/nazoauthctl"),
         backup_root: root.join("backups"),
         deployment_root: root.join("deployments"),
         operator: Operator {

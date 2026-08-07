@@ -128,7 +128,10 @@ Options:
   --profile-secrets-stdin             Read standards-full profile bearer secrets as strict JSON from stdin
   --profile-secret-fd FD              Read the same profile JSON from an already-open FD (Linux)
 
-With managed dependencies, identities and secrets are generated automatically.
+With managed dependencies and standards-full profile, identities and service-owned
+secrets are generated automatically and persisted in the installation secret store.
+Profile secret input is optional and is intended only for importing an existing
+secret during a controlled recovery or migration.
 External JSON keys: database_url, migration_database_url, valkey_url.
 Profile JSON keys: dynamic_registration_initial_access_token,
 ciba_automated_decision_token, openid4vci_management_token,

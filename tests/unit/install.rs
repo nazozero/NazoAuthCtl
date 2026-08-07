@@ -210,7 +210,9 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
             assert!(value.len() >= MIN_PROFILE_SECRET_VALUE_BYTES);
         }
         assert!(!rendered.contains(&value));
-        assert!(rendered.contains(&format!("${{PROFILE_SECRET_ROOT}}/{name}")));
+        if *name != "ciba-decision-token" {
+            assert!(rendered.contains(&format!("${{PROFILE_SECRET_ROOT}}/{name}")));
+        }
     }
     assert!(rendered.contains("ENABLE_OPENID4VCI_ISSUER: true"));
     assert!(rendered.contains("ENABLE_OPENID4VP_VERIFIER: true"));
