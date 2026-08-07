@@ -766,12 +766,52 @@ fn parses_time_bounded_conformance_lease_operations() {
             lease: ConformanceLeaseCommand::Create {
                 profile,
                 material,
+                dynamic_registration_token_file: None,
+                ciba_automated_decision_token_file: None,
                 ttl_seconds: 28_800,
                 yes: true,
             },
             candidate: None,
         }) if profile == "oidf-full"
             && material == std::path::Path::new("/run/oidf-onboarding-manifest.json")
+    ));
+
+    let with_token_file = parse(&[
+        "nazoauthctl",
+        "conformance",
+        "lease",
+        "create",
+        "--profile",
+        "oidc-fapi-ciba",
+        "--material",
+        "/run/oidf-onboarding-manifest.json",
+        "--dynamic-registration-token-file",
+        "/run/oidf-dcr-token",
+        "--ciba-automated-decision-token-file",
+        "/run/oidf-ciba-decision-token",
+        "--ttl-seconds",
+        "300",
+        "--yes",
+    ])
+    .unwrap()
+    .unwrap()
+    .command;
+    assert!(matches!(
+        with_token_file,
+        Command::Conformance(ConformanceCommand {
+            lease: ConformanceLeaseCommand::Create {
+                profile,
+                material,
+                dynamic_registration_token_file: Some(token_file),
+                ciba_automated_decision_token_file: Some(ciba_token_file),
+                ttl_seconds: 300,
+                yes: true,
+            },
+            candidate: None,
+        }) if profile == "oidc-fapi-ciba"
+            && material == std::path::Path::new("/run/oidf-onboarding-manifest.json")
+            && token_file == std::path::Path::new("/run/oidf-dcr-token")
+            && ciba_token_file == std::path::Path::new("/run/oidf-ciba-decision-token")
     ));
 
     assert!(matches!(

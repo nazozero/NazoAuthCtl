@@ -38,6 +38,9 @@ const STANDARDS_PROFILE_SECRET_NAMES: &[&str] = &[
 const MAX_PROFILE_SECRET_INPUT_BYTES: u64 = 32 * 1024;
 const MIN_PROFILE_SECRET_VALUE_BYTES: usize = 32;
 const MAX_PROFILE_SECRET_VALUE_BYTES: usize = 4096;
+const MFA_TOTP_KEY_FILE_NAME: &str = "mfa-totp-encryption-key";
+const MFA_TOTP_KEY_ID: &str = "nazoauth-mfa-totp-v1";
+const MFA_TOTP_CONTAINER_KEY_PATH: &str = "/run/nazoauth-secrets/mfa-totp-encryption-key";
 
 pub(crate) struct PreparedInstall {
     pub(crate) config: UpdateConfig,
@@ -144,6 +147,7 @@ pub(crate) fn prepare(
     ] {
         create_directory(&path, 0o700)?;
     }
+    ensure_mfa_totp_configuration(config_dir, runtime_backend)?;
     let profile = write_install_profile(config_dir, &options)?;
 
     let dependency_mode = if options.database_url.is_some() {
@@ -158,6 +162,7 @@ pub(crate) fn prepare(
     write_server_config(
         config_dir,
         &options,
+        &bootstrap_operator.deployment_id,
         runtime_backend,
         &options.data_root,
         trusted_proxy_cidr.as_deref(),
@@ -213,11 +218,17 @@ fn configure_runtime_permissions(config: &UpdateConfig) -> anyhow::Result<()> {
         .context("server configuration mount is unavailable")?
         .source
         .clone();
+    let mfa_key = config_file
+        .parent()
+        .context("server configuration directory is unavailable")?
+        .join("secrets")
+        .join(MFA_TOTP_KEY_FILE_NAME);
     let mut readable = vec![
         config_file,
         config.dependencies.database_url_file.clone(),
         config.dependencies.migration_database_url_file.clone(),
         config.dependencies.valkey_url_file.clone(),
+        mfa_key,
         config.operator.receipt_private_key.clone(),
     ];
     for name in STANDARDS_PROFILE_SECRET_NAMES {
@@ -315,13 +326,14 @@ pub(crate) fn install_systemd(config: &UpdateConfig) -> anyhow::Result<()> {
                 .to_owned(),
             migration_url: config.dependencies.migration_database_url_file.clone(),
             receipt_private_key: config.operator.receipt_private_key.clone(),
-            runtime_readable_secret_names: ["database-url", "valkey-url"]
+            runtime_readable_secret_names: ["database-url", "valkey-url", MFA_TOTP_KEY_FILE_NAME]
                 .into_iter()
                 .chain(STANDARDS_PROFILE_SECRET_NAMES.iter().copied())
                 .map(ToOwned::to_owned)
                 .collect(),
         },
-    )
+    )?;
+    Ok(())
 }
 
 fn normalize_external_dependencies(options: &mut InstallOptions) -> anyhow::Result<()> {
@@ -601,24 +613,311 @@ fn write_managed_secrets(
     Ok("managed".to_owned())
 }
 
+fn mfa_totp_key_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("secrets").join(MFA_TOTP_KEY_FILE_NAME)
+}
+
+fn mfa_totp_config_path(runtime: RuntimeBackendKind, config_dir: &Path) -> String {
+    if runtime == RuntimeBackendKind::Systemd {
+        mfa_totp_key_path(config_dir).display().to_string()
+    } else {
+        MFA_TOTP_CONTAINER_KEY_PATH.to_owned()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MfaTotpSourceState {
+    ManagedCreated,
+    ManagedExisting,
+    External,
+}
+
+pub(crate) fn ensure_mfa_totp_configuration(
+    config_dir: &Path,
+    runtime: RuntimeBackendKind,
+) -> anyhow::Result<()> {
+    ensure_mfa_totp_configuration_state(config_dir, runtime).map(|_| ())
+}
+
+fn ensure_mfa_totp_configuration_state(
+    config_dir: &Path,
+    runtime: RuntimeBackendKind,
+) -> anyhow::Result<MfaTotpSourceState> {
+    let target = config_dir.join(".env.yaml");
+    let Some(existing) = read_existing_server_config(&target)? else {
+        ensure_mfa_totp_key(&mfa_totp_key_path(config_dir))?;
+        return Ok(MfaTotpSourceState::ManagedCreated);
+    };
+    let inline_key = config_key_present(&existing, "MFA_TOTP_ENCRYPTION_KEY")?;
+    let file_key = config_key_present(&existing, "MFA_TOTP_ENCRYPTION_KEY_FILE")?;
+    let key_id = config_key_present(&existing, "MFA_TOTP_ENCRYPTION_KEY_ID")?;
+    let mut additions = Vec::new();
+    let mut managed_created = false;
+    if !inline_key && !file_key {
+        ensure_mfa_totp_key(&mfa_totp_key_path(config_dir))?;
+        managed_created = true;
+        additions.push(format!(
+            "MFA_TOTP_ENCRYPTION_KEY_FILE: \"{}\"\n",
+            mfa_totp_config_path(runtime, config_dir)
+        ));
+    }
+    if !key_id {
+        additions.push(format!(
+            "MFA_TOTP_ENCRYPTION_KEY_ID: \"{MFA_TOTP_KEY_ID}\"\n"
+        ));
+    }
+    if additions.is_empty() {
+        return if managed_mfa_totp_source(config_dir, runtime)? {
+            Ok(MfaTotpSourceState::ManagedExisting)
+        } else {
+            Ok(MfaTotpSourceState::External)
+        };
+    }
+    let mut updated = existing;
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    for addition in additions {
+        updated.push_str(&addition);
+    }
+    atomic_write(&target, updated.as_bytes(), 0o640)?;
+    if managed_mfa_totp_source(config_dir, runtime)? {
+        Ok(if managed_created {
+            MfaTotpSourceState::ManagedCreated
+        } else {
+            MfaTotpSourceState::ManagedExisting
+        })
+    } else {
+        Ok(MfaTotpSourceState::External)
+    }
+}
+
+pub(crate) fn ensure_mfa_totp_runtime(
+    config_dir: &Path,
+    config: &mut UpdateConfig,
+) -> anyhow::Result<bool> {
+    let runtime = config.runtime.backend;
+    let source = ensure_mfa_totp_configuration_state(config_dir, runtime)?;
+    if source == MfaTotpSourceState::External {
+        return Ok(false);
+    }
+
+    let key_path = mfa_totp_key_path(config_dir);
+    if source == MfaTotpSourceState::ManagedExisting && !key_path.exists() {
+        bail!(
+            "managed MFA TOTP encryption key is missing; restore {} from backup",
+            key_path.display()
+        );
+    }
+    ensure_mfa_totp_key(&key_path)?;
+    let mut changed = false;
+    let secrets_dir = config_dir.join("secrets");
+    if !config.runtime.snapshot_paths.contains(&secrets_dir) {
+        config.runtime.snapshot_paths.push(secrets_dir);
+        changed = true;
+    }
+    if runtime != RuntimeBackendKind::Systemd {
+        let target = PathBuf::from(MFA_TOTP_CONTAINER_KEY_PATH);
+        if let Some(existing) = config
+            .runtime
+            .mounts
+            .iter_mut()
+            .find(|mount| mount.target == target)
+        {
+            if existing.source != key_path {
+                bail!(
+                    "managed MFA TOTP mount conflicts with {}",
+                    existing.source.display()
+                );
+            }
+            if !existing.read_only {
+                existing.read_only = true;
+                changed = true;
+            }
+            if !existing.selinux_relabel {
+                existing.selinux_relabel = true;
+                changed = true;
+            }
+        } else {
+            config.runtime.mounts.push(mount(
+                key_path.clone(),
+                MFA_TOTP_CONTAINER_KEY_PATH,
+                true,
+                true,
+            ));
+            changed = true;
+        }
+    }
+    protect_mfa_totp_runtime_file(config, &key_path)?;
+    Ok(changed)
+}
+
+fn managed_mfa_totp_source(config_dir: &Path, runtime: RuntimeBackendKind) -> anyhow::Result<bool> {
+    let Some(existing) = read_existing_server_config(&config_dir.join(".env.yaml"))? else {
+        return Ok(false);
+    };
+    if config_key_value(&existing, "MFA_TOTP_ENCRYPTION_KEY")?.is_some() {
+        return Ok(false);
+    }
+    let Some(configured) = config_key_value(&existing, "MFA_TOTP_ENCRYPTION_KEY_FILE")? else {
+        return Ok(false);
+    };
+    if runtime != RuntimeBackendKind::Systemd {
+        return Ok(configured == MFA_TOTP_CONTAINER_KEY_PATH);
+    }
+    let configured = Path::new(&configured);
+    let configured = if configured.is_absolute() {
+        configured.to_owned()
+    } else {
+        config_dir.join(configured)
+    };
+    Ok(configured == mfa_totp_key_path(config_dir))
+}
+
+fn protect_mfa_totp_runtime_file(config: &UpdateConfig, key_path: &Path) -> anyhow::Result<()> {
+    if cfg!(test) || test_mode() {
+        return Ok(());
+    }
+    let parent = key_path
+        .parent()
+        .context("MFA TOTP key has no parent directory")?;
+    let (owner, parent_mode) = if config.runtime.backend == RuntimeBackendKind::Systemd {
+        let service_user = config.runtime.service_user.trim();
+        if service_user.is_empty() {
+            bail!("host runtime has no MFA TOTP service user");
+        }
+        (format!("root:{service_user}"), 0o750)
+    } else {
+        ("root:root".to_owned(), 0o700)
+    };
+    Process::new("chown").arg(&owner).arg(parent).run_quiet()?;
+    set_mode(parent, parent_mode)?;
+    let key_owner = if config.runtime.backend == RuntimeBackendKind::Systemd {
+        owner
+    } else {
+        "root:10001".to_owned()
+    };
+    Process::new("chown")
+        .arg(key_owner)
+        .arg(key_path)
+        .run_quiet()?;
+    set_mode(key_path, 0o440)
+}
+
+fn ensure_mfa_totp_key(path: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!(
+                    "MFA TOTP encryption key must be a regular file: {}",
+                    path.display()
+                );
+            }
+            let value = fs::read_to_string(path).with_context(|| {
+                format!("failed to read MFA TOTP encryption key {}", path.display())
+            })?;
+            validate_mfa_totp_key(&value)?;
+            set_mode(path, 0o440)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let value = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+            atomic_write(path, value.as_bytes(), 0o440)
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect MFA TOTP encryption key {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn validate_mfa_totp_key(value: &str) -> anyhow::Result<()> {
+    let value = value.trim();
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .context("MFA TOTP encryption key is not valid base64url")?;
+    if decoded.len() != 32 {
+        bail!("MFA TOTP encryption key must decode to exactly 32 bytes");
+    }
+    Ok(())
+}
+
+fn read_existing_server_config(target: &Path) -> anyhow::Result<Option<String>> {
+    let metadata = match fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+        bail!(
+            "existing server configuration is invalid: {}",
+            target.display()
+        );
+    }
+    fs::read_to_string(target)
+        .with_context(|| {
+            format!(
+                "failed to read existing server configuration {}",
+                target.display()
+            )
+        })
+        .map(Some)
+}
+
+fn config_key_present(content: &str, key: &str) -> anyhow::Result<bool> {
+    Ok(config_key_value(content, key)?.is_some())
+}
+
+fn config_key_value(content: &str, key: &str) -> anyhow::Result<Option<String>> {
+    let mut value = None;
+    for line in content.lines() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, raw_value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim() != key {
+            continue;
+        }
+        if value.is_some() {
+            bail!("server configuration contains duplicate {key}");
+        }
+        let parsed = raw_value.split('#').next().unwrap_or_default().trim();
+        let parsed = parsed
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                parsed
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
+            .unwrap_or(parsed)
+            .trim();
+        if parsed.is_empty() {
+            bail!("{key} must not be empty in existing server configuration");
+        }
+        value = Some(parsed.to_owned());
+    }
+    Ok(value)
+}
+
 fn write_server_config(
     config_dir: &Path,
     options: &InstallOptions,
+    deployment_id: &str,
     runtime: RuntimeBackendKind,
     data_root: &Path,
     trusted_proxy_cidr: Option<&str>,
     profile: Option<&str>,
 ) -> anyhow::Result<()> {
     let target = config_dir.join(".env.yaml");
-    if target.exists() {
-        if !target.is_file() || target.is_symlink() || fs::metadata(&target)?.len() == 0 {
-            bail!(
-                "existing server configuration is invalid: {}",
-                target.display()
-            );
-        }
+    if read_existing_server_config(&target)?.is_some() {
         return Ok(());
     }
+    ensure_mfa_totp_key(&mfa_totp_key_path(config_dir))?;
     let (bind, data_dir, ui_dir, dependency_files) = if runtime == RuntimeBackendKind::Systemd {
         (
             format!("127.0.0.1:{}", options.port),
@@ -652,12 +951,17 @@ fn write_server_config(
         "# Generated by nazoauthctl install. Explicit operator overrides are preserved.\n\
          BIND: \"{bind}\"\n\
          PUBLIC_BASE_URL: \"{public_url}\"\n\
+         DEPLOYMENT_ID: \"{deployment_id}\"\n\
+         MFA_TOTP_ENCRYPTION_KEY_FILE: \"{mfa_key_file}\"\n\
+         MFA_TOTP_ENCRYPTION_KEY_ID: \"{mfa_key_id}\"\n\
          DATABASE_MAX_CONNECTIONS: 32\n\
          DATA_DIR: \"{data_dir}\"\n\
          UI_CACHE_DIR: \"{ui_dir}\"\n\
          RUST_LOG: \"info\"\n\
          {dependency_files}{profile}",
         public_url = options.public_url,
+        mfa_key_file = mfa_totp_config_path(runtime, config_dir),
+        mfa_key_id = MFA_TOTP_KEY_ID,
         profile = profile
             .unwrap_or_default()
             .replace(
@@ -998,6 +1302,16 @@ fn build_config(
     } else {
         Vec::new()
     };
+    let mfa_key = secrets.join(MFA_TOTP_KEY_FILE_NAME);
+    let managed_mfa = managed_mfa_totp_source(config_dir, runtime_backend)?;
+    if container && managed_mfa && mfa_key.exists() {
+        mounts.push(mount(
+            mfa_key.clone(),
+            MFA_TOTP_CONTAINER_KEY_PATH,
+            true,
+            true,
+        ));
+    }
     if container && options.profile == "standards-full" {
         mounts.extend(STANDARDS_PROFILE_SECRET_NAMES.iter().map(|name| {
             mount(
@@ -1086,12 +1400,18 @@ fn build_config(
             ),
             expected_issuer: options.public_url.trim_end_matches('/').to_owned(),
             mounts,
-            snapshot_paths: vec![
-                app.join("keys"),
-                app.join("secrets"),
-                app.join("bootstrap"),
-                app.join("instance"),
-            ],
+            snapshot_paths: {
+                let mut paths = vec![
+                    app.join("keys"),
+                    app.join("secrets"),
+                    app.join("bootstrap"),
+                    app.join("instance"),
+                ];
+                if managed_mfa {
+                    paths.push(secrets);
+                }
+                paths
+            },
             environment,
             service_name,
             service_user,
@@ -1209,16 +1529,39 @@ pub(crate) fn grant_runtime_database(config: &UpdateConfig) -> anyhow::Result<()
     if config.dependencies.mode != "managed" {
         return Ok(());
     }
-    let sql = b"GRANT CONNECT ON DATABASE oauth TO nazoauth_runtime;\n\
-        GRANT USAGE ON SCHEMA public TO nazoauth_runtime;\n\
-        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO nazoauth_runtime;\n\
-        GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO nazoauth_runtime;\n\
-        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO nazoauth_runtime;\n\
-        ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO nazoauth_runtime;\n\
-        ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO nazoauth_runtime;\n\
-        ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO nazoauth_runtime;\n";
-    crate::runtime::Runtime::new(config).execute_managed_postgres(sql)
+    crate::runtime::Runtime::new(config)
+        .execute_managed_postgres(MANAGED_RUNTIME_DATABASE_GRANT_SQL)
 }
+
+const MANAGED_RUNTIME_DATABASE_GRANT_SQL: &[u8] = b"GRANT CONNECT ON DATABASE oauth TO nazoauth_runtime;\n\
+    GRANT USAGE ON SCHEMA public TO nazoauth_runtime;\n\
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO nazoauth_runtime;\n\
+    REVOKE ALL ON TABLE\n\
+        public.security_audit_chain_state,\n\
+        public.security_audit_events,\n\
+        public.security_audit_event_outbox\n\
+    FROM nazoauth_runtime;\n\
+    GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO nazoauth_runtime;\n\
+    GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO nazoauth_runtime;\n\
+    REVOKE ALL ON FUNCTION\n\
+        public.nazo_reject_security_audit_event_mutation(),\n\
+        public.nazo_claim_security_audit_events(BIGINT, INTEGER),\n\
+        public.nazo_ack_security_audit_event(UUID, INTEGER),\n\
+        public.nazo_reschedule_security_audit_event(UUID, INTEGER, TIMESTAMPTZ, TEXT),\n\
+        public.nazo_security_audit_anchor_health()\n\
+    FROM nazoauth_runtime;\n\
+    GRANT EXECUTE ON FUNCTION\n\
+        public.nazo_security_audit_privilege_preflight(BOOLEAN, BOOLEAN, BOOLEAN),\n\
+        public.nazo_security_audit_chain_head_for_update(),\n\
+        public.nazo_append_security_audit_event(UUID, TEXT, TEXT, JSONB, TIMESTAMPTZ, BYTEA, BYTEA),\n\
+        public.nazo_security_audit_anchor_freshness()\n\
+    TO nazoauth_runtime;\n\
+    ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public\n\
+        REVOKE ALL ON TABLES FROM nazoauth_runtime;\n\
+    ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public\n\
+        REVOKE ALL ON SEQUENCES FROM nazoauth_runtime;\n\
+    ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public\n\
+        REVOKE ALL ON FUNCTIONS FROM nazoauth_runtime;\n";
 
 pub(crate) fn verify_runtime_no_ddl(config: &UpdateConfig) -> anyhow::Result<()> {
     if test_mode() {
@@ -1310,10 +1653,17 @@ fn require_root() -> anyhow::Result<()> {
     if test_mode() {
         return Ok(());
     }
-    if Process::new("id").arg("-u").stdout()?.trim() != "0" {
-        bail!("install and update require root");
+    #[cfg(not(unix))]
+    {
+        bail!("install and update require root on a Unix host");
     }
-    Ok(())
+    #[cfg(unix)]
+    {
+        if Process::new("id").arg("-u").stdout()?.trim() != "0" {
+            bail!("install and update require root");
+        }
+        Ok(())
+    }
 }
 
 fn test_mode() -> bool {

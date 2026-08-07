@@ -185,7 +185,10 @@ never exports a leaf certificate or private key."
         cli::HelpTopic::Conformance => {
             "Usage:
   nazoauthctl [--config PATH] conformance lease create --profile PROFILE \
-    --material PUBLIC_MANIFEST --ttl-seconds SECONDS --yes
+    --material PUBLIC_MANIFEST \
+    [--dynamic-registration-token-file PATH] \
+    [--ciba-automated-decision-token-file PATH] \
+    --ttl-seconds SECONDS --yes
   nazoauthctl [--config PATH] conformance lease list
   nazoauthctl [--config PATH] conformance lease revoke --lease-id UUID --yes
   nazoauthctl [--config PATH] conformance lease cleanup --yes
@@ -194,8 +197,13 @@ For an unreleased OCI candidate, insert all four target bindings before `lease`:
   --candidate-release vX.Y.Z --candidate-revision GIT_SHA \
   --candidate-build-id BUILD_ID --candidate-oci-digest sha256:HEX
 
-The lease stores only the SHA-256 digest of the public onboarding manifest. Private
-keys and plaintext client secrets remain with the conformance runner. Expired or
+The lease stores only the SHA-256 digest of the public onboarding manifest. When
+`--dynamic-registration-token-file` is supplied, nazoauthctl reads a bounded private
+file and sends only its lowercase SHA-256 digest; the token plaintext and digest are
+not printed or included in receipt summaries. The optional
+`--ciba-automated-decision-token-file` follows the same rule and is only valid for
+`oidc-fapi-ciba`. Private keys and plaintext client secrets remain with the
+conformance runner. Expired or
 revoked clients fail closed immediately; cleanup physically deletes their database
 records and retains only the non-secret lease tombstone. Candidate mode is limited
 to explicit migration and conformance operations and binds the operator task to the

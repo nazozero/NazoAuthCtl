@@ -317,11 +317,37 @@ fn conformance_operation(command: ConformanceLeaseCommand) -> anyhow::Result<Tas
         ConformanceLeaseCommand::Create {
             profile,
             material,
+            dynamic_registration_token_file,
+            ciba_automated_decision_token_file,
             ttl_seconds,
             yes,
         } => {
             require_confirmation(yes, "create a temporary conformance lease")?;
             let material_sha256 = crate::filesystem::sha256(&material)?;
+            let dynamic_registration_initial_access_token_sha256 = if let Some(path) =
+                dynamic_registration_token_file
+            {
+                if profile != "oidc-fapi-ciba" {
+                    bail!(
+                        "--dynamic-registration-token-file is supported only for the oidc-fapi-ciba profile"
+                    );
+                }
+                Some(read_conformance_token_sha256(&path)?)
+            } else {
+                None
+            };
+            let ciba_automated_decision_token_sha256 = if let Some(path) =
+                ciba_automated_decision_token_file
+            {
+                if profile != "oidc-fapi-ciba" {
+                    bail!(
+                        "--ciba-automated-decision-token-file is supported only for the oidc-fapi-ciba profile"
+                    );
+                }
+                Some(read_conformance_token_sha256(&path)?)
+            } else {
+                None
+            };
             let public_material = if profile == "openid4vc" {
                 let metadata = fs::symlink_metadata(&material)
                     .context("failed to inspect OpenID4VC conformance material")?;
@@ -347,6 +373,8 @@ fn conformance_operation(command: ConformanceLeaseCommand) -> anyhow::Result<Tas
                 profile,
                 material_sha256,
                 public_material,
+                dynamic_registration_initial_access_token_sha256,
+                ciba_automated_decision_token_sha256,
                 ttl_seconds,
             }
         }
@@ -363,6 +391,78 @@ fn conformance_operation(command: ConformanceLeaseCommand) -> anyhow::Result<Tas
             TaskOperation::ConformanceLeaseCleanup
         }
     })
+}
+
+const MAX_CONFORMANCE_TOKEN_FILE_BYTES: u64 = 4096;
+
+fn read_conformance_token_sha256(path: &Path) -> anyhow::Result<String> {
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to inspect conformance token file {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "conformance token file must be a regular non-symlink file: {}",
+            path.display()
+        );
+    }
+    validate_conformance_token_metadata(&metadata)?;
+
+    let file = File::open(path)
+        .with_context(|| format!("failed to open conformance token file {}", path.display()))?;
+    let opened_metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect opened conformance token file {}",
+            path.display()
+        )
+    })?;
+    validate_same_file(&metadata, &opened_metadata, "conformance token file")?;
+    validate_conformance_token_metadata(&opened_metadata)?;
+
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    file.take(MAX_CONFORMANCE_TOKEN_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read conformance token file {}", path.display()))?;
+    if bytes.is_empty() {
+        bail!("conformance token file must not be empty");
+    }
+    if bytes.len() as u64 > MAX_CONFORMANCE_TOKEN_FILE_BYTES {
+        bail!(
+            "conformance token file exceeds the {} byte limit",
+            MAX_CONFORMANCE_TOKEN_FILE_BYTES
+        );
+    }
+    Ok(encode_controller_digest(&Sha256::digest(bytes.as_slice())))
+}
+
+#[cfg(unix)]
+fn validate_conformance_token_metadata(metadata: &fs::Metadata) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let current_uid = Process::new("id")
+        .arg("-u")
+        .stdout()?
+        .trim()
+        .parse::<u32>()
+        .context("current process has no valid numeric UID")?;
+    if metadata.uid() != 0 && metadata.uid() != current_uid {
+        bail!("conformance token file has an unexpected owner");
+    }
+    if metadata.nlink() != 1 {
+        bail!("conformance token file must have exactly one hard link");
+    }
+    let mode = metadata.mode() & 0o7777;
+    if mode & !0o600 != 0 || mode & 0o400 == 0 {
+        bail!("conformance token file permissions must be 0400 or 0600");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_conformance_token_metadata(_metadata: &fs::Metadata) -> anyhow::Result<()> {
+    Ok(())
 }
 
 pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
@@ -1932,7 +2032,7 @@ fn read_bootstrap_token(path: &Path, expected_owner_uid: Option<u32>) -> anyhow:
     let opened_metadata = file
         .metadata()
         .context("failed to inspect opened initial administrator token")?;
-    validate_same_file(&metadata, &opened_metadata)?;
+    validate_same_file(&metadata, &opened_metadata, "initial administrator token")?;
     let mut bytes = Vec::new();
     file.take(MAX_BOOTSTRAP_TOKEN_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -2022,17 +2122,25 @@ fn validate_bootstrap_secret_metadata(
 }
 
 #[cfg(unix)]
-fn validate_same_file(before: &fs::Metadata, opened: &fs::Metadata) -> anyhow::Result<()> {
+fn validate_same_file(
+    before: &fs::Metadata,
+    opened: &fs::Metadata,
+    description: &str,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
 
     if before.dev() != opened.dev() || before.ino() != opened.ino() {
-        bail!("initial administrator token changed while it was being opened");
+        bail!("{description} changed while it was being opened");
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn validate_same_file(_before: &fs::Metadata, _opened: &fs::Metadata) -> anyhow::Result<()> {
+fn validate_same_file(
+    _before: &fs::Metadata,
+    _opened: &fs::Metadata,
+    _description: &str,
+) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -2576,16 +2684,16 @@ fn register_installed_deployment(
 }
 
 fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> anyhow::Result<()> {
+    let mut config = config.clone();
     let release = VerifiedRelease::fetch(
         &config.repository,
         options.version.as_deref(),
         config.container_backend(),
     )?;
-    enforce_release_trust(config, &release.manifest)?;
-    release.persist_verification_evidence(&release_cache_dir(config, &release.manifest))?;
-    let runtime = Runtime::new(config);
-    let current = runtime.active_revision()?;
-    let active = load_active_release(config)?;
+    enforce_release_trust(&config, &release.manifest)?;
+    release.persist_verification_evidence(&release_cache_dir(&config, &release.manifest))?;
+    let current = Runtime::new(&config).active_revision()?;
+    let active = load_active_release(&config)?;
     let minimum = format!("v{}", release.manifest.rollback.minimum_supported_version);
     if compare_versions(&active.version, &minimum)? == std::cmp::Ordering::Less {
         bail!(
@@ -2595,7 +2703,7 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
         );
     }
     if options.plan {
-        print_update_plan(config, &active.version, &current, &release.manifest)?;
+        print_update_plan(&config, &active.version, &current, &release.manifest)?;
         return Ok(());
     }
     if current == release.manifest.backend_commit {
@@ -2611,8 +2719,12 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
             "this Release crosses an irreversible migration barrier; inspect update --plan and repeat with --accept-migration-barrier --yes"
         );
     }
+    // Complete legacy MFA configuration before the update journal and its
+    // recovery backup are created. The backup must include the durable key.
+    persist_mfa_totp_runtime_upgrade(config_path, &mut config)?;
+    let runtime = Runtime::new(&config);
     crate::operator::append_management_event(
-        config,
+        &config,
         "update-intent",
         &release.manifest.version,
         recovery_boundary_name(release.manifest.rollback.database_restore),
@@ -2622,7 +2734,7 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
     } else {
         None
     };
-    let previous_manifest = load_active_release(config)?;
+    let previous_manifest = load_active_release(&config)?;
     let previous_ui = Some(
         config
             .ui
@@ -2637,11 +2749,11 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
     } else {
         previous_manifest.image_ref()?
     };
-    cache_trusted_runtime(config, &previous_manifest, &previous_runtime)?;
+    cache_trusted_runtime(&config, &previous_manifest, &previous_runtime)?;
 
     let candidate = if config.runtime.backend == RuntimeBackendKind::Systemd {
         install_host_candidate(
-            config,
+            &config,
             &release,
             runtime_artifact
                 .as_deref()
@@ -2675,14 +2787,28 @@ fn update(config_path: &Path, config: &UpdateConfig, options: UpdateOptions) -> 
         candidate_ui,
         backup: None,
     };
-    write_update_journal(config, &journal)?;
-    if let Err(error) = advance_update_transaction(config_path, config, &mut journal) {
-        return handle_update_failure(config, &journal, error);
+    write_update_journal(&config, &journal)?;
+    if let Err(error) = advance_update_transaction(config_path, &config, &mut journal) {
+        return handle_update_failure(&config, &journal, error);
     }
     println!(
         "NazoAuth updated to {} ({})",
         release.manifest.version, release.manifest.backend_commit
     );
+    Ok(())
+}
+
+fn persist_mfa_totp_runtime_upgrade(
+    config_path: &Path,
+    config: &mut UpdateConfig,
+) -> anyhow::Result<()> {
+    let config_dir = config_path
+        .parent()
+        .context("update config path has no parent directory")?;
+    if !install::ensure_mfa_totp_runtime(config_dir, config)? {
+        return Ok(());
+    }
+    atomic_write(config_path, &serde_json::to_vec_pretty(config)?, 0o600)?;
     Ok(())
 }
 
@@ -4212,10 +4338,17 @@ fn require_root() -> anyhow::Result<()> {
     if test_mode() {
         return Ok(());
     }
-    if Process::new("id").arg("-u").stdout()?.trim() != "0" {
-        bail!("this command requires root");
+    #[cfg(not(unix))]
+    {
+        bail!("this command requires root on a Unix host");
     }
-    Ok(())
+    #[cfg(unix)]
+    {
+        if Process::new("id").arg("-u").stdout()?.trim() != "0" {
+            bail!("this command requires root");
+        }
+        Ok(())
+    }
 }
 
 fn test_mode() -> bool {

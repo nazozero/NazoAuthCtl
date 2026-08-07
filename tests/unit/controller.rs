@@ -905,6 +905,29 @@ fn every_pre_migration_fault_window_restores_the_previous_runtime() {
 }
 
 #[test]
+fn mfa_totp_runtime_upgrade_keeps_inline_key_sources_unmounted() {
+    let work = PrivateTempDir::new("nazoauth-mfa-totp-inline-upgrade").unwrap();
+    let config_path = work.path().join("config/update.json");
+    let config_dir = config_path.parent().unwrap();
+    fs::create_dir_all(config_dir).unwrap();
+    fs::write(
+        config_dir.join(".env.yaml"),
+        "MFA_TOTP_ENCRYPTION_KEY: \"inline-key\"\n",
+    )
+    .unwrap();
+    let mut value = config(&work);
+
+    persist_mfa_totp_runtime_upgrade(&config_path, &mut value).unwrap();
+
+    let server_config = fs::read_to_string(config_dir.join(".env.yaml")).unwrap();
+    assert!(server_config.contains("MFA_TOTP_ENCRYPTION_KEY: \"inline-key\"\n"));
+    assert!(server_config.contains("MFA_TOTP_ENCRYPTION_KEY_ID: \"nazoauth-mfa-totp-v1\"\n"));
+    assert!(value.runtime.snapshot_paths.is_empty());
+    assert!(value.runtime.mounts.is_empty());
+    assert!(!config_path.exists());
+}
+
+#[test]
 fn migration_faults_always_unwind_without_the_faulting_server() {
     let work = PrivateTempDir::new("nazoauth-update-migration").unwrap();
     let config = config(&work);
@@ -2162,6 +2185,8 @@ fn conformance_commands_build_closed_operator_tasks() {
     let create = conformance_operation(ConformanceLeaseCommand::Create {
         profile: "oidf-fapi2".to_owned(),
         material: material.clone(),
+        dynamic_registration_token_file: None,
+        ciba_automated_decision_token_file: None,
         ttl_seconds: 28_800,
         yes: true,
     })
@@ -2170,11 +2195,158 @@ fn conformance_commands_build_closed_operator_tasks() {
         create,
         TaskOperation::ConformanceLeaseCreate {
             profile: "oidf-fapi2".to_owned(),
-            material_sha256: expected_sha256,
+            material_sha256: expected_sha256.clone(),
             public_material: None,
+            dynamic_registration_initial_access_token_sha256: None,
+            ciba_automated_decision_token_sha256: None,
             ttl_seconds: 28_800,
         }
     );
+
+    let token_path = work.path().join("dynamic-registration-token");
+    fs::write(&token_path, b"caller-supplied-high-entropy-token").unwrap();
+    crate::filesystem::set_mode(&token_path, 0o600).unwrap();
+    let token_sha256 = crate::filesystem::sha256(&token_path).unwrap();
+    let ciba_token_path = work.path().join("ciba-automated-decision-token");
+    fs::write(&ciba_token_path, b"ciba-decision-secret-material").unwrap();
+    crate::filesystem::set_mode(&ciba_token_path, 0o600).unwrap();
+    let ciba_token_sha256 = crate::filesystem::sha256(&ciba_token_path).unwrap();
+    let token_create = conformance_operation(ConformanceLeaseCommand::Create {
+        profile: "oidc-fapi-ciba".to_owned(),
+        material: material.clone(),
+        dynamic_registration_token_file: Some(token_path.clone()),
+        ciba_automated_decision_token_file: Some(ciba_token_path.clone()),
+        ttl_seconds: 300,
+        yes: true,
+    })
+    .unwrap();
+    assert_eq!(
+        token_create,
+        TaskOperation::ConformanceLeaseCreate {
+            profile: "oidc-fapi-ciba".to_owned(),
+            material_sha256: expected_sha256.clone(),
+            public_material: None,
+            dynamic_registration_initial_access_token_sha256: Some(token_sha256.clone()),
+            ciba_automated_decision_token_sha256: Some(ciba_token_sha256.clone()),
+            ttl_seconds: 300,
+        }
+    );
+    let serialized = serde_json::to_string(&token_create).unwrap();
+    assert!(!serialized.contains("caller-supplied-high-entropy-token"));
+    assert!(!serialized.contains("ciba-decision-secret-material"));
+    assert!(serialized.contains(&token_sha256));
+    assert!(serialized.contains(&ciba_token_sha256));
+
+    assert!(
+        conformance_operation(ConformanceLeaseCommand::Create {
+            profile: "oidc-fapi-ciba".to_owned(),
+            material: material.clone(),
+            dynamic_registration_token_file: Some(work.path().join("missing-token")),
+            ciba_automated_decision_token_file: None,
+            ttl_seconds: 300,
+            yes: true,
+        })
+        .is_err()
+    );
+    assert!(
+        conformance_operation(ConformanceLeaseCommand::Create {
+            profile: "oidc-fapi-ciba".to_owned(),
+            material: material.clone(),
+            dynamic_registration_token_file: None,
+            ciba_automated_decision_token_file: Some(work.path().join("missing-ciba-token")),
+            ttl_seconds: 300,
+            yes: true,
+        })
+        .is_err()
+    );
+    assert!(
+        conformance_operation(ConformanceLeaseCommand::Create {
+            profile: "oidf-fapi2".to_owned(),
+            material: material.clone(),
+            dynamic_registration_token_file: None,
+            ciba_automated_decision_token_file: Some(ciba_token_path.clone()),
+            ttl_seconds: 300,
+            yes: true,
+        })
+        .is_err()
+    );
+
+    let empty_token_path = work.path().join("empty-token");
+    fs::write(&empty_token_path, []).unwrap();
+    crate::filesystem::set_mode(&empty_token_path, 0o600).unwrap();
+    assert!(
+        conformance_operation(ConformanceLeaseCommand::Create {
+            profile: "oidc-fapi-ciba".to_owned(),
+            material: material.clone(),
+            dynamic_registration_token_file: Some(empty_token_path),
+            ciba_automated_decision_token_file: None,
+            ttl_seconds: 300,
+            yes: true,
+        })
+        .is_err()
+    );
+
+    let oversized_token_path = work.path().join("oversized-token");
+    fs::write(&oversized_token_path, vec![b'x'; 4097]).unwrap();
+    crate::filesystem::set_mode(&oversized_token_path, 0o600).unwrap();
+    assert!(
+        conformance_operation(ConformanceLeaseCommand::Create {
+            profile: "oidc-fapi-ciba".to_owned(),
+            material: material.clone(),
+            dynamic_registration_token_file: Some(oversized_token_path),
+            ciba_automated_decision_token_file: None,
+            ttl_seconds: 300,
+            yes: true,
+        })
+        .is_err()
+    );
+
+    #[cfg(unix)]
+    {
+        let wide_token_path = work.path().join("wide-token");
+        fs::write(&wide_token_path, b"token").unwrap();
+        crate::filesystem::set_mode(&wide_token_path, 0o644).unwrap();
+        assert!(
+            conformance_operation(ConformanceLeaseCommand::Create {
+                profile: "oidc-fapi-ciba".to_owned(),
+                material: material.clone(),
+                dynamic_registration_token_file: Some(wide_token_path),
+                ciba_automated_decision_token_file: None,
+                ttl_seconds: 300,
+                yes: true,
+            })
+            .is_err()
+        );
+
+        let symlink_token_path = work.path().join("symlink-token");
+        std::os::unix::fs::symlink(&token_path, &symlink_token_path).unwrap();
+        assert!(
+            conformance_operation(ConformanceLeaseCommand::Create {
+                profile: "oidc-fapi-ciba".to_owned(),
+                material: material.clone(),
+                dynamic_registration_token_file: Some(symlink_token_path),
+                ciba_automated_decision_token_file: None,
+                ttl_seconds: 300,
+                yes: true,
+            })
+            .is_err()
+        );
+
+        let hardlink_token_path = work.path().join("hardlink-token");
+        fs::hard_link(&token_path, &hardlink_token_path).unwrap();
+        assert!(
+            conformance_operation(ConformanceLeaseCommand::Create {
+                profile: "oidc-fapi-ciba".to_owned(),
+                material: material.clone(),
+                dynamic_registration_token_file: Some(hardlink_token_path),
+                ciba_automated_decision_token_file: None,
+                ttl_seconds: 300,
+                yes: true,
+            })
+            .is_err()
+        );
+    }
+
     assert_eq!(
         conformance_operation(ConformanceLeaseCommand::List).unwrap(),
         TaskOperation::ConformanceLeaseList
@@ -2194,6 +2366,8 @@ fn conformance_commands_build_closed_operator_tasks() {
         conformance_operation(ConformanceLeaseCommand::Create {
             profile: "openid4vc".to_owned(),
             material: openid4vc_material,
+            dynamic_registration_token_file: None,
+            ciba_automated_decision_token_file: None,
             ttl_seconds: 28_800,
             yes: true,
         })
@@ -2222,6 +2396,8 @@ fn conformance_commands_build_closed_operator_tasks() {
         conformance_operation(ConformanceLeaseCommand::Create {
             profile: "oidf-fapi2".to_owned(),
             material,
+            dynamic_registration_token_file: None,
+            ciba_automated_decision_token_file: None,
             ttl_seconds: 60,
             yes: false,
         })
