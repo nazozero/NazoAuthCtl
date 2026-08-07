@@ -471,20 +471,21 @@ impl<'a> Runtime<'a> {
     }
     pub(crate) fn remove_container(&self) -> anyhow::Result<()> {
         let backend = self.backend()?;
-        if self
+        if !self
             .config
             .capabilities
             .runtime
             .responsibility
             .permits_mutation()
         {
-            backend.verify_ownership(
-                &self.config.runtime.container_name,
-                &self.config.operator.deployment_id,
-                &self.config.runtime.runtime_instance_id,
-                &self.config.operator.controller_key_id,
-            )?;
+            bail!("runtime removal requires explicit mutation authority");
         }
+        backend.verify_ownership(
+            &self.config.runtime.container_name,
+            &self.config.operator.deployment_id,
+            &self.config.runtime.runtime_instance_id,
+            &self.config.operator.controller_key_id,
+        )?;
         backend.remove(&self.config.runtime.container_name)
     }
 
