@@ -733,7 +733,7 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
     .unwrap();
     options.profile = "standards-full".to_owned();
     let config_path = config_dir.join("update.json");
-    let mut config = build_config(
+    let config = build_config(
         &config_path,
         &options,
         RuntimeBackendKind::Podman,
