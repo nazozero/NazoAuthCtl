@@ -7,7 +7,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    deployment::{DeploymentRecord, DeploymentStore},
+    deployment::{Capability, DeploymentRecord, DeploymentStore},
     filesystem::{atomic_write, remove_file_durable, sha256},
 };
 
@@ -115,12 +115,23 @@ struct PlanStep {
     action: String,
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_update(
     store: &DeploymentStore,
     record: &DeploymentRecord,
     plan: &Value,
 ) -> anyhow::Result<UpdateCoordination> {
-    let _lock = store.deployment_lock(&record.deployment_id)?;
+    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
+    let current = current_record_locked(store, record)?;
+    let _shared_locks = store.shared_capability_locks(&current, &Capability::ALL)?;
+    prepare_update_locked(store, &current, plan)
+}
+
+pub(crate) fn prepare_update_locked(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    plan: &Value,
+) -> anyhow::Result<UpdateCoordination> {
     let plan_deployment = plan
         .get("deployment_id")
         .and_then(Value::as_str)
@@ -210,6 +221,15 @@ pub(crate) fn show(
     store: &DeploymentStore,
     record: &DeploymentRecord,
 ) -> anyhow::Result<UpdateCoordination> {
+    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
+    let current = current_record_locked(store, record)?;
+    show_locked(store, &current)
+}
+
+pub(crate) fn show_locked(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+) -> anyhow::Result<UpdateCoordination> {
     let transaction = load_path(&transaction_path(store, &record.deployment_id))?;
     validate_binding(&transaction, record)?;
     Ok(transaction)
@@ -220,9 +240,11 @@ pub(crate) fn submit_evidence(
     record: &DeploymentRecord,
     input_path: &Path,
 ) -> anyhow::Result<UpdateCoordination> {
-    let _lock = store.deployment_lock(&record.deployment_id)?;
+    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
+    let current = current_record_locked(store, record)?;
+    let _shared_locks = store.shared_capability_locks(&current, &Capability::ALL)?;
     let mut transaction = load_path(&transaction_path(store, &record.deployment_id))?;
-    validate_binding(&transaction, record)?;
+    validate_binding(&transaction, &current)?;
     if matches!(
         transaction.state,
         CoordinationState::Committed | CoordinationState::Aborted
@@ -268,9 +290,11 @@ pub(crate) fn resume(
     store: &DeploymentStore,
     record: &DeploymentRecord,
 ) -> anyhow::Result<UpdateCoordination> {
-    let _lock = store.deployment_lock(&record.deployment_id)?;
+    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
+    let current = current_record_locked(store, record)?;
+    let _shared_locks = store.shared_capability_locks(&current, &Capability::ALL)?;
     let mut transaction = load_path(&transaction_path(store, &record.deployment_id))?;
-    validate_binding(&transaction, record)?;
+    validate_binding(&transaction, &current)?;
     for step in transaction
         .steps
         .iter()
@@ -308,8 +332,10 @@ pub(crate) fn complete_controller_step(
     step_id: &str,
     evidence_sha256: &str,
 ) -> anyhow::Result<UpdateCoordination> {
-    let _lock = store.deployment_lock(&record.deployment_id)?;
-    complete_controller_step_locked(store, record, transaction_id, step_id, evidence_sha256)
+    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
+    let current = current_record_locked(store, record)?;
+    let _shared_locks = store.shared_capability_locks(&current, &Capability::ALL)?;
+    complete_controller_step_locked(store, &current, transaction_id, step_id, evidence_sha256)
 }
 
 pub(crate) fn complete_controller_step_locked(
@@ -369,9 +395,11 @@ pub(crate) fn commit_controller_update(
     evidence_sha256: &str,
 ) -> anyhow::Result<UpdateCoordination> {
     let _deployment_lock = store.deployment_lock(&current.deployment_id)?;
+    let current = current_record_locked(store, current)?;
+    let _shared_locks = store.shared_capability_locks(&current, &Capability::ALL)?;
     commit_controller_update_locked(
         store,
-        current,
+        &current,
         updated,
         transaction_id,
         step_id,
@@ -389,9 +417,14 @@ pub(crate) fn commit_controller_update_locked(
 ) -> anyhow::Result<UpdateCoordination> {
     let mut transaction = load_path(&transaction_path(store, &current.deployment_id))?;
     validate_binding(&transaction, current)?;
+    let next_revision = current
+        .declaration_revision
+        .checked_add(1)
+        .context("deployment declaration revision overflow")?;
     if transaction.transaction_id != transaction_id
         || updated.deployment_id != current.deployment_id
-        || updated.declaration_revision != current.declaration_revision + 1
+        || updated.declaration_revision != next_revision
+        || updated.active_release != transaction.target_release
     {
         bail!("committed update is not bound to the active deployment transaction");
     }
@@ -417,7 +450,7 @@ pub(crate) fn commit_controller_update_locked(
         bail!("controller update still has incomplete or blocked steps");
     }
     updated.validate()?;
-    store.persist_declaration_locked(updated)?;
+    store.persist_declaration_cas_locked(current, updated)?;
     transaction.declaration_revision = updated.declaration_revision;
     transaction.updated_at = Utc::now().timestamp();
     persist(store, &transaction)?;
@@ -472,6 +505,21 @@ fn validate_binding(
         bail!("deployment declaration changed after the coordination plan was prepared");
     }
     Ok(())
+}
+
+fn current_record_locked(
+    store: &DeploymentStore,
+    expected: &DeploymentRecord,
+) -> anyhow::Result<DeploymentRecord> {
+    // Unit-level coordination can prepare a transaction before the declaration
+    // is registered.  Production paths always have a declaration, in which
+    // case reload_locked turns a stale caller snapshot into a fail-closed
+    // error.
+    if store.declaration_path(&expected.deployment_id).exists() {
+        store.reload_locked(expected)
+    } else {
+        Ok(expected.clone())
+    }
 }
 
 fn validate_evidence_input(

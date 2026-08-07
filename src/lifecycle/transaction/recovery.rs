@@ -4,6 +4,10 @@ pub(crate) fn recover_registered(
     store: &DeploymentStore,
     record: &DeploymentRecord,
 ) -> anyhow::Result<()> {
+    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
+    let current_record = store.reload_locked(record)?;
+    let record = &current_record;
+    let _shared_locks = store.shared_capability_locks(record, &Capability::ALL)?;
     record.require_mutation(&[
         Capability::Runtime,
         Capability::Artifact,
@@ -133,8 +137,11 @@ pub(crate) fn recover_registered(
         runtime.local_artifact_id = cached_local_artifact_id(cached);
     }
     if recovered != *record {
-        recovered.declaration_revision += 1;
-        store.persist_declaration_locked(&recovered)?;
+        recovered.declaration_revision = record
+            .declaration_revision
+            .checked_add(1)
+            .context("deployment declaration revision overflow")?;
+        store.persist_declaration_cas_locked(record, &recovered)?;
     }
     transaction.state = RecoveryTransactionState::Committed;
     transaction.updated_at = Utc::now().timestamp();

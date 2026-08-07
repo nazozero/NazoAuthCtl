@@ -14,7 +14,7 @@ use crate::{
     model::UpdateConfig,
     process::{Process, command_exists},
     runtime::Runtime,
-    runtime_backend::{ManagedDependencyBackup, backend},
+    runtime_backend::{ManagedDependencyBackup, backend, managed_dependency_identity},
     secret_provider::{PostgresProvider, ValkeyProvider},
 };
 
@@ -32,6 +32,7 @@ impl Backup {
         }
         let backup = Self { path };
         backup.verify_checksums()?;
+        backup.verify_identity(config)?;
         Ok(backup)
     }
     pub(crate) fn create(
@@ -125,6 +126,7 @@ impl Backup {
 
     pub(crate) fn restore_databases(&self, config: &UpdateConfig) -> anyhow::Result<()> {
         self.verify_checksums()?;
+        self.verify_identity(config)?;
         if config.dependencies.mode != "managed" {
             bail!(
                 "automatic external database recovery is unavailable; use the provider's documented PostgreSQL and Valkey recovery procedures"
@@ -191,17 +193,72 @@ impl Backup {
         let kind = config
             .container_backend()
             .context("managed dependencies require a container backend")?;
+        let postgres_volume = format!("{}-data", config.postgres.container_name);
+        let identity = managed_dependency_identity(
+            &config.operator.deployment_id,
+            &config.operator.controller_key_id,
+            &config.runtime.runtime_instance_id,
+            &config.runtime.network,
+            &config.postgres.container_name,
+            &postgres_volume,
+            &config.postgres.image,
+            &config.postgres.database,
+            &config.postgres.user,
+            &config.valkey.container_name,
+            &config.valkey.data_volume,
+            &config.valkey.image,
+        );
         backend(kind).backup_managed_dependencies(&ManagedDependencyBackup {
             destination: self.path.clone(),
+            network: config.runtime.network.clone(),
             postgres_object: config.postgres.container_name.clone(),
+            postgres_volume,
+            postgres_image: config.postgres.image.clone(),
             postgres_user: config.postgres.user.clone(),
             postgres_database: config.postgres.database.clone(),
             postgres_validation_image: config.postgres.validation_image.clone(),
             valkey_object: config.valkey.container_name.clone(),
+            valkey_volume: config.valkey.data_volume.clone(),
+            valkey_image: config.valkey.image.clone(),
             valkey_rdb_path: config.valkey.rdb_path.clone(),
             valkey_password_file: (!config.valkey.password_file.as_os_str().is_empty())
                 .then(|| config.valkey.password_file.clone()),
+            identity,
         })
+    }
+
+    /// A backup carries a complete update configuration.  Before any
+    /// snapshot/database restore, require that its deployment, controller,
+    /// runtime instance and managed dependency configuration all match the
+    /// currently selected deployment.  Legacy or hand-edited backups fail
+    /// closed because they cannot provide this identity evidence.
+    fn verify_identity(&self, config: &UpdateConfig) -> anyhow::Result<()> {
+        let archived_config_path = self.path.join("update-config.json");
+        let archived =
+            UpdateConfig::parse(&fs::read(&archived_config_path).with_context(|| {
+                format!(
+                    "failed to read archived update configuration {}",
+                    archived_config_path.display()
+                )
+            })?)
+            .context("archived update configuration is invalid")?;
+        if archived.dependencies.mode != config.dependencies.mode {
+            bail!("backup dependency mode does not match the selected deployment");
+        }
+        if archived.container_backend() != config.container_backend()
+            || archived.postgres.validation_image != config.postgres.validation_image
+            || archived.valkey.rdb_path != config.valkey.rdb_path
+        {
+            bail!(
+                "backup immutable dependency configuration does not match the selected deployment"
+            );
+        }
+        let current_identity = dependency_identity_for_config(config);
+        let archived_identity = dependency_identity_for_config(&archived);
+        if archived_identity != current_identity {
+            bail!("backup managed dependency identity does not match the selected deployment");
+        }
+        Ok(())
     }
 
     fn snapshots(&self, config: &UpdateConfig) -> anyhow::Result<()> {
@@ -288,6 +345,26 @@ fn allocate_backup_dir(root: &Path, version: &str) -> anyhow::Result<PathBuf> {
         }
     }
     bail!("failed to allocate a unique backup directory")
+}
+
+fn dependency_identity_for_config(
+    config: &UpdateConfig,
+) -> crate::runtime_backend::ManagedDependencyIdentity {
+    let postgres_volume = format!("{}-data", config.postgres.container_name);
+    managed_dependency_identity(
+        &config.operator.deployment_id,
+        &config.operator.controller_key_id,
+        &config.runtime.runtime_instance_id,
+        &config.runtime.network,
+        &config.postgres.container_name,
+        &postgres_volume,
+        &config.postgres.image,
+        &config.postgres.database,
+        &config.postgres.user,
+        &config.valkey.container_name,
+        &config.valkey.data_volume,
+        &config.valkey.image,
+    )
 }
 
 fn validate_secret(path: &Path) -> anyhow::Result<()> {

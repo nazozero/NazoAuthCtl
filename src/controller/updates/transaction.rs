@@ -373,6 +373,10 @@ pub(crate) fn activate_candidate(
     runtime: &Runtime<'_>,
     journal: &UpdateJournal,
 ) -> anyhow::Result<()> {
+    // This helper is reachable from recovery/resume paths as well as the
+    // initial update.  Keep the runtime transition fail-closed even if a
+    // caller supplied a stale configuration snapshot.
+    config.require_managed_lifecycle()?;
     if target_is_active(config, journal) {
         if config.runtime.backend == RuntimeBackendKind::Systemd {
             runtime.start_service()?;
@@ -471,6 +475,7 @@ pub(crate) fn stop_active_runtime(
     config: &UpdateConfig,
     runtime: &Runtime<'_>,
 ) -> anyhow::Result<()> {
+    config.require_managed_lifecycle()?;
     if config.runtime.backend == RuntimeBackendKind::Systemd {
         runtime.stop_service()
     } else if runtime.container_exists() {

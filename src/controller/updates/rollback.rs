@@ -6,6 +6,7 @@ pub(crate) fn rollback(
     previous_ui: Option<&Path>,
     backup: &Backup,
 ) -> anyhow::Result<()> {
+    config.require_managed_lifecycle()?;
     let runtime = Runtime::new(config);
     if config.runtime.backend == RuntimeBackendKind::Systemd {
         runtime.stop_service().ok();
@@ -39,6 +40,7 @@ pub(crate) fn write_rollback_state(
 }
 
 pub(crate) fn public_rollback(config: &UpdateConfig) -> anyhow::Result<()> {
+    config.require_managed_lifecycle()?;
     let state: RollbackState = serde_json::from_slice(&fs::read(rollback_state_path(config))?)
         .context("rollback state is invalid")?;
     if state.schema != 1 {
@@ -85,6 +87,7 @@ pub(crate) fn public_rollback(config: &UpdateConfig) -> anyhow::Result<()> {
 }
 
 pub(crate) fn recover_from_backup(config: &UpdateConfig) -> anyhow::Result<()> {
+    require_legacy_recovery_capabilities(config)?;
     let state: RollbackState = serde_json::from_slice(&fs::read(rollback_state_path(config))?)
         .context("recovery state is invalid")?;
     if state.schema != 1

@@ -3,10 +3,11 @@ mod docker;
 mod podman;
 mod systemd;
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf};
 
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::deployment::{ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind};
 
@@ -139,38 +140,68 @@ pub(crate) struct OneShotTask {
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedPostgresRestore {
     pub(crate) network: String,
+    pub(crate) postgres_object: String,
+    pub(crate) postgres_image: String,
     pub(crate) backup_directory: PathBuf,
     pub(crate) service_file: PathBuf,
     pub(crate) password_file: PathBuf,
     pub(crate) image: String,
+    pub(crate) identity: ManagedDependencyIdentity,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedValkeyRestore {
+    pub(crate) network: String,
     pub(crate) object_reference: String,
     pub(crate) data_volume: String,
     pub(crate) backup_directory: PathBuf,
     pub(crate) image: String,
+    pub(crate) identity: ManagedDependencyIdentity,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedPostgresCommand {
     pub(crate) object_reference: String,
+    pub(crate) network: String,
     pub(crate) database: String,
     pub(crate) user: String,
     pub(crate) stdin: Vec<u8>,
+    pub(crate) image: String,
+    pub(crate) identity: ManagedDependencyIdentity,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedDependencyBackup {
     pub(crate) destination: PathBuf,
+    pub(crate) network: String,
     pub(crate) postgres_object: String,
+    pub(crate) postgres_volume: String,
+    pub(crate) postgres_image: String,
     pub(crate) postgres_user: String,
     pub(crate) postgres_database: String,
     pub(crate) postgres_validation_image: String,
     pub(crate) valkey_object: String,
+    pub(crate) valkey_volume: String,
+    pub(crate) valkey_image: String,
     pub(crate) valkey_rdb_path: String,
     pub(crate) valkey_password_file: Option<PathBuf>,
+    pub(crate) identity: ManagedDependencyIdentity,
+}
+
+/// Immutable identities and configuration digests used when a managed
+/// dependency is touched.  Runtime/deployment labels alone are not enough:
+/// the digest binds the expected object role, names, network, volumes and
+/// pinned images to the operation that is about to run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedDependencyIdentity {
+    pub(crate) deployment_id: String,
+    pub(crate) control_authority: String,
+    pub(crate) runtime_instance_id: String,
+    pub(crate) network_config_digest: String,
+    pub(crate) postgres_config_digest: String,
+    pub(crate) postgres_volume_config_digest: String,
+    pub(crate) valkey_config_digest: String,
+    pub(crate) valkey_volume_config_digest: String,
 }
 
 #[derive(Clone, Debug)]
@@ -196,6 +227,140 @@ pub(crate) struct ManagedDependencies {
     pub(crate) valkey_image: String,
     pub(crate) valkey_password_file: PathBuf,
     pub(crate) valkey_acl_file: PathBuf,
+}
+
+impl ManagedDependencies {
+    pub(crate) fn identity(&self) -> ManagedDependencyIdentity {
+        managed_dependency_identity(
+            &self.network.deployment_id,
+            &self.network.control_authority,
+            &self.runtime_instance_id,
+            &self.network.name,
+            &self.postgres_object,
+            &self.postgres_volume,
+            &self.postgres_image,
+            &self.postgres_database,
+            &self.postgres_user,
+            &self.valkey_object,
+            &self.valkey_volume,
+            &self.valkey_image,
+        )
+    }
+}
+
+/// Build a stable, length-delimited digest for a managed resource's
+/// immutable configuration.  Length prefixes avoid ambiguity when values are
+/// concatenated (for example `ab` + `c` versus `a` + `bc`).
+pub(crate) fn managed_config_digest(resource_kind: &str, fields: &[(&str, &str)]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"nazoauthctl-managed-resource-v1\0");
+    update_digest_part(&mut digest, "resource-kind", resource_kind);
+    for (name, value) in fields {
+        update_digest_part(&mut digest, name, value);
+    }
+    let digest = digest.finalize();
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing digest to String cannot fail");
+    }
+    format!("sha256:{encoded}")
+}
+
+fn update_digest_part(digest: &mut Sha256, name: &str, value: &str) {
+    digest.update(name.len().to_string().as_bytes());
+    digest.update(b":");
+    digest.update(name.as_bytes());
+    digest.update(value.len().to_string().as_bytes());
+    digest.update(b":");
+    digest.update(value.as_bytes());
+    digest.update(b"\0");
+}
+
+pub(crate) fn managed_network_config_digest(
+    deployment_id: &str,
+    control_authority: &str,
+    network: &str,
+) -> String {
+    managed_config_digest(
+        "network",
+        &[
+            ("deployment-id", deployment_id),
+            ("control-authority", control_authority),
+            ("network", network),
+        ],
+    )
+}
+
+pub(crate) fn managed_dependency_identity(
+    deployment_id: &str,
+    control_authority: &str,
+    runtime_instance_id: &str,
+    network: &str,
+    postgres_object: &str,
+    postgres_volume: &str,
+    postgres_image: &str,
+    postgres_database: &str,
+    postgres_user: &str,
+    valkey_object: &str,
+    valkey_volume: &str,
+    valkey_image: &str,
+) -> ManagedDependencyIdentity {
+    let common = [
+        ("deployment-id", deployment_id),
+        ("control-authority", control_authority),
+        ("runtime-instance-id", runtime_instance_id),
+        ("network", network),
+    ];
+    // A network is deployment-scoped and may be ensured before the runtime
+    // instance is materialized.  Its immutable digest therefore binds the
+    // network's own deployment/authority/name identity; dependency resources
+    // additionally bind the runtime instance below.
+    let network_fields = [
+        ("deployment-id", deployment_id),
+        ("control-authority", control_authority),
+        ("network", network),
+    ];
+    let network_config_digest = managed_config_digest("network", &network_fields);
+
+    let mut postgres_fields = common.to_vec();
+    postgres_fields.extend([
+        ("role", "postgres"),
+        ("object", postgres_object),
+        ("volume", postgres_volume),
+        ("image", postgres_image),
+        ("database", postgres_database),
+        ("user", postgres_user),
+    ]);
+    let postgres_config_digest = managed_config_digest("postgres", &postgres_fields);
+
+    let mut postgres_volume_fields = common.to_vec();
+    postgres_volume_fields.extend([("role", "postgres-volume"), ("volume", postgres_volume)]);
+    let postgres_volume_config_digest =
+        managed_config_digest("postgres-volume", &postgres_volume_fields);
+
+    let mut valkey_fields = common.to_vec();
+    valkey_fields.extend([
+        ("role", "valkey"),
+        ("object", valkey_object),
+        ("volume", valkey_volume),
+        ("image", valkey_image),
+    ]);
+    let valkey_config_digest = managed_config_digest("valkey", &valkey_fields);
+
+    let mut valkey_volume_fields = common.to_vec();
+    valkey_volume_fields.extend([("role", "valkey-volume"), ("volume", valkey_volume)]);
+    let valkey_volume_config_digest = managed_config_digest("valkey-volume", &valkey_volume_fields);
+
+    ManagedDependencyIdentity {
+        deployment_id: deployment_id.to_owned(),
+        control_authority: control_authority.to_owned(),
+        runtime_instance_id: runtime_instance_id.to_owned(),
+        network_config_digest,
+        postgres_config_digest,
+        postgres_volume_config_digest,
+        valkey_config_digest,
+        valkey_volume_config_digest,
+    }
 }
 
 #[derive(Clone, Debug)]

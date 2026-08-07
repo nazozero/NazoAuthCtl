@@ -185,6 +185,26 @@ fn declaration_drift_and_conflicting_update_plans_fail_closed() {
 }
 
 #[test]
+fn persisted_declaration_drift_is_rejected_after_the_transaction_was_prepared() {
+    let work = PrivateTempDir::new("nazoauthctl-coordination-persisted-drift").unwrap();
+    let store = store(&work);
+    let current = record("deployment-a");
+    store.persist(&current).unwrap();
+    prepare_update(&store, &current, &plan("deployment-a")).unwrap();
+
+    let mut changed = current.clone();
+    changed.alias = Some("changed-after-plan".to_owned());
+    changed.declaration_revision += 1;
+    let _lock = store.deployment_lock("deployment-a").unwrap();
+    store
+        .persist_declaration_cas_locked(&current, &changed)
+        .unwrap();
+    drop(_lock);
+
+    assert!(resume(&store, &current).is_err());
+}
+
+#[test]
 fn controller_steps_commit_the_new_declaration_only_after_final_acceptance() {
     let work = PrivateTempDir::new("nazoauthctl-coordination-commit").unwrap();
     let store = store(&work);

@@ -7,6 +7,11 @@ pub(crate) fn execute_coordinated_update(
 ) -> anyhow::Result<crate::coordination::UpdateCoordination> {
     use crate::coordination::{CoordinationState, StepOwner, StepState};
 
+    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
+    let current_record = store.reload_locked(record)?;
+    let record = &current_record;
+    let _shared_locks = store.shared_capability_locks(record, &Capability::ALL)?;
+
     if transaction.deployment_id != record.deployment_id {
         bail!("update transaction is bound to a different deployment");
     }
@@ -30,7 +35,6 @@ pub(crate) fn execute_coordinated_update(
         bail!("controller update is forbidden until offline recovery is proven");
     }
 
-    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
     let lifecycle_path = lifecycle_path(record)?;
     let lifecycle = LifecycleManifest::load(lifecycle_path)?;
     validate_lifecycle_record_binding(&lifecycle, record)?;
@@ -89,7 +93,7 @@ pub(crate) fn execute_coordinated_update(
         }
     };
     persist_update_execution(&execution_path, &execution)?;
-    let mut current = crate::coordination::show(store, record)?;
+    let mut current = crate::coordination::show_locked(store, record)?;
 
     if controller_step_pending(&current, "recovery-point") {
         record.require_mutation(&[Capability::Backups])?;
@@ -227,7 +231,10 @@ pub(crate) fn execute_coordinated_update(
             declared.artifact = activated_artifact_reference(runtime, cached)?;
             declared.local_artifact_id = cached_local_artifact_id(cached);
         }
-        updated.declaration_revision += 1;
+        updated.declaration_revision = record
+            .declaration_revision
+            .checked_add(1)
+            .context("deployment declaration revision overflow")?;
         current = crate::coordination::commit_controller_update_locked(
             store,
             record,
@@ -260,11 +267,14 @@ pub(crate) fn rollback_registered(
     store: &DeploymentStore,
     record: &DeploymentRecord,
 ) -> anyhow::Result<()> {
+    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
+    let current_record = store.reload_locked(record)?;
+    let record = &current_record;
+    let _shared_locks = store.shared_capability_locks(record, &Capability::ALL)?;
     record.require_mutation(&[Capability::Runtime, Capability::Artifact])?;
     if !record.core_recovery_is_proven() {
         bail!("deployment has no proven controller-independent rollback contract");
     }
-    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
     let lifecycle_path = lifecycle_path(record)?;
     let lifecycle = LifecycleManifest::load(lifecycle_path)?;
     validate_lifecycle_record_binding(&lifecycle, record)?;
@@ -301,8 +311,11 @@ pub(crate) fn rollback_registered(
         declared.local_artifact_id = cached_local_artifact_id(cached);
     }
     if rolled_back != *record {
-        rolled_back.declaration_revision += 1;
-        store.persist_declaration_locked(&rolled_back)?;
+        rolled_back.declaration_revision = record
+            .declaration_revision
+            .checked_add(1)
+            .context("deployment declaration revision overflow")?;
+        store.persist_declaration_cas_locked(record, &rolled_back)?;
     }
     crate::governance::append_management_audit(
         store,

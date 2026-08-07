@@ -48,6 +48,7 @@ pub(crate) fn recover_pending_update(
     let Some(journal) = load_update_journal(config)? else {
         return Ok(());
     };
+    require_legacy_recovery_capabilities(config)?;
     eprintln!(
         "nazoauthctl: recovering update transaction {} at phase {:?}",
         journal.transaction_id, journal.phase
@@ -80,6 +81,11 @@ pub(crate) fn restore_previous_transaction(
     config: &UpdateConfig,
     journal: &UpdateJournal,
 ) -> anyhow::Result<()> {
+    // This function is also called from update failure handling, not only from
+    // the CLI gate.  Re-check the complete legacy authority immediately before
+    // any stop/remove/start operation so a stale or tampered config cannot turn
+    // recovery into an unauthorized runtime mutation.
+    require_legacy_recovery_capabilities(config)?;
     ensure_trusted_runtime_available(config, &journal.from_release, &journal.previous_runtime)?;
     if journal.phase >= UpdatePhase::MigrationRunning {
         let backup = journal_backup(config, journal)?;
@@ -125,6 +131,28 @@ pub(crate) fn restore_previous_transaction(
     verify_public(config)?;
     verify_ui(config, &journal.from_release)?;
     write_active_release(config, &journal.from_release)
+}
+
+pub(crate) fn require_legacy_recovery_capabilities(config: &UpdateConfig) -> anyhow::Result<()> {
+    config.require_managed_lifecycle()?;
+    let denied = [Capability::Database, Capability::Valkey]
+        .into_iter()
+        .filter(|capability| {
+            !config
+                .capabilities
+                .grant(*capability)
+                .responsibility
+                .permits_mutation()
+        })
+        .map(Capability::name)
+        .collect::<Vec<_>>();
+    if !denied.is_empty() {
+        bail!(
+            "legacy update recovery exceeds granted capabilities: {}",
+            denied.join(", ")
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn handle_update_failure(

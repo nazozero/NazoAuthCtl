@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, File, OpenOptions},
+    io::ErrorKind,
     path::{Path, PathBuf},
 };
 
@@ -9,7 +10,7 @@ use anyhow::{Context as _, bail};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
-use crate::filesystem::atomic_write;
+use crate::filesystem::{atomic_write, read_regular_file};
 
 pub(crate) const REGISTRY_SCHEMA: u32 = 1;
 pub(crate) const DEPLOYMENT_SCHEMA: u32 = 1;
@@ -450,26 +451,40 @@ impl DeploymentStore {
             ("controller state root", &self.state_root),
             ("break-glass root", &self.break_glass_root),
         ] {
-            if !path.is_absolute()
-                || path.parent().is_none()
-                || path.components().any(|component| {
-                    matches!(
-                        component,
-                        std::path::Component::ParentDir | std::path::Component::CurDir
-                    )
-                })
-            {
-                bail!("{label} must be a normalized absolute non-root path");
-            }
+            validate_storage_root(path, label, label == "break-glass root")?;
         }
-        if self.break_glass_root.starts_with(&self.state_root)
-            || self.state_root.starts_with(&self.break_glass_root)
-            || self.break_glass_root.starts_with(&self.config_root)
-            || self.config_root.starts_with(&self.break_glass_root)
+        let config_identity = storage_identity(&self.config_root)?;
+        let state_identity = storage_identity(&self.state_root)?;
+        let break_glass_identity = storage_identity(&self.break_glass_root)?;
+        if paths_overlap(&break_glass_identity, &state_identity)
+            || paths_overlap(&state_identity, &config_identity)
+            || paths_overlap(&break_glass_identity, &config_identity)
         {
             bail!("break-glass material must use a separate storage failure domain");
         }
         Ok(())
+    }
+
+    /// Create the three controller roots only after validating every existing
+    /// path component.  The second validation closes the common create-time
+    /// symlink substitution window and makes all later atomic writes/locks
+    /// inherit a trusted parent chain.
+    fn ensure_storage_roots(&self) -> anyhow::Result<()> {
+        self.validate_failure_domains()?;
+        for (label, path, private) in [
+            ("controller configuration root", &self.config_root, false),
+            ("controller state root", &self.state_root, false),
+            ("break-glass root", &self.break_glass_root, true),
+        ] {
+            if matches!(fs::symlink_metadata(path), Err(error) if error.kind() == ErrorKind::NotFound)
+            {
+                fs::create_dir_all(path)
+                    .with_context(|| format!("failed to create {label} {}", path.display()))?;
+                crate::filesystem::set_mode(path, 0o700)?;
+            }
+            validate_storage_root(path, label, private)?;
+        }
+        self.validate_failure_domains()
     }
 
     pub(crate) fn declaration_path(&self, deployment_id: &str) -> PathBuf {
@@ -490,17 +505,15 @@ impl DeploymentStore {
     }
 
     pub(crate) fn load_registry(&self) -> anyhow::Result<Registry> {
+        self.validate_failure_domains()?;
         let path = self.registry_path();
-        if !path.exists() {
+        let Some(bytes) = read_regular_file(&path)? else {
             return Ok(Registry {
                 schema: REGISTRY_SCHEMA,
                 deployments: BTreeMap::new(),
             });
-        }
-        let registry: Registry = serde_json::from_slice(
-            &fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?,
-        )
-        .context("registry is invalid")?;
+        };
+        let registry: Registry = serde_json::from_slice(&bytes).context("registry is invalid")?;
         if registry.schema != REGISTRY_SCHEMA {
             bail!("unsupported registry schema");
         }
@@ -508,12 +521,13 @@ impl DeploymentStore {
     }
 
     pub(crate) fn load(&self, deployment_id: &str) -> anyhow::Result<DeploymentRecord> {
+        self.validate_failure_domains()?;
         validate_identifier(deployment_id, "deployment ID")?;
         let path = self.declaration_path(deployment_id);
-        let record: DeploymentRecord = serde_json::from_slice(
-            &fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?,
-        )
-        .context("deployment declaration is invalid")?;
+        let bytes = read_regular_file(&path)?
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let record: DeploymentRecord =
+            serde_json::from_slice(&bytes).context("deployment declaration is invalid")?;
         record.validate()?;
         if record.deployment_id != deployment_id {
             bail!("deployment declaration ID does not match its registry key");
@@ -569,6 +583,7 @@ impl DeploymentStore {
     }
 
     pub(crate) fn persist(&self, record: &DeploymentRecord) -> anyhow::Result<()> {
+        self.ensure_storage_roots()?;
         record.validate()?;
         let _registry_lock = self.registry_lock()?;
         let _deployment_lock = self.deployment_lock(&record.deployment_id)?;
@@ -576,6 +591,7 @@ impl DeploymentStore {
     }
 
     pub(crate) fn persist_locked(&self, record: &DeploymentRecord) -> anyhow::Result<()> {
+        self.ensure_storage_roots()?;
         record.validate()?;
         let mut registry = self.load_registry()?;
         if registry.deployments.iter().any(|(id, entry)| {
@@ -606,11 +622,60 @@ impl DeploymentStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn persist_declaration_locked(
         &self,
         record: &DeploymentRecord,
     ) -> anyhow::Result<()> {
         record.validate()?;
+        let current = self.load(&record.deployment_id)?;
+        let expected_revision = current
+            .declaration_revision
+            .checked_add(1)
+            .context("deployment declaration revision overflow")?;
+        if record.declaration_revision != expected_revision {
+            bail!(
+                "deployment declaration revision is stale; expected {}, got {}",
+                expected_revision,
+                record.declaration_revision
+            );
+        }
+        self.persist_declaration_file_locked(record)
+    }
+
+    /// Persist a declaration only if the caller still owns the exact record it
+    /// loaded while holding the deployment lock.  A revision check alone is
+    /// insufficient: a stale caller could otherwise replay a different
+    /// declaration with the same expected revision.
+    pub(crate) fn persist_declaration_cas_locked(
+        &self,
+        expected: &DeploymentRecord,
+        updated: &DeploymentRecord,
+    ) -> anyhow::Result<()> {
+        expected.validate()?;
+        updated.validate()?;
+        if expected.deployment_id != updated.deployment_id {
+            bail!("deployment declaration CAS crossed deployment boundaries");
+        }
+        let expected_revision = expected
+            .declaration_revision
+            .checked_add(1)
+            .context("deployment declaration revision overflow")?;
+        if updated.declaration_revision != expected_revision {
+            bail!(
+                "deployment declaration CAS must advance revision from {} to {}",
+                expected.declaration_revision,
+                expected_revision
+            );
+        }
+        let current = self.load(&expected.deployment_id)?;
+        if current != *expected {
+            bail!("deployment declaration changed while the operation was in progress");
+        }
+        self.persist_declaration_file_locked(updated)
+    }
+
+    fn persist_declaration_file_locked(&self, record: &DeploymentRecord) -> anyhow::Result<()> {
         let registry = self.load_registry()?;
         if !registry.deployments.contains_key(&record.deployment_id) {
             bail!("deployment declaration is not registered");
@@ -622,11 +687,28 @@ impl DeploymentStore {
         )
     }
 
+    /// Reload a declaration after its deployment lock has been acquired and
+    /// reject a caller that still holds an older snapshot.  This is intentionally
+    /// a separate operation from `load`: callers must establish the lock before
+    /// invoking it.
+    pub(crate) fn reload_locked(
+        &self,
+        expected: &DeploymentRecord,
+    ) -> anyhow::Result<DeploymentRecord> {
+        let current = self.load(&expected.deployment_id)?;
+        if current != *expected {
+            bail!("deployment declaration changed while the operation was being prepared");
+        }
+        Ok(current)
+    }
+
     pub(crate) fn registry_lock(&self) -> anyhow::Result<FileLock> {
+        self.ensure_storage_roots()?;
         FileLock::acquire(&self.state_root.join("locks").join("registry.lock"))
     }
 
     pub(crate) fn deployment_lock(&self, deployment_id: &str) -> anyhow::Result<FileLock> {
+        self.ensure_storage_roots()?;
         validate_identifier(deployment_id, "deployment ID")?;
         FileLock::acquire(
             &self
@@ -637,6 +719,7 @@ impl DeploymentStore {
     }
 
     pub(crate) fn shared_resource_lock(&self, resource_id: &str) -> anyhow::Result<FileLock> {
+        self.ensure_storage_roots()?;
         validate_identifier(resource_id, "shared resource ID")?;
         FileLock::acquire(
             &self
@@ -646,9 +729,160 @@ impl DeploymentStore {
         )
     }
 
+    /// Acquire deterministic operational locks for capabilities whose backing
+    /// resource is shared with another deployment.  The capability name is the
+    /// stable lock identity because declarations intentionally carry provider
+    /// references, not a controller-owned resource locator.
+    pub(crate) fn shared_capability_locks(
+        &self,
+        record: &DeploymentRecord,
+        capabilities: &[Capability],
+    ) -> anyhow::Result<Vec<FileLock>> {
+        let mut shared = capabilities
+            .iter()
+            .copied()
+            .filter(|capability| {
+                record.capabilities.grant(*capability).scope == ResourceScope::Shared
+            })
+            .map(Capability::name)
+            .collect::<Vec<_>>();
+        shared.sort_unstable();
+        shared.dedup();
+        shared
+            .into_iter()
+            .map(|capability| self.shared_resource_lock(capability))
+            .collect()
+    }
+
     pub(crate) fn controller_self_lock(&self) -> anyhow::Result<FileLock> {
+        self.ensure_storage_roots()?;
         FileLock::acquire(&self.state_root.join("locks").join("controller-self.lock"))
     }
+}
+
+fn validate_storage_root(path: &Path, label: &str, break_glass: bool) -> anyhow::Result<()> {
+    if !path.is_absolute()
+        || path.parent().is_none()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        bail!("{label} must be a normalized absolute non-root path");
+    }
+
+    // Inspect every existing component, including the nearest existing
+    // ancestor when the configured root has not yet been created.  A normal
+    // metadata/stat call follows symlinks; symlink_metadata is deliberate so
+    // a link cannot silently redirect controller state or lock files.
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        match fs::symlink_metadata(candidate) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    bail!(
+                        "{label} contains a symlink component: {}",
+                        candidate.display()
+                    );
+                }
+                if !metadata.is_dir() {
+                    bail!(
+                        "{label} component is not a directory: {}",
+                        candidate.display()
+                    );
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {label} {}", candidate.display()));
+            }
+        }
+        current = candidate.parent();
+    }
+
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        validate_storage_directory_metadata(&metadata, path, label, break_glass)?;
+    }
+    Ok(())
+}
+
+fn validate_storage_directory_metadata(
+    metadata: &fs::Metadata,
+    path: &Path,
+    label: &str,
+    break_glass: bool,
+) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o022 != 0 {
+            bail!("{label} is group/world writable: {}", path.display());
+        }
+        if break_glass && mode & 0o077 != 0 {
+            bail!("{label} must be owner-only: {}", path.display());
+        }
+        if let Some(uid) = effective_uid()
+            && metadata.uid() != uid
+        {
+            bail!(
+                "{label} is not owned by the controller user: {}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (metadata, path, label, break_glass);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn effective_uid() -> Option<u32> {
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                let value = line.strip_prefix("Uid:")?.split_whitespace().nth(1)?;
+                value.parse().ok()
+            })
+        })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn effective_uid() -> Option<u32> {
+    None
+}
+
+fn storage_identity(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut existing = path;
+    while matches!(
+        fs::symlink_metadata(existing),
+        Err(error) if error.kind() == ErrorKind::NotFound
+    ) {
+        existing = existing
+            .parent()
+            .context("storage root has no existing ancestor")?;
+    }
+    let canonical = fs::canonicalize(existing).with_context(|| {
+        format!(
+            "failed to canonicalize storage ancestor {}",
+            existing.display()
+        )
+    })?;
+    let suffix = path
+        .strip_prefix(existing)
+        .context("storage root is not below its existing ancestor")?;
+    Ok(canonical.join(suffix))
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
 }
 
 pub(crate) struct FileLock {
@@ -658,7 +892,7 @@ pub(crate) struct FileLock {
 impl FileLock {
     fn acquire(path: &Path) -> anyhow::Result<Self> {
         let parent = path.parent().context("lock path has no parent")?;
-        fs::create_dir_all(parent)?;
+        crate::filesystem::ensure_directory_chain(parent)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)

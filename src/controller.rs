@@ -57,6 +57,7 @@ struct ControlConfig {
     path: PathBuf,
     config: UpdateConfig,
     _deployment_lock: Option<FileLock>,
+    _shared_capability_locks: Vec<FileLock>,
 }
 
 fn control_config(
@@ -78,6 +79,7 @@ fn control_config(
             path: config_path.to_path_buf(),
             config,
             _deployment_lock: None,
+            _shared_capability_locks: Vec::new(),
         });
     }
 
@@ -87,6 +89,11 @@ fn control_config(
         .then(|| store.deployment_lock(&resolved.deployment_id))
         .transpose()?;
     let record = store.load(&resolved.deployment_id)?;
+    let shared_capability_locks = if destructive {
+        store.shared_capability_locks(&record, capabilities)?
+    } else {
+        Vec::new()
+    };
     if !capabilities.is_empty() {
         record.require_mutation(capabilities)?;
     }
@@ -114,16 +121,23 @@ fn control_config(
             record.deployment_id
         ),
     };
-    let config = if unsettled {
+    let mut config = if unsettled {
         load_config_unsettled(&path)?
     } else {
         load_config(&path)?
     };
     verify_control_binding(&record, &config)?;
+    // The declaration is the authoritative capability state.  Keep the
+    // in-memory legacy config aligned after the lock/reload boundary so a
+    // stale file cannot grant extra authority (or deny an intentional
+    // capability transition) to runtime helpers.
+    config.trust = record.trust;
+    config.capabilities = record.capabilities.clone();
     Ok(ControlConfig {
         path,
         config,
         _deployment_lock: deployment_lock,
+        _shared_capability_locks: shared_capability_locks,
     })
 }
 

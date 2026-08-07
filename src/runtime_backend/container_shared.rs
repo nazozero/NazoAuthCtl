@@ -14,8 +14,22 @@ use crate::process::Process;
 
 use super::{
     ContainerRestartPolicy, ContainerRuntimePolicy, ManagedDependencyBackup, ManagedNetwork,
-    NeutralMount, OneShotTask,
+    NeutralMount, OneShotTask, managed_network_config_digest,
 };
+
+const DEPLOYMENT_LABEL: &str = "io.nazoauth.deployment-id";
+const AUTHORITY_LABEL: &str = "io.nazoauth.control-authority";
+const RUNTIME_INSTANCE_LABEL: &str = "io.nazoauth.runtime-instance-id";
+const RESOURCE_KIND_LABEL: &str = "io.nazoauth.managed-resource";
+const CONFIG_DIGEST_LABEL: &str = "io.nazoauth.config-digest";
+
+pub(crate) fn network_config_digest(network: &ManagedNetwork) -> String {
+    managed_network_config_digest(
+        &network.deployment_id,
+        &network.control_authority,
+        &network.name,
+    )
+}
 
 /// Build the common hardening flags used by managed containers.
 pub(crate) fn append_container_policy(
@@ -155,17 +169,30 @@ pub(crate) fn backup_managed_dependencies(
         .run_quiet()
 }
 
-pub(crate) fn assert_control_labels(
+/// Require the complete managed-resource identity before an operation can
+/// inspect or mutate an engine object.  A deployment/authority pair is only a
+/// coarse namespace; runtime id, resource role and configuration digest close
+/// the cross-instance and stale-configuration gaps.
+pub(crate) fn assert_managed_labels(
     command: &OsStr,
     arguments: &[&str],
     deployment_id: &str,
     control_authority: &str,
+    runtime_instance_id: Option<&str>,
+    resource_kind: &str,
+    config_digest: &str,
     backend_name: &str,
 ) -> anyhow::Result<()> {
-    for (label, expected) in [
-        ("io.nazoauth.deployment-id", deployment_id),
-        ("io.nazoauth.control-authority", control_authority),
-    ] {
+    let mut expected_labels = vec![
+        (DEPLOYMENT_LABEL, deployment_id),
+        (AUTHORITY_LABEL, control_authority),
+        (RESOURCE_KIND_LABEL, resource_kind),
+        (CONFIG_DIGEST_LABEL, config_digest),
+    ];
+    if let Some(runtime_instance_id) = runtime_instance_id {
+        expected_labels.push((RUNTIME_INSTANCE_LABEL, runtime_instance_id));
+    }
+    for (label, expected) in expected_labels {
         let mut matched = false;
         for format in [
             format!("{{{{index .Config.Labels \"{label}\"}}}}"),
@@ -183,10 +210,90 @@ pub(crate) fn assert_control_labels(
             }
         }
         if !matched {
-            bail!("refusing to manage a {backend_name} object outside this deployment authority");
+            bail!(
+                "refusing to manage a {backend_name} object without the expected immutable managed-resource identity"
+            );
         }
     }
     Ok(())
+}
+
+/// Compare the engine-reported image reference before touching a managed
+/// container.  The image reference is expected to be digest-pinned by the
+/// install/recovery policy; accepting a tag or an unavailable inspect field
+/// would turn the labels back into the only trust boundary.
+pub(crate) fn assert_container_image(
+    command: &OsStr,
+    arguments: &[&str],
+    expected_image: &str,
+    backend_name: &str,
+) -> anyhow::Result<()> {
+    require_digest_pinned_image(expected_image, backend_name)?;
+    let expected_digest = expected_image
+        .rsplit_once("@sha256:")
+        .map(|(_, digest)| format!("sha256:{digest}"))
+        .filter(|digest| valid_digest(digest))
+        .context("managed dependency image has an invalid digest")?;
+    for format in [
+        "{{{{.Config.Image}}}}",
+        "{{{{.ImageName}}}}",
+        "{{{{.Config.ImageName}}}}",
+        "{{{{index .RepoDigests 0}}}}",
+    ] {
+        let actual = Process::new(command)
+            .args(arguments)
+            .arg("--format")
+            .arg(format)
+            .stdout()
+            .ok()
+            .map(|value| value.trim().to_owned());
+        if actual.as_deref().is_some_and(|value| {
+            value == expected_image
+                || value == expected_digest
+                || value.ends_with(&format!("@{expected_digest}"))
+        }) {
+            return Ok(());
+        }
+    }
+    bail!("refusing to manage a {backend_name} container whose immutable image does not match")
+}
+
+pub(crate) fn require_digest_pinned_image(
+    expected_image: &str,
+    backend_name: &str,
+) -> anyhow::Result<()> {
+    let Some((_, digest)) = expected_image.rsplit_once('@') else {
+        bail!("{backend_name} managed dependency image is not digest-pinned");
+    };
+    if valid_digest(digest) {
+        return Ok(());
+    }
+    bail!("{backend_name} managed dependency image is not digest-pinned")
+}
+
+pub(crate) fn append_managed_labels(
+    mut command: Process,
+    deployment_id: &str,
+    control_authority: &str,
+    runtime_instance_id: Option<&str>,
+    resource_kind: &str,
+    config_digest: &str,
+) -> Process {
+    command = command
+        .arg("--label")
+        .arg(format!("{DEPLOYMENT_LABEL}={deployment_id}"))
+        .arg("--label")
+        .arg(format!("{AUTHORITY_LABEL}={control_authority}"))
+        .arg("--label")
+        .arg(format!("{RESOURCE_KIND_LABEL}={resource_kind}"))
+        .arg("--label")
+        .arg(format!("{CONFIG_DIGEST_LABEL}={config_digest}"));
+    if let Some(runtime_instance_id) = runtime_instance_id {
+        command = command
+            .arg("--label")
+            .arg(format!("{RUNTIME_INSTANCE_LABEL}={runtime_instance_id}"));
+    }
+    command
 }
 
 pub(crate) fn network_gateway(document: &serde_json::Value) -> Option<std::net::IpAddr> {
@@ -207,50 +314,61 @@ pub(crate) fn ensure_volume(
     command: &OsStr,
     name: &str,
     network: &ManagedNetwork,
+    runtime_instance_id: &str,
+    resource_kind: &str,
+    config_digest: &str,
     backend_name: &str,
 ) -> anyhow::Result<()> {
     if Process::new(command)
         .args(["volume", "inspect", name])
         .succeeds()
     {
-        return assert_control_labels(
+        return assert_managed_labels(
             command,
             &["volume", "inspect", name],
             &network.deployment_id,
             &network.control_authority,
+            Some(runtime_instance_id),
+            resource_kind,
+            config_digest,
             backend_name,
         );
     }
-    Process::new(command)
-        .args(["volume", "create", "--label"])
-        .arg(format!(
-            "io.nazoauth.deployment-id={}",
-            network.deployment_id
-        ))
-        .arg("--label")
-        .arg(format!(
-            "io.nazoauth.control-authority={}",
-            network.control_authority
-        ))
-        .arg(name)
-        .run_quiet()
+    append_managed_labels(
+        Process::new(command).args(["volume", "create"]),
+        &network.deployment_id,
+        &network.control_authority,
+        Some(runtime_instance_id),
+        resource_kind,
+        config_digest,
+    )
+    .arg(name)
+    .run_quiet()
 }
 
 pub(crate) fn ensure_container(
     command: &OsStr,
     name: &str,
     network: &ManagedNetwork,
+    runtime_instance_id: &str,
+    resource_kind: &str,
+    config_digest: &str,
+    expected_image: &str,
     create: Process,
     backend_name: &str,
 ) -> anyhow::Result<()> {
     if Process::new(command).args(["inspect", name]).succeeds() {
-        assert_control_labels(
+        assert_managed_labels(
             command,
             &["inspect", name],
             &network.deployment_id,
             &network.control_authority,
+            Some(runtime_instance_id),
+            resource_kind,
+            config_digest,
             backend_name,
         )?;
+        assert_container_image(command, &["inspect", name], expected_image, backend_name)?;
         return Process::new(command).args(["start", name]).run_quiet();
     }
     create.run_quiet()

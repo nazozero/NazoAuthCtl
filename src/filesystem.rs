@@ -57,7 +57,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Resu
     let parent = path
         .parent()
         .context("atomic-write target has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    ensure_directory_chain(parent)?;
     if let Ok(metadata) = fs::symlink_metadata(path)
         && (metadata.file_type().is_symlink() || !metadata.is_file())
     {
@@ -106,12 +106,67 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Resu
     Ok(())
 }
 
+pub(crate) fn read_regular_file(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("file is not a regular non-symlink: {}", path.display());
+    }
+    fs::read(path)
+        .map(Some)
+        .with_context(|| format!("failed to read {}", path.display()))
+}
+
 pub(crate) fn remove_file_durable(path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        validate_directory_chain(parent)?;
+    }
     match fs::remove_file(path) {
         Ok(()) => sync_parent(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
     }
+}
+
+/// Ensure a path's directory chain contains no symlink or non-directory
+/// component.  This is deliberately used immediately before every lock and
+/// atomic write; `create_dir_all` by itself follows an attacker-controlled
+/// symlink in an existing parent.
+pub(crate) fn ensure_directory_chain(path: &Path) -> anyhow::Result<()> {
+    validate_directory_chain(path)?;
+    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+    validate_directory_chain(path)
+}
+
+pub(crate) fn validate_directory_chain(path: &Path) -> anyhow::Result<()> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        match fs::symlink_metadata(candidate) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    bail!("directory path contains a symlink: {}", candidate.display());
+                }
+                if !metadata.is_dir() {
+                    bail!(
+                        "directory path component is not a directory: {}",
+                        candidate.display()
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", candidate.display()));
+            }
+        }
+        current = candidate.parent();
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

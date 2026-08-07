@@ -72,8 +72,16 @@ fn transition(
     handoff: bool,
 ) -> anyhow::Result<()> {
     let store = DeploymentStore::system();
-    let resolved = store.resolve(selector, true)?;
+    let selected = store.resolve(selector, true)?;
     let _registry_lock = store.registry_lock()?;
+    let resolved = store.resolve(selector, true)?;
+    if resolved.deployment_id != selected.deployment_id {
+        bail!("deployment selection changed while capability transition was being prepared");
+    }
+    // Resolve only chooses the deployment ID.  The declaration must be
+    // reloaded after the registry/deployment lock is held so a caller cannot
+    // replay capability changes from a stale snapshot.
+    let _deployment_lock = store.deployment_lock(&resolved.deployment_id)?;
     let record = store.load(&resolved.deployment_id)?;
     let mut shared_resources = changes
         .iter()
@@ -89,7 +97,6 @@ fn transition(
         .into_iter()
         .map(|resource| store.shared_resource_lock(resource))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let _deployment_lock = store.deployment_lock(&resolved.deployment_id)?;
     if record.trust != TrustState::Adopted {
         bail!("capabilities cannot change until the deployment is adopted");
     }
@@ -149,7 +156,7 @@ fn transition(
     if transaction.state == TransitionState::Prepared {
         match record.declaration_revision {
             revision if revision == transaction.from_revision => {
-                store.persist_locked(&transaction.target)?;
+                store.persist_declaration_cas_locked(&record, &transaction.target)?;
             }
             revision if revision == transaction.target.declaration_revision => {
                 if record.capabilities != transaction.target.capabilities {

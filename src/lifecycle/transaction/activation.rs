@@ -6,6 +6,7 @@ pub(crate) fn activate_cached_runtime(
     expected_release: &nazo_operator_protocol::EmbeddedIdentity,
     cached: &CachedRuntimeArtifact,
 ) -> anyhow::Result<()> {
+    record.require_mutation(&[Capability::Runtime])?;
     let backend = backend(runtime.backend);
     let mut trusted_local_artifact_id = None;
     let artifact = match cached {
@@ -47,19 +48,12 @@ pub(crate) fn activate_cached_runtime(
         bail!("trusted recovery artifact embedded identity changed before activation");
     }
     if let Some(observation) = backend.inspect_optional(&runtime.object_reference)? {
-        if record
-            .capabilities
-            .runtime
-            .responsibility
-            .permits_mutation()
-        {
-            backend.verify_ownership(
-                &runtime.object_reference,
-                &record.deployment_id,
-                &runtime.runtime_instance_id,
-                &record.control_authority,
-            )?;
-        }
+        backend.verify_ownership(
+            &runtime.object_reference,
+            &record.deployment_id,
+            &runtime.runtime_instance_id,
+            &record.control_authority,
+        )?;
         if observation.running {
             backend.stop(&runtime.object_reference)?;
         }
@@ -110,19 +104,12 @@ pub(crate) fn activate_cached_runtime(
             observation.artifact
         );
     }
-    if record
-        .capabilities
-        .runtime
-        .responsibility
-        .permits_mutation()
-    {
-        backend.verify_ownership(
-            &runtime.object_reference,
-            &record.deployment_id,
-            &runtime.runtime_instance_id,
-            &record.control_authority,
-        )?;
-    }
+    backend.verify_ownership(
+        &runtime.object_reference,
+        &record.deployment_id,
+        &runtime.runtime_instance_id,
+        &record.control_authority,
+    )?;
     Ok(())
 }
 

@@ -337,7 +337,11 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             let context = control_config(
                 &configured_path,
                 selector.as_deref(),
-                &[Capability::Runtime, Capability::Artifact],
+                &[
+                    Capability::Runtime,
+                    Capability::Artifact,
+                    Capability::Backups,
+                ],
                 false,
                 false,
                 false,
@@ -354,7 +358,6 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
                 if record.resources.contains_key("lifecycle_contract") {
-                    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
                     require_confirmation(
                         yes,
                         "execute the deployment-bound offline recovery contract and activate the cached trusted runtime",

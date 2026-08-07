@@ -132,6 +132,38 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
 }
 
 #[test]
+fn managed_dependency_identity_binds_runtime_and_immutable_configuration() {
+    let identity = crate::runtime_backend::managed_dependency_identity(
+        "deployment-a",
+        "controller-a",
+        "runtime-a",
+        "nazoauth-network",
+        "nazoauth-postgres",
+        "nazoauth-postgres-data",
+        "postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "nazoauth",
+        "nazoauth_runtime",
+        "nazoauth-valkey",
+        "nazoauth-valkey-data",
+        "valkey@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+    let mut runtime_changed = identity.clone();
+    runtime_changed.runtime_instance_id = "runtime-b".to_owned();
+    let mut image_changed = identity.clone();
+    image_changed.postgres_config_digest = crate::runtime_backend::managed_config_digest(
+        "postgres",
+        &[(
+            "image",
+            "postgres@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        )],
+    );
+    assert_ne!(identity, runtime_changed);
+    assert_ne!(identity, image_changed);
+    assert!(identity.network_config_digest.starts_with("sha256:"));
+    assert!(identity.postgres_config_digest.starts_with("sha256:"));
+}
+
+#[test]
 fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
     let work = PrivateTempDir::new("runtime-task-mounts").unwrap();
     let config = config(&work);

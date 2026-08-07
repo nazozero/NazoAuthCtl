@@ -115,6 +115,22 @@ fn deployment_state_and_break_glass_roots_are_separate() {
     store.validate_failure_domains().unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn storage_failure_domains_reject_symlinked_roots() {
+    let work = PrivateTempDir::new("nazoauthctl-storage-symlink").unwrap();
+    let real = work.path().join("real-config");
+    std::fs::create_dir(&real).unwrap();
+    let linked = work.path().join("linked-config");
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    let store = DeploymentStore {
+        config_root: linked,
+        state_root: work.path().join("state"),
+        break_glass_root: work.path().join("break-glass"),
+    };
+    assert!(store.validate_failure_domains().is_err());
+}
+
 #[test]
 fn locks_are_per_deployment_and_per_shared_resource() {
     let work = PrivateTempDir::new("nazoauthctl-registry-locks").unwrap();
@@ -125,6 +141,47 @@ fn locks_are_per_deployment_and_per_shared_resource() {
     let _shared_a = store.shared_resource_lock("database-a").unwrap();
     let _shared_b = store.shared_resource_lock("database-b").unwrap();
     assert!(store.shared_resource_lock("database-a").is_err());
+}
+
+#[test]
+fn shared_capability_operations_use_the_same_stable_lock_as_resource_transitions() {
+    let work = PrivateTempDir::new("nazoauthctl-shared-capability-locks").unwrap();
+    let store = store(&work);
+    let mut deployment = record("deployment-a", "alpha");
+    deployment.capabilities.database.scope = ResourceScope::Shared;
+    deployment.capabilities.database.responsibility = Responsibility::Delegated;
+    let _deployment_lock = store.deployment_lock("deployment-a").unwrap();
+    let _capability_locks = store
+        .shared_capability_locks(&deployment, &[Capability::Database])
+        .unwrap();
+    assert!(store.shared_resource_lock("database").is_err());
+}
+
+#[test]
+fn declaration_persistence_requires_a_single_revision_step_and_exact_cas_snapshot() {
+    let work = PrivateTempDir::new("nazoauthctl-declaration-cas").unwrap();
+    let store = store(&work);
+    let current = record("deployment-a", "alpha");
+    store.persist(&current).unwrap();
+
+    let mut updated = current.clone();
+    updated.declaration_revision += 1;
+    store
+        .persist_declaration_cas_locked(&current, &updated)
+        .unwrap();
+
+    let mut stale = current;
+    stale.alias = Some("stale".to_owned());
+    stale.declaration_revision += 1;
+    assert!(
+        store
+            .persist_declaration_cas_locked(&stale, &updated)
+            .is_err()
+    );
+
+    let mut skipped = store.load("deployment-a").unwrap();
+    skipped.declaration_revision += 2;
+    assert!(store.persist_declaration_locked(&skipped).is_err());
 }
 
 #[test]

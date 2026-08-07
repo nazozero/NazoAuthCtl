@@ -1268,10 +1268,16 @@ fn verified_journal_backup_is_opened_only_from_the_configured_root() {
     fs::create_dir(&backup).unwrap();
     fs::write(backup.join("state.bin"), b"durable-state").unwrap();
     fs::write(
+        backup.join("update-config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    fs::write(
         backup.join("SHA256SUMS"),
         format!(
-            "{}  state.bin\n",
-            crate::filesystem::sha256(&backup.join("state.bin")).unwrap()
+            "{}  state.bin\n{}  update-config.json\n",
+            crate::filesystem::sha256(&backup.join("state.bin")).unwrap(),
+            crate::filesystem::sha256(&backup.join("update-config.json")).unwrap(),
         ),
     )
     .unwrap();
@@ -1289,6 +1295,22 @@ fn no_pending_update_is_an_idempotent_recovery_noop() {
     let config = config(&work);
     recover_pending_update(&work.path().join("config.json"), &config).unwrap();
     assert!(!update_journal_path(&config).exists());
+}
+
+#[test]
+fn legacy_recovery_requires_all_runtime_and_provider_mutation_capabilities() {
+    let work = PrivateTempDir::new("nazoauth-legacy-recovery-capabilities").unwrap();
+    let mut config = config(&work);
+    config.trust = crate::deployment::TrustState::Observed;
+    assert!(require_legacy_recovery_capabilities(&config).is_err());
+
+    config.trust = crate::deployment::TrustState::Adopted;
+    config.capabilities.runtime.responsibility = Responsibility::External;
+    assert!(require_legacy_recovery_capabilities(&config).is_err());
+
+    config.capabilities.runtime.responsibility = Responsibility::Managed;
+    config.capabilities.database.responsibility = Responsibility::External;
+    assert!(require_legacy_recovery_capabilities(&config).is_err());
 }
 
 #[test]

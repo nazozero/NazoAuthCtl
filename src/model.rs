@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
 };
 
-use crate::deployment::{CapabilityGrants, TrustState};
+use crate::deployment::{Capability, CapabilityGrants, TrustState};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
@@ -231,6 +231,17 @@ impl UpdateConfig {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.schema != 2 {
             bail!("unsupported update config schema");
+        }
+        self.capabilities.validate()?;
+        if self.trust == TrustState::Observed
+            && Capability::ALL.iter().any(|capability| {
+                self.capabilities
+                    .grant(*capability)
+                    .responsibility
+                    .permits_mutation()
+            })
+        {
+            bail!("observed update configuration cannot grant mutation capability");
         }
         if !matches!(self.install_profile.as_str(), "baseline" | "standards-full") {
             bail!("unsupported install profile {}", self.install_profile);

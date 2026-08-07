@@ -15,6 +15,33 @@ pub(super) fn restore_postgres(
     command: &OsStr,
     restore: &ManagedPostgresRestore,
 ) -> anyhow::Result<()> {
+    container_shared::require_digest_pinned_image(&restore.image, "Podman")?;
+    container_shared::assert_managed_labels(
+        command,
+        &["network", "inspect", restore.network.as_str()],
+        &restore.identity.deployment_id,
+        &restore.identity.control_authority,
+        None,
+        "network",
+        &restore.identity.network_config_digest,
+        "Podman",
+    )?;
+    container_shared::assert_managed_labels(
+        command,
+        &["inspect", restore.postgres_object.as_str()],
+        &restore.identity.deployment_id,
+        &restore.identity.control_authority,
+        Some(restore.identity.runtime_instance_id.as_str()),
+        "postgres",
+        &restore.identity.postgres_config_digest,
+        "Podman",
+    )?;
+    container_shared::assert_container_image(
+        command,
+        &["inspect", restore.postgres_object.as_str()],
+        &restore.postgres_image,
+        "Podman",
+    )?;
     Process::new(command)
         .args(["run", "--rm", "--network"])
         .arg(&restore.network)
@@ -56,6 +83,43 @@ pub(super) fn restore_valkey(
     command: &OsStr,
     restore: &ManagedValkeyRestore,
 ) -> anyhow::Result<()> {
+    container_shared::require_digest_pinned_image(&restore.image, "Podman")?;
+    container_shared::assert_managed_labels(
+        command,
+        &["network", "inspect", restore.network.as_str()],
+        &restore.identity.deployment_id,
+        &restore.identity.control_authority,
+        None,
+        "network",
+        &restore.identity.network_config_digest,
+        "Podman",
+    )?;
+    container_shared::assert_managed_labels(
+        command,
+        &["inspect", restore.object_reference.as_str()],
+        &restore.identity.deployment_id,
+        &restore.identity.control_authority,
+        Some(restore.identity.runtime_instance_id.as_str()),
+        "valkey",
+        &restore.identity.valkey_config_digest,
+        "Podman",
+    )?;
+    container_shared::assert_container_image(
+        command,
+        &["inspect", restore.object_reference.as_str()],
+        &restore.image,
+        "Podman",
+    )?;
+    container_shared::assert_managed_labels(
+        command,
+        &["volume", "inspect", restore.data_volume.as_str()],
+        &restore.identity.deployment_id,
+        &restore.identity.control_authority,
+        Some(restore.identity.runtime_instance_id.as_str()),
+        "valkey-volume",
+        &restore.identity.valkey_volume_config_digest,
+        "Podman",
+    )?;
     Process::new(command)
         .args(["stop", restore.object_reference.as_str()])
         .run_quiet()?;
@@ -86,6 +150,32 @@ pub(super) fn execute_postgres(
     command: &OsStr,
     operation: &ManagedPostgresCommand,
 ) -> anyhow::Result<()> {
+    container_shared::assert_managed_labels(
+        command,
+        &["network", "inspect", operation.network.as_str()],
+        &operation.identity.deployment_id,
+        &operation.identity.control_authority,
+        None,
+        "network",
+        &operation.identity.network_config_digest,
+        "Podman",
+    )?;
+    container_shared::assert_managed_labels(
+        command,
+        &["inspect", operation.object_reference.as_str()],
+        &operation.identity.deployment_id,
+        &operation.identity.control_authority,
+        Some(operation.identity.runtime_instance_id.as_str()),
+        "postgres",
+        &operation.identity.postgres_config_digest,
+        "Podman",
+    )?;
+    container_shared::assert_container_image(
+        command,
+        &["inspect", operation.object_reference.as_str()],
+        &operation.image,
+        "Podman",
+    )?;
     Process::new(command)
         .args(["exec", "-i"])
         .arg(&operation.object_reference)
@@ -98,6 +188,67 @@ pub(super) fn execute_postgres(
 }
 
 pub(super) fn backup(command: &OsStr, backup: &ManagedDependencyBackup) -> anyhow::Result<()> {
+    container_shared::require_digest_pinned_image(&backup.postgres_validation_image, "Podman")?;
+    let identity = &backup.identity;
+    container_shared::assert_managed_labels(
+        command,
+        &["network", "inspect", backup.network.as_str()],
+        &identity.deployment_id,
+        &identity.control_authority,
+        None,
+        "network",
+        &identity.network_config_digest,
+        "Podman",
+    )?;
+    for (object, role, digest, image) in [
+        (
+            backup.postgres_object.as_str(),
+            "postgres",
+            identity.postgres_config_digest.as_str(),
+            backup.postgres_image.as_str(),
+        ),
+        (
+            backup.valkey_object.as_str(),
+            "valkey",
+            identity.valkey_config_digest.as_str(),
+            backup.valkey_image.as_str(),
+        ),
+    ] {
+        container_shared::assert_managed_labels(
+            command,
+            &["inspect", object],
+            &identity.deployment_id,
+            &identity.control_authority,
+            Some(identity.runtime_instance_id.as_str()),
+            role,
+            digest,
+            "Podman",
+        )?;
+        container_shared::assert_container_image(command, &["inspect", object], image, "Podman")?;
+    }
+    for (volume, role, digest) in [
+        (
+            backup.postgres_volume.as_str(),
+            "postgres-volume",
+            identity.postgres_volume_config_digest.as_str(),
+        ),
+        (
+            backup.valkey_volume.as_str(),
+            "valkey-volume",
+            identity.valkey_volume_config_digest.as_str(),
+        ),
+    ] {
+        container_shared::assert_managed_labels(
+            command,
+            &["volume", "inspect", volume],
+            &identity.deployment_id,
+            &identity.control_authority,
+            Some(identity.runtime_instance_id.as_str()),
+            role,
+            digest,
+            "Podman",
+        )?;
+    }
     container_shared::backup_managed_dependencies(command, backup, true)
 }
 
@@ -109,25 +260,25 @@ pub(super) fn ensure_network(
         .args(["network", "inspect", network.name.as_str()])
         .succeeds()
     {
-        container_shared::assert_control_labels(
+        container_shared::assert_managed_labels(
             command,
             &["network", "inspect", network.name.as_str()],
             &network.deployment_id,
             &network.control_authority,
+            None,
+            "network",
+            &container_shared::network_config_digest(network),
             "Podman",
         )?;
     } else {
-        let mut create = Process::new(command)
-            .args(["network", "create", "--label"])
-            .arg(format!(
-                "io.nazoauth.deployment-id={}",
-                network.deployment_id
-            ))
-            .arg("--label")
-            .arg(format!(
-                "io.nazoauth.control-authority={}",
-                network.control_authority
-            ));
+        let mut create = container_shared::append_managed_labels(
+            Process::new(command).args(["network", "create"]),
+            &network.deployment_id,
+            &network.control_authority,
+            None,
+            "network",
+            &container_shared::network_config_digest(network),
+        );
         if let Some(subnet) = &network.subnet {
             create = create.args(["--subnet", subnet]);
         }
@@ -147,104 +298,117 @@ pub(super) fn ensure_dependencies(
     command: &OsStr,
     dependencies: &ManagedDependencies,
 ) -> anyhow::Result<()> {
+    container_shared::require_digest_pinned_image(&dependencies.postgres_image, "Podman")?;
+    container_shared::require_digest_pinned_image(&dependencies.valkey_image, "Podman")?;
     ensure_network(command, &dependencies.network)?;
     for volume in [
-        dependencies.postgres_volume.as_str(),
-        dependencies.valkey_volume.as_str(),
+        (
+            dependencies.postgres_volume.as_str(),
+            "postgres-volume",
+            dependencies.identity().postgres_volume_config_digest,
+        ),
+        (
+            dependencies.valkey_volume.as_str(),
+            "valkey-volume",
+            dependencies.identity().valkey_volume_config_digest,
+        ),
     ] {
-        container_shared::ensure_volume(command, volume, &dependencies.network, "Podman")?;
+        container_shared::ensure_volume(
+            command,
+            volume.0,
+            &dependencies.network,
+            &dependencies.runtime_instance_id,
+            volume.1,
+            &volume.2,
+            "Podman",
+        )?;
     }
-    let postgres = Process::new(command)
-        .args(["run", "-d", "--name", dependencies.postgres_object.as_str()])
-        .arg("--label")
-        .arg(format!(
-            "io.nazoauth.deployment-id={}",
-            dependencies.network.deployment_id
-        ))
-        .arg("--label")
-        .arg(format!(
-            "io.nazoauth.control-authority={}",
-            dependencies.network.control_authority
-        ))
-        .arg("--label")
-        .arg(format!(
-            "io.nazoauth.runtime-instance-id={}-postgres",
-            dependencies.runtime_instance_id
-        ))
-        .args(["--restart", "unless-stopped", "--network"])
-        .arg(&dependencies.network.name)
-        .arg("--env")
-        .arg(format!("POSTGRES_DB={}", dependencies.postgres_database))
-        .arg("--env")
-        .arg(format!("POSTGRES_USER={}", dependencies.postgres_user))
-        .args([
-            "--env",
-            "POSTGRES_PASSWORD_FILE=/run/nazoauth-secrets/postgres-password",
-            "--volume",
-        ])
-        .arg(format!(
-            "{}:/var/lib/postgresql",
-            dependencies.postgres_volume
-        ))
-        .arg("--volume")
-        .arg(format!(
-            "{}:/run/nazoauth-secrets/postgres-password:ro,Z",
-            dependencies.postgres_password_file.display()
-        ))
-        .arg(&dependencies.postgres_image);
+    let identity = dependencies.identity();
+    let postgres =
+        Process::new(command).args(["run", "-d", "--name", dependencies.postgres_object.as_str()]);
+    let postgres = container_shared::append_managed_labels(
+        postgres,
+        &identity.deployment_id,
+        &identity.control_authority,
+        Some(identity.runtime_instance_id.as_str()),
+        "postgres",
+        &identity.postgres_config_digest,
+    )
+    .args(["--restart", "unless-stopped", "--network"])
+    .arg(&dependencies.network.name)
+    .arg("--env")
+    .arg(format!("POSTGRES_DB={}", dependencies.postgres_database))
+    .arg("--env")
+    .arg(format!("POSTGRES_USER={}", dependencies.postgres_user))
+    .args([
+        "--env",
+        "POSTGRES_PASSWORD_FILE=/run/nazoauth-secrets/postgres-password",
+        "--volume",
+    ])
+    .arg(format!(
+        "{}:/var/lib/postgresql",
+        dependencies.postgres_volume
+    ))
+    .arg("--volume")
+    .arg(format!(
+        "{}:/run/nazoauth-secrets/postgres-password:ro,Z",
+        dependencies.postgres_password_file.display()
+    ))
+    .arg(&dependencies.postgres_image);
     container_shared::ensure_container(
         command,
         &dependencies.postgres_object,
         &dependencies.network,
+        &dependencies.runtime_instance_id,
+        "postgres",
+        &identity.postgres_config_digest,
+        &dependencies.postgres_image,
         postgres,
         "Podman",
     )?;
 
-    let valkey = Process::new(command)
-        .args(["run", "-d", "--name", dependencies.valkey_object.as_str()])
-        .arg("--label")
-        .arg(format!(
-            "io.nazoauth.deployment-id={}",
-            dependencies.network.deployment_id
-        ))
-        .arg("--label")
-        .arg(format!(
-            "io.nazoauth.control-authority={}",
-            dependencies.network.control_authority
-        ))
-        .arg("--label")
-        .arg(format!(
-            "io.nazoauth.runtime-instance-id={}-valkey",
-            dependencies.runtime_instance_id
-        ))
-        .args(["--restart", "unless-stopped", "--network"])
-        .arg(&dependencies.network.name)
-        .arg("--volume")
-        .arg(format!("{}:/data", dependencies.valkey_volume))
-        .arg("--volume")
-        .arg(format!(
-            "{}:/run/nazoauth-secrets/valkey-password:ro,Z",
-            dependencies.valkey_password_file.display()
-        ))
-        .arg("--volume")
-        .arg(format!(
-            "{}:/run/nazoauth-secrets/valkey.acl:ro,Z",
-            dependencies.valkey_acl_file.display()
-        ))
-        .arg(&dependencies.valkey_image)
-        .args([
-            "valkey-server",
-            "--aclfile",
-            "/run/nazoauth-secrets/valkey.acl",
-            "--appendonly",
-            "yes",
-            "--dir",
-            "/data",
-        ]);
+    let valkey =
+        Process::new(command).args(["run", "-d", "--name", dependencies.valkey_object.as_str()]);
+    let valkey = container_shared::append_managed_labels(
+        valkey,
+        &identity.deployment_id,
+        &identity.control_authority,
+        Some(identity.runtime_instance_id.as_str()),
+        "valkey",
+        &identity.valkey_config_digest,
+    )
+    .args(["--restart", "unless-stopped", "--network"])
+    .arg(&dependencies.network.name)
+    .arg("--volume")
+    .arg(format!("{}:/data", dependencies.valkey_volume))
+    .arg("--volume")
+    .arg(format!(
+        "{}:/run/nazoauth-secrets/valkey-password:ro,Z",
+        dependencies.valkey_password_file.display()
+    ))
+    .arg("--volume")
+    .arg(format!(
+        "{}:/run/nazoauth-secrets/valkey.acl:ro,Z",
+        dependencies.valkey_acl_file.display()
+    ))
+    .arg(&dependencies.valkey_image)
+    .args([
+        "valkey-server",
+        "--aclfile",
+        "/run/nazoauth-secrets/valkey.acl",
+        "--appendonly",
+        "yes",
+        "--dir",
+        "/data",
+    ]);
     container_shared::ensure_container(
         command,
         &dependencies.valkey_object,
         &dependencies.network,
+        &dependencies.runtime_instance_id,
+        "valkey",
+        &identity.valkey_config_digest,
+        &dependencies.valkey_image,
         valkey,
         "Podman",
     )?;

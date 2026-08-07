@@ -28,6 +28,13 @@ pub(crate) fn registered_update_prepare(
 ) -> anyhow::Result<()> {
     const SERVER_REPOSITORY: &str = "nazozero/NazoAuth";
 
+    // Keep the declaration snapshot and all staged transaction material under
+    // one deployment/shared-capability lock.  `resolve` happens before this
+    // function is called and is therefore only an ID selection step.
+    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
+    let record = store.reload_locked(record)?;
+    let _shared_locks = store.shared_capability_locks(&record, &Capability::ALL)?;
+
     let container_backend = record
         .runtime_instances
         .iter()
@@ -38,7 +45,7 @@ pub(crate) fn registered_update_prepare(
         options.version.as_deref(),
         container_backend,
     )?;
-    let plan = build_registered_update_plan(record, &release.manifest)?;
+    let plan = build_registered_update_plan(&record, &release.manifest)?;
     let evidence_root = store
         .deployment_state_dir(&record.deployment_id)
         .join("recovery")
@@ -46,9 +53,9 @@ pub(crate) fn registered_update_prepare(
         .join(&release.manifest.version);
     release.persist_verification_evidence(&evidence_root)?;
     if record.resources.contains_key("lifecycle_contract") {
-        crate::lifecycle::stage_update_release(store, record, &release)?;
+        crate::lifecycle::stage_update_release(store, &record, &release)?;
     }
-    let transaction = crate::coordination::prepare_update(store, record, &plan)?;
+    let transaction = crate::coordination::prepare_update_locked(store, &record, &plan)?;
     println!("{}", serde_json::to_string_pretty(&transaction)?);
     Ok(())
 }
