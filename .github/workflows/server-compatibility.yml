@@ -396,42 +396,11 @@ jobs:
           # runner-side material has been written.
           sudo chown -R 0:0 "$config_root" "$state_root" "$break_glass_root"
           sudo chmod 0700 "$break_glass_root"
-          docker_real="$(command -v docker)"
-          docker_trace="$root/docker-recovery-trace.log"
-          docker_wrapper="$root/docker"
-          : >"$docker_trace"
-          cat >"$docker_wrapper" <<SH
-          #!/bin/sh
-          printf 'docker %s\n' "\$*" >>"$docker_trace"
-          docker_stderr="\$docker_trace.stderr"
-          "$docker_real" "\$@" 2>"\$docker_stderr"
-          status=\$?
-          cat "\$docker_stderr" >>"$docker_trace"
-          cat "\$docker_stderr" >&2
-          rm -f "\$docker_stderr"
-          printf 'status=%s\n' "\$status" >>"$docker_trace"
-          exit "\$status"
-          SH
-          chmod 0755 "$docker_wrapper"
-          docker_wrapper_path=""
-          for candidate in /usr/local/sbin/docker /usr/local/bin/docker; do
-            if [ ! -e "$candidate" ]; then
-              docker_wrapper_path="$candidate"
-              break
-            fi
-          done
-          test -n "$docker_wrapper_path"
-          sudo install -m 0755 "$docker_wrapper" "$docker_wrapper_path"
-          if ! sudo env \
+          sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
-            "$GITHUB_WORKSPACE/controller/nazoauthctl" --deployment "$deployment_id" recover --yes; then
-            sudo rm -f "$docker_wrapper_path"
-            sed -E 's/(SECRET_MARKER|postgresql:[^ ]+|redis:[^ ]+)/<redacted>/g' "$docker_trace"
-            exit 1
-          fi
-          sudo rm -f "$docker_wrapper_path"
+            "$GITHUB_WORKSPACE/controller/nazoauthctl" --deployment "$deployment_id" recover --yes
           ready=false
           for _ in $(seq 1 90); do
             if curl --fail --silent http://127.0.0.1:19081/ready >/dev/null; then
