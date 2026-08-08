@@ -1897,7 +1897,7 @@ fn fake_container_runtime(
         deployment = config.operator.deployment_id,
         authority = config.operator.controller_key_id,
         runtime = config.runtime.runtime_instance_id,
-        network_digest,
+        network_digest = network_digest,
         postgres_volume = postgres_volume,
         valkey_volume = config.valkey.data_volume,
         postgres_volume_digest = identity.postgres_volume_config_digest,
@@ -1906,8 +1906,8 @@ fn fake_container_runtime(
         valkey_digest = identity.valkey_config_digest,
         postgres_image = config.postgres.image,
         valkey_image = config.valkey.image,
-        runtime_image,
-        inspect_json,
+        runtime_image = runtime_image,
+        inspect_json = inspect_json,
     );
     write_shell_executable(&engine, &script);
     engine

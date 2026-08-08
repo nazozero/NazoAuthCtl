@@ -427,6 +427,12 @@ impl DeploymentStore {
                 r"C:\ProgramData\NazoAuthCtl\state",
                 r"C:\ProgramData\NazoAuthCtl-BreakGlass",
             )
+        } else if cfg!(target_os = "macos") {
+            (
+                "/private/etc/nazoauthctl",
+                "/private/var/lib/nazoauthctl",
+                "/private/var/lib/nazoauthctl-break-glass",
+            )
         } else {
             (
                 "/etc/nazoauthctl",
