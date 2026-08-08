@@ -173,6 +173,7 @@ pub(crate) fn backup_managed_dependencies(
 /// inspect or mutate an engine object.  A deployment/authority pair is only a
 /// coarse namespace; runtime id, resource role and configuration digest close
 /// the cross-instance and stale-configuration gaps.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn assert_managed_labels(
     command: &OsStr,
     arguments: &[&str],
@@ -346,6 +347,7 @@ pub(crate) fn ensure_volume(
     .run_quiet()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ensure_container(
     command: &OsStr,
     name: &str,

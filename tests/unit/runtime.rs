@@ -662,7 +662,7 @@ fn application_container_command_uses_hardening_and_secret_file_references() {
     write_shell_executable(
         &engine,
         &format!(
-            "case \"$*\" in\n  *'image inspect'*) printf '%s\\n' '[\"{image}\"]' ;;\n  *) printf '%s\\n' \"$@\" > '{}' ;;\nesac",
+            "case \"$*\" in\n  *'container inspect'*) printf '%s\\n' 'no such object' >&2; exit 1 ;;\n  *'image inspect'*) printf '%s\\n' '[\"{image}\"]' ;;\n  *) printf '%s\\n' \"$@\" > '{}' ;;\nesac",
             argv.display()
         ),
     );

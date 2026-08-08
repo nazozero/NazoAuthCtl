@@ -291,6 +291,7 @@ pub(crate) fn managed_network_config_digest(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn managed_dependency_identity(
     deployment_id: &str,
     control_authority: &str,
