@@ -359,10 +359,13 @@ pub(crate) fn ensure_container(
     create: Process,
     backend_name: &str,
 ) -> anyhow::Result<()> {
-    if Process::new(command).args(["inspect", name]).succeeds() {
+    if Process::new(command)
+        .args(["container", "inspect", name])
+        .succeeds()
+    {
         assert_managed_labels(
             command,
-            &["inspect", name],
+            &["container", "inspect", name],
             &network.deployment_id,
             &network.control_authority,
             Some(runtime_instance_id),
@@ -370,10 +373,64 @@ pub(crate) fn ensure_container(
             config_digest,
             backend_name,
         )?;
-        assert_container_image(command, &["inspect", name], expected_image, backend_name)?;
+        assert_container_image(
+            command,
+            &["container", "inspect", name],
+            expected_image,
+            backend_name,
+        )?;
         return Process::new(command).args(["start", name]).run_quiet();
     }
     create.run_quiet()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+
+    use crate::{
+        filesystem::PrivateTempDir, process::Process, runtime_backend::ManagedNetwork,
+        test_support::write_shell_executable,
+    };
+
+    #[test]
+    fn container_lookup_cannot_resolve_a_volume_with_the_container_name_as_prefix() {
+        let work = PrivateTempDir::new("runtime-container-inspect-type").unwrap();
+        let engine = work.path().join("fake-podman");
+        let generic_marker = work.path().join("generic-inspect-was-used");
+        let create_argv = work.path().join("create-argv");
+        write_shell_executable(
+            &engine,
+            &format!(
+                "if [ \"$*\" = 'container inspect managed-postgres' ]; then exit 1; fi\nif [ \"$*\" = 'inspect managed-postgres' ]; then : > '{}'; exit 0; fi\nprintf '%s\\n' \"$@\" > '{}'\n",
+                generic_marker.display(),
+                create_argv.display(),
+            ),
+        );
+        let network = ManagedNetwork {
+            name: "managed-network".to_owned(),
+            subnet: None,
+            deployment_id: "deployment-test".to_owned(),
+            control_authority: "controller-test".to_owned(),
+        };
+        super::ensure_container(
+            engine.as_os_str(),
+            "managed-postgres",
+            &network,
+            "runtime-test",
+            "postgres",
+            &format!("sha256:{}", "c".repeat(64)),
+            "postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Process::new(engine.as_os_str()).args(["run", "--name", "managed-postgres"]),
+            "Podman",
+        )
+        .unwrap();
+        assert!(!generic_marker.exists());
+        assert_eq!(
+            fs::read_to_string(create_argv).unwrap(),
+            "run\n--name\nmanaged-postgres\n"
+        );
+    }
 }
 
 pub(crate) fn append_mounts(mut command: Process, mounts: &[NeutralMount]) -> Process {

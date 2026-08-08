@@ -40,7 +40,7 @@ pub(super) fn backup(command: &OsStr, backup: &ManagedDependencyBackup) -> anyho
     ] {
         container_shared::assert_managed_labels(
             command,
-            &["inspect", object],
+            &["container", "inspect", object],
             &identity.deployment_id,
             &identity.control_authority,
             Some(identity.runtime_instance_id.as_str()),
@@ -48,7 +48,12 @@ pub(super) fn backup(command: &OsStr, backup: &ManagedDependencyBackup) -> anyho
             digest,
             "Docker",
         )?;
-        container_shared::assert_container_image(command, &["inspect", object], image, "Docker")?;
+        container_shared::assert_container_image(
+            command,
+            &["container", "inspect", object],
+            image,
+            "Docker",
+        )?;
     }
     for (volume, role, digest) in [
         (
@@ -93,7 +98,7 @@ pub(super) fn restore_postgres(
     )?;
     container_shared::assert_managed_labels(
         command,
-        &["inspect", restore.postgres_object.as_str()],
+        &["container", "inspect", restore.postgres_object.as_str()],
         &restore.identity.deployment_id,
         &restore.identity.control_authority,
         Some(restore.identity.runtime_instance_id.as_str()),
@@ -103,7 +108,7 @@ pub(super) fn restore_postgres(
     )?;
     container_shared::assert_container_image(
         command,
-        &["inspect", restore.postgres_object.as_str()],
+        &["container", "inspect", restore.postgres_object.as_str()],
         &restore.postgres_image,
         "Docker",
     )?;
@@ -158,7 +163,7 @@ pub(super) fn restore_valkey(
     )?;
     container_shared::assert_managed_labels(
         command,
-        &["inspect", restore.object_reference.as_str()],
+        &["container", "inspect", restore.object_reference.as_str()],
         &restore.identity.deployment_id,
         &restore.identity.control_authority,
         Some(restore.identity.runtime_instance_id.as_str()),
@@ -168,7 +173,7 @@ pub(super) fn restore_valkey(
     )?;
     container_shared::assert_container_image(
         command,
-        &["inspect", restore.object_reference.as_str()],
+        &["container", "inspect", restore.object_reference.as_str()],
         &restore.image,
         "Docker",
     )?;
@@ -220,7 +225,7 @@ pub(super) fn execute_postgres(
     )?;
     container_shared::assert_managed_labels(
         command,
-        &["inspect", operation.object_reference.as_str()],
+        &["container", "inspect", operation.object_reference.as_str()],
         &operation.identity.deployment_id,
         &operation.identity.control_authority,
         Some(operation.identity.runtime_instance_id.as_str()),
@@ -230,7 +235,7 @@ pub(super) fn execute_postgres(
     )?;
     container_shared::assert_container_image(
         command,
-        &["inspect", operation.object_reference.as_str()],
+        &["container", "inspect", operation.object_reference.as_str()],
         &operation.image,
         "Docker",
     )?;
