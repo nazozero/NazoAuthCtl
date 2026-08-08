@@ -247,6 +247,7 @@ fn configure_runtime_permissions(config: &UpdateConfig) -> anyhow::Result<()> {
         config.dependencies.valkey_url_file.clone(),
         mfa_key,
         config.operator.receipt_private_key.clone(),
+        config.operator.secret_revision_file.clone(),
     ];
     for name in STANDARDS_PROFILE_SECRET_NAMES {
         readable.push(

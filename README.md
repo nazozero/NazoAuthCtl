@@ -32,7 +32,7 @@ documented in the [lifecycle contract](docs/lifecycle-contract.md).
 On Linux, install an independently attested Release with GitHub CLI available:
 
 ```sh
-sudo ./scripts/install_nazoauthctl.sh --version v0.1.29
+sudo ./scripts/install_nazoauthctl.sh --version v0.1.30
 ```
 
 The installer verifies the exact tag, repository, hosted release workflow, and
