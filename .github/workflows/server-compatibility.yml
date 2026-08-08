@@ -531,7 +531,11 @@ jobs:
             echo "ambiguous destructive deployment selection unexpectedly succeeded" >&2
             exit 1
           fi
-          grep -F "multiple deployments" "$root/ambiguous.err"
+          if ! grep -F "multiple deployments" "$root/ambiguous.err"; then
+            cat "$root/ambiguous.out"
+            cat "$root/ambiguous.err" >&2
+            exit 1
+          fi
           test "$(systemctl show "$unit" --property=ActiveState --value)" = active
           jq 'del(.deployments["deployment-ci-decoy"])' "$config_root/registry.json" \
             >"$config_root/registry.single.json"
@@ -552,7 +556,11 @@ jobs:
             echo "unsupported operator protocol unexpectedly allowed migration" >&2
             exit 1
           fi
-          grep -F "does not support operator protocol" "$root/migrate.err"
+          if ! grep -F "does not support operator protocol" "$root/migrate.err"; then
+            cat "$root/migrate.out"
+            cat "$root/migrate.err" >&2
+            exit 1
+          fi
           sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
