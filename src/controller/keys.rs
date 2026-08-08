@@ -97,6 +97,52 @@ pub(super) fn safe_export_destination(output: &Path) -> anyhow::Result<()> {
 }
 
 pub(super) fn extract_openid4vc_trust_anchors(bundle: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let certificates = parse_managed_openid4vc_bundle(bundle)?;
+    let mut output = Vec::new();
+    append_pem_certificate(&mut output, &certificates[1]);
+    Ok(output)
+}
+
+pub(super) fn bootstrap_openid4vc_revocation_snapshot(config: &UpdateConfig) -> anyhow::Result<()> {
+    let bundle = managed_openid4vc_bundle_path(config)?;
+    let snapshot = bundle.with_file_name(OPENID4VC_REVOCATION_SNAPSHOT);
+    match fs::symlink_metadata(&snapshot) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!("managed OpenID4VC revocation snapshot must be a regular non-symlink file")
+        }
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect OpenID4VC revocation snapshot"),
+    }
+
+    let bundle_metadata = fs::symlink_metadata(&bundle)
+        .context("failed to inspect managed OpenID4VC certificate bundle")?;
+    if bundle_metadata.file_type().is_symlink() || !bundle_metadata.is_file() {
+        bail!("managed OpenID4VC certificate bundle must be a regular non-symlink file");
+    }
+    let certificates = parse_managed_openid4vc_bundle(&fs::read(&bundle)?)?;
+    let issuer = config.runtime.expected_issuer.trim_end_matches('/');
+    let now = Utc::now();
+    let entries = certificates
+        .iter()
+        .map(|certificate| {
+            json!({
+                "issuer": issuer,
+                "certificate": format!("sha256:{}", URL_SAFE_NO_PAD.encode(Sha256::digest(certificate))),
+                "status": "good",
+            })
+        })
+        .collect::<Vec<_>>();
+    let document = json!({
+        "version": 1,
+        "this_update": (now - chrono::Duration::minutes(5)).to_rfc3339(),
+        "next_update": (now + chrono::Duration::days(7)).to_rfc3339(),
+        "entries": entries,
+    });
+    atomic_write(&snapshot, &serde_json::to_vec_pretty(&document)?, 0o644)
+}
+
+pub(super) fn parse_managed_openid4vc_bundle(bundle: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
     if bundle.len() > MAX_OPENID4VC_CERTIFICATE_BUNDLE_BYTES {
         bail!("managed OpenID4VC certificate bundle exceeds 1 MiB");
     }
@@ -104,7 +150,7 @@ pub(super) fn extract_openid4vc_trust_anchors(bundle: &[u8]) -> anyhow::Result<V
     let mut certificate_count = 0;
     let mut ca_count = 0;
     let mut leaf_count = 0;
-    let mut output = Vec::new();
+    let mut certificates = Vec::new();
     while !remaining.is_empty() {
         if !remaining.starts_with(b"-----BEGIN CERTIFICATE-----") {
             bail!("managed OpenID4VC certificate bundle contains a non-certificate block");
@@ -129,10 +175,10 @@ pub(super) fn extract_openid4vc_trust_anchors(bundle: &[u8]) -> anyhow::Result<V
         }
         if is_ca {
             ca_count += 1;
-            append_pem_certificate(&mut output, &pem.contents);
         } else {
             leaf_count += 1;
         }
+        certificates.push(pem.contents);
         remaining = trim_ascii_whitespace(rest);
     }
     if certificate_count != 2 || ca_count != 1 || leaf_count != 1 {
@@ -140,7 +186,7 @@ pub(super) fn extract_openid4vc_trust_anchors(bundle: &[u8]) -> anyhow::Result<V
             "managed OpenID4VC certificate bundle must contain exactly one leaf certificate and one CA trust anchor"
         );
     }
-    Ok(output)
+    Ok(certificates)
 }
 
 pub(super) fn append_pem_certificate(output: &mut Vec<u8>, der: &[u8]) {

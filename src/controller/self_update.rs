@@ -361,5 +361,6 @@ pub(super) fn encode_controller_digest(bytes: &[u8]) -> String {
 }
 
 pub(super) const OPENID4VC_CERTIFICATE_BUNDLE: &str = "openid4vc-certificate-bundle.pem";
+pub(super) const OPENID4VC_REVOCATION_SNAPSHOT: &str = "openid4vc-revocation-snapshot.json";
 pub(super) const OPENID4VC_KEYS_MOUNT: &str = "/var/lib/nazo_oauth/keys";
 pub(super) const MAX_OPENID4VC_CERTIFICATE_BUNDLE_BYTES: usize = 1024 * 1024;

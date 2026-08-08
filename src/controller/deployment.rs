@@ -324,8 +324,8 @@ pub(super) fn bootstrap_profile_keys(
             purposes: vec!["credential".to_owned(), "presentation_request".to_owned()],
         },
         None,
-    )
-    .map(|_| ())
+    )?;
+    bootstrap_openid4vc_revocation_snapshot(config)
 }
 
 pub(super) fn install_completion_path(config: &UpdateConfig) -> PathBuf {

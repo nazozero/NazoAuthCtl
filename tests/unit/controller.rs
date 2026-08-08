@@ -1379,6 +1379,46 @@ fn observation_lock_never_creates_persistent_state() {
     drop(lock);
 }
 
+#[test]
+fn standards_full_bootstraps_a_bounded_revocation_snapshot_without_overwriting_it() {
+    let work = PrivateTempDir::new("openid4vc-revocation-bootstrap").unwrap();
+    let mut value = config(&work);
+    value.install_profile = "standards-full".to_owned();
+    value.runtime.expected_issuer = "https://auth.example/".to_owned();
+    let keys = work.path().join("app/keys");
+    fs::create_dir_all(&keys).unwrap();
+    value.runtime.snapshot_paths = vec![keys.clone()];
+    fs::write(
+        keys.join(OPENID4VC_CERTIFICATE_BUNDLE),
+        format!("{OPENID4VC_TEST_LEAF}{OPENID4VC_TEST_CA}"),
+    )
+    .unwrap();
+
+    bootstrap_openid4vc_revocation_snapshot(&value).unwrap();
+    let snapshot = keys.join(OPENID4VC_REVOCATION_SNAPSHOT);
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+    assert_eq!(document["version"], 1);
+    assert_eq!(document["entries"].as_array().unwrap().len(), 2);
+    assert!(document["entries"].as_array().unwrap().iter().all(|entry| {
+        entry["issuer"] == "https://auth.example"
+            && entry["status"] == "good"
+            && entry["certificate"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("sha256:"))
+    }));
+    let this_update = document["this_update"].as_str().unwrap();
+    let next_update = document["next_update"].as_str().unwrap();
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(this_update).unwrap()
+            < chrono::DateTime::parse_from_rfc3339(next_update).unwrap()
+    );
+
+    fs::write(&snapshot, b"operator-owned").unwrap();
+    bootstrap_openid4vc_revocation_snapshot(&value).unwrap();
+    assert_eq!(fs::read(&snapshot).unwrap(), b"operator-owned");
+}
+
 #[cfg(unix)]
 #[test]
 fn legacy_controller_lock_rejects_symlink_and_writable_entries() {

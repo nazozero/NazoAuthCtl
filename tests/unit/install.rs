@@ -254,6 +254,10 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
     }
     assert!(rendered.contains("ENABLE_OPENID4VCI_ISSUER: true"));
     assert!(rendered.contains("ENABLE_OPENID4VP_VERIFIER: true"));
+    assert!(rendered.contains("OPENID4VC_REVOCATION_POLICY: \"required\""));
+    assert!(rendered.contains(
+        "OPENID4VC_REVOCATION_SNAPSHOT_FILE: \"${PROFILE_APP_ROOT}/keys/openid4vc-revocation-snapshot.json\""
+    ));
     assert_eq!(
         rendered.matches("openid4vc-certificate-bundle.pem").count(),
         2
