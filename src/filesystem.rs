@@ -323,7 +323,7 @@ fn validate_secure_file_metadata(
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::MetadataExt;
         let mode = metadata.mode() & 0o7777;
         if !owner_is_controller_or_root(metadata.uid()) {
             bail!("{label} has an unexpected owner: {}", path.display());
@@ -368,7 +368,7 @@ fn validate_secure_directory_metadata(
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::MetadataExt;
         let mode = metadata.mode() & 0o7777;
         if !owner_is_controller_or_root(metadata.uid()) {
             bail!("{label} has an unexpected owner: {}", path.display());

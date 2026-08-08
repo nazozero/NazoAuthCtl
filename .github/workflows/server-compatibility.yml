@@ -458,9 +458,10 @@ jobs:
           deployment_id=deployment-ci-systemd-recovery
           runtime_id=runtime-ci-systemd-recovery
           unit=manual-auth-recovery.service
-          target="$root/live/nazoauth"
-          cached="$root/cache/nazoauth"
-          mkdir -p "$root/live" "$root/cache" "$root/live-data" "$root/live-config" "$break_glass_root"
+          target="$control_root/systemd-live/nazoauth"
+          cached="$control_root/systemd-cache/nazoauth"
+          mkdir -p "$control_root/systemd-live" "$control_root/systemd-cache" \
+            "$root/live-data" "$root/live-config" "$break_glass_root"
           install -m 0755 "$GITHUB_WORKSPACE/signed-server/nazoauth-x86_64-unknown-linux-gnu" "$target"
           install -m 0500 "$target" "$cached"
           cat >"$root/live-config/.env.yaml" <<YAML
@@ -570,7 +571,7 @@ jobs:
             "$config_root/deployments/$deployment_id/deployment.json"
           test "$(systemctl show "$unit" --property=ActiveState --value)" = active
           sudo systemctl stop "$unit"
-          rm "$target"
+          sudo rm "$target"
           test ! -e "$target"
           sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
