@@ -409,17 +409,27 @@ jobs:
           exit "$status"
           SH
           chmod 0755 "$docker_wrapper"
+          docker_wrapper_path=""
+          for candidate in /usr/local/sbin/docker /usr/local/bin/docker; do
+            if [ ! -e "$candidate" ]; then
+              docker_wrapper_path="$candidate"
+              break
+            fi
+          done
+          test -n "$docker_wrapper_path"
+          sudo install -m 0755 "$docker_wrapper" "$docker_wrapper_path"
           if ! sudo env \
-            "PATH=$root:$PATH" \
             "NAZOAUTHCTL_REAL_DOCKER=$docker_real" \
             "NAZOAUTHCTL_DOCKER_TRACE=$docker_trace" \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
             "$GITHUB_WORKSPACE/controller/nazoauthctl" --deployment "$deployment_id" recover --yes; then
+            sudo rm -f "$docker_wrapper_path"
             sed -E 's/(SECRET_MARKER|postgresql:[^ ]+|redis:[^ ]+)/<redacted>/g' "$docker_trace"
             exit 1
           fi
+          sudo rm -f "$docker_wrapper_path"
           ready=false
           for _ in $(seq 1 90); do
             if curl --fail --silent http://127.0.0.1:19081/ready >/dev/null; then
