@@ -476,12 +476,16 @@ jobs:
           RUST_LOG: "warn"
           YAML
           sudo tee "/etc/systemd/system/$unit" >/dev/null <<UNIT
+          # Managed by nazoauthctl
           [Unit]
           Description=Manual NazoAuth systemd recovery fixture
           After=network-online.target
           [Service]
           Type=simple
           WorkingDirectory=$root/live-config
+          Environment=DEPLOYMENT_ID=$deployment_id
+          Environment=RUNTIME_INSTANCE_ID=$runtime_id
+          Environment=CONTROL_AUTHORITY=controller-$deployment_id
           Environment=DATA_DIR=$root/live-data
           ExecStart=$target server
           Restart=no
@@ -514,6 +518,12 @@ jobs:
               declared_ports:[],operator_protocol_versions:[999],operator_tasks_responsibility:"delegated",
               database_responsibility:"delegated"}' >"$root/spec.json"
           python3 "$GITHUB_WORKSPACE/.github/scripts/write_recovery_fixture.py" "$root/spec.json"
+
+          # The fixture is authored by the runner, while destructive controller
+          # operations intentionally run as root.  Match the production storage
+          # ownership invariant before invoking any controller command.
+          sudo chown -R 0:0 "$config_root" "$state_root" "$break_glass_root"
+          sudo chmod 0700 "$break_glass_root"
 
           jq '.deployments["deployment-ci-decoy"]={alias:"ci-decoy",declaration:.deployments["deployment-ci-systemd-recovery"].declaration}' \
             "$config_root/registry.json" >"$config_root/registry.multi.json"
@@ -559,7 +569,12 @@ jobs:
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
-            "$GITHUB_WORKSPACE/controller/nazoauthctl" --deployment "$deployment_id" recover --yes
+            "$GITHUB_WORKSPACE/controller/nazoauthctl" --deployment "$deployment_id" recover --yes \
+            >"$root/recover.out" 2>"$root/recover.err" || {
+              cat "$root/recover.out"
+              cat "$root/recover.err" >&2
+              exit 1
+            }
           ready=false
           for _ in $(seq 1 90); do
             if curl --fail --silent http://127.0.0.1:19084/ready >/dev/null; then
