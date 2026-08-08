@@ -236,10 +236,10 @@ pub(crate) fn assert_container_image(
         .filter(|digest| valid_digest(digest))
         .context("managed dependency image has an invalid digest")?;
     for format in [
-        "{{{{.Config.Image}}}}",
-        "{{{{.ImageName}}}}",
-        "{{{{.Config.ImageName}}}}",
-        "{{{{index .RepoDigests 0}}}}",
+        "{{.Config.Image}}",
+        "{{.ImageName}}",
+        "{{.Config.ImageName}}",
+        "{{index .RepoDigests 0}}",
     ] {
         let actual = Process::new(command)
             .args(arguments)
@@ -430,6 +430,24 @@ mod tests {
             fs::read_to_string(create_argv).unwrap(),
             "run\n--name\nmanaged-postgres\n"
         );
+    }
+
+    #[test]
+    fn image_identity_uses_valid_engine_templates() {
+        let work = PrivateTempDir::new("runtime-image-inspect-template").unwrap();
+        let engine = work.path().join("fake-podman");
+        let expected = "docker.io/library/postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        write_shell_executable(
+            &engine,
+            "if [ \"$*\" = 'container inspect managed-postgres --format {{.Config.Image}}' ]; then\n  printf '%s\\n' 'docker.io/library/postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n  exit 0\nfi\nexit 1",
+        );
+        super::assert_container_image(
+            engine.as_os_str(),
+            &["container", "inspect", "managed-postgres"],
+            expected,
+            "Podman",
+        )
+        .unwrap();
     }
 }
 
