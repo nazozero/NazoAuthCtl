@@ -188,7 +188,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/controller-self-lifecycle"
+          root="$(mktemp -d /tmp/controller-self-lifecycle.XXXXXX)"
+          trap 'sudo rm -rf "$root"' EXIT
+          chmod 0755 "$root"
           binary="$root/bin/nazoauthctl"
           config_root="$root/config"
           state_root="$root/state"
@@ -197,6 +199,11 @@ jobs:
           install -m 0755 previous/nazoauthctl-x86_64-unknown-linux-gnu "$binary"
           previous_sha="$(sha256sum "$binary" | cut -d' ' -f1)"
           candidate_sha="$(sha256sum candidate/nazoauthctl-x86_64-unknown-linux-gnu | cut -d' ' -f1)"
+          # Self-management runs as root. Keep the fixture directly below the
+          # root-owned sticky /tmp boundary, then transfer it only after the
+          # runner has finished authoring every initial fixture path.
+          sudo chown -R 0:0 "$root"
+          sudo chmod 0700 "$break_glass_root"
           sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
