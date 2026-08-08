@@ -1868,7 +1868,7 @@ fn fake_container_runtime(
         &config.valkey.image,
     );
     let runtime_image = format!("fixture@sha256:{}", "c".repeat(64));
-    let inspect_json = serde_json::json!({
+    let inspect_json = serde_json::json!([{
         "Id": "fixture-container-id",
         "Name": "/nazoauth",
         "ImageName": runtime_image.clone(),
@@ -1885,7 +1885,7 @@ fn fake_container_runtime(
         "State": {"Running": true},
         "NetworkSettings": {"Ports": {}, "Networks": {}},
         "Mounts": []
-    })
+    }])
     .to_string();
     let network_digest = crate::runtime_backend::managed_network_config_digest(
         &config.operator.deployment_id,
