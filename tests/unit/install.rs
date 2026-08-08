@@ -145,6 +145,7 @@ fn host_service_unit_exposes_only_runtime_state() {
             runtime_readable_secret_names: Vec::new(),
         },
     )
+    .unwrap()
     .replace('\\', "/");
 
     assert!(unit.contains("User=nazoauth\nGroup=nazoauth"));

@@ -449,6 +449,17 @@ fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
         migration.environment.get("DATABASE_URL_FILE"),
         Some(&"/run/nazoauth-secrets/database-url".to_owned())
     );
+    assert_eq!(
+        migration
+            .environment
+            .get("NAZOAUTH_OPERATOR_SECRET_REVISION_FILE"),
+        Some(&"/run/nazoauth-operator/secret-revision".to_owned())
+    );
+    assert!(migration.mounts.iter().any(|mount| {
+        mount.source == config.operator.secret_revision_file
+            && mount.destination == Path::new("/run/nazoauth-operator/secret-revision")
+            && mount.read_only
+    }));
     assert!(migration.mounts.iter().any(|mount| {
         mount.source == config.dependencies.migration_database_url_file
             && mount.destination == Path::new("/run/nazoauth-secrets/database-url")
@@ -500,6 +511,34 @@ fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
             .any(|mount| mount.destination == Path::new("/run/nazoauth-operator/public.jwk"))
     );
     assert!(!keys.environment.contains_key("DATABASE_URL"));
+}
+
+#[test]
+fn privileged_systemd_task_uses_a_read_only_secret_revision_credential() {
+    let work = PrivateTempDir::new("runtime-systemd-task").unwrap();
+    let mut config = config(&work);
+    config.runtime.backend = RuntimeBackendKind::Systemd;
+    let runtime = Runtime::new(&config);
+    let task = runtime
+        .one_shot_task(
+            ArtifactReference::HostBinary {
+                path: work.path().join("nazoauth"),
+                sha256: "a".repeat(64),
+            },
+            &TaskOperation::KeysValidate,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        task.environment
+            .get("NAZOAUTH_OPERATOR_SECRET_REVISION_FILE"),
+        Some(&"%d/operator-secret-revision".to_owned())
+    );
+    assert_eq!(
+        task.transient_credentials.get("operator-secret-revision"),
+        Some(&config.operator.secret_revision_file)
+    );
 }
 
 #[cfg(unix)]

@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::filesystem::{open_secure_regular_file, sha256_file, validate_secure_directory};
+
 mod activation;
 mod execution;
 mod persistence;
@@ -20,17 +22,12 @@ impl RecoveryDriver {
                 }
             }
         }
-        let metadata = fs::symlink_metadata(&self.program).with_context(|| {
-            format!(
-                "failed to inspect recovery driver {}",
-                self.program.display()
-            )
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
-            bail!("recovery driver must be a non-empty regular file");
-        }
         validate_lower_hex(&self.program_sha256)?;
-        if sha256(&self.program)? != self.program_sha256 {
+        let mut program = open_secure_regular_file(&self.program, "recovery driver", false)?;
+        if program.metadata()?.len() == 0
+            || sha256_file(&mut program, &self.program.display().to_string())?
+                != self.program_sha256
+        {
             bail!("recovery driver digest does not match the lifecycle contract");
         }
         if self.arguments.len() > MAX_ARGUMENTS {
@@ -45,6 +42,11 @@ impl RecoveryDriver {
             }
         }
         validate_absolute_path(&self.rehearsal_workspace, "recovery rehearsal workspace")?;
+        validate_secure_directory(
+            &self.rehearsal_workspace,
+            "recovery rehearsal workspace",
+            false,
+        )?;
         for runtime in runtimes {
             for mount in &runtime.mounts {
                 if paths_overlap(&self.rehearsal_workspace, &mount.source) {
@@ -65,12 +67,7 @@ impl RecoveryDriver {
                     }) {
                         bail!("recovery credential is inside the application failure domain");
                     }
-                    let metadata = fs::symlink_metadata(path).with_context(|| {
-                        format!("failed to inspect recovery credential {}", path.display())
-                    })?;
-                    if metadata.file_type().is_symlink() || !metadata.is_file() {
-                        bail!("recovery credential reference must name a regular file");
-                    }
+                    let _credential = open_secure_regular_file(path, "recovery credential", false)?;
                 }
                 CredentialReference::Provider { provider, key } => {
                     validate_file_identifier(provider, "recovery credential provider")?;

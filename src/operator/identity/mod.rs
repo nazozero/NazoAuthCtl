@@ -1,5 +1,7 @@
 use super::*;
 
+use std::io::Read as _;
+
 mod adoption;
 mod generation;
 mod recovery;
@@ -103,7 +105,9 @@ pub(super) fn remove_managed_regular_file(path: &Path) -> anyhow::Result<()> {
 }
 
 pub(super) fn read_signing_key(path: &Path) -> anyhow::Result<SigningKey> {
-    let bytes = read_key(path)?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(read_private_single_line(path)?)
+        .context("operator private key is not canonical base64url")?;
     let bytes: [u8; 32] = bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid signing key length"))?;
@@ -122,6 +126,17 @@ pub(super) fn read_key(path: &Path) -> anyhow::Result<Vec<u8>> {
     URL_SAFE_NO_PAD
         .decode(read_single_line(path)?)
         .context("operator key is not canonical base64url")
+}
+
+fn read_private_single_line(path: &Path) -> anyhow::Result<String> {
+    let mut file = crate::filesystem::open_secure_regular_file(path, "operator private key", true)?;
+    let mut value = String::new();
+    file.read_to_string(&mut value)
+        .with_context(|| format!("failed to read operator private key {}", path.display()))?;
+    if value.is_empty() || value.contains(['\r', '\n']) {
+        bail!("operator private key is invalid: {}", path.display());
+    }
+    Ok(value)
 }
 
 pub(super) fn read_single_line(path: &Path) -> anyhow::Result<String> {

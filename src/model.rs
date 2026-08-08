@@ -316,7 +316,7 @@ impl UpdateConfig {
                 &self.runtime.binary_releases,
                 &self.runtime.working_directory,
             ] {
-                safe_absolute(path)?;
+                safe_systemd_path(path)?;
             }
             if self.runtime.service_name.is_empty() || self.runtime.service_user.is_empty() {
                 bail!("host runtime requires service_name and service_user");
@@ -375,6 +375,36 @@ pub(crate) fn safe_absolute(path: &std::path::Path) -> anyhow::Result<()> {
             "path must be a normalized absolute non-root path: {}",
             path.display()
         );
+    }
+    Ok(())
+}
+
+pub(crate) fn safe_systemd_path(path: &std::path::Path) -> anyhow::Result<()> {
+    let value = path.to_str().context("systemd path must be valid UTF-8")?;
+    let unix_absolute = value.starts_with('/');
+    if unix_absolute {
+        if value == "/"
+            || value
+                .split('/')
+                .skip(1)
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        {
+            bail!("systemd path must be a normalized absolute non-root path: {value}");
+        }
+    } else {
+        // Model and recovery checks are exercised on non-Unix controller hosts even
+        // though the systemd backend itself is Unix-only. Preserve native absolute
+        // path validation there; the renderer still rejects every character that
+        // can alter a unit directive.
+        safe_absolute(path)?;
+    }
+    if value.chars().any(|character| {
+        character.is_control()
+            || character.is_whitespace()
+            || matches!(character, '%' | '\'' | '"')
+            || (unix_absolute && character == '\\')
+    }) {
+        bail!("systemd path contains unsupported whitespace or quoting: {value}");
     }
     Ok(())
 }

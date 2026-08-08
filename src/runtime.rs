@@ -15,6 +15,8 @@ use crate::{
     },
 };
 
+const CONTAINER_SECRET_REVISION_PATH: &str = "/run/nazoauth-operator/secret-revision";
+
 #[derive(Debug)]
 pub(crate) struct PreparedAppTask {
     backend: RuntimeBackendKind,
@@ -183,6 +185,10 @@ impl<'a> Runtime<'a> {
                 "/run/nazoauth-operator/receipt.key".to_owned(),
             ),
             (
+                "NAZOAUTH_OPERATOR_SECRET_REVISION_FILE".to_owned(),
+                CONTAINER_SECRET_REVISION_PATH.to_owned(),
+            ),
+            (
                 "NAZOAUTH_OPERATOR_STATE_DIRECTORY".to_owned(),
                 "/var/lib/nazoauth/operator-state".to_owned(),
             ),
@@ -236,6 +242,11 @@ impl<'a> Runtime<'a> {
             (
                 self.config.operator.receipt_private_key.as_path(),
                 Path::new("/run/nazoauth-operator/receipt.key"),
+                true,
+            ),
+            (
+                self.config.operator.secret_revision_file.as_path(),
+                Path::new(CONTAINER_SECRET_REVISION_PATH),
                 true,
             ),
             (
@@ -333,6 +344,10 @@ impl<'a> Runtime<'a> {
                 "%d/operator-receipt-key".to_owned(),
             ),
             (
+                "NAZOAUTH_OPERATOR_SECRET_REVISION_FILE".to_owned(),
+                "%d/operator-secret-revision".to_owned(),
+            ),
+            (
                 "NAZOAUTH_OPERATOR_STATE_DIRECTORY".to_owned(),
                 self.config.operator.state_directory.display().to_string(),
             ),
@@ -353,10 +368,16 @@ impl<'a> Runtime<'a> {
                     .to_string(),
             ),
         ]);
-        let mut transient_credentials = BTreeMap::from([(
-            "operator-receipt-key".to_owned(),
-            self.config.operator.receipt_private_key.clone(),
-        )]);
+        let mut transient_credentials = BTreeMap::from([
+            (
+                "operator-receipt-key".to_owned(),
+                self.config.operator.receipt_private_key.clone(),
+            ),
+            (
+                "operator-secret-revision".to_owned(),
+                self.config.operator.secret_revision_file.clone(),
+            ),
+        ]);
         let mut read_only_paths = Vec::new();
         let mut read_write_paths = vec![self.config.operator.state_directory.clone()];
         let mut inaccessible_paths = vec![

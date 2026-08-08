@@ -143,6 +143,34 @@ fn locks_are_per_deployment_and_per_shared_resource() {
     assert!(store.shared_resource_lock("database-a").is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn deployment_locks_reject_symlink_hardlink_and_writable_entries() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let work = PrivateTempDir::new("nazoauthctl-lock-filesystem-boundary").unwrap();
+    let store = store(&work);
+    store.ensure_storage_roots().unwrap();
+    let locks = store.state_root.join("locks");
+    std::fs::create_dir_all(&locks).unwrap();
+
+    let symlink_path = locks.join("deployment-deployment-symlink.lock");
+    let target = work.path().join("lock-target");
+    std::fs::write(&target, []).unwrap();
+    symlink(&target, &symlink_path).unwrap();
+    assert!(store.deployment_lock("deployment-symlink").is_err());
+
+    let hard_link_path = locks.join("deployment-deployment-hard-link.lock");
+    std::fs::hard_link(&target, &hard_link_path).unwrap();
+    assert!(store.deployment_lock("deployment-hard-link").is_err());
+    std::fs::remove_file(&hard_link_path).unwrap();
+
+    let writable_path = locks.join("deployment-deployment-writable.lock");
+    std::fs::write(&writable_path, []).unwrap();
+    std::fs::set_permissions(&writable_path, std::fs::Permissions::from_mode(0o660)).unwrap();
+    assert!(store.deployment_lock("deployment-writable").is_err());
+}
+
 #[test]
 fn shared_capability_operations_use_the_same_stable_lock_as_resource_transitions() {
     let work = PrivateTempDir::new("nazoauthctl-shared-capability-locks").unwrap();

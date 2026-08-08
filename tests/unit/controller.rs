@@ -1368,6 +1368,7 @@ fn observation_lock_never_creates_persistent_state() {
 
     fs::create_dir_all(missing.parent().unwrap()).unwrap();
     fs::write(&missing, []).unwrap();
+    crate::filesystem::set_mode(&missing, 0o600).unwrap();
     let lock = acquire_lock_at(&missing, &Command::Status).unwrap();
     assert_eq!(fs::metadata(&missing).unwrap().len(), 0);
     drop(lock);
@@ -1376,6 +1377,25 @@ fn observation_lock_never_creates_persistent_state() {
     let lock = acquire_lock_at(&created, &Command::Rollback { yes: true }).unwrap();
     assert!(created.is_file());
     drop(lock);
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_controller_lock_rejects_symlink_and_writable_entries() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let work = PrivateTempDir::new("nazoauth-controller-lock-boundary").unwrap();
+    let target = work.path().join("target.lock");
+    fs::write(&target, []).unwrap();
+
+    let symlink_path = work.path().join("symlink.lock");
+    symlink(&target, &symlink_path).unwrap();
+    assert!(acquire_lock_at(&symlink_path, &Command::Rollback { yes: true }).is_err());
+
+    let writable_path = work.path().join("writable.lock");
+    fs::write(&writable_path, []).unwrap();
+    fs::set_permissions(&writable_path, fs::Permissions::from_mode(0o660)).unwrap();
+    assert!(acquire_lock_at(&writable_path, &Command::Rollback { yes: true }).is_err());
 }
 
 #[test]
@@ -1985,6 +2005,8 @@ fn install_audit_key(config: &UpdateConfig) {
         URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
     )
     .unwrap();
+    crate::filesystem::set_mode(&config.operator.audit_private_key, 0o400).unwrap();
+    crate::filesystem::set_mode(&config.operator.audit_public_key, 0o444).unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -2288,6 +2310,37 @@ fn registered_update_plan_preserves_mixed_ownership_and_replica_identity() {
             .is_some_and(|value| value.contains("lifecycle configuration"))
     }));
     assert_eq!(plan["core_recovery_requires_operator_task"], false);
+}
+
+#[test]
+fn registered_update_rejects_a_downgrade_before_plan_side_effects() {
+    let work = PrivateTempDir::new("nazoauth-registered-downgrade").unwrap();
+    let active = manifest("v0.1.19", 'a');
+    let target = manifest("v0.1.18", 'b');
+    let record = DeploymentRecord {
+        schema: crate::deployment::DEPLOYMENT_SCHEMA,
+        deployment_id: "deployment-downgrade".to_owned(),
+        control_authority: "controller-downgrade".to_owned(),
+        alias: None,
+        issuer: "https://downgrade.example".to_owned(),
+        active_release: active.embedded,
+        trust: crate::deployment::TrustState::Adopted,
+        capabilities: crate::deployment::CapabilityGrants::observed(),
+        runtime_instances: Vec::new(),
+        resources: BTreeMap::new(),
+        recovery: crate::deployment::RecoveryAssessment {
+            conclusion: RecoveryConclusion::Proven,
+            evidence: Vec::new(),
+            off_host_package_required_for_machine_loss: true,
+        },
+        operator_protocol_versions: std::collections::BTreeSet::new(),
+        control_protocol_versions: std::collections::BTreeSet::new(),
+        declaration_revision: 1,
+    };
+
+    let error = build_registered_update_plan(&record, &target).unwrap_err();
+    assert!(error.to_string().contains("anti-downgrade"));
+    assert_eq!(fs::read_dir(work.path()).unwrap().count(), 0);
 }
 
 #[test]

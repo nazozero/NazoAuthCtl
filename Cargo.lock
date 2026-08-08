@@ -589,6 +589,7 @@ dependencies = [
  "ed25519-dalek",
  "fs2",
  "hmac",
+ "libc",
  "nazo-operator-protocol",
  "rand",
  "rpassword",

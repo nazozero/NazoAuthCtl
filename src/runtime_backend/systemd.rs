@@ -8,7 +8,10 @@ use anyhow::{Context as _, bail};
 
 use crate::{
     deployment::{ArtifactReference, RuntimeBackendKind},
-    filesystem::{atomic_write, copy_atomic, set_mode, sha256},
+    filesystem::{
+        atomic_write, copy_atomic_from_file, open_secure_regular_file, set_mode, sha256,
+        sha256_file, validate_secure_directory,
+    },
     process::Process,
 };
 
@@ -282,6 +285,12 @@ impl RuntimeBackend for SystemdBackend {
             .map(PathBuf::from)
             .context("systemd replacement has no executable path")?;
         if !target.is_absolute()
+            || target.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
             || !target
                 .file_name()
                 .and_then(|value| value.to_str())
@@ -290,12 +299,32 @@ impl RuntimeBackend for SystemdBackend {
         {
             bail!("systemd replacement command is not an absolute nazoauth server command");
         }
-        if sha256(source)? != *expected {
+        let current_target = systemd_unit_executable(&replacement.object_reference)?;
+        if current_target != target {
+            bail!("systemd replacement target does not match the current unit ExecStart path");
+        }
+        validate_secure_directory(
+            target
+                .parent()
+                .context("systemd replacement target has no parent")?,
+            "systemd replacement target directory",
+            false,
+        )?;
+        let mut source_file =
+            open_secure_regular_file(source, "systemd replacement source", false)?;
+        if source_file.metadata()?.len() == 0
+            || sha256_file(&mut source_file, &source.display().to_string())? != *expected
+        {
             bail!("systemd replacement source digest changed before activation");
         }
         self.stop(&replacement.object_reference)?;
-        copy_atomic(source, &target, 0o755)?;
-        if sha256(&target)? != *expected {
+        if systemd_unit_executable(&replacement.object_reference)? != target {
+            bail!("systemd unit ExecStart changed during replacement");
+        }
+        copy_atomic_from_file(&mut source_file, &target, 0o755)?;
+        let mut target_file =
+            open_secure_regular_file(&target, "systemd replacement target", false)?;
+        if sha256_file(&mut target_file, &target.display().to_string())? != *expected {
             bail!("systemd replacement target digest changed during activation");
         }
         self.start(&replacement.object_reference)
@@ -363,6 +392,7 @@ impl RuntimeBackend for SystemdBackend {
     }
 
     fn install_host_service(&self, install: &HostServiceInstall) -> anyhow::Result<()> {
+        validate_host_service_install(install)?;
         if !Process::new("id")
             .args(["-u", install.service_user.as_str()])
             .succeeds()
@@ -436,7 +466,7 @@ impl RuntimeBackend for SystemdBackend {
         let unit_directory = env::var_os("NAZOAUTH_SYSTEMD_UNIT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/etc/systemd/system"));
-        crate::model::safe_absolute(&unit_directory)?;
+        crate::model::safe_systemd_path(&unit_directory)?;
         if unit_directory.is_symlink() {
             bail!("systemd unit directory must not be a symlink");
         }
@@ -451,11 +481,8 @@ impl RuntimeBackend for SystemdBackend {
                 unit_path.display()
             );
         }
-        atomic_write(
-            &unit_path,
-            render_host_service_unit(install).as_bytes(),
-            0o644,
-        )?;
+        let rendered = render_host_service_unit(install)?;
+        atomic_write(&unit_path, rendered.as_bytes(), 0o644)?;
         Process::new("systemctl").arg("daemon-reload").run_quiet()?;
         Process::new("systemctl")
             .args(["enable", install.service_name.as_str()])
@@ -497,8 +524,9 @@ impl RuntimeBackend for SystemdBackend {
     }
 }
 
-pub(crate) fn render_host_service_unit(install: &HostServiceInstall) -> String {
-    format!(
+pub(crate) fn render_host_service_unit(install: &HostServiceInstall) -> anyhow::Result<String> {
+    validate_host_service_install(install)?;
+    Ok(format!(
         "# Managed by nazoauthctl\n\
          [Unit]\n\
          Description=NazoAuth authorization server\n\
@@ -551,7 +579,50 @@ pub(crate) fn render_host_service_unit(install: &HostServiceInstall) -> String {
         operator_dir = install.operator_directory.display(),
         recovery_dir = install.recovery_directory.display(),
         migration_url = install.migration_url.display(),
-    )
+    ))
+}
+
+fn validate_host_service_install(install: &HostServiceInstall) -> anyhow::Result<()> {
+    validate_unit_name(&install.service_name)?;
+    for (name, value) in [
+        ("service user", install.service_user.as_str()),
+        ("deployment id", install.deployment_id.as_str()),
+        ("runtime instance id", install.runtime_instance_id.as_str()),
+        ("control authority", install.control_authority.as_str()),
+    ] {
+        validate_systemd_scalar(name, value)?;
+    }
+    for (name, path) in [
+        ("working directory", &install.working_directory),
+        ("binary path", &install.binary),
+        ("application root", &install.app_root),
+        ("UI releases path", &install.ui_releases),
+        ("operator state path", &install.operator_state),
+        ("operator directory", &install.operator_directory),
+        ("recovery directory", &install.recovery_directory),
+        ("migration URL path", &install.migration_url),
+        ("receipt private key path", &install.receipt_private_key),
+    ] {
+        crate::model::safe_systemd_path(path)
+            .with_context(|| format!("{name} is unsafe for a systemd unit"))?;
+    }
+    for name in &install.runtime_readable_secret_names {
+        validate_systemd_scalar("runtime secret name", name)?;
+    }
+    Ok(())
+}
+
+fn validate_systemd_scalar(name: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || value.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '%' | '\'' | '"' | '\\')
+        })
+    {
+        bail!("{name} contains unsupported systemd input characters");
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_systemd_version(output: &str) -> anyhow::Result<u32> {
@@ -713,17 +784,234 @@ fn parse_properties(output: &str) -> BTreeMap<String, String> {
 }
 
 fn executable_from_systemd(exec_start: &str) -> Option<String> {
-    let value = exec_start.split("path=").nth(1)?;
-    let path = value.split(';').next()?.trim();
-    (!path.is_empty()).then(|| path.to_owned())
+    parse_systemd_exec_start(exec_start)
+        .ok()
+        .and_then(|argv| argv.into_iter().next())
+}
+
+fn systemd_unit_executable(object_reference: &str) -> anyhow::Result<PathBuf> {
+    let output = Process::new("systemctl")
+        .args([
+            "show",
+            object_reference,
+            "--no-pager",
+            "--property=ExecStart",
+            "--value",
+        ])
+        .stdout()?;
+    let argv = parse_systemd_exec_start(&output)?;
+    if !is_nazoauth_server_argv(&argv) {
+        bail!("systemd unit ExecStart is not an authorized nazoauth server command");
+    }
+    Ok(PathBuf::from(&argv[0]))
 }
 
 fn command_is_nazoauth_server(command: &str) -> bool {
-    let words = command.split_whitespace().collect::<Vec<_>>();
-    words.windows(2).any(|pair| {
-        pair[0].trim_end_matches(';').ends_with("nazoauth")
-            && pair[1].trim_end_matches(';') == "server"
-    })
+    let command = command.strip_suffix('\n').unwrap_or(command);
+    if validate_systemd_exec_input(command).is_err() {
+        return false;
+    }
+    let command = command.trim();
+    if command.starts_with('{') {
+        return parse_systemd_exec_start(command).is_ok_and(|argv| is_nazoauth_server_argv(&argv));
+    }
+    let words = command
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    words.windows(2).any(is_nazoauth_server_argv)
+}
+
+fn is_nazoauth_server_argv(argv: &[String]) -> bool {
+    argv.first()
+        .and_then(|value| Path::new(value).file_name())
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| matches!(value, "nazoauth" | "nazoauth.exe"))
+        && argv.get(1).map(String::as_str) == Some("server")
+}
+
+fn parse_systemd_exec_start(value: &str) -> anyhow::Result<Vec<String>> {
+    let value = value.strip_suffix('\n').unwrap_or(value);
+    validate_systemd_exec_input(value)?;
+    let value = value.trim();
+    let body = value
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+        .context("systemd ExecStart is not a single structured command")?;
+    if body.contains(['{', '}']) {
+        bail!("systemd ExecStart contains multiple structured commands");
+    }
+
+    let mut path = None;
+    let mut argv_fields = Vec::new();
+    let mut cursor = 0;
+    let bytes = body.as_bytes();
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && (bytes[cursor].is_ascii_whitespace() || bytes[cursor] == b';')
+        {
+            cursor += 1;
+        }
+        if cursor == bytes.len() {
+            break;
+        }
+        let key_start = cursor;
+        while cursor < bytes.len()
+            && bytes[cursor] != b'='
+            && !bytes[cursor].is_ascii_whitespace()
+            && bytes[cursor] != b';'
+        {
+            cursor += 1;
+        }
+        if cursor == key_start || cursor == bytes.len() || bytes[cursor] != b'=' {
+            bail!("systemd ExecStart contains a malformed field");
+        }
+        let key = &body[key_start..cursor];
+        cursor += 1;
+        let value_start = cursor;
+        let mut escaped = false;
+        while cursor < bytes.len() {
+            match (bytes[cursor], escaped) {
+                (b'\\', false) => {
+                    escaped = true;
+                    cursor += 1;
+                }
+                (b';', false) => break,
+                (_, _) => {
+                    escaped = false;
+                    cursor += 1;
+                }
+            }
+        }
+        if escaped {
+            bail!("systemd ExecStart contains a truncated escape");
+        }
+        let raw = body[value_start..cursor].trim();
+        if raw.is_empty() {
+            bail!("systemd ExecStart contains an empty field");
+        }
+        match key {
+            "path" => {
+                if path.is_some() {
+                    bail!("systemd ExecStart contains multiple paths");
+                }
+                path = Some(decode_systemd_scalar(raw)?);
+            }
+            "argv[]" => argv_fields.push(raw),
+            _ => {}
+        }
+        if cursor < bytes.len() {
+            cursor += 1;
+        }
+    }
+
+    let path = path.context("systemd ExecStart has no path field")?;
+    let mut argv = Vec::new();
+    for field in argv_fields {
+        argv.extend(split_systemd_argv(field)?);
+    }
+    if argv.is_empty() {
+        bail!("systemd ExecStart has no argv[] field");
+    }
+    if argv[0] != path {
+        bail!("systemd ExecStart path and argv[0] differ");
+    }
+    Ok(argv)
+}
+
+fn decode_systemd_scalar(value: &str) -> anyhow::Result<String> {
+    let values = split_systemd_argv(value)?;
+    if values.len() != 1 {
+        bail!("systemd ExecStart scalar contains multiple words");
+    }
+    Ok(values.into_iter().next().unwrap())
+}
+
+fn split_systemd_argv(value: &str) -> anyhow::Result<Vec<String>> {
+    validate_systemd_exec_input(value)?;
+    let bytes = value.as_bytes();
+    let mut values = Vec::new();
+    let mut current = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor].is_ascii_whitespace() {
+            if !current.is_empty() {
+                values.push(String::from_utf8(std::mem::take(&mut current))?);
+            }
+            cursor += 1;
+            continue;
+        }
+        if bytes[cursor] != b'\\' {
+            if bytes[cursor] < 0x80 {
+                current.push(bytes[cursor]);
+                cursor += 1;
+            } else {
+                let character = value[cursor..]
+                    .chars()
+                    .next()
+                    .context("systemd ExecStart contains invalid UTF-8")?;
+                let length = character.len_utf8();
+                current.extend_from_slice(&bytes[cursor..cursor + length]);
+                cursor += length;
+            }
+            continue;
+        }
+        cursor += 1;
+        if cursor >= bytes.len() {
+            bail!("systemd ExecStart contains a truncated escape");
+        }
+        match bytes[cursor] {
+            b'x' if cursor + 2 < bytes.len() => {
+                let high = hex_value(bytes[cursor + 1])?;
+                let low = hex_value(bytes[cursor + 2])?;
+                current.push(high * 16 + low);
+                cursor += 3;
+            }
+            b'n' => {
+                current.push(b'\n');
+                cursor += 1;
+            }
+            b'r' => {
+                current.push(b'\r');
+                cursor += 1;
+            }
+            b't' => {
+                current.push(b'\t');
+                cursor += 1;
+            }
+            b's' => {
+                current.push(b' ');
+                cursor += 1;
+            }
+            b'\\' | b'"' | b'\'' => {
+                current.push(bytes[cursor]);
+                cursor += 1;
+            }
+            _ => bail!("systemd ExecStart contains an unsupported escape"),
+        }
+    }
+    if !current.is_empty() {
+        values.push(String::from_utf8(current)?);
+    }
+    Ok(values)
+}
+
+fn hex_value(value: u8) -> anyhow::Result<u8> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => bail!("systemd ExecStart contains an invalid hex escape"),
+    }
+}
+
+fn validate_systemd_exec_input(value: &str) -> anyhow::Result<()> {
+    if value
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '%' | '\'' | '"' | '\\'))
+    {
+        bail!("systemd ExecStart contains unsupported control, specifier, quote, or escape input");
+    }
+    Ok(())
 }
 
 fn host_artifact(path: &Path) -> anyhow::Result<ArtifactReference> {
@@ -739,7 +1027,7 @@ fn validate_unit_name(unit: &str) -> anyhow::Result<()> {
         || unit.len() > 256
         || !unit
             .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "@_.:-\\".contains(character))
+            .all(|character| character.is_ascii_alphanumeric() || "@_.:-".contains(character))
     {
         bail!("invalid systemd service reference");
     }
@@ -751,4 +1039,64 @@ fn validate_mutable_unit(object_reference: &str) -> anyhow::Result<()> {
         bail!("unmanaged process cannot be mutated through the systemd backend");
     }
     validate_unit_name(object_reference)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{command_is_nazoauth_server, parse_systemd_exec_start};
+
+    #[test]
+    fn parses_systemd_structured_exec_start_without_shell_splitting() {
+        let value = "{ path=/opt/nazoauth ; argv[]=/opt/nazoauth server --label=hello-world ; ignore_errors=no ; }";
+        assert_eq!(
+            parse_systemd_exec_start(value).unwrap(),
+            vec!["/opt/nazoauth", "server", "--label=hello-world"]
+        );
+        assert!(command_is_nazoauth_server(value));
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_mismatched_systemd_exec_start() {
+        for value in [
+            "{ path=/opt/nazoauth ; argv[]=/opt/nazoauth server ; } { path=/tmp/nazoauth ; argv[]=/tmp/nazoauth server ; }",
+            "{ path=/opt/nazoauth ; argv[]=/tmp/nazoauth server ; }",
+            "{ path=/opt/nazoauth ; argv[]=/opt/nazoauth server ; argv[]= ; }",
+        ] {
+            assert!(parse_systemd_exec_start(value).is_err());
+            assert!(!command_is_nazoauth_server(value));
+        }
+
+        let unauthorized = "{ path=/opt/nazoauth ; argv[]=/opt/nazoauth shell ; }";
+        assert_eq!(
+            parse_systemd_exec_start(unauthorized).unwrap(),
+            vec!["/opt/nazoauth", "shell"]
+        );
+        assert!(!command_is_nazoauth_server(unauthorized));
+    }
+
+    #[test]
+    fn simple_process_command_keeps_exact_server_contract() {
+        assert!(command_is_nazoauth_server("/opt/nazoauth server"));
+        assert!(!command_is_nazoauth_server("/opt/not-nazoauth server"));
+        assert!(!command_is_nazoauth_server("/opt/nazoauth shell"));
+    }
+
+    #[test]
+    fn rejects_untrusted_systemd_exec_start_boundaries() {
+        for value in [
+            "{ path=/opt/nazoauth ; argv[]=/opt/nazoauth server% ; }",
+            "{ path=/opt/nazoauth ; argv[]=\"/opt/nazoauth server\" ; }",
+            "{ path=/opt/nazoauth ; argv[]=/opt/nazoauth\\ server ; }",
+            "{ path=/opt/nazoauth ; argv[]=/opt/nazoauth server\r\n; }",
+            "{ path=/opt/nazoauth ; argv[]=/opt/nazoauth server\0 ; }",
+            "{ path=/opt/nazo auth ; argv[]=/opt/nazo auth server ; }",
+        ] {
+            assert!(parse_systemd_exec_start(value).is_err(), "{value:?}");
+            assert!(!command_is_nazoauth_server(value), "{value:?}");
+        }
+        assert!(
+            parse_systemd_exec_start("{ path=/opt/nazoauth ; argv[]=/opt/nazoauth server ; }\n")
+                .is_ok()
+        );
+    }
 }

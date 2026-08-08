@@ -283,6 +283,29 @@ fn external_and_container_dependency_modes_resolve_explicitly() {
 }
 
 #[test]
+fn systemd_runtime_paths_reject_unit_injection_boundaries() {
+    for (field, value) in [
+        ("binary_path", "/opt/nazoauth%releases/nazoauth"),
+        (
+            "binary_releases",
+            "/opt/nazoauth/releases\r\nEnvironment=BAD=1",
+        ),
+        ("working_directory", "/opt/nazoauth\\quoted"),
+        ("working_directory", "/opt/nazo auth"),
+        ("binary_path", "/opt/nazoauth\0server"),
+    ] {
+        let mut config = valid_config();
+        match field {
+            "binary_path" => config.runtime.binary_path = value.into(),
+            "binary_releases" => config.runtime.binary_releases = value.into(),
+            "working_directory" => config.runtime.working_directory = value.into(),
+            _ => unreachable!(),
+        }
+        assert!(config.validate().is_err(), "{field}={value:?}");
+    }
+}
+
+#[test]
 fn release_manifest_binds_every_binary_frontend_and_oci_identity() {
     let manifest = valid_manifest();
     manifest.validate("v0.2.0", "release-identity").unwrap();

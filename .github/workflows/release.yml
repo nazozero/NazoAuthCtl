@@ -7,14 +7,40 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   policy:
+    outputs:
+      self_update_matrix: ${{ steps.resolve_self_update.outputs.matrix }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Require successful controller CI for exact tag commit
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          response="$(gh api \
+            --header 'Accept: application/vnd.github+json' \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?event=push&head_sha=${RELEASE_SHA}&per_page=100")"
+          successful_run="$(printf '%s' "$response" | jq -r --arg sha "$RELEASE_SHA" '
+            [
+              .workflow_runs[]
+              | select(.head_sha == $sha and .head_branch == "main" and .event == "push")
+              | select(.status == "completed" and .conclusion == "success")
+              | .id
+            ] | .[0] // empty
+          ')"
+          if [ -z "$successful_run" ]; then
+            echo "no completed successful controller-ci run exists for tag commit $RELEASE_SHA" >&2
+            exit 1
+          fi
+          echo "controller-ci run $successful_run completed successfully for $RELEASE_SHA"
       - name: Validate immutable controller release input
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -32,6 +58,38 @@ jobs:
               raise SystemExit(f"release tag {actual!r} does not match Cargo package version {expected!r}")
           print(f"validated controller release input {expected}; publish={os.environ['RELEASE_REF_TYPE'] == 'tag'}")
           PY
+      - name: Resolve the previous controller release for self-update validation
+        if: github.ref_type == 'tag'
+        id: resolve_self_update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_RELEASE: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          releases="$(gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 100 \
+            --exclude-drafts \
+            --exclude-pre-releases \
+            --json tagName,publishedAt)"
+          previous_release="$(printf '%s' "$releases" | jq -r --arg current "$CURRENT_RELEASE" '
+            map(select(.tagName != $current))
+            | sort_by(.publishedAt)
+            | reverse
+            | .[0].tagName // empty
+          ')"
+          if [ -z "$previous_release" ]; then
+            echo "no previous stable controller release is available for self-update validation" >&2
+            exit 1
+          fi
+          case "$previous_release" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "previous release is not an immutable semantic tag: $previous_release" >&2; exit 1 ;;
+          esac
+          matrix="$(jq -cn --arg from "$previous_release" --arg to "$CURRENT_RELEASE" \
+            '{include:[{from_release:$from,to_release:$to}]}')"
+          echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
+          echo "self-update transition: $previous_release -> $CURRENT_RELEASE"
 
   build:
     needs: policy
@@ -85,14 +143,19 @@ jobs:
         run: gh release create "${{ github.ref_name }}" release/nazoauthctl-* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
 
   self-update-rollback:
-    if: github.ref_type == 'tag' && github.ref_name == 'v0.1.23'
-    needs: attest
+    if: github.ref_type == 'tag'
+    needs: [policy, attest]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.policy.outputs.self_update_matrix) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       attestations: read
     env:
       GH_TOKEN: ${{ github.token }}
+      CURRENT_RELEASE: ${{ matrix.to_release }}
+      PREVIOUS_RELEASE: ${{ matrix.from_release }}
     steps:
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Install Cosign in the controller's sanitized execution path
@@ -108,13 +171,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p previous candidate
-          gh release download v0.1.22 --repo "$GITHUB_REPOSITORY" \
+          gh release download "$PREVIOUS_RELEASE" --repo "$GITHUB_REPOSITORY" \
             --pattern nazoauthctl-x86_64-unknown-linux-gnu --dir previous
-          gh release download v0.1.23 --repo "$GITHUB_REPOSITORY" \
+          gh release download "$CURRENT_RELEASE" --repo "$GITHUB_REPOSITORY" \
             --pattern nazoauthctl-x86_64-unknown-linux-gnu --dir candidate
-          for version in v0.1.22 v0.1.23; do
+          for version in "$PREVIOUS_RELEASE" "$CURRENT_RELEASE"; do
             directory=previous
-            [ "$version" = v0.1.22 ] || directory=candidate
+            [ "$version" = "$PREVIOUS_RELEASE" ] || directory=candidate
             gh attestation verify "$directory/nazoauthctl-x86_64-unknown-linux-gnu" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
@@ -138,12 +201,12 @@ jobs:
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
-            "$binary" self check --to v0.1.23
+            "$binary" self check --to "$CURRENT_RELEASE"
           sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
-            "$binary" self update --to v0.1.23 --yes
+            "$binary" self update --to "$CURRENT_RELEASE" --yes
           test "$(sha256sum "$binary" | cut -d' ' -f1)" = "$candidate_sha"
 
           record="$(sudo find "$state_root/controller-self/audit/records" -type f -name '*.json' | sort | head -n 1)"
@@ -171,4 +234,4 @@ jobs:
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
-            "$binary" self check --to v0.1.22
+            "$binary" self check --to "$PREVIOUS_RELEASE"

@@ -19,6 +19,12 @@ fn keypair(directory: &Path, name: &str, seed: u8) -> (String, PathBuf, PathBuf)
         URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
     )
     .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::set_permissions(&public, fs::Permissions::from_mode(0o444)).unwrap();
+    }
     let digest = encode_hex(&Sha256::digest(key.verifying_key().to_bytes()));
     (format!("{name}-{}", &digest[..16]), private, public)
 }
@@ -1185,6 +1191,24 @@ fn key_and_audit_file_readers_reject_ambiguous_or_unsafe_input() {
     fs::write(&invalid, URL_SAFE_NO_PAD.encode([1_u8; 31])).unwrap();
     assert!(read_signing_key(&invalid).is_err());
     assert!(read_verifying_key(&invalid).is_err());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        crate::filesystem::set_mode(&config.operator.controller_private_key, 0o640).unwrap();
+        assert!(read_signing_key(&config.operator.controller_private_key).is_err());
+        crate::filesystem::set_mode(&config.operator.controller_private_key, 0o400).unwrap();
+
+        let hard_link = work.path().join("controller-hard-link");
+        fs::hard_link(&config.operator.controller_private_key, &hard_link).unwrap();
+        assert!(read_signing_key(&config.operator.controller_private_key).is_err());
+        fs::remove_file(&hard_link).unwrap();
+
+        let link = work.path().join("controller-link");
+        symlink(&config.operator.controller_private_key, &link).unwrap();
+        assert!(read_signing_key(&link).is_err());
+    }
 
     let line = work.path().join("line");
     fs::write(&line, "one\ntwo").unwrap();

@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::filesystem::{ensure_private_directory, open_secure_regular_file, sha256_file};
+
 pub(crate) fn invoke_recovery_driver(
     lifecycle_path: &Path,
     lifecycle: &LifecycleManifest,
@@ -9,8 +11,18 @@ pub(crate) fn invoke_recovery_driver(
     capabilities: &CapabilityGrants,
 ) -> anyhow::Result<RecoveryDriverReceipt> {
     lifecycle.validate()?;
-    let lifecycle_sha256 = sha256(lifecycle_path)?;
-    let recovery_manifest_sha256 = sha256(recovery_manifest)?;
+    let mut lifecycle_file = open_secure_regular_file(lifecycle_path, "lifecycle contract", false)?;
+    let lifecycle_sha256 = sha256_file(&mut lifecycle_file, &lifecycle_path.display().to_string())?;
+    let mut recovery_file =
+        open_secure_regular_file(recovery_manifest, "recovery manifest", false)?;
+    let recovery_manifest_sha256 =
+        sha256_file(&mut recovery_file, &recovery_manifest.display().to_string())?;
+    if operation == RecoveryOperation::Rehearse {
+        ensure_private_directory(
+            &lifecycle.recovery_driver.rehearsal_workspace,
+            "recovery rehearsal workspace",
+        )?;
+    }
     let request_id = uuid::Uuid::now_v7().to_string();
     let request = RecoveryDriverRequest {
         schema: RECOVERY_DRIVER_SCHEMA,
@@ -29,7 +41,14 @@ pub(crate) fn invoke_recovery_driver(
     if request.len() > MAX_LIFECYCLE_BYTES as usize {
         bail!("recovery driver request exceeds the protocol limit");
     }
-    if sha256(&lifecycle.recovery_driver.program)? != lifecycle.recovery_driver.program_sha256 {
+    let mut program =
+        open_secure_regular_file(&lifecycle.recovery_driver.program, "recovery driver", false)?;
+    if program.metadata()?.len() == 0
+        || sha256_file(
+            &mut program,
+            &lifecycle.recovery_driver.program.display().to_string(),
+        )? != lifecycle.recovery_driver.program_sha256
+    {
         bail!("recovery driver changed after lifecycle validation");
     }
     let output = Process::new(lifecycle.recovery_driver.program.as_os_str())
@@ -54,10 +73,16 @@ pub(crate) fn invoke_recovery_driver(
     }
     let receipt: RecoveryDriverReceipt =
         serde_json::from_str(&output).context("recovery driver returned an invalid receipt")?;
-    if operation != RecoveryOperation::Checkpoint
-        && sha256(recovery_manifest)? != recovery_manifest_sha256
-    {
-        bail!("recovery driver changed immutable recovery evidence during validation or restore");
+    if operation != RecoveryOperation::Checkpoint {
+        let mut recovery_file =
+            open_secure_regular_file(recovery_manifest, "recovery manifest", false)?;
+        if sha256_file(&mut recovery_file, &recovery_manifest.display().to_string())?
+            != recovery_manifest_sha256
+        {
+            bail!(
+                "recovery driver changed immutable recovery evidence during validation or restore"
+            );
+        }
     }
     validate_receipt(
         &receipt,

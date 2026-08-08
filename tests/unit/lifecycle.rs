@@ -14,6 +14,10 @@ use crate::{
     runtime_backend::{ContainerRestartPolicy, ContainerRuntimePolicy, RuntimeObservation},
 };
 
+use crate::filesystem::ensure_private_directory;
+#[cfg(unix)]
+use crate::filesystem::set_mode;
+
 fn candidate(root: &Path, runtime_id: &str) -> DiscoveredDeployment {
     let mount = NeutralMount {
         source: root.join("application-data"),
@@ -219,6 +223,54 @@ fn lifecycle_rejects_inline_secret_environment_and_rehearsal_mount_overlap() {
     let mut value = lifecycle(&work);
     value.schema = 1;
     assert!(value.validate().is_err());
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn recovery_driver_and_rehearsal_workspace_use_a_private_filesystem_boundary() {
+    let work = PrivateTempDir::new("nazoauth-lifecycle-filesystem-boundary").unwrap();
+    let value = lifecycle(&work);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let driver = value.recovery_driver.program.clone();
+        set_mode(&driver, 0o620).unwrap();
+        assert!(value.validate().is_err());
+
+        set_mode(&driver, 0o500).unwrap();
+        let hard_link = work.path().join("recovery-driver-hard-link");
+        std::fs::hard_link(&driver, &hard_link).unwrap();
+        assert!(value.validate().is_err());
+        std::fs::remove_file(&hard_link).unwrap();
+    }
+
+    let workspace = value.recovery_driver.rehearsal_workspace.clone();
+    ensure_private_directory(&workspace, "recovery rehearsal workspace").unwrap();
+
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::metadata(workspace).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+
+    #[cfg(windows)]
+    {
+        assert!(workspace.is_dir());
+        assert!(
+            !std::fs::symlink_metadata(&workspace)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        crate::filesystem::validate_secure_directory(
+            &workspace,
+            "recovery rehearsal workspace",
+            true,
+        )
+        .unwrap();
+    }
 }
 
 #[test]

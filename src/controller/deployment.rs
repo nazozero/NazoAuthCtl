@@ -139,26 +139,16 @@ pub(super) fn acquire_lock(command: &Command) -> anyhow::Result<File> {
 
 pub(super) fn acquire_lock_at(path: &Path, command: &Command) -> anyhow::Result<File> {
     let read_only = command_is_read_only(command);
-    let file = if read_only {
-        OpenOptions::new().read(true).open(path).with_context(|| {
+    let file = open_lock_file(path, read_only, "lifecycle lock").with_context(|| {
+        if read_only {
             format!(
                 "failed to open existing lifecycle lock {} for read-only observation",
                 path.display()
             )
-        })?
-    } else {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
+        } else {
+            format!("failed to open lifecycle lock {}", path.display())
         }
-        OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)
-            .with_context(|| format!("failed to open lifecycle lock {}", path.display()))?
-    };
+    })?;
     let result = if read_only {
         file.try_lock_shared()
     } else {

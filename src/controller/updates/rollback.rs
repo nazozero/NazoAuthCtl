@@ -14,7 +14,7 @@ pub(crate) fn rollback(
         runtime.remove_container().ok();
     }
     let _ = previous_ui;
-    backup.restore_snapshots()?;
+    backup.restore_snapshots(&config.runtime.snapshot_paths)?;
     if config.runtime.backend == RuntimeBackendKind::Systemd {
         symlink_atomic(Path::new(previous_runtime), &config.runtime.binary_path)?;
         runtime.start_service()?;
@@ -112,7 +112,7 @@ pub(crate) fn recover_from_backup(config: &UpdateConfig) -> anyhow::Result<()> {
         runtime.remove_container()?;
     }
     backup.restore_databases(config)?;
-    backup.restore_snapshots()?;
+    backup.restore_snapshots(&config.runtime.snapshot_paths)?;
     install::grant_runtime_database(config)?;
     if config.runtime.backend == RuntimeBackendKind::Systemd {
         symlink_atomic(

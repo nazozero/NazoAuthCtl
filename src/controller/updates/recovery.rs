@@ -98,7 +98,7 @@ pub(crate) fn restore_previous_transaction(
             runtime.remove_container().ok();
         }
         backup.restore_databases(config)?;
-        backup.restore_snapshots()?;
+        backup.restore_snapshots(&config.runtime.snapshot_paths)?;
         install::grant_runtime_database(config)?;
         if config.runtime.backend == RuntimeBackendKind::Systemd {
             symlink_atomic(

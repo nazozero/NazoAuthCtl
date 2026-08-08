@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::ErrorKind,
     path::{Path, PathBuf},
 };
@@ -10,7 +10,7 @@ use anyhow::{Context as _, bail};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
-use crate::filesystem::{atomic_write, read_regular_file};
+use crate::filesystem::{atomic_write, open_lock_file, read_regular_file};
 
 pub(crate) const REGISTRY_SCHEMA: u32 = 1;
 pub(crate) const DEPLOYMENT_SCHEMA: u32 = 1;
@@ -897,15 +897,7 @@ pub(crate) struct FileLock {
 
 impl FileLock {
     fn acquire(path: &Path) -> anyhow::Result<Self> {
-        let parent = path.parent().context("lock path has no parent")?;
-        crate::filesystem::ensure_directory_chain(parent)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .with_context(|| format!("failed to open lock {}", path.display()))?;
+        let file = open_lock_file(path, false, "deployment lock")?;
         file.try_lock_exclusive()
             .with_context(|| format!("another operation holds {}", path.display()))?;
         Ok(Self { file })

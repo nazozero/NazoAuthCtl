@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File, OpenOptions, TryLockError},
+    fs::{self, File, TryLockError},
     io::{IsTerminal as _, Read as _, Write as _},
     path::{Path, PathBuf},
     thread,
@@ -28,7 +28,9 @@ use crate::{
         BootstrapAdminOptions, CandidateTarget, Cli, Command, ConformanceLeaseCommand, KeysCommand,
         UpdateOptions,
     },
-    filesystem::{atomic_write, copy_atomic, remove_file_durable, set_mode, symlink_atomic},
+    filesystem::{
+        atomic_write, copy_atomic, open_lock_file, remove_file_durable, set_mode, symlink_atomic,
+    },
     install::{self, PreparedInstall},
     model::{ReleaseManifest, UpdateConfig},
     operator::{self, ExpectedReleaseTarget},

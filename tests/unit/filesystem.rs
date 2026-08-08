@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, path::Path};
 
 use super::*;
 
@@ -96,6 +96,63 @@ fn filesystem_helpers_fail_closed_without_clobbering_staging_or_non_files() {
     assert!(
         PrivateTempDir::new(&format!("nazoauthctl-missing-{}/child", std::process::id())).is_err()
     );
+}
+
+#[test]
+fn private_directory_is_created_and_revalidated_without_opening_as_a_file() {
+    let work = PrivateTempDir::new("nazoauth-private-directory-test").unwrap();
+    let workspace = work.path().join("rehearsal");
+
+    ensure_private_directory(&workspace, "recovery rehearsal workspace").unwrap();
+    validate_secure_directory(&workspace, "recovery rehearsal workspace", true).unwrap();
+    assert!(workspace.is_dir());
+    assert!(
+        validate_secure_directory(Path::new("relative/rehearsal"), "workspace", false).is_err()
+    );
+
+    #[cfg(windows)]
+    assert!(
+        !fs::symlink_metadata(&workspace)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn secure_regular_file_rejects_a_symlink_before_open() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let work = PrivateTempDir::new("nazoauth-secure-open-symlink").unwrap();
+    let target = work.path().join("target");
+    fs::write(&target, b"trusted").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+    let link = work.path().join("link");
+    symlink(&target, &link).unwrap();
+
+    assert!(open_secure_regular_file(&link, "secure test file", true).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn secure_regular_file_returns_the_post_open_validated_descriptor() {
+    use std::{io::Read as _, os::unix::fs::PermissionsExt as _};
+
+    let work = PrivateTempDir::new("nazoauth-secure-open-descriptor").unwrap();
+    let path = work.path().join("record");
+    fs::write(&path, b"before replacement").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut opened = open_secure_regular_file(&path, "secure test file", true).unwrap();
+    let replacement = work.path().join("replacement");
+    fs::write(&replacement, b"after replacement").unwrap();
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::rename(&replacement, &path).unwrap();
+
+    let mut contents = String::new();
+    opened.read_to_string(&mut contents).unwrap();
+    assert_eq!(contents, "before replacement");
 }
 
 #[cfg(unix)]

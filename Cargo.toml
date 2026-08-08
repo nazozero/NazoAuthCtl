@@ -17,6 +17,7 @@ chrono = "0.4.45"
 ed25519-dalek = "3.0.0"
 fs2 = "0.4.3"
 hmac = "0.13.0"
+libc = "0.2.189"
 nazo-operator-protocol = { version = "=0.1.22", git = "https://github.com/nazozero/NazoAuth", rev = "94878e307aa4f0793722a52d65bbea4683d69c50" }
 rand = "0.10.1"
 rpassword = "7.4.0"

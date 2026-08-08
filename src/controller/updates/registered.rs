@@ -64,6 +64,7 @@ pub(crate) fn build_registered_update_plan(
     record: &DeploymentRecord,
     target: &ReleaseManifest,
 ) -> anyhow::Result<serde_json::Value> {
+    crate::release::enforce_release_trust_floor(&record.active_release.release, target)?;
     let minimum = format!("v{}", target.rollback.minimum_supported_version);
     let mut blockers = Vec::new();
     if record.trust != crate::deployment::TrustState::Adopted {
