@@ -400,13 +400,13 @@ jobs:
           docker_trace="$root/docker-recovery-trace.log"
           docker_wrapper="$root/docker"
           : >"$docker_trace"
-          cat >"$docker_wrapper" <<'SH'
+          cat >"$docker_wrapper" <<SH
           #!/bin/sh
-          printf 'docker %s\n' "$*" >>"$NAZOAUTHCTL_DOCKER_TRACE"
-          "$NAZOAUTHCTL_REAL_DOCKER" "$@" 2>>"$NAZOAUTHCTL_DOCKER_TRACE"
-          status=$?
-          printf 'status=%s\n' "$status" >>"$NAZOAUTHCTL_DOCKER_TRACE"
-          exit "$status"
+          printf 'docker %s\n' "\$*" >>"$docker_trace"
+          "$docker_real" "\$@" 2>>"$docker_trace"
+          status=\$?
+          printf 'status=%s\n' "\$status" >>"$docker_trace"
+          exit "\$status"
           SH
           chmod 0755 "$docker_wrapper"
           docker_wrapper_path=""
@@ -419,8 +419,6 @@ jobs:
           test -n "$docker_wrapper_path"
           sudo install -m 0755 "$docker_wrapper" "$docker_wrapper_path"
           if ! sudo env \
-            "NAZOAUTHCTL_REAL_DOCKER=$docker_real" \
-            "NAZOAUTHCTL_DOCKER_TRACE=$docker_trace" \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
             "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
