@@ -393,6 +393,7 @@ jobs:
           # GitHub runner account, so hand ownership over only after all
           # runner-side material has been written.
           sudo chown -R 0:0 "$config_root" "$state_root" "$break_glass_root"
+          sudo chmod 0700 "$break_glass_root"
           sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
