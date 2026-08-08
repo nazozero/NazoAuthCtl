@@ -389,9 +389,7 @@ mod tests {
     use std::fs;
 
     use crate::{
-        filesystem::PrivateTempDir,
-        process::Process,
-        runtime_backend::ManagedNetwork,
+        filesystem::PrivateTempDir, process::Process, runtime_backend::ManagedNetwork,
         test_support::write_shell_executable,
     };
 
