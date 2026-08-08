@@ -15,7 +15,7 @@ use crate::{
 #[cfg(unix)]
 use crate::runtime_backend::{
     ManagedDependencyBackup, ManagedDependencyIdentity, ManagedPostgresCommand,
-    ManagedValkeyRestore, RuntimeBackend,
+    ManagedValkeyRestore,
 };
 
 fn config(work: &PrivateTempDir) -> UpdateConfig {

@@ -1898,7 +1898,6 @@ fn fake_container_runtime(
         authority = config.operator.controller_key_id,
         runtime = config.runtime.runtime_instance_id,
         network_digest = network_digest,
-        postgres_volume = postgres_volume,
         valkey_volume = config.valkey.data_volume,
         postgres_volume_digest = identity.postgres_volume_config_digest,
         valkey_volume_digest = identity.valkey_volume_config_digest,
