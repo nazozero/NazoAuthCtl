@@ -359,10 +359,13 @@ pub(crate) fn ensure_container(
     create: Process,
     backend_name: &str,
 ) -> anyhow::Result<()> {
-    if Process::new(command).args(["inspect", name]).succeeds() {
+    if Process::new(command)
+        .args(["container", "inspect", name])
+        .succeeds()
+    {
         assert_managed_labels(
             command,
-            &["inspect", name],
+            &["container", "inspect", name],
             &network.deployment_id,
             &network.control_authority,
             Some(runtime_instance_id),
@@ -370,7 +373,12 @@ pub(crate) fn ensure_container(
             config_digest,
             backend_name,
         )?;
-        assert_container_image(command, &["inspect", name], expected_image, backend_name)?;
+        assert_container_image(
+            command,
+            &["container", "inspect", name],
+            expected_image,
+            backend_name,
+        )?;
         return Process::new(command).args(["start", name]).run_quiet();
     }
     create.run_quiet()
