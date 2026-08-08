@@ -2,6 +2,8 @@ use std::fs;
 
 use super::*;
 use crate::filesystem::PrivateTempDir;
+#[cfg(unix)]
+use crate::test_support::write_shell_executable;
 
 fn install_options(data_root: PathBuf) -> InstallOptions {
     let control_root = data_root.with_file_name("control");
@@ -28,6 +30,38 @@ fn install_options(data_root: PathBuf) -> InstallOptions {
         profile_secrets: None,
         version: Some("v0.2.0".to_owned()),
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn container_operator_state_is_private_and_owned_by_the_runtime_identity() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let work = PrivateTempDir::new("operator-state-ownership").unwrap();
+    let state = work.path().join("operator-state");
+    let command = work.path().join("fake-chown");
+    let arguments = work.path().join("arguments");
+    fs::create_dir(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+    write_shell_executable(
+        &command,
+        &format!("printf '%s\\n' \"$*\" > '{}'", arguments.display()),
+    );
+
+    configure_container_operator_state_permissions(command.as_os_str(), &state).unwrap();
+
+    assert_eq!(
+        fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::read_to_string(arguments).unwrap().trim(),
+        format!("10001:10001 {}", state.display())
+    );
+
+    let symlink = work.path().join("operator-state-link");
+    std::os::unix::fs::symlink(&state, &symlink).unwrap();
+    assert!(configure_container_operator_state_permissions(command.as_os_str(), &symlink).is_err());
 }
 
 #[test]
