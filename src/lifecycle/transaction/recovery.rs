@@ -67,13 +67,23 @@ pub(crate) fn recover_registered(
     persist_recovery_transaction(&transaction_path, &transaction)?;
     if transaction.state < RecoveryTransactionState::RuntimesQuiesced {
         for runtime in &lifecycle.runtimes {
-            backend(runtime.backend).verify_ownership(
-                &runtime.object_reference,
-                &record.deployment_id,
-                &runtime.runtime_instance_id,
-                &record.control_authority,
-            )?;
-            backend(runtime.backend).quiesce_for_recovery(&runtime.object_reference)?;
+            let runtime_backend = backend(runtime.backend);
+            // A runtime can legitimately be absent after an interrupted
+            // replacement.  Only an observed object can be ownership-checked;
+            // quiesce_for_recovery still fails closed for inspection errors
+            // and rechecks any object before stopping it.
+            if runtime_backend
+                .inspect_optional(&runtime.object_reference)?
+                .is_some()
+            {
+                runtime_backend.verify_ownership(
+                    &runtime.object_reference,
+                    &record.deployment_id,
+                    &runtime.runtime_instance_id,
+                    &record.control_authority,
+                )?;
+            }
+            runtime_backend.quiesce_for_recovery(&runtime.object_reference)?;
         }
         transaction.state = RecoveryTransactionState::RuntimesQuiesced;
         transaction.updated_at = Utc::now().timestamp();

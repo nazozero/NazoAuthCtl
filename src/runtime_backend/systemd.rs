@@ -138,6 +138,34 @@ impl RuntimeBackend for SystemdBackend {
         })
     }
 
+    fn inspect_optional(
+        &self,
+        object_reference: &str,
+    ) -> anyhow::Result<Option<RuntimeObservation>> {
+        if object_reference.starts_with("process:") {
+            return self.inspect(object_reference).map(Some);
+        }
+        validate_unit_name(object_reference)?;
+        let output = Process::new("systemctl")
+            .args([
+                "show",
+                object_reference,
+                "--no-pager",
+                "--property=LoadState",
+                "--value",
+            ])
+            .output()?;
+        if !output.status.success() {
+            bail!("systemd could not inspect the recovery unit");
+        }
+        let load_state = String::from_utf8(output.stdout)
+            .context("systemd returned a non-UTF-8 unit load state")?;
+        if load_state.trim() == "not-found" {
+            return Ok(None);
+        }
+        self.inspect(object_reference).map(Some)
+    }
+
     fn verify_ownership(
         &self,
         object_reference: &str,
