@@ -403,8 +403,12 @@ jobs:
           cat >"$docker_wrapper" <<SH
           #!/bin/sh
           printf 'docker %s\n' "\$*" >>"$docker_trace"
-          "$docker_real" "\$@" 2>>"$docker_trace"
+          docker_stderr="\$docker_trace.stderr"
+          "$docker_real" "\$@" 2>"\$docker_stderr"
           status=\$?
+          cat "\$docker_stderr" >>"$docker_trace"
+          cat "\$docker_stderr" >&2
+          rm -f "\$docker_stderr"
           printf 'status=%s\n' "\$status" >>"$docker_trace"
           exit "\$status"
           SH
