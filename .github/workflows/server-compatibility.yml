@@ -344,13 +344,15 @@ jobs:
           identity="$(cat host-identity.json)"
           declaration="$config_root/deployments/$deployment_id/deployment.json"
           audit_key="$state_root/deployments/$deployment_id/identities/audit.key"
+          lifecycle_sha="$(sha256sum "$lifecycle" | cut -d' ' -f1)"
           head -c 32 /dev/urandom | base64 -w0 | tr '+/' '-_' | tr -d '=' >"$audit_key"
           chmod 0600 "$audit_key"
           jq -n \
             --arg deployment "$deployment_id" --arg runtime "$runtime_id" \
             --arg image "$image" --arg digest "$digest" --arg data "$root/docker-live-data" \
             --arg config "$root/docker-live-config/.env.yaml" --arg network "$network" \
-            --arg lifecycle "$lifecycle" --arg audit "$audit_key" --argjson identity "$identity" \
+            --arg lifecycle "$lifecycle" --arg lifecycle_sha "$lifecycle_sha" \
+            --arg audit "$audit_key" --argjson identity "$identity" \
             '{schema:1,deployment_id:$deployment,control_authority:"controller-ci-recovery",alias:"ci-recovery",
               issuer:"http://127.0.0.1:19081",active_release:$identity,trust:"adopted",
               capabilities:{
@@ -364,7 +366,7 @@ jobs:
                   {source:$config,destination:"/app/.env.yaml",read_only:true,selinux_relabel:false,scope:"deployment",ownership:"external"},
                   {source:$data,destination:"/var/lib/nazo_oauth",read_only:false,selinux_relabel:false,scope:"deployment",ownership:"external"}],
                 instance_key_id:null,deployment_statement:null}],
-              resources:{audit_private_key:{kind:"file",path:$audit},lifecycle_contract:{kind:"file",path:$lifecycle},
+              resources:{audit_private_key:{kind:"file",path:$audit},lifecycle_contract:{kind:"digest-bound-file",path:$lifecycle,sha256:$lifecycle_sha},
                 database:{kind:"provider",provider:"external-postgres",key:"ci-recovery"},
                 valkey:{kind:"provider",provider:"external-valkey",key:"ci-recovery"}},
               recovery:{conclusion:"proven",evidence:["ci-offline-cache"],off_host_package_required_for_machine_loss:true},
