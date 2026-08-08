@@ -135,6 +135,8 @@ pub(super) fn write_install_profile(
         "OPENID4VP_VERIFIER_MANAGEMENT_TOKEN_FILE: \"${PROFILE_SECRET_ROOT}/openid4vp-management-token\"".to_owned(),
         "OPENID4VC_SIGNING_CERTIFICATE_CHAIN_FILE: \"${PROFILE_APP_ROOT}/keys/openid4vc-certificate-bundle.pem\"".to_owned(),
         "OPENID4VC_TRUST_ANCHORS_FILE: \"${PROFILE_APP_ROOT}/keys/openid4vc-certificate-bundle.pem\"".to_owned(),
+        "OPENID4VC_REVOCATION_POLICY: \"required\"".to_owned(),
+        "OPENID4VC_REVOCATION_SNAPSHOT_FILE: \"${PROFILE_APP_ROOT}/keys/openid4vc-revocation-snapshot.json\"".to_owned(),
     ];
     if let (Some(issuer), Some(jwks)) = (
         &material.client_attestation_issuer,
