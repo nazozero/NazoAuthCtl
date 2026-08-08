@@ -1,5 +1,18 @@
 use super::*;
 
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigBackedUpdateEvidence<'a> {
+    schema: u32,
+    deployment_id: &'a str,
+    transaction_id: &'a str,
+    target_release: &'a EmbeddedIdentity,
+    active_release_sha256: String,
+    rollback_state_sha256: String,
+    runtime_observations: &'a [crate::runtime_backend::RuntimeObservation],
+    verified_at: i64,
+}
+
 pub(crate) fn registered_update_plan(
     record: &DeploymentRecord,
     options: &UpdateOptions,
@@ -57,6 +70,248 @@ pub(crate) fn registered_update_prepare(
     }
     let transaction = crate::coordination::prepare_update_locked(store, &record, &plan)?;
     println!("{}", serde_json::to_string_pretty(&transaction)?);
+    Ok(())
+}
+
+pub(crate) fn resume_config_backed_update_locked(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    transaction: &crate::coordination::UpdateCoordination,
+    config_path: &Path,
+    config: &UpdateConfig,
+) -> anyhow::Result<crate::coordination::UpdateCoordination> {
+    use crate::coordination::{CoordinationState, StepOwner, StepState};
+    use crate::deployment::ArtifactReference;
+
+    if transaction.state != CoordinationState::ReadyForController {
+        bail!("update transaction is not ready for controller execution");
+    }
+    match record.resources.get("controller_config") {
+        Some(SafeReference::File { path })
+            if fs::canonicalize(path)? == fs::canonicalize(config_path)? => {}
+        _ => bail!("registered update is not bound to this controller configuration"),
+    }
+    if record.resources.contains_key("lifecycle_contract") {
+        bail!("config-backed update cannot replace an offline lifecycle update");
+    }
+    if record.runtime_instances.len() != 1 {
+        bail!("config-backed update requires exactly one managed runtime instance");
+    }
+
+    update(
+        config_path,
+        config,
+        UpdateOptions {
+            version: Some(transaction.target_release.release.clone()),
+            plan: false,
+            yes: true,
+            accept_migration_barrier: false,
+        },
+    )?;
+
+    let active = load_active_release(config)?;
+    if active.embedded != transaction.target_release {
+        bail!("config-backed update did not activate the coordinated Release");
+    }
+    let runtime = Runtime::new(config);
+    if runtime.active_revision()? != transaction.target_release.revision {
+        bail!("config-backed update runtime revision differs from the coordinated Release");
+    }
+    wait_ready(config)?;
+    verify_public(config)?;
+    verify_ui(config, &active)?;
+
+    let mut observations = Vec::with_capacity(record.runtime_instances.len());
+    for declared in &record.runtime_instances {
+        let observation = crate::runtime_backend::backend(declared.backend)
+            .inspect(&declared.object_reference)?;
+        validate_config_backed_runtime_observation(declared, &observation)?;
+        let artifact_matches = match (&observation.artifact, declared.backend) {
+            (
+                ArtifactReference::Oci {
+                    image_reference,
+                    digest,
+                },
+                RuntimeBackendKind::Podman | RuntimeBackendKind::Docker,
+            ) => {
+                let expected_digest = active.runtime_oci_digest()?;
+                digest == expected_digest
+                    && image_reference == &format!("{}@{expected_digest}", active.oci.repository)
+            }
+            (ArtifactReference::HostBinary { sha256, .. }, RuntimeBackendKind::Systemd) => {
+                sha256 == &active.artifacts["binary"].sha256
+            }
+            _ => false,
+        };
+        if !artifact_matches {
+            bail!("updated runtime artifact differs from the signed coordinated Release");
+        }
+        observations.push(observation);
+    }
+
+    let active_release_path = active_release_path(config);
+    let rollback_path = rollback_state_path(config);
+    let evidence_path = store
+        .deployment_state_dir(&record.deployment_id)
+        .join("transactions")
+        .join(&transaction.transaction_id)
+        .join("config-backed-execution.json");
+    fs::create_dir_all(
+        evidence_path
+            .parent()
+            .context("config-backed update evidence path has no parent")?,
+    )?;
+    atomic_write(
+        &evidence_path,
+        &serde_json::to_vec_pretty(&ConfigBackedUpdateEvidence {
+            schema: 1,
+            deployment_id: &record.deployment_id,
+            transaction_id: &transaction.transaction_id,
+            target_release: &transaction.target_release,
+            active_release_sha256: crate::filesystem::sha256(&active_release_path)?,
+            rollback_state_sha256: crate::filesystem::sha256(&rollback_path)?,
+            runtime_observations: &observations,
+            verified_at: Utc::now().timestamp(),
+        })?,
+        0o600,
+    )?;
+    let evidence_sha256 = crate::filesystem::sha256(&evidence_path)?;
+
+    let current_record = store.reload_locked(record)?;
+    let current = crate::coordination::show_locked(store, &current_record)?;
+    if current.transaction_id != transaction.transaction_id {
+        bail!("active update transaction changed during config-backed execution");
+    }
+    for step in current.steps.clone() {
+        if step.owner == StepOwner::CtlOwned
+            && step.state == StepState::Pending
+            && step.id != "acceptance"
+        {
+            crate::coordination::complete_controller_step_locked(
+                store,
+                &current_record,
+                &transaction.transaction_id,
+                &step.id,
+                &evidence_sha256,
+            )?;
+        }
+    }
+
+    let mut updated = current_record.clone();
+    updated.active_release = transaction.target_release.clone();
+    for declared in &mut updated.runtime_instances {
+        let observation = observations
+            .iter()
+            .find(|candidate| candidate.object_reference == declared.object_reference)
+            .context("updated runtime observation disappeared before declaration commit")?;
+        declared.artifact = observation.artifact.clone();
+        declared.local_artifact_id = observation.local_artifact_id.clone();
+    }
+    updated.declaration_revision = current_record
+        .declaration_revision
+        .checked_add(1)
+        .context("deployment declaration revision overflow")?;
+    let current = crate::coordination::commit_controller_update_locked(
+        store,
+        &current_record,
+        &updated,
+        &transaction.transaction_id,
+        "acceptance",
+        &evidence_sha256,
+    )?;
+    crate::governance::append_management_audit(
+        store,
+        &updated,
+        &transaction.transaction_id,
+        "config-backed-update",
+        &transaction.target_release.release,
+    )?;
+    crate::coordination::finalize_committed_locked(store, &updated, &transaction.transaction_id)?;
+    Ok(current)
+}
+
+fn validate_config_backed_runtime_observation(
+    declared: &crate::deployment::RuntimeInstance,
+    observation: &crate::runtime_backend::RuntimeObservation,
+) -> anyhow::Result<()> {
+    if observation.backend != declared.backend
+        || observation.object_reference != declared.object_reference
+        || !observation.running
+        || !observation.server_command_verified
+    {
+        bail!("updated runtime failed registered acceptance");
+    }
+
+    if matches!(
+        declared.backend,
+        RuntimeBackendKind::Podman | RuntimeBackendKind::Docker
+    ) {
+        if !observation.missing.is_empty() {
+            bail!("updated container runtime has incomplete acceptance evidence");
+        }
+
+        let mut declared_networks = declared.networks.clone();
+        let mut observed_networks = observation.networks.clone();
+        declared_networks.sort();
+        observed_networks.sort();
+        if declared_networks != observed_networks {
+            bail!("updated container runtime network surface differs from the declaration");
+        }
+
+        let mut declared_mounts = declared
+            .mounts
+            .iter()
+            .map(|mount| {
+                (
+                    mount.source.clone(),
+                    mount.destination.clone(),
+                    mount.read_only,
+                    mount.selinux_relabel,
+                    mount.scope,
+                    mount.ownership,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut observed_mounts = observation
+            .mounts
+            .iter()
+            .map(|mount| {
+                (
+                    mount.source.clone(),
+                    mount.destination.clone(),
+                    mount.read_only,
+                    mount.selinux_relabel,
+                    mount.scope,
+                    mount.ownership,
+                )
+            })
+            .collect::<Vec<_>>();
+        declared_mounts.sort();
+        observed_mounts.sort();
+        if declared_mounts != observed_mounts {
+            bail!("updated container runtime mount surface differs from the declaration");
+        }
+
+        let mut declared_ports = declared.ports.clone();
+        let mut observed_ports = observation.ports.clone();
+        declared_ports.sort();
+        observed_ports.sort();
+        if declared_ports.len() != observed_ports.len()
+            || declared_ports
+                .iter()
+                .zip(&observed_ports)
+                .any(|(declared, observed)| !observed.starts_with(&format!("{declared}->")))
+        {
+            bail!("updated container runtime published-port surface differs from the declaration");
+        }
+    } else if observation
+        .missing
+        .iter()
+        .any(|item| item == "host binary digest could not be resolved")
+    {
+        bail!("updated systemd runtime binary digest is unavailable");
+    }
+
     Ok(())
 }
 
@@ -278,5 +533,82 @@ pub(crate) fn recovery_boundary_name(boundary: crate::model::DatabaseRestore) ->
         crate::model::DatabaseRestore::Backup => "database-backup",
         crate::model::DatabaseRestore::Pitr => "database-pitr",
         crate::model::DatabaseRestore::None => "database-unavailable",
+    }
+}
+
+#[cfg(test)]
+mod config_backed_update_tests {
+    use super::*;
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    fn declared_runtime() -> crate::deployment::RuntimeInstance {
+        crate::deployment::RuntimeInstance {
+            runtime_instance_id: "runtime-1".to_owned(),
+            backend: RuntimeBackendKind::Podman,
+            object_reference: "nazoauth-server".to_owned(),
+            artifact: crate::deployment::ArtifactReference::Unknown,
+            local_artifact_id: None,
+            ports: vec!["127.0.0.1:8000".to_owned()],
+            networks: vec!["nazoauth".to_owned()],
+            mounts: vec![crate::deployment::MountReference {
+                source: PathBuf::from("/srv/nazoauth/data"),
+                destination: PathBuf::from("/var/lib/nazo_oauth"),
+                read_only: false,
+                selinux_relabel: true,
+                scope: crate::deployment::ResourceScope::Deployment,
+                ownership: Responsibility::Managed,
+            }],
+            instance_key_id: None,
+            deployment_statement: None,
+        }
+    }
+
+    fn observed_runtime() -> crate::runtime_backend::RuntimeObservation {
+        crate::runtime_backend::RuntimeObservation {
+            backend: RuntimeBackendKind::Podman,
+            object_reference: "nazoauth-server".to_owned(),
+            display_name: "nazoauth-server".to_owned(),
+            running: true,
+            server_command_verified: true,
+            artifact: crate::deployment::ArtifactReference::Unknown,
+            local_artifact_id: None,
+            ports: vec!["127.0.0.1:8000->8000/tcp".to_owned()],
+            networks: vec!["nazoauth".to_owned()],
+            mounts: vec![crate::runtime_backend::NeutralMount {
+                source: PathBuf::from("/srv/nazoauth/data"),
+                destination: PathBuf::from("/var/lib/nazo_oauth"),
+                read_only: false,
+                selinux_relabel: true,
+                scope: crate::deployment::ResourceScope::Deployment,
+                ownership: Responsibility::Managed,
+            }],
+            safe_environment: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            evidence: vec!["runtime inspected".to_owned()],
+            missing: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn config_backed_acceptance_requires_the_declared_runtime_surface() {
+        validate_config_backed_runtime_observation(&declared_runtime(), &observed_runtime())
+            .unwrap();
+
+        let mut drifted = observed_runtime();
+        drifted.networks = vec!["unexpected".to_owned()];
+        let error =
+            validate_config_backed_runtime_observation(&declared_runtime(), &drifted).unwrap_err();
+        assert!(error.to_string().contains("network surface"));
+    }
+
+    #[test]
+    fn config_backed_acceptance_rejects_incomplete_container_evidence() {
+        let mut incomplete = observed_runtime();
+        incomplete
+            .missing
+            .push("trusted OCI digest could not be resolved".to_owned());
+        let error = validate_config_backed_runtime_observation(&declared_runtime(), &incomplete)
+            .unwrap_err();
+        assert!(error.to_string().contains("incomplete acceptance evidence"));
     }
 }

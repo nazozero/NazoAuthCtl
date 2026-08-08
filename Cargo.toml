@@ -1,6 +1,6 @@
 [package]
 name = "nazoauthctl"
-version = "0.1.31"
+version = "0.1.32"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/nazozero/NazoAuthCtl"
@@ -18,7 +18,7 @@ ed25519-dalek = "3.0.0"
 fs2 = "0.4.3"
 hmac = "0.13.0"
 libc = "0.2.189"
-nazo-operator-protocol = { version = "=0.1.24", git = "https://github.com/nazozero/NazoAuth", rev = "d759b069de50a5ee00c28a0adede88e6b448d08c" }
+nazo-operator-protocol = { version = "=0.1.25", git = "https://github.com/nazozero/NazoAuth", rev = "f7a6dbe7b136c7b08c85443e81bbe1e5f44e5de7" }
 rand = "0.10.1"
 rpassword = "7.4.0"
 semver = "1.0.27"
