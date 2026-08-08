@@ -64,7 +64,8 @@ fn server_compatibility_does_not_expose_github_token_to_pr_controller() {
         env!("CARGO_MANIFEST_DIR"),
         "/.github/workflows/server-compatibility.yml"
     ))
-    .unwrap();
+    .unwrap()
+    .replace("\r\n", "\n");
     let top_level = workflow.split_once("\njobs:").unwrap().0;
     assert!(top_level.contains("permissions:\n  contents: read"));
     assert!(!top_level.contains("attestations: read"));
