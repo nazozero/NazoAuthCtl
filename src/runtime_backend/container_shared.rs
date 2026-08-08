@@ -127,7 +127,7 @@ pub(crate) fn backup_managed_dependencies(
         if let Some(password_file) = &backup.valkey_password_file {
             return Process::new(command)
                 .args(["exec", backup.valkey_object.as_str(), "sh", "-eu", "-c"])
-                .arg("VALKEYCLI_AUTH=$(cat \"$1\"); export VALKEYCLI_AUTH; shift; exec valkey-cli \"$@\"")
+                .arg("password_file=$1; shift; exec valkey-cli --askpass \"$@\" < \"$password_file\"")
                 .arg("_")
                 .arg(password_file)
                 .args(arguments)
@@ -388,6 +388,7 @@ pub(crate) fn ensure_container(
 mod tests {
     use std::fs;
 
+    use crate::runtime_backend::{ManagedDependencyBackup, managed_dependency_identity};
     use crate::{
         filesystem::PrivateTempDir, process::Process, runtime_backend::ManagedNetwork,
         test_support::write_shell_executable,
@@ -448,6 +449,62 @@ mod tests {
             "Podman",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn managed_valkey_backup_reads_auth_from_stdin_without_a_secret_environment_variable() {
+        let work = PrivateTempDir::new("managed-valkey-backup-auth").unwrap();
+        let engine = work.path().join("fake-podman");
+        let argv = work.path().join("argv");
+        let lastsave_seen = work.path().join("lastsave-seen");
+        let password_file = work.path().join("valkey-password");
+        fs::write(&password_file, "secret-canary").unwrap();
+        write_shell_executable(
+            &engine,
+            &format!(
+                "printf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *LASTSAVE*) if [ -e '{}' ]; then printf '101\\n'; else : > '{}'; printf '100\\n'; fi ;;\n  *) exit 0 ;;\nesac",
+                argv.display(),
+                lastsave_seen.display(),
+                lastsave_seen.display(),
+            ),
+        );
+        let postgres_image = format!("postgres@sha256:{}", "a".repeat(64));
+        let valkey_image = format!("valkey@sha256:{}", "b".repeat(64));
+        let backup = ManagedDependencyBackup {
+            destination: work.path().join("backup"),
+            network: "managed-network".to_owned(),
+            postgres_object: "managed-postgres".to_owned(),
+            postgres_volume: "managed-postgres-data".to_owned(),
+            postgres_image: postgres_image.clone(),
+            postgres_user: "nazoauth_runtime".to_owned(),
+            postgres_database: "oauth".to_owned(),
+            postgres_validation_image: postgres_image.clone(),
+            valkey_object: "managed-valkey".to_owned(),
+            valkey_volume: "managed-valkey-data".to_owned(),
+            valkey_image: valkey_image.clone(),
+            valkey_rdb_path: "/data/dump.rdb".to_owned(),
+            valkey_password_file: Some(password_file),
+            identity: managed_dependency_identity(
+                "deployment-test",
+                "controller-test",
+                "runtime-test",
+                "managed-network",
+                "managed-postgres",
+                "managed-postgres-data",
+                &postgres_image,
+                "oauth",
+                "nazoauth_runtime",
+                "managed-valkey",
+                "managed-valkey-data",
+                &valkey_image,
+            ),
+        };
+        super::backup_managed_dependencies(engine.as_os_str(), &backup, true).unwrap();
+        let arguments = fs::read_to_string(argv).unwrap();
+        assert!(arguments.contains("valkey-cli --askpass"));
+        assert!(!arguments.contains("VALKEYCLI_AUTH"));
+        assert!(!arguments.contains("REDISCLI_AUTH"));
+        assert!(!arguments.contains("secret-canary"));
     }
 }
 
