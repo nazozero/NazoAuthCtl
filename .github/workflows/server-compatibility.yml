@@ -710,6 +710,11 @@ jobs:
           sudo podman image rm "$image"
           ! sudo podman image exists "$image"
           printf 'tampered' >>"$archive"
+          # The fixture is authored by the runner, while destructive controller
+          # operations intentionally run as root.  Hand ownership over after
+          # the tamper mutation and keep cache restoration privileged as well.
+          sudo chown -R 0:0 "$config_root" "$state_root" "$break_glass_root"
+          sudo chmod 0700 "$break_glass_root"
           if sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
@@ -719,7 +724,7 @@ jobs:
             exit 1
           fi
           test ! -e "$state_root/deployments/$deployment_id/recovery/driver-invocations"
-          cp "$archive.good" "$archive"
+          sudo cp "$archive.good" "$archive"
           if ! sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
