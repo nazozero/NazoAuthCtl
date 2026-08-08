@@ -387,6 +387,12 @@ jobs:
           docker rm --force manual-auth-same-name
           docker image rm "$image"
           ! docker image inspect "$image" >/dev/null 2>&1
+          # The recovery command is deliberately executed as the controller
+          # (root) user.  Its storage-root invariant requires every existing
+          # component to be owned by that user; the fixture was created by the
+          # GitHub runner account, so hand ownership over only after all
+          # runner-side material has been written.
+          sudo chown -R 0:0 "$config_root" "$state_root" "$break_glass_root"
           sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
