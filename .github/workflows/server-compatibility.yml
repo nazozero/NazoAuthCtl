@@ -252,9 +252,10 @@ jobs:
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/nazoauthctl-real-backends"
-          config_root="$root/controller-config"
-          state_root="$root/controller-state"
-          break_glass_root="$root/controller-break-glass"
+          control_root="/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker"
+          config_root="$control_root/controller-config"
+          state_root="$control_root/controller-state"
+          break_glass_root="$control_root/controller-break-glass"
           deployment_id=deployment-ci-recovery
           runtime_id=runtime-ci-recovery
           image=ghcr.io/nazozero/nazoauth:v0.1.20
@@ -417,10 +418,10 @@ jobs:
           ! docker image inspect "$image" >/dev/null 2>&1
           # The recovery command is deliberately executed as the controller
           # (root) user.  Its storage-root invariant requires every existing
-          # component to be owned by that user; the fixture was created by the
-          # GitHub runner account, so hand ownership over only after all
-          # runner-side material has been written.
-          sudo chown -R 0:0 "$config_root" "$state_root" "$break_glass_root"
+          # component and every non-sticky ancestor to be owned by that user.
+          # Keep controller storage directly below root-owned sticky /tmp, then
+          # hand ownership over only after all runner-side material is written.
+          sudo chown -R 0:0 "$control_root"
           sudo chmod 0700 "$break_glass_root"
           sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
@@ -450,9 +451,10 @@ jobs:
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/nazoauthctl-systemd-recovery"
-          config_root="$root/controller-config"
-          state_root="$root/controller-state"
-          break_glass_root="$root/controller-break-glass"
+          control_root="/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-systemd"
+          config_root="$control_root/controller-config"
+          state_root="$control_root/controller-state"
+          break_glass_root="$control_root/controller-break-glass"
           deployment_id=deployment-ci-systemd-recovery
           runtime_id=runtime-ci-systemd-recovery
           unit=manual-auth-recovery.service
@@ -519,10 +521,10 @@ jobs:
           mv "$config_root/registry.multi.json" "$config_root/registry.json"
 
           # The fixture is authored by the runner, while destructive controller
-          # operations intentionally run as root.  Hand ownership over before
-          # the first controller invocation and keep subsequent registry edits
-          # in the same privileged domain.
-          sudo chown -R 0:0 "$config_root" "$state_root" "$break_glass_root"
+          # operations intentionally run as root.  The controller boundary is
+          # directly below root-owned sticky /tmp, so its complete ancestor
+          # chain satisfies the same invariant as a production installation.
+          sudo chown -R 0:0 "$control_root"
           sudo chmod 0700 "$break_glass_root"
 
           if sudo env \
@@ -600,9 +602,10 @@ jobs:
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/nazoauthctl-podman-recovery"
-          config_root="$root/controller-config"
-          state_root="$root/controller-state"
-          break_glass_root="$root/controller-break-glass"
+          control_root="/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman"
+          config_root="$control_root/controller-config"
+          state_root="$control_root/controller-state"
+          break_glass_root="$control_root/controller-break-glass"
           deployment_id=deployment-ci-podman-recovery
           runtime_id=runtime-ci-podman-recovery
           object=manual-auth-podman-recovery
@@ -706,9 +709,10 @@ jobs:
           ! sudo podman image exists "$image"
           printf 'tampered' >>"$archive"
           # The fixture is authored by the runner, while destructive controller
-          # operations intentionally run as root.  Hand ownership over after
-          # the tamper mutation and keep cache restoration privileged as well.
-          sudo chown -R 0:0 "$config_root" "$state_root" "$break_glass_root"
+          # operations intentionally run as root.  Keep the controller storage
+          # under root-owned sticky /tmp and transfer the whole boundary after
+          # the tamper mutation; cache restoration remains privileged as well.
+          sudo chown -R 0:0 "$control_root"
           sudo chmod 0700 "$break_glass_root"
           if sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
@@ -762,4 +766,8 @@ jobs:
           sudo systemctl stop manual-auth-recovery.service 2>/dev/null || true
           sudo rm -f /etc/systemd/system/manual-auth-unusual.service \
             /etc/systemd/system/manual-auth-recovery.service
+          sudo rm -rf -- \
+            "/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker" \
+            "/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-systemd" \
+            "/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman"
           sudo systemctl daemon-reload

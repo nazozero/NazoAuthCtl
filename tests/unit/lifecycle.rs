@@ -228,13 +228,14 @@ fn lifecycle_rejects_inline_secret_environment_and_rehearsal_mount_overlap() {
 #[cfg(any(unix, windows))]
 #[test]
 fn recovery_driver_and_rehearsal_workspace_use_a_private_filesystem_boundary() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
     let work = PrivateTempDir::new("nazoauth-lifecycle-filesystem-boundary").unwrap();
     let value = lifecycle(&work);
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let driver = value.recovery_driver.program.clone();
         set_mode(&driver, 0o620).unwrap();
         assert!(value.validate().is_err());
