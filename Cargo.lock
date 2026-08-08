@@ -565,8 +565,8 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "nazo-operator-protocol"
-version = "0.1.22"
-source = "git+https://github.com/nazozero/NazoAuth?rev=94878e307aa4f0793722a52d65bbea4683d69c50#195261111edb130862ced432ae3c489e24d278ac"
+version = "0.1.24"
+source = "git+https://github.com/nazozero/NazoAuth?rev=d759b069de50a5ee00c28a0adede88e6b448d08c#d759b069de50a5ee00c28a0adede88e6b448d08c"
 dependencies = [
  "anyhow",
  "base64",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "anyhow",
  "base64",
