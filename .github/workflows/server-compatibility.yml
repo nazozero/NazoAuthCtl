@@ -519,12 +519,6 @@ jobs:
               database_responsibility:"delegated"}' >"$root/spec.json"
           python3 "$GITHUB_WORKSPACE/.github/scripts/write_recovery_fixture.py" "$root/spec.json"
 
-          # The fixture is authored by the runner, while destructive controller
-          # operations intentionally run as root.  Match the production storage
-          # ownership invariant before invoking any controller command.
-          sudo chown -R 0:0 "$config_root" "$state_root" "$break_glass_root"
-          sudo chmod 0700 "$break_glass_root"
-
           jq '.deployments["deployment-ci-decoy"]={alias:"ci-decoy",declaration:.deployments["deployment-ci-systemd-recovery"].declaration}' \
             "$config_root/registry.json" >"$config_root/registry.multi.json"
           mv "$config_root/registry.multi.json" "$config_root/registry.json"
@@ -542,6 +536,12 @@ jobs:
           jq 'del(.deployments["deployment-ci-decoy"])' "$config_root/registry.json" \
             >"$config_root/registry.single.json"
           mv "$config_root/registry.single.json" "$config_root/registry.json"
+
+          # The fixture is authored by the runner, while destructive controller
+          # operations intentionally run as root.  Match the production storage
+          # ownership invariant only after all runner-side edits are complete.
+          sudo chown -R 0:0 "$config_root" "$state_root" "$break_glass_root"
+          sudo chmod 0700 "$break_glass_root"
 
           if sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
