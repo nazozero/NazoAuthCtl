@@ -1947,6 +1947,7 @@ if [ "${{1:-}}" = inspect ]; then
         &inspect_override,
         1,
     );
+    let script = script.replace("io.nazoauth.resource-kind", "io.nazoauth.managed-resource");
     let trace_path = engine.with_extension("calls");
     let script = format!(
         "printf '%s\n' \"$*\" >> '{}'\n{}",
