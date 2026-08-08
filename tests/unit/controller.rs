@@ -1947,6 +1947,12 @@ if [ "${{1:-}}" = inspect ]; then
         &inspect_override,
         1,
     );
+    let trace_path = engine.with_extension("calls");
+    let script = format!(
+        "printf '%s\\n' \"$*\" >> '{}'\\n{}",
+        trace_path.display(),
+        script
+    );
     write_shell_executable(&engine, &script);
     engine
 }
@@ -2167,7 +2173,12 @@ fn pending_active_candidate_restores_previous_release_and_closes_the_journal() {
     write_update_journal(&config, &value).unwrap();
 
     let result = recover_pending_update(&work.path().join("config.json"), &config);
-    assert!(result.is_ok(), "recovery failed: {result:#?}");
+    assert!(
+        result.is_ok(),
+        "recovery failed: {result:#?}; podman calls: {}",
+        fs::read_to_string(work.path().join("active-container-engine.calls"))
+            .unwrap_or_else(|error| format!("<trace unavailable: {error}>"))
+    );
     server.join().unwrap();
     assert_eq!(
         load_active_release(&config).unwrap().version,
