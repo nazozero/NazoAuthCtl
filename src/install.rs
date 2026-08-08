@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     io::Read as _,
     path::{Path, PathBuf},
 };
@@ -201,6 +203,10 @@ fn configure_runtime_permissions(config: &UpdateConfig) -> anyhow::Result<()> {
     if config.runtime.backend == RuntimeBackendKind::Systemd {
         return Ok(());
     }
+    configure_container_operator_state_permissions(
+        OsStr::new("chown"),
+        &config.operator.state_directory,
+    )?;
     let app_root = config
         .runtime
         .snapshot_paths
@@ -261,6 +267,26 @@ fn configure_runtime_permissions(config: &UpdateConfig) -> anyhow::Result<()> {
         set_mode(&path, 0o440)?;
     }
     Ok(())
+}
+
+fn configure_container_operator_state_permissions(
+    chown_command: &OsStr,
+    state_directory: &Path,
+) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(state_directory).with_context(|| {
+        format!(
+            "failed to inspect operator state directory {}",
+            state_directory.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("operator state path must be a real directory");
+    }
+    Process::new(chown_command)
+        .arg("10001:10001")
+        .arg(state_directory)
+        .run_quiet()?;
+    set_mode(state_directory, 0o700)
 }
 
 pub(crate) fn start_managed_dependencies(config: &UpdateConfig) -> anyhow::Result<()> {
