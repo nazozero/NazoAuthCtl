@@ -241,7 +241,11 @@ json.dump({
             ],
             "resources": {
                 "audit_private_key": {"kind": "file", "path": str(audit_key)},
-                "lifecycle_contract": {"kind": "file", "path": str(lifecycle_path)},
+                "lifecycle_contract": {
+                    "kind": "digest-bound-file",
+                    "path": str(lifecycle_path),
+                    "sha256": sha256(lifecycle_path),
+                },
                 "database": {"kind": "provider", "provider": "external-postgres", "key": deployment_id},
                 "valkey": {"kind": "provider", "provider": "external-valkey", "key": deployment_id},
             },

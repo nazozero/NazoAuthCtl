@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
 };
 
-use crate::deployment::{CapabilityGrants, TrustState};
+use crate::deployment::{Capability, CapabilityGrants, TrustState};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +16,6 @@ pub(crate) struct UpdateConfig {
     #[serde(default = "baseline_install_profile")]
     pub(crate) install_profile: String,
     pub(crate) repository: String,
-    pub(crate) updater_install_path: PathBuf,
     pub(crate) backup_root: PathBuf,
     pub(crate) deployment_root: PathBuf,
     pub(crate) operator: Operator,
@@ -233,6 +232,17 @@ impl UpdateConfig {
         if self.schema != 2 {
             bail!("unsupported update config schema");
         }
+        self.capabilities.validate()?;
+        if self.trust == TrustState::Observed
+            && Capability::ALL.iter().any(|capability| {
+                self.capabilities
+                    .grant(*capability)
+                    .responsibility
+                    .permits_mutation()
+            })
+        {
+            bail!("observed update configuration cannot grant mutation capability");
+        }
         if !matches!(self.install_profile.as_str(), "baseline" | "standards-full") {
             bail!("unsupported install profile {}", self.install_profile);
         }
@@ -261,7 +271,6 @@ impl UpdateConfig {
             }
         }
         for path in [
-            &self.updater_install_path,
             &self.backup_root,
             &self.deployment_root,
             &self.ui.releases_root,
@@ -307,7 +316,7 @@ impl UpdateConfig {
                 &self.runtime.binary_releases,
                 &self.runtime.working_directory,
             ] {
-                safe_absolute(path)?;
+                safe_systemd_path(path)?;
             }
             if self.runtime.service_name.is_empty() || self.runtime.service_user.is_empty() {
                 bail!("host runtime requires service_name and service_user");
@@ -353,11 +362,49 @@ impl UpdateConfig {
 }
 
 pub(crate) fn safe_absolute(path: &std::path::Path) -> anyhow::Result<()> {
-    if !path.is_absolute() || path.parent().is_none() {
+    if !path.is_absolute()
+        || path.parent().is_none()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
         bail!(
-            "path must be absolute and must not be the filesystem root: {}",
+            "path must be a normalized absolute non-root path: {}",
             path.display()
         );
+    }
+    Ok(())
+}
+
+pub(crate) fn safe_systemd_path(path: &std::path::Path) -> anyhow::Result<()> {
+    let value = path.to_str().context("systemd path must be valid UTF-8")?;
+    let unix_absolute = value.starts_with('/');
+    if unix_absolute {
+        if value == "/"
+            || value
+                .split('/')
+                .skip(1)
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        {
+            bail!("systemd path must be a normalized absolute non-root path: {value}");
+        }
+    } else {
+        // Model and recovery checks are exercised on non-Unix controller hosts even
+        // though the systemd backend itself is Unix-only. Preserve native absolute
+        // path validation there; the renderer still rejects every character that
+        // can alter a unit directive.
+        safe_absolute(path)?;
+    }
+    if value.chars().any(|character| {
+        character.is_control()
+            || character.is_whitespace()
+            || matches!(character, '%' | '\'' | '"')
+            || (unix_absolute && character == '\\')
+    }) {
+        bail!("systemd path contains unsupported whitespace or quoting: {value}");
     }
     Ok(())
 }

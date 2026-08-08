@@ -14,6 +14,10 @@ use crate::{
     runtime_backend::{ContainerRestartPolicy, ContainerRuntimePolicy, RuntimeObservation},
 };
 
+use crate::filesystem::ensure_private_directory;
+#[cfg(unix)]
+use crate::filesystem::set_mode;
+
 fn candidate(root: &Path, runtime_id: &str) -> DiscoveredDeployment {
     let mount = NeutralMount {
         source: root.join("application-data"),
@@ -139,6 +143,50 @@ fn lifecycle_is_bound_to_every_discovered_runtime_without_secret_values() {
 }
 
 #[test]
+fn lifecycle_mounts_must_be_an_exact_match_and_support_redacted_sources() {
+    let work = PrivateTempDir::new("nazoauth-lifecycle-mount-boundary-test").unwrap();
+    let value = lifecycle(&work);
+    let mut discovered = candidate(work.path(), "runtime-a");
+    let actual_source = discovered.runtime.mounts[0].source.clone();
+    discovered.runtime.mounts[0].source = PathBuf::from("<redacted-secret-source>");
+    discovered.sensitive_mount_sources.insert(
+        discovered.runtime.mounts[0].destination.clone(),
+        actual_source,
+    );
+
+    value
+        .validate_for_adoption(&[discovered.clone()], &CapabilityGrants::observed())
+        .unwrap();
+
+    let mut extra = value.clone();
+    extra.runtimes[0].mounts.push(NeutralMount {
+        source: work.path().join("extra"),
+        destination: PathBuf::from("/var/lib/extra"),
+        read_only: true,
+        selinux_relabel: false,
+        ownership: Responsibility::External,
+        scope: ResourceScope::Deployment,
+    });
+    assert!(
+        extra
+            .validate_for_adoption(&[discovered], &CapabilityGrants::observed())
+            .is_err()
+    );
+
+    let mut shared = value;
+    shared.runtimes[0].mounts[0].scope = ResourceScope::Shared;
+    let mut discovered_shared = candidate(work.path(), "runtime-a");
+    discovered_shared.runtime.mounts[0].scope = ResourceScope::Shared;
+    let mut mutable_capabilities = CapabilityGrants::observed();
+    mutable_capabilities.runtime.responsibility = Responsibility::Delegated;
+    assert!(
+        shared
+            .validate_for_adoption(&[discovered_shared], &mutable_capabilities,)
+            .is_err()
+    );
+}
+
+#[test]
 fn lifecycle_rejects_inline_secret_environment_and_rehearsal_mount_overlap() {
     let work = PrivateTempDir::new("nazoauth-lifecycle-invalid-test").unwrap();
     let mut value = lifecycle(&work);
@@ -175,6 +223,55 @@ fn lifecycle_rejects_inline_secret_environment_and_rehearsal_mount_overlap() {
     let mut value = lifecycle(&work);
     value.schema = 1;
     assert!(value.validate().is_err());
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn recovery_driver_and_rehearsal_workspace_use_a_private_filesystem_boundary() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let work = PrivateTempDir::new("nazoauth-lifecycle-filesystem-boundary").unwrap();
+    let value = lifecycle(&work);
+
+    #[cfg(unix)]
+    {
+        let driver = value.recovery_driver.program.clone();
+        set_mode(&driver, 0o620).unwrap();
+        assert!(value.validate().is_err());
+
+        set_mode(&driver, 0o500).unwrap();
+        let hard_link = work.path().join("recovery-driver-hard-link");
+        std::fs::hard_link(&driver, &hard_link).unwrap();
+        assert!(value.validate().is_err());
+        std::fs::remove_file(&hard_link).unwrap();
+    }
+
+    let workspace = value.recovery_driver.rehearsal_workspace.clone();
+    ensure_private_directory(&workspace, "recovery rehearsal workspace").unwrap();
+
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::metadata(workspace).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+
+    #[cfg(windows)]
+    {
+        assert!(workspace.is_dir());
+        assert!(
+            !std::fs::symlink_metadata(&workspace)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        crate::filesystem::validate_secure_directory(
+            &workspace,
+            "recovery rehearsal workspace",
+            true,
+        )
+        .unwrap();
+    }
 }
 
 #[test]

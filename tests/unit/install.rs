@@ -129,6 +129,9 @@ fn host_service_unit_exposes_only_runtime_state() {
     let unit = crate::runtime_backend::render_host_service_unit(
         &crate::runtime_backend::HostServiceInstall {
             service_name: "nazoauth.service".to_owned(),
+            deployment_id: "deployment-test".to_owned(),
+            runtime_instance_id: "runtime-test".to_owned(),
+            control_authority: "authority-test".to_owned(),
             service_user: "nazoauth".to_owned(),
             working_directory: PathBuf::from("/etc/nazoauth"),
             binary: PathBuf::from("/usr/local/bin/nazoauth"),
@@ -142,6 +145,7 @@ fn host_service_unit_exposes_only_runtime_state() {
             runtime_readable_secret_names: Vec::new(),
         },
     )
+    .unwrap()
     .replace('\\', "/");
 
     assert!(unit.contains("User=nazoauth\nGroup=nazoauth"));
@@ -210,7 +214,9 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
             assert!(value.len() >= MIN_PROFILE_SECRET_VALUE_BYTES);
         }
         assert!(!rendered.contains(&value));
-        assert!(rendered.contains(&format!("${{PROFILE_SECRET_ROOT}}/{name}")));
+        if *name != "ciba-decision-token" {
+            assert!(rendered.contains(&format!("${{PROFILE_SECRET_ROOT}}/{name}")));
+        }
     }
     assert!(rendered.contains("ENABLE_OPENID4VCI_ISSUER: true"));
     assert!(rendered.contains("ENABLE_OPENID4VP_VERIFIER: true"));

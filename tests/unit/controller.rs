@@ -118,7 +118,6 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
         capabilities: crate::deployment::CapabilityGrants::controller_installed(),
         install_profile: "baseline".to_owned(),
         repository: "nazozero/NazoAuth".to_owned(),
-        updater_install_path: absolute("installed-nazoauthctl"),
         backup_root: absolute("backups"),
         deployment_root: absolute("deployments"),
         operator: Operator {
@@ -886,7 +885,7 @@ fn assert_invalid_journal(config: &UpdateConfig, value: &UpdateJournal, expected
 }
 
 #[test]
-fn every_pre_migration_fault_window_restores_the_previous_runtime() {
+fn recovery_action_selects_restore_previous_before_migration() {
     let work = PrivateTempDir::new("nazoauth-update-phase").unwrap();
     let config = config(&work);
     for phase in [
@@ -928,7 +927,7 @@ fn mfa_totp_runtime_upgrade_keeps_inline_key_sources_unmounted() {
 }
 
 #[test]
-fn migration_faults_always_unwind_without_the_faulting_server() {
+fn recovery_action_selects_restore_previous_for_migration_faults() {
     let work = PrivateTempDir::new("nazoauth-update-migration").unwrap();
     let config = config(&work);
     let compatible = journal(&config, UpdatePhase::MigrationRunning);
@@ -969,7 +968,7 @@ fn container_target_binds_the_platform_manifest_not_the_index() {
 }
 
 #[test]
-fn an_activated_target_is_unwound_during_recovery() {
+fn recovery_action_selects_restore_previous_after_target_activation() {
     let work = PrivateTempDir::new("nazoauth-update-active").unwrap();
     let config = config(&work);
     for phase in [
@@ -997,7 +996,7 @@ fn an_activated_target_is_unwound_during_recovery() {
 }
 
 #[test]
-fn a_persisted_candidate_active_phase_is_unwound_without_runtime_inspection() {
+fn recovery_action_selects_restore_previous_for_persisted_post_activation_phases() {
     let work = PrivateTempDir::new("nazoauth-update-persisted-active").unwrap();
     let config = config(&work);
     for phase in [
@@ -1022,7 +1021,7 @@ fn a_persisted_candidate_active_phase_is_unwound_without_runtime_inspection() {
 }
 
 #[test]
-fn journal_is_durable_closed_and_monotonic() {
+fn update_journal_persists_rejects_unknown_fields_and_forbids_phase_regression() {
     let work = PrivateTempDir::new("nazoauth-update-journal").unwrap();
     let config = config(&work);
     fs::create_dir_all(&config.deployment_root).unwrap();
@@ -1054,7 +1053,7 @@ fn journal_is_durable_closed_and_monotonic() {
 }
 
 #[test]
-fn every_external_fault_window_round_trips_the_last_durable_phase() {
+fn update_journal_round_trips_each_persisted_phase() {
     let work = PrivateTempDir::new("nazoauth-update-fault-windows").unwrap();
     let config = config(&work);
     fs::create_dir_all(&config.deployment_root).unwrap();
@@ -1269,10 +1268,16 @@ fn verified_journal_backup_is_opened_only_from_the_configured_root() {
     fs::create_dir(&backup).unwrap();
     fs::write(backup.join("state.bin"), b"durable-state").unwrap();
     fs::write(
+        backup.join("update-config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    fs::write(
         backup.join("SHA256SUMS"),
         format!(
-            "{}  state.bin\n",
-            crate::filesystem::sha256(&backup.join("state.bin")).unwrap()
+            "{}  state.bin\n{}  update-config.json\n",
+            crate::filesystem::sha256(&backup.join("state.bin")).unwrap(),
+            crate::filesystem::sha256(&backup.join("update-config.json")).unwrap(),
         ),
     )
     .unwrap();
@@ -1293,6 +1298,66 @@ fn no_pending_update_is_an_idempotent_recovery_noop() {
 }
 
 #[test]
+fn legacy_recovery_requires_all_runtime_and_provider_mutation_capabilities() {
+    let work = PrivateTempDir::new("nazoauth-legacy-recovery-capabilities").unwrap();
+    let mut config = config(&work);
+    config.trust = crate::deployment::TrustState::Observed;
+    assert!(require_legacy_recovery_capabilities(&config).is_err());
+
+    config.trust = crate::deployment::TrustState::Adopted;
+    config.capabilities.runtime.responsibility = Responsibility::External;
+    assert!(require_legacy_recovery_capabilities(&config).is_err());
+
+    config.capabilities.runtime.responsibility = Responsibility::Managed;
+    config.capabilities.database.responsibility = Responsibility::External;
+    assert!(require_legacy_recovery_capabilities(&config).is_err());
+}
+
+#[test]
+fn public_rollback_rejects_unmanaged_lifecycle_before_reading_or_mutating_state() {
+    let work = PrivateTempDir::new("nazoauth-public-rollback-capabilities").unwrap();
+    let mut config = config(&work);
+    let state = rollback_state_path(&config);
+
+    config.trust = crate::deployment::TrustState::Observed;
+    assert!(public_rollback(&config).is_err());
+    assert!(!state.exists());
+
+    config.trust = crate::deployment::TrustState::Adopted;
+    config.capabilities.runtime.responsibility = Responsibility::External;
+    assert!(public_rollback(&config).is_err());
+    assert!(!state.exists());
+
+    config.capabilities.runtime.responsibility = Responsibility::Managed;
+    config.capabilities.artifact.responsibility = Responsibility::External;
+    assert!(public_rollback(&config).is_err());
+    assert!(!state.exists());
+
+    config.capabilities.artifact.responsibility = Responsibility::Managed;
+    config.capabilities.backups.responsibility = Responsibility::External;
+    assert!(public_rollback(&config).is_err());
+    assert!(!state.exists());
+    assert!(!config.deployment_root.exists());
+}
+
+#[test]
+fn backup_recovery_rejects_provider_mutation_without_reading_rollback_state() {
+    let work = PrivateTempDir::new("nazoauth-backup-recovery-capabilities").unwrap();
+    let mut config = config(&work);
+    let state = rollback_state_path(&config);
+
+    config.capabilities.database.responsibility = Responsibility::External;
+    assert!(recover_from_backup(&config).is_err());
+    assert!(!state.exists());
+
+    config.capabilities.database.responsibility = Responsibility::Managed;
+    config.capabilities.valkey.responsibility = Responsibility::External;
+    assert!(recover_from_backup(&config).is_err());
+    assert!(!state.exists());
+    assert!(!config.deployment_root.exists());
+}
+
+#[test]
 fn observation_lock_never_creates_persistent_state() {
     let work = PrivateTempDir::new("nazoauth-read-only-lock").unwrap();
     let missing = work.path().join("missing/lifecycle.lock");
@@ -1303,6 +1368,7 @@ fn observation_lock_never_creates_persistent_state() {
 
     fs::create_dir_all(missing.parent().unwrap()).unwrap();
     fs::write(&missing, []).unwrap();
+    crate::filesystem::set_mode(&missing, 0o600).unwrap();
     let lock = acquire_lock_at(&missing, &Command::Status).unwrap();
     assert_eq!(fs::metadata(&missing).unwrap().len(), 0);
     drop(lock);
@@ -1311,6 +1377,25 @@ fn observation_lock_never_creates_persistent_state() {
     let lock = acquire_lock_at(&created, &Command::Rollback { yes: true }).unwrap();
     assert!(created.is_file());
     drop(lock);
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_controller_lock_rejects_symlink_and_writable_entries() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let work = PrivateTempDir::new("nazoauth-controller-lock-boundary").unwrap();
+    let target = work.path().join("target.lock");
+    fs::write(&target, []).unwrap();
+
+    let symlink_path = work.path().join("symlink.lock");
+    symlink(&target, &symlink_path).unwrap();
+    assert!(acquire_lock_at(&symlink_path, &Command::Rollback { yes: true }).is_err());
+
+    let writable_path = work.path().join("writable.lock");
+    fs::write(&writable_path, []).unwrap();
+    fs::set_permissions(&writable_path, fs::Permissions::from_mode(0o660)).unwrap();
+    assert!(acquire_lock_at(&writable_path, &Command::Rollback { yes: true }).is_err());
 }
 
 #[test]
@@ -1341,7 +1426,7 @@ fn only_observation_commands_use_the_shared_noncreating_lock() {
 
 #[cfg(unix)]
 #[test]
-fn production_config_permission_policy_requires_root_and_rejects_writable_files() {
+fn config_permission_predicate_rejects_non_root_and_writable_modes() {
     assert!(config_permissions_are_safe(0, 0o100600));
     assert!(config_permissions_are_safe(0, 0o100640));
     assert!(!config_permissions_are_safe(1000, 0o100600));
@@ -1778,6 +1863,7 @@ fn public_server(requests: usize) -> (String, std::thread::JoinHandle<()>) {
 #[cfg(target_os = "linux")]
 fn fake_container_runtime(
     work: &PrivateTempDir,
+    config: &UpdateConfig,
     candidate_commit: &str,
     candidate_active: bool,
 ) -> PathBuf {
@@ -1786,12 +1872,103 @@ fn fake_container_runtime(
     } else {
         "inactive-container-engine"
     });
-    write_shell_executable(
-        &engine,
-        &format!(
-            "if [ \"${{1:-}}\" = image ] && [ \"${{2:-}}\" = inspect ]; then\n  image=\"${{3:-}}\"\n  digest=\"${{image##*@}}\"\n  printf '[\"fixture@%s\"]\\n' \"$digest\"\n  exit 0\nfi\nif [ \"${{1:-}}\" = inspect ]; then\n  if [ \"{candidate_active}\" != true ]; then exit 1; fi\n  if [ \"$#\" -gt 2 ]; then printf '%s\\n' '{candidate_commit}'; fi\n  exit 0\nfi\ncat >/dev/null\nexit 0"
-        ),
+    let postgres_volume = format!("{}-data", config.postgres.container_name);
+    let identity = crate::runtime_backend::managed_dependency_identity(
+        &config.operator.deployment_id,
+        &config.operator.controller_key_id,
+        &config.runtime.runtime_instance_id,
+        &config.runtime.network,
+        &config.postgres.container_name,
+        &postgres_volume,
+        &config.postgres.image,
+        &config.postgres.database,
+        &config.postgres.user,
+        &config.valkey.container_name,
+        &config.valkey.data_volume,
+        &config.valkey.image,
     );
+    let runtime_image = format!("fixture@sha256:{}", "c".repeat(64));
+    let inspect_json = serde_json::json!([{
+        "Id": "fixture-container-id",
+        "Name": "/nazoauth",
+        "ImageName": runtime_image.clone(),
+        "Config": {
+            "Image": runtime_image.clone(),
+            "Labels": {
+                "io.nazoauth.deployment-id": config.operator.deployment_id.clone(),
+                "io.nazoauth.control-authority": config.operator.controller_key_id.clone(),
+                "io.nazoauth.runtime-instance-id": config.runtime.runtime_instance_id.clone(),
+                "org.opencontainers.image.revision": candidate_commit,
+            },
+            "Command": ["nazoauth", "server"]
+        },
+        "State": {"Running": true},
+        "NetworkSettings": {"Ports": {}, "Networks": {}},
+        "Mounts": []
+    }])
+    .to_string();
+    let network_digest = crate::runtime_backend::managed_network_config_digest(
+        &config.operator.deployment_id,
+        &config.operator.controller_key_id,
+        &config.runtime.network,
+    );
+    let script = format!(
+        "if [ \"${{1:-}}\" = image ] && [ \"${{2:-}}\" = inspect ]; then\n  image=\"${{3:-}}\"\n  digest=\"${{image##*@}}\"\n  printf '[\"fixture@%s\"]\\n' \"$digest\"\n  exit 0\nfi\nif [ \"${{1:-}}\" = network ] && [ \"${{2:-}}\" = inspect ]; then\n  case \"$*\" in\n    *io.nazoauth.deployment-id*) printf '%s\\n' '{deployment}' ;;\n    *io.nazoauth.control-authority*) printf '%s\\n' '{authority}' ;;\n    *io.nazoauth.resource-kind*) printf '%s\\n' 'network' ;;\n    *io.nazoauth.config-digest*) printf '%s\\n' '{network_digest}' ;;\n    *) printf '%s\\n' '{{\"subnets\":[{{\"gateway\":\"10.89.0.1\"}}]}}' ;;\n  esac\n  exit 0\nfi\nif [ \"${{1:-}}\" = volume ] && [ \"${{2:-}}\" = inspect ]; then\n  case \"$*\" in\n    *io.nazoauth.deployment-id*) printf '%s\\n' '{deployment}' ;;\n    *io.nazoauth.control-authority*) printf '%s\\n' '{authority}' ;;\n    *io.nazoauth.runtime-instance-id*) printf '%s\\n' '{runtime}' ;;\n    *io.nazoauth.resource-kind*) case \"$*\" in *{valkey_volume}*) printf '%s\\n' 'valkey-volume' ;; *) printf '%s\\n' 'postgres-volume' ;; esac ;;\n    *io.nazoauth.config-digest*) case \"$*\" in *{valkey_volume}*) printf '%s\\n' '{valkey_volume_digest}' ;; *) printf '%s\\n' '{postgres_volume_digest}' ;; esac ;;\n    *) printf '%s\\n' '{{}}' ;;\n  esac\n  exit 0\nfi\nif [ \"${{1:-}}\" = container ] && [ \"${{2:-}}\" = inspect ]; then\n  if [ \"{candidate_active}\" != true ]; then printf '%s\\n' 'no such object' >&2; exit 1; fi\n  printf '%s\\n' '{inspect_json}'\n  exit 0\nfi\nif [ \"${{1:-}}\" = inspect ]; then\n  case \"$*\" in\n    *--format*io.nazoauth.deployment-id*) printf '%s\\n' '{deployment}' ;;\n    *--format*io.nazoauth.control-authority*) printf '%s\\n' '{authority}' ;;\n    *--format*io.nazoauth.runtime-instance-id*) printf '%s\\n' '{runtime}' ;;\n    *--format*io.nazoauth.resource-kind*) case \"$*\" in *postgres*) printf '%s\\n' 'postgres' ;; *valkey*) printf '%s\\n' 'valkey' ;; *) printf '%s\\n' 'application' ;; esac ;;\n    *--format*io.nazoauth.config-digest*) case \"$*\" in *postgres*) printf '%s\\n' '{postgres_digest}' ;; *valkey*) printf '%s\\n' '{valkey_digest}' ;; *) printf '%s\\n' '{network_digest}' ;; esac ;;\n    *--format*) case \"$*\" in *postgres*) printf '%s\\n' '{postgres_image}' ;; *valkey*) printf '%s\\n' '{valkey_image}' ;; *) printf '%s\\n' '{runtime_image}' ;; esac ;;\n    *) printf '%s\\n' '{inspect_json}' ;;\n  esac\n  exit 0\nfi\ncat >/dev/null\nexit 0",
+        deployment = config.operator.deployment_id,
+        authority = config.operator.controller_key_id,
+        runtime = config.runtime.runtime_instance_id,
+        network_digest = network_digest,
+        valkey_volume = config.valkey.data_volume,
+        postgres_volume_digest = identity.postgres_volume_config_digest,
+        valkey_volume_digest = identity.valkey_volume_config_digest,
+        postgres_digest = identity.postgres_config_digest,
+        valkey_digest = identity.valkey_config_digest,
+        postgres_image = config.postgres.image,
+        valkey_image = config.valkey.image,
+        runtime_image = runtime_image,
+        inspect_json = inspect_json,
+    );
+    let inspect_override = format!(
+        r#"if [ "${{1:-}}" = inspect ]; then
+  object="${{2:-}}"
+  format="${{4:-}}"
+  if [ -z "$format" ]; then
+    printf '%s\n' '{inspect_json}'
+    exit 0
+  fi
+  case "$format" in
+    *io.nazoauth.deployment-id*) printf '%s\n' '{deployment}' ;;
+    *io.nazoauth.control-authority*) printf '%s\n' '{authority}' ;;
+    *io.nazoauth.runtime-instance-id*) printf '%s\n' '{runtime}' ;;
+    *io.nazoauth.resource-kind*) case "$object" in '{postgres_object}') printf '%s\n' 'postgres' ;; '{valkey_object}') printf '%s\n' 'valkey' ;; *) printf '%s\n' 'application' ;; esac ;;
+    *io.nazoauth.config-digest*) case "$object" in '{postgres_object}') printf '%s\n' '{postgres_digest}' ;; '{valkey_object}') printf '%s\n' '{valkey_digest}' ;; *) printf '%s\n' '{network_digest}' ;; esac ;;
+    *Image*|*RepoDigests*) case "$object" in '{postgres_object}') printf '%s\n' '{postgres_image}' ;; '{valkey_object}') printf '%s\n' '{valkey_image}' ;; *) printf '%s\n' '{runtime_image}' ;; esac ;;
+    *) printf '%s\n' '{inspect_json}' ;;
+  esac
+  exit 0
+fi
+if [ "${{1:-}}" = inspect ]; then
+  case "$*" in"#,
+        inspect_json = inspect_json,
+        deployment = config.operator.deployment_id,
+        authority = config.operator.controller_key_id,
+        runtime = config.runtime.runtime_instance_id,
+        postgres_object = config.postgres.container_name,
+        valkey_object = config.valkey.container_name,
+        postgres_digest = identity.postgres_config_digest,
+        valkey_digest = identity.valkey_config_digest,
+        network_digest = network_digest,
+        postgres_image = config.postgres.image,
+        valkey_image = config.valkey.image,
+        runtime_image = runtime_image,
+    );
+    let script = script.replacen(
+        "if [ \"${1:-}\" = inspect ]; then\n  case \"$*\" in",
+        &inspect_override,
+        1,
+    );
+    let script = script.replace("io.nazoauth.resource-kind", "io.nazoauth.managed-resource");
+    write_shell_executable(&engine, &script);
     engine
 }
 
@@ -1828,6 +2005,8 @@ fn install_audit_key(config: &UpdateConfig) {
         URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
     )
     .unwrap();
+    crate::filesystem::set_mode(&config.operator.audit_private_key, 0o400).unwrap();
+    crate::filesystem::set_mode(&config.operator.audit_public_key, 0o444).unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -1861,10 +2040,16 @@ fn materialize_verified_backup(config: &UpdateConfig, path: &std::path::Path) {
     fs::create_dir(path).unwrap();
     fs::write(path.join("state.bin"), b"durable-state").unwrap();
     fs::write(
+        path.join("update-config.json"),
+        serde_json::to_vec_pretty(config).unwrap(),
+    )
+    .unwrap();
+    fs::write(
         path.join("SHA256SUMS"),
         format!(
-            "{}  state.bin\n",
-            crate::filesystem::sha256(&path.join("state.bin")).unwrap()
+            "{}  state.bin\n{}  update-config.json\n",
+            crate::filesystem::sha256(&path.join("state.bin")).unwrap(),
+            crate::filesystem::sha256(&path.join("update-config.json")).unwrap(),
         ),
     )
     .unwrap();
@@ -1937,6 +2122,7 @@ fn pending_pre_migration_update_restores_previous_artifact_and_closes_the_journa
     config.runtime.backend = RuntimeBackendKind::Podman;
     config.runtime.backend_command_override = Some(fake_container_runtime(
         &work,
+        &config,
         &value.to_release.backend_commit,
         false,
     ));
@@ -1966,6 +2152,9 @@ fn pending_pre_migration_update_restores_previous_artifact_and_closes_the_journa
 fn pending_active_candidate_restores_previous_release_and_closes_the_journal() {
     let work = PrivateTempDir::new("nazoauth-recover-active-unwind").unwrap();
     let mut config = config(&work);
+    config.postgres.image = format!("postgres@sha256:{}", "a".repeat(64));
+    config.postgres.validation_image = config.postgres.image.clone();
+    config.valkey.image = format!("valkey@sha256:{}", "b".repeat(64));
     config.dependencies.migration_database_url_file =
         work.path().join("secrets/database-migration-url");
     fs::create_dir_all(
@@ -1985,6 +2174,7 @@ fn pending_active_candidate_restores_previous_release_and_closes_the_journal() {
     config.runtime.backend = RuntimeBackendKind::Podman;
     config.runtime.backend_command_override = Some(fake_container_runtime(
         &work,
+        &config,
         &value.to_release.backend_commit,
         true,
     ));
@@ -2120,6 +2310,37 @@ fn registered_update_plan_preserves_mixed_ownership_and_replica_identity() {
             .is_some_and(|value| value.contains("lifecycle configuration"))
     }));
     assert_eq!(plan["core_recovery_requires_operator_task"], false);
+}
+
+#[test]
+fn registered_update_rejects_a_downgrade_before_plan_side_effects() {
+    let work = PrivateTempDir::new("nazoauth-registered-downgrade").unwrap();
+    let active = manifest("v0.1.19", 'a');
+    let target = manifest("v0.1.18", 'b');
+    let record = DeploymentRecord {
+        schema: crate::deployment::DEPLOYMENT_SCHEMA,
+        deployment_id: "deployment-downgrade".to_owned(),
+        control_authority: "controller-downgrade".to_owned(),
+        alias: None,
+        issuer: "https://downgrade.example".to_owned(),
+        active_release: active.embedded,
+        trust: crate::deployment::TrustState::Adopted,
+        capabilities: crate::deployment::CapabilityGrants::observed(),
+        runtime_instances: Vec::new(),
+        resources: BTreeMap::new(),
+        recovery: crate::deployment::RecoveryAssessment {
+            conclusion: RecoveryConclusion::Proven,
+            evidence: Vec::new(),
+            off_host_package_required_for_machine_loss: true,
+        },
+        operator_protocol_versions: std::collections::BTreeSet::new(),
+        control_protocol_versions: std::collections::BTreeSet::new(),
+        declaration_revision: 1,
+    };
+
+    let error = build_registered_update_plan(&record, &target).unwrap_err();
+    assert!(error.to_string().contains("anti-downgrade"));
+    assert_eq!(fs::read_dir(work.path()).unwrap().count(), 0);
 }
 
 #[test]

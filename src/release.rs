@@ -101,25 +101,31 @@ pub(crate) fn enforce_release_trust(
     enforce_release_trust_state(&state, manifest)
 }
 
+pub(crate) fn enforce_release_trust_floor(
+    trusted_version: &str,
+    manifest: &ReleaseManifest,
+) -> anyhow::Result<()> {
+    if compare_versions(&manifest.version, trusted_version)? == std::cmp::Ordering::Less {
+        bail!(
+            "Release anti-downgrade policy rejected {} below trusted {}; use the explicit rollback or break-glass recovery flow",
+            manifest.version,
+            trusted_version
+        );
+    }
+    Ok(())
+}
+
 fn enforce_release_trust_state(
     state: &ReleaseTrustState,
     manifest: &ReleaseManifest,
 ) -> anyhow::Result<()> {
-    match compare_versions(&manifest.version, &state.version)? {
-        std::cmp::Ordering::Less => bail!(
-            "Release anti-downgrade policy rejected {} below trusted {}; use the explicit rollback or break-glass recovery flow",
-            manifest.version,
-            state.version
-        ),
-        std::cmp::Ordering::Equal => {
-            if manifest.backend_commit != state.backend_commit
-                || manifest.image_oci_digest() != state.image_oci_digest
-                || manifest.release_identity != state.release_identity
-            {
-                bail!("immutable Release identity changed for an already trusted version");
-            }
-        }
-        std::cmp::Ordering::Greater => {}
+    enforce_release_trust_floor(&state.version, manifest)?;
+    if compare_versions(&manifest.version, &state.version)? == std::cmp::Ordering::Equal
+        && (manifest.backend_commit != state.backend_commit
+            || manifest.image_oci_digest() != state.image_oci_digest
+            || manifest.release_identity != state.release_identity)
+    {
+        bail!("immutable Release identity changed for an already trusted version");
     }
     Ok(())
 }

@@ -8,7 +8,6 @@ fn valid_config() -> UpdateConfig {
         capabilities: crate::deployment::CapabilityGrants::controller_installed(),
         install_profile: "baseline".to_owned(),
         repository: "nazozero/NazoAuth".to_owned(),
-        updater_install_path: root.join("bin/nazoauthctl"),
         backup_root: root.join("backups"),
         deployment_root: root.join("deployments"),
         operator: Operator {
@@ -169,10 +168,47 @@ fn environment_keys_are_strict() {
 }
 
 #[test]
-fn runtime_environment_cannot_carry_secret_values() {
-    assert!(valid_environment_key("DATABASE_URL_FILE"));
-    assert!(!"DATABASE_URL_FILE".ends_with("PASSWORD"));
-    assert!(!"DATABASE_URL".ends_with("_FILE"));
+fn runtime_environment_requires_normalized_file_locators() {
+    let mut inline_secret = valid_config();
+    inline_secret.runtime.environment.insert(
+        "DATABASE_URL".to_owned(),
+        "/run/secrets/database-url".to_owned(),
+    );
+    assert!(
+        inline_secret.validate().is_err(),
+        "runtime environment must not carry inline secret values"
+    );
+
+    let mut relative_locator = valid_config();
+    relative_locator
+        .runtime
+        .environment
+        .insert("DATABASE_URL_FILE".to_owned(), "../database-url".to_owned());
+    assert!(
+        relative_locator.validate().is_err(),
+        "secret locators must be normalized absolute paths"
+    );
+
+    let mut valid_locator = valid_config();
+    let valid_path = std::path::PathBuf::from(
+        valid_locator
+            .runtime
+            .environment
+            .get("DATABASE_URL_FILE")
+            .expect("baseline fixture should contain a file locator"),
+    );
+    valid_locator.runtime.environment.insert(
+        "VALKEY_URL_FILE".to_owned(),
+        valid_path
+            .parent()
+            .expect("baseline locator should have a parent")
+            .join("valkey-url")
+            .display()
+            .to_string(),
+    );
+    valid_locator
+        .validate()
+        .expect("normalized *_FILE locators should remain valid");
 }
 
 #[test]
@@ -243,6 +279,30 @@ fn external_and_container_dependency_modes_resolve_explicitly() {
     assert!(config.validate().is_err());
     assert!(safe_absolute(std::path::Path::new("relative")).is_err());
     assert!(safe_absolute(std::path::Path::new(&std::path::MAIN_SEPARATOR.to_string())).is_err());
+    assert!(safe_absolute(std::path::Path::new("/var/lib/../nazoauthctl")).is_err());
+}
+
+#[test]
+fn systemd_runtime_paths_reject_unit_injection_boundaries() {
+    for (field, value) in [
+        ("binary_path", "/opt/nazoauth%releases/nazoauth"),
+        (
+            "binary_releases",
+            "/opt/nazoauth/releases\r\nEnvironment=BAD=1",
+        ),
+        ("working_directory", "/opt/nazoauth\\quoted"),
+        ("working_directory", "/opt/nazo auth"),
+        ("binary_path", "/opt/nazoauth\0server"),
+    ] {
+        let mut config = valid_config();
+        match field {
+            "binary_path" => config.runtime.binary_path = value.into(),
+            "binary_releases" => config.runtime.binary_releases = value.into(),
+            "working_directory" => config.runtime.working_directory = value.into(),
+            _ => unreachable!(),
+        }
+        assert!(config.validate().is_err(), "{field}={value:?}");
+    }
 }
 
 #[test]

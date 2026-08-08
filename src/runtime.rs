@@ -4,14 +4,18 @@ use anyhow::{Context, bail};
 use nazo_operator_protocol::{RuntimeTargetClaim, TaskOperation};
 
 use crate::{
-    deployment::{ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind},
+    deployment::{
+        ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind, TrustState,
+    },
     filesystem::{atomic_write, sha256},
     model::{Mount, UpdateConfig},
     runtime_backend::{
         self, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount,
-        OneShotTask,
+        OneShotTask, managed_dependency_identity,
     },
 };
+
+const CONTAINER_SECRET_REVISION_PATH: &str = "/run/nazoauth-operator/secret-revision";
 
 #[derive(Debug)]
 pub(crate) struct PreparedAppTask {
@@ -181,6 +185,10 @@ impl<'a> Runtime<'a> {
                 "/run/nazoauth-operator/receipt.key".to_owned(),
             ),
             (
+                "NAZOAUTH_OPERATOR_SECRET_REVISION_FILE".to_owned(),
+                CONTAINER_SECRET_REVISION_PATH.to_owned(),
+            ),
+            (
                 "NAZOAUTH_OPERATOR_STATE_DIRECTORY".to_owned(),
                 "/var/lib/nazoauth/operator-state".to_owned(),
             ),
@@ -234,6 +242,11 @@ impl<'a> Runtime<'a> {
             (
                 self.config.operator.receipt_private_key.as_path(),
                 Path::new("/run/nazoauth-operator/receipt.key"),
+                true,
+            ),
+            (
+                self.config.operator.secret_revision_file.as_path(),
+                Path::new(CONTAINER_SECRET_REVISION_PATH),
                 true,
             ),
             (
@@ -331,6 +344,10 @@ impl<'a> Runtime<'a> {
                 "%d/operator-receipt-key".to_owned(),
             ),
             (
+                "NAZOAUTH_OPERATOR_SECRET_REVISION_FILE".to_owned(),
+                "%d/operator-secret-revision".to_owned(),
+            ),
+            (
                 "NAZOAUTH_OPERATOR_STATE_DIRECTORY".to_owned(),
                 self.config.operator.state_directory.display().to_string(),
             ),
@@ -351,10 +368,16 @@ impl<'a> Runtime<'a> {
                     .to_string(),
             ),
         ]);
-        let mut transient_credentials = BTreeMap::from([(
-            "operator-receipt-key".to_owned(),
-            self.config.operator.receipt_private_key.clone(),
-        )]);
+        let mut transient_credentials = BTreeMap::from([
+            (
+                "operator-receipt-key".to_owned(),
+                self.config.operator.receipt_private_key.clone(),
+            ),
+            (
+                "operator-secret-revision".to_owned(),
+                self.config.operator.secret_revision_file.clone(),
+            ),
+        ]);
         let mut read_only_paths = Vec::new();
         let mut read_write_paths = vec![self.config.operator.state_directory.clone()];
         let mut inaccessible_paths = vec![
@@ -409,11 +432,23 @@ impl<'a> Runtime<'a> {
     }
 
     pub(crate) fn start_container(&self, image: &str) -> anyhow::Result<()> {
+        self.require_runtime_mutation("container start")?;
         let backend_kind = self.backend_kind()?;
         if backend_kind == RuntimeBackendKind::Systemd {
             bail!("systemd runtime requires an explicit staged binary transaction");
         }
         let backend = self.backend()?;
+        if backend
+            .inspect_optional(&self.config.runtime.container_name)?
+            .is_some()
+        {
+            backend.verify_ownership(
+                &self.config.runtime.container_name,
+                &self.config.operator.deployment_id,
+                &self.config.runtime.runtime_instance_id,
+                &self.config.operator.controller_key_id,
+            )?;
+        }
         let replacement = runtime_backend::RuntimeReplacement {
             object_reference: self.config.runtime.container_name.clone(),
             artifact: ArtifactReference::Oci {
@@ -459,13 +494,15 @@ impl<'a> Runtime<'a> {
         backend.replace(&replacement)
     }
     pub(crate) fn remove_container(&self) -> anyhow::Result<()> {
-        if self.config.capabilities.runtime.responsibility
-            == crate::deployment::Responsibility::Managed
-            && !self.container_has_authorized_labels()
-        {
-            bail!("refusing to replace an unlabelled application container");
-        }
-        self.backend()?.remove(&self.config.runtime.container_name)
+        self.require_runtime_mutation("runtime removal")?;
+        let backend = self.backend()?;
+        backend.verify_ownership(
+            &self.config.runtime.container_name,
+            &self.config.operator.deployment_id,
+            &self.config.runtime.runtime_instance_id,
+            &self.config.operator.controller_key_id,
+        )?;
+        backend.remove(&self.config.runtime.container_name)
     }
 
     pub(crate) fn container_exists(&self) -> bool {
@@ -478,16 +515,41 @@ impl<'a> Runtime<'a> {
     }
 
     pub(crate) fn restart(&self) -> anyhow::Result<()> {
+        self.require_runtime_mutation("runtime restart")?;
         let kind = self.backend_kind()?;
-        self.backend()?.restart(self.object_reference(kind))
+        let backend = self.backend()?;
+        let object_reference = self.object_reference(kind);
+        backend.verify_ownership(
+            object_reference,
+            &self.config.operator.deployment_id,
+            &self.config.runtime.runtime_instance_id,
+            &self.config.operator.controller_key_id,
+        )?;
+        backend.restart(object_reference)
     }
 
     pub(crate) fn start_service(&self) -> anyhow::Result<()> {
-        self.backend()?.start(&self.config.runtime.service_name)
+        self.require_runtime_mutation("service start")?;
+        let backend = self.backend()?;
+        backend.verify_ownership(
+            &self.config.runtime.service_name,
+            &self.config.operator.deployment_id,
+            &self.config.runtime.runtime_instance_id,
+            &self.config.operator.controller_key_id,
+        )?;
+        backend.start(&self.config.runtime.service_name)
     }
 
     pub(crate) fn stop_service(&self) -> anyhow::Result<()> {
-        self.backend()?.stop(&self.config.runtime.service_name)
+        self.require_runtime_mutation("service stop")?;
+        let backend = self.backend()?;
+        backend.verify_ownership(
+            &self.config.runtime.service_name,
+            &self.config.operator.deployment_id,
+            &self.config.runtime.runtime_instance_id,
+            &self.config.operator.controller_key_id,
+        )?;
+        backend.stop(&self.config.runtime.service_name)
     }
 
     fn object_reference(&self, kind: RuntimeBackendKind) -> &str {
@@ -497,6 +559,20 @@ impl<'a> Runtime<'a> {
                 &self.config.runtime.container_name
             }
         }
+    }
+
+    fn require_runtime_mutation(&self, operation: &str) -> anyhow::Result<()> {
+        if self.config.trust != TrustState::Adopted
+            || !self
+                .config
+                .capabilities
+                .runtime
+                .responsibility
+                .permits_mutation()
+        {
+            bail!("{operation} requires explicit runtime mutation authority");
+        }
+        Ok(())
     }
 
     pub(crate) fn pull_image(&self, image: &str) -> anyhow::Result<()> {
@@ -540,29 +616,57 @@ impl<'a> Runtime<'a> {
         postgres_password_file: &Path,
     ) -> anyhow::Result<()> {
         let backend = self.backend()?;
+        let identity = self.managed_dependency_identity();
         backend.restore_managed_postgres(&ManagedPostgresRestore {
             network: self.config.runtime.network.clone(),
+            postgres_object: self.config.postgres.container_name.clone(),
+            postgres_image: self.config.postgres.image.clone(),
             backup_directory: backup_directory.to_path_buf(),
             service_file: postgres_service_file.to_path_buf(),
             password_file: postgres_password_file.to_path_buf(),
             image: self.config.postgres.validation_image.clone(),
+            identity: identity.clone(),
         })?;
         backend.restore_managed_valkey(&ManagedValkeyRestore {
+            network: self.config.runtime.network.clone(),
             object_reference: self.config.valkey.container_name.clone(),
             data_volume: self.config.valkey.data_volume.clone(),
             backup_directory: backup_directory.to_path_buf(),
             image: self.config.valkey.image.clone(),
+            identity,
         })
     }
 
     pub(crate) fn execute_managed_postgres(&self, sql: &[u8]) -> anyhow::Result<()> {
+        let identity = self.managed_dependency_identity();
         self.backend()?
             .execute_managed_postgres(&ManagedPostgresCommand {
                 object_reference: self.config.postgres.container_name.clone(),
+                network: self.config.runtime.network.clone(),
                 database: self.config.postgres.database.clone(),
                 user: self.config.postgres.user.clone(),
                 stdin: sql.to_vec(),
+                image: self.config.postgres.image.clone(),
+                identity,
             })
+    }
+
+    fn managed_dependency_identity(&self) -> crate::runtime_backend::ManagedDependencyIdentity {
+        let postgres_volume = format!("{}-data", self.config.postgres.container_name);
+        managed_dependency_identity(
+            &self.config.operator.deployment_id,
+            &self.config.operator.controller_key_id,
+            &self.config.runtime.runtime_instance_id,
+            &self.config.runtime.network,
+            &self.config.postgres.container_name,
+            &postgres_volume,
+            &self.config.postgres.image,
+            &self.config.postgres.database,
+            &self.config.postgres.user,
+            &self.config.valkey.container_name,
+            &self.config.valkey.data_volume,
+            &self.config.valkey.image,
+        )
     }
 
     pub(crate) fn image_revision(&self, image: &str) -> anyhow::Result<String> {
@@ -661,20 +765,6 @@ impl<'a> Runtime<'a> {
             .iter()
             .find(|mount| mount.target == Path::new(target))
             .with_context(|| format!("runtime mount {target} is unavailable"))
-    }
-
-    fn container_has_authorized_labels(&self) -> bool {
-        self.backend_kind().is_ok_and(|_| {
-            self.backend().is_ok_and(|backend| {
-                backend
-                    .verify_ownership(
-                        &self.config.runtime.container_name,
-                        &self.config.operator.deployment_id,
-                        &self.config.operator.controller_key_id,
-                    )
-                    .is_ok()
-            })
-        })
     }
 }
 
