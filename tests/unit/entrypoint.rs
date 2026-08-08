@@ -129,6 +129,9 @@ fn release_self_update_validation_uses_a_generic_current_previous_transition() {
         "gh release download \"$CURRENT_RELEASE\"",
         "self update --to \"$CURRENT_RELEASE\" --yes",
         "self check --to \"$PREVIOUS_RELEASE\"",
+        "mktemp -d /tmp/controller-self-lifecycle.XXXXXX",
+        "sudo chown -R 0:0 \"$root\"",
+        "sudo chmod 0700 \"$break_glass_root\"",
     ] {
         assert!(
             workflow.contains(required),
@@ -138,4 +141,5 @@ fn release_self_update_validation_uses_a_generic_current_previous_transition() {
     assert!(!workflow.contains("github.ref_name == 'v0.1.23'"));
     assert!(!workflow.contains("gh release download v0.1.23"));
     assert!(!workflow.contains("self update --to v0.1.23"));
+    assert!(!workflow.contains("$RUNNER_TEMP/controller-self-lifecycle"));
 }
