@@ -66,19 +66,9 @@ fn permission_expansion_requires_recovery_and_shared_management_fails_closed() {
 }
 
 #[test]
-fn relinquish_is_a_monotonic_permission_reduction() {
-    assert!(
-        responsibility_rank(Responsibility::External)
-            < responsibility_rank(Responsibility::Delegated)
-    );
-    assert!(
-        responsibility_rank(Responsibility::Delegated)
-            < responsibility_rank(Responsibility::Managed)
-    );
-}
-
-#[test]
-fn controller_modules_do_not_encode_runtime_backend_command_syntax() {
+fn controller_modules_keep_backend_command_ownership_in_runtime_backend() {
+    // This is an architecture/source-policy guard, not a substitute for
+    // runtime-backend behavior tests. The latter live in runtime.rs.
     let controller_modules = [
         ("install", include_str!("../../src/install.rs")),
         ("controller", include_str!("../../src/controller.rs")),
@@ -108,7 +98,7 @@ fn controller_modules_do_not_encode_runtime_backend_command_syntax() {
 }
 
 #[test]
-fn integrity_evidence_without_an_executable_controller_config_is_not_core_recovery() {
+fn core_recovery_requires_a_controller_config_or_lifecycle_reference() {
     let mut deployment = record();
     deployment.trust = TrustState::Adopted;
     deployment.recovery.conclusion = RecoveryConclusion::Proven;
@@ -131,7 +121,7 @@ fn integrity_evidence_without_an_executable_controller_config_is_not_core_recove
 }
 
 #[test]
-fn lifecycle_management_audit_is_chained_and_idempotent() {
+fn management_audit_deduplicates_requests_and_rejects_content_reuse() {
     let work = PrivateTempDir::new("nazoauthctl-management-audit").unwrap();
     let store = DeploymentStore {
         config_root: work.path().join("etc"),

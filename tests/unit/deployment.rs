@@ -158,6 +158,40 @@ fn shared_capability_operations_use_the_same_stable_lock_as_resource_transitions
 }
 
 #[test]
+fn shared_capability_locks_are_sorted_deduplicated_and_exclude_deployment_resources() {
+    let work = PrivateTempDir::new("nazoauthctl-shared-capability-lock-order").unwrap();
+    let store = store(&work);
+    let mut deployment = record("deployment-a", "alpha");
+    deployment.capabilities.database.scope = ResourceScope::Shared;
+    deployment.capabilities.database.responsibility = Responsibility::Delegated;
+    deployment.capabilities.valkey.scope = ResourceScope::Shared;
+    deployment.capabilities.valkey.responsibility = Responsibility::Delegated;
+
+    let _locks = store
+        .shared_capability_locks(
+            &deployment,
+            &[
+                Capability::Valkey,
+                Capability::Runtime,
+                Capability::Database,
+                Capability::Valkey,
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        _locks.len(),
+        2,
+        "shared capability locks must be deterministic and deduplicated"
+    );
+    assert!(store.shared_resource_lock("database").is_err());
+    assert!(store.shared_resource_lock("valkey").is_err());
+    assert!(
+        store.shared_resource_lock("runtime").is_ok(),
+        "deployment-scoped capabilities must not acquire shared-resource locks"
+    );
+}
+
+#[test]
 fn declaration_persistence_requires_a_single_revision_step_and_exact_cas_snapshot() {
     let work = PrivateTempDir::new("nazoauthctl-declaration-cas").unwrap();
     let store = store(&work);
@@ -178,10 +212,29 @@ fn declaration_persistence_requires_a_single_revision_step_and_exact_cas_snapsho
             .persist_declaration_cas_locked(&stale, &updated)
             .is_err()
     );
+    assert_eq!(store.load("deployment-a").unwrap(), updated);
 
     let mut skipped = store.load("deployment-a").unwrap();
     skipped.declaration_revision += 2;
     assert!(store.persist_declaration_locked(&skipped).is_err());
+    assert_eq!(store.load("deployment-a").unwrap(), updated);
+}
+
+#[test]
+fn declaration_revision_overflow_fails_closed_without_changing_the_snapshot() {
+    let work = PrivateTempDir::new("nazoauthctl-declaration-revision-overflow").unwrap();
+    let store = store(&work);
+    let mut current = record("deployment-a", "alpha");
+    current.declaration_revision = u64::MAX;
+    store.persist(&current).unwrap();
+
+    assert!(store.persist_declaration_locked(&current).is_err());
+    assert!(
+        store
+            .persist_declaration_cas_locked(&current, &current)
+            .is_err()
+    );
+    assert_eq!(store.load("deployment-a").unwrap(), current);
 }
 
 #[test]

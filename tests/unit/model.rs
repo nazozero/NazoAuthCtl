@@ -168,10 +168,47 @@ fn environment_keys_are_strict() {
 }
 
 #[test]
-fn runtime_environment_cannot_carry_secret_values() {
-    assert!(valid_environment_key("DATABASE_URL_FILE"));
-    assert!(!"DATABASE_URL_FILE".ends_with("PASSWORD"));
-    assert!(!"DATABASE_URL".ends_with("_FILE"));
+fn runtime_environment_requires_normalized_file_locators() {
+    let mut inline_secret = valid_config();
+    inline_secret.runtime.environment.insert(
+        "DATABASE_URL".to_owned(),
+        "/run/secrets/database-url".to_owned(),
+    );
+    assert!(
+        inline_secret.validate().is_err(),
+        "runtime environment must not carry inline secret values"
+    );
+
+    let mut relative_locator = valid_config();
+    relative_locator
+        .runtime
+        .environment
+        .insert("DATABASE_URL_FILE".to_owned(), "../database-url".to_owned());
+    assert!(
+        relative_locator.validate().is_err(),
+        "secret locators must be normalized absolute paths"
+    );
+
+    let mut valid_locator = valid_config();
+    let valid_path = std::path::PathBuf::from(
+        valid_locator
+            .runtime
+            .environment
+            .get("DATABASE_URL_FILE")
+            .expect("baseline fixture should contain a file locator"),
+    );
+    valid_locator.runtime.environment.insert(
+        "VALKEY_URL_FILE".to_owned(),
+        valid_path
+            .parent()
+            .expect("baseline locator should have a parent")
+            .join("valkey-url")
+            .display()
+            .to_string(),
+    );
+    valid_locator
+        .validate()
+        .expect("normalized *_FILE locators should remain valid");
 }
 
 #[test]

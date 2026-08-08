@@ -12,6 +12,12 @@ use crate::{
     model::{Dependencies, Operator, Postgres, Runtime as RuntimeConfig, Ui, Valkey},
 };
 
+#[cfg(unix)]
+use crate::runtime_backend::{
+    ManagedDependencyBackup, ManagedDependencyIdentity, ManagedPostgresCommand,
+    ManagedValkeyRestore, RuntimeBackend,
+};
+
 fn config(work: &PrivateTempDir) -> UpdateConfig {
     let config_dir = work.path().join("config");
     let operator_dir = config_dir.join("operator");
@@ -161,6 +167,269 @@ fn managed_dependency_identity_binds_runtime_and_immutable_configuration() {
     assert_ne!(identity, image_changed);
     assert!(identity.network_config_digest.starts_with("sha256:"));
     assert!(identity.postgres_config_digest.starts_with("sha256:"));
+}
+
+#[cfg(unix)]
+fn managed_dependency_fixture() -> (ManagedDependencyIdentity, String, String) {
+    let postgres_image = format!("postgres@sha256:{}", "a".repeat(64));
+    let valkey_image = format!("valkey@sha256:{}", "b".repeat(64));
+    let identity = crate::runtime_backend::managed_dependency_identity(
+        "deployment-test",
+        "controller-test",
+        "runtime-test",
+        "nazoauth-network",
+        "nazoauth-postgres",
+        "nazoauth-postgres-data",
+        &postgres_image,
+        "oauth",
+        "nazoauth_runtime",
+        "nazoauth-valkey",
+        "nazoauth-valkey-data",
+        &valkey_image,
+    );
+    (identity, postgres_image, valkey_image)
+}
+
+#[cfg(unix)]
+fn managed_identity_engine(
+    work: &PrivateTempDir,
+    identity: &ManagedDependencyIdentity,
+    postgres_image: &str,
+    valkey_image: &str,
+    drift: &str,
+) -> (PathBuf, PathBuf) {
+    let engine = work.path().join("managed-identity-engine");
+    let marker = work.path().join("managed-side-effect.marker");
+    let wrong_digest = format!("sha256:{}", "d".repeat(64));
+    let wrong_image = format!("postgres@sha256:{}", "e".repeat(64));
+    let network_digest = if drift == "network" {
+        &wrong_digest
+    } else {
+        &identity.network_config_digest
+    };
+    let postgres_digest = if drift == "config-digest" {
+        &wrong_digest
+    } else {
+        &identity.postgres_config_digest
+    };
+    let valkey_digest = if drift == "config-digest" {
+        &wrong_digest
+    } else {
+        &identity.valkey_config_digest
+    };
+    let postgres_volume_digest = if drift == "volume" {
+        &wrong_digest
+    } else {
+        &identity.postgres_volume_config_digest
+    };
+    let valkey_volume_digest = if drift == "volume" {
+        &wrong_digest
+    } else {
+        &identity.valkey_volume_config_digest
+    };
+    let runtime_instance_id = if drift == "runtime-instance" {
+        "runtime-foreign"
+    } else {
+        identity.runtime_instance_id.as_str()
+    };
+    let postgres_role = if drift == "container" {
+        "foreign-container"
+    } else {
+        "postgres"
+    };
+    let valkey_role = if drift == "container" {
+        "foreign-container"
+    } else {
+        "valkey"
+    };
+    let postgres_reported_image = if drift == "image" {
+        wrong_image.as_str()
+    } else {
+        postgres_image
+    };
+    let valkey_reported_image = if drift == "image" {
+        wrong_image.as_str()
+    } else {
+        valkey_image
+    };
+    write_shell_executable(
+        &engine,
+        &format!(
+            r#"case "$*" in
+  *'io.nazoauth.deployment-id'*) printf '%s\n' 'deployment-test' ;;
+  *'io.nazoauth.control-authority'*) printf '%s\n' 'controller-test' ;;
+  *'io.nazoauth.runtime-instance-id'*) printf '%s\n' '{runtime_instance_id}' ;;
+  *'io.nazoauth.managed-resource'*)
+    case "$*" in
+      *'network inspect'*) printf '%s\n' 'network' ;;
+      *'postgres-data'*) printf '%s\n' 'postgres-volume' ;;
+      *'valkey-data'*) printf '%s\n' 'valkey-volume' ;;
+      *'postgres'*) printf '%s\n' '{postgres_role}' ;;
+      *'valkey'*) printf '%s\n' '{valkey_role}' ;;
+      *) exit 1 ;;
+    esac ;;
+  *'io.nazoauth.config-digest'*)
+    case "$*" in
+      *'network inspect'*) printf '%s\n' '{network_digest}' ;;
+      *'volume inspect'*)
+        case "$*" in
+          *'postgres-data'*) printf '%s\n' '{postgres_volume_digest}' ;;
+          *'valkey-data'*) printf '%s\n' '{valkey_volume_digest}' ;;
+          *) exit 1 ;;
+        esac
+        ;;
+      *'postgres'*) printf '%s\n' '{postgres_digest}' ;;
+      *'valkey'*) printf '%s\n' '{valkey_digest}' ;;
+      *) exit 1 ;;
+    esac ;;
+  *'Config.Image'*|*'ImageName'*|*'RepoDigests'*)
+    case "$*" in
+      *'postgres'*) printf '%s\n' '{postgres_reported_image}' ;;
+      *'valkey'*) printf '%s\n' '{valkey_reported_image}' ;;
+      *) exit 1 ;;
+    esac ;;
+  *)
+    case "${{1-}}" in
+      exec|run|stop|start|cp) printf '%s\n' "$*" >> '{marker}' ;;
+    esac ;;
+esac"#,
+            marker = marker.display(),
+            runtime_instance_id = runtime_instance_id,
+            postgres_role = postgres_role,
+            valkey_role = valkey_role,
+            network_digest = network_digest,
+            postgres_volume_digest = postgres_volume_digest,
+            valkey_volume_digest = valkey_volume_digest,
+            postgres_digest = postgres_digest,
+            valkey_digest = valkey_digest,
+            postgres_reported_image = postgres_reported_image,
+            valkey_reported_image = valkey_reported_image,
+        ),
+    );
+    (engine, marker)
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_postgres_execute_rejects_container_identity_drift_before_exec() {
+    for drift in ["container", "config-digest", "runtime-instance", "image"] {
+        let work = PrivateTempDir::new("runtime-managed-execute").unwrap();
+        let (identity, postgres_image, _) = managed_dependency_fixture();
+        let (engine, marker) = managed_identity_engine(
+            &work,
+            &identity,
+            &postgres_image,
+            "valkey@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            drift,
+        );
+        let command = ManagedPostgresCommand {
+            object_reference: "nazoauth-postgres".to_owned(),
+            network: "nazoauth-network".to_owned(),
+            database: "oauth".to_owned(),
+            user: "nazoauth_runtime".to_owned(),
+            stdin: b"select 1".to_vec(),
+            image: postgres_image,
+            identity,
+        };
+        let error =
+            crate::runtime_backend::backend_with_command(RuntimeBackendKind::Podman, engine)
+                .execute_managed_postgres(&command)
+                .unwrap_err();
+        let expected = if drift == "image" {
+            "immutable image"
+        } else {
+            "immutable managed-resource identity"
+        };
+        assert!(
+            error.to_string().contains(expected),
+            "{drift} drift returned an unexpected error: {error:#}"
+        );
+        assert!(
+            !marker.exists(),
+            "{drift} drift reached the PostgreSQL exec side effect"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_valkey_restore_rejects_network_and_volume_drift_before_stop() {
+    for drift in ["network", "volume"] {
+        let work = PrivateTempDir::new("runtime-managed-valkey-restore").unwrap();
+        let (identity, _, valkey_image) = managed_dependency_fixture();
+        let (engine, marker) = managed_identity_engine(
+            &work,
+            &identity,
+            "postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &valkey_image,
+            drift,
+        );
+        let restore = ManagedValkeyRestore {
+            network: "nazoauth-network".to_owned(),
+            object_reference: "nazoauth-valkey".to_owned(),
+            data_volume: "nazoauth-valkey-data".to_owned(),
+            backup_directory: work.path().join("backup"),
+            image: valkey_image,
+            identity,
+        };
+        let error =
+            crate::runtime_backend::backend_with_command(RuntimeBackendKind::Podman, engine)
+                .restore_managed_valkey(&restore)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("immutable managed-resource identity"),
+            "{drift} drift returned an unexpected error: {error:#}"
+        );
+        assert!(
+            !marker.exists(),
+            "{drift} drift reached the Valkey stop/restore side effect"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_backup_rejects_config_digest_drift_before_dump() {
+    let work = PrivateTempDir::new("runtime-managed-backup").unwrap();
+    let (identity, postgres_image, valkey_image) = managed_dependency_fixture();
+    let (engine, marker) = managed_identity_engine(
+        &work,
+        &identity,
+        &postgres_image,
+        &valkey_image,
+        "config-digest",
+    );
+    let backup = ManagedDependencyBackup {
+        destination: work.path().join("backup"),
+        network: "nazoauth-network".to_owned(),
+        postgres_object: "nazoauth-postgres".to_owned(),
+        postgres_volume: "nazoauth-postgres-data".to_owned(),
+        postgres_image: postgres_image.clone(),
+        postgres_user: "nazoauth_runtime".to_owned(),
+        postgres_database: "oauth".to_owned(),
+        postgres_validation_image: postgres_image,
+        valkey_object: "nazoauth-valkey".to_owned(),
+        valkey_volume: "nazoauth-valkey-data".to_owned(),
+        valkey_image,
+        valkey_rdb_path: "/data/dump.rdb".to_owned(),
+        valkey_password_file: None,
+        identity,
+    };
+    let error = crate::runtime_backend::backend_with_command(RuntimeBackendKind::Podman, engine)
+        .backup_managed_dependencies(&backup)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("immutable managed-resource identity"),
+        "config digest drift returned an unexpected error: {error:#}"
+    );
+    assert!(
+        !marker.exists(),
+        "config digest drift reached the backup dump"
+    );
 }
 
 #[test]

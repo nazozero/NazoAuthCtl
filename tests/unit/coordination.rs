@@ -2,7 +2,8 @@ use super::*;
 use crate::{
     deployment::{
         ArtifactReference, CapabilityGrants, DEPLOYMENT_SCHEMA, DeploymentRecord,
-        RecoveryAssessment, RecoveryConclusion, RuntimeBackendKind, RuntimeInstance, TrustState,
+        RecoveryAssessment, RecoveryConclusion, ResourceScope, Responsibility, RuntimeBackendKind,
+        RuntimeInstance, TrustState,
     },
     filesystem::PrivateTempDir,
 };
@@ -205,6 +206,25 @@ fn persisted_declaration_drift_is_rejected_after_the_transaction_was_prepared() 
 }
 
 #[test]
+fn prepare_update_refuses_a_locked_shared_capability_without_persisting_state() {
+    let work = PrivateTempDir::new("nazoauthctl-coordination-shared-lock").unwrap();
+    let store = store(&work);
+    let mut current = record("deployment-a");
+    current.capabilities.database.scope = ResourceScope::Shared;
+    current.capabilities.database.responsibility = Responsibility::Delegated;
+    store.persist(&current).unwrap();
+
+    let _database_lock = store.shared_resource_lock("database").unwrap();
+    assert!(prepare_update(&store, &current, &plan("deployment-a")).is_err());
+    assert!(
+        !store
+            .deployment_state_dir("deployment-a")
+            .join("transactions/active-update.json")
+            .exists()
+    );
+}
+
+#[test]
 fn controller_steps_commit_the_new_declaration_only_after_final_acceptance() {
     let work = PrivateTempDir::new("nazoauthctl-coordination-commit").unwrap();
     let store = store(&work);
@@ -227,6 +247,27 @@ fn controller_steps_commit_the_new_declaration_only_after_final_acceptance() {
     )
     .unwrap();
     assert_eq!(after_runtime.state, CoordinationState::ReadyForController);
+
+    let mut wrong_target = current.clone();
+    wrong_target.active_release = prepared.target_release.clone();
+    wrong_target.active_release.build_id = "build:not-the-transaction-target".to_owned();
+    wrong_target.declaration_revision += 1;
+    assert!(
+        commit_controller_update(
+            &store,
+            &current,
+            &wrong_target,
+            &prepared.transaction_id,
+            "acceptance",
+            &"e".repeat(64),
+        )
+        .is_err()
+    );
+    assert_eq!(store.load("deployment-a").unwrap(), current);
+    assert_eq!(
+        show(&store, &current).unwrap().state,
+        CoordinationState::ReadyForController
+    );
 
     let mut updated = current.clone();
     updated.active_release = prepared.target_release;

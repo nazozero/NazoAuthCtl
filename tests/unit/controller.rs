@@ -885,7 +885,7 @@ fn assert_invalid_journal(config: &UpdateConfig, value: &UpdateJournal, expected
 }
 
 #[test]
-fn every_pre_migration_fault_window_restores_the_previous_runtime() {
+fn recovery_action_selects_restore_previous_before_migration() {
     let work = PrivateTempDir::new("nazoauth-update-phase").unwrap();
     let config = config(&work);
     for phase in [
@@ -927,7 +927,7 @@ fn mfa_totp_runtime_upgrade_keeps_inline_key_sources_unmounted() {
 }
 
 #[test]
-fn migration_faults_always_unwind_without_the_faulting_server() {
+fn recovery_action_selects_restore_previous_for_migration_faults() {
     let work = PrivateTempDir::new("nazoauth-update-migration").unwrap();
     let config = config(&work);
     let compatible = journal(&config, UpdatePhase::MigrationRunning);
@@ -968,7 +968,7 @@ fn container_target_binds_the_platform_manifest_not_the_index() {
 }
 
 #[test]
-fn an_activated_target_is_unwound_during_recovery() {
+fn recovery_action_selects_restore_previous_after_target_activation() {
     let work = PrivateTempDir::new("nazoauth-update-active").unwrap();
     let config = config(&work);
     for phase in [
@@ -996,7 +996,7 @@ fn an_activated_target_is_unwound_during_recovery() {
 }
 
 #[test]
-fn a_persisted_candidate_active_phase_is_unwound_without_runtime_inspection() {
+fn recovery_action_selects_restore_previous_for_persisted_post_activation_phases() {
     let work = PrivateTempDir::new("nazoauth-update-persisted-active").unwrap();
     let config = config(&work);
     for phase in [
@@ -1021,7 +1021,7 @@ fn a_persisted_candidate_active_phase_is_unwound_without_runtime_inspection() {
 }
 
 #[test]
-fn journal_is_durable_closed_and_monotonic() {
+fn update_journal_persists_rejects_unknown_fields_and_forbids_phase_regression() {
     let work = PrivateTempDir::new("nazoauth-update-journal").unwrap();
     let config = config(&work);
     fs::create_dir_all(&config.deployment_root).unwrap();
@@ -1053,7 +1053,7 @@ fn journal_is_durable_closed_and_monotonic() {
 }
 
 #[test]
-fn every_external_fault_window_round_trips_the_last_durable_phase() {
+fn update_journal_round_trips_each_persisted_phase() {
     let work = PrivateTempDir::new("nazoauth-update-fault-windows").unwrap();
     let config = config(&work);
     fs::create_dir_all(&config.deployment_root).unwrap();
@@ -1314,6 +1314,50 @@ fn legacy_recovery_requires_all_runtime_and_provider_mutation_capabilities() {
 }
 
 #[test]
+fn public_rollback_rejects_unmanaged_lifecycle_before_reading_or_mutating_state() {
+    let work = PrivateTempDir::new("nazoauth-public-rollback-capabilities").unwrap();
+    let mut config = config(&work);
+    let state = rollback_state_path(&config);
+
+    config.trust = crate::deployment::TrustState::Observed;
+    assert!(public_rollback(&config).is_err());
+    assert!(!state.exists());
+
+    config.trust = crate::deployment::TrustState::Adopted;
+    config.capabilities.runtime.responsibility = Responsibility::External;
+    assert!(public_rollback(&config).is_err());
+    assert!(!state.exists());
+
+    config.capabilities.runtime.responsibility = Responsibility::Managed;
+    config.capabilities.artifact.responsibility = Responsibility::External;
+    assert!(public_rollback(&config).is_err());
+    assert!(!state.exists());
+
+    config.capabilities.artifact.responsibility = Responsibility::Managed;
+    config.capabilities.backups.responsibility = Responsibility::External;
+    assert!(public_rollback(&config).is_err());
+    assert!(!state.exists());
+    assert!(!config.deployment_root.exists());
+}
+
+#[test]
+fn backup_recovery_rejects_provider_mutation_without_reading_rollback_state() {
+    let work = PrivateTempDir::new("nazoauth-backup-recovery-capabilities").unwrap();
+    let mut config = config(&work);
+    let state = rollback_state_path(&config);
+
+    config.capabilities.database.responsibility = Responsibility::External;
+    assert!(recover_from_backup(&config).is_err());
+    assert!(!state.exists());
+
+    config.capabilities.database.responsibility = Responsibility::Managed;
+    config.capabilities.valkey.responsibility = Responsibility::External;
+    assert!(recover_from_backup(&config).is_err());
+    assert!(!state.exists());
+    assert!(!config.deployment_root.exists());
+}
+
+#[test]
 fn observation_lock_never_creates_persistent_state() {
     let work = PrivateTempDir::new("nazoauth-read-only-lock").unwrap();
     let missing = work.path().join("missing/lifecycle.lock");
@@ -1362,7 +1406,7 @@ fn only_observation_commands_use_the_shared_noncreating_lock() {
 
 #[cfg(unix)]
 #[test]
-fn production_config_permission_policy_requires_root_and_rejects_writable_files() {
+fn config_permission_predicate_rejects_non_root_and_writable_modes() {
     assert!(config_permissions_are_safe(0, 0o100600));
     assert!(config_permissions_are_safe(0, 0o100640));
     assert!(!config_permissions_are_safe(1000, 0o100600));
