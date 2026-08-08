@@ -1908,6 +1908,45 @@ fn fake_container_runtime(
         runtime_image = runtime_image,
         inspect_json = inspect_json,
     );
+    let inspect_override = format!(
+        r#"if [ "${{1:-}}" = inspect ]; then
+  object="${{2:-}}"
+  format="${{4:-}}"
+  if [ -z "$format" ]; then
+    printf '%s\n' '{inspect_json}'
+    exit 0
+  fi
+  case "$format" in
+    *io.nazoauth.deployment-id*) printf '%s\n' '{deployment}' ;;
+    *io.nazoauth.control-authority*) printf '%s\n' '{authority}' ;;
+    *io.nazoauth.runtime-instance-id*) printf '%s\n' '{runtime}' ;;
+    *io.nazoauth.resource-kind*) case "$object" in '{postgres_object}') printf '%s\n' 'postgres' ;; '{valkey_object}') printf '%s\n' 'valkey' ;; *) printf '%s\n' 'application' ;; esac ;;
+    *io.nazoauth.config-digest*) case "$object" in '{postgres_object}') printf '%s\n' '{postgres_digest}' ;; '{valkey_object}') printf '%s\n' '{valkey_digest}' ;; *) printf '%s\n' '{network_digest}' ;; esac ;;
+    *Image*|*RepoDigests*) case "$object" in '{postgres_object}') printf '%s\n' '{postgres_image}' ;; '{valkey_object}') printf '%s\n' '{valkey_image}' ;; *) printf '%s\n' '{runtime_image}' ;; esac ;;
+    *) printf '%s\n' '{inspect_json}' ;;
+  esac
+  exit 0
+fi
+if [ "${{1:-}}" = inspect ]; then
+  case "$*" in"#,
+        inspect_json = inspect_json,
+        deployment = config.operator.deployment_id,
+        authority = config.operator.controller_key_id,
+        runtime = config.runtime.runtime_instance_id,
+        postgres_object = config.postgres.container_name,
+        valkey_object = config.valkey.container_name,
+        postgres_digest = identity.postgres_config_digest,
+        valkey_digest = identity.valkey_config_digest,
+        network_digest = network_digest,
+        postgres_image = config.postgres.image,
+        valkey_image = config.valkey.image,
+        runtime_image = runtime_image,
+    );
+    let script = script.replacen(
+        "if [ \"${1:-}\" = inspect ]; then\n  case \"$*\" in",
+        &inspect_override,
+        1,
+    );
     write_shell_executable(&engine, &script);
     engine
 }
