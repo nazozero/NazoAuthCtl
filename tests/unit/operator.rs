@@ -434,7 +434,7 @@ fn staged_identity_cleanup_and_controller_availability_match_managed_files() {
     assert!(!recovery_generation.exists());
 
     assert!(report_controller_availability(&value).unwrap());
-    fs::write(&value.operator.controller_public_key, b"invalid").unwrap();
+    atomic_write(&value.operator.controller_public_key, b"invalid", 0o444).unwrap();
     assert!(!report_controller_availability(&value).unwrap());
 }
 

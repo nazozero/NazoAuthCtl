@@ -106,8 +106,10 @@ fn snapshot_restore_rejects_traversal_and_special_archive_entries() {
         let mut malicious = Header::new_gnu();
         malicious.set_entry_type(entry_type);
         malicious.set_size(0);
+        let name = name.as_bytes();
+        malicious.as_mut_bytes()[..name.len()].copy_from_slice(name);
         malicious.set_cksum();
-        archive.append_data(&mut malicious, name, &[][..]).unwrap();
+        archive.append(&malicious, &[][..]).unwrap();
         archive.finish().unwrap();
         fs::write(
             backup_path.join("snapshot-0.path"),

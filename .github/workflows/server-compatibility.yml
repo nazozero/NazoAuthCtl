@@ -331,7 +331,7 @@ jobs:
           recovery_manifest="$state_root/deployments/$deployment_id/recovery/manual-manifest.json"
           printf '%s' '{"schema":1,"fixture":"external resources remain external"}' >"$recovery_manifest"
           recovery_sha="$(sha256sum "$recovery_manifest" | cut -d' ' -f1)"
-          driver="$root/recovery-driver.py"
+          driver="$control_root/recovery-driver.py"
           cat >"$driver" <<'PY'
           #!/usr/bin/env python3
           import json, sys, time
@@ -356,7 +356,7 @@ jobs:
             --arg deployment "$deployment_id" --arg runtime "$runtime_id" \
             --arg object manual-auth-same-name --arg data "$root/docker-live-data" \
             --arg config "$root/docker-live-config/.env.yaml" --arg network "$network" \
-            --arg driver "$driver" --arg driver_sha "$driver_sha" --arg rehearsal "$root/rehearsal" \
+            --arg driver "$driver" --arg driver_sha "$driver_sha" --arg rehearsal "$control_root/rehearsal" \
             '{schema:2,deployment_id:$deployment,runtimes:[{
               runtime_instance_id:$runtime,backend:"docker",object_reference:$object,
               command:["nazoauth","server"],mounts:[
