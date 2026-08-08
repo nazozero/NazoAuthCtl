@@ -1949,7 +1949,7 @@ if [ "${{1:-}}" = inspect ]; then
     );
     let trace_path = engine.with_extension("calls");
     let script = format!(
-        "printf '%s\\n' \"$*\" >> '{}'\\n{}",
+        "printf '%s\n' \"$*\" >> '{}'\n{}",
         trace_path.display(),
         script
     );
