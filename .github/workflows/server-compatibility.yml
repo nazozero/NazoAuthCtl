@@ -522,6 +522,14 @@ jobs:
           jq '.deployments["deployment-ci-decoy"]={alias:"ci-decoy",declaration:.deployments["deployment-ci-systemd-recovery"].declaration}' \
             "$config_root/registry.json" >"$config_root/registry.multi.json"
           mv "$config_root/registry.multi.json" "$config_root/registry.json"
+
+          # The fixture is authored by the runner, while destructive controller
+          # operations intentionally run as root.  Hand ownership over before
+          # the first controller invocation and keep subsequent registry edits
+          # in the same privileged domain.
+          sudo chown -R 0:0 "$config_root" "$state_root" "$break_glass_root"
+          sudo chmod 0700 "$break_glass_root"
+
           if sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
@@ -537,15 +545,9 @@ jobs:
             exit 1
           fi
           test "$(systemctl show "$unit" --property=ActiveState --value)" = active
-          jq 'del(.deployments["deployment-ci-decoy"])' "$config_root/registry.json" \
-            >"$config_root/registry.single.json"
-          mv "$config_root/registry.single.json" "$config_root/registry.json"
-
-          # The fixture is authored by the runner, while destructive controller
-          # operations intentionally run as root.  Match the production storage
-          # ownership invariant only after all runner-side edits are complete.
-          sudo chown -R 0:0 "$config_root" "$state_root" "$break_glass_root"
-          sudo chmod 0700 "$break_glass_root"
+          sudo jq 'del(.deployments["deployment-ci-decoy"])' "$config_root/registry.json" \
+            | sudo tee "$config_root/registry.single.json" >/dev/null
+          sudo mv "$config_root/registry.single.json" "$config_root/registry.json"
 
           if sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
