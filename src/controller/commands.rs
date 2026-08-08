@@ -191,11 +191,36 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             let store = DeploymentStore::system();
             let record = store.resolve(selector.as_deref(), true)?;
             let transaction = crate::coordination::resume(&store, &record)?;
-            if transaction.state == crate::coordination::CoordinationState::ReadyForController
-                && record.resources.contains_key("lifecycle_contract")
-            {
-                let transaction =
-                    crate::lifecycle::execute_coordinated_update(&store, &record, &transaction)?;
+            if transaction.state == crate::coordination::CoordinationState::ReadyForController {
+                let transaction = if record.resources.contains_key("lifecycle_contract") {
+                    crate::lifecycle::execute_coordinated_update(&store, &record, &transaction)?
+                } else if record.resources.contains_key("controller_config") {
+                    let context = control_config(
+                        &configured_path,
+                        selector.as_deref(),
+                        &[
+                            Capability::Runtime,
+                            Capability::Artifact,
+                            Capability::ServerConfig,
+                            Capability::Database,
+                            Capability::Valkey,
+                            Capability::Backups,
+                            Capability::OperatorTasks,
+                        ],
+                        true,
+                        true,
+                        false,
+                    )?;
+                    resume_config_backed_update_locked(
+                        &store,
+                        &record,
+                        &transaction,
+                        &context.path,
+                        &context.config,
+                    )?
+                } else {
+                    bail!("update transaction has no executable lifecycle authority");
+                };
                 println!("{}", serde_json::to_string_pretty(&transaction)?);
                 return Ok(());
             }
