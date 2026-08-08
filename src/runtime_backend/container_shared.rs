@@ -458,6 +458,7 @@ mod tests {
         let argv = work.path().join("argv");
         let lastsave_seen = work.path().join("lastsave-seen");
         let password_file = work.path().join("valkey-password");
+        fs::create_dir(work.path().join("backup")).unwrap();
         fs::write(&password_file, "secret-canary").unwrap();
         write_shell_executable(
             &engine,
