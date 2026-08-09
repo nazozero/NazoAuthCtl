@@ -112,25 +112,7 @@ pub(super) fn inspect(
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|mount| {
-            let source = mount.get("Source")?.as_str()?;
-            let destination = mount.get("Destination")?.as_str()?;
-            let options = mount
-                .get("Options")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(serde_json::Value::as_str)
-                .collect::<Vec<_>>();
-            Some(super::super::NeutralMount {
-                source: PathBuf::from(source),
-                destination: PathBuf::from(destination),
-                read_only: options.contains(&"ro"),
-                selinux_relabel: options.iter().any(|value| matches!(*value, "z" | "Z")),
-                ownership: Responsibility::External,
-                scope: ResourceScope::Deployment,
-            })
-        })
+        .filter_map(podman_mount)
         .collect();
     let safe_environment = safe_environment(
         config
@@ -177,6 +159,30 @@ pub(super) fn inspect(
             format!("Podman immutable container ID observed: {id}"),
         ],
         missing,
+    })
+}
+
+fn podman_mount(mount: &serde_json::Value) -> Option<super::super::NeutralMount> {
+    let source = mount.get("Source")?.as_str()?;
+    let destination = mount.get("Destination")?.as_str()?;
+    let options = mount
+        .get("Options")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    let read_only = mount
+        .get("RW")
+        .and_then(serde_json::Value::as_bool)
+        .map_or_else(|| options.contains(&"ro"), |read_write| !read_write);
+    Some(super::super::NeutralMount {
+        source: PathBuf::from(source),
+        destination: PathBuf::from(destination),
+        read_only,
+        selinux_relabel: options.iter().any(|value| matches!(*value, "z" | "Z")),
+        ownership: Responsibility::External,
+        scope: ResourceScope::Deployment,
     })
 }
 
@@ -294,4 +300,23 @@ pub(super) fn read_build_identity(
     Ok(Some(serde_json::from_str(output.trim()).context(
         "Podman image returned an invalid build identity",
     )?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn podman_mount_uses_the_inspect_rw_field_for_read_only_state() {
+        let mount = serde_json::json!({
+            "Source": "/etc/nazoauth/secret",
+            "Destination": "/run/nazoauth/secret",
+            "Options": ["rbind"],
+            "RW": false,
+        });
+        let observed = podman_mount(&mount).unwrap();
+        assert!(observed.read_only);
+        assert!(!observed.selinux_relabel);
+        assert_eq!(observed.ownership, Responsibility::External);
+    }
 }
