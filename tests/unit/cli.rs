@@ -536,11 +536,15 @@ fn coordination_commands_require_explicit_deployment_evidence_and_confirmation()
             "transaction",
             "resume",
             "--yes",
+            "--accept-migration-barrier",
         ])
         .unwrap()
         .unwrap()
         .command,
-        Command::TransactionResume { yes: true }
+        Command::TransactionResume {
+            yes: true,
+            accept_migration_barrier: true,
+        }
     ));
     assert!(parse(&["nazoauthctl", "transaction", "evidence"]).is_err());
     assert!(parse(&["nazoauthctl", "transaction", "show", "extra"]).is_err());

@@ -2266,7 +2266,11 @@ fn update_deployment_record_is_idempotent_for_a_transaction() {
 #[test]
 fn registered_update_plan_preserves_mixed_ownership_and_replica_identity() {
     let active = manifest("v0.1.19", 'a');
-    let target = manifest("v0.2.0", 'b');
+    let mut target = manifest("v0.2.0", 'b');
+    target.rollback.schema_compatible = false;
+    target.rollback.irreversible_migration = true;
+    target.rollback.migration_floor = "20260808000200".to_owned();
+    target.rollback.rationale = "encrypt TOTP secrets and clear plaintext".to_owned();
     let mut capabilities = crate::deployment::CapabilityGrants::observed();
     capabilities.runtime = CapabilityGrant {
         responsibility: Responsibility::Delegated,
@@ -2350,6 +2354,13 @@ fn registered_update_plan_preserves_mixed_ownership_and_replica_identity() {
             .is_some_and(|value| value.contains("lifecycle configuration"))
     }));
     assert_eq!(plan["core_recovery_requires_operator_task"], false);
+    assert_eq!(plan["schema_compatible_rollback"], false);
+    assert_eq!(plan["irreversible_migration_barrier"], true);
+    assert_eq!(plan["migration_floor"], "20260808000200");
+    assert_eq!(
+        plan["migration_rationale"],
+        "encrypt TOTP secrets and clear plaintext"
+    );
 }
 
 #[test]

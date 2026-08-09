@@ -24,7 +24,7 @@ use common::{no_arguments, parse_candidate_target, parse_version_option, parse_y
 use conformance::parse_conformance;
 use install::parse_install;
 use keys::parse_keys;
-use transaction::parse_transaction_evidence;
+use transaction::{parse_transaction_evidence, parse_transaction_resume};
 use update::parse_update_options;
 
 impl Cli {
@@ -78,8 +78,10 @@ impl Cli {
             }
             "transaction" if values.first().is_some_and(|value| value == "resume") => {
                 values.remove(0);
+                let (yes, accept_migration_barrier) = parse_transaction_resume(values)?;
                 Command::TransactionResume {
-                    yes: parse_yes(values, "transaction resume")?,
+                    yes,
+                    accept_migration_barrier,
                 }
             }
             "permissions" if values.first().is_some_and(|value| value == "set") => {

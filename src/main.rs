@@ -67,7 +67,7 @@ Start here:
   nazoauthctl deployments list
   nazoauthctl --deployment ID transaction show
   nazoauthctl --deployment ID transaction evidence --file PATH --yes
-  nazoauthctl --deployment ID transaction resume --yes
+  nazoauthctl --deployment ID transaction resume --yes [--accept-migration-barrier]
   nazoauthctl --deployment ID permissions set --capability runtime=delegated --yes
   nazoauthctl --deployment ID relinquish --capability runtime --yes
   nazoauthctl --deployment ID reconcile
