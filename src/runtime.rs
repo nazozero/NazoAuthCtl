@@ -550,13 +550,19 @@ impl<'a> Runtime<'a> {
         let kind = self.backend_kind()?;
         let backend = self.backend()?;
         let object_reference = self.object_reference(kind);
-        if backend.inspect_optional(object_reference)?.is_some() {
+        if let Some(observation) = backend.inspect_optional(object_reference)? {
             backend.verify_ownership(
                 object_reference,
                 &self.config.operator.deployment_id,
                 &self.config.runtime.runtime_instance_id,
                 &self.config.operator.controller_key_id,
             )?;
+            if observation.running {
+                backend.stop(object_reference)?;
+            }
+            if kind != RuntimeBackendKind::Systemd {
+                backend.remove(object_reference)?;
+            }
         }
         let replacement = runtime_backend::RuntimeReplacement {
             object_reference: object_reference.to_owned(),
