@@ -77,6 +77,7 @@ Start here:
   nazoauthctl [--config PATH] doctor
   nazoauthctl [--config PATH] update --plan
   nazoauthctl [--config PATH] update --yes
+  nazoauthctl [--deployment ID] development activate --artifact IMAGE_OR_BINARY --yes
 
 Commands:
   discover      Read-only local Podman, Docker, systemd and process discovery
@@ -92,6 +93,7 @@ Commands:
   doctor        Read-only health and security diagnostics
   check         Resolve and verify a candidate Release
   update        Plan or perform a signed transactional update
+  development   Explicitly activate an immutable local development artifact
   rollback      Roll back the application artifact within the declared schema boundary
   recover       Restore the declared database backup and previous artifact
   recover-update    Explicitly resume or unwind an interrupted update

@@ -155,6 +155,40 @@ fn validate_conformance_token_metadata(_metadata: &fs::Metadata) -> anyhow::Resu
     Ok(())
 }
 
+fn validate_local_development_identity(identity: &EmbeddedIdentity) -> anyhow::Result<()> {
+    if identity.protocol != nazo_operator_protocol::PROTOCOL_VERSION {
+        bail!(
+            "local development artifact uses operator protocol {}, expected {}",
+            identity.protocol,
+            nazo_operator_protocol::PROTOCOL_VERSION
+        );
+    }
+    if identity.revision.len() != 40
+        || !identity
+            .revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("local development artifact revision is not a full lowercase commit SHA");
+    }
+    if identity.build_id != format!("local:{}", identity.revision) {
+        bail!("local development artifact build ID must be local:<full-revision>");
+    }
+    let version = identity
+        .release
+        .strip_prefix('v')
+        .context("local development artifact release has no v prefix")?;
+    let version = semver::Version::parse(version)
+        .context("local development artifact release is not semantic")?;
+    if version.pre.is_empty() {
+        bail!("local development artifact release must use a unique prerelease version");
+    }
+    if !version.pre.as_str().contains(&identity.revision[..8]) {
+        bail!("local development prerelease must contain the first eight revision characters");
+    }
+    Ok(())
+}
+
 pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
     let configured_path = cli.config.clone();
     let selector = cli.deployment.clone();
@@ -349,6 +383,76 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 )?;
                 update(&context.path, &context.config, options)
             }
+        }
+        Command::DevelopmentActivate(options) => {
+            require_root()?;
+            require_confirmation(
+                options.yes,
+                "replace the managed runtime with an unsigned local development artifact",
+            )?;
+            let store = DeploymentStore::system();
+            if !store.registry_path().exists() {
+                bail!("development activation requires a registered deployment");
+            }
+            let selected = store.resolve(selector.as_deref(), true)?;
+            let context = control_config(
+                &configured_path,
+                selector.as_deref(),
+                &[Capability::Runtime, Capability::Artifact],
+                false,
+                false,
+                false,
+            )?;
+            let record = store.load(&selected.deployment_id)?;
+            if record.runtime_instances.len() != 1 {
+                bail!("development activation currently requires exactly one runtime instance");
+            }
+            if crate::coordination::active_update_exists(&store, &record) {
+                bail!("development activation is forbidden while an update transaction is active");
+            }
+            let runtime = Runtime::new(&context.config);
+            let target = runtime.inspect_local_development_artifact(&options.artifact)?;
+            validate_local_development_identity(&target.embedded)?;
+            crate::lifecycle::cache_trusted_runtime(&store, &record)?;
+            runtime.activate_local_development_artifact(&target)?;
+            let mut updated = record.clone();
+            updated.active_release = target.embedded.clone();
+            let declared = updated
+                .runtime_instances
+                .first_mut()
+                .context("registered deployment has no runtime instance")?;
+            if declared.runtime_instance_id != context.config.runtime.runtime_instance_id {
+                bail!("registered runtime does not match the controller configuration");
+            }
+            declared.artifact = target.declared_artifact.clone();
+            declared.local_artifact_id = target.local_artifact_id.clone();
+            let artifact = declared.artifact.clone();
+            let local_artifact_id = declared.local_artifact_id.clone();
+            updated.declaration_revision = record
+                .declaration_revision
+                .checked_add(1)
+                .context("deployment declaration revision overflow")?;
+            store.persist_declaration_cas_locked(&record, &updated)?;
+            crate::governance::append_management_audit(
+                &store,
+                &updated,
+                &format!("development-{:020}", updated.declaration_revision),
+                "local-development-activation",
+                &updated.active_release.release,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "mode": "development-local",
+                    "deployment_id": updated.deployment_id,
+                    "active_release": updated.active_release,
+                    "artifact": artifact,
+                    "local_artifact_id": local_artifact_id,
+                    "migrations_applied": false,
+                    "release_trust_updated": false,
+                }))?
+            );
+            Ok(())
         }
         Command::Rollback { yes } => {
             require_root()?;
@@ -699,5 +803,37 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             require_confirmation(yes, "restore the previous signed nazoauthctl binary")?;
             controller_rollback()
         }
+    }
+}
+
+#[cfg(test)]
+mod development_identity_tests {
+    use super::*;
+
+    fn identity() -> EmbeddedIdentity {
+        let revision = "52bca844beac0889d82f138cde1e48f8ce4e06e4".to_owned();
+        EmbeddedIdentity {
+            release: "v0.1.28-dev.52bca844".to_owned(),
+            build_id: format!("local:{revision}"),
+            revision,
+            protocol: nazo_operator_protocol::PROTOCOL_VERSION,
+        }
+    }
+
+    #[test]
+    fn local_development_identity_is_bound_to_revision_and_prerelease() {
+        validate_local_development_identity(&identity()).unwrap();
+
+        let mut wrong_build = identity();
+        wrong_build.build_id = format!("local:{}", "a".repeat(40));
+        assert!(validate_local_development_identity(&wrong_build).is_err());
+
+        let mut signed_release = identity();
+        signed_release.release = "v0.1.28".to_owned();
+        assert!(validate_local_development_identity(&signed_release).is_err());
+
+        let mut unrelated_prerelease = identity();
+        unrelated_prerelease.release = "v0.1.28-dev.unrelated".to_owned();
+        assert!(validate_local_development_identity(&unrelated_prerelease).is_err());
     }
 }
