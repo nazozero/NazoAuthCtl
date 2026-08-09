@@ -47,6 +47,7 @@ pub(crate) enum Command {
     Doctor,
     Check(Option<String>),
     Update(UpdateOptions),
+    DevelopmentActivate(DevelopmentActivateOptions),
     Rollback {
         yes: bool,
     },
@@ -88,6 +89,12 @@ pub(crate) enum Command {
     SelfRollback {
         yes: bool,
     },
+}
+
+#[derive(Debug)]
+pub(crate) struct DevelopmentActivateOptions {
+    pub(crate) artifact: String,
+    pub(crate) yes: bool,
 }
 
 #[derive(Clone, Debug)]

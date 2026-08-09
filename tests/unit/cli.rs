@@ -479,6 +479,52 @@ fn parses_update_and_recovery_authorization_without_weakening_plan_mode() {
 }
 
 #[test]
+fn development_activation_requires_one_explicit_local_artifact() {
+    let command = parse(&[
+        "nazoauthctl",
+        "--deployment",
+        "dev-instance",
+        "development",
+        "activate",
+        "--artifact",
+        "localhost/nazoauth:dev-abc12345",
+        "--yes",
+    ])
+    .unwrap()
+    .unwrap();
+    assert_eq!(command.deployment.as_deref(), Some("dev-instance"));
+    assert!(matches!(
+        command.command,
+        Command::DevelopmentActivate(options)
+            if options.artifact == "localhost/nazoauth:dev-abc12345" && options.yes
+    ));
+
+    for arguments in [
+        &["nazoauthctl", "development", "activate"][..],
+        &[
+            "nazoauthctl",
+            "development",
+            "activate",
+            "--artifact",
+            "image-a",
+            "--artifact",
+            "image-b",
+        ][..],
+        &[
+            "nazoauthctl",
+            "development",
+            "activate",
+            "--artifact",
+            "image-a",
+            "--yes",
+            "--yes",
+        ][..],
+    ] {
+        assert!(parse(arguments).is_err(), "accepted {arguments:?}");
+    }
+}
+
+#[test]
 fn parses_exact_candidate_migration_target() {
     let command = parse(&[
         "nazoauthctl",

@@ -56,6 +56,19 @@ pub(crate) struct Runtime<'a> {
     config: &'a UpdateConfig,
 }
 
+pub(crate) struct LocalDevelopmentTarget {
+    pub(crate) embedded: nazo_operator_protocol::EmbeddedIdentity,
+    pub(crate) declared_artifact: ArtifactReference,
+    pub(crate) local_artifact_id: Option<String>,
+    activation_artifact: ArtifactReference,
+}
+
+pub(crate) struct ActiveBuildTarget {
+    pub(crate) embedded: nazo_operator_protocol::EmbeddedIdentity,
+    pub(crate) image_digest: String,
+    pub(crate) binary_digest: String,
+}
+
 impl<'a> Runtime<'a> {
     pub(crate) fn new(config: &'a UpdateConfig) -> Self {
         Self { config }
@@ -493,6 +506,189 @@ impl<'a> Runtime<'a> {
         };
         backend.replace(&replacement)
     }
+
+    pub(crate) fn active_build_target(&self) -> anyhow::Result<ActiveBuildTarget> {
+        let kind = self.backend_kind()?;
+        let backend = self.backend()?;
+        let observation = backend.inspect(self.object_reference(kind))?;
+        if !observation.running {
+            bail!("active runtime is not running");
+        }
+        let embedded = backend
+            .read_build_identity(
+                &observation.artifact,
+                observation.local_artifact_id.as_deref(),
+            )?
+            .context("active runtime exposes no embedded build identity")?;
+        let (image_digest, binary_digest) = match &observation.artifact {
+            ArtifactReference::Oci {
+                image_reference, ..
+            } => (
+                backend.resolve_image_digest(image_reference)?,
+                String::new(),
+            ),
+            ArtifactReference::HostBinary {
+                path,
+                sha256: expected_sha256,
+            } => {
+                if sha256(path)? != *expected_sha256 {
+                    bail!("active host binary changed while resolving its build target");
+                }
+                (String::new(), expected_sha256.clone())
+            }
+            ArtifactReference::Unknown => bail!("active runtime artifact is unidentified"),
+        };
+        Ok(ActiveBuildTarget {
+            embedded,
+            image_digest,
+            binary_digest,
+        })
+    }
+
+    pub(crate) fn inspect_local_development_artifact(
+        &self,
+        artifact: &str,
+    ) -> anyhow::Result<LocalDevelopmentTarget> {
+        let kind = self.backend_kind()?;
+        let backend = self.backend()?;
+        let (activation_artifact, declared_artifact, local_artifact_id) = match kind {
+            RuntimeBackendKind::Systemd => {
+                let source = fs::canonicalize(artifact)
+                    .context("failed to resolve local development binary")?;
+                let digest = sha256(&source)?;
+                let activation = ArtifactReference::HostBinary {
+                    path: source,
+                    sha256: digest.clone(),
+                };
+                let declared = ArtifactReference::HostBinary {
+                    path: self.config.runtime.binary_path.clone(),
+                    sha256: digest,
+                };
+                (activation, declared, None)
+            }
+            RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
+                let local_id = backend.resolve_local_image_id(artifact)?;
+                let activation = ArtifactReference::Oci {
+                    image_reference: local_id.clone(),
+                    digest: local_id.clone(),
+                };
+                (activation.clone(), activation, Some(local_id))
+            }
+        };
+        let embedded = backend
+            .read_build_identity(&activation_artifact, local_artifact_id.as_deref())?
+            .context("local development artifact exposes no embedded build identity")?;
+        Ok(LocalDevelopmentTarget {
+            embedded,
+            declared_artifact,
+            local_artifact_id,
+            activation_artifact,
+        })
+    }
+
+    pub(crate) fn activate_local_development_artifact(
+        &self,
+        target: &LocalDevelopmentTarget,
+    ) -> anyhow::Result<()> {
+        self.require_runtime_mutation("local development activation")?;
+        let kind = self.backend_kind()?;
+        let backend = self.backend()?;
+        let object_reference = self.object_reference(kind);
+        if let Some(observation) = backend.inspect_optional(object_reference)? {
+            backend.verify_ownership(
+                object_reference,
+                &self.config.operator.deployment_id,
+                &self.config.runtime.runtime_instance_id,
+                &self.config.operator.controller_key_id,
+            )?;
+            if observation.running {
+                backend.stop(object_reference)?;
+            }
+            if kind != RuntimeBackendKind::Systemd {
+                backend.remove(object_reference)?;
+            }
+        }
+        let replacement = runtime_backend::RuntimeReplacement {
+            object_reference: object_reference.to_owned(),
+            artifact: target.activation_artifact.clone(),
+            local_artifact_id: target.local_artifact_id.clone(),
+            command: match kind {
+                RuntimeBackendKind::Systemd => vec![
+                    self.config.runtime.binary_path.display().to_string(),
+                    "server".to_owned(),
+                ],
+                RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
+                    vec!["nazoauth".to_owned(), "server".to_owned()]
+                }
+            },
+            mounts: if kind == RuntimeBackendKind::Systemd {
+                Vec::new()
+            } else {
+                self.config
+                    .runtime
+                    .mounts
+                    .iter()
+                    .map(neutral_mount)
+                    .collect()
+            },
+            environment: if kind == RuntimeBackendKind::Systemd {
+                BTreeMap::new()
+            } else {
+                self.config.runtime.environment.clone()
+            },
+            networks: if kind == RuntimeBackendKind::Systemd
+                || self.config.runtime.network.is_empty()
+            {
+                Vec::new()
+            } else {
+                vec![self.config.runtime.network.clone()]
+            },
+            ip_address: (kind != RuntimeBackendKind::Systemd
+                && !self.config.runtime.ip_address.is_empty())
+            .then(|| self.config.runtime.ip_address.clone()),
+            ports: (kind != RuntimeBackendKind::Systemd
+                && !self.config.runtime.publish_address.is_empty())
+            .then(|| self.config.runtime.publish_address.clone())
+            .into_iter()
+            .collect(),
+            labels: BTreeMap::from([
+                (
+                    "io.nazoauth.deployment-id".to_owned(),
+                    self.config.operator.deployment_id.clone(),
+                ),
+                (
+                    "io.nazoauth.runtime-instance-id".to_owned(),
+                    self.config.runtime.runtime_instance_id.clone(),
+                ),
+                (
+                    "io.nazoauth.control-authority".to_owned(),
+                    self.config.operator.controller_key_id.clone(),
+                ),
+            ]),
+            container_policy: (kind != RuntimeBackendKind::Systemd)
+                .then(runtime_backend::ContainerRuntimePolicy::managed_default),
+        };
+        backend.replace(&replacement)?;
+        let observation = backend.inspect(object_reference)?;
+        if !observation.running {
+            bail!("local development runtime did not remain active");
+        }
+        if let Some(expected) = target.local_artifact_id.as_deref()
+            && observation.local_artifact_id.as_deref() != Some(expected)
+        {
+            bail!("local development runtime activated a different local artifact identity");
+        }
+        let active = backend
+            .read_build_identity(
+                &target.declared_artifact,
+                target.local_artifact_id.as_deref(),
+            )?
+            .context("active local development runtime exposes no embedded build identity")?;
+        if active != target.embedded {
+            bail!("active local development runtime build identity changed during activation");
+        }
+        Ok(())
+    }
     pub(crate) fn remove_container(&self) -> anyhow::Result<()> {
         self.require_runtime_mutation("runtime removal")?;
         let backend = self.backend()?;
@@ -674,6 +870,13 @@ impl<'a> Runtime<'a> {
     }
 
     pub(crate) fn image_digest(&self, image: &str) -> anyhow::Result<String> {
+        if let Some(expected_local_id) = runtime_backend::normalize_local_image_id(image, false) {
+            let actual_local_id = self.backend()?.resolve_local_image_id(image)?;
+            if actual_local_id != expected_local_id {
+                bail!("container engine retained a different local OCI identity");
+            }
+            return self.backend()?.resolve_image_digest(image);
+        }
         let (_, expected_digest) = image
             .rsplit_once('@')
             .context("managed OCI image reference is not pinned by digest")?;

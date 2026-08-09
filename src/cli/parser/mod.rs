@@ -105,6 +105,41 @@ impl Cli {
             }
             "check" => Command::Check(parse_version_option(values)?),
             "update" => Command::Update(parse_update_options(values)?),
+            "development" if values.first().is_some_and(|value| value == "activate") => {
+                values.remove(0);
+                let mut artifact = None;
+                let mut yes = false;
+                let mut index = 0;
+                while index < values.len() {
+                    match values[index].as_str() {
+                        "--artifact" => {
+                            let value = values.get(index + 1).context(
+                                "--artifact requires a local image reference or binary path",
+                            )?;
+                            if value.is_empty() || value.len() > 4096 || value.contains('\0') {
+                                bail!("development artifact reference is invalid");
+                            }
+                            if artifact.replace(value.clone()).is_some() {
+                                bail!("--artifact may be specified only once");
+                            }
+                            index += 2;
+                        }
+                        "--yes" => {
+                            if yes {
+                                bail!("development activate --yes may be specified only once");
+                            }
+                            yes = true;
+                            index += 1;
+                        }
+                        other => bail!("unknown development activate option {other}"),
+                    }
+                }
+                Command::DevelopmentActivate(DevelopmentActivateOptions {
+                    artifact: artifact
+                        .context("development activate requires --artifact IMAGE_OR_BINARY")?,
+                    yes,
+                })
+            }
             "rollback" => Command::Rollback {
                 yes: parse_yes(values, "rollback")?,
             },

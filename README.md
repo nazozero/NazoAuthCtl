@@ -85,6 +85,36 @@ The repository builds only `nazoauthctl`. The server compatibility workflow
 downloads signed NazoAuth Release binaries and OCI images; it never rebuilds the
 server.
 
+An adopted deployment with managed runtime and artifact capabilities can also
+activate an unsigned artifact built on the same machine. This is a generic local
+development boundary for Podman, Docker, and systemd; it does not depend on
+GitHub or on a particular host. For example, from a NazoAuth checkout:
+
+```sh
+revision="$(git rev-parse HEAD)"
+short_revision="$(printf '%s' "$revision" | cut -c1-8)"
+podman build \
+  --build-arg "NAZOAUTH_BUILD_RELEASE=v0.1.28-dev.$short_revision" \
+  --build-arg "NAZOAUTH_BUILD_REVISION=$revision" \
+  --build-arg "NAZOAUTH_BUILD_ID=local:$revision" \
+  --tag "localhost/nazoauth:dev-$short_revision" \
+  .
+sudo nazoauthctl --deployment DEPLOYMENT_ID development activate \
+  --artifact "localhost/nazoauth:dev-$short_revision" --yes
+```
+
+The artifact must embed the current operator protocol, a full lowercase commit
+revision, an exact `local:<full-revision>` build ID, and a semantic prerelease
+containing the first eight revision characters. The controller resolves an OCI
+reference to its immutable local image ID (or hashes a local systemd binary),
+caches the previously active runtime, performs the existing managed replacement,
+and verifies the identity after activation. It deliberately does not run
+migrations, fetch or publish a GitHub Release, or update the signed Release trust
+floor. The normal `update` command remains the signed path back to a published
+Release. Conformance tasks detect this declared local mode and bind their
+one-shot task to the currently observed local build identity and OCI manifest
+digest; all other application tasks retain the signed Release expectation.
+
 ```sh
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings

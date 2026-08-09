@@ -26,10 +26,15 @@ pub(crate) fn cache_trusted_runtime(
             } => {
                 validate_oci_digest(digest)?;
                 let runtime_backend = backend(runtime.backend);
-                if runtime_backend.resolve_image_digest(image_reference)? != *digest {
+                let local_image_id = runtime_backend.resolve_local_image_id(image_reference)?;
+                let local_development = record.active_release.build_id.starts_with("local:");
+                if local_development {
+                    if runtime.local_artifact_id.as_deref() != Some(local_image_id.as_str()) {
+                        bail!("local development runtime no longer matches its immutable image ID");
+                    }
+                } else if runtime_backend.resolve_image_digest(image_reference)? != *digest {
                     bail!("runtime OCI artifact no longer matches its signed Release digest");
                 }
-                let local_image_id = runtime_backend.resolve_local_image_id(image_reference)?;
                 let archive = artifact_directory.join("image.tar");
                 let temporary = artifact_directory.join("image.partial.tar");
                 for stale in [&temporary, &archive] {
@@ -37,13 +42,15 @@ pub(crate) fn cache_trusted_runtime(
                         fs::remove_file(stale)?;
                     }
                 }
-                runtime_backend.export_image(
-                    &format!(
+                let export_reference = if local_development {
+                    local_image_id.clone()
+                } else {
+                    format!(
                         "{}@{digest}",
                         image_reference.split('@').next().unwrap_or(image_reference)
-                    ),
-                    &temporary,
-                )?;
+                    )
+                };
+                runtime_backend.export_image(&export_reference, &temporary)?;
                 if runtime_backend.resolve_local_image_id(image_reference)? != local_image_id {
                     bail!("runtime OCI artifact changed while entering the recovery cache");
                 }

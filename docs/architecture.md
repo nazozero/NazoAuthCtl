@@ -78,6 +78,30 @@ trust record, and rollback slot under the controller state root. It does not
 select or borrow configuration, keys, or mutable state from any NazoAuth
 deployment.
 
+## Local development activation
+
+Local development is a separate, explicit trust domain. Any operator may build
+a NazoAuth OCI image or host binary locally and activate it with `development
+activate`; the feature has no host-provider or GitHub dependency. It requires an
+adopted, single-runtime deployment whose runtime and artifact capabilities are
+managed, refuses to race an active update transaction, and uses the same locked
+runtime replacement boundary as managed Release activation.
+
+The unsigned artifact is accepted only when its embedded identity binds an exact
+`local:<full-revision>` build ID to a full lowercase commit revision and a unique
+semantic prerelease containing that revision's first eight characters. OCI
+activation is pinned to the backend's immutable local image ID; host activation
+is pinned to the binary SHA-256. The controller caches the previous runtime and
+verifies the active local identity before updating the deployment declaration.
+
+Development activation does not perform application migrations and does not
+write the signed Release trust state. Consequently it cannot lower the normal
+signed update floor or turn local material into a trusted Release. Returning to
+a published build still uses the ordinary signed `update` transaction. The
+conformance command may execute against a declared local runtime, but only after
+re-reading its embedded identity and OCI manifest or host-binary digest; the
+default signed task path and explicit signed candidate path are unchanged.
+
 ## Operator-task boundary
 
 The operator-task is a one-shot application executor. The controller prepares a

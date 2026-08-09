@@ -226,6 +226,10 @@ pub(crate) fn show(
     show_locked(store, &current)
 }
 
+pub(crate) fn active_update_exists(store: &DeploymentStore, record: &DeploymentRecord) -> bool {
+    transaction_path(store, &record.deployment_id).exists()
+}
+
 pub(crate) fn show_locked(
     store: &DeploymentStore,
     record: &DeploymentRecord,

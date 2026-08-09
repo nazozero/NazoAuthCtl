@@ -534,11 +534,13 @@ pub(crate) fn one_shot_process(
     else {
         bail!("{backend_name} one-shot task requires a digest-bound OCI artifact");
     };
-    let image = format!(
-        "{}@{}",
-        image_reference.split('@').next().unwrap_or(image_reference),
-        digest
-    );
+    let image = normalize_local_image_id(image_reference, false).unwrap_or_else(|| {
+        format!(
+            "{}@{}",
+            image_reference.split('@').next().unwrap_or(image_reference),
+            digest
+        )
+    });
     let mut process = Process::new(command)
         .timeout(Duration::from_secs(300))
         .args([
