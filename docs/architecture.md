@@ -97,7 +97,10 @@ verifies the active local identity before updating the deployment declaration.
 Development activation does not perform application migrations and does not
 write the signed Release trust state. Consequently it cannot lower the normal
 signed update floor or turn local material into a trusted Release. Returning to
-a published build still uses the ordinary signed `update` transaction.
+a published build still uses the ordinary signed `update` transaction. The
+conformance command may execute against a declared local runtime, but only after
+re-reading its embedded identity and OCI manifest or host-binary digest; the
+default signed task path and explicit signed candidate path are unchanged.
 
 ## Operator-task boundary
 

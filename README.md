@@ -111,7 +111,9 @@ caches the previously active runtime, performs the existing managed replacement,
 and verifies the identity after activation. It deliberately does not run
 migrations, fetch or publish a GitHub Release, or update the signed Release trust
 floor. The normal `update` command remains the signed path back to a published
-Release.
+Release. Conformance tasks detect this declared local mode and bind their
+one-shot task to the currently observed local build identity and OCI manifest
+digest; all other application tasks retain the signed Release expectation.
 
 ```sh
 cargo fmt --all -- --check

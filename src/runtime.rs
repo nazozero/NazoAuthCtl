@@ -63,6 +63,12 @@ pub(crate) struct LocalDevelopmentTarget {
     activation_artifact: ArtifactReference,
 }
 
+pub(crate) struct ActiveBuildTarget {
+    pub(crate) embedded: nazo_operator_protocol::EmbeddedIdentity,
+    pub(crate) image_digest: String,
+    pub(crate) binary_digest: String,
+}
+
 impl<'a> Runtime<'a> {
     pub(crate) fn new(config: &'a UpdateConfig) -> Self {
         Self { config }
@@ -499,6 +505,44 @@ impl<'a> Runtime<'a> {
             container_policy: Some(runtime_backend::ContainerRuntimePolicy::managed_default()),
         };
         backend.replace(&replacement)
+    }
+
+    pub(crate) fn active_build_target(&self) -> anyhow::Result<ActiveBuildTarget> {
+        let kind = self.backend_kind()?;
+        let backend = self.backend()?;
+        let observation = backend.inspect(self.object_reference(kind))?;
+        if !observation.running {
+            bail!("active runtime is not running");
+        }
+        let embedded = backend
+            .read_build_identity(
+                &observation.artifact,
+                observation.local_artifact_id.as_deref(),
+            )?
+            .context("active runtime exposes no embedded build identity")?;
+        let (image_digest, binary_digest) = match &observation.artifact {
+            ArtifactReference::Oci {
+                image_reference, ..
+            } => (
+                backend.resolve_image_digest(image_reference)?,
+                String::new(),
+            ),
+            ArtifactReference::HostBinary {
+                path,
+                sha256: expected_sha256,
+            } => {
+                if sha256(path)? != *expected_sha256 {
+                    bail!("active host binary changed while resolving its build target");
+                }
+                (String::new(), expected_sha256.clone())
+            }
+            ArtifactReference::Unknown => bail!("active runtime artifact is unidentified"),
+        };
+        Ok(ActiveBuildTarget {
+            embedded,
+            image_digest,
+            binary_digest,
+        })
     }
 
     pub(crate) fn inspect_local_development_artifact(

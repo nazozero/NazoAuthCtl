@@ -656,7 +656,27 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 false,
             )?;
             let operation = conformance_operation(command.lease)?;
-            conformance_app_command(&context.config, operation, command.candidate.as_ref())
+            let local_development = if command.candidate.is_none()
+                && DeploymentStore::system().registry_path().exists()
+            {
+                let store = DeploymentStore::system();
+                let selected = store.resolve(selector.as_deref(), false)?;
+                let record = store.load(&selected.deployment_id)?;
+                if record.active_release.build_id.starts_with("local:") {
+                    validate_local_development_identity(&record.active_release)?;
+                    Some(record.active_release)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            conformance_app_command(
+                &context.config,
+                operation,
+                command.candidate.as_ref(),
+                local_development.as_ref(),
+            )
         }
         Command::AuditVerify => {
             let context = control_config(
