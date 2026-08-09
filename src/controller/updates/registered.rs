@@ -256,59 +256,15 @@ fn validate_config_backed_runtime_observation(
             bail!("updated container runtime has incomplete acceptance evidence");
         }
 
-        let mut declared_networks = declared.networks.clone();
-        let mut observed_networks = observation.networks.clone();
-        declared_networks.sort();
-        observed_networks.sort();
-        if declared_networks != observed_networks {
+        let drift =
+            crate::runtime_backend::compare_declared_runtime_surface(declared, observation)?;
+        if drift.networks {
             bail!("updated container runtime network surface differs from the declaration");
         }
-
-        let mut declared_mounts = declared
-            .mounts
-            .iter()
-            .map(|mount| {
-                (
-                    mount.source.clone(),
-                    mount.destination.clone(),
-                    mount.read_only,
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut observed_mounts = observation
-            .mounts
-            .iter()
-            .map(|mount| {
-                (
-                    mount.source.clone(),
-                    mount.destination.clone(),
-                    mount.read_only,
-                )
-            })
-            .collect::<Vec<_>>();
-        declared_mounts.sort();
-        observed_mounts.sort();
-        if declared_mounts != observed_mounts {
+        if drift.mounts {
             bail!("updated container runtime mount surface differs from the declaration");
         }
-
-        let mut declared_ports = declared
-            .ports
-            .iter()
-            .map(|port| {
-                let (host_binding, container_port) = port
-                    .rsplit_once(':')
-                    .context("declared container port has no host binding")?;
-                if host_binding.is_empty() || container_port.is_empty() {
-                    bail!("declared container port binding is incomplete");
-                }
-                Ok(format!("{host_binding}->{container_port}/tcp"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let mut observed_ports = observation.ports.clone();
-        declared_ports.sort();
-        observed_ports.sort();
-        if declared_ports != observed_ports {
+        if drift.ports {
             bail!("updated container runtime published-port surface differs from the declaration");
         }
     } else if observation
@@ -615,6 +571,18 @@ mod config_backed_update_tests {
         let error =
             validate_config_backed_runtime_observation(&declared_runtime(), &drifted).unwrap_err();
         assert!(error.to_string().contains("network surface"));
+
+        let mut drifted = observed_runtime();
+        drifted.ports = vec!["127.0.0.1:9000->8000/tcp".to_owned()];
+        let error =
+            validate_config_backed_runtime_observation(&declared_runtime(), &drifted).unwrap_err();
+        assert!(error.to_string().contains("published-port surface"));
+
+        let mut drifted = observed_runtime();
+        drifted.mounts[0].read_only = true;
+        let error =
+            validate_config_backed_runtime_observation(&declared_runtime(), &drifted).unwrap_err();
+        assert!(error.to_string().contains("mount surface"));
     }
 
     #[test]
