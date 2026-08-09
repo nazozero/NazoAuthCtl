@@ -185,7 +185,10 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&transaction)?);
             Ok(())
         }
-        Command::TransactionResume { yes } => {
+        Command::TransactionResume {
+            yes,
+            accept_migration_barrier,
+        } => {
             require_root()?;
             require_confirmation(yes, "resume the deployment-bound update transaction")?;
             let store = DeploymentStore::system();
@@ -217,6 +220,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                         &transaction,
                         &context.path,
                         &context.config,
+                        accept_migration_barrier,
                     )?
                 } else {
                     bail!("update transaction has no executable lifecycle authority");

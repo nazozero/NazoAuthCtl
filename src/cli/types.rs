@@ -36,6 +36,7 @@ pub(crate) enum Command {
     },
     TransactionResume {
         yes: bool,
+        accept_migration_barrier: bool,
     },
     PermissionsSet(PermissionOptions),
     Relinquish(RelinquishOptions),

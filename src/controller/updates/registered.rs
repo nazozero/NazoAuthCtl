@@ -58,6 +58,11 @@ pub(crate) fn registered_update_prepare(
         options.version.as_deref(),
         container_backend,
     )?;
+    if release.manifest.rollback.irreversible_migration && !options.accept_migration_barrier {
+        bail!(
+            "this Release crosses an irreversible migration barrier; inspect update --plan and repeat with --accept-migration-barrier --yes"
+        );
+    }
     let plan = build_registered_update_plan(&record, &release.manifest)?;
     let evidence_root = store
         .deployment_state_dir(&record.deployment_id)
@@ -79,6 +84,7 @@ pub(crate) fn resume_config_backed_update_locked(
     transaction: &crate::coordination::UpdateCoordination,
     config_path: &Path,
     config: &UpdateConfig,
+    accept_migration_barrier: bool,
 ) -> anyhow::Result<crate::coordination::UpdateCoordination> {
     use crate::coordination::{CoordinationState, StepOwner, StepState};
     use crate::deployment::ArtifactReference;
@@ -105,7 +111,7 @@ pub(crate) fn resume_config_backed_update_locked(
             version: Some(transaction.target_release.release.clone()),
             plan: false,
             yes: true,
-            accept_migration_barrier: false,
+            accept_migration_barrier,
         },
     )?;
 
@@ -454,6 +460,11 @@ pub(crate) fn build_registered_update_plan(
         "active_release": &record.active_release,
         "target_release": &target.embedded,
         "target_oci_digest": target.image_oci_digest(),
+        "schema_compatible_rollback": target.rollback.schema_compatible,
+        "database_restore": target.rollback.database_restore,
+        "irreversible_migration_barrier": target.rollback.irreversible_migration,
+        "migration_floor": target.rollback.migration_floor,
+        "migration_rationale": target.rollback.rationale,
         "capabilities": &record.capabilities,
         "recovery": &record.recovery,
         "operator_protocol_compatible": operator_compatible,
