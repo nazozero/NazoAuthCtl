@@ -3,13 +3,19 @@ mod docker;
 mod podman;
 mod systemd;
 
-use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    path::PathBuf,
+};
 
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::deployment::{ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind};
+use crate::deployment::{
+    ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind, RuntimeInstance,
+};
 
 pub(crate) use docker::DockerBackend;
 pub(crate) use podman::PodmanBackend;
@@ -48,6 +54,73 @@ pub(crate) struct NeutralMount {
     pub(crate) selinux_relabel: bool,
     pub(crate) ownership: Responsibility,
     pub(crate) scope: ResourceScope,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RuntimeSurfaceDrift {
+    pub(crate) ports: bool,
+    pub(crate) networks: bool,
+    pub(crate) mounts: bool,
+}
+
+pub(crate) fn compare_declared_runtime_surface(
+    declared: &RuntimeInstance,
+    observed: &RuntimeObservation,
+) -> anyhow::Result<RuntimeSurfaceDrift> {
+    let container = matches!(
+        declared.backend,
+        RuntimeBackendKind::Podman | RuntimeBackendKind::Docker
+    );
+    let expected_ports = if container {
+        declared
+            .ports
+            .iter()
+            .map(|port| {
+                let Some((host_binding, container_port)) = port.rsplit_once(':') else {
+                    bail!("declared container port has no host binding");
+                };
+                if host_binding.is_empty() || container_port.is_empty() {
+                    bail!("declared container port binding is incomplete");
+                }
+                Ok(format!("{host_binding}->{container_port}/tcp"))
+            })
+            .collect::<anyhow::Result<BTreeSet<_>>>()?
+    } else {
+        declared.ports.iter().cloned().collect()
+    };
+    let observed_ports = observed.ports.iter().cloned().collect::<BTreeSet<_>>();
+
+    let expected_mounts = declared
+        .mounts
+        .iter()
+        .map(|mount| {
+            (
+                mount.source.clone(),
+                mount.destination.clone(),
+                mount.read_only,
+                (!container).then_some(mount.selinux_relabel),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let observed_mounts = observed
+        .mounts
+        .iter()
+        .map(|mount| {
+            (
+                mount.source.clone(),
+                mount.destination.clone(),
+                mount.read_only,
+                (!container).then_some(mount.selinux_relabel),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+
+    Ok(RuntimeSurfaceDrift {
+        ports: expected_ports != observed_ports,
+        networks: declared.networks.iter().collect::<BTreeSet<_>>()
+            != observed.networks.iter().collect::<BTreeSet<_>>(),
+        mounts: expected_mounts != observed_mounts,
+    })
 }
 
 #[derive(Clone, Debug)]

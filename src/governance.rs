@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, fs};
+use std::fs;
 
 use anyhow::{Context as _, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -363,39 +363,15 @@ pub(crate) fn reconcile(selector: Option<&str>) -> anyhow::Result<()> {
         if !artifact_matches {
             drift.push(format!("{}:artifact", runtime.runtime_instance_id));
         }
-        if sorted(&observation.ports) != sorted(&runtime.ports) {
+        let surface =
+            crate::runtime_backend::compare_declared_runtime_surface(runtime, &observation)?;
+        if surface.ports {
             drift.push(format!("{}:ports", runtime.runtime_instance_id));
         }
-        if sorted(&observation.networks) != sorted(&runtime.networks) {
+        if surface.networks {
             drift.push(format!("{}:networks", runtime.runtime_instance_id));
         }
-        let expected_mounts = runtime
-            .mounts
-            .iter()
-            .map(|mount| {
-                format!(
-                    "{}:{}:{}:{}",
-                    mount.source.display(),
-                    mount.destination.display(),
-                    mount.read_only,
-                    mount.selinux_relabel
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        let actual_mounts = observation
-            .mounts
-            .iter()
-            .map(|mount| {
-                format!(
-                    "{}:{}:{}:{}",
-                    mount.source.display(),
-                    mount.destination.display(),
-                    mount.read_only,
-                    mount.selinux_relabel
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        if expected_mounts != actual_mounts {
+        if surface.mounts {
             drift.push(format!("{}:mounts", runtime.runtime_instance_id));
         }
     }
@@ -415,10 +391,6 @@ pub(crate) fn reconcile(selector: Option<&str>) -> anyhow::Result<()> {
         bail!("managed runtime drift requires explicit re-verification");
     }
     Ok(())
-}
-
-fn sorted(values: &[String]) -> BTreeSet<&str> {
-    values.iter().map(String::as_str).collect()
 }
 
 #[cfg(test)]
