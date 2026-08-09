@@ -292,16 +292,23 @@ fn validate_config_backed_runtime_observation(
             bail!("updated container runtime mount surface differs from the declaration");
         }
 
-        let mut declared_ports = declared.ports.clone();
+        let mut declared_ports = declared
+            .ports
+            .iter()
+            .map(|port| {
+                let (host_binding, container_port) = port
+                    .rsplit_once(':')
+                    .context("declared container port has no host binding")?;
+                if host_binding.is_empty() || container_port.is_empty() {
+                    bail!("declared container port binding is incomplete");
+                }
+                Ok(format!("{host_binding}->{container_port}/tcp"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let mut observed_ports = observation.ports.clone();
         declared_ports.sort();
         observed_ports.sort();
-        if declared_ports.len() != observed_ports.len()
-            || declared_ports
-                .iter()
-                .zip(&observed_ports)
-                .any(|(declared, observed)| !observed.starts_with(&format!("{declared}->")))
-        {
+        if declared_ports != observed_ports {
             bail!("updated container runtime published-port surface differs from the declaration");
         }
     } else if observation
@@ -553,7 +560,7 @@ mod config_backed_update_tests {
             object_reference: "nazoauth-server".to_owned(),
             artifact: crate::deployment::ArtifactReference::Unknown,
             local_artifact_id: None,
-            ports: vec!["127.0.0.1:8000".to_owned()],
+            ports: vec!["127.0.0.1:8000:8000".to_owned()],
             networks: vec!["nazoauth".to_owned()],
             mounts: vec![crate::deployment::MountReference {
                 source: PathBuf::from("/srv/nazoauth/data"),
