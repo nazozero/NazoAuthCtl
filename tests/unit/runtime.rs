@@ -583,6 +583,48 @@ fn privileged_container_task_attaches_the_signed_envelope_stdin() {
     assert_eq!(fs::read(stdin).unwrap(), b"signed-envelope");
 }
 
+#[cfg(unix)]
+#[test]
+fn privileged_container_task_runs_an_immutable_local_image_id_directly() {
+    let work = PrivateTempDir::new("runtime-local-task-image").unwrap();
+    let engine = work.path().join("fake-engine");
+    let argv = work.path().join("argv.txt");
+    write_shell_executable(
+        &engine,
+        &format!(
+            "cat >/dev/null\nprintf '%s\\n' \"$@\" > '{}'",
+            argv.display()
+        ),
+    );
+    let local_id = format!("sha256:{}", "b".repeat(64));
+    let manifest_digest = format!("sha256:{}", "a".repeat(64));
+    let task = OneShotTask {
+        artifact: ArtifactReference::Oci {
+            image_reference: local_id.clone(),
+            digest: manifest_digest.clone(),
+        },
+        command: vec!["nazoauth".to_owned(), "operator-task".to_owned()],
+        network: None,
+        mounts: Vec::new(),
+        environment: BTreeMap::new(),
+        working_directory: None,
+        service_user: None,
+        transient_credentials: BTreeMap::new(),
+        read_only_paths: Vec::new(),
+        read_write_paths: Vec::new(),
+        inaccessible_paths: Vec::new(),
+        private_mounts: false,
+        stdin: b"signed-envelope".to_vec(),
+    };
+
+    runtime_backend::backend_with_command(RuntimeBackendKind::Podman, engine)
+        .run_one_shot(&task)
+        .unwrap();
+    let arguments = fs::read_to_string(argv).unwrap();
+    assert!(arguments.lines().any(|argument| argument == local_id));
+    assert!(!arguments.contains(&format!("{local_id}@{manifest_digest}")));
+}
+
 #[test]
 fn privileged_task_fails_closed_without_required_config_mount() {
     let work = PrivateTempDir::new("runtime-missing-mount").unwrap();
@@ -788,6 +830,29 @@ fn image_digest_accepts_an_exact_repo_digest() {
     let image = format!("ghcr.io/nazozero/nazoauth@{digest}");
 
     assert_eq!(Runtime::new(&config).image_digest(&image).unwrap(), digest);
+}
+
+#[cfg(unix)]
+#[test]
+fn image_digest_accepts_an_exact_immutable_local_image_id() {
+    let work = PrivateTempDir::new("runtime-local-image-digest").unwrap();
+    let mut config = config(&work);
+    let engine = work.path().join("fake-engine");
+    let local_id = format!("sha256:{}", "b".repeat(64));
+    let manifest_digest = format!("sha256:{}", "a".repeat(64));
+    write_shell_executable(
+        &engine,
+        &format!(
+            "case \"$*\" in\n  *'{{.Id}}'*) printf '%s\\n' '{local_id}' ;;\n  *'{{json .RepoDigests}}'*) printf '%s\\n' '[\"localhost/nazoauth@{manifest_digest}\"]' ;;\n  *) exit 1 ;;\nesac"
+        ),
+    );
+    config.runtime.backend = RuntimeBackendKind::Podman;
+    config.runtime.backend_command_override = Some(engine);
+
+    assert_eq!(
+        Runtime::new(&config).image_digest(&local_id).unwrap(),
+        manifest_digest
+    );
 }
 
 #[cfg(unix)]

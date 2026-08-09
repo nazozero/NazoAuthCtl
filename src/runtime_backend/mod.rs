@@ -17,6 +17,7 @@ use crate::deployment::{
     ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind, RuntimeInstance,
 };
 
+pub(crate) use container_shared::normalize_local_image_id;
 pub(crate) use docker::DockerBackend;
 pub(crate) use podman::PodmanBackend;
 pub(crate) use systemd::SystemdBackend;

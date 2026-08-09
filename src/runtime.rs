@@ -870,6 +870,13 @@ impl<'a> Runtime<'a> {
     }
 
     pub(crate) fn image_digest(&self, image: &str) -> anyhow::Result<String> {
+        if let Some(expected_local_id) = runtime_backend::normalize_local_image_id(image, false) {
+            let actual_local_id = self.backend()?.resolve_local_image_id(image)?;
+            if actual_local_id != expected_local_id {
+                bail!("container engine retained a different local OCI identity");
+            }
+            return self.backend()?.resolve_image_digest(image);
+        }
         let (_, expected_digest) = image
             .rsplit_once('@')
             .context("managed OCI image reference is not pinned by digest")?;
