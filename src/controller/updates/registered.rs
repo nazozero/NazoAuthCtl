@@ -272,7 +272,6 @@ fn validate_config_backed_runtime_observation(
                     mount.source.clone(),
                     mount.destination.clone(),
                     mount.read_only,
-                    mount.selinux_relabel,
                     mount.scope,
                     mount.ownership,
                 )
@@ -286,7 +285,6 @@ fn validate_config_backed_runtime_observation(
                     mount.source.clone(),
                     mount.destination.clone(),
                     mount.read_only,
-                    mount.selinux_relabel,
                     mount.scope,
                     mount.ownership,
                 )
@@ -589,7 +587,9 @@ mod config_backed_update_tests {
                 source: PathBuf::from("/srv/nazoauth/data"),
                 destination: PathBuf::from("/var/lib/nazo_oauth"),
                 read_only: false,
-                selinux_relabel: true,
+                // Podman applies :Z at creation but does not retain it in the
+                // inspect Mounts Options surface.
+                selinux_relabel: false,
                 scope: crate::deployment::ResourceScope::Deployment,
                 ownership: Responsibility::Managed,
             }],
