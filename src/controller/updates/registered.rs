@@ -272,8 +272,6 @@ fn validate_config_backed_runtime_observation(
                     mount.source.clone(),
                     mount.destination.clone(),
                     mount.read_only,
-                    mount.scope,
-                    mount.ownership,
                 )
             })
             .collect::<Vec<_>>();
@@ -285,8 +283,6 @@ fn validate_config_backed_runtime_observation(
                     mount.source.clone(),
                     mount.destination.clone(),
                     mount.read_only,
-                    mount.scope,
-                    mount.ownership,
                 )
             })
             .collect::<Vec<_>>();
@@ -591,7 +587,9 @@ mod config_backed_update_tests {
                 // inspect Mounts Options surface.
                 selinux_relabel: false,
                 scope: crate::deployment::ResourceScope::Deployment,
-                ownership: Responsibility::Managed,
+                // Governance responsibility is not inferable from Podman
+                // inspect and is therefore reported as external.
+                ownership: Responsibility::External,
             }],
             safe_environment: BTreeMap::new(),
             labels: BTreeMap::new(),
