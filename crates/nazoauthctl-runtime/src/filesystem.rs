@@ -540,7 +540,7 @@ pub fn remove_file_durable(path: &Path) -> anyhow::Result<()> {
 pub fn ensure_directory_chain(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
-        return ensure_directory_chain_at(path);
+        ensure_directory_chain_at(path)
     }
     #[cfg(not(unix))]
     {

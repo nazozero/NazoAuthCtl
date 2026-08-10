@@ -452,7 +452,7 @@ fn prepare_non_root_directory(path: &Path) -> anyhow::Result<()> {
             )
         })?;
         set_mode(path, 0o750)?;
-        return File::open(path)
+        File::open(path)
             .with_context(|| {
                 format!(
                     "failed to reopen restore credential directory {}",
@@ -465,7 +465,7 @@ fn prepare_non_root_directory(path: &Path) -> anyhow::Result<()> {
                     "failed to synchronize restore credential directory {}",
                     path.display()
                 )
-            });
+            })
     }
     #[cfg(not(unix))]
     {
@@ -714,7 +714,7 @@ fn prepare_oci_backup_output(path: &Path) -> anyhow::Result<()> {
             )
         })?;
         set_mode(path, 0o440)?;
-        return File::open(path)
+        File::open(path)
             .with_context(|| format!("failed to reopen OCI backup artifact {}", path.display()))?
             .sync_all()
             .with_context(|| {
@@ -722,7 +722,7 @@ fn prepare_oci_backup_output(path: &Path) -> anyhow::Result<()> {
                     "failed to synchronize OCI backup artifact {}",
                     path.display()
                 )
-            });
+            })
     }
     #[cfg(not(unix))]
     {
@@ -1462,14 +1462,16 @@ mod tests {
             &format!("valkey@sha256:{}", "b".repeat(64)),
         );
         let (path, journal) =
-            load_dependency_restore_journal(&backup, "Docker", &identity).unwrap();
-        persist_dependency_restore_journal(&path, &journal).unwrap();
-        let error = load_dependency_restore_journal(&backup, "Podman", &identity).unwrap_err();
+            super::load_dependency_restore_journal(&backup, "Docker", &identity).unwrap();
+        super::persist_dependency_restore_journal(&path, &journal).unwrap();
+        let error =
+            super::load_dependency_restore_journal(&backup, "Podman", &identity).unwrap_err();
         assert!(error.to_string().contains("not bound"));
         let mut tampered = journal.clone();
         tampered.deployment_id = "other-deployment".to_owned();
-        persist_dependency_restore_journal(&path, &tampered).unwrap();
-        let error = load_dependency_restore_journal(&backup, "Docker", &identity).unwrap_err();
+        super::persist_dependency_restore_journal(&path, &tampered).unwrap();
+        let error =
+            super::load_dependency_restore_journal(&backup, "Docker", &identity).unwrap_err();
         assert!(error.to_string().contains("not bound"));
     }
 
@@ -1548,14 +1550,20 @@ mod tests {
         fs::set_permissions(&backup, fs::Permissions::from_mode(0o750)).unwrap();
         let payload = backup.join("payload");
         fs::write(&payload, b"payload").unwrap();
-        let payload_digest = format!("{:x}", Sha256::digest(b"payload"));
+        let digest = |bytes: &[u8]| {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let payload_digest = digest(b"payload");
         fs::write(
             backup.join("SHA256SUMS"),
             format!("{payload_digest}  payload\n"),
         )
         .unwrap();
         let manifest_bytes = fs::read(backup.join("SHA256SUMS")).unwrap();
-        let manifest_digest = format!("{:x}", Sha256::digest(manifest_bytes));
+        let manifest_digest = digest(&manifest_bytes);
         fs::write(
             backup.join("BACKUP-COMPLETE"),
             format!("marker=BACKUP-COMPLETE\nversion=1\nmanifest-sha256={manifest_digest}\n"),
@@ -1566,14 +1574,11 @@ mod tests {
             chown(&path, Some(0), Some(10001)).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o440)).unwrap();
         }
-        let marker_digest = format!(
-            "{:x}",
-            Sha256::digest(fs::read(backup.join("BACKUP-COMPLETE")).unwrap())
-        );
-        verify_oci_backup_artifacts(&backup, &manifest_digest, &marker_digest).unwrap();
+        let marker_digest = digest(&fs::read(backup.join("BACKUP-COMPLETE")).unwrap());
+        super::verify_oci_backup_artifacts(&backup, &manifest_digest, &marker_digest).unwrap();
         fs::write(&payload, b"tampered").unwrap();
-        let error =
-            verify_oci_backup_artifacts(&backup, &manifest_digest, &marker_digest).unwrap_err();
+        let error = super::verify_oci_backup_artifacts(&backup, &manifest_digest, &marker_digest)
+            .unwrap_err();
         assert!(error.to_string().contains("checksum"));
     }
 }
