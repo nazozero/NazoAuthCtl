@@ -99,6 +99,7 @@ fn lifecycle(work: &PrivateTempDir) -> LifecycleManifest {
             ports: vec!["127.0.0.1:19000:8000".to_owned()],
             container_policy: Some(ContainerRuntimePolicy {
                 restart: ContainerRestartPolicy::No,
+                service_user: None,
                 read_only_root: false,
                 no_new_privileges: false,
                 drop_all_capabilities: false,

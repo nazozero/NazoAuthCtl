@@ -678,7 +678,44 @@ pub(super) fn ensure_dependencies(
         )?;
     }
     let identity = dependencies.identity();
-    let policy = ContainerRuntimePolicy::managed_default();
+    let postgres_policy = ContainerRuntimePolicy::managed_postgres();
+    let valkey_policy = ContainerRuntimePolicy::managed_valkey();
+    if container_shared::inspect_document_optional(
+        command,
+        &[
+            "container",
+            "inspect",
+            dependencies.postgres_object.as_str(),
+        ],
+        "Docker",
+    )?
+    .is_none()
+    {
+        container_shared::prepare_managed_volume_ownership(
+            command,
+            &dependencies.postgres_volume,
+            &dependencies.postgres_image,
+            "/var/lib/postgresql",
+            "999:999",
+            "Docker",
+        )?;
+    }
+    if container_shared::inspect_document_optional(
+        command,
+        &["container", "inspect", dependencies.valkey_object.as_str()],
+        "Docker",
+    )?
+    .is_none()
+    {
+        container_shared::prepare_managed_volume_ownership(
+            command,
+            &dependencies.valkey_volume,
+            &dependencies.valkey_image,
+            "/data",
+            "999:1000",
+            "Docker",
+        )?;
+    }
     let postgres_password_source = dependencies
         .postgres_password_file
         .to_string_lossy()
@@ -694,7 +731,7 @@ pub(super) fn ensure_dependencies(
             "postgres",
             &identity.postgres_config_digest,
         ),
-        &policy,
+        &postgres_policy,
     )
     .args(["--network"])
     .arg(&dependencies.network.name)
@@ -727,7 +764,7 @@ pub(super) fn ensure_dependencies(
         &dependencies.postgres_image,
         postgres,
         "Docker",
-        &policy,
+        &postgres_policy,
         &[
             (
                 "/var/lib/postgresql",
@@ -766,7 +803,7 @@ pub(super) fn ensure_dependencies(
             "valkey",
             &identity.valkey_config_digest,
         ),
-        &policy,
+        &valkey_policy,
     )
     .args(["--network"])
     .arg(&dependencies.network.name)
@@ -802,7 +839,7 @@ pub(super) fn ensure_dependencies(
         &dependencies.valkey_image,
         valkey,
         "Docker",
-        &policy,
+        &valkey_policy,
         &[
             ("/data", false, Some(dependencies.valkey_volume.as_str())),
             (

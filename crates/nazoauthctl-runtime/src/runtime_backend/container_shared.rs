@@ -563,6 +563,9 @@ pub(crate) fn append_container_policy(
         ContainerRestartPolicy::Always => command.args(["--restart", "always"]),
         ContainerRestartPolicy::UnlessStopped => command.args(["--restart", "unless-stopped"]),
     };
+    if let Some(user) = &policy.service_user {
+        command = command.arg("--user").arg(user);
+    }
     if policy.drop_all_capabilities {
         command = command.args(["--cap-drop", "ALL"]);
     }
@@ -962,6 +965,46 @@ pub(crate) fn ensure_container(
     create.run_quiet()
 }
 
+pub(crate) fn prepare_managed_volume_ownership(
+    command: &OsStr,
+    volume: &str,
+    image: &str,
+    destination: &str,
+    owner: &str,
+    backend_name: &str,
+) -> anyhow::Result<()> {
+    require_digest_pinned_image(image, backend_name)?;
+    Process::new(command)
+        .args([
+            "run",
+            "--rm",
+            "--user",
+            "0:0",
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "CHOWN",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            "64",
+            "--memory",
+            "134217728",
+            "--cpus",
+            "1.000",
+            "--volume",
+        ])
+        .arg(format!("{volume}:{destination}"))
+        .args(["--entrypoint", "chown"])
+        .arg(image)
+        .args(["-R", owner, destination])
+        .run_quiet()
+        .with_context(|| format!("failed to initialize {backend_name} managed volume ownership"))
+}
+
 /// Inspect a single engine object as JSON.  The JSON path is deliberately
 /// shared by Docker and Podman so a template failure cannot be mistaken for a
 /// missing object.  Engine/daemon failures are surfaced as a distinct,
@@ -1096,6 +1139,15 @@ pub(crate) fn assert_managed_container_policy(
     };
     if restart != expected_restart {
         bail!("{backend_name} managed container restart policy drifted");
+    }
+    if let Some(expected_user) = &policy.service_user {
+        let observed_user = object_member_case_insensitive(&document, "config")
+            .and_then(|config| object_member_case_insensitive(config, "user"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if observed_user != expected_user {
+            bail!("{backend_name} managed container service user drifted");
+        }
     }
     if policy.read_only_root
         && !host_config
@@ -1400,6 +1452,27 @@ mod tests {
             "Podman",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn managed_dependency_policy_runs_services_as_the_image_non_root_identity() {
+        let work = PrivateTempDir::new("runtime-managed-service-user").unwrap();
+        let engine = work.path().join("fake-engine");
+        let arguments = work.path().join("arguments");
+        write_shell_executable(
+            &engine,
+            &format!("printf '%s\\n' \"$@\" > '{}'", arguments.display()),
+        );
+        super::append_container_policy(
+            Process::new(engine.as_os_str()).arg("run"),
+            &super::ContainerRuntimePolicy::managed_postgres(),
+        )
+        .run_quiet()
+        .unwrap();
+        let arguments = fs::read_to_string(arguments).unwrap();
+        assert!(arguments.contains("--user\n999:999\n"));
+        assert!(arguments.contains("--cap-drop\nALL\n"));
+        assert!(arguments.contains("--read-only\n"));
     }
 
     #[test]

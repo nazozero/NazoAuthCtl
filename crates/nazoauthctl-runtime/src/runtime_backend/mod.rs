@@ -274,6 +274,7 @@ pub struct NeutralTmpfs {
 #[serde(deny_unknown_fields)]
 pub struct ContainerRuntimePolicy {
     pub restart: ContainerRestartPolicy,
+    pub service_user: Option<String>,
     pub read_only_root: bool,
     pub no_new_privileges: bool,
     pub drop_all_capabilities: bool,
@@ -287,6 +288,7 @@ impl ContainerRuntimePolicy {
     pub fn managed_default() -> Self {
         Self {
             restart: ContainerRestartPolicy::UnlessStopped,
+            service_user: None,
             read_only_root: true,
             no_new_privileges: true,
             drop_all_capabilities: true,
@@ -309,6 +311,18 @@ impl ContainerRuntimePolicy {
             })
             .collect(),
         }
+    }
+
+    pub fn managed_postgres() -> Self {
+        let mut policy = Self::managed_default();
+        policy.service_user = Some("999:999".to_owned());
+        policy
+    }
+
+    pub fn managed_valkey() -> Self {
+        let mut policy = Self::managed_default();
+        policy.service_user = Some("999:1000".to_owned());
+        policy
     }
 }
 
