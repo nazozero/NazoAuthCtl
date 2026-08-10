@@ -2372,6 +2372,7 @@ fn pending_active_candidate_restores_previous_release_and_closes_the_journal() {
         "postgresql://migrator:recovery-test@database.invalid/oauth",
     )
     .unwrap();
+    crate::filesystem::set_mode(&config.dependencies.migration_database_url_file, 0o400).unwrap();
     let mut value = journal(&config, UpdatePhase::CandidateActive);
     config.runtime.backend = RuntimeBackendKind::Podman;
     config.runtime.backend_command_override = Some(fake_container_runtime(
