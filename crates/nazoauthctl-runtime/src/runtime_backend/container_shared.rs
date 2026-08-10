@@ -756,10 +756,9 @@ pub(crate) fn assert_managed_labels(
         expected_labels.push((RUNTIME_INSTANCE_LABEL, runtime_instance_id));
     }
     let document = inspect_document(command, arguments, backend_name)?;
-    let labels = document
-        .get("Config")
-        .and_then(|config| config.get("Labels"))
-        .or_else(|| document.get("Labels"))
+    let labels = object_member_case_insensitive(&document, "config")
+        .and_then(|config| object_member_case_insensitive(config, "labels"))
+        .or_else(|| object_member_case_insensitive(&document, "labels"))
         .and_then(serde_json::Value::as_object);
     for (label, expected) in expected_labels {
         if !labels
@@ -773,6 +772,16 @@ pub(crate) fn assert_managed_labels(
         }
     }
     Ok(())
+}
+
+fn object_member_case_insensitive<'a>(
+    value: &'a serde_json::Value,
+    expected: &str,
+) -> Option<&'a serde_json::Value> {
+    value
+        .as_object()?
+        .iter()
+        .find_map(|(name, value)| name.eq_ignore_ascii_case(expected).then_some(value))
 }
 
 /// Compare the engine-reported image reference before touching a managed
@@ -1367,6 +1376,27 @@ mod tests {
             engine.as_os_str(),
             &["container", "inspect", "managed-postgres"],
             expected,
+            "Podman",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn managed_identity_accepts_podman_lowercase_label_surface() {
+        let work = PrivateTempDir::new("runtime-podman-label-surface").unwrap();
+        let engine = work.path().join("fake-podman");
+        write_shell_executable(
+            &engine,
+            "printf '%s\n' '{\"labels\":{\"io.nazoauth.deployment-id\":\"deployment-test\",\"io.nazoauth.control-authority\":\"controller-test\",\"io.nazoauth.managed-resource\":\"network\",\"io.nazoauth.config-digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}'",
+        );
+        super::assert_managed_labels(
+            engine.as_os_str(),
+            &["network", "inspect", "managed-network"],
+            "deployment-test",
+            "controller-test",
+            None,
+            "network",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "Podman",
         )
         .unwrap();
