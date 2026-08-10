@@ -66,13 +66,13 @@ fn read_managed_openid4vc_bundle(
 ) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
     #[cfg(unix)]
     {
-        return crate::filesystem::read_secure_regular_file_for_uid(
+        crate::filesystem::read_secure_regular_file_for_uid(
             bundle,
             "managed OpenID4VC certificate bundle",
             false,
             MAX_OPENID4VC_CERTIFICATE_BUNDLE_BYTES as u64,
             crate::runtime::runtime_service_owner_uid(config)?,
-        );
+        )
     }
     #[cfg(not(unix))]
     {
