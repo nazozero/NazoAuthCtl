@@ -198,7 +198,8 @@ pub(crate) fn read_bounded(
             return Err(SecureFileError::UnsafePath);
         }
         let mut bytes = Vec::new();
-        file.take(max_bytes.saturating_add(1) as u64)
+        (&mut file)
+            .take(max_bytes.saturating_add(1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|_| SecureFileError::Io)?;
         if bytes.len() > max_bytes {
@@ -234,7 +235,8 @@ pub(crate) fn read_descriptor(
     let before = file.metadata().map_err(|_| SecureFileError::Io)?;
     validate_descriptor_metadata(&before, private)?;
     let mut bytes = Vec::new();
-    file.take(max_bytes.saturating_add(1) as u64)
+    (&mut file)
+        .take(max_bytes.saturating_add(1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| SecureFileError::Io)?;
     if bytes.len() > max_bytes {
