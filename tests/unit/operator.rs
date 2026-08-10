@@ -407,7 +407,7 @@ fn legacy_adoption_rejects_ambiguous_state_and_removes_only_staged_identity() {
 
     fs::create_dir(layout.generations.join(&expected.generation)).unwrap();
     fs::create_dir_all(layout.recovery_generations.join(&expected.generation)).unwrap();
-    fs::write(&intent_path, serde_json::to_vec(&expected).unwrap()).unwrap();
+    atomic_write(&intent_path, &serde_json::to_vec(&expected).unwrap(), 0o600).unwrap();
     refuse_ambiguous_legacy_adoption(&value, &layout, &intent_path, &expected).unwrap();
 
     let conflicting = LegacyAdoptionIntent {
@@ -416,9 +416,10 @@ fn legacy_adoption_rejects_ambiguous_state_and_removes_only_staged_identity() {
     };
     assert!(refuse_ambiguous_legacy_adoption(&value, &layout, &intent_path, &conflicting).is_err());
 
-    fs::write(
-        layout.operator_directory.join("rotation-intent.json"),
+    atomic_write(
+        &layout.operator_directory.join("rotation-intent.json"),
         b"pending",
+        0o600,
     )
     .unwrap();
     assert!(refuse_ambiguous_legacy_adoption(&value, &layout, &intent_path, &conflicting).is_err());
@@ -1005,7 +1006,7 @@ fn controller_and_audit_rotation_chain_survives_normal_and_break_glass_recovery(
         .unwrap()
         .operator_directory
         .join("rotation-intent.json");
-    fs::write(&intent_path, serde_json::to_vec(&intent).unwrap()).unwrap();
+    atomic_write(&intent_path, &serde_json::to_vec(&intent).unwrap(), 0o600).unwrap();
     recover_pending_rotation(&config_path, &mut recovered).unwrap();
     assert!(!intent_path.exists());
 }
@@ -1410,23 +1411,26 @@ fn duplicate_management_request_ids_fail_before_untrusted_files_are_parsed() {
         &key,
     )
     .unwrap();
-    fs::write(
-        directory.join(format!("00000000000000000001-{request_id}.jws")),
+    atomic_write(
+        &directory.join(format!("00000000000000000001-{request_id}.jws")),
         first.as_bytes(),
+        0o400,
     )
     .unwrap();
-    fs::write(
-        directory.join(format!("00000000000000000002-{request_id}.jws")),
+    atomic_write(
+        &directory.join(format!("00000000000000000002-{request_id}.jws")),
         second.as_bytes(),
+        0o400,
     )
     .unwrap();
-    fs::write(
-        config.operator.audit_directory.join("management-head.json"),
-        serde_json::to_vec(&AuditHead {
+    atomic_write(
+        &config.operator.audit_directory.join("management-head.json"),
+        &serde_json::to_vec(&AuditHead {
             sequence: 2,
             sha256: compact_sha256(&second),
         })
         .unwrap(),
+        0o600,
     )
     .unwrap();
 
@@ -1491,9 +1495,10 @@ fn interrupted_rotation_activates_one_complete_staged_generation() {
         transition_file: "staged-transition.jws".to_owned(),
         compact_transition,
     };
-    fs::write(
-        layout.operator_directory.join("rotation-intent.json"),
-        serde_json::to_vec(&intent).unwrap(),
+    atomic_write(
+        &layout.operator_directory.join("rotation-intent.json"),
+        &serde_json::to_vec(&intent).unwrap(),
+        0o600,
     )
     .unwrap();
     assert!(identity_recovery_required(&config).unwrap());

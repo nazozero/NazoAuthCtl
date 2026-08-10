@@ -21,7 +21,8 @@ use crate::{
     process::{Process, command_exists},
     runtime::Runtime,
     runtime_backend::{
-        ManagedDependencyBackup, RuntimeBackendKind, backend, managed_dependency_identity,
+        MANAGED_VALKEY_BACKUP_USER, ManagedDependencyBackup, RuntimeBackendKind, backend,
+        managed_dependency_identity,
     },
     secret_provider::{PostgresProvider, ValkeyProvider},
 };
@@ -274,6 +275,12 @@ impl Backup {
             &config.valkey.data_volume,
             &config.valkey.image,
         );
+        let dependency_secrets = config
+            .dependencies
+            .valkey_url_file
+            .parent()
+            .context("managed Valkey URL file has no secret directory")?
+            .join("dependencies");
         backend(kind).backup_managed_dependencies(&ManagedDependencyBackup {
             destination: self.path.clone(),
             network: config.runtime.network.clone(),
@@ -287,8 +294,8 @@ impl Backup {
             valkey_volume: config.valkey.data_volume.clone(),
             valkey_image: config.valkey.image.clone(),
             valkey_rdb_path: config.valkey.rdb_path.clone(),
-            valkey_password_file: (!config.valkey.password_file.as_os_str().is_empty())
-                .then(|| config.valkey.password_file.clone()),
+            valkey_password_file: Some(dependency_secrets.join("valkey-backup-password")),
+            valkey_user: Some(MANAGED_VALKEY_BACKUP_USER.to_owned()),
             identity,
         })?;
         for name in ["postgresql.dump", "valkey-dump.rdb"] {

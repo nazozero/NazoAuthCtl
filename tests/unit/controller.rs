@@ -1013,6 +1013,12 @@ fn mfa_totp_runtime_upgrade_keeps_inline_key_sources_unmounted() {
         "MFA_TOTP_ENCRYPTION_KEY: \"inline-key\"\n",
     )
     .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        config_dir.join(".env.yaml"),
+        fs::Permissions::from_mode(0o640),
+    )
+    .unwrap();
     let mut value = config(&work);
 
     persist_mfa_totp_runtime_upgrade(&config_path, &mut value).unwrap();
@@ -1380,6 +1386,7 @@ fn verified_journal_backup_is_opened_only_from_the_configured_root() {
         ),
     )
     .unwrap();
+    crate::filesystem::set_mode(&backup.join("SHA256SUMS"), 0o600).unwrap();
     let manifest_digest = crate::filesystem::sha256(&backup.join("SHA256SUMS")).unwrap();
     fs::write(
         backup.join("BACKUP-COMPLETE"),
@@ -1621,7 +1628,6 @@ fn public_command_dispatch_fails_closed_before_every_confirmed_mutation() {
             yes: false,
         }),
         Command::Rollback { yes: false },
-        Command::Recover { yes: false },
         Command::Migrate {
             yes: false,
             candidate: None,
@@ -1648,6 +1654,15 @@ fn public_command_dispatch_fails_closed_before_every_confirmed_mutation() {
         assert!(invoke(command).is_err());
         assert_eq!(fs::read(&config_path).unwrap(), config_before);
     }
+
+    let recover_journal = update_journal_path(&config);
+    assert!(!recover_journal.exists());
+    assert_root_or_error(
+        invoke(Command::Recover { yes: false }),
+        "no interrupted update transaction requires recovery",
+    );
+    assert_eq!(fs::read(&config_path).unwrap(), config_before);
+    assert!(!recover_journal.exists());
 
     assert_root_or_error(
         invoke(Command::RecoverUpdate { yes: false }),
@@ -2162,6 +2177,7 @@ fn materialize_trusted_recovery_release(config: &UpdateConfig, release: &Release
         serde_json::to_vec_pretty(release).unwrap(),
     )
     .unwrap();
+    crate::filesystem::set_mode(&directory.join("server-release-manifest.json"), 0o400).unwrap();
     fs::write(
         directory.join("server-image.tar"),
         b"trusted OCI recovery archive",
@@ -2234,6 +2250,7 @@ fn materialize_verified_backup(config: &UpdateConfig, path: &std::path::Path) {
         ),
     )
     .unwrap();
+    crate::filesystem::set_mode(&path.join("SHA256SUMS"), 0o600).unwrap();
 }
 
 #[cfg(unix)]

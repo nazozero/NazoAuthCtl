@@ -4,6 +4,15 @@ use super::*;
 use crate::filesystem::PrivateTempDir;
 #[cfg(unix)]
 use crate::test_support::write_shell_executable;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+
+fn set_server_config_fixture_permissions(path: &std::path::Path) {
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o640)).unwrap();
+    #[cfg(not(unix))]
+    let _ = path;
+}
 
 fn install_options(data_root: PathBuf) -> InstallOptions {
     let control_root = data_root.with_file_name("control");
@@ -105,6 +114,7 @@ fn managed_dependency_credentials_are_outside_runtime_secret_directory() {
         "postgres-password",
         "postgres-runtime-password",
         "valkey-password",
+        "valkey-backup-password",
         "valkey.acl",
     ] {
         assert!(dependencies.join(name).is_file());
@@ -125,6 +135,10 @@ fn managed_dependency_credentials_are_outside_runtime_secret_directory() {
             .contains("example-valkey")
     );
     assert_ne!(runtime_url, migration_url);
+    let valkey_acl = fs::read_to_string(dependencies.join("valkey.acl")).unwrap();
+    assert!(valkey_acl.contains("user nazoauth_runtime on"));
+    assert!(valkey_acl.contains("user nazoauth_backup on"));
+    assert!(valkey_acl.contains("+lastsave +bgsave"));
 }
 
 #[test]
@@ -875,6 +889,7 @@ fn fresh_server_config_persists_bootstrap_deployment_identity_without_rewriting_
         "PUBLIC_BASE_URL: \"https://auth.example\"\nDEPLOYMENT_ID: existing\n",
     )
     .unwrap();
+    set_server_config_fixture_permissions(&target);
     write_server_config(
         &config_dir,
         &options,
@@ -954,6 +969,7 @@ fn mfa_totp_upgrade_fills_missing_config_without_replacing_existing_key_sources(
     fs::create_dir(&config_dir).unwrap();
     let target = config_dir.join(".env.yaml");
     fs::write(&target, "PUBLIC_BASE_URL: \"https://auth.example\"\n").unwrap();
+    set_server_config_fixture_permissions(&target);
 
     ensure_mfa_totp_configuration(&config_dir, RuntimeBackendKind::Podman).unwrap();
     let first = fs::read_to_string(&target).unwrap();
@@ -976,6 +992,7 @@ fn mfa_totp_upgrade_fills_missing_config_without_replacing_existing_key_sources(
         "MFA_TOTP_ENCRYPTION_KEY: \"existing-inline-key\"\n",
     )
     .unwrap();
+    set_server_config_fixture_permissions(&inline_dir.join(".env.yaml"));
     ensure_mfa_totp_configuration(&inline_dir, RuntimeBackendKind::Podman).unwrap();
     let inline = fs::read_to_string(inline_dir.join(".env.yaml")).unwrap();
     assert!(inline.contains("MFA_TOTP_ENCRYPTION_KEY: \"existing-inline-key\"\n"));
@@ -995,6 +1012,7 @@ fn mfa_totp_upgrade_fills_missing_config_without_replacing_existing_key_sources(
         ),
     )
     .unwrap();
+    set_server_config_fixture_permissions(&file_dir.join(".env.yaml"));
     ensure_mfa_totp_configuration(&file_dir, RuntimeBackendKind::Podman).unwrap();
     let file_config = fs::read_to_string(file_dir.join(".env.yaml")).unwrap();
     assert!(file_config.contains(&format!(
@@ -1028,6 +1046,7 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
         "MFA_TOTP_ENCRYPTION_KEY_FILE: \"/run/nazoauth-secrets/mfa-totp-encryption-key\"\nMFA_TOTP_ENCRYPTION_KEY_ID: \"nazoauth-mfa-totp-v1\"\n",
     )
     .unwrap();
+    set_server_config_fixture_permissions(&config_dir.join(".env.yaml"));
     options.profile = "standards-full".to_owned();
     let config_path = config_dir.join("update.json");
     let config = build_config(

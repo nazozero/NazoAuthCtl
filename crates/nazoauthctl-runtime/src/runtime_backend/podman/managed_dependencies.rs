@@ -914,6 +914,13 @@ pub(super) fn ensure_dependencies(
         ],
         &[],
     )?;
+    container_shared::reconcile_bound_file(
+        command,
+        &dependencies.valkey_object,
+        &dependencies.valkey_acl_file,
+        "/run/nazoauth-secrets/valkey.acl",
+        "Podman Valkey",
+    )?;
 
     for _ in 0..60 {
         let postgres_ready = Process::new(command)
@@ -937,7 +944,9 @@ pub(super) fn ensure_dependencies(
                 "-eu",
                 "-c",
             ])
-            .arg("cat /run/nazoauth-secrets/valkey-password | valkey-cli --askpass PING")
+            .arg("exec valkey-cli --user \"$1\" --askpass PING < /run/nazoauth-secrets/valkey-password")
+            .arg("_")
+            .arg(&dependencies.valkey_user)
             .succeeds();
         if postgres_ready && valkey_ready {
             return Ok(());

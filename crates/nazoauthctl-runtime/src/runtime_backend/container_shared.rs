@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
 use crate::filesystem::set_mode;
-use crate::filesystem::{atomic_write, open_secure_regular_file, sha256_file};
+use crate::filesystem::{
+    atomic_write, open_secure_regular_file, read_secure_secret_file, sha256_file,
+};
 use crate::process::Process;
 #[cfg(unix)]
 use std::fs::File;
@@ -644,15 +646,45 @@ pub(crate) fn backup_managed_dependencies(
         .args(["pg_restore", "--list", "/backup/postgresql.dump"])
         .run_quiet()?;
 
+    let valkey_password = backup
+        .valkey_password_file
+        .as_ref()
+        .map(|path| read_secure_secret_file(path, "managed Valkey backup password", 4 * 1024))
+        .transpose()?;
+    if valkey_password.as_deref().is_some_and(|password| {
+        password.is_empty()
+            || password.contains(&b'\n')
+            || password.contains(&b'\r')
+            || password.contains(&b'\0')
+    }) {
+        bail!("managed Valkey backup password is empty or malformed");
+    }
+    if backup.valkey_password_file.is_some() != backup.valkey_user.is_some() {
+        bail!("managed Valkey backup authentication is incomplete");
+    }
+    if backup.valkey_user.as_deref().is_some_and(|user| {
+        user.is_empty()
+            || user.len() > 128
+            || !user
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    }) {
+        bail!("managed Valkey backup user is invalid");
+    }
     let output = |arguments: &[&str]| -> anyhow::Result<String> {
-        if let Some(password_file) = &backup.valkey_password_file {
+        if let (Some(password), Some(user)) = (&valkey_password, &backup.valkey_user) {
             return Process::new(command)
-                .args(["exec", backup.valkey_object.as_str(), "sh", "-eu", "-c"])
-                .arg("password_file=$1; shift; exec valkey-cli --askpass \"$@\" < \"$password_file\"")
-                .arg("_")
-                .arg(password_file)
+                .args([
+                    "exec",
+                    "--interactive",
+                    backup.valkey_object.as_str(),
+                    "valkey-cli",
+                    "--user",
+                    user,
+                    "--askpass",
+                ])
                 .args(arguments)
-                .stdout();
+                .stdin_stdout(password);
         }
         Process::new(command)
             .args(["exec", backup.valkey_object.as_str(), "valkey-cli"])
@@ -772,6 +804,61 @@ pub(crate) fn assert_managed_labels(
         }
     }
     Ok(())
+}
+
+/// Rebind an atomically replaced host secret into an existing managed
+/// container. OCI bind mounts retain the old inode until the container is
+/// started again, so comparing only the configured source path misses secret
+/// and ACL rotations.
+pub(crate) fn reconcile_bound_file(
+    command: &OsStr,
+    object_reference: &str,
+    host_path: &Path,
+    container_path: &str,
+    backend_name: &str,
+) -> anyhow::Result<()> {
+    let mut host = open_secure_regular_file(host_path, "managed dependency bound file", false)?;
+    let expected = sha256_file(&mut host, "managed dependency bound file")?;
+    let observed = container_file_digest(command, object_reference, container_path)?;
+    if observed == expected {
+        return Ok(());
+    }
+
+    Process::new(command)
+        .args(["restart", object_reference])
+        .run_quiet()
+        .with_context(|| format!("failed to restart managed {backend_name} dependency"))?;
+    for _ in 0..30 {
+        if container_file_digest(command, object_reference, container_path)
+            .is_ok_and(|observed| observed == expected)
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    bail!("managed {backend_name} dependency did not load the current bound file")
+}
+
+fn container_file_digest(
+    command: &OsStr,
+    object_reference: &str,
+    container_path: &str,
+) -> anyhow::Result<String> {
+    let output = Process::new(command)
+        .args(["exec", object_reference, "sha256sum", container_path])
+        .stdout()?;
+    let digest = output
+        .split_whitespace()
+        .next()
+        .context("managed dependency returned no bound-file digest")?;
+    if digest.len() != 64
+        || !digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        bail!("managed dependency returned an invalid bound-file digest");
+    }
+    Ok(digest.to_ascii_lowercase())
 }
 
 fn object_member_case_insensitive<'a>(
@@ -1650,10 +1737,11 @@ mod tests {
         )
         .unwrap();
         fs::write(&password_file, "secret-canary").unwrap();
+        fs::set_permissions(&password_file, fs::Permissions::from_mode(0o400)).unwrap();
         write_shell_executable(
             &engine,
             &format!(
-                "printf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *LASTSAVE*) if [ -e '{}' ]; then printf '101\\n'; else : > '{}'; printf '100\\n'; fi ;;\n  *) if [ \"$1\" = cp ]; then : > \"$3\"; fi; exit 0 ;;\nesac",
+                "case \"$*\" in *--interactive*) IFS= read -r _ || true ;; esac\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *LASTSAVE*) if [ -e '{}' ]; then printf '101\\n'; else : > '{}'; printf '100\\n'; fi ;;\n  *) if [ \"$1\" = cp ]; then : > \"$3\"; fi; exit 0 ;;\nesac",
                 argv.display(),
                 lastsave_seen.display(),
                 lastsave_seen.display(),
@@ -1675,6 +1763,7 @@ mod tests {
             valkey_image: valkey_image.clone(),
             valkey_rdb_path: "/data/dump.rdb".to_owned(),
             valkey_password_file: Some(password_file),
+            valkey_user: Some(super::super::MANAGED_VALKEY_BACKUP_USER.to_owned()),
             identity: managed_dependency_identity(
                 "deployment-test",
                 "controller-test",
@@ -1692,7 +1781,7 @@ mod tests {
         };
         super::backup_managed_dependencies(engine.as_os_str(), &backup, true).unwrap();
         let arguments = fs::read_to_string(argv).unwrap();
-        assert!(arguments.contains("valkey-cli --askpass"));
+        assert!(arguments.contains("valkey-cli --user nazoauth_backup --askpass"));
         assert!(!arguments.contains("VALKEYCLI_AUTH"));
         assert!(!arguments.contains("REDISCLI_AUTH"));
         assert!(!arguments.contains("secret-canary"));

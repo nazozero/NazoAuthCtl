@@ -394,6 +394,7 @@ pub struct ManagedDependencyBackup {
     pub valkey_image: String,
     pub valkey_rdb_path: String,
     pub valkey_password_file: Option<PathBuf>,
+    pub valkey_user: Option<String>,
     pub identity: ManagedDependencyIdentity,
 }
 
@@ -436,7 +437,11 @@ pub struct ManagedDependencies {
     pub valkey_image: String,
     pub valkey_password_file: PathBuf,
     pub valkey_acl_file: PathBuf,
+    pub valkey_user: String,
 }
+
+pub const MANAGED_VALKEY_RUNTIME_USER: &str = "nazoauth_runtime";
+pub const MANAGED_VALKEY_BACKUP_USER: &str = "nazoauth_backup";
 
 impl ManagedDependencies {
     pub fn identity(&self) -> ManagedDependencyIdentity {

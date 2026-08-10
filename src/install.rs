@@ -328,6 +328,7 @@ pub(crate) fn start_managed_dependencies(config: &UpdateConfig) -> anyhow::Resul
         valkey_image: config.valkey.image.clone(),
         valkey_password_file: secrets.join("valkey-password"),
         valkey_acl_file: secrets.join("valkey.acl"),
+        valkey_user: runtime_backend::MANAGED_VALKEY_RUNTIME_USER.to_owned(),
     })?;
     configure_managed_database_roles(config)
         .context("failed to configure managed PostgreSQL roles after final readiness")

@@ -256,38 +256,11 @@ fn managed_identity_engine(
         &engine,
         &format!(
             r#"case "$*" in
-  *'io.nazoauth.deployment-id'*) printf '%s\n' 'deployment-test' ;;
-  *'io.nazoauth.control-authority'*) printf '%s\n' 'controller-test' ;;
-  *'io.nazoauth.runtime-instance-id'*) printf '%s\n' '{runtime_instance_id}' ;;
-  *'io.nazoauth.managed-resource'*)
-    case "$*" in
-      *'network inspect'*) printf '%s\n' 'network' ;;
-      *'postgres-data'*) printf '%s\n' 'postgres-volume' ;;
-      *'valkey-data'*) printf '%s\n' 'valkey-volume' ;;
-      *'postgres'*) printf '%s\n' '{postgres_role}' ;;
-      *'valkey'*) printf '%s\n' '{valkey_role}' ;;
-      *) exit 1 ;;
-    esac ;;
-  *'io.nazoauth.config-digest'*)
-    case "$*" in
-      *'network inspect'*) printf '%s\n' '{network_digest}' ;;
-      *'volume inspect'*)
-        case "$*" in
-          *'postgres-data'*) printf '%s\n' '{postgres_volume_digest}' ;;
-          *'valkey-data'*) printf '%s\n' '{valkey_volume_digest}' ;;
-          *) exit 1 ;;
-        esac
-        ;;
-      *'postgres'*) printf '%s\n' '{postgres_digest}' ;;
-      *'valkey'*) printf '%s\n' '{valkey_digest}' ;;
-      *) exit 1 ;;
-    esac ;;
-  *'Config.Image'*|*'ImageName'*|*'RepoDigests'*)
-    case "$*" in
-      *'postgres'*) printf '%s\n' '{postgres_reported_image}' ;;
-      *'valkey'*) printf '%s\n' '{valkey_reported_image}' ;;
-      *) exit 1 ;;
-    esac ;;
+  *'network inspect'*) printf '%s\n' '{{"Config":{{"Labels":{{"io.nazoauth.deployment-id":"deployment-test","io.nazoauth.control-authority":"controller-test","io.nazoauth.managed-resource":"network","io.nazoauth.config-digest":"{network_digest}"}}}}}}' ;;
+  *'container inspect nazoauth-postgres'*) printf '%s\n' '{{"Config":{{"Image":"{postgres_reported_image}","Labels":{{"io.nazoauth.deployment-id":"deployment-test","io.nazoauth.control-authority":"controller-test","io.nazoauth.runtime-instance-id":"{runtime_instance_id}","io.nazoauth.managed-resource":"{postgres_role}","io.nazoauth.config-digest":"{postgres_digest}"}}}},"State":{{"Running":true}}}}' ;;
+  *'container inspect nazoauth-valkey'*) printf '%s\n' '{{"Config":{{"Image":"{valkey_reported_image}","Labels":{{"io.nazoauth.deployment-id":"deployment-test","io.nazoauth.control-authority":"controller-test","io.nazoauth.runtime-instance-id":"{runtime_instance_id}","io.nazoauth.managed-resource":"{valkey_role}","io.nazoauth.config-digest":"{valkey_digest}"}}}},"State":{{"Running":true}}}}' ;;
+  *'volume inspect nazoauth-postgres-data'*) printf '%s\n' '{{"Labels":{{"io.nazoauth.deployment-id":"deployment-test","io.nazoauth.control-authority":"controller-test","io.nazoauth.runtime-instance-id":"{runtime_instance_id}","io.nazoauth.managed-resource":"postgres-volume","io.nazoauth.config-digest":"{postgres_volume_digest}"}}}}' ;;
+  *'volume inspect nazoauth-valkey-data'*) printf '%s\n' '{{"Labels":{{"io.nazoauth.deployment-id":"deployment-test","io.nazoauth.control-authority":"controller-test","io.nazoauth.runtime-instance-id":"{runtime_instance_id}","io.nazoauth.managed-resource":"valkey-volume","io.nazoauth.config-digest":"{valkey_volume_digest}"}}}}' ;;
   *)
     case "${{1-}}" in
       exec|run|stop|start|cp) printf '%s\n' "$*" >> '{marker}' ;;
@@ -417,6 +390,7 @@ fn managed_backup_rejects_config_digest_drift_before_dump() {
         valkey_image,
         valkey_rdb_path: "/data/dump.rdb".to_owned(),
         valkey_password_file: None,
+        valkey_user: None,
         identity,
     };
     let error = crate::runtime_backend::backend_with_command(RuntimeBackendKind::Podman, engine)
@@ -584,7 +558,7 @@ fn privileged_container_task_attaches_the_signed_envelope_stdin() {
         mounts: Vec::new(),
         environment: BTreeMap::new(),
         working_directory: None,
-        service_user: None,
+        service_user: Some("10001:10001".to_owned()),
         transient_credentials: BTreeMap::new(),
         read_only_paths: Vec::new(),
         read_write_paths: Vec::new(),
@@ -626,7 +600,7 @@ fn privileged_container_task_runs_an_immutable_local_image_id_directly() {
         mounts: Vec::new(),
         environment: BTreeMap::new(),
         working_directory: None,
-        service_user: None,
+        service_user: Some("10001:10001".to_owned()),
         transient_credentials: BTreeMap::new(),
         read_only_paths: Vec::new(),
         read_write_paths: Vec::new(),
@@ -697,7 +671,7 @@ fn retirement_probe_accepts_only_the_closed_runtime_authorization_marker() {
             mounts: Vec::new(),
             environment: BTreeMap::new(),
             working_directory: None,
-            service_user: None,
+            service_user: Some("10001:10001".to_owned()),
             transient_credentials: BTreeMap::new(),
             read_only_paths: Vec::new(),
             read_write_paths: Vec::new(),
@@ -733,7 +707,7 @@ fn retirement_probe_accepts_only_the_closed_runtime_authorization_marker() {
                 mounts: Vec::new(),
                 environment: BTreeMap::new(),
                 working_directory: None,
-                service_user: None,
+                service_user: Some("10001:10001".to_owned()),
                 transient_credentials: BTreeMap::new(),
                 read_only_paths: Vec::new(),
                 read_write_paths: Vec::new(),
@@ -927,17 +901,7 @@ fn image_digest_rejects_unpinned_invalid_and_unretained_references() {
 #[cfg(unix)]
 #[test]
 fn podman_image_digest_uses_the_engine_digest_fallback() {
-    const CHILD: &str = "NAZOAUTHCTL_TEST_PODMAN_DIGEST_FALLBACK";
     let digest = format!("sha256:{}", "c".repeat(64));
-    if std::env::var_os(CHILD).is_some() {
-        let work = PrivateTempDir::new("runtime-podman-digest-child").unwrap();
-        let mut config = config(&work);
-        config.runtime.backend = RuntimeBackendKind::Podman;
-        let image = format!("ghcr.io/nazozero/nazoauth@{digest}");
-        assert_eq!(Runtime::new(&config).image_digest(&image).unwrap(), digest);
-        return;
-    }
-
     let work = PrivateTempDir::new("runtime-podman-digest").unwrap();
     let bin = work.path().join("bin");
     fs::create_dir(&bin).unwrap();
@@ -948,43 +912,17 @@ fn podman_image_digest_uses_the_engine_digest_fallback() {
             "case \"$5\" in\n  *RepoDigests*) printf '%s\\n' '[]' ;;\n  *) printf '%s\\n' '{digest}' ;;\nesac"
         ),
     );
-    let mut paths = vec![bin];
-    if let Some(path) = std::env::var_os("PATH") {
-        paths.extend(std::env::split_paths(&path));
-    }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "runtime::tests::podman_image_digest_uses_the_engine_digest_fallback",
-            "--nocapture",
-        ])
-        .env("PATH", std::env::join_paths(paths).unwrap())
-        .env("NAZOAUTHCTL_TESTING", "1")
-        .env(CHILD, "1")
-        .status()
-        .unwrap();
-    assert!(status.success());
+    let mut config = config(&work);
+    config.runtime.backend = RuntimeBackendKind::Podman;
+    config.runtime.backend_command_override = Some(engine);
+    let image = format!("ghcr.io/nazozero/nazoauth@{digest}");
+    assert_eq!(Runtime::new(&config).image_digest(&image).unwrap(), digest);
 }
 
 #[cfg(unix)]
 #[test]
 fn podman_image_digest_rejects_a_mismatched_fallback_digest() {
-    const CHILD: &str = "NAZOAUTHCTL_TEST_PODMAN_DIGEST_MISMATCH";
     let image = format!("ghcr.io/nazozero/nazoauth@sha256:{}", "e".repeat(64));
-    if std::env::var_os(CHILD).is_some() {
-        let work = PrivateTempDir::new("runtime-podman-mismatch-child").unwrap();
-        let mut config = config(&work);
-        config.runtime.backend = RuntimeBackendKind::Podman;
-        assert_eq!(
-            Runtime::new(&config)
-                .image_digest(&image)
-                .unwrap_err()
-                .to_string(),
-            "container engine retained a different OCI digest"
-        );
-        return;
-    }
-
     let work = PrivateTempDir::new("runtime-podman-mismatch").unwrap();
     let bin = work.path().join("bin");
     fs::create_dir(&bin).unwrap();
@@ -995,22 +933,16 @@ fn podman_image_digest_rejects_a_mismatched_fallback_digest() {
             "d".repeat(64)
         ),
     );
-    let mut paths = vec![bin];
-    if let Some(path) = std::env::var_os("PATH") {
-        paths.extend(std::env::split_paths(&path));
-    }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "runtime::tests::podman_image_digest_rejects_a_mismatched_fallback_digest",
-            "--nocapture",
-        ])
-        .env("PATH", std::env::join_paths(paths).unwrap())
-        .env("NAZOAUTHCTL_TESTING", "1")
-        .env(CHILD, "1")
-        .status()
-        .unwrap();
-    assert!(status.success());
+    let mut config = config(&work);
+    config.runtime.backend = RuntimeBackendKind::Podman;
+    config.runtime.backend_command_override = Some(bin.join("podman"));
+    assert_eq!(
+        Runtime::new(&config)
+            .image_digest(&image)
+            .unwrap_err()
+            .to_string(),
+        "container engine retained a different OCI digest"
+    );
 }
 
 #[cfg(unix)]

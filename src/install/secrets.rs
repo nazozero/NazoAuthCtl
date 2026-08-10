@@ -248,11 +248,13 @@ pub(super) fn write_managed_secrets(
     let postgres = generate_secret(&dependencies.join("postgres-password"))?;
     let runtime_postgres = generate_secret(&dependencies.join("postgres-runtime-password"))?;
     let valkey = generate_secret(&dependencies.join("valkey-password"))?;
+    let valkey_backup = generate_secret(&dependencies.join("valkey-backup-password"))?;
     // Dependency containers use fixed internal UIDs unrelated to host groups.
     // The dependency-only parent remains root-owned 0700, and these bind mounts
     // are read-only in their containers, so runtime users cannot traverse to them.
     set_mode(&dependencies.join("postgres-password"), 0o444)?;
     set_mode(&dependencies.join("valkey-password"), 0o444)?;
+    set_mode(&dependencies.join("valkey-backup-password"), 0o400)?;
     atomic_write(
         &secrets.join("database-url"),
         format!(
@@ -274,7 +276,8 @@ pub(super) fn write_managed_secrets(
     atomic_write(
         &secrets.join("valkey-url"),
         format!(
-            "redis://nazoauth_runtime:{}@{valkey_container}:6379/0",
+            "redis://{}:{}@{valkey_container}:6379/0",
+            runtime_backend::MANAGED_VALKEY_RUNTIME_USER,
             valkey.as_str()
         )
         .as_bytes(),
@@ -285,13 +288,17 @@ pub(super) fn write_managed_secrets(
         format!(
             concat!(
                 "user default off\n",
-                "user nazoauth_runtime on >{} ~* ",
+                "user {} on >{} ~* ",
                 "+get +mget +getdel +set +setnx +del +exists ",
                 "+expire +expireat +expiretime +pexpireat +pexpiretime +ttl ",
                 "+incr +zadd +zrangebyscore +zrem +time +eval ",
-                "+ping +hello +select +client|setname +client|setinfo\n"
+                "+ping +hello +select +client|setname +client|setinfo\n",
+                "user {} on >{} ~* +ping +lastsave +bgsave\n"
             ),
-            valkey.as_str()
+            runtime_backend::MANAGED_VALKEY_RUNTIME_USER,
+            valkey.as_str(),
+            runtime_backend::MANAGED_VALKEY_BACKUP_USER,
+            valkey_backup.as_str()
         )
         .as_bytes(),
         0o444,
