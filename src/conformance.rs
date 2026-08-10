@@ -15,7 +15,6 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     controller::{ControlConfig, conformance_control_context},
-    deployment::RuntimeBackendKind,
     filesystem::{atomic_write, ensure_directory_chain, remove_file_durable, set_mode},
     operator::{self, ExpectedReleaseTarget},
     process::Process,
@@ -24,7 +23,6 @@ use crate::{
 const MAX_MATRIX_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ONBOARDING_OUTPUT_BYTES: u64 = 1024 * 1024;
 const MAX_BUNDLE_BYTES: usize = 4 * 1024 * 1024;
-const CONTAINER_SERVICE_UID: u32 = 10001;
 
 pub struct ConformanceMatrix {
     pub bytes: Vec<u8>,
@@ -63,7 +61,7 @@ pub struct ConformanceSession {
 impl ConformanceSession {
     pub fn open(config_path: &Path, selector: Option<&str>) -> anyhow::Result<Self> {
         let (context, target, expected) = conformance_control_context(config_path, selector)?;
-        let runtime_uid = runtime_uid(&context)?;
+        let runtime_uid = crate::runtime::runtime_service_owner_uid(&context.config)?;
         let suffix = hex(rand::random::<[u8; 16]>());
         let run_directory = PathBuf::from(format!("/run/nazoauthctl-conformance-{suffix}"));
         ensure_directory_chain(&run_directory)?;
@@ -274,20 +272,6 @@ impl Drop for ConformanceSession {
             let _ = fs::remove_dir_all(&self.run_directory);
         }
     }
-}
-
-fn runtime_uid(context: &ControlConfig) -> anyhow::Result<u32> {
-    if context.config.runtime.backend != RuntimeBackendKind::Systemd {
-        return Ok(CONTAINER_SERVICE_UID);
-    }
-    let output = Process::new("id")
-        .args(["-u", context.config.runtime.service_user.as_str()])
-        .stdout()
-        .context("failed to resolve NazoAuth service UID")?;
-    output
-        .trim()
-        .parse::<u32>()
-        .context("NazoAuth service UID is invalid")
 }
 
 #[cfg(unix)]

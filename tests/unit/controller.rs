@@ -706,7 +706,10 @@ fn bootstrap_owner_policy_matches_real_container_and_host_runtime_identities() {
         &mut config,
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-",
     );
-    assert_eq!(bootstrap_state_owner_uid(&config).unwrap(), 10_001);
+    assert_eq!(
+        crate::runtime::runtime_service_owner_uid(&config).unwrap(),
+        10_001
+    );
 
     let actual_uid = fs::metadata(token_path.parent().unwrap()).unwrap().uid();
     assert_eq!(
@@ -722,7 +725,10 @@ fn bootstrap_owner_policy_matches_real_container_and_host_runtime_identities() {
         .unwrap()
         .trim()
         .to_owned();
-    assert_eq!(bootstrap_state_owner_uid(&config).unwrap(), actual_uid);
+    assert_eq!(
+        crate::runtime::runtime_service_owner_uid(&config).unwrap(),
+        actual_uid
+    );
 }
 
 #[cfg(unix)]

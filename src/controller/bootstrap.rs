@@ -9,7 +9,7 @@ pub(super) fn bootstrap_admin(
         config,
         &credentials,
         std::ffi::OsStr::new("curl"),
-        Some(bootstrap_state_owner_uid(config)?),
+        Some(crate::runtime::runtime_service_owner_uid(config)?),
     )?;
     println!(
         "Initial administrator created (request ID: {request_id}). Continue at {}/ui/auth",
@@ -587,18 +587,6 @@ pub(super) fn read_bootstrap_token(
 ) -> anyhow::Result<String> {
     let _ = (path, expected_owner_uid);
     bail!("bootstrap-admin is supported only on Unix managed hosts")
-}
-
-pub(super) fn bootstrap_state_owner_uid(config: &UpdateConfig) -> anyhow::Result<u32> {
-    if config.runtime.backend != RuntimeBackendKind::Systemd {
-        return Ok(10_001);
-    }
-    Process::new("id")
-        .args(["-u", config.runtime.service_user.as_str()])
-        .stdout()?
-        .trim()
-        .parse()
-        .context("managed host service user has no valid numeric UID")
 }
 
 #[cfg(unix)]

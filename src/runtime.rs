@@ -18,6 +18,18 @@ use crate::{
 const CONTAINER_SECRET_REVISION_PATH: &str = "/run/nazoauth-operator/secret-revision";
 const NAZOAUTH_CONTAINER_SERVICE_USER: &str = "10001:10001";
 
+pub(crate) fn runtime_service_owner_uid(config: &UpdateConfig) -> anyhow::Result<u32> {
+    if config.runtime.backend != RuntimeBackendKind::Systemd {
+        return Ok(10_001);
+    }
+    crate::process::Process::new("id")
+        .args(["-u", config.runtime.service_user.as_str()])
+        .stdout()?
+        .trim()
+        .parse()
+        .context("managed host service user has no valid numeric UID")
+}
+
 #[derive(Debug)]
 pub(crate) struct PreparedAppTask {
     backend: RuntimeBackendKind,

@@ -6,12 +6,7 @@ pub(super) fn export_openid4vc_trust(config: &UpdateConfig, output: &Path) -> an
     }
     safe_export_destination(output)?;
     let bundle = managed_openid4vc_bundle_path(config)?;
-    let bundle_bytes = crate::filesystem::read_secure_regular_file(
-        &bundle,
-        "managed OpenID4VC certificate bundle",
-        false,
-        MAX_OPENID4VC_CERTIFICATE_BUNDLE_BYTES as u64,
-    )?;
+    let bundle_bytes = read_managed_openid4vc_bundle(config, &bundle)?;
     let anchors = extract_openid4vc_trust_anchors(&bundle_bytes)?;
     let release = load_active_release(config)?;
     crate::operator::append_management_event(
@@ -65,6 +60,32 @@ pub(super) fn managed_openid4vc_bundle_path(config: &UpdateConfig) -> anyhow::Re
     Ok(keys.join(OPENID4VC_CERTIFICATE_BUNDLE))
 }
 
+fn read_managed_openid4vc_bundle(
+    config: &UpdateConfig,
+    bundle: &Path,
+) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+    #[cfg(unix)]
+    {
+        return crate::filesystem::read_secure_regular_file_for_uid(
+            bundle,
+            "managed OpenID4VC certificate bundle",
+            false,
+            MAX_OPENID4VC_CERTIFICATE_BUNDLE_BYTES as u64,
+            crate::runtime::runtime_service_owner_uid(config)?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config;
+        crate::filesystem::read_secure_regular_file(
+            bundle,
+            "managed OpenID4VC certificate bundle",
+            false,
+            MAX_OPENID4VC_CERTIFICATE_BUNDLE_BYTES as u64,
+        )
+    }
+}
+
 pub(super) fn safe_export_destination(output: &Path) -> anyhow::Result<()> {
     crate::model::safe_absolute(output)?;
     let parent = output
@@ -112,12 +133,7 @@ pub(super) fn bootstrap_openid4vc_revocation_snapshot(config: &UpdateConfig) -> 
         Err(error) => return Err(error).context("failed to inspect OpenID4VC revocation snapshot"),
     }
 
-    let bundle_bytes = crate::filesystem::read_secure_regular_file(
-        &bundle,
-        "managed OpenID4VC certificate bundle",
-        false,
-        MAX_OPENID4VC_CERTIFICATE_BUNDLE_BYTES as u64,
-    )?;
+    let bundle_bytes = read_managed_openid4vc_bundle(config, &bundle)?;
     let certificates = parse_managed_openid4vc_bundle(&bundle_bytes)?;
     let issuer = config.runtime.expected_issuer.trim_end_matches('/');
     let now = Utc::now();

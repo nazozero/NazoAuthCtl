@@ -170,6 +170,29 @@ pub fn read_secure_regular_file(
     Ok(bytes)
 }
 
+#[cfg(unix)]
+pub fn read_secure_regular_file_for_uid(
+    path: &Path,
+    label: &str,
+    private: bool,
+    max_bytes: u64,
+    expected_owner_uid: u32,
+) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+    let mut file = open_secure_regular_file_for_uid(path, label, private, expected_owner_uid)?;
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    let mut limited = (&mut file).take(max_bytes.saturating_add(1));
+    limited
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label} {}", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        bail!(
+            "{label} exceeds the {max_bytes}-byte limit: {}",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
 /// Read a secret input whose service account may legitimately have a
 /// read-only group ACL (for example root:service 0440).  Group/world write,
 /// world read, execute bits, symlinks, hard links, and path races remain
