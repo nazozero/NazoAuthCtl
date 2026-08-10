@@ -75,6 +75,11 @@ impl<'a> Runtime<'a> {
     }
 
     pub(crate) fn active_revision(&self) -> anyhow::Result<String> {
+        if self.backend_kind()? == RuntimeBackendKind::Systemd {
+            return Ok(self
+                .embedded_identity(&self.config.runtime.binary_path.to_string_lossy())?
+                .revision);
+        }
         Ok(self.active_build_target()?.embedded.revision)
     }
 
