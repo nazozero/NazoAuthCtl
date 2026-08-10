@@ -249,38 +249,36 @@ fn run_postgres_psql_with_credentials(
     credentials: &container_shared::TemporaryPostgresCredentials,
     sql: &str,
 ) -> anyhow::Result<()> {
-    container_shared::append_build_identity_policy(
-        Process::new(command)
-            .args(["run", "--rm", "--network"])
-            .arg(&restore.network),
-    )
-    .args([
-        "--env",
-        "PGSERVICEFILE=/run/nazoauth-secrets/pg_service.conf",
-        "--env",
-        "PGPASSFILE=/run/nazoauth-secrets/pgpass",
-        "--volume",
-    ])
-    .arg(format!(
-        "{}:/run/nazoauth-secrets/pg_service.conf:ro",
-        credentials.service_file().display()
-    ))
-    .arg("--volume")
-    .arg(format!(
-        "{}:/run/nazoauth-secrets/pgpass:ro",
-        credentials.password_file().display()
-    ))
-    .arg(&restore.image)
-    .args([
-        "psql",
-        "--no-psqlrc",
-        "--set",
-        "ON_ERROR_STOP=1",
-        "--dbname=service=nazoauth",
-        "--command",
-    ])
-    .arg(sql)
-    .run_quiet()
+    container_shared::build_identity_process(command)
+        .arg("--network")
+        .arg(&restore.network)
+        .args([
+            "--env",
+            "PGSERVICEFILE=/run/nazoauth-secrets/pg_service.conf",
+            "--env",
+            "PGPASSFILE=/run/nazoauth-secrets/pgpass",
+            "--volume",
+        ])
+        .arg(format!(
+            "{}:/run/nazoauth-secrets/pg_service.conf:ro",
+            credentials.service_file().display()
+        ))
+        .arg("--volume")
+        .arg(format!(
+            "{}:/run/nazoauth-secrets/pgpass:ro",
+            credentials.password_file().display()
+        ))
+        .arg(&restore.image)
+        .args([
+            "psql",
+            "--no-psqlrc",
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--dbname=service=nazoauth",
+            "--command",
+        ])
+        .arg(sql)
+        .run_quiet()
 }
 
 fn run_postgres_restore(
@@ -288,38 +286,36 @@ fn run_postgres_restore(
     restore: &ManagedPostgresRestore,
     credentials: &container_shared::TemporaryPostgresCredentials,
 ) -> anyhow::Result<()> {
-    container_shared::append_build_identity_policy(
-        Process::new(command)
-            .args(["run", "--rm", "--network"])
-            .arg(&restore.network),
-    )
-    .args([
-        "--env",
-        "PGSERVICEFILE=/run/nazoauth-secrets/pg_service.conf",
-        "--env",
-        "PGPASSFILE=/run/nazoauth-secrets/pgpass",
-        "--volume",
-    ])
-    .arg(format!("{}:/backup:ro", restore.backup_directory.display()))
-    .arg("--volume")
-    .arg(format!(
-        "{}:/run/nazoauth-secrets/pg_service.conf:ro",
-        credentials.service_file().display()
-    ))
-    .arg("--volume")
-    .arg(format!(
-        "{}:/run/nazoauth-secrets/pgpass:ro",
-        credentials.password_file().display()
-    ))
-    .arg(&restore.image)
-    .args([
-        "pg_restore",
-        "--no-owner",
-        "--no-privileges",
-        "--dbname=service=nazoauth",
-        "/backup/postgresql.dump",
-    ])
-    .run_quiet()
+    container_shared::build_identity_process(command)
+        .arg("--network")
+        .arg(&restore.network)
+        .args([
+            "--env",
+            "PGSERVICEFILE=/run/nazoauth-secrets/pg_service.conf",
+            "--env",
+            "PGPASSFILE=/run/nazoauth-secrets/pgpass",
+            "--volume",
+        ])
+        .arg(format!("{}:/backup:ro", restore.backup_directory.display()))
+        .arg("--volume")
+        .arg(format!(
+            "{}:/run/nazoauth-secrets/pg_service.conf:ro",
+            credentials.service_file().display()
+        ))
+        .arg("--volume")
+        .arg(format!(
+            "{}:/run/nazoauth-secrets/pgpass:ro",
+            credentials.password_file().display()
+        ))
+        .arg(&restore.image)
+        .args([
+            "pg_restore",
+            "--no-owner",
+            "--no-privileges",
+            "--dbname=service=nazoauth",
+            "/backup/postgresql.dump",
+        ])
+        .run_quiet()
 }
 
 pub(super) fn restore_valkey(
@@ -475,9 +471,8 @@ fn restore_valkey_into_temporary(
     restore: &ManagedValkeyRestore,
     volume: &str,
 ) -> anyhow::Result<()> {
-    container_shared::append_build_identity_policy(
-        Process::new(command).args(["run", "--rm", "--network", "none"]),
-    )
+    container_shared::build_identity_process(command)
+    .args(["--network", "none"])
     .arg("--volume")
     .arg(format!("{volume}:/data"))
     .arg("--volume")
@@ -501,29 +496,23 @@ fn validate_temporary_valkey(
     let _ = Process::new(command)
         .args(["rm", "--force", &container])
         .run_quiet();
-    container_shared::append_build_identity_policy(Process::new(command).args([
-        "run",
-        "-d",
-        "--name",
-        &container,
-        "--network",
-        "none",
-    ]))
-    .arg("--volume")
-    .arg(format!("{volume}:/data"))
-    .arg(&restore.image)
-    .args([
-        "valkey-server",
-        "--save",
-        "",
-        "--appendonly",
-        "no",
-        "--port",
-        "6379",
-        "--protected-mode",
-        "no",
-    ])
-    .run_quiet()?;
+    container_shared::build_identity_process(command)
+        .args(["-d", "--name", &container, "--network", "none"])
+        .arg("--volume")
+        .arg(format!("{volume}:/data"))
+        .arg(&restore.image)
+        .args([
+            "valkey-server",
+            "--save",
+            "",
+            "--appendonly",
+            "no",
+            "--port",
+            "6379",
+            "--protected-mode",
+            "no",
+        ])
+        .run_quiet()?;
     let mut ready = false;
     for _ in 0..30 {
         if Process::new(command)
@@ -550,9 +539,8 @@ fn copy_valkey_volume(
     source: &str,
     destination: &str,
 ) -> anyhow::Result<()> {
-    container_shared::append_build_identity_policy(
-        Process::new(command).args(["run", "--rm", "--network", "none"]),
-    )
+    container_shared::build_identity_process(command)
+    .args(["--network", "none"])
     .arg("--volume")
     .arg(format!("{source}:/source:ro"))
     .arg("--volume")
@@ -892,11 +880,9 @@ pub(super) fn verify_database_privileges(
     command: &OsStr,
     probe: &RuntimeDatabasePrivilegeProbe,
 ) -> anyhow::Result<()> {
-    container_shared::append_build_identity_policy(
-        Process::new(command)
-            .args(["run", "--rm", "--network"])
-            .arg(&probe.network),
-    )
+    container_shared::build_identity_process(command)
+    .arg("--network")
+    .arg(&probe.network)
         .args([
             "--env",
             "PGSERVICEFILE=/run/nazoauth-secrets/pg_service.conf",
@@ -933,42 +919,40 @@ fn postgres_database_exists(
         &restore.password_file,
         "postgres",
     )?;
-    let output = container_shared::append_build_identity_policy(
-        Process::new(command)
-            .args(["run", "--rm", "--network"])
-            .arg(&restore.network),
-    )
-    .args([
-        "--env",
-        "PGSERVICEFILE=/run/nazoauth-secrets/pg_service.conf",
-        "--env",
-        "PGPASSFILE=/run/nazoauth-secrets/pgpass",
-        "--volume",
-    ])
-    .arg(format!(
-        "{}:/run/nazoauth-secrets/pg_service.conf:ro",
-        credentials.service_file().display()
-    ))
-    .arg("--volume")
-    .arg(format!(
-        "{}:/run/nazoauth-secrets/pgpass:ro",
-        credentials.password_file().display()
-    ))
-    .arg(&restore.image)
-    .args([
-        "psql",
-        "--no-psqlrc",
-        "--tuples-only",
-        "--no-align",
-        "--set",
-        "ON_ERROR_STOP=1",
-        "--dbname=service=nazoauth",
-        "--command",
-    ])
-    .arg(format!(
-        "SELECT 1 FROM pg_database WHERE datname = '{database}'"
-    ))
-    .stdout()?;
+    let output = container_shared::build_identity_process(command)
+        .arg("--network")
+        .arg(&restore.network)
+        .args([
+            "--env",
+            "PGSERVICEFILE=/run/nazoauth-secrets/pg_service.conf",
+            "--env",
+            "PGPASSFILE=/run/nazoauth-secrets/pgpass",
+            "--volume",
+        ])
+        .arg(format!(
+            "{}:/run/nazoauth-secrets/pg_service.conf:ro",
+            credentials.service_file().display()
+        ))
+        .arg("--volume")
+        .arg(format!(
+            "{}:/run/nazoauth-secrets/pgpass:ro",
+            credentials.password_file().display()
+        ))
+        .arg(&restore.image)
+        .args([
+            "psql",
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--dbname=service=nazoauth",
+            "--command",
+        ])
+        .arg(format!(
+            "SELECT 1 FROM pg_database WHERE datname = '{database}'"
+        ))
+        .stdout()?;
     match output.trim() {
         "" => Ok(false),
         "1" => Ok(true),

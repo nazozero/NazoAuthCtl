@@ -4,9 +4,7 @@ use std::{ffi::OsStr, path::PathBuf};
 
 use anyhow::{Context as _, bail};
 
-use crate::{
-    ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind, process::Process,
-};
+use crate::{ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind};
 
 use super::super::container_shared;
 use super::super::{RuntimeObservation, labels, safe_environment, server_command_verified};
@@ -298,15 +296,11 @@ pub(super) fn read_build_identity(
             digest
         )
     });
-    let output = container_shared::append_build_identity_policy(Process::new(command).args([
-        "run",
-        "--rm",
-        "--network",
-        "none",
-    ]))
-    .arg(image)
-    .args(["nazoauth", "build-identity"])
-    .stdout()?;
+    let output = container_shared::build_identity_process(command)
+        .args(["--network", "none"])
+        .arg(image)
+        .args(["nazoauth", "build-identity"])
+        .stdout()?;
     Ok(Some(serde_json::from_str(output.trim()).context(
         "Podman image returned an invalid build identity",
     )?))

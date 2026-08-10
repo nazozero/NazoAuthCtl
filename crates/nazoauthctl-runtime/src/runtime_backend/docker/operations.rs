@@ -27,8 +27,8 @@ pub(super) fn verify_blob_attestation(
     Process::new(command)
         .args(["run", "--rm", "--user"])
         .arg(container_shared::NON_ROOT_ONE_SHOT_USER)
-        .args(["--cap-drop", "ALL"])
-        .args(["--read-only", "--security-opt", "no-new-privileges"])
+        .arg("--cap-drop=ALL")
+        .args(["--read-only", "--security-opt=no-new-privileges"])
         .args([
             "--pids-limit",
             "64",

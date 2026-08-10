@@ -565,10 +565,10 @@ pub(crate) fn append_container_policy(
         command = command.arg("--user").arg(user);
     }
     if policy.drop_all_capabilities {
-        command = command.args(["--cap-drop", "ALL"]);
+        command = command.arg("--cap-drop=ALL");
     }
     if policy.no_new_privileges {
-        command = command.args(["--security-opt", "no-new-privileges"]);
+        command = command.arg("--security-opt=no-new-privileges");
     }
     if policy.read_only_root {
         command = command.arg("--read-only");
@@ -630,15 +630,14 @@ pub(crate) fn backup_managed_dependencies(
     prepare_oci_backup_output(&postgres)?;
 
     let validation = if selinux_relabel {
-        append_build_identity_policy(Process::new(command).args(["run", "--rm", "-v"]))
+        build_identity_process(command)
+            .arg("-v")
             .arg(format!("{}:/backup:ro,Z", backup.destination.display()))
     } else {
-        append_build_identity_policy(Process::new(command).args(["run", "--rm", "--mount"])).arg(
-            format!(
-                "type=bind,src={},dst=/backup,readonly",
-                backup.destination.display()
-            ),
-        )
+        build_identity_process(command).arg("--mount").arg(format!(
+            "type=bind,src={},dst=/backup,readonly",
+            backup.destination.display()
+        ))
     };
     validation
         .arg(&backup.postgres_validation_image)
@@ -1572,8 +1571,41 @@ mod tests {
         .unwrap();
         let arguments = fs::read_to_string(arguments).unwrap();
         assert!(arguments.contains("--user\n999:999\n"));
-        assert!(arguments.contains("--cap-drop\nALL\n"));
+        assert!(arguments.contains("--cap-drop=ALL\n"));
         assert!(arguments.contains("--read-only\n"));
+    }
+
+    #[test]
+    fn build_identity_policy_is_closed_before_the_image_positional() {
+        let work = PrivateTempDir::new("runtime-build-identity-order").unwrap();
+        let engine = work.path().join("fake-engine");
+        let arguments = work.path().join("arguments");
+        write_shell_executable(
+            &engine,
+            &format!("printf '%s\\n' \"$@\" > '{}'", arguments.display()),
+        );
+        let image = "example.invalid/nazoauth@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        super::build_identity_process(engine.as_os_str())
+            .args(["--network", "none"])
+            .arg(image)
+            .arg("nazoauth")
+            .arg("build-identity")
+            .run_quiet()
+            .unwrap();
+
+        let arguments = fs::read_to_string(arguments).unwrap();
+        let arguments = arguments.lines().collect::<Vec<_>>();
+        let policy = arguments
+            .iter()
+            .position(|argument| *argument == "--cap-drop=ALL")
+            .unwrap();
+        let image = arguments
+            .iter()
+            .position(|argument| *argument == image)
+            .unwrap();
+        assert!(policy < image);
+        assert!(!arguments.contains(&"ALL"));
     }
 
     #[test]
@@ -1872,11 +1904,17 @@ pub(crate) fn one_shot_process(
         .args(&task.command))
 }
 
-pub(crate) fn append_build_identity_policy(mut command: Process) -> Process {
+/// Start a hardened one-shot container command before any caller-controlled
+/// engine options or image reference are appended.
+///
+/// Taking the engine binary rather than a partially assembled `Process`
+/// makes it impossible to append policy flags after the image positional.
+pub(crate) fn build_identity_process(command: &OsStr) -> Process {
     let mut policy = ContainerRuntimePolicy::managed_default();
     policy.restart = ContainerRestartPolicy::No;
-    command = append_container_policy(command, &policy);
-    command.arg("--user").arg(NON_ROOT_ONE_SHOT_USER)
+    append_container_policy(Process::new(command).args(["run", "--rm"]), &policy)
+        .arg("--user")
+        .arg(NON_ROOT_ONE_SHOT_USER)
 }
 
 fn validate_non_root_user(user: &str, backend_name: &str) -> anyhow::Result<()> {
