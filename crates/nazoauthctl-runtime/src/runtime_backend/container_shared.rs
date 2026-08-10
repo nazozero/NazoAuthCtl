@@ -1569,7 +1569,7 @@ mod tests {
         write_shell_executable(
             &engine,
             &format!(
-                "if [ \"$*\" = 'container inspect managed-postgres --format {{json .}}' ]; then printf '%s\\n' 'no such object' >&2; exit 1; fi\nif [ \"$*\" = 'inspect managed-postgres' ]; then : > '{}'; exit 0; fi\nprintf '%s\\n' \"$@\" > '{}'\n",
+                "if [ \"$*\" = 'container inspect managed-postgres --format {{{{json .}}}}' ]; then printf '%s\\n' 'no such object' >&2; exit 1; fi\nif [ \"$*\" = 'inspect managed-postgres' ]; then : > '{}'; exit 0; fi\nprintf '%s\\n' \"$@\" > '{}'\n",
                 generic_marker.display(),
                 create_argv.display(),
             ),
