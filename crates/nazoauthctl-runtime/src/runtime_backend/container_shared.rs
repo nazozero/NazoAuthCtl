@@ -1218,6 +1218,23 @@ pub(crate) fn assert_managed_container_policy(
             bail!("{backend_name} managed container CPU limit drifted");
         }
     }
+    let observed_tmpfs = host_config
+        .get("Tmpfs")
+        .and_then(serde_json::Value::as_object)
+        .context("container inspect omitted tmpfs policy")?;
+    let expected_tmpfs = policy
+        .tmpfs
+        .iter()
+        .map(|tmpfs| tmpfs.destination.to_string_lossy().into_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    if observed_tmpfs
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        != expected_tmpfs
+    {
+        bail!("{backend_name} managed container tmpfs surface drifted");
+    }
     for tmpfs in &policy.tmpfs {
         let destination = tmpfs.destination.to_string_lossy();
         let observed = host_config
@@ -1644,8 +1661,7 @@ mod tests {
         let policy = super::ContainerRuntimePolicy::managed_default();
         let tmpfs = serde_json::json!({
             "/tmp": "rw,noexec,nosuid,nodev,size=67108864",
-            "/run/postgresql": "rw,noexec,nosuid,nodev,size=16777216",
-            "/var/run/postgresql": "rw,noexec,nosuid,nodev,size=16777216"
+            "/run/postgresql": "rw,noexec,nosuid,nodev,size=16777216"
         });
         for (extra_mount, extra_env, expected_error) in [
             (true, false, "undeclared mount"),
@@ -1903,14 +1919,10 @@ mod policy_tests {
         assert_eq!(policy.pids_limit, Some(512));
         assert_eq!(policy.memory_limit_bytes, Some(1024 * 1024 * 1024));
         assert_eq!(policy.cpu_limit_millis, Some(2_000));
-        assert_eq!(policy.tmpfs.len(), 3);
+        assert_eq!(policy.tmpfs.len(), 2);
         assert_eq!(
             policy.tmpfs[1].destination,
             std::path::Path::new("/run/postgresql")
-        );
-        assert_eq!(
-            policy.tmpfs[2].destination,
-            std::path::Path::new("/var/run/postgresql")
         );
     }
 }

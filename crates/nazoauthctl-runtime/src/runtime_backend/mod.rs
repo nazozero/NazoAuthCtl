@@ -298,7 +298,6 @@ impl ContainerRuntimePolicy {
             tmpfs: [
                 ("/tmp", 64 * 1024 * 1024),
                 ("/run/postgresql", 16 * 1024 * 1024),
-                ("/var/run/postgresql", 16 * 1024 * 1024),
             ]
             .into_iter()
             .map(|(destination, size_bytes)| NeutralTmpfs {
