@@ -40,7 +40,9 @@ pub(crate) use runtime::{
     verify_runtime_no_ddl,
 };
 use secrets::*;
-pub(crate) use secrets::{ensure_mfa_totp_configuration, ensure_mfa_totp_runtime};
+pub(crate) use secrets::{
+    ensure_mfa_totp_configuration, ensure_mfa_totp_runtime, reconcile_managed_secrets,
+};
 
 pub(crate) const POSTGRES_IMAGE: &str = "docker.io/library/postgres:18@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a";
 pub(crate) const VALKEY_IMAGE: &str = "docker.io/valkey/valkey:8-alpine@sha256:a038175878d66b9d274fbf8be73c0305e93798b83917647f167e18cef3c71eec";

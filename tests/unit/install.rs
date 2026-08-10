@@ -139,6 +139,19 @@ fn managed_dependency_credentials_are_outside_runtime_secret_directory() {
     assert!(valkey_acl.contains("user nazoauth_runtime on"));
     assert!(valkey_acl.contains("user nazoauth_backup on"));
     assert!(valkey_acl.contains("+lastsave +bgsave"));
+
+    fs::remove_file(dependencies.join("valkey-backup-password")).unwrap();
+    crate::filesystem::atomic_write(
+        &dependencies.join("valkey.acl"),
+        b"user default off\nuser nazoauth_runtime on >legacy ~* +get\n",
+        0o444,
+    )
+    .unwrap();
+    write_managed_secrets(&secrets, "example-postgres", "example-valkey").unwrap();
+    assert!(dependencies.join("valkey-backup-password").is_file());
+    let reconciled_acl = fs::read_to_string(dependencies.join("valkey.acl")).unwrap();
+    assert!(reconciled_acl.contains("user nazoauth_backup on"));
+    assert!(!reconciled_acl.contains(">legacy"));
 }
 
 #[test]

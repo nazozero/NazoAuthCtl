@@ -183,7 +183,11 @@ pub(super) fn install(
     if config_present {
         let config = load_config(&config_path)?;
         config.require_managed_lifecycle()?;
+        let managed_secrets_changed = install::reconcile_managed_secrets(&config)?;
         if install_is_complete(&config)? {
+            if managed_secrets_changed {
+                install::start_managed_dependencies(&config)?;
+            }
             if !health_ready(&config) {
                 bail!("managed installation is complete but not healthy; run nazoauthctl doctor");
             }

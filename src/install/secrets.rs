@@ -243,19 +243,70 @@ pub(super) fn write_managed_secrets(
     postgres_container: &str,
     valkey_container: &str,
 ) -> anyhow::Result<String> {
+    ensure_managed_secrets(secrets, postgres_container, valkey_container)?;
+    Ok("managed".to_owned())
+}
+
+pub(crate) fn reconcile_managed_secrets(config: &UpdateConfig) -> anyhow::Result<bool> {
+    if config.dependencies.mode != "managed" {
+        return Ok(false);
+    }
+    let secrets = config
+        .dependencies
+        .database_url_file
+        .parent()
+        .context("managed database URL has no secret directory")?;
+    for (configured, name) in [
+        (&config.dependencies.database_url_file, "database-url"),
+        (
+            &config.dependencies.migration_database_url_file,
+            "database-migration-url",
+        ),
+        (&config.dependencies.valkey_url_file, "valkey-url"),
+    ] {
+        if configured != &secrets.join(name) {
+            bail!("managed dependency secret paths do not share the installation secret root");
+        }
+    }
+    ensure_managed_secrets(
+        secrets,
+        &config.postgres.container_name,
+        &config.valkey.container_name,
+    )
+}
+
+fn ensure_managed_secrets(
+    secrets: &Path,
+    postgres_container: &str,
+    valkey_container: &str,
+) -> anyhow::Result<bool> {
     let dependencies = secrets.join("dependencies");
     create_directory(&dependencies, 0o700)?;
-    let postgres = generate_secret(&dependencies.join("postgres-password"))?;
-    let runtime_postgres = generate_secret(&dependencies.join("postgres-runtime-password"))?;
-    let valkey = generate_secret(&dependencies.join("valkey-password"))?;
-    let valkey_backup = generate_secret(&dependencies.join("valkey-backup-password"))?;
+    let postgres_path = dependencies.join("postgres-password");
+    let runtime_postgres_path = dependencies.join("postgres-runtime-password");
+    let valkey_path = dependencies.join("valkey-password");
+    let valkey_backup_path = dependencies.join("valkey-backup-password");
+    let mut changed = [
+        &postgres_path,
+        &runtime_postgres_path,
+        &valkey_path,
+        &valkey_backup_path,
+    ]
+    .into_iter()
+    .try_fold(false, |changed, path| {
+        Ok::<_, anyhow::Error>(changed | managed_material_is_missing(path)?)
+    })?;
+    let postgres = generate_secret(&postgres_path)?;
+    let runtime_postgres = generate_secret(&runtime_postgres_path)?;
+    let valkey = generate_secret(&valkey_path)?;
+    let valkey_backup = generate_secret(&valkey_backup_path)?;
     // Dependency containers use fixed internal UIDs unrelated to host groups.
     // The dependency-only parent remains root-owned 0700, and these bind mounts
     // are read-only in their containers, so runtime users cannot traverse to them.
-    set_mode(&dependencies.join("postgres-password"), 0o444)?;
-    set_mode(&dependencies.join("valkey-password"), 0o444)?;
-    set_mode(&dependencies.join("valkey-backup-password"), 0o400)?;
-    atomic_write(
+    set_mode(&postgres_path, 0o444)?;
+    set_mode(&valkey_path, 0o444)?;
+    set_mode(&valkey_backup_path, 0o400)?;
+    changed |= write_managed_material(
         &secrets.join("database-url"),
         format!(
             "postgresql://nazoauth_runtime:{}@{postgres_container}:5432/oauth",
@@ -264,7 +315,7 @@ pub(super) fn write_managed_secrets(
         .as_bytes(),
         0o440,
     )?;
-    atomic_write(
+    changed |= write_managed_material(
         &secrets.join("database-migration-url"),
         format!(
             "postgresql://nazoauth_migrator:{}@{postgres_container}:5432/oauth",
@@ -273,7 +324,7 @@ pub(super) fn write_managed_secrets(
         .as_bytes(),
         0o440,
     )?;
-    atomic_write(
+    changed |= write_managed_material(
         &secrets.join("valkey-url"),
         format!(
             "redis://{}:{}@{valkey_container}:6379/0",
@@ -283,7 +334,7 @@ pub(super) fn write_managed_secrets(
         .as_bytes(),
         0o440,
     )?;
-    atomic_write(
+    changed |= write_managed_material(
         &dependencies.join("valkey.acl"),
         format!(
             concat!(
@@ -303,7 +354,40 @@ pub(super) fn write_managed_secrets(
         .as_bytes(),
         0o444,
     )?;
-    Ok("managed".to_owned())
+    Ok(changed)
+}
+
+fn managed_material_is_missing(path: &Path) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect managed material {}", path.display())),
+    }
+}
+
+fn write_managed_material(path: &Path, value: &[u8], mode: u32) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let existing = crate::filesystem::read_secure_regular_file(
+                path,
+                "persisted managed material",
+                false,
+                64 * 1024,
+            )?;
+            if existing.as_slice() == value {
+                set_mode(path, mode)?;
+                return Ok(false);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect managed material {}", path.display()));
+        }
+    }
+    atomic_write(path, value, mode)?;
+    Ok(true)
 }
 
 pub(super) fn mfa_totp_key_path(config_dir: &Path) -> PathBuf {
