@@ -1813,7 +1813,7 @@ mod tests {
             let root = std::env::temp_dir()
                 .join(format!("nazoauthctl-materializer-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
-            fs::create_dir_all(&root).expect("root");
+            crate::secure_file::ensure_directory(&root, true).expect("private root");
             let (_, bundle) = DescriptorMaterializer::prepare(
                 descriptor(),
                 "https://issuer.example",
