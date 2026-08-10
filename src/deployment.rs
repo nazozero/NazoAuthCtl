@@ -455,7 +455,14 @@ impl DeploymentStore {
         {
             bail!("controller configuration, state, and break-glass roots must not overlap");
         }
-        validate_break_glass_device(&self.break_glass_root, &self.config_root, &self.state_root)?;
+        validate_independent_recovery_device(
+            &self.break_glass_root,
+            &[
+                ("controller configuration root", &self.config_root),
+                ("controller state root", &self.state_root),
+            ],
+            "break-glass root",
+        )?;
         Ok(())
     }
 
@@ -1155,45 +1162,42 @@ struct RegistrationJournal {
 }
 
 #[cfg(all(not(test), unix))]
-fn validate_break_glass_device(
-    break_glass: &Path,
-    config: &Path,
-    state: &Path,
+pub(crate) fn validate_independent_recovery_device(
+    recovery: &Path,
+    primary_roots: &[(&str, &Path)],
+    recovery_label: &str,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let metadata = fs::symlink_metadata(break_glass).with_context(|| {
+    let metadata = fs::symlink_metadata(recovery).with_context(|| {
         format!(
-            "break-glass root must be a pre-provisioned mounted failure domain: {}",
-            break_glass.display()
+            "{recovery_label} must be a pre-provisioned mounted failure domain: {}",
+            recovery.display()
         )
     })?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        bail!("break-glass root must be a real pre-provisioned directory");
+        bail!("{recovery_label} must be a real pre-provisioned directory");
     }
-    let break_glass_device = metadata.dev();
-    for (label, path) in [
-        ("controller configuration root", config),
-        ("controller state root", state),
-    ] {
+    let recovery_device = metadata.dev();
+    for (label, path) in primary_roots {
         let existing = nearest_existing_ancestor(path)?;
-        if fs::symlink_metadata(existing)?.dev() == break_glass_device {
-            bail!("break-glass root must be mounted on a different filesystem device from {label}");
+        if fs::symlink_metadata(existing)?.dev() == recovery_device {
+            bail!("{recovery_label} must be mounted on a different filesystem device from {label}");
         }
     }
     Ok(())
 }
 
 #[cfg(all(not(test), windows))]
-fn validate_break_glass_device(
-    break_glass: &Path,
-    config: &Path,
-    state: &Path,
+pub(crate) fn validate_independent_recovery_device(
+    recovery: &Path,
+    primary_roots: &[(&str, &Path)],
+    recovery_label: &str,
 ) -> anyhow::Result<()> {
     use std::path::Component;
 
-    if !break_glass.is_dir() {
-        bail!("break-glass root must be a pre-provisioned mounted failure domain");
+    if !recovery.is_dir() {
+        bail!("{recovery_label} must be a pre-provisioned mounted failure domain");
     }
     let volume = |path: &Path| -> anyhow::Result<std::ffi::OsString> {
         let existing = nearest_existing_ancestor(path)?;
@@ -1202,15 +1206,21 @@ fn validate_break_glass_device(
             _ => bail!("storage root has no provable Windows volume boundary"),
         }
     };
-    let break_glass_volume = volume(break_glass)?;
-    if volume(config)? == break_glass_volume || volume(state)? == break_glass_volume {
-        bail!("break-glass root must use a different Windows volume");
+    let recovery_volume = volume(recovery)?;
+    for (label, path) in primary_roots {
+        if volume(path)? == recovery_volume {
+            bail!("{recovery_label} must use a different Windows volume from {label}");
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
-fn validate_break_glass_device(_: &Path, _: &Path, _: &Path) -> anyhow::Result<()> {
+pub(crate) fn validate_independent_recovery_device(
+    _: &Path,
+    _: &[(&str, &Path)],
+    _: &str,
+) -> anyhow::Result<()> {
     // Unit-test temporary directories necessarily share one device. Production
     // binaries compile the platform-specific proof above; overlap and symlink
     // semantics remain covered in unit tests.
@@ -1218,8 +1228,12 @@ fn validate_break_glass_device(_: &Path, _: &Path, _: &Path) -> anyhow::Result<(
 }
 
 #[cfg(all(not(test), not(any(unix, windows))))]
-fn validate_break_glass_device(_: &Path, _: &Path, _: &Path) -> anyhow::Result<()> {
-    bail!("this platform cannot prove an independent break-glass storage device")
+pub(crate) fn validate_independent_recovery_device(
+    _: &Path,
+    _: &[(&str, &Path)],
+    recovery_label: &str,
+) -> anyhow::Result<()> {
+    bail!("this platform cannot prove an independent {recovery_label} storage device")
 }
 
 #[cfg(not(test))]

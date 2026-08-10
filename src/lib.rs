@@ -126,7 +126,8 @@ Options:
                                       Required only for standards-full; one explicit proxy host
   --data-root PATH                    Default: /var/lib/nazoauth
   --control-root PATH                 Default: /var/lib/nazoauthctl
-  --recovery-root PATH                Default: /var/lib/nazoauth-recovery; use a separate mount
+  --recovery-root PATH                Default: /var/lib/nazoauth-recovery; must be a separate mount
+                                      and owns durable backups plus break-glass material
   --port PORT                         Default: 8000
   --network-subnet CIDR               Optional fixed container subnet; requires --runtime-ip
   --runtime-ip ADDRESS                Optional fixed application IP; requires --network-subnet

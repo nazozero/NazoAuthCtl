@@ -147,7 +147,7 @@ pub(super) fn build_config(
         capabilities: crate::deployment::CapabilityGrants::controller_installed(),
         install_profile: options.profile.clone(),
         repository: "nazozero/NazoAuth".to_owned(),
-        backup_root: options.control_root.join("backups"),
+        backup_root: options.recovery_root.join("backups"),
         deployment_root: options.control_root.join("deployments"),
         operator,
         dependencies: Dependencies {

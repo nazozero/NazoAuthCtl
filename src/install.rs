@@ -116,6 +116,14 @@ pub(crate) fn prepare(
         .context("update config path has no parent")?;
     let secrets_dir = config_dir.join("secrets");
     let app_root = options.data_root.join("app");
+    crate::deployment::validate_independent_recovery_device(
+        &options.recovery_root,
+        &[
+            ("application root", &options.data_root),
+            ("controller root", &options.control_root),
+        ],
+        "installation recovery root",
+    )?;
     create_directory(config_dir, 0o755)?;
     create_directory(&options.data_root, 0o755)?;
     create_directory(&options.control_root, 0o700)?;
@@ -140,8 +148,8 @@ pub(crate) fn prepare(
     }
     create_directory(&secrets_dir, 0o700)?;
     create_directory(&options.data_root.join("ui-releases"), 0o755)?;
+    create_directory(&options.recovery_root.join("backups"), 0o700)?;
     for path in [
-        options.control_root.join("backups"),
         options.control_root.join("deployments"),
         options.control_root.join("audit"),
         options.control_root.join("operator-state"),
