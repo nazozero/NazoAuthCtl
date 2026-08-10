@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     deployment::RuntimeBackendKind,
     filesystem::atomic_write,
-    filesystem::{PrivateTempDir, sha256},
+    filesystem::{PrivateTempDir, read_secure_regular_file, sha256},
     model::{Artifact, ReleaseManifest, release_target, semantic_tag},
     process::{Process, command_exists},
     runtime_backend::{BlobAttestationVerification, backend},
@@ -93,8 +93,9 @@ pub(crate) fn enforce_release_trust(
     if !path.exists() {
         return Ok(());
     }
+    let bytes = read_secure_regular_file(path, "Release trust state", true, 64 * 1024)?;
     let state: ReleaseTrustState =
-        serde_json::from_slice(&fs::read(path)?).context("Release trust state is invalid")?;
+        serde_json::from_slice(&bytes).context("Release trust state is invalid")?;
     if state.schema != 1 {
         bail!("unsupported Release trust state");
     }
@@ -241,7 +242,7 @@ impl VerifiedRelease {
     }
 
     pub(crate) fn persist_verification_evidence(&self, destination: &Path) -> anyhow::Result<()> {
-        fs::create_dir_all(destination)?;
+        crate::filesystem::ensure_directory_chain(destination)?;
         atomic_write(
             &destination.join("server-release-manifest.json"),
             &serde_json::to_vec_pretty(&self.manifest)?,
@@ -261,7 +262,13 @@ impl VerifiedRelease {
             {
                 bail!("verified Release evidence contains an invalid bundle");
             }
-            atomic_write(&destination.join(name), &fs::read(entry.path())?, 0o400)?;
+            let bytes = read_secure_regular_file(
+                &entry.path(),
+                "verified Release attestation",
+                false,
+                MAX_GITHUB_JSON_BYTES,
+            )?;
+            atomic_write(&destination.join(name), &bytes, 0o400)?;
         }
         Ok(())
     }
@@ -373,7 +380,7 @@ impl VerifiedControllerRelease {
     }
 
     pub(crate) fn persist_evidence(&self, destination: &Path) -> anyhow::Result<()> {
-        fs::create_dir_all(destination)?;
+        crate::filesystem::ensure_directory_chain(destination)?;
         for entry in fs::read_dir(self.work.path())? {
             let entry = entry?;
             let name = entry.file_name();
@@ -381,7 +388,13 @@ impl VerifiedControllerRelease {
                 continue;
             };
             if name.starts_with("controller-attestation-") && name.ends_with(".json") {
-                atomic_write(&destination.join(name), &fs::read(entry.path())?, 0o400)?;
+                let bytes = read_secure_regular_file(
+                    &entry.path(),
+                    "verified controller attestation",
+                    false,
+                    MAX_GITHUB_JSON_BYTES,
+                )?;
+                atomic_write(&destination.join(name), &bytes, 0o400)?;
             }
         }
         Ok(())

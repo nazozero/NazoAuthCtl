@@ -16,6 +16,7 @@ use crate::{
 };
 
 const CONTAINER_SECRET_REVISION_PATH: &str = "/run/nazoauth-operator/secret-revision";
+const NAZOAUTH_CONTAINER_SERVICE_USER: &str = "10001:10001";
 
 #[derive(Debug)]
 pub(crate) struct PreparedAppTask {
@@ -105,6 +106,8 @@ impl<'a> Runtime<'a> {
         image_or_binary: &str,
         operation: &TaskOperation,
         public_jwk: Option<&Path>,
+        conformance_bundle: Option<&Path>,
+        conformance_output_directory: Option<&Path>,
         config_manifest: &[u8],
     ) -> anyhow::Result<PreparedAppTask> {
         self.write_task_context(config_manifest)?;
@@ -137,7 +140,13 @@ impl<'a> Runtime<'a> {
             },
             ArtifactReference::Unknown => bail!("operator task artifact is not verified"),
         };
-        let task = self.one_shot_task(artifact, operation, public_jwk)?;
+        let task = self.one_shot_task(
+            artifact,
+            operation,
+            public_jwk,
+            conformance_bundle,
+            conformance_output_directory,
+        )?;
         Ok(PreparedAppTask {
             backend,
             command_override: self.command_override(),
@@ -165,14 +174,30 @@ impl<'a> Runtime<'a> {
         ))
     }
 
+    fn dependency_backend(&self) -> anyhow::Result<Box<dyn runtime_backend::RuntimeBackend>> {
+        let kind = self
+            .config
+            .container_backend()
+            .context("managed dependencies require an explicit container backend")?;
+        Ok(selected_backend(kind, self.command_override().as_deref()))
+    }
+
     fn one_shot_task(
         &self,
         artifact: ArtifactReference,
         operation: &TaskOperation,
         public_jwk: Option<&Path>,
+        conformance_bundle: Option<&Path>,
+        conformance_output_directory: Option<&Path>,
     ) -> anyhow::Result<OneShotTask> {
         if self.backend_kind()? == RuntimeBackendKind::Systemd {
-            return self.systemd_one_shot_task(artifact, operation, public_jwk);
+            return self.systemd_one_shot_task(
+                artifact,
+                operation,
+                public_jwk,
+                conformance_bundle,
+                conformance_output_directory,
+            );
         }
         let mut mounts = Vec::new();
         let mut environment = BTreeMap::from([
@@ -277,6 +302,28 @@ impl<'a> Runtime<'a> {
                 "/run/nazoauth-operator/public.jwk".to_owned(),
             );
         }
+        if let Some(path) = conformance_bundle {
+            mounts.push(task_mount(
+                path,
+                Path::new("/run/nazoauth-operator/conformance-bundle.json"),
+                true,
+            ));
+            environment.insert(
+                "NAZOAUTH_OPERATOR_CONFORMANCE_BUNDLE_FILE".to_owned(),
+                "/run/nazoauth-operator/conformance-bundle.json".to_owned(),
+            );
+        }
+        if let Some(path) = conformance_output_directory {
+            mounts.push(task_mount(
+                path,
+                Path::new("/run/nazoauth-operator-output"),
+                false,
+            ));
+            environment.insert(
+                "NAZOAUTH_OPERATOR_OUTPUT_DIRECTORY".to_owned(),
+                "/run/nazoauth-operator-output".to_owned(),
+            );
+        }
         Ok(OneShotTask {
             artifact,
             command: match self.backend_kind()? {
@@ -291,8 +338,14 @@ impl<'a> Runtime<'a> {
             environment,
             working_directory: (self.backend_kind()? == RuntimeBackendKind::Systemd)
                 .then(|| self.config.runtime.working_directory.clone()),
-            service_user: (self.backend_kind()? == RuntimeBackendKind::Systemd)
-                .then(|| self.config.runtime.service_user.clone()),
+            service_user: Some(if self.backend_kind()? == RuntimeBackendKind::Systemd {
+                self.config.runtime.service_user.clone()
+            } else {
+                // The verified NazoAuth OCI artifact declares this immutable
+                // numeric identity. Operation-scoped tasks must never inherit
+                // engine root merely because the image metadata drifts.
+                NAZOAUTH_CONTAINER_SERVICE_USER.to_owned()
+            }),
             transient_credentials: BTreeMap::new(),
             read_only_paths: Vec::new(),
             read_write_paths: Vec::new(),
@@ -307,6 +360,8 @@ impl<'a> Runtime<'a> {
         artifact: ArtifactReference,
         operation: &TaskOperation,
         public_jwk: Option<&Path>,
+        conformance_bundle: Option<&Path>,
+        conformance_output_directory: Option<&Path>,
     ) -> anyhow::Result<OneShotTask> {
         let key_directory = self
             .config
@@ -417,6 +472,20 @@ impl<'a> Runtime<'a> {
                     path.display().to_string(),
                 );
             }
+        }
+        if let Some(path) = conformance_bundle {
+            transient_credentials.insert("conformance-bundle".to_owned(), path.to_path_buf());
+            environment.insert(
+                "NAZOAUTH_OPERATOR_CONFORMANCE_BUNDLE_FILE".to_owned(),
+                "%d/conformance-bundle".to_owned(),
+            );
+        }
+        if let Some(path) = conformance_output_directory {
+            read_write_paths.push(path.to_path_buf());
+            environment.insert(
+                "NAZOAUTH_OPERATOR_OUTPUT_DIRECTORY".to_owned(),
+                path.display().to_string(),
+            );
         }
         Ok(OneShotTask {
             artifact,
@@ -770,7 +839,7 @@ impl<'a> Runtime<'a> {
         let parent = archive
             .parent()
             .context("OCI recovery archive has no parent")?;
-        fs::create_dir_all(parent)?;
+        crate::filesystem::ensure_directory_chain(parent)?;
         let temporary = archive.with_extension("oci-archive.tmp");
         if temporary.exists() {
             fs::remove_file(&temporary)?;
@@ -802,8 +871,10 @@ impl<'a> Runtime<'a> {
         postgres_service_file: &Path,
         postgres_password_file: &Path,
     ) -> anyhow::Result<()> {
-        let backend = self.backend()?;
+        let backend = self.dependency_backend()?;
         let identity = self.managed_dependency_identity();
+        let (manifest_digest, completion_marker_digest) =
+            crate::runtime_backend::oci_backup_digests(backup_directory)?;
         backend.restore_managed_postgres(&ManagedPostgresRestore {
             network: self.config.runtime.network.clone(),
             postgres_object: self.config.postgres.container_name.clone(),
@@ -812,6 +883,8 @@ impl<'a> Runtime<'a> {
             service_file: postgres_service_file.to_path_buf(),
             password_file: postgres_password_file.to_path_buf(),
             image: self.config.postgres.validation_image.clone(),
+            manifest_digest: manifest_digest.clone(),
+            completion_marker_digest: completion_marker_digest.clone(),
             identity: identity.clone(),
         })?;
         backend.restore_managed_valkey(&ManagedValkeyRestore {
@@ -820,13 +893,15 @@ impl<'a> Runtime<'a> {
             data_volume: self.config.valkey.data_volume.clone(),
             backup_directory: backup_directory.to_path_buf(),
             image: self.config.valkey.image.clone(),
+            manifest_digest,
+            completion_marker_digest,
             identity,
         })
     }
 
     pub(crate) fn execute_managed_postgres(&self, sql: &[u8]) -> anyhow::Result<()> {
         let identity = self.managed_dependency_identity();
-        self.backend()?
+        self.dependency_backend()?
             .execute_managed_postgres(&ManagedPostgresCommand {
                 object_reference: self.config.postgres.container_name.clone(),
                 network: self.config.runtime.network.clone(),
@@ -993,6 +1068,7 @@ fn operation_uses_database(operation: &TaskOperation) -> bool {
     matches!(
         operation,
         TaskOperation::MigrateApply
+            | TaskOperation::ConformanceOnboardingApply { .. }
             | TaskOperation::ConformanceLeaseCreate { .. }
             | TaskOperation::ConformanceLeaseList
             | TaskOperation::ConformanceLeaseRevoke { .. }

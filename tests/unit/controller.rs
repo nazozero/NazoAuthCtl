@@ -16,6 +16,38 @@ use crate::{
 };
 
 #[test]
+fn self_update_install_path_is_normalized_and_non_symlink() {
+    let work = PrivateTempDir::new("nazoauth-self-update-install-path").unwrap();
+    let binary = work.path().join("nazoauthctl");
+    fs::write(&binary, b"controller").unwrap();
+    assert_eq!(controller_install_path(&binary).unwrap(), binary);
+    assert!(controller_install_path(Path::new("relative/controller")).is_err());
+    let navigated = work.path().join("missing/../controller");
+    if navigated.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        assert!(controller_install_path(&navigated).is_err());
+    } else {
+        // Windows may normalize the joined PathBuf before the API observes it;
+        // in that case the resulting value is already a normalized path.
+        assert_eq!(controller_install_path(&navigated).unwrap(), navigated);
+    }
+
+    let directory = work.path().join("directory");
+    fs::create_dir(&directory).unwrap();
+    assert!(controller_install_path(&directory).is_err());
+}
+
+#[test]
+fn self_update_journal_round_trip_preserves_phase_and_digest_bindings() {
+    let work = PrivateTempDir::new("nazoauth-self-update-journal").unwrap();
+    assert!(self_update_journal_round_trip_for_test(work.path()).unwrap());
+}
+
+#[test]
 fn operation_results_are_machine_readable_json() {
     let value: serde_json::Value = serde_json::from_str(
         &operation_result_json(&operator::OperationResult {
@@ -343,6 +375,8 @@ fn openid4vc_trust_export_uses_only_the_managed_key_directory() {
 #[cfg(unix)]
 #[test]
 fn openid4vc_trust_export_is_release_bound_audited_and_fail_closed() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
     let work = PrivateTempDir::new("openid4vc-trust-export-audit").unwrap();
     let output = work.path().join("export/trust-anchors.pem");
     fs::create_dir(output.parent().unwrap()).unwrap();
@@ -360,6 +394,23 @@ fn openid4vc_trust_export_is_release_bound_audited_and_fail_closed() {
     fs::create_dir(&bundle).unwrap();
     assert!(export_openid4vc_trust(&value, &output).is_err());
     fs::remove_dir(&bundle).unwrap();
+    fs::write(&bundle, format!("{OPENID4VC_TEST_LEAF}{OPENID4VC_TEST_CA}")).unwrap();
+
+    fs::set_permissions(&bundle, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(export_openid4vc_trust(&value, &output).is_err());
+    fs::set_permissions(&bundle, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let decoy = keys.join("decoy-certificate-bundle.pem");
+    fs::write(&decoy, format!("{OPENID4VC_TEST_LEAF}{OPENID4VC_TEST_CA}")).unwrap();
+    fs::set_permissions(&decoy, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_file(&bundle).unwrap();
+    symlink(&decoy, &bundle).unwrap();
+    assert!(export_openid4vc_trust(&value, &output).is_err());
+    fs::remove_file(&bundle).unwrap();
+
+    fs::write(&bundle, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    fs::set_permissions(&bundle, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(export_openid4vc_trust(&value, &output).is_err());
     fs::write(&bundle, format!("{OPENID4VC_TEST_LEAF}{OPENID4VC_TEST_CA}")).unwrap();
 
     fs::create_dir_all(&value.deployment_root).unwrap();
@@ -457,6 +508,11 @@ fn write_bootstrap_fixture(
         b"stable-deployment-bootstrap-binding",
     )
     .unwrap();
+    fs::set_permissions(
+        &config.operator.secret_revision_file,
+        fs::Permissions::from_mode(0o400),
+    )
+    .unwrap();
     fs::create_dir(&directory).unwrap();
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
     let token_path = directory.join(BOOTSTRAP_TOKEN_FILE);
@@ -505,6 +561,11 @@ fn write_bootstrap_pending_fixture(
     fs::write(
         &config.operator.secret_revision_file,
         b"stable-deployment-bootstrap-binding",
+    )
+    .unwrap();
+    fs::set_permissions(
+        &config.operator.secret_revision_file,
+        fs::Permissions::from_mode(0o400),
     )
     .unwrap();
     let pending = BootstrapAdminPending {
@@ -660,6 +721,42 @@ fn bootstrap_owner_policy_matches_real_container_and_host_runtime_identities() {
         .trim()
         .to_owned();
     assert_eq!(bootstrap_state_owner_uid(&config).unwrap(), actual_uid);
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_token_descriptor_rejects_symlink_unsafe_mode_and_oversize_inputs() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+    let work = PrivateTempDir::new("nazoauth-bootstrap-token-descriptor").unwrap();
+    let mut config = config(&work);
+    let token = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+    let token_path = write_bootstrap_fixture(&work, &mut config, token);
+    let owner_uid = fs::metadata(&token_path).unwrap().uid();
+    assert_eq!(
+        read_bootstrap_token(&token_path, Some(owner_uid)).unwrap(),
+        token
+    );
+
+    let decoy = token_path.with_file_name("decoy-token");
+    fs::write(&decoy, token).unwrap();
+    fs::set_permissions(&decoy, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(&token_path).unwrap();
+    symlink(&decoy, &token_path).unwrap();
+    assert!(read_bootstrap_token(&token_path, Some(owner_uid)).is_err());
+
+    fs::remove_file(&token_path).unwrap();
+    fs::write(&token_path, token).unwrap();
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(read_bootstrap_token(&token_path, Some(owner_uid)).is_err());
+
+    fs::write(
+        &token_path,
+        vec![b'x'; MAX_BOOTSTRAP_TOKEN_BYTES as usize + 1],
+    )
+    .unwrap();
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(read_bootstrap_token(&token_path, Some(owner_uid)).is_err());
 }
 
 #[cfg(unix)]
@@ -1279,6 +1376,12 @@ fn verified_journal_backup_is_opened_only_from_the_configured_root() {
             crate::filesystem::sha256(&backup.join("state.bin")).unwrap(),
             crate::filesystem::sha256(&backup.join("update-config.json")).unwrap(),
         ),
+    )
+    .unwrap();
+    let manifest_digest = crate::filesystem::sha256(&backup.join("SHA256SUMS")).unwrap();
+    fs::write(
+        backup.join("BACKUP-COMPLETE"),
+        format!("marker=BACKUP-COMPLETE\nversion=1\nmanifest-sha256={manifest_digest}\n"),
     )
     .unwrap();
     value.backup = Some(backup.clone());

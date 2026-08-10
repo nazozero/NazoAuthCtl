@@ -14,11 +14,11 @@ pub(crate) fn cache_trusted_runtime(
         ensure_adoption_recovery_slot(store, record)?;
         return Ok(());
     }
-    fs::create_dir_all(&directory)?;
+    crate::filesystem::ensure_directory_chain(&directory)?;
     let mut runtimes = BTreeMap::new();
     for runtime in &record.runtime_instances {
         let artifact_directory = directory.join(&runtime.runtime_instance_id);
-        fs::create_dir_all(&artifact_directory)?;
+        crate::filesystem::ensure_directory_chain(&artifact_directory)?;
         let cached = match &runtime.artifact {
             ArtifactReference::Oci {
                 image_reference,
@@ -72,15 +72,12 @@ pub(crate) fn cache_trusted_runtime(
                 sha256: expected,
             } => {
                 validate_lower_hex(expected)?;
-                if sha256(path)? != *expected {
-                    bail!("host runtime binary changed before recovery caching");
-                }
                 let binary = artifact_directory.join(if cfg!(windows) {
                     "nazoauth.exe"
                 } else {
                     "nazoauth"
                 });
-                copy_atomic(path, &binary, 0o500)?;
+                copy_atomic_verified(path, &binary, 0o500, expected)?;
                 set_mode(&binary, 0o500)?;
                 if sha256(&binary)? != *expected {
                     bail!("cached host runtime binary changed during persistence");
@@ -147,27 +144,32 @@ pub(crate) fn stage_update_release(
         let cache = load_cache(&manifest_path, &staged_record)?;
         return validate_cached_artifacts(&cache);
     }
-    fs::create_dir_all(&directory)?;
+    crate::filesystem::ensure_directory_chain(&directory)?;
     let mut runtimes = BTreeMap::new();
     for runtime in &record.runtime_instances {
         let artifact_directory = directory.join(&runtime.runtime_instance_id);
-        fs::create_dir_all(&artifact_directory)?;
+        crate::filesystem::ensure_directory_chain(&artifact_directory)?;
         let cached = if runtime.backend == RuntimeBackendKind::Systemd {
             let source = release.artifact("binary", "nazozero/NazoAuth")?;
-            let expected = crate::filesystem::sha256(&source)?;
+            let expected = release
+                .manifest
+                .artifacts
+                .get("binary")
+                .map(|artifact| artifact.sha256.as_str())
+                .context("signed Release has no binary digest")?;
             let binary = artifact_directory.join(if cfg!(windows) {
                 "nazoauth.exe"
             } else {
                 "nazoauth"
             });
-            copy_atomic(&source, &binary, 0o500)?;
+            copy_atomic_verified(&source, &binary, 0o500, expected)?;
             set_mode(&binary, 0o500)?;
             if crate::filesystem::sha256(&binary)? != expected {
                 bail!("staged host Release changed while entering the recovery cache");
             }
             CachedRuntimeArtifact::HostBinary {
                 binary,
-                sha256: expected,
+                sha256: expected.to_owned(),
             }
         } else {
             let runtime_backend = backend(runtime.backend);

@@ -10,10 +10,14 @@ use anyhow::{Context as _, bail};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
-use crate::filesystem::{atomic_write, open_lock_file, read_regular_file};
+use crate::filesystem::{atomic_write, open_lock_file, read_secure_regular_file};
 
 pub(crate) const REGISTRY_SCHEMA: u32 = 1;
 pub(crate) const DEPLOYMENT_SCHEMA: u32 = 1;
+const REGISTRATION_JOURNAL_SCHEMA: u32 = 1;
+const REGISTRY_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const DEPLOYMENT_DECLARATION_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const REGISTRATION_JOURNAL_MAX_BYTES: u64 = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -22,35 +26,10 @@ pub(crate) enum TrustState {
     Adopted,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum Responsibility {
-    External,
-    Delegated,
-    Managed,
-}
-
-impl Responsibility {
-    pub(crate) fn permits_mutation(self) -> bool {
-        matches!(self, Self::Delegated | Self::Managed)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum ResourceScope {
-    Deployment,
-    Shared,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum RuntimeBackendKind {
-    Podman,
-    Docker,
-    #[serde(alias = "host")]
-    Systemd,
-}
+pub(crate) use nazoauthctl_runtime::{
+    ArtifactReference, MountReference, ResourceScope, Responsibility, RuntimeBackendKind,
+    RuntimeInstance,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -194,47 +173,6 @@ impl CapabilityGrants {
         }
         Ok(())
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub(crate) enum ArtifactReference {
-    Oci {
-        image_reference: String,
-        digest: String,
-    },
-    HostBinary {
-        path: PathBuf,
-        sha256: String,
-    },
-    Unknown,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RuntimeInstance {
-    pub(crate) runtime_instance_id: String,
-    pub(crate) backend: RuntimeBackendKind,
-    pub(crate) object_reference: String,
-    pub(crate) artifact: ArtifactReference,
-    #[serde(default)]
-    pub(crate) local_artifact_id: Option<String>,
-    pub(crate) ports: Vec<String>,
-    pub(crate) networks: Vec<String>,
-    pub(crate) mounts: Vec<MountReference>,
-    pub(crate) instance_key_id: Option<String>,
-    pub(crate) deployment_statement: Option<PathBuf>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct MountReference {
-    pub(crate) source: PathBuf,
-    pub(crate) destination: PathBuf,
-    pub(crate) read_only: bool,
-    pub(crate) selinux_relabel: bool,
-    pub(crate) scope: ResourceScope,
-    pub(crate) ownership: Responsibility,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -451,6 +389,55 @@ impl DeploymentStore {
         self.config_root.join("registry.json")
     }
 
+    /// Return whether the registration registry exists without following a
+    /// link.  Callers use this only to choose the registered/legacy command
+    /// boundary; the subsequent load still validates the same descriptor.
+    pub(crate) fn registry_present(&self) -> anyhow::Result<bool> {
+        self.validate_failure_domains()?;
+        if self.registration_pending()? {
+            bail!("deployment registration transaction is pending; rerun install to reconcile it");
+        }
+        let path = self.registry_path();
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
+            Ok(_) => bail!(
+                "deployment registry must be a regular non-symlink file: {}",
+                path.display()
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).with_context(|| {
+                format!("failed to inspect deployment registry {}", path.display())
+            }),
+        }
+    }
+
+    fn registration_pending(&self) -> anyhow::Result<bool> {
+        let directory = self.state_root.join("transactions");
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", directory.display()));
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("controller transaction directory is not a real directory");
+        }
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("registration-") && name.ends_with(".json") {
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    bail!("registration journal must be a regular non-symlink file");
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn validate_failure_domains(&self) -> anyhow::Result<()> {
         for (label, path) in [
             ("controller configuration root", &self.config_root),
@@ -466,8 +453,9 @@ impl DeploymentStore {
             || paths_overlap(&state_identity, &config_identity)
             || paths_overlap(&break_glass_identity, &config_identity)
         {
-            bail!("break-glass material must use a separate storage failure domain");
+            bail!("controller configuration, state, and break-glass roots must not overlap");
         }
+        validate_break_glass_device(&self.break_glass_root, &self.config_root, &self.state_root)?;
         Ok(())
     }
 
@@ -484,12 +472,19 @@ impl DeploymentStore {
         ] {
             if matches!(fs::symlink_metadata(path), Err(error) if error.kind() == ErrorKind::NotFound)
             {
-                fs::create_dir_all(path)
+                crate::filesystem::ensure_directory_chain(path)
                     .with_context(|| format!("failed to create {label} {}", path.display()))?;
                 crate::filesystem::set_mode(path, 0o700)?;
             }
             validate_storage_root(path, label, private)?;
         }
+        let transactions = self.state_root.join("transactions");
+        if !path_present(&transactions)? {
+            crate::filesystem::ensure_directory_chain(&transactions)
+                .with_context(|| format!("failed to create {}", transactions.display()))?;
+            crate::filesystem::set_mode(&transactions, 0o700)?;
+        }
+        ensure_real_directory(&transactions, "controller transaction directory")?;
         self.validate_failure_domains()
     }
 
@@ -498,6 +493,18 @@ impl DeploymentStore {
             .join("deployments")
             .join(deployment_id)
             .join("deployment.json")
+    }
+
+    pub(crate) fn registration_journal_path(&self, deployment_id: &str) -> PathBuf {
+        self.state_root
+            .join("transactions")
+            .join(format!("registration-{deployment_id}.json"))
+    }
+
+    pub(crate) fn identity_rotation_journal_path(&self, deployment_id: &str) -> PathBuf {
+        self.deployment_state_dir(deployment_id)
+            .join("transactions")
+            .join("identity-rotation.json")
     }
 
     pub(crate) fn deployment_state_dir(&self, deployment_id: &str) -> PathBuf {
@@ -513,11 +520,25 @@ impl DeploymentStore {
     pub(crate) fn load_registry(&self) -> anyhow::Result<Registry> {
         self.validate_failure_domains()?;
         let path = self.registry_path();
-        let Some(bytes) = read_regular_file(&path)? else {
-            return Ok(Registry {
-                schema: REGISTRY_SCHEMA,
-                deployments: BTreeMap::new(),
-            });
+        let bytes = match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    bail!(
+                        "registry must be a regular non-symlink file: {}",
+                        path.display()
+                    );
+                }
+                read_secure_regular_file(&path, "deployment registry", false, REGISTRY_MAX_BYTES)?
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok(Registry {
+                    schema: REGISTRY_SCHEMA,
+                    deployments: BTreeMap::new(),
+                });
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+            }
         };
         let registry: Registry = serde_json::from_slice(&bytes).context("registry is invalid")?;
         if registry.schema != REGISTRY_SCHEMA {
@@ -530,8 +551,28 @@ impl DeploymentStore {
         self.validate_failure_domains()?;
         validate_identifier(deployment_id, "deployment ID")?;
         let path = self.declaration_path(deployment_id);
-        let bytes = read_regular_file(&path)?
-            .with_context(|| format!("failed to read {}", path.display()))?;
+        let bytes = match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    bail!(
+                        "deployment declaration must be a regular non-symlink file: {}",
+                        path.display()
+                    );
+                }
+                read_secure_regular_file(
+                    &path,
+                    "deployment declaration",
+                    false,
+                    DEPLOYMENT_DECLARATION_MAX_BYTES,
+                )?
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                bail!("failed to read {}", path.display());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+            }
+        };
         let record: DeploymentRecord =
             serde_json::from_slice(&bytes).context("deployment declaration is invalid")?;
         record.validate()?;
@@ -599,33 +640,193 @@ impl DeploymentStore {
     pub(crate) fn persist_locked(&self, record: &DeploymentRecord) -> anyhow::Result<()> {
         self.ensure_storage_roots()?;
         record.validate()?;
-        let mut registry = self.load_registry()?;
+        let journal_path = self.registration_journal_path(&record.deployment_id);
+        let registration_journal_present = match fs::symlink_metadata(&journal_path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    bail!(
+                        "registration journal must be a regular non-symlink file: {}",
+                        journal_path.display()
+                    );
+                }
+                true
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", journal_path.display()));
+            }
+        };
+        if registration_journal_present {
+            let journal_bytes = read_secure_regular_file(
+                &journal_path,
+                "registration journal",
+                true,
+                REGISTRATION_JOURNAL_MAX_BYTES,
+            )?;
+            let journal: RegistrationJournal = serde_json::from_slice(&journal_bytes)
+                .context("registration journal is invalid")?;
+            if journal.schema != REGISTRATION_JOURNAL_SCHEMA
+                || journal.deployment_id != record.deployment_id
+            {
+                bail!("registration journal does not bind to the requested deployment");
+            }
+            if journal.record != *record && !registration_identity_matches(&journal.record, record)
+            {
+                bail!("a different registration is already pending for this deployment");
+            }
+            self.reconcile_registration_locked(&journal, &journal_path)?;
+            return Ok(());
+        }
+
+        let declaration = self.declaration_path(&record.deployment_id);
+        let mut target_record = record.clone();
+        if path_present(&declaration)? {
+            let existing = self.load(&record.deployment_id)?;
+            if existing != *record {
+                if !registration_identity_matches(&existing, record) {
+                    bail!("deployment declaration already exists with different identity");
+                }
+                // A completed install may be retried after later declaration
+                // revisions.  Reconcile the authoritative existing record
+                // and its registry/state fan-out; never replace it with the
+                // stale install snapshot.
+                target_record = existing;
+            }
+        }
+        let registry = self.load_registry()?;
         if registry.deployments.iter().any(|(id, entry)| {
-            id != &record.deployment_id && record.alias.is_some() && entry.alias == record.alias
+            id != &target_record.deployment_id
+                && target_record.alias.is_some()
+                && entry.alias == target_record.alias
         }) {
             bail!("deployment alias is already registered");
         }
-        let declaration = self.declaration_path(&record.deployment_id);
-        atomic_write(&declaration, &serde_json::to_vec_pretty(record)?, 0o640)?;
-        registry.deployments.insert(
-            record.deployment_id.clone(),
-            RegistryEntry {
-                alias: record.alias.clone(),
-                declaration,
-            },
-        );
-        atomic_write(
-            &self.registry_path(),
-            &serde_json::to_vec_pretty(&registry)?,
-            0o640,
-        )?;
-        for directory in ["identities", "audit", "transactions", "recovery"] {
-            fs::create_dir_all(
-                self.deployment_state_dir(&record.deployment_id)
-                    .join(directory),
+        let journal = RegistrationJournal {
+            schema: REGISTRATION_JOURNAL_SCHEMA,
+            deployment_id: target_record.deployment_id.clone(),
+            phase: RegistrationPhase::Prepared,
+            record: target_record,
+        };
+        self.write_registration_journal(&journal_path, &journal)?;
+        self.reconcile_registration_locked(&journal, &journal_path)?;
+        Ok(())
+    }
+
+    fn write_registration_journal(
+        &self,
+        path: &Path,
+        journal: &RegistrationJournal,
+    ) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec_pretty(journal)?;
+        if bytes.len() as u64 > REGISTRATION_JOURNAL_MAX_BYTES {
+            bail!("registration journal exceeds its size limit");
+        }
+        atomic_write(path, &bytes, 0o600)
+    }
+
+    fn reconcile_registration_locked(
+        &self,
+        journal: &RegistrationJournal,
+        journal_path: &Path,
+    ) -> anyhow::Result<()> {
+        if journal.schema != REGISTRATION_JOURNAL_SCHEMA
+            || journal.deployment_id != journal.record.deployment_id
+        {
+            bail!("registration journal is invalid");
+        }
+        journal.record.validate()?;
+        let declaration = self.declaration_path(&journal.deployment_id);
+        let deployment_dir = declaration
+            .parent()
+            .context("deployment declaration path has no deployment directory")?;
+        let deployments_dir = deployment_dir
+            .parent()
+            .context("deployment declaration path has no deployments directory")?;
+        ensure_real_directory(deployments_dir, "deployment declarations directory")?;
+        if !path_present(deployments_dir)? {
+            crate::filesystem::ensure_directory_chain(deployments_dir)?;
+            crate::filesystem::set_mode(deployments_dir, 0o700)?;
+        }
+        ensure_real_directory(deployment_dir, "deployment declaration directory")?;
+        if !path_present(deployment_dir)? {
+            crate::filesystem::ensure_directory_chain(deployment_dir)?;
+            crate::filesystem::set_mode(deployment_dir, 0o700)?;
+        }
+        if path_present(&declaration)? {
+            let existing = self.load(&journal.deployment_id)?;
+            if existing != journal.record {
+                bail!("deployment declaration conflicts with registration journal");
+            }
+        } else {
+            atomic_write(
+                &declaration,
+                &serde_json::to_vec_pretty(&journal.record)?,
+                0o640,
             )?;
         }
-        Ok(())
+        if journal.phase == RegistrationPhase::Prepared {
+            let mut next = journal.clone();
+            next.phase = RegistrationPhase::DeclarationCommitted;
+            self.write_registration_journal(journal_path, &next)?;
+        }
+
+        let mut registry = self.load_registry()?;
+        if registry.deployments.iter().any(|(id, entry)| {
+            id != &journal.deployment_id
+                && journal.record.alias.is_some()
+                && entry.alias == journal.record.alias
+        }) {
+            bail!("deployment alias is already registered");
+        }
+        let registry_entry = RegistryEntry {
+            alias: journal.record.alias.clone(),
+            declaration: declaration.clone(),
+        };
+        if registry.deployments.get(&journal.deployment_id) != Some(&registry_entry) {
+            registry
+                .deployments
+                .insert(journal.deployment_id.clone(), registry_entry);
+            atomic_write(
+                &self.registry_path(),
+                &serde_json::to_vec_pretty(&registry)?,
+                0o640,
+            )?;
+        }
+        if journal.phase <= RegistrationPhase::DeclarationCommitted {
+            let mut next = journal.clone();
+            next.phase = RegistrationPhase::RegistryCommitted;
+            self.write_registration_journal(journal_path, &next)?;
+        }
+
+        let state = self.deployment_state_dir(&journal.deployment_id);
+        let deployments = state
+            .parent()
+            .context("deployment state path has no deployments parent")?;
+        ensure_real_directory(deployments, "deployment state deployments directory")?;
+        if !path_present(deployments)? {
+            crate::filesystem::ensure_directory_chain(deployments)?;
+            crate::filesystem::set_mode(deployments, 0o700)?;
+        }
+        ensure_real_directory(&state, "deployment state directory")?;
+        if !path_present(&state)? {
+            crate::filesystem::ensure_directory_chain(&state)?;
+            crate::filesystem::set_mode(&state, 0o700)?;
+        }
+        for directory in ["identities", "audit", "transactions", "recovery"] {
+            let path = state.join(directory);
+            ensure_real_directory(&path, "deployment state subdirectory")?;
+            if !path_present(&path)? {
+                crate::filesystem::ensure_directory_chain(&path)?;
+                crate::filesystem::set_mode(&path, 0o700)?;
+            }
+        }
+        if journal.phase <= RegistrationPhase::RegistryCommitted {
+            let mut next = journal.clone();
+            next.phase = RegistrationPhase::StateCommitted;
+            self.write_registration_journal(journal_path, &next)?;
+        }
+        crate::filesystem::remove_file_durable(journal_path)
     }
 
     #[cfg(test)]
@@ -889,6 +1090,151 @@ fn storage_identity(path: &Path) -> anyhow::Result<PathBuf> {
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
+}
+
+fn path_present(path: &Path) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn ensure_real_directory(path: &Path, label: &str) -> anyhow::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => bail!("{label} is not a real directory: {}", path.display()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn registration_identity_matches(
+    existing: &DeploymentRecord,
+    requested: &DeploymentRecord,
+) -> bool {
+    let runtime_identity = |record: &DeploymentRecord| {
+        record
+            .runtime_instances
+            .iter()
+            .map(|runtime| {
+                (
+                    runtime.runtime_instance_id.clone(),
+                    runtime.backend,
+                    runtime.object_reference.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    existing.deployment_id == requested.deployment_id
+        && existing.control_authority == requested.control_authority
+        && existing.issuer == requested.issuer
+        && runtime_identity(existing) == runtime_identity(requested)
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum RegistrationPhase {
+    Prepared,
+    DeclarationCommitted,
+    RegistryCommitted,
+    StateCommitted,
+}
+
+/// Durable intent for the multi-file registration commit.  Declaration,
+/// registry and state directories live in separate failure domains, so a
+/// retry must know the exact declaration it is reconciling rather than
+/// treating an existing declaration as proof that registration completed.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RegistrationJournal {
+    schema: u32,
+    deployment_id: String,
+    phase: RegistrationPhase,
+    record: DeploymentRecord,
+}
+
+#[cfg(all(not(test), unix))]
+fn validate_break_glass_device(
+    break_glass: &Path,
+    config: &Path,
+    state: &Path,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::symlink_metadata(break_glass).with_context(|| {
+        format!(
+            "break-glass root must be a pre-provisioned mounted failure domain: {}",
+            break_glass.display()
+        )
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("break-glass root must be a real pre-provisioned directory");
+    }
+    let break_glass_device = metadata.dev();
+    for (label, path) in [
+        ("controller configuration root", config),
+        ("controller state root", state),
+    ] {
+        let existing = nearest_existing_ancestor(path)?;
+        if fs::symlink_metadata(existing)?.dev() == break_glass_device {
+            bail!("break-glass root must be mounted on a different filesystem device from {label}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(not(test), windows))]
+fn validate_break_glass_device(
+    break_glass: &Path,
+    config: &Path,
+    state: &Path,
+) -> anyhow::Result<()> {
+    use std::path::Component;
+
+    if !break_glass.is_dir() {
+        bail!("break-glass root must be a pre-provisioned mounted failure domain");
+    }
+    let volume = |path: &Path| -> anyhow::Result<std::ffi::OsString> {
+        let existing = nearest_existing_ancestor(path)?;
+        match existing.components().next() {
+            Some(Component::Prefix(prefix)) => Ok(prefix.as_os_str().to_owned()),
+            _ => bail!("storage root has no provable Windows volume boundary"),
+        }
+    };
+    let break_glass_volume = volume(break_glass)?;
+    if volume(config)? == break_glass_volume || volume(state)? == break_glass_volume {
+        bail!("break-glass root must use a different Windows volume");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_break_glass_device(_: &Path, _: &Path, _: &Path) -> anyhow::Result<()> {
+    // Unit-test temporary directories necessarily share one device. Production
+    // binaries compile the platform-specific proof above; overlap and symlink
+    // semantics remain covered in unit tests.
+    Ok(())
+}
+
+#[cfg(all(not(test), not(any(unix, windows))))]
+fn validate_break_glass_device(_: &Path, _: &Path, _: &Path) -> anyhow::Result<()> {
+    bail!("this platform cannot prove an independent break-glass storage device")
+}
+
+#[cfg(not(test))]
+fn nearest_existing_ancestor(mut path: &Path) -> anyhow::Result<&Path> {
+    loop {
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Ok(path),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                path = path
+                    .parent()
+                    .context("storage root has no existing ancestor")?;
+            }
+            Err(error) => return Err(error).context("failed to inspect storage ancestor"),
+        }
+    }
 }
 
 pub(crate) struct FileLock {

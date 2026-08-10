@@ -1,9 +1,16 @@
-use std::{collections::BTreeMap, fs};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+};
 
 use serde_json::json;
 
 use super::*;
 use crate::{
+    deployment::{
+        ArtifactReference, CapabilityGrants, DEPLOYMENT_SCHEMA, RecoveryAssessment,
+        RecoveryConclusion, RuntimeInstance,
+    },
     filesystem::PrivateTempDir,
     model::{Dependencies, Operator, Postgres, Runtime as RuntimeConfig, Ui, Valkey},
     runtime::Runtime,
@@ -499,6 +506,8 @@ fn host_task_uses_transient_credentials_and_hides_unrelated_state() {
             &binary.to_string_lossy(),
             &TaskOperation::MigrateApply,
             None,
+            None,
+            None,
             b"{}",
         )
         .unwrap();
@@ -528,6 +537,8 @@ fn host_task_uses_transient_credentials_and_hides_unrelated_state() {
         .prepare_app_task(
             &binary.to_string_lossy(),
             &TaskOperation::ConformanceLeaseCleanup,
+            None,
+            None,
             None,
             b"{}",
         )
@@ -559,6 +570,7 @@ fn pending_intent_reuses_jti_and_only_unobserved_expired_intent_is_reissued() {
         embedded.clone(),
         binding.clone(),
         operation.clone(),
+        None,
     )
     .unwrap();
     let (same, same_compact, _) = load_or_issue_task(
@@ -567,6 +579,7 @@ fn pending_intent_reuses_jti_and_only_unobserved_expired_intent_is_reissued() {
         embedded.clone(),
         binding.clone(),
         operation.clone(),
+        None,
     )
     .unwrap();
     assert_eq!(first.jti, same.jti);
@@ -591,6 +604,7 @@ fn pending_intent_reuses_jti_and_only_unobserved_expired_intent_is_reissued() {
         embedded.clone(),
         binding.clone(),
         operation.clone(),
+        None,
     )
     .unwrap();
     assert_ne!(reissued.jti, expired.jti);
@@ -617,7 +631,7 @@ fn pending_intent_reuses_jti_and_only_unobserved_expired_intent_is_reissued() {
     )
     .unwrap();
     let (preserved, preserved_compact, _) =
-        load_or_issue_task(&config, target, embedded, binding, operation).unwrap();
+        load_or_issue_task(&config, target, embedded, binding, operation, None).unwrap();
     assert_eq!(preserved.jti, observed.jti);
     assert_eq!(
         verify_task_signature(
@@ -644,6 +658,7 @@ fn persisted_operator_intent_symlink_fails_closed() {
         embedded.clone(),
         binding.clone(),
         operation.clone(),
+        None,
     )
     .unwrap();
     fs::remove_file(&path).unwrap();
@@ -651,12 +666,12 @@ fn persisted_operator_intent_symlink_fails_closed() {
     fs::write(&external, compact).unwrap();
     symlink(&external, &path).unwrap();
 
-    assert!(load_or_issue_task(&config, target, embedded, binding, operation).is_err());
+    assert!(load_or_issue_task(&config, target, embedded, binding, operation, None).is_err());
     assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
 }
 
 #[test]
-fn stale_audit_head_repairs_forward_but_tampering_fails_closed() {
+fn stale_audit_head_is_read_only_and_writer_recovery_repairs_it() {
     let work = PrivateTempDir::new("nazoauth-audit-test").unwrap();
     let config = config(&work);
     let event = append_management_event(&config, "install", "v1.0.0", "backup").unwrap();
@@ -670,12 +685,26 @@ fn stale_audit_head_repairs_forward_but_tampering_fails_closed() {
         0o600,
     )
     .unwrap();
+    assert!(verify_audit(&config).is_err());
+    let unchanged: AuditHead = serde_json::from_slice(
+        &fs::read(config.operator.audit_directory.join("management-head.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(unchanged.sequence, 0);
+    append_management_event_idempotent(
+        &config,
+        "writer-recovery",
+        "update-completed",
+        "v1.0.0",
+        "backup",
+    )
+    .unwrap();
     verify_audit(&config).unwrap();
     let repaired: AuditHead = serde_json::from_slice(
         &fs::read(config.operator.audit_directory.join("management-head.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(repaired.sequence, 1);
+    assert_eq!(repaired.sequence, 2);
     let mut compact = fs::read_to_string(&event).unwrap();
     compact.push('x');
     atomic_write(&event, compact.as_bytes(), 0o400).unwrap();
@@ -982,6 +1011,95 @@ fn controller_and_audit_rotation_chain_survives_normal_and_break_glass_recovery(
 }
 
 #[test]
+fn registered_rotation_cas_binds_declaration_and_recovers_audit_history() {
+    let work = PrivateTempDir::new("nazoauth-registered-rotation-test").unwrap();
+    let config_path = work.path().join("update.json");
+    let mut config = config(&work);
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    recover_pending_rotation(&config_path, &mut config).unwrap();
+
+    let store = DeploymentStore {
+        config_root: work.path().join("registry-config"),
+        state_root: work.path().join("registry-state"),
+        break_glass_root: work.path().join("registry-break-glass"),
+    };
+    let record = DeploymentRecord {
+        schema: DEPLOYMENT_SCHEMA,
+        deployment_id: config.operator.deployment_id.clone(),
+        control_authority: config.operator.controller_key_id.clone(),
+        alias: None,
+        issuer: config.runtime.expected_issuer.clone(),
+        active_release: EmbeddedIdentity {
+            release: "v0.1.0".to_owned(),
+            revision: "a".repeat(40),
+            protocol: nazo_operator_protocol::PROTOCOL_VERSION,
+            build_id: "build:test".to_owned(),
+        },
+        trust: TrustState::Adopted,
+        capabilities: CapabilityGrants::controller_installed(),
+        runtime_instances: vec![RuntimeInstance {
+            runtime_instance_id: config.runtime.runtime_instance_id.clone(),
+            backend: config.runtime.backend,
+            object_reference: config.runtime.service_name.clone(),
+            artifact: ArtifactReference::Unknown,
+            local_artifact_id: None,
+            ports: Vec::new(),
+            networks: Vec::new(),
+            mounts: Vec::new(),
+            instance_key_id: None,
+            deployment_statement: None,
+        }],
+        resources: BTreeMap::from([
+            (
+                "controller_config".to_owned(),
+                SafeReference::File {
+                    path: config_path.clone(),
+                },
+            ),
+            (
+                "audit_private_key".to_owned(),
+                SafeReference::File {
+                    path: config.operator.audit_private_key.clone(),
+                },
+            ),
+            (
+                "break_glass_private_key".to_owned(),
+                SafeReference::File {
+                    path: config.operator.break_glass_private_key.clone(),
+                },
+            ),
+        ]),
+        recovery: RecoveryAssessment {
+            conclusion: RecoveryConclusion::Proven,
+            evidence: Vec::new(),
+            off_host_package_required_for_machine_loss: true,
+        },
+        operator_protocol_versions: BTreeSet::from([1]),
+        control_protocol_versions: BTreeSet::from([1]),
+        declaration_revision: 1,
+    };
+    store.persist(&record).unwrap();
+    let _lock = store.deployment_lock(&record.deployment_id).unwrap();
+
+    let result =
+        rotate_registered_controller(&store, &record, &config_path, &config, false, "normal")
+            .unwrap();
+    assert_eq!(result.previous_controller_key_id, record.control_authority);
+    let updated = store.load(&record.deployment_id).unwrap();
+    assert_ne!(updated.control_authority, record.control_authority);
+    assert_eq!(updated.declaration_revision, 2);
+    assert!(
+        !store
+            .identity_rotation_journal_path(&record.deployment_id)
+            .exists()
+    );
+    let active: UpdateConfig = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(active.operator.controller_key_id, updated.control_authority);
+    assert_ne!(active.operator.audit_key_id, config.operator.audit_key_id);
+    verify_audit(&active).unwrap();
+}
+
+#[test]
 fn operator_target_and_receipt_bindings_are_closed_over_every_claim() {
     let work = PrivateTempDir::new("nazoauth-operator-binding-test").unwrap();
     let config = config(&work);
@@ -992,6 +1110,7 @@ fn operator_target_and_receipt_bindings_are_closed_over_every_claim() {
         embedded.clone(),
         binding.clone(),
         operation,
+        None,
     )
     .unwrap();
     let host_claim = RuntimeTargetClaim::HostBinary {
@@ -1222,7 +1341,7 @@ fn nonempty_receipt_chain_and_public_audit_rendering_are_verified() {
     let config = config(&work);
     let (target, embedded, binding, operation) = task_parts();
     let (task, compact_task, _) =
-        load_or_issue_task(&config, target, embedded, binding, operation).unwrap();
+        load_or_issue_task(&config, target, embedded, binding, operation, None).unwrap();
     let receipt = nazo_operator_protocol::FinalReceipt {
         ver: nazo_operator_protocol::PROTOCOL_VERSION,
         iss: task.iss.clone(),

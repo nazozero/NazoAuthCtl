@@ -370,6 +370,8 @@ fn managed_valkey_restore_rejects_network_and_volume_drift_before_stop() {
             data_volume: "nazoauth-valkey-data".to_owned(),
             backup_directory: work.path().join("backup"),
             image: valkey_image,
+            manifest_digest: String::new(),
+            completion_marker_digest: String::new(),
             identity,
         };
         let error =
@@ -442,7 +444,13 @@ fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
         digest: format!("sha256:{}", "a".repeat(64)),
     };
     let migration = runtime
-        .one_shot_task(artifact.clone(), &TaskOperation::MigrateApply, None)
+        .one_shot_task(
+            artifact.clone(),
+            &TaskOperation::MigrateApply,
+            None,
+            None,
+            None,
+        )
         .unwrap();
 
     assert_eq!(
@@ -476,6 +484,8 @@ fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
             artifact.clone(),
             &TaskOperation::ConformanceLeaseCleanup,
             None,
+            None,
+            None,
         )
         .unwrap();
     assert!(conformance.mounts.iter().any(|mount| {
@@ -497,7 +507,13 @@ fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
 
     let public_jwk = work.path().join("public.jwk");
     let keys = runtime
-        .one_shot_task(artifact, &TaskOperation::KeysValidate, Some(&public_jwk))
+        .one_shot_task(
+            artifact,
+            &TaskOperation::KeysValidate,
+            Some(&public_jwk),
+            None,
+            None,
+        )
         .unwrap();
 
     assert!(
@@ -526,6 +542,8 @@ fn privileged_systemd_task_uses_a_read_only_secret_revision_credential() {
                 sha256: "a".repeat(64),
             },
             &TaskOperation::KeysValidate,
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -641,6 +659,8 @@ fn privileged_task_fails_closed_without_required_config_mount() {
                 digest: format!("sha256:{}", "a".repeat(64)),
             },
             &TaskOperation::KeysList,
+            None,
+            None,
             None,
         )
         .unwrap_err();

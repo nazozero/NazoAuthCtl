@@ -1,5 +1,15 @@
 use super::*;
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActiveIdentityManifest {
+    schema: u32,
+    generation: String,
+    controller_key_id: String,
+    audit_key_id: String,
+    break_glass_key_id: String,
+}
+
 pub(super) fn build_config(
     config_path: &Path,
     options: &InstallOptions,
@@ -211,9 +221,19 @@ pub(super) fn operator_config(
     recovery_root: &Path,
 ) -> anyhow::Result<Operator> {
     let directory = config_dir.join("operator");
-    let deployment_id = fs::read_to_string(directory.join("deployment-id"))?;
-    let active = operator::read_active_identity(&directory.join("active-generation.json"))?;
-    let receipt_key_id = fs::read_to_string(directory.join("receipt.kid"))?;
+    let deployment_id =
+        read_operator_identity_line(&directory.join("deployment-id"), "deployment identity")?;
+    let active_bytes = crate::filesystem::read_secure_regular_file(
+        &directory.join("active-generation.json"),
+        "active operator identity",
+        true,
+        16 * 1024,
+    )?;
+    let active: ActiveIdentityManifest =
+        serde_json::from_slice(&active_bytes).context("active operator identity is invalid")?;
+    validate_active_identity_manifest(&active)?;
+    let receipt_key_id =
+        read_operator_identity_line(&directory.join("receipt.kid"), "receipt key identity")?;
     let generation = directory.join("generations").join(&active.generation);
     let recovery_generation = recovery_root.join("generations").join(&active.generation);
     Ok(Operator {
@@ -238,6 +258,37 @@ pub(super) fn operator_config(
         audit_directory: control_root.join("audit"),
         trust_state_file: directory.join("release-trust.json"),
     })
+}
+
+fn read_operator_identity_line(path: &Path, label: &str) -> anyhow::Result<String> {
+    // These identifiers are public metadata, but still need descriptor-bound
+    // reads so a symlink or path replacement cannot redirect configuration.
+    let bytes = crate::filesystem::read_secure_regular_file(path, label, false, 256)?;
+    let value = std::str::from_utf8(&bytes).with_context(|| format!("{label} is not UTF-8"))?;
+    if value.is_empty() || value.contains(['\r', '\n']) {
+        bail!("{label} is invalid");
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_active_identity_manifest(active: &ActiveIdentityManifest) -> anyhow::Result<()> {
+    if active.schema != 1
+        || !valid_identity_component(&active.generation)
+        || !valid_identity_component(&active.controller_key_id)
+        || !valid_identity_component(&active.audit_key_id)
+        || !valid_identity_component(&active.break_glass_key_id)
+    {
+        bail!("active operator identity is invalid");
+    }
+    Ok(())
+}
+
+fn valid_identity_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
 }
 
 pub(super) fn object_name_suffix(deployment_id: &str) -> String {

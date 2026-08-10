@@ -1,26 +1,30 @@
 mod adoption;
 mod backup;
 mod cli;
+mod conformance;
 mod coordination;
 mod deployment;
 mod discovery;
-mod filesystem;
 mod governance;
 mod install;
 mod lifecycle;
 mod model;
 mod operator;
-mod process;
 mod release;
 mod runtime;
 mod runtime_backend;
 mod secret_provider;
 
+pub(crate) use nazoauthctl_runtime::filesystem;
+pub(crate) use nazoauthctl_runtime::process;
+
+pub use conformance::{ConformanceMatrix, ConformanceOnboarding, ConformanceSession};
+
 #[cfg(all(test, unix))]
 #[path = "../tests/unit/support.rs"]
 mod test_support;
 
-fn main() {
+pub fn main_entry() {
     let args = std::env::args().collect::<Vec<_>>();
     if let Some(topic) = cli::help_topic(&args) {
         print_help(topic);
@@ -77,6 +81,7 @@ Start here:
   nazoauthctl [--config PATH] doctor
   nazoauthctl [--config PATH] update --plan
   nazoauthctl [--config PATH] update --yes
+  nazoauthctl [--config PATH] conformance run
   nazoauthctl [--deployment ID] development activate --artifact IMAGE_OR_BINARY --yes
 
 Commands:
@@ -100,7 +105,7 @@ Commands:
   recover-identity  Explicitly finish an interrupted identity transition
   migrate       Run the signed migration operation
   keys          List, validate, export OpenID4VC trust, generate, or register signing keys
-  conformance   Manage time-bounded conformance leases
+  conformance   Run official OIDF tests or manage time-bounded leases
   audit         Show or verify the management audit chain
   identity      Rotate controller and audit identities
   break-glass   Recover after controller-key loss or suspected theft
@@ -117,6 +122,8 @@ Options:
   --public-url URL                    Public issuer origin; default is local trial mode
   --profile baseline|standards-full   Default: baseline
   --profile-material PATH             Required only for standards-full
+  --trusted-proxy-cidr HOST/32|HOST/128
+                                      Required only for standards-full; one explicit proxy host
   --data-root PATH                    Default: /var/lib/nazoauth
   --control-root PATH                 Default: /var/lib/nazoauthctl
   --recovery-root PATH                Default: /var/lib/nazoauth-recovery; use a separate mount
@@ -189,6 +196,9 @@ never exports a leaf certificate or private key."
         }
         cli::HelpTopic::Conformance => {
             "Usage:
+  nazoauthctl [--deployment ID] [--config PATH] conformance run [--suite URL]
+    [--token TOKEN|--token-file PATH|--token-stdin|--token-fd FD]
+    [--webdriver URL] [--evidence-dir PATH]
   nazoauthctl [--config PATH] conformance lease create --profile PROFILE \
     --material PUBLIC_MANIFEST \
     [--dynamic-registration-token-file PATH] \
@@ -197,6 +207,14 @@ never exports a leaf certificate or private key."
   nazoauthctl [--config PATH] conformance lease list
   nazoauthctl [--config PATH] conformance lease revoke --lease-id UUID --yes
   nazoauthctl [--config PATH] conformance lease cleanup --yes
+
+`conformance run` validates the deployment, authenticates to the official Suite by
+default, obtains the deployment Matrix, creates an atomic lease/onboarding bundle,
+runs the Matrix-selected official plans, preserves official PASS/FAIL values, and
+always attempts Suite and deployment cleanup. In a TTY, a missing API token is read
+without echo and can be stored securely per Suite origin. `--token` is supported for
+automation but is visible in argv and shell history. Progress is item-count based on
+stderr; the final structured report is written to stdout without secrets.
 
 For an unreleased OCI candidate, insert all four target bindings before `lease`:
   --candidate-release vX.Y.Z --candidate-revision GIT_SHA \

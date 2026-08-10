@@ -41,8 +41,15 @@ pub(crate) fn write_rollback_state(
 
 pub(crate) fn public_rollback(config: &UpdateConfig) -> anyhow::Result<()> {
     config.require_managed_lifecycle()?;
-    let state: RollbackState = serde_json::from_slice(&fs::read(rollback_state_path(config))?)
-        .context("rollback state is invalid")?;
+    let state_path = rollback_state_path(config);
+    let state_bytes = crate::filesystem::read_secure_regular_file(
+        &state_path,
+        "rollback state",
+        true,
+        1024 * 1024,
+    )?;
+    let state: RollbackState =
+        serde_json::from_slice(&state_bytes).context("rollback state is invalid")?;
     if state.schema != 1 {
         bail!("unsupported rollback state");
     }
@@ -88,8 +95,15 @@ pub(crate) fn public_rollback(config: &UpdateConfig) -> anyhow::Result<()> {
 
 pub(crate) fn recover_from_backup(config: &UpdateConfig) -> anyhow::Result<()> {
     require_legacy_recovery_capabilities(config)?;
-    let state: RollbackState = serde_json::from_slice(&fs::read(rollback_state_path(config))?)
-        .context("recovery state is invalid")?;
+    let state_path = rollback_state_path(config);
+    let state_bytes = crate::filesystem::read_secure_regular_file(
+        &state_path,
+        "recovery state",
+        true,
+        1024 * 1024,
+    )?;
+    let state: RollbackState =
+        serde_json::from_slice(&state_bytes).context("recovery state is invalid")?;
     if state.schema != 1
         || state.to_release.rollback.database_restore != crate::model::DatabaseRestore::Backup
     {

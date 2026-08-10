@@ -92,6 +92,10 @@ fn filesystem_helpers_fail_closed_without_clobbering_staging_or_non_files() {
     assert!(atomic_write(&directory, b"replacement", 0o600).is_err());
     assert!(remove_file_durable(&directory).is_err());
     assert!(copy_atomic(&work.path().join("missing"), &target, 0o600).is_err());
+    let source = work.path().join("verified-source");
+    atomic_write(&source, b"candidate", 0o600).unwrap();
+    assert!(copy_atomic_verified(&source, &target, 0o600, &"00".repeat(32)).is_err());
+    assert_eq!(fs::read(&target).unwrap(), b"replacement");
     assert!(sha256(&work.path().join("missing")).is_err());
     assert!(
         PrivateTempDir::new(&format!("nazoauthctl-missing-{}/child", std::process::id())).is_err()
@@ -153,6 +157,46 @@ fn secure_regular_file_returns_the_post_open_validated_descriptor() {
     let mut contents = String::new();
     opened.read_to_string(&mut contents).unwrap();
     assert_eq!(contents, "before replacement");
+}
+
+#[cfg(unix)]
+#[test]
+fn secure_regular_file_reader_is_bounded_and_uses_owner_only_input() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let work = PrivateTempDir::new("nazoauth-secure-read-bounded").unwrap();
+    let path = work.path().join("secret");
+    fs::write(&path, b"secret").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let bytes = read_secure_regular_file(&path, "secure test secret", true, 64).unwrap();
+    assert_eq!(bytes.as_slice(), b"secret");
+
+    fs::write(&path, vec![b'x'; 65]).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(read_secure_regular_file(&path, "secure test secret", true, 64).is_err());
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    assert!(read_secure_regular_file(&path, "secure test secret", true, 64).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn secure_secret_reader_allows_read_only_group_acl_but_not_world_read() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let work = PrivateTempDir::new("nazoauth-secure-secret-reader").unwrap();
+    let path = work.path().join("secret");
+    fs::write(&path, b"secret").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o440)).unwrap();
+    assert_eq!(
+        read_secure_secret_file(&path, "secure provider secret", 64)
+            .unwrap()
+            .as_slice(),
+        b"secret"
+    );
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+    assert!(read_secure_secret_file(&path, "secure provider secret", 64).is_err());
 }
 
 #[cfg(unix)]

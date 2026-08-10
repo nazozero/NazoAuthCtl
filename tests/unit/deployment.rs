@@ -66,6 +66,35 @@ fn registry_requires_explicit_selection_when_multiple_deployments_exist() {
 }
 
 #[test]
+fn registration_reconciles_an_existing_declaration_without_treating_it_as_complete() {
+    let work = PrivateTempDir::new("nazoauthctl-registration-reconcile").unwrap();
+    let store = store(&work);
+    let deployment = record("deployment-a", "alpha");
+    store.persist(&deployment).unwrap();
+    let registry = store.registry_path();
+    std::fs::remove_file(&registry).unwrap();
+    std::fs::remove_dir_all(store.deployment_state_dir("deployment-a")).unwrap();
+
+    store.persist(&deployment).unwrap();
+
+    assert_eq!(store.load("deployment-a").unwrap(), deployment);
+    assert!(
+        store
+            .load_registry()
+            .unwrap()
+            .deployments
+            .contains_key("deployment-a")
+    );
+    assert!(
+        store
+            .deployment_state_dir("deployment-a")
+            .join("transactions")
+            .is_dir()
+    );
+    assert!(!store.registration_journal_path("deployment-a").exists());
+}
+
+#[test]
 fn observed_state_cannot_smuggle_mutation_capabilities() {
     let mut observed = record("deployment-a", "alpha");
     observed.trust = TrustState::Observed;

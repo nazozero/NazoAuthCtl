@@ -259,6 +259,43 @@ fn update_config_accepts_only_closed_safe_runtime_boundaries() {
 }
 
 #[test]
+fn public_runtime_urls_are_same_origin_and_never_remote_plaintext() {
+    let mut config = valid_config();
+    config.validate().unwrap();
+
+    for issuer in [
+        "http://auth.example",
+        "http://10.0.0.8:8000",
+        "https://user@auth.example",
+        "https://auth.example/issuer",
+        "https://auth.example?tenant=one",
+    ] {
+        let mut invalid = config.clone();
+        invalid.runtime.expected_issuer = issuer.to_owned();
+        assert!(invalid.validate().is_err(), "accepted issuer {issuer}");
+    }
+
+    for discovery in [
+        "http://auth.example/.well-known/openid-configuration",
+        "https://other.example/.well-known/openid-configuration",
+        "https://auth.example/.well-known/openid-configuration?tenant=one",
+        "https://auth.example/redirect",
+    ] {
+        let mut invalid = config.clone();
+        invalid.runtime.public_discovery_url = discovery.to_owned();
+        assert!(
+            invalid.validate().is_err(),
+            "accepted public Discovery URL {discovery}"
+        );
+    }
+
+    config.runtime.expected_issuer = "http://127.0.0.1:8000".to_owned();
+    config.runtime.public_discovery_url =
+        "http://127.0.0.1:8000/.well-known/openid-configuration".to_owned();
+    config.validate().unwrap();
+}
+
+#[test]
 fn external_and_container_dependency_modes_resolve_explicitly() {
     let mut config = valid_config();
     config.runtime.backend = crate::deployment::RuntimeBackendKind::Docker;

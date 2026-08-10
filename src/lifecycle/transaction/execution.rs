@@ -38,6 +38,7 @@ pub(crate) fn execute_coordinated_update(
     let lifecycle_path = lifecycle_path(record)?;
     let lifecycle = LifecycleManifest::load(lifecycle_path)?;
     validate_lifecycle_record_binding(&lifecycle, record)?;
+    validate_lifecycle_acceptance_record_binding(&lifecycle, record)?;
     let from_cache_path =
         trusted_runtime_directory(store, &record.deployment_id, &record.active_release.release)?
             .join("cache.json");
@@ -61,8 +62,13 @@ pub(crate) fn execute_coordinated_update(
     let from_cache_sha256 = sha256(&from_cache_path)?;
     let target_cache_sha256 = sha256(&target_cache_path)?;
     let mut execution = if execution_path.exists() {
-        let execution: UpdateExecution = serde_json::from_slice(&fs::read(&execution_path)?)
-            .context("lifecycle update execution journal is invalid")?;
+        let execution: UpdateExecution = serde_json::from_slice(&read_secure_regular_file(
+            &execution_path,
+            "lifecycle update execution journal",
+            true,
+            MAX_LIFECYCLE_BYTES,
+        )?)
+        .context("lifecycle update execution journal is invalid")?;
         if execution.schema != 1
             || execution.transaction_id != transaction.transaction_id
             || execution.deployment_id != record.deployment_id
@@ -190,12 +196,22 @@ pub(crate) fn execute_coordinated_update(
     persist_update_execution(&execution_path, &execution)?;
 
     if controller_step_pending(&current, "acceptance") {
-        for runtime in &lifecycle.runtimes {
-            let cached = target_cache
-                .runtimes
-                .get(&runtime.runtime_instance_id)
-                .context("target cache omits a lifecycle runtime")?;
-            verify_active_runtime(runtime, &transaction.target_release, cached)?;
+        let acceptance = (|| -> anyhow::Result<()> {
+            for runtime in &lifecycle.runtimes {
+                let cached = target_cache
+                    .runtimes
+                    .get(&runtime.runtime_instance_id)
+                    .context("target cache omits a lifecycle runtime")?;
+                verify_active_runtime(runtime, &transaction.target_release, cached)?;
+                verify_runtime_acceptance(runtime)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = acceptance {
+            execution.state = UpdateExecutionState::AcceptanceFailed;
+            execution.updated_at = Utc::now().timestamp();
+            persist_update_execution(&execution_path, &execution)?;
+            return Err(error);
         }
         let old_slot = load_recovery_slot(store, record)?;
         let rollback_manifest = execution
@@ -278,6 +294,7 @@ pub(crate) fn rollback_registered(
     let lifecycle_path = lifecycle_path(record)?;
     let lifecycle = LifecycleManifest::load(lifecycle_path)?;
     validate_lifecycle_record_binding(&lifecycle, record)?;
+    validate_lifecycle_acceptance_record_binding(&lifecycle, record)?;
     let slot = load_recovery_slot(store, record)?;
     let trusted_record = DeploymentRecord {
         active_release: slot.trusted_release.clone(),
@@ -288,41 +305,153 @@ pub(crate) fn rollback_registered(
             .join("cache.json");
     let cache = load_cache(&cache_path, &trusted_record)?;
     validate_cached_artifacts(&cache)?;
-    for runtime in &lifecycle.runtimes {
-        let cached = cache
-            .runtimes
-            .get(&runtime.runtime_instance_id)
-            .context("rollback cache omits a lifecycle runtime")?;
-        activate_cached_runtime(record, runtime, &slot.trusted_release, cached)?;
+    let execution_path = rollback_execution_path(store, &record.deployment_id);
+    let lifecycle_sha256 = sha256(lifecycle_path)?;
+    let cache_sha256 = sha256(&cache_path)?;
+    let target_release_sha256 = embedded_identity_digest(&slot.trusted_release)?;
+    let mut execution = if execution_path.exists() {
+        let execution = load_rollback_execution(&execution_path)?;
+        if execution.schema != ROLLBACK_EXECUTION_SCHEMA
+            || execution.deployment_id != record.deployment_id
+            || execution.target_release != slot.trusted_release
+            || execution.lifecycle_sha256 != lifecycle_sha256
+            || execution.cache_sha256 != cache_sha256
+            || execution.target_release_sha256 != target_release_sha256
+        {
+            bail!("lifecycle rollback journal binding changed after preparation");
+        }
+        if execution.state < RollbackExecutionState::DeclarationCommitted
+            && execution.source_release != record.active_release
+            && execution.target_release != record.active_release
+        {
+            bail!("lifecycle rollback journal source Release changed after preparation");
+        }
+        if execution.state >= RollbackExecutionState::DeclarationCommitted
+            && record.active_release != execution.target_release
+        {
+            bail!("lifecycle rollback declaration state is not reflected in the deployment");
+        }
+        execution
+    } else {
+        RollbackExecution {
+            schema: ROLLBACK_EXECUTION_SCHEMA,
+            transaction_id: uuid::Uuid::now_v7().to_string(),
+            deployment_id: record.deployment_id.clone(),
+            source_release: record.active_release.clone(),
+            target_release: slot.trusted_release.clone(),
+            lifecycle_sha256,
+            cache_sha256,
+            target_release_sha256,
+            state: RollbackExecutionState::Prepared,
+            completed_runtimes: BTreeSet::new(),
+            updated_at: Utc::now().timestamp(),
+        }
+    };
+    let lifecycle_runtime_ids = lifecycle
+        .runtimes
+        .iter()
+        .map(|runtime| runtime.runtime_instance_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if execution
+        .completed_runtimes
+        .iter()
+        .any(|runtime_id| !lifecycle_runtime_ids.contains(runtime_id.as_str()))
+    {
+        bail!("lifecycle rollback journal contains an unknown runtime");
     }
-    let mut rolled_back = record.clone();
-    rolled_back.active_release = slot.trusted_release;
-    for declared in &mut rolled_back.runtime_instances {
-        let runtime = lifecycle
-            .runtimes
-            .iter()
-            .find(|runtime| runtime.runtime_instance_id == declared.runtime_instance_id)
-            .context("lifecycle lost a declared runtime during rollback")?;
-        let cached = cache
-            .runtimes
-            .get(&declared.runtime_instance_id)
-            .context("rollback cache lost a declared runtime")?;
-        declared.artifact = activated_artifact_reference(runtime, cached)?;
-        declared.local_artifact_id = cached_local_artifact_id(cached);
+    if execution.state >= RollbackExecutionState::DeclarationCommitted
+        && execution.completed_runtimes.len() != lifecycle.runtimes.len()
+    {
+        bail!("lifecycle rollback journal committed before every runtime completed");
     }
-    if rolled_back != *record {
-        rolled_back.declaration_revision = record
-            .declaration_revision
-            .checked_add(1)
-            .context("deployment declaration revision overflow")?;
-        store.persist_declaration_cas_locked(record, &rolled_back)?;
+    persist_rollback_execution(&execution_path, &execution)?;
+
+    if execution.state < RollbackExecutionState::DeclarationCommitted {
+        for runtime in &lifecycle.runtimes {
+            let cached = cache
+                .runtimes
+                .get(&runtime.runtime_instance_id)
+                .context("rollback cache omits a lifecycle runtime")?;
+            if execution
+                .completed_runtimes
+                .contains(&runtime.runtime_instance_id)
+                && verify_active_runtime(runtime, &slot.trusted_release, cached).is_ok()
+            {
+                continue;
+            }
+            activate_cached_runtime(record, runtime, &slot.trusted_release, cached)?;
+            execution
+                .completed_runtimes
+                .insert(runtime.runtime_instance_id.clone());
+            execution.updated_at = Utc::now().timestamp();
+            persist_rollback_execution(&execution_path, &execution)?;
+        }
+        execution.state = RollbackExecutionState::RuntimesActivated;
+        execution.updated_at = Utc::now().timestamp();
+        persist_rollback_execution(&execution_path, &execution)?;
+
+        for runtime in &lifecycle.runtimes {
+            let cached = cache
+                .runtimes
+                .get(&runtime.runtime_instance_id)
+                .context("rollback cache omits a lifecycle runtime")?;
+            verify_active_runtime(runtime, &slot.trusted_release, cached)?;
+            verify_runtime_acceptance(runtime)?;
+        }
+
+        let mut rolled_back = record.clone();
+        rolled_back.active_release = slot.trusted_release.clone();
+        for declared in &mut rolled_back.runtime_instances {
+            let runtime = lifecycle
+                .runtimes
+                .iter()
+                .find(|runtime| runtime.runtime_instance_id == declared.runtime_instance_id)
+                .context("lifecycle lost a declared runtime during rollback")?;
+            let cached = cache
+                .runtimes
+                .get(&declared.runtime_instance_id)
+                .context("rollback cache lost a declared runtime")?;
+            declared.artifact = activated_artifact_reference(runtime, cached)?;
+            declared.local_artifact_id = cached_local_artifact_id(cached);
+        }
+        if rolled_back != *record {
+            rolled_back.declaration_revision = record
+                .declaration_revision
+                .checked_add(1)
+                .context("deployment declaration revision overflow")?;
+            store.persist_declaration_cas_locked(record, &rolled_back)?;
+        }
+        execution.state = RollbackExecutionState::DeclarationCommitted;
+        execution.updated_at = Utc::now().timestamp();
+        persist_rollback_execution(&execution_path, &execution)?;
     }
-    crate::governance::append_management_audit(
-        store,
-        &rolled_back,
-        &format!("rollback-{:020}", record.declaration_revision),
-        "lifecycle-rollback",
-        &rolled_back.active_release.release,
-    )?;
-    Ok(())
+
+    let committed_record = if execution.state >= RollbackExecutionState::DeclarationCommitted {
+        store.load(&record.deployment_id)?
+    } else {
+        record.clone()
+    };
+    if execution.state < RollbackExecutionState::AuditCommitted {
+        crate::governance::append_management_audit(
+            store,
+            &committed_record,
+            &execution.transaction_id,
+            "lifecycle-rollback",
+            &execution.target_release.release,
+        )?;
+        execution.state = RollbackExecutionState::AuditCommitted;
+        execution.updated_at = Utc::now().timestamp();
+        persist_rollback_execution(&execution_path, &execution)?;
+    }
+    if execution.state < RollbackExecutionState::Committed {
+        execution.state = RollbackExecutionState::Committed;
+        execution.updated_at = Utc::now().timestamp();
+        persist_rollback_execution(&execution_path, &execution)?;
+    }
+    let history = execution_path.with_file_name(format!(
+        "lifecycle-rollback-{}.json",
+        execution.transaction_id
+    ));
+    atomic_write(&history, &serde_json::to_vec_pretty(&execution)?, 0o600)?;
+    remove_file_durable(&execution_path)
 }

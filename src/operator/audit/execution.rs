@@ -7,6 +7,48 @@ pub(crate) fn execute(
     operation: TaskOperation,
     public_jwk: Option<&Path>,
 ) -> anyhow::Result<OperationResult> {
+    execute_with_io(
+        config, target, expected, operation, public_jwk, None, None, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_with_io(
+    config: &UpdateConfig,
+    target: &str,
+    expected: &ExpectedReleaseTarget,
+    operation: TaskOperation,
+    public_jwk: Option<&Path>,
+    conformance_bundle: Option<&Path>,
+    conformance_output_directory: Option<&Path>,
+    requested_jti: Option<&str>,
+) -> anyhow::Result<OperationResult> {
+    match &operation {
+        TaskOperation::ConformanceMatrixDescribe => {
+            if conformance_bundle.is_some()
+                || conformance_output_directory.is_none()
+                || requested_jti.is_some()
+            {
+                bail!("conformance matrix task I/O contract is invalid");
+            }
+        }
+        TaskOperation::ConformanceOnboardingApply { .. } => {
+            if conformance_bundle.is_none()
+                || conformance_output_directory.is_none()
+                || requested_jti.is_none()
+            {
+                bail!("conformance onboarding task I/O contract is invalid");
+            }
+        }
+        _ => {
+            if conformance_bundle.is_some()
+                || conformance_output_directory.is_some()
+                || requested_jti.is_some()
+            {
+                bail!("operator task does not accept conformance I/O");
+            }
+        }
+    }
     // A privileged operation is admissible only while the existing audit,
     // intent and trust-transition state is verifiably intact.  Checking after
     // the runtime side effect would be too late: the mutation could succeed
@@ -22,7 +64,14 @@ pub(crate) fn execute(
 
     // Runtime/image, network, mounts, task context and sandbox are prepared before issuance.
     let runtime = Runtime::new(config);
-    let prepared = runtime.prepare_app_task(target, &operation, public_jwk, &manifest_bytes)?;
+    let prepared = runtime.prepare_app_task(
+        target,
+        &operation,
+        public_jwk,
+        conformance_bundle,
+        conformance_output_directory,
+        &manifest_bytes,
+    )?;
     verify_target_expectation(&prepared.target, expected)?;
 
     let secret_revision = read_single_line(&config.operator.secret_revision_file)?;
@@ -39,11 +88,15 @@ pub(crate) fn execute(
         expected.embedded.clone(),
         config_binding.clone(),
         operation,
+        requested_jti,
     )?;
     let request_id = task.jti.clone();
     if let Some(result) = existing_final_result(config, &task, &compact_task)? {
-        if intent_path.exists() {
-            fs::remove_file(&intent_path)?;
+        if path_present(&intent_path)? {
+            if !is_regular_non_symlink(&intent_path)? {
+                bail!("operator task intent is not a regular non-symlink file");
+            }
+            crate::filesystem::remove_file_durable(&intent_path)?;
         }
         return Ok(result);
     }
@@ -61,6 +114,11 @@ pub(crate) fn execute(
     // Revalidate immediately before reading the head and appending.  The
     // lifecycle lock excludes another ctl writer; this second check also
     // catches out-of-band corruption during the runtime operation.
+    // A stale derived head may be recovered only on this writer path, after
+    // the runtime receipt has been verified and while the caller holds the
+    // lifecycle/deployment lock.  AuditVerify/AuditShow remain strictly
+    // read-only and fail closed on the same condition.
+    repair_audit_head_for_append(config)?;
     verify_audit(config).context("operator audit changed during task execution")?;
     let (sequence, previous) = audit_head(config)?;
     let final_receipt = FinalReceipt {
@@ -85,7 +143,12 @@ pub(crate) fn execute(
     let compact_final =
         sign_final_receipt(&final_receipt, &config.operator.audit_key_id, &audit_key)?;
     let final_path = append_audit(config, sequence, &request_id, &compact_final)?;
-    fs::remove_file(&intent_path)?;
+    if path_present(&intent_path)? {
+        if !is_regular_non_symlink(&intent_path)? {
+            bail!("operator task intent is not a regular non-symlink file");
+        }
+        crate::filesystem::remove_file_durable(&intent_path)?;
+    }
     match runtime_receipt.outcome {
         TaskOutcome::Succeeded { result } => Ok(OperationResult {
             request_id,
@@ -105,7 +168,11 @@ pub(crate) fn load_or_issue_task(
     embedded: EmbeddedIdentity,
     config_binding: ConfigBinding,
     operation: TaskOperation,
+    requested_jti: Option<&str>,
 ) -> anyhow::Result<(TaskEnvelope, String, PathBuf)> {
+    if let Some(requested_jti) = requested_jti {
+        validate_requested_jti(requested_jti)?;
+    }
     let actor = Actor {
         kind: ActorKind::LocalRoot,
         id: "uid:0".to_owned(),
@@ -117,16 +184,17 @@ pub(crate) fn load_or_issue_task(
         "config": config_binding,
         "operation": operation,
         "actor": actor,
+        "requested_jti": requested_jti,
     }))?));
     let directory = config.operator.audit_directory.join("intents");
-    fs::create_dir_all(&directory)?;
+    crate::filesystem::ensure_directory_chain(&directory)?;
     let path = directory.join(format!("{fingerprint}.jws"));
     let now = Utc::now().timestamp();
     if path_present(&path)? {
         if !is_regular_non_symlink(&path)? {
             bail!("persisted operator intent is not a regular non-symlink file");
         }
-        let compact = fs::read_to_string(&path)?;
+        let compact = read_audit_text(&path, "persisted operator intent")?;
         let header = protected_header(&compact)?;
         let task = verify_task_signature(
             &compact,
@@ -140,7 +208,8 @@ pub(crate) fn load_or_issue_task(
             && task.target == target
             && task.embedded == embedded
             && task.config == config_binding
-            && task.operation == operation;
+            && task.operation == operation
+            && requested_jti.is_none_or(|requested| task.jti == requested);
         if !matches {
             bail!("persisted operator intent does not match the requested operation");
         }
@@ -167,9 +236,11 @@ pub(crate) fn load_or_issue_task(
         if task.exp >= now || cached_receipt_present || runtime_has_observed_request {
             return Ok((task, compact, path));
         }
-        fs::remove_file(&path)?;
+        crate::filesystem::remove_file_durable(&path)?;
     }
-    let request_id = format!("request-{}", encode_hex(&rand::random::<[u8; 16]>()));
+    let request_id = requested_jti
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("request-{}", encode_hex(&rand::random::<[u8; 16]>())));
     let task = TaskEnvelope {
         ver: nazo_operator_protocol::PROTOCOL_VERSION,
         iss: format!("controller:{}", config.operator.deployment_id),
@@ -189,6 +260,20 @@ pub(crate) fn load_or_issue_task(
     let compact = sign_task(&task, &config.operator.controller_key_id, &controller_key)?;
     atomic_write(&path, compact.as_bytes(), 0o400)?;
     Ok((task, compact, path))
+}
+
+fn validate_requested_jti(value: &str) -> anyhow::Result<()> {
+    let Some(suffix) = value.strip_prefix("request-") else {
+        bail!("operator request JTI is invalid");
+    };
+    if suffix.len() != 32
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("operator request JTI is invalid");
+    }
+    Ok(())
 }
 
 fn existing_final_result(
@@ -213,7 +298,7 @@ fn existing_final_result(
     let Some(entry) = matches.pop() else {
         return Ok(None);
     };
-    let compact = fs::read_to_string(entry.path())?;
+    let compact = read_audit_text(&entry.path(), "audit receipt")?;
     let header = protected_header(&compact)?;
     let receipt = verify_final_receipt(
         &compact,
@@ -271,7 +356,9 @@ pub(crate) fn execute_test_task(
         TaskOperation::KeysGenerateLocal { .. } | TaskOperation::KeysRegisterExternal { .. } => {
             bail!("test task adapter does not implement key mutation")
         }
-        TaskOperation::ConformanceLeaseCreate { .. }
+        TaskOperation::ConformanceMatrixDescribe
+        | TaskOperation::ConformanceOnboardingApply { .. }
+        | TaskOperation::ConformanceLeaseCreate { .. }
         | TaskOperation::ConformanceLeaseList
         | TaskOperation::ConformanceLeaseRevoke { .. }
         | TaskOperation::ConformanceLeaseCleanup => {
@@ -286,7 +373,7 @@ pub(crate) fn execute_test_task(
     )?;
     let request_id = format!("request-test-{}", encode_hex(&rand::random::<[u8; 8]>()));
     let directory = config.operator.audit_directory.join("test-receipts");
-    fs::create_dir_all(&directory)?;
+    crate::filesystem::ensure_directory_chain(&directory)?;
     let receipt = directory.join(format!("{request_id}.txt"));
     atomic_write(&receipt, b"debug-build-test-adapter", 0o400)?;
     Ok(OperationResult {
@@ -301,6 +388,8 @@ pub(crate) fn execute_test_task(
             },
             TaskOperation::KeysGenerateLocal { .. }
             | TaskOperation::KeysRegisterExternal { .. }
+            | TaskOperation::ConformanceMatrixDescribe
+            | TaskOperation::ConformanceOnboardingApply { .. }
             | TaskOperation::ConformanceLeaseCreate { .. }
             | TaskOperation::ConformanceLeaseList
             | TaskOperation::ConformanceLeaseRevoke { .. }
@@ -342,6 +431,8 @@ pub(crate) fn canonical_manifest(
 pub(crate) fn operation_name(operation: &TaskOperation) -> &'static str {
     match operation {
         TaskOperation::MigrateApply => "migrate-apply",
+        TaskOperation::ConformanceMatrixDescribe => "conformance-matrix-describe",
+        TaskOperation::ConformanceOnboardingApply { .. } => "conformance-onboarding-apply",
         TaskOperation::ConformanceLeaseCreate { .. } => "conformance-lease-create",
         TaskOperation::ConformanceLeaseList => "conformance-lease-list",
         TaskOperation::ConformanceLeaseRevoke { .. } => "conformance-lease-revoke",

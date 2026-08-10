@@ -13,6 +13,7 @@ fn install_options(data_root: PathBuf) -> InstallOptions {
         public_url: "https://auth.example".to_owned(),
         profile: "baseline".to_owned(),
         profile_material: None,
+        trusted_proxy_cidr: None,
         data_root,
         control_root,
         recovery_root,
@@ -222,6 +223,7 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
         public_url: "https://auth.example".to_owned(),
         profile: "standards-full".to_owned(),
         profile_material: Some(material),
+        trusted_proxy_cidr: Some("192.0.2.10/32".to_owned()),
         data_root: work.path().join("data"),
         control_root: work.path().join("control"),
         recovery_root: work.path().join("recovery"),
@@ -254,6 +256,9 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
     }
     assert!(rendered.contains("ENABLE_OPENID4VCI_ISSUER: true"));
     assert!(rendered.contains("ENABLE_OPENID4VP_VERIFIER: true"));
+    assert!(rendered.contains("TRUSTED_PROXY_CIDRS: \"${TRUSTED_PROXY_CIDR}\""));
+    assert!(rendered.contains("MTLS_CERTIFICATE_SOURCE: \"rfc9440\""));
+    assert!(!rendered.contains("legacy-verified-headers"));
     assert!(rendered.contains("OPENID4VC_REVOCATION_POLICY: \"required\""));
     assert!(rendered.contains(
         "OPENID4VC_REVOCATION_SNAPSHOT_FILE: \"${PROFILE_APP_ROOT}/keys/openid4vc-revocation-snapshot.json\""
@@ -321,6 +326,116 @@ fn oidf_profile_secret_override_is_strict_private_and_resumable() {
     });
     let error = write_install_profile(&config, &mismatched).unwrap_err();
     assert!(!format!("{error:#}").contains(&canary));
+}
+
+#[cfg(unix)]
+#[test]
+fn persisted_profile_secret_descriptor_rejects_symlink_unsafe_mode_and_oversize_inputs() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let work = PrivateTempDir::new("profile-secret-descriptor-boundaries").unwrap();
+    let path = work.path().join("profile-secret");
+    let value = "x".repeat(32);
+    fs::write(&path, &value).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+    assert_eq!(
+        load_profile_secret(&path, "test profile secret", 32)
+            .unwrap()
+            .as_str(),
+        value
+    );
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+    assert!(load_profile_secret(&path, "test profile secret", 32).is_err());
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+    fs::write(&path, vec![b'x'; 33]).unwrap();
+    assert!(load_profile_secret(&path, "test profile secret", 32).is_err());
+
+    let decoy = work.path().join("profile-secret-decoy");
+    fs::write(&decoy, &value).unwrap();
+    fs::set_permissions(&decoy, fs::Permissions::from_mode(0o400)).unwrap();
+    fs::remove_file(&path).unwrap();
+    symlink(&decoy, &path).unwrap();
+    assert!(load_profile_secret(&path, "test profile secret", 32).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn operator_identity_descriptor_rejects_symlink_private_mode_and_oversize_inputs() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let work = PrivateTempDir::new("operator-identity-descriptor-boundaries").unwrap();
+    let config_dir = work.path().join("config");
+    let operator_dir = config_dir.join("operator");
+    fs::create_dir_all(&operator_dir).unwrap();
+    let deployment_id = operator_dir.join("deployment-id");
+    fs::write(&deployment_id, b"deployment-test").unwrap();
+    fs::set_permissions(&deployment_id, fs::Permissions::from_mode(0o644)).unwrap();
+    let active = operator_dir.join("active-generation.json");
+    fs::write(
+        &active,
+        serde_json::json!({
+            "schema": 1,
+            "generation": "generation-test",
+            "controller_key_id": "controller-test",
+            "audit_key_id": "audit-test",
+            "break_glass_key_id": "break-glass-test"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::set_permissions(&active, fs::Permissions::from_mode(0o600)).unwrap();
+    let receipt_kid = operator_dir.join("receipt.kid");
+    fs::write(&receipt_kid, b"receipt-test").unwrap();
+    fs::set_permissions(&receipt_kid, fs::Permissions::from_mode(0o444)).unwrap();
+
+    let operator = operator_config(
+        &config_dir,
+        &work.path().join("control"),
+        &work.path().join("recovery"),
+    )
+    .unwrap();
+    assert_eq!(operator.deployment_id, "deployment-test");
+    assert_eq!(operator.receipt_key_id, "receipt-test");
+
+    fs::set_permissions(&active, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        operator_config(
+            &config_dir,
+            &work.path().join("control"),
+            &work.path().join("recovery"),
+        )
+        .is_err()
+    );
+    fs::set_permissions(&active, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let decoy = operator_dir.join("deployment-decoy");
+    fs::write(&decoy, b"deployment-test").unwrap();
+    fs::remove_file(&deployment_id).unwrap();
+    symlink(&decoy, &deployment_id).unwrap();
+    assert!(
+        operator_config(
+            &config_dir,
+            &work.path().join("control"),
+            &work.path().join("recovery"),
+        )
+        .is_err()
+    );
+    fs::remove_file(&deployment_id).unwrap();
+    fs::write(&deployment_id, b"deployment-test").unwrap();
+    fs::set_permissions(&deployment_id, fs::Permissions::from_mode(0o644)).unwrap();
+
+    fs::write(&active, vec![b'x'; 16 * 1024 + 1]).unwrap();
+    fs::set_permissions(&active, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        operator_config(
+            &config_dir,
+            &work.path().join("control"),
+            &work.path().join("recovery"),
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -476,9 +591,39 @@ fn oidf_profile_origins_are_strict_https_origins() {
 }
 
 #[test]
-fn trusted_proxy_gateway_uses_a_single_host_prefix_for_each_address_family() {
-    assert_eq!(host_cidr("10.89.0.1".parse().unwrap()), "10.89.0.1/32");
-    assert_eq!(host_cidr("fd00::1".parse().unwrap()), "fd00::1/128");
+fn trusted_proxy_requires_a_single_host_cidr() {
+    assert_eq!(
+        normalize_single_host_cidr("10.89.0.1/32").unwrap(),
+        "10.89.0.1/32"
+    );
+    assert_eq!(
+        normalize_single_host_cidr("fd00::1/128").unwrap(),
+        "fd00::1/128"
+    );
+    for value in ["10.89.0.0/24", "0.0.0.0/0", "fd00::/64", "not-a-cidr"] {
+        assert!(
+            normalize_single_host_cidr(value).is_err(),
+            "accepted {value}"
+        );
+    }
+}
+
+#[test]
+fn standards_full_public_origin_rejects_non_loopback_http() {
+    assert!(normalize_public_url_for_profile("https://auth.example", "standards-full").is_ok());
+    for value in ["http://auth.example", "http://10.0.0.7:8000"] {
+        assert!(
+            normalize_public_url_for_profile(value, "standards-full").is_err(),
+            "accepted insecure standards-full URL {value}"
+        );
+    }
+    assert!(normalize_public_url_for_profile("http://auth.example", "baseline").is_err());
+    for value in ["http://localhost:8000/", "http://127.0.0.1:8000/"] {
+        assert_eq!(
+            normalize_public_url_for_profile(value, "standards-full").unwrap(),
+            value.trim_end_matches('/')
+        );
+    }
 }
 
 #[test]
@@ -576,6 +721,74 @@ fn dependency_secret_channels_and_url_set_fail_closed() {
 }
 
 #[test]
+fn dependency_urls_bind_credentials_database_and_query_safely() {
+    assert!(
+        validate_dependency_url(
+            "postgresql://alice:p%40ss@db.example/oauth?sslmode=require",
+            &["postgres", "postgresql"],
+            "PostgreSQL",
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_dependency_url(
+            "rediss://default:cache-secret@cache.example/0",
+            &["redis", "rediss"],
+            "Valkey",
+        )
+        .is_ok()
+    );
+
+    for (value, schemes, name) in [
+        (
+            "postgresql://alice@db.example/oauth",
+            &["postgres", "postgresql"][..],
+            "PostgreSQL",
+        ),
+        (
+            "postgresql://alice:p%0Ass@db.example/oauth",
+            &["postgres", "postgresql"][..],
+            "PostgreSQL",
+        ),
+        (
+            "postgresql://alice:p%40ss@db.example/a/b",
+            &["postgres", "postgresql"][..],
+            "PostgreSQL",
+        ),
+        (
+            "postgresql://alice:p%40ss@db.example/oauth#fragment",
+            &["postgres", "postgresql"][..],
+            "PostgreSQL",
+        ),
+        (
+            "postgresql://alice:p%40ss@db.example/oauth?password=leak",
+            &["postgres", "postgresql"][..],
+            "PostgreSQL",
+        ),
+        (
+            "rediss://default:cache-secret@cache.example/01",
+            &["redis", "rediss"][..],
+            "Valkey",
+        ),
+        (
+            "rediss://default:cache-secret@cache.example/0?tls=true",
+            &["redis", "rediss"][..],
+            "Valkey",
+        ),
+        (
+            "redis://default:cache-secret@cache.example/cache",
+            &["redis", "rediss"][..],
+            "Valkey",
+        ),
+    ] {
+        assert!(
+            validate_dependency_url(value, schemes, name).is_err(),
+            "accepted unsafe dependency URL {value}"
+        );
+    }
+}
+
+#[test]
 fn external_urls_are_persisted_only_as_private_secret_files() {
     let work = PrivateTempDir::new("external-url-files").unwrap();
     let secrets = work.path().join("secrets");
@@ -588,15 +801,15 @@ fn external_urls_are_persisted_only_as_private_secret_files() {
     assert_eq!(write_external_urls(&secrets, &options).unwrap(), "external");
     assert_eq!(
         fs::read_to_string(secrets.join("database-url")).unwrap(),
-        options.database_url.unwrap()
+        options.database_url.as_deref().unwrap()
     );
     assert_eq!(
         fs::read_to_string(secrets.join("database-migration-url")).unwrap(),
-        options.migration_database_url.unwrap()
+        options.migration_database_url.as_deref().unwrap()
     );
     assert_eq!(
         fs::read_to_string(secrets.join("valkey-url")).unwrap(),
-        options.valkey_url.unwrap()
+        options.valkey_url.as_deref().unwrap()
     );
     #[cfg(unix)]
     for name in ["database-url", "database-migration-url", "valkey-url"] {
@@ -657,7 +870,11 @@ fn fresh_server_config_persists_bootstrap_deployment_identity_without_rewriting_
     )));
     assert!(managed_mfa_totp_source(&host_config_dir, RuntimeBackendKind::Systemd).unwrap());
 
-    fs::write(&target, "DEPLOYMENT_ID: existing\n").unwrap();
+    fs::write(
+        &target,
+        "PUBLIC_BASE_URL: \"https://auth.example\"\nDEPLOYMENT_ID: existing\n",
+    )
+    .unwrap();
     write_server_config(
         &config_dir,
         &options,
@@ -670,8 +887,44 @@ fn fresh_server_config_persists_bootstrap_deployment_identity_without_rewriting_
     .unwrap();
     assert_eq!(
         fs::read_to_string(target).unwrap(),
-        "DEPLOYMENT_ID: existing\n"
+        "PUBLIC_BASE_URL: \"https://auth.example\"\nDEPLOYMENT_ID: existing\n"
     );
+}
+
+#[test]
+fn existing_standards_full_server_config_must_match_the_explicit_proxy_boundary() {
+    let work = PrivateTempDir::new("standards-full-existing-config-validation").unwrap();
+    let mut options = install_options(work.path().join("data"));
+    options.profile = "standards-full".to_owned();
+    options.trusted_proxy_cidr = Some("192.0.2.10/32".to_owned());
+    let valid = "PUBLIC_BASE_URL: \"https://auth.example\"\n\
+                 MTLS_ENDPOINT_BASE_URL: \"https://auth.example\"\n\
+                 MTLS_CERTIFICATE_SOURCE: \"rfc9440\"\n\
+                 TRUSTED_PROXY_CIDRS: \"192.0.2.10/32\"\n\
+                 ENABLE_OPENID4VCI_ISSUER: true\n\
+                 ENABLE_OPENID4VP_VERIFIER: true\n";
+    validate_existing_server_config(valid, &options, options.trusted_proxy_cidr.as_deref())
+        .unwrap();
+
+    for invalid in [
+        valid.replace("rfc9440", "legacy-verified-headers"),
+        valid.replace("192.0.2.10/32", "0.0.0.0/0"),
+        valid.replace("https://auth.example", "https://other.example"),
+        valid.replace(
+            "ENABLE_OPENID4VP_VERIFIER: true",
+            "ENABLE_OPENID4VP_VERIFIER: false",
+        ),
+    ] {
+        assert!(
+            validate_existing_server_config(
+                &invalid,
+                &options,
+                options.trusted_proxy_cidr.as_deref(),
+            )
+            .is_err(),
+            "accepted invalid standards-full server configuration: {invalid}"
+        );
+    }
 }
 
 #[test]
@@ -916,23 +1169,48 @@ fn managed_runtime_database_grants_keep_the_audit_ledger_api_least_privileged() 
         .collect::<Vec<_>>()
         .join(" ");
 
-    assert!(sql.contains(
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO nazoauth_runtime;"
-    ));
+    assert!(sql.contains("full_dml_tables CONSTANT text[]"));
+    assert!(sql.contains("append_tables CONSTANT text[]"));
+    assert!(sql.contains("runtime table privilege allowlist is incomplete"));
+    for table in [
+        "scim_tokens",
+        "oauth_client_mtls_trust_anchor_requests",
+        "openid4vci_credential_dataset_events",
+        "security_audit_event_outbox",
+    ] {
+        assert!(
+            sql.contains(table),
+            "missing runtime table allowlist entry: {table}"
+        );
+    }
+    assert!(
+        sql.contains("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO nazoauth_runtime")
+    );
+    assert!(sql.contains("GRANT SELECT, INSERT ON TABLE public.%I TO nazoauth_runtime"));
+    assert!(sql.contains("GRANT DELETE ON TABLE public.%I TO nazoauth_runtime"));
+    assert!(!sql.contains("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES"));
+    assert!(!sql.contains("GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES"));
+    assert!(!sql.contains("GRANT EXECUTE ON ALL FUNCTIONS"));
     assert!(sql.contains(
         "REVOKE ALL ON TABLE public.security_audit_chain_state, public.security_audit_events, public.security_audit_event_outbox FROM nazoauth_runtime;"
     ));
-    assert!(sql.contains(
-        "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO nazoauth_runtime;"
-    ));
-    assert!(sql.contains("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO nazoauth_runtime;"));
-
-    assert!(sql.contains(
-        "REVOKE ALL ON FUNCTION public.nazo_reject_security_audit_event_mutation(), public.nazo_claim_security_audit_events(BIGINT, INTEGER), public.nazo_ack_security_audit_event(UUID, INTEGER), public.nazo_reschedule_security_audit_event(UUID, INTEGER, TIMESTAMPTZ, TEXT), public.nazo_security_audit_anchor_health() FROM nazoauth_runtime;"
-    ));
-    assert!(sql.contains(
-        "GRANT EXECUTE ON FUNCTION public.nazo_security_audit_privilege_preflight(BOOLEAN, BOOLEAN, BOOLEAN), public.nazo_security_audit_chain_head_for_update(), public.nazo_append_security_audit_event(UUID, TEXT, TEXT, JSONB, TIMESTAMPTZ, BYTEA, BYTEA), public.nazo_security_audit_anchor_freshness() TO nazoauth_runtime;"
-    ));
+    assert!(sql.contains("REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM nazoauth_runtime;"));
+    assert!(sql.contains("REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM nazoauth_runtime;"));
+    assert!(sql.contains("nazo_oauth_cleanup_expired_security_state()"));
+    assert!(sql.contains("nazo_oauth_conformance_lease_is_active(UUID, UUID)"));
+    assert!(sql.contains("nazo_oauth_cleanup_expired_conformance_leases()"));
+    for function in [
+        "public.nazo_security_audit_privilege_preflight(BOOLEAN, BOOLEAN, BOOLEAN)",
+        "public.nazo_security_audit_chain_head_for_update()",
+        "public.nazo_append_security_audit_event(UUID, TEXT, TEXT, JSONB, TIMESTAMPTZ, BYTEA, BYTEA)",
+        "public.nazo_security_audit_anchor_freshness()",
+    ] {
+        assert!(
+            sql.contains(function),
+            "missing explicit audit function grant: {function}"
+        );
+    }
+    assert!(!sql.contains("nazo_security_audit_anchor_health()"));
 
     for revoke in [
         "ALTER DEFAULT PRIVILEGES FOR ROLE nazoauth_migrator IN SCHEMA public REVOKE ALL ON TABLES FROM nazoauth_runtime;",
@@ -949,17 +1227,7 @@ fn managed_runtime_database_grants_keep_the_audit_ledger_api_least_privileged() 
     );
 
     assert!(
-        sql.find("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES")
-            .unwrap()
-            < sql
-                .find("REVOKE ALL ON TABLE public.security_audit_chain_state")
-                .unwrap()
-    );
-    assert!(
-        sql.find("GRANT EXECUTE ON ALL FUNCTIONS").unwrap()
-            < sql
-                .find("REVOKE ALL ON FUNCTION public.nazo_reject_security_audit_event_mutation")
-                .unwrap()
+        sql.find("full_dml_tables CONSTANT").unwrap() < sql.find("REVOKE ALL ON TABLE").unwrap()
     );
 }
 
@@ -975,11 +1243,7 @@ fn managed_directory_rejects_symlink_targets() {
     symlink(&real, &linked).unwrap();
 
     let error = create_directory(&linked, 0o700).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("managed directory must not be a symlink")
-    );
+    assert!(error.to_string().contains("symlink"));
 }
 
 #[test]

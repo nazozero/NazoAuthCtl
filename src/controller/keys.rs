@@ -6,16 +6,13 @@ pub(super) fn export_openid4vc_trust(config: &UpdateConfig, output: &Path) -> an
     }
     safe_export_destination(output)?;
     let bundle = managed_openid4vc_bundle_path(config)?;
-    let metadata = fs::symlink_metadata(&bundle).with_context(|| {
-        format!(
-            "failed to inspect managed OpenID4VC bundle {}",
-            bundle.display()
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("managed OpenID4VC certificate bundle must be a regular non-symlink file");
-    }
-    let anchors = extract_openid4vc_trust_anchors(&fs::read(&bundle)?)?;
+    let bundle_bytes = crate::filesystem::read_secure_regular_file(
+        &bundle,
+        "managed OpenID4VC certificate bundle",
+        false,
+        MAX_OPENID4VC_CERTIFICATE_BUNDLE_BYTES as u64,
+    )?;
+    let anchors = extract_openid4vc_trust_anchors(&bundle_bytes)?;
     let release = load_active_release(config)?;
     crate::operator::append_management_event(
         config,
@@ -115,12 +112,13 @@ pub(super) fn bootstrap_openid4vc_revocation_snapshot(config: &UpdateConfig) -> 
         Err(error) => return Err(error).context("failed to inspect OpenID4VC revocation snapshot"),
     }
 
-    let bundle_metadata = fs::symlink_metadata(&bundle)
-        .context("failed to inspect managed OpenID4VC certificate bundle")?;
-    if bundle_metadata.file_type().is_symlink() || !bundle_metadata.is_file() {
-        bail!("managed OpenID4VC certificate bundle must be a regular non-symlink file");
-    }
-    let certificates = parse_managed_openid4vc_bundle(&fs::read(&bundle)?)?;
+    let bundle_bytes = crate::filesystem::read_secure_regular_file(
+        &bundle,
+        "managed OpenID4VC certificate bundle",
+        false,
+        MAX_OPENID4VC_CERTIFICATE_BUNDLE_BYTES as u64,
+    )?;
+    let certificates = parse_managed_openid4vc_bundle(&bundle_bytes)?;
     let issuer = config.runtime.expected_issuer.trim_end_matches('/');
     let now = Utc::now();
     let entries = certificates

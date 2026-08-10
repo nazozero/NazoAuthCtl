@@ -90,7 +90,7 @@ pub(super) fn normalize_profile_secrets(options: &mut InstallOptions) -> anyhow:
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 struct ExternalDependencySecrets {
     database_url: String,
@@ -102,7 +102,7 @@ pub(super) fn read_external_dependency_secrets(
     options: &mut InstallOptions,
     mut source: impl std::io::Read,
 ) -> anyhow::Result<()> {
-    let mut bytes = Vec::new();
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
     source
         .by_ref()
         .take(64 * 1024 + 1)
@@ -112,9 +112,12 @@ pub(super) fn read_external_dependency_secrets(
     }
     let secrets: ExternalDependencySecrets =
         serde_json::from_slice(&bytes).context("dependency secret input must be strict JSON")?;
-    options.database_url = Some(secrets.database_url);
-    options.migration_database_url = Some(secrets.migration_database_url);
-    options.valkey_url = Some(secrets.valkey_url);
+    // InstallOptions owns the working copies for the duration of the
+    // transaction; the deserialization buffer and temporary input object are
+    // independently wiped on drop.
+    options.database_url = Some(secrets.database_url.clone());
+    options.migration_database_url = Some(secrets.migration_database_url.clone());
+    options.valkey_url = Some(secrets.valkey_url.clone());
     Ok(())
 }
 
@@ -196,14 +199,9 @@ pub(super) fn select_runtime(
     if options.database_url.is_some() {
         return Ok((runtime, None));
     }
-    let dependency_backend = if runtime_backend::backend(RuntimeBackendKind::Podman).available() {
-        RuntimeBackendKind::Podman
-    } else if runtime_backend::backend(RuntimeBackendKind::Docker).available() {
-        RuntimeBackendKind::Docker
-    } else {
-        bail!("host runtime requires Podman or Docker for managed dependencies");
-    };
-    Ok((runtime, Some(dependency_backend)))
+    bail!(
+        "host runtime requires explicit external PostgreSQL and Valkey URLs; managed container dependencies are not network-reachable from the systemd service"
+    )
 }
 
 pub(super) fn write_external_urls(
@@ -257,24 +255,45 @@ pub(super) fn write_managed_secrets(
     set_mode(&dependencies.join("valkey-password"), 0o444)?;
     atomic_write(
         &secrets.join("database-url"),
-        format!("postgresql://nazoauth_runtime:{runtime_postgres}@{postgres_container}:5432/oauth")
-            .as_bytes(),
+        format!(
+            "postgresql://nazoauth_runtime:{}@{postgres_container}:5432/oauth",
+            runtime_postgres.as_str()
+        )
+        .as_bytes(),
         0o440,
     )?;
     atomic_write(
         &secrets.join("database-migration-url"),
-        format!("postgresql://nazoauth_migrator:{postgres}@{postgres_container}:5432/oauth")
-            .as_bytes(),
+        format!(
+            "postgresql://nazoauth_migrator:{}@{postgres_container}:5432/oauth",
+            postgres.as_str()
+        )
+        .as_bytes(),
         0o440,
     )?;
     atomic_write(
         &secrets.join("valkey-url"),
-        format!("redis://default:{valkey}@{valkey_container}:6379/0").as_bytes(),
+        format!(
+            "redis://nazoauth_runtime:{}@{valkey_container}:6379/0",
+            valkey.as_str()
+        )
+        .as_bytes(),
         0o440,
     )?;
     atomic_write(
         &dependencies.join("valkey.acl"),
-        format!("user default on >{valkey} ~* &* +@all\n").as_bytes(),
+        format!(
+            concat!(
+                "user default off\n",
+                "user nazoauth_runtime on >{} ~* ",
+                "+get +mget +getdel +set +setnx +del +exists ",
+                "+expire +expireat +expiretime +pexpireat +pexpiretime +ttl ",
+                "+incr +zadd +zrangebyscore +zrem +time +eval ",
+                "+ping +hello +select +client|setname +client|setinfo\n"
+            ),
+            valkey.as_str()
+        )
+        .as_bytes(),
         0o444,
     )?;
     Ok("managed".to_owned())
@@ -486,10 +505,10 @@ pub(super) fn ensure_mfa_totp_key(path: &Path) -> anyhow::Result<()> {
                     path.display()
                 );
             }
-            let value = fs::read_to_string(path).with_context(|| {
-                format!("failed to read MFA TOTP encryption key {}", path.display())
-            })?;
-            validate_mfa_totp_key(&value)?;
+            let bytes = read_secure_secret_file(path, "MFA TOTP encryption key", 4 * 1024)?;
+            let value = std::str::from_utf8(&bytes)
+                .context("MFA TOTP encryption key is not valid UTF-8")?;
+            validate_mfa_totp_key(value)?;
             set_mode(path, 0o440)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -516,7 +535,9 @@ pub(super) fn validate_mfa_totp_key(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn read_existing_server_config(target: &Path) -> anyhow::Result<Option<String>> {
+pub(super) fn read_existing_server_config(
+    target: &Path,
+) -> anyhow::Result<Option<zeroize::Zeroizing<String>>> {
     let metadata = match fs::symlink_metadata(target) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -528,14 +549,14 @@ pub(super) fn read_existing_server_config(target: &Path) -> anyhow::Result<Optio
             target.display()
         );
     }
-    fs::read_to_string(target)
-        .with_context(|| {
-            format!(
-                "failed to read existing server configuration {}",
-                target.display()
-            )
-        })
-        .map(Some)
+    let bytes = read_secure_secret_file(target, "existing server configuration", 1024 * 1024)?;
+    let value = String::from_utf8(bytes.to_vec()).with_context(|| {
+        format!(
+            "existing server configuration is not valid UTF-8: {}",
+            target.display()
+        )
+    })?;
+    Ok(Some(zeroize::Zeroizing::new(value)))
 }
 
 pub(super) fn config_key_present(content: &str, key: &str) -> anyhow::Result<bool> {
@@ -584,10 +605,22 @@ pub(super) fn write_server_config(
     runtime: RuntimeBackendKind,
     data_root: &Path,
     trusted_proxy_cidr: Option<&str>,
-    profile: Option<&str>,
+    profile_config: Option<&str>,
 ) -> anyhow::Result<()> {
+    let standards_full = options.profile == "standards-full";
+    if standards_full != profile_config.is_some() {
+        bail!("server profile selection does not match the validated install profile");
+    }
+    if standards_full {
+        normalize_single_host_cidr(
+            trusted_proxy_cidr.context("standards-full requires an explicit trusted proxy CIDR")?,
+        )?;
+    } else if trusted_proxy_cidr.is_some() {
+        bail!("server profile and trusted proxy settings are inconsistent");
+    }
     let target = config_dir.join(".env.yaml");
-    if read_existing_server_config(&target)?.is_some() {
+    if let Some(existing) = read_existing_server_config(&target)? {
+        validate_existing_server_config(&existing, options, trusted_proxy_cidr)?;
         return Ok(());
     }
     ensure_mfa_totp_key(&mfa_totp_key_path(config_dir))?;
@@ -632,10 +665,10 @@ pub(super) fn write_server_config(
          UI_CACHE_DIR: \"{ui_dir}\"\n\
          RUST_LOG: \"info\"\n\
          {dependency_files}{profile}",
-        public_url = options.public_url,
+        public_url = options.public_url.trim_end_matches('/'),
         mfa_key_file = mfa_totp_config_path(runtime, config_dir),
         mfa_key_id = MFA_TOTP_KEY_ID,
-        profile = profile
+        profile = profile_config
             .unwrap_or_default()
             .replace(
                 "${TRUSTED_PROXY_CIDR}",
@@ -645,4 +678,83 @@ pub(super) fn write_server_config(
             .replace("${PROFILE_APP_ROOT}", &profile_app_root),
     );
     atomic_write(&target, content.as_bytes(), 0o640)
+}
+
+pub(super) fn validate_existing_server_config(
+    content: &str,
+    options: &InstallOptions,
+    trusted_proxy_cidr: Option<&str>,
+) -> anyhow::Result<()> {
+    let expected_public_url =
+        normalize_public_url_for_profile(&options.public_url, &options.profile)?;
+    let configured_public_url = config_key_value(content, "PUBLIC_BASE_URL")?
+        .context("existing server configuration has no PUBLIC_BASE_URL")?;
+    let normalized_public_url =
+        normalize_public_url_for_profile(&configured_public_url, &options.profile)?;
+    if configured_public_url != normalized_public_url
+        || normalized_public_url != expected_public_url
+    {
+        bail!("existing PUBLIC_BASE_URL does not match the requested issuer origin");
+    }
+
+    if let Some(configured_issuer) = config_key_value(content, "ISSUER")? {
+        let normalized_issuer =
+            normalize_public_url_for_profile(&configured_issuer, &options.profile)?;
+        if configured_issuer != normalized_issuer || normalized_issuer != expected_public_url {
+            bail!("existing ISSUER does not match the requested issuer origin");
+        }
+    }
+
+    if options.profile == "standards-full" {
+        let configured_mtls_endpoint = config_key_value(content, "MTLS_ENDPOINT_BASE_URL")?
+            .context(
+                "standards-full existing server configuration has no MTLS_ENDPOINT_BASE_URL",
+            )?;
+        let normalized_mtls_endpoint =
+            normalize_public_url_for_profile(&configured_mtls_endpoint, &options.profile)?;
+        if configured_mtls_endpoint != normalized_mtls_endpoint
+            || normalized_mtls_endpoint != expected_public_url
+        {
+            bail!("existing MTLS_ENDPOINT_BASE_URL does not match the requested issuer origin");
+        }
+
+        let configured_source = config_key_value(content, "MTLS_CERTIFICATE_SOURCE")?.context(
+            "standards-full existing server configuration has no MTLS_CERTIFICATE_SOURCE",
+        )?;
+        if configured_source != "rfc9440" {
+            bail!("standards-full requires MTLS_CERTIFICATE_SOURCE=rfc9440");
+        }
+
+        let configured_cidr = config_key_value(content, "TRUSTED_PROXY_CIDRS")?
+            .context("standards-full existing server configuration has no TRUSTED_PROXY_CIDRS")?;
+        let configured_cidr = normalize_single_host_cidr(&configured_cidr)?;
+        let expected_cidr = trusted_proxy_cidr
+            .context("standards-full requires an explicit trusted proxy CIDR")
+            .and_then(normalize_single_host_cidr)?;
+        if configured_cidr != expected_cidr {
+            bail!("existing TRUSTED_PROXY_CIDRS does not match the requested proxy boundary");
+        }
+
+        for key in ["ENABLE_OPENID4VCI_ISSUER", "ENABLE_OPENID4VP_VERIFIER"] {
+            if config_key_value(content, key)?.as_deref() != Some("true") {
+                bail!("standards-full existing server configuration must enable {key}");
+            }
+        }
+    } else {
+        if trusted_proxy_cidr.is_some() {
+            bail!("server profile and trusted proxy settings are inconsistent");
+        }
+        for key in [
+            "MTLS_ENDPOINT_BASE_URL",
+            "MTLS_CERTIFICATE_SOURCE",
+            "TRUSTED_PROXY_CIDRS",
+            "ENABLE_OPENID4VCI_ISSUER",
+            "ENABLE_OPENID4VP_VERIFIER",
+        ] {
+            if config_key_value(content, key)?.is_some() {
+                bail!("baseline existing server configuration contains standards-full key {key}");
+            }
+        }
+    }
+    Ok(())
 }

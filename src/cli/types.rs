@@ -177,6 +177,7 @@ pub(crate) struct InstallOptions {
     pub(crate) public_url: String,
     pub(crate) profile: String,
     pub(crate) profile_material: Option<PathBuf>,
+    pub(crate) trusted_proxy_cidr: Option<String>,
     pub(crate) data_root: PathBuf,
     pub(crate) control_root: PathBuf,
     pub(crate) recovery_root: PathBuf,
@@ -193,6 +194,20 @@ pub(crate) struct InstallOptions {
     pub(crate) profile_secret_fd: Option<u32>,
     pub(crate) profile_secrets: Option<StandardsProfileSecrets>,
     pub(crate) version: Option<String>,
+}
+
+impl Drop for InstallOptions {
+    fn drop(&mut self) {
+        for value in [
+            &mut self.database_url,
+            &mut self.migration_database_url,
+            &mut self.valkey_url,
+        ] {
+            if let Some(value) = value.as_mut() {
+                zeroize::Zeroize::zeroize(value);
+            }
+        }
+    }
 }
 
 /// Profile-scoped bearer secrets. This deliberately has no `Debug` implementation,

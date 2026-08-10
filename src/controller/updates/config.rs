@@ -18,7 +18,7 @@ pub(crate) fn cache_trusted_runtime(
     runtime_target: &str,
 ) -> anyhow::Result<()> {
     let directory = release_cache_dir(config, manifest);
-    fs::create_dir_all(&directory)?;
+    crate::filesystem::ensure_directory_chain(&directory)?;
     atomic_write(
         &directory.join("server-release-manifest.json"),
         &serde_json::to_vec_pretty(manifest)?,
@@ -30,13 +30,11 @@ pub(crate) fn cache_trusted_runtime(
             .get("binary")
             .context("Release manifest has no server binary")?
             .sha256;
-        if crate::filesystem::sha256(Path::new(runtime_target))? != *expected {
-            bail!("trusted host recovery binary differs from the signed Release");
-        }
-        copy_atomic(
+        crate::filesystem::copy_atomic_verified(
             Path::new(runtime_target),
             &directory.join("nazoauth"),
             0o500,
+            expected,
         )
     } else {
         Runtime::new(config).export_image(runtime_target, &directory.join("server-image.tar"))
@@ -49,11 +47,16 @@ pub(crate) fn ensure_trusted_runtime_available(
     runtime_target: &str,
 ) -> anyhow::Result<()> {
     let directory = release_cache_dir(config, manifest);
-    let cached: ReleaseManifest = serde_json::from_slice(
-        &fs::read(directory.join("server-release-manifest.json"))
-            .context("trusted recovery manifest is unavailable")?,
+    let cached_path = directory.join("server-release-manifest.json");
+    let cached_bytes = crate::filesystem::read_secure_regular_file(
+        &cached_path,
+        "trusted recovery manifest",
+        true,
+        1024 * 1024,
     )
-    .context("trusted recovery manifest is invalid")?;
+    .context("trusted recovery manifest is unavailable")?;
+    let cached: ReleaseManifest =
+        serde_json::from_slice(&cached_bytes).context("trusted recovery manifest is invalid")?;
     if &cached != manifest {
         bail!("trusted recovery manifest differs from the persisted rollback state");
     }
@@ -70,15 +73,17 @@ pub(crate) fn ensure_trusted_runtime_available(
             return Ok(());
         }
         let cached_binary = directory.join("nazoauth");
-        if crate::filesystem::sha256(&cached_binary)? != *expected {
-            bail!("cached host recovery binary differs from the signed Release");
-        }
-        fs::create_dir_all(
+        crate::filesystem::ensure_directory_chain(
             Path::new(runtime_target)
                 .parent()
                 .context("host recovery target has no parent")?,
         )?;
-        copy_atomic(&cached_binary, Path::new(runtime_target), 0o500)
+        crate::filesystem::copy_atomic_verified(
+            &cached_binary,
+            Path::new(runtime_target),
+            0o500,
+            expected,
+        )
     } else {
         let runtime = Runtime::new(config);
         if runtime.image_digest(runtime_target).is_ok() {
@@ -104,8 +109,14 @@ pub(crate) fn write_active_release(
 }
 
 pub(crate) fn load_active_release(config: &UpdateConfig) -> anyhow::Result<ReleaseManifest> {
-    let manifest: ReleaseManifest =
-        serde_json::from_slice(&fs::read(active_release_path(config))?)?;
+    let path = active_release_path(config);
+    let bytes = crate::filesystem::read_secure_regular_file(
+        &path,
+        "active Release manifest",
+        true,
+        1024 * 1024,
+    )?;
+    let manifest: ReleaseManifest = serde_json::from_slice(&bytes)?;
     let identity = format!(
         "https://github.com/{}/.github/workflows/release-security.yml@refs/tags/{}",
         config.repository, manifest.version
@@ -123,9 +134,14 @@ pub(crate) fn load_config_unsettled(path: &Path) -> anyhow::Result<UpdateConfig>
         );
     }
     validate_config_permissions(path)?;
-    UpdateConfig::parse(
-        &fs::read(path).with_context(|| format!("failed to read {}", path.display()))?,
+    let bytes = crate::filesystem::read_secure_regular_file(
+        path,
+        "update configuration",
+        false,
+        4 * 1024 * 1024,
     )
+    .with_context(|| format!("failed to read {}", path.display()))?;
+    UpdateConfig::parse(&bytes)
 }
 
 pub(crate) fn ensure_no_pending_update(config: &UpdateConfig) -> anyhow::Result<()> {

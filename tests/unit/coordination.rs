@@ -3,10 +3,13 @@ use crate::{
     deployment::{
         ArtifactReference, CapabilityGrants, DEPLOYMENT_SCHEMA, DeploymentRecord,
         RecoveryAssessment, RecoveryConclusion, ResourceScope, Responsibility, RuntimeBackendKind,
-        RuntimeInstance, TrustState,
+        RuntimeInstance, SafeReference, TrustState,
     },
-    filesystem::PrivateTempDir,
+    filesystem::{PrivateTempDir, sha256},
 };
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chrono::Utc;
+use ed25519_dalek::{Signer as _, SigningKey};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -60,6 +63,21 @@ fn record(deployment_id: &str) -> DeploymentRecord {
     }
 }
 
+fn provider_record(work: &PrivateTempDir, deployment_id: &str) -> (DeploymentRecord, SigningKey) {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let key_path = work.path().join(format!("{deployment_id}-provider.pub"));
+    fs::write(&key_path, key.verifying_key().to_bytes()).unwrap();
+    let mut record = record(deployment_id);
+    record.resources.insert(
+        "provider-evidence:backups".to_owned(),
+        SafeReference::DigestBoundFile {
+            path: key_path.clone(),
+            sha256: sha256(&key_path).unwrap(),
+        },
+    );
+    (record, key)
+}
+
 fn plan(deployment_id: &str) -> Value {
     json!({
         "deployment_id": deployment_id,
@@ -80,7 +98,8 @@ fn plan(deployment_id: &str) -> Value {
                 "id": "external-recovery-point",
                 "owner": "provider-owned",
                 "capability": "backups",
-                "action": "create external recovery point"
+                "action": "create external recovery point",
+                "evidence_kind": "recovery-point"
             },
             {
                 "id": "replace-runtime",
@@ -99,31 +118,78 @@ fn plan(deployment_id: &str) -> Value {
     })
 }
 
-fn evidence(transaction: &UpdateCoordination, deployment_id: &str) -> Value {
-    json!({
-        "schema": 1,
-        "deployment_id": deployment_id,
-        "transaction_id": transaction.transaction_id,
-        "step_id": "external-recovery-point",
-        "kind": "provider-receipt",
-        "reference_id": "snapshot-20260803-001",
-        "artifact_sha256": "c".repeat(64),
-        "issued_at": 1785783900
-    })
+fn unsigned_evidence(
+    transaction: &UpdateCoordination,
+    deployment_id: &str,
+    now: i64,
+) -> EvidenceInput {
+    EvidenceInput {
+        schema: EVIDENCE_SCHEMA,
+        deployment_id: deployment_id.to_owned(),
+        transaction_id: transaction.transaction_id.clone(),
+        step_id: "external-recovery-point".to_owned(),
+        kind: EvidenceKind::RecoveryPoint,
+        action: "create external recovery point".to_owned(),
+        capability: "backups".to_owned(),
+        reference_id: "snapshot-20260803-001".to_owned(),
+        artifact_sha256: "c".repeat(64),
+        plan_sha256: transaction.plan_sha256.clone(),
+        target_release: transaction.target_release.clone(),
+        issued_at: now,
+        expires_at: now + 300,
+        nonce: format!("nonce-{}", transaction.transaction_id),
+        signature: None,
+    }
+}
+
+fn signed_evidence(
+    transaction: &UpdateCoordination,
+    deployment_id: &str,
+    signing_key: &SigningKey,
+) -> EvidenceInput {
+    let now = Utc::now().timestamp();
+    sign_evidence(
+        transaction,
+        signing_key,
+        unsigned_evidence(transaction, deployment_id, now),
+    )
+}
+
+fn sign_evidence(
+    transaction: &UpdateCoordination,
+    signing_key: &SigningKey,
+    mut input: EvidenceInput,
+) -> EvidenceInput {
+    input.signature = Some(
+        URL_SAFE_NO_PAD.encode(
+            signing_key
+                .sign(&canonical_signing_payload(&input, transaction).unwrap())
+                .to_bytes(),
+        ),
+    );
+    input
+}
+
+fn evidence(
+    transaction: &UpdateCoordination,
+    deployment_id: &str,
+    signing_key: &SigningKey,
+) -> Value {
+    serde_json::to_value(signed_evidence(transaction, deployment_id, signing_key)).unwrap()
 }
 
 #[test]
 fn external_step_pauses_accepts_bound_evidence_and_resumes_without_claiming_completion() {
     let work = PrivateTempDir::new("nazoauthctl-coordination").unwrap();
     let store = store(&work);
-    let record = record("deployment-a");
+    let (record, signing_key) = provider_record(&work, "deployment-a");
     let prepared = prepare_update(&store, &record, &plan("deployment-a")).unwrap();
     assert_eq!(prepared.state, CoordinationState::WaitingForEvidence);
 
     let input = work.path().join("evidence.json");
     fs::write(
         &input,
-        serde_json::to_vec_pretty(&evidence(&prepared, "deployment-a")).unwrap(),
+        serde_json::to_vec_pretty(&evidence(&prepared, "deployment-a", &signing_key)).unwrap(),
     )
     .unwrap();
     let accepted = submit_evidence(&store, &record, &input).unwrap();
@@ -142,16 +208,145 @@ fn external_step_pauses_accepts_bound_evidence_and_resumes_without_claiming_comp
 }
 
 #[test]
+fn provider_evidence_rejects_forgery_and_wrong_signer() {
+    for wrong_signer in [false, true] {
+        let work = PrivateTempDir::new("nazoauthctl-coordination-signature").unwrap();
+        let store = store(&work);
+        let (record, signing_key) = provider_record(&work, "deployment-a");
+        let prepared = prepare_update(&store, &record, &plan("deployment-a")).unwrap();
+        let mut input = signed_evidence(&prepared, "deployment-a", &signing_key);
+        if wrong_signer {
+            input = sign_evidence(&prepared, &SigningKey::from_bytes(&[8; 32]), input);
+        } else {
+            input.artifact_sha256 = "d".repeat(64);
+        }
+        let path = work.path().join("evidence.json");
+        fs::write(&path, serde_json::to_vec(&input).unwrap()).unwrap();
+        assert!(submit_evidence(&store, &record, &path).is_err());
+    }
+}
+
+#[test]
+fn provider_evidence_requires_a_pinned_provider_key() {
+    let work = PrivateTempDir::new("nazoauthctl-coordination-no-pin").unwrap();
+    let store = store(&work);
+    let record = record("deployment-a");
+    let signing_key = SigningKey::from_bytes(&[7; 32]);
+    let prepared = prepare_update(&store, &record, &plan("deployment-a")).unwrap();
+    let input = work.path().join("evidence.json");
+    fs::write(
+        &input,
+        serde_json::to_vec(&evidence(&prepared, "deployment-a", &signing_key)).unwrap(),
+    )
+    .unwrap();
+    assert!(submit_evidence(&store, &record, &input).is_err());
+}
+
+#[test]
+fn provider_evidence_rejects_stale_and_future_validity_windows() {
+    for future in [false, true] {
+        let work = PrivateTempDir::new("nazoauthctl-coordination-freshness").unwrap();
+        let store = store(&work);
+        let (record, signing_key) = provider_record(&work, "deployment-a");
+        let prepared = prepare_update(&store, &record, &plan("deployment-a")).unwrap();
+        let now = Utc::now().timestamp();
+        let issued_at = if future {
+            now + MAX_EVIDENCE_FUTURE_SKEW_SECONDS + 1
+        } else {
+            now - MAX_EVIDENCE_AGE_SECONDS - 1
+        };
+        let input = sign_evidence(
+            &prepared,
+            &signing_key,
+            unsigned_evidence(&prepared, "deployment-a", issued_at),
+        );
+        let path = work.path().join("evidence.json");
+        fs::write(&path, serde_json::to_vec(&input).unwrap()).unwrap();
+        assert!(submit_evidence(&store, &record, &path).is_err());
+    }
+}
+
+#[test]
+fn evidence_rejects_wrong_kind_action_capability_and_cross_transaction_binding() {
+    for mutation in 0..4 {
+        let work = PrivateTempDir::new("nazoauthctl-coordination-binding").unwrap();
+        let store = store(&work);
+        let (record, signing_key) = provider_record(&work, "deployment-a");
+        let prepared = prepare_update(&store, &record, &plan("deployment-a")).unwrap();
+        let mut input = unsigned_evidence(&prepared, "deployment-a", Utc::now().timestamp());
+        match mutation {
+            0 => input.kind = EvidenceKind::ProviderReceipt,
+            1 => input.action = "replace runtime".to_owned(),
+            2 => input.capability = "runtime".to_owned(),
+            _ => input.transaction_id = "other-transaction".to_owned(),
+        }
+        let input = sign_evidence(&prepared, &signing_key, input);
+        let path = work.path().join("evidence.json");
+        fs::write(&path, serde_json::to_vec(&input).unwrap()).unwrap();
+        assert!(submit_evidence(&store, &record, &path).is_err());
+    }
+}
+
+#[test]
+fn duplicate_provider_evidence_is_rejected_without_overwriting_the_acceptance() {
+    let work = PrivateTempDir::new("nazoauthctl-coordination-duplicate").unwrap();
+    let store = store(&work);
+    let (record, signing_key) = provider_record(&work, "deployment-a");
+    let prepared = prepare_update(&store, &record, &plan("deployment-a")).unwrap();
+    let path = work.path().join("evidence.json");
+    fs::write(
+        &path,
+        serde_json::to_vec(&evidence(&prepared, "deployment-a", &signing_key)).unwrap(),
+    )
+    .unwrap();
+    submit_evidence(&store, &record, &path).unwrap();
+    assert!(submit_evidence(&store, &record, &path).is_err());
+}
+
+#[test]
+fn resume_recomputes_and_rejects_a_tampered_source_digest() {
+    let work = PrivateTempDir::new("nazoauthctl-coordination-source-digest").unwrap();
+    let store = store(&work);
+    let (record, signing_key) = provider_record(&work, "deployment-a");
+    let prepared = prepare_update(&store, &record, &plan("deployment-a")).unwrap();
+    let input = work.path().join("evidence.json");
+    fs::write(
+        &input,
+        serde_json::to_vec(&evidence(&prepared, "deployment-a", &signing_key)).unwrap(),
+    )
+    .unwrap();
+    submit_evidence(&store, &record, &input).unwrap();
+
+    let persisted = store
+        .deployment_state_dir("deployment-a")
+        .join("transactions/evidence/external-recovery-point.json");
+    let mut accepted: AcceptedEvidence =
+        serde_json::from_slice(&fs::read(&persisted).unwrap()).unwrap();
+    accepted.source_manifest_sha256 = "0".repeat(64);
+    let bytes = serde_json::to_vec_pretty(&accepted).unwrap();
+    fs::write(&persisted, &bytes).unwrap();
+
+    let active = store
+        .deployment_state_dir("deployment-a")
+        .join("transactions/active-update.json");
+    let mut transaction: UpdateCoordination =
+        serde_json::from_slice(&fs::read(&active).unwrap()).unwrap();
+    transaction.steps[1].evidence_sha256 = Some(digest_bytes(&bytes));
+    fs::write(&active, serde_json::to_vec_pretty(&transaction).unwrap()).unwrap();
+    assert!(resume(&store, &record).is_err());
+}
+
+#[test]
 fn evidence_cannot_cross_deployment_or_survive_persisted_tampering() {
     let work = PrivateTempDir::new("nazoauthctl-coordination-isolation").unwrap();
     let store = store(&work);
-    let record_a = record("deployment-a");
+    let (record_a, signing_key) = provider_record(&work, "deployment-a");
     let record_b = record("deployment-b");
     let prepared = prepare_update(&store, &record_a, &plan("deployment-a")).unwrap();
     let input = work.path().join("wrong-deployment.json");
     fs::write(
         &input,
-        serde_json::to_vec(&evidence(&prepared, "deployment-b")).unwrap(),
+        serde_json::to_vec(&evidence(&prepared, "deployment-b", &signing_key)).unwrap(),
     )
     .unwrap();
     assert!(submit_evidence(&store, &record_a, &input).is_err());
@@ -159,7 +354,7 @@ fn evidence_cannot_cross_deployment_or_survive_persisted_tampering() {
 
     fs::write(
         &input,
-        serde_json::to_vec(&evidence(&prepared, "deployment-a")).unwrap(),
+        serde_json::to_vec(&evidence(&prepared, "deployment-a", &signing_key)).unwrap(),
     )
     .unwrap();
     submit_evidence(&store, &record_a, &input).unwrap();
@@ -228,13 +423,13 @@ fn prepare_update_refuses_a_locked_shared_capability_without_persisting_state() 
 fn controller_steps_commit_the_new_declaration_only_after_final_acceptance() {
     let work = PrivateTempDir::new("nazoauthctl-coordination-commit").unwrap();
     let store = store(&work);
-    let current = record("deployment-a");
+    let (current, signing_key) = provider_record(&work, "deployment-a");
     store.persist(&current).unwrap();
     let prepared = prepare_update(&store, &current, &plan("deployment-a")).unwrap();
     let input = work.path().join("evidence.json");
     fs::write(
         &input,
-        serde_json::to_vec(&evidence(&prepared, "deployment-a")).unwrap(),
+        serde_json::to_vec(&evidence(&prepared, "deployment-a", &signing_key)).unwrap(),
     )
     .unwrap();
     submit_evidence(&store, &current, &input).unwrap();

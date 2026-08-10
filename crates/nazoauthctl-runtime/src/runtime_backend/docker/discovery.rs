@@ -5,41 +5,46 @@ use std::{ffi::OsStr, path::PathBuf};
 use anyhow::{Context as _, bail};
 
 use crate::{
-    deployment::{ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind},
-    process::Process,
+    ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind, process::Process,
 };
 
 use super::super::container_shared;
 use super::super::{RuntimeObservation, labels, safe_environment, server_command_verified};
 
 pub(super) fn discover(command: &OsStr) -> anyhow::Result<Vec<RuntimeObservation>> {
-    let ids = Process::new(command)
-        .args(["container", "ls", "-a", "--no-trunc", "--format", "{{.ID}}"])
-        .stdout()?;
-    ids.lines()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(|id| inspect(command, id))
-        .filter_map(|result| match result {
-            Ok(observation) if observation.server_command_verified => Some(Ok(observation)),
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect()
+    let ids = container_shared::command_stdout(
+        command,
+        &["container", "ls", "-a", "--no-trunc", "--format", "{{.ID}}"],
+        "Docker",
+    )?;
+    let mut observations = Vec::new();
+    for id in ids.lines().map(str::trim).filter(|id| !id.is_empty()) {
+        match inspect(command, id) {
+            Ok(observation) if observation.server_command_verified => {
+                observations.push(observation)
+            }
+            Ok(_) => {}
+            Err(error) if container_shared::is_engine_unavailable_error(&error) => {
+                return Err(error);
+            }
+            Err(_) => {
+                // A malformed or concurrently removed object is isolated to
+                // that object; it must not hide healthy server candidates.
+            }
+        }
+    }
+    Ok(observations)
 }
 
 pub(super) fn inspect(
     command: &OsStr,
     object_reference: &str,
 ) -> anyhow::Result<RuntimeObservation> {
-    let output = Process::new(command)
-        .args(["container", "inspect", object_reference])
-        .stdout()?;
-    let values: Vec<serde_json::Value> =
-        serde_json::from_str(&output).context("Docker inspect returned invalid JSON")?;
-    let value = values
-        .first()
-        .context("Docker inspect returned no object")?;
+    let value = container_shared::inspect_document(
+        command,
+        &["container", "inspect", object_reference],
+        "Docker",
+    )?;
     let config = value
         .get("Config")
         .context("Docker inspect omitted Config")?;
@@ -75,6 +80,7 @@ pub(super) fn inspect(
             },
             None,
         ),
+        Err(error) if container_shared::is_engine_unavailable_error(&error) => return Err(error),
         Err(_) => (
             ArtifactReference::Unknown,
             Some("trusted OCI digest could not be resolved".to_owned()),
@@ -182,15 +188,14 @@ pub(super) fn inspect_optional(
     command: &OsStr,
     object_reference: &str,
 ) -> anyhow::Result<Option<RuntimeObservation>> {
-    let output = Process::new(command)
-        .args(["container", "inspect", object_reference])
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-        if stderr.contains("no such object") || stderr.contains("no such container") {
-            return Ok(None);
-        }
-        bail!("Docker container inspection failed: {}", stderr.trim());
+    if container_shared::inspect_document_optional(
+        command,
+        &["container", "inspect", object_reference],
+        "Docker",
+    )?
+    .is_none()
+    {
+        return Ok(None);
     }
     Ok(Some(inspect(command, object_reference)?))
 }
@@ -199,22 +204,35 @@ pub(super) fn resolve_image_digest(
     command: &OsStr,
     image_reference: &str,
 ) -> anyhow::Result<String> {
-    let output = Process::new(command)
-        .args([
+    let output = container_shared::command_stdout(
+        command,
+        &[
             "image",
             "inspect",
             image_reference,
             "--format",
             "{{json .RepoDigests}}",
-        ])
-        .stdout()?;
+        ],
+        "Docker",
+    )?;
     let digests: Vec<String> = serde_json::from_str(output.trim())
         .context("Docker image inspect returned invalid RepoDigests")?;
+    let requested = image_reference
+        .rsplit_once('@')
+        .map(|(_, digest)| digest.to_ascii_lowercase());
     let digest = digests
         .iter()
         .filter_map(|value| value.rsplit_once('@').map(|(_, digest)| digest))
-        .find(|digest| container_shared::valid_digest(digest))
-        .context("Docker image has no immutable repository digest")?;
+        .find(|digest| {
+            container_shared::valid_digest(digest)
+                && container_shared::requested_digest_matches(image_reference, digest)
+        })
+        .with_context(|| {
+            requested.map_or_else(
+                || "Docker image has no immutable repository digest".to_owned(),
+                |requested| format!("Docker image does not retain requested digest {requested}"),
+            )
+        })?;
     Ok(digest.to_ascii_lowercase())
 }
 
@@ -222,9 +240,11 @@ pub(super) fn resolve_local_image_id(
     command: &OsStr,
     image_reference: &str,
 ) -> anyhow::Result<String> {
-    let output = Process::new(command)
-        .args(["image", "inspect", image_reference, "--format", "{{.Id}}"])
-        .stdout()?;
+    let output = container_shared::command_stdout(
+        command,
+        &["image", "inspect", image_reference, "--format", "{{.Id}}"],
+        "Docker",
+    )?;
     container_shared::normalize_local_image_id(output.trim(), false)
         .context("Docker image has no immutable local content identity")
 }
@@ -248,21 +268,15 @@ pub(super) fn read_build_identity(
             digest
         )
     });
-    let output = Process::new(command)
-        .args([
-            "run",
-            "--rm",
-            "--network",
-            "none",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--read-only",
-        ])
-        .arg(image)
-        .args(["nazoauth", "build-identity"])
-        .stdout()?;
+    let output = container_shared::append_build_identity_policy(Process::new(command).args([
+        "run",
+        "--rm",
+        "--network",
+        "none",
+    ]))
+    .arg(image)
+    .args(["nazoauth", "build-identity"])
+    .stdout()?;
     Ok(Some(serde_json::from_str(output.trim()).context(
         "Docker image returned an invalid build identity",
     )?))

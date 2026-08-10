@@ -7,10 +7,10 @@ use std::{
 use anyhow::{Context as _, bail};
 
 use crate::{
-    deployment::{ArtifactReference, RuntimeBackendKind},
+    ArtifactReference, RuntimeBackendKind,
     filesystem::{
-        atomic_write, copy_atomic_from_file, open_secure_regular_file, set_mode, sha256,
-        sha256_file, validate_secure_directory,
+        atomic_write, copy_atomic_from_file, ensure_directory_chain, open_secure_regular_file,
+        read_secure_regular_file, set_mode, sha256, sha256_file, validate_secure_directory,
     },
     process::Process,
 };
@@ -21,10 +21,16 @@ use super::{
     BlobAttestationVerification, HostServiceInstall, ManagedDependencies, ManagedDependencyBackup,
     ManagedNetwork, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore,
     OneShotTask, RuntimeBackend, RuntimeDatabasePrivilegeProbe, RuntimeObservation,
-    RuntimeReplacement, safe_environment,
+    RuntimeReplacement, safe_environment, safe_systemd_path,
 };
 
-pub(crate) struct SystemdBackend;
+pub struct SystemdBackend;
+
+const SYSTEMD_TASKS_MAX: &str = "512";
+const SYSTEMD_MEMORY_MAX: &str = "1G";
+const SYSTEMD_CPU_QUOTA: &str = "200%";
+const SYSTEMD_START_LIMIT_INTERVAL: &str = "60s";
+const SYSTEMD_START_LIMIT_BURST: &str = "5";
 
 impl RuntimeBackend for SystemdBackend {
     fn kind(&self) -> RuntimeBackendKind {
@@ -90,7 +96,7 @@ impl RuntimeBackend for SystemdBackend {
                 "show",
                 object_reference,
                 "--no-pager",
-                "--property=Id,LoadState,ActiveState,FragmentPath,ExecStart,Environment,EnvironmentFiles",
+                "--property=Id,LoadState,ActiveState,FragmentPath,ExecStart,Environment,EnvironmentFiles,User,Group,TasksMax,MemoryMax,CPUQuota,StartLimitIntervalUSec,StartLimitBurst,NoNewPrivileges,ProtectSystem,PrivateTmp",
             ])
             .stdout()?;
         let properties = parse_properties(&output);
@@ -118,6 +124,56 @@ impl RuntimeBackend for SystemdBackend {
             .flat_map(|value| value.split_whitespace())
             .map(|value| serde_json::Value::String(value.trim_matches('"').to_owned()))
             .collect::<Vec<_>>();
+        let safe_environment = safe_environment(&environment);
+        let mut evidence = vec!["systemd ExecStart identifies nazoauth server".to_owned()];
+        for (property, expected) in [
+            ("TasksMax", SYSTEMD_TASKS_MAX),
+            ("MemoryMax", SYSTEMD_MEMORY_MAX),
+            ("CPUQuota", SYSTEMD_CPU_QUOTA),
+            ("StartLimitBurst", SYSTEMD_START_LIMIT_BURST),
+        ] {
+            if properties
+                .get(property)
+                .is_some_and(|value| systemd_property_matches(property, value, expected))
+            {
+                evidence.push(format!("systemd {property} policy observed"));
+            } else {
+                missing.push(format!("systemd {property} policy is missing or drifted"));
+            }
+        }
+        if properties
+            .get("StartLimitIntervalUSec")
+            .is_some_and(|value| {
+                matches!(value.as_str(), "60000000" | "1min" | "60s" | "60000000us")
+            })
+        {
+            evidence.push("systemd StartLimitIntervalSec policy observed".to_owned());
+        } else {
+            missing.push("systemd StartLimitIntervalSec policy is missing or drifted".to_owned());
+        }
+        for (property, expected) in [
+            ("NoNewPrivileges", "yes"),
+            ("ProtectSystem", "strict"),
+            ("PrivateTmp", "yes"),
+        ] {
+            if !properties
+                .get(property)
+                .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+            {
+                missing.push(format!("systemd {property} hardening is not observable"));
+            }
+        }
+        for variable in ["DEPLOYMENT_ID", "RUNTIME_INSTANCE_ID", "CONTROL_AUTHORITY"] {
+            if !safe_environment.contains_key(variable) {
+                missing.push(format!("systemd Environment is missing {variable}"));
+            }
+        }
+        if properties
+            .get("EnvironmentFiles")
+            .is_some_and(|value| !value.is_empty() && value != "-")
+        {
+            evidence.push("systemd EnvironmentFiles observed".to_owned());
+        }
         Ok(RuntimeObservation {
             backend: self.kind(),
             object_reference: object_reference.to_owned(),
@@ -134,9 +190,9 @@ impl RuntimeBackend for SystemdBackend {
             ports: Vec::new(),
             networks: Vec::new(),
             mounts: Vec::new(),
-            safe_environment: safe_environment(&environment),
+            safe_environment,
             labels: BTreeMap::new(),
-            evidence: vec!["systemd ExecStart identifies nazoauth server".to_owned()],
+            evidence,
             missing,
         })
     }
@@ -204,11 +260,13 @@ impl RuntimeBackend for SystemdBackend {
             .stdout()?
             .trim()
             .to_owned();
-        let metadata = fs::symlink_metadata(&fragment_path)?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || !fs::read_to_string(&fragment_path)?.starts_with("# Managed by nazoauthctl\n")
-        {
+        let fragment = read_secure_regular_file(
+            Path::new(&fragment_path),
+            "managed systemd unit",
+            false,
+            1024 * 1024,
+        )?;
+        if !fragment.starts_with(b"# Managed by nazoauthctl\n") {
             bail!("systemd unit is not an authorized nazoauthctl-managed file");
         }
         Ok(())
@@ -466,20 +524,30 @@ impl RuntimeBackend for SystemdBackend {
         let unit_directory = env::var_os("NAZOAUTH_SYSTEMD_UNIT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/etc/systemd/system"));
-        crate::model::safe_systemd_path(&unit_directory)?;
+        safe_systemd_path(&unit_directory)?;
         if unit_directory.is_symlink() {
             bail!("systemd unit directory must not be a symlink");
         }
-        fs::create_dir_all(&unit_directory)?;
+        ensure_directory_chain(&unit_directory)?;
         set_mode(&unit_directory, 0o755)?;
         let unit_path = unit_directory.join(&install.service_name);
-        if unit_path.exists()
-            && !fs::read_to_string(&unit_path)?.starts_with("# Managed by nazoauthctl\n")
-        {
-            bail!(
-                "refusing to replace an unmanaged systemd unit: {}",
-                unit_path.display()
-            );
+        match fs::symlink_metadata(&unit_path) {
+            Ok(_) => {
+                let existing = read_secure_regular_file(
+                    &unit_path,
+                    "existing systemd unit",
+                    false,
+                    1024 * 1024,
+                )?;
+                if !existing.starts_with(b"# Managed by nazoauthctl\n") {
+                    bail!(
+                        "refusing to replace an unmanaged systemd unit: {}",
+                        unit_path.display()
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("failed to inspect systemd unit"),
         }
         let rendered = render_host_service_unit(install)?;
         atomic_write(&unit_path, rendered.as_bytes(), 0o644)?;
@@ -524,14 +592,16 @@ impl RuntimeBackend for SystemdBackend {
     }
 }
 
-pub(crate) fn render_host_service_unit(install: &HostServiceInstall) -> anyhow::Result<String> {
+pub fn render_host_service_unit(install: &HostServiceInstall) -> anyhow::Result<String> {
     validate_host_service_install(install)?;
     Ok(format!(
         "# Managed by nazoauthctl\n\
          [Unit]\n\
          Description=NazoAuth authorization server\n\
          After=network-online.target\n\
-         Wants=network-online.target\n\n\
+         Wants=network-online.target\n\
+         StartLimitIntervalSec={start_limit_interval}\n\
+         StartLimitBurst={start_limit_burst}\n\n\
          [Service]\n\
          Type=simple\n\
          User={user}\n\
@@ -545,6 +615,9 @@ pub(crate) fn render_host_service_unit(install: &HostServiceInstall) -> anyhow::
          Environment=INSTANCE_IDENTITY_DIR={instance_dir}\n\
          Restart=on-failure\n\
          RestartSec=2\n\
+         TasksMax={tasks_max}\n\
+         MemoryMax={memory_max}\n\
+         CPUQuota={cpu_quota}\n\
          NoNewPrivileges=true\n\
          PrivateTmp=true\n\
          PrivateDevices=true\n\
@@ -565,6 +638,11 @@ pub(crate) fn render_host_service_unit(install: &HostServiceInstall) -> anyhow::
         deployment_id = install.deployment_id,
         runtime_instance_id = install.runtime_instance_id,
         control_authority = install.control_authority,
+        tasks_max = SYSTEMD_TASKS_MAX,
+        memory_max = SYSTEMD_MEMORY_MAX,
+        cpu_quota = SYSTEMD_CPU_QUOTA,
+        start_limit_interval = SYSTEMD_START_LIMIT_INTERVAL,
+        start_limit_burst = SYSTEMD_START_LIMIT_BURST,
         working = install.working_directory.display(),
         binary = install.binary.display(),
         app_root = install.app_root.display(),
@@ -603,8 +681,7 @@ fn validate_host_service_install(install: &HostServiceInstall) -> anyhow::Result
         ("migration URL path", &install.migration_url),
         ("receipt private key path", &install.receipt_private_key),
     ] {
-        crate::model::safe_systemd_path(path)
-            .with_context(|| format!("{name} is unsafe for a systemd unit"))?;
+        safe_systemd_path(path).with_context(|| format!("{name} is unsafe for a systemd unit"))?;
     }
     for name in &install.runtime_readable_secret_names {
         validate_systemd_scalar("runtime secret name", name)?;
@@ -625,7 +702,7 @@ fn validate_systemd_scalar(name: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn parse_systemd_version(output: &str) -> anyhow::Result<u32> {
+pub fn parse_systemd_version(output: &str) -> anyhow::Result<u32> {
     let mut fields = output.lines().next().unwrap_or_default().split_whitespace();
     if fields.next() != Some("systemd") {
         bail!("systemd returned an invalid version banner");
@@ -657,6 +734,11 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
             "--pipe",
             "--collect",
             "--service-type=exec",
+            "--property=TasksMax=512",
+            "--property=MemoryMax=1G",
+            "--property=CPUQuota=200%",
+            "--property=StartLimitIntervalSec=60s",
+            "--property=StartLimitBurst=5",
             "--property=NoNewPrivileges=yes",
             "--property=PrivateTmp=yes",
             "--property=PrivateDevices=yes",
@@ -781,6 +863,13 @@ fn parse_properties(output: &str) -> BTreeMap<String, String> {
         .filter_map(|line| line.split_once('='))
         .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect()
+}
+
+fn systemd_property_matches(property: &str, value: &str, expected: &str) -> bool {
+    match property {
+        "MemoryMax" => matches!(value, "1073741824" | "1G" | "1073741824B") && expected == "1G",
+        _ => value == expected,
+    }
 }
 
 fn executable_from_systemd(exec_start: &str) -> Option<String> {
@@ -1043,7 +1132,7 @@ fn validate_mutable_unit(object_reference: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_is_nazoauth_server, parse_systemd_exec_start};
+    use super::{command_is_nazoauth_server, parse_systemd_exec_start, systemd_property_matches};
 
     #[test]
     fn parses_systemd_structured_exec_start_without_shell_splitting() {
@@ -1098,5 +1187,13 @@ mod tests {
             parse_systemd_exec_start("{ path=/opt/nazoauth ; argv[]=/opt/nazoauth server ; }\n")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn accepts_systemd_show_limit_units_without_treating_missing_values_as_safe() {
+        assert!(systemd_property_matches("TasksMax", "512", "512"));
+        assert!(systemd_property_matches("MemoryMax", "1073741824", "1G"));
+        assert!(systemd_property_matches("CPUQuota", "200%", "200%"));
+        assert!(!systemd_property_matches("TasksMax", "infinity", "512"));
     }
 }

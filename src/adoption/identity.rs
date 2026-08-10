@@ -13,8 +13,11 @@ pub(super) fn create_identities(
 ) -> anyhow::Result<Identities> {
     let active = store.deployment_state_dir(deployment_id).join("identities");
     let break_glass = store.break_glass_dir(deployment_id);
-    fs::create_dir_all(&active)?;
-    fs::create_dir_all(&break_glass)?;
+    crate::filesystem::ensure_private_directory(&active, "active deployment identity directory")?;
+    crate::filesystem::ensure_private_directory(
+        &break_glass,
+        "deployment break-glass identity directory",
+    )?;
     let controller = create_identity(&active, "controller")?;
     let receipt = create_identity(&active, "receipt")?;
     let audit = create_identity(&active, "audit")?;
@@ -45,17 +48,50 @@ pub(super) fn create_identities(
 fn create_identity(directory: &Path, name: &str) -> anyhow::Result<(String, SigningKey)> {
     let private_path = directory.join(format!("{name}.key"));
     let public_path = directory.join(format!("{name}.pub"));
-    if private_path.exists() {
+    let private_present = match fs::symlink_metadata(&private_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("stored identity private key must be a regular non-symlink file");
+            }
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("failed to inspect stored identity private key"),
+    };
+    if private_present {
         let private = URL_SAFE_NO_PAD
-            .decode(fs::read_to_string(&private_path)?.trim())
+            .decode(
+                String::from_utf8_lossy(&read_secure_regular_file(
+                    &private_path,
+                    "stored identity private key",
+                    true,
+                    4096,
+                )?)
+                .trim(),
+            )
             .context("stored identity private key is invalid")?;
         let private: [u8; 32] = private
             .try_into()
             .map_err(|_| anyhow::anyhow!("stored identity private key has an invalid length"))?;
         let signing = SigningKey::from_bytes(&private);
         let public = URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
-        if public_path.exists() {
-            if fs::read_to_string(&public_path)?.trim() != public {
+        let public_present = match fs::symlink_metadata(&public_path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    bail!("stored identity public key must be a regular non-symlink file");
+                }
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error).context("failed to inspect stored identity public key");
+            }
+        };
+        if public_present {
+            let stored_public_bytes =
+                read_secure_regular_file(&public_path, "stored identity public key", false, 4096)?;
+            let stored_public = String::from_utf8_lossy(&stored_public_bytes);
+            if stored_public.trim() != public {
                 bail!("stored identity public key does not match its private key");
             }
         } else {
@@ -68,8 +104,10 @@ fn create_identity(directory: &Path, name: &str) -> anyhow::Result<(String, Sign
         );
         return Ok((key_id, signing));
     }
-    if public_path.exists() {
-        bail!("stored identity has a public key but no private key");
+    match fs::symlink_metadata(&public_path) {
+        Ok(_) => bail!("stored identity has a public key but no private key"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect stored identity public key"),
     }
     let signing = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
     let key_id = nazo_operator_protocol::instance_key_id(&signing.verifying_key()).replacen(

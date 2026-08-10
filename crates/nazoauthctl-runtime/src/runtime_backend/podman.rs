@@ -12,7 +12,7 @@ mod operations;
 
 use std::ffi::OsString;
 
-use crate::deployment::{ArtifactReference, RuntimeBackendKind};
+use crate::{ArtifactReference, RuntimeBackendKind};
 
 #[cfg(debug_assertions)]
 use super::DebugArtifactTask;
@@ -23,7 +23,7 @@ use super::{
     RuntimeReplacement,
 };
 
-pub(crate) struct PodmanBackend {
+pub struct PodmanBackend {
     command: OsString,
 }
 
@@ -36,8 +36,7 @@ impl Default for PodmanBackend {
 }
 
 impl PodmanBackend {
-    #[cfg(test)]
-    pub(crate) fn with_command(command: impl Into<OsString>) -> Self {
+    pub fn with_command(command: impl Into<OsString>) -> Self {
         Self {
             command: command.into(),
         }

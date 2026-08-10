@@ -1,0 +1,1834 @@
+//! Two-phase Rust-native materialization for NazoAuth's conformance matrix.
+//!
+//! `prepare` allocates the complete ephemeral credential set and emits only
+//! the values required by the NazoAuth onboarding endpoint.  The operator
+//! applies that bundle and returns an `OnboardingOutput` containing lease and
+//! logical-to-actual client mappings.  `finalize` then substitutes private
+//! material from the in-memory preparation into the Suite configuration.  A
+//! bundle or mapping from another run cannot be accepted because all three
+//! identities (lease, matrix, and bundle) are checked before finalization.
+
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(all(test, unix))]
+use std::fs;
+use std::path::Path;
+
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use p256::ecdsa::SigningKey;
+use rand_core::{OsRng, RngCore};
+use rcgen::{
+    BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    KeyUsagePurpose,
+};
+use rsa::RsaPrivateKey;
+use rsa::traits::{PrivateKeyParts, PublicKeyParts};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+use time::{Duration as TimeDuration, OffsetDateTime};
+use url::Url;
+use uuid::Uuid;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+use crate::matrix::{MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix};
+use crate::origin::Origin;
+
+pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
+pub const MAX_DESCRIPTOR_BYTES: usize = 8 * 1024 * 1024;
+pub const SECURE_BUNDLE_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DescriptorSource {
+    pub release: String,
+    pub digest: String,
+}
+
+/// Non-secret matrix authority.  Test plan names and profile/variant choices
+/// come from this document; no plan is selected in Rust code.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatrixDescriptor {
+    pub schema: u32,
+    pub source: DescriptorSource,
+    pub groups: Vec<DescriptorGroup>,
+    #[serde(skip)]
+    raw_sha256: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DescriptorGroup {
+    pub id: String,
+    pub profile: String,
+    pub variant: DescriptorVariant,
+    #[serde(default)]
+    pub required_roles: Vec<RoleRequirement>,
+    pub plans: Vec<DescriptorPlan>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DescriptorVariant {
+    pub id: String,
+    #[serde(default)]
+    pub values: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DescriptorPlan {
+    pub id: String,
+    /// Official Suite `planName`.
+    pub plan: String,
+    pub config_template: Value,
+    #[serde(default)]
+    pub variant: BTreeMap<String, String>,
+    #[serde(default)]
+    pub required_roles: Vec<RoleRequirement>,
+    /// Local aliases.  Values must be one complete placeholder.
+    #[serde(default)]
+    pub secret_bindings: BTreeMap<String, String>,
+    #[serde(default)]
+    pub crypto: CryptoPolicy,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleRequirement {
+    pub role: String,
+    /// When omitted, the role name is the logical client id.
+    #[serde(default)]
+    pub logical_client_id: Option<String>,
+    #[serde(default)]
+    pub secret_refs: Vec<String>,
+    /// Complete non-secret CreateClientRequest template.  Only roles with a
+    /// registration template create a client in the onboarding bundle.
+    #[serde(default)]
+    pub registration_template: Option<Value>,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CryptoPolicy {
+    #[serde(default = "default_rsa_bits")]
+    pub rsa_bits: u16,
+    #[serde(default = "default_ec_curve")]
+    pub ec_curve: String,
+    #[serde(default = "default_mtls_signature")]
+    pub mtls_signature: String,
+}
+
+impl Default for CryptoPolicy {
+    fn default() -> Self {
+        Self {
+            rsa_bits: default_rsa_bits(),
+            ec_curve: default_ec_curve(),
+            mtls_signature: default_mtls_signature(),
+        }
+    }
+}
+
+fn default_rsa_bits() -> u16 {
+    2048
+}
+
+fn default_ec_curve() -> String {
+    "P-256".to_owned()
+}
+
+fn default_mtls_signature() -> String {
+    "ECDSA-P256-SHA256".to_owned()
+}
+
+/// Lease/apply result.  It intentionally contains no password, client secret,
+/// private JWK, or private certificate key.  The values are retained only in
+/// `PreparedMaterialization` and are substituted during `finalize`.
+#[derive(Clone)]
+pub struct OnboardingOutput {
+    lease_id: String,
+    request_jti: String,
+    matrix_sha256: String,
+    clients: BTreeMap<String, String>,
+}
+
+impl OnboardingOutput {
+    pub fn new(
+        lease_id: impl Into<String>,
+        request_jti: impl Into<String>,
+        matrix_sha256: impl Into<String>,
+        clients: BTreeMap<String, String>,
+    ) -> Result<Self, MaterializerError> {
+        let lease_id = lease_id.into();
+        let request_jti = request_jti.into();
+        let matrix_sha256 = matrix_sha256.into();
+        validate_lease_id(&lease_id)?;
+        validate_request_jti(&request_jti)?;
+        validate_digest(&matrix_sha256, "matrix_sha256")?;
+        for (logical, actual) in &clients {
+            validate_public_id(logical, "logical client id", 256)?;
+            validate_public_id(actual, "actual client id", 512)?;
+        }
+        let actual_ids = clients.values().collect::<BTreeSet<_>>();
+        if actual_ids.len() != clients.len() {
+            return Err(MaterializerError::DuplicateClientMapping);
+        }
+        Ok(Self {
+            lease_id,
+            request_jti,
+            matrix_sha256,
+            clients,
+        })
+    }
+
+    pub fn lease_id(&self) -> &str {
+        &self.lease_id
+    }
+
+    pub fn matrix_sha256(&self) -> &str {
+        &self.matrix_sha256
+    }
+
+    /// Compatibility accessor; this is the raw MatrixDescribe SHA-256, not a
+    /// second derived identity.
+    pub fn matrix_digest(&self) -> &str {
+        self.matrix_sha256()
+    }
+
+    pub fn request_jti(&self) -> &str {
+        &self.request_jti
+    }
+
+    pub fn clients(&self) -> &BTreeMap<String, String> {
+        &self.clients
+    }
+}
+
+impl std::fmt::Debug for OnboardingOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OnboardingOutput")
+            .field("lease_id", &self.lease_id)
+            .field("request_jti", &self.request_jti)
+            .field("matrix_sha256", &self.matrix_sha256)
+            .field("clients", &self.clients)
+            .finish()
+    }
+}
+
+/// Preparation state is deliberately neither serializable nor printable.
+/// Its `Zeroize`/`ZeroizeOnDrop` implementation clears every private field;
+/// descriptor/public metadata is retained only for the duration of finalize.
+pub struct PreparedMaterialization {
+    descriptor: MatrixDescriptor,
+    target_issuer: String,
+    suite_base_url: String,
+    request_jti: String,
+    matrix_sha256: String,
+    bundle_digest: String,
+    applicant_email: Zeroizing<String>,
+    applicant_password: Zeroizing<String>,
+    dynamic_registration_initial_access_token: Option<Zeroizing<String>>,
+    ciba_automated_decision_token: Option<Zeroizing<String>>,
+    clients: BTreeMap<String, PreparedClient>,
+}
+
+impl Zeroize for PreparedMaterialization {
+    fn zeroize(&mut self) {
+        self.applicant_password.zeroize();
+        self.applicant_email.zeroize();
+        self.dynamic_registration_initial_access_token.zeroize();
+        self.ciba_automated_decision_token.zeroize();
+        for client in self.clients.values_mut() {
+            client.zeroize();
+        }
+    }
+}
+
+impl ZeroizeOnDrop for PreparedMaterialization {}
+
+impl Drop for PreparedMaterialization {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl PreparedMaterialization {
+    pub fn request_jti(&self) -> &str {
+        &self.request_jti
+    }
+
+    pub fn matrix_sha256(&self) -> &str {
+        &self.matrix_sha256
+    }
+
+    pub fn matrix_digest(&self) -> &str {
+        self.matrix_sha256()
+    }
+
+    pub fn bundle_digest(&self) -> &str {
+        &self.bundle_digest
+    }
+
+    pub fn expected_clients(&self) -> BTreeSet<String> {
+        self.clients.keys().cloned().collect()
+    }
+
+    pub fn applicant_email(&self) -> &str {
+        &self.applicant_email
+    }
+
+    pub fn suite_base_url(&self) -> &str {
+        &self.suite_base_url
+    }
+}
+
+struct PreparedClient {
+    logical_client_id: String,
+    client_secret: Zeroizing<String>,
+    rsa_private_jwk: Zeroizing<String>,
+    rsa_public_jwks: Zeroizing<String>,
+    ec_private_jwk: Zeroizing<String>,
+    ec_public_jwks: Zeroizing<String>,
+    mtls_ca_certificate: Zeroizing<String>,
+    mtls_client_certificate: Zeroizing<String>,
+    mtls_client_key: Zeroizing<String>,
+    request: Value,
+}
+
+impl Zeroize for PreparedClient {
+    fn zeroize(&mut self) {
+        self.client_secret.zeroize();
+        self.rsa_private_jwk.zeroize();
+        self.rsa_public_jwks.zeroize();
+        self.ec_private_jwk.zeroize();
+        self.ec_public_jwks.zeroize();
+        self.mtls_ca_certificate.zeroize();
+        self.mtls_client_certificate.zeroize();
+        self.mtls_client_key.zeroize();
+    }
+}
+
+/// Private bytes are zeroized and can only be written using the owner-only
+/// atomic writer.  The bundle record below intentionally excludes private JWK
+/// values and the mTLS private key.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct SecureBytes(Zeroizing<Vec<u8>>);
+
+impl SecureBytes {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn write_private(&self, path: &Path) -> Result<(), MaterializerError> {
+        crate::secure_file::write_atomic(path, self.as_bytes(), true).map_err(|error| match error {
+            crate::secure_file::SecureFileError::UnsupportedPlatform => {
+                MaterializerError::UnsupportedPlatform
+            }
+            _ => MaterializerError::SecureIo,
+        })
+    }
+}
+
+impl std::fmt::Debug for SecureBytes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SecureBytes([redacted])")
+    }
+}
+
+pub struct SecureOnboardingBundle {
+    bytes: SecureBytes,
+    digest: String,
+    matrix_sha256: String,
+    request_jti: String,
+}
+
+impl SecureOnboardingBundle {
+    pub fn bytes(&self) -> &SecureBytes {
+        &self.bytes
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub fn matrix_sha256(&self) -> &str {
+        &self.matrix_sha256
+    }
+
+    pub fn request_jti(&self) -> &str {
+        &self.request_jti
+    }
+
+    pub fn write_private(&self, path: &Path) -> Result<(), MaterializerError> {
+        self.bytes.write_private(path)
+    }
+}
+
+impl std::fmt::Debug for SecureOnboardingBundle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecureOnboardingBundle")
+            .field("digest", &self.digest)
+            .field("matrix_sha256", &self.matrix_sha256)
+            .field("request_jti", &self.request_jti)
+            .field("bytes", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Error, Clone, Eq, PartialEq)]
+pub enum MaterializerError {
+    #[error("matrix descriptor exceeds its size limit")]
+    Oversize,
+    #[error("matrix descriptor is malformed")]
+    Malformed,
+    #[error("matrix descriptor schema is unsupported: {0}")]
+    UnsupportedSchema(u32),
+    #[error("matrix descriptor field {0} is invalid")]
+    InvalidField(&'static str),
+    #[error("matrix descriptor contains duplicate id: {0}")]
+    DuplicateId(String),
+    #[error("matrix descriptor contains duplicate role: {0}")]
+    DuplicateRole(String),
+    #[error("matrix descriptor contains a static sensitive value")]
+    EmbeddedSecret,
+    #[error("matrix template contains an invalid placeholder")]
+    InvalidPlaceholder,
+    #[error("matrix template references an unknown secret: {0}")]
+    UnknownSecretReference(String),
+    #[error("matrix template references another plan or group: {0}")]
+    CrossPlanReference(String),
+    #[error("matrix template contains a cyclic secret reference")]
+    SecretCycle,
+    #[error("matrix template references an unknown logical client: {0}")]
+    UnknownClientReference(String),
+    #[error("matrix template contains an ambiguous logical client reference")]
+    AmbiguousClientReference,
+    #[error("descriptor requests a weak or unsupported cryptographic policy")]
+    WeakAlgorithm,
+    #[error("target issuer is not an HTTPS or loopback HTTP URL")]
+    UnsafeIssuer,
+    #[error("cryptographic material generation failed")]
+    Crypto,
+    #[error("secure bundle encoding failed")]
+    Encoding,
+    #[error("secure bundle persistence is unsupported on this platform")]
+    UnsupportedPlatform,
+    #[error("secure bundle persistence failed")]
+    SecureIo,
+    #[error("onboarding output is missing a required logical client")]
+    MissingClientMapping,
+    #[error("onboarding output contains an unexpected logical client")]
+    ExtraClientMapping,
+    #[error("onboarding output contains duplicate actual clients")]
+    DuplicateClientMapping,
+    #[error("onboarding request identity does not match preparation")]
+    RequestMismatch,
+    #[error("onboarding matrix identity does not match preparation")]
+    MatrixDigestMismatch,
+}
+
+pub struct DescriptorMaterializer;
+
+impl DescriptorMaterializer {
+    pub fn from_bytes(bytes: &[u8]) -> Result<MatrixDescriptor, MaterializerError> {
+        if bytes.len() > MAX_DESCRIPTOR_BYTES {
+            return Err(MaterializerError::Oversize);
+        }
+        let mut descriptor: MatrixDescriptor =
+            serde_json::from_slice(bytes).map_err(|_| MaterializerError::Malformed)?;
+        validate_descriptor(&descriptor)?;
+        descriptor.raw_sha256 = Some(digest_hex(bytes));
+        Ok(descriptor)
+    }
+
+    /// Generate all ephemeral material and an onboarding-only bundle.  No
+    /// actual client ids or lease are known at this point.
+    pub fn prepare(
+        descriptor: MatrixDescriptor,
+        target_issuer: &str,
+        suite_origin: &Origin,
+        request_jti: &str,
+    ) -> Result<(PreparedMaterialization, SecureOnboardingBundle), MaterializerError> {
+        validate_descriptor(&descriptor)?;
+        validate_target_issuer(target_issuer)?;
+        validate_request_jti(request_jti)?;
+        let matrix_sha256 = descriptor
+            .raw_sha256
+            .clone()
+            .ok_or(MaterializerError::InvalidField("matrix_sha256"))?;
+        let policies = collect_client_policies(&descriptor)?;
+        let registrations = collect_registrations(&descriptor)?;
+        let applicant_password = Zeroizing::new(random_secret(32));
+        let applicant_email = Zeroizing::new(format!("oidf-{}@example.invalid", random_hex(16)));
+        let mut clients = BTreeMap::new();
+        for (logical_client_id, policy) in policies {
+            let registration = registrations
+                .get(&logical_client_id)
+                .ok_or(MaterializerError::InvalidField("registration_template"))?;
+            clients.insert(
+                logical_client_id.clone(),
+                PreparedClient::new(
+                    logical_client_id,
+                    &policy,
+                    registration,
+                    target_issuer,
+                    suite_origin.as_str(),
+                )?,
+            );
+        }
+        let needs_dynamic_token = descriptor_requires_reference(
+            &descriptor,
+            "generated.dynamic_registration_initial_access_token",
+        );
+        let needs_ciba_token =
+            descriptor_requires_reference(&descriptor, "generated.ciba_automated_decision_token");
+        let dynamic_registration_initial_access_token =
+            needs_dynamic_token.then(|| Zeroizing::new(random_secret(32)));
+        let ciba_automated_decision_token =
+            needs_ciba_token.then(|| Zeroizing::new(random_secret(32)));
+        let bundle_record = SecureBundleRecord {
+            schema: SECURE_BUNDLE_SCHEMA_VERSION,
+            request_jti: request_jti.to_owned(),
+            matrix_sha256: matrix_sha256.clone(),
+            profile: "nazoauth-full".to_owned(),
+            target_issuer: target_issuer.to_owned(),
+            suite_base_url: suite_origin.as_str().to_owned(),
+            applicant: SecureApplicantBundle {
+                email: applicant_email.clone(),
+                password: applicant_password.clone(),
+            },
+            dynamic_registration_initial_access_token: dynamic_registration_initial_access_token
+                .clone(),
+            ciba_automated_decision_token: ciba_automated_decision_token.clone(),
+            clients: clients
+                .values()
+                .map(PreparedClient::server_record)
+                .collect(),
+        };
+        let bytes = serde_json::to_vec(&bundle_record).map_err(|_| MaterializerError::Encoding)?;
+        let bundle_digest = digest_hex(&bytes);
+        let bundle = SecureOnboardingBundle {
+            bytes: SecureBytes(Zeroizing::new(bytes)),
+            digest: bundle_digest.clone(),
+            matrix_sha256: matrix_sha256.clone(),
+            request_jti: request_jti.to_owned(),
+        };
+        let prepared = PreparedMaterialization {
+            descriptor,
+            target_issuer: target_issuer.to_owned(),
+            suite_base_url: suite_origin.as_str().to_owned(),
+            request_jti: request_jti.to_owned(),
+            matrix_sha256,
+            bundle_digest,
+            applicant_email,
+            applicant_password,
+            dynamic_registration_initial_access_token,
+            ciba_automated_decision_token,
+            clients,
+        };
+        Ok((prepared, bundle))
+    }
+
+    /// Verify the lease/apply result and only then construct the Suite matrix
+    /// with actual client ids and private in-memory material.
+    pub fn finalize(
+        prepared: PreparedMaterialization,
+        onboarding: OnboardingOutput,
+    ) -> Result<MaterializedMatrix, MaterializerError> {
+        validate_lease_id(&onboarding.lease_id)?;
+        if onboarding.request_jti != prepared.request_jti {
+            return Err(MaterializerError::RequestMismatch);
+        }
+        if onboarding.matrix_sha256 != prepared.matrix_sha256 {
+            return Err(MaterializerError::MatrixDigestMismatch);
+        }
+        let expected = prepared.clients.keys().collect::<BTreeSet<_>>();
+        let actual = onboarding.clients.keys().collect::<BTreeSet<_>>();
+        if actual.len() < expected.len() && !expected.is_subset(&actual) {
+            return Err(MaterializerError::MissingClientMapping);
+        }
+        if !expected.is_subset(&actual) {
+            return Err(MaterializerError::MissingClientMapping);
+        }
+        if !actual.is_subset(&expected) {
+            return Err(MaterializerError::ExtraClientMapping);
+        }
+
+        let mut groups = Vec::with_capacity(prepared.descriptor.groups.len());
+        for group in &prepared.descriptor.groups {
+            let mut plans = Vec::with_capacity(group.plans.len());
+            for plan in &group.plans {
+                let config = materialize_value(
+                    &plan.config_template,
+                    &plan.secret_bindings,
+                    &prepared,
+                    &onboarding.clients,
+                    &mut BTreeSet::new(),
+                )?;
+                plans.push(MatrixPlan {
+                    id: plan.id.clone(),
+                    plan: plan.plan.clone(),
+                    config,
+                    variant: plan.variant.clone(),
+                });
+            }
+            groups.push(MatrixGroup {
+                id: group.id.clone(),
+                profile: group.profile.clone(),
+                variant: MatrixVariant {
+                    id: group.variant.id.clone(),
+                    values: group.variant.values.clone(),
+                },
+                plans,
+            });
+        }
+        let matrix = MatrixDocument {
+            schema: crate::matrix::MATRIX_SCHEMA_VERSION,
+            name: format!("nazoauth-{}", prepared.descriptor.source.release),
+            groups,
+        };
+        Ok(MaterializedMatrix {
+            matrix: Some(SelectedMatrix::from_materialized(
+                matrix,
+                prepared.matrix_sha256.clone(),
+            )),
+            matrix_sha256: prepared.matrix_sha256.clone(),
+            bundle_digest: prepared.bundle_digest.clone(),
+            lease_id: onboarding.lease_id.clone(),
+        })
+    }
+}
+
+pub struct MaterializedMatrix {
+    matrix: Option<SelectedMatrix>,
+    matrix_sha256: String,
+    bundle_digest: String,
+    lease_id: String,
+}
+
+impl Drop for MaterializedMatrix {
+    fn drop(&mut self) {
+        if let Some(matrix) = &mut self.matrix {
+            matrix.zeroize_config();
+        }
+    }
+}
+
+impl MaterializedMatrix {
+    pub fn matrix(&self) -> &SelectedMatrix {
+        self.matrix
+            .as_ref()
+            .expect("materialized matrix has not been transferred")
+    }
+
+    /// Transfer the secret-bearing Suite configuration into the runner
+    /// without cloning it. The empty shell remains safely droppable.
+    pub fn take_matrix(&mut self) -> SelectedMatrix {
+        self.matrix
+            .take()
+            .expect("materialized matrix may be transferred only once")
+    }
+
+    pub fn matrix_sha256(&self) -> &str {
+        &self.matrix_sha256
+    }
+
+    pub fn matrix_digest(&self) -> &str {
+        self.matrix_sha256()
+    }
+
+    pub fn bundle_digest(&self) -> &str {
+        &self.bundle_digest
+    }
+
+    pub fn lease_id(&self) -> &str {
+        &self.lease_id
+    }
+}
+
+impl std::fmt::Debug for MaterializedMatrix {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MaterializedMatrix")
+            .field("matrix_sha256", &self.matrix_sha256)
+            .field("bundle_digest", &self.bundle_digest)
+            .field("lease_id", &self.lease_id)
+            .finish()
+    }
+}
+
+impl PreparedClient {
+    fn new(
+        logical_client_id: String,
+        policy: &CryptoPolicy,
+        registration_template: &Value,
+        target_issuer: &str,
+        suite_origin: &str,
+    ) -> Result<Self, MaterializerError> {
+        let client_secret = Zeroizing::new(random_secret(32));
+        let mut rng = OsRng;
+        let rsa = RsaPrivateKey::new(&mut rng, policy.rsa_bits as usize)
+            .map_err(|_| MaterializerError::Crypto)?;
+        let (rsa_private_jwk, rsa_public_jwks) = rsa_jwks(&rsa)?;
+        let ec = SigningKey::random(&mut rng);
+        let (ec_private_jwk, ec_public_jwks) = ec_jwks(&ec)?;
+        let (mtls_ca_certificate, mtls_client_certificate, mtls_client_key) = generate_mtls()?;
+        let request = materialize_registration_template(
+            registration_template,
+            &logical_client_id,
+            target_issuer,
+            suite_origin,
+            &rsa_public_jwks,
+            &ec_public_jwks,
+            &mtls_ca_certificate,
+            &mtls_client_certificate,
+        )?;
+        let auth_method = request
+            .get("token_endpoint_auth_method")
+            .and_then(Value::as_str)
+            .ok_or(MaterializerError::InvalidField(
+                "registration_template.token_endpoint_auth_method",
+            ))?;
+        let client_secret = if matches!(auth_method, "client_secret_basic" | "client_secret_post") {
+            client_secret
+        } else {
+            Zeroizing::new(String::new())
+        };
+        Ok(Self {
+            logical_client_id,
+            client_secret,
+            rsa_private_jwk: Zeroizing::new(rsa_private_jwk),
+            rsa_public_jwks: Zeroizing::new(rsa_public_jwks),
+            ec_private_jwk: Zeroizing::new(ec_private_jwk),
+            ec_public_jwks: Zeroizing::new(ec_public_jwks),
+            mtls_ca_certificate: Zeroizing::new(mtls_ca_certificate),
+            mtls_client_certificate: Zeroizing::new(mtls_client_certificate),
+            mtls_client_key: Zeroizing::new(mtls_client_key),
+            request,
+        })
+    }
+
+    fn server_record(&self) -> SecureClientRecord {
+        SecureClientRecord {
+            client_secret: if self.client_secret.is_empty() {
+                None
+            } else {
+                Some(self.client_secret.clone())
+            },
+            request: self.request.clone(),
+            mtls_trust_anchor_pem: if registration_requires_mtls(&self.request) {
+                Some(self.mtls_ca_certificate.clone())
+            } else {
+                None
+            },
+            logical_client_id: self.logical_client_id.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SecureBundleRecord {
+    schema: u32,
+    request_jti: String,
+    matrix_sha256: String,
+    profile: String,
+    target_issuer: String,
+    suite_base_url: String,
+    applicant: SecureApplicantBundle,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_registration_initial_access_token: Option<Zeroizing<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ciba_automated_decision_token: Option<Zeroizing<String>>,
+    clients: Vec<SecureClientRecord>,
+}
+
+#[derive(Serialize)]
+struct SecureClientRecord {
+    logical_client_id: String,
+    request: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_secret: Option<Zeroizing<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mtls_trust_anchor_pem: Option<Zeroizing<String>>,
+}
+
+#[derive(Serialize)]
+struct SecureApplicantBundle {
+    email: Zeroizing<String>,
+    password: Zeroizing<String>,
+}
+
+fn validate_descriptor(descriptor: &MatrixDescriptor) -> Result<(), MaterializerError> {
+    if descriptor.schema != DESCRIPTOR_SCHEMA_VERSION {
+        return Err(MaterializerError::UnsupportedSchema(descriptor.schema));
+    }
+    validate_name(&descriptor.source.release, "source.release")?;
+    validate_digest(&descriptor.source.digest, "source.digest")?;
+    if descriptor.groups.is_empty() {
+        return Err(MaterializerError::InvalidField("groups"));
+    }
+    let mut groups = BTreeSet::new();
+    let mut plans = BTreeSet::new();
+    for group in &descriptor.groups {
+        validate_name(&group.id, "group.id")?;
+        validate_name(&group.profile, "group.profile")?;
+        validate_name(&group.variant.id, "variant.id")?;
+        if !groups.insert(group.id.clone()) {
+            return Err(MaterializerError::DuplicateId(group.id.clone()));
+        }
+        role_names(&group.required_roles)?;
+        if group.plans.is_empty() {
+            return Err(MaterializerError::InvalidField("group.plans"));
+        }
+        for plan in &group.plans {
+            validate_name(&plan.id, "plan.id")?;
+            validate_name(&plan.plan, "plan")?;
+            if !plan.config_template.is_object() {
+                return Err(MaterializerError::InvalidField("plan.config_template"));
+            }
+            if !plans.insert(plan.id.clone()) {
+                return Err(MaterializerError::DuplicateId(plan.id.clone()));
+            }
+            role_names(&plan.required_roles)?;
+            validate_crypto_policy(&plan.crypto)?;
+            validate_bindings(plan)?;
+            validate_value_template(&plan.config_template)?;
+            validate_template_references(&plan.config_template, &plan.secret_bindings)?;
+            validate_role_refs(plan, group, &group.required_roles, &plan.required_roles)?;
+        }
+    }
+    let clients = collect_client_policies(descriptor)?
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for group in &descriptor.groups {
+        for plan in &group.plans {
+            validate_template_clients(&plan.config_template, &plan.secret_bindings, &clients)?;
+            for template in plan.secret_bindings.values() {
+                validate_template_clients(
+                    &Value::String(template.clone()),
+                    &plan.secret_bindings,
+                    &clients,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_role_refs(
+    plan: &DescriptorPlan,
+    group: &DescriptorGroup,
+    group_roles: &[RoleRequirement],
+    plan_roles: &[RoleRequirement],
+) -> Result<(), MaterializerError> {
+    let mut roles = BTreeSet::new();
+    for requirement in group_roles.iter().chain(plan_roles) {
+        let logical = logical_client_id(requirement)?;
+        if !roles.insert(logical.clone()) {
+            return Err(MaterializerError::DuplicateRole(logical));
+        }
+        for reference in &requirement.secret_refs {
+            validate_binding_reference(reference, &plan.secret_bindings, &mut BTreeSet::new())?;
+        }
+        if let Some(template) = &requirement.registration_template {
+            validate_registration_template(template)?;
+        }
+    }
+    let _ = group;
+    Ok(())
+}
+
+fn collect_client_policies(
+    descriptor: &MatrixDescriptor,
+) -> Result<BTreeMap<String, CryptoPolicy>, MaterializerError> {
+    let mut policies = BTreeMap::new();
+    for group in &descriptor.groups {
+        for plan in &group.plans {
+            for role in group.required_roles.iter().chain(&plan.required_roles) {
+                if role.registration_template.is_none() {
+                    continue;
+                }
+                let logical = logical_client_id(role)?;
+                if let Some(previous) = policies.get(&logical)
+                    && previous != &plan.crypto
+                {
+                    return Err(MaterializerError::InvalidField("client crypto policy"));
+                }
+                policies.insert(logical, plan.crypto.clone());
+            }
+        }
+    }
+    Ok(policies)
+}
+
+fn collect_registrations(
+    descriptor: &MatrixDescriptor,
+) -> Result<BTreeMap<String, Value>, MaterializerError> {
+    let mut registrations = BTreeMap::new();
+    for group in &descriptor.groups {
+        for plan in &group.plans {
+            for role in group.required_roles.iter().chain(&plan.required_roles) {
+                let Some(template) = &role.registration_template else {
+                    continue;
+                };
+                let logical = logical_client_id(role)?;
+                if let Some(previous) = registrations.get(&logical)
+                    && previous != template
+                {
+                    return Err(MaterializerError::InvalidField("registration_template"));
+                }
+                registrations.insert(logical, template.clone());
+            }
+        }
+    }
+    Ok(registrations)
+}
+
+fn logical_client_id(role: &RoleRequirement) -> Result<String, MaterializerError> {
+    let value = role.logical_client_id.as_deref().unwrap_or(&role.role);
+    validate_name(value, "logical_client_id")?;
+    Ok(value.to_owned())
+}
+
+fn role_names(roles: &[RoleRequirement]) -> Result<BTreeSet<String>, MaterializerError> {
+    let mut names = BTreeSet::new();
+    for role in roles {
+        validate_name(&role.role, "role")?;
+        if !names.insert(role.role.clone()) {
+            return Err(MaterializerError::DuplicateRole(role.role.clone()));
+        }
+        if let Some(logical) = &role.logical_client_id {
+            validate_name(logical, "logical_client_id")?;
+        }
+    }
+    Ok(names)
+}
+
+fn validate_bindings(plan: &DescriptorPlan) -> Result<(), MaterializerError> {
+    for (name, template) in &plan.secret_bindings {
+        validate_name(name, "secret binding")?;
+        let reference = parse_placeholder(template)?;
+        validate_binding_reference(reference, &plan.secret_bindings, &mut BTreeSet::new())?;
+    }
+    Ok(())
+}
+
+fn validate_binding_reference(
+    reference: &str,
+    bindings: &BTreeMap<String, String>,
+    stack: &mut BTreeSet<String>,
+) -> Result<(), MaterializerError> {
+    let name = reference.trim();
+    if name.starts_with("plan.") || name.starts_with("group.") || name.contains("::") {
+        return Err(MaterializerError::CrossPlanReference(name.to_owned()));
+    }
+    if let Some(binding_name) = name.strip_prefix("secret.") {
+        if !bindings.contains_key(binding_name) {
+            return Err(MaterializerError::UnknownSecretReference(name.to_owned()));
+        }
+        if !stack.insert(binding_name.to_owned()) {
+            return Err(MaterializerError::SecretCycle);
+        }
+        let nested = parse_placeholder(
+            bindings
+                .get(binding_name)
+                .ok_or(MaterializerError::InvalidPlaceholder)?,
+        )?;
+        let result = validate_binding_reference(nested, bindings, stack);
+        stack.remove(binding_name);
+        return result;
+    }
+    if bindings.contains_key(name) {
+        return validate_binding_reference(&format!("secret.{name}"), bindings, stack);
+    }
+    if is_builtin_reference(name) {
+        return Ok(());
+    }
+    Err(MaterializerError::UnknownSecretReference(name.to_owned()))
+}
+
+fn validate_value_template(value: &Value) -> Result<(), MaterializerError> {
+    match value {
+        Value::Array(values) => values.iter().try_for_each(validate_value_template),
+        Value::Object(values) => {
+            for (key, child) in values {
+                if is_sensitive_key(key)
+                    && matches!(child, Value::String(text) if !is_placeholder(text))
+                {
+                    return Err(MaterializerError::EmbeddedSecret);
+                }
+                validate_value_template(child)?;
+            }
+            Ok(())
+        }
+        Value::String(text)
+            if text.contains("{{") || text.contains("}}") || text.contains("${") =>
+        {
+            parse_placeholder(text).map(|_| ())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_registration_template(value: &Value) -> Result<(), MaterializerError> {
+    let object = value
+        .as_object()
+        .ok_or(MaterializerError::InvalidField("registration_template"))?;
+    for required in [
+        "client_name",
+        "client_type",
+        "redirect_uris",
+        "scopes",
+        "allowed_audiences",
+        "grant_types",
+        "token_endpoint_auth_method",
+    ] {
+        if !object.contains_key(required) {
+            return Err(MaterializerError::InvalidField("registration_template"));
+        }
+    }
+    validate_registration_value(value)
+}
+
+fn validate_registration_value(value: &Value) -> Result<(), MaterializerError> {
+    match value {
+        Value::Array(values) => values.iter().try_for_each(validate_registration_value),
+        Value::Object(values) => {
+            for (key, child) in values {
+                if matches!(
+                    key.as_str(),
+                    "client_secret" | "private_key" | "private_key_pem" | "mtls_client_key"
+                ) {
+                    return Err(MaterializerError::EmbeddedSecret);
+                }
+                validate_registration_value(child)?;
+            }
+            Ok(())
+        }
+        Value::String(text)
+            if text.contains("{{") || text.contains("}}") || text.contains("${") =>
+        {
+            parse_placeholder(text).map(|_| ())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_template_references(
+    value: &Value,
+    bindings: &BTreeMap<String, String>,
+) -> Result<(), MaterializerError> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .try_for_each(|value| validate_template_references(value, bindings)),
+        Value::Object(values) => values
+            .values()
+            .try_for_each(|value| validate_template_references(value, bindings)),
+        Value::String(text) if is_placeholder(text) => {
+            validate_binding_reference(parse_placeholder(text)?, bindings, &mut BTreeSet::new())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_template_clients(
+    value: &Value,
+    bindings: &BTreeMap<String, String>,
+    clients: &BTreeSet<String>,
+) -> Result<(), MaterializerError> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .try_for_each(|value| validate_template_clients(value, bindings, clients)),
+        Value::Object(values) => values
+            .values()
+            .try_for_each(|value| validate_template_clients(value, bindings, clients)),
+        Value::String(text) if is_placeholder(text) => validate_reference_client(
+            parse_placeholder(text)?,
+            bindings,
+            clients,
+            &mut BTreeSet::new(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn validate_reference_client(
+    name: &str,
+    bindings: &BTreeMap<String, String>,
+    clients: &BTreeSet<String>,
+    stack: &mut BTreeSet<String>,
+) -> Result<(), MaterializerError> {
+    if let Some(binding_name) = name.strip_prefix("secret.") {
+        if !stack.insert(binding_name.to_owned()) {
+            return Err(MaterializerError::SecretCycle);
+        }
+        let nested = parse_placeholder(
+            bindings
+                .get(binding_name)
+                .ok_or(MaterializerError::UnknownSecretReference(name.to_owned()))?,
+        )?;
+        let result = validate_reference_client(nested, bindings, clients, stack);
+        stack.remove(binding_name);
+        return result;
+    }
+    if bindings.contains_key(name) {
+        return validate_reference_client(&format!("secret.{name}"), bindings, clients, stack);
+    }
+    if let Some(rest) = name.strip_prefix("client.") {
+        let logical = rest
+            .split_once('.')
+            .map(|(logical, _)| logical)
+            .ok_or_else(|| MaterializerError::UnknownClientReference(rest.to_owned()))?;
+        if !clients.contains(logical) {
+            return Err(MaterializerError::UnknownClientReference(
+                logical.to_owned(),
+            ));
+        }
+    } else if matches!(name, "onboarding.client_id" | "onboarding.client_secret")
+        && clients.len() != 1
+    {
+        return Err(MaterializerError::AmbiguousClientReference);
+    }
+    Ok(())
+}
+
+fn is_builtin_reference(name: &str) -> bool {
+    matches!(
+        name,
+        "generated.applicant_password"
+            | "generated.client_secret"
+            | "generated.rsa.private_jwk"
+            | "generated.rsa.public_jwks"
+            | "generated.ec.private_jwk"
+            | "generated.ec.public_jwks"
+            | "generated.mtls.ca_cert"
+            | "generated.mtls.client_cert"
+            | "generated.mtls.client_key"
+            | "generated.dynamic_registration_initial_access_token"
+            | "generated.ciba_automated_decision_token"
+            | "onboarding.client_id"
+            | "onboarding.client_secret"
+            | "target.issuer"
+            | "target.suite"
+            | "suite.origin"
+    ) || name.starts_with("client.")
+}
+
+fn materialize_value(
+    value: &Value,
+    bindings: &BTreeMap<String, String>,
+    prepared: &PreparedMaterialization,
+    actual_clients: &BTreeMap<String, String>,
+    stack: &mut BTreeSet<String>,
+) -> Result<Value, MaterializerError> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .map(|value| materialize_value(value, bindings, prepared, actual_clients, stack))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Value::Object(values) => {
+            let mut output = serde_json::Map::new();
+            for (key, value) in values {
+                output.insert(
+                    key.clone(),
+                    materialize_value(value, bindings, prepared, actual_clients, stack)?,
+                );
+            }
+            Ok(Value::Object(output))
+        }
+        Value::String(text) if is_placeholder(text) => resolve_reference(
+            parse_placeholder(text)?,
+            bindings,
+            prepared,
+            actual_clients,
+            stack,
+        ),
+        Value::String(text)
+            if text.contains("{{") || text.contains("}}") || text.contains("${") =>
+        {
+            Err(MaterializerError::InvalidPlaceholder)
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
+fn resolve_reference(
+    name: &str,
+    bindings: &BTreeMap<String, String>,
+    prepared: &PreparedMaterialization,
+    actual_clients: &BTreeMap<String, String>,
+    stack: &mut BTreeSet<String>,
+) -> Result<Value, MaterializerError> {
+    validate_binding_reference(name, bindings, &mut BTreeSet::new())?;
+    if let Some(binding_name) = name.strip_prefix("secret.") {
+        if !stack.insert(binding_name.to_owned()) {
+            return Err(MaterializerError::SecretCycle);
+        }
+        let nested = parse_placeholder(
+            bindings
+                .get(binding_name)
+                .ok_or(MaterializerError::InvalidPlaceholder)?,
+        )?;
+        let result = resolve_reference(nested, bindings, prepared, actual_clients, stack);
+        stack.remove(binding_name);
+        return result;
+    }
+    if bindings.contains_key(name) {
+        return resolve_reference(
+            &format!("secret.{name}"),
+            bindings,
+            prepared,
+            actual_clients,
+            stack,
+        );
+    }
+    if name == "target.issuer" {
+        return Ok(Value::String(prepared.target_issuer.clone()));
+    }
+    if matches!(name, "target.suite" | "suite.origin") {
+        return Ok(Value::String(prepared.suite_base_url.clone()));
+    }
+    if name == "generated.applicant_password" {
+        return Ok(Value::String(prepared.applicant_password.to_string()));
+    }
+    if name == "generated.dynamic_registration_initial_access_token" {
+        return prepared
+            .dynamic_registration_initial_access_token
+            .as_ref()
+            .map(|value| Value::String(value.to_string()))
+            .ok_or(MaterializerError::UnknownSecretReference(name.to_owned()));
+    }
+    if name == "generated.ciba_automated_decision_token" {
+        return prepared
+            .ciba_automated_decision_token
+            .as_ref()
+            .map(|value| Value::String(value.to_string()))
+            .ok_or(MaterializerError::UnknownSecretReference(name.to_owned()));
+    }
+    if name == "onboarding.client_id" || name == "onboarding.client_secret" {
+        if prepared.clients.len() != 1 {
+            return Err(MaterializerError::AmbiguousClientReference);
+        }
+        let logical = prepared
+            .clients
+            .keys()
+            .next()
+            .ok_or(MaterializerError::AmbiguousClientReference)?;
+        let field = if name == "onboarding.client_id" {
+            "id"
+        } else {
+            "client_secret"
+        };
+        return resolve_client_reference(logical, field, prepared, actual_clients);
+    }
+    if let Some(client_reference) = name.strip_prefix("client.") {
+        let (logical, field) = client_reference.split_once('.').ok_or_else(|| {
+            MaterializerError::UnknownClientReference(client_reference.to_owned())
+        })?;
+        return resolve_client_reference(logical, field, prepared, actual_clients);
+    }
+    if name.starts_with("generated.") {
+        if prepared.clients.len() != 1 {
+            return Err(MaterializerError::AmbiguousClientReference);
+        }
+        let logical = prepared
+            .clients
+            .keys()
+            .next()
+            .ok_or(MaterializerError::AmbiguousClientReference)?;
+        return resolve_client_reference(
+            logical,
+            name.strip_prefix("generated.").unwrap_or_default(),
+            prepared,
+            actual_clients,
+        );
+    }
+    Err(MaterializerError::UnknownSecretReference(name.to_owned()))
+}
+
+fn resolve_client_reference(
+    logical: &str,
+    field: &str,
+    prepared: &PreparedMaterialization,
+    actual_clients: &BTreeMap<String, String>,
+) -> Result<Value, MaterializerError> {
+    let client = prepared
+        .clients
+        .get(logical)
+        .ok_or_else(|| MaterializerError::UnknownClientReference(logical.to_owned()))?;
+    match field {
+        "id" => actual_clients
+            .get(logical)
+            .map(|id| Value::String(id.clone()))
+            .ok_or(MaterializerError::MissingClientMapping),
+        "client_secret" => Ok(Value::String(client.client_secret.to_string())),
+        "rsa.private_jwk" => json_value(&client.rsa_private_jwk),
+        "rsa.public_jwks" => json_value(&client.rsa_public_jwks),
+        "ec.private_jwk" => json_value(&client.ec_private_jwk),
+        "ec.public_jwks" => json_value(&client.ec_public_jwks),
+        "mtls.ca_cert" => Ok(Value::String(client.mtls_ca_certificate.to_string())),
+        "mtls.client_cert" => Ok(Value::String(client.mtls_client_certificate.to_string())),
+        "mtls.client_key" => Ok(Value::String(client.mtls_client_key.to_string())),
+        _ => Err(MaterializerError::UnknownSecretReference(field.to_owned())),
+    }
+}
+
+fn json_value(value: &Zeroizing<String>) -> Result<Value, MaterializerError> {
+    serde_json::from_str(value.as_str()).map_err(|_| MaterializerError::Encoding)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_registration_template(
+    value: &Value,
+    logical_client_id: &str,
+    target_issuer: &str,
+    suite_origin: &str,
+    rsa_public_jwks: &str,
+    ec_public_jwks: &str,
+    mtls_ca_certificate: &str,
+    mtls_client_certificate: &str,
+) -> Result<Value, MaterializerError> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                materialize_registration_template(
+                    value,
+                    logical_client_id,
+                    target_issuer,
+                    suite_origin,
+                    rsa_public_jwks,
+                    ec_public_jwks,
+                    mtls_ca_certificate,
+                    mtls_client_certificate,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Value::Object(values) => {
+            let mut output = serde_json::Map::new();
+            for (key, child) in values {
+                output.insert(
+                    key.clone(),
+                    materialize_registration_template(
+                        child,
+                        logical_client_id,
+                        target_issuer,
+                        suite_origin,
+                        rsa_public_jwks,
+                        ec_public_jwks,
+                        mtls_ca_certificate,
+                        mtls_client_certificate,
+                    )?,
+                );
+            }
+            Ok(Value::Object(output))
+        }
+        Value::String(text) if is_placeholder(text) => {
+            let name = parse_placeholder(text)?;
+            let value = match name {
+                "target.issuer" => Value::String(target_issuer.to_owned()),
+                "target.suite" | "suite.origin" => Value::String(suite_origin.to_owned()),
+                "client.id" | "onboarding.client_id" => {
+                    return Err(MaterializerError::InvalidField(
+                        "registration_template.client_id",
+                    ));
+                }
+                "client.rsa.public_jwks" | "generated.rsa.public_jwks" => {
+                    serde_json::from_str(rsa_public_jwks)
+                        .map_err(|_| MaterializerError::Encoding)?
+                }
+                "client.ec.public_jwks" | "generated.ec.public_jwks" => {
+                    serde_json::from_str(ec_public_jwks).map_err(|_| MaterializerError::Encoding)?
+                }
+                "client.mtls.ca_cert" | "generated.mtls.ca_cert" => {
+                    Value::String(mtls_ca_certificate.to_owned())
+                }
+                "client.mtls.client_cert" | "generated.mtls.client_cert" => {
+                    Value::String(mtls_client_certificate.to_owned())
+                }
+                name if name.starts_with("client.") => {
+                    let prefix = format!("client.{logical_client_id}.");
+                    if !name.starts_with(&prefix) {
+                        return Err(MaterializerError::UnknownClientReference(name.to_owned()));
+                    }
+                    match name.strip_prefix(&prefix) {
+                        Some("rsa.public_jwks") => serde_json::from_str(rsa_public_jwks)
+                            .map_err(|_| MaterializerError::Encoding)?,
+                        Some("ec.public_jwks") => serde_json::from_str(ec_public_jwks)
+                            .map_err(|_| MaterializerError::Encoding)?,
+                        Some("mtls.ca_cert") => Value::String(mtls_ca_certificate.to_owned()),
+                        Some("mtls.client_cert") => {
+                            Value::String(mtls_client_certificate.to_owned())
+                        }
+                        _ => {
+                            return Err(MaterializerError::UnknownSecretReference(name.to_owned()));
+                        }
+                    }
+                }
+                _ => return Err(MaterializerError::UnknownSecretReference(name.to_owned())),
+            };
+            Ok(value)
+        }
+        Value::String(text)
+            if text.contains("{{") || text.contains("}}") || text.contains("${") =>
+        {
+            Err(MaterializerError::InvalidPlaceholder)
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
+fn registration_requires_mtls(request: &Value) -> bool {
+    request
+        .get("token_endpoint_auth_method")
+        .and_then(Value::as_str)
+        .is_some_and(|method| matches!(method, "tls_client_auth" | "self_signed_tls_client_auth"))
+        || request
+            .get("require_mtls_bound_tokens")
+            .and_then(Value::as_bool)
+            == Some(true)
+        || request.get("tls_client_auth_subject_dn").is_some()
+        || request.get("tls_client_auth_cert_sha256").is_some()
+}
+
+fn descriptor_requires_reference(descriptor: &MatrixDescriptor, reference: &str) -> bool {
+    descriptor.groups.iter().any(|group| {
+        group
+            .plans
+            .iter()
+            .any(|plan| value_contains_reference(&plan.config_template, reference))
+    })
+}
+
+fn value_contains_reference(value: &Value, reference: &str) -> bool {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value_contains_reference(value, reference)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| value_contains_reference(value, reference)),
+        Value::String(text) => {
+            is_placeholder(text) && parse_placeholder(text).ok() == Some(reference)
+        }
+        _ => false,
+    }
+}
+
+fn parse_placeholder(value: &str) -> Result<&str, MaterializerError> {
+    if !value.starts_with("{{") || !value.ends_with("}}") || value.len() < 5 {
+        return Err(MaterializerError::InvalidPlaceholder);
+    }
+    let name = value[2..value.len() - 2].trim();
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || name.contains("{{")
+        || name.contains("}}")
+    {
+        return Err(MaterializerError::InvalidPlaceholder);
+    }
+    Ok(name)
+}
+
+fn is_placeholder(value: &str) -> bool {
+    value.starts_with("{{") && value.ends_with("}}") && parse_placeholder(value).is_ok()
+}
+
+fn validate_crypto_policy(policy: &CryptoPolicy) -> Result<(), MaterializerError> {
+    if !matches!(policy.rsa_bits, 2048 | 3072 | 4096)
+        || policy.ec_curve != "P-256"
+        || policy.mtls_signature != "ECDSA-P256-SHA256"
+    {
+        return Err(MaterializerError::WeakAlgorithm);
+    }
+    Ok(())
+}
+
+fn validate_target_issuer(value: &str) -> Result<(), MaterializerError> {
+    let parsed = Url::parse(value.trim()).map_err(|_| MaterializerError::UnsafeIssuer)?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.host_str().is_none()
+        || parsed.path().contains("//")
+        || parsed.path().split('/').any(|part| part == "..")
+    {
+        return Err(MaterializerError::UnsafeIssuer);
+    }
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+    if parsed.scheme() != "http" {
+        return Err(MaterializerError::UnsafeIssuer);
+    }
+    let host = parsed
+        .host_str()
+        .unwrap_or_default()
+        .trim_matches(['[', ']']);
+    if matches!(host, "localhost" | "localhost.localdomain")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    {
+        Ok(())
+    } else {
+        Err(MaterializerError::UnsafeIssuer)
+    }
+}
+
+fn validate_name(value: &str, field: &'static str) -> Result<(), MaterializerError> {
+    if value.trim().is_empty()
+        || value.len() > 256
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(MaterializerError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn validate_public_id(
+    value: &str,
+    field: &'static str,
+    max: usize,
+) -> Result<(), MaterializerError> {
+    if value.trim().is_empty()
+        || value.len() > max
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(MaterializerError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn validate_lease_id(value: &str) -> Result<(), MaterializerError> {
+    Uuid::parse_str(value)
+        .map(|_| ())
+        .map_err(|_| MaterializerError::InvalidField("lease_id"))
+}
+
+fn validate_request_jti(value: &str) -> Result<(), MaterializerError> {
+    let suffix = value
+        .strip_prefix("request-")
+        .ok_or(MaterializerError::InvalidField("request_jti"))?;
+    if suffix.len() != 32
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(MaterializerError::InvalidField("request_jti"));
+    }
+    Ok(())
+}
+
+fn validate_digest(value: &str, field: &'static str) -> Result<(), MaterializerError> {
+    if value.len() != 64
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || value != value.to_ascii_lowercase()
+    {
+        return Err(MaterializerError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "client_secret" | "password" | "token" | "private_key" | "private_key_pem" | "secret"
+    )
+}
+
+fn random_secret(bytes: usize) -> String {
+    let mut random = vec![0_u8; bytes];
+    let mut rng = OsRng;
+    rng.fill_bytes(&mut random);
+    URL_SAFE_NO_PAD.encode(random)
+}
+
+fn random_hex(bytes: usize) -> String {
+    let mut random = vec![0_u8; bytes];
+    let mut rng = OsRng;
+    rng.fill_bytes(&mut random);
+    random.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn rsa_jwks(key: &RsaPrivateKey) -> Result<(String, String), MaterializerError> {
+    let public = serde_json::json!({
+        "kty": "RSA", "n": b64(key.n().to_bytes_be()), "e": b64(key.e().to_bytes_be()),
+        "alg": "PS256", "use": "sig", "key_ops": ["verify"]
+    });
+    let private = serde_json::json!({
+        "kty": "RSA", "n": b64(key.n().to_bytes_be()), "e": b64(key.e().to_bytes_be()),
+        "d": b64(key.d().to_bytes_be()),
+        "p": b64(key.primes().first().ok_or(MaterializerError::Crypto)?.to_bytes_be()),
+        "q": b64(key.primes().get(1).ok_or(MaterializerError::Crypto)?.to_bytes_be()),
+        "dp": b64(key.dp().ok_or(MaterializerError::Crypto)?.to_bytes_be()),
+        "dq": b64(key.dq().ok_or(MaterializerError::Crypto)?.to_bytes_be()),
+        "qi": b64(key.qinv().and_then(|value| value.to_biguint()).ok_or(MaterializerError::Crypto)?.to_bytes_be()),
+        "alg": "PS256", "use": "sig", "key_ops": ["sign"]
+    });
+    let private_string =
+        serde_json::to_string(&private).map_err(|_| MaterializerError::Encoding)?;
+    let public_jwks = serde_json::to_string(&serde_json::json!({"keys": [public]}))
+        .map_err(|_| MaterializerError::Encoding)?;
+    Ok((private_string, public_jwks))
+}
+
+fn ec_jwks(key: &SigningKey) -> Result<(String, String), MaterializerError> {
+    let encoded = key.verifying_key().to_encoded_point(false);
+    let x = encoded.x().ok_or(MaterializerError::Crypto)?;
+    let y = encoded.y().ok_or(MaterializerError::Crypto)?;
+    let mut digest = Sha256::new();
+    digest.update(x);
+    digest.update(y);
+    let kid = URL_SAFE_NO_PAD.encode(&digest.finalize()[..8]);
+    let public = serde_json::json!({
+        "kty":"EC", "crv":"P-256", "x":b64(x), "y":b64(y), "kid":kid,
+        "alg":"ES256", "use":"sig", "key_ops":["verify"]
+    });
+    let private = serde_json::json!({
+        "kty":"EC", "crv":"P-256", "x":b64(x), "y":b64(y), "d":b64(key.to_bytes()), "kid":kid,
+        "alg":"ES256", "use":"sig", "key_ops":["sign"]
+    });
+    let private_string =
+        serde_json::to_string(&private).map_err(|_| MaterializerError::Encoding)?;
+    let public_jwks = serde_json::to_string(&serde_json::json!({"keys": [public]}))
+        .map_err(|_| MaterializerError::Encoding)?;
+    Ok((private_string, public_jwks))
+}
+
+fn generate_mtls() -> Result<(String, String, String), MaterializerError> {
+    let now = OffsetDateTime::now_utc();
+    let mut ca_params =
+        CertificateParams::new(Vec::<String>::new()).map_err(|_| MaterializerError::Crypto)?;
+    ca_params.not_before = now - TimeDuration::days(1);
+    ca_params.not_after = now + TimeDuration::days(365);
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let ca_key = KeyPair::generate().map_err(|_| MaterializerError::Crypto)?;
+    let ca =
+        CertifiedIssuer::self_signed(ca_params, ca_key).map_err(|_| MaterializerError::Crypto)?;
+    let mut client_params = CertificateParams::new(vec!["nazoauthctl-client".to_owned()])
+        .map_err(|_| MaterializerError::Crypto)?;
+    client_params.not_before = now - TimeDuration::days(1);
+    client_params.not_after = now + TimeDuration::days(365);
+    client_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyAgreement,
+    ];
+    client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let client_key = KeyPair::generate().map_err(|_| MaterializerError::Crypto)?;
+    let client = client_params
+        .signed_by(&client_key, &ca)
+        .map_err(|_| MaterializerError::Crypto)?;
+    Ok((ca.pem(), client.pem(), client_key.serialize_pem()))
+}
+
+fn b64<T: AsRef<[u8]>>(value: T) -> String {
+    URL_SAFE_NO_PAD.encode(value)
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn descriptor() -> MatrixDescriptor {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema":1,
+            "source":{"release":"test","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+            "groups":[{"id":"oidc","profile":"oidc","variant":{"id":"default"},
+                "required_roles":[{"role":"applicant","logical_client_id":"web","registration_template":{
+                    "client_name":"test-client","client_type":"confidential","redirect_uris":["{{target.suite}}"],
+                    "post_logout_redirect_uris":[],"scopes":["openid"],"allowed_audiences":["resource://default"],
+                    "grant_types":["authorization_code"],"token_endpoint_auth_method":"client_secret_basic",
+                    "jwks":"{{client.web.ec.public_jwks}}"
+                }}],
+                "plans":[{"id":"basic","plan":"oidcc-basic-certification-test-plan",
+                    "config_template":{"issuer":"{{target.issuer}}","client_id":"{{client.web.id}}",
+                        "client_secret":"{{client.web.client_secret}}","jwks":"{{client.web.ec.public_jwks}}",
+                        "password":"{{generated.applicant_password}}"},
+                    "required_roles":[]}]
+            }]
+        })).expect("descriptor");
+        DescriptorMaterializer::from_bytes(&bytes).expect("descriptor")
+    }
+
+    fn suite() -> Origin {
+        Origin::parse_suite("https://suite.example").expect("suite")
+    }
+
+    fn request_jti() -> &'static str {
+        "request-0123456789abcdef0123456789abcdef"
+    }
+
+    #[test]
+    fn two_phase_bundle_excludes_private_factors_and_matrix_reuses_secret() {
+        let (prepared, bundle) = DescriptorMaterializer::prepare(
+            descriptor(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+        )
+        .expect("prepare");
+        let bundle_text =
+            String::from_utf8(bundle.bytes().as_bytes().to_vec()).expect("bundle utf8");
+        assert!(bundle_text.contains("client_secret"));
+        assert!(bundle_text.contains("\"applicant\""));
+        assert!(bundle_text.contains("\"password\""));
+        assert!(!bundle_text.contains("\"d\""));
+        assert!(!bundle_text.contains("private_jwk"));
+        assert!(!bundle_text.contains("client_key"));
+        let actual = BTreeMap::from([("web".to_owned(), "actual-client".to_owned())]);
+        let output = OnboardingOutput::new(
+            "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
+            prepared.request_jti(),
+            prepared.matrix_sha256(),
+            actual,
+        )
+        .expect("output");
+        let matrix = DescriptorMaterializer::finalize(prepared, output).expect("finalize");
+        let config = &matrix.matrix().document.groups[0].plans[0].config;
+        assert_eq!(
+            config.get("client_id").and_then(Value::as_str),
+            Some("actual-client")
+        );
+        assert!(
+            config
+                .get("client_secret")
+                .and_then(Value::as_str)
+                .is_some()
+        );
+        assert_eq!(matrix.matrix_sha256().len(), 64);
+    }
+
+    #[test]
+    fn missing_extra_and_cross_run_mappings_are_rejected() {
+        let (prepared, _bundle) = DescriptorMaterializer::prepare(
+            descriptor(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+        )
+        .expect("prepare");
+        let missing = OnboardingOutput::new(
+            "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
+            prepared.request_jti(),
+            prepared.matrix_sha256(),
+            BTreeMap::new(),
+        )
+        .expect("output");
+        assert_eq!(
+            DescriptorMaterializer::finalize(prepared, missing).unwrap_err(),
+            MaterializerError::MissingClientMapping
+        );
+
+        let (prepared, _bundle) = DescriptorMaterializer::prepare(
+            descriptor(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+        )
+        .expect("prepare");
+        let extra = OnboardingOutput::new(
+            "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
+            prepared.request_jti(),
+            prepared.matrix_sha256(),
+            BTreeMap::from([
+                ("web".to_owned(), "actual".to_owned()),
+                ("extra".to_owned(), "other".to_owned()),
+            ]),
+        )
+        .expect("output");
+        assert_eq!(
+            DescriptorMaterializer::finalize(prepared, extra).unwrap_err(),
+            MaterializerError::ExtraClientMapping
+        );
+
+        let (prepared, _) = DescriptorMaterializer::prepare(
+            descriptor(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+        )
+        .expect("prepare");
+        let wrong_matrix = OnboardingOutput::new(
+            "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
+            prepared.request_jti(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            BTreeMap::from([("web".to_owned(), "actual".to_owned())]),
+        )
+        .expect("output");
+        assert_eq!(
+            DescriptorMaterializer::finalize(prepared, wrong_matrix).unwrap_err(),
+            MaterializerError::MatrixDigestMismatch
+        );
+
+        let (prepared, _) = DescriptorMaterializer::prepare(
+            descriptor(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+        )
+        .expect("prepare");
+        let invalid_lease = OnboardingOutput::new(
+            "not-a-uuid",
+            prepared.request_jti(),
+            prepared.matrix_sha256(),
+            BTreeMap::from([("web".to_owned(), "actual".to_owned())]),
+        );
+        assert_eq!(
+            invalid_lease.unwrap_err(),
+            MaterializerError::InvalidField("lease_id")
+        );
+    }
+
+    #[test]
+    fn secure_bundle_writer_is_owner_only() {
+        #[cfg(unix)]
+        {
+            let root = std::env::temp_dir()
+                .join(format!("nazoauthctl-materializer-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("root");
+            let (_, bundle) = DescriptorMaterializer::prepare(
+                descriptor(),
+                "https://issuer.example",
+                &suite(),
+                request_jti(),
+            )
+            .expect("prepare");
+            let path = root.join("bundle.json");
+            bundle.write_private(&path).expect("write");
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+                0o600
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+}

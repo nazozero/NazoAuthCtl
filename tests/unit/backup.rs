@@ -6,12 +6,59 @@ use std::{
 };
 
 #[cfg(unix)]
-use super::{Backup, Builder};
+use super::{Backup, Builder, validate_secret};
 #[cfg(unix)]
 use tar::{EntryType, Header};
 
 #[cfg(unix)]
 use crate::filesystem::PrivateTempDir;
+
+#[cfg(unix)]
+fn complete_backup(path: &std::path::Path) {
+    let backup = Backup {
+        path: path.to_owned(),
+    };
+    backup.write_checksums().unwrap();
+    backup.write_completion_marker().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn backup_secret_validation_rejects_symlink_unsafe_mode_and_oversize_inputs() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let work = PrivateTempDir::new("backup-secret-boundaries").unwrap();
+    let path = work.path().join("provider-secret");
+    fs::write(&path, b"one-line-secret").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+    validate_secret(&path).unwrap();
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+    assert!(validate_secret(&path).is_err());
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+    fs::write(&path, vec![b'x'; 16 * 1024 + 1]).unwrap();
+    assert!(validate_secret(&path).is_err());
+
+    let decoy = work.path().join("provider-secret-decoy");
+    fs::write(&decoy, b"one-line-secret").unwrap();
+    fs::set_permissions(&decoy, fs::Permissions::from_mode(0o400)).unwrap();
+    fs::remove_file(&path).unwrap();
+    symlink(&decoy, &path).unwrap();
+    assert!(validate_secret(&path).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn incomplete_backup_never_enters_snapshot_restore() {
+    let work = PrivateTempDir::new("backup-incomplete-marker").unwrap();
+    let backup_path = work.path().join("backup");
+    fs::create_dir(&backup_path).unwrap();
+    let error = Backup { path: backup_path }
+        .restore_snapshots(&[])
+        .unwrap_err();
+    assert!(error.to_string().contains("completion marker"));
+}
 
 #[cfg(unix)]
 #[test]
@@ -37,6 +84,7 @@ fn snapshot_restore_does_not_preserve_archived_numeric_ownership_when_running_as
     archive.finish().unwrap();
     let mut path_file = File::create(backup_path.join("snapshot-0.path")).unwrap();
     writeln!(path_file, "{}", target.display()).unwrap();
+    complete_backup(&backup_path);
 
     Backup { path: backup_path }
         .restore_snapshots(std::slice::from_ref(&target))
@@ -73,6 +121,7 @@ fn snapshot_restore_binds_manifest_to_current_configured_path() {
         format!("{}\n", sibling.display()),
     )
     .unwrap();
+    complete_backup(&backup_path);
 
     let error = Backup { path: backup_path }
         .restore_snapshots(std::slice::from_ref(&target))
@@ -116,6 +165,7 @@ fn snapshot_restore_rejects_traversal_and_special_archive_entries() {
             format!("{}\n", target.display()),
         )
         .unwrap();
+        complete_backup(&backup_path);
 
         let error = Backup { path: backup_path }
             .restore_snapshots(std::slice::from_ref(&target))

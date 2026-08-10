@@ -5,41 +5,46 @@ use std::{ffi::OsStr, path::PathBuf};
 use anyhow::{Context as _, bail};
 
 use crate::{
-    deployment::{ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind},
-    process::Process,
+    ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind, process::Process,
 };
 
 use super::super::container_shared;
 use super::super::{RuntimeObservation, labels, safe_environment, server_command_verified};
 
 pub(super) fn discover(command: &OsStr) -> anyhow::Result<Vec<RuntimeObservation>> {
-    let ids = Process::new(command)
-        .args(["container", "ls", "-a", "--no-trunc", "--format", "{{.ID}}"])
-        .stdout()?;
-    ids.lines()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(|id| inspect(command, id))
-        .filter_map(|result| match result {
-            Ok(observation) if observation.server_command_verified => Some(Ok(observation)),
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect()
+    let ids = container_shared::command_stdout(
+        command,
+        &["container", "ls", "-a", "--no-trunc", "--format", "{{.ID}}"],
+        "Podman",
+    )?;
+    let mut observations = Vec::new();
+    for id in ids.lines().map(str::trim).filter(|id| !id.is_empty()) {
+        match inspect(command, id) {
+            Ok(observation) if observation.server_command_verified => {
+                observations.push(observation)
+            }
+            Ok(_) => {}
+            Err(error) if container_shared::is_engine_unavailable_error(&error) => {
+                return Err(error);
+            }
+            Err(_) => {
+                // A malformed or concurrently removed object is isolated to
+                // that object; it must not hide healthy server candidates.
+            }
+        }
+    }
+    Ok(observations)
 }
 
 pub(super) fn inspect(
     command: &OsStr,
     object_reference: &str,
 ) -> anyhow::Result<RuntimeObservation> {
-    let output = Process::new(command)
-        .args(["container", "inspect", object_reference])
-        .stdout()?;
-    let values: Vec<serde_json::Value> =
-        serde_json::from_str(&output).context("Podman inspect returned invalid JSON")?;
-    let value = values
-        .first()
-        .context("Podman inspect returned no object")?;
+    let value = container_shared::inspect_document(
+        command,
+        &["container", "inspect", object_reference],
+        "Podman",
+    )?;
     let config = value
         .get("Config")
         .context("Podman inspect omitted Config")?;
@@ -77,6 +82,7 @@ pub(super) fn inspect(
             },
             None,
         ),
+        Err(error) if container_shared::is_engine_unavailable_error(&error) => return Err(error),
         Err(_) => (
             ArtifactReference::Unknown,
             Some("trusted OCI digest could not be resolved".to_owned()),
@@ -190,18 +196,14 @@ pub(super) fn inspect_optional(
     command: &OsStr,
     object_reference: &str,
 ) -> anyhow::Result<Option<RuntimeObservation>> {
-    let output = Process::new(command)
-        .args(["container", "inspect", object_reference])
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-        if stderr.contains("no such object")
-            || stderr.contains("no such container")
-            || stderr.contains("no container with name or id")
-        {
-            return Ok(None);
-        }
-        bail!("Podman container inspection failed: {}", stderr.trim());
+    if container_shared::inspect_document_optional(
+        command,
+        &["container", "inspect", object_reference],
+        "Podman",
+    )?
+    .is_none()
+    {
+        return Ok(None);
     }
     Ok(Some(inspect(command, object_reference)?))
 }
@@ -210,43 +212,55 @@ pub(super) fn resolve_image_digest(
     command: &OsStr,
     image_reference: &str,
 ) -> anyhow::Result<String> {
-    let repo_digests = Process::new(command)
-        .args([
+    let repo_digests = container_shared::command_stdout(
+        command,
+        &[
             "image",
             "inspect",
             image_reference,
             "--format",
             "{{json .RepoDigests}}",
-        ])
-        .stdout()?;
+        ],
+        "Podman",
+    )?;
+    let expected = image_reference
+        .rsplit_once('@')
+        .map(|(_, digest)| digest.to_ascii_lowercase());
     if let Ok(values) = serde_json::from_str::<Vec<String>>(repo_digests.trim()) {
-        let expected = image_reference.rsplit_once('@').map(|(_, digest)| digest);
         if let Some(digest) = values
             .iter()
             .filter_map(|value| value.rsplit_once('@').map(|(_, digest)| digest))
-            .find(|digest| Some(*digest) == expected && container_shared::valid_digest(digest))
+            .find(|digest| {
+                container_shared::valid_digest(digest)
+                    && container_shared::requested_digest_matches(image_reference, digest)
+            })
         {
             return Ok(digest.to_ascii_lowercase());
         }
-        if let Some(digest) = values
-            .iter()
-            .filter_map(|value| value.rsplit_once('@').map(|(_, digest)| digest))
-            .find(|digest| container_shared::valid_digest(digest))
+        if expected.is_none()
+            && let Some(digest) = values
+                .iter()
+                .filter_map(|value| value.rsplit_once('@').map(|(_, digest)| digest))
+                .find(|digest| container_shared::valid_digest(digest))
         {
             return Ok(digest.to_ascii_lowercase());
         }
     }
-    let digest = Process::new(command)
-        .args([
+    let digest = container_shared::command_stdout(
+        command,
+        &[
             "image",
             "inspect",
             image_reference,
             "--format",
             "{{.Digest}}",
-        ])
-        .stdout()?;
+        ],
+        "Podman",
+    )?;
     let digest = digest.trim();
-    if !container_shared::valid_digest(digest) {
+    if !container_shared::valid_digest(digest)
+        || !container_shared::requested_digest_matches(image_reference, digest)
+    {
         bail!("container engine did not retain the signed OCI digest");
     }
     Ok(digest.to_ascii_lowercase())
@@ -256,9 +270,11 @@ pub(super) fn resolve_local_image_id(
     command: &OsStr,
     image_reference: &str,
 ) -> anyhow::Result<String> {
-    let output = Process::new(command)
-        .args(["image", "inspect", image_reference, "--format", "{{.Id}}"])
-        .stdout()?;
+    let output = container_shared::command_stdout(
+        command,
+        &["image", "inspect", image_reference, "--format", "{{.Id}}"],
+        "Podman",
+    )?;
     container_shared::normalize_local_image_id(output.trim(), true)
         .context("Podman image has no immutable local content identity")
 }
@@ -282,21 +298,15 @@ pub(super) fn read_build_identity(
             digest
         )
     });
-    let output = Process::new(command)
-        .args([
-            "run",
-            "--rm",
-            "--network",
-            "none",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--read-only",
-        ])
-        .arg(image)
-        .args(["nazoauth", "build-identity"])
-        .stdout()?;
+    let output = container_shared::append_build_identity_policy(Process::new(command).args([
+        "run",
+        "--rm",
+        "--network",
+        "none",
+    ]))
+    .arg(image)
+    .args(["nazoauth", "build-identity"])
+    .stdout()?;
     Ok(Some(serde_json::from_str(output.trim()).context(
         "Podman image returned an invalid build identity",
     )?))

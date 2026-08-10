@@ -162,7 +162,7 @@ pub(crate) fn resume_config_backed_update_locked(
         .join("transactions")
         .join(&transaction.transaction_id)
         .join("config-backed-execution.json");
-    fs::create_dir_all(
+    crate::filesystem::ensure_directory_chain(
         evidence_path
             .parent()
             .context("config-backed update evidence path has no parent")?,
@@ -365,16 +365,19 @@ pub(crate) fn build_registered_update_plan(
         "action": "verify signed Release, attestation, compatibility, and exact OCI or binary identity",
         "evidence_required": true,
     })];
+    let recovery_owner = owner(Capability::Backups, "backups");
     steps.push(json!({
         "id": "recovery-point",
-        "owner": owner(Capability::Backups, "backups"),
+        "owner": recovery_owner,
         "capability": "backups",
         "action": "create and verify a deployment-bound recovery point before writer shutdown",
         "evidence_required": true,
+        "evidence_kind": external_evidence_kind(recovery_owner, "recovery-point"),
     }));
+    let database_owner = owner(Capability::Database, "database");
     steps.push(json!({
         "id": "database-migration",
-        "owner": owner(Capability::Database, "database"),
+        "owner": database_owner,
         "capability": "database",
         "action": if operator_compatible {
             "apply the Release migration under the granted database and operator-task boundaries"
@@ -382,25 +385,30 @@ pub(crate) fn build_registered_update_plan(
             "blocked application task; do not infer migration compatibility"
         },
         "evidence_required": true,
+        "evidence_kind": external_evidence_kind(database_owner, "provider-receipt"),
     }));
     for runtime in &record.runtime_instances {
+        let runtime_owner = owner(Capability::Runtime, "runtime");
         steps.push(json!({
             "id": format!("runtime-replace-{}", runtime.runtime_instance_id),
-            "owner": owner(Capability::Runtime, "runtime"),
+            "owner": runtime_owner,
             "capability": "runtime",
             "runtime_instance_id": runtime.runtime_instance_id,
             "backend": runtime.backend,
             "object_reference": runtime.object_reference,
             "action": "replace this runtime instance with the digest-bound candidate and retain the previous trusted artifact",
             "evidence_required": true,
+            "evidence_kind": external_evidence_kind(runtime_owner, "provider-receipt"),
         }));
     }
+    let proxy_owner = owner(Capability::ProxyTls, "proxy_tls");
     steps.push(json!({
         "id": "proxy-cutover",
-        "owner": owner(Capability::ProxyTls, "proxy_tls"),
+        "owner": proxy_owner,
         "capability": "proxy_tls",
         "action": "switch or verify the external routing and TLS boundary",
         "evidence_required": true,
+        "evidence_kind": external_evidence_kind(proxy_owner, "routing-change"),
     }));
     steps.push(json!({
         "id": "acceptance",
@@ -429,6 +437,14 @@ pub(crate) fn build_registered_update_plan(
         "steps": steps,
         "blockers": blockers,
     }))
+}
+
+fn external_evidence_kind(owner: &str, provider_kind: &'static str) -> Option<&'static str> {
+    match owner {
+        "provider-owned" => Some(provider_kind),
+        "user-required" => Some("operator-confirmation"),
+        _ => None,
+    }
 }
 
 pub(crate) fn update_step_owner(

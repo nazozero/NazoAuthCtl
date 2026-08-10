@@ -15,7 +15,7 @@ use url::Url;
 use crate::{
     cli::{InstallOptions, StandardsProfileSecrets},
     deployment::RuntimeBackendKind,
-    filesystem::{atomic_write, generate_secret, set_mode},
+    filesystem::{atomic_write, generate_secret, read_secure_secret_file, set_mode},
     model::{
         Dependencies, Mount, Operator, Postgres, Runtime, Ui, UpdateConfig, Valkey, safe_absolute,
     },
@@ -35,7 +35,10 @@ mod secrets;
 use config::*;
 use profile::*;
 use runtime::*;
-pub(crate) use runtime::{grant_runtime_database, verify_runtime_no_ddl};
+pub(crate) use runtime::{
+    grant_runtime_database, normalize_public_url_for_profile, normalize_single_host_cidr,
+    verify_runtime_no_ddl,
+};
 use secrets::*;
 pub(crate) use secrets::{ensure_mfa_totp_configuration, ensure_mfa_totp_runtime};
 
@@ -95,7 +98,16 @@ pub(crate) fn prepare(
             bail!("{label} must be distinct non-nested failure domains");
         }
     }
-    validate_public_url(&options.public_url)?;
+    options.public_url = normalize_public_url_for_profile(&options.public_url, &options.profile)?;
+    if options.profile == "standards-full" {
+        let cidr = options
+            .trusted_proxy_cidr
+            .as_deref()
+            .context("standards-full requires an explicit trusted proxy CIDR")?;
+        options.trusted_proxy_cidr = Some(normalize_single_host_cidr(cidr)?);
+    } else if options.trusted_proxy_cidr.is_some() {
+        bail!("--trusted-proxy-cidr is accepted only with --profile standards-full");
+    }
     normalize_external_dependencies(&mut options)?;
     normalize_profile_secrets(&mut options)?;
     let (runtime_backend, dependency_backend) = select_runtime(&options)?;
@@ -118,29 +130,14 @@ pub(crate) fn prepare(
     if runtime_backend == RuntimeBackendKind::Systemd && options.network_subnet.is_some() {
         bail!("container network options are unavailable with the selected host runtime");
     }
-    let network_gateway = if runtime_backend != RuntimeBackendKind::Systemd {
-        Some(
-            runtime_backend::backend(runtime_backend).ensure_managed_network(&ManagedNetwork {
-                name: network_name.clone(),
-                subnet: options.network_subnet.clone(),
-                deployment_id: bootstrap_operator.deployment_id.clone(),
-                control_authority: bootstrap_operator.controller_key_id.clone(),
-            })?,
-        )
-    } else {
-        None
-    };
-    let trusted_proxy_cidr = if options.profile == "standards-full" {
-        if runtime_backend == RuntimeBackendKind::Systemd {
-            Some("127.0.0.1/32".to_owned())
-        } else {
-            Some(host_cidr(
-                network_gateway.context("container network gateway was not established")?,
-            ))
-        }
-    } else {
-        None
-    };
+    if runtime_backend != RuntimeBackendKind::Systemd {
+        runtime_backend::backend(runtime_backend).ensure_managed_network(&ManagedNetwork {
+            name: network_name.clone(),
+            subnet: options.network_subnet.clone(),
+            deployment_id: bootstrap_operator.deployment_id.clone(),
+            control_authority: bootstrap_operator.controller_key_id.clone(),
+        })?;
+    }
     create_directory(&secrets_dir, 0o700)?;
     create_directory(&options.data_root.join("ui-releases"), 0o755)?;
     for path in [
@@ -178,7 +175,7 @@ pub(crate) fn prepare(
         &bootstrap_operator.deployment_id,
         runtime_backend,
         &options.data_root,
-        trusted_proxy_cidr.as_deref(),
+        options.trusted_proxy_cidr.as_deref(),
         profile.as_deref(),
     )?;
     let config = build_config(

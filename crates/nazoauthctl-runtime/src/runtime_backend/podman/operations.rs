@@ -24,9 +24,19 @@ pub(super) fn verify_blob_attestation(
     verification: &BlobAttestationVerification,
 ) -> anyhow::Result<()> {
     Process::new(command)
-        .args(["run", "--rm", "--user", "0:0", "--cap-drop", "ALL"])
+        .args(["run", "--rm", "--user"])
+        .arg(container_shared::NON_ROOT_ONE_SHOT_USER)
+        .args(["--cap-drop", "ALL"])
         .args(["--read-only", "--security-opt", "no-new-privileges"])
-        .args(["--pids-limit", "64", "--tmpfs"])
+        .args([
+            "--pids-limit",
+            "64",
+            "--memory",
+            "256m",
+            "--cpus",
+            "1",
+            "--tmpfs",
+        ])
         .arg("/root/.sigstore:rw,noexec,nosuid,nodev,size=16m")
         .arg("-v")
         .arg(format!("{}:/work:ro,Z", verification.work.display()))

@@ -1,6 +1,8 @@
 use super::*;
 
-use crate::filesystem::{open_secure_regular_file, sha256_file, validate_secure_directory};
+use crate::filesystem::{
+    open_secure_regular_file, read_secure_regular_file, sha256_file, validate_secure_directory,
+};
 
 mod activation;
 mod execution;

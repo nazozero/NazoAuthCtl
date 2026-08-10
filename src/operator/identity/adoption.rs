@@ -79,7 +79,13 @@ pub(crate) fn refuse_ambiguous_legacy_adoption(
         bail!("legacy identity cannot be adopted from an ambiguous rotation state")
     }
     if path_present(intent_path)? {
-        let actual: LegacyAdoptionIntent = serde_json::from_slice(&fs::read(intent_path)?)?;
+        let intent_bytes = crate::filesystem::read_secure_regular_file(
+            intent_path,
+            "legacy adoption journal",
+            true,
+            64 * 1024,
+        )?;
+        let actual: LegacyAdoptionIntent = serde_json::from_slice(&intent_bytes)?;
         if actual.schema != expected.schema
             || actual.generation != expected.generation
             || actual.controller_key_id != expected.controller_key_id

@@ -17,11 +17,14 @@ pub(super) fn persist_lifecycle_contract(
         .deployment_state_dir(&plan.deployment_id)
         .join("recovery")
         .join("adoption");
-    fs::create_dir_all(&directory)?;
+    crate::filesystem::ensure_private_directory(
+        &directory,
+        "adoption recovery evidence directory",
+    )?;
     let target = directory.join("lifecycle.json");
-    copy_atomic(source, &target, 0o600)?;
-    let lifecycle_digest = sha256(&target)?;
-    if lifecycle_digest != LifecycleManifest::digest(source)? {
+    let lifecycle_digest = LifecycleManifest::digest(source)?;
+    copy_atomic_verified(source, &target, 0o600, &lifecycle_digest)?;
+    if sha256(&target)? != lifecycle_digest {
         bail!("persisted lifecycle contract changed during adoption");
     }
     recovery_evidence.push(format!("lifecycle-sha256:{lifecycle_digest}"));
@@ -48,7 +51,10 @@ pub(super) fn execute(
     let transaction_dir = store
         .deployment_state_dir(&plan.deployment_id)
         .join("transactions");
-    fs::create_dir_all(&transaction_dir)?;
+    crate::filesystem::ensure_private_directory(
+        &transaction_dir,
+        "adoption transaction directory",
+    )?;
     let transaction_path = transaction_dir.join("adoption.json");
     let plan_sha256 = hex_sha256(&serde_json::to_vec(plan)?);
     let lifecycle_sha256 = options
@@ -57,9 +63,13 @@ pub(super) fn execute(
         .map(LifecycleManifest::digest)
         .transpose()?;
     if transaction_path.exists() {
-        let transaction: AdoptionTransaction =
-            serde_json::from_slice(&fs::read(&transaction_path)?)
-                .context("adoption transaction is invalid")?;
+        let transaction: AdoptionTransaction = serde_json::from_slice(&read_secure_regular_file(
+            &transaction_path,
+            "adoption transaction journal",
+            true,
+            MAX_ADOPTION_TRANSACTION_BYTES,
+        )?)
+        .context("adoption transaction is invalid")?;
         if transaction.schema != 1
             || transaction.plan_sha256 != plan_sha256
             || transaction.lifecycle_sha256 != lifecycle_sha256
@@ -202,7 +212,7 @@ pub(crate) fn persist_bound_recovery_package(
     directory: &Path,
 ) -> anyhow::Result<Vec<String>> {
     let mut manifest = verify_recovery_evidence(manifest_path, deployment_id, release)?;
-    fs::create_dir_all(directory)?;
+    crate::filesystem::ensure_private_directory(directory, "adoption recovery evidence directory")?;
     let evidence = vec![
         persist_recovery_artifact(directory, "data-snapshot", &mut manifest.data_snapshot)?,
         persist_recovery_artifact(
@@ -235,7 +245,7 @@ fn persist_recovery_artifact(
     artifact: &mut RecoveryArtifact,
 ) -> anyhow::Result<String> {
     let target = directory.join(name);
-    copy_atomic(&artifact.path, &target, 0o600)?;
+    copy_atomic_verified(&artifact.path, &target, 0o600, &artifact.sha256)?;
     let actual = sha256(&target)?;
     if actual != artifact.sha256 {
         bail!("persisted recovery artifact changed during adoption");

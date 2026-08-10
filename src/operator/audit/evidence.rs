@@ -82,17 +82,19 @@ fn valid_sha256(value: &str) -> bool {
 
 pub(crate) fn verify_trust_transitions(config: &UpdateConfig) -> anyhow::Result<()> {
     let directory = config.operator.audit_directory.join("trust-transitions");
-    if !directory.exists() {
+    if !is_real_directory_or_missing(&directory, "trust-transition directory")? {
         return Ok(());
     }
     let mut paths = fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
     paths.sort_by_key(std::fs::DirEntry::file_name);
     let mut expected_previous: Option<(String, String, String)> = None;
     for entry in paths {
-        if !entry.file_type()?.is_file() {
+        if !is_regular_non_symlink(&entry.path())?
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("jws")
+        {
             bail!("trust transition directory contains an unexpected entry");
         }
-        let compact = fs::read_to_string(entry.path())?;
+        let compact = read_audit_text(&entry.path(), "trust transition")?;
         let header = protected_header(&compact)?;
         let key = if header.kid.starts_with("break-glass-") {
             trusted_break_glass_key(config, &header.kid)?

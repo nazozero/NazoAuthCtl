@@ -217,6 +217,8 @@ fn parses_complete_install_contract_and_rejects_invalid_boundaries() {
         "standards-full",
         "--profile-material",
         "/srv/oidf-profile.json",
+        "--trusted-proxy-cidr",
+        "192.0.2.10/32",
         "--data-root",
         "/srv/nazoauth",
         "--port",
@@ -242,6 +244,7 @@ fn parses_complete_install_contract_and_rejects_invalid_boundaries() {
         options.profile_material,
         Some(PathBuf::from("/srv/oidf-profile.json"))
     );
+    assert_eq!(options.trusted_proxy_cidr.as_deref(), Some("192.0.2.10/32"));
     assert_eq!(options.data_root, PathBuf::from("/srv/nazoauth"));
     assert_eq!(options.port, 8443);
     assert_eq!(options.secret_fd, Some(9));
@@ -272,6 +275,12 @@ fn parses_complete_install_contract_and_rejects_invalid_boundaries() {
             "/tmp/material.json",
         ][..],
         &["nazoauthctl", "install", "--public-url"][..],
+        &[
+            "nazoauthctl",
+            "install",
+            "--trusted-proxy-cidr",
+            "192.0.2.0/24",
+        ][..],
         &["nazoauthctl", "install", "--unknown", "value"][..],
         &["nazoauthctl", "--config"][..],
     ] {

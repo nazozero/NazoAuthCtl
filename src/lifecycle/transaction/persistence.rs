@@ -52,13 +52,13 @@ pub(crate) fn load_cache(
     path: &Path,
     record: &DeploymentRecord,
 ) -> anyhow::Result<TrustedRuntimeCache> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect trusted runtime cache {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
-        bail!("trusted runtime cache manifest is not a regular file");
+    let bytes =
+        read_secure_regular_file(path, "trusted runtime cache", false, MAX_LIFECYCLE_BYTES)?;
+    if bytes.is_empty() {
+        bail!("trusted runtime cache manifest is empty");
     }
     let cache: TrustedRuntimeCache =
-        serde_json::from_slice(&fs::read(path)?).context("trusted runtime cache is invalid")?;
+        serde_json::from_slice(&bytes).context("trusted runtime cache is invalid")?;
     if cache.schema != TRUSTED_RUNTIME_CACHE_SCHEMA
         || cache.deployment_id != record.deployment_id
         || cache.release != record.active_release
@@ -138,13 +138,14 @@ pub(crate) fn load_recovery_slot(
     record: &DeploymentRecord,
 ) -> anyhow::Result<RecoverySlot> {
     let path = recovery_slot_path(store, &record.deployment_id);
-    let metadata = fs::symlink_metadata(&path)
-        .context("deployment has no controller-independent recovery slot")?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
-        bail!("deployment recovery slot is not a regular file");
+    let bytes =
+        read_secure_regular_file(&path, "deployment recovery slot", true, MAX_LIFECYCLE_BYTES)
+            .context("deployment has no controller-independent recovery slot")?;
+    if bytes.is_empty() {
+        bail!("deployment recovery slot is empty");
     }
     let slot: RecoverySlot =
-        serde_json::from_slice(&fs::read(&path)?).context("deployment recovery slot is invalid")?;
+        serde_json::from_slice(&bytes).context("deployment recovery slot is invalid")?;
     if slot.schema != 1 || slot.deployment_id != record.deployment_id {
         bail!("deployment recovery slot is bound to a different deployment");
     }
@@ -196,8 +197,13 @@ pub(crate) fn archive_update_execution(
     if !active.exists() {
         return Ok(());
     }
-    let execution: UpdateExecution = serde_json::from_slice(&fs::read(&active)?)
-        .context("lifecycle update execution journal is invalid")?;
+    let execution: UpdateExecution = serde_json::from_slice(&read_secure_regular_file(
+        &active,
+        "lifecycle update execution journal",
+        true,
+        MAX_LIFECYCLE_BYTES,
+    )?)
+    .context("lifecycle update execution journal is invalid")?;
     if execution.transaction_id != transaction_id
         || execution.state != UpdateExecutionState::Committed
     {

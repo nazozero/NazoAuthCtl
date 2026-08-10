@@ -135,6 +135,11 @@ fn management_audit_deduplicates_requests_and_rejects_content_reuse() {
         .join("identities/audit.key");
     fs::create_dir_all(key_path.parent().unwrap()).unwrap();
     fs::write(&key_path, URL_SAFE_NO_PAD.encode(key.to_bytes())).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o400)).unwrap();
+    }
     deployment.resources.insert(
         "audit_private_key".to_owned(),
         SafeReference::File { path: key_path },
@@ -174,4 +179,53 @@ fn management_audit_deduplicates_requests_and_rejects_content_reuse() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn management_audit_intent_recovers_after_declaration_commit() {
+    let work = PrivateTempDir::new("nazoauthctl-management-audit-intent").unwrap();
+    let store = DeploymentStore {
+        config_root: work.path().join("etc"),
+        state_root: work.path().join("state"),
+        break_glass_root: work.path().join("break-glass"),
+    };
+    let mut previous = record();
+    let key = SigningKey::from_bytes(&[9; 32]);
+    let key_path = store
+        .deployment_state_dir(&previous.deployment_id)
+        .join("identities/audit.key");
+    fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+    fs::write(&key_path, URL_SAFE_NO_PAD.encode(key.to_bytes())).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o400)).unwrap();
+    }
+    previous.resources.insert(
+        "audit_private_key".to_owned(),
+        SafeReference::File { path: key_path },
+    );
+    store.persist(&previous).unwrap();
+    let mut target = previous.clone();
+    target.declaration_revision = 2;
+    target.active_release.release = "v0.1.20".to_owned();
+    prepare_management_audit_intent(
+        &store,
+        &previous,
+        &target,
+        "development-00000000000000000002",
+        "local-development-activation",
+        "v0.1.20",
+        "controller-state",
+    )
+    .unwrap();
+    let _lock = store.deployment_lock(&previous.deployment_id).unwrap();
+    store
+        .persist_declaration_cas_locked(&previous, &target)
+        .unwrap();
+    mark_management_audit_intent_committed(&store, &target).unwrap();
+    assert!(recover_pending_management_audit_intent_locked(&store, &target).unwrap());
+    assert!(!management_audit_intent_path(&store, &target.deployment_id).exists());
+    assert_eq!(verify_management_audit(&store, &target).unwrap().0, 1);
+    assert!(!recover_pending_management_audit_intent_locked(&store, &target).unwrap());
 }
