@@ -75,21 +75,7 @@ impl<'a> Runtime<'a> {
     }
 
     pub(crate) fn active_revision(&self) -> anyhow::Result<String> {
-        let kind = self.backend_kind()?;
-        if kind == RuntimeBackendKind::Systemd {
-            let target = std::fs::canonicalize(&self.config.runtime.binary_path)
-                .context("failed to resolve active host binary")?;
-            return target
-                .parent()
-                .and_then(Path::file_name)
-                .map(|name| name.to_string_lossy().into_owned())
-                .context("active host binary does not have a release directory");
-        }
-        self.backend()?
-            .inspect(self.object_reference(kind))?
-            .labels
-            .remove("org.opencontainers.image.revision")
-            .context("runtime image has no revision label")
+        Ok(self.active_build_target()?.embedded.revision)
     }
 
     pub(crate) fn active_image(&self) -> anyhow::Result<String> {

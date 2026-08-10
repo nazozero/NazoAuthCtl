@@ -1938,7 +1938,6 @@ fn fake_container_runtime(
                 "io.nazoauth.deployment-id": config.operator.deployment_id.clone(),
                 "io.nazoauth.control-authority": config.operator.controller_key_id.clone(),
                 "io.nazoauth.runtime-instance-id": config.runtime.runtime_instance_id.clone(),
-                "org.opencontainers.image.revision": candidate_commit,
             },
             "Command": ["nazoauth", "server"]
         },
@@ -1952,8 +1951,15 @@ fn fake_container_runtime(
         &config.operator.controller_key_id,
         &config.runtime.network,
     );
+    let embedded_identity = serde_json::to_string(&nazo_operator_protocol::EmbeddedIdentity {
+        release: "v0.2.0".to_owned(),
+        revision: candidate_commit.to_owned(),
+        protocol: nazo_operator_protocol::PROTOCOL_VERSION,
+        build_id: "build:test".to_owned(),
+    })
+    .unwrap();
     let script = format!(
-        "if [ \"${{1:-}}\" = image ] && [ \"${{2:-}}\" = inspect ]; then\n  image=\"${{3:-}}\"\n  digest=\"${{image##*@}}\"\n  printf '[\"fixture@%s\"]\\n' \"$digest\"\n  exit 0\nfi\nif [ \"${{1:-}}\" = network ] && [ \"${{2:-}}\" = inspect ]; then\n  case \"$*\" in\n    *io.nazoauth.deployment-id*) printf '%s\\n' '{deployment}' ;;\n    *io.nazoauth.control-authority*) printf '%s\\n' '{authority}' ;;\n    *io.nazoauth.resource-kind*) printf '%s\\n' 'network' ;;\n    *io.nazoauth.config-digest*) printf '%s\\n' '{network_digest}' ;;\n    *) printf '%s\\n' '{{\"subnets\":[{{\"gateway\":\"10.89.0.1\"}}]}}' ;;\n  esac\n  exit 0\nfi\nif [ \"${{1:-}}\" = volume ] && [ \"${{2:-}}\" = inspect ]; then\n  case \"$*\" in\n    *io.nazoauth.deployment-id*) printf '%s\\n' '{deployment}' ;;\n    *io.nazoauth.control-authority*) printf '%s\\n' '{authority}' ;;\n    *io.nazoauth.runtime-instance-id*) printf '%s\\n' '{runtime}' ;;\n    *io.nazoauth.resource-kind*) case \"$*\" in *{valkey_volume}*) printf '%s\\n' 'valkey-volume' ;; *) printf '%s\\n' 'postgres-volume' ;; esac ;;\n    *io.nazoauth.config-digest*) case \"$*\" in *{valkey_volume}*) printf '%s\\n' '{valkey_volume_digest}' ;; *) printf '%s\\n' '{postgres_volume_digest}' ;; esac ;;\n    *) printf '%s\\n' '{{}}' ;;\n  esac\n  exit 0\nfi\nif [ \"${{1:-}}\" = container ] && [ \"${{2:-}}\" = inspect ]; then\n  if [ \"{candidate_active}\" != true ]; then printf '%s\\n' 'no such object' >&2; exit 1; fi\n  shift 2\n  set -- inspect \"$@\"\nfi\nif [ \"${{1:-}}\" = inspect ]; then\n  case \"$*\" in\n    *--format*io.nazoauth.deployment-id*) printf '%s\\n' '{deployment}' ;;\n    *--format*io.nazoauth.control-authority*) printf '%s\\n' '{authority}' ;;\n    *--format*io.nazoauth.runtime-instance-id*) printf '%s\\n' '{runtime}' ;;\n    *--format*io.nazoauth.resource-kind*) case \"$*\" in *postgres*) printf '%s\\n' 'postgres' ;; *valkey*) printf '%s\\n' 'valkey' ;; *) printf '%s\\n' 'application' ;; esac ;;\n    *--format*io.nazoauth.config-digest*) case \"$*\" in *postgres*) printf '%s\\n' '{postgres_digest}' ;; *valkey*) printf '%s\\n' '{valkey_digest}' ;; *) printf '%s\\n' '{network_digest}' ;; esac ;;\n    *--format*) case \"$*\" in *postgres*) printf '%s\\n' '{postgres_image}' ;; *valkey*) printf '%s\\n' '{valkey_image}' ;; *) printf '%s\\n' '{runtime_image}' ;; esac ;;\n    *) printf '%s\\n' '{inspect_json}' ;;\n  esac\n  exit 0\nfi\ncat >/dev/null\nexit 0",
+        "if [ \"${{1:-}}\" = image ] && [ \"${{2:-}}\" = inspect ]; then\n  image=\"${{3:-}}\"\n  digest=\"${{image##*@}}\"\n  printf '[\"fixture@%s\"]\\n' \"$digest\"\n  exit 0\nfi\nif [ \"${{1:-}}\" = network ] && [ \"${{2:-}}\" = inspect ]; then\n  case \"$*\" in\n    *io.nazoauth.deployment-id*) printf '%s\\n' '{deployment}' ;;\n    *io.nazoauth.control-authority*) printf '%s\\n' '{authority}' ;;\n    *io.nazoauth.resource-kind*) printf '%s\\n' 'network' ;;\n    *io.nazoauth.config-digest*) printf '%s\\n' '{network_digest}' ;;\n    *) printf '%s\\n' '{{\"subnets\":[{{\"gateway\":\"10.89.0.1\"}}]}}' ;;\n  esac\n  exit 0\nfi\nif [ \"${{1:-}}\" = volume ] && [ \"${{2:-}}\" = inspect ]; then\n  case \"$*\" in\n    *io.nazoauth.deployment-id*) printf '%s\\n' '{deployment}' ;;\n    *io.nazoauth.control-authority*) printf '%s\\n' '{authority}' ;;\n    *io.nazoauth.runtime-instance-id*) printf '%s\\n' '{runtime}' ;;\n    *io.nazoauth.resource-kind*) case \"$*\" in *{valkey_volume}*) printf '%s\\n' 'valkey-volume' ;; *) printf '%s\\n' 'postgres-volume' ;; esac ;;\n    *io.nazoauth.config-digest*) case \"$*\" in *{valkey_volume}*) printf '%s\\n' '{valkey_volume_digest}' ;; *) printf '%s\\n' '{postgres_volume_digest}' ;; esac ;;\n    *) printf '%s\\n' '{{}}' ;;\n  esac\n  exit 0\nfi\nif [ \"${{1:-}}\" = container ] && [ \"${{2:-}}\" = inspect ]; then\n  if [ \"{candidate_active}\" != true ]; then printf '%s\\n' 'no such object' >&2; exit 1; fi\n  shift 2\n  set -- inspect \"$@\"\nfi\nif [ \"${{1:-}}\" = inspect ]; then\n  case \"$*\" in\n    *--format*io.nazoauth.deployment-id*) printf '%s\\n' '{deployment}' ;;\n    *--format*io.nazoauth.control-authority*) printf '%s\\n' '{authority}' ;;\n    *--format*io.nazoauth.runtime-instance-id*) printf '%s\\n' '{runtime}' ;;\n    *--format*io.nazoauth.resource-kind*) case \"$*\" in *postgres*) printf '%s\\n' 'postgres' ;; *valkey*) printf '%s\\n' 'valkey' ;; *) printf '%s\\n' 'application' ;; esac ;;\n    *--format*io.nazoauth.config-digest*) case \"$*\" in *postgres*) printf '%s\\n' '{postgres_digest}' ;; *valkey*) printf '%s\\n' '{valkey_digest}' ;; *) printf '%s\\n' '{network_digest}' ;; esac ;;\n    *--format*) case \"$*\" in *postgres*) printf '%s\\n' '{postgres_image}' ;; *valkey*) printf '%s\\n' '{valkey_image}' ;; *) printf '%s\\n' '{runtime_image}' ;; esac ;;\n    *) printf '%s\\n' '{inspect_json}' ;;\n  esac\n  exit 0\nfi\nif [ \"${{1:-}}\" = run ] && [ \"${{*: -2}}\" = \"nazoauth build-identity\" ]; then\n  printf '%s\\n' '{embedded_identity}'\n  exit 0\nfi\ncat >/dev/null\nexit 0",
         deployment = config.operator.deployment_id,
         authority = config.operator.controller_key_id,
         runtime = config.runtime.runtime_instance_id,
@@ -1967,7 +1973,24 @@ fn fake_container_runtime(
         valkey_image = config.valkey.image,
         runtime_image = runtime_image,
         inspect_json = inspect_json,
+        embedded_identity = embedded_identity,
     );
+    let legacy_build_identity_case = format!(
+        r#"if [ "${{1:-}}" = run ] && [ "${{*: -2}}" = "nazoauth build-identity" ]; then
+  printf '%s\n' '{}'
+  exit 0
+fi"#,
+        embedded_identity
+    );
+    let portable_build_identity_case = format!(
+        r#"if [ "${{1:-}}" = run ]; then
+  case "$*" in
+    *'nazoauth build-identity') printf '%s\n' '{}'; exit 0 ;;
+  esac
+fi"#,
+        embedded_identity
+    );
+    let script = script.replace(&legacy_build_identity_case, &portable_build_identity_case);
     let inspect_override = format!(
         r#"if [ "${{1:-}}" = inspect ]; then
   object="${{2:-}}"
@@ -2010,6 +2033,19 @@ if [ "${{1:-}}" = inspect ]; then
     let script = script.replace("io.nazoauth.resource-kind", "io.nazoauth.managed-resource");
     write_shell_executable(&engine, &script);
     engine
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn active_revision_uses_embedded_identity_without_optional_oci_revision_label() {
+    let work = PrivateTempDir::new("nazoauth-active-revision-identity").unwrap();
+    let mut config = config(&work);
+    let revision = "d".repeat(40);
+    config.runtime.backend = RuntimeBackendKind::Podman;
+    config.runtime.backend_command_override =
+        Some(fake_container_runtime(&work, &config, &revision, true));
+
+    assert_eq!(Runtime::new(&config).active_revision().unwrap(), revision);
 }
 
 #[cfg(target_os = "linux")]
