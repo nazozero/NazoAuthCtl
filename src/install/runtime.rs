@@ -70,11 +70,17 @@ DECLARE
         'openid4vci_access_grants', 'openid4vci_nonces',
         'openid4vci_deferred_transactions', 'openid4vci_notifications',
         'openid4vp_transactions', 'openid4vci_credential_datasets',
-        'openid4vci_pre_authorized_code_consumptions',
         'oauth_client_mtls_trust_anchor_requests',
         'runtime_module_default_policy', 'initial_admin_bootstrap',
         'conformance_leases', 'openid4vci_issuance_responses',
-        'oauth_token_issuances', 'conformance_lease_applicants'
+        'oauth_token_issuances'
+    ];
+    -- These tables are introduced by newer signed Releases. They remain an
+    -- explicit allowlist: if present they receive the exact runtime grant,
+    -- while their absence on an older supported Release is not schema drift.
+    optional_full_dml_tables CONSTANT text[] := ARRAY[
+        'openid4vci_pre_authorized_code_consumptions',
+        'conformance_lease_applicants', 'conformance_lease_clients'
     ];
     append_tables CONSTANT text[] := ARRAY[
         'scim_audit_events', 'scim_security_events',
@@ -104,7 +110,8 @@ DECLARE
     table_name text;
     sequence_record record;
 BEGIN
-    known_tables := full_dml_tables || append_tables || denied_tables
+    known_tables := full_dml_tables || optional_full_dml_tables
+        || append_tables || denied_tables
         || ARRAY['__diesel_schema_migrations'];
 
     SELECT array_agg(candidate.relname ORDER BY candidate.relname)
@@ -131,11 +138,13 @@ BEGIN
     END IF;
 
     REVOKE ALL ON ALL TABLES IN SCHEMA public FROM nazoauth_runtime;
-    FOREACH table_name IN ARRAY full_dml_tables LOOP
-        EXECUTE format(
-            'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO nazoauth_runtime',
-            table_name
-        );
+    FOREACH table_name IN ARRAY full_dml_tables || optional_full_dml_tables LOOP
+        IF to_regclass(format('public.%I', table_name)) IS NOT NULL THEN
+            EXECUTE format(
+                'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO nazoauth_runtime',
+                table_name
+            );
+        END IF;
     END LOOP;
     FOREACH table_name IN ARRAY append_tables LOOP
         EXECUTE format(
@@ -176,7 +185,10 @@ BEGIN
                 AND dependency.refclassid = 'pg_class'::regclass
                 AND dependency.deptype IN ('a', 'i')
                 AND owner_namespace.nspname = 'public'
-                AND owner_table.relname = ANY(full_dml_tables || append_tables || denied_tables)
+                AND owner_table.relname = ANY(
+                    full_dml_tables || optional_full_dml_tables
+                    || append_tables || denied_tables
+                )
           )
     ) THEN
         RAISE EXCEPTION 'runtime sequence privilege allowlist is incomplete';
@@ -198,7 +210,9 @@ BEGIN
         WHERE sequence_namespace.nspname = 'public'
           AND sequence_rel.relkind = 'S'
           AND owner_namespace.nspname = 'public'
-          AND owner_table.relname = ANY(full_dml_tables || append_tables)
+          AND owner_table.relname = ANY(
+              full_dml_tables || optional_full_dml_tables || append_tables
+          )
     LOOP
         EXECUTE format(
             'GRANT USAGE, SELECT, UPDATE ON SEQUENCE %I.%I TO nazoauth_runtime',

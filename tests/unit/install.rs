@@ -1202,12 +1202,15 @@ fn managed_runtime_database_grants_keep_the_audit_ledger_api_least_privileged() 
         .join(" ");
 
     assert!(sql.contains("full_dml_tables CONSTANT text[]"));
+    assert!(sql.contains("optional_full_dml_tables CONSTANT text[]"));
     assert!(sql.contains("append_tables CONSTANT text[]"));
     assert!(sql.contains("runtime table privilege allowlist is incomplete"));
     for table in [
         "scim_tokens",
         "oauth_client_mtls_trust_anchor_requests",
         "openid4vci_credential_dataset_events",
+        "conformance_lease_applicants",
+        "conformance_lease_clients",
         "security_audit_event_outbox",
     ] {
         assert!(
