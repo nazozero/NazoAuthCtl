@@ -987,6 +987,8 @@ pub(crate) fn prepare_managed_volume_ownership(
             "ALL",
             "--cap-add",
             "CHOWN",
+            "--cap-add",
+            "DAC_OVERRIDE",
             "--security-opt",
             "no-new-privileges",
             "--pids-limit",
