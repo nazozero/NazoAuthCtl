@@ -15,7 +15,7 @@ use crate::{
     },
 };
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, chown};
 
 #[test]
 fn self_update_install_path_is_normalized_and_non_symlink() {
@@ -2363,6 +2363,18 @@ fn materialize_verified_backup(config: &UpdateConfig, path: &std::path::Path) {
     )
     .unwrap();
     crate::filesystem::set_mode(&path.join("BACKUP-COMPLETE"), 0o600).unwrap();
+    chown(path, Some(0), Some(10001)).unwrap();
+    crate::filesystem::set_mode(path, 0o750).unwrap();
+    for name in [
+        "state.bin",
+        "update-config.json",
+        "SHA256SUMS",
+        "BACKUP-COMPLETE",
+    ] {
+        let artifact = path.join(name);
+        chown(&artifact, Some(0), Some(10001)).unwrap();
+        crate::filesystem::set_mode(&artifact, 0o440).unwrap();
+    }
 }
 
 #[cfg(unix)]
@@ -2461,6 +2473,9 @@ fn pending_pre_migration_update_restores_previous_artifact_and_closes_the_journa
 #[test]
 fn pending_active_candidate_restores_previous_release_and_closes_the_journal() {
     let work = PrivateTempDir::new("nazoauth-recover-active-unwind").unwrap();
+    if fs::metadata(work.path()).unwrap().uid() != 0 {
+        return;
+    }
     let mut config = config(&work);
     config.postgres.image = format!("postgres@sha256:{}", "a".repeat(64));
     config.postgres.validation_image = config.postgres.image.clone();
