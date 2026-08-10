@@ -941,7 +941,7 @@ fn podman_image_digest_rejects_a_mismatched_fallback_digest() {
             .image_digest(&image)
             .unwrap_err()
             .to_string(),
-        "container engine retained a different OCI digest"
+        "container engine did not retain the signed OCI digest"
     );
 }
 

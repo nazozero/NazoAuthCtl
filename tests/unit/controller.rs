@@ -1628,6 +1628,7 @@ fn public_command_dispatch_fails_closed_before_every_confirmed_mutation() {
             yes: false,
         }),
         Command::Rollback { yes: false },
+        Command::Recover { yes: false },
         Command::Migrate {
             yes: false,
             candidate: None,
@@ -1658,16 +1659,12 @@ fn public_command_dispatch_fails_closed_before_every_confirmed_mutation() {
     let recover_journal = update_journal_path(&config);
     assert!(!recover_journal.exists());
     assert_root_or_error(
-        invoke(Command::Recover { yes: false }),
+        invoke(Command::RecoverUpdate { yes: false }),
         "no interrupted update transaction requires recovery",
     );
     assert_eq!(fs::read(&config_path).unwrap(), config_before);
     assert!(!recover_journal.exists());
 
-    assert_root_or_error(
-        invoke(Command::RecoverUpdate { yes: false }),
-        "no interrupted update",
-    );
     assert_root_or_error(
         invoke(Command::RecoverIdentity { yes: false }),
         "no interrupted identity",
@@ -2251,6 +2248,13 @@ fn materialize_verified_backup(config: &UpdateConfig, path: &std::path::Path) {
     )
     .unwrap();
     crate::filesystem::set_mode(&path.join("SHA256SUMS"), 0o600).unwrap();
+    let manifest_digest = crate::filesystem::sha256(&path.join("SHA256SUMS")).unwrap();
+    fs::write(
+        path.join("BACKUP-COMPLETE"),
+        format!("marker=BACKUP-COMPLETE\nversion=1\nmanifest-sha256={manifest_digest}\n"),
+    )
+    .unwrap();
+    crate::filesystem::set_mode(&path.join("BACKUP-COMPLETE"), 0o600).unwrap();
 }
 
 #[cfg(unix)]
