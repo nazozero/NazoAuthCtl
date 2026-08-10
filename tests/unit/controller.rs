@@ -14,6 +14,8 @@ use crate::{
         OperatorProtocolCompatibility, Postgres, Rollback, Runtime as RuntimeConfig, Ui, Valkey,
     },
 };
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 
 #[test]
 fn self_update_install_path_is_normalized_and_non_symlink() {
