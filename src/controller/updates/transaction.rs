@@ -13,7 +13,8 @@ pub(crate) fn update(
     )?;
     enforce_release_trust(&config, &release.manifest)?;
     release.persist_verification_evidence(&release_cache_dir(&config, &release.manifest))?;
-    let current = Runtime::new(&config).active_revision()?;
+    let active_target = Runtime::new(&config).active_build_target()?;
+    let current = active_target.embedded.revision.clone();
     let active = load_active_release(&config)?;
     let minimum = format!("v{}", release.manifest.rollback.minimum_supported_version);
     if compare_versions(&active.version, &minimum)? == std::cmp::Ordering::Less {
@@ -27,7 +28,7 @@ pub(crate) fn update(
         print_update_plan(&config, &active.version, &current, &release.manifest)?;
         return Ok(());
     }
-    if current == release.manifest.backend_commit {
+    if active_target_matches_release(&config, &active, &active_target, &release.manifest)? {
         println!(
             "NazoAuth is already at {} ({})",
             release.manifest.version, current
@@ -117,6 +118,29 @@ pub(crate) fn update(
         release.manifest.version, release.manifest.backend_commit
     );
     Ok(())
+}
+
+pub(crate) fn active_target_matches_release(
+    config: &UpdateConfig,
+    recorded: &ReleaseManifest,
+    observed: &crate::runtime::ActiveBuildTarget,
+    target: &ReleaseManifest,
+) -> anyhow::Result<bool> {
+    if recorded != target || observed.embedded != target.embedded {
+        return Ok(false);
+    }
+    match config.runtime.backend {
+        RuntimeBackendKind::Systemd => Ok(observed.binary_digest
+            == target
+                .artifacts
+                .get("binary")
+                .context("signed Release has no runtime binary artifact")?
+                .sha256
+                .as_str()),
+        RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
+            Ok(observed.image_digest == target.runtime_oci_digest()?)
+        }
+    }
 }
 
 pub(crate) fn persist_mfa_totp_runtime_upgrade(

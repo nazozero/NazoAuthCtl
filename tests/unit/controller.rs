@@ -2300,6 +2300,38 @@ fn update_deployment_record_is_idempotent_for_a_transaction() {
 }
 
 #[test]
+fn update_noop_requires_exact_signed_state_identity_and_artifact() {
+    let work = PrivateTempDir::new("nazoauth-update-noop-identity").unwrap();
+    let mut config = config(&work);
+    config.runtime.backend = RuntimeBackendKind::Systemd;
+    let target = manifest("v0.2.0", 'b');
+    let expected_digest = target.artifacts["binary"].sha256.clone();
+    let exact = crate::runtime::ActiveBuildTarget {
+        embedded: target.embedded.clone(),
+        image_digest: String::new(),
+        binary_digest: expected_digest,
+    };
+
+    assert!(active_target_matches_release(&config, &target, &exact, &target).unwrap());
+
+    let mut local = exact;
+    local.embedded.release = "v0.2.0-dev.bbbbbbbb".to_owned();
+    local.embedded.build_id = format!("local:{}", local.embedded.revision);
+    assert!(!active_target_matches_release(&config, &target, &local, &target).unwrap());
+
+    let mut substituted = crate::runtime::ActiveBuildTarget {
+        embedded: target.embedded.clone(),
+        image_digest: String::new(),
+        binary_digest: "c".repeat(64),
+    };
+    assert!(!active_target_matches_release(&config, &target, &substituted, &target).unwrap());
+
+    let previous = manifest("v0.1.9", 'a');
+    substituted.binary_digest = target.artifacts["binary"].sha256.clone();
+    assert!(!active_target_matches_release(&config, &previous, &substituted, &target).unwrap());
+}
+
+#[test]
 fn registered_update_plan_preserves_mixed_ownership_and_replica_identity() {
     let active = manifest("v0.1.19", 'a');
     let mut target = manifest("v0.2.0", 'b');
