@@ -445,7 +445,7 @@ impl Backup {
         let manifest_bytes = read_secure_regular_file(
             &manifest_path,
             "backup checksum manifest",
-            true,
+            false,
             1024 * 1024,
         )?;
         let content = std::str::from_utf8(&manifest_bytes)

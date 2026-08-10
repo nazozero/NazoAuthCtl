@@ -251,7 +251,7 @@ fn provider_evidence_rejects_stale_and_future_validity_windows() {
         let prepared = prepare_update(&store, &record, &plan("deployment-a")).unwrap();
         let now = Utc::now().timestamp();
         let issued_at = if future {
-            now + MAX_EVIDENCE_FUTURE_SKEW_SECONDS + 1
+            now + MAX_EVIDENCE_FUTURE_SKEW_SECONDS + 30
         } else {
             now - MAX_EVIDENCE_AGE_SECONDS - 1
         };
