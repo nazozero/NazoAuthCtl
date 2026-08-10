@@ -122,19 +122,43 @@ pub(super) fn health_ready(config: &UpdateConfig) -> bool {
         .succeeds()
 }
 
+pub(super) fn retry_runtime_transport<T>(
+    attempts: u32,
+    interval: Duration,
+    mut operation: impl FnMut() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut last_error = None;
+    for attempt in 0..attempts.max(1) {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < attempts.max(1) {
+            thread::sleep(interval);
+        }
+    }
+    Err(last_error.expect("at least one runtime transport attempt is made"))
+}
+
 pub(super) fn verify_public(config: &UpdateConfig) -> anyhow::Result<()> {
-    let response = Process::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--proto",
-            "=http,https",
-            "--max-time",
-            "10",
-            config.runtime.public_discovery_url.as_str(),
-        ])
-        .stdout()?;
+    let response = retry_runtime_transport(
+        config.runtime.readiness_attempts,
+        Duration::from_secs(config.runtime.readiness_interval_seconds),
+        || {
+            Process::new("curl")
+                .args([
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--proto",
+                    "=http,https",
+                    "--max-time",
+                    "10",
+                    config.runtime.public_discovery_url.as_str(),
+                ])
+                .stdout()
+        },
+    )?;
     let value: serde_json::Value =
         serde_json::from_str(&response).context("Discovery response is not valid JSON")?;
     if value.get("issuer").and_then(serde_json::Value::as_str)
@@ -155,11 +179,12 @@ pub(super) fn signed_ui_index(
         .ui
         .releases_root
         .join(&release.frontend.artifact.sha256);
-    if !frontend_cache_matches(&cache, release) {
+    if !frontend_cache_matches(config, &cache, release) {
         bail!("runtime frontend cache does not match the signed Release descriptor");
     }
     let index = cache.join("index.html");
-    let content = crate::filesystem::read_secure_regular_file(
+    let content = crate::runtime::read_runtime_owned_regular_file(
+        config,
         &index,
         "signed frontend index",
         false,
@@ -189,23 +214,30 @@ pub(super) fn verify_ui(config: &UpdateConfig, release: &ReleaseManifest) -> any
         "{}/ui/",
         config.runtime.expected_issuer.trim_end_matches('/')
     );
-    let output = Process::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--proto",
-            "=http,https",
-            "--max-time",
-            "10",
-        ])
-        .arg("--max-filesize")
-        .arg(expected.len().to_string())
-        .arg(&url)
-        .output()?;
-    if !output.status.success() {
-        bail!("public frontend verification request failed");
-    }
+    let output = retry_runtime_transport(
+        config.runtime.readiness_attempts,
+        Duration::from_secs(config.runtime.readiness_interval_seconds),
+        || {
+            let output = Process::new("curl")
+                .args([
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--proto",
+                    "=http,https",
+                    "--max-time",
+                    "10",
+                ])
+                .arg("--max-filesize")
+                .arg(expected.len().to_string())
+                .arg(&url)
+                .output()?;
+            if !output.status.success() {
+                bail!("public frontend verification request failed");
+            }
+            Ok(output)
+        },
+    )?;
     verify_ui_binding(config, release, &output.stdout)
 }
 

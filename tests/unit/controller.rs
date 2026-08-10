@@ -1859,19 +1859,19 @@ fn ui_cache_validation_rejects_missing_non_regular_and_malformed_artifacts() {
     let work = PrivateTempDir::new("nazoauth-frontend-cache-boundaries").unwrap();
     let config = config(&work);
     let value = journal(&config, UpdatePhase::UiActivating);
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
 
     fs::create_dir_all(value.candidate_ui.parent().unwrap()).unwrap();
     fs::write(&value.candidate_ui, b"not a directory").unwrap();
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
     fs::remove_file(&value.candidate_ui).unwrap();
 
     fs::create_dir_all(&value.candidate_ui).unwrap();
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
     fs::write(value.candidate_ui.join("index.html"), b"ui").unwrap();
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
     fs::write(value.candidate_ui.join(".nazoauth-ui.json"), b"not-json").unwrap();
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
 }
 
 fn ui_server(body: &[u8]) -> (String, std::thread::JoinHandle<()>) {
@@ -1915,6 +1915,31 @@ fn ui_verification_binds_the_served_body_to_the_signed_runtime_cache() {
 }
 
 #[test]
+fn public_transport_retry_is_bounded_and_converges_without_masking_failure() {
+    let mut attempts = 0;
+    let value = retry_runtime_transport(3, Duration::ZERO, || {
+        attempts += 1;
+        if attempts < 3 {
+            anyhow::bail!("edge has not observed the ready backend");
+        }
+        Ok("ready")
+    })
+    .unwrap();
+    assert_eq!(value, "ready");
+    assert_eq!(attempts, 3);
+
+    let mut failures = 0;
+    assert!(
+        retry_runtime_transport(2, Duration::ZERO, || -> anyhow::Result<()> {
+            failures += 1;
+            anyhow::bail!("persistent public failure")
+        })
+        .is_err()
+    );
+    assert_eq!(failures, 2);
+}
+
+#[test]
 fn ui_verification_rejects_an_unrelated_success_response_through_curl() {
     let work = PrivateTempDir::new("nazoauth-frontend-http-binding").unwrap();
     let mut config = config(&work);
@@ -1942,7 +1967,7 @@ fn ui_cache_validation_rejects_symlinked_index_and_marker_files() {
     let external_index = work.path().join("external-index.html");
     fs::write(&external_index, b"ui").unwrap();
     std::os::unix::fs::symlink(&external_index, value.candidate_ui.join("index.html")).unwrap();
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
 
     fs::remove_file(value.candidate_ui.join("index.html")).unwrap();
     fs::write(value.candidate_ui.join("index.html"), b"ui").unwrap();
@@ -1953,7 +1978,7 @@ fn ui_cache_validation_rejects_symlinked_index_and_marker_files() {
         value.candidate_ui.join(".nazoauth-ui.json"),
     )
     .unwrap();
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
 }
 
 #[cfg(unix)]
@@ -2768,7 +2793,7 @@ fn frontend_cache_marker_must_exactly_match_the_signed_release() {
         serde_json::to_vec(&expected).unwrap(),
     )
     .unwrap();
-    assert!(target_ui_is_active(&value));
+    assert!(target_ui_is_active(&config, &value));
 
     let mut changed = expected;
     changed["unexpected"] = serde_json::json!(true);
@@ -2777,7 +2802,7 @@ fn frontend_cache_marker_must_exactly_match_the_signed_release() {
         serde_json::to_vec(&changed).unwrap(),
     )
     .unwrap();
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
 }
 
 #[test]

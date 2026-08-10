@@ -167,7 +167,7 @@ pub(crate) fn advance_update_transaction(
     if resuming_activated_target {
         activate_candidate(config, &runtime, journal)?;
     }
-    if journal.phase >= UpdatePhase::UiActive && !target_ui_is_active(journal) {
+    if journal.phase >= UpdatePhase::UiActive && !target_ui_is_active(config, journal) {
         bail!("candidate application did not retain its signed frontend cache");
     }
     if journal.phase >= UpdatePhase::HealthVerified {
@@ -207,7 +207,7 @@ pub(crate) fn advance_update_transaction(
         set_update_phase(config, journal, UpdatePhase::UiActivating)?;
         wait_ready(config)?;
         verify_ui(config, &journal.to_release)?;
-        if !target_ui_is_active(journal) {
+        if !target_ui_is_active(config, journal) {
             bail!("candidate application did not materialize its signed frontend cache");
         }
         set_update_phase(config, journal, UpdatePhase::UiActive)?;
@@ -430,7 +430,11 @@ pub(crate) fn activate_candidate(
     }
 }
 
-pub(crate) fn frontend_cache_matches(candidate_ui: &Path, release: &ReleaseManifest) -> bool {
+pub(crate) fn frontend_cache_matches(
+    config: &UpdateConfig,
+    candidate_ui: &Path,
+    release: &ReleaseManifest,
+) -> bool {
     fn regular_file(path: &Path) -> bool {
         fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
     }
@@ -446,7 +450,8 @@ pub(crate) fn frontend_cache_matches(candidate_ui: &Path, release: &ReleaseManif
     if !regular_file(&marker) {
         return false;
     }
-    let Ok(bytes) = crate::filesystem::read_secure_regular_file(
+    let Ok(bytes) = crate::runtime::read_runtime_owned_regular_file(
+        config,
         &marker,
         "frontend cache marker",
         false,
@@ -468,8 +473,8 @@ pub(crate) fn frontend_cache_matches(candidate_ui: &Path, release: &ReleaseManif
         })
 }
 
-pub(crate) fn target_ui_is_active(journal: &UpdateJournal) -> bool {
-    frontend_cache_matches(&journal.candidate_ui, &journal.to_release)
+pub(crate) fn target_ui_is_active(config: &UpdateConfig, journal: &UpdateJournal) -> bool {
+    frontend_cache_matches(config, &journal.candidate_ui, &journal.to_release)
 }
 
 pub(crate) fn finish_update_journal(

@@ -926,13 +926,29 @@ fn existing_standards_full_server_config_must_match_the_explicit_proxy_boundary(
     options.profile = "standards-full".to_owned();
     options.trusted_proxy_cidr = Some("192.0.2.10/32".to_owned());
     let valid = "PUBLIC_BASE_URL: \"https://auth.example\"\n\
+                 ENABLE_AUTHORIZATION_DETAILS: true\n\
+                 ENABLE_NATIVE_SSO: true\n\
                  MTLS_ENDPOINT_BASE_URL: \"https://auth.example\"\n\
                  MTLS_CERTIFICATE_SOURCE: \"rfc9440\"\n\
                  TRUSTED_PROXY_CIDRS: \"192.0.2.10/32\"\n\
                  ENABLE_OPENID4VCI_ISSUER: true\n\
-                 ENABLE_OPENID4VP_VERIFIER: true\n";
-    validate_existing_server_config(valid, &options, options.trusted_proxy_cidr.as_deref())
-        .unwrap();
+                 ENABLE_OPENID4VP_VERIFIER: true\n\
+                 OPENID4VCI_CREDENTIAL_CONFIGURATIONS_JSON: \"{\\\"example\\\":{\\\"format\\\":\\\"dc+sd-jwt\\\"}}\"\n";
+    let expected_profile = "ENABLE_AUTHORIZATION_DETAILS: true\n\
+                            ENABLE_NATIVE_SSO: true\n\
+                            ENABLE_OPENID4VCI_ISSUER: true\n\
+                            ENABLE_OPENID4VP_VERIFIER: true\n\
+                            MTLS_ENDPOINT_BASE_URL: \"https://auth.example\"\n\
+                            TRUSTED_PROXY_CIDRS: \"192.0.2.10/32\"\n\
+                            MTLS_CERTIFICATE_SOURCE: \"rfc9440\"\n\
+                            OPENID4VCI_CREDENTIAL_CONFIGURATIONS_JSON: \"{\\\"example\\\":{\\\"format\\\":\\\"dc+sd-jwt\\\"}}\"\n";
+    validate_existing_server_config(
+        valid,
+        &options,
+        options.trusted_proxy_cidr.as_deref(),
+        Some(expected_profile),
+    )
+    .unwrap();
 
     for invalid in [
         valid.replace("rfc9440", "legacy-verified-headers"),
@@ -942,12 +958,14 @@ fn existing_standards_full_server_config_must_match_the_explicit_proxy_boundary(
             "ENABLE_OPENID4VP_VERIFIER: true",
             "ENABLE_OPENID4VP_VERIFIER: false",
         ),
+        valid.replace("dc+sd-jwt", "jwt_vc_json"),
     ] {
         assert!(
             validate_existing_server_config(
                 &invalid,
                 &options,
                 options.trusted_proxy_cidr.as_deref(),
+                Some(expected_profile),
             )
             .is_err(),
             "accepted invalid standards-full server configuration: {invalid}"

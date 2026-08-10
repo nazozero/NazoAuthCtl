@@ -30,6 +30,40 @@ pub(crate) fn runtime_service_owner_uid(config: &UpdateConfig) -> anyhow::Result
         .context("managed host service user has no valid numeric UID")
 }
 
+pub(crate) fn read_runtime_owned_regular_file(
+    config: &UpdateConfig,
+    path: &Path,
+    label: &str,
+    private: bool,
+    max_bytes: u64,
+) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+    #[cfg(unix)]
+    {
+        match crate::filesystem::read_secure_regular_file(path, label, private, max_bytes) {
+            Ok(bytes) => Ok(bytes),
+            Err(controller_owner_error) => {
+                crate::filesystem::read_secure_regular_file_for_uid(
+                    path,
+                    label,
+                    private,
+                    max_bytes,
+                    runtime_service_owner_uid(config)?,
+                )
+                .with_context(|| {
+                    format!(
+                        "{label} is neither controller-owned nor owned by the bound runtime service: {controller_owner_error:#}"
+                    )
+                })
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config;
+        crate::filesystem::read_secure_regular_file(path, label, private, max_bytes)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PreparedAppTask {
     backend: RuntimeBackendKind,
