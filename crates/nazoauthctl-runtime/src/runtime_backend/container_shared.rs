@@ -36,9 +36,7 @@ pub(crate) const NON_ROOT_ONE_SHOT_USER: &str = "10001:10001";
 
 const ENGINE_FIXED_MOUNT_DESTINATIONS: &[&str] =
     &["/etc/hosts", "/etc/hostname", "/etc/resolv.conf"];
-const ENGINE_FIXED_ENV_NAMES: &[&str] = &[
-    "PATH", "HOSTNAME", "HOME", "TERM", "LANG", "LC_ALL", "PGDATA",
-];
+const ENGINE_FIXED_ENV_NAMES: &[&str] = &["HOSTNAME", "HOME", "TERM", "LC_ALL", "container"];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -951,6 +949,7 @@ pub(crate) fn ensure_container(
             backend_name,
         )?;
         assert_container_image(command, &arguments, expected_image, backend_name)?;
+        let image_environment = inspect_image_environment(command, expected_image, backend_name)?;
         assert_managed_container_policy(
             command,
             &arguments,
@@ -959,10 +958,37 @@ pub(crate) fn ensure_container(
             &network.name,
             expected_mounts,
             expected_environment,
+            &image_environment,
         )?;
         return Process::new(command).args(["start", name]).run_quiet();
     }
     create.run_quiet()
+}
+
+fn inspect_image_environment(
+    command: &OsStr,
+    image: &str,
+    backend_name: &str,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let document = inspect_document(command, &["image", "inspect", image], backend_name)?;
+    let values = document
+        .pointer("/Config/Env")
+        .and_then(serde_json::Value::as_array)
+        .context("managed image inspect omitted environment")?;
+    let mut environment = std::collections::BTreeMap::new();
+    for value in values.iter().filter_map(serde_json::Value::as_str) {
+        let (name, value) = value
+            .split_once('=')
+            .context("managed image contains an invalid environment entry")?;
+        if name.is_empty()
+            || environment
+                .insert(name.to_owned(), value.to_owned())
+                .is_some()
+        {
+            bail!("managed image environment is ambiguous");
+        }
+    }
+    Ok(environment)
 }
 
 pub(crate) fn prepare_managed_volume_ownership(
@@ -1123,6 +1149,7 @@ pub(crate) fn assert_managed_container_policy(
     expected_network: &str,
     expected_mounts: &[(&str, bool, Option<&str>)],
     expected_environment: &[(&str, &str)],
+    image_environment: &std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     let document = inspect_document(command, arguments, backend_name)?;
     let host_config = document
@@ -1340,12 +1367,21 @@ pub(crate) fn assert_managed_container_policy(
         .iter()
         .map(|(name, _)| *name)
         .collect::<std::collections::BTreeSet<_>>();
-    for name in env
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .filter_map(|value| value.split_once('=').map(|(name, _)| name))
-    {
-        if !expected_names.contains(name) && !ENGINE_FIXED_ENV_NAMES.contains(&name) {
+    let mut observed_environment = std::collections::BTreeMap::new();
+    for entry in env.iter().filter_map(serde_json::Value::as_str) {
+        let (name, value) = entry
+            .split_once('=')
+            .context("managed container contains an invalid environment entry")?;
+        if observed_environment
+            .insert(name.to_owned(), value.to_owned())
+            .is_some()
+        {
+            bail!("{backend_name} managed container environment is ambiguous");
+        }
+        if !expected_names.contains(name)
+            && !ENGINE_FIXED_ENV_NAMES.contains(&name)
+            && image_environment.get(name).map(String::as_str) != Some(value)
+        {
             bail!("{backend_name} managed container contains an undeclared environment variable");
         }
     }
@@ -1361,6 +1397,15 @@ pub(crate) fn assert_managed_container_policy(
             bail!(
                 "{backend_name} managed container contains an unauthorized secret environment variable"
             );
+        }
+    }
+    for (name, expected) in image_environment {
+        if expected_names.contains(name.as_str()) || ENGINE_FIXED_ENV_NAMES.contains(&name.as_str())
+        {
+            continue;
+        }
+        if observed_environment.get(name) != Some(expected) {
+            bail!("{backend_name} managed container image environment drifted");
         }
     }
     for (name, expected) in expected_environment {
@@ -1709,6 +1754,10 @@ mod tests {
                 "managed-network",
                 &[("/data", false, Some("managed-data"))],
                 &[("POSTGRES_DB", "oauth")],
+                &std::collections::BTreeMap::from([(
+                    "PATH".to_owned(),
+                    "/usr/local/bin".to_owned(),
+                )]),
             )
             .unwrap_err();
             assert!(error.to_string().contains(expected_error));
