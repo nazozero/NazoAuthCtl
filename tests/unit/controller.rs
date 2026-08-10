@@ -2174,6 +2174,7 @@ if [ "${{1:-}}" = volume ] && [ "${{2:-}}" = inspect ]; then
   case "${{3:-}}" in
     '{postgres_volume}') printf '%s\n' '{postgres_volume_inspect_json}' ;;
     '{valkey_volume}') printf '%s\n' '{valkey_volume_inspect_json}' ;;
+    *) printf '%s\n' 'no such object' >&2; exit 1 ;;
   esac
   exit 0
 fi
@@ -2185,6 +2186,18 @@ if [ "${{1:-}}" = container ] && [ "${{2:-}}" = inspect ]; then
     *) printf '%s\n' '{application_inspect_json}' ;;
   esac
   exit 0
+fi
+if [ "${{1:-}}" = run ]; then
+  case "$*" in
+    *'ALTER DATABASE "{database}" RENAME TO "{database}_previous_'*) : > '{postgres_state}' ; exit 0 ;;
+    *SELECT*pg_database*datname*)
+      case "$*" in
+        *"{database}_previous_"*) if [ -f '{postgres_state}' ]; then printf '%s\n' '1'; fi ;;
+        *"{database}_restore_"*) printf '%s\n' '1' ;;
+        *"datname = '{database}'"*) if [ ! -f '{postgres_state}' ]; then printf '%s\n' '1'; fi ;;
+      esac
+      exit 0 ;;
+  esac
 fi"#,
         network = config.runtime.network,
         network_inspect_json = network_inspect_json,
@@ -2198,6 +2211,8 @@ fi"#,
         postgres_inspect_json = postgres_inspect_json,
         valkey_inspect_json = valkey_inspect_json,
         application_inspect_json = inspect_json,
+        database = config.postgres.database,
+        postgres_state = work.path().join("postgres-old-quarantined").display(),
     );
     let script = format!("{raw_identity_override}\n{script}");
     let legacy_build_identity_case = format!(
