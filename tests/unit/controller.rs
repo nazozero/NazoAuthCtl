@@ -17,6 +17,16 @@ use crate::{
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, chown};
 
+#[cfg(unix)]
+fn current_unix_user() -> String {
+    Process::new("id")
+        .arg("-un")
+        .stdout()
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
 #[test]
 fn self_update_install_path_is_normalized_and_non_symlink() {
     let work = PrivateTempDir::new("nazoauth-self-update-install-path").unwrap();
@@ -384,6 +394,7 @@ fn openid4vc_trust_export_is_release_bound_audited_and_fail_closed() {
     fs::create_dir(output.parent().unwrap()).unwrap();
 
     let mut value = config(&work);
+    value.runtime.service_user = current_unix_user();
     assert!(export_openid4vc_trust(&value, &output).is_err());
 
     value.install_profile = "standards-full".to_owned();
@@ -1501,6 +1512,10 @@ fn observation_lock_never_creates_persistent_state() {
 fn standards_full_bootstraps_a_bounded_revocation_snapshot_without_overwriting_it() {
     let work = PrivateTempDir::new("openid4vc-revocation-bootstrap").unwrap();
     let mut value = config(&work);
+    #[cfg(unix)]
+    {
+        value.runtime.service_user = current_unix_user();
+    }
     value.install_profile = "standards-full".to_owned();
     value.runtime.expected_issuer = "https://auth.example/".to_owned();
     let keys = work.path().join("app/keys");
