@@ -19,6 +19,10 @@ use std::{
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum SecureFileError {
+    // This is emitted by the Windows/unsupported-platform branches and must
+    // remain part of the shared error contract even though Unix builds cannot
+    // construct it.
+    #[allow(dead_code)]
     UnsupportedPlatform,
     NotFound,
     Oversize,
