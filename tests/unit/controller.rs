@@ -1700,7 +1700,7 @@ fn public_command_dispatch_fails_closed_before_every_confirmed_mutation() {
     fs::write(abandoned.join("controller.key"), b"pending-secret").unwrap();
     assert_root_or_error(
         invoke(Command::RecoverUpdate { yes: false }),
-        "identity recovery is pending",
+        "no interrupted update transaction requires recovery",
     );
     assert!(invoke(Command::RecoverIdentity { yes: false }).is_err());
     assert_eq!(fs::read(&config_path).unwrap(), config_before);
@@ -2068,6 +2068,79 @@ fn fake_container_runtime(
         &config.operator.controller_key_id,
         &config.runtime.network,
     );
+    let network_inspect_json = serde_json::json!({
+        "Name": config.runtime.network.clone(),
+        "Labels": {
+            "io.nazoauth.deployment-id": config.operator.deployment_id.clone(),
+            "io.nazoauth.control-authority": config.operator.controller_key_id.clone(),
+            "io.nazoauth.managed-resource": "network",
+            "io.nazoauth.config-digest": network_digest.clone(),
+        },
+        "subnets": [{"gateway": "10.89.0.1"}],
+    })
+    .to_string();
+    let postgres_inspect_json = serde_json::json!({
+        "Id": "fixture-postgres-container-id",
+        "Name": format!("/{}", config.postgres.container_name),
+        "ImageName": config.postgres.image.clone(),
+        "Config": {
+            "Image": config.postgres.image.clone(),
+            "Labels": {
+                "io.nazoauth.deployment-id": config.operator.deployment_id.clone(),
+                "io.nazoauth.control-authority": config.operator.controller_key_id.clone(),
+                "io.nazoauth.runtime-instance-id": config.runtime.runtime_instance_id.clone(),
+                "io.nazoauth.managed-resource": "postgres",
+                "io.nazoauth.config-digest": identity.postgres_config_digest.clone(),
+            },
+            "Command": ["postgres"],
+        },
+        "State": {"Running": true},
+        "NetworkSettings": {"Ports": {}, "Networks": {}},
+        "Mounts": [],
+    })
+    .to_string();
+    let valkey_inspect_json = serde_json::json!({
+        "Id": "fixture-valkey-container-id",
+        "Name": format!("/{}", config.valkey.container_name),
+        "ImageName": config.valkey.image.clone(),
+        "Config": {
+            "Image": config.valkey.image.clone(),
+            "Labels": {
+                "io.nazoauth.deployment-id": config.operator.deployment_id.clone(),
+                "io.nazoauth.control-authority": config.operator.controller_key_id.clone(),
+                "io.nazoauth.runtime-instance-id": config.runtime.runtime_instance_id.clone(),
+                "io.nazoauth.managed-resource": "valkey",
+                "io.nazoauth.config-digest": identity.valkey_config_digest.clone(),
+            },
+            "Command": ["valkey-server"],
+        },
+        "State": {"Running": true},
+        "NetworkSettings": {"Ports": {}, "Networks": {}},
+        "Mounts": [],
+    })
+    .to_string();
+    let postgres_volume_inspect_json = serde_json::json!({
+        "Name": postgres_volume.clone(),
+        "Labels": {
+            "io.nazoauth.deployment-id": config.operator.deployment_id.clone(),
+            "io.nazoauth.control-authority": config.operator.controller_key_id.clone(),
+            "io.nazoauth.runtime-instance-id": config.runtime.runtime_instance_id.clone(),
+            "io.nazoauth.managed-resource": "postgres-volume",
+            "io.nazoauth.config-digest": identity.postgres_volume_config_digest.clone(),
+        },
+    })
+    .to_string();
+    let valkey_volume_inspect_json = serde_json::json!({
+        "Name": config.valkey.data_volume.clone(),
+        "Labels": {
+            "io.nazoauth.deployment-id": config.operator.deployment_id.clone(),
+            "io.nazoauth.control-authority": config.operator.controller_key_id.clone(),
+            "io.nazoauth.runtime-instance-id": config.runtime.runtime_instance_id.clone(),
+            "io.nazoauth.managed-resource": "valkey-volume",
+            "io.nazoauth.config-digest": identity.valkey_volume_config_digest.clone(),
+        },
+    })
+    .to_string();
     let embedded_identity = serde_json::to_string(&nazo_operator_protocol::EmbeddedIdentity {
         release: "v0.2.0".to_owned(),
         revision: candidate_commit.to_owned(),
@@ -2092,6 +2165,41 @@ fn fake_container_runtime(
         inspect_json = inspect_json,
         embedded_identity = embedded_identity,
     );
+    let raw_identity_override = format!(
+        r#"if [ "${{1:-}}" = network ] && [ "${{2:-}}" = inspect ] && [ "${{3:-}}" = '{network}' ]; then
+  printf '%s\n' '{network_inspect_json}'
+  exit 0
+fi
+if [ "${{1:-}}" = volume ] && [ "${{2:-}}" = inspect ]; then
+  case "${{3:-}}" in
+    '{postgres_volume}') printf '%s\n' '{postgres_volume_inspect_json}' ;;
+    '{valkey_volume}') printf '%s\n' '{valkey_volume_inspect_json}' ;;
+  esac
+  exit 0
+fi
+if [ "${{1:-}}" = container ] && [ "${{2:-}}" = inspect ]; then
+  if [ "{candidate_active}" != true ]; then printf '%s\n' 'no such object' >&2; exit 1; fi
+  case "${{3:-}}" in
+    '{postgres_object}') printf '%s\n' '{postgres_inspect_json}' ;;
+    '{valkey_object}') printf '%s\n' '{valkey_inspect_json}' ;;
+    *) printf '%s\n' '{application_inspect_json}' ;;
+  esac
+  exit 0
+fi"#,
+        network = config.runtime.network,
+        network_inspect_json = network_inspect_json,
+        postgres_volume = postgres_volume,
+        valkey_volume = config.valkey.data_volume,
+        postgres_volume_inspect_json = postgres_volume_inspect_json,
+        valkey_volume_inspect_json = valkey_volume_inspect_json,
+        candidate_active = candidate_active,
+        postgres_object = config.postgres.container_name,
+        valkey_object = config.valkey.container_name,
+        postgres_inspect_json = postgres_inspect_json,
+        valkey_inspect_json = valkey_inspect_json,
+        application_inspect_json = inspect_json,
+    );
+    let script = format!("{raw_identity_override}\n{script}");
     let legacy_build_identity_case = format!(
         r#"if [ "${{1:-}}" = run ] && [ "${{*: -2}}" = "nazoauth build-identity" ]; then
   printf '%s\n' '{}'
