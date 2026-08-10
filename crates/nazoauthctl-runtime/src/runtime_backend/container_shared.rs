@@ -1173,16 +1173,18 @@ pub(crate) fn assert_managed_container_policy(
     {
         bail!("{backend_name} managed container no-new-privileges policy drifted");
     }
-    if policy.drop_all_capabilities
-        && !host_config
+    if policy.drop_all_capabilities {
+        let dropped = host_config
             .get("CapDrop")
             .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-            .any(|value| value.eq_ignore_ascii_case("ALL"))
-    {
-        bail!("{backend_name} managed container capability policy drifted");
+            .context("container inspect omitted dropped capabilities")?;
+        let added = host_config
+            .get("CapAdd")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        if added != 0 || !observed_cap_drop_all(dropped) {
+            bail!("{backend_name} managed container capability policy drifted");
+        }
     }
     if let Some(limit) = policy.pids_limit
         && host_config
@@ -1357,6 +1359,41 @@ pub(crate) fn assert_managed_container_policy(
     Ok(())
 }
 
+fn observed_cap_drop_all(values: &[serde_json::Value]) -> bool {
+    let normalized = values
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(|value| {
+            let upper = value.to_ascii_uppercase();
+            upper.strip_prefix("CAP_").unwrap_or(&upper).to_owned()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if normalized.contains("ALL") {
+        return true;
+    }
+    // Podman expands `--cap-drop ALL` to its complete default bounding set in
+    // inspect output. Requiring every member distinguishes that dialect from
+    // a partial drop while remaining fail-closed if the engine adds a new
+    // default capability that this controller does not understand.
+    const PODMAN_DEFAULT_CAPABILITIES: &[&str] = &[
+        "CHOWN",
+        "DAC_OVERRIDE",
+        "FOWNER",
+        "FSETID",
+        "KILL",
+        "NET_BIND_SERVICE",
+        "SETFCAP",
+        "SETGID",
+        "SETPCAP",
+        "SETUID",
+        "SYS_CHROOT",
+    ];
+    normalized.len() == PODMAN_DEFAULT_CAPABILITIES.len()
+        && PODMAN_DEFAULT_CAPABILITIES
+            .iter()
+            .all(|capability| normalized.contains(*capability))
+}
+
 fn mount_source_matches(observed: &str, expected: &str) -> bool {
     observed == expected
         || (!expected.contains('/')
@@ -1475,6 +1512,28 @@ mod tests {
         assert!(arguments.contains("--user\n999:999\n"));
         assert!(arguments.contains("--cap-drop\nALL\n"));
         assert!(arguments.contains("--read-only\n"));
+    }
+
+    #[test]
+    fn podman_expanded_cap_drop_all_is_recognized_without_accepting_partial_sets() {
+        let complete = [
+            "CAP_CHOWN",
+            "CAP_DAC_OVERRIDE",
+            "CAP_FOWNER",
+            "CAP_FSETID",
+            "CAP_KILL",
+            "CAP_NET_BIND_SERVICE",
+            "CAP_SETFCAP",
+            "CAP_SETGID",
+            "CAP_SETPCAP",
+            "CAP_SETUID",
+            "CAP_SYS_CHROOT",
+        ]
+        .into_iter()
+        .map(serde_json::Value::from)
+        .collect::<Vec<_>>();
+        assert!(super::observed_cap_drop_all(&complete));
+        assert!(!super::observed_cap_drop_all(&complete[..10]));
     }
 
     #[test]
