@@ -358,6 +358,29 @@ impl<'a> Runtime<'a> {
                 "NAZOAUTH_OPERATOR_CONFORMANCE_BUNDLE_FILE".to_owned(),
                 "/run/nazoauth-operator/conformance-bundle.json".to_owned(),
             );
+            let client_secret_pepper = self.required_runtime_secret("client-secret-pepper")?;
+            mounts.push(task_mount(
+                &client_secret_pepper,
+                Path::new("/run/nazoauth-operator/client-secret-pepper"),
+                true,
+            ));
+            environment.insert(
+                "NAZOAUTH_OPERATOR_CLIENT_SECRET_PEPPER_FILE".to_owned(),
+                "/run/nazoauth-operator/client-secret-pepper".to_owned(),
+            );
+            if let Some(pairwise_subject_secret) =
+                self.optional_runtime_secret("pairwise-subject-secret")?
+            {
+                mounts.push(task_mount(
+                    &pairwise_subject_secret,
+                    Path::new("/run/nazoauth-operator/pairwise-subject-secret"),
+                    true,
+                ));
+                environment.insert(
+                    "NAZOAUTH_OPERATOR_PAIRWISE_SUBJECT_SECRET_FILE".to_owned(),
+                    "/run/nazoauth-operator/pairwise-subject-secret".to_owned(),
+                );
+            }
         }
         if let Some(path) = conformance_output_directory {
             mounts.push(task_mount(
@@ -525,6 +548,27 @@ impl<'a> Runtime<'a> {
                 "NAZOAUTH_OPERATOR_CONFORMANCE_BUNDLE_FILE".to_owned(),
                 "%d/conformance-bundle".to_owned(),
             );
+            let client_secret_pepper = app_root.join("secrets/client-secret-pepper");
+            require_real_regular_file(&client_secret_pepper, "conformance client secret pepper")?;
+            transient_credentials.insert("client-secret-pepper".to_owned(), client_secret_pepper);
+            environment.insert(
+                "NAZOAUTH_OPERATOR_CLIENT_SECRET_PEPPER_FILE".to_owned(),
+                "%d/client-secret-pepper".to_owned(),
+            );
+            let pairwise_subject_secret = app_root.join("secrets/pairwise-subject-secret");
+            if real_regular_file_or_missing(
+                &pairwise_subject_secret,
+                "conformance pairwise subject secret",
+            )? {
+                transient_credentials.insert(
+                    "pairwise-subject-secret".to_owned(),
+                    pairwise_subject_secret,
+                );
+                environment.insert(
+                    "NAZOAUTH_OPERATOR_PAIRWISE_SUBJECT_SECRET_FILE".to_owned(),
+                    "%d/pairwise-subject-secret".to_owned(),
+                );
+            }
         }
         if let Some(path) = conformance_output_directory {
             read_write_paths.push(path.to_path_buf());
@@ -1080,6 +1124,48 @@ impl<'a> Runtime<'a> {
             .iter()
             .find(|mount| mount.target == Path::new(target))
             .with_context(|| format!("runtime mount {target} is unavailable"))
+    }
+
+    fn required_runtime_secret(&self, name: &str) -> anyhow::Result<std::path::PathBuf> {
+        let path = self
+            .required_mount("/var/lib/nazo_oauth/secrets")?
+            .source
+            .join(name);
+        require_real_regular_file(&path, "conformance runtime secret")?;
+        Ok(path)
+    }
+
+    fn optional_runtime_secret(&self, name: &str) -> anyhow::Result<Option<std::path::PathBuf>> {
+        let path = self
+            .required_mount("/var/lib/nazo_oauth/secrets")?
+            .source
+            .join(name);
+        if real_regular_file_or_missing(&path, "conformance runtime secret")? {
+            Ok(Some(path))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+fn require_real_regular_file(path: &Path, label: &str) -> anyhow::Result<()> {
+    if !real_regular_file_or_missing(path, label)? {
+        bail!("{label} is unavailable: {}", path.display());
+    }
+    Ok(())
+}
+
+fn real_regular_file_or_missing(path: &Path, label: &str) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => bail!(
+            "{label} is not a regular non-symlink file: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to inspect {label} {}", path.display()))
+        }
     }
 }
 
