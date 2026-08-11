@@ -215,6 +215,33 @@ impl MatrixGroup {
         values.extend(plan.variant.clone());
         values
     }
+
+    /// Expand local driver semantics without changing the compact official
+    /// variant sent to the Suite. This mirrors the Python materializer's
+    /// `full_vci_variant`: profile defaults are the baseline, group values
+    /// override them, and plan values have final precedence.
+    pub(crate) fn effective_runtime_variant(&self, plan: &MatrixPlan) -> BTreeMap<String, String> {
+        let mut values = BTreeMap::new();
+        if self.variant.id == "vci-haip" {
+            values.extend([
+                ("sender_constrain".to_owned(), "dpop".to_owned()),
+                (
+                    "client_auth_type".to_owned(),
+                    "client_attestation".to_owned(),
+                ),
+                ("authorization_request_type".to_owned(), "simple".to_owned()),
+                ("openid".to_owned(), "plain_oauth".to_owned()),
+                ("fapi_request_method".to_owned(), "unsigned".to_owned()),
+                ("vci_grant_type".to_owned(), "authorization_code".to_owned()),
+                ("vci_credential_encryption".to_owned(), "plain".to_owned()),
+                ("fapi_profile".to_owned(), "vci_haip".to_owned()),
+                ("fapi_response_mode".to_owned(), "plain_response".to_owned()),
+            ]);
+        }
+        values.extend(self.variant.values.clone());
+        values.extend(plan.variant.clone());
+        values
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -344,6 +371,54 @@ mod tests {
 
     fn fixture() -> Vec<u8> {
         br#"{"schema":1,"name":"fixture","groups":[{"id":"g","profile":"oidc","variant":{"id":"v","values":{"mode":"plain"}},"plans":[{"id":"p","plan":"oidcc-basic-certification-test-plan","config":{"alias":"a"},"expected_results":{"oidcc-expected-skip":"SKIPPED"}}]}]}"#.to_vec()
+    }
+
+    #[test]
+    fn vci_haip_runtime_defaults_do_not_change_the_official_suite_variant() {
+        let group = MatrixGroup {
+            id: "openid4vc-vci-haip".to_owned(),
+            profile: "openid4vc".to_owned(),
+            variant: MatrixVariant {
+                id: "vci-haip".to_owned(),
+                values: BTreeMap::new(),
+            },
+            plans: Vec::new(),
+        };
+        let plan = MatrixPlan {
+            id: "openid4vc-vci-haip-p036".to_owned(),
+            plan: "oid4vci-1_0-issuer-haip-test-plan".to_owned(),
+            config: serde_json::json!({}),
+            variant: BTreeMap::from([
+                (
+                    "vci_authorization_code_flow_variant".to_owned(),
+                    "issuer_initiated".to_owned(),
+                ),
+                ("credential_format".to_owned(), "sd_jwt_vc".to_owned()),
+            ]),
+            expected_results: BTreeMap::new(),
+        };
+
+        let suite = group.effective_variant(&plan);
+        assert_eq!(suite.len(), 2);
+        assert!(!suite.contains_key("vci_grant_type"));
+
+        let runtime = group.effective_runtime_variant(&plan);
+        assert_eq!(
+            runtime.get("vci_grant_type").map(String::as_str),
+            Some("authorization_code")
+        );
+        assert_eq!(
+            runtime.get("client_auth_type").map(String::as_str),
+            Some("client_attestation")
+        );
+        assert_eq!(
+            runtime.get("sender_constrain").map(String::as_str),
+            Some("dpop")
+        );
+        assert_eq!(
+            runtime.get("fapi_profile").map(String::as_str),
+            Some("vci_haip")
+        );
     }
 
     #[test]

@@ -90,6 +90,7 @@ struct PlannedPlan {
     suite_plan_id: String,
     plan_name: String,
     variant: BTreeMap<String, String>,
+    runtime_variant: BTreeMap<String, String>,
     expected_results: BTreeMap<String, String>,
     modules: Vec<ModuleDefinition>,
     config: Value,
@@ -211,7 +212,7 @@ impl ConformanceRunner {
             let module_context = OpenId4VciModule::new(
                 module_id.to_owned(),
                 module.test_name.clone(),
-                plan.variant.clone(),
+                plan.runtime_variant.clone(),
                 plan.config.clone(),
                 runner,
             )
@@ -404,6 +405,7 @@ impl ConformanceRunner {
                         break 'create;
                     }
                     let variant = group.effective_variant(plan);
+                    let runtime_variant = group.effective_runtime_variant(plan);
                     current_variant = Some(redacted_variant(&variant));
                     current_test = None;
                     let created =
@@ -437,6 +439,7 @@ impl ConformanceRunner {
                         suite_plan_id: created.id,
                         plan_name: created.name,
                         variant,
+                        runtime_variant,
                         expected_results: plan.expected_results.clone(),
                         modules: created.modules,
                         config: plan.config.clone(),
@@ -1423,6 +1426,10 @@ mod tests {
                 "vci_authorization_code_flow_variant".into(),
                 "wallet_initiated".into(),
             )]),
+            runtime_variant: BTreeMap::from([(
+                "vci_authorization_code_flow_variant".into(),
+                "wallet_initiated".into(),
+            )]),
             expected_results: BTreeMap::new(),
             modules: Vec::new(),
             config: serde_json::json!({}),
@@ -1546,6 +1553,7 @@ mod tests {
             suite_plan_id: "suite-plan".into(),
             plan_name: "oidcc-basic-certification-test-plan".into(),
             variant: BTreeMap::new(),
+            runtime_variant: BTreeMap::new(),
             expected_results: BTreeMap::new(),
             modules: Vec::new(),
             config: serde_json::json!({

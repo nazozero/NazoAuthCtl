@@ -40,9 +40,8 @@ pub use descriptor::{
     DescriptorVariant, MAX_DESCRIPTOR_BYTES, MatrixDescriptor, RoleRequirement,
 };
 use descriptor::{
-    collect_client_policies, collect_registrations, descriptor_requires_reference,
-    effective_group_variant_values, effective_plan_variant, is_placeholder, parse_placeholder,
-    validate_binding_reference, validate_descriptor, validate_digest,
+    collect_client_policies, collect_registrations, descriptor_requires_reference, is_placeholder,
+    parse_placeholder, validate_binding_reference, validate_descriptor, validate_digest,
 };
 use template::{
     materialize_registration_template, materialize_value, materialize_vci_config,
@@ -556,10 +555,8 @@ impl DescriptorMaterializer {
 
         let mut groups = Vec::with_capacity(prepared.descriptor.groups.len());
         for group in &prepared.descriptor.groups {
-            let group_variant_values = effective_group_variant_values(group);
             let mut plans = Vec::with_capacity(group.plans.len());
             for plan in &group.plans {
-                let effective_variant = effective_plan_variant(group, plan);
                 let config = materialize_value(
                     &plan.config_template,
                     &plan.secret_bindings,
@@ -569,7 +566,7 @@ impl DescriptorMaterializer {
                 )?;
                 let config = materialize_vci_config(
                     &plan.plan,
-                    &effective_variant,
+                    &plan.variant,
                     config,
                     &prepared.target_issuer,
                     &prepared.suite_base_url,
@@ -578,7 +575,7 @@ impl DescriptorMaterializer {
                 )?;
                 let config = materialize_vp_config(
                     &plan.plan,
-                    &effective_variant,
+                    &plan.variant,
                     config,
                     &onboarding.openid4vc_request_object_trust_anchor_pem,
                 )?;
@@ -595,7 +592,7 @@ impl DescriptorMaterializer {
                 profile: group.profile.clone(),
                 variant: MatrixVariant {
                     id: group.variant.id.clone(),
-                    values: group_variant_values,
+                    values: group.variant.values.clone(),
                 },
                 plans,
             });
