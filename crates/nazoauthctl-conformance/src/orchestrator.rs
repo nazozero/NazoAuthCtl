@@ -446,7 +446,12 @@ impl ConformanceRunner {
                         observed = None;
                     }
 
-                    if observed.is_none() {
+                    // A freshly-created runner may already report RUNNING
+                    // before it reaches its interactive WAITING boundary.
+                    // Do not skip automation merely because the first info
+                    // document exists; only WAITING and terminal states are
+                    // actionable here.
+                    if needs_interactive_or_terminal_wait(observed.as_ref()) {
                         observed = match self.wait_for_state_interruptible(
                             &instance.id,
                             &["WAITING", "FINISHED", "INTERRUPTED"],
@@ -914,6 +919,10 @@ fn is_terminal_state(value: &Value) -> bool {
     matches!(status(value), Some("FINISHED" | "INTERRUPTED"))
 }
 
+fn needs_interactive_or_terminal_wait(value: Option<&Value>) -> bool {
+    value.is_none_or(|state| !is_waiting(state) && !is_terminal_state(state))
+}
+
 fn is_terminal(value: &Value) -> bool {
     matches!(
         value.get("status").and_then(Value::as_str),
@@ -1340,5 +1349,16 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(issuer.lock().expect("issuer").drives >= 1);
+    }
+
+    #[test]
+    fn running_initial_state_must_reach_an_interactive_or_terminal_boundary() {
+        let running = serde_json::json!({"status":"RUNNING"});
+        let waiting = serde_json::json!({"status":"WAITING"});
+        let finished = serde_json::json!({"status":"FINISHED"});
+        assert!(needs_interactive_or_terminal_wait(None));
+        assert!(needs_interactive_or_terminal_wait(Some(&running)));
+        assert!(!needs_interactive_or_terminal_wait(Some(&waiting)));
+        assert!(!needs_interactive_or_terminal_wait(Some(&finished)));
     }
 }
