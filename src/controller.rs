@@ -42,6 +42,9 @@ mod commands;
 mod deployment;
 mod diagnostics;
 mod keys;
+pub(crate) use keys::{
+    extract_openid4vc_trust_anchors, managed_openid4vc_bundle_path, read_managed_openid4vc_bundle,
+};
 mod self_update;
 mod updates;
 use bootstrap::*;

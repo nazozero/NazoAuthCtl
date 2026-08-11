@@ -256,10 +256,15 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let lease_id = onboarding.lease_id.clone();
 
     let run_result = (|| -> anyhow::Result<RunOutput> {
+        let openid4vc_request_object_trust_anchor_pem = session
+            .openid4vc_request_object_trust_anchor_pem()
+            .context("failed to load the deployment OpenID4VC public trust anchor")?;
         let onboarding_output = OnboardingOutput::new(
             onboarding.lease_id.clone(),
             onboarding.request_jti.clone(),
             onboarding.matrix_sha256.clone(),
+            onboarding.applicant_id.clone(),
+            openid4vc_request_object_trust_anchor_pem,
             onboarding.client_mappings.clone(),
         )?;
         let mut materialized = DescriptorMaterializer::finalize(prepared, onboarding_output)

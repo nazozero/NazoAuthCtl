@@ -95,6 +95,20 @@ impl ConformanceSession {
         &self.context.config.runtime.expected_issuer
     }
 
+    /// Return the deployment-owned public CA that signs OpenID4VP request
+    /// objects. The secure bundle stays on the managed host; only the public
+    /// trust anchor is copied into the Suite configuration.
+    pub fn openid4vc_request_object_trust_anchor_pem(&self) -> anyhow::Result<String> {
+        if self.context.config.install_profile != "standards-full" {
+            bail!("OpenID4VC conformance requires a standards-full deployment");
+        }
+        let bundle = crate::controller::managed_openid4vc_bundle_path(&self.context.config)?;
+        let bytes =
+            crate::controller::read_managed_openid4vc_bundle(&self.context.config, &bundle)?;
+        let public = crate::controller::extract_openid4vc_trust_anchors(&bytes)?;
+        String::from_utf8(public).context("managed OpenID4VC trust anchor is not UTF-8 PEM")
+    }
+
     pub fn describe_matrix(&self) -> anyhow::Result<ConformanceMatrix> {
         let result = operator::execute_with_io(
             &self.context.config,

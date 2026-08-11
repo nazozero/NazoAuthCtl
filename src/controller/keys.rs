@@ -26,7 +26,7 @@ pub(super) fn export_openid4vc_trust(config: &UpdateConfig, output: &Path) -> an
     Ok(())
 }
 
-pub(super) fn managed_openid4vc_bundle_path(config: &UpdateConfig) -> anyhow::Result<PathBuf> {
+pub(crate) fn managed_openid4vc_bundle_path(config: &UpdateConfig) -> anyhow::Result<PathBuf> {
     let key_directories = if config.runtime.backend == RuntimeBackendKind::Systemd {
         config
             .runtime
@@ -60,7 +60,7 @@ pub(super) fn managed_openid4vc_bundle_path(config: &UpdateConfig) -> anyhow::Re
     Ok(keys.join(OPENID4VC_CERTIFICATE_BUNDLE))
 }
 
-fn read_managed_openid4vc_bundle(
+pub(crate) fn read_managed_openid4vc_bundle(
     config: &UpdateConfig,
     bundle: &Path,
 ) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
@@ -114,7 +114,7 @@ pub(super) fn safe_export_destination(output: &Path) -> anyhow::Result<()> {
     }
 }
 
-pub(super) fn extract_openid4vc_trust_anchors(bundle: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn extract_openid4vc_trust_anchors(bundle: &[u8]) -> anyhow::Result<Vec<u8>> {
     let certificates = parse_managed_openid4vc_bundle(bundle)?;
     let mut output = Vec::new();
     append_pem_certificate(&mut output, &certificates[1]);

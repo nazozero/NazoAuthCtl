@@ -150,6 +150,8 @@ pub struct OnboardingOutput {
     lease_id: String,
     request_jti: String,
     matrix_sha256: String,
+    applicant_id: String,
+    openid4vc_request_object_trust_anchor_pem: String,
     clients: BTreeMap<String, String>,
 }
 
@@ -158,14 +160,22 @@ impl OnboardingOutput {
         lease_id: impl Into<String>,
         request_jti: impl Into<String>,
         matrix_sha256: impl Into<String>,
+        applicant_id: impl Into<String>,
+        openid4vc_request_object_trust_anchor_pem: impl Into<String>,
         clients: BTreeMap<String, String>,
     ) -> Result<Self, MaterializerError> {
         let lease_id = lease_id.into();
         let request_jti = request_jti.into();
         let matrix_sha256 = matrix_sha256.into();
+        let applicant_id = applicant_id.into();
+        let openid4vc_request_object_trust_anchor_pem =
+            openid4vc_request_object_trust_anchor_pem.into();
         validate_lease_id(&lease_id)?;
         validate_request_jti(&request_jti)?;
         validate_digest(&matrix_sha256, "matrix_sha256")?;
+        validate_lease_id(&applicant_id)
+            .map_err(|_| MaterializerError::InvalidField("applicant_id"))?;
+        validate_public_certificate_bundle(&openid4vc_request_object_trust_anchor_pem)?;
         for (logical, actual) in &clients {
             validate_public_id(logical, "logical client id", 256)?;
             validate_public_id(actual, "actual client id", 512)?;
@@ -178,6 +188,8 @@ impl OnboardingOutput {
             lease_id,
             request_jti,
             matrix_sha256,
+            applicant_id,
+            openid4vc_request_object_trust_anchor_pem,
             clients,
         })
     }
@@ -212,6 +224,11 @@ impl std::fmt::Debug for OnboardingOutput {
             .field("lease_id", &self.lease_id)
             .field("request_jti", &self.request_jti)
             .field("matrix_sha256", &self.matrix_sha256)
+            .field("applicant_id", &self.applicant_id)
+            .field(
+                "openid4vc_request_object_trust_anchor_pem",
+                &"<public-certificate>",
+            )
             .field("clients", &self.clients)
             .finish()
     }
@@ -294,6 +311,7 @@ struct PreparedClient {
     mtls_ca_certificate: Zeroizing<String>,
     mtls_client_certificate: Zeroizing<String>,
     mtls_client_key: Zeroizing<String>,
+    mtls_client_certificate_sha256: String,
     request: Value,
 }
 
@@ -476,6 +494,7 @@ impl DescriptorMaterializer {
                     registration,
                     target_issuer,
                     suite_origin.as_str(),
+                    request_jti,
                 )?,
             );
         }
@@ -484,7 +503,8 @@ impl DescriptorMaterializer {
             "generated.dynamic_registration_initial_access_token",
         );
         let needs_ciba_token =
-            descriptor_requires_reference(&descriptor, "generated.ciba_automated_decision_token");
+            descriptor_requires_reference(&descriptor, "generated.ciba_automated_decision_token")
+                || descriptor_requires_reference(&descriptor, "target.ciba_automated_decision_url");
         let dynamic_registration_initial_access_token =
             needs_dynamic_token.then(|| Zeroizing::new(random_secret(32)));
         let ciba_automated_decision_token =
@@ -565,7 +585,7 @@ impl DescriptorMaterializer {
                     &plan.config_template,
                     &plan.secret_bindings,
                     &prepared,
-                    &onboarding.clients,
+                    &onboarding,
                     &mut BTreeSet::new(),
                 )?;
                 plans.push(MatrixPlan {
@@ -667,6 +687,7 @@ impl PreparedClient {
         registration_template: &Value,
         target_issuer: &str,
         suite_origin: &str,
+        request_jti: &str,
     ) -> Result<Self, MaterializerError> {
         let client_secret = Zeroizing::new(random_secret(32));
         let mut rng = OsRng;
@@ -675,7 +696,12 @@ impl PreparedClient {
         let (rsa_private_jwk, rsa_public_jwks) = rsa_jwks(&rsa)?;
         let ec = SigningKey::random(&mut rng);
         let (ec_private_jwk, ec_public_jwks) = ec_jwks(&ec)?;
-        let (mtls_ca_certificate, mtls_client_certificate, mtls_client_key) = generate_mtls()?;
+        let (
+            mtls_ca_certificate,
+            mtls_client_certificate,
+            mtls_client_key,
+            mtls_client_certificate_sha256,
+        ) = generate_mtls()?;
         let request = materialize_registration_template(
             registration_template,
             &logical_client_id,
@@ -685,6 +711,8 @@ impl PreparedClient {
             &ec_public_jwks,
             &mtls_ca_certificate,
             &mtls_client_certificate,
+            &mtls_client_certificate_sha256,
+            request_jti,
         )?;
         let auth_method = request
             .get("token_endpoint_auth_method")
@@ -707,6 +735,7 @@ impl PreparedClient {
             mtls_ca_certificate: Zeroizing::new(mtls_ca_certificate),
             mtls_client_certificate: Zeroizing::new(mtls_client_certificate),
             mtls_client_key: Zeroizing::new(mtls_client_key),
+            mtls_client_certificate_sha256,
             request,
         })
     }
@@ -1110,27 +1139,40 @@ fn is_builtin_reference(name: &str) -> bool {
             | "generated.mtls.ca_cert"
             | "generated.mtls.client_cert"
             | "generated.mtls.client_key"
+            | "generated.mtls.cert_sha256"
             | "generated.dynamic_registration_initial_access_token"
             | "generated.ciba_automated_decision_token"
+            | "generated.applicant_email"
+            | "generated.credential_holder_email_sha256"
+            | "onboarding.applicant_id"
+            | "onboarding.openid4vc_request_object_trust_anchor_pem"
             | "onboarding.client_id"
             | "onboarding.client_secret"
             | "target.issuer"
+            | "target.host"
+            | "target.ciba_automated_decision_url"
             | "target.suite"
             | "suite.origin"
     ) || name.starts_with("client.")
+        || name.starts_with("target.url.")
+        || name.starts_with("target.pattern.")
+        || name.starts_with("run.alias.")
+        || name.starts_with("suite.test.")
+        || name.starts_with("suite.test_query.")
+        || name.starts_with("suite.pattern.")
 }
 
 fn materialize_value(
     value: &Value,
     bindings: &BTreeMap<String, String>,
     prepared: &PreparedMaterialization,
-    actual_clients: &BTreeMap<String, String>,
+    onboarding: &OnboardingOutput,
     stack: &mut BTreeSet<String>,
 ) -> Result<Value, MaterializerError> {
     match value {
         Value::Array(values) => values
             .iter()
-            .map(|value| materialize_value(value, bindings, prepared, actual_clients, stack))
+            .map(|value| materialize_value(value, bindings, prepared, onboarding, stack))
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array),
         Value::Object(values) => {
@@ -1138,7 +1180,7 @@ fn materialize_value(
             for (key, value) in values {
                 output.insert(
                     key.clone(),
-                    materialize_value(value, bindings, prepared, actual_clients, stack)?,
+                    materialize_value(value, bindings, prepared, onboarding, stack)?,
                 );
             }
             Ok(Value::Object(output))
@@ -1147,7 +1189,7 @@ fn materialize_value(
             parse_placeholder(text)?,
             bindings,
             prepared,
-            actual_clients,
+            onboarding,
             stack,
         ),
         Value::String(text)
@@ -1163,7 +1205,7 @@ fn resolve_reference(
     name: &str,
     bindings: &BTreeMap<String, String>,
     prepared: &PreparedMaterialization,
-    actual_clients: &BTreeMap<String, String>,
+    onboarding: &OnboardingOutput,
     stack: &mut BTreeSet<String>,
 ) -> Result<Value, MaterializerError> {
     validate_binding_reference(name, bindings, &mut BTreeSet::new())?;
@@ -1176,7 +1218,7 @@ fn resolve_reference(
                 .get(binding_name)
                 .ok_or(MaterializerError::InvalidPlaceholder)?,
         )?;
-        let result = resolve_reference(nested, bindings, prepared, actual_clients, stack);
+        let result = resolve_reference(nested, bindings, prepared, onboarding, stack);
         stack.remove(binding_name);
         return result;
     }
@@ -1185,7 +1227,7 @@ fn resolve_reference(
             &format!("secret.{name}"),
             bindings,
             prepared,
-            actual_clients,
+            onboarding,
             stack,
         );
     }
@@ -1195,8 +1237,75 @@ fn resolve_reference(
     if matches!(name, "target.suite" | "suite.origin") {
         return Ok(Value::String(prepared.suite_base_url.clone()));
     }
+    if name == "target.host" {
+        return Ok(Value::String(target_host(&prepared.target_issuer)?));
+    }
+    if let Some(path) = name.strip_prefix("target.url.") {
+        return Ok(Value::String(resolve_target_url(
+            &prepared.target_issuer,
+            path,
+            false,
+        )?));
+    }
+    if let Some(path) = name.strip_prefix("target.pattern.") {
+        return Ok(Value::String(resolve_target_url(
+            &prepared.target_issuer,
+            path,
+            true,
+        )?));
+    }
+    if let Some(endpoint) = name.strip_prefix("suite.pattern.") {
+        validate_url_segment(endpoint)?;
+        return Ok(Value::String(format!("*/test/*/{endpoint}*")));
+    }
+    if let Some(alias_key) = name.strip_prefix("run.alias.") {
+        return Ok(Value::String(resolve_run_alias(
+            &prepared.request_jti,
+            alias_key,
+        )?));
+    }
+    if let Some(reference) = name.strip_prefix("suite.test.") {
+        return Ok(Value::String(resolve_suite_test_url(
+            &prepared.suite_base_url,
+            &prepared.request_jti,
+            reference,
+        )?));
+    }
+    if let Some(reference) = name.strip_prefix("suite.test_query.") {
+        return Ok(Value::String(format!(
+            "{}?dummy1=lorem&dummy2=ipsum",
+            resolve_suite_test_url(&prepared.suite_base_url, &prepared.request_jti, reference,)?
+        )));
+    }
+    if name == "target.ciba_automated_decision_url" {
+        let token = prepared
+            .ciba_automated_decision_token
+            .as_ref()
+            .ok_or_else(|| MaterializerError::UnknownSecretReference(name.to_owned()))?;
+        return Ok(Value::String(format!(
+            "{}/auth/ciba-automated-decision?token={{auth_req_id}}&type={{action}}&decision_token={}",
+            prepared.target_issuer.trim_end_matches('/'),
+            token.as_str()
+        )));
+    }
+    if name == "generated.applicant_email" {
+        return Ok(Value::String(prepared.applicant_email.to_string()));
+    }
     if name == "generated.applicant_password" {
         return Ok(Value::String(prepared.applicant_password.to_string()));
+    }
+    if name == "generated.credential_holder_email_sha256" {
+        return Ok(Value::String(digest_hex(
+            prepared.applicant_email.as_bytes(),
+        )));
+    }
+    if name == "onboarding.applicant_id" {
+        return Ok(Value::String(onboarding.applicant_id.clone()));
+    }
+    if name == "onboarding.openid4vc_request_object_trust_anchor_pem" {
+        return Ok(Value::String(
+            onboarding.openid4vc_request_object_trust_anchor_pem.clone(),
+        ));
     }
     if name == "generated.dynamic_registration_initial_access_token" {
         return prepared
@@ -1226,13 +1335,13 @@ fn resolve_reference(
         } else {
             "client_secret"
         };
-        return resolve_client_reference(logical, field, prepared, actual_clients);
+        return resolve_client_reference(logical, field, prepared, &onboarding.clients);
     }
     if let Some(client_reference) = name.strip_prefix("client.") {
         let (logical, field) = client_reference.split_once('.').ok_or_else(|| {
             MaterializerError::UnknownClientReference(client_reference.to_owned())
         })?;
-        return resolve_client_reference(logical, field, prepared, actual_clients);
+        return resolve_client_reference(logical, field, prepared, &onboarding.clients);
     }
     if name.starts_with("generated.") {
         if prepared.clients.len() != 1 {
@@ -1247,7 +1356,7 @@ fn resolve_reference(
             logical,
             name.strip_prefix("generated.").unwrap_or_default(),
             prepared,
-            actual_clients,
+            &onboarding.clients,
         );
     }
     Err(MaterializerError::UnknownSecretReference(name.to_owned()))
@@ -1276,6 +1385,7 @@ fn resolve_client_reference(
         "mtls.ca_cert" => Ok(Value::String(client.mtls_ca_certificate.to_string())),
         "mtls.client_cert" => Ok(Value::String(client.mtls_client_certificate.to_string())),
         "mtls.client_key" => Ok(Value::String(client.mtls_client_key.to_string())),
+        "mtls.cert_sha256" => Ok(Value::String(client.mtls_client_certificate_sha256.clone())),
         _ => Err(MaterializerError::UnknownSecretReference(field.to_owned())),
     }
 }
@@ -1294,6 +1404,8 @@ fn materialize_registration_template(
     ec_public_jwks: &str,
     mtls_ca_certificate: &str,
     mtls_client_certificate: &str,
+    mtls_client_certificate_sha256: &str,
+    request_jti: &str,
 ) -> Result<Value, MaterializerError> {
     match value {
         Value::Array(values) => values
@@ -1308,6 +1420,8 @@ fn materialize_registration_template(
                     ec_public_jwks,
                     mtls_ca_certificate,
                     mtls_client_certificate,
+                    mtls_client_certificate_sha256,
+                    request_jti,
                 )
             })
             .collect::<Result<Vec<_>, _>>()
@@ -1326,6 +1440,8 @@ fn materialize_registration_template(
                         ec_public_jwks,
                         mtls_ca_certificate,
                         mtls_client_certificate,
+                        mtls_client_certificate_sha256,
+                        request_jti,
                     )?,
                 );
             }
@@ -1336,6 +1452,34 @@ fn materialize_registration_template(
             let value = match name {
                 "target.issuer" => Value::String(target_issuer.to_owned()),
                 "target.suite" | "suite.origin" => Value::String(suite_origin.to_owned()),
+                "target.host" => Value::String(target_host(target_issuer)?),
+                name if name.starts_with("target.url.") => Value::String(resolve_target_url(
+                    target_issuer,
+                    name.trim_start_matches("target.url."),
+                    false,
+                )?),
+                name if name.starts_with("target.pattern.") => Value::String(resolve_target_url(
+                    target_issuer,
+                    name.trim_start_matches("target.pattern."),
+                    true,
+                )?),
+                name if name.starts_with("run.alias.") => Value::String(resolve_run_alias(
+                    request_jti,
+                    name.trim_start_matches("run.alias."),
+                )?),
+                name if name.starts_with("suite.test.") => Value::String(resolve_suite_test_url(
+                    suite_origin,
+                    request_jti,
+                    name.trim_start_matches("suite.test."),
+                )?),
+                name if name.starts_with("suite.test_query.") => Value::String(format!(
+                    "{}?dummy1=lorem&dummy2=ipsum",
+                    resolve_suite_test_url(
+                        suite_origin,
+                        request_jti,
+                        name.trim_start_matches("suite.test_query."),
+                    )?
+                )),
                 "client.id" | "onboarding.client_id" => {
                     return Err(MaterializerError::InvalidField(
                         "registration_template.client_id",
@@ -1354,6 +1498,9 @@ fn materialize_registration_template(
                 "client.mtls.client_cert" | "generated.mtls.client_cert" => {
                     Value::String(mtls_client_certificate.to_owned())
                 }
+                "client.mtls.cert_sha256" | "generated.mtls.cert_sha256" => {
+                    Value::String(mtls_client_certificate_sha256.to_owned())
+                }
                 name if name.starts_with("client.") => {
                     let prefix = format!("client.{logical_client_id}.");
                     if !name.starts_with(&prefix) {
@@ -1367,6 +1514,9 @@ fn materialize_registration_template(
                         Some("mtls.ca_cert") => Value::String(mtls_ca_certificate.to_owned()),
                         Some("mtls.client_cert") => {
                             Value::String(mtls_client_certificate.to_owned())
+                        }
+                        Some("mtls.cert_sha256") => {
+                            Value::String(mtls_client_certificate_sha256.to_owned())
                         }
                         _ => {
                             return Err(MaterializerError::UnknownSecretReference(name.to_owned()));
@@ -1506,6 +1656,95 @@ fn validate_target_issuer(value: &str) -> Result<(), MaterializerError> {
     }
 }
 
+fn target_host(target_issuer: &str) -> Result<String, MaterializerError> {
+    Url::parse(target_issuer)
+        .map_err(|_| MaterializerError::UnsafeIssuer)?
+        .host_str()
+        .map(str::to_owned)
+        .ok_or(MaterializerError::UnsafeIssuer)
+}
+
+fn resolve_target_url(
+    target_issuer: &str,
+    suffix: &str,
+    allow_trailing_wildcard: bool,
+) -> Result<String, MaterializerError> {
+    let (path, wildcard) = if allow_trailing_wildcard && suffix.ends_with('*') {
+        (&suffix[..suffix.len() - 1], true)
+    } else {
+        (suffix, false)
+    };
+    if !path.starts_with('/')
+        || path.len() > 512
+        || path.contains(['?', '#', '\\', '{', '}'])
+        || path.contains("//")
+        || path.split('/').any(|segment| segment == "..")
+        || (!allow_trailing_wildcard && suffix.contains('*'))
+        || (allow_trailing_wildcard && suffix.trim_end_matches('*').contains('*'))
+    {
+        return Err(MaterializerError::InvalidPlaceholder);
+    }
+    let result = format!("{}{}", target_issuer.trim_end_matches('/'), path);
+    Url::parse(&result).map_err(|_| MaterializerError::UnsafeIssuer)?;
+    Ok(if wildcard {
+        format!("{result}*")
+    } else {
+        result
+    })
+}
+
+fn validate_url_segment(value: &str) -> Result<(), MaterializerError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(MaterializerError::InvalidPlaceholder);
+    }
+    Ok(())
+}
+
+fn resolve_run_alias(request_jti: &str, alias_key: &str) -> Result<String, MaterializerError> {
+    validate_url_segment(alias_key)?;
+    validate_request_jti(request_jti)?;
+    let suffix = request_jti
+        .strip_prefix("request-")
+        .ok_or(MaterializerError::InvalidPlaceholder)?;
+    Ok(format!("nazo-{suffix}-{alias_key}"))
+}
+
+fn resolve_suite_test_url(
+    suite_origin: &str,
+    request_jti: &str,
+    reference: &str,
+) -> Result<String, MaterializerError> {
+    let (alias_key, endpoint) = reference
+        .split_once('.')
+        .ok_or(MaterializerError::InvalidPlaceholder)?;
+    validate_url_segment(endpoint)?;
+    let alias = resolve_run_alias(request_jti, alias_key)?;
+    Ok(format!(
+        "{}/test/a/{alias}/{endpoint}",
+        suite_origin.trim_end_matches('/')
+    ))
+}
+
+fn validate_public_certificate_bundle(value: &str) -> Result<(), MaterializerError> {
+    if value.is_empty()
+        || value.len() > 256 * 1024
+        || value.contains('\0')
+        || value.contains("PRIVATE KEY")
+        || !value.contains("-----BEGIN CERTIFICATE-----")
+        || !value.contains("-----END CERTIFICATE-----")
+    {
+        return Err(MaterializerError::InvalidField(
+            "openid4vc_request_object_trust_anchor_pem",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_name(value: &str, field: &'static str) -> Result<(), MaterializerError> {
     if value.trim().is_empty()
         || value.len() > 256
@@ -1630,7 +1869,7 @@ fn ec_jwks(key: &SigningKey) -> Result<(String, String), MaterializerError> {
     Ok((private_string, public_jwks))
 }
 
-fn generate_mtls() -> Result<(String, String, String), MaterializerError> {
+fn generate_mtls() -> Result<(String, String, String, String), MaterializerError> {
     let now = OffsetDateTime::now_utc();
     let mut ca_params =
         CertificateParams::new(Vec::<String>::new()).map_err(|_| MaterializerError::Crypto)?;
@@ -1657,7 +1896,13 @@ fn generate_mtls() -> Result<(String, String, String), MaterializerError> {
     let client = client_params
         .signed_by(&client_key, &ca)
         .map_err(|_| MaterializerError::Crypto)?;
-    Ok((ca.pem(), client.pem(), client_key.serialize_pem()))
+    let certificate_sha256 = digest_hex(client.der().as_ref());
+    Ok((
+        ca.pem(),
+        client.pem(),
+        client_key.serialize_pem(),
+        certificate_sha256,
+    ))
 }
 
 fn b64<T: AsRef<[u8]>>(value: T) -> String {
@@ -1727,6 +1972,26 @@ mod tests {
         "request-0123456789abcdef0123456789abcdef"
     }
 
+    fn test_trust_anchor() -> &'static str {
+        "-----BEGIN CERTIFICATE-----\nVEVTVA==\n-----END CERTIFICATE-----\n"
+    }
+
+    fn onboarding_output(
+        lease_id: &str,
+        request_jti: &str,
+        matrix_sha256: &str,
+        clients: BTreeMap<String, String>,
+    ) -> Result<OnboardingOutput, MaterializerError> {
+        OnboardingOutput::new(
+            lease_id,
+            request_jti,
+            matrix_sha256,
+            "01890f8e-7c18-7b70-9d1e-9bb8c44a2f41",
+            test_trust_anchor(),
+            clients,
+        )
+    }
+
     #[test]
     fn two_phase_bundle_excludes_private_factors_and_matrix_reuses_secret() {
         let (prepared, bundle) = DescriptorMaterializer::prepare(
@@ -1745,7 +2010,7 @@ mod tests {
         assert!(!bundle_text.contains("private_jwk"));
         assert!(!bundle_text.contains("client_key"));
         let actual = BTreeMap::from([("web".to_owned(), "actual-client".to_owned())]);
-        let output = OnboardingOutput::new(
+        let output = onboarding_output(
             "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
             prepared.request_jti(),
             prepared.matrix_sha256(),
@@ -1776,7 +2041,7 @@ mod tests {
             request_jti(),
         )
         .expect("prepare");
-        let missing = OnboardingOutput::new(
+        let missing = onboarding_output(
             "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
             prepared.request_jti(),
             prepared.matrix_sha256(),
@@ -1795,7 +2060,7 @@ mod tests {
             request_jti(),
         )
         .expect("prepare");
-        let extra = OnboardingOutput::new(
+        let extra = onboarding_output(
             "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
             prepared.request_jti(),
             prepared.matrix_sha256(),
@@ -1817,7 +2082,7 @@ mod tests {
             request_jti(),
         )
         .expect("prepare");
-        let wrong_matrix = OnboardingOutput::new(
+        let wrong_matrix = onboarding_output(
             "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
             prepared.request_jti(),
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -1836,7 +2101,7 @@ mod tests {
             request_jti(),
         )
         .expect("prepare");
-        let invalid_lease = OnboardingOutput::new(
+        let invalid_lease = onboarding_output(
             "not-a-uuid",
             prepared.request_jti(),
             prepared.matrix_sha256(),
