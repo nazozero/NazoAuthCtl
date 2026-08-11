@@ -35,6 +35,7 @@ use crate::matrix::{MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, Sele
 use crate::origin::Origin;
 
 pub const SECURE_BUNDLE_SCHEMA_VERSION: u32 = 2;
+const MTLS_CLIENT_SAN_DNS: &str = "nazoauthctl-client";
 
 mod descriptor;
 
@@ -619,6 +620,7 @@ impl PreparedClient {
             &mtls_client_certificate_sha256,
             request_jti,
         )?;
+        validate_materialized_mtls_registration(&request, &mtls_client_certificate_sha256)?;
         let auth_method = request
             .get("token_endpoint_auth_method")
             .and_then(Value::as_str)
@@ -661,6 +663,48 @@ impl PreparedClient {
             logical_client_id: self.logical_client_id.clone(),
         }
     }
+}
+
+fn validate_materialized_mtls_registration(
+    request: &Value,
+    generated_certificate_sha256: &str,
+) -> Result<(), MaterializerError> {
+    if request
+        .get("token_endpoint_auth_method")
+        .and_then(Value::as_str)
+        != Some("tls_client_auth")
+    {
+        return Ok(());
+    }
+    let expected_dns = [Value::String(MTLS_CLIENT_SAN_DNS.to_owned())];
+    let dns_matches = request
+        .get("tls_client_auth_san_dns")
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.as_slice() == expected_dns);
+    let other_selectors_absent = request
+        .get("tls_client_auth_subject_dn")
+        .is_none_or(Value::is_null)
+        && [
+            "tls_client_auth_san_uri",
+            "tls_client_auth_san_ip",
+            "tls_client_auth_san_email",
+        ]
+        .iter()
+        .all(|field| {
+            request
+                .get(*field)
+                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+        });
+    let digest_matches = request
+        .get("tls_client_auth_cert_sha256")
+        .and_then(Value::as_str)
+        == Some(generated_certificate_sha256);
+    if !dns_matches || !other_selectors_absent || !digest_matches {
+        return Err(MaterializerError::InvalidField(
+            "registration_template.mtls_identity",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -1332,7 +1376,7 @@ fn generate_mtls() -> Result<(String, String, String, String), MaterializerError
     let ca_key = KeyPair::generate().map_err(|_| MaterializerError::Crypto)?;
     let ca =
         CertifiedIssuer::self_signed(ca_params, ca_key).map_err(|_| MaterializerError::Crypto)?;
-    let mut client_params = CertificateParams::new(vec!["nazoauthctl-client".to_owned()])
+    let mut client_params = CertificateParams::new(vec![MTLS_CLIENT_SAN_DNS.to_owned()])
         .map_err(|_| MaterializerError::Crypto)?;
     client_params.not_before = now - TimeDuration::days(1);
     client_params.not_after = now + TimeDuration::days(365);
@@ -1390,6 +1434,29 @@ mod tests {
         let mut san_bound = baseline;
         san_bound["tls_client_auth_san_uri"] = serde_json::json!(["spiffe://client"]);
         assert!(registration_requires_mtls(&san_bound));
+    }
+
+    #[test]
+    fn tls_client_auth_must_bind_the_generated_certificate_identity() {
+        let digest = "a".repeat(64);
+        let valid = serde_json::json!({
+            "token_endpoint_auth_method": "tls_client_auth",
+            "tls_client_auth_subject_dn": null,
+            "tls_client_auth_cert_sha256": digest,
+            "tls_client_auth_san_dns": [MTLS_CLIENT_SAN_DNS],
+            "tls_client_auth_san_uri": [],
+            "tls_client_auth_san_ip": [],
+            "tls_client_auth_san_email": []
+        });
+        assert!(validate_materialized_mtls_registration(&valid, &"a".repeat(64)).is_ok());
+
+        let mut wrong_san = valid.clone();
+        wrong_san["tls_client_auth_san_dns"] = serde_json::json!(["other-client"]);
+        assert!(validate_materialized_mtls_registration(&wrong_san, &"a".repeat(64)).is_err());
+
+        let mut wrong_digest = valid;
+        wrong_digest["tls_client_auth_cert_sha256"] = serde_json::json!("b".repeat(64));
+        assert!(validate_materialized_mtls_registration(&wrong_digest, &"a".repeat(64)).is_err());
     }
 
     fn descriptor() -> MatrixDescriptor {
