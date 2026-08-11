@@ -14,7 +14,7 @@ path = "src/lib.rs"
 anyhow = "1.0.103"
 atomic-write-file = "0.3.0"
 libc = "0.2.189"
-nazo-operator-protocol = { version = "=0.1.29", git = "https://github.com/nazozero/NazoAuth.git", rev = "71d1c46bff54cc8120e8b9caed173be2759b3e4d" }
+nazo-operator-protocol.workspace = true
 rand = "0.10.1"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { version = "1.0.228", features = ["derive"] }
