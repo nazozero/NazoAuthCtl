@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -7,13 +7,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
 use crate::browser::{
-    BrowserAutomation, BrowserError, BrowserTargetOrigin, ConformanceBinding, OpenId4VciError,
-    OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpStartRequest, OpenId4VpVerifier,
-    parse_browser_entries_owned,
+    BrowserAutomation, BrowserError, BrowserPolicy, BrowserTargetOrigin, ConformanceBinding,
+    OpenId4VcBrowserState, OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule,
+    OpenId4VpStartRequest, OpenId4VpVerifier, parse_browser_entries_owned,
 };
 use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
 use crate::matrix::{MatrixError, SelectedMatrix};
@@ -142,13 +143,13 @@ impl ConformanceRunner {
         }
     }
 
-    fn wait_for_vci_refresh(&self, deadline: Instant) -> Result<(), String> {
+    fn wait_for_runner_refresh(&self, deadline: Instant, context: &str) -> Result<(), String> {
         if self.config.control.is_interrupted() {
             return Err("run interrupted".to_owned());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err("OpenID4VCI WAITING drive timed out".to_owned());
+            return Err(format!("{context} WAITING drive timed out"));
         }
         thread::sleep(remaining.min(Duration::from_millis(200)));
         Ok(())
@@ -202,7 +203,7 @@ impl ConformanceRunner {
             let runner = match self.config.client.runner_info(module_id) {
                 Ok(runner) => runner,
                 Err(SuiteClientError::HttpStatus(404)) => {
-                    self.wait_for_vci_refresh(deadline)?;
+                    self.wait_for_runner_refresh(deadline, "OpenID4VCI")?;
                     continue;
                 }
                 Err(error) => return Err(safe_error(&error)),
@@ -225,7 +226,102 @@ impl ConformanceRunner {
                 Ok(()) | Err(OpenId4VciError::Pending) => {}
                 Err(error) => return Err(error.to_string()),
             }
-            self.wait_for_vci_refresh(deadline)?;
+            self.wait_for_runner_refresh(deadline, "OpenID4VCI")?;
+        }
+    }
+
+    fn drive_browser_waiting_interruptible(
+        &self,
+        browser: &Arc<Mutex<dyn BrowserAutomation>>,
+        plan: &PlannedPlan,
+        module_id: &str,
+        initial: Value,
+    ) -> Result<Value, String> {
+        let browser_config = plan.config.get("browser").cloned().ok_or_else(|| {
+            "Suite runner is WAITING but the Matrix plan has no browser tasks".to_owned()
+        })?;
+        let entries =
+            parse_browser_entries_owned(browser_config).map_err(|error| error.to_string())?;
+        let target_origin = self.config.target_origin.clone().ok_or_else(|| {
+            "Suite runner is WAITING but the target browser origin is unavailable".to_owned()
+        })?;
+        let policy = BrowserPolicy::new(target_origin, self.config.client.origin().clone())
+            .map_err(|error| error.to_string())?;
+        let deadline = Instant::now()
+            .checked_add(self.config.poll_timeout)
+            .ok_or_else(|| "browser poll timeout is out of range".to_owned())?;
+        let mut observed = initial;
+        let mut first_round = true;
+        let mut completed_url_digests = BTreeSet::<[u8; 32]>::new();
+
+        loop {
+            if self.config.control.is_interrupted() {
+                return Err("run interrupted".to_owned());
+            }
+            if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                return Err("browser WAITING drive timed out".to_owned());
+            }
+            if !first_round {
+                observed = self
+                    .config
+                    .client
+                    .module_info(module_id)
+                    .map_err(|error| safe_error(&error))?;
+                if is_terminal_state(&observed) {
+                    return Ok(observed);
+                }
+                if !is_waiting(&observed) {
+                    observed = self.wait_for_state_until(
+                        module_id,
+                        &["WAITING", "FINISHED", "INTERRUPTED"],
+                        deadline,
+                    )?;
+                    if is_terminal_state(&observed) {
+                        return Ok(observed);
+                    }
+                }
+            }
+            first_round = false;
+            if !is_waiting(&observed) {
+                return Ok(observed);
+            }
+
+            let runner = match self.config.client.runner_info(module_id) {
+                Ok(runner) => runner,
+                Err(SuiteClientError::HttpStatus(404)) => {
+                    self.wait_for_runner_refresh(deadline, "browser")?;
+                    continue;
+                }
+                Err(error) => return Err(safe_error(&error)),
+            };
+            let Some(browser_state) = runner.get("browser") else {
+                self.wait_for_runner_refresh(deadline, "browser")?;
+                continue;
+            };
+            let browser_state = OpenId4VcBrowserState::parse(browser_state, &policy)
+                .map_err(|error| error.to_string())?;
+            let pending_url = browser_state.urls().iter().find(|url| {
+                let digest: [u8; 32] = Sha256::digest(url.as_str().as_bytes()).into();
+                !browser_state
+                    .visited()
+                    .iter()
+                    .any(|visited| visited == *url)
+                    && !completed_url_digests.contains(&digest)
+            });
+            let Some(pending_url) = pending_url else {
+                self.wait_for_runner_refresh(deadline, "browser")?;
+                continue;
+            };
+            {
+                let mut driver = browser
+                    .lock()
+                    .map_err(|_| "browser automation lock failed".to_owned())?;
+                driver
+                    .execute(pending_url, &entries)
+                    .map_err(|error| error.to_string())?;
+            }
+            completed_url_digests.insert(Sha256::digest(pending_url.as_str().as_bytes()).into());
+            self.wait_for_runner_refresh(deadline, "browser")?;
         }
     }
 
@@ -577,53 +673,18 @@ impl ConformanceRunner {
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
                             };
-                            let Some(browser_config) = plan.config.get("browser").cloned() else {
-                                errors.push(
-                                    "Suite runner is WAITING but the Matrix plan has no browser tasks"
-                                        .to_owned(),
-                                );
-                                groups[group_index].status = GroupStatus::Failed;
-                                break 'execute;
-                            };
-                            let entries = match parse_browser_entries_owned(browser_config) {
-                                Ok(entries) => entries,
+                            match self.drive_browser_waiting_interruptible(
+                                browser,
+                                plan,
+                                &instance.id,
+                                observed.clone().expect("waiting runner state"),
+                            ) {
+                                Ok(state) => observed = Some(state),
                                 Err(error) => {
-                                    errors.push(error.to_string());
+                                    errors.push(error);
                                     groups[group_index].status = GroupStatus::Failed;
                                     break 'execute;
                                 }
-                            };
-                            let Some(runner_url) = instance.raw.get("url").and_then(Value::as_str)
-                            else {
-                                errors.push(
-                                    "Suite runner is WAITING but did not provide a browser URL"
-                                        .to_owned(),
-                                );
-                                groups[group_index].status = GroupStatus::Failed;
-                                break 'execute;
-                            };
-                            let runner_url = match Url::parse(runner_url) {
-                                Ok(url) => url,
-                                Err(_) => {
-                                    errors.push(
-                                        "Suite runner returned an invalid browser URL".to_owned(),
-                                    );
-                                    groups[group_index].status = GroupStatus::Failed;
-                                    break 'execute;
-                                }
-                            };
-                            let mut driver = match browser.lock() {
-                                Ok(driver) => driver,
-                                Err(_) => {
-                                    errors.push("browser automation lock failed".to_owned());
-                                    groups[group_index].status = GroupStatus::Failed;
-                                    break 'execute;
-                                }
-                            };
-                            if let Err(error) = driver.execute(&runner_url, &entries) {
-                                errors.push(error.to_string());
-                                groups[group_index].status = GroupStatus::Failed;
-                                break 'execute;
                             }
                         }
                     }
@@ -1387,6 +1448,128 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(issuer.lock().expect("issuer").drives >= 1);
+    }
+
+    struct BrowserWaitingTransport {
+        completed: Arc<AtomicBool>,
+    }
+
+    impl Transport for BrowserWaitingTransport {
+        fn send(
+            &self,
+            request: HttpRequest,
+            _max_response_bytes: usize,
+        ) -> Result<HttpResponse, TransportError> {
+            let body = match request.url().path() {
+                "/api/info/m" if self.completed.load(Ordering::SeqCst) => {
+                    serde_json::json!({"status":"FINISHED","result":"PASSED"})
+                }
+                "/api/info/m" => serde_json::json!({"status":"WAITING"}),
+                "/api/runner/m" => serde_json::json!({
+                    "browser": {
+                        "urls": ["https://target.example/authorize?state=opaque"],
+                        "visited": []
+                    }
+                }),
+                _ => serde_json::json!({}),
+            };
+            Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("json"),
+            })
+        }
+    }
+
+    struct CompletingBrowser {
+        completed: Arc<AtomicBool>,
+    }
+
+    impl BrowserAutomation for CompletingBrowser {
+        fn execute(
+            &mut self,
+            authorization_url: &Url,
+            entries: &[crate::browser::BrowserEntry],
+        ) -> Result<crate::browser::BrowserRunReport, BrowserError> {
+            assert_eq!(authorization_url.path(), "/authorize");
+            assert_eq!(entries.len(), 1);
+            self.completed.store(true, Ordering::SeqCst);
+            Ok(crate::browser::BrowserRunReport {
+                steps: 0,
+                tasks: 0,
+                entry_index: 0,
+                final_origin: "https://target.example".into(),
+            })
+        }
+
+        fn navigate(&mut self, _url: &Url) -> Result<(), BrowserError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn generic_waiting_uses_authoritative_runner_browser_url_until_terminal() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            Arc::new(BrowserWaitingTransport {
+                completed: completed.clone(),
+            }),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix: SelectedMatrix {
+                document: MatrixDocument {
+                    schema: 1,
+                    name: "matrix".into(),
+                    groups: Vec::new(),
+                },
+                digest: "digest".into(),
+            },
+            target_origin: Some(
+                BrowserTargetOrigin::parse("https://target.example").expect("target"),
+            ),
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(2),
+            control: RunControl::default(),
+            browser: None,
+            verifier: None,
+            issuer: None,
+        })
+        .expect("runner");
+        let plan = PlannedPlan {
+            group_index: 0,
+            matrix_plan_id: "matrix-plan".into(),
+            suite_plan_id: "suite-plan".into(),
+            plan_name: "oidcc-basic-certification-test-plan".into(),
+            variant: BTreeMap::new(),
+            expected_results: BTreeMap::new(),
+            modules: Vec::new(),
+            config: serde_json::json!({
+                "browser": [{
+                    "match": "https://target.example/authorize*",
+                    "tasks": []
+                }]
+            }),
+            report_index: 0,
+        };
+        let browser: Arc<Mutex<dyn BrowserAutomation>> = Arc::new(Mutex::new(CompletingBrowser {
+            completed: completed.clone(),
+        }));
+
+        let observed = runner
+            .drive_browser_waiting_interruptible(
+                &browser,
+                &plan,
+                "m",
+                serde_json::json!({"status":"WAITING"}),
+            )
+            .expect("browser drive");
+        assert_eq!(status(&observed), Some("FINISHED"));
+        assert!(completed.load(Ordering::SeqCst));
     }
 
     #[test]
