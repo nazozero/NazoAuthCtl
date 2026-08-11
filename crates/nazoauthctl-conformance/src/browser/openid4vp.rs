@@ -15,7 +15,10 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::{BrowserTargetOrigin, MAX_STEP_TIMEOUT, redacted_origin};
+use super::{
+    BrowserTargetOrigin,
+    validation::{MAX_STEP_TIMEOUT, redacted_origin},
+};
 use crate::origin::Origin;
 use crate::transport::{HttpMethod, HttpRequest, HttpTransport, Transport, TransportError};
 

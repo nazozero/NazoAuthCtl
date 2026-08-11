@@ -12,7 +12,8 @@ use reqwest::redirect::Policy;
 use serde_json::{Value, json};
 use url::Url;
 
-use super::{BrowserDriver, BrowserError, BrowserSelector, MAX_TEXT_BYTES, is_loopback_host};
+use super::validation::{MAX_TEXT_BYTES, is_loopback_host};
+use super::{BrowserDriver, BrowserError, BrowserSelector};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const W3C_ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";

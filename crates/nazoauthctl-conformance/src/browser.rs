@@ -1,678 +1,95 @@
 //! Rust-native browser automation for the OpenID Foundation Suite.
 //!
-//! The Suite's `browser` value is deliberately treated as data, not as a
-//! script.  Only the small command vocabulary used by the official runner is
-//! accepted.  Browser control is performed through the W3C WebDriver HTTP
-//! protocol; no Python, Node, shell, or JavaScript runner is involved.
+//! Suite browser values are data, not scripts. The schema/parser and origin
+//! validation live in private modules; this file owns the driver-facing
+//! execution state machine and its public orchestration traits.
 
 use std::collections::HashMap;
-use std::fmt;
-use std::net::IpAddr;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
 use thiserror::Error;
 use url::Url;
-use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(test)]
 use crate::origin::Origin;
 
+#[derive(Debug, Error, Clone, Copy, Eq, PartialEq)]
+pub enum BrowserError {
+    #[error("browser endpoint is invalid")]
+    InvalidEndpoint,
+    #[error("plaintext browser endpoint must be loopback")]
+    InsecureEndpoint,
+    #[error("browser target origin is invalid")]
+    InvalidOrigin,
+    #[error("plaintext browser target must be loopback")]
+    InsecureTarget,
+    #[error("browser limits are invalid")]
+    InvalidLimits,
+    #[error("browser schema is invalid")]
+    InvalidSchema,
+    #[error("browser command is unsupported")]
+    UnsupportedCommand,
+    #[error("browser timeout expired")]
+    Timeout,
+    #[error("browser step limit exceeded")]
+    StepLimit,
+    #[error("browser redirect or navigation crossed the allowlist")]
+    CrossOriginNavigation,
+    #[error("browser entry did not match the current page")]
+    NoMatchingEntry,
+    #[error("browser command pattern is invalid")]
+    InvalidPattern,
+    #[error("browser command timeout is invalid")]
+    InvalidTimeout,
+    #[error("browser transport failed")]
+    Transport,
+    #[error("browser WebDriver protocol response is invalid")]
+    Protocol,
+    #[error("browser WebDriver rejected the request")]
+    DriverRejected,
+    #[error("browser response exceeds the size limit")]
+    ResponseTooLarge,
+    #[error("browser session is already started")]
+    SessionAlreadyStarted,
+    #[error("browser session is not started")]
+    SessionNotStarted,
+    #[error("browser element was not found")]
+    ElementNotFound,
+    #[error("chromedriver or chromium-driver was not found")]
+    DriverUnavailable,
+    #[error("managed browser driver failed to start")]
+    DriverStartFailed,
+}
+
 mod openid4vp;
+mod parser;
+mod plan;
+mod schema;
+mod validation;
 mod webdriver;
+
 pub use openid4vp::{
     OpenId4VpError, OpenId4VpPresentation, OpenId4VpStartRequest, OpenId4VpVerifier,
     OpenId4VpVerifierClient,
 };
+pub use parser::{parse_browser_entries, parse_browser_entries_owned};
+pub use plan::OpenId4VcBrowserState;
+pub use schema::{BrowserCommand, BrowserEntry, BrowserSelector, BrowserTask};
+pub use validation::{BrowserLimits, BrowserPolicy, BrowserTargetOrigin};
 pub use webdriver::{ManagedWebDriver, WebDriverClient, WebDriverEndpoint};
 
-const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_STEP_TIMEOUT: Duration = Duration::from_secs(300);
-const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const MAX_STEPS: usize = 256;
-const MAX_MATCH_BYTES: usize = 4096;
-const MAX_SELECTOR_BYTES: usize = 4096;
-const MAX_TEXT_BYTES: usize = 64 * 1024;
-const MAX_REDIRECTS: usize = 3;
+use validation::{
+    DEFAULT_STEP_TIMEOUT, MAX_MATCH_BYTES, compile_pattern, glob_matches, redacted_origin,
+    validate_match_pattern,
+};
 
-fn is_loopback_host(host: &str) -> bool {
-    let normalized = host.trim_matches(['[', ']']).to_ascii_lowercase();
-    normalized == "localhost"
-        || normalized == "localhost.localdomain"
-        || normalized
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
-}
-
-/// A target origin accepted by the browser policy.  Production targets must
-/// be HTTPS; plaintext HTTP is only accepted for an explicitly loopback
-/// development target.
-#[derive(Clone, Eq, PartialEq)]
-pub struct BrowserTargetOrigin {
-    url: Url,
-}
-
-impl BrowserTargetOrigin {
-    pub fn parse(value: &str) -> Result<Self, BrowserError> {
-        let url = Url::parse(value.trim()).map_err(|_| BrowserError::InvalidOrigin)?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-            || !matches!(url.path(), "" | "/")
-        {
-            return Err(BrowserError::InvalidOrigin);
-        }
-        if url.scheme() == "http"
-            && !is_loopback_host(url.host_str().ok_or(BrowserError::InvalidOrigin)?)
-        {
-            return Err(BrowserError::InsecureTarget);
-        }
-        let mut canonical = url;
-        canonical.set_path("");
-        Ok(Self { url: canonical })
-    }
-
-    pub fn from_origin(origin: &Origin) -> Result<Self, BrowserError> {
-        Self::parse(origin.as_str())
-    }
-
-    pub fn as_url(&self) -> &Url {
-        &self.url
-    }
-
-    fn allows(&self, candidate: &Url) -> bool {
-        same_origin(&self.url, candidate)
-    }
-}
-
-impl fmt::Debug for BrowserTargetOrigin {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("BrowserTargetOrigin")
-            .field(&self.url.origin().ascii_serialization())
-            .finish()
-    }
-}
-
-/// The only URLs a browser session may visit.  Navigation to a third-party
-/// redirect is a hard error, including redirects hidden behind WebDriver.
-#[derive(Clone, Debug)]
-pub struct BrowserPolicy {
-    pub target_origin: BrowserTargetOrigin,
-    pub suite_origin: Origin,
-    pub limits: BrowserLimits,
-}
-
-impl BrowserPolicy {
-    pub fn new(
-        target_origin: BrowserTargetOrigin,
-        suite_origin: Origin,
-    ) -> Result<Self, BrowserError> {
-        let policy = Self {
-            target_origin,
-            suite_origin,
-            limits: BrowserLimits::default(),
-        };
-        policy.limits.validate()?;
-        Ok(policy)
-    }
-
-    pub fn with_limits(mut self, limits: BrowserLimits) -> Result<Self, BrowserError> {
-        limits.validate()?;
-        self.limits = limits;
-        Ok(self)
-    }
-
-    pub fn allows_url(&self, url: &Url) -> bool {
-        (self.target_origin.allows(url) || self.suite_origin.same_origin_url(url))
-            && matches!(url.scheme(), "https" | "http")
-    }
-
-    fn validate_url(&self, url: &Url) -> Result<(), BrowserError> {
-        if self.allows_url(url) {
-            Ok(())
-        } else {
-            Err(BrowserError::CrossOriginNavigation)
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct BrowserLimits {
-    pub max_steps: usize,
-    pub max_redirects: usize,
-    pub max_step_timeout: Duration,
-    pub poll_interval: Duration,
-}
-
-impl Default for BrowserLimits {
-    fn default() -> Self {
-        Self {
-            max_steps: MAX_STEPS,
-            max_redirects: MAX_REDIRECTS,
-            max_step_timeout: MAX_STEP_TIMEOUT,
-            poll_interval: DEFAULT_POLL_INTERVAL,
-        }
-    }
-}
-
-impl BrowserLimits {
-    fn validate(self) -> Result<(), BrowserError> {
-        if self.max_steps == 0
-            || self.max_steps > MAX_STEPS
-            || self.max_redirects > MAX_REDIRECTS
-            || self.max_step_timeout.is_zero()
-            || self.max_step_timeout > MAX_STEP_TIMEOUT
-            || self.poll_interval.is_zero()
-        {
-            return Err(BrowserError::InvalidLimits);
-        }
-        Ok(())
-    }
-}
-
-/// A Suite `browser` entry.  Secret values are kept only in `BrowserCommand`;
-/// this structure intentionally has no custom Debug implementation that could
-/// expose them.
-pub struct BrowserEntry {
-    pub match_pattern: String,
-    pub match_limit: Option<u32>,
-    pub tasks: Vec<BrowserTask>,
-}
-
-impl fmt::Debug for BrowserEntry {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("BrowserEntry")
-            .field("match_pattern", &self.match_pattern)
-            .field("match_limit", &self.match_limit)
-            .field("tasks", &self.tasks.len())
-            .finish()
-    }
-}
-
-pub struct BrowserTask {
-    pub task: Option<String>,
-    pub optional: bool,
-    pub match_pattern: Option<String>,
-    pub commands: Vec<BrowserCommand>,
-}
-
-impl fmt::Debug for BrowserTask {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("BrowserTask")
-            .field("task", &self.task)
-            .field("optional", &self.optional)
-            .field("match_pattern", &self.match_pattern)
-            .field("commands", &self.commands.len())
-            .finish()
-    }
-}
-
-impl BrowserTask {
-    fn parse(value: &Value) -> Result<Self, BrowserError> {
-        let object = value.as_object().ok_or(BrowserError::InvalidSchema)?;
-        reject_unknown_keys(object, &["task", "optional", "match", "commands"])?;
-        let task = match object.get("task") {
-            None => None,
-            Some(value) => Some(
-                value
-                    .as_str()
-                    .ok_or(BrowserError::InvalidSchema)?
-                    .to_owned(),
-            ),
-        };
-        let optional = object
-            .get("optional")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let match_pattern = match object.get("match") {
-            None => None,
-            Some(value) => {
-                let value = value.as_str().ok_or(BrowserError::InvalidSchema)?;
-                validate_match_pattern(value, MAX_MATCH_BYTES)?;
-                Some(value.to_owned())
-            }
-        };
-        let raw_commands = object
-            .get("commands")
-            .and_then(Value::as_array)
-            .ok_or(BrowserError::InvalidSchema)?;
-        if raw_commands.len() > MAX_STEPS {
-            return Err(BrowserError::StepLimit);
-        }
-        let commands = raw_commands
-            .iter()
-            .map(BrowserCommand::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            task,
-            optional,
-            match_pattern,
-            commands,
-        })
-    }
-}
-
-fn reject_unknown_keys(
-    object: &serde_json::Map<String, Value>,
-    allowed: &[&str],
-) -> Result<(), BrowserError> {
-    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
-        return Err(BrowserError::InvalidSchema);
-    }
-    Ok(())
-}
-
-impl BrowserEntry {
-    pub fn parse(value: &Value) -> Result<Self, BrowserError> {
-        let object = value.as_object().ok_or(BrowserError::InvalidSchema)?;
-        reject_unknown_keys(object, &["match", "match-limit", "tasks"])?;
-        let match_pattern = object
-            .get("match")
-            .and_then(Value::as_str)
-            .ok_or(BrowserError::InvalidSchema)?;
-        validate_match_pattern(match_pattern, MAX_MATCH_BYTES)?;
-        let match_limit = match object.get("match-limit") {
-            None => None,
-            Some(value) => Some(
-                value
-                    .as_u64()
-                    .and_then(|value| u32::try_from(value).ok())
-                    .ok_or(BrowserError::InvalidSchema)?,
-            ),
-        };
-        if match_limit == Some(0) {
-            return Err(BrowserError::InvalidSchema);
-        }
-        let raw_tasks = object
-            .get("tasks")
-            .and_then(Value::as_array)
-            .ok_or(BrowserError::InvalidSchema)?;
-        if raw_tasks.len() > MAX_STEPS {
-            return Err(BrowserError::StepLimit);
-        }
-        let tasks = raw_tasks
-            .iter()
-            .map(BrowserTask::parse)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            match_pattern: match_pattern.to_owned(),
-            match_limit,
-            tasks,
-        })
-    }
-}
-
-/// OpenID4VC verifier modules expose browser work as a small state object,
-/// rather than Suite command tuples.  Only target-origin `/authorize` URLs
-/// with a query are accepted; `visited` is retained to make repeated modules
-/// deterministic and is never trusted as proof of completion.
-#[derive(Clone)]
-pub struct OpenId4VcBrowserState {
-    urls: Vec<Url>,
-    visited: Vec<Url>,
-}
-
-impl fmt::Debug for OpenId4VcBrowserState {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("OpenId4VcBrowserState")
-            .field("url_count", &self.urls.len())
-            .field("visited_count", &self.visited.len())
-            .finish()
-    }
-}
-
-impl OpenId4VcBrowserState {
-    pub fn parse(value: &Value, policy: &BrowserPolicy) -> Result<Self, BrowserError> {
-        let object = value.as_object().ok_or(BrowserError::InvalidSchema)?;
-        reject_unknown_keys(object, &["urls", "visited"])?;
-        let urls = parse_browser_urls(
-            Some(object.get("urls").ok_or(BrowserError::InvalidSchema)?),
-            policy,
-        )?;
-        let visited = parse_browser_urls(object.get("visited"), policy)?;
-        if visited
-            .iter()
-            .any(|seen| !urls.iter().any(|url| url == seen))
-        {
-            return Err(BrowserError::InvalidSchema);
-        }
-        Ok(Self { urls, visited })
-    }
-
-    pub fn pending_url(&self) -> Option<&Url> {
-        self.urls
-            .iter()
-            .find(|url| !self.visited.iter().any(|seen| seen == *url))
-    }
-
-    pub fn mark_visited(&mut self, url: &Url, policy: &BrowserPolicy) -> Result<(), BrowserError> {
-        policy.validate_url(url)?;
-        if !self.urls.iter().any(|candidate| candidate == url) {
-            return Err(BrowserError::InvalidSchema);
-        }
-        if !self.visited.iter().any(|seen| seen == url) {
-            self.visited.push(url.clone());
-        }
-        Ok(())
-    }
-
-    pub fn urls(&self) -> &[Url] {
-        &self.urls
-    }
-
-    pub fn visited(&self) -> &[Url] {
-        &self.visited
-    }
-}
-
-fn parse_browser_urls(
-    value: Option<&Value>,
-    policy: &BrowserPolicy,
-) -> Result<Vec<Url>, BrowserError> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let values = value.as_array().ok_or(BrowserError::InvalidSchema)?;
-    if values.len() > MAX_STEPS {
-        return Err(BrowserError::StepLimit);
-    }
-    let mut parsed = Vec::with_capacity(values.len());
-    for value in values {
-        let text = value.as_str().ok_or(BrowserError::InvalidSchema)?;
-        if text.len() > MAX_MATCH_BYTES {
-            return Err(BrowserError::InvalidSchema);
-        }
-        let url = Url::parse(text).map_err(|_| BrowserError::InvalidSchema)?;
-        policy.validate_url(&url)?;
-        if url.path() != "/authorize"
-            || url.query().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(BrowserError::InvalidSchema);
-        }
-        if !parsed.iter().any(|candidate| candidate == &url) {
-            parsed.push(url);
-        }
-    }
-    Ok(parsed)
-}
-
-pub fn parse_browser_entries(value: &Value) -> Result<Vec<BrowserEntry>, BrowserError> {
-    let values = value.as_array().ok_or(BrowserError::InvalidSchema)?;
-    if values.is_empty() || values.len() > MAX_STEPS {
-        return Err(BrowserError::InvalidSchema);
-    }
-    values.iter().map(BrowserEntry::parse).collect()
-}
-
-/// Parse and consume a browser value while clearing the input JSON strings.
-/// Callers handling a materialized private plan should prefer this variant so
-/// credentials do not remain in the source `Value` after command parsing.
-pub fn parse_browser_entries_owned(mut value: Value) -> Result<Vec<BrowserEntry>, BrowserError> {
-    let result = parse_browser_entries(&value);
-    zeroize_value(&mut value);
-    result
-}
-
-fn zeroize_value(value: &mut Value) {
-    match value {
-        Value::String(text) => text.zeroize(),
-        Value::Array(values) => values.iter_mut().for_each(zeroize_value),
-        Value::Object(values) => values.values_mut().for_each(zeroize_value),
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
-    }
-}
-
-/// A parsed selector accepted by WebDriver.  `contains` is not passed to the
-/// driver as CSS; it is handled by page-source/URL matching, preventing XPath
-/// or CSS injection from Suite configuration.
-#[derive(Clone, Eq, PartialEq)]
-pub enum BrowserSelector {
-    Id(String),
-    Css(String),
-}
-
-impl fmt::Debug for BrowserSelector {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Id(_) => "Id(<redacted>)",
-            Self::Css(_) => "Css(<redacted>)",
-        })
-    }
-}
-
-impl BrowserSelector {
-    fn parse(kind: &str, value: &str) -> Result<Self, BrowserError> {
-        if value.is_empty()
-            || value.len() > MAX_SELECTOR_BYTES
-            || value.chars().any(char::is_control)
-        {
-            return Err(BrowserError::InvalidSchema);
-        }
-        match kind {
-            "id" => Ok(Self::Id(value.to_owned())),
-            "css" => Ok(Self::Css(value.to_owned())),
-            _ => Err(BrowserError::UnsupportedCommand),
-        }
-    }
-}
-
-/// The supported subset of the official Suite browser command tuples.
-pub enum BrowserCommand {
-    WaitForElement {
-        selector: BrowserSelector,
-        timeout: Duration,
-        text_pattern: Option<String>,
-    },
-    WaitElementVisible {
-        selector: BrowserSelector,
-        timeout: Duration,
-    },
-    WaitContains {
-        needle: String,
-        timeout: Duration,
-    },
-    Text {
-        selector: BrowserSelector,
-        value: Zeroizing<String>,
-    },
-    Click {
-        selector: BrowserSelector,
-    },
-}
-
-impl fmt::Debug for BrowserCommand {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let kind = match self {
-            Self::WaitForElement { .. } => "wait",
-            Self::WaitElementVisible { .. } => "wait-element-visible",
-            Self::WaitContains { .. } => "wait-contains",
-            Self::Text { .. } => "text",
-            Self::Click { .. } => "click",
-        };
-        formatter.write_str(kind)
-    }
-}
-
-impl TryFrom<&Value> for BrowserCommand {
-    type Error = BrowserError;
-
-    fn try_from(value: &Value) -> Result<Self, Self::Error> {
-        let values = value.as_array().ok_or(BrowserError::InvalidSchema)?;
-        if values.is_empty() || values.len() > 6 {
-            return Err(BrowserError::InvalidSchema);
-        }
-        let op = values[0].as_str().ok_or(BrowserError::InvalidSchema)?;
-        match op {
-            "wait" => {
-                let kind = values
-                    .get(1)
-                    .and_then(Value::as_str)
-                    .ok_or(BrowserError::InvalidSchema)?;
-                if kind == "contains" {
-                    let needle = values
-                        .get(2)
-                        .and_then(Value::as_str)
-                        .ok_or(BrowserError::InvalidSchema)?;
-                    validate_contains(needle)?;
-                    let timeout = parse_timeout(values.get(3))?;
-                    if values.len() != 4 {
-                        return Err(BrowserError::InvalidSchema);
-                    }
-                    Ok(Self::WaitContains {
-                        needle: needle.to_owned(),
-                        timeout,
-                    })
-                } else {
-                    let selector_value = values
-                        .get(2)
-                        .and_then(Value::as_str)
-                        .ok_or(BrowserError::InvalidSchema)?;
-                    let selector = BrowserSelector::parse(kind, selector_value)?;
-                    let timeout = parse_timeout(values.get(3))?;
-                    let text_pattern = match values.get(4) {
-                        None => None,
-                        Some(Value::String(pattern)) => {
-                            compile_pattern(pattern)?;
-                            Some(pattern.clone())
-                        }
-                        _ => return Err(BrowserError::InvalidSchema),
-                    };
-                    if values.len() == 6
-                        && values[5].as_str() != Some("update-image-placeholder-optional")
-                    {
-                        return Err(BrowserError::UnsupportedCommand);
-                    }
-                    if values.len() > 6 {
-                        return Err(BrowserError::InvalidSchema);
-                    }
-                    Ok(Self::WaitForElement {
-                        selector,
-                        timeout,
-                        text_pattern,
-                    })
-                }
-            }
-            "wait-element-visible" => {
-                if values.len() != 4 {
-                    return Err(BrowserError::InvalidSchema);
-                }
-                let selector = BrowserSelector::parse(
-                    values
-                        .get(1)
-                        .and_then(Value::as_str)
-                        .ok_or(BrowserError::InvalidSchema)?,
-                    values
-                        .get(2)
-                        .and_then(Value::as_str)
-                        .ok_or(BrowserError::InvalidSchema)?,
-                )?;
-                Ok(Self::WaitElementVisible {
-                    selector,
-                    timeout: parse_timeout(values.get(3))?,
-                })
-            }
-            "text" => {
-                if values.len() != 4 {
-                    return Err(BrowserError::InvalidSchema);
-                }
-                let selector = BrowserSelector::parse(
-                    values
-                        .get(1)
-                        .and_then(Value::as_str)
-                        .ok_or(BrowserError::InvalidSchema)?,
-                    values
-                        .get(2)
-                        .and_then(Value::as_str)
-                        .ok_or(BrowserError::InvalidSchema)?,
-                )?;
-                let value = values
-                    .get(3)
-                    .and_then(Value::as_str)
-                    .ok_or(BrowserError::InvalidSchema)?;
-                if value.len() > MAX_TEXT_BYTES || value.chars().any(char::is_control) {
-                    return Err(BrowserError::InvalidSchema);
-                }
-                Ok(Self::Text {
-                    selector,
-                    value: Zeroizing::new(value.to_owned()),
-                })
-            }
-            "click" => {
-                if values.len() != 3 {
-                    return Err(BrowserError::InvalidSchema);
-                }
-                Ok(Self::Click {
-                    selector: BrowserSelector::parse(
-                        values
-                            .get(1)
-                            .and_then(Value::as_str)
-                            .ok_or(BrowserError::InvalidSchema)?,
-                        values
-                            .get(2)
-                            .and_then(Value::as_str)
-                            .ok_or(BrowserError::InvalidSchema)?,
-                    )?,
-                })
-            }
-            _ => Err(BrowserError::UnsupportedCommand),
-        }
-    }
-}
-
-fn parse_timeout(value: Option<&Value>) -> Result<Duration, BrowserError> {
-    let seconds = value
-        .and_then(Value::as_u64)
-        .ok_or(BrowserError::InvalidSchema)?;
-    if seconds == 0 || seconds > MAX_STEP_TIMEOUT.as_secs() {
-        return Err(BrowserError::InvalidTimeout);
-    }
-    Ok(Duration::from_secs(seconds))
-}
-
-fn validate_contains(value: &str) -> Result<(), BrowserError> {
-    if value.is_empty()
-        || value.len() > MAX_MATCH_BYTES
-        || value.chars().any(char::is_control)
-        || value.contains("://")
-        || value.contains("..")
-    {
-        return Err(BrowserError::InvalidSchema);
-    }
-    Ok(())
-}
-
-fn compile_pattern(value: &str) -> Result<Regex, BrowserError> {
-    if value.len() > MAX_MATCH_BYTES || value.chars().any(char::is_control) {
-        return Err(BrowserError::InvalidSchema);
-    }
-    Regex::new(value).map_err(|_| BrowserError::InvalidPattern)
-}
-
-fn validate_match_pattern(value: &str, max: usize) -> Result<(), BrowserError> {
-    if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
-        return Err(BrowserError::InvalidSchema);
-    }
-    // A match is a simple glob.  Embedded URLs are checked against the
-    // policy at execution time; arbitrary schemes are never navigated.
-    Ok(())
-}
-
-/// Driver abstraction used both by the WebDriver implementation and by
-/// deterministic tests.  A driver never receives a URL before policy checks.
+/// Driver abstraction used both by WebDriver and deterministic tests. A
+/// driver never receives a URL before policy checks.
 pub trait BrowserDriver: Send {
     fn navigate(&mut self, url: &Url) -> Result<(), BrowserError>;
     fn current_url(&mut self) -> Result<Url, BrowserError>;
@@ -685,8 +102,8 @@ pub trait BrowserDriver: Send {
 }
 
 /// Contract consumed by the conformance orchestrator while a Suite module is
-/// in `WAITING`.  Implementations must preserve official Suite results; this
-/// trait only drives the browser and returns execution evidence.
+/// in `WAITING`. This trait drives browser work only and returns no Suite
+/// result, preserving the official PASS/FAIL decision.
 pub trait BrowserAutomation: Send {
     fn execute(
         &mut self,
@@ -696,10 +113,9 @@ pub trait BrowserAutomation: Send {
 
     fn navigate(&mut self, url: &Url) -> Result<(), BrowserError>;
 
-    /// Wait for an exact browser URL after an out-of-band flow (for example,
-    /// an OpenID4VP verifier start) has navigated the session.  The default
-    /// keeps existing BrowserAutomation implementations source-compatible;
-    /// drivers that do not support polling fail closed.
+    /// Wait for an exact browser URL after an out-of-band flow, such as an
+    /// OpenID4VP verifier start. Existing implementations fail closed unless
+    /// they opt into URL polling.
     fn wait_for_url(&mut self, expected: &Url, timeout: Duration) -> Result<(), BrowserError> {
         let _ = (expected, timeout);
         Err(BrowserError::UnsupportedCommand)
@@ -802,9 +218,9 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                     if current.as_str().contains(needle) {
                         return Ok(());
                     }
-                    // `contains` in the Suite runner is primarily a URL
-                    // matcher.  Page source is also checked for OpenID4VC
-                    // callback markers that are rendered without a URL change.
+                    // `contains` is primarily a URL matcher. Page source is
+                    // also checked for OpenID4VC callback markers rendered
+                    // without a URL change.
                     if self.driver.page_source()?.contains(needle) {
                         return Ok(());
                     }
@@ -926,89 +342,6 @@ impl<D: BrowserDriver> BrowserAutomation for BrowserExecutor<D> {
             self.sleep_until(deadline)?;
         }
     }
-}
-
-fn glob_matches(pattern: &str, value: &str) -> bool {
-    // Suite match strings use `*` as a whole-string wildcard.  Avoid regex
-    // conversion so a Suite-provided pattern cannot become executable syntax.
-    let mut remainder = value;
-    let mut parts = pattern.split('*');
-    let Some(first) = parts.next() else {
-        return false;
-    };
-    if !remainder.starts_with(first) {
-        return false;
-    }
-    remainder = &remainder[first.len()..];
-    let mut suffixes: Vec<&str> = parts.collect();
-    let last = suffixes.pop().unwrap_or("");
-    for part in suffixes {
-        let Some(index) = remainder.find(part) else {
-            return false;
-        };
-        remainder = &remainder[index + part.len()..];
-    }
-    remainder.ends_with(last)
-}
-
-fn redacted_origin(url: &Url) -> String {
-    url.origin().ascii_serialization()
-}
-
-fn same_origin(expected: &Url, actual: &Url) -> bool {
-    expected.scheme() == actual.scheme()
-        && expected.host_str() == actual.host_str()
-        && expected.port_or_known_default() == actual.port_or_known_default()
-        && actual.username().is_empty()
-        && actual.password().is_none()
-}
-
-#[derive(Debug, Error, Clone, Copy, Eq, PartialEq)]
-pub enum BrowserError {
-    #[error("browser endpoint is invalid")]
-    InvalidEndpoint,
-    #[error("plaintext browser endpoint must be loopback")]
-    InsecureEndpoint,
-    #[error("browser target origin is invalid")]
-    InvalidOrigin,
-    #[error("plaintext browser target must be loopback")]
-    InsecureTarget,
-    #[error("browser limits are invalid")]
-    InvalidLimits,
-    #[error("browser schema is invalid")]
-    InvalidSchema,
-    #[error("browser command is unsupported")]
-    UnsupportedCommand,
-    #[error("browser timeout expired")]
-    Timeout,
-    #[error("browser step limit exceeded")]
-    StepLimit,
-    #[error("browser redirect or navigation crossed the allowlist")]
-    CrossOriginNavigation,
-    #[error("browser entry did not match the current page")]
-    NoMatchingEntry,
-    #[error("browser command pattern is invalid")]
-    InvalidPattern,
-    #[error("browser command timeout is invalid")]
-    InvalidTimeout,
-    #[error("browser transport failed")]
-    Transport,
-    #[error("browser WebDriver protocol response is invalid")]
-    Protocol,
-    #[error("browser WebDriver rejected the request")]
-    DriverRejected,
-    #[error("browser response exceeds the size limit")]
-    ResponseTooLarge,
-    #[error("browser session is already started")]
-    SessionAlreadyStarted,
-    #[error("browser session is not started")]
-    SessionNotStarted,
-    #[error("browser element was not found")]
-    ElementNotFound,
-    #[error("chromedriver or chromium-driver was not found")]
-    DriverUnavailable,
-    #[error("managed browser driver failed to start")]
-    DriverStartFailed,
 }
 
 #[cfg(test)]
