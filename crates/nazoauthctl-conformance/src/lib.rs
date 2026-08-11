@@ -32,10 +32,11 @@ pub use client::{
 };
 pub use credentials::{BearerToken, CredentialStore, CredentialStoreError};
 pub use materializer::{
-    CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DescriptorGroup, DescriptorMaterializer,
-    DescriptorPlan, DescriptorSource, DescriptorVariant, MAX_DESCRIPTOR_BYTES, MaterializedMatrix,
-    MaterializerError, MatrixDescriptor, OnboardingOutput, PreparedMaterialization,
-    RoleRequirement, SECURE_BUNDLE_SCHEMA_VERSION, SecureBytes, SecureOnboardingBundle,
+    CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DeploymentConformanceSecrets, DescriptorGroup,
+    DescriptorMaterializer, DescriptorPlan, DescriptorSource, DescriptorVariant,
+    MAX_DESCRIPTOR_BYTES, MaterializedMatrix, MaterializerError, MatrixDescriptor,
+    OnboardingOutput, PreparedMaterialization, RoleRequirement, SECURE_BUNDLE_SCHEMA_VERSION,
+    SecureBytes, SecureOnboardingBundle,
 };
 pub use matrix::{
     MATRIX_SCHEMA_VERSION, MAX_MATRIX_BYTES, MatrixArtifact, MatrixDocument, MatrixError,

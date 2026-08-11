@@ -356,6 +356,41 @@ pub enum MaterializerError {
 
 pub struct DescriptorMaterializer;
 
+/// Deployment-owned profile tokens required by official dynamic-registration
+/// and CIBA plans. They are supplied by the controller's secure-file boundary;
+/// the materializer never invents a second authority value.
+pub struct DeploymentConformanceSecrets {
+    dynamic_registration_initial_access_token: Zeroizing<String>,
+    ciba_automated_decision_token: Zeroizing<String>,
+}
+
+impl DeploymentConformanceSecrets {
+    pub fn new(
+        dynamic_registration_initial_access_token: Zeroizing<String>,
+        ciba_automated_decision_token: Zeroizing<String>,
+    ) -> Result<Self, MaterializerError> {
+        for value in [
+            dynamic_registration_initial_access_token.as_str(),
+            ciba_automated_decision_token.as_str(),
+        ] {
+            if value.len() < 32
+                || value.len() > 4096
+                || value
+                    .chars()
+                    .any(|character| character.is_control() || character.is_whitespace())
+            {
+                return Err(MaterializerError::InvalidField(
+                    "deployment_conformance_secret",
+                ));
+            }
+        }
+        Ok(Self {
+            dynamic_registration_initial_access_token,
+            ciba_automated_decision_token,
+        })
+    }
+}
+
 impl DescriptorMaterializer {
     pub fn from_bytes(bytes: &[u8]) -> Result<MatrixDescriptor, MaterializerError> {
         if bytes.len() > MAX_DESCRIPTOR_BYTES {
@@ -375,6 +410,7 @@ impl DescriptorMaterializer {
         target_issuer: &str,
         suite_origin: &Origin,
         request_jti: &str,
+        deployment_secrets: DeploymentConformanceSecrets,
     ) -> Result<(PreparedMaterialization, SecureOnboardingBundle), MaterializerError> {
         validate_descriptor(&descriptor)?;
         validate_target_issuer(target_issuer)?;
@@ -406,15 +442,15 @@ impl DescriptorMaterializer {
         }
         let needs_dynamic_token = descriptor_requires_reference(
             &descriptor,
-            "generated.dynamic_registration_initial_access_token",
+            "deployment.dynamic_registration_initial_access_token",
         );
         let needs_ciba_token =
-            descriptor_requires_reference(&descriptor, "generated.ciba_automated_decision_token")
+            descriptor_requires_reference(&descriptor, "deployment.ciba_automated_decision_token")
                 || descriptor_requires_reference(&descriptor, "target.ciba_automated_decision_url");
-        let dynamic_registration_initial_access_token =
-            needs_dynamic_token.then(|| Zeroizing::new(random_secret(32)));
+        let dynamic_registration_initial_access_token = needs_dynamic_token
+            .then_some(deployment_secrets.dynamic_registration_initial_access_token);
         let ciba_automated_decision_token =
-            needs_ciba_token.then(|| Zeroizing::new(random_secret(32)));
+            needs_ciba_token.then_some(deployment_secrets.ciba_automated_decision_token);
         let bundle_record = SecureBundleRecord {
             schema: SECURE_BUNDLE_SCHEMA_VERSION,
             request_jti: request_jti.to_owned(),
@@ -884,14 +920,14 @@ fn resolve_reference(
             onboarding.openid4vc_request_object_trust_anchor_pem.clone(),
         ));
     }
-    if name == "generated.dynamic_registration_initial_access_token" {
+    if name == "deployment.dynamic_registration_initial_access_token" {
         return prepared
             .dynamic_registration_initial_access_token
             .as_ref()
             .map(|value| Value::String(value.to_string()))
             .ok_or(MaterializerError::UnknownSecretReference(name.to_owned()));
     }
-    if name == "generated.ciba_automated_decision_token" {
+    if name == "deployment.ciba_automated_decision_token" {
         return prepared
             .ciba_automated_decision_token
             .as_ref()
@@ -1484,6 +1520,41 @@ mod tests {
         Origin::parse_suite("https://suite.example").expect("suite")
     }
 
+    fn deployment_secrets() -> DeploymentConformanceSecrets {
+        DeploymentConformanceSecrets::new(
+            Zeroizing::new("d".repeat(32)),
+            Zeroizing::new("c".repeat(32)),
+        )
+        .expect("deployment secrets")
+    }
+
+    #[test]
+    fn secure_bundle_uses_deployment_profile_tokens_without_generating_another_authority() {
+        let mut descriptor = descriptor();
+        let config = &mut descriptor.groups[0].plans[0].config_template;
+        config["initial_access_token"] =
+            serde_json::json!("{{deployment.dynamic_registration_initial_access_token}}");
+        config["automated_ciba_token"] =
+            serde_json::json!("{{deployment.ciba_automated_decision_token}}");
+        let dynamic = "dynamic-deployment-token-0123456789";
+        let ciba = "ciba-deployment-token-01234567890123";
+        let (_, bundle) = DescriptorMaterializer::prepare(
+            descriptor,
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+            DeploymentConformanceSecrets::new(
+                Zeroizing::new(dynamic.to_owned()),
+                Zeroizing::new(ciba.to_owned()),
+            )
+            .expect("deployment secrets"),
+        )
+        .expect("prepare");
+        let value: Value = serde_json::from_slice(bundle.bytes().as_bytes()).expect("bundle");
+        assert_eq!(value["dynamic_registration_initial_access_token"], dynamic);
+        assert_eq!(value["ciba_automated_decision_token"], ciba);
+    }
+
     fn request_jti() -> &'static str {
         "request-0123456789abcdef0123456789abcdef"
     }
@@ -1515,6 +1586,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            deployment_secrets(),
         )
         .expect("prepare");
         let bundle_text =
@@ -1555,6 +1627,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            deployment_secrets(),
         )
         .expect("prepare");
         let missing = onboarding_output(
@@ -1574,6 +1647,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            deployment_secrets(),
         )
         .expect("prepare");
         let extra = onboarding_output(
@@ -1596,6 +1670,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            deployment_secrets(),
         )
         .expect("prepare");
         let wrong_matrix = onboarding_output(
@@ -1615,6 +1690,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            deployment_secrets(),
         )
         .expect("prepare");
         let invalid_lease = onboarding_output(
@@ -1642,6 +1718,7 @@ mod tests {
                 "https://issuer.example",
                 &suite(),
                 request_jti(),
+                deployment_secrets(),
             )
             .expect("prepare");
             let path = root.join("bundle.json");

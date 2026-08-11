@@ -8,9 +8,10 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use nazoauthctl_conformance::{
     BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy, BrowserTargetOrigin,
-    ClientConfig, ConformanceRunConfig, ConformanceRunner, CredentialStore, DescriptorMaterializer,
-    ManagedWebDriver, OnboardingOutput, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin,
-    RunControl, StableRenderer, SuiteClient, TtyRenderer, WebDriverClient, WebDriverEndpoint,
+    ClientConfig, ConformanceRunConfig, ConformanceRunner, CredentialStore,
+    DeploymentConformanceSecrets, DescriptorMaterializer, ManagedWebDriver, OnboardingOutput,
+    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, RunControl, StableRenderer, SuiteClient,
+    TtyRenderer, WebDriverClient, WebDriverEndpoint,
 };
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
@@ -232,11 +233,20 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let descriptor = DescriptorMaterializer::from_bytes(&matrix.bytes)
         .context("deployment Matrix cannot be materialized")?;
     let request_jti = format!("request-{}", hex(rand::random::<[u8; 16]>()));
+    let deployment_secrets = DeploymentConformanceSecrets::new(
+        session
+            .dynamic_registration_initial_access_token()
+            .context("failed to load the deployment dynamic-registration token")?,
+        session
+            .ciba_automated_decision_token()
+            .context("failed to load the deployment CIBA decision token")?,
+    )?;
     let (prepared, bundle) = DescriptorMaterializer::prepare(
         descriptor,
         session.target_issuer(),
         &suite_origin,
         &request_jti,
+        deployment_secrets,
     )
     .context("failed to prepare ephemeral conformance material")?;
     if prepared.matrix_sha256() != matrix.sha256 {
