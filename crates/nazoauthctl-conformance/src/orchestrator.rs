@@ -664,7 +664,7 @@ impl ConformanceRunner {
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
                             }
-                        } else {
+                        } else if plan.config.get("browser").is_some() {
                             let Some(browser) = &self.config.browser else {
                                 errors.push(
                                     "Suite runner is WAITING but browser automation is unavailable"
