@@ -453,6 +453,47 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn suite_browser_state_projects_urls_from_the_full_runner_shape() {
+        let policy = BrowserPolicy::new(
+            BrowserTargetOrigin::parse("https://target.example").expect("target"),
+            Origin::parse("https://suite.example").expect("suite"),
+        )
+        .expect("policy");
+        let state = OpenId4VcBrowserState::parse(
+            &json!({
+                "show_qr_code": false,
+                "urls": [{
+                    "url": "https://target.example/authorize?state=opaque",
+                    "method": "GET"
+                }],
+                "urlsWithMethod": [],
+                "browserApiRequests": [],
+                "uriInputRequests": [],
+                "visited": [],
+                "visitedUrlsWithMethod": [],
+                "runners": []
+            }),
+            &policy,
+        )
+        .expect("runner browser state");
+        assert_eq!(state.pending_url().map(Url::path), Some("/authorize"));
+
+        assert!(matches!(
+            OpenId4VcBrowserState::parse(
+                &json!({
+                    "urls": [{
+                        "url": "https://target.example/authorize?state=opaque",
+                        "method": "POST"
+                    }],
+                    "visited": []
+                }),
+                &policy,
+            ),
+            Err(BrowserError::UnsupportedCommand)
+        ));
+    }
+
     struct MockDriver {
         current: Url,
         source: String,

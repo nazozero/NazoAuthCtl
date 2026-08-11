@@ -285,7 +285,26 @@ pub(super) fn parse_browser_urls(
     }
     let mut parsed = Vec::with_capacity(values.len());
     for value in values {
-        let text = value.as_str().ok_or(BrowserError::InvalidSchema)?;
+        let text = match value {
+            Value::String(text) => text.as_str(),
+            Value::Object(object) => {
+                if object
+                    .keys()
+                    .any(|key| !["url", "method"].contains(&key.as_str()))
+                    || object
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .is_some_and(|method| method != "GET")
+                {
+                    return Err(BrowserError::UnsupportedCommand);
+                }
+                object
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .ok_or(BrowserError::InvalidSchema)?
+            }
+            _ => return Err(BrowserError::InvalidSchema),
+        };
         if text.len() > MAX_MATCH_BYTES {
             return Err(BrowserError::InvalidSchema);
         }

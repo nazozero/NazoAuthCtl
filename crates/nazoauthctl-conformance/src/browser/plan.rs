@@ -7,9 +7,11 @@ use super::BrowserError;
 use super::parser::parse_browser_urls;
 use super::validation::BrowserPolicy;
 
-/// OpenID4VC browser work is represented as a bounded plan of URLs rather
-/// than executable command tuples. `visited` is bookkeeping only and is never
-/// trusted as evidence that a Suite module passed.
+/// Suite browser work is represented as a bounded plan of URLs rather than
+/// executable command tuples. The upstream browser object also exposes other
+/// interaction channels; this type deliberately projects only `urls` and
+/// `visited`. `visited` is bookkeeping only and is never trusted as evidence
+/// that a Suite module passed.
 #[derive(Clone)]
 pub struct OpenId4VcBrowserState {
     urls: Vec<Url>,
@@ -29,12 +31,6 @@ impl fmt::Debug for OpenId4VcBrowserState {
 impl OpenId4VcBrowserState {
     pub fn parse(value: &Value, policy: &BrowserPolicy) -> Result<Self, BrowserError> {
         let object = value.as_object().ok_or(BrowserError::InvalidSchema)?;
-        if object
-            .keys()
-            .any(|key| !["urls", "visited"].contains(&key.as_str()))
-        {
-            return Err(BrowserError::InvalidSchema);
-        }
         let urls = parse_browser_urls(
             Some(object.get("urls").ok_or(BrowserError::InvalidSchema)?),
             policy,
