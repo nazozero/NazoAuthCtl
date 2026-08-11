@@ -242,11 +242,15 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let descriptor = DescriptorMaterializer::from_bytes(&matrix.bytes)
         .context("deployment Matrix cannot be materialized")?;
     let request_jti = format!("request-{}", hex(rand::random::<[u8; 16]>()));
+    let openid4vc_request_object_trust_anchor_pem = session
+        .openid4vc_request_object_trust_anchor_pem()
+        .context("failed to load the deployment OpenID4VC public trust anchor")?;
     let (prepared, bundle) = DescriptorMaterializer::prepare(
         descriptor,
         session.target_issuer(),
         &suite_origin,
         &request_jti,
+        &openid4vc_request_object_trust_anchor_pem,
     )
     .context("failed to prepare ephemeral conformance material")?;
     if prepared.matrix_sha256() != matrix.sha256 {
@@ -269,16 +273,13 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let static_tx_code = prepared.tx_code();
 
     let run_result = (|| -> anyhow::Result<RunOutput> {
-        let openid4vc_request_object_trust_anchor_pem = session
-            .openid4vc_request_object_trust_anchor_pem()
-            .context("failed to load the deployment OpenID4VC public trust anchor")?;
         let onboarding_output = OnboardingOutput::new(
             onboarding.lease_id.clone(),
             onboarding.request_jti.clone(),
             onboarding.matrix_sha256.clone(),
             onboarding.bundle_sha256.clone(),
             onboarding.applicant_id.clone(),
-            openid4vc_request_object_trust_anchor_pem,
+            openid4vc_request_object_trust_anchor_pem.clone(),
             onboarding.client_mappings.clone(),
         )?;
         let binding =

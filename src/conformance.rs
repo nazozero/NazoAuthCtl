@@ -278,7 +278,11 @@ impl ConformanceSession {
                 &self.expected,
                 TaskOperation::ConformanceOnboardingApply {
                     profile: "nazoauth-full".to_owned(),
-                    bundle_schema: 2,
+                    // Schema 3 includes the required public OpenID4VC
+                    // conformance trust object in the secure bundle.  Keep
+                    // this task envelope version aligned with the
+                    // conformance crate's SECURE_BUNDLE_SCHEMA_VERSION.
+                    bundle_schema: 3,
                     bundle_sha256: bundle_sha256.clone(),
                     matrix_sha256: matrix_sha256.to_owned(),
                     client_count,

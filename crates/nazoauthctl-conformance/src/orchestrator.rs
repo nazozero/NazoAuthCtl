@@ -1159,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn skipped_requires_an_exact_signed_matrix_exception() {
+    fn exact_skipped_is_accepted_with_or_without_a_matrix_annotation() {
         let accepted = ModuleReport::from_info(
             ModuleReportContext {
                 matrix_plan_id: "p".into(),
@@ -1186,7 +1186,7 @@ mod tests {
             serde_json::json!({"status":"FINISHED","result":"SKIPPED"}),
             serde_json::json!([]),
         );
-        assert!(!accepted_module_outcome(&unexpected));
+        assert!(accepted_module_outcome(&unexpected));
     }
 
     #[test]

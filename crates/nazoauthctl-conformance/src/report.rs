@@ -92,7 +92,7 @@ pub struct ConformanceReport {
     pub errors: Vec<String>,
     pub local_success: bool,
     /// Whether every collected official module has an accepted terminal
-    /// outcome: PASSED, REVIEW, or an exact Matrix-declared SKIPPED result.
+    /// outcome: PASSED, REVIEW, or the Suite's exact SKIPPED result.
     pub suite_pass: bool,
     /// True when one or more accepted modules returned REVIEW. These modules
     /// remain listed in `modules` and require explicit human follow-up.
@@ -196,11 +196,10 @@ impl ModuleReport {
         let accepted = context.terminal
             && official_status.as_deref() == Some("FINISHED")
             && blocking_log_results.is_empty()
-            && match official_result.as_deref() {
-                Some("PASSED" | "REVIEW") => true,
-                Some("SKIPPED") => context.expected_result.as_deref() == Some("SKIPPED"),
-                _ => false,
-            };
+            && matches!(
+                official_result.as_deref(),
+                Some("PASSED" | "REVIEW" | "SKIPPED")
+            );
         Self {
             matrix_plan_id: context.matrix_plan_id,
             suite_plan_id: context.suite_plan_id,

@@ -22,7 +22,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::matrix::{MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix};
 use crate::origin::Origin;
 
-pub const SECURE_BUNDLE_SCHEMA_VERSION: u32 = 2;
+pub const SECURE_BUNDLE_SCHEMA_VERSION: u32 = 3;
 
 mod crypto;
 mod descriptor;
@@ -404,10 +404,12 @@ impl DescriptorMaterializer {
         target_issuer: &str,
         suite_origin: &Origin,
         request_jti: &str,
+        credential_trust_anchor_pem: &str,
     ) -> Result<(PreparedMaterialization, SecureOnboardingBundle), MaterializerError> {
         validate_descriptor(&descriptor)?;
         validate_target_issuer(target_issuer)?;
         validate_request_jti(request_jti)?;
+        validate_openid4vc_credential_trust_anchor(credential_trust_anchor_pem)?;
         let matrix_sha256 = descriptor
             .raw_sha256
             .clone()
@@ -422,9 +424,12 @@ impl DescriptorMaterializer {
         // VCI plan whose issuer metadata advertises it.  Keep one run-scoped
         // attestation identity for all VCI plans; HAIP adds the client
         // attestation envelope, but it is not the owner of the proof key.
-        let attestation = descriptor_requires_vci(&descriptor)
-            .then(generate_attestation_material)
-            .transpose()?;
+        // The schema-3 onboarding contract requires one lease-scoped public
+        // trust object even when a selected subset does not include a VCI
+        // plan.  The corresponding private keys remain in `PreparedMaterialization`
+        // and are only consumed if a finalized VCI/HAIP plan needs them.
+        let attestation = Some(generate_attestation_material()?);
+        let attestation_ref = attestation.as_ref().ok_or(MaterializerError::Crypto)?;
         let mut clients = BTreeMap::new();
         for (logical_client_id, policy) in policies {
             let registration = registrations
@@ -465,6 +470,22 @@ impl DescriptorMaterializer {
             profile: "nazoauth-full".to_owned(),
             target_issuer: target_issuer.to_owned(),
             suite_base_url: suite_origin.as_str().to_owned(),
+            openid4vc_conformance_trust: SecureOpenid4vcConformanceTrust {
+                schema: 1,
+                client_attestation_issuer: format!(
+                    "{}/",
+                    suite_origin.as_str().trim_end_matches('/')
+                ),
+                client_attestation_jwks: serde_json::from_str(
+                    attestation_ref.attester_public_jwks.as_str(),
+                )
+                .map_err(|_| MaterializerError::Encoding)?,
+                key_attestation_jwks: serde_json::from_str(
+                    attestation_ref.key_attestation_public_jwks.as_str(),
+                )
+                .map_err(|_| MaterializerError::Encoding)?,
+                credential_trust_anchor_pem: credential_trust_anchor_pem.to_owned(),
+            },
             openid4vc_credential_datasets: descriptor.openid4vc_credential_datasets.clone(),
             applicant: SecureApplicantBundle {
                 email: applicant_email.clone(),
@@ -729,6 +750,7 @@ struct SecureBundleRecord {
     profile: String,
     target_issuer: String,
     suite_base_url: String,
+    openid4vc_conformance_trust: SecureOpenid4vcConformanceTrust,
     openid4vc_credential_datasets: BTreeMap<String, Value>,
     applicant: SecureApplicantBundle,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -736,6 +758,15 @@ struct SecureBundleRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     ciba_automated_decision_token: Option<Zeroizing<String>>,
     clients: Vec<SecureClientRecord>,
+}
+
+#[derive(Serialize)]
+struct SecureOpenid4vcConformanceTrust {
+    schema: u32,
+    client_attestation_issuer: String,
+    client_attestation_jwks: Value,
+    key_attestation_jwks: Value,
+    credential_trust_anchor_pem: String,
 }
 
 #[derive(Serialize)]
@@ -761,6 +792,19 @@ fn validate_public_certificate_bundle(value: &str) -> Result<(), MaterializerErr
         || value.contains("PRIVATE KEY")
         || !value.contains("-----BEGIN CERTIFICATE-----")
         || !value.contains("-----END CERTIFICATE-----")
+    {
+        return Err(MaterializerError::InvalidField(
+            "openid4vc_request_object_trust_anchor_pem",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_openid4vc_credential_trust_anchor(value: &str) -> Result<(), MaterializerError> {
+    validate_public_certificate_bundle(value)?;
+    if value.len() > 16 * 1024
+        || !value.starts_with("-----BEGIN CERTIFICATE-----\n")
+        || !value.ends_with("-----END CERTIFICATE-----\n")
     {
         return Err(MaterializerError::InvalidField(
             "openid4vc_request_object_trust_anchor_pem",
@@ -812,15 +856,6 @@ fn descriptor_requires_pre_authorized_vci(descriptor: &MatrixDescriptor) -> bool
                 && plan.variant.get("vci_grant_type").map(String::as_str)
                     == Some("pre_authorization_code")
         })
-    })
-}
-
-fn descriptor_requires_vci(descriptor: &MatrixDescriptor) -> bool {
-    descriptor.groups.iter().any(|group| {
-        group
-            .plans
-            .iter()
-            .any(|plan| plan.plan.starts_with("oid4vci-"))
     })
 }
 
@@ -987,6 +1022,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            test_trust_anchor(),
         )
         .expect("first prepare");
         let (second_prepared, second_bundle) = DescriptorMaterializer::prepare(
@@ -994,6 +1030,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             "request-fedcba9876543210fedcba9876543210",
+            test_trust_anchor(),
         )
         .expect("second prepare");
         let first: Value = serde_json::from_slice(first_bundle.bytes().as_bytes()).expect("bundle");
@@ -1058,6 +1095,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            test_trust_anchor(),
         )
         .expect("prepare");
         let value: Value = serde_json::from_slice(bundle.bytes().as_bytes()).expect("bundle");
@@ -1102,6 +1140,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            test_trust_anchor(),
         )
         .expect("prepare");
         let bundle_text =
@@ -1285,6 +1324,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            test_trust_anchor(),
         )
         .expect("prepare");
         let value: Value = serde_json::from_slice(bundle.bytes().as_bytes()).expect("bundle");
@@ -1319,7 +1359,8 @@ mod tests {
                 missing,
                 "https://issuer.example",
                 &suite(),
-                request_jti()
+                request_jti(),
+                test_trust_anchor()
             )
             .err()
             .expect("missing dataset must fail"),
@@ -1336,7 +1377,8 @@ mod tests {
                 extra,
                 "https://issuer.example",
                 &suite(),
-                request_jti()
+                request_jti(),
+                test_trust_anchor()
             )
             .err()
             .expect("extra dataset must fail"),
@@ -1353,7 +1395,8 @@ mod tests {
                 conflicting,
                 "https://issuer.example",
                 &suite(),
-                request_jti()
+                request_jti(),
+                test_trust_anchor()
             )
             .err()
             .expect("conflicting dataset must fail"),
@@ -1382,7 +1425,8 @@ mod tests {
                 private,
                 "https://issuer.example",
                 &suite(),
-                request_jti()
+                request_jti(),
+                test_trust_anchor()
             )
             .err()
             .expect("private dataset must fail"),
@@ -1402,7 +1446,8 @@ mod tests {
                 empty,
                 "https://issuer.example",
                 &suite(),
-                request_jti()
+                request_jti(),
+                test_trust_anchor()
             )
             .err()
             .expect("empty dataset must fail"),
@@ -1441,6 +1486,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            test_trust_anchor(),
         )
         .expect("preauth prepare");
         let tx_code = prepared.tx_code().expect("run-scoped tx code");
@@ -1489,6 +1535,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            test_trust_anchor(),
         )
         .expect("first prepare");
         let (second, second_bundle) = DescriptorMaterializer::prepare(
@@ -1496,6 +1543,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             "request-fedcba9876543210fedcba9876543210",
+            test_trust_anchor(),
         )
         .expect("second prepare");
         assert_ne!(first_bundle.digest(), second_bundle.digest());
@@ -1527,6 +1575,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            test_trust_anchor(),
         )
         .err()
         .expect("static tx code must fail");
@@ -1545,6 +1594,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            test_trust_anchor(),
         )
         .err()
         .expect("descriptor-supplied proof key must fail");
@@ -1573,12 +1623,27 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            test_trust_anchor(),
         )
         .expect("HAIP prepare");
         let bundle_text = String::from_utf8(bundle.bytes().as_bytes().to_vec()).expect("bundle");
-        assert!(!bundle_text.contains("client_attestation"));
-        assert!(!bundle_text.contains("key_attestation"));
-        assert!(!bundle_text.contains("BEGIN CERTIFICATE"));
+        let bundle_value: Value = serde_json::from_str(&bundle_text).expect("bundle json");
+        let trust = &bundle_value["openid4vc_conformance_trust"];
+        assert_eq!(trust["schema"], 1);
+        assert_eq!(trust["client_attestation_issuer"], "https://suite.example/");
+        assert_eq!(trust["credential_trust_anchor_pem"], test_trust_anchor());
+        assert!(
+            trust["client_attestation_jwks"]["keys"][0]["kid"]
+                .as_str()
+                .is_some()
+        );
+        assert!(
+            trust["key_attestation_jwks"]["keys"][0]["kid"]
+                .as_str()
+                .is_some()
+        );
+        assert!(!bundle_text.contains("\"d\""));
+        assert!(!bundle_text.contains("PRIVATE KEY"));
         let output = onboarding_output(
             "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
             prepared.request_jti(),
@@ -1606,8 +1671,112 @@ mod tests {
                 .is_some_and(|value| !value.is_empty())
         );
         assert_eq!(
+            trust["client_attestation_jwks"]["keys"][0]["kid"],
+            config["client_attestation"]["attester_jwks"]["keys"][0]["kid"]
+        );
+        assert_eq!(
+            trust["key_attestation_jwks"]["keys"][0]["kid"],
+            config["vci"]["key_attestation_jwks"]["keys"][0]["kid"]
+        );
+        assert_eq!(
             config["client_attestation"]["issuer"],
             "https://suite.example/"
+        );
+    }
+
+    #[test]
+    fn vci_conformance_trust_keys_are_fresh_public_and_anchor_bound() {
+        let variant = BTreeMap::from([("credential_format".to_owned(), "sd_jwt_vc".to_owned())]);
+        let config = serde_json::json!({
+            "alias": "nazo-vci-trust",
+            "vci": {"credential_configuration_id": "eu.example.pid"},
+            "nazo": {
+                "openid4vc_role": "issuer",
+                "client_auth_type": "private_key_jwt",
+                "credential_format": "sd_jwt_vc"
+            }
+        });
+        let descriptor =
+            descriptor_with_openid4vc_plan("oid4vci-1_0-issuer-test-plan", variant, config);
+        let (first_prepared, first_bundle) = DescriptorMaterializer::prepare(
+            descriptor.clone(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+            test_trust_anchor(),
+        )
+        .expect("first prepare");
+        let (second_prepared, second_bundle) = DescriptorMaterializer::prepare(
+            descriptor,
+            "https://issuer.example",
+            &suite(),
+            "request-fedcba9876543210fedcba9876543210",
+            test_trust_anchor(),
+        )
+        .expect("second prepare");
+        let first_value: Value =
+            serde_json::from_slice(first_bundle.bytes().as_bytes()).expect("first bundle");
+        let second_value: Value =
+            serde_json::from_slice(second_bundle.bytes().as_bytes()).expect("second bundle");
+        let first_trust = &first_value["openid4vc_conformance_trust"];
+        let second_trust = &second_value["openid4vc_conformance_trust"];
+        assert_eq!(
+            first_trust["credential_trust_anchor_pem"],
+            test_trust_anchor()
+        );
+        assert_ne!(
+            first_trust["client_attestation_jwks"],
+            second_trust["client_attestation_jwks"]
+        );
+        assert_ne!(
+            first_trust["key_attestation_jwks"],
+            second_trust["key_attestation_jwks"]
+        );
+        let first_bundle_text = first_bundle.bytes().as_bytes();
+        let second_bundle_text = second_bundle.bytes().as_bytes();
+        assert!(
+            !first_bundle_text
+                .windows(3)
+                .any(|window| window == b"\"d\"")
+        );
+        assert!(
+            !second_bundle_text
+                .windows(3)
+                .any(|window| window == b"\"d\"")
+        );
+        assert!(!String::from_utf8_lossy(first_bundle_text).contains("PRIVATE KEY"));
+        assert!(!String::from_utf8_lossy(second_bundle_text).contains("PRIVATE KEY"));
+
+        let first_output = onboarding_output(
+            "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
+            first_prepared.request_jti(),
+            first_prepared.matrix_sha256(),
+            first_prepared.bundle_digest(),
+            BTreeMap::from([("web".to_owned(), "first-client".to_owned())]),
+        )
+        .expect("first output");
+        let first_matrix =
+            DescriptorMaterializer::finalize(first_prepared, first_output).expect("first finalize");
+        let first_config = &first_matrix.matrix().document.groups[0].plans[0].config;
+        assert_eq!(
+            first_trust["key_attestation_jwks"]["keys"][0]["kid"],
+            first_config["vci"]["key_attestation_jwks"]["keys"][0]["kid"]
+        );
+
+        let second_output = onboarding_output(
+            "01890f8e-7c18-7b70-9d1e-9bb8c44a2f42",
+            second_prepared.request_jti(),
+            second_prepared.matrix_sha256(),
+            second_prepared.bundle_digest(),
+            BTreeMap::from([("web".to_owned(), "second-client".to_owned())]),
+        )
+        .expect("second output");
+        let second_matrix = DescriptorMaterializer::finalize(second_prepared, second_output)
+            .expect("second finalize");
+        let second_config = &second_matrix.matrix().document.groups[0].plans[0].config;
+        assert_eq!(
+            second_trust["key_attestation_jwks"]["keys"][0]["kid"],
+            second_config["vci"]["key_attestation_jwks"]["keys"][0]["kid"]
         );
     }
 
@@ -1625,6 +1794,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            test_trust_anchor(),
         )
         .expect("signed VP prepare");
         let output = onboarding_output(
@@ -1687,6 +1857,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            test_trust_anchor(),
         )
         .expect("prepare");
         let missing = onboarding_output(
@@ -1707,6 +1878,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            test_trust_anchor(),
         )
         .expect("prepare");
         let extra = onboarding_output(
@@ -1730,6 +1902,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            test_trust_anchor(),
         )
         .expect("prepare");
         let wrong_matrix = onboarding_output(
@@ -1750,6 +1923,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            test_trust_anchor(),
         )
         .expect("prepare");
         let wrong_bundle = onboarding_output(
@@ -1770,6 +1944,7 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
+            test_trust_anchor(),
         )
         .expect("prepare");
         let invalid_lease = onboarding_output(
@@ -1798,6 +1973,7 @@ mod tests {
                 "https://issuer.example",
                 &suite(),
                 request_jti(),
+                test_trust_anchor(),
             )
             .expect("prepare");
             let path = root.join("bundle.json");
