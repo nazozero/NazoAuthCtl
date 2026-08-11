@@ -606,7 +606,9 @@ impl ConformanceRunner {
         let human_review_required = !human_review_modules.is_empty();
         let snapshot = snapshot(&groups, current_profile, current_variant, current_test);
         let report = ConformanceReport {
-            schema: 1,
+            // Schema 2 adds explicit accepted/reviewed/skipped outcome
+            // semantics; schema 1 treated every non-PASSED result as failure.
+            schema: 2,
             matrix_digest: self.config.matrix.digest.clone(),
             suite_origin: self.config.client.origin().to_string(),
             auth_probe,
