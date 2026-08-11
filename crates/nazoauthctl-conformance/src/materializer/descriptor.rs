@@ -454,9 +454,9 @@ fn is_builtin_reference(name: &str) -> bool {
         name,
         "generated.applicant_password"
             | "generated.client_secret"
-            | "generated.rsa.private_jwk"
+            | "generated.rsa.private_jwks"
             | "generated.rsa.public_jwks"
-            | "generated.ec.private_jwk"
+            | "generated.ec.private_jwks"
             | "generated.ec.public_jwks"
             | "generated.mtls.ca_cert"
             | "generated.mtls.client_cert"

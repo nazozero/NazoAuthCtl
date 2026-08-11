@@ -225,9 +225,9 @@ fn resolve_client_reference(
             .map(|id| Value::String(id.clone()))
             .ok_or(MaterializerError::MissingClientMapping),
         "client_secret" => Ok(Value::String(client.client_secret.to_string())),
-        "rsa.private_jwk" => json_value(&client.rsa_private_jwk),
+        "rsa.private_jwks" => json_value(&client.rsa_private_jwks),
         "rsa.public_jwks" => json_value(&client.rsa_public_jwks),
-        "ec.private_jwk" => json_value(&client.ec_private_jwk),
+        "ec.private_jwks" => json_value(&client.ec_private_jwks),
         "ec.public_jwks" => json_value(&client.ec_public_jwks),
         "mtls.ca_cert" => Ok(Value::String(client.mtls_ca_certificate.to_string())),
         "mtls.client_cert" => Ok(Value::String(client.mtls_client_certificate.to_string())),

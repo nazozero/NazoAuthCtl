@@ -206,9 +206,9 @@ impl PreparedMaterialization {
 struct PreparedClient {
     logical_client_id: String,
     client_secret: Zeroizing<String>,
-    rsa_private_jwk: Zeroizing<String>,
+    rsa_private_jwks: Zeroizing<String>,
     rsa_public_jwks: Zeroizing<String>,
-    ec_private_jwk: Zeroizing<String>,
+    ec_private_jwks: Zeroizing<String>,
     ec_public_jwks: Zeroizing<String>,
     mtls_ca_certificate: Zeroizing<String>,
     mtls_client_certificate: Zeroizing<String>,
@@ -220,9 +220,9 @@ struct PreparedClient {
 impl Zeroize for PreparedClient {
     fn zeroize(&mut self) {
         self.client_secret.zeroize();
-        self.rsa_private_jwk.zeroize();
+        self.rsa_private_jwks.zeroize();
         self.rsa_public_jwks.zeroize();
-        self.ec_private_jwk.zeroize();
+        self.ec_private_jwks.zeroize();
         self.ec_public_jwks.zeroize();
         self.mtls_ca_certificate.zeroize();
         self.mtls_client_certificate.zeroize();
@@ -658,9 +658,9 @@ impl PreparedClient {
         Ok(Self {
             logical_client_id,
             client_secret,
-            rsa_private_jwk: generated.rsa_private_jwk,
+            rsa_private_jwks: generated.rsa_private_jwks,
             rsa_public_jwks: generated.rsa_public_jwks,
-            ec_private_jwk: generated.ec_private_jwk,
+            ec_private_jwks: generated.ec_private_jwks,
             ec_public_jwks: generated.ec_public_jwks,
             mtls_ca_certificate: generated.mtls_ca_certificate,
             mtls_client_certificate: generated.mtls_client_certificate,
@@ -834,7 +834,7 @@ mod tests {
                 }}],
                 "plans":[{"id":"basic","plan":"oidcc-basic-certification-test-plan",
                     "config_template":{"issuer":"{{target.issuer}}","client_id":"{{client.web.id}}",
-                        "client_secret":"{{client.web.client_secret}}","jwks":"{{client.web.ec.public_jwks}}",
+                        "client_secret":"{{client.web.client_secret}}","jwks":"{{client.web.ec.private_jwks}}",
                         "password":"{{generated.applicant_password}}"},
                     "required_roles":[]}]
             }]
@@ -943,6 +943,13 @@ mod tests {
                 .and_then(Value::as_str)
                 .is_some()
         );
+        let private_key = config
+            .get("jwks")
+            .and_then(|value| value.get("keys"))
+            .and_then(Value::as_array)
+            .and_then(|keys| keys.first())
+            .expect("Suite client.jwks must be a JWKS containing a private key");
+        assert!(private_key.get("d").and_then(Value::as_str).is_some());
         assert_eq!(matrix.matrix_sha256().len(), 64);
     }
 

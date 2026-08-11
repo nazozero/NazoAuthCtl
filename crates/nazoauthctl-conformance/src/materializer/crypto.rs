@@ -17,9 +17,9 @@ pub(super) const MTLS_CLIENT_SAN_DNS: &str = "nazoauthctl-client";
 
 pub(super) struct GeneratedClientCrypto {
     pub(super) client_secret: Zeroizing<String>,
-    pub(super) rsa_private_jwk: Zeroizing<String>,
+    pub(super) rsa_private_jwks: Zeroizing<String>,
     pub(super) rsa_public_jwks: Zeroizing<String>,
-    pub(super) ec_private_jwk: Zeroizing<String>,
+    pub(super) ec_private_jwks: Zeroizing<String>,
     pub(super) ec_public_jwks: Zeroizing<String>,
     pub(super) mtls_ca_certificate: Zeroizing<String>,
     pub(super) mtls_client_certificate: Zeroizing<String>,
@@ -34,9 +34,9 @@ pub(super) fn generate_client_crypto(
     let mut rng = OsRng;
     let rsa = RsaPrivateKey::new(&mut rng, policy.rsa_bits as usize)
         .map_err(|_| MaterializerError::Crypto)?;
-    let (rsa_private_jwk, rsa_public_jwks) = rsa_jwks(&rsa)?;
+    let (rsa_private_jwks, rsa_public_jwks) = rsa_jwks(&rsa)?;
     let ec = SigningKey::random(&mut rng);
-    let (ec_private_jwk, ec_public_jwks) = ec_jwks(&ec)?;
+    let (ec_private_jwks, ec_public_jwks) = ec_jwks(&ec)?;
     let (
         mtls_ca_certificate,
         mtls_client_certificate,
@@ -45,9 +45,9 @@ pub(super) fn generate_client_crypto(
     ) = generate_mtls()?;
     Ok(GeneratedClientCrypto {
         client_secret,
-        rsa_private_jwk: Zeroizing::new(rsa_private_jwk),
+        rsa_private_jwks: Zeroizing::new(rsa_private_jwks),
         rsa_public_jwks: Zeroizing::new(rsa_public_jwks),
-        ec_private_jwk: Zeroizing::new(ec_private_jwk),
+        ec_private_jwks: Zeroizing::new(ec_private_jwks),
         ec_public_jwks: Zeroizing::new(ec_public_jwks),
         mtls_ca_certificate: Zeroizing::new(mtls_ca_certificate),
         mtls_client_certificate: Zeroizing::new(mtls_client_certificate),
@@ -85,8 +85,8 @@ pub(super) fn rsa_jwks(key: &RsaPrivateKey) -> Result<(String, String), Material
         "qi": b64(key.qinv().and_then(|value| value.to_biguint()).ok_or(MaterializerError::Crypto)?.to_bytes_be()),
         "alg": "PS256", "use": "sig", "key_ops": ["sign"]
     });
-    let private_string =
-        serde_json::to_string(&private).map_err(|_| MaterializerError::Encoding)?;
+    let private_string = serde_json::to_string(&serde_json::json!({"keys": [private]}))
+        .map_err(|_| MaterializerError::Encoding)?;
     let public_jwks = serde_json::to_string(&serde_json::json!({"keys": [public]}))
         .map_err(|_| MaterializerError::Encoding)?;
     Ok((private_string, public_jwks))
@@ -108,8 +108,8 @@ pub(super) fn ec_jwks(key: &SigningKey) -> Result<(String, String), Materializer
         "kty":"EC", "crv":"P-256", "x":b64(x), "y":b64(y), "d":b64(key.to_bytes()), "kid":kid,
         "alg":"ES256", "use":"sig", "key_ops":["sign"]
     });
-    let private_string =
-        serde_json::to_string(&private).map_err(|_| MaterializerError::Encoding)?;
+    let private_string = serde_json::to_string(&serde_json::json!({"keys": [private]}))
+        .map_err(|_| MaterializerError::Encoding)?;
     let public_jwks = serde_json::to_string(&serde_json::json!({"keys": [public]}))
         .map_err(|_| MaterializerError::Encoding)?;
     Ok((private_string, public_jwks))
