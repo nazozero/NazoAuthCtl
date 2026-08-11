@@ -463,21 +463,22 @@ mod tests {
         let state = OpenId4VcBrowserState::parse(
             &json!({
                 "show_qr_code": false,
-                "urls": [{
-                    "url": "https://target.example/authorize?state=opaque",
-                    "method": "GET"
-                }],
+                "urls": [],
                 "urlsWithMethod": [],
                 "browserApiRequests": [],
                 "uriInputRequests": [],
-                "visited": [],
+                "visited": [{
+                    "url": "https://target.example/authorize?state=opaque",
+                    "method": "GET"
+                }],
                 "visitedUrlsWithMethod": [],
                 "runners": []
             }),
             &policy,
         )
         .expect("runner browser state");
-        assert_eq!(state.pending_url().map(Url::path), Some("/authorize"));
+        assert!(state.pending_url().is_none());
+        assert_eq!(state.visited().first().map(Url::path), Some("/authorize"));
 
         assert!(matches!(
             OpenId4VcBrowserState::parse(

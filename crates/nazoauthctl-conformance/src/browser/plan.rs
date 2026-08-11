@@ -36,12 +36,6 @@ impl OpenId4VcBrowserState {
             policy,
         )?;
         let visited = parse_browser_urls(object.get("visited"), policy)?;
-        if visited
-            .iter()
-            .any(|seen| !urls.iter().any(|url| url == seen))
-        {
-            return Err(BrowserError::InvalidSchema);
-        }
         Ok(Self { urls, visited })
     }
 
