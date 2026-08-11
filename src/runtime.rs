@@ -387,9 +387,9 @@ impl<'a> Runtime<'a> {
                 );
             }
             let openid4vc_data_encryption_key =
-                self.required_runtime_secret("openid4vc-data-encryption-key")?;
+                self.required_mount("/run/nazoauth-secrets/openid4vc-data-encryption-key")?;
             mounts.push(task_mount(
-                &openid4vc_data_encryption_key,
+                &openid4vc_data_encryption_key.source,
                 Path::new("/run/nazoauth-operator/openid4vc-data-encryption-key"),
                 true,
             ));
@@ -587,8 +587,11 @@ impl<'a> Runtime<'a> {
                     "%d/pairwise-subject-secret".to_owned(),
                 );
             }
-            let openid4vc_data_encryption_key =
-                app_root.join("secrets/openid4vc-data-encryption-key");
+            let openid4vc_data_encryption_key = self
+                .config
+                .runtime
+                .working_directory
+                .join("secrets/openid4vc-data-encryption-key");
             require_real_regular_file(
                 &openid4vc_data_encryption_key,
                 "conformance OpenID4VC data encryption key",

@@ -416,14 +416,20 @@ fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
         "fixture-pepper",
     )
     .unwrap();
-    fs::write(
-        runtime_secret_directory.join("openid4vc-data-encryption-key"),
-        "fixture-encryption-key",
-    )
-    .unwrap();
+    let openid4vc_data_encryption_key = work
+        .path()
+        .join("config/secrets/openid4vc-data-encryption-key");
+    fs::create_dir_all(openid4vc_data_encryption_key.parent().unwrap()).unwrap();
+    fs::write(&openid4vc_data_encryption_key, "fixture-encryption-key").unwrap();
     config.runtime.mounts.push(Mount {
         source: runtime_secret_directory.clone(),
         target: PathBuf::from("/var/lib/nazo_oauth/secrets"),
+        read_only: true,
+        selinux_relabel: true,
+    });
+    config.runtime.mounts.push(Mount {
+        source: openid4vc_data_encryption_key.clone(),
+        target: PathBuf::from("/run/nazoauth-secrets/openid4vc-data-encryption-key"),
         read_only: true,
         selinux_relabel: true,
     });
@@ -518,7 +524,7 @@ fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
         Some(&"/run/nazoauth-operator/openid4vc-data-encryption-key".to_owned())
     );
     assert!(onboarding.mounts.iter().any(|mount| {
-        mount.source == runtime_secret_directory.join("openid4vc-data-encryption-key")
+        mount.source == openid4vc_data_encryption_key
             && mount.destination
                 == Path::new("/run/nazoauth-operator/openid4vc-data-encryption-key")
             && mount.read_only
