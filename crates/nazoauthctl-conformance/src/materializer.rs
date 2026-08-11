@@ -230,6 +230,13 @@ impl PreparedMaterialization {
         &self.applicant_email
     }
 
+    /// Return a zeroizing clone for the lease-owned hosted authorization
+    /// session. The password remains neither serializable nor printable and
+    /// is only copied across this explicit in-memory boundary.
+    pub fn applicant_password(&self) -> Zeroizing<String> {
+        Zeroizing::new(self.applicant_password.to_string())
+    }
+
     pub fn suite_base_url(&self) -> &str {
         &self.suite_base_url
     }

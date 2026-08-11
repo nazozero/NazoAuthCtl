@@ -290,6 +290,8 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let applicant_id = uuid::Uuid::parse_str(&onboarding.applicant_id)
         .context("operator onboarding returned an invalid applicant identifier")?;
     let static_tx_code = prepared.tx_code();
+    let hosted_email = Zeroizing::new(prepared.applicant_email().to_owned());
+    let hosted_password = prepared.applicant_password();
 
     let run_result = (|| -> anyhow::Result<RunOutput> {
         let onboarding_output = OnboardingOutput::new(
@@ -326,11 +328,12 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                         suite_origin.clone(),
                         applicant_id,
                         static_tx_code.clone(),
+                        hosted_email.clone(),
+                        hosted_password.clone(),
                         Duration::from_secs(30),
                     )?,
                     openid4vci_management_token.clone(),
                     token.clone(),
-                    browser.clone(),
                 )?));
             let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
                 Arc::new(Mutex::new(OpenId4VpVerifierClient::new(
