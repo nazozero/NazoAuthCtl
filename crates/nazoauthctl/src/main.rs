@@ -9,7 +9,7 @@ use anyhow::{Context as _, bail};
 use nazoauthctl_conformance::{
     BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy, BrowserTargetOrigin,
     ClientConfig, ConformanceBinding, ConformanceRunConfig, ConformanceRunner, CredentialStore,
-    DescriptorMaterializer, ManagedWebDriver, MatrixSelection, OnboardingOutput,
+    DescriptorMaterializer, MAX_PARALLEL_JOBS, ManagedWebDriver, MatrixSelection, OnboardingOutput,
     OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
     OpenId4VpVerifierClient, Origin, RunControl, StableRenderer, SuiteClient, TtyRenderer,
     WebDriverClient, WebDriverEndpoint,
@@ -20,6 +20,7 @@ use zeroize::{Zeroize, Zeroizing};
 const DEFAULT_CONFIG: &str = "/etc/nazoauth/update.json";
 const DEFAULT_POLL_TIMEOUT_SECONDS: u64 = 1_800;
 const DEFAULT_LEASE_TTL_SECONDS: u64 = 14_400;
+const DEFAULT_JOBS: usize = 4;
 const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
 
 fn main() {
@@ -69,6 +70,7 @@ struct RunInvocation {
     plans: Vec<String>,
     poll_timeout: Duration,
     lease_ttl_seconds: u64,
+    jobs: usize,
 }
 
 fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocation>> {
@@ -129,12 +131,14 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
     let mut plans = Vec::new();
     let mut poll_timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECONDS);
     let mut lease_ttl_seconds = DEFAULT_LEASE_TTL_SECONDS;
+    let mut jobs = DEFAULT_JOBS;
     let mut index = 0usize;
     while index < values.len() {
         let option = values[index].as_str();
         match option {
             "--suite" | "--token" | "--token-file" | "--token-fd" | "--webdriver"
-            | "--evidence-dir" | "--group" | "--plan" | "--poll-timeout" | "--lease-ttl" => {
+            | "--evidence-dir" | "--group" | "--plan" | "--poll-timeout" | "--lease-ttl"
+            | "--jobs" => {
                 let value = values
                     .get(index + 1)
                     .with_context(|| format!("{option} requires a value"))?
@@ -167,6 +171,11 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
                             .parse::<u64>()
                             .context("--lease-ttl must be an integer")?;
                     }
+                    "--jobs" => {
+                        jobs = value
+                            .parse::<usize>()
+                            .context("--jobs must be an integer")?;
+                    }
                     _ => unreachable!(),
                 }
                 index += 2;
@@ -188,8 +197,13 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
     if token_sources > 1 {
         bail!("--token, --token-file, --token-stdin, and --token-fd are mutually exclusive");
     }
-    if poll_timeout.is_zero() || !(300..=86_400).contains(&lease_ttl_seconds) {
-        bail!("poll timeout must be positive and lease TTL must be between 300 and 86400 seconds");
+    if poll_timeout.is_zero()
+        || !(300..=86_400).contains(&lease_ttl_seconds)
+        || !(1..=MAX_PARALLEL_JOBS).contains(&jobs)
+    {
+        bail!(
+            "poll timeout must be positive, lease TTL must be between 300 and 86400 seconds, and jobs must be between 1 and {MAX_PARALLEL_JOBS}"
+        );
     }
     Ok(Some(RunInvocation {
         config,
@@ -205,6 +219,7 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
         plans,
         poll_timeout,
         lease_ttl_seconds,
+        jobs,
     }))
 }
 
@@ -339,6 +354,7 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             binding,
             poll_timeout: invocation.poll_timeout,
             control,
+            jobs: invocation.jobs,
             browser: Some(browser),
             verifier: Some(verifier),
             issuer: Some(issuer),
@@ -522,7 +538,7 @@ struct DeploymentReport {
 
 fn print_run_help() {
     println!(
-        "Usage:\n  nazoauthctl [--deployment ID_OR_ALIAS] [--config PATH] conformance run [options]\n\nOptions:\n  --suite URL             OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN           API token; visible in argv/shell history\n  --token-file PATH       Read token from a private regular file\n  --token-stdin           Read token from stdin\n  --token-fd FD           Read token from an inherited private descriptor\n  --webdriver URL         Use an existing W3C WebDriver endpoint\n  --evidence-dir PATH     Persist private raw Suite evidence securely\n  --group ID              Run one Matrix group; repeat to select more\n  --plan ID               Run one Matrix plan; repeat to select more\n  --poll-timeout SECONDS  Per-module Suite wait bound (default: 1800)\n  --lease-ttl SECONDS     Deployment lease lifetime (default: 14400)"
+        "Usage:\n  nazoauthctl [--deployment ID_OR_ALIAS] [--config PATH] conformance run [options]\n\nOptions:\n  --suite URL             OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN           API token; visible in argv/shell history\n  --token-file PATH       Read token from a private regular file\n  --token-stdin           Read token from stdin\n  --token-fd FD           Read token from an inherited private descriptor\n  --webdriver URL         Use an existing W3C WebDriver endpoint\n  --evidence-dir PATH     Persist private raw Suite evidence securely\n  --group ID              Run one Matrix group; repeat to select more\n  --plan ID               Run one Matrix plan; repeat to select more\n  --jobs N                Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS  Per-module Suite wait bound (default: 1800)\n  --lease-ttl SECONDS     Deployment lease lifetime (default: 14400)"
     );
 }
 
@@ -561,6 +577,8 @@ mod tests {
             "oidc",
             "--plan",
             "oidc-core-p001",
+            "--jobs",
+            "3",
         ]))
         .expect("parse")
         .expect("run");
@@ -569,6 +587,24 @@ mod tests {
         assert_eq!(parsed.token_fd, Some(7));
         assert_eq!(parsed.groups, ["oidc"]);
         assert_eq!(parsed.plans, ["oidc-core-p001"]);
+        assert_eq!(parsed.jobs, 3);
+    }
+
+    #[test]
+    fn run_rejects_jobs_outside_the_validated_bound() {
+        for jobs in ["0", "5"] {
+            let error = match parse_run_invocation(&args(&[
+                "nazoauthctl",
+                "conformance",
+                "run",
+                "--jobs",
+                jobs,
+            ])) {
+                Err(error) => error,
+                Ok(_) => panic!("jobs outside 1-4 must fail"),
+            };
+            assert!(error.to_string().contains("jobs must be between 1 and 4"));
+        }
     }
 
     #[test]

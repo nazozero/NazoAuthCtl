@@ -38,6 +38,7 @@ impl Default for ClientConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct SuiteClient {
     origin: Origin,
     token: Option<BearerToken>,

@@ -27,6 +27,10 @@ use crate::report::{
     OrchestrationIntegrity, PlanReport,
 };
 
+mod parallel;
+
+pub const MAX_PARALLEL_JOBS: usize = 4;
+
 #[derive(Clone)]
 pub struct RunControl {
     interrupted: Arc<AtomicBool>,
@@ -61,6 +65,11 @@ pub struct ConformanceRunConfig {
     pub binding: ConformanceBinding,
     pub poll_timeout: Duration,
     pub control: RunControl,
+    /// Maximum number of independent Suite plans executed at once. Modules
+    /// inside one plan remain strictly ordered. Browser, verifier, and issuer
+    /// automation retain their existing mutex-owned sessions, so parallel
+    /// HTTP runners cannot interleave interactive state.
+    pub jobs: usize,
     /// Optional bounded Rust-native WebDriver driver.  It is invoked only for
     /// a Suite runner that exposes WAITING plus a URL and only with browser
     /// tasks from that plan's materialized config.
@@ -99,7 +108,7 @@ struct PlannedPlan {
 
 impl ConformanceRunner {
     pub fn new(config: ConformanceRunConfig) -> Result<Self, OrchestrationError> {
-        if config.poll_timeout.is_zero() {
+        if config.poll_timeout.is_zero() || !(1..=MAX_PARALLEL_JOBS).contains(&config.jobs) {
             return Err(OrchestrationError::InvalidInput);
         }
         validate_matrix_origins(
@@ -352,6 +361,13 @@ impl ConformanceRunner {
     }
 
     pub fn run<S: ProgressSink>(&self, sink: &mut S) -> RunSummary {
+        if self.config.jobs == 1 || self.config.matrix.document.plan_count() <= 1 {
+            return self.run_serial(sink);
+        }
+        parallel::run(self, sink)
+    }
+
+    fn run_serial<S: ProgressSink>(&self, sink: &mut S) -> RunSummary {
         let mut groups = self
             .config
             .matrix
@@ -1178,6 +1194,7 @@ mod tests {
                 binding: test_binding(),
                 poll_timeout: Duration::from_secs(1),
                 control: RunControl::default(),
+                jobs: 1,
                 browser: None,
                 verifier: None,
                 issuer: None,
@@ -1338,6 +1355,7 @@ mod tests {
             binding: test_binding(),
             poll_timeout: Duration::from_secs(30),
             control,
+            jobs: 1,
             browser: None,
             verifier: None,
             issuer: None,
@@ -1411,6 +1429,7 @@ mod tests {
             binding: test_binding(),
             poll_timeout: Duration::from_millis(250),
             control,
+            jobs: 1,
             browser: None,
             verifier: None,
             issuer: None,
@@ -1542,6 +1561,7 @@ mod tests {
             binding: test_binding(),
             poll_timeout: Duration::from_secs(2),
             control: RunControl::default(),
+            jobs: 1,
             browser: None,
             verifier: None,
             issuer: None,
