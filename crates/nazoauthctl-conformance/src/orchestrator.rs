@@ -12,8 +12,8 @@ use thiserror::Error;
 use url::Url;
 
 use crate::browser::{
-    BrowserAutomation, BrowserError, BrowserPolicy, BrowserTargetOrigin, ConformanceBinding,
-    OpenId4VcBrowserState, OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule,
+    BrowserAutomation, BrowserError, BrowserPolicy, BrowserRunnerState, BrowserTargetOrigin,
+    ConformanceBinding, OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule,
     OpenId4VpStartRequest, OpenId4VpVerifier, parse_browser_entries_owned,
 };
 use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
@@ -298,7 +298,7 @@ impl ConformanceRunner {
                 self.wait_for_runner_refresh(deadline, "browser")?;
                 continue;
             };
-            let browser_state = OpenId4VcBrowserState::parse(browser_state, &policy)
+            let browser_state = BrowserRunnerState::parse(browser_state, &policy)
                 .map_err(|error| error.to_string())?;
             let pending_url = browser_state.urls().iter().find(|url| {
                 let digest: [u8; 32] = Sha256::digest(url.as_str().as_bytes()).into();

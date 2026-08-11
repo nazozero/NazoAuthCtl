@@ -13,22 +13,22 @@ use super::validation::BrowserPolicy;
 /// `visited`. `visited` is bookkeeping only and is never trusted as evidence
 /// that a Suite module passed.
 #[derive(Clone)]
-pub struct OpenId4VcBrowserState {
+pub struct BrowserRunnerState {
     urls: Vec<Url>,
     visited: Vec<Url>,
 }
 
-impl fmt::Debug for OpenId4VcBrowserState {
+impl fmt::Debug for BrowserRunnerState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("OpenId4VcBrowserState")
+            .debug_struct("BrowserRunnerState")
             .field("url_count", &self.urls.len())
             .field("visited_count", &self.visited.len())
             .finish()
     }
 }
 
-impl OpenId4VcBrowserState {
+impl BrowserRunnerState {
     pub fn parse(value: &Value, policy: &BrowserPolicy) -> Result<Self, BrowserError> {
         let object = value.as_object().ok_or(BrowserError::InvalidSchema)?;
         let urls = parse_browser_urls(
@@ -64,3 +64,7 @@ impl OpenId4VcBrowserState {
         &self.visited
     }
 }
+
+/// Backward-compatible name for callers that used the original, overly
+/// specific type name. Runner browser state is shared by OIDC and OpenID4VC.
+pub type OpenId4VcBrowserState = BrowserRunnerState;

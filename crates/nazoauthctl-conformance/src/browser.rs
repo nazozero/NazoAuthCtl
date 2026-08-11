@@ -85,7 +85,7 @@ pub use openid4vp::{
     OpenId4VpVerifier, OpenId4VpVerifierClient,
 };
 pub use parser::{parse_browser_entries, parse_browser_entries_owned};
-pub use plan::OpenId4VcBrowserState;
+pub use plan::{BrowserRunnerState, OpenId4VcBrowserState};
 pub use schema::{BrowserCommand, BrowserEntry, BrowserSelector, BrowserTask};
 pub use validation::{BrowserLimits, BrowserPolicy, BrowserTargetOrigin};
 pub use webdriver::{ManagedWebDriver, WebDriverClient, WebDriverEndpoint};
@@ -460,7 +460,7 @@ mod tests {
             Origin::parse("https://suite.example").expect("suite"),
         )
         .expect("policy");
-        let state = OpenId4VcBrowserState::parse(
+        let state = BrowserRunnerState::parse(
             &json!({
                 "show_qr_code": false,
                 "urls": [],
@@ -480,8 +480,18 @@ mod tests {
         assert!(state.pending_url().is_none());
         assert_eq!(state.visited().first().map(Url::path), Some("/authorize"));
 
+        let logout = BrowserRunnerState::parse(
+            &json!({
+                "urls": ["https://target.example/logout"],
+                "visited": []
+            }),
+            &policy,
+        )
+        .expect("OIDC logout runner URL");
+        assert_eq!(logout.pending_url().map(Url::path), Some("/logout"));
+
         assert!(matches!(
-            OpenId4VcBrowserState::parse(
+            BrowserRunnerState::parse(
                 &json!({
                     "urls": [{
                         "url": "https://target.example/authorize?state=opaque",

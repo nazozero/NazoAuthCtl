@@ -310,12 +310,7 @@ pub(super) fn parse_browser_urls(
         }
         let url = url::Url::parse(text).map_err(|_| BrowserError::InvalidSchema)?;
         policy.validate_url(&url)?;
-        if url.path() != "/authorize"
-            || url.query().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.fragment().is_some()
-        {
+        if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
             return Err(BrowserError::InvalidSchema);
         }
         if !parsed.iter().any(|candidate| candidate == &url) {
