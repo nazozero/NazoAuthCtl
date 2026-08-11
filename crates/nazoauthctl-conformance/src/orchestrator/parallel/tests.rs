@@ -204,11 +204,21 @@ fn parallel_fixture(
     (runner, transport)
 }
 
+#[derive(Default)]
+struct RecordingSink(Vec<ProgressSnapshot>);
+
+impl ProgressSink for RecordingSink {
+    fn update(&mut self, event: &ProgressEvent) {
+        self.0.push(event.snapshot.clone());
+    }
+}
+
 #[test]
 fn independent_plans_overlap_but_reports_remain_in_matrix_order() {
     let (runner, transport) = parallel_fixture(serde_json::json!({}), &["plan-a", "plan-b"], None);
+    let mut progress = RecordingSink::default();
 
-    let summary = runner.run(&mut ());
+    let summary = runner.run(&mut progress);
 
     assert!(
         summary.report.local_success,
@@ -231,6 +241,24 @@ fn independent_plans_overlap_but_reports_remain_in_matrix_order() {
     assert_eq!(summary.report.orchestration_integrity.defined_modules, 2);
     assert_eq!(summary.report.orchestration_integrity.terminal_modules, 2);
     assert!(summary.report.cleanup.failures.is_empty());
+    assert!(!progress.0.is_empty());
+    assert!(
+        progress.0.iter().all(|snapshot| snapshot.total == 2),
+        "the complete denominator must be frozen before any worker starts"
+    );
+    let requests = transport.requests.lock().expect("requests");
+    let first_runner = requests
+        .iter()
+        .position(|(_, path)| path == "/api/runner")
+        .expect("runner request");
+    assert_eq!(
+        requests[..first_runner]
+            .iter()
+            .filter(|(method, path)| *method == HttpMethod::Post && path == "/api/plan")
+            .count(),
+        2,
+        "every selected plan must be created before module execution begins"
+    );
 }
 
 #[test]
@@ -272,7 +300,18 @@ fn orchestration_error_stops_queued_plans_and_drains_in_flight_cleanup() {
             .any(|error| error.contains("scheduler stopped before every selected"))
     );
     let created_plans = transport.created_plans.lock().expect("plans").clone();
-    assert!(!created_plans.contains(&"plan-c".to_owned()));
+    assert_eq!(created_plans, ["plan-a", "plan-b", "plan-c"]);
+    assert_eq!(
+        summary
+            .report
+            .plans
+            .iter()
+            .find(|plan| plan.matrix_plan_id == "plan-c")
+            .expect("queued plan report")
+            .created_instances,
+        0,
+        "phase 1 creates every plan, but a fatal worker error must stop the queued plan before module execution"
+    );
     assert!(summary.report.cleanup.failures.is_empty());
     assert!(created_plans.iter().all(|plan| {
         summary

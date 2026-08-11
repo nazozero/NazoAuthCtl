@@ -94,6 +94,7 @@ pub struct ConformanceRunner {
 /// module definitions enumerated before any module is started, freezing the
 /// progress denominator and ensuring later failures can clean up everything
 /// already allocated by the Suite.
+#[derive(Clone)]
 struct PlannedPlan {
     group_index: usize,
     matrix_plan_id: String,
@@ -105,6 +106,17 @@ struct PlannedPlan {
     modules: Vec<ModuleDefinition>,
     config: Value,
     report_index: usize,
+}
+
+struct PreparedRun {
+    groups: Vec<GroupProgress>,
+    plans: Vec<PlanReport>,
+    planned: Vec<PlannedPlan>,
+    suite_plan_ids: Vec<String>,
+    errors: Vec<String>,
+    auth_probe: Option<crate::client::AuthProbe>,
+    current_profile: Option<String>,
+    current_variant: Option<BTreeMap<String, String>>,
 }
 
 impl ConformanceRunner {
@@ -371,7 +383,7 @@ impl ConformanceRunner {
         parallel::run(self, sink)
     }
 
-    fn run_serial<S: ProgressSink>(&self, sink: &mut S) -> RunSummary {
+    fn prepare_run(&self) -> PreparedRun {
         let mut groups = self
             .config
             .matrix
@@ -392,15 +404,11 @@ impl ConformanceRunner {
             .collect::<Vec<_>>();
         let mut plans = Vec::new();
         let mut planned = Vec::<PlannedPlan>::new();
-        let mut modules = Vec::new();
-        let mut cleanup = CleanupReport::default();
         let mut suite_plan_ids = Vec::<String>::new();
-        let mut module_ids = Vec::<String>::new();
         let mut errors = Vec::<String>::new();
         let mut auth_probe = None;
         let mut current_profile = None;
         let mut current_variant = None;
-        let mut current_test = None;
 
         match self.config.client.probe_auth() {
             Ok(probe) => auth_probe = Some(probe),
@@ -427,7 +435,6 @@ impl ConformanceRunner {
                     let variant = group.effective_variant(plan);
                     let runtime_variant = group.effective_runtime_variant(plan);
                     current_variant = Some(redacted_variant(&variant));
-                    current_test = None;
                     let created =
                         match self
                             .config
@@ -468,6 +475,38 @@ impl ConformanceRunner {
                 }
             }
         }
+
+        PreparedRun {
+            groups,
+            plans,
+            planned,
+            suite_plan_ids,
+            errors,
+            auth_probe,
+            current_profile,
+            current_variant,
+        }
+    }
+
+    fn run_serial<S: ProgressSink>(&self, sink: &mut S) -> RunSummary {
+        self.run_prepared(sink, self.prepare_run())
+    }
+
+    fn run_prepared<S: ProgressSink>(&self, sink: &mut S, prepared: PreparedRun) -> RunSummary {
+        let PreparedRun {
+            mut groups,
+            mut plans,
+            mut planned,
+            suite_plan_ids,
+            mut errors,
+            auth_probe,
+            mut current_profile,
+            mut current_variant,
+        } = prepared;
+        let mut modules = Vec::new();
+        let mut cleanup = CleanupReport::default();
+        let mut module_ids = Vec::<String>::new();
+        let mut current_test = None;
 
         // The denominator is now frozen. A plan-creation failure leaves the
         // successfully created subset visible, but no execution is attempted.

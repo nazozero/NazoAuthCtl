@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use super::*;
-use crate::matrix::{MatrixDocument, SelectedMatrix};
 
 const SUITE_NON_SUCCESS: &str = "Suite reported a non-success or incomplete module result";
 const SCHEDULER_INCOMPLETE: &str =
@@ -15,7 +14,9 @@ struct PlanWork {
     index: usize,
     group_index: usize,
     matrix_plan_id: String,
-    matrix: SelectedMatrix,
+    group: GroupProgress,
+    report: PlanReport,
+    plan: PlannedPlan,
     serialized_ciba: bool,
 }
 
@@ -47,7 +48,24 @@ impl ProgressSink for ChannelSink {
 }
 
 pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> RunSummary {
-    let work = plan_work(&runner.config.matrix);
+    // Phase 1 is single-owner and completes before any worker is launched.
+    // This freezes the complete denominator and gives cleanup one inventory
+    // containing every Suite plan, including plans never dequeued after a
+    // later worker failure or interruption.
+    let prepared = runner.prepare_run();
+    sink.update(&ProgressEvent {
+        snapshot: snapshot(
+            &prepared.groups,
+            prepared.current_profile.clone(),
+            prepared.current_variant.clone(),
+            None,
+        ),
+    });
+    if !prepared.errors.is_empty() || prepared.planned.is_empty() {
+        return runner.run_prepared(sink, prepared);
+    }
+
+    let work = plan_work(&prepared);
     let worker_count = runner.config.jobs.min(work.len());
     let queue = Arc::new(Mutex::new(VecDeque::from(work.clone())));
     let stop_launching = Arc::new(AtomicBool::new(false));
@@ -82,7 +100,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                         let child = ConformanceRunner {
                             config: ConformanceRunConfig {
                                 client: runner.config.client.clone(),
-                                matrix: next.matrix.clone(),
+                                matrix: runner.config.matrix.clone(),
                                 target_origin: runner.config.target_origin.clone(),
                                 binding: runner.config.binding.clone(),
                                 poll_timeout: runner.config.poll_timeout,
@@ -101,15 +119,12 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                             index: next.index,
                             sender: sender.clone(),
                         };
-                        // The validated Python runner keeps CIBA globally
-                        // serial. Browser/VCI/VP plans use this worker's own
-                        // automation lane and may overlap other workers.
                         let _ciba_guard = if next.serialized_ciba {
                             Some(ciba_lane.lock().map_err(|_| ()).expect("CIBA lane lock"))
                         } else {
                             None
                         };
-                        let summary = child.run_serial(&mut progress);
+                        let summary = child.run_prepared(&mut progress, worker_prepared(&next));
                         if has_fatal_orchestration_failure(&summary.report) {
                             stop_launching.store(true, Ordering::SeqCst);
                         }
@@ -140,7 +155,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                     snapshots[index] = Some(snapshot);
                     sink.update(&ProgressEvent {
                         snapshot: aggregate_progress(
-                            &runner.config.matrix,
+                            &prepared.groups,
                             &work,
                             &snapshots,
                             &finished,
@@ -153,7 +168,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                     results[index] = Some(*summary);
                     sink.update(&ProgressEvent {
                         snapshot: aggregate_progress(
-                            &runner.config.matrix,
+                            &prepared.groups,
                             &work,
                             &snapshots,
                             &finished,
@@ -170,61 +185,79 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
         }
     });
 
-    merge_reports(runner, &work, snapshots, finished, results, worker_panicked)
+    merge_reports(
+        runner,
+        prepared,
+        &work,
+        snapshots,
+        finished,
+        results,
+        worker_panicked,
+    )
 }
 
-fn plan_work(matrix: &SelectedMatrix) -> Vec<PlanWork> {
-    let mut work = Vec::new();
-    for (group_index, group) in matrix.document.groups.iter().enumerate() {
-        for plan in &group.plans {
-            work.push(PlanWork {
-                index: work.len(),
-                group_index,
-                matrix_plan_id: plan.id.clone(),
-                serialized_ciba: plan.plan.contains("ciba"),
-                matrix: SelectedMatrix {
-                    document: MatrixDocument {
-                        schema: matrix.document.schema,
-                        name: matrix.document.name.clone(),
-                        groups: vec![crate::matrix::MatrixGroup {
-                            id: group.id.clone(),
-                            profile: group.profile.clone(),
-                            variant: group.variant.clone(),
-                            plans: vec![plan.clone()],
-                        }],
-                    },
-                    digest: matrix.digest.clone(),
-                },
-            });
-        }
+fn plan_work(prepared: &PreparedRun) -> Vec<PlanWork> {
+    prepared
+        .planned
+        .iter()
+        .enumerate()
+        .map(|(index, plan)| PlanWork {
+            index,
+            group_index: plan.group_index,
+            matrix_plan_id: plan.matrix_plan_id.clone(),
+            group: prepared.groups[plan.group_index].clone(),
+            report: prepared.plans[plan.report_index].clone(),
+            plan: plan.clone(),
+            serialized_ciba: plan.plan_name.contains("ciba"),
+        })
+        .collect()
+}
+
+fn worker_prepared(work: &PlanWork) -> PreparedRun {
+    let mut group = work.group.clone();
+    group.completed = 0;
+    group.total = work.plan.modules.len();
+    group.status = GroupStatus::Remaining;
+    group.passed = 0;
+    group.failed = 0;
+    group.running = 0;
+    group.remaining = group.total;
+    let mut plan = work.plan.clone();
+    plan.group_index = 0;
+    plan.report_index = 0;
+    let mut report = work.report.clone();
+    report.created_instances = 0;
+    PreparedRun {
+        groups: vec![group.clone()],
+        plans: vec![report],
+        planned: vec![plan],
+        // Workers cancel their runner modules, while the phase-1 owner
+        // deletes every plan after all workers have drained.
+        suite_plan_ids: Vec::new(),
+        errors: Vec::new(),
+        auth_probe: None,
+        current_profile: Some(group.profile),
+        current_variant: Some(redacted_variant(&work.plan.variant)),
     }
-    work
 }
 
 fn aggregate_progress(
-    matrix: &SelectedMatrix,
+    base_groups: &[GroupProgress],
     work: &[PlanWork],
     snapshots: &[Option<ProgressSnapshot>],
     finished: &[bool],
 ) -> ProgressSnapshot {
-    let mut groups = matrix
-        .document
-        .groups
-        .iter()
-        .map(|group| GroupProgress {
-            id: group.id.clone(),
-            profile: group.profile.clone(),
-            completed: 0,
-            total: 0,
-            status: GroupStatus::Remaining,
-            passed: 0,
-            failed: 0,
-            running: 0,
-            remaining: 0,
-        })
-        .collect::<Vec<_>>();
-    for (index, snapshot) in snapshots.iter().enumerate() {
-        let Some(source) = snapshot
+    let mut groups = base_groups.to_vec();
+    for group in &mut groups {
+        group.completed = 0;
+        group.status = GroupStatus::Remaining;
+        group.passed = 0;
+        group.failed = 0;
+        group.running = 0;
+        group.remaining = group.total;
+    }
+    for (index, worker_snapshot) in snapshots.iter().enumerate() {
+        let Some(source) = worker_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.groups.first())
         else {
@@ -232,13 +265,14 @@ fn aggregate_progress(
         };
         let target = &mut groups[work[index].group_index];
         target.completed += source.completed;
-        target.total += source.total;
         target.passed += source.passed;
         target.failed += source.failed;
         target.running += source.running;
-        target.remaining += source.remaining;
     }
     for (group_index, group) in groups.iter_mut().enumerate() {
+        group.remaining = group
+            .total
+            .saturating_sub(group.completed.saturating_add(group.running));
         let indices = work
             .iter()
             .filter(|work| work.group_index == group_index)
@@ -275,6 +309,7 @@ fn aggregate_progress(
 
 fn merge_reports(
     runner: &ConformanceRunner,
+    prepared: PreparedRun,
     work: &[PlanWork],
     snapshots: Vec<Option<ProgressSnapshot>>,
     finished: Vec<bool>,
@@ -282,10 +317,9 @@ fn merge_reports(
     worker_panicked: bool,
 ) -> RunSummary {
     let all_plans_finished = results.iter().all(Option::is_some);
-    let progress = aggregate_progress(&runner.config.matrix, work, &snapshots, &finished);
-    let mut auth_probe = None;
-    let mut errors = Vec::new();
-    let mut plans = Vec::new();
+    let progress = aggregate_progress(&prepared.groups, work, &snapshots, &finished);
+    let mut errors = prepared.errors;
+    let mut plans = prepared.plans;
     let mut modules = Vec::new();
     let mut cleanup = CleanupReport::default();
     if worker_panicked {
@@ -296,7 +330,9 @@ fn merge_reports(
             continue;
         };
         let report = summary.report;
-        auth_probe = auth_probe.or(report.auth_probe);
+        if let Some(plan_report) = report.plans.first() {
+            plans[work[index].plan.report_index].created_instances = plan_report.created_instances;
+        }
         for error in report.errors {
             if error == SUITE_NON_SUCCESS {
                 continue;
@@ -309,15 +345,20 @@ fn merge_reports(
                 errors.push(format!("{}: {error}", work[index].matrix_plan_id));
             }
         }
-        plans.extend(report.plans);
         modules.extend(report.modules);
         cleanup.cancelled.extend(report.cleanup.cancelled);
-        cleanup.deleted_plans.extend(report.cleanup.deleted_plans);
-        cleanup
-            .immutable_plans
-            .extend(report.cleanup.immutable_plans);
         cleanup.failures.extend(report.cleanup.failures);
     }
+
+    // Phase 1 owns every Suite plan. Deletion is deliberately centralized
+    // after all workers stop so one worker can never delete a plan another
+    // worker still needs, and queued plans are cleaned even if never run.
+    cleanup_all(
+        &runner.config.client,
+        &[],
+        &prepared.suite_plan_ids,
+        &mut cleanup,
+    );
 
     if !all_plans_finished && !errors.iter().any(|error| error == "run interrupted") {
         errors.push(SCHEDULER_INCOMPLETE.to_owned());
@@ -355,7 +396,7 @@ fn merge_reports(
             schema: 2,
             matrix_digest: runner.config.matrix.digest.clone(),
             suite_origin: runner.config.client.origin().to_string(),
-            auth_probe,
+            auth_probe: prepared.auth_probe,
             errors,
             local_success,
             suite_pass,
