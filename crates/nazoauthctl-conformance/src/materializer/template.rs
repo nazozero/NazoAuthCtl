@@ -10,6 +10,15 @@ use super::{
     parse_placeholder, validate_binding_reference, validate_request_jti,
 };
 
+const USER_REJECT_MODULES: [&str; 2] = [
+    "fapi2-security-profile-final-user-rejects-authentication",
+    "fapi2-security-profile-id2-user-rejects-authentication",
+];
+const PAR_REUSE_BEFORE_AUTH_MODULES: [&str; 2] = [
+    "fapi2-security-profile-final-par-ensure-reused-request-uri-prior-to-auth-completion-succeeds",
+    "fapi2-security-profile-id2-par-ensure-reused-request-uri-prior-to-auth-completion-succeeds",
+];
+
 pub(super) fn materialize_value(
     value: &Value,
     bindings: &BTreeMap<String, String>,
@@ -211,7 +220,128 @@ pub(super) fn materialize_vci_config(
         Value::String(credential_format),
     );
     root.insert("nazo".to_owned(), Value::Object(nazo));
+    materialize_vci_browser_overrides(&mut root, target_issuer)?;
     Ok(Value::Object(root))
+}
+
+/// Materialize the module-specific Suite WebRunner configuration before the
+/// plan is created.  The Suite executes these overrides itself; changing only
+/// the local browser driver would race the default approval/login workflow.
+fn materialize_vci_browser_overrides(
+    root: &mut serde_json::Map<String, Value>,
+    target_issuer: &str,
+) -> Result<(), MaterializerError> {
+    let Some(browser) = root.get("browser") else {
+        return Ok(());
+    };
+    let browser = browser
+        .as_array()
+        .ok_or(MaterializerError::InvalidField("browser"))?;
+    let authorization_match = format!("{}/authorize*", target_issuer.trim_end_matches('/'));
+    let login_match = format!("{}/ui/auth*", target_issuer.trim_end_matches('/'));
+    let authorization_entries = browser
+        .iter()
+        .filter(|entry| entry.get("match").and_then(Value::as_str) == Some(&authorization_match))
+        .cloned()
+        .collect::<Vec<_>>();
+    if authorization_entries.len() != 1 {
+        return Err(MaterializerError::InvalidField("browser.authorize"));
+    }
+
+    let mut rejection_browser = authorization_entries.clone();
+    let mut denial_controls = 0usize;
+    replace_consent_approval_with_denial(&mut rejection_browser, &mut denial_controls)?;
+    if denial_controls < 2 {
+        return Err(MaterializerError::InvalidField("browser.consent_deny"));
+    }
+
+    let mut second_authorization = authorization_entries[0].clone();
+    second_authorization
+        .as_object_mut()
+        .ok_or(MaterializerError::InvalidField("browser.authorize"))?
+        .remove("match-limit");
+    let first_authorization = serde_json::json!({
+        "comment": "This module requires the first authorization endpoint visit to stop at the login page without authenticating.",
+        "match": authorization_match,
+        "match-limit": 1,
+        "tasks": [{
+            "task": "Observe first login page without authentication",
+            "match": login_match,
+            "commands": [[
+                "wait", "id", "nazo-login-email", 30, ".*",
+                "update-image-placeholder-optional"
+            ]]
+        }]
+    });
+    let par_browser = Value::Array(vec![first_authorization, second_authorization]);
+    let rejection_browser = Value::Array(rejection_browser);
+
+    let overrides = match root.entry("override".to_owned()) {
+        serde_json::map::Entry::Vacant(entry) => {
+            entry.insert(Value::Object(serde_json::Map::new()))
+        }
+        serde_json::map::Entry::Occupied(entry) => entry.into_mut(),
+    };
+    let overrides = overrides
+        .as_object_mut()
+        .ok_or(MaterializerError::InvalidField("override"))?;
+    for module in USER_REJECT_MODULES {
+        insert_exact_browser_override(overrides, module, &rejection_browser)?;
+    }
+    for module in PAR_REUSE_BEFORE_AUTH_MODULES {
+        insert_exact_browser_override(overrides, module, &par_browser)?;
+    }
+    Ok(())
+}
+
+fn replace_consent_approval_with_denial(
+    values: &mut [Value],
+    denial_controls: &mut usize,
+) -> Result<(), MaterializerError> {
+    for entry in values {
+        let tasks = entry
+            .get_mut("tasks")
+            .and_then(Value::as_array_mut)
+            .ok_or(MaterializerError::InvalidField("browser.tasks"))?;
+        for task in tasks {
+            let commands = task
+                .get_mut("commands")
+                .and_then(Value::as_array_mut)
+                .ok_or(MaterializerError::InvalidField("browser.commands"))?;
+            for command in commands {
+                let tuple = command
+                    .as_array_mut()
+                    .ok_or(MaterializerError::InvalidField("browser.command"))?;
+                if tuple.get(1).and_then(Value::as_str) == Some("id") {
+                    match tuple.get(2).and_then(Value::as_str) {
+                        Some("nazo-consent-approve") => {
+                            tuple[2] = Value::String("nazo-consent-deny".to_owned());
+                            *denial_controls += 1;
+                        }
+                        Some("nazo-consent-deny") => *denial_controls += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn insert_exact_browser_override(
+    overrides: &mut serde_json::Map<String, Value>,
+    module: &str,
+    browser: &Value,
+) -> Result<(), MaterializerError> {
+    let expected = serde_json::json!({"browser": browser});
+    match overrides.get(module) {
+        None => {
+            overrides.insert(module.to_owned(), expected);
+            Ok(())
+        }
+        Some(existing) if existing == &expected => Ok(()),
+        Some(_) => Err(MaterializerError::InvalidField("override.browser")),
+    }
 }
 
 pub(super) fn materialize_vp_config(

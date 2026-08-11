@@ -1238,6 +1238,28 @@ mod tests {
         let config = serde_json::json!({
             "alias": "nazo-vci-run",
             "vci": {"credential_configuration_id": "eu.example.pid"},
+            "browser": [{
+                "match": "https://issuer.example/authorize*",
+                "tasks": [
+                    {
+                        "task": "Complete login page",
+                        "match": "https://issuer.example/ui/auth*",
+                        "commands": [
+                            ["text", "id", "nazo-login-email", "applicant@example.test"],
+                            ["text", "id", "nazo-login-password", "password"],
+                            ["click", "id", "nazo-login-submit"]
+                        ]
+                    },
+                    {
+                        "task": "Complete consent page",
+                        "match": "https://issuer.example/ui/consent*",
+                        "commands": [
+                            ["wait-element-visible", "id", "nazo-consent-approve", 30],
+                            ["click", "id", "nazo-consent-approve"]
+                        ]
+                    }
+                ]
+            }],
             "nazo": {
                 "openid4vc_role": "issuer",
                 "client_auth_type": "private_key_jwt",
@@ -1281,6 +1303,53 @@ mod tests {
             materialized["vci"]["key_attestation_jwks"]["keys"][0]["d"]
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
+        );
+        let reject = &materialized["override"]["fapi2-security-profile-final-user-rejects-authentication"]
+            ["browser"];
+        let reject_text = serde_json::to_string(reject).expect("reject override");
+        assert!(!reject_text.contains("nazo-consent-approve"));
+        assert_eq!(reject_text.matches("nazo-consent-deny").count(), 2);
+        let par = &materialized["override"]["fapi2-security-profile-final-par-ensure-reused-request-uri-prior-to-auth-completion-succeeds"]
+            ["browser"];
+        assert_eq!(par[0]["match-limit"], 1);
+        let first_text = serde_json::to_string(&par[0]).expect("first authorization");
+        assert!(!first_text.contains("\"text\""));
+        assert!(!first_text.contains("\"click\""));
+        assert!(par[1].get("match-limit").is_none());
+        let second_text = serde_json::to_string(&par[1]).expect("second authorization");
+        assert!(second_text.contains("nazo-login-email"));
+        assert!(second_text.contains("nazo-login-submit"));
+
+        let rematerialized = materialize_vci_config(
+            "oid4vci-1_0-issuer-test-plan",
+            &variant,
+            materialized.clone(),
+            "https://issuer.example",
+            "https://suite.example",
+            None,
+            Some(&first_attestation),
+            test_trust_anchor(),
+        )
+        .expect("identical Suite overrides are idempotent");
+        assert_eq!(rematerialized["override"], materialized["override"]);
+
+        let mut conflicting_override = config.clone();
+        conflicting_override["override"] = serde_json::json!({
+            "fapi2-security-profile-final-user-rejects-authentication": {"browser": []}
+        });
+        assert_eq!(
+            materialize_vci_config(
+                "oid4vci-1_0-issuer-test-plan",
+                &variant,
+                conflicting_override,
+                "https://issuer.example",
+                "https://suite.example",
+                None,
+                Some(&first_attestation),
+                test_trust_anchor(),
+            )
+            .expect_err("conflicting Suite browser override must fail"),
+            MaterializerError::InvalidField("override.browser")
         );
 
         let mut conflicting_url = config.clone();

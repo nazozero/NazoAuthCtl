@@ -97,15 +97,9 @@ use validation::{
     validate_match_pattern,
 };
 
-const USER_REJECT_AUTHENTICATION_MODULES: [&str; 2] = [
-    "fapi2-security-profile-final-user-rejects-authentication",
-    "fapi2-security-profile-id2-user-rejects-authentication",
-];
-
-/// Select the Suite's module-specific browser override when present. Older
-/// executable Matrix documents did not carry the negative-consent override
-/// into OpenID4VC plans, so the two official user-rejection modules are
-/// normalized to the target's explicit deny control at this single boundary.
+/// Select the Suite's explicit module-specific browser override when present.
+/// Overrides are materialized before plan creation so the Suite WebRunner and
+/// the local driver consume the same authoritative configuration.
 pub(crate) fn browser_config_for_module(
     plan_config: &Value,
     test_name: &str,
@@ -119,47 +113,9 @@ pub(crate) fn browser_config_for_module(
         },
         Some(_) => return Err(BrowserError::InvalidSchema),
     };
-    let mut browser = overridden
+    overridden
         .or_else(|| plan_config.get("browser").cloned())
-        .ok_or(BrowserError::InvalidSchema)?;
-    if USER_REJECT_AUTHENTICATION_MODULES.contains(&test_name) {
-        normalize_consent_denial(&mut browser)?;
-    }
-    Ok(browser)
-}
-
-fn normalize_consent_denial(browser: &mut Value) -> Result<(), BrowserError> {
-    let entries = browser.as_array_mut().ok_or(BrowserError::InvalidSchema)?;
-    let mut denial_commands = 0usize;
-    for entry in entries {
-        let tasks = entry
-            .get_mut("tasks")
-            .and_then(Value::as_array_mut)
-            .ok_or(BrowserError::InvalidSchema)?;
-        for task in tasks {
-            let commands = task
-                .get_mut("commands")
-                .and_then(Value::as_array_mut)
-                .ok_or(BrowserError::InvalidSchema)?;
-            for command in commands {
-                let Some(tuple) = command.as_array_mut() else {
-                    return Err(BrowserError::InvalidSchema);
-                };
-                let selector = tuple.get(1).and_then(Value::as_str);
-                let element = tuple.get(2).and_then(Value::as_str);
-                if selector == Some("id") && element == Some("nazo-consent-approve") {
-                    tuple[2] = Value::String("nazo-consent-deny".to_owned());
-                    denial_commands += 1;
-                } else if selector == Some("id") && element == Some("nazo-consent-deny") {
-                    denial_commands += 1;
-                }
-            }
-        }
-    }
-    if denial_commands < 2 {
-        return Err(BrowserError::InvalidSchema);
-    }
-    Ok(())
+        .ok_or(BrowserError::InvalidSchema)
 }
 
 /// Driver abstraction used both by WebDriver and deterministic tests. A
@@ -780,28 +736,31 @@ mod tests {
     }
 
     #[test]
-    fn user_rejection_module_uses_the_explicit_consent_deny_control() {
+    fn module_browser_selection_uses_the_explicit_suite_override() {
         let config = json!({
             "browser": [{
                 "match": "https://issuer.example/authorize*",
                 "tasks": [{
                     "match": "https://issuer.example/ui/consent*",
-                    "commands": [
-                        ["wait-element-visible", "id", "nazo-consent-approve", 30],
-                        ["click", "id", "nazo-consent-approve"]
-                    ]
+                    "commands": [["click", "id", "nazo-consent-approve"]]
                 }]
-            }]
+            }],
+            "override": {
+                "negative-module": {"browser": [{
+                    "match": "https://issuer.example/authorize*",
+                    "tasks": [{
+                        "match": "https://issuer.example/ui/consent*",
+                        "commands": [["click", "id", "nazo-consent-deny"]]
+                    }]
+                }]}
+            }
         });
 
-        let selected = browser_config_for_module(
-            &config,
-            "fapi2-security-profile-final-user-rejects-authentication",
-        )
-        .expect("negative consent browser plan");
+        let selected = browser_config_for_module(&config, "negative-module")
+            .expect("explicit module browser plan");
         let text = serde_json::to_string(&selected).expect("json");
         assert!(!text.contains("nazo-consent-approve"));
-        assert_eq!(text.matches("nazo-consent-deny").count(), 2);
+        assert_eq!(text.matches("nazo-consent-deny").count(), 1);
     }
 
     #[test]
