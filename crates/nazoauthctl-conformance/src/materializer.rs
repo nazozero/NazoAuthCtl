@@ -950,6 +950,7 @@ mod tests {
             .and_then(|keys| keys.first())
             .expect("Suite client.jwks must be a JWKS containing a private key");
         assert!(private_key.get("d").and_then(Value::as_str).is_some());
+        assert!(private_key.get("kid").and_then(Value::as_str).is_some());
         assert_eq!(matrix.matrix_sha256().len(), 64);
     }
 

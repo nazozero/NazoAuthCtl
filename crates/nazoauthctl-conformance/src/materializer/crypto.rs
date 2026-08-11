@@ -71,12 +71,15 @@ pub(super) fn random_hex(bytes: usize) -> String {
 }
 
 pub(super) fn rsa_jwks(key: &RsaPrivateKey) -> Result<(String, String), MaterializerError> {
+    let n = b64(key.n().to_bytes_be());
+    let e = b64(key.e().to_bytes_be());
+    let kid = jwk_thumbprint(&format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#));
     let public = serde_json::json!({
-        "kty": "RSA", "n": b64(key.n().to_bytes_be()), "e": b64(key.e().to_bytes_be()),
+        "kty": "RSA", "n": n, "e": e, "kid": kid,
         "alg": "PS256", "use": "sig", "key_ops": ["verify"]
     });
     let private = serde_json::json!({
-        "kty": "RSA", "n": b64(key.n().to_bytes_be()), "e": b64(key.e().to_bytes_be()),
+        "kty": "RSA", "n": n, "e": e, "kid": kid,
         "d": b64(key.d().to_bytes_be()),
         "p": b64(key.primes().first().ok_or(MaterializerError::Crypto)?.to_bytes_be()),
         "q": b64(key.primes().get(1).ok_or(MaterializerError::Crypto)?.to_bytes_be()),
@@ -96,16 +99,17 @@ pub(super) fn ec_jwks(key: &SigningKey) -> Result<(String, String), Materializer
     let encoded = key.verifying_key().to_encoded_point(false);
     let x = encoded.x().ok_or(MaterializerError::Crypto)?;
     let y = encoded.y().ok_or(MaterializerError::Crypto)?;
-    let mut digest = Sha256::new();
-    digest.update(x);
-    digest.update(y);
-    let kid = URL_SAFE_NO_PAD.encode(&digest.finalize()[..8]);
+    let x = b64(x);
+    let y = b64(y);
+    let kid = jwk_thumbprint(&format!(
+        r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#
+    ));
     let public = serde_json::json!({
-        "kty":"EC", "crv":"P-256", "x":b64(x), "y":b64(y), "kid":kid,
+        "kty":"EC", "crv":"P-256", "x":x, "y":y, "kid":kid,
         "alg":"ES256", "use":"sig", "key_ops":["verify"]
     });
     let private = serde_json::json!({
-        "kty":"EC", "crv":"P-256", "x":b64(x), "y":b64(y), "d":b64(key.to_bytes()), "kid":kid,
+        "kty":"EC", "crv":"P-256", "x":x, "y":y, "d":b64(key.to_bytes()), "kid":kid,
         "alg":"ES256", "use":"sig", "key_ops":["sign"]
     });
     let private_string = serde_json::to_string(&serde_json::json!({"keys": [private]}))
@@ -113,6 +117,10 @@ pub(super) fn ec_jwks(key: &SigningKey) -> Result<(String, String), Materializer
     let public_jwks = serde_json::to_string(&serde_json::json!({"keys": [public]}))
         .map_err(|_| MaterializerError::Encoding)?;
     Ok((private_string, public_jwks))
+}
+
+fn jwk_thumbprint(canonical_public_members: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(canonical_public_members.as_bytes()))
 }
 
 pub(super) fn generate_mtls() -> Result<(String, String, String, String), MaterializerError> {
