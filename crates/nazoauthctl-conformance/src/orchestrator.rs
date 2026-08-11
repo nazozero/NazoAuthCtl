@@ -1190,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn review_with_a_blocking_condition_is_rejected() {
+    fn review_with_a_warning_is_accepted_and_requires_human_follow_up() {
         let report = ModuleReport::from_info(
             ModuleReportContext {
                 matrix_plan_id: "p".into(),
@@ -1203,9 +1203,47 @@ mod tests {
             serde_json::json!({"status":"FINISHED","result":"REVIEW"}),
             serde_json::json!([{"result":"WARNING"}]),
         );
-        assert!(!accepted_module_outcome(&report));
-        assert!(!report.human_review_required);
-        assert_eq!(report.blocking_log_results, vec!["WARNING"]);
+        assert!(accepted_module_outcome(&report));
+        assert!(report.human_review_required);
+        assert!(report.blocking_log_results.is_empty());
+        assert_eq!(report.advisory_log_results, vec!["WARNING"]);
+    }
+
+    #[test]
+    fn warning_is_accepted_but_failure_remains_blocking() {
+        let warning = ModuleReport::from_info(
+            ModuleReportContext {
+                matrix_plan_id: "p".into(),
+                suite_plan_id: "s".into(),
+                module_id: Some("m-warning".into()),
+                test_name: "oidcc-warning".into(),
+                terminal: true,
+                expected_result: None,
+            },
+            serde_json::json!({"status":"FINISHED","result":"WARNING"}),
+            serde_json::json!([{"result":"WARNING"}]),
+        );
+        assert!(accepted_module_outcome(&warning));
+        assert!(warning.human_review_required);
+        assert!(warning.blocking_log_results.is_empty());
+        assert_eq!(warning.advisory_log_results, vec!["WARNING"]);
+
+        let failure = ModuleReport::from_info(
+            ModuleReportContext {
+                matrix_plan_id: "p".into(),
+                suite_plan_id: "s".into(),
+                module_id: Some("m-failure".into()),
+                test_name: "oidcc-failure".into(),
+                terminal: true,
+                expected_result: None,
+            },
+            serde_json::json!({"status":"FINISHED","result":"WARNING"}),
+            serde_json::json!([{"result":"WARNING"},{"result":"FAILURE"}]),
+        );
+        assert!(!accepted_module_outcome(&failure));
+        assert!(!failure.human_review_required);
+        assert_eq!(failure.blocking_log_results, vec!["FAILURE"]);
+        assert_eq!(failure.advisory_log_results, vec!["WARNING"]);
     }
 
     #[test]

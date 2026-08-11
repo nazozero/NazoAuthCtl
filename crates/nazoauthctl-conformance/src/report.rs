@@ -48,12 +48,15 @@ pub struct ModuleReport {
     /// The signed Matrix exception applying to this exact module, if any.
     pub expected_result: Option<String>,
     /// True only when the terminal Suite outcome satisfies the acceptance
-    /// policy and the raw log contains no FAILURE/WARNING condition result.
+    /// policy and the raw log contains no FAILURE condition result.
     pub accepted: bool,
-    /// `REVIEW` counts as accepted but must remain visible to a human.
+    /// `REVIEW` and `WARNING` count as accepted but must remain visible to a
+    /// human. A PASSED/SKIPPED outcome with a WARNING log is treated the same.
     pub human_review_required: bool,
-    /// Blocking condition results found in the raw Suite log.
+    /// Blocking FAILURE condition results found in the raw Suite log.
     pub blocking_log_results: Vec<String>,
+    /// Non-blocking WARNING condition results found in the raw Suite log.
+    pub advisory_log_results: Vec<String>,
     /// Public evidence omits config/owner/secret-bearing fields. The complete
     /// objects are retained in the in-memory fields below for evidence sinks.
     pub info: Value,
@@ -92,10 +95,11 @@ pub struct ConformanceReport {
     pub errors: Vec<String>,
     pub local_success: bool,
     /// Whether every collected official module has an accepted terminal
-    /// outcome: PASSED, REVIEW, or the Suite's exact SKIPPED result.
+    /// outcome: PASSED, REVIEW, WARNING, or the Suite's exact SKIPPED result.
     pub suite_pass: bool,
-    /// True when one or more accepted modules returned REVIEW. These modules
-    /// remain listed in `modules` and require explicit human follow-up.
+    /// True when one or more accepted modules returned REVIEW/WARNING or
+    /// emitted a WARNING condition. These modules remain listed in `modules`
+    /// and require explicit human follow-up.
     pub human_review_required: bool,
     /// Exact `matrix_plan_id/test_name` entries requiring human review.
     pub human_review_modules: Vec<String>,
@@ -187,19 +191,24 @@ impl ModuleReport {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
         let mut blocking_log_results = BTreeSet::new();
-        collect_blocking_log_results(&raw_log, &mut blocking_log_results);
+        let mut advisory_log_results = BTreeSet::new();
+        collect_condition_log_results(
+            &raw_log,
+            &mut blocking_log_results,
+            &mut advisory_log_results,
+        );
         let blocking_log_results = blocking_log_results.into_iter().collect::<Vec<_>>();
-        let human_review_required = context.terminal
-            && official_status.as_deref() == Some("FINISHED")
-            && official_result.as_deref() == Some("REVIEW")
-            && blocking_log_results.is_empty();
+        let advisory_log_results = advisory_log_results.into_iter().collect::<Vec<_>>();
         let accepted = context.terminal
             && official_status.as_deref() == Some("FINISHED")
             && blocking_log_results.is_empty()
             && matches!(
                 official_result.as_deref(),
-                Some("PASSED" | "REVIEW" | "SKIPPED")
+                Some("PASSED" | "REVIEW" | "WARNING" | "SKIPPED")
             );
+        let human_review_required = accepted
+            && (matches!(official_result.as_deref(), Some("REVIEW" | "WARNING"))
+                || !advisory_log_results.is_empty());
         Self {
             matrix_plan_id: context.matrix_plan_id,
             suite_plan_id: context.suite_plan_id,
@@ -212,6 +221,7 @@ impl ModuleReport {
             accepted,
             human_review_required,
             blocking_log_results,
+            advisory_log_results,
             info: public_info_summary(&raw_info),
             log: public_log_summary(&raw_log),
             raw_info,
@@ -220,21 +230,31 @@ impl ModuleReport {
     }
 }
 
-fn collect_blocking_log_results(value: &Value, results: &mut BTreeSet<String>) {
+fn collect_condition_log_results(
+    value: &Value,
+    blocking: &mut BTreeSet<String>,
+    advisory: &mut BTreeSet<String>,
+) {
     match value {
         Value::Array(values) => {
             for value in values {
-                collect_blocking_log_results(value, results);
+                collect_condition_log_results(value, blocking, advisory);
             }
         }
         Value::Object(values) => {
-            if let Some(result) = values.get("result").and_then(Value::as_str)
-                && matches!(result, "FAILURE" | "WARNING")
-            {
-                results.insert(result.to_owned());
+            if let Some(result) = values.get("result").and_then(Value::as_str) {
+                match result {
+                    "FAILURE" => {
+                        blocking.insert(result.to_owned());
+                    }
+                    "WARNING" => {
+                        advisory.insert(result.to_owned());
+                    }
+                    _ => {}
+                }
             }
             for value in values.values() {
-                collect_blocking_log_results(value, results);
+                collect_condition_log_results(value, blocking, advisory);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
