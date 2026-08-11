@@ -386,7 +386,23 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
 
 impl<D: BrowserDriver> BrowserAutomation for BrowserExecutor<D> {
     fn reset_session(&mut self) -> Result<(), BrowserError> {
-        self.driver.clear_cookies()?;
+        // W3C delete-all-cookies is scoped to the current browsing context's
+        // cookie domain. Visit and clear each allowed origin independently;
+        // validation rejects a redirect from target to Suite (or vice versa)
+        // even though both origins are otherwise allowed for a test flow.
+        let target = self.policy.target_origin.as_url().clone();
+        let suite = self
+            .policy
+            .suite_origin
+            .url("/")
+            .map_err(|_| BrowserError::InvalidOrigin)?;
+        for expected in [&target, &suite] {
+            self.policy.validate_url(expected)?;
+            self.driver.navigate(expected)?;
+            let actual = self.driver.current_url()?;
+            self.policy.validate_cookie_redirect(expected, &actual)?;
+            self.driver.clear_cookies()?;
+        }
         self.entry_uses.clear();
         self.steps = 0;
         self.redirects = 0;
@@ -600,16 +616,21 @@ mod tests {
         displayed: bool,
         clicked: bool,
         cookies_cleared: bool,
+        cookie_clear_count: usize,
+        navigated: Vec<Url>,
+        redirect_to: Option<Url>,
     }
 
     impl BrowserDriver for MockDriver {
         fn clear_cookies(&mut self) -> Result<(), BrowserError> {
             self.cookies_cleared = true;
+            self.cookie_clear_count += 1;
             Ok(())
         }
 
         fn navigate(&mut self, url: &Url) -> Result<(), BrowserError> {
-            self.current = url.clone();
+            self.navigated.push(url.clone());
+            self.current = self.redirect_to.clone().unwrap_or_else(|| url.clone());
             Ok(())
         }
         fn current_url(&mut self) -> Result<Url, BrowserError> {
@@ -701,10 +722,15 @@ mod tests {
             displayed: true,
             clicked: false,
             cookies_cleared: false,
+            cookie_clear_count: 0,
+            navigated: Vec::new(),
+            redirect_to: None,
         };
         let mut executor = BrowserExecutor::new(driver, policy);
         executor.reset_session().expect("reset browser session");
         assert!(executor.driver_mut().cookies_cleared);
+        assert_eq!(executor.driver_mut().cookie_clear_count, 2);
+        assert_eq!(executor.driver_mut().navigated.len(), 2);
         assert!(matches!(
             executor.navigate(&Url::parse("https://evil.example/").expect("url")),
             Err(BrowserError::CrossOriginNavigation)
@@ -723,6 +749,34 @@ mod tests {
             )
             .expect("flow");
         assert_eq!(report.steps, 2);
+    }
+
+    #[test]
+    fn reset_session_rejects_redirect_between_allowed_cookie_origins() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse("https://suite.example").expect("suite");
+        let policy = BrowserPolicy::new(target, suite).expect("policy");
+        let driver = MockDriver {
+            current: Url::parse("https://issuer.example/").expect("url"),
+            source: String::new(),
+            found: false,
+            displayed: false,
+            clicked: false,
+            cookies_cleared: false,
+            cookie_clear_count: 0,
+            navigated: Vec::new(),
+            redirect_to: Some(Url::parse("https://suite.example/").expect("redirect")),
+        };
+        let mut executor = BrowserExecutor::new(driver, policy);
+        assert_eq!(
+            executor
+                .reset_session()
+                .expect_err("cross-origin cleanup redirect"),
+            BrowserError::CrossOriginNavigation
+        );
+        let driver = executor.driver_mut();
+        assert_eq!(driver.cookie_clear_count, 0);
+        assert_eq!(driver.navigated.len(), 1);
     }
 
     #[test]

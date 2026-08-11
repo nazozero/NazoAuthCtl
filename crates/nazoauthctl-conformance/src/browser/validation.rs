@@ -121,6 +121,26 @@ impl BrowserPolicy {
             Err(BrowserError::CrossOriginNavigation)
         }
     }
+
+    /// Validate a navigation used solely to select a cookie store.  The
+    /// ordinary browser policy permits both the target and Suite origins,
+    /// but a cleanup navigation must not jump from one allowed origin to the
+    /// other: WebDriver's delete-all-cookies command applies to the current
+    /// document's domain, so accepting such a redirect could clear the wrong
+    /// store.
+    pub(super) fn validate_cookie_redirect(
+        &self,
+        expected: &Url,
+        actual: &Url,
+    ) -> Result<(), BrowserError> {
+        self.validate_url(expected)?;
+        self.validate_url(actual)?;
+        if same_origin(expected, actual) {
+            Ok(())
+        } else {
+            Err(BrowserError::CrossOriginNavigation)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
