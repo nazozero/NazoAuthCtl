@@ -1130,7 +1130,7 @@ dependencies = [
 [[package]]
 name = "nazo-operator-protocol"
 version = "0.1.29"
-source = "git+https://github.com/nazozero/NazoAuth.git?rev=48408e59407a9c1516dd9466e21305b7e8510c5e#48408e59407a9c1516dd9466e21305b7e8510c5e"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=50d29ec6c146f8c25d36c144a710548be185a829#50d29ec6c146f8c25d36c144a710548be185a829"
 dependencies = [
  "anyhow",
  "base64",

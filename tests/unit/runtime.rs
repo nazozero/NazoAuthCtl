@@ -505,7 +505,7 @@ fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
             artifact.clone(),
             &TaskOperation::ConformanceOnboardingApply {
                 profile: "nazoauth-full".to_owned(),
-                bundle_schema: 2,
+                bundle_schema: 3,
                 bundle_sha256: "b".repeat(64),
                 matrix_sha256: "c".repeat(64),
                 client_count: 1,
