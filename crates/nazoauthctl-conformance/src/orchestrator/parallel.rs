@@ -16,7 +16,7 @@ struct PlanWork {
     group_index: usize,
     matrix_plan_id: String,
     matrix: SelectedMatrix,
-    serialized_automation: bool,
+    serialized_ciba: bool,
 }
 
 enum WorkerMessage {
@@ -51,7 +51,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
     let worker_count = runner.config.jobs.min(work.len());
     let queue = Arc::new(Mutex::new(VecDeque::from(work.clone())));
     let stop_launching = Arc::new(AtomicBool::new(false));
-    let automation_lane = Arc::new(Mutex::new(()));
+    let ciba_lane = Arc::new(Mutex::new(()));
     let mut snapshots = vec![None::<ProgressSnapshot>; work.len()];
     let mut finished = vec![false; work.len()];
     let mut results = vec![None::<RunSummary>; work.len()];
@@ -59,11 +59,11 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
 
     thread::scope(|scope| {
         let (sender, receiver) = mpsc::channel::<WorkerMessage>();
-        for _ in 0..worker_count {
+        for worker_index in 0..worker_count {
             let sender = sender.clone();
             let queue = Arc::clone(&queue);
             let stop_launching = Arc::clone(&stop_launching);
-            let automation_lane = Arc::clone(&automation_lane);
+            let ciba_lane = Arc::clone(&ciba_lane);
             scope.spawn(move || {
                 let worker = catch_unwind(AssertUnwindSafe(|| {
                     loop {
@@ -88,27 +88,24 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                                 poll_timeout: runner.config.poll_timeout,
                                 control: runner.config.control.clone(),
                                 jobs: 1,
-                                browser: runner.config.browser.clone(),
-                                verifier: runner.config.verifier.clone(),
-                                issuer: runner.config.issuer.clone(),
+                                automation: runner
+                                    .config
+                                    .automation
+                                    .get(worker_index)
+                                    .cloned()
+                                    .into_iter()
+                                    .collect(),
                             },
                         };
                         let mut progress = ChannelSink {
                             index: next.index,
                             sender: sender.clone(),
                         };
-                        // The validated Python runner uses a single lane for
-                        // CIBA and browser-driven plans. Preserve that ownership
-                        // here: independent HTTP-only plans overlap, while one
-                        // WebDriver/issuer/verifier session is never interleaved
-                        // across plans.
-                        let _automation_guard = if next.serialized_automation {
-                            Some(
-                                automation_lane
-                                    .lock()
-                                    .map_err(|_| ())
-                                    .expect("automation lane lock"),
-                            )
+                        // The validated Python runner keeps CIBA globally
+                        // serial. Browser/VCI/VP plans use this worker's own
+                        // automation lane and may overlap other workers.
+                        let _ciba_guard = if next.serialized_ciba {
+                            Some(ciba_lane.lock().map_err(|_| ()).expect("CIBA lane lock"))
                         } else {
                             None
                         };
@@ -184,10 +181,7 @@ fn plan_work(matrix: &SelectedMatrix) -> Vec<PlanWork> {
                 index: work.len(),
                 group_index,
                 matrix_plan_id: plan.id.clone(),
-                serialized_automation: plan.plan.contains("ciba")
-                    || plan.plan.starts_with("oid4vci-")
-                    || plan.plan.starts_with("oid4vp-")
-                    || plan.config.get("browser").is_some(),
+                serialized_ciba: plan.plan.contains("ciba"),
                 matrix: SelectedMatrix {
                     document: MatrixDocument {
                         schema: matrix.document.schema,

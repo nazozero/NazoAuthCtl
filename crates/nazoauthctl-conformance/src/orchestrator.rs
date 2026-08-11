@@ -31,6 +31,16 @@ mod parallel;
 
 pub const MAX_PARALLEL_JOBS: usize = 4;
 
+/// One worker-owned interactive automation lane. A lane is never shared by
+/// concurrent plan workers, so WebDriver cookies/navigation and OpenID4VC
+/// driver state cannot interleave across plans.
+#[derive(Clone, Default)]
+pub struct ConformanceAutomation {
+    pub browser: Option<Arc<Mutex<dyn BrowserAutomation>>>,
+    pub verifier: Option<Arc<Mutex<dyn OpenId4VpVerifier>>>,
+    pub issuer: Option<Arc<Mutex<dyn OpenId4VciIssuerDriver>>>,
+}
+
 #[derive(Clone)]
 pub struct RunControl {
     interrupted: Arc<AtomicBool>,
@@ -70,18 +80,9 @@ pub struct ConformanceRunConfig {
     /// automation retain their existing mutex-owned sessions, so parallel
     /// HTTP runners cannot interleave interactive state.
     pub jobs: usize,
-    /// Optional bounded Rust-native WebDriver driver.  It is invoked only for
-    /// a Suite runner that exposes WAITING plus a URL and only with browser
-    /// tasks from that plan's materialized config.
-    pub browser: Option<Arc<Mutex<dyn BrowserAutomation>>>,
-    /// Optional verifier-start client for OpenID4VP WAITING modules.  The
-    /// browser driver remains a separate dependency so WebDriver protocol
-    /// details cannot leak into the target HTTP client.
-    pub verifier: Option<Arc<Mutex<dyn OpenId4VpVerifier>>>,
-    /// Optional issuer-side driver for OpenID4VCI WAITING modules.  The
-    /// driver owns its browser session and target management token; the
-    /// orchestrator only supplies the Suite-observed runner data.
-    pub issuer: Option<Arc<Mutex<dyn OpenId4VciIssuerDriver>>>,
+    /// Worker-owned automation lanes. HTTP-only test fixtures may leave this
+    /// empty; production creates one independent lane per configured job.
+    pub automation: Vec<ConformanceAutomation>,
 }
 
 pub struct ConformanceRunner {
@@ -108,7 +109,10 @@ struct PlannedPlan {
 
 impl ConformanceRunner {
     pub fn new(config: ConformanceRunConfig) -> Result<Self, OrchestrationError> {
-        if config.poll_timeout.is_zero() || !(1..=MAX_PARALLEL_JOBS).contains(&config.jobs) {
+        if config.poll_timeout.is_zero()
+            || !(1..=MAX_PARALLEL_JOBS).contains(&config.jobs)
+            || (!config.automation.is_empty() && config.automation.len() != config.jobs)
+        {
             return Err(OrchestrationError::InvalidInput);
         }
         validate_matrix_origins(
@@ -582,7 +586,12 @@ impl ConformanceRunner {
 
                     if observed.as_ref().is_some_and(is_waiting) {
                         if plan.plan_name.starts_with("oid4vci-") {
-                            let Some(issuer) = &self.config.issuer else {
+                            let Some(issuer) = self
+                                .config
+                                .automation
+                                .first()
+                                .and_then(|automation| automation.issuer.as_ref())
+                            else {
                                 errors
                                     .push("OpenID4VCI issuer automation is unavailable".to_owned());
                                 groups[group_index].status = GroupStatus::Failed;
@@ -603,7 +612,12 @@ impl ConformanceRunner {
                                 }
                             }
                         } else if plan.plan_name.starts_with("oid4vp-1final-verifier") {
-                            let Some(browser) = &self.config.browser else {
+                            let Some(browser) = self
+                                .config
+                                .automation
+                                .first()
+                                .and_then(|automation| automation.browser.as_ref())
+                            else {
                                 errors.push(
                                     "Suite runner is WAITING but browser automation is unavailable"
                                         .to_owned(),
@@ -611,7 +625,12 @@ impl ConformanceRunner {
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
                             };
-                            let Some(verifier) = &self.config.verifier else {
+                            let Some(verifier) = self
+                                .config
+                                .automation
+                                .first()
+                                .and_then(|automation| automation.verifier.as_ref())
+                            else {
                                 errors.push(
                                     "OpenID4VP verifier automation is unavailable".to_owned(),
                                 );
@@ -684,7 +703,12 @@ impl ConformanceRunner {
                                 break 'execute;
                             }
                         } else if plan.config.get("browser").is_some() {
-                            let Some(browser) = &self.config.browser else {
+                            let Some(browser) = self
+                                .config
+                                .automation
+                                .first()
+                                .and_then(|automation| automation.browser.as_ref())
+                            else {
                                 errors.push(
                                     "Suite runner is WAITING but browser automation is unavailable"
                                         .to_owned(),
@@ -1195,9 +1219,7 @@ mod tests {
                 poll_timeout: Duration::from_secs(1),
                 control: RunControl::default(),
                 jobs: 1,
-                browser: None,
-                verifier: None,
-                issuer: None,
+                automation: Vec::new(),
             })
             .is_err()
         );
@@ -1356,9 +1378,7 @@ mod tests {
             poll_timeout: Duration::from_secs(30),
             control,
             jobs: 1,
-            browser: None,
-            verifier: None,
-            issuer: None,
+            automation: Vec::new(),
         })
         .expect("runner");
 
@@ -1430,9 +1450,7 @@ mod tests {
             poll_timeout: Duration::from_millis(250),
             control,
             jobs: 1,
-            browser: None,
-            verifier: None,
-            issuer: None,
+            automation: Vec::new(),
         })
         .expect("runner");
         let issuer = Arc::new(Mutex::new(PendingIssuer { drives: 0 }));
@@ -1562,9 +1580,7 @@ mod tests {
             poll_timeout: Duration::from_secs(2),
             control: RunControl::default(),
             jobs: 1,
-            browser: None,
-            verifier: None,
-            issuer: None,
+            automation: Vec::new(),
         })
         .expect("runner");
         let plan = PlannedPlan {

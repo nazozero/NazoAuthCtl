@@ -198,9 +198,7 @@ fn parallel_fixture(
         poll_timeout: Duration::from_secs(2),
         control: RunControl::default(),
         jobs: 2,
-        browser: None,
-        verifier: None,
-        issuer: None,
+        automation: Vec::new(),
     })
     .expect("runner");
     (runner, transport)
@@ -236,12 +234,9 @@ fn independent_plans_overlap_but_reports_remain_in_matrix_order() {
 }
 
 #[test]
-fn browser_owned_plans_use_one_serial_automation_lane() {
-    let (runner, transport) = parallel_fixture(
-        serde_json::json!({"browser": []}),
-        &["plan-a", "plan-b"],
-        None,
-    );
+fn ciba_plans_use_one_global_serial_lane() {
+    let (runner, transport) =
+        parallel_fixture(serde_json::json!({}), &["ciba-plan-a", "ciba-plan-b"], None);
 
     let summary = runner.run(&mut ());
 

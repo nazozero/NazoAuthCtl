@@ -44,8 +44,8 @@ pub use matrix::{
     MatrixGroup, MatrixPlan, MatrixSelection, MatrixVariant, SelectedMatrix,
 };
 pub use orchestrator::{
-    ConformanceRunConfig, ConformanceRunner, MAX_PARALLEL_JOBS, OrchestrationError, RunControl,
-    RunSummary,
+    ConformanceAutomation, ConformanceRunConfig, ConformanceRunner, MAX_PARALLEL_JOBS,
+    OrchestrationError, RunControl, RunSummary,
 };
 pub use origin::{Origin, OriginError};
 pub use progress::{
