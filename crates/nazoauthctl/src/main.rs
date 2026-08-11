@@ -65,7 +65,7 @@ struct RunInvocation {
     token_file: Option<PathBuf>,
     token_stdin: bool,
     token_fd: Option<u32>,
-    webdriver: Option<String>,
+    webdriver: Vec<String>,
     evidence_directory: Option<PathBuf>,
     groups: Vec<String>,
     plans: Vec<String>,
@@ -126,7 +126,7 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
     let mut token_file = None;
     let mut token_stdin = false;
     let mut token_fd = None;
-    let mut webdriver = None;
+    let mut webdriver = Vec::new();
     let mut evidence_directory = None;
     let mut groups = Vec::new();
     let mut plans = Vec::new();
@@ -154,7 +154,7 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
                             .context("--token-fd must be an integer")?;
                         set_once(&mut token_fd, value, option)?;
                     }
-                    "--webdriver" => set_once(&mut webdriver, value, option)?,
+                    "--webdriver" => webdriver.push(value),
                     "--evidence-dir" => {
                         set_once(&mut evidence_directory, PathBuf::from(value), option)?;
                     }
@@ -198,12 +198,15 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
     if token_sources > 1 {
         bail!("--token, --token-file, --token-stdin, and --token-fd are mutually exclusive");
     }
+    let distinct_webdrivers = webdriver.iter().collect::<std::collections::BTreeSet<_>>();
     if poll_timeout.is_zero()
         || !(300..=86_400).contains(&lease_ttl_seconds)
         || !(1..=MAX_PARALLEL_JOBS).contains(&jobs)
+        || (!webdriver.is_empty()
+            && (webdriver.len() != jobs || distinct_webdrivers.len() != webdriver.len()))
     {
         bail!(
-            "poll timeout must be positive, lease TTL must be between 300 and 86400 seconds, and jobs must be between 1 and {MAX_PARALLEL_JOBS}"
+            "poll timeout must be positive, lease TTL must be between 300 and 86400 seconds, jobs must be between 1 and {MAX_PARALLEL_JOBS}, and explicit WebDriver endpoints must be distinct and repeated exactly once per job"
         );
     }
     Ok(Some(RunInvocation {
@@ -310,9 +313,9 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             .openid4vp_management_token()
             .context("failed to load the deployment OpenID4VP management token")?;
         let mut automation = Vec::with_capacity(invocation.jobs);
-        for _ in 0..invocation.jobs {
+        for worker_index in 0..invocation.jobs {
             let browser = build_browser(
-                invocation.webdriver.as_deref(),
+                invocation.webdriver.get(worker_index).map(String::as_str),
                 session.target_issuer(),
                 &suite_origin,
             )?;
@@ -548,7 +551,7 @@ struct DeploymentReport {
 
 fn print_run_help() {
     println!(
-        "Usage:\n  nazoauthctl [--deployment ID_OR_ALIAS] [--config PATH] conformance run [options]\n\nOptions:\n  --suite URL             OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN           API token; visible in argv/shell history\n  --token-file PATH       Read token from a private regular file\n  --token-stdin           Read token from stdin\n  --token-fd FD           Read token from an inherited private descriptor\n  --webdriver URL         Use an existing W3C WebDriver endpoint\n  --evidence-dir PATH     Persist private raw Suite evidence securely\n  --group ID              Run one Matrix group; repeat to select more\n  --plan ID               Run one Matrix plan; repeat to select more\n  --jobs N                Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS  Per-module Suite wait bound (default: 1800)\n  --lease-ttl SECONDS     Deployment lease lifetime (default: 14400)"
+        "Usage:\n  nazoauthctl [--deployment ID_OR_ALIAS] [--config PATH] conformance run [options]\n\nOptions:\n  --suite URL             OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN           API token; visible in argv/shell history\n  --token-file PATH       Read token from a private regular file\n  --token-stdin           Read token from stdin\n  --token-fd FD           Read token from an inherited private descriptor\n  --webdriver URL         Dedicated W3C endpoint; repeat exactly once per job\n  --evidence-dir PATH     Persist private raw Suite evidence securely\n  --group ID              Run one Matrix group; repeat to select more\n  --plan ID               Run one Matrix plan; repeat to select more\n  --jobs N                Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS  Per-module Suite wait bound (default: 1800)\n  --lease-ttl SECONDS     Deployment lease lifetime (default: 14400)"
     );
 }
 
@@ -615,6 +618,48 @@ mod tests {
             };
             assert!(error.to_string().contains("jobs must be between 1 and 4"));
         }
+    }
+
+    #[test]
+    fn explicit_webdrivers_are_distinct_and_one_per_job() {
+        let one = parse_run_invocation(&args(&[
+            "nazoauthctl",
+            "conformance",
+            "run",
+            "--jobs",
+            "2",
+            "--webdriver",
+            "http://127.0.0.1:24444/wd/hub",
+        ]));
+        assert!(one.is_err());
+
+        let duplicate = parse_run_invocation(&args(&[
+            "nazoauthctl",
+            "conformance",
+            "run",
+            "--jobs",
+            "2",
+            "--webdriver",
+            "http://127.0.0.1:24444/wd/hub",
+            "--webdriver",
+            "http://127.0.0.1:24444/wd/hub",
+        ]));
+        assert!(duplicate.is_err());
+
+        let distinct = parse_run_invocation(&args(&[
+            "nazoauthctl",
+            "conformance",
+            "run",
+            "--jobs",
+            "2",
+            "--webdriver",
+            "http://127.0.0.1:24444/wd/hub",
+            "--webdriver",
+            "http://127.0.0.1:24445/wd/hub",
+        ]))
+        .expect("parse")
+        .expect("run");
+        assert_eq!(distinct.webdriver.len(), 2);
     }
 
     #[test]
