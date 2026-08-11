@@ -917,6 +917,11 @@ mod tests {
         .expect("prepare");
         let bundle_text =
             String::from_utf8(bundle.bytes().as_bytes().to_vec()).expect("bundle utf8");
+        let bundle_value: Value = serde_json::from_str(&bundle_text).expect("bundle json");
+        let public_kid = bundle_value["clients"][0]["request"]["jwks"]["keys"][0]["kid"]
+            .as_str()
+            .expect("public JWK kid")
+            .to_owned();
         assert!(bundle_text.contains("client_secret"));
         assert!(bundle_text.contains("\"applicant\""));
         assert!(bundle_text.contains("\"password\""));
@@ -950,7 +955,10 @@ mod tests {
             .and_then(|keys| keys.first())
             .expect("Suite client.jwks must be a JWKS containing a private key");
         assert!(private_key.get("d").and_then(Value::as_str).is_some());
-        assert!(private_key.get("kid").and_then(Value::as_str).is_some());
+        assert_eq!(
+            private_key.get("kid").and_then(Value::as_str),
+            Some(public_kid.as_str())
+        );
         assert_eq!(matrix.matrix_sha256().len(), 64);
     }
 
