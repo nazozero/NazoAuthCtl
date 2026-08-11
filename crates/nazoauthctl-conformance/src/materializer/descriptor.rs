@@ -109,6 +109,40 @@ impl Default for CryptoPolicy {
     }
 }
 
+/// Expand a compact, versioned Matrix profile into the exact baseline sent
+/// to the Suite. These defaults mirror the authoritative Python
+/// `full_vci_variant`; explicit Matrix values retain precedence.
+pub(super) fn effective_group_variant_values(group: &DescriptorGroup) -> BTreeMap<String, String> {
+    let mut values = BTreeMap::new();
+    if group.variant.id == "vci-haip" {
+        values.extend([
+            ("sender_constrain".to_owned(), "dpop".to_owned()),
+            (
+                "client_auth_type".to_owned(),
+                "client_attestation".to_owned(),
+            ),
+            ("authorization_request_type".to_owned(), "simple".to_owned()),
+            ("openid".to_owned(), "plain_oauth".to_owned()),
+            ("fapi_request_method".to_owned(), "unsigned".to_owned()),
+            ("vci_grant_type".to_owned(), "authorization_code".to_owned()),
+            ("vci_credential_encryption".to_owned(), "plain".to_owned()),
+            ("fapi_profile".to_owned(), "vci_haip".to_owned()),
+            ("fapi_response_mode".to_owned(), "plain_response".to_owned()),
+        ]);
+    }
+    values.extend(group.variant.values.clone());
+    values
+}
+
+pub(super) fn effective_plan_variant(
+    group: &DescriptorGroup,
+    plan: &DescriptorPlan,
+) -> BTreeMap<String, String> {
+    let mut values = effective_group_variant_values(group);
+    values.extend(plan.variant.clone());
+    values
+}
+
 fn default_rsa_bits() -> u16 {
     2048
 }
@@ -852,4 +886,67 @@ fn is_sensitive_key(key: &str) -> bool {
         key.to_ascii_lowercase().as_str(),
         "client_secret" | "password" | "token" | "private_key" | "private_key_pem" | "secret"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vci_haip_profile_expands_the_authoritative_python_defaults() {
+        let group = DescriptorGroup {
+            id: "openid4vc-vci-haip".to_owned(),
+            profile: "openid4vc".to_owned(),
+            variant: DescriptorVariant {
+                id: "vci-haip".to_owned(),
+                values: BTreeMap::new(),
+            },
+            required_roles: Vec::new(),
+            plans: Vec::new(),
+        };
+        let plan = DescriptorPlan {
+            id: "openid4vc-vci-haip-p036".to_owned(),
+            plan: "oid4vci-1_0-issuer-haip-test-plan".to_owned(),
+            config_template: serde_json::json!({}),
+            variant: BTreeMap::from([
+                (
+                    "vci_authorization_code_flow_variant".to_owned(),
+                    "issuer_initiated".to_owned(),
+                ),
+                ("credential_format".to_owned(), "sd_jwt_vc".to_owned()),
+            ]),
+            expected_results: BTreeMap::new(),
+            required_roles: Vec::new(),
+            secret_bindings: BTreeMap::new(),
+            crypto: CryptoPolicy::default(),
+        };
+
+        let effective = effective_plan_variant(&group, &plan);
+        assert_eq!(
+            effective.get("vci_grant_type").map(String::as_str),
+            Some("authorization_code")
+        );
+        assert_eq!(
+            effective.get("client_auth_type").map(String::as_str),
+            Some("client_attestation")
+        );
+        assert_eq!(
+            effective.get("sender_constrain").map(String::as_str),
+            Some("dpop")
+        );
+        assert_eq!(
+            effective.get("fapi_profile").map(String::as_str),
+            Some("vci_haip")
+        );
+        assert_eq!(
+            effective.get("credential_format").map(String::as_str),
+            Some("sd_jwt_vc")
+        );
+        assert_eq!(
+            effective
+                .get("vci_authorization_code_flow_variant")
+                .map(String::as_str),
+            Some("issuer_initiated")
+        );
+    }
 }
