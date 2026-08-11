@@ -1,7 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf};
-
-#[cfg(unix)]
-use std::fs;
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
 #[cfg(unix)]
 use crate::test_support::write_shell_executable;
@@ -411,7 +408,25 @@ fn managed_backup_rejects_config_digest_drift_before_dump() {
 #[test]
 fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
     let work = PrivateTempDir::new("runtime-task-mounts").unwrap();
-    let config = config(&work);
+    let mut config = config(&work);
+    let runtime_secret_directory = work.path().join("app/secrets");
+    fs::create_dir_all(&runtime_secret_directory).unwrap();
+    fs::write(
+        runtime_secret_directory.join("client-secret-pepper"),
+        "fixture-pepper",
+    )
+    .unwrap();
+    fs::write(
+        runtime_secret_directory.join("openid4vc-data-encryption-key"),
+        "fixture-encryption-key",
+    )
+    .unwrap();
+    config.runtime.mounts.push(Mount {
+        source: runtime_secret_directory.clone(),
+        target: PathBuf::from("/var/lib/nazo_oauth/secrets"),
+        read_only: true,
+        selinux_relabel: true,
+    });
     let runtime = Runtime::new(&config);
     let artifact = ArtifactReference::Oci {
         image_reference: "fixture.invalid/nazoauth".to_owned(),
@@ -478,6 +493,36 @@ fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
             .iter()
             .any(|mount| mount.destination == Path::new("/var/lib/nazo_oauth/keys"))
     );
+
+    let onboarding = runtime
+        .one_shot_task(
+            artifact.clone(),
+            &TaskOperation::ConformanceOnboardingApply {
+                profile: "nazoauth-full".to_owned(),
+                bundle_schema: 2,
+                bundle_sha256: "b".repeat(64),
+                matrix_sha256: "c".repeat(64),
+                client_count: 1,
+                ttl_seconds: 600,
+            },
+            None,
+            Some(&work.path().join("conformance-bundle.json")),
+            Some(&work.path().join("conformance-output")),
+        )
+        .unwrap();
+    assert_eq!(onboarding.working_directory, Some(PathBuf::from("/app")));
+    assert_eq!(
+        onboarding
+            .environment
+            .get("NAZOAUTH_OPERATOR_OPENID4VC_DATA_ENCRYPTION_KEY_FILE"),
+        Some(&"/run/nazoauth-operator/openid4vc-data-encryption-key".to_owned())
+    );
+    assert!(onboarding.mounts.iter().any(|mount| {
+        mount.source == runtime_secret_directory.join("openid4vc-data-encryption-key")
+            && mount.destination
+                == Path::new("/run/nazoauth-operator/openid4vc-data-encryption-key")
+            && mount.read_only
+    }));
 
     let public_jwk = work.path().join("public.jwk");
     let keys = runtime

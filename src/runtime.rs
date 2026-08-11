@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, ffi::OsString, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, bail};
 use nazo_operator_protocol::{RuntimeTargetClaim, TaskOperation};
@@ -381,6 +386,17 @@ impl<'a> Runtime<'a> {
                     "/run/nazoauth-operator/pairwise-subject-secret".to_owned(),
                 );
             }
+            let openid4vc_data_encryption_key =
+                self.required_runtime_secret("openid4vc-data-encryption-key")?;
+            mounts.push(task_mount(
+                &openid4vc_data_encryption_key,
+                Path::new("/run/nazoauth-operator/openid4vc-data-encryption-key"),
+                true,
+            ));
+            environment.insert(
+                "NAZOAUTH_OPERATOR_OPENID4VC_DATA_ENCRYPTION_KEY_FILE".to_owned(),
+                "/run/nazoauth-operator/openid4vc-data-encryption-key".to_owned(),
+            );
         }
         if let Some(path) = conformance_output_directory {
             mounts.push(task_mount(
@@ -405,8 +421,10 @@ impl<'a> Runtime<'a> {
                 .then(|| self.config.runtime.network.clone()),
             mounts,
             environment,
-            working_directory: (self.backend_kind()? == RuntimeBackendKind::Systemd)
-                .then(|| self.config.runtime.working_directory.clone()),
+            working_directory: Some(match self.backend_kind()? {
+                RuntimeBackendKind::Systemd => self.config.runtime.working_directory.clone(),
+                RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => PathBuf::from("/app"),
+            }),
             service_user: Some(if self.backend_kind()? == RuntimeBackendKind::Systemd {
                 self.config.runtime.service_user.clone()
             } else {
@@ -569,6 +587,20 @@ impl<'a> Runtime<'a> {
                     "%d/pairwise-subject-secret".to_owned(),
                 );
             }
+            let openid4vc_data_encryption_key =
+                app_root.join("secrets/openid4vc-data-encryption-key");
+            require_real_regular_file(
+                &openid4vc_data_encryption_key,
+                "conformance OpenID4VC data encryption key",
+            )?;
+            transient_credentials.insert(
+                "openid4vc-data-encryption-key".to_owned(),
+                openid4vc_data_encryption_key,
+            );
+            environment.insert(
+                "NAZOAUTH_OPERATOR_OPENID4VC_DATA_ENCRYPTION_KEY_FILE".to_owned(),
+                "%d/openid4vc-data-encryption-key".to_owned(),
+            );
         }
         if let Some(path) = conformance_output_directory {
             read_write_paths.push(path.to_path_buf());
