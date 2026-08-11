@@ -164,6 +164,7 @@ pub struct PreparedMaterialization {
     request_jti: String,
     matrix_sha256: String,
     bundle_digest: String,
+    credential_trust_anchor_pem: String,
     applicant_email: Zeroizing<String>,
     applicant_password: Zeroizing<String>,
     tx_code: Option<Zeroizing<String>>,
@@ -514,6 +515,7 @@ impl DescriptorMaterializer {
             request_jti: request_jti.to_owned(),
             matrix_sha256,
             bundle_digest,
+            credential_trust_anchor_pem: credential_trust_anchor_pem.to_owned(),
             applicant_email,
             applicant_password,
             tx_code,
@@ -572,6 +574,7 @@ impl DescriptorMaterializer {
                     &prepared.suite_base_url,
                     prepared.tx_code.as_ref().map(|value| value.as_str()),
                     prepared.attestation.as_ref(),
+                    &prepared.credential_trust_anchor_pem,
                 )?;
                 let config = materialize_vp_config(
                     &plan.plan,
@@ -1246,6 +1249,7 @@ mod tests {
             "https://suite.example",
             None,
             Some(&first_attestation),
+            test_trust_anchor(),
         )
         .expect("VCI config");
         assert_eq!(
@@ -1258,6 +1262,14 @@ mod tests {
         );
         assert_eq!(materialized["nazo"]["credential_format"], "sd_jwt_vc");
         assert_eq!(materialized["nazo"]["openid4vc_role"], "issuer");
+        assert_eq!(
+            materialized["credential"]["trust_anchor_pem"],
+            test_trust_anchor()
+        );
+        assert_eq!(
+            materialized["credential"]["status_list_trust_anchor_pem"],
+            test_trust_anchor()
+        );
         assert!(
             materialized["vci"]["key_attestation_jwks"]["keys"][0]["d"]
                 .as_str()
@@ -1276,6 +1288,7 @@ mod tests {
                 "https://suite.example",
                 None,
                 Some(&first_attestation),
+                test_trust_anchor(),
             )
             .expect_err("conflicting issuer must fail"),
             MaterializerError::InvalidField("vci.credential_issuer_url")
@@ -1292,9 +1305,30 @@ mod tests {
                 "https://suite.example",
                 None,
                 Some(&first_attestation),
+                test_trust_anchor(),
             )
             .expect_err("conflicting format must fail"),
             MaterializerError::InvalidField("nazo.credential_format")
+        );
+
+        let conflicting_anchor = serde_json::json!({
+            "alias": "nazo-vci-run",
+            "vci": {"credential_configuration_id": "eu.example.pid"},
+            "credential": {"trust_anchor_pem": "different"}
+        });
+        assert_eq!(
+            materialize_vci_config(
+                "oid4vci-1_0-issuer-test-plan",
+                &variant,
+                conflicting_anchor,
+                "https://issuer.example",
+                "https://suite.example",
+                None,
+                Some(&first_attestation),
+                test_trust_anchor(),
+            )
+            .expect_err("a second credential trust source must fail"),
+            MaterializerError::InvalidField("credential.trust_anchor")
         );
     }
 

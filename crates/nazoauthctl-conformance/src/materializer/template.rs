@@ -63,6 +63,7 @@ pub(super) fn materialize_vci_config(
     suite_origin: &str,
     tx_code: Option<&str>,
     attestation: Option<&GeneratedAttestationMaterial>,
+    credential_trust_anchor_pem: &str,
 ) -> Result<Value, MaterializerError> {
     if !plan_name.starts_with("oid4vci-") {
         return Ok(config);
@@ -163,6 +164,23 @@ pub(super) fn materialize_vci_config(
             }),
         );
     }
+    let mut credential = match root.remove("credential") {
+        None => serde_json::Map::new(),
+        Some(Value::Object(value)) => value,
+        Some(_) => return Err(MaterializerError::InvalidField("credential")),
+    };
+    for field in ["trust_anchor_pem", "status_list_trust_anchor_pem"] {
+        if let Some(existing) = credential.get(field)
+            && existing.as_str() != Some(credential_trust_anchor_pem)
+        {
+            return Err(MaterializerError::InvalidField("credential.trust_anchor"));
+        }
+        credential.insert(
+            field.to_owned(),
+            Value::String(credential_trust_anchor_pem.to_owned()),
+        );
+    }
+    root.insert("credential".to_owned(), Value::Object(credential));
     root.insert("vci".to_owned(), Value::Object(vci));
 
     let mut nazo = match root.remove("nazo") {
