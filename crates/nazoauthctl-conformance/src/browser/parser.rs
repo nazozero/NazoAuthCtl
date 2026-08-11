@@ -68,7 +68,16 @@ fn reject_unknown_keys(
 impl BrowserEntry {
     pub fn parse(value: &Value) -> Result<Self, BrowserError> {
         let object = value.as_object().ok_or(BrowserError::InvalidSchema)?;
-        reject_unknown_keys(object, &["match", "match-limit", "tasks"])?;
+        reject_unknown_keys(object, &["comment", "match", "match-limit", "tasks"])?;
+        if let Some(comment) = object.get("comment") {
+            let comment = comment.as_str().ok_or(BrowserError::InvalidSchema)?;
+            if comment.is_empty()
+                || comment.len() > MAX_TEXT_BYTES
+                || comment.chars().any(char::is_control)
+            {
+                return Err(BrowserError::InvalidSchema);
+            }
+        }
         let match_pattern = object
             .get("match")
             .and_then(Value::as_str)
@@ -226,9 +235,14 @@ impl TryFrom<&Value> for BrowserCommand {
                 })
             }
             "click" => {
-                if values.len() != 3 {
+                if values.len() != 3 && values.len() != 4 {
                     return Err(BrowserError::InvalidSchema);
                 }
+                let optional = match values.get(3) {
+                    None => false,
+                    Some(Value::String(marker)) if marker == "optional" => true,
+                    Some(_) => return Err(BrowserError::UnsupportedCommand),
+                };
                 Ok(Self::Click {
                     selector: BrowserSelector::parse(
                         values
@@ -240,6 +254,7 @@ impl TryFrom<&Value> for BrowserCommand {
                             .and_then(Value::as_str)
                             .ok_or(BrowserError::InvalidSchema)?,
                     )?,
+                    optional,
                 })
             }
             _ => Err(BrowserError::UnsupportedCommand),

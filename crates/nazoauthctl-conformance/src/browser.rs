@@ -90,6 +90,8 @@ pub use schema::{BrowserCommand, BrowserEntry, BrowserSelector, BrowserTask};
 pub use validation::{BrowserLimits, BrowserPolicy, BrowserTargetOrigin};
 pub use webdriver::{ManagedWebDriver, WebDriverClient, WebDriverEndpoint};
 
+#[cfg(test)]
+use validation::MAX_TEXT_BYTES;
 use validation::{
     DEFAULT_STEP_TIMEOUT, MAX_MATCH_BYTES, compile_pattern, glob_matches, redacted_origin,
     validate_match_pattern,
@@ -241,8 +243,12 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                 let element = self.driver.find_element(selector)?;
                 self.driver.element_send_keys(&element, value.as_str())
             }
-            BrowserCommand::Click { selector } => {
-                let element = self.driver.find_element(selector)?;
+            BrowserCommand::Click { selector, optional } => {
+                let element = match self.driver.find_element(selector) {
+                    Ok(element) => element,
+                    Err(BrowserError::ElementNotFound) if *optional => return Ok(()),
+                    Err(error) => return Err(error),
+                };
                 self.driver.element_click(&element)
             }
         }
@@ -396,6 +402,15 @@ mod tests {
             .expect("text");
         assert_eq!(format!("{command:?}"), "text");
         assert!(BrowserCommand::try_from(&json!(["execute-script", "alert(1)"])).is_err());
+
+        assert!(matches!(
+            BrowserCommand::try_from(&json!(["click", "id", "logout", "optional"])),
+            Ok(BrowserCommand::Click { optional: true, .. })
+        ));
+        assert!(matches!(
+            BrowserCommand::try_from(&json!(["click", "id", "logout", "ignored"])),
+            Err(BrowserError::UnsupportedCommand)
+        ));
     }
 
     #[test]
@@ -412,6 +427,7 @@ mod tests {
     #[test]
     fn browser_entry_parses_official_nazo_schema() {
         let value = json!({
+            "comment": "NazoAuth conformance browser automation.",
             "match": "https://issuer.example/authorize*",
             "match-limit": 1,
             "tasks": [{
@@ -425,6 +441,16 @@ mod tests {
             }]
         });
         assert!(BrowserEntry::parse(&value).is_ok());
+
+        let invalid_comment = json!({
+            "comment": "x".repeat(MAX_TEXT_BYTES + 1),
+            "match": "https://issuer.example/authorize*",
+            "tasks": []
+        });
+        assert!(matches!(
+            BrowserEntry::parse(&invalid_comment),
+            Err(BrowserError::InvalidSchema)
+        ));
     }
 
     struct MockDriver {
