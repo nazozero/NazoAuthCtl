@@ -1395,8 +1395,27 @@ fn registration_requires_mtls(request: &Value) -> bool {
             .get("require_mtls_bound_tokens")
             .and_then(Value::as_bool)
             == Some(true)
-        || request.get("tls_client_auth_subject_dn").is_some()
-        || request.get("tls_client_auth_cert_sha256").is_some()
+        || ["tls_client_auth_subject_dn", "tls_client_auth_cert_sha256"]
+            .iter()
+            .any(|field| {
+                request
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+            })
+        || [
+            "tls_client_auth_san_dns",
+            "tls_client_auth_san_uri",
+            "tls_client_auth_san_ip",
+            "tls_client_auth_san_email",
+        ]
+        .iter()
+        .any(|field| {
+            request
+                .get(*field)
+                .and_then(Value::as_array)
+                .is_some_and(|values| !values.is_empty())
+        })
 }
 
 fn descriptor_requires_reference(descriptor: &MatrixDescriptor, reference: &str) -> bool {
@@ -1655,6 +1674,29 @@ fn digest_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_optional_mtls_selectors_do_not_create_a_trust_anchor() {
+        let baseline = serde_json::json!({
+            "token_endpoint_auth_method": "client_secret_basic",
+            "require_mtls_bound_tokens": false,
+            "tls_client_auth_subject_dn": null,
+            "tls_client_auth_cert_sha256": null,
+            "tls_client_auth_san_dns": [],
+            "tls_client_auth_san_uri": [],
+            "tls_client_auth_san_ip": [],
+            "tls_client_auth_san_email": []
+        });
+        assert!(!registration_requires_mtls(&baseline));
+
+        let mut mtls = baseline.clone();
+        mtls["token_endpoint_auth_method"] = serde_json::json!("tls_client_auth");
+        assert!(registration_requires_mtls(&mtls));
+
+        let mut san_bound = baseline;
+        san_bound["tls_client_auth_san_uri"] = serde_json::json!(["spiffe://client"]);
+        assert!(registration_requires_mtls(&san_bound));
+    }
 
     fn descriptor() -> MatrixDescriptor {
         let bytes = serde_json::to_vec(&serde_json::json!({
