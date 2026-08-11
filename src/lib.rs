@@ -199,7 +199,7 @@ never exports a leaf certificate or private key."
             "Usage:
   nazoauthctl [--deployment ID] [--config PATH] conformance run [--suite URL]
     [--token TOKEN|--token-file PATH|--token-stdin|--token-fd FD]
-    [--webdriver URL] [--evidence-dir PATH]
+    [--webdriver URL] [--evidence-dir PATH] [--group ID] [--plan ID]
   nazoauthctl [--config PATH] conformance lease create --profile PROFILE \
     --material PUBLIC_MANIFEST \
     [--dynamic-registration-token-file PATH] \

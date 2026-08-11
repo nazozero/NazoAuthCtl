@@ -47,6 +47,10 @@ pub struct MatrixPlan {
     /// Optional per-plan overrides; the group variant remains the baseline.
     #[serde(default)]
     pub variant: BTreeMap<String, String>,
+    /// Exact Suite module names allowed to finish as `SKIPPED` by the signed
+    /// Matrix. Other non-PASSED outcomes are interpreted at run time.
+    #[serde(default)]
+    pub expected_results: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -62,6 +66,8 @@ pub struct MatrixSelection {
     pub groups: Vec<String>,
     #[serde(default)]
     pub profiles: Vec<String>,
+    #[serde(default)]
+    pub plans: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -101,8 +107,19 @@ impl MatrixArtifact {
     }
 
     pub fn select(&self, selection: &MatrixSelection) -> Result<SelectedMatrix, MatrixError> {
+        SelectedMatrix {
+            document: self.document.clone(),
+            digest: self.digest.clone(),
+        }
+        .select(selection)
+    }
+}
+
+impl SelectedMatrix {
+    pub fn select(mut self, selection: &MatrixSelection) -> Result<Self, MatrixError> {
         let groups_filter = filter_set(&selection.groups)?;
         let profiles_filter = filter_set(&selection.profiles)?;
+        let plans_filter = filter_set(&selection.plans)?;
         for wanted in &groups_filter {
             if !self.document.groups.iter().any(|group| &group.id == wanted) {
                 return Err(MatrixError::UnknownSelection(wanted.clone()));
@@ -118,31 +135,32 @@ impl MatrixArtifact {
                 return Err(MatrixError::UnknownSelection(wanted.clone()));
             }
         }
-        let groups = self
-            .document
-            .groups
-            .iter()
-            .filter(|group| {
-                (groups_filter.is_empty() || groups_filter.contains(&group.id))
-                    && (profiles_filter.is_empty() || profiles_filter.contains(&group.profile))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if groups.is_empty() {
+        for wanted in &plans_filter {
+            if !self
+                .document
+                .groups
+                .iter()
+                .flat_map(|group| &group.plans)
+                .any(|plan| &plan.id == wanted)
+            {
+                return Err(MatrixError::UnknownSelection(wanted.clone()));
+            }
+        }
+        self.document.groups.retain(|group| {
+            (groups_filter.is_empty() || groups_filter.contains(&group.id))
+                && (profiles_filter.is_empty() || profiles_filter.contains(&group.profile))
+        });
+        for group in &mut self.document.groups {
+            group
+                .plans
+                .retain(|plan| plans_filter.is_empty() || plans_filter.contains(&plan.id));
+        }
+        self.document.groups.retain(|group| !group.plans.is_empty());
+        if self.document.groups.is_empty() {
             return Err(MatrixError::EmptySelection);
         }
-        Ok(SelectedMatrix {
-            document: MatrixDocument {
-                schema: self.document.schema,
-                name: self.document.name.clone(),
-                groups,
-            },
-            digest: self.digest.clone(),
-        })
+        Ok(self)
     }
-}
-
-impl SelectedMatrix {
     /// Build a selected matrix from a trusted, already-materialized document.
     ///
     /// The digest is supplied by the caller because private configuration
@@ -283,6 +301,18 @@ fn validate_document(document: &MatrixDocument) -> Result<(), MatrixError> {
             if !plan_ids.insert(plan.id.clone()) {
                 return Err(MatrixError::DuplicateId(plan.id.clone()));
             }
+            if plan.expected_results.len() > 64
+                || plan.expected_results.iter().any(|(test_name, result)| {
+                    test_name.trim().is_empty()
+                        || test_name.len() > 256
+                        || test_name
+                            .chars()
+                            .any(|character| character.is_control() || character.is_whitespace())
+                        || result != "SKIPPED"
+                })
+            {
+                return Err(MatrixError::Malformed);
+            }
         }
     }
     Ok(())
@@ -313,13 +343,20 @@ mod tests {
     use super::*;
 
     fn fixture() -> Vec<u8> {
-        br#"{"schema":1,"name":"fixture","groups":[{"id":"g","profile":"oidc","variant":{"id":"v","values":{"mode":"plain"}},"plans":[{"id":"p","plan":"oidcc-basic-certification-test-plan","config":{"alias":"a"}}]}]}"#.to_vec()
+        br#"{"schema":1,"name":"fixture","groups":[{"id":"g","profile":"oidc","variant":{"id":"v","values":{"mode":"plain"}},"plans":[{"id":"p","plan":"oidcc-basic-certification-test-plan","config":{"alias":"a"},"expected_results":{"oidcc-expected-skip":"SKIPPED"}}]}]}"#.to_vec()
     }
 
     #[test]
     fn digest_and_selection_are_stable() {
         let artifact = MatrixArtifact::from_bytes(&fixture()).expect("matrix");
         assert_eq!(artifact.document.plan_count(), 1);
+        assert_eq!(
+            artifact.document.groups[0].plans[0]
+                .expected_results
+                .get("oidcc-expected-skip")
+                .map(String::as_str),
+            Some("SKIPPED")
+        );
         assert_eq!(
             artifact
                 .select(&MatrixSelection::default())
@@ -335,9 +372,33 @@ mod tests {
         let selection = MatrixSelection {
             groups: vec!["missing".into()],
             profiles: vec![],
+            plans: vec![],
         };
         assert!(matches!(
             artifact.select(&selection),
+            Err(MatrixError::UnknownSelection(_))
+        ));
+    }
+
+    #[test]
+    fn plan_selection_filters_without_changing_the_descriptor_digest() {
+        let artifact = MatrixArtifact::from_bytes(&fixture()).expect("matrix");
+        let selected = artifact
+            .select(&MatrixSelection {
+                groups: vec![],
+                profiles: vec![],
+                plans: vec!["p".into()],
+            })
+            .expect("selection");
+        assert_eq!(selected.document.plan_count(), 1);
+        assert_eq!(selected.digest, artifact.digest);
+
+        assert!(matches!(
+            artifact.select(&MatrixSelection {
+                groups: vec![],
+                profiles: vec![],
+                plans: vec!["missing".into()],
+            }),
             Err(MatrixError::UnknownSelection(_))
         ));
     }
@@ -352,6 +413,13 @@ mod tests {
         assert!(matches!(
             MatrixArtifact::from_bytes(&bytes),
             Err(MatrixError::Oversize)
+        ));
+        let review = String::from_utf8(fixture())
+            .expect("utf8")
+            .replace("SKIPPED", "REVIEW");
+        assert!(matches!(
+            MatrixArtifact::from_bytes(review.as_bytes()),
+            Err(MatrixError::Malformed)
         ));
     }
 }

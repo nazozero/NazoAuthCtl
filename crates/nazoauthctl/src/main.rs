@@ -9,9 +9,9 @@ use anyhow::{Context as _, bail};
 use nazoauthctl_conformance::{
     BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy, BrowserTargetOrigin,
     ClientConfig, ConformanceRunConfig, ConformanceRunner, CredentialStore,
-    DeploymentConformanceSecrets, DescriptorMaterializer, ManagedWebDriver, OnboardingOutput,
-    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, RunControl, StableRenderer, SuiteClient,
-    TtyRenderer, WebDriverClient, WebDriverEndpoint,
+    DeploymentConformanceSecrets, DescriptorMaterializer, ManagedWebDriver, MatrixSelection,
+    OnboardingOutput, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, RunControl,
+    StableRenderer, SuiteClient, TtyRenderer, WebDriverClient, WebDriverEndpoint,
 };
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
@@ -64,6 +64,8 @@ struct RunInvocation {
     token_fd: Option<u32>,
     webdriver: Option<String>,
     evidence_directory: Option<PathBuf>,
+    groups: Vec<String>,
+    plans: Vec<String>,
     poll_timeout: Duration,
     lease_ttl_seconds: u64,
 }
@@ -122,6 +124,8 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
     let mut token_fd = None;
     let mut webdriver = None;
     let mut evidence_directory = None;
+    let mut groups = Vec::new();
+    let mut plans = Vec::new();
     let mut poll_timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECONDS);
     let mut lease_ttl_seconds = DEFAULT_LEASE_TTL_SECONDS;
     let mut index = 0usize;
@@ -129,7 +133,7 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
         let option = values[index].as_str();
         match option {
             "--suite" | "--token" | "--token-file" | "--token-fd" | "--webdriver"
-            | "--evidence-dir" | "--poll-timeout" | "--lease-ttl" => {
+            | "--evidence-dir" | "--group" | "--plan" | "--poll-timeout" | "--lease-ttl" => {
                 let value = values
                     .get(index + 1)
                     .with_context(|| format!("{option} requires a value"))?
@@ -148,6 +152,8 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
                     "--evidence-dir" => {
                         set_once(&mut evidence_directory, PathBuf::from(value), option)?;
                     }
+                    "--group" => groups.push(value),
+                    "--plan" => plans.push(value),
                     "--poll-timeout" => {
                         poll_timeout = Duration::from_secs(
                             value
@@ -194,6 +200,8 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
         token_fd,
         webdriver,
         evidence_directory,
+        groups,
+        plans,
         poll_timeout,
         lease_ttl_seconds,
     }))
@@ -297,9 +305,21 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         let interrupt = control.clone();
         ctrlc::set_handler(move || interrupt.interrupt())
             .context("failed to install the conformance interrupt handler")?;
+        let selected_matrix = materialized
+            .take_matrix()
+            .select(&MatrixSelection {
+                groups: invocation.groups.clone(),
+                profiles: Vec::new(),
+                plans: invocation.plans.clone(),
+            })
+            .context("requested conformance Matrix selection is invalid")?;
+        let selected_groups = u32::try_from(selected_matrix.document.groups.len())
+            .context("selected Matrix contains too many groups")?;
+        let selected_plans = u32::try_from(selected_matrix.document.plan_count())
+            .context("selected Matrix contains too many plans")?;
         let runner = ConformanceRunner::new(ConformanceRunConfig {
             client,
-            matrix: materialized.take_matrix(),
+            matrix: selected_matrix,
             target_origin: Some(BrowserTargetOrigin::parse(session.target_issuer())?),
             poll_timeout: invocation.poll_timeout,
             control,
@@ -326,6 +346,8 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                 matrix_source_release: matrix.source_release.clone(),
                 matrix_groups: matrix.group_count,
                 matrix_plans: matrix.plan_count,
+                selected_groups,
+                selected_plans,
                 lease_id: onboarding.lease_id.clone(),
                 applicant_id: onboarding.applicant_id.clone(),
                 client_count,
@@ -471,6 +493,8 @@ struct DeploymentReport {
     matrix_source_release: String,
     matrix_groups: u32,
     matrix_plans: u32,
+    selected_groups: u32,
+    selected_plans: u32,
     lease_id: String,
     applicant_id: String,
     client_count: u32,
@@ -481,7 +505,7 @@ struct DeploymentReport {
 
 fn print_run_help() {
     println!(
-        "Usage:\n  nazoauthctl [--deployment ID_OR_ALIAS] [--config PATH] conformance run [options]\n\nOptions:\n  --suite URL             OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN           API token; visible in argv/shell history\n  --token-file PATH       Read token from a private regular file\n  --token-stdin           Read token from stdin\n  --token-fd FD           Read token from an inherited private descriptor\n  --webdriver URL         Use an existing W3C WebDriver endpoint\n  --evidence-dir PATH     Persist private raw Suite evidence securely\n  --poll-timeout SECONDS  Per-module Suite wait bound (default: 1800)\n  --lease-ttl SECONDS     Deployment lease lifetime (default: 14400)"
+        "Usage:\n  nazoauthctl [--deployment ID_OR_ALIAS] [--config PATH] conformance run [options]\n\nOptions:\n  --suite URL             OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN           API token; visible in argv/shell history\n  --token-file PATH       Read token from a private regular file\n  --token-stdin           Read token from stdin\n  --token-fd FD           Read token from an inherited private descriptor\n  --webdriver URL         Use an existing W3C WebDriver endpoint\n  --evidence-dir PATH     Persist private raw Suite evidence securely\n  --group ID              Run one Matrix group; repeat to select more\n  --plan ID               Run one Matrix plan; repeat to select more\n  --poll-timeout SECONDS  Per-module Suite wait bound (default: 1800)\n  --lease-ttl SECONDS     Deployment lease lifetime (default: 14400)"
     );
 }
 
@@ -516,12 +540,18 @@ mod tests {
             "https://suite.example",
             "--token-fd",
             "7",
+            "--group",
+            "oidc",
+            "--plan",
+            "oidc-core-p001",
         ]))
         .expect("parse")
         .expect("run");
         assert_eq!(parsed.deployment.as_deref(), Some("prod"));
         assert_eq!(parsed.config, PathBuf::from("/x/update.json"));
         assert_eq!(parsed.token_fd, Some(7));
+        assert_eq!(parsed.groups, ["oidc"]);
+        assert_eq!(parsed.plans, ["oidc-core-p001"]);
     }
 
     #[test]

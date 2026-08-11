@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 
 use crate::client::AuthProbe;
 use crate::progress::ProgressSnapshot;
@@ -42,8 +42,18 @@ pub struct ModuleReport {
     /// The suite's status is preserved verbatim; it is not mapped to a local
     /// pass/fail result.
     pub official_status: Option<String>,
-    /// The suite's result is preserved verbatim; it is not interpreted.
+    /// The Suite's result is preserved verbatim and evaluated separately by
+    /// the explicit acceptance fields below.
     pub official_result: Option<String>,
+    /// The signed Matrix exception applying to this exact module, if any.
+    pub expected_result: Option<String>,
+    /// True only when the terminal Suite outcome satisfies the acceptance
+    /// policy and the raw log contains no FAILURE/WARNING condition result.
+    pub accepted: bool,
+    /// `REVIEW` counts as accepted but must remain visible to a human.
+    pub human_review_required: bool,
+    /// Blocking condition results found in the raw Suite log.
+    pub blocking_log_results: Vec<String>,
     /// Public evidence omits config/owner/secret-bearing fields. The complete
     /// objects are retained in the in-memory fields below for evidence sinks.
     pub info: Value,
@@ -52,6 +62,15 @@ pub struct ModuleReport {
     pub raw_info: Value,
     #[serde(skip)]
     pub raw_log: Value,
+}
+
+pub(crate) struct ModuleReportContext {
+    pub matrix_plan_id: String,
+    pub suite_plan_id: String,
+    pub module_id: Option<String>,
+    pub test_name: String,
+    pub terminal: bool,
+    pub expected_result: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -72,10 +91,14 @@ pub struct ConformanceReport {
     pub auth_probe: Option<AuthProbe>,
     pub errors: Vec<String>,
     pub local_success: bool,
-    /// Whether every collected official module result is exactly `PASSED` and
-    /// has a terminal `FINISHED` status. This is independent from local
-    /// orchestration integrity and preserves the Suite's raw values below.
+    /// Whether every collected official module has an accepted terminal
+    /// outcome: PASSED, REVIEW, or an exact Matrix-declared SKIPPED result.
     pub suite_pass: bool,
+    /// True when one or more accepted modules returned REVIEW. These modules
+    /// remain listed in `modules` and require explicit human follow-up.
+    pub human_review_required: bool,
+    /// Exact `matrix_plan_id/test_name` entries requiring human review.
+    pub human_review_modules: Vec<String>,
     pub orchestration_integrity: OrchestrationIntegrity,
     pub progress: ProgressSnapshot,
     pub plans: Vec<PlanReport>,
@@ -154,15 +177,7 @@ impl std::fmt::Display for EvidenceError {
 impl std::error::Error for EvidenceError {}
 
 impl ModuleReport {
-    pub fn from_info(
-        matrix_plan_id: String,
-        suite_plan_id: String,
-        module_id: Option<String>,
-        test_name: String,
-        raw_info: Value,
-        raw_log: Value,
-        terminal: bool,
-    ) -> Self {
+    pub(crate) fn from_info(context: ModuleReportContext, raw_info: Value, raw_log: Value) -> Self {
         let official_status = raw_info
             .get("status")
             .and_then(Value::as_str)
@@ -171,19 +186,59 @@ impl ModuleReport {
             .get("result")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
+        let mut blocking_log_results = BTreeSet::new();
+        collect_blocking_log_results(&raw_log, &mut blocking_log_results);
+        let blocking_log_results = blocking_log_results.into_iter().collect::<Vec<_>>();
+        let human_review_required = context.terminal
+            && official_status.as_deref() == Some("FINISHED")
+            && official_result.as_deref() == Some("REVIEW")
+            && blocking_log_results.is_empty();
+        let accepted = context.terminal
+            && official_status.as_deref() == Some("FINISHED")
+            && blocking_log_results.is_empty()
+            && match official_result.as_deref() {
+                Some("PASSED" | "REVIEW") => true,
+                Some("SKIPPED") => context.expected_result.as_deref() == Some("SKIPPED"),
+                _ => false,
+            };
         Self {
-            matrix_plan_id,
-            suite_plan_id,
-            module_id,
-            test_name,
-            terminal,
+            matrix_plan_id: context.matrix_plan_id,
+            suite_plan_id: context.suite_plan_id,
+            module_id: context.module_id,
+            test_name: context.test_name,
+            terminal: context.terminal,
             official_status,
             official_result,
+            expected_result: context.expected_result,
+            accepted,
+            human_review_required,
+            blocking_log_results,
             info: public_info_summary(&raw_info),
             log: public_log_summary(&raw_log),
             raw_info,
             raw_log,
         }
+    }
+}
+
+fn collect_blocking_log_results(value: &Value, results: &mut BTreeSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_blocking_log_results(value, results);
+            }
+        }
+        Value::Object(values) => {
+            if let Some(result) = values.get("result").and_then(Value::as_str)
+                && matches!(result, "FAILURE" | "WARNING")
+            {
+                results.insert(result.to_owned());
+            }
+            for value in values.values() {
+                collect_blocking_log_results(value, results);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -235,13 +290,16 @@ mod tests {
         let raw = serde_json::json!({"status":"FINISHED","result":"PASSED","config":{"client_secret":"abc"},"token":"abc"});
         let log = serde_json::json!([{"message":"secret-value","token":"secret-token"}]);
         let report = ModuleReport::from_info(
-            "p".into(),
-            "s".into(),
-            Some("m".into()),
-            "test".into(),
+            ModuleReportContext {
+                matrix_plan_id: "p".into(),
+                suite_plan_id: "s".into(),
+                module_id: Some("m".into()),
+                test_name: "test".into(),
+                terminal: true,
+                expected_result: None,
+            },
             raw,
             log,
-            true,
         );
         let encoded = serde_json::to_string(&report).expect("report");
         assert!(!encoded.contains("client_secret"));

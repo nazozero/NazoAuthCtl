@@ -531,6 +531,7 @@ impl DescriptorMaterializer {
                     plan: plan.plan.clone(),
                     config,
                     variant: plan.variant.clone(),
+                    expected_results: plan.expected_results.clone(),
                 });
             }
             groups.push(MatrixGroup {
@@ -821,6 +822,34 @@ mod tests {
         assert!(validate_materialized_mtls_registration(&wrong_digest, &"a".repeat(64)).is_err());
     }
 
+    #[test]
+    fn every_run_generates_fresh_secret_key_and_certificate_material() {
+        let first = generate_client_crypto(&CryptoPolicy::default()).expect("first material");
+        let second = generate_client_crypto(&CryptoPolicy::default()).expect("second material");
+
+        assert_ne!(first.client_secret.as_str(), second.client_secret.as_str());
+        assert_ne!(
+            first.rsa_private_jwks.as_str(),
+            second.rsa_private_jwks.as_str()
+        );
+        assert_ne!(
+            first.ec_private_jwks.as_str(),
+            second.ec_private_jwks.as_str()
+        );
+        assert_ne!(
+            first.mtls_ca_certificate.as_str(),
+            second.mtls_ca_certificate.as_str()
+        );
+        assert_ne!(
+            first.mtls_client_certificate_sha256,
+            second.mtls_client_certificate_sha256
+        );
+        assert_ne!(
+            first.mtls_client_key.as_str(),
+            second.mtls_client_key.as_str()
+        );
+    }
+
     fn descriptor() -> MatrixDescriptor {
         let bytes = serde_json::to_vec(&serde_json::json!({
             "schema":1,
@@ -836,6 +865,7 @@ mod tests {
                     "config_template":{"issuer":"{{target.issuer}}","client_id":"{{client.web.id}}",
                         "client_secret":"{{client.web.client_secret}}","jwks":"{{client.web.ec.private_jwks}}",
                         "password":"{{generated.applicant_password}}"},
+                    "expected_results":{"oidcc-expected-skip":"SKIPPED"},
                     "required_roles":[]}]
             }]
         })).expect("descriptor");
@@ -937,6 +967,13 @@ mod tests {
         )
         .expect("output");
         let matrix = DescriptorMaterializer::finalize(prepared, output).expect("finalize");
+        assert_eq!(
+            matrix.matrix().document.groups[0].plans[0]
+                .expected_results
+                .get("oidcc-expected-skip")
+                .map(String::as_str),
+            Some("SKIPPED")
+        );
         let config = &matrix.matrix().document.groups[0].plans[0].config;
         assert_eq!(
             config.get("client_id").and_then(Value::as_str),
@@ -960,6 +997,20 @@ mod tests {
             Some(public_kid.as_str())
         );
         assert_eq!(matrix.matrix_sha256().len(), 64);
+    }
+
+    #[test]
+    fn review_cannot_be_preapproved_by_the_signed_matrix() {
+        let mut descriptor = descriptor();
+        descriptor.groups[0].plans[0]
+            .expected_results
+            .insert("oidcc-review".to_owned(), "REVIEW".to_owned());
+        assert_eq!(
+            validate_descriptor(&descriptor),
+            Err(MaterializerError::InvalidField(
+                "plan.expected_results.result"
+            ))
+        );
     }
 
     #[test]

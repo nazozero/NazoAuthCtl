@@ -20,8 +20,8 @@ use crate::progress::{
     GroupProgress, GroupStatus, ProgressEvent, ProgressSink, ProgressSnapshot, redacted_variant,
 };
 use crate::report::{
-    CleanupFailure, CleanupReport, ConformanceReport, ModuleReport, OrchestrationIntegrity,
-    PlanReport,
+    CleanupFailure, CleanupReport, ConformanceReport, ModuleReport, ModuleReportContext,
+    OrchestrationIntegrity, PlanReport,
 };
 
 #[derive(Clone)]
@@ -78,6 +78,7 @@ struct PlannedPlan {
     suite_plan_id: String,
     plan_name: String,
     variant: BTreeMap<String, String>,
+    expected_results: BTreeMap<String, String>,
     modules: Vec<ModuleDefinition>,
     config: Value,
     report_index: usize,
@@ -233,6 +234,7 @@ impl ConformanceRunner {
                         suite_plan_id: created.id,
                         plan_name: created.name,
                         variant,
+                        expected_results: plan.expected_results.clone(),
                         modules: created.modules,
                         config: plan.config.clone(),
                         report_index,
@@ -516,15 +518,18 @@ impl ConformanceRunner {
                         groups[group_index].status = GroupStatus::Failed;
                     }
                     modules.push(ModuleReport::from_info(
-                        plan.matrix_plan_id.clone(),
-                        plan.suite_plan_id.clone(),
-                        Some(instance.id.clone()),
-                        module.test_name.clone(),
+                        ModuleReportContext {
+                            matrix_plan_id: plan.matrix_plan_id.clone(),
+                            suite_plan_id: plan.suite_plan_id.clone(),
+                            module_id: Some(instance.id.clone()),
+                            test_name: module.test_name.clone(),
+                            terminal,
+                            expected_result: plan.expected_results.get(&module.test_name).cloned(),
+                        },
                         info,
                         log,
-                        terminal,
                     ));
-                    let module_pass = modules.last().is_some_and(official_module_pass);
+                    let module_pass = modules.last().is_some_and(accepted_module_outcome);
                     if terminal {
                         groups[group_index].running = groups[group_index].running.saturating_sub(1);
                         groups[group_index].completed += 1;
@@ -576,7 +581,7 @@ impl ConformanceRunner {
         let all_modules_instantiated = defined_modules == created_instances;
         let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
         let cleanup_complete = cleanup.failures.is_empty();
-        let suite_pass = all_modules_terminal && modules.iter().all(official_module_pass);
+        let suite_pass = all_modules_terminal && modules.iter().all(accepted_module_outcome);
         if !suite_pass && errors.is_empty() {
             errors.push("Suite reported a non-success or incomplete module result".to_owned());
         }
@@ -593,6 +598,12 @@ impl ConformanceRunner {
             && orchestration_integrity.all_modules_instantiated
             && orchestration_integrity.all_modules_terminal
             && orchestration_integrity.cleanup_complete;
+        let human_review_modules = modules
+            .iter()
+            .filter(|module| module.human_review_required)
+            .map(|module| format!("{}/{}", module.matrix_plan_id, module.test_name))
+            .collect::<Vec<_>>();
+        let human_review_required = !human_review_modules.is_empty();
         let snapshot = snapshot(&groups, current_profile, current_variant, current_test);
         let report = ConformanceReport {
             schema: 1,
@@ -602,6 +613,8 @@ impl ConformanceRunner {
             errors,
             local_success,
             suite_pass,
+            human_review_required,
+            human_review_modules,
             orchestration_integrity,
             progress: snapshot,
             plans,
@@ -769,10 +782,8 @@ fn is_terminal(value: &Value) -> bool {
     )
 }
 
-fn official_module_pass(module: &ModuleReport) -> bool {
-    module.terminal
-        && module.official_status.as_deref() == Some("FINISHED")
-        && module.official_result.as_deref() == Some("PASSED")
+fn accepted_module_outcome(module: &ModuleReport) -> bool {
+    module.accepted
 }
 
 fn validate_matrix_origins(
@@ -921,6 +932,7 @@ mod tests {
                     plan: "plan".into(),
                     config: serde_json::json!({"audience":"https://evil.example"}),
                     variant: BTreeMap::new(),
+                    expected_results: BTreeMap::new(),
                 }],
             }],
         };
@@ -952,18 +964,89 @@ mod tests {
     }
 
     #[test]
-    fn official_result_is_not_rewritten_and_non_pass_fails_suite_check() {
+    fn failed_official_result_is_preserved_and_rejected() {
         let report = ModuleReport::from_info(
-            "p".into(),
-            "s".into(),
-            Some("m".into()),
-            "test".into(),
+            ModuleReportContext {
+                matrix_plan_id: "p".into(),
+                suite_plan_id: "s".into(),
+                module_id: Some("m".into()),
+                test_name: "test".into(),
+                terminal: true,
+                expected_result: None,
+            },
             serde_json::json!({"status":"FINISHED","result":"FAILED"}),
             serde_json::json!([]),
-            true,
         );
         assert_eq!(report.official_result.as_deref(), Some("FAILED"));
-        assert!(!official_module_pass(&report));
+        assert!(!accepted_module_outcome(&report));
+    }
+
+    #[test]
+    fn review_is_accepted_and_requires_human_follow_up() {
+        let report = ModuleReport::from_info(
+            ModuleReportContext {
+                matrix_plan_id: "p".into(),
+                suite_plan_id: "s".into(),
+                module_id: Some("m".into()),
+                test_name: "oidcc-review".into(),
+                terminal: true,
+                expected_result: None,
+            },
+            serde_json::json!({"status":"FINISHED","result":"REVIEW"}),
+            serde_json::json!([{"result":"REVIEW"}]),
+        );
+        assert!(accepted_module_outcome(&report));
+        assert!(report.human_review_required);
+    }
+
+    #[test]
+    fn skipped_requires_an_exact_signed_matrix_exception() {
+        let accepted = ModuleReport::from_info(
+            ModuleReportContext {
+                matrix_plan_id: "p".into(),
+                suite_plan_id: "s".into(),
+                module_id: Some("m".into()),
+                test_name: "oidcc-skip".into(),
+                terminal: true,
+                expected_result: Some("SKIPPED".into()),
+            },
+            serde_json::json!({"status":"FINISHED","result":"SKIPPED"}),
+            serde_json::json!([]),
+        );
+        assert!(accepted_module_outcome(&accepted));
+
+        let unexpected = ModuleReport::from_info(
+            ModuleReportContext {
+                matrix_plan_id: "p".into(),
+                suite_plan_id: "s".into(),
+                module_id: Some("m".into()),
+                test_name: "oidcc-other".into(),
+                terminal: true,
+                expected_result: None,
+            },
+            serde_json::json!({"status":"FINISHED","result":"SKIPPED"}),
+            serde_json::json!([]),
+        );
+        assert!(!accepted_module_outcome(&unexpected));
+    }
+
+    #[test]
+    fn review_with_a_blocking_condition_is_rejected() {
+        let report = ModuleReport::from_info(
+            ModuleReportContext {
+                matrix_plan_id: "p".into(),
+                suite_plan_id: "s".into(),
+                module_id: Some("m".into()),
+                test_name: "oidcc-review".into(),
+                terminal: true,
+                expected_result: None,
+            },
+            serde_json::json!({"status":"FINISHED","result":"REVIEW"}),
+            serde_json::json!([{"result":"WARNING"}]),
+        );
+        assert!(!accepted_module_outcome(&report));
+        assert!(!report.human_review_required);
+        assert_eq!(report.blocking_log_results, vec!["WARNING"]);
     }
 
     #[test]

@@ -55,6 +55,10 @@ pub struct DescriptorPlan {
     pub config_template: Value,
     #[serde(default)]
     pub variant: BTreeMap<String, String>,
+    /// Exact Suite module names which the signed Matrix permits to finish as
+    /// `SKIPPED`. `REVIEW` is a live result and is never pre-approved.
+    #[serde(default)]
+    pub expected_results: BTreeMap<String, String>,
     #[serde(default)]
     pub required_roles: Vec<RoleRequirement>,
     /// Local aliases.  Values must be one complete placeholder.
@@ -142,6 +146,17 @@ pub(super) fn validate_descriptor(descriptor: &MatrixDescriptor) -> Result<(), M
             }
             if !plans.insert(plan.id.clone()) {
                 return Err(MaterializerError::DuplicateId(plan.id.clone()));
+            }
+            if plan.expected_results.len() > 64 {
+                return Err(MaterializerError::InvalidField("plan.expected_results"));
+            }
+            for (test_name, result) in &plan.expected_results {
+                validate_name(test_name, "plan.expected_results.module")?;
+                if result != "SKIPPED" {
+                    return Err(MaterializerError::InvalidField(
+                        "plan.expected_results.result",
+                    ));
+                }
             }
             role_names(&plan.required_roles)?;
             validate_crypto_policy(&plan.crypto)?;
