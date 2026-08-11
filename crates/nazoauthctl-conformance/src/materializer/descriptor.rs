@@ -426,11 +426,11 @@ fn validate_vci_dynamic_policy(plan: &DescriptorPlan) -> Result<(), Materializer
     if vci.is_some_and(|vci| vci.contains_key("static_tx_code")) {
         return Err(MaterializerError::InvalidField("vci.static_tx_code"));
     }
-    let is_haip = plan.plan.contains("haip")
-        || plan.variant.get("fapi_profile").map(String::as_str) == Some("vci_haip");
-    if is_haip && vci.is_some_and(|vci| vci.contains_key("key_attestation_jwks")) {
+    if vci.is_some_and(|vci| vci.contains_key("key_attestation_jwks")) {
         return Err(MaterializerError::InvalidField("vci.key_attestation_jwks"));
     }
+    let is_haip = plan.plan.contains("haip")
+        || plan.variant.get("fapi_profile").map(String::as_str) == Some("vci_haip");
     if is_haip && config.contains_key("client_attestation") {
         return Err(MaterializerError::InvalidField("client_attestation"));
     }

@@ -133,22 +133,22 @@ pub(super) fn materialize_vci_config(
         "credential_issuer_url".to_owned(),
         Value::String(target_issuer.to_owned()),
     );
+    let attestation = attestation.ok_or(MaterializerError::InvalidField(
+        "generated.vci_key_attestation",
+    ))?;
+    let key_attestation_jwks = jwks_value(&attestation.key_attestation_private_jwks)?;
+    if let Some(existing) = vci.get("key_attestation_jwks")
+        && existing != &key_attestation_jwks
+    {
+        return Err(MaterializerError::InvalidField("vci.key_attestation_jwks"));
+    }
+    vci.insert(
+        "key_attestation_jwks".to_owned(),
+        key_attestation_jwks.clone(),
+    );
     let haip = plan_name.contains("haip")
         || variant.get("fapi_profile").map(String::as_str) == Some("vci_haip");
     if haip {
-        let attestation = attestation.ok_or(MaterializerError::InvalidField(
-            "generated.vci_haip_attestation",
-        ))?;
-        let key_attestation_jwks = jwks_value(&attestation.key_attestation_private_jwks)?;
-        if let Some(existing) = vci.get("key_attestation_jwks")
-            && existing != &key_attestation_jwks
-        {
-            return Err(MaterializerError::InvalidField("vci.key_attestation_jwks"));
-        }
-        vci.insert(
-            "key_attestation_jwks".to_owned(),
-            key_attestation_jwks.clone(),
-        );
         if root.contains_key("client_attestation") {
             return Err(MaterializerError::InvalidField("client_attestation"));
         }

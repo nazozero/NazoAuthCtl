@@ -30,9 +30,11 @@ pub(super) struct GeneratedClientCrypto {
     pub(super) mtls_client_certificate_sha256: String,
 }
 
-/// Run-scoped OpenID4VC-HAIP attestation material.  The private JWKs are
-/// retained only in the prepared Suite configuration and are zeroized with
-/// the preparation state; only public trust material is ever sent elsewhere.
+/// Run-scoped OpenID4VC proof and HAIP attestation material.  Every VCI plan
+/// receives the proof key because the Suite may select an attestation proof;
+/// HAIP plans additionally consume the attester identity and trust anchor.
+/// Private JWKs remain only in the prepared Suite configuration and are
+/// zeroized with the preparation state.
 pub(super) struct GeneratedAttestationMaterial {
     pub(super) trust_anchor_pem: Zeroizing<String>,
     pub(super) attester_private_jwks: Zeroizing<String>,
@@ -106,10 +108,10 @@ pub(super) fn random_tx_code() -> String {
     }
 }
 
-/// Generate the independent P-256 attester/key-attestation identities used by
-/// VCI-HAIP.  The key material is generated from `OsRng`, then wrapped in a
-/// run-local CA so the Suite can validate the x5c chains without deployment
-/// secrets.  No generated value is returned in the onboarding bundle.
+/// Generate independent P-256 proof/attester identities for VCI and VCI-HAIP.
+/// The key material comes from `OsRng`, then is wrapped in a run-local CA so
+/// the Suite can validate x5c chains without deployment secrets.  No generated
+/// private value is returned in the onboarding bundle.
 pub(super) fn generate_attestation_material()
 -> Result<GeneratedAttestationMaterial, MaterializerError> {
     let now = OffsetDateTime::now_utc();

@@ -3,6 +3,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -10,7 +11,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::browser::{
-    BrowserAutomation, BrowserError, BrowserTargetOrigin, ConformanceBinding,
+    BrowserAutomation, BrowserError, BrowserTargetOrigin, ConformanceBinding, OpenId4VciError,
     OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpStartRequest, OpenId4VpVerifier,
     parse_browser_entries_owned,
 };
@@ -115,6 +116,15 @@ impl ConformanceRunner {
         let deadline = Instant::now()
             .checked_add(self.config.poll_timeout)
             .ok_or_else(|| "Suite poll timeout is out of range".to_owned())?;
+        self.wait_for_state_until(module_id, states, deadline)
+    }
+
+    fn wait_for_state_until(
+        &self,
+        module_id: &str,
+        states: &[&str],
+        deadline: Instant,
+    ) -> Result<Value, String> {
         loop {
             if self.config.control.is_interrupted() {
                 return Err("run interrupted".to_owned());
@@ -129,6 +139,93 @@ impl ConformanceRunner {
                 Err(SuiteClientError::Timeout) => continue,
                 Err(error) => return Err(safe_error(&error)),
             }
+        }
+    }
+
+    fn wait_for_vci_refresh(&self, deadline: Instant) -> Result<(), String> {
+        if self.config.control.is_interrupted() {
+            return Err("run interrupted".to_owned());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("OpenID4VCI WAITING drive timed out".to_owned());
+        }
+        thread::sleep(remaining.min(Duration::from_millis(200)));
+        Ok(())
+    }
+
+    fn drive_vci_waiting_interruptible(
+        &self,
+        issuer: &Arc<Mutex<dyn OpenId4VciIssuerDriver>>,
+        plan: &PlannedPlan,
+        module: &ModuleDefinition,
+        module_id: &str,
+        initial: Value,
+    ) -> Result<Value, String> {
+        let deadline = Instant::now()
+            .checked_add(self.config.poll_timeout)
+            .ok_or_else(|| "OpenID4VCI poll timeout is out of range".to_owned())?;
+        let mut observed = initial;
+        let mut first_round = true;
+        loop {
+            if self.config.control.is_interrupted() {
+                return Err("run interrupted".to_owned());
+            }
+            if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                return Err("OpenID4VCI WAITING drive timed out".to_owned());
+            }
+            if !first_round {
+                observed = self
+                    .config
+                    .client
+                    .module_info(module_id)
+                    .map_err(|error| safe_error(&error))?;
+                if is_terminal_state(&observed) {
+                    return Ok(observed);
+                }
+                if !is_waiting(&observed) {
+                    observed = self.wait_for_state_until(
+                        module_id,
+                        &["WAITING", "FINISHED", "INTERRUPTED"],
+                        deadline,
+                    )?;
+                    if is_terminal_state(&observed) {
+                        return Ok(observed);
+                    }
+                }
+            }
+            first_round = false;
+            if !is_waiting(&observed) {
+                return Ok(observed);
+            }
+
+            let runner = match self.config.client.runner_info(module_id) {
+                Ok(runner) => runner,
+                Err(SuiteClientError::HttpStatus(404)) => {
+                    self.wait_for_vci_refresh(deadline)?;
+                    continue;
+                }
+                Err(error) => return Err(safe_error(&error)),
+            };
+            let module_context = OpenId4VciModule::new(
+                module_id.to_owned(),
+                module.test_name.clone(),
+                plan.variant.clone(),
+                plan.config.clone(),
+                runner,
+            )
+            .map_err(|error| error.to_string())?;
+            let drive_result = {
+                let mut issuer = issuer
+                    .lock()
+                    .map_err(|_| "OpenID4VCI issuer lock failed".to_owned())?;
+                issuer.drive(&module_context)
+            };
+            match drive_result {
+                Ok(()) | Err(OpenId4VciError::Pending) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            self.wait_for_vci_refresh(deadline)?;
         }
     }
 
@@ -371,40 +468,19 @@ impl ConformanceRunner {
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
                             };
-                            let runner = match self.config.client.runner_info(&instance.id) {
-                                Ok(runner) => runner,
-                                Err(error) => {
-                                    errors.push(safe_error(&error));
-                                    groups[group_index].status = GroupStatus::Failed;
-                                    break 'execute;
-                                }
-                            };
-                            let module_context = match OpenId4VciModule::new(
-                                instance.id.clone(),
-                                module.test_name.clone(),
-                                plan.variant.clone(),
-                                plan.config.clone(),
-                                runner,
+                            match self.drive_vci_waiting_interruptible(
+                                issuer,
+                                plan,
+                                module,
+                                &instance.id,
+                                observed.clone().expect("waiting runner state"),
                             ) {
-                                Ok(module_context) => module_context,
+                                Ok(state) => observed = Some(state),
                                 Err(error) => {
-                                    errors.push(error.to_string());
+                                    errors.push(error);
                                     groups[group_index].status = GroupStatus::Failed;
                                     break 'execute;
                                 }
-                            };
-                            let mut issuer = match issuer.lock() {
-                                Ok(issuer) => issuer,
-                                Err(_) => {
-                                    errors.push("OpenID4VCI issuer lock failed".to_owned());
-                                    groups[group_index].status = GroupStatus::Failed;
-                                    break 'execute;
-                                }
-                            };
-                            if let Err(error) = issuer.drive(&module_context) {
-                                errors.push(error.to_string());
-                                groups[group_index].status = GroupStatus::Failed;
-                                break 'execute;
                             }
                         } else if plan.plan_name.starts_with("oid4vp-1final-verifier") {
                             let Some(browser) = &self.config.browser else {
@@ -931,6 +1007,7 @@ fn same_url_origin(origin: &Origin, url: &Url) -> bool {
 mod tests {
     use super::*;
     use crate::client::ClientConfig;
+    use crate::credentials::BearerToken;
     use crate::matrix::{MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix};
     use crate::transport::{HttpRequest, HttpResponse, Transport, TransportError};
     use std::collections::BTreeMap;
@@ -1163,5 +1240,105 @@ mod tests {
             "run interrupted"
         );
         assert!(transport.requests.lock().expect("lock").is_empty());
+    }
+
+    struct PendingTransport;
+
+    impl Transport for PendingTransport {
+        fn send(
+            &self,
+            request: HttpRequest,
+            _max_response_bytes: usize,
+        ) -> Result<HttpResponse, TransportError> {
+            let body = match request.url().path() {
+                "/api/info/m" => serde_json::json!({"status":"WAITING"}),
+                "/api/runner/m" => serde_json::json!({
+                    "browser": {"urls": []}
+                }),
+                _ => serde_json::json!({}),
+            };
+            Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("json"),
+            })
+        }
+    }
+
+    struct PendingIssuer {
+        drives: usize,
+    }
+
+    impl OpenId4VciIssuerDriver for PendingIssuer {
+        fn drive(&mut self, _module: &OpenId4VciModule) -> Result<(), OpenId4VciError> {
+            self.drives += 1;
+            Err(OpenId4VciError::Pending)
+        }
+    }
+
+    #[test]
+    fn vci_waiting_empty_urls_are_refreshed_until_bounded_timeout() {
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            Arc::new(PendingTransport),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let control = RunControl::default();
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix: SelectedMatrix {
+                document: MatrixDocument {
+                    schema: 1,
+                    name: "matrix".into(),
+                    groups: Vec::new(),
+                },
+                digest: "digest".into(),
+            },
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_millis(250),
+            control,
+            browser: None,
+            verifier: None,
+            issuer: None,
+        })
+        .expect("runner");
+        let issuer = Arc::new(Mutex::new(PendingIssuer { drives: 0 }));
+        let plan = PlannedPlan {
+            group_index: 0,
+            matrix_plan_id: "matrix-plan".into(),
+            suite_plan_id: "suite-plan".into(),
+            plan_name: "oid4vci-test-plan".into(),
+            variant: BTreeMap::from([(
+                "vci_authorization_code_flow_variant".into(),
+                "wallet_initiated".into(),
+            )]),
+            expected_results: BTreeMap::new(),
+            modules: Vec::new(),
+            config: serde_json::json!({}),
+            report_index: 0,
+        };
+        let module = ModuleDefinition {
+            test_name: "test".into(),
+            variant: None,
+            raw: serde_json::json!({}),
+        };
+        let issuer_driver: Arc<Mutex<dyn OpenId4VciIssuerDriver>> = issuer.clone();
+        let error = runner
+            .drive_vci_waiting_interruptible(
+                &issuer_driver,
+                &plan,
+                &module,
+                "m",
+                serde_json::json!({"status":"WAITING"}),
+            )
+            .expect_err("pending VCI must not be treated as complete");
+        assert!(
+            error.contains("WAITING drive timed out"),
+            "unexpected error: {error}"
+        );
+        assert!(issuer.lock().expect("issuer").drives >= 1);
     }
 }

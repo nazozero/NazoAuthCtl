@@ -418,7 +418,11 @@ impl DescriptorMaterializer {
         let applicant_email = Zeroizing::new(format!("oidf-{}@example.invalid", random_hex(16)));
         let tx_code = descriptor_requires_pre_authorized_vci(&descriptor)
             .then(|| Zeroizing::new(random_tx_code()));
-        let attestation = descriptor_requires_vci_haip(&descriptor)
+        // The official VCI runner may select proof type `attestation` for any
+        // VCI plan whose issuer metadata advertises it.  Keep one run-scoped
+        // attestation identity for all VCI plans; HAIP adds the client
+        // attestation envelope, but it is not the owner of the proof key.
+        let attestation = descriptor_requires_vci(&descriptor)
             .then(generate_attestation_material)
             .transpose()?;
         let mut clients = BTreeMap::new();
@@ -811,13 +815,12 @@ fn descriptor_requires_pre_authorized_vci(descriptor: &MatrixDescriptor) -> bool
     })
 }
 
-fn descriptor_requires_vci_haip(descriptor: &MatrixDescriptor) -> bool {
+fn descriptor_requires_vci(descriptor: &MatrixDescriptor) -> bool {
     descriptor.groups.iter().any(|group| {
-        group.plans.iter().any(|plan| {
-            plan.plan.starts_with("oid4vci-")
-                && (plan.plan.contains("haip")
-                    || plan.variant.get("fapi_profile").map(String::as_str) == Some("vci_haip"))
-        })
+        group
+            .plans
+            .iter()
+            .any(|plan| plan.plan.starts_with("oid4vci-"))
     })
 }
 
@@ -1176,6 +1179,13 @@ mod tests {
 
     #[test]
     fn vci_materialization_binds_issuer_and_declared_variant() {
+        let first_attestation = generate_attestation_material().expect("first attestation");
+        let second_attestation = generate_attestation_material().expect("second attestation");
+        assert_ne!(
+            first_attestation.key_attestation_private_jwks.as_str(),
+            second_attestation.key_attestation_private_jwks.as_str(),
+            "VCI proof keys must be generated afresh for each run"
+        );
         let config = serde_json::json!({
             "alias": "nazo-vci-run",
             "vci": {"credential_configuration_id": "eu.example.pid"},
@@ -1196,7 +1206,7 @@ mod tests {
             "https://issuer.example",
             "https://suite.example",
             None,
-            None,
+            Some(&first_attestation),
         )
         .expect("VCI config");
         assert_eq!(
@@ -1209,6 +1219,11 @@ mod tests {
         );
         assert_eq!(materialized["nazo"]["credential_format"], "sd_jwt_vc");
         assert_eq!(materialized["nazo"]["openid4vc_role"], "issuer");
+        assert!(
+            materialized["vci"]["key_attestation_jwks"]["keys"][0]["d"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
 
         let mut conflicting_url = config.clone();
         conflicting_url["vci"]["credential_issuer_url"] =
@@ -1221,7 +1236,7 @@ mod tests {
                 "https://issuer.example",
                 "https://suite.example",
                 None,
-                None,
+                Some(&first_attestation),
             )
             .expect_err("conflicting issuer must fail"),
             MaterializerError::InvalidField("vci.credential_issuer_url")
@@ -1237,7 +1252,7 @@ mod tests {
                 "https://issuer.example",
                 "https://suite.example",
                 None,
-                None,
+                Some(&first_attestation),
             )
             .expect_err("conflicting format must fail"),
             MaterializerError::InvalidField("nazo.credential_format")
@@ -1502,8 +1517,11 @@ mod tests {
             },
             "nazo": {"openid4vc_role": "issuer", "credential_format": "sd_jwt_vc"}
         });
-        let descriptor =
-            descriptor_with_openid4vc_plan("oid4vci-1_0-issuer-test-plan", variant, config);
+        let descriptor = descriptor_with_openid4vc_plan(
+            "oid4vci-1_0-issuer-test-plan",
+            variant.clone(),
+            config.clone(),
+        );
         let error = DescriptorMaterializer::prepare(
             descriptor,
             "https://issuer.example",
@@ -1513,6 +1531,27 @@ mod tests {
         .err()
         .expect("static tx code must fail");
         assert_eq!(error, MaterializerError::InvalidField("vci.static_tx_code"));
+
+        let mut static_key = config;
+        static_key["vci"]
+            .as_object_mut()
+            .expect("vci object")
+            .remove("static_tx_code");
+        static_key["vci"]["key_attestation_jwks"] = serde_json::json!({"keys": []});
+        let descriptor =
+            descriptor_with_openid4vc_plan("oid4vci-1_0-issuer-test-plan", variant, static_key);
+        let error = DescriptorMaterializer::prepare(
+            descriptor,
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+        )
+        .err()
+        .expect("descriptor-supplied proof key must fail");
+        assert_eq!(
+            error,
+            MaterializerError::InvalidField("vci.key_attestation_jwks")
+        );
     }
 
     #[test]

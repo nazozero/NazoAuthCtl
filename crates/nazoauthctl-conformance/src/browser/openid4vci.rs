@@ -48,6 +48,8 @@ pub enum OpenId4VciError {
     InvalidSuiteCallback,
     #[error("OpenID4VCI runner data is unavailable")]
     MissingRunnerData,
+    #[error("OpenID4VCI runner is waiting for browser data")]
+    Pending,
     #[error("OpenID4VCI credential offer endpoint is unavailable")]
     MissingOfferEndpoint,
     #[error("OpenID4VCI credential configuration is unavailable")]
@@ -436,11 +438,11 @@ impl OpenId4VciIssuerClient {
             .runner
             .get("exposed")
             .and_then(Value::as_object)
-            .ok_or(OpenId4VciError::MissingRunnerData)?;
+            .ok_or(OpenId4VciError::Pending)?;
         let endpoint = exposed
             .get("credential_offer_endpoint")
             .and_then(Value::as_str)
-            .ok_or(OpenId4VciError::MissingOfferEndpoint)?;
+            .ok_or(OpenId4VciError::Pending)?;
         let endpoint = self.validate_suite_callback(endpoint)?;
         let vci = module
             .plan_config
@@ -500,17 +502,28 @@ impl OpenId4VciIssuerClient {
             .runner
             .get("browser")
             .and_then(Value::as_object)
-            .ok_or(OpenId4VciError::MissingRunnerData)?;
+            .ok_or(OpenId4VciError::Pending)?;
         let urls = browser
             .get("urls")
             .and_then(Value::as_array)
-            .ok_or(OpenId4VciError::MissingRunnerData)?;
+            .ok_or(OpenId4VciError::Pending)?;
         let mut candidates = Vec::new();
+        let mut invalid_authorization_url = false;
         for value in urls {
             let Some(value) = value.as_str() else {
                 continue;
             };
             let Ok(url) = Url::parse(value) else { continue };
+            if matches!(url.scheme(), "http" | "https")
+                && url.path() == "/authorize"
+                && (!self.target_origin.allows(&url)
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                    || url.fragment().is_some())
+            {
+                invalid_authorization_url = true;
+                continue;
+            }
             if url.username().is_empty()
                 && url.password().is_none()
                 && url.fragment().is_none()
@@ -538,7 +551,10 @@ impl OpenId4VciIssuerClient {
                 .collect::<Vec<_>>()
         };
         if pending.is_empty() {
-            return Ok(());
+            if invalid_authorization_url {
+                return Err(OpenId4VciError::InvalidAuthorizationUrl);
+            }
+            return Err(OpenId4VciError::Pending);
         }
         if pending.len() != 1 {
             return Err(OpenId4VciError::InvalidAuthorizationUrl);
@@ -928,5 +944,29 @@ mod tests {
             .expect("drive");
         assert_eq!(transport.requests.lock().expect("requests").len(), 1);
         assert_eq!(browser.lock().expect("browser").executed, 1);
+    }
+
+    #[test]
+    fn empty_runner_browser_urls_are_pending_not_complete() {
+        let transport = Arc::new(FixtureTransport {
+            requests: Mutex::new(Vec::new()),
+            responses: Mutex::new(Vec::new()),
+        });
+        let browser = Arc::new(Mutex::new(FixtureBrowser {
+            navigated: Vec::new(),
+            executed: 0,
+        }));
+        let mut client = OpenId4VciIssuerClient::with_transport(
+            issuer_config(None),
+            Zeroizing::new("issuer-secret".to_owned()),
+            BearerToken::new("suite-secret").expect("token"),
+            browser,
+            transport.clone(),
+        )
+        .expect("client");
+        let mut pending = module("wallet_initiated", "authorization_code");
+        pending.runner["browser"]["urls"] = serde_json::json!([]);
+        assert_eq!(client.drive(&pending), Err(OpenId4VciError::Pending));
+        assert!(transport.requests.lock().expect("requests").is_empty());
     }
 }
