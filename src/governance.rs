@@ -376,6 +376,13 @@ fn management_audit_intent_path(
         .join("management-audit.json")
 }
 
+pub(crate) fn management_audit_intent_pending(
+    store: &DeploymentStore,
+    deployment_id: &str,
+) -> anyhow::Result<bool> {
+    path_present(&management_audit_intent_path(store, deployment_id))
+}
+
 /// Persist the smallest declaration-bound intent needed to finish a
 /// management audit after a declaration CAS.  This is a recovery pointer,
 /// not a second audit chain; the signed operator/governance event remains the

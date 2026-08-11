@@ -172,6 +172,30 @@ fn locks_are_per_deployment_and_per_shared_resource() {
     assert!(store.shared_resource_lock("database-a").is_err());
 }
 
+#[test]
+fn conformance_shared_locks_overlap_but_exclude_mutation_and_serialize_writers() {
+    let work = PrivateTempDir::new("nazoauthctl-conformance-shared-locks").unwrap();
+    let store = store(&work);
+
+    let deployment_reader_a = store.deployment_shared_lock("deployment-a").unwrap();
+    let deployment_reader_b = store.deployment_shared_lock("deployment-a").unwrap();
+    assert!(store.deployment_lock("deployment-a").is_err());
+
+    let resource_reader_a = store.shared_resource_shared_lock("database").unwrap();
+    let resource_reader_b = store.shared_resource_shared_lock("database").unwrap();
+    assert!(store.shared_resource_lock("database").is_err());
+
+    let operator_writer = store.operator_task_lock("deployment-a").unwrap();
+    assert!(store.operator_task_lock("deployment-a").is_err());
+    drop(operator_writer);
+    assert!(store.operator_task_lock("deployment-a").is_ok());
+
+    drop((deployment_reader_a, deployment_reader_b));
+    assert!(store.deployment_lock("deployment-a").is_ok());
+    drop((resource_reader_a, resource_reader_b));
+    assert!(store.shared_resource_lock("database").is_ok());
+}
+
 #[cfg(unix)]
 #[test]
 fn deployment_locks_reject_symlink_hardlink_and_writable_entries() {

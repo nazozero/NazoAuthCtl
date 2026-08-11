@@ -137,6 +137,31 @@ pub(super) fn acquire_lock(command: &Command) -> anyhow::Result<File> {
     acquire_lock_at(&path, command)
 }
 
+/// The standalone conformance runner does not enter `main_entry`, so a legacy
+/// (unregistered) deployment must explicitly participate in the same
+/// lifecycle lock as update/recovery. Shared mode allows independent
+/// conformance leases to overlap while still excluding every mutation.
+pub(super) fn acquire_conformance_shared_lock() -> anyhow::Result<File> {
+    let path = std::env::var_os("NAZOAUTHCTL_LOCK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/run/lock/nazoauthctl.lock"));
+    acquire_conformance_shared_lock_at(&path)
+}
+
+pub(super) fn acquire_conformance_shared_lock_at(path: &Path) -> anyhow::Result<File> {
+    let file = open_lock_file(path, false, "lifecycle lock")
+        .with_context(|| format!("failed to open lifecycle lock {}", path.display()))?;
+    match file.try_lock_shared() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => {
+            bail!("another nazoauthctl lifecycle operation is already running")
+        }
+        Err(TryLockError::Error(error)) => {
+            Err(error).context("failed to acquire shared lifecycle lock")
+        }
+    }
+}
+
 pub(super) fn acquire_lock_at(path: &Path, command: &Command) -> anyhow::Result<File> {
     let read_only = command_is_read_only(command);
     let file = open_lock_file(path, read_only, "lifecycle lock").with_context(|| {

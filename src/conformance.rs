@@ -15,6 +15,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     controller::{ControlConfig, conformance_control_context},
+    deployment::DeploymentStore,
     filesystem::{atomic_write, ensure_directory_chain, remove_file_durable, set_mode},
     operator::{self, ExpectedReleaseTarget},
     process::Process,
@@ -50,12 +51,14 @@ pub struct ConformanceOnboarding {
     pub idempotent_replay: bool,
 }
 
-/// Holds the deployment capability lock for the complete Suite run.
+/// Holds shared deployment/capability locks for the complete Suite run.
 ///
-/// The lock prevents update/rotation/recovery from changing the target after
-/// MatrixDescribe and before Suite cleanup. Secret material lives only in a
-/// private `/run` directory and is removed immediately after the operator
-/// task consumes it.
+/// Independent lease-scoped conformance sessions may overlap. Exclusive
+/// update/rotation/recovery operations remain blocked until every session has
+/// completed. Each controller-side operator transaction additionally takes a
+/// short writer lock so intent and audit-chain appends cannot race. Secret
+/// material lives only in a private `/run` directory and is removed
+/// immediately after the operator task consumes it.
 pub struct ConformanceSession {
     context: ControlConfig,
     config_path: PathBuf,
@@ -197,16 +200,18 @@ impl ConformanceSession {
     }
 
     pub fn describe_matrix(&self) -> anyhow::Result<ConformanceMatrix> {
-        let result = operator::execute_with_io(
-            &self.context.config,
-            &self.target,
-            &self.expected,
-            TaskOperation::ConformanceMatrixDescribe,
-            None,
-            None,
-            Some(&self.output_directory),
-            None,
-        )?;
+        let result = self.with_operator_task_lock(|| {
+            operator::execute_with_io(
+                &self.context.config,
+                &self.target,
+                &self.expected,
+                TaskOperation::ConformanceMatrixDescribe,
+                None,
+                None,
+                Some(&self.output_directory),
+                None,
+            )
+        })?;
         let TaskResult::ConformanceMatrix { summary } = result.result else {
             bail!("operator returned an unexpected MatrixDescribe result");
         };
@@ -252,23 +257,25 @@ impl ConformanceSession {
             .run_quiet()
             .context("failed to bind conformance bundle ownership")?;
 
-        let result = operator::execute_with_io(
-            &self.context.config,
-            &self.target,
-            &self.expected,
-            TaskOperation::ConformanceOnboardingApply {
-                profile: "nazoauth-full".to_owned(),
-                bundle_schema: 2,
-                bundle_sha256: bundle_sha256.clone(),
-                matrix_sha256: matrix_sha256.to_owned(),
-                client_count,
-                ttl_seconds,
-            },
-            None,
-            Some(&bundle_path),
-            Some(&self.output_directory),
-            Some(request_jti),
-        );
+        let result = self.with_operator_task_lock(|| {
+            operator::execute_with_io(
+                &self.context.config,
+                &self.target,
+                &self.expected,
+                TaskOperation::ConformanceOnboardingApply {
+                    profile: "nazoauth-full".to_owned(),
+                    bundle_schema: 2,
+                    bundle_sha256: bundle_sha256.clone(),
+                    matrix_sha256: matrix_sha256.to_owned(),
+                    client_count,
+                    ttl_seconds,
+                },
+                None,
+                Some(&bundle_path),
+                Some(&self.output_directory),
+                Some(request_jti),
+            )
+        });
         let bundle_cleanup = remove_file_durable(&bundle_path);
         let result = match (result, bundle_cleanup) {
             (Ok(result), Ok(())) => result,
@@ -332,22 +339,25 @@ impl ConformanceSession {
     }
 
     pub fn cleanup_lease(&self, lease_id: &str) -> anyhow::Result<()> {
-        let revoke = operator::execute(
-            &self.context.config,
-            &self.target,
-            &self.expected,
-            TaskOperation::ConformanceLeaseRevoke {
-                lease_id: lease_id.to_owned(),
-            },
-            None,
-        );
-        let cleanup = operator::execute(
-            &self.context.config,
-            &self.target,
-            &self.expected,
-            TaskOperation::ConformanceLeaseCleanup,
-            None,
-        );
+        let (revoke, cleanup) = self.with_operator_task_lock(|| {
+            let revoke = operator::execute(
+                &self.context.config,
+                &self.target,
+                &self.expected,
+                TaskOperation::ConformanceLeaseRevoke {
+                    lease_id: lease_id.to_owned(),
+                },
+                None,
+            );
+            let cleanup = operator::execute(
+                &self.context.config,
+                &self.target,
+                &self.expected,
+                TaskOperation::ConformanceLeaseCleanup,
+                None,
+            );
+            Ok((revoke, cleanup))
+        })?;
         match (revoke, cleanup) {
             (Ok(_), Ok(_)) => Ok(()),
             (Err(revoke), Ok(_)) => Err(revoke).context("failed to revoke conformance lease"),
@@ -356,6 +366,15 @@ impl ConformanceSession {
                 "failed to revoke and cleanup conformance lease: revoke={revoke:#}; cleanup={cleanup:#}"
             ),
         }
+    }
+
+    fn with_operator_task_lock<T>(
+        &self,
+        operation: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let store = DeploymentStore::system();
+        let _writer = store.operator_task_lock(&self.context.config.operator.deployment_id)?;
+        operation()
     }
 }
 

@@ -1509,6 +1509,19 @@ fn observation_lock_never_creates_persistent_state() {
 }
 
 #[test]
+fn legacy_conformance_locks_overlap_and_exclude_lifecycle_mutation() {
+    let work = PrivateTempDir::new("nazoauth-conformance-legacy-lock").unwrap();
+    let path = work.path().join("lifecycle.lock");
+
+    let conformance_a = acquire_conformance_shared_lock_at(&path).unwrap();
+    let conformance_b = acquire_conformance_shared_lock_at(&path).unwrap();
+    assert!(acquire_lock_at(&path, &Command::Rollback { yes: true }).is_err());
+
+    drop((conformance_a, conformance_b));
+    assert!(acquire_lock_at(&path, &Command::Rollback { yes: true }).is_ok());
+}
+
+#[test]
 fn standards_full_bootstraps_a_bounded_revocation_snapshot_without_overwriting_it() {
     let work = PrivateTempDir::new("openid4vc-revocation-bootstrap").unwrap();
     let mut value = config(&work);

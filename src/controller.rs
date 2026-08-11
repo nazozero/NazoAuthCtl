@@ -66,8 +66,15 @@ pub(crate) struct ControlConfig {
     /// legacy, unregistered configuration has no declaration and therefore
     /// keeps this field as `None`.
     record: Option<DeploymentRecord>,
+    _legacy_lock: Option<File>,
     _deployment_lock: Option<FileLock>,
     _shared_capability_locks: Vec<FileLock>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DeploymentLockMode {
+    Exclusive,
+    Shared,
 }
 
 pub(crate) fn conformance_control_context(
@@ -75,13 +82,14 @@ pub(crate) fn conformance_control_context(
     selector: Option<&str>,
 ) -> anyhow::Result<(ControlConfig, String, ExpectedReleaseTarget)> {
     require_root()?;
-    let context = control_config(
+    let context = control_config_with_lock_mode(
         config_path,
         selector,
         &[Capability::OperatorTasks],
         true,
         false,
         false,
+        DeploymentLockMode::Shared,
     )?;
     let runtime = Runtime::new(&context.config);
     let target = if context.config.runtime.backend == RuntimeBackendKind::Systemd {
@@ -123,8 +131,32 @@ fn control_config(
     core_recovery: bool,
     unsettled: bool,
 ) -> anyhow::Result<ControlConfig> {
+    control_config_with_lock_mode(
+        config_path,
+        selector,
+        capabilities,
+        application_task,
+        core_recovery,
+        unsettled,
+        DeploymentLockMode::Exclusive,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn control_config_with_lock_mode(
+    config_path: &Path,
+    selector: Option<&str>,
+    capabilities: &[Capability],
+    application_task: bool,
+    core_recovery: bool,
+    unsettled: bool,
+    lock_mode: DeploymentLockMode,
+) -> anyhow::Result<ControlConfig> {
     let store = DeploymentStore::system();
     if !store.registry_present()? {
+        let legacy_lock = (lock_mode == DeploymentLockMode::Shared)
+            .then(deployment::acquire_conformance_shared_lock)
+            .transpose()?;
         let config = if unsettled {
             load_config_unsettled(config_path)?
         } else {
@@ -134,6 +166,7 @@ fn control_config(
             path: config_path.to_path_buf(),
             config,
             record: None,
+            _legacy_lock: legacy_lock,
             _deployment_lock: None,
             _shared_capability_locks: Vec::new(),
         });
@@ -141,9 +174,14 @@ fn control_config(
 
     let destructive = !capabilities.is_empty() || core_recovery;
     let resolved = store.resolve(selector, destructive)?;
-    let deployment_lock = destructive
-        .then(|| store.deployment_lock(&resolved.deployment_id))
-        .transpose()?;
+    let deployment_lock = if destructive {
+        Some(match lock_mode {
+            DeploymentLockMode::Exclusive => store.deployment_lock(&resolved.deployment_id)?,
+            DeploymentLockMode::Shared => store.deployment_shared_lock(&resolved.deployment_id)?,
+        })
+    } else {
+        None
+    };
     let mut record = store.load(&resolved.deployment_id)?;
     let rotation_journal = store.identity_rotation_journal_path(&record.deployment_id);
     let rotation_pending = match fs::symlink_metadata(&rotation_journal) {
@@ -164,6 +202,12 @@ fn control_config(
             });
         }
     };
+    if destructive && rotation_pending && lock_mode == DeploymentLockMode::Shared {
+        bail!(
+            "deployment {} has a pending identity rotation; recover it before conformance",
+            record.deployment_id
+        );
+    }
     if destructive && rotation_pending {
         // A registered identity transition owns the declaration/config
         // boundary.  Resume it while the same deployment lock is held before
@@ -177,12 +221,28 @@ fn control_config(
         crate::operator::recover_registered_rotation_locked(&store, recovery_path, &record)?;
         record = store.load(&resolved.deployment_id)?;
     }
-    if destructive {
+    if destructive
+        && lock_mode == DeploymentLockMode::Shared
+        && crate::governance::management_audit_intent_pending(&store, &record.deployment_id)?
+    {
+        bail!(
+            "deployment {} has a pending management audit intent; recover it before conformance",
+            record.deployment_id
+        );
+    }
+    if destructive && lock_mode == DeploymentLockMode::Exclusive {
         crate::governance::recover_pending_management_audit_intent_locked(&store, &record)?;
         record = store.load(&resolved.deployment_id)?;
     }
     let shared_capability_locks = if destructive {
-        store.shared_capability_locks(&record, capabilities)?
+        match lock_mode {
+            DeploymentLockMode::Exclusive => {
+                store.shared_capability_locks(&record, capabilities)?
+            }
+            DeploymentLockMode::Shared => {
+                store.shared_capability_shared_locks(&record, capabilities)?
+            }
+        }
     } else {
         Vec::new()
     };
@@ -229,6 +289,7 @@ fn control_config(
         path,
         config,
         record: Some(record),
+        _legacy_lock: None,
         _deployment_lock: deployment_lock,
         _shared_capability_locks: shared_capability_locks,
     })

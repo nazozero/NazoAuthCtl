@@ -932,10 +932,52 @@ impl DeploymentStore {
         )
     }
 
+    /// Hold a stable deployment snapshot while a lease-scoped operation runs.
+    /// Multiple conformance sessions may share this lock; every deployment
+    /// mutation continues to take the exclusive `deployment_lock` above.
+    pub(crate) fn deployment_shared_lock(&self, deployment_id: &str) -> anyhow::Result<FileLock> {
+        self.ensure_storage_roots()?;
+        validate_identifier(deployment_id, "deployment ID")?;
+        FileLock::acquire_shared(
+            &self
+                .state_root
+                .join("locks")
+                .join(format!("deployment-{deployment_id}.lock")),
+        )
+    }
+
+    /// Serialize the short controller-side operator task transaction (intent,
+    /// runtime receipt and audit-chain append) without serializing the remote
+    /// Suite execution that happens between onboarding and cleanup.
+    pub(crate) fn operator_task_lock(&self, deployment_id: &str) -> anyhow::Result<FileLock> {
+        self.ensure_storage_roots()?;
+        validate_identifier(deployment_id, "deployment ID")?;
+        FileLock::acquire(
+            &self
+                .state_root
+                .join("locks")
+                .join(format!("operator-task-{deployment_id}.lock")),
+        )
+    }
+
     pub(crate) fn shared_resource_lock(&self, resource_id: &str) -> anyhow::Result<FileLock> {
         self.ensure_storage_roots()?;
         validate_identifier(resource_id, "shared resource ID")?;
         FileLock::acquire(
+            &self
+                .state_root
+                .join("locks")
+                .join(format!("shared-{resource_id}.lock")),
+        )
+    }
+
+    pub(crate) fn shared_resource_shared_lock(
+        &self,
+        resource_id: &str,
+    ) -> anyhow::Result<FileLock> {
+        self.ensure_storage_roots()?;
+        validate_identifier(resource_id, "shared resource ID")?;
+        FileLock::acquire_shared(
             &self
                 .state_root
                 .join("locks")
@@ -965,6 +1007,27 @@ impl DeploymentStore {
         shared
             .into_iter()
             .map(|capability| self.shared_resource_lock(capability))
+            .collect()
+    }
+
+    pub(crate) fn shared_capability_shared_locks(
+        &self,
+        record: &DeploymentRecord,
+        capabilities: &[Capability],
+    ) -> anyhow::Result<Vec<FileLock>> {
+        let mut shared = capabilities
+            .iter()
+            .copied()
+            .filter(|capability| {
+                record.capabilities.grant(*capability).scope == ResourceScope::Shared
+            })
+            .map(Capability::name)
+            .collect::<Vec<_>>();
+        shared.sort_unstable();
+        shared.dedup();
+        shared
+            .into_iter()
+            .map(|capability| self.shared_resource_shared_lock(capability))
             .collect()
     }
 
@@ -1259,6 +1322,13 @@ impl FileLock {
     fn acquire(path: &Path) -> anyhow::Result<Self> {
         let file = open_lock_file(path, false, "deployment lock")?;
         file.try_lock_exclusive()
+            .with_context(|| format!("another operation holds {}", path.display()))?;
+        Ok(Self { file })
+    }
+
+    fn acquire_shared(path: &Path) -> anyhow::Result<Self> {
+        let file = open_lock_file(path, false, "deployment lock")?;
+        file.try_lock_shared()
             .with_context(|| format!("another operation holds {}", path.display()))?;
         Ok(Self { file })
     }
