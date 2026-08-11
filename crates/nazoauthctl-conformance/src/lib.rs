@@ -22,8 +22,9 @@ mod transport;
 pub use browser::{
     BrowserAutomation, BrowserCommand, BrowserDriver, BrowserEntry, BrowserError, BrowserExecutor,
     BrowserLimits, BrowserPolicy, BrowserRunReport, BrowserSelector, BrowserTargetOrigin,
-    BrowserTask, ManagedWebDriver, OpenId4VcBrowserState, WebDriverClient, WebDriverEndpoint,
-    parse_browser_entries, parse_browser_entries_owned,
+    BrowserTask, ManagedWebDriver, OpenId4VcBrowserState, OpenId4VpError, OpenId4VpPresentation,
+    OpenId4VpStartRequest, OpenId4VpVerifier, OpenId4VpVerifierClient, WebDriverClient,
+    WebDriverEndpoint, parse_browser_entries, parse_browser_entries_owned,
 };
 pub use client::{
     AuthProbe, CancelOutcome, ClientConfig, DeleteOutcome, ModuleDefinition, ModuleInstance,

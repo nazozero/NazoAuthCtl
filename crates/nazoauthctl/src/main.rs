@@ -9,8 +9,8 @@ use anyhow::{Context as _, bail};
 use nazoauthctl_conformance::{
     BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy, BrowserTargetOrigin,
     ClientConfig, ConformanceRunConfig, ConformanceRunner, CredentialStore, DescriptorMaterializer,
-    ManagedWebDriver, OnboardingOutput, Origin, RunControl, StableRenderer, SuiteClient,
-    TtyRenderer, WebDriverClient, WebDriverEndpoint,
+    ManagedWebDriver, OnboardingOutput, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin,
+    RunControl, StableRenderer, SuiteClient, TtyRenderer, WebDriverClient, WebDriverEndpoint,
 };
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
@@ -274,6 +274,15 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             session.target_issuer(),
             &suite_origin,
         )?;
+        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
+            Arc::new(Mutex::new(OpenId4VpVerifierClient::new(
+                BrowserTargetOrigin::parse(session.target_issuer())?,
+                suite_origin.clone(),
+                session
+                    .openid4vp_management_token()
+                    .context("failed to load the deployment OpenID4VP management token")?,
+                Duration::from_secs(30),
+            )?));
         let control = RunControl::default();
         let interrupt = control.clone();
         ctrlc::set_handler(move || interrupt.interrupt())
@@ -285,6 +294,7 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             poll_timeout: invocation.poll_timeout,
             control,
             browser: Some(browser),
+            verifier: Some(verifier),
         })?;
         let summary = if io::stderr().is_terminal() {
             let mut renderer = TtyRenderer::new(io::stderr().lock());

@@ -3,14 +3,17 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use thiserror::Error;
 use url::Url;
 
-use crate::browser::{BrowserAutomation, BrowserTargetOrigin, parse_browser_entries_owned};
-use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient};
+use crate::browser::{
+    BrowserAutomation, BrowserError, BrowserTargetOrigin, OpenId4VpStartRequest, OpenId4VpVerifier,
+    parse_browser_entries_owned,
+};
+use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
 use crate::matrix::{MatrixError, SelectedMatrix};
 use crate::origin::Origin;
 use crate::progress::{
@@ -54,6 +57,10 @@ pub struct ConformanceRunConfig {
     /// a Suite runner that exposes WAITING plus a URL and only with browser
     /// tasks from that plan's materialized config.
     pub browser: Option<Arc<Mutex<dyn BrowserAutomation>>>,
+    /// Optional verifier-start client for OpenID4VP WAITING modules.  The
+    /// browser driver remains a separate dependency so WebDriver protocol
+    /// details cannot leak into the target HTTP client.
+    pub verifier: Option<Arc<Mutex<dyn OpenId4VpVerifier>>>,
 }
 
 pub struct ConformanceRunner {
@@ -69,6 +76,7 @@ struct PlannedPlan {
     group_index: usize,
     matrix_plan_id: String,
     suite_plan_id: String,
+    plan_name: String,
     variant: BTreeMap<String, String>,
     modules: Vec<ModuleDefinition>,
     config: Value,
@@ -86,6 +94,56 @@ impl ConformanceRunner {
             config.target_origin.as_ref(),
         )?;
         Ok(Self { config })
+    }
+
+    fn wait_for_state_interruptible(
+        &self,
+        module_id: &str,
+        states: &[&str],
+    ) -> Result<Value, String> {
+        let deadline = Instant::now()
+            .checked_add(self.config.poll_timeout)
+            .ok_or_else(|| "Suite poll timeout is out of range".to_owned())?;
+        loop {
+            if self.config.control.is_interrupted() {
+                return Err("run interrupted".to_owned());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(SuiteClientError::Timeout.to_string());
+            }
+            let slice = remaining.min(Duration::from_secs(5));
+            match self.config.client.wait_for_state(module_id, states, slice) {
+                Ok(state) => return Ok(state),
+                Err(SuiteClientError::Timeout) => continue,
+                Err(error) => return Err(safe_error(&error)),
+            }
+        }
+    }
+
+    fn wait_for_browser_url_interruptible(
+        &self,
+        browser: &mut dyn BrowserAutomation,
+        expected: &Url,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "browser poll timeout is out of range".to_owned())?;
+        loop {
+            if self.config.control.is_interrupted() {
+                return Err("run interrupted".to_owned());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(BrowserError::Timeout.to_string());
+            }
+            match browser.wait_for_url(expected, remaining.min(Duration::from_secs(5))) {
+                Ok(()) => return Ok(()),
+                Err(BrowserError::Timeout) => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
     }
 
     pub fn run<S: ProgressSink>(&self, sink: &mut S) -> RunSummary {
@@ -173,6 +231,7 @@ impl ConformanceRunner {
                         group_index,
                         matrix_plan_id: plan.id.clone(),
                         suite_plan_id: created.id,
+                        plan_name: created.name,
                         variant,
                         modules: created.modules,
                         config: plan.config.clone(),
@@ -279,14 +338,13 @@ impl ConformanceRunner {
                     }
 
                     if observed.is_none() {
-                        observed = match self.config.client.wait_for_state(
+                        observed = match self.wait_for_state_interruptible(
                             &instance.id,
                             &["WAITING", "FINISHED", "INTERRUPTED"],
-                            self.config.poll_timeout,
                         ) {
                             Ok(state) => Some(state),
                             Err(error) => {
-                                errors.push(safe_error(&error));
+                                errors.push(error);
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
                             }
@@ -302,64 +360,137 @@ impl ConformanceRunner {
                             groups[group_index].status = GroupStatus::Failed;
                             break 'execute;
                         };
-                        let Some(browser_config) = plan.config.get("browser").cloned() else {
-                            errors.push(
-                                "Suite runner is WAITING but the Matrix plan has no browser tasks"
-                                    .to_owned(),
-                            );
-                            groups[group_index].status = GroupStatus::Failed;
-                            break 'execute;
-                        };
-                        let entries = match parse_browser_entries_owned(browser_config) {
-                            Ok(entries) => entries,
-                            Err(error) => {
+                        if plan.plan_name.starts_with("oid4vp-1final-verifier") {
+                            let Some(verifier) = &self.config.verifier else {
+                                errors.push(
+                                    "OpenID4VP verifier automation is unavailable".to_owned(),
+                                );
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            };
+                            let alias = instance
+                                .raw
+                                .get("alias")
+                                .and_then(Value::as_str)
+                                .or_else(|| plan.config.get("alias").and_then(Value::as_str));
+                            let Some(alias) = alias else {
+                                errors.push("OpenID4VP module has no verifier alias".to_owned());
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            };
+                            let haip = plan.plan_name == "oid4vp-1final-verifier-haip-test-plan";
+                            let request = match OpenId4VpStartRequest::new(
+                                alias,
+                                &module.test_name,
+                                plan.variant.clone(),
+                                haip,
+                            ) {
+                                Ok(request) => request,
+                                Err(error) => {
+                                    errors.push(error.to_string());
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                }
+                            };
+                            let presentation = {
+                                let mut verifier = match verifier.lock() {
+                                    Ok(verifier) => verifier,
+                                    Err(_) => {
+                                        errors.push("OpenID4VP verifier lock failed".to_owned());
+                                        groups[group_index].status = GroupStatus::Failed;
+                                        break 'execute;
+                                    }
+                                };
+                                match verifier.start(&request) {
+                                    Ok(presentation) => presentation,
+                                    Err(error) => {
+                                        errors.push(error.to_string());
+                                        groups[group_index].status = GroupStatus::Failed;
+                                        break 'execute;
+                                    }
+                                }
+                            };
+                            let mut driver = match browser.lock() {
+                                Ok(driver) => driver,
+                                Err(_) => {
+                                    errors.push("browser automation lock failed".to_owned());
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                }
+                            };
+                            if let Err(error) = driver.navigate(&presentation.authorization_url) {
                                 errors.push(error.to_string());
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
                             }
-                        };
-                        let Some(runner_url) = instance.raw.get("url").and_then(Value::as_str)
-                        else {
-                            errors.push(
-                                "Suite runner is WAITING but did not provide a browser URL"
-                                    .to_owned(),
-                            );
-                            groups[group_index].status = GroupStatus::Failed;
-                            break 'execute;
-                        };
-                        let runner_url = match Url::parse(runner_url) {
-                            Ok(url) => url,
-                            Err(_) => {
+                            if let Err(error) = self.wait_for_browser_url_interruptible(
+                                &mut *driver,
+                                &presentation.completion_url,
+                                self.config.poll_timeout.min(Duration::from_secs(300)),
+                            ) {
+                                errors.push(error);
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            }
+                        } else {
+                            let Some(browser_config) = plan.config.get("browser").cloned() else {
                                 errors.push(
-                                    "Suite runner returned an invalid browser URL".to_owned(),
+                                    "Suite runner is WAITING but the Matrix plan has no browser tasks"
+                                        .to_owned(),
                                 );
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
-                            }
-                        };
-                        let mut driver = match browser.lock() {
-                            Ok(driver) => driver,
-                            Err(_) => {
-                                errors.push("browser automation lock failed".to_owned());
+                            };
+                            let entries = match parse_browser_entries_owned(browser_config) {
+                                Ok(entries) => entries,
+                                Err(error) => {
+                                    errors.push(error.to_string());
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                }
+                            };
+                            let Some(runner_url) = instance.raw.get("url").and_then(Value::as_str)
+                            else {
+                                errors.push(
+                                    "Suite runner is WAITING but did not provide a browser URL"
+                                        .to_owned(),
+                                );
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            };
+                            let runner_url = match Url::parse(runner_url) {
+                                Ok(url) => url,
+                                Err(_) => {
+                                    errors.push(
+                                        "Suite runner returned an invalid browser URL".to_owned(),
+                                    );
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                }
+                            };
+                            let mut driver = match browser.lock() {
+                                Ok(driver) => driver,
+                                Err(_) => {
+                                    errors.push("browser automation lock failed".to_owned());
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                }
+                            };
+                            if let Err(error) = driver.execute(&runner_url, &entries) {
+                                errors.push(error.to_string());
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
                             }
-                        };
-                        if let Err(error) = driver.execute(&runner_url, &entries) {
-                            errors.push(error.to_string());
-                            groups[group_index].status = GroupStatus::Failed;
-                            break 'execute;
                         }
                     }
 
                     if !observed.as_ref().is_some_and(is_terminal_state)
-                        && let Err(error) = self.config.client.wait_for_state(
+                        && let Err(error) = self.wait_for_state_interruptible(
                             &instance.id,
                             &["FINISHED", "INTERRUPTED"],
-                            self.config.poll_timeout,
                         )
                     {
-                        errors.push(safe_error(&error));
+                        errors.push(error);
                         groups[group_index].status = GroupStatus::Failed;
                         break 'execute;
                     }
@@ -813,7 +944,8 @@ mod tests {
                 target_origin: None,
                 poll_timeout: Duration::from_secs(1),
                 control: RunControl::default(),
-                browser: None
+                browser: None,
+                verifier: None,
             })
             .is_err()
         );
@@ -832,5 +964,46 @@ mod tests {
         );
         assert_eq!(report.official_result.as_deref(), Some("FAILED"));
         assert!(!official_module_pass(&report));
+    }
+
+    #[test]
+    fn interrupted_wait_stops_before_the_next_suite_request() {
+        let transport = Arc::new(FixtureTransport {
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            None,
+            transport.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let control = RunControl::default();
+        control.interrupt();
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix: SelectedMatrix {
+                document: MatrixDocument {
+                    schema: 1,
+                    name: "matrix".into(),
+                    groups: Vec::new(),
+                },
+                digest: "digest".into(),
+            },
+            target_origin: None,
+            poll_timeout: Duration::from_secs(30),
+            control,
+            browser: None,
+            verifier: None,
+        })
+        .expect("runner");
+
+        assert_eq!(
+            runner
+                .wait_for_state_interruptible("module", &["FINISHED"])
+                .expect_err("interrupt must stop the wait"),
+            "run interrupted"
+        );
+        assert!(transport.requests.lock().expect("lock").is_empty());
     }
 }

@@ -22,7 +22,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::origin::Origin;
 
+mod openid4vp;
 mod webdriver;
+pub use openid4vp::{
+    OpenId4VpError, OpenId4VpPresentation, OpenId4VpStartRequest, OpenId4VpVerifier,
+    OpenId4VpVerifierClient,
+};
 pub use webdriver::{ManagedWebDriver, WebDriverClient, WebDriverEndpoint};
 
 const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -690,6 +695,15 @@ pub trait BrowserAutomation: Send {
     ) -> Result<BrowserRunReport, BrowserError>;
 
     fn navigate(&mut self, url: &Url) -> Result<(), BrowserError>;
+
+    /// Wait for an exact browser URL after an out-of-band flow (for example,
+    /// an OpenID4VP verifier start) has navigated the session.  The default
+    /// keeps existing BrowserAutomation implementations source-compatible;
+    /// drivers that do not support polling fail closed.
+    fn wait_for_url(&mut self, expected: &Url, timeout: Duration) -> Result<(), BrowserError> {
+        let _ = (expected, timeout);
+        Err(BrowserError::UnsupportedCommand)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -899,6 +913,18 @@ impl<D: BrowserDriver> BrowserAutomation for BrowserExecutor<D> {
         self.policy.validate_url(url)?;
         self.driver.navigate(url)?;
         self.ensure_current_url().map(|_| ())
+    }
+
+    fn wait_for_url(&mut self, expected: &Url, timeout: Duration) -> Result<(), BrowserError> {
+        self.policy.validate_url(expected)?;
+        let deadline = self.deadline(timeout);
+        loop {
+            let current = self.ensure_current_url()?;
+            if current == *expected {
+                return Ok(());
+            }
+            self.sleep_until(deadline)?;
+        }
     }
 }
 

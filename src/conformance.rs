@@ -23,6 +23,9 @@ use crate::{
 const MAX_MATRIX_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ONBOARDING_OUTPUT_BYTES: u64 = 1024 * 1024;
 const MAX_BUNDLE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_OPENID4VP_MANAGEMENT_TOKEN_BYTES: u64 = 4 * 1024;
+const OPENID4VP_MANAGEMENT_TOKEN_NAME: &str = "openid4vp-management-token";
+const OPENID4VP_MANAGEMENT_TOKEN_TARGET: &str = "/run/nazoauth-secrets/openid4vp-management-token";
 
 pub struct ConformanceMatrix {
     pub bytes: Vec<u8>,
@@ -51,6 +54,7 @@ pub struct ConformanceOnboarding {
 /// task consumes it.
 pub struct ConformanceSession {
     context: ControlConfig,
+    config_path: PathBuf,
     target: String,
     expected: ExpectedReleaseTarget,
     run_directory: PathBuf,
@@ -83,6 +87,7 @@ impl ConformanceSession {
 
         Ok(Self {
             context,
+            config_path: config_path.to_path_buf(),
             target,
             expected,
             run_directory,
@@ -93,6 +98,57 @@ impl ConformanceSession {
 
     pub fn target_issuer(&self) -> &str {
         &self.context.config.runtime.expected_issuer
+    }
+
+    /// Load the deployment-owned OpenID4VP verifier management token from the
+    /// same secure file that is bound into the managed runtime.  The path is
+    /// derived from the active deployment declaration, never from a CLI
+    /// argument, and the token stays in zeroizing memory.
+    pub fn openid4vp_management_token(&self) -> anyhow::Result<zeroize::Zeroizing<String>> {
+        if self.context.config.install_profile != "standards-full" {
+            bail!("OpenID4VP conformance requires a standards-full deployment");
+        }
+        let path = if self.context.config.runtime.backend
+            == crate::deployment::RuntimeBackendKind::Systemd
+        {
+            self.config_path
+                .parent()
+                .context("controller configuration has no parent")?
+                .join("secrets")
+                .join(OPENID4VP_MANAGEMENT_TOKEN_NAME)
+        } else {
+            let target = Path::new(OPENID4VP_MANAGEMENT_TOKEN_TARGET);
+            let mut matches = self
+                .context
+                .config
+                .runtime
+                .mounts
+                .iter()
+                .filter(|mount| mount.target == target);
+            let mount = matches
+                .next()
+                .context("managed runtime lacks the OpenID4VP management-token mount")?;
+            if matches.next().is_some() || !mount.read_only {
+                bail!("managed OpenID4VP management-token mount is ambiguous or writable");
+            }
+            mount.source.clone()
+        };
+        let bytes = crate::filesystem::read_secure_secret_file(
+            &path,
+            "OpenID4VP management token",
+            MAX_OPENID4VP_MANAGEMENT_TOKEN_BYTES,
+        )?;
+        let value =
+            std::str::from_utf8(&bytes).context("OpenID4VP management token is not UTF-8")?;
+        if value.len() < 32
+            || value.len() > MAX_OPENID4VP_MANAGEMENT_TOKEN_BYTES as usize
+            || value
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace())
+        {
+            bail!("OpenID4VP management token is invalid");
+        }
+        Ok(zeroize::Zeroizing::new(value.to_owned()))
     }
 
     /// Return the deployment-owned public CA that signs OpenID4VP request
