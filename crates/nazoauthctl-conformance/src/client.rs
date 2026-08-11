@@ -16,6 +16,8 @@ use crate::transport::{HttpMethod, HttpRequest, Transport, TransportError};
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_LOG_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_REDIRECTS: usize = 3;
+const MAX_SUITE_LONG_POLL_MS: u128 = 30_000;
+const MAX_SUITE_LONG_POLL_HEADROOM_MS: u128 = 5_000;
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -209,7 +211,7 @@ impl SuiteClient {
             if remaining.is_zero() {
                 return Err(SuiteClientError::Timeout);
             }
-            let call_ms = remaining.as_millis().clamp(1, 30_000).to_string();
+            let call_ms = wait_state_call_timeout_ms(remaining, self.config.timeout).to_string();
             let response = self.request_json(
                 HttpMethod::Get,
                 &format!("/api/runner/{module_id}/wait-state"),
@@ -527,6 +529,19 @@ fn same_origin(expected: &Origin, actual: &Url) -> bool {
     expected.as_str() == format!("https://{authority}")
 }
 
+fn wait_state_call_timeout_ms(remaining: Duration, transport_timeout: Duration) -> u128 {
+    let transport_ms = transport_timeout.as_millis().max(1);
+    // The Suite's wait-state timeout is a server-side long poll. It must finish
+    // before the HTTP client's own deadline; using the same 30-second value for
+    // both creates a deterministic race whenever a module legitimately runs
+    // for at least one poll interval.
+    let headroom_ms = (transport_ms / 6).clamp(1, MAX_SUITE_LONG_POLL_HEADROOM_MS);
+    let server_budget_ms = transport_ms.saturating_sub(headroom_ms).max(1);
+    remaining
+        .as_millis()
+        .clamp(1, server_budget_ms.min(MAX_SUITE_LONG_POLL_MS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,6 +557,22 @@ mod tests {
                 body: b"{}".to_vec(),
             })
         }
+    }
+
+    #[test]
+    fn wait_state_long_poll_finishes_before_the_transport_deadline() {
+        assert_eq!(
+            wait_state_call_timeout_ms(Duration::from_secs(60), Duration::from_secs(30)),
+            25_000
+        );
+        assert_eq!(
+            wait_state_call_timeout_ms(Duration::from_secs(3), Duration::from_secs(30)),
+            3_000
+        );
+        assert_eq!(
+            wait_state_call_timeout_ms(Duration::from_secs(60), Duration::from_secs(1)),
+            834
+        );
     }
 
     #[test]
