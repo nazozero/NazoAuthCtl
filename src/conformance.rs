@@ -31,6 +31,9 @@ const CIBA_DECISION_TOKEN_NAME: &str = "ciba-decision-token";
 const CIBA_DECISION_TOKEN_TARGET: &str = "/run/nazoauth-secrets/ciba-decision-token";
 const OPENID4VP_MANAGEMENT_TOKEN_NAME: &str = "openid4vp-management-token";
 const OPENID4VP_MANAGEMENT_TOKEN_TARGET: &str = "/run/nazoauth-secrets/openid4vp-management-token";
+const OPENID4VCI_MANAGEMENT_TOKEN_NAME: &str = "openid4vci-management-token";
+const OPENID4VCI_MANAGEMENT_TOKEN_TARGET: &str =
+    "/run/nazoauth-secrets/openid4vci-management-token";
 
 pub struct ConformanceMatrix {
     pub bytes: Vec<u8>,
@@ -116,6 +119,17 @@ impl ConformanceSession {
             OPENID4VP_MANAGEMENT_TOKEN_NAME,
             OPENID4VP_MANAGEMENT_TOKEN_TARGET,
             "OpenID4VP management token",
+        )
+    }
+
+    /// Load the deployment-owned OpenID4VCI issuer management token from the
+    /// active deployment's bound secret. The token is never accepted from a
+    /// command-line argument and remains in zeroizing memory.
+    pub fn openid4vci_management_token(&self) -> anyhow::Result<zeroize::Zeroizing<String>> {
+        self.read_profile_secret(
+            OPENID4VCI_MANAGEMENT_TOKEN_NAME,
+            OPENID4VCI_MANAGEMENT_TOKEN_TARGET,
+            "OpenID4VCI management token",
         )
     }
 

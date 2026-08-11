@@ -1,5 +1,8 @@
 use super::MaterializerError;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use p256::ecdsa::SigningKey;
 use rand_core::{OsRng, RngCore};
 use rcgen::{
@@ -11,7 +14,7 @@ use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::{Duration as TimeDuration, OffsetDateTime};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 pub(super) const MTLS_CLIENT_SAN_DNS: &str = "nazoauthctl-client";
 
@@ -25,6 +28,27 @@ pub(super) struct GeneratedClientCrypto {
     pub(super) mtls_client_certificate: Zeroizing<String>,
     pub(super) mtls_client_key: Zeroizing<String>,
     pub(super) mtls_client_certificate_sha256: String,
+}
+
+/// Run-scoped OpenID4VC-HAIP attestation material.  The private JWKs are
+/// retained only in the prepared Suite configuration and are zeroized with
+/// the preparation state; only public trust material is ever sent elsewhere.
+pub(super) struct GeneratedAttestationMaterial {
+    pub(super) trust_anchor_pem: Zeroizing<String>,
+    pub(super) attester_private_jwks: Zeroizing<String>,
+    pub(super) attester_public_jwks: Zeroizing<String>,
+    pub(super) key_attestation_private_jwks: Zeroizing<String>,
+    pub(super) key_attestation_public_jwks: Zeroizing<String>,
+}
+
+impl Zeroize for GeneratedAttestationMaterial {
+    fn zeroize(&mut self) {
+        self.trust_anchor_pem.zeroize();
+        self.attester_private_jwks.zeroize();
+        self.attester_public_jwks.zeroize();
+        self.key_attestation_private_jwks.zeroize();
+        self.key_attestation_public_jwks.zeroize();
+    }
 }
 
 pub(super) fn generate_client_crypto(
@@ -68,6 +92,150 @@ pub(super) fn random_hex(bytes: usize) -> String {
     let mut rng = OsRng;
     rng.fill_bytes(&mut random);
     random.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub(super) fn random_tx_code() -> String {
+    const RANGE: u32 = 1_000_000;
+    let limit = u32::MAX - (u32::MAX % RANGE);
+    let mut rng = OsRng;
+    loop {
+        let value = rng.next_u32();
+        if value < limit {
+            return format!("{:06}", value % RANGE);
+        }
+    }
+}
+
+/// Generate the independent P-256 attester/key-attestation identities used by
+/// VCI-HAIP.  The key material is generated from `OsRng`, then wrapped in a
+/// run-local CA so the Suite can validate the x5c chains without deployment
+/// secrets.  No generated value is returned in the onboarding bundle.
+pub(super) fn generate_attestation_material()
+-> Result<GeneratedAttestationMaterial, MaterializerError> {
+    let now = OffsetDateTime::now_utc();
+    let mut ca_params =
+        CertificateParams::new(Vec::<String>::new()).map_err(|_| MaterializerError::Crypto)?;
+    ca_params.not_before = now - TimeDuration::days(1);
+    ca_params.not_after = now + TimeDuration::days(2);
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let mut rng = OsRng;
+    let ca_key = p256::ecdsa::SigningKey::random(&mut rng);
+    let ca_key_der = Zeroizing::new(ec_pkcs8_der(&ca_key));
+    let ca_key_pair =
+        KeyPair::try_from(ca_key_der.as_slice()).map_err(|_| MaterializerError::Crypto)?;
+    let ca = CertifiedIssuer::self_signed(ca_params, ca_key_pair)
+        .map_err(|_| MaterializerError::Crypto)?;
+    let trust_anchor_pem = Zeroizing::new(ca.pem());
+
+    let (attester_private_jwks, attester_public_jwks) =
+        generate_attestation_leaf(&ca, "NazoAuth client attestation")?;
+    let (key_attestation_private_jwks, key_attestation_public_jwks) =
+        generate_attestation_leaf(&ca, "NazoAuth key attestation")?;
+    Ok(GeneratedAttestationMaterial {
+        trust_anchor_pem,
+        attester_private_jwks,
+        attester_public_jwks,
+        key_attestation_private_jwks,
+        key_attestation_public_jwks,
+    })
+}
+
+fn generate_attestation_leaf<'a>(
+    ca: &CertifiedIssuer<'a, KeyPair>,
+    common_name: &str,
+) -> Result<(Zeroizing<String>, Zeroizing<String>), MaterializerError> {
+    let mut rng = OsRng;
+    let signing_key = p256::ecdsa::SigningKey::random(&mut rng);
+    let key_der = Zeroizing::new(ec_pkcs8_der(&signing_key));
+    let key_pair = KeyPair::try_from(key_der.as_slice()).map_err(|_| MaterializerError::Crypto)?;
+    let now = OffsetDateTime::now_utc();
+    let mut params =
+        CertificateParams::new(Vec::<String>::new()).map_err(|_| MaterializerError::Crypto)?;
+    params.not_before = now - TimeDuration::days(1);
+    params.not_after = now + TimeDuration::days(2);
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, common_name.to_owned());
+    let certificate = params
+        .signed_by(&key_pair, ca)
+        .map_err(|_| MaterializerError::Crypto)?;
+    let encoded_certificate = STANDARD.encode(certificate.der().as_ref());
+    let point = signing_key.verifying_key().to_encoded_point(false);
+    let x = URL_SAFE_NO_PAD.encode(point.x().ok_or(MaterializerError::Crypto)?);
+    let y = URL_SAFE_NO_PAD.encode(point.y().ok_or(MaterializerError::Crypto)?);
+    let d = URL_SAFE_NO_PAD.encode(signing_key.to_bytes());
+    let kid = format!("nazo-openid4vc-attestation-{}", random_hex(8));
+    let public = serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "alg": "ES256",
+        "use": "sig",
+        "kid": kid,
+        "x": x,
+        "y": y,
+        "x5c": [encoded_certificate]
+    });
+    let private = serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "alg": "ES256",
+        "use": "sig",
+        "kid": kid,
+        "x": x,
+        "y": y,
+        "d": d,
+        "x5c": [encoded_certificate]
+    });
+    let public_jwks = serde_json::to_string(&serde_json::json!({"keys": [public]}))
+        .map_err(|_| MaterializerError::Encoding)?;
+    let private_jwks = serde_json::to_string(&serde_json::json!({"keys": [private]}))
+        .map_err(|_| MaterializerError::Encoding)?;
+    Ok((Zeroizing::new(private_jwks), Zeroizing::new(public_jwks)))
+}
+
+fn ec_pkcs8_der(signing_key: &p256::ecdsa::SigningKey) -> Vec<u8> {
+    let point = signing_key.verifying_key().to_encoded_point(false);
+    let scalar = signing_key.to_bytes();
+    let ec_private = der_sequence(&[
+        der_tlv(0x02, &[0x01]),
+        der_tlv(0x04, scalar.as_ref()),
+        der_tlv(
+            0xa0,
+            &der_tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]),
+        ),
+        der_tlv(0xa1, &der_tlv(0x03, &[&[0x00], point.as_bytes()].concat())),
+    ]);
+    der_sequence(&[
+        der_tlv(0x02, &[0x00]),
+        der_sequence(&[
+            der_tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]),
+            der_tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]),
+        ]),
+        der_tlv(0x04, &ec_private),
+    ])
+}
+
+fn der_sequence(parts: &[Vec<u8>]) -> Vec<u8> {
+    let payload = parts.concat();
+    der_tlv(0x30, &payload)
+}
+
+fn der_tlv(tag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut output = vec![tag];
+    let length = payload.len();
+    if length < 128 {
+        output.push(length as u8);
+    } else {
+        let bytes = (length as u32).to_be_bytes();
+        let first = bytes.iter().position(|byte| *byte != 0).unwrap_or(3);
+        output.push(0x80 | u8::try_from(4 - first).unwrap_or(4));
+        output.extend_from_slice(&bytes[first..]);
+    }
+    output.extend_from_slice(payload);
+    output
 }
 
 pub(super) fn rsa_jwks(key: &RsaPrivateKey) -> Result<(String, String), MaterializerError> {

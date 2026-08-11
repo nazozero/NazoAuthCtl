@@ -1130,7 +1130,7 @@ dependencies = [
 [[package]]
 name = "nazo-operator-protocol"
 version = "0.1.29"
-source = "git+https://github.com/nazozero/NazoAuth.git?rev=fda14c79bdc8693ccaf06082ab6d7197c5a6893f#fda14c79bdc8693ccaf06082ab6d7197c5a6893f"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=6e61c0eff26261c36bf921a4373e3cfd6b90d03d#6e61c0eff26261c36bf921a4373e3cfd6b90d03d"
 dependencies = [
  "anyhow",
  "base64",
@@ -1155,6 +1155,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "uuid",
  "zeroize",
 ]
 

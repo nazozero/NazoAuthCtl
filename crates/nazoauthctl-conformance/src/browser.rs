@@ -40,6 +40,8 @@ pub enum BrowserError {
     StepLimit,
     #[error("browser redirect or navigation crossed the allowlist")]
     CrossOriginNavigation,
+    #[error("browser redirect limit exceeded")]
+    RedirectLimit,
     #[error("browser entry did not match the current page")]
     NoMatchingEntry,
     #[error("browser command pattern is invalid")]
@@ -66,6 +68,7 @@ pub enum BrowserError {
     DriverStartFailed,
 }
 
+mod openid4vci;
 mod openid4vp;
 mod parser;
 mod plan;
@@ -73,9 +76,13 @@ mod schema;
 mod validation;
 mod webdriver;
 
+pub use openid4vci::{
+    OpenId4VciError, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
+    OpenId4VciModule,
+};
 pub use openid4vp::{
-    OpenId4VpError, OpenId4VpPresentation, OpenId4VpStartRequest, OpenId4VpVerifier,
-    OpenId4VpVerifierClient,
+    ConformanceBinding, OpenId4VpError, OpenId4VpPresentation, OpenId4VpStartRequest,
+    OpenId4VpVerifier, OpenId4VpVerifierClient,
 };
 pub use parser::{parse_browser_entries, parse_browser_entries_owned};
 pub use plan::OpenId4VcBrowserState;
@@ -135,6 +142,8 @@ pub struct BrowserExecutor<D> {
     policy: BrowserPolicy,
     entry_uses: HashMap<usize, u32>,
     steps: usize,
+    redirects: usize,
+    last_url: Option<Url>,
 }
 
 impl<D: BrowserDriver> BrowserExecutor<D> {
@@ -144,6 +153,8 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             policy,
             entry_uses: HashMap::new(),
             steps: 0,
+            redirects: 0,
+            last_url: None,
         }
     }
 
@@ -213,8 +224,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             BrowserCommand::WaitContains { needle, timeout } => {
                 let deadline = self.deadline(*timeout);
                 loop {
-                    let current = self.driver.current_url()?;
-                    self.policy.validate_url(&current)?;
+                    let current = self.ensure_current_url()?;
                     if current.as_str().contains(needle) {
                         return Ok(());
                     }
@@ -254,6 +264,15 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
     fn ensure_current_url(&mut self) -> Result<Url, BrowserError> {
         let current = self.driver.current_url()?;
         self.policy.validate_url(&current)?;
+        if let Some(previous) = &self.last_url
+            && previous != &current
+        {
+            self.redirects = self.redirects.saturating_add(1);
+            if self.redirects > self.policy.limits.max_redirects {
+                return Err(BrowserError::RedirectLimit);
+            }
+        }
+        self.last_url = Some(current.clone());
         Ok(current)
     }
 
@@ -290,9 +309,14 @@ impl<D: BrowserDriver> BrowserAutomation for BrowserExecutor<D> {
             return Err(BrowserError::InvalidSchema);
         }
         self.policy.validate_url(authorization_url)?;
+        self.redirects = 0;
+        self.last_url = None;
+        // Match the Suite entry against the URL that was requested.  The
+        // first navigation commonly redirects `/authorize` to hosted login
+        // or consent; selecting after navigation would lose the entry whose
+        // tasks are explicitly responsible for those bounded redirects.
+        let entry_index = self.matching_entry(authorization_url, entries)?;
         self.navigate(authorization_url)?;
-        let current = self.ensure_current_url()?;
-        let entry_index = self.matching_entry(&current, entries)?;
         *self.entry_uses.entry(entry_index).or_default() += 1;
         let mut task_count = 0usize;
         let entry = &entries[entry_index];
@@ -327,6 +351,8 @@ impl<D: BrowserDriver> BrowserAutomation for BrowserExecutor<D> {
 
     fn navigate(&mut self, url: &Url) -> Result<(), BrowserError> {
         self.policy.validate_url(url)?;
+        self.redirects = 0;
+        self.last_url = Some(url.clone());
         self.driver.navigate(url)?;
         self.ensure_current_url().map(|_| ())
     }
@@ -442,6 +468,55 @@ mod tests {
         }
     }
 
+    struct RedirectingMockDriver {
+        current: Url,
+        cross_origin: bool,
+    }
+
+    impl BrowserDriver for RedirectingMockDriver {
+        fn navigate(&mut self, _url: &Url) -> Result<(), BrowserError> {
+            self.current = if self.cross_origin {
+                Url::parse("https://evil.example/ui/auth").expect("url")
+            } else {
+                Url::parse("https://issuer.example/ui/auth").expect("url")
+            };
+            Ok(())
+        }
+
+        fn current_url(&mut self) -> Result<Url, BrowserError> {
+            Ok(self.current.clone())
+        }
+
+        fn page_source(&mut self) -> Result<String, BrowserError> {
+            Ok(String::new())
+        }
+
+        fn find_element(&mut self, _selector: &BrowserSelector) -> Result<String, BrowserError> {
+            Ok("element".to_owned())
+        }
+
+        fn element_displayed(&mut self, _element: &str) -> Result<bool, BrowserError> {
+            Ok(true)
+        }
+
+        fn element_text(&mut self, _element: &str) -> Result<String, BrowserError> {
+            Ok(String::new())
+        }
+
+        fn element_send_keys(&mut self, _element: &str, _value: &str) -> Result<(), BrowserError> {
+            Ok(())
+        }
+
+        fn element_click(&mut self, _element: &str) -> Result<(), BrowserError> {
+            self.current = match self.current.path() {
+                "/ui/auth" => Url::parse("https://issuer.example/ui/consent").expect("url"),
+                "/ui/consent" => Url::parse("https://suite.example/test/callback").expect("url"),
+                _ => self.current.clone(),
+            };
+            Ok(())
+        }
+    }
+
     #[test]
     fn executor_rejects_cross_origin_navigation_and_runs_mock_flow() {
         let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
@@ -473,5 +548,71 @@ mod tests {
             )
             .expect("flow");
         assert_eq!(report.steps, 2);
+    }
+
+    #[test]
+    fn executor_matches_initial_authorize_entry_before_hosted_redirects() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse("https://suite.example").expect("suite");
+        let policy = BrowserPolicy::new(target, suite).expect("policy");
+        let driver = RedirectingMockDriver {
+            current: Url::parse("https://issuer.example/authorize?x=1").expect("url"),
+            cross_origin: false,
+        };
+        let mut executor = BrowserExecutor::new(driver, policy);
+        let entries = vec![
+            BrowserEntry::parse(&json!({
+                "match": "https://issuer.example/authorize*",
+                "tasks": [
+                    {
+                        "match": "https://issuer.example/ui/auth*",
+                        "commands": [["click", "id", "login"]]
+                    },
+                    {
+                        "match": "https://issuer.example/ui/consent*",
+                        "commands": [["click", "id", "approve"]]
+                    },
+                    {
+                        "match": "https://suite.example/test/callback*",
+                        "commands": []
+                    }
+                ]
+            }))
+            .expect("entry"),
+        ];
+        executor
+            .execute(
+                &Url::parse("https://issuer.example/authorize?x=1").expect("url"),
+                &entries,
+            )
+            .expect("redirect flow");
+    }
+
+    #[test]
+    fn executor_rejects_cross_origin_redirect_after_initial_match() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse("https://suite.example").expect("suite");
+        let policy = BrowserPolicy::new(target, suite).expect("policy");
+        let driver = RedirectingMockDriver {
+            current: Url::parse("https://issuer.example/authorize?x=1").expect("url"),
+            cross_origin: true,
+        };
+        let mut executor = BrowserExecutor::new(driver, policy);
+        let entries = vec![
+            BrowserEntry::parse(&json!({
+                "match": "https://issuer.example/authorize*",
+                "tasks": []
+            }))
+            .expect("entry"),
+        ];
+        assert_eq!(
+            executor
+                .execute(
+                    &Url::parse("https://issuer.example/authorize?x=1").expect("url"),
+                    &entries,
+                )
+                .expect_err("cross-origin redirect"),
+            BrowserError::CrossOriginNavigation
+        );
     }
 }

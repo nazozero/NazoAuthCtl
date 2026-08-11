@@ -8,10 +8,11 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use nazoauthctl_conformance::{
     BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy, BrowserTargetOrigin,
-    ClientConfig, ConformanceRunConfig, ConformanceRunner, CredentialStore,
-    DeploymentConformanceSecrets, DescriptorMaterializer, ManagedWebDriver, MatrixSelection,
-    OnboardingOutput, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, RunControl,
-    StableRenderer, SuiteClient, TtyRenderer, WebDriverClient, WebDriverEndpoint,
+    ClientConfig, ConformanceBinding, ConformanceRunConfig, ConformanceRunner, CredentialStore,
+    DescriptorMaterializer, ManagedWebDriver, MatrixSelection, OnboardingOutput,
+    OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
+    OpenId4VpVerifierClient, Origin, RunControl, StableRenderer, SuiteClient, TtyRenderer,
+    WebDriverClient, WebDriverEndpoint,
 };
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
@@ -241,20 +242,11 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let descriptor = DescriptorMaterializer::from_bytes(&matrix.bytes)
         .context("deployment Matrix cannot be materialized")?;
     let request_jti = format!("request-{}", hex(rand::random::<[u8; 16]>()));
-    let deployment_secrets = DeploymentConformanceSecrets::new(
-        session
-            .dynamic_registration_initial_access_token()
-            .context("failed to load the deployment dynamic-registration token")?,
-        session
-            .ciba_automated_decision_token()
-            .context("failed to load the deployment CIBA decision token")?,
-    )?;
     let (prepared, bundle) = DescriptorMaterializer::prepare(
         descriptor,
         session.target_issuer(),
         &suite_origin,
         &request_jti,
-        deployment_secrets,
     )
     .context("failed to prepare ephemeral conformance material")?;
     if prepared.matrix_sha256() != matrix.sha256 {
@@ -272,6 +264,9 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         )
         .context("failed to atomically provision the conformance lease")?;
     let lease_id = onboarding.lease_id.clone();
+    let applicant_id = uuid::Uuid::parse_str(&onboarding.applicant_id)
+        .context("operator onboarding returned an invalid applicant identifier")?;
+    let static_tx_code = prepared.tx_code();
 
     let run_result = (|| -> anyhow::Result<RunOutput> {
         let openid4vc_request_object_trust_anchor_pem = session
@@ -281,10 +276,13 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             onboarding.lease_id.clone(),
             onboarding.request_jti.clone(),
             onboarding.matrix_sha256.clone(),
+            onboarding.bundle_sha256.clone(),
             onboarding.applicant_id.clone(),
             openid4vc_request_object_trust_anchor_pem,
             onboarding.client_mappings.clone(),
         )?;
+        let binding =
+            ConformanceBinding::new(&onboarding.lease_id, onboarding.request_jti.clone())?;
         let mut materialized = DescriptorMaterializer::finalize(prepared, onboarding_output)
             .context("operator onboarding result does not match the prepared Matrix")?;
         let browser = build_browser(
@@ -292,6 +290,21 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             session.target_issuer(),
             &suite_origin,
         )?;
+        let issuer: Arc<Mutex<dyn OpenId4VciIssuerDriver>> =
+            Arc::new(Mutex::new(OpenId4VciIssuerClient::new(
+                OpenId4VciIssuerConfig::new(
+                    BrowserTargetOrigin::parse(session.target_issuer())?,
+                    suite_origin.clone(),
+                    applicant_id,
+                    static_tx_code,
+                    Duration::from_secs(30),
+                )?,
+                session
+                    .openid4vci_management_token()
+                    .context("failed to load the deployment OpenID4VCI management token")?,
+                token.clone(),
+                browser.clone(),
+            )?));
         let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
             Arc::new(Mutex::new(OpenId4VpVerifierClient::new(
                 BrowserTargetOrigin::parse(session.target_issuer())?,
@@ -300,6 +313,7 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                     .openid4vp_management_token()
                     .context("failed to load the deployment OpenID4VP management token")?,
                 Duration::from_secs(30),
+                binding.clone(),
             )?));
         let control = RunControl::default();
         let interrupt = control.clone();
@@ -321,10 +335,12 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             client,
             matrix: selected_matrix,
             target_origin: Some(BrowserTargetOrigin::parse(session.target_issuer())?),
+            binding,
             poll_timeout: invocation.poll_timeout,
             control,
             browser: Some(browser),
             verifier: Some(verifier),
+            issuer: Some(issuer),
         })?;
         let summary = if io::stderr().is_terminal() {
             let mut renderer = TtyRenderer::new(io::stderr().lock());

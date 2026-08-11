@@ -31,7 +31,8 @@ mod template;
 #[cfg(test)]
 use crypto::MTLS_CLIENT_SAN_DNS;
 use crypto::{
-    digest_hex, generate_client_crypto, random_hex, random_secret, registration_requires_mtls,
+    GeneratedAttestationMaterial, digest_hex, generate_attestation_material,
+    generate_client_crypto, random_hex, random_secret, random_tx_code, registration_requires_mtls,
     validate_materialized_mtls_registration,
 };
 pub use descriptor::{
@@ -42,7 +43,10 @@ use descriptor::{
     collect_client_policies, collect_registrations, descriptor_requires_reference, is_placeholder,
     parse_placeholder, validate_binding_reference, validate_descriptor, validate_digest,
 };
-use template::{materialize_registration_template, materialize_value, validate_target_issuer};
+use template::{
+    materialize_registration_template, materialize_value, materialize_vci_config,
+    materialize_vp_config, validate_target_issuer,
+};
 
 /// Lease/apply result.  It intentionally contains no password, client secret,
 /// private JWK, or private certificate key.  The values are retained only in
@@ -52,6 +56,7 @@ pub struct OnboardingOutput {
     lease_id: String,
     request_jti: String,
     matrix_sha256: String,
+    bundle_sha256: String,
     applicant_id: String,
     openid4vc_request_object_trust_anchor_pem: String,
     clients: BTreeMap<String, String>,
@@ -62,6 +67,7 @@ impl OnboardingOutput {
         lease_id: impl Into<String>,
         request_jti: impl Into<String>,
         matrix_sha256: impl Into<String>,
+        bundle_sha256: impl Into<String>,
         applicant_id: impl Into<String>,
         openid4vc_request_object_trust_anchor_pem: impl Into<String>,
         clients: BTreeMap<String, String>,
@@ -69,12 +75,14 @@ impl OnboardingOutput {
         let lease_id = lease_id.into();
         let request_jti = request_jti.into();
         let matrix_sha256 = matrix_sha256.into();
+        let bundle_sha256 = bundle_sha256.into();
         let applicant_id = applicant_id.into();
         let openid4vc_request_object_trust_anchor_pem =
             openid4vc_request_object_trust_anchor_pem.into();
         validate_lease_id(&lease_id)?;
         validate_request_jti(&request_jti)?;
         validate_digest(&matrix_sha256, "matrix_sha256")?;
+        validate_digest(&bundle_sha256, "bundle_sha256")?;
         validate_lease_id(&applicant_id)
             .map_err(|_| MaterializerError::InvalidField("applicant_id"))?;
         validate_public_certificate_bundle(&openid4vc_request_object_trust_anchor_pem)?;
@@ -90,6 +98,7 @@ impl OnboardingOutput {
             lease_id,
             request_jti,
             matrix_sha256,
+            bundle_sha256,
             applicant_id,
             openid4vc_request_object_trust_anchor_pem,
             clients,
@@ -104,6 +113,10 @@ impl OnboardingOutput {
         &self.matrix_sha256
     }
 
+    pub fn bundle_sha256(&self) -> &str {
+        &self.bundle_sha256
+    }
+
     /// Compatibility accessor; this is the raw MatrixDescribe SHA-256, not a
     /// second derived identity.
     pub fn matrix_digest(&self) -> &str {
@@ -112,6 +125,10 @@ impl OnboardingOutput {
 
     pub fn request_jti(&self) -> &str {
         &self.request_jti
+    }
+
+    pub fn applicant_id(&self) -> &str {
+        &self.applicant_id
     }
 
     pub fn clients(&self) -> &BTreeMap<String, String> {
@@ -126,6 +143,7 @@ impl std::fmt::Debug for OnboardingOutput {
             .field("lease_id", &self.lease_id)
             .field("request_jti", &self.request_jti)
             .field("matrix_sha256", &self.matrix_sha256)
+            .field("bundle_sha256", &self.bundle_sha256)
             .field("applicant_id", &self.applicant_id)
             .field(
                 "openid4vc_request_object_trust_anchor_pem",
@@ -148,6 +166,8 @@ pub struct PreparedMaterialization {
     bundle_digest: String,
     applicant_email: Zeroizing<String>,
     applicant_password: Zeroizing<String>,
+    tx_code: Option<Zeroizing<String>>,
+    attestation: Option<GeneratedAttestationMaterial>,
     dynamic_registration_initial_access_token: Option<Zeroizing<String>>,
     ciba_automated_decision_token: Option<Zeroizing<String>>,
     clients: BTreeMap<String, PreparedClient>,
@@ -157,6 +177,8 @@ impl Zeroize for PreparedMaterialization {
     fn zeroize(&mut self) {
         self.applicant_password.zeroize();
         self.applicant_email.zeroize();
+        self.tx_code.zeroize();
+        self.attestation.zeroize();
         self.dynamic_registration_initial_access_token.zeroize();
         self.ciba_automated_decision_token.zeroize();
         for client in self.clients.values_mut() {
@@ -188,6 +210,15 @@ impl PreparedMaterialization {
 
     pub fn bundle_digest(&self) -> &str {
         &self.bundle_digest
+    }
+
+    /// Return a zeroizing run-scoped pre-authorized-code clone for the issuer
+    /// driver. It is neither serializable nor printable; callers must not
+    /// persist or log it.
+    pub fn tx_code(&self) -> Option<Zeroizing<String>> {
+        self.tx_code
+            .as_ref()
+            .map(|value| Zeroizing::new(value.to_string()))
     }
 
     pub fn expected_clients(&self) -> BTreeSet<String> {
@@ -348,44 +379,11 @@ pub enum MaterializerError {
     RequestMismatch,
     #[error("onboarding matrix identity does not match preparation")]
     MatrixDigestMismatch,
+    #[error("onboarding bundle identity does not match preparation")]
+    BundleDigestMismatch,
 }
 
 pub struct DescriptorMaterializer;
-
-/// Deployment-owned profile tokens required by official dynamic-registration
-/// and CIBA plans. They are supplied by the controller's secure-file boundary;
-/// the materializer never invents a second authority value.
-pub struct DeploymentConformanceSecrets {
-    dynamic_registration_initial_access_token: Zeroizing<String>,
-    ciba_automated_decision_token: Zeroizing<String>,
-}
-
-impl DeploymentConformanceSecrets {
-    pub fn new(
-        dynamic_registration_initial_access_token: Zeroizing<String>,
-        ciba_automated_decision_token: Zeroizing<String>,
-    ) -> Result<Self, MaterializerError> {
-        for value in [
-            dynamic_registration_initial_access_token.as_str(),
-            ciba_automated_decision_token.as_str(),
-        ] {
-            if value.len() < 32
-                || value.len() > 4096
-                || value
-                    .chars()
-                    .any(|character| character.is_control() || character.is_whitespace())
-            {
-                return Err(MaterializerError::InvalidField(
-                    "deployment_conformance_secret",
-                ));
-            }
-        }
-        Ok(Self {
-            dynamic_registration_initial_access_token,
-            ciba_automated_decision_token,
-        })
-    }
-}
 
 impl DescriptorMaterializer {
     pub fn from_bytes(bytes: &[u8]) -> Result<MatrixDescriptor, MaterializerError> {
@@ -406,7 +404,6 @@ impl DescriptorMaterializer {
         target_issuer: &str,
         suite_origin: &Origin,
         request_jti: &str,
-        deployment_secrets: DeploymentConformanceSecrets,
     ) -> Result<(PreparedMaterialization, SecureOnboardingBundle), MaterializerError> {
         validate_descriptor(&descriptor)?;
         validate_target_issuer(target_issuer)?;
@@ -419,6 +416,11 @@ impl DescriptorMaterializer {
         let registrations = collect_registrations(&descriptor)?;
         let applicant_password = Zeroizing::new(random_secret(32));
         let applicant_email = Zeroizing::new(format!("oidf-{}@example.invalid", random_hex(16)));
+        let tx_code = descriptor_requires_pre_authorized_vci(&descriptor)
+            .then(|| Zeroizing::new(random_tx_code()));
+        let attestation = descriptor_requires_vci_haip(&descriptor)
+            .then(generate_attestation_material)
+            .transpose()?;
         let mut clients = BTreeMap::new();
         for (logical_client_id, policy) in policies {
             let registration = registrations
@@ -436,17 +438,22 @@ impl DescriptorMaterializer {
                 )?,
             );
         }
+        // These values are lease-scoped capabilities, not deployment profile
+        // configuration.  Generate them only when the signed descriptor
+        // actually references the capability.  This keeps unrelated runs from
+        // receiving a token and prevents a second run from reusing a DB-unique
+        // deployment token.
         let needs_dynamic_token = descriptor_requires_reference(
             &descriptor,
-            "deployment.dynamic_registration_initial_access_token",
+            "generated.dynamic_registration_initial_access_token",
         );
         let needs_ciba_token =
-            descriptor_requires_reference(&descriptor, "deployment.ciba_automated_decision_token")
+            descriptor_requires_reference(&descriptor, "generated.ciba_automated_decision_token")
                 || descriptor_requires_reference(&descriptor, "target.ciba_automated_decision_url");
-        let dynamic_registration_initial_access_token = needs_dynamic_token
-            .then_some(deployment_secrets.dynamic_registration_initial_access_token);
+        let dynamic_registration_initial_access_token =
+            needs_dynamic_token.then(|| Zeroizing::new(random_secret(32)));
         let ciba_automated_decision_token =
-            needs_ciba_token.then_some(deployment_secrets.ciba_automated_decision_token);
+            needs_ciba_token.then(|| Zeroizing::new(random_secret(32)));
         let bundle_record = SecureBundleRecord {
             schema: SECURE_BUNDLE_SCHEMA_VERSION,
             request_jti: request_jti.to_owned(),
@@ -454,6 +461,7 @@ impl DescriptorMaterializer {
             profile: "nazoauth-full".to_owned(),
             target_issuer: target_issuer.to_owned(),
             suite_base_url: suite_origin.as_str().to_owned(),
+            openid4vc_credential_datasets: descriptor.openid4vc_credential_datasets.clone(),
             applicant: SecureApplicantBundle {
                 email: applicant_email.clone(),
                 password: applicant_password.clone(),
@@ -483,6 +491,8 @@ impl DescriptorMaterializer {
             bundle_digest,
             applicant_email,
             applicant_password,
+            tx_code,
+            attestation,
             dynamic_registration_initial_access_token,
             ciba_automated_decision_token,
             clients,
@@ -502,6 +512,9 @@ impl DescriptorMaterializer {
         }
         if onboarding.matrix_sha256 != prepared.matrix_sha256 {
             return Err(MaterializerError::MatrixDigestMismatch);
+        }
+        if onboarding.bundle_sha256 != prepared.bundle_digest {
+            return Err(MaterializerError::BundleDigestMismatch);
         }
         let expected = prepared.clients.keys().collect::<BTreeSet<_>>();
         let actual = onboarding.clients.keys().collect::<BTreeSet<_>>();
@@ -525,6 +538,21 @@ impl DescriptorMaterializer {
                     &prepared,
                     &onboarding,
                     &mut BTreeSet::new(),
+                )?;
+                let config = materialize_vci_config(
+                    &plan.plan,
+                    &plan.variant,
+                    config,
+                    &prepared.target_issuer,
+                    &prepared.suite_base_url,
+                    prepared.tx_code.as_ref().map(|value| value.as_str()),
+                    prepared.attestation.as_ref(),
+                )?;
+                let config = materialize_vp_config(
+                    &plan.plan,
+                    &plan.variant,
+                    config,
+                    &onboarding.openid4vc_request_object_trust_anchor_pem,
                 )?;
                 plans.push(MatrixPlan {
                     id: plan.id.clone(),
@@ -697,6 +725,7 @@ struct SecureBundleRecord {
     profile: String,
     target_issuer: String,
     suite_base_url: String,
+    openid4vc_credential_datasets: BTreeMap<String, Value>,
     applicant: SecureApplicantBundle,
     #[serde(skip_serializing_if = "Option::is_none")]
     dynamic_registration_initial_access_token: Option<Zeroizing<String>>,
@@ -770,6 +799,26 @@ fn validate_request_jti(value: &str) -> Result<(), MaterializerError> {
         return Err(MaterializerError::InvalidField("request_jti"));
     }
     Ok(())
+}
+
+fn descriptor_requires_pre_authorized_vci(descriptor: &MatrixDescriptor) -> bool {
+    descriptor.groups.iter().any(|group| {
+        group.plans.iter().any(|plan| {
+            plan.plan.starts_with("oid4vci-")
+                && plan.variant.get("vci_grant_type").map(String::as_str)
+                    == Some("pre_authorization_code")
+        })
+    })
+}
+
+fn descriptor_requires_vci_haip(descriptor: &MatrixDescriptor) -> bool {
+    descriptor.groups.iter().any(|group| {
+        group.plans.iter().any(|plan| {
+            plan.plan.starts_with("oid4vci-")
+                && (plan.plan.contains("haip")
+                    || plan.variant.get("fapi_profile").map(String::as_str) == Some("vci_haip"))
+        })
+    })
 }
 
 #[cfg(test)]
@@ -872,43 +921,149 @@ mod tests {
         DescriptorMaterializer::from_bytes(&bytes).expect("descriptor")
     }
 
+    fn descriptor_with_openid4vc_plan(
+        plan_name: &str,
+        variant: BTreeMap<String, String>,
+        config: Value,
+    ) -> MatrixDescriptor {
+        let mut descriptor = descriptor();
+        let configuration_id = config
+            .get("vci")
+            .and_then(Value::as_object)
+            .and_then(|vci| vci.get("credential_configuration_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| variant.get("credential_configuration_id").cloned());
+        let dataset = config
+            .get("nazo")
+            .and_then(Value::as_object)
+            .and_then(|nazo| nazo.get("credential_dataset"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"given_name":"Conformance"}));
+        {
+            let plan = &mut descriptor.groups[0].plans[0];
+            plan.plan = plan_name.to_owned();
+            plan.variant = variant;
+            plan.config_template = config;
+        }
+        if let Some(configuration_id) = configuration_id {
+            descriptor
+                .openid4vc_credential_datasets
+                .insert(configuration_id, dataset);
+        }
+        descriptor
+    }
+
+    fn descriptor_with_openid4vp_plan(request_method: &str, config: Value) -> MatrixDescriptor {
+        let mut descriptor = descriptor();
+        let plan = &mut descriptor.groups[0].plans[0];
+        plan.plan = "oid4vp-1final-verifier-test-plan".to_owned();
+        plan.variant = BTreeMap::from([
+            ("vp_profile".to_owned(), "plain_vp".to_owned()),
+            ("credential_format".to_owned(), "sd_jwt_vc".to_owned()),
+            ("request_method".to_owned(), request_method.to_owned()),
+        ]);
+        plan.config_template = config;
+        descriptor
+    }
+
     fn suite() -> Origin {
         Origin::parse_suite("https://suite.example").expect("suite")
     }
 
-    fn deployment_secrets() -> DeploymentConformanceSecrets {
-        DeploymentConformanceSecrets::new(
-            Zeroizing::new("d".repeat(32)),
-            Zeroizing::new("c".repeat(32)),
-        )
-        .expect("deployment secrets")
-    }
-
     #[test]
-    fn secure_bundle_uses_deployment_profile_tokens_without_generating_another_authority() {
+    fn secure_bundle_generates_run_scoped_profile_tokens_only_when_referenced() {
         let mut descriptor = descriptor();
         let config = &mut descriptor.groups[0].plans[0].config_template;
         config["initial_access_token"] =
-            serde_json::json!("{{deployment.dynamic_registration_initial_access_token}}");
+            serde_json::json!("{{generated.dynamic_registration_initial_access_token}}");
         config["automated_ciba_token"] =
-            serde_json::json!("{{deployment.ciba_automated_decision_token}}");
-        let dynamic = "dynamic-deployment-token-0123456789";
-        let ciba = "ciba-deployment-token-01234567890123";
-        let (_, bundle) = DescriptorMaterializer::prepare(
-            descriptor,
+            serde_json::json!("{{generated.ciba_automated_decision_token}}");
+        let (first_prepared, first_bundle) = DescriptorMaterializer::prepare(
+            descriptor.clone(),
             "https://issuer.example",
             &suite(),
             request_jti(),
-            DeploymentConformanceSecrets::new(
-                Zeroizing::new(dynamic.to_owned()),
-                Zeroizing::new(ciba.to_owned()),
-            )
-            .expect("deployment secrets"),
+        )
+        .expect("first prepare");
+        let (second_prepared, second_bundle) = DescriptorMaterializer::prepare(
+            descriptor,
+            "https://issuer.example",
+            &suite(),
+            "request-fedcba9876543210fedcba9876543210",
+        )
+        .expect("second prepare");
+        let first: Value = serde_json::from_slice(first_bundle.bytes().as_bytes()).expect("bundle");
+        let second: Value =
+            serde_json::from_slice(second_bundle.bytes().as_bytes()).expect("bundle");
+        let first_dynamic = first["dynamic_registration_initial_access_token"]
+            .as_str()
+            .expect("dynamic token");
+        let second_dynamic = second["dynamic_registration_initial_access_token"]
+            .as_str()
+            .expect("dynamic token");
+        let first_ciba = first["ciba_automated_decision_token"]
+            .as_str()
+            .expect("CIBA token");
+        let second_ciba = second["ciba_automated_decision_token"]
+            .as_str()
+            .expect("CIBA token");
+        assert!(first_dynamic.len() >= 32);
+        assert!(first_ciba.len() >= 32);
+        assert_ne!(first_dynamic, second_dynamic);
+        assert_ne!(first_ciba, second_ciba);
+        assert_ne!(first_bundle.digest(), second_bundle.digest());
+
+        let first_output = onboarding_output(
+            "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
+            first_prepared.request_jti(),
+            first_prepared.matrix_sha256(),
+            first_prepared.bundle_digest(),
+            BTreeMap::from([("web".to_owned(), "first-client".to_owned())]),
+        )
+        .expect("first output");
+        let second_output = onboarding_output(
+            "01890f8e-7c18-7b70-9d1e-9bb8c44a2f42",
+            second_prepared.request_jti(),
+            second_prepared.matrix_sha256(),
+            second_prepared.bundle_digest(),
+            BTreeMap::from([("web".to_owned(), "second-client".to_owned())]),
+        )
+        .expect("second output");
+        let first_matrix =
+            DescriptorMaterializer::finalize(first_prepared, first_output).expect("first finalize");
+        let second_matrix = DescriptorMaterializer::finalize(second_prepared, second_output)
+            .expect("second finalize");
+        assert_eq!(
+            first_matrix.matrix().document.groups[0].plans[0].config["initial_access_token"],
+            first_dynamic
+        );
+        assert_eq!(
+            first_matrix.matrix().document.groups[0].plans[0].config["automated_ciba_token"],
+            first_ciba
+        );
+        assert_ne!(
+            first_matrix.matrix().document.groups[0].plans[0].config["initial_access_token"],
+            second_matrix.matrix().document.groups[0].plans[0].config["initial_access_token"]
+        );
+    }
+
+    #[test]
+    fn secure_bundle_omits_profile_tokens_without_references() {
+        let (_, bundle) = DescriptorMaterializer::prepare(
+            descriptor(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
         )
         .expect("prepare");
         let value: Value = serde_json::from_slice(bundle.bytes().as_bytes()).expect("bundle");
-        assert_eq!(value["dynamic_registration_initial_access_token"], dynamic);
-        assert_eq!(value["ciba_automated_decision_token"], ciba);
+        assert!(
+            value
+                .get("dynamic_registration_initial_access_token")
+                .is_none()
+        );
+        assert!(value.get("ciba_automated_decision_token").is_none());
     }
 
     fn request_jti() -> &'static str {
@@ -923,12 +1078,14 @@ mod tests {
         lease_id: &str,
         request_jti: &str,
         matrix_sha256: &str,
+        bundle_sha256: &str,
         clients: BTreeMap<String, String>,
     ) -> Result<OnboardingOutput, MaterializerError> {
         OnboardingOutput::new(
             lease_id,
             request_jti,
             matrix_sha256,
+            bundle_sha256,
             "01890f8e-7c18-7b70-9d1e-9bb8c44a2f41",
             test_trust_anchor(),
             clients,
@@ -942,7 +1099,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
-            deployment_secrets(),
         )
         .expect("prepare");
         let bundle_text =
@@ -963,9 +1119,14 @@ mod tests {
             "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
             prepared.request_jti(),
             prepared.matrix_sha256(),
+            prepared.bundle_digest(),
             actual,
         )
         .expect("output");
+        assert_eq!(
+            output.applicant_id(),
+            "01890f8e-7c18-7b70-9d1e-9bb8c44a2f41"
+        );
         let matrix = DescriptorMaterializer::finalize(prepared, output).expect("finalize");
         assert_eq!(
             matrix.matrix().document.groups[0].plans[0]
@@ -1014,19 +1175,486 @@ mod tests {
     }
 
     #[test]
-    fn missing_extra_and_cross_run_mappings_are_rejected() {
+    fn vci_materialization_binds_issuer_and_declared_variant() {
+        let config = serde_json::json!({
+            "alias": "nazo-vci-run",
+            "vci": {"credential_configuration_id": "eu.example.pid"},
+            "nazo": {
+                "openid4vc_role": "issuer",
+                "client_auth_type": "private_key_jwt",
+                "credential_dataset": {"name": "fixture"}
+            }
+        });
+        let variant = BTreeMap::from([
+            ("credential_format".to_owned(), "sd_jwt_vc".to_owned()),
+            ("client_auth_type".to_owned(), "private_key_jwt".to_owned()),
+        ]);
+        let materialized = materialize_vci_config(
+            "oid4vci-1_0-issuer-test-plan",
+            &variant,
+            config.clone(),
+            "https://issuer.example",
+            "https://suite.example",
+            None,
+            None,
+        )
+        .expect("VCI config");
+        assert_eq!(
+            materialized["vci"]["credential_issuer_url"],
+            "https://issuer.example"
+        );
+        assert_eq!(
+            materialized["vci"]["credential_configuration_id"],
+            "eu.example.pid"
+        );
+        assert_eq!(materialized["nazo"]["credential_format"], "sd_jwt_vc");
+        assert_eq!(materialized["nazo"]["openid4vc_role"], "issuer");
+
+        let mut conflicting_url = config.clone();
+        conflicting_url["vci"]["credential_issuer_url"] =
+            serde_json::json!("https://other.example");
+        assert_eq!(
+            materialize_vci_config(
+                "oid4vci-1_0-issuer-test-plan",
+                &variant,
+                conflicting_url,
+                "https://issuer.example",
+                "https://suite.example",
+                None,
+                None,
+            )
+            .expect_err("conflicting issuer must fail"),
+            MaterializerError::InvalidField("vci.credential_issuer_url")
+        );
+
+        let mut conflicting_format = config;
+        conflicting_format["nazo"]["credential_format"] = serde_json::json!("mdoc");
+        assert_eq!(
+            materialize_vci_config(
+                "oid4vci-1_0-issuer-test-plan",
+                &variant,
+                conflicting_format,
+                "https://issuer.example",
+                "https://suite.example",
+                None,
+                None,
+            )
+            .expect_err("conflicting format must fail"),
+            MaterializerError::InvalidField("nazo.credential_format")
+        );
+    }
+
+    #[test]
+    fn vci_dataset_authority_is_copied_into_the_onboarding_bundle() {
+        let config = serde_json::json!({
+            "alias": "nazo-vci-dataset",
+            "vci": {"credential_configuration_id": "eu.example.pid"},
+            "nazo": {
+                "openid4vc_role": "issuer",
+                "credential_format": "sd_jwt_vc",
+                "credential_dataset": {"given_name": "Fixture", "age": 42}
+            }
+        });
+        let descriptor = descriptor_with_openid4vc_plan(
+            "oid4vci-1_0-issuer-test-plan",
+            BTreeMap::from([("credential_format".to_owned(), "sd_jwt_vc".to_owned())]),
+            config,
+        );
+        let expected = descriptor
+            .openid4vc_credential_datasets
+            .get("eu.example.pid")
+            .cloned()
+            .expect("dataset authority");
+        let (_, bundle) = DescriptorMaterializer::prepare(
+            descriptor,
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+        )
+        .expect("prepare");
+        let value: Value = serde_json::from_slice(bundle.bytes().as_bytes()).expect("bundle");
+        assert_eq!(
+            value["openid4vc_credential_datasets"]["eu.example.pid"],
+            expected
+        );
+    }
+
+    #[test]
+    fn vci_dataset_authority_rejects_missing_extra_and_conflicting_entries() {
+        let config = serde_json::json!({
+            "alias": "nazo-vci-dataset",
+            "vci": {"credential_configuration_id": "eu.example.pid"},
+            "nazo": {
+                "openid4vc_role": "issuer",
+                "credential_format": "sd_jwt_vc",
+                "credential_dataset": {"given_name": "Fixture"}
+            }
+        });
+        let make_descriptor = || {
+            descriptor_with_openid4vc_plan(
+                "oid4vci-1_0-issuer-test-plan",
+                BTreeMap::from([("credential_format".to_owned(), "sd_jwt_vc".to_owned())]),
+                config.clone(),
+            )
+        };
+        let mut missing = make_descriptor();
+        missing.openid4vc_credential_datasets.clear();
+        assert_eq!(
+            DescriptorMaterializer::prepare(
+                missing,
+                "https://issuer.example",
+                &suite(),
+                request_jti()
+            )
+            .err()
+            .expect("missing dataset must fail"),
+            MaterializerError::InvalidField("openid4vc_credential_datasets")
+        );
+
+        let mut extra = make_descriptor();
+        extra.openid4vc_credential_datasets.insert(
+            "unused.configuration".to_owned(),
+            serde_json::json!({"given_name":"Unused"}),
+        );
+        assert_eq!(
+            DescriptorMaterializer::prepare(
+                extra,
+                "https://issuer.example",
+                &suite(),
+                request_jti()
+            )
+            .err()
+            .expect("extra dataset must fail"),
+            MaterializerError::InvalidField("openid4vc_credential_datasets")
+        );
+
+        let mut conflicting = make_descriptor();
+        conflicting.openid4vc_credential_datasets.insert(
+            "eu.example.pid".to_owned(),
+            serde_json::json!({"given_name":"Different"}),
+        );
+        assert_eq!(
+            DescriptorMaterializer::prepare(
+                conflicting,
+                "https://issuer.example",
+                &suite(),
+                request_jti()
+            )
+            .err()
+            .expect("conflicting dataset must fail"),
+            MaterializerError::InvalidField("nazo.credential_dataset")
+        );
+    }
+
+    #[test]
+    fn vci_dataset_authority_rejects_private_or_empty_claims() {
+        let config = serde_json::json!({
+            "alias": "nazo-vci-dataset",
+            "vci": {"credential_configuration_id": "eu.example.pid"},
+            "nazo": {"openid4vc_role": "issuer", "credential_format": "sd_jwt_vc"}
+        });
+        let mut private = descriptor_with_openid4vc_plan(
+            "oid4vci-1_0-issuer-test-plan",
+            BTreeMap::from([("credential_format".to_owned(), "sd_jwt_vc".to_owned())]),
+            config.clone(),
+        );
+        private.openid4vc_credential_datasets.insert(
+            "eu.example.pid".to_owned(),
+            serde_json::json!({"private_key": "not-a-public-claim"}),
+        );
+        assert_eq!(
+            DescriptorMaterializer::prepare(
+                private,
+                "https://issuer.example",
+                &suite(),
+                request_jti()
+            )
+            .err()
+            .expect("private dataset must fail"),
+            MaterializerError::EmbeddedSecret
+        );
+
+        let mut empty = descriptor_with_openid4vc_plan(
+            "oid4vci-1_0-issuer-test-plan",
+            BTreeMap::from([("credential_format".to_owned(), "sd_jwt_vc".to_owned())]),
+            config,
+        );
+        empty
+            .openid4vc_credential_datasets
+            .insert("eu.example.pid".to_owned(), serde_json::json!({}));
+        assert_eq!(
+            DescriptorMaterializer::prepare(
+                empty,
+                "https://issuer.example",
+                &suite(),
+                request_jti()
+            )
+            .err()
+            .expect("empty dataset must fail"),
+            MaterializerError::InvalidField("openid4vc_credential_datasets")
+        );
+    }
+
+    #[test]
+    fn pre_authorized_vci_gets_a_fresh_six_digit_tx_code_in_private_matrix_only() {
+        let variant = BTreeMap::from([
+            ("fapi_profile".to_owned(), "vci".to_owned()),
+            ("client_auth_type".to_owned(), "private_key_jwt".to_owned()),
+            (
+                "vci_grant_type".to_owned(),
+                "pre_authorization_code".to_owned(),
+            ),
+            ("credential_format".to_owned(), "sd_jwt_vc".to_owned()),
+            (
+                "vci_authorization_code_flow_variant".to_owned(),
+                "issuer_initiated".to_owned(),
+            ),
+        ]);
+        let config = serde_json::json!({
+            "alias": "nazo-vci-preauth",
+            "vci": {"credential_configuration_id": "eu.example.pid"},
+            "nazo": {
+                "openid4vc_role": "issuer",
+                "client_auth_type": "private_key_jwt",
+                "credential_format": "sd_jwt_vc"
+            }
+        });
+        let descriptor =
+            descriptor_with_openid4vc_plan("oid4vci-1_0-issuer-test-plan", variant, config);
+        let (prepared, bundle) = DescriptorMaterializer::prepare(
+            descriptor,
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+        )
+        .expect("preauth prepare");
+        let tx_code = prepared.tx_code().expect("run-scoped tx code");
+        assert_eq!(tx_code.len(), 6);
+        assert!(tx_code.bytes().all(|byte| byte.is_ascii_digit()));
+        let bundle_value: Value =
+            serde_json::from_slice(bundle.bytes().as_bytes()).expect("bundle");
+        assert!(bundle_value["applicant"].is_object());
+        assert!(bundle_value.get("static_tx_code").is_none());
+        assert!(bundle_value.get("tx_code").is_none());
+        assert!(!bundle_value.to_string().contains(tx_code.as_str()));
+
+        let output = onboarding_output(
+            "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
+            prepared.request_jti(),
+            prepared.matrix_sha256(),
+            prepared.bundle_digest(),
+            BTreeMap::from([("web".to_owned(), "actual-client".to_owned())]),
+        )
+        .expect("output");
+        let matrix = DescriptorMaterializer::finalize(prepared, output).expect("finalize");
+        assert_eq!(
+            matrix.matrix().document.groups[0].plans[0].config["vci"]["static_tx_code"],
+            tx_code.as_str()
+        );
+    }
+
+    #[test]
+    fn two_pre_authorized_runs_do_not_reuse_tx_code_or_bundle_digest() {
+        let variant = BTreeMap::from([
+            (
+                "vci_grant_type".to_owned(),
+                "pre_authorization_code".to_owned(),
+            ),
+            ("credential_format".to_owned(), "sd_jwt_vc".to_owned()),
+        ]);
+        let config = serde_json::json!({
+            "alias": "nazo-vci-preauth",
+            "vci": {"credential_configuration_id": "eu.example.pid"},
+            "nazo": {"openid4vc_role": "issuer", "credential_format": "sd_jwt_vc"}
+        });
+        let descriptor =
+            descriptor_with_openid4vc_plan("oid4vci-1_0-issuer-test-plan", variant, config);
+        let (first, first_bundle) = DescriptorMaterializer::prepare(
+            descriptor.clone(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+        )
+        .expect("first prepare");
+        let (second, second_bundle) = DescriptorMaterializer::prepare(
+            descriptor,
+            "https://issuer.example",
+            &suite(),
+            "request-fedcba9876543210fedcba9876543210",
+        )
+        .expect("second prepare");
+        assert_ne!(first_bundle.digest(), second_bundle.digest());
+        assert!(first.tx_code().is_some_and(|value| value.len() == 6));
+        assert!(second.tx_code().is_some_and(|value| value.len() == 6));
+    }
+
+    #[test]
+    fn non_pre_authorized_vci_rejects_descriptor_static_tx_code() {
+        let variant = BTreeMap::from([
+            ("vci_grant_type".to_owned(), "authorization_code".to_owned()),
+            ("credential_format".to_owned(), "sd_jwt_vc".to_owned()),
+        ]);
+        let config = serde_json::json!({
+            "alias": "nazo-vci-authcode",
+            "vci": {
+                "credential_configuration_id": "eu.example.pid",
+                "static_tx_code": "123456"
+            },
+            "nazo": {"openid4vc_role": "issuer", "credential_format": "sd_jwt_vc"}
+        });
+        let descriptor =
+            descriptor_with_openid4vc_plan("oid4vci-1_0-issuer-test-plan", variant, config);
+        let error = DescriptorMaterializer::prepare(
+            descriptor,
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+        )
+        .err()
+        .expect("static tx code must fail");
+        assert_eq!(error, MaterializerError::InvalidField("vci.static_tx_code"));
+    }
+
+    #[test]
+    fn vci_haip_materializes_run_attestation_only_in_suite_config() {
+        let variant = BTreeMap::from([("credential_format".to_owned(), "sd_jwt_vc".to_owned())]);
+        let config = serde_json::json!({
+            "alias": "nazo-vci-haip",
+            "vci": {"credential_configuration_id": "eu.example.pid"},
+            "nazo": {
+                "openid4vc_role": "issuer",
+                "client_auth_type": "client_attestation",
+                "credential_format": "sd_jwt_vc"
+            }
+        });
+        let descriptor =
+            descriptor_with_openid4vc_plan("oid4vci-1_0-issuer-haip-test-plan", variant, config);
+        let (prepared, bundle) = DescriptorMaterializer::prepare(
+            descriptor,
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+        )
+        .expect("HAIP prepare");
+        let bundle_text = String::from_utf8(bundle.bytes().as_bytes().to_vec()).expect("bundle");
+        assert!(!bundle_text.contains("client_attestation"));
+        assert!(!bundle_text.contains("key_attestation"));
+        assert!(!bundle_text.contains("BEGIN CERTIFICATE"));
+        let output = onboarding_output(
+            "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
+            prepared.request_jti(),
+            prepared.matrix_sha256(),
+            prepared.bundle_digest(),
+            BTreeMap::from([("web".to_owned(), "actual-client".to_owned())]),
+        )
+        .expect("output");
+        let matrix = DescriptorMaterializer::finalize(prepared, output).expect("finalize");
+        let config = &matrix.matrix().document.groups[0].plans[0].config;
+        assert_eq!(config["nazo"]["client_auth_type"], "client_attestation");
+        assert!(
+            config["client_attestation"]["trust_anchor"]
+                .as_str()
+                .is_some_and(|value| value.contains("BEGIN CERTIFICATE"))
+        );
+        assert!(
+            config["client_attestation"]["attester_jwks"]["keys"][0]["d"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            config["vci"]["key_attestation_jwks"]["keys"][0]["d"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(
+            config["client_attestation"]["issuer"],
+            "https://suite.example/"
+        );
+    }
+
+    #[test]
+    fn signed_vp_binds_onboarding_trust_anchor_and_url_query_rejects_it() {
+        let signed = descriptor_with_openid4vp_plan(
+            "request_uri_signed",
+            serde_json::json!({
+                "alias": "nazo-vp-signed",
+                "client": {"client_id": "{{target.host}}"}
+            }),
+        );
         let (prepared, _bundle) = DescriptorMaterializer::prepare(
+            signed,
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+        )
+        .expect("signed VP prepare");
+        let output = onboarding_output(
+            "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
+            prepared.request_jti(),
+            prepared.matrix_sha256(),
+            prepared.bundle_digest(),
+            BTreeMap::from([("web".to_owned(), "actual-client".to_owned())]),
+        )
+        .expect("output");
+        let matrix = DescriptorMaterializer::finalize(prepared, output).expect("signed finalize");
+        assert_eq!(
+            matrix.matrix().document.groups[0].plans[0].config["client"]["request_object_trust_anchor_pem"],
+            test_trust_anchor()
+        );
+
+        let query_variant = BTreeMap::from([("request_method".to_owned(), "url_query".to_owned())]);
+        let query_config = serde_json::json!({
+            "alias": "nazo-vp-query",
+            "client": {
+                "request_object_trust_anchor_pem": test_trust_anchor()
+            }
+        });
+        assert_eq!(
+            materialize_vp_config(
+                "oid4vp-1final-verifier-test-plan",
+                &query_variant,
+                query_config,
+                test_trust_anchor(),
+            )
+            .unwrap_err(),
+            MaterializerError::InvalidField("client.request_object_trust_anchor_pem")
+        );
+    }
+
+    #[test]
+    fn vp_haip_without_transport_variant_still_binds_request_trust_anchor() {
+        let config = serde_json::json!({
+            "alias": "nazo-vp-haip",
+            "client": {"client_id": "issuer.example"}
+        });
+        let variant = BTreeMap::from([("credential_format".to_owned(), "sd_jwt_vc".to_owned())]);
+        let materialized = materialize_vp_config(
+            "oid4vp-1final-verifier-haip-test-plan",
+            &variant,
+            config,
+            test_trust_anchor(),
+        )
+        .expect("VP HAIP config");
+        assert_eq!(
+            materialized["client"]["request_object_trust_anchor_pem"],
+            test_trust_anchor()
+        );
+    }
+
+    #[test]
+    fn missing_extra_and_cross_run_mappings_are_rejected() {
+        let (prepared, bundle) = DescriptorMaterializer::prepare(
             descriptor(),
             "https://issuer.example",
             &suite(),
             request_jti(),
-            deployment_secrets(),
         )
         .expect("prepare");
         let missing = onboarding_output(
             "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
             prepared.request_jti(),
             prepared.matrix_sha256(),
+            bundle.digest(),
             BTreeMap::new(),
         )
         .expect("output");
@@ -1035,18 +1663,18 @@ mod tests {
             MaterializerError::MissingClientMapping
         );
 
-        let (prepared, _bundle) = DescriptorMaterializer::prepare(
+        let (prepared, bundle) = DescriptorMaterializer::prepare(
             descriptor(),
             "https://issuer.example",
             &suite(),
             request_jti(),
-            deployment_secrets(),
         )
         .expect("prepare");
         let extra = onboarding_output(
             "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
             prepared.request_jti(),
             prepared.matrix_sha256(),
+            bundle.digest(),
             BTreeMap::from([
                 ("web".to_owned(), "actual".to_owned()),
                 ("extra".to_owned(), "other".to_owned()),
@@ -1058,18 +1686,18 @@ mod tests {
             MaterializerError::ExtraClientMapping
         );
 
-        let (prepared, _) = DescriptorMaterializer::prepare(
+        let (prepared, bundle) = DescriptorMaterializer::prepare(
             descriptor(),
             "https://issuer.example",
             &suite(),
             request_jti(),
-            deployment_secrets(),
         )
         .expect("prepare");
         let wrong_matrix = onboarding_output(
             "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
             prepared.request_jti(),
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            bundle.digest(),
             BTreeMap::from([("web".to_owned(), "actual".to_owned())]),
         )
         .expect("output");
@@ -1078,18 +1706,38 @@ mod tests {
             MaterializerError::MatrixDigestMismatch
         );
 
-        let (prepared, _) = DescriptorMaterializer::prepare(
+        let (prepared, _bundle) = DescriptorMaterializer::prepare(
             descriptor(),
             "https://issuer.example",
             &suite(),
             request_jti(),
-            deployment_secrets(),
+        )
+        .expect("prepare");
+        let wrong_bundle = onboarding_output(
+            "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
+            prepared.request_jti(),
+            prepared.matrix_sha256(),
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            BTreeMap::from([("web".to_owned(), "actual".to_owned())]),
+        )
+        .expect("output");
+        assert_eq!(
+            DescriptorMaterializer::finalize(prepared, wrong_bundle).unwrap_err(),
+            MaterializerError::BundleDigestMismatch
+        );
+
+        let (prepared, bundle) = DescriptorMaterializer::prepare(
+            descriptor(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
         )
         .expect("prepare");
         let invalid_lease = onboarding_output(
             "not-a-uuid",
             prepared.request_jti(),
             prepared.matrix_sha256(),
+            bundle.digest(),
             BTreeMap::from([("web".to_owned(), "actual".to_owned())]),
         );
         assert_eq!(
@@ -1111,7 +1759,6 @@ mod tests {
                 "https://issuer.example",
                 &suite(),
                 request_jti(),
-                deployment_secrets(),
             )
             .expect("prepare");
             let path = root.join("bundle.json");

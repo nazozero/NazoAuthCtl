@@ -22,9 +22,11 @@ mod transport;
 pub use browser::{
     BrowserAutomation, BrowserCommand, BrowserDriver, BrowserEntry, BrowserError, BrowserExecutor,
     BrowserLimits, BrowserPolicy, BrowserRunReport, BrowserSelector, BrowserTargetOrigin,
-    BrowserTask, ManagedWebDriver, OpenId4VcBrowserState, OpenId4VpError, OpenId4VpPresentation,
-    OpenId4VpStartRequest, OpenId4VpVerifier, OpenId4VpVerifierClient, WebDriverClient,
-    WebDriverEndpoint, parse_browser_entries, parse_browser_entries_owned,
+    BrowserTask, ConformanceBinding, ManagedWebDriver, OpenId4VcBrowserState, OpenId4VciError,
+    OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VciModule,
+    OpenId4VpError, OpenId4VpPresentation, OpenId4VpStartRequest, OpenId4VpVerifier,
+    OpenId4VpVerifierClient, WebDriverClient, WebDriverEndpoint, parse_browser_entries,
+    parse_browser_entries_owned,
 };
 pub use client::{
     AuthProbe, CancelOutcome, ClientConfig, DeleteOutcome, ModuleDefinition, ModuleInstance,
@@ -32,11 +34,10 @@ pub use client::{
 };
 pub use credentials::{BearerToken, CredentialStore, CredentialStoreError};
 pub use materializer::{
-    CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DeploymentConformanceSecrets, DescriptorGroup,
-    DescriptorMaterializer, DescriptorPlan, DescriptorSource, DescriptorVariant,
-    MAX_DESCRIPTOR_BYTES, MaterializedMatrix, MaterializerError, MatrixDescriptor,
-    OnboardingOutput, PreparedMaterialization, RoleRequirement, SECURE_BUNDLE_SCHEMA_VERSION,
-    SecureBytes, SecureOnboardingBundle,
+    CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DescriptorGroup, DescriptorMaterializer,
+    DescriptorPlan, DescriptorSource, DescriptorVariant, MAX_DESCRIPTOR_BYTES, MaterializedMatrix,
+    MaterializerError, MatrixDescriptor, OnboardingOutput, PreparedMaterialization,
+    RoleRequirement, SECURE_BUNDLE_SCHEMA_VERSION, SecureBytes, SecureOnboardingBundle,
 };
 pub use matrix::{
     MATRIX_SCHEMA_VERSION, MAX_MATRIX_BYTES, MatrixArtifact, MatrixDocument, MatrixError,

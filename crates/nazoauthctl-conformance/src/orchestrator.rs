@@ -10,7 +10,8 @@ use thiserror::Error;
 use url::Url;
 
 use crate::browser::{
-    BrowserAutomation, BrowserError, BrowserTargetOrigin, OpenId4VpStartRequest, OpenId4VpVerifier,
+    BrowserAutomation, BrowserError, BrowserTargetOrigin, ConformanceBinding,
+    OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpStartRequest, OpenId4VpVerifier,
     parse_browser_entries_owned,
 };
 use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
@@ -51,6 +52,11 @@ pub struct ConformanceRunConfig {
     pub client: SuiteClient,
     pub matrix: SelectedMatrix,
     pub target_origin: Option<BrowserTargetOrigin>,
+    /// The lease and task identity allocated for this run.  OpenID4VP
+    /// verifier starts must carry the complete pair; keeping it on the run
+    /// config lets the request and verifier client be checked against the
+    /// same capability instead of accepting a partial/mixed binding.
+    pub binding: ConformanceBinding,
     pub poll_timeout: Duration,
     pub control: RunControl,
     /// Optional bounded Rust-native WebDriver driver.  It is invoked only for
@@ -61,6 +67,10 @@ pub struct ConformanceRunConfig {
     /// browser driver remains a separate dependency so WebDriver protocol
     /// details cannot leak into the target HTTP client.
     pub verifier: Option<Arc<Mutex<dyn OpenId4VpVerifier>>>,
+    /// Optional issuer-side driver for OpenID4VCI WAITING modules.  The
+    /// driver owns its browser session and target management token; the
+    /// orchestrator only supplies the Suite-observed runner data.
+    pub issuer: Option<Arc<Mutex<dyn OpenId4VciIssuerDriver>>>,
 }
 
 pub struct ConformanceRunner {
@@ -354,15 +364,57 @@ impl ConformanceRunner {
                     }
 
                     if observed.as_ref().is_some_and(is_waiting) {
-                        let Some(browser) = &self.config.browser else {
-                            errors.push(
-                                "Suite runner is WAITING but browser automation is unavailable"
-                                    .to_owned(),
-                            );
-                            groups[group_index].status = GroupStatus::Failed;
-                            break 'execute;
-                        };
-                        if plan.plan_name.starts_with("oid4vp-1final-verifier") {
+                        if plan.plan_name.starts_with("oid4vci-") {
+                            let Some(issuer) = &self.config.issuer else {
+                                errors
+                                    .push("OpenID4VCI issuer automation is unavailable".to_owned());
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            };
+                            let runner = match self.config.client.runner_info(&instance.id) {
+                                Ok(runner) => runner,
+                                Err(error) => {
+                                    errors.push(safe_error(&error));
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                }
+                            };
+                            let module_context = match OpenId4VciModule::new(
+                                instance.id.clone(),
+                                module.test_name.clone(),
+                                plan.variant.clone(),
+                                plan.config.clone(),
+                                runner,
+                            ) {
+                                Ok(module_context) => module_context,
+                                Err(error) => {
+                                    errors.push(error.to_string());
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                }
+                            };
+                            let mut issuer = match issuer.lock() {
+                                Ok(issuer) => issuer,
+                                Err(_) => {
+                                    errors.push("OpenID4VCI issuer lock failed".to_owned());
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                }
+                            };
+                            if let Err(error) = issuer.drive(&module_context) {
+                                errors.push(error.to_string());
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            }
+                        } else if plan.plan_name.starts_with("oid4vp-1final-verifier") {
+                            let Some(browser) = &self.config.browser else {
+                                errors.push(
+                                    "Suite runner is WAITING but browser automation is unavailable"
+                                        .to_owned(),
+                                );
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            };
                             let Some(verifier) = &self.config.verifier else {
                                 errors.push(
                                     "OpenID4VP verifier automation is unavailable".to_owned(),
@@ -386,6 +438,7 @@ impl ConformanceRunner {
                                 &module.test_name,
                                 plan.variant.clone(),
                                 haip,
+                                self.config.binding.clone(),
                             ) {
                                 Ok(request) => request,
                                 Err(error) => {
@@ -435,6 +488,14 @@ impl ConformanceRunner {
                                 break 'execute;
                             }
                         } else {
+                            let Some(browser) = &self.config.browser else {
+                                errors.push(
+                                    "Suite runner is WAITING but browser automation is unavailable"
+                                        .to_owned(),
+                                );
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            };
                             let Some(browser_config) = plan.config.get("browser").cloned() else {
                                 errors.push(
                                     "Suite runner is WAITING but the Matrix plan has no browser tasks"
@@ -917,6 +978,14 @@ mod tests {
         }
     }
 
+    fn test_binding() -> ConformanceBinding {
+        ConformanceBinding::new(
+            "019ff000-8190-7393-8c33-ab4339c3d85e",
+            "request-0123456789abcdef0123456789abcdef",
+        )
+        .expect("binding")
+    }
+
     #[test]
     fn origin_validation_rejects_cross_origin_config() {
         let document = MatrixDocument {
@@ -956,10 +1025,12 @@ mod tests {
                 client,
                 matrix: selected,
                 target_origin: None,
+                binding: test_binding(),
                 poll_timeout: Duration::from_secs(1),
                 control: RunControl::default(),
                 browser: None,
                 verifier: None,
+                issuer: None,
             })
             .is_err()
         );
@@ -1076,10 +1147,12 @@ mod tests {
                 digest: "digest".into(),
             },
             target_origin: None,
+            binding: test_binding(),
             poll_timeout: Duration::from_secs(30),
             control,
             browser: None,
             verifier: None,
+            issuer: None,
         })
         .expect("runner");
 

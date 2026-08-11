@@ -4,6 +4,7 @@ use serde_json::Value;
 use url::Url;
 use zeroize::Zeroizing;
 
+use super::crypto::GeneratedAttestationMaterial;
 use super::{
     MaterializerError, OnboardingOutput, PreparedMaterialization, digest_hex, is_placeholder,
     parse_placeholder, validate_binding_reference, validate_request_jti,
@@ -46,6 +47,241 @@ pub(super) fn materialize_value(
         }
         _ => Ok(value.clone()),
     }
+}
+
+/// Normalize the small amount of issuer-side configuration that the official
+/// OpenID4VC materializer derives from a VCI plan.  The descriptor remains the
+/// authority for the credential configuration id and variant; this function
+/// only binds that declared configuration to the current issuer and rejects a
+/// conflicting pre-materialized value.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn materialize_vci_config(
+    plan_name: &str,
+    variant: &BTreeMap<String, String>,
+    config: Value,
+    target_issuer: &str,
+    suite_origin: &str,
+    tx_code: Option<&str>,
+    attestation: Option<&GeneratedAttestationMaterial>,
+) -> Result<Value, MaterializerError> {
+    if !plan_name.starts_with("oid4vci-") {
+        return Ok(config);
+    }
+    let Value::Object(mut root) = config else {
+        return Err(MaterializerError::InvalidField("plan.config_template"));
+    };
+    let alias =
+        root.get("alias")
+            .and_then(Value::as_str)
+            .ok_or(MaterializerError::InvalidField(
+                "plan.config_template.alias",
+            ))?;
+    validate_vci_string(alias, "plan.config_template.alias")?;
+
+    let mut vci = match root.remove("vci") {
+        None => serde_json::Map::new(),
+        Some(Value::Object(value)) => value,
+        Some(_) => return Err(MaterializerError::InvalidField("vci")),
+    };
+    let pre_authorized =
+        variant.get("vci_grant_type").map(String::as_str) == Some("pre_authorization_code");
+    if pre_authorized {
+        let tx_code = tx_code.ok_or(MaterializerError::InvalidField("generated.tx_code"))?;
+        if vci.contains_key("static_tx_code") {
+            return Err(MaterializerError::InvalidField("vci.static_tx_code"));
+        }
+        validate_tx_code(tx_code)?;
+        vci.insert(
+            "static_tx_code".to_owned(),
+            Value::String(tx_code.to_owned()),
+        );
+    } else if vci.contains_key("static_tx_code") {
+        return Err(MaterializerError::InvalidField("vci.static_tx_code"));
+    }
+    let declared_id = variant.get("credential_configuration_id");
+    let configured_id = vci
+        .get("credential_configuration_id")
+        .and_then(Value::as_str);
+    let credential_configuration_id = match (configured_id, declared_id) {
+        (Some(configured), Some(declared)) if configured != declared.as_str() => {
+            return Err(MaterializerError::InvalidField(
+                "vci.credential_configuration_id",
+            ));
+        }
+        (Some(configured), _) => configured.to_owned(),
+        (None, Some(declared)) => declared.to_owned(),
+        (None, None) => {
+            return Err(MaterializerError::InvalidField(
+                "vci.credential_configuration_id",
+            ));
+        }
+    };
+    validate_vci_string(
+        &credential_configuration_id,
+        "vci.credential_configuration_id",
+    )?;
+    vci.insert(
+        "credential_configuration_id".to_owned(),
+        Value::String(credential_configuration_id),
+    );
+    if let Some(configured_issuer) = vci.get("credential_issuer_url")
+        && configured_issuer.as_str() != Some(target_issuer)
+    {
+        return Err(MaterializerError::InvalidField("vci.credential_issuer_url"));
+    }
+    vci.insert(
+        "credential_issuer_url".to_owned(),
+        Value::String(target_issuer.to_owned()),
+    );
+    let haip = plan_name.contains("haip")
+        || variant.get("fapi_profile").map(String::as_str) == Some("vci_haip");
+    if haip {
+        let attestation = attestation.ok_or(MaterializerError::InvalidField(
+            "generated.vci_haip_attestation",
+        ))?;
+        let key_attestation_jwks = jwks_value(&attestation.key_attestation_private_jwks)?;
+        if let Some(existing) = vci.get("key_attestation_jwks")
+            && existing != &key_attestation_jwks
+        {
+            return Err(MaterializerError::InvalidField("vci.key_attestation_jwks"));
+        }
+        vci.insert(
+            "key_attestation_jwks".to_owned(),
+            key_attestation_jwks.clone(),
+        );
+        if root.contains_key("client_attestation") {
+            return Err(MaterializerError::InvalidField("client_attestation"));
+        }
+        root.insert(
+            "client_attestation".to_owned(),
+            serde_json::json!({
+                "issuer": format!("{}/", suite_origin.trim_end_matches('/')),
+                "trust_anchor": attestation.trust_anchor_pem.to_string(),
+                "key_attestation_trust_anchor_pem": attestation.trust_anchor_pem.to_string(),
+                "attester_jwks": jwks_value(&attestation.attester_private_jwks)?,
+                "key_attestation_jwks": key_attestation_jwks,
+            }),
+        );
+    }
+    root.insert("vci".to_owned(), Value::Object(vci));
+
+    let mut nazo = match root.remove("nazo") {
+        None => serde_json::Map::new(),
+        Some(Value::Object(value)) => value,
+        Some(_) => return Err(MaterializerError::InvalidField("nazo")),
+    };
+    ensure_vci_field(&mut nazo, "openid4vc_role", "issuer")?;
+    if let Some(client_auth_type) = variant.get("client_auth_type") {
+        validate_vci_string(client_auth_type, "variant.client_auth_type")?;
+        ensure_vci_field(&mut nazo, "client_auth_type", client_auth_type)?;
+    }
+    let variant_format = variant.get("credential_format");
+    let configured_format = nazo.get("credential_format").and_then(Value::as_str);
+    let credential_format = match (configured_format, variant_format) {
+        (Some(configured), Some(declared)) if configured != declared => {
+            return Err(MaterializerError::InvalidField("nazo.credential_format"));
+        }
+        (Some(configured), _) => configured.to_owned(),
+        (None, Some(declared)) => declared.to_owned(),
+        (None, None) => {
+            return Err(MaterializerError::InvalidField("nazo.credential_format"));
+        }
+    };
+    validate_vci_string(&credential_format, "nazo.credential_format")?;
+    nazo.insert(
+        "credential_format".to_owned(),
+        Value::String(credential_format),
+    );
+    root.insert("nazo".to_owned(), Value::Object(nazo));
+    Ok(Value::Object(root))
+}
+
+pub(super) fn materialize_vp_config(
+    plan_name: &str,
+    variant: &BTreeMap<String, String>,
+    config: Value,
+    request_object_trust_anchor_pem: &str,
+) -> Result<Value, MaterializerError> {
+    if !plan_name.starts_with("oid4vp-") {
+        return Ok(config);
+    }
+    let Value::Object(mut root) = config else {
+        return Err(MaterializerError::InvalidField("plan.config_template"));
+    };
+    let request_method = variant.get("request_method").map(String::as_str);
+    // The official verifier HAIP plan is request-URI signed even though its
+    // executable Matrix variant does not repeat the transport selector.
+    let request_uri_signed = plan_name == "oid4vp-1final-verifier-haip-test-plan"
+        || request_method.is_some_and(|value| value.starts_with("request_uri_signed"));
+    if !root.contains_key("client") {
+        if request_uri_signed {
+            return Err(MaterializerError::InvalidField("client"));
+        }
+        return Ok(Value::Object(root));
+    }
+    let client_value = root
+        .get_mut("client")
+        .ok_or(MaterializerError::InvalidField("client"))?;
+    let Value::Object(client) = client_value else {
+        return Err(MaterializerError::InvalidField("client"));
+    };
+    if request_uri_signed {
+        if let Some(existing) = client.get("request_object_trust_anchor_pem")
+            && existing.as_str() != Some(request_object_trust_anchor_pem)
+        {
+            return Err(MaterializerError::InvalidField(
+                "client.request_object_trust_anchor_pem",
+            ));
+        }
+        client.insert(
+            "request_object_trust_anchor_pem".to_owned(),
+            Value::String(request_object_trust_anchor_pem.to_owned()),
+        );
+    } else if request_method == Some("url_query")
+        && client.contains_key("request_object_trust_anchor_pem")
+    {
+        return Err(MaterializerError::InvalidField(
+            "client.request_object_trust_anchor_pem",
+        ));
+    }
+    Ok(Value::Object(root))
+}
+
+fn ensure_vci_field(
+    object: &mut serde_json::Map<String, Value>,
+    field: &str,
+    expected: &str,
+) -> Result<(), MaterializerError> {
+    if let Some(value) = object.get(field)
+        && value.as_str() != Some(expected)
+    {
+        return Err(MaterializerError::InvalidField("nazo"));
+    }
+    object.insert(field.to_owned(), Value::String(expected.to_owned()));
+    Ok(())
+}
+
+fn validate_vci_string(value: &str, field: &'static str) -> Result<(), MaterializerError> {
+    if value.trim().is_empty()
+        || value.len() > 512
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(MaterializerError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn validate_tx_code(value: &str) -> Result<(), MaterializerError> {
+    if value.len() != 6 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(MaterializerError::InvalidField("generated.tx_code"));
+    }
+    Ok(())
+}
+
+fn jwks_value(value: &Zeroizing<String>) -> Result<Value, MaterializerError> {
+    serde_json::from_str(value.as_str()).map_err(|_| MaterializerError::Encoding)
 }
 
 fn resolve_reference(
@@ -154,14 +390,14 @@ fn resolve_reference(
             onboarding.openid4vc_request_object_trust_anchor_pem.clone(),
         ));
     }
-    if name == "deployment.dynamic_registration_initial_access_token" {
+    if name == "generated.dynamic_registration_initial_access_token" {
         return prepared
             .dynamic_registration_initial_access_token
             .as_ref()
             .map(|value| Value::String(value.to_string()))
             .ok_or(MaterializerError::UnknownSecretReference(name.to_owned()));
     }
-    if name == "deployment.ciba_automated_decision_token" {
+    if name == "generated.ciba_automated_decision_token" {
         return prepared
             .ciba_automated_decision_token
             .as_ref()

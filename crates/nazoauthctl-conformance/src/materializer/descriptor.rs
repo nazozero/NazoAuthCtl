@@ -22,6 +22,11 @@ pub struct DescriptorSource {
 pub struct MatrixDescriptor {
     pub schema: u32,
     pub source: DescriptorSource,
+    /// Public OpenID4VC claims, keyed by credential configuration id.  This
+    /// map is the only dataset authority; executable plan templates may
+    /// repeat a dataset only as a consistency check.
+    #[serde(default)]
+    pub openid4vc_credential_datasets: BTreeMap<String, Value>,
     pub groups: Vec<DescriptorGroup>,
     #[serde(skip)]
     pub(super) raw_sha256: Option<String>,
@@ -162,10 +167,12 @@ pub(super) fn validate_descriptor(descriptor: &MatrixDescriptor) -> Result<(), M
             validate_crypto_policy(&plan.crypto)?;
             validate_bindings(plan)?;
             validate_value_template(&plan.config_template)?;
+            validate_vci_dynamic_policy(plan)?;
             validate_template_references(&plan.config_template, &plan.secret_bindings)?;
             validate_role_refs(plan, group, &group.required_roles, &plan.required_roles)?;
         }
     }
+    validate_openid4vc_credential_datasets(descriptor)?;
     let clients = collect_client_policies(descriptor)?
         .keys()
         .cloned()
@@ -181,6 +188,251 @@ pub(super) fn validate_descriptor(descriptor: &MatrixDescriptor) -> Result<(), M
                 )?;
             }
         }
+    }
+    Ok(())
+}
+
+const MAX_OPENID4VC_DATASETS: usize = 16;
+const MAX_OPENID4VC_DATASET_BYTES: usize = 64 * 1024;
+const MAX_OPENID4VC_DATASET_TOTAL_BYTES: usize = 512 * 1024;
+const MAX_OPENID4VC_DATASET_DEPTH: usize = 8;
+const MAX_OPENID4VC_DATASET_NODES: usize = 512;
+const MAX_OPENID4VC_DATASET_STRING_BYTES: usize = 4096;
+
+/// Validate the public dataset authority and prove that every VCI plan is
+/// bound to exactly one entry.  Keeping this check at descriptor validation
+/// means prepare cannot accidentally onboard a dataset for a different plan
+/// or silently omit one referenced by the executable configuration.
+fn validate_openid4vc_credential_datasets(
+    descriptor: &MatrixDescriptor,
+) -> Result<(), MaterializerError> {
+    if descriptor.openid4vc_credential_datasets.len() > MAX_OPENID4VC_DATASETS {
+        return Err(MaterializerError::Oversize);
+    }
+    let mut referenced = BTreeMap::<String, Option<Value>>::new();
+    for group in &descriptor.groups {
+        for plan in &group.plans {
+            if !plan.plan.starts_with("oid4vci-") {
+                continue;
+            }
+            let configuration_id = descriptor_vci_configuration_id(plan)?;
+            let dataset = descriptor
+                .openid4vc_credential_datasets
+                .get(&configuration_id)
+                .ok_or(MaterializerError::InvalidField(
+                    "openid4vc_credential_datasets",
+                ))?;
+            validate_public_credential_dataset(dataset)?;
+
+            // The plan-local value is not authoritative.  If present, it is
+            // required to match the descriptor map byte-for-byte so an
+            // executable template cannot smuggle a second claims source.
+            if let Some(plan_dataset) = plan
+                .config_template
+                .get("nazo")
+                .and_then(Value::as_object)
+                .and_then(|nazo| nazo.get("credential_dataset"))
+                && plan_dataset != dataset
+            {
+                return Err(MaterializerError::InvalidField("nazo.credential_dataset"));
+            }
+
+            if let Some(previous) = referenced.get(&configuration_id)
+                && previous.as_ref() != Some(dataset)
+            {
+                return Err(MaterializerError::InvalidField(
+                    "openid4vc_credential_datasets",
+                ));
+            }
+            referenced.insert(configuration_id, Some(dataset.clone()));
+        }
+    }
+
+    if descriptor.openid4vc_credential_datasets.len() != referenced.len()
+        || descriptor
+            .openid4vc_credential_datasets
+            .keys()
+            .any(|key| !referenced.contains_key(key))
+    {
+        return Err(MaterializerError::InvalidField(
+            "openid4vc_credential_datasets",
+        ));
+    }
+    let mut total_bytes = 0usize;
+    for dataset in descriptor.openid4vc_credential_datasets.values() {
+        let encoded_len = serde_json::to_vec(dataset)
+            .map_err(|_| MaterializerError::Encoding)?
+            .len();
+        total_bytes = total_bytes
+            .checked_add(encoded_len)
+            .ok_or(MaterializerError::Oversize)?;
+        if total_bytes > MAX_OPENID4VC_DATASET_TOTAL_BYTES {
+            return Err(MaterializerError::Oversize);
+        }
+    }
+    Ok(())
+}
+
+fn descriptor_vci_configuration_id(plan: &DescriptorPlan) -> Result<String, MaterializerError> {
+    let configured = plan
+        .config_template
+        .get("vci")
+        .and_then(Value::as_object)
+        .and_then(|vci| vci.get("credential_configuration_id"))
+        .and_then(Value::as_str);
+    let declared = plan
+        .variant
+        .get("credential_configuration_id")
+        .map(String::as_str);
+    let value = match (configured, declared) {
+        (Some(configured), Some(declared)) if configured != declared => {
+            return Err(MaterializerError::InvalidField(
+                "vci.credential_configuration_id",
+            ));
+        }
+        (Some(configured), _) => configured,
+        (None, Some(declared)) => declared,
+        (None, None) => {
+            return Err(MaterializerError::InvalidField(
+                "vci.credential_configuration_id",
+            ));
+        }
+    };
+    if is_placeholder(value) {
+        return Err(MaterializerError::InvalidField(
+            "vci.credential_configuration_id",
+        ));
+    }
+    validate_name(value, "vci.credential_configuration_id")?;
+    Ok(value.to_owned())
+}
+
+fn validate_public_credential_dataset(value: &Value) -> Result<(), MaterializerError> {
+    let object = value
+        .as_object()
+        .filter(|object| !object.is_empty())
+        .ok_or(MaterializerError::InvalidField(
+            "openid4vc_credential_datasets",
+        ))?;
+    let bytes = serde_json::to_vec(value).map_err(|_| MaterializerError::Encoding)?;
+    if bytes.len() > MAX_OPENID4VC_DATASET_BYTES {
+        return Err(MaterializerError::Oversize);
+    }
+    let mut nodes = 0;
+    validate_public_dataset_object(object, 0, &mut nodes)
+}
+
+fn validate_public_dataset_object(
+    object: &serde_json::Map<String, Value>,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<(), MaterializerError> {
+    *nodes = (*nodes).checked_add(1).ok_or(MaterializerError::Oversize)?;
+    if depth > MAX_OPENID4VC_DATASET_DEPTH || *nodes > MAX_OPENID4VC_DATASET_NODES {
+        return Err(MaterializerError::Oversize);
+    }
+    for (key, value) in object {
+        validate_public_dataset_key(key)?;
+        validate_public_dataset_value(value, depth + 1, nodes)?;
+    }
+    Ok(())
+}
+
+fn validate_public_dataset_value(
+    value: &Value,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<(), MaterializerError> {
+    *nodes = (*nodes).checked_add(1).ok_or(MaterializerError::Oversize)?;
+    if depth > MAX_OPENID4VC_DATASET_DEPTH || *nodes > MAX_OPENID4VC_DATASET_NODES {
+        return Err(MaterializerError::Oversize);
+    }
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                validate_public_dataset_key(key)?;
+                validate_public_dataset_value(child, depth + 1, nodes)?;
+            }
+            Ok(())
+        }
+        Value::Array(values) => values
+            .iter()
+            .try_for_each(|child| validate_public_dataset_value(child, depth + 1, nodes)),
+        Value::String(text) => validate_public_dataset_string(text),
+        _ => Ok(()),
+    }
+}
+
+fn validate_public_dataset_key(key: &str) -> Result<(), MaterializerError> {
+    let key_lower = key.to_ascii_lowercase();
+    if key.trim().is_empty()
+        || key.len() > 255
+        || key
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || matches!(
+            key_lower.as_str(),
+            "client_secret"
+                | "password"
+                | "secret"
+                | "token"
+                | "access_token"
+                | "refresh_token"
+                | "authorization_code"
+                | "tx_code"
+                | "password_hash"
+                | "private_key"
+                | "private_jwk"
+                | "private_jwks"
+                | "private_key_pem"
+                | "d"
+                | "p"
+                | "q"
+                | "dp"
+                | "dq"
+                | "qi"
+                | "oth"
+                | "k"
+        )
+    {
+        return Err(MaterializerError::EmbeddedSecret);
+    }
+    Ok(())
+}
+
+fn validate_public_dataset_string(value: &str) -> Result<(), MaterializerError> {
+    if value.len() > MAX_OPENID4VC_DATASET_STRING_BYTES {
+        return Err(MaterializerError::Oversize);
+    }
+    if value.contains("PRIVATE KEY")
+        || value.contains("{{")
+        || value.contains("}}")
+        || value.contains("${")
+    {
+        return Err(MaterializerError::EmbeddedSecret);
+    }
+    Ok(())
+}
+
+fn validate_vci_dynamic_policy(plan: &DescriptorPlan) -> Result<(), MaterializerError> {
+    if !plan.plan.starts_with("oid4vci-") {
+        return Ok(());
+    }
+    let config = plan
+        .config_template
+        .as_object()
+        .ok_or(MaterializerError::InvalidField("plan.config_template"))?;
+    let vci = config.get("vci").and_then(Value::as_object);
+    if vci.is_some_and(|vci| vci.contains_key("static_tx_code")) {
+        return Err(MaterializerError::InvalidField("vci.static_tx_code"));
+    }
+    let is_haip = plan.plan.contains("haip")
+        || plan.variant.get("fapi_profile").map(String::as_str) == Some("vci_haip");
+    if is_haip && vci.is_some_and(|vci| vci.contains_key("key_attestation_jwks")) {
+        return Err(MaterializerError::InvalidField("vci.key_attestation_jwks"));
+    }
+    if is_haip && config.contains_key("client_attestation") {
+        return Err(MaterializerError::InvalidField("client_attestation"));
     }
     Ok(())
 }
@@ -477,8 +729,8 @@ fn is_builtin_reference(name: &str) -> bool {
             | "generated.mtls.client_cert"
             | "generated.mtls.client_key"
             | "generated.mtls.cert_sha256"
-            | "deployment.dynamic_registration_initial_access_token"
-            | "deployment.ciba_automated_decision_token"
+            | "generated.dynamic_registration_initial_access_token"
+            | "generated.ciba_automated_decision_token"
             | "generated.applicant_email"
             | "generated.credential_holder_email_sha256"
             | "onboarding.applicant_id"
@@ -504,10 +756,26 @@ pub(super) fn descriptor_requires_reference(
     reference: &str,
 ) -> bool {
     descriptor.groups.iter().any(|group| {
-        group
-            .plans
-            .iter()
-            .any(|plan| value_contains_reference(&plan.config_template, reference))
+        group.required_roles.iter().any(|role| {
+            role.secret_refs.iter().any(|secret_ref| {
+                secret_ref.trim() == reference
+                    || value_contains_reference(&Value::String(secret_ref.clone()), reference)
+            })
+        }) || group.plans.iter().any(|plan| {
+            value_contains_reference(&plan.config_template, reference)
+                || plan.secret_bindings.values().any(|binding| {
+                    value_contains_reference(&Value::String(binding.clone()), reference)
+                })
+                || plan.required_roles.iter().any(|role| {
+                    role.secret_refs.iter().any(|secret_ref| {
+                        secret_ref.trim() == reference
+                            || value_contains_reference(
+                                &Value::String(secret_ref.clone()),
+                                reference,
+                            )
+                    })
+                })
+        })
     })
 }
 

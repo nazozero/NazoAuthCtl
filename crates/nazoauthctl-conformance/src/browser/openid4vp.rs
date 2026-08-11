@@ -28,6 +28,45 @@ const MAX_TEST_NAME_BYTES: usize = 512;
 const MAX_VARIANT_VALUE_BYTES: usize = 256;
 const SPECIAL_POST_TEST: &str = "oid4vp-1final-verifier-request-uri-method-post";
 
+/// The deployment capability binding that must accompany every target-side
+/// verifier start.  Keeping the two values in one validated type makes a
+/// partial binding unrepresentable at the HTTP boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConformanceBinding {
+    lease_id: Uuid,
+    task_jti: String,
+}
+
+impl ConformanceBinding {
+    pub fn new(
+        lease_id: impl AsRef<str>,
+        task_jti: impl Into<String>,
+    ) -> Result<Self, OpenId4VpError> {
+        let lease_id =
+            Uuid::parse_str(lease_id.as_ref()).map_err(|_| OpenId4VpError::InvalidBinding)?;
+        let task_jti = task_jti.into();
+        let suffix = task_jti
+            .strip_prefix("request-")
+            .ok_or(OpenId4VpError::InvalidBinding)?;
+        if suffix.len() != 32
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(OpenId4VpError::InvalidBinding);
+        }
+        Ok(Self { lease_id, task_jti })
+    }
+
+    pub fn lease_id(&self) -> Uuid {
+        self.lease_id
+    }
+
+    pub fn task_jti(&self) -> &str {
+        &self.task_jti
+    }
+}
+
 /// Inputs required to start one OpenID4VP verifier presentation. Matrix
 /// values stay opaque until this boundary; the verifier client accepts only
 /// formats and request methods used by the official plans.
@@ -37,6 +76,7 @@ pub struct OpenId4VpStartRequest {
     pub test_name: String,
     pub variant: BTreeMap<String, String>,
     pub haip: bool,
+    pub binding: ConformanceBinding,
 }
 
 impl OpenId4VpStartRequest {
@@ -45,12 +85,14 @@ impl OpenId4VpStartRequest {
         test_name: impl Into<String>,
         variant: BTreeMap<String, String>,
         haip: bool,
+        binding: ConformanceBinding,
     ) -> Result<Self, OpenId4VpError> {
         let request = Self {
             alias: alias.into(),
             test_name: test_name.into(),
             variant,
             haip,
+            binding,
         };
         request.validate()?;
         Ok(request)
@@ -124,6 +166,7 @@ pub struct OpenId4VpVerifierClient {
     target_origin: BrowserTargetOrigin,
     suite_origin: Origin,
     management_token: Zeroizing<String>,
+    binding: ConformanceBinding,
     transport: Arc<dyn Transport>,
     max_response_bytes: usize,
 }
@@ -135,6 +178,7 @@ impl fmt::Debug for OpenId4VpVerifierClient {
             .field("target_origin", &self.target_origin)
             .field("suite_origin", &self.suite_origin)
             .field("management_token", &"<redacted>")
+            .field("binding", &self.binding)
             .field("max_response_bytes", &self.max_response_bytes)
             .finish()
     }
@@ -146,6 +190,7 @@ impl OpenId4VpVerifierClient {
         suite_origin: Origin,
         management_token: Zeroizing<String>,
         timeout: Duration,
+        binding: ConformanceBinding,
     ) -> Result<Self, OpenId4VpError> {
         if management_token.trim().is_empty()
             || management_token.len() > MAX_VARIANT_VALUE_BYTES * 64
@@ -162,6 +207,7 @@ impl OpenId4VpVerifierClient {
             target_origin,
             suite_origin,
             management_token,
+            binding,
             transport: Arc::new(transport),
             max_response_bytes: MAX_RESPONSE_BYTES,
         })
@@ -173,12 +219,14 @@ impl OpenId4VpVerifierClient {
         suite_origin: Origin,
         management_token: Zeroizing<String>,
         transport: Arc<dyn Transport>,
+        binding: ConformanceBinding,
     ) -> Result<Self, OpenId4VpError> {
         let mut client = Self::new(
             target_origin,
             suite_origin,
             management_token,
             Duration::from_secs(30),
+            binding,
         )?;
         client.transport = transport;
         Ok(client)
@@ -189,6 +237,9 @@ impl OpenId4VpVerifierClient {
         request: &OpenId4VpStartRequest,
     ) -> Result<OpenId4VpPresentation, OpenId4VpError> {
         request.validate()?;
+        if self.binding != request.binding {
+            return Err(OpenId4VpError::BindingMismatch);
+        }
         let format_name = request
             .variant
             .get("credential_format")
@@ -267,6 +318,8 @@ impl OpenId4VpVerifierClient {
             "client_id_prefix": client_id_prefix,
             "request_method": request_method,
             "response_mode": response_mode,
+            "conformance_lease_id": self.binding.lease_id().to_string(),
+            "conformance_task_jti": self.binding.task_jti(),
         });
         let body = serde_json::to_vec(&body).map_err(|_| OpenId4VpError::InvalidInput)?;
         let response = self
@@ -342,6 +395,10 @@ impl OpenId4VpVerifier for OpenId4VpVerifierClient {
 pub enum OpenId4VpError {
     #[error("OpenID4VP verifier input is invalid")]
     InvalidInput,
+    #[error("OpenID4VP conformance binding is invalid")]
+    InvalidBinding,
+    #[error("OpenID4VP conformance binding does not match the verifier client")]
+    BindingMismatch,
     #[error("OpenID4VP credential format is unsupported")]
     UnsupportedCredentialFormat,
     #[error("OpenID4VP request method is unsupported")]
@@ -381,6 +438,14 @@ mod tests {
         }
     }
 
+    fn binding() -> ConformanceBinding {
+        ConformanceBinding::new(
+            "019ff000-8190-7393-8c33-ab4339c3d85e",
+            "request-0123456789abcdef0123456789abcdef",
+        )
+        .expect("binding")
+    }
+
     #[test]
     fn maps_sd_jwt_and_post_method_without_leaking_token() {
         let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
@@ -402,13 +467,15 @@ mod tests {
             suite,
             Zeroizing::new("management-secret".to_owned()),
             transport.clone(),
+            binding(),
         )
         .expect("client");
         let mut variant = BTreeMap::new();
         variant.insert("credential_format".to_owned(), "sd_jwt_vc".to_owned());
         variant.insert("request_method".to_owned(), "request_uri_signed".to_owned());
         let request =
-            OpenId4VpStartRequest::new("vp", SPECIAL_POST_TEST, variant, false).expect("request");
+            OpenId4VpStartRequest::new("vp", SPECIAL_POST_TEST, variant, false, binding())
+                .expect("request");
         let presentation = client.start(&request).expect("presentation");
         assert_eq!(
             presentation.completion_url.as_str(),
@@ -431,6 +498,14 @@ mod tests {
         assert_eq!(
             body["dcql_query"]["credentials"][0]["meta"]["vct_values"][0],
             "urn:eudi:pid:1"
+        );
+        assert_eq!(
+            body["conformance_lease_id"],
+            "019ff000-8190-7393-8c33-ab4339c3d85e"
+        );
+        assert_eq!(
+            body["conformance_task_jti"],
+            "request-0123456789abcdef0123456789abcdef"
         );
     }
 
@@ -455,14 +530,64 @@ mod tests {
             suite,
             Zeroizing::new("management-secret".to_owned()),
             transport,
+            binding(),
         )
         .expect("client");
         let mut variant = BTreeMap::new();
         variant.insert("credential_format".to_owned(), "iso_mdl".to_owned());
-        let request = OpenId4VpStartRequest::new("vp", "happy", variant, true).expect("request");
+        let request =
+            OpenId4VpStartRequest::new("vp", "happy", variant, true, binding()).expect("request");
         assert_eq!(
             client.start(&request).expect_err("cross origin"),
             OpenId4VpError::CrossOriginNavigation
         );
+    }
+
+    #[test]
+    fn rejects_malformed_or_partial_binding() {
+        assert_eq!(
+            ConformanceBinding::new("not-a-uuid", "request-0123456789abcdef0123456789abcdef")
+                .expect_err("invalid lease"),
+            OpenId4VpError::InvalidBinding
+        );
+        assert_eq!(
+            ConformanceBinding::new(
+                "019ff000-8190-7393-8c33-ab4339c3d85e",
+                "request-0123456789abcdef0123456789ABCDEf",
+            )
+            .expect_err("uppercase task jti"),
+            OpenId4VpError::InvalidBinding
+        );
+    }
+
+    #[test]
+    fn rejects_binding_mismatch_before_transport() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse("https://suite.example").expect("suite");
+        let transport = Arc::new(VerifierTransport {
+            request: std::sync::Mutex::new(None),
+            response: std::sync::Mutex::new(None),
+        });
+        let mut client = OpenId4VpVerifierClient::with_transport(
+            target,
+            suite,
+            Zeroizing::new("management-secret".to_owned()),
+            transport.clone(),
+            binding(),
+        )
+        .expect("client");
+        let other_binding = ConformanceBinding::new(
+            "019ff000-8190-7393-8c33-ab4339c3d85f",
+            "request-fedcba9876543210fedcba9876543210",
+        )
+        .expect("other binding");
+        let request =
+            OpenId4VpStartRequest::new("vp", "happy", BTreeMap::new(), false, other_binding)
+                .expect("request");
+        assert_eq!(
+            client.start(&request).expect_err("mismatch"),
+            OpenId4VpError::BindingMismatch
+        );
+        assert!(transport.request.lock().expect("request lock").is_none());
     }
 }

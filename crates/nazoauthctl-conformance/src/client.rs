@@ -258,6 +258,39 @@ impl SuiteClient {
         Ok(response.body)
     }
 
+    /// Fetch the Suite runner document for a WAITING module.  The runner
+    /// document is distinct from `/api/info/{id}` and carries the authoritative
+    /// `exposed` and `browser` fields consumed by the native OpenID4VC drivers.
+    pub fn runner_info(&self, module_id: &str) -> Result<Value, SuiteClientError> {
+        if module_id.is_empty()
+            || module_id.len() > 256
+            || module_id == "."
+            || module_id == ".."
+            || module_id.chars().any(|character| {
+                character.is_control()
+                    || !matches!(character, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.')
+            })
+        {
+            return Err(SuiteClientError::InvalidInput);
+        }
+        let response = self.request_json(
+            HttpMethod::Get,
+            &format!("/api/runner/{module_id}"),
+            &[],
+            None,
+            true,
+            self.config.max_response_bytes,
+        )?;
+        if response.status != 200 || !response.body.is_object() {
+            return Err(if response.status == 200 {
+                SuiteClientError::MalformedResponse
+            } else {
+                SuiteClientError::HttpStatus(response.status)
+            });
+        }
+        Ok(response.body)
+    }
+
     pub fn module_log(&self, module_id: &str) -> Result<Value, SuiteClientError> {
         let response = self.request_json(
             HttpMethod::Get,
