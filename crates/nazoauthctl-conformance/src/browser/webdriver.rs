@@ -76,9 +76,8 @@ impl fmt::Debug for WebDriverEndpoint {
     }
 }
 
-/// A small W3C WebDriver client.  The client intentionally omits cookie APIs;
-/// browser cookies remain inside the driver process and are destroyed by
-/// `quit`/`Drop` rather than being copied into CTL memory or logs.
+/// A small W3C WebDriver client. Cookie values never leave the driver; the
+/// only cookie operation is W3C delete-all, used to isolate Suite modules.
 pub struct WebDriverClient {
     endpoint: WebDriverEndpoint,
     client: Client,
@@ -213,6 +212,11 @@ impl WebDriverClient {
 }
 
 impl BrowserDriver for WebDriverClient {
+    fn clear_cookies(&mut self) -> Result<(), BrowserError> {
+        self.delete_value(&self.session_path("/cookie")?)
+            .map(|_| ())
+    }
+
     fn navigate(&mut self, url: &Url) -> Result<(), BrowserError> {
         let path = self.session_path("/url")?;
         self.post_value(&path, &json!({ "url": url.as_str() }))
@@ -445,6 +449,10 @@ fn current_effective_uid() -> Option<u32> {
 }
 
 impl BrowserDriver for ManagedWebDriver {
+    fn clear_cookies(&mut self) -> Result<(), BrowserError> {
+        self.client.clear_cookies()
+    }
+
     fn navigate(&mut self, url: &Url) -> Result<(), BrowserError> {
         self.client.navigate(url)
     }

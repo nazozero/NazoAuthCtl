@@ -20,8 +20,8 @@ use zeroize::Zeroizing;
 #[cfg(test)]
 use super::BrowserEntry;
 use super::{
-    BrowserAutomation, BrowserError, BrowserTargetOrigin, parse_browser_entries_owned,
-    validation::MAX_STEP_TIMEOUT,
+    BrowserAutomation, BrowserError, BrowserTargetOrigin, browser_config_for_module,
+    parse_browser_entries_owned, validation::MAX_STEP_TIMEOUT,
 };
 use crate::credentials::BearerToken;
 use crate::origin::Origin;
@@ -581,11 +581,8 @@ impl OpenId4VciIssuerClient {
             self.suite_visit(&module.module_id, &authorization_url)?;
         } else {
             self.suite_visit(&module.module_id, &authorization_url)?;
-            let browser_config = module
-                .plan_config
-                .get("browser")
-                .cloned()
-                .ok_or(OpenId4VciError::MissingBrowserTasks)?;
+            let browser_config = browser_config_for_module(&module.plan_config, &module.test_name)
+                .map_err(OpenId4VciError::Browser)?;
             let entries =
                 parse_browser_entries_owned(browser_config).map_err(OpenId4VciError::Browser)?;
             if entries.is_empty() {

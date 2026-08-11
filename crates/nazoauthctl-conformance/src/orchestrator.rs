@@ -14,7 +14,8 @@ use url::Url;
 use crate::browser::{
     BrowserAutomation, BrowserError, BrowserPolicy, BrowserRunnerState, BrowserTargetOrigin,
     ConformanceBinding, OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule,
-    OpenId4VpStartRequest, OpenId4VpVerifier, parse_browser_entries_owned,
+    OpenId4VpStartRequest, OpenId4VpVerifier, browser_config_for_module,
+    parse_browser_entries_owned,
 };
 use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
 use crate::matrix::{MatrixError, SelectedMatrix};
@@ -146,6 +147,22 @@ impl ConformanceRunner {
         self.wait_for_state_until(module_id, states, deadline)
     }
 
+    fn reset_browser_session(&self) -> Result<(), String> {
+        let Some(browser) = self
+            .config
+            .automation
+            .first()
+            .and_then(|automation| automation.browser.as_ref())
+        else {
+            return Ok(());
+        };
+        browser
+            .lock()
+            .map_err(|_| "browser automation lock failed".to_owned())?
+            .reset_session()
+            .map_err(|error| error.to_string())
+    }
+
     fn wait_for_state_until(
         &self,
         module_id: &str,
@@ -260,12 +277,12 @@ impl ConformanceRunner {
         &self,
         browser: &Arc<Mutex<dyn BrowserAutomation>>,
         plan: &PlannedPlan,
+        module: &ModuleDefinition,
         module_id: &str,
         initial: Value,
     ) -> Result<Value, String> {
-        let browser_config = plan.config.get("browser").cloned().ok_or_else(|| {
-            "Suite runner is WAITING but the Matrix plan has no browser tasks".to_owned()
-        })?;
+        let browser_config = browser_config_for_module(&plan.config, &module.test_name)
+            .map_err(|error| error.to_string())?;
         let entries =
             parse_browser_entries_owned(browser_config).map_err(|error| error.to_string())?;
         let target_origin = self.config.target_origin.clone().ok_or_else(|| {
@@ -539,6 +556,11 @@ impl ConformanceRunner {
                         groups[group_index].status = GroupStatus::Failed;
                         break 'execute;
                     }
+                    if let Err(error) = self.reset_browser_session() {
+                        errors.push(error);
+                        groups[group_index].status = GroupStatus::Failed;
+                        break 'execute;
+                    }
                     current_test = Some(module.test_name.clone());
                     emit_progress(
                         sink,
@@ -758,6 +780,7 @@ impl ConformanceRunner {
                             match self.drive_browser_waiting_interruptible(
                                 browser,
                                 plan,
+                                module,
                                 &instance.id,
                                 observed.clone().expect("waiting runner state"),
                             ) {
@@ -1642,11 +1665,17 @@ mod tests {
         let browser: Arc<Mutex<dyn BrowserAutomation>> = Arc::new(Mutex::new(CompletingBrowser {
             completed: completed.clone(),
         }));
+        let module = ModuleDefinition {
+            test_name: "browser-module".to_owned(),
+            variant: None,
+            raw: Value::Null,
+        };
 
         let observed = runner
             .drive_browser_waiting_interruptible(
                 &browser,
                 &plan,
+                &module,
                 "m",
                 serde_json::json!({"status":"WAITING"}),
             )

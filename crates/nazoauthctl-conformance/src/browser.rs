@@ -97,9 +97,81 @@ use validation::{
     validate_match_pattern,
 };
 
+const USER_REJECT_AUTHENTICATION_MODULES: [&str; 2] = [
+    "fapi2-security-profile-final-user-rejects-authentication",
+    "fapi2-security-profile-id2-user-rejects-authentication",
+];
+
+/// Select the Suite's module-specific browser override when present. Older
+/// executable Matrix documents did not carry the negative-consent override
+/// into OpenID4VC plans, so the two official user-rejection modules are
+/// normalized to the target's explicit deny control at this single boundary.
+pub(crate) fn browser_config_for_module(
+    plan_config: &Value,
+    test_name: &str,
+) -> Result<Value, BrowserError> {
+    let overridden = match plan_config.get("override") {
+        None => None,
+        Some(Value::Object(overrides)) => match overrides.get(test_name) {
+            None => None,
+            Some(Value::Object(module)) => module.get("browser").cloned(),
+            Some(_) => return Err(BrowserError::InvalidSchema),
+        },
+        Some(_) => return Err(BrowserError::InvalidSchema),
+    };
+    let mut browser = overridden
+        .or_else(|| plan_config.get("browser").cloned())
+        .ok_or(BrowserError::InvalidSchema)?;
+    if USER_REJECT_AUTHENTICATION_MODULES.contains(&test_name) {
+        normalize_consent_denial(&mut browser)?;
+    }
+    Ok(browser)
+}
+
+fn normalize_consent_denial(browser: &mut Value) -> Result<(), BrowserError> {
+    let entries = browser.as_array_mut().ok_or(BrowserError::InvalidSchema)?;
+    let mut denial_commands = 0usize;
+    for entry in entries {
+        let tasks = entry
+            .get_mut("tasks")
+            .and_then(Value::as_array_mut)
+            .ok_or(BrowserError::InvalidSchema)?;
+        for task in tasks {
+            let commands = task
+                .get_mut("commands")
+                .and_then(Value::as_array_mut)
+                .ok_or(BrowserError::InvalidSchema)?;
+            for command in commands {
+                let Some(tuple) = command.as_array_mut() else {
+                    return Err(BrowserError::InvalidSchema);
+                };
+                let selector = tuple.get(1).and_then(Value::as_str);
+                let element = tuple.get(2).and_then(Value::as_str);
+                if selector == Some("id") && element == Some("nazo-consent-approve") {
+                    tuple[2] = Value::String("nazo-consent-deny".to_owned());
+                    denial_commands += 1;
+                } else if selector == Some("id") && element == Some("nazo-consent-deny") {
+                    denial_commands += 1;
+                }
+            }
+        }
+    }
+    if denial_commands < 2 {
+        return Err(BrowserError::InvalidSchema);
+    }
+    Ok(())
+}
+
 /// Driver abstraction used both by WebDriver and deterministic tests. A
 /// driver never receives a URL before policy checks.
 pub trait BrowserDriver: Send {
+    /// Remove client-side authentication state before another independent
+    /// Suite module uses this worker lane. Implementations must not export or
+    /// inspect cookie values.
+    fn clear_cookies(&mut self) -> Result<(), BrowserError> {
+        Ok(())
+    }
+
     fn navigate(&mut self, url: &Url) -> Result<(), BrowserError>;
     fn current_url(&mut self) -> Result<Url, BrowserError>;
     fn page_source(&mut self) -> Result<String, BrowserError>;
@@ -114,6 +186,13 @@ pub trait BrowserDriver: Send {
 /// in `WAITING`. This trait drives browser work only and returns no Suite
 /// result, preserving the official PASS/FAIL decision.
 pub trait BrowserAutomation: Send {
+    /// Establish a clean browser boundary for the next Suite module. The
+    /// default keeps non-browser test doubles source-compatible; production
+    /// WebDriver automation overrides this and deletes every browser cookie.
+    fn reset_session(&mut self) -> Result<(), BrowserError> {
+        Ok(())
+    }
+
     fn execute(
         &mut self,
         authorization_url: &Url,
@@ -306,6 +385,15 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
 }
 
 impl<D: BrowserDriver> BrowserAutomation for BrowserExecutor<D> {
+    fn reset_session(&mut self) -> Result<(), BrowserError> {
+        self.driver.clear_cookies()?;
+        self.entry_uses.clear();
+        self.steps = 0;
+        self.redirects = 0;
+        self.last_url = None;
+        Ok(())
+    }
+
     fn execute(
         &mut self,
         authorization_url: &Url,
@@ -511,9 +599,15 @@ mod tests {
         found: bool,
         displayed: bool,
         clicked: bool,
+        cookies_cleared: bool,
     }
 
     impl BrowserDriver for MockDriver {
+        fn clear_cookies(&mut self) -> Result<(), BrowserError> {
+            self.cookies_cleared = true;
+            Ok(())
+        }
+
         fn navigate(&mut self, url: &Url) -> Result<(), BrowserError> {
             self.current = url.clone();
             Ok(())
@@ -606,8 +700,11 @@ mod tests {
             found: true,
             displayed: true,
             clicked: false,
+            cookies_cleared: false,
         };
         let mut executor = BrowserExecutor::new(driver, policy);
+        executor.reset_session().expect("reset browser session");
+        assert!(executor.driver_mut().cookies_cleared);
         assert!(matches!(
             executor.navigate(&Url::parse("https://evil.example/").expect("url")),
             Err(BrowserError::CrossOriginNavigation)
@@ -626,6 +723,31 @@ mod tests {
             )
             .expect("flow");
         assert_eq!(report.steps, 2);
+    }
+
+    #[test]
+    fn user_rejection_module_uses_the_explicit_consent_deny_control() {
+        let config = json!({
+            "browser": [{
+                "match": "https://issuer.example/authorize*",
+                "tasks": [{
+                    "match": "https://issuer.example/ui/consent*",
+                    "commands": [
+                        ["wait-element-visible", "id", "nazo-consent-approve", 30],
+                        ["click", "id", "nazo-consent-approve"]
+                    ]
+                }]
+            }]
+        });
+
+        let selected = browser_config_for_module(
+            &config,
+            "fapi2-security-profile-final-user-rejects-authentication",
+        )
+        .expect("negative consent browser plan");
+        let text = serde_json::to_string(&selected).expect("json");
+        assert!(!text.contains("nazo-consent-approve"));
+        assert_eq!(text.matches("nazo-consent-deny").count(), 2);
     }
 
     #[test]
