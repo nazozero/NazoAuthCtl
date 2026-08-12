@@ -574,6 +574,13 @@ fn write_bootstrap_pending_fixture(
     status: BootstrapAdminPendingStatus,
 ) {
     fs::create_dir_all(config.operator.secret_revision_file.parent().unwrap()).unwrap();
+    if config.operator.secret_revision_file.exists() {
+        fs::set_permissions(
+            &config.operator.secret_revision_file,
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
     fs::write(
         &config.operator.secret_revision_file,
         b"stable-deployment-bootstrap-binding",

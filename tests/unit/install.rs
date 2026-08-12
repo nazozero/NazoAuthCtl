@@ -375,7 +375,7 @@ fn persisted_profile_secret_descriptor_rejects_symlink_unsafe_mode_and_oversize_
     fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
     assert!(load_profile_secret(&path, "test profile secret", 32).is_err());
 
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     fs::write(&path, vec![b'x'; 33]).unwrap();
     assert!(load_profile_secret(&path, "test profile secret", 32).is_err());
 
