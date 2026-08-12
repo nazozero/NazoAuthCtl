@@ -324,6 +324,7 @@ jobs:
           DATABASE_URL: "postgresql://postgres:${SECRET_MARKER}@${postgres}:5432/oauth"
           DATABASE_MAX_CONNECTIONS: 8
           VALKEY_URL: "redis://${valkey}:6379/0"
+          SECURITY_AUDIT_REQUIRE_LEAST_PRIVILEGE: false
           RUST_LOG: "warn"
           YAML
           docker run -d --name manual-auth-same-name --network "$network" \
@@ -515,6 +516,7 @@ jobs:
           DATABASE_URL: "postgresql://postgres:${SECRET_MARKER}@127.0.0.1:15432/oauth"
           DATABASE_MAX_CONNECTIONS: 8
           VALKEY_URL: "redis://127.0.0.1:16379/0"
+          SECURITY_AUDIT_REQUIRE_LEAST_PRIVILEGE: false
           RUST_LOG: "warn"
           YAML
           sudo tee "/etc/systemd/system/$unit" >/dev/null <<UNIT
@@ -712,6 +714,7 @@ jobs:
           DATABASE_URL: "postgresql://postgres:${SECRET_MARKER}@127.0.0.1:15432/oauth"
           DATABASE_MAX_CONNECTIONS: 8
           VALKEY_URL: "redis://127.0.0.1:16379/0"
+          SECURITY_AUDIT_REQUIRE_LEAST_PRIVILEGE: false
           RUST_LOG: "warn"
           YAML
           sudo podman pull "$image"

@@ -15,7 +15,9 @@ use crate::{
     },
 };
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, chown};
+use std::os::unix::fs::PermissionsExt as _;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{MetadataExt as _, chown};
 
 #[cfg(unix)]
 fn current_unix_user() -> String {
