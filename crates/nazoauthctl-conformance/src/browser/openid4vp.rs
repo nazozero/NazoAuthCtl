@@ -27,6 +27,16 @@ const MAX_ALIAS_BYTES: usize = 256;
 const MAX_TEST_NAME_BYTES: usize = 512;
 const MAX_VARIANT_VALUE_BYTES: usize = 256;
 const SPECIAL_POST_TEST: &str = "oid4vp-1final-verifier-request-uri-method-post";
+const IMMEDIATE_REJECTION_TESTS: [&str; 8] = [
+    "oid4vp-1final-verifier-invalid-session-transcript",
+    "oid4vp-1final-verifier-invalid-kb-jwt-signature",
+    "oid4vp-1final-verifier-invalid-credential-signature",
+    "oid4vp-1final-verifier-invalid-sd-hash",
+    "oid4vp-1final-verifier-invalid-kb-jwt-nonce",
+    "oid4vp-1final-verifier-invalid-kb-jwt-aud",
+    "oid4vp-1final-verifier-kb-jwt-iat-in-past",
+    "oid4vp-1final-verifier-kb-jwt-iat-in-future",
+];
 
 /// The deployment capability binding that must accompany every target-side
 /// verifier start.  Keeping the two values in one validated type makes a
@@ -136,6 +146,7 @@ pub struct OpenId4VpPresentation {
     pub authorization_url: Url,
     pub completion_url: Url,
     pub transaction_id: Uuid,
+    immediate_rejection_allowed: bool,
 }
 
 impl fmt::Debug for OpenId4VpPresentation {
@@ -148,6 +159,10 @@ impl fmt::Debug for OpenId4VpPresentation {
             )
             .field("completion_origin", &redacted_origin(&self.completion_url))
             .field("transaction_id", &self.transaction_id)
+            .field(
+                "immediate_rejection_allowed",
+                &self.immediate_rejection_allowed,
+            )
             .finish()
     }
 }
@@ -378,6 +393,8 @@ impl OpenId4VpVerifierClient {
             authorization_url,
             completion_url,
             transaction_id,
+            immediate_rejection_allowed: IMMEDIATE_REJECTION_TESTS
+                .contains(&request.test_name.as_str()),
         })
     }
 
@@ -405,6 +422,13 @@ impl OpenId4VpVerifierClient {
                 self.max_response_bytes,
             )
             .map_err(OpenId4VpError::Transport)?;
+        // OID4VP negative tests explicitly pass when the verifier rejects the
+        // invalid response at response_uri with a 4xx. Only those named tests
+        // may terminate without the transaction completion redirect; positive
+        // tests and deferred verification remain bound to the exact redirect.
+        if (400..500).contains(&response.status) && presentation.immediate_rejection_allowed {
+            return Ok(());
+        }
         if !matches!(response.status, 302 | 303) {
             return Err(OpenId4VpError::UnexpectedAuthorizationRedirect);
         }
@@ -718,6 +742,7 @@ mod tests {
             completion_url: completion_url.clone(),
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
+            immediate_rejection_allowed: false,
         };
 
         client.complete(&presentation).expect("completion");
@@ -730,6 +755,91 @@ mod tests {
         assert_eq!(
             requests[0].header("Accept"),
             Some("text/html,application/xhtml+xml")
+        );
+    }
+
+    #[test]
+    fn negative_test_accepts_immediate_4xx_without_completion_redirect() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse("https://suite.example").expect("suite");
+        let transport = Arc::new(CompletionTransport {
+            requests: std::sync::Mutex::new(Vec::new()),
+            responses: std::sync::Mutex::new(VecDeque::from([
+                HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "authorization_url": "https://suite.example/test/a/vp/authorize?x=1",
+                        "transaction_id": "550e8400-e29b-41d4-a716-446655440000"
+                    }))
+                    .expect("start response"),
+                },
+                HttpResponse {
+                    status: 400,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+            ])),
+        });
+        let mut client = OpenId4VpVerifierClient::with_transport(
+            target,
+            suite,
+            Zeroizing::new("management-secret".to_owned()),
+            transport.clone(),
+            binding(),
+        )
+        .expect("client");
+        let request = OpenId4VpStartRequest::new(
+            "vp",
+            "oid4vp-1final-verifier-invalid-session-transcript",
+            BTreeMap::new(),
+            false,
+            binding(),
+        )
+        .expect("request");
+        let presentation = client.start(&request).expect("presentation");
+
+        client
+            .complete(&presentation)
+            .expect("immediate rejection is an expected negative outcome");
+        assert_eq!(transport.requests.lock().expect("request lock").len(), 2);
+    }
+
+    #[test]
+    fn positive_test_rejects_4xx_without_completion_redirect() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse("https://suite.example").expect("suite");
+        let transport = Arc::new(CompletionTransport {
+            requests: std::sync::Mutex::new(Vec::new()),
+            responses: std::sync::Mutex::new(VecDeque::from([HttpResponse {
+                status: 400,
+                headers: Vec::new(),
+                body: Vec::new(),
+            }])),
+        });
+        let mut client = OpenId4VpVerifierClient::with_transport(
+            target,
+            suite,
+            Zeroizing::new("management-secret".to_owned()),
+            transport,
+            binding(),
+        )
+        .expect("client");
+        let presentation = OpenId4VpPresentation {
+            authorization_url: Url::parse("https://suite.example/test/a/vp/authorize?x=1")
+                .expect("authorization URL"),
+            completion_url: Url::parse(
+                "https://issuer.example/openid4vp/complete/550e8400-e29b-41d4-a716-446655440000",
+            )
+            .expect("completion URL"),
+            transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+                .expect("transaction ID"),
+            immediate_rejection_allowed: false,
+        };
+
+        assert_eq!(
+            client.complete(&presentation).expect_err("positive 4xx"),
+            OpenId4VpError::UnexpectedAuthorizationRedirect
         );
     }
 
@@ -766,6 +876,7 @@ mod tests {
             .expect("completion URL"),
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
+            immediate_rejection_allowed: false,
         };
 
         assert_eq!(
