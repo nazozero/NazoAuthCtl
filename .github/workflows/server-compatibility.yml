@@ -320,6 +320,11 @@ jobs:
             sleep 2
           done
           test "$ready" = true
+          ui_url=http://127.0.0.1:19081/ui/
+          curl --fail --silent --show-error "$ui_url" >"$root/docker-ui.html"
+          ui_sha="$(sha256sum "$root/docker-ui.html" | cut -d' ' -f1)"
+          ui_size="$(stat -c %s "$root/docker-ui.html")"
+          test "$ui_size" -gt 0
           docker inspect manual-auth-same-name | jq -S '.[0].HostConfig | {
             ReadonlyRootfs, RestartPolicy, CapDrop, Memory, NanoCpus, PidsLimit, Tmpfs
           }' >"$root/docker-policy-before.json"
@@ -352,13 +357,21 @@ jobs:
           PY
           chmod 0500 "$driver"
           driver_sha="$(sha256sum "$driver" | cut -d' ' -f1)"
+          provider_key="/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker-provider-key"
+          printf '%s' 'ci-recovery-provider-verification-key-v1' \
+            | sudo tee "$provider_key" >/dev/null
+          sudo chown 0:0 "$provider_key"
+          sudo chmod 0444 "$provider_key"
+          provider_key_sha="$(sha256sum "$provider_key" | cut -d' ' -f1)"
           lifecycle="$state_root/deployments/$deployment_id/recovery/lifecycle.json"
           jq -n \
             --arg deployment "$deployment_id" --arg runtime "$runtime_id" \
             --arg object manual-auth-same-name --arg data "$root/docker-live-data" \
             --arg config "$root/docker-live-config/.env.yaml" --arg network "$network" \
             --arg driver "$driver" --arg driver_sha "$driver_sha" --arg rehearsal "$control_root/rehearsal" \
-            '{schema:2,deployment_id:$deployment,runtimes:[{
+            --arg ui_url "$ui_url" --arg ui_sha "$ui_sha" --argjson ui_size "$ui_size" \
+            --arg provider_key "$provider_key" --arg provider_key_sha "$provider_key_sha" \
+            '{schema:3,deployment_id:$deployment,runtimes:[{
               runtime_instance_id:$runtime,backend:"docker",object_reference:$object,
               command:["nazoauth","server"],mounts:[
                 {source:$config,destination:"/app/.env.yaml",read_only:true,selinux_relabel:false,ownership:"external",scope:"deployment"},
@@ -366,8 +379,14 @@ jobs:
               ],environment:{DATA_DIR:"/var/lib/nazo_oauth"},networks:[$network],ip_address:null,
               ports:["127.0.0.1:19081:8000"],container_policy:{restart:"no",read_only_root:false,
                 no_new_privileges:false,drop_all_capabilities:false,pids_limit:null,memory_limit_bytes:null,
-                cpu_limit_millis:null,tmpfs:[]}
-            }],recovery_driver:{program:$driver,program_sha256:$driver_sha,arguments:[],rehearsal_workspace:$rehearsal,credentials:{}}}' \
+                cpu_limit_millis:null,tmpfs:[]},acceptance:{readiness_url:"http://127.0.0.1:19081/ready",
+                expected_issuer:"http://127.0.0.1:19081",
+                discovery_url:"http://127.0.0.1:19081/.well-known/openid-configuration",
+                ui_url:$ui_url,ui_sha256:$ui_sha,ui_size:$ui_size,attempts:90,interval_seconds:2}
+            }],recovery_driver:{program:$driver,program_sha256:$driver_sha,arguments:[],rehearsal_workspace:$rehearsal,credentials:{}},
+              recovery_providers:[{provider_id:"ci-recovery-provider",
+                roles:["data-snapshot","database-restore","last-trusted-artifact","verification-material"],
+                verification_key:{kind:"digest-bound-file",path:$provider_key,sha256:$provider_key_sha}}]}' \
             >"$lifecycle"
           identity="$(cat host-identity.json)"
           declaration="$config_root/deployments/$deployment_id/deployment.json"
@@ -780,5 +799,6 @@ jobs:
             "/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman" \
             "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker-break-glass" \
             "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-systemd-break-glass" \
-            "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman-break-glass"
+            "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman-break-glass" \
+            "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker-provider-key"
           sudo systemctl daemon-reload
