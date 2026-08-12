@@ -294,7 +294,7 @@ jobs:
             "$state_root/deployments/$deployment_id/transactions" \
             "$state_root/deployments/$deployment_id/recovery/trusted-runtime/v0.1.20/$runtime_id" \
             "$break_glass_root"
-          test "$(stat -c %d "$config_root")" != "$(stat -c %d "$break_glass_root")"
+          test "$(stat -c %d "$control_root")" != "$(stat -c %d "$break_glass_root")"
           sudo chown -R 10001:10001 "$root/docker-live-data"
           cat >"$root/docker-live-config/.env.yaml" <<YAML
           BIND: "0.0.0.0:8000"
@@ -464,7 +464,7 @@ jobs:
           cached="$control_root/systemd-cache/nazoauth"
           mkdir -p "$control_root/systemd-live" "$control_root/systemd-cache" \
             "$root/live-data" "$root/live-config" "$break_glass_root"
-          test "$(stat -c %d "$config_root")" != "$(stat -c %d "$break_glass_root")"
+          test "$(stat -c %d "$control_root")" != "$(stat -c %d "$break_glass_root")"
           install -m 0755 "$GITHUB_WORKSPACE/signed-server/nazoauth-x86_64-unknown-linux-gnu" "$target"
           install -m 0500 "$target" "$cached"
           cat >"$root/live-config/.env.yaml" <<YAML
@@ -650,7 +650,7 @@ jobs:
           PATTERNS
           }
           mkdir -p "$root/live-data" "$root/live-config" "$root/cache" "$break_glass_root"
-          test "$(stat -c %d "$config_root")" != "$(stat -c %d "$break_glass_root")"
+          test "$(stat -c %d "$control_root")" != "$(stat -c %d "$break_glass_root")"
           sudo chown -R 10001:10001 "$root/live-data"
           cat >"$root/live-config/.env.yaml" <<YAML
           BIND: "127.0.0.1:19083"
