@@ -1848,7 +1848,7 @@ fn public_command_dispatch_fails_closed_before_every_confirmed_mutation() {
     fs::write(abandoned.join("controller.key"), b"pending-secret").unwrap();
     assert_root_or_error(
         invoke(Command::RecoverUpdate { yes: false }),
-        "no interrupted update transaction requires recovery",
+        "identity recovery is pending",
     );
     assert!(invoke(Command::RecoverIdentity { yes: false }).is_err());
     assert_eq!(fs::read(&config_path).unwrap(), config_before);
@@ -2208,6 +2208,7 @@ fn fake_container_runtime(
         &config.operator.controller_key_id,
         &config.runtime.runtime_instance_id,
         &config.runtime.network,
+        config.runtime.network_subnet.as_deref(),
         &config.postgres.container_name,
         &postgres_volume,
         &config.postgres.image,
@@ -2315,6 +2316,8 @@ fn fake_container_runtime(
         },
     })
     .to_string();
+    let restore_check_name = work.path().join("restore-check-name");
+    let restore_check_digest = work.path().join("restore-check-digest");
     let embedded_identity = serde_json::to_string(&nazo_operator_protocol::EmbeddedIdentity {
         release: "v0.2.0".to_owned(),
         revision: candidate_commit.to_owned(),
@@ -2340,7 +2343,59 @@ fn fake_container_runtime(
         embedded_identity = embedded_identity,
     );
     let raw_identity_override = format!(
-        r#"if [ "${{1:-}}" = network ] && [ "${{2:-}}" = inspect ] && [ "${{3:-}}" = '{network}' ]; then
+        r#"restore_check_name_file='{restore_check_name}'
+restore_check_digest_file='{restore_check_digest}'
+restore_check_id='fixture-restore-check-id'
+if [ "${{1:-}}" = container ] && [ "${{2:-}}" = inspect ]; then
+  restore_check_object="${{3:-}}"
+  case "$restore_check_object" in
+    nazoauthctl-restore-check-*|"$restore_check_id")
+      if [ ! -f "$restore_check_name_file" ]; then
+        printf '%s\n' 'no such object' >&2
+        exit 1
+      fi
+      restore_check_name="$(cat "$restore_check_name_file")"
+      if [ "$restore_check_object" != "$restore_check_name" ] && [ "$restore_check_object" != "$restore_check_id" ]; then
+        printf '%s\n' 'no such object' >&2
+        exit 1
+      fi
+      restore_check_digest_value="$(cat "$restore_check_digest_file")"
+      printf '{{"Id":"%s","Name":"/%s","Config":{{"Labels":{{"io.nazoauth.deployment-id":"{deployment}","io.nazoauth.control-authority":"{authority}","io.nazoauth.runtime-instance-id":"{runtime}","io.nazoauth.managed-resource":"valkey-restore-check","io.nazoauth.config-digest":"%s"}}}}}}\n' "$restore_check_id" "$restore_check_name" "$restore_check_digest_value"
+      exit 0 ;;
+  esac
+fi
+if [ "${{1:-}}" = run ]; then
+  restore_check_name_value=''
+  restore_check_digest_value=''
+  capture_restore_check_name=false
+  for restore_check_argument in "$@"; do
+    if [ "$capture_restore_check_name" = true ]; then
+      restore_check_name_value="$restore_check_argument"
+      capture_restore_check_name=false
+      continue
+    fi
+    case "$restore_check_argument" in
+      --name) capture_restore_check_name=true ;;
+      io.nazoauth.config-digest=*) restore_check_digest_value="${{restore_check_argument#*=}}" ;;
+    esac
+  done
+  case "$restore_check_name_value" in
+    nazoauthctl-restore-check-*)
+      test -n "$restore_check_digest_value"
+      printf '%s' "$restore_check_name_value" > "$restore_check_name_file"
+      printf '%s' "$restore_check_digest_value" > "$restore_check_digest_file"
+      printf '%s\n' "$restore_check_id"
+      exit 0 ;;
+  esac
+fi
+if [ "${{1:-}}" = exec ] && [ "${{2:-}}" = "$restore_check_id" ]; then
+  exit 0
+fi
+if [ "${{1:-}}" = rm ] && [ "${{2:-}}" = --force ] && [ "${{3:-}}" = "$restore_check_id" ]; then
+  rm -f -- "$restore_check_name_file" "$restore_check_digest_file"
+  exit 0
+fi
+if [ "${{1:-}}" = network ] && [ "${{2:-}}" = inspect ] && [ "${{3:-}}" = '{network}' ]; then
   printf '%s\n' '{network_inspect_json}'
   exit 0
 fi
@@ -2374,6 +2429,11 @@ if [ "${{1:-}}" = run ]; then
   esac
 fi"#,
         network = config.runtime.network,
+        restore_check_name = restore_check_name.display(),
+        restore_check_digest = restore_check_digest.display(),
+        deployment = config.operator.deployment_id,
+        authority = config.operator.controller_key_id,
+        runtime = config.runtime.runtime_instance_id,
         network_inspect_json = network_inspect_json,
         postgres_volume = postgres_volume,
         valkey_volume = config.valkey.data_volume,
