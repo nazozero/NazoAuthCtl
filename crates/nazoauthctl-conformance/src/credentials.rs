@@ -331,7 +331,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn origin_isolation_uses_distinct_records() {
-        let root = std::env::temp_dir().join(format!("nazo-conformance-{}", std::process::id()));
+        let root = fs::canonicalize(std::env::temp_dir())
+            .expect("canonical temporary root")
+            .join(format!("nazo-conformance-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let store = CredentialStore::new(&root).expect("store");
         let first = Origin::parse("https://suite-one.example").expect("origin");

@@ -2527,7 +2527,8 @@ mod tests {
     fn secure_bundle_writer_is_owner_only() {
         #[cfg(unix)]
         {
-            let root = std::env::temp_dir()
+            let root = fs::canonicalize(std::env::temp_dir())
+                .expect("canonical temporary root")
                 .join(format!("nazoauthctl-materializer-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             crate::secure_file::ensure_directory(&root, true).expect("private root");
