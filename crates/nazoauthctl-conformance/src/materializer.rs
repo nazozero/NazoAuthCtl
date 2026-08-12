@@ -608,6 +608,7 @@ impl DescriptorMaterializer {
                     &plan.plan,
                     &plan.variant,
                     config,
+                    &prepared.suite_base_url,
                     &onboarding.openid4vc_request_object_trust_anchor_pem,
                     prepared.attestation.as_ref(),
                 )?;
@@ -2205,6 +2206,21 @@ mod tests {
             test_trust_anchor()
         );
         assert_vp_credential_signer(config, "suite.example");
+        assert_eq!(
+            config["browser"][0]["match"],
+            "https://suite.example/test/a/*/verification-evidence"
+        );
+        assert_eq!(
+            config["browser"][0]["tasks"][0]["commands"][0],
+            serde_json::json!([
+                "wait",
+                "xpath",
+                "//*",
+                10,
+                ".*Deferred verification evidence.*",
+                "update-image-placeholder"
+            ])
+        );
         let bundle_value: Value =
             serde_json::from_slice(bundle.bytes().as_bytes()).expect("bundle JSON");
         let public_anchor =
@@ -2236,6 +2252,7 @@ mod tests {
                 "oid4vp-1final-verifier-test-plan",
                 &query_variant,
                 query_config,
+                "https://suite.example",
                 test_trust_anchor(),
                 Some(&generate_attestation_material("suite.example").expect("attestation")),
             )
@@ -2256,6 +2273,7 @@ mod tests {
             "oid4vp-1final-verifier-haip-test-plan",
             &variant,
             config,
+            "https://suite.example",
             test_trust_anchor(),
             Some(&attestation),
         )
@@ -2265,6 +2283,36 @@ mod tests {
             test_trust_anchor()
         );
         assert_vp_credential_signer(&materialized, "suite.example");
+        assert_eq!(
+            materialize_vp_config(
+                "oid4vp-1final-verifier-haip-test-plan",
+                &variant,
+                materialized.clone(),
+                "https://suite.example",
+                test_trust_anchor(),
+                Some(&attestation),
+            )
+            .expect("idempotent VP materialization"),
+            materialized
+        );
+
+        let conflicting_browser = serde_json::json!({
+            "alias": "nazo-vp-haip",
+            "client": {"client_id": "issuer.example"},
+            "browser": []
+        });
+        assert_eq!(
+            materialize_vp_config(
+                "oid4vp-1final-verifier-haip-test-plan",
+                &variant,
+                conflicting_browser,
+                "https://suite.example",
+                test_trust_anchor(),
+                Some(&attestation),
+            )
+            .unwrap_err(),
+            MaterializerError::InvalidField("browser")
+        );
 
         let conflicting = serde_json::json!({
             "alias": "nazo-vp-haip",
@@ -2276,6 +2324,7 @@ mod tests {
                 "oid4vp-1final-verifier-haip-test-plan",
                 &variant,
                 conflicting,
+                "https://suite.example",
                 test_trust_anchor(),
                 Some(&attestation),
             )
