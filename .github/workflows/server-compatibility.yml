@@ -141,9 +141,12 @@ jobs:
       - name: Install independent Podman adapter dependency
         run: |
           sudo apt-get update
-          sudo apt-get install --yes podman
+          sudo apt-get install --yes podman python3-cryptography
       - name: Validate the closed recovery fixture generator
-        run: python3 -c 'compile(open(".github/scripts/write_recovery_fixture.py", encoding="utf-8").read(), "write_recovery_fixture.py", "exec")'
+        run: |
+          python3 -m py_compile \
+            .github/scripts/recovery_evidence.py \
+            .github/scripts/write_recovery_fixture.py
       - name: Download and verify the already-built host server
         env:
           GH_TOKEN: ${{ github.token }}
@@ -334,9 +337,6 @@ jobs:
           archive="$state_root/deployments/$deployment_id/recovery/trusted-runtime/v0.1.20/$runtime_id/image.tar"
           docker image save --output "$archive" "$image@$digest"
           archive_sha="$(sha256sum "$archive" | cut -d' ' -f1)"
-          recovery_manifest="$state_root/deployments/$deployment_id/recovery/manual-manifest.json"
-          printf '%s' '{"schema":1,"fixture":"external resources remain external"}' >"$recovery_manifest"
-          recovery_sha="$(sha256sum "$recovery_manifest" | cut -d' ' -f1)"
           driver="$control_root/recovery-driver.py"
           cat >"$driver" <<'PY'
           #!/usr/bin/env python3
@@ -357,12 +357,7 @@ jobs:
           PY
           chmod 0500 "$driver"
           driver_sha="$(sha256sum "$driver" | cut -d' ' -f1)"
-          provider_key="/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker-provider-key"
-          printf '%s' 'ci-recovery-provider-verification-key-v1' \
-            | sudo tee "$provider_key" >/dev/null
-          sudo chown 0:0 "$provider_key"
-          sudo chmod 0444 "$provider_key"
-          provider_key_sha="$(sha256sum "$provider_key" | cut -d' ' -f1)"
+          provider_key="$control_root/recovery-provider.key"
           lifecycle="$state_root/deployments/$deployment_id/recovery/lifecycle.json"
           jq -n \
             --arg deployment "$deployment_id" --arg runtime "$runtime_id" \
@@ -370,7 +365,6 @@ jobs:
             --arg config "$root/docker-live-config/.env.yaml" --arg network "$network" \
             --arg driver "$driver" --arg driver_sha "$driver_sha" --arg rehearsal "$control_root/rehearsal" \
             --arg ui_url "$ui_url" --arg ui_sha "$ui_sha" --argjson ui_size "$ui_size" \
-            --arg provider_key "$provider_key" --arg provider_key_sha "$provider_key_sha" \
             '{schema:3,deployment_id:$deployment,runtimes:[{
               runtime_instance_id:$runtime,backend:"docker",object_reference:$object,
               command:["nazoauth","server"],mounts:[
@@ -384,10 +378,18 @@ jobs:
                 discovery_url:"http://127.0.0.1:19081/.well-known/openid-configuration",
                 ui_url:$ui_url,ui_sha256:$ui_sha,ui_size:$ui_size,attempts:90,interval_seconds:2}
             }],recovery_driver:{program:$driver,program_sha256:$driver_sha,arguments:[],rehearsal_workspace:$rehearsal,credentials:{}},
-              recovery_providers:[{provider_id:"ci-recovery-provider",
-                roles:["data-snapshot","database-restore","last-trusted-artifact","verification-material"],
-                verification_key:{kind:"digest-bound-file",path:$provider_key,sha256:$provider_key_sha}}]}' \
+              recovery_providers:[]}' \
             >"$lifecycle"
+          recovery_manifest="$state_root/deployments/$deployment_id/recovery/manual-manifest.json"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/recovery_evidence.py" \
+            --lifecycle "$lifecycle" \
+            --output "$recovery_manifest" \
+            --artifact-root "$state_root/deployments/$deployment_id/recovery/provider-artifacts" \
+            --provider-key "$provider_key" \
+            --deployment-id "$deployment_id" \
+            --release v0.1.20 \
+            --operation restore
+          recovery_sha="$(sha256sum "$recovery_manifest" | cut -d' ' -f1)"
           identity="$(cat host-identity.json)"
           declaration="$config_root/deployments/$deployment_id/deployment.json"
           audit_key="$state_root/deployments/$deployment_id/identities/audit.key"
@@ -523,6 +525,11 @@ jobs:
             sleep 2
           done
           test "$ready" = true
+          ui_url=http://127.0.0.1:19084/ui/
+          curl --fail --silent --show-error "$ui_url" >"$root/systemd-ui.html"
+          ui_sha="$(sha256sum "$root/systemd-ui.html" | cut -d' ' -f1)"
+          ui_size="$(stat -c %s "$root/systemd-ui.html")"
+          test "$ui_size" -gt 0
 
           binary_sha="$(sha256sum "$cached" | cut -d' ' -f1)"
           jq -n \
@@ -532,11 +539,17 @@ jobs:
             --arg config_root "$config_root" --arg state_root "$state_root" \
             --arg break_glass_root "$break_glass_root" --arg target "$target" \
             --arg cached "$cached" --arg sha "$binary_sha" \
+            --arg provider_key "$control_root/recovery-provider.key" \
+            --arg ui_url "$ui_url" --arg ui_sha "$ui_sha" --argjson ui_size "$ui_size" \
             '{backend:$backend,deployment_id:$deployment,runtime_id:$runtime,object_reference:$object,
               release:$release,alias:$alias,issuer:$issuer,identity_file:$identity,config_root:$config_root,
               state_root:$state_root,break_glass_root:$break_glass_root,
               artifact:{kind:"host",target_path:$target,cached_binary:$cached,sha256:$sha},
               runtime:{command:[$target,"server"],mounts:[],environment:{},networks:[],ip_address:null,ports:[],container_policy:null},
+              acceptance:{readiness_url:"http://127.0.0.1:19084/ready",expected_issuer:"http://127.0.0.1:19084",
+                discovery_url:"http://127.0.0.1:19084/.well-known/openid-configuration",
+                ui_url:$ui_url,ui_sha256:$ui_sha,ui_size:$ui_size,attempts:90,interval_seconds:2},
+              provider_key:$provider_key,
               declared_ports:[],operator_protocol_versions:[999],operator_tasks_responsibility:"delegated",
               database_responsibility:"delegated"}' >"$root/spec.json"
           python3 "$GITHUB_WORKSPACE/.github/scripts/write_recovery_fixture.py" "$root/spec.json"
@@ -698,6 +711,11 @@ jobs:
             sleep 2
           done
           test "$ready" = true
+          ui_url=http://127.0.0.1:19083/ui/
+          curl --fail --silent --show-error "$ui_url" >"$root/podman-ui.html"
+          ui_sha="$(sha256sum "$root/podman-ui.html" | cut -d' ' -f1)"
+          ui_size="$(stat -c %s "$root/podman-ui.html")"
+          test "$ui_size" -gt 0
           sudo podman inspect "$object" | jq -S '.[0].HostConfig | {
             ReadonlyRootfs, RestartPolicy, CapDrop, Memory, NanoCpus, PidsLimit, Tmpfs
           }' >"$root/podman-policy-before.json"
@@ -718,6 +736,8 @@ jobs:
             --arg break_glass_root "$break_glass_root" --arg image "$image" \
             --arg digest "$digest" --arg local_image_id "$local_image_id" --arg archive "$archive" \
             --arg config "$root/live-config/.env.yaml" --arg data "$root/live-data" \
+            --arg provider_key "$control_root/recovery-provider.key" \
+            --arg ui_url "$ui_url" --arg ui_sha "$ui_sha" --argjson ui_size "$ui_size" \
             '{backend:$backend,deployment_id:$deployment,runtime_id:$runtime,object_reference:$object,
               release:$release,alias:$alias,issuer:$issuer,identity_file:$identity,config_root:$config_root,
               state_root:$state_root,break_glass_root:$break_glass_root,
@@ -727,7 +747,11 @@ jobs:
                 {source:$data,destination:"/var/lib/nazo_oauth",read_only:false,selinux_relabel:false,ownership:"external",scope:"deployment"}],
                 environment:{DATA_DIR:"/var/lib/nazo_oauth"},networks:["host"],ip_address:null,ports:[],
                 container_policy:{restart:"no",read_only_root:false,no_new_privileges:false,
-                  drop_all_capabilities:false,pids_limit:null,memory_limit_bytes:null,cpu_limit_millis:null,tmpfs:[]}},declared_ports:[]}' \
+                  drop_all_capabilities:false,pids_limit:null,memory_limit_bytes:null,cpu_limit_millis:null,tmpfs:[]}},
+              acceptance:{readiness_url:"http://127.0.0.1:19083/ready",expected_issuer:"http://127.0.0.1:19083",
+                discovery_url:"http://127.0.0.1:19083/.well-known/openid-configuration",
+                ui_url:$ui_url,ui_sha256:$ui_sha,ui_size:$ui_size,attempts:90,interval_seconds:2},
+              provider_key:$provider_key,declared_ports:[]}' \
             >"$root/spec.json"
           python3 "$GITHUB_WORKSPACE/.github/scripts/write_recovery_fixture.py" "$root/spec.json"
 
@@ -800,6 +824,5 @@ jobs:
             "/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman" \
             "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker-break-glass" \
             "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-systemd-break-glass" \
-            "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman-break-glass" \
-            "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker-provider-key"
+            "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman-break-glass"
           sudo systemctl daemon-reload
