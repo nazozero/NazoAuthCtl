@@ -212,6 +212,18 @@ impl WebDriverClient {
 }
 
 impl BrowserDriver for WebDriverClient {
+    fn ensure_session(&mut self) -> Result<(), BrowserError> {
+        let path = self.session_path("/url")?;
+        match self.get_value(&path) {
+            Ok(_) => Ok(()),
+            Err(BrowserError::InvalidSession) => {
+                self.session_id = None;
+                self.start_chrome()
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn clear_cookies(&mut self) -> Result<(), BrowserError> {
         self.delete_value(&self.session_path("/cookie")?)
             .map(|_| ())
@@ -449,6 +461,10 @@ fn current_effective_uid() -> Option<u32> {
 }
 
 impl BrowserDriver for ManagedWebDriver {
+    fn ensure_session(&mut self) -> Result<(), BrowserError> {
+        self.client.ensure_session()
+    }
+
     fn clear_cookies(&mut self) -> Result<(), BrowserError> {
         self.client.clear_cookies()
     }
@@ -598,6 +614,7 @@ fn classify_webdriver_error(value: &Value) -> BrowserError {
     {
         Some("no such element") => BrowserError::ElementNotFound,
         Some("stale element reference") => BrowserError::StaleElement,
+        Some("invalid session id") => BrowserError::InvalidSession,
         _ => BrowserError::DriverRejected,
     }
 }
@@ -623,6 +640,12 @@ mod tests {
         assert_eq!(
             classify_webdriver_error(&json!({
                 "value": {"error": "invalid session id", "message": "sensitive session"}
+            })),
+            BrowserError::InvalidSession
+        );
+        assert_eq!(
+            classify_webdriver_error(&json!({
+                "value": {"error": "unknown error", "message": "sensitive driver detail"}
             })),
             BrowserError::DriverRejected
         );

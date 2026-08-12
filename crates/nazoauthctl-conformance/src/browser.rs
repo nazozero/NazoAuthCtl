@@ -60,6 +60,8 @@ pub enum BrowserError {
     SessionAlreadyStarted,
     #[error("browser session is not started")]
     SessionNotStarted,
+    #[error("browser session expired or was removed")]
+    InvalidSession,
     #[error("browser element was not found")]
     ElementNotFound,
     #[error("browser element became stale")]
@@ -123,6 +125,13 @@ pub(crate) fn browser_config_for_module(
 /// Driver abstraction used both by WebDriver and deterministic tests. A
 /// driver never receives a URL before policy checks.
 pub trait BrowserDriver: Send {
+    /// Confirm that the session is live before another Suite module claims
+    /// this lane. Implementations may recreate only an explicitly expired
+    /// session; other failures remain fail-closed.
+    fn ensure_session(&mut self) -> Result<(), BrowserError> {
+        Ok(())
+    }
+
     /// Remove client-side authentication state before another independent
     /// Suite module uses this worker lane. Implementations must not export or
     /// inspect cookie values.
@@ -389,6 +398,7 @@ impl<D: BrowserDriver> BrowserAutomation for BrowserExecutor<D> {
         // cookie domain. Visit and clear each allowed origin independently;
         // validation rejects a redirect from target to Suite (or vice versa)
         // even though both origins are otherwise allowed for a test flow.
+        self.driver.ensure_session()?;
         let target = self.policy.target_origin.as_url().clone();
         let suite = self
             .policy
@@ -618,9 +628,15 @@ mod tests {
         cookie_clear_count: usize,
         navigated: Vec<Url>,
         redirect_to: Option<Url>,
+        session_checks: usize,
     }
 
     impl BrowserDriver for MockDriver {
+        fn ensure_session(&mut self) -> Result<(), BrowserError> {
+            self.session_checks += 1;
+            Ok(())
+        }
+
         fn clear_cookies(&mut self) -> Result<(), BrowserError> {
             self.cookies_cleared = true;
             self.cookie_clear_count += 1;
@@ -724,9 +740,11 @@ mod tests {
             cookie_clear_count: 0,
             navigated: Vec::new(),
             redirect_to: None,
+            session_checks: 0,
         };
         let mut executor = BrowserExecutor::new(driver, policy);
         executor.reset_session().expect("reset browser session");
+        assert_eq!(executor.driver_mut().session_checks, 1);
         assert!(executor.driver_mut().cookies_cleared);
         assert_eq!(executor.driver_mut().cookie_clear_count, 2);
         assert_eq!(executor.driver_mut().navigated.len(), 2);
@@ -765,6 +783,7 @@ mod tests {
             cookie_clear_count: 0,
             navigated: Vec::new(),
             redirect_to: Some(Url::parse("https://suite.example/").expect("redirect")),
+            session_checks: 0,
         };
         let mut executor = BrowserExecutor::new(driver, policy);
         assert_eq!(
