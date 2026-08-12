@@ -1069,7 +1069,11 @@ fn validate_value_origins(
         Value::Object(object) => object
             .iter()
             .try_for_each(|(key, value)| validate_value_origins(value, suite, target, Some(key))),
-        Value::String(text) if text.starts_with("//") => Err(()),
+        // Browser command tuples have already passed the command schema. Their
+        // selector argument may be the valid XPath `//*`; treating every `//`
+        // command literal as a protocol-relative URL rejects the official
+        // verification-evidence automation before any Suite resource exists.
+        Value::String(text) if text.starts_with("//") && key != Some("commands") => Err(()),
         Value::String(text) if text.contains("://") => {
             let parsed = Url::parse(text).map_err(|_| ())?;
             let _host = parsed.host_str().ok_or(())?;
@@ -1228,6 +1232,28 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn origin_validation_accepts_suite_verification_evidence_glob() {
+        let suite = Origin::parse("https://suite.example").expect("origin");
+        let parsed =
+            Url::parse("https://suite.example/test/a/*/verification-evidence").expect("glob URL");
+        assert!(same_url_origin(&suite, &parsed));
+        let config = serde_json::json!({
+            "browser": [{
+                "match": "https://suite.example/test/a/*/verification-evidence",
+                "tasks": [{
+                    "match": "https://suite.example/test/a/*/verification-evidence",
+                    "commands": [[
+                        "wait", "xpath", "//*", 10,
+                        ".*Deferred verification evidence.*",
+                        "update-image-placeholder"
+                    ]]
+                }]
+            }]
+        });
+        assert_eq!(validate_value_origins(&config, &suite, None, None), Ok(()));
     }
 
     #[test]
