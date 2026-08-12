@@ -194,13 +194,16 @@ jobs:
         run: |
           set -euo pipefail
           root="$(mktemp -d /tmp/controller-self-lifecycle.XXXXXX)"
-          trap 'sudo rm -rf "$root"' EXIT
+          break_glass_root="/dev/shm/controller-self-lifecycle-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$break_glass_root"
+          trap 'sudo rm -rf "$root" "$break_glass_root"' EXIT
           chmod 0755 "$root"
           binary="$root/bin/nazoauthctl"
           config_root="$root/config"
           state_root="$root/state"
-          break_glass_root="$root/break-glass"
-          mkdir -p "$root/bin" "$config_root" "$state_root" "$break_glass_root"
+          mkdir -p "$root/bin" "$config_root" "$state_root"
+          sudo install -d -m 0700 -o 0 -g 0 "$break_glass_root"
+          test "$(stat -c %d "$config_root")" != "$(stat -c %d "$break_glass_root")"
           install -m 0755 previous/nazoauthctl-x86_64-unknown-linux-gnu "$binary"
           previous_sha="$(sha256sum "$binary" | cut -d' ' -f1)"
           candidate_sha="$(sha256sum candidate/nazoauthctl-x86_64-unknown-linux-gnu | cut -d' ' -f1)"
@@ -208,7 +211,6 @@ jobs:
           # root-owned sticky /tmp boundary, then transfer it only after the
           # runner has finished authoring every initial fixture path.
           sudo chown -R 0:0 "$root"
-          sudo chmod 0700 "$break_glass_root"
           sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
