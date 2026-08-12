@@ -42,6 +42,7 @@ pub use descriptor::{
 use descriptor::{
     collect_client_policies, collect_registrations, descriptor_requires_reference, is_placeholder,
     parse_placeholder, validate_binding_reference, validate_descriptor, validate_digest,
+    validate_single_mdoc_trust_anchor,
 };
 use template::{
     materialize_registration_template, materialize_value, materialize_vci_config,
@@ -417,7 +418,14 @@ impl DescriptorMaterializer {
         validate_descriptor(&descriptor)?;
         validate_target_issuer(target_issuer)?;
         validate_request_jti(request_jti)?;
-        validate_openid4vc_credential_trust_anchor(credential_trust_anchor_pem)?;
+        // The server's run-scoped deployment anchor and the Suite's mdoc root
+        // are distinct trust domains.  Bind both to this raw Matrix and fail
+        // closed if an operator accidentally supplies the same certificate
+        // twice; the bundle must contain exactly these two roots in order.
+        let credential_trust_anchor_pem = combine_openid4vc_credential_trust_anchors(
+            credential_trust_anchor_pem,
+            &descriptor.openid4vc_suite_mdoc_trust_anchor_pem,
+        )?;
         let matrix_sha256 = descriptor
             .raw_sha256
             .clone()
@@ -492,7 +500,7 @@ impl DescriptorMaterializer {
                     attestation_ref.key_attestation_public_jwks.as_str(),
                 )
                 .map_err(|_| MaterializerError::Encoding)?,
-                credential_trust_anchor_pem: credential_trust_anchor_pem.to_owned(),
+                credential_trust_anchor_pem: credential_trust_anchor_pem.clone(),
             },
             openid4vc_credential_datasets: descriptor.openid4vc_credential_datasets.clone(),
             applicant: SecureApplicantBundle {
@@ -522,7 +530,7 @@ impl DescriptorMaterializer {
             request_jti: request_jti.to_owned(),
             matrix_sha256,
             bundle_digest,
-            credential_trust_anchor_pem: credential_trust_anchor_pem.to_owned(),
+            credential_trust_anchor_pem,
             applicant_email,
             applicant_password,
             tx_code,
@@ -810,17 +818,28 @@ fn validate_public_certificate_bundle(value: &str) -> Result<(), MaterializerErr
     Ok(())
 }
 
-fn validate_openid4vc_credential_trust_anchor(value: &str) -> Result<(), MaterializerError> {
-    validate_public_certificate_bundle(value)?;
-    if value.len() > 16 * 1024
-        || !value.starts_with("-----BEGIN CERTIFICATE-----\n")
-        || !value.ends_with("-----END CERTIFICATE-----\n")
-    {
+fn combine_openid4vc_credential_trust_anchors(
+    deployment_anchor_pem: &str,
+    suite_anchor_pem: &str,
+) -> Result<String, MaterializerError> {
+    let deployment_der =
+        validate_single_mdoc_trust_anchor(deployment_anchor_pem, "credential_trust_anchor_pem")?;
+    let suite_der = validate_single_mdoc_trust_anchor(
+        suite_anchor_pem,
+        "openid4vc_suite_mdoc_trust_anchor_pem",
+    )?;
+    if deployment_der == suite_der {
         return Err(MaterializerError::InvalidField(
-            "openid4vc_request_object_trust_anchor_pem",
+            "credential_trust_anchor_pem",
         ));
     }
-    Ok(())
+
+    let mut combined = String::with_capacity(deployment_anchor_pem.len() + suite_anchor_pem.len());
+    combined.push_str(deployment_anchor_pem.trim_end());
+    combined.push('\n');
+    combined.push_str(suite_anchor_pem.trim_end());
+    combined.push('\n');
+    Ok(combined)
 }
 
 fn validate_public_id(
@@ -871,6 +890,10 @@ fn descriptor_requires_pre_authorized_vci(descriptor: &MatrixDescriptor) -> bool
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+
     use super::*;
 
     #[test]
@@ -947,10 +970,11 @@ mod tests {
         );
     }
 
-    fn descriptor() -> MatrixDescriptor {
-        let bytes = serde_json::to_vec(&serde_json::json!({
+    fn descriptor_json() -> Value {
+        serde_json::json!({
             "schema":1,
             "source":{"release":"test","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+            "openid4vc_suite_mdoc_trust_anchor_pem": test_suite_mdoc_trust_anchor(),
             "groups":[{"id":"oidc","profile":"oidc","variant":{"id":"default"},
                 "required_roles":[{"role":"applicant","logical_client_id":"web","registration_template":{
                     "client_name":"test-client","client_type":"confidential","redirect_uris":["{{target.suite}}"],
@@ -965,7 +989,11 @@ mod tests {
                     "expected_results":{"oidcc-expected-skip":"SKIPPED"},
                     "required_roles":[]}]
             }]
-        })).expect("descriptor");
+        })
+    }
+
+    fn descriptor() -> MatrixDescriptor {
+        let bytes = serde_json::to_vec(&descriptor_json()).expect("descriptor");
         DescriptorMaterializer::from_bytes(&bytes).expect("descriptor")
     }
 
@@ -1121,8 +1149,165 @@ mod tests {
         "request-0123456789abcdef0123456789abcdef"
     }
 
+    fn generated_test_anchor(
+        common_name: &str,
+        is_ca: IsCa,
+        days_before: i64,
+        days_after: i64,
+    ) -> String {
+        let now = time::OffsetDateTime::now_utc();
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name.to_owned());
+        params.not_before = now - time::Duration::days(days_before);
+        params.not_after = now + time::Duration::days(days_after);
+        params.is_ca = is_ca;
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let key_pair = KeyPair::generate().expect("key pair");
+        params
+            .self_signed(&key_pair)
+            .expect("certificate")
+            .pem()
+            .replace("\r\n", "\n")
+    }
+
     fn test_trust_anchor() -> &'static str {
-        "-----BEGIN CERTIFICATE-----\nVEVTVA==\n-----END CERTIFICATE-----\n"
+        static ANCHOR: OnceLock<String> = OnceLock::new();
+        ANCHOR
+            .get_or_init(|| {
+                generated_test_anchor(
+                    "nazoauthctl-deployment",
+                    IsCa::Ca(BasicConstraints::Constrained(1)),
+                    1,
+                    30,
+                )
+            })
+            .as_str()
+    }
+
+    fn test_suite_mdoc_trust_anchor() -> &'static str {
+        static ANCHOR: OnceLock<String> = OnceLock::new();
+        ANCHOR
+            .get_or_init(|| {
+                generated_test_anchor(
+                    "oidf-suite-mdoc",
+                    IsCa::Ca(BasicConstraints::Constrained(1)),
+                    1,
+                    30,
+                )
+            })
+            .as_str()
+    }
+
+    fn combined_test_trust_anchor() -> String {
+        format!(
+            "{}\n{}\n",
+            test_trust_anchor().trim_end(),
+            test_suite_mdoc_trust_anchor().trim_end()
+        )
+    }
+
+    #[test]
+    fn suite_mdoc_anchor_is_required_and_cryptographically_validated() {
+        let mut missing = descriptor_json();
+        missing
+            .as_object_mut()
+            .expect("descriptor object")
+            .remove("openid4vc_suite_mdoc_trust_anchor_pem");
+        assert!(
+            DescriptorMaterializer::from_bytes(
+                &serde_json::to_vec(&missing).expect("missing descriptor")
+            )
+            .is_err()
+        );
+
+        let mut malformed = descriptor_json();
+        malformed["openid4vc_suite_mdoc_trust_anchor_pem"] =
+            serde_json::json!("-----BEGIN CERTIFICATE-----\nVEVST1I=\n-----END CERTIFICATE-----\n");
+        assert!(
+            DescriptorMaterializer::from_bytes(
+                &serde_json::to_vec(&malformed).expect("malformed descriptor")
+            )
+            .is_err()
+        );
+
+        let mut expired = descriptor_json();
+        expired["openid4vc_suite_mdoc_trust_anchor_pem"] =
+            serde_json::json!(generated_test_anchor(
+                "expired-suite-mdoc",
+                IsCa::Ca(BasicConstraints::Constrained(1)),
+                2,
+                -1
+            ));
+        assert!(
+            DescriptorMaterializer::from_bytes(
+                &serde_json::to_vec(&expired).expect("expired descriptor")
+            )
+            .is_err()
+        );
+
+        let mut leaf = descriptor_json();
+        leaf["openid4vc_suite_mdoc_trust_anchor_pem"] =
+            serde_json::json!(generated_test_anchor("leaf-suite-mdoc", IsCa::NoCa, 1, 30));
+        assert!(
+            DescriptorMaterializer::from_bytes(
+                &serde_json::to_vec(&leaf).expect("leaf descriptor")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn deployment_and_suite_mdoc_roots_must_be_distinct_and_complete() {
+        let descriptor = descriptor();
+        let duplicate = DescriptorMaterializer::prepare(
+            descriptor.clone(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+            test_suite_mdoc_trust_anchor(),
+        )
+        .err()
+        .expect("duplicate roots must fail closed");
+        assert!(matches!(
+            duplicate,
+            MaterializerError::InvalidField("credential_trust_anchor_pem")
+        ));
+
+        let missing = DescriptorMaterializer::prepare(
+            descriptor.clone(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+            "",
+        )
+        .err()
+        .expect("missing deployment root must fail closed");
+        assert!(matches!(
+            missing,
+            MaterializerError::InvalidField("credential_trust_anchor_pem")
+        ));
+
+        let expired = generated_test_anchor(
+            "expired-deployment-mdoc",
+            IsCa::Ca(BasicConstraints::Constrained(1)),
+            2,
+            -1,
+        );
+        let expired = DescriptorMaterializer::prepare(
+            descriptor,
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+            &expired,
+        )
+        .err()
+        .expect("expired deployment root must fail closed");
+        assert!(matches!(
+            expired,
+            MaterializerError::InvalidField("credential_trust_anchor_pem")
+        ));
     }
 
     fn onboarding_output(
@@ -1741,7 +1926,18 @@ mod tests {
         let trust = &bundle_value["openid4vc_conformance_trust"];
         assert_eq!(trust["schema"], 1);
         assert_eq!(trust["client_attestation_issuer"], "https://suite.example/");
-        assert_eq!(trust["credential_trust_anchor_pem"], test_trust_anchor());
+        assert_eq!(
+            trust["credential_trust_anchor_pem"],
+            combined_test_trust_anchor()
+        );
+        assert_eq!(
+            trust["credential_trust_anchor_pem"]
+                .as_str()
+                .expect("combined trust anchor")
+                .matches("-----BEGIN CERTIFICATE-----")
+                .count(),
+            2
+        );
         assert!(
             trust["client_attestation_jwks"]["keys"][0]["kid"]
                 .as_str()
@@ -1832,7 +2028,7 @@ mod tests {
         let second_trust = &second_value["openid4vc_conformance_trust"];
         assert_eq!(
             first_trust["credential_trust_anchor_pem"],
-            test_trust_anchor()
+            combined_test_trust_anchor()
         );
         assert_ne!(
             first_trust["client_attestation_jwks"],

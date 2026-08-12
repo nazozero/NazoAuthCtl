@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use x509_parser::{parse_x509_certificate, pem::parse_x509_pem};
 
 use super::MaterializerError;
 
@@ -27,6 +28,11 @@ pub struct MatrixDescriptor {
     /// repeat a dataset only as a consistency check.
     #[serde(default)]
     pub openid4vc_credential_datasets: BTreeMap<String, Value>,
+    /// Public mdoc trust anchor advertised by the OIDF Suite.  The value is
+    /// part of the signed/raw matrix and is deliberately required rather than
+    /// defaulted: silently accepting a descriptor without the Suite trust
+    /// root would make a VCI run depend on an unrelated deployment setting.
+    pub openid4vc_suite_mdoc_trust_anchor_pem: String,
     pub groups: Vec<DescriptorGroup>,
     #[serde(skip)]
     pub(super) raw_sha256: Option<String>,
@@ -127,6 +133,10 @@ pub(super) fn validate_descriptor(descriptor: &MatrixDescriptor) -> Result<(), M
     }
     validate_name(&descriptor.source.release, "source.release")?;
     validate_digest(&descriptor.source.digest, "source.digest")?;
+    validate_single_mdoc_trust_anchor(
+        &descriptor.openid4vc_suite_mdoc_trust_anchor_pem,
+        "openid4vc_suite_mdoc_trust_anchor_pem",
+    )?;
     if descriptor.groups.is_empty() {
         return Err(MaterializerError::InvalidField("groups"));
     }
@@ -190,6 +200,47 @@ pub(super) fn validate_descriptor(descriptor: &MatrixDescriptor) -> Result<(), M
         }
     }
     Ok(())
+}
+
+/// Parse and validate one trust anchor used by the OpenID4VC mdoc verifier.
+///
+/// This is intentionally stricter than the request-object trust material: the
+/// mdoc anchor is an actual cryptographic root.  Textual PEM checks alone
+/// would allow malformed, expired, non-CA, or attacker-controlled leaf data to
+/// reach the server bundle.
+pub(super) fn validate_single_mdoc_trust_anchor(
+    value: &str,
+    field: &'static str,
+) -> Result<Vec<u8>, MaterializerError> {
+    let upper = value.to_ascii_uppercase();
+    if value.is_empty()
+        || value.len() > 16 * 1024
+        || value.contains('\0')
+        || upper.contains("PRIVATE KEY")
+        || !value.starts_with("-----BEGIN CERTIFICATE-----\n")
+        || !value.ends_with("-----END CERTIFICATE-----\n")
+    {
+        return Err(MaterializerError::InvalidField(field));
+    }
+
+    let (remaining, pem) =
+        parse_x509_pem(value.as_bytes()).map_err(|_| MaterializerError::InvalidField(field))?;
+    if pem.label != "CERTIFICATE" || !remaining.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Err(MaterializerError::InvalidField(field));
+    }
+    let (der_remaining, certificate) = parse_x509_certificate(&pem.contents)
+        .map_err(|_| MaterializerError::InvalidField(field))?;
+    if !der_remaining.is_empty()
+        || !certificate.is_ca()
+        || !certificate.validity().is_valid()
+        || certificate.issuer() != certificate.subject()
+        || certificate
+            .verify_signature(Some(certificate.public_key()))
+            .is_err()
+    {
+        return Err(MaterializerError::InvalidField(field));
+    }
+    Ok(pem.contents)
 }
 
 const MAX_OPENID4VC_DATASETS: usize = 16;
