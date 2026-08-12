@@ -17,15 +17,25 @@ pub(crate) fn append_management_event_idempotent(
     release: &str,
     recovery_boundary: &str,
 ) -> anyhow::Result<PathBuf> {
+    if !safe_identity_component(request_id) {
+        bail!("management audit request ID is not a safe file identifier");
+    }
+    // Recovery of the derived management head is a writer operation.  The
+    // command paths call this while holding their lifecycle/deployment lock;
+    // read-only verification never repairs the head.
+    repair_management_head_for_append(config)?;
     verify_audit_chain(config)?;
     let directory = config.operator.audit_directory.join("management");
-    fs::create_dir_all(&directory)?;
+    is_real_directory_or_missing(&directory, "management audit directory")?;
+    crate::filesystem::ensure_directory_chain(&directory)?;
     let suffix = format!("-{request_id}.jws");
     let existing = fs::read_dir(&directory)?
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .filter(|entry| {
-            entry.file_type().is_ok_and(|kind| kind.is_file())
+            entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_file() && !kind.is_symlink())
                 && entry.file_name().to_string_lossy().ends_with(&suffix)
         })
         .collect::<Vec<_>>();
@@ -45,9 +55,22 @@ pub(crate) fn append_management_event_idempotent(
         return Ok(entry.path());
     }
     let head_path = config.operator.audit_directory.join("management-head.json");
-    let (sequence, previous) = if head_path.exists() {
-        let head: AuditHead = serde_json::from_slice(&fs::read(&head_path)?)?;
-        (head.sequence + 1, head.sha256)
+    let (sequence, previous) = if is_regular_non_symlink(&head_path)? {
+        let head: AuditHead =
+            serde_json::from_slice(&crate::filesystem::read_secure_regular_file(
+                &head_path,
+                "management audit head",
+                true,
+                16 * 1024,
+            )?)?;
+        (
+            head.sequence
+                .checked_add(1)
+                .context("management audit sequence overflow")?,
+            head.sha256,
+        )
+    } else if path_present(&head_path)? {
+        bail!("management audit head must be a regular non-symlink file");
     } else {
         (1, "0".repeat(64))
     };
@@ -95,8 +118,10 @@ pub(crate) fn load_management_event(
         .audit_directory
         .join("management")
         .join(candidate);
-    let compact = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read management audit event {}", path.display()))?;
+    if !is_regular_non_symlink(&path)? {
+        bail!("management audit event is not a regular non-symlink file");
+    }
+    let compact = read_audit_text(&path, "management audit event")?;
     let header = protected_header(&compact)?;
     let key = trusted_audit_key(config, &header.kid)?;
     let event = verify_management_event(&compact, &header.kid, &key)?;
@@ -107,51 +132,62 @@ pub(crate) fn load_management_event(
 }
 
 pub(crate) fn verify_management_events(config: &UpdateConfig) -> anyhow::Result<()> {
-    let directory = config.operator.audit_directory.join("management");
+    let _directory = config.operator.audit_directory.join("management");
     let head_path = config.operator.audit_directory.join("management-head.json");
-    if !is_real_directory_or_missing(&directory, "management audit directory")? {
-        if path_present(&head_path)? {
-            bail!("management audit directory is missing while a management audit head exists");
-        }
-        return Ok(());
-    }
-    let mut paths = fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
-    paths.sort_by_key(std::fs::DirEntry::file_name);
-    let mut sequence = 0;
-    let mut previous = "0".repeat(64);
-    let mut checkpoints = BTreeMap::from([(0_u64, previous.clone())]);
-    for entry in paths {
-        if !entry.file_type()?.is_file() {
-            bail!("management audit directory contains an unexpected entry");
-        }
-        let compact = fs::read_to_string(entry.path())?;
-        let header = protected_header(&compact)?;
-        let key = trusted_audit_key(config, &header.kid)?;
-        let event = verify_management_event(&compact, &header.kid, &key)?;
-        if event.sequence != sequence + 1
-            || event.previous_sha256 != previous
-            || event.deployment_id != config.operator.deployment_id
-        {
-            bail!("management audit chain is discontinuous");
-        }
-        if event.operation == "controller-retirement-probe" {
-            validate_retirement_probe_audit_evidence(&event.recovery_boundary)?;
-        }
-        sequence = event.sequence;
-        previous = compact_sha256(&compact);
-        checkpoints.insert(sequence, previous.clone());
-    }
-    let head = if head_path.exists() {
-        Some(serde_json::from_slice::<AuditHead>(&fs::read(&head_path)?)?)
+    let (sequence, previous) = verify_management_chain(config)?;
+    let head = if is_regular_non_symlink(&head_path)? {
+        Some(serde_json::from_slice::<AuditHead>(
+            &crate::filesystem::read_secure_regular_file(
+                &head_path,
+                "management audit head",
+                true,
+                16 * 1024,
+            )?,
+        )?)
+    } else if path_present(&head_path)? {
+        bail!("management audit head must be a regular non-symlink file");
     } else {
         None
     };
     if let Some(head) = &head
-        && (head.sequence > sequence || checkpoints.get(&head.sequence) != Some(&head.sha256))
+        && (head.sequence != sequence || head.sha256 != previous)
     {
         bail!("management audit head conflicts with the verified chain");
     }
-    if head.is_none_or(|head| head.sequence != sequence || head.sha256 != previous) {
+    if sequence > 0 && head.is_none() {
+        bail!("management audit head is missing while signed events exist");
+    }
+    if sequence == 0 && head.is_some() {
+        bail!("management audit head exists without a signed event chain");
+    }
+    Ok(())
+}
+
+pub(crate) fn repair_management_head_for_append(config: &UpdateConfig) -> anyhow::Result<()> {
+    let (sequence, previous) = verify_management_chain(config)?;
+    let head_path = config.operator.audit_directory.join("management-head.json");
+    if path_present(&head_path)? && !is_regular_non_symlink(&head_path)? {
+        bail!("management audit head must be a regular non-symlink file");
+    }
+    if sequence == 0 {
+        if path_present(&head_path)? {
+            crate::filesystem::remove_file_durable(&head_path)?;
+        }
+        return Ok(());
+    }
+    let needs_write = if is_regular_non_symlink(&head_path)? {
+        let head: AuditHead =
+            serde_json::from_slice(&crate::filesystem::read_secure_regular_file(
+                &head_path,
+                "management audit head",
+                true,
+                16 * 1024,
+            )?)?;
+        head.sequence != sequence || head.sha256 != previous
+    } else {
+        true
+    };
+    if needs_write {
         atomic_write(
             &head_path,
             &serde_json::to_vec_pretty(&AuditHead {
@@ -162,4 +198,41 @@ pub(crate) fn verify_management_events(config: &UpdateConfig) -> anyhow::Result<
         )?;
     }
     Ok(())
+}
+
+fn verify_management_chain(config: &UpdateConfig) -> anyhow::Result<(u64, String)> {
+    let directory = config.operator.audit_directory.join("management");
+    if !is_real_directory_or_missing(&directory, "management audit directory")? {
+        return Ok((0, "0".repeat(64)));
+    }
+    let mut paths = fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
+    paths.sort_by_key(std::fs::DirEntry::file_name);
+    let mut sequence: u64 = 0;
+    let mut previous = "0".repeat(64);
+    for entry in paths {
+        if !is_regular_non_symlink(&entry.path())?
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("jws")
+        {
+            bail!("management audit directory contains an unexpected entry");
+        }
+        let compact = read_audit_text(&entry.path(), "management audit event")?;
+        let header = protected_header(&compact)?;
+        let key = trusted_audit_key(config, &header.kid)?;
+        let event = verify_management_event(&compact, &header.kid, &key)?;
+        let expected_sequence = sequence
+            .checked_add(1)
+            .context("management audit sequence overflow")?;
+        if event.sequence != expected_sequence
+            || event.previous_sha256 != previous
+            || event.deployment_id != config.operator.deployment_id
+        {
+            bail!("management audit chain is discontinuous");
+        }
+        if event.operation == "controller-retirement-probe" {
+            validate_retirement_probe_audit_evidence(&event.recovery_boundary)?;
+        }
+        sequence = event.sequence;
+        previous = compact_sha256(&compact);
+    }
+    Ok((sequence, previous))
 }

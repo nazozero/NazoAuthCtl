@@ -14,6 +14,50 @@ use crate::{
         OperatorProtocolCompatibility, Postgres, Rollback, Runtime as RuntimeConfig, Ui, Valkey,
     },
 };
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, chown};
+
+#[cfg(unix)]
+fn current_unix_user() -> String {
+    Process::new("id")
+        .arg("-un")
+        .stdout()
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn self_update_install_path_is_normalized_and_non_symlink() {
+    let work = PrivateTempDir::new("nazoauth-self-update-install-path").unwrap();
+    let binary = work.path().join("nazoauthctl");
+    fs::write(&binary, b"controller").unwrap();
+    assert_eq!(controller_install_path(&binary).unwrap(), binary);
+    assert!(controller_install_path(Path::new("relative/controller")).is_err());
+    let navigated = work.path().join("missing/../controller");
+    if navigated.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        assert!(controller_install_path(&navigated).is_err());
+    } else {
+        // Windows may normalize the joined PathBuf before the API observes it;
+        // in that case the resulting value is already a normalized path.
+        assert_eq!(controller_install_path(&navigated).unwrap(), navigated);
+    }
+
+    let directory = work.path().join("directory");
+    fs::create_dir(&directory).unwrap();
+    assert!(controller_install_path(&directory).is_err());
+}
+
+#[test]
+fn self_update_journal_round_trip_preserves_phase_and_digest_bindings() {
+    let work = PrivateTempDir::new("nazoauth-self-update-journal").unwrap();
+    assert!(self_update_journal_round_trip_for_test(work.path()).unwrap());
+}
 
 #[test]
 fn operation_results_are_machine_readable_json() {
@@ -343,11 +387,14 @@ fn openid4vc_trust_export_uses_only_the_managed_key_directory() {
 #[cfg(unix)]
 #[test]
 fn openid4vc_trust_export_is_release_bound_audited_and_fail_closed() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
     let work = PrivateTempDir::new("openid4vc-trust-export-audit").unwrap();
     let output = work.path().join("export/trust-anchors.pem");
     fs::create_dir(output.parent().unwrap()).unwrap();
 
     let mut value = config(&work);
+    value.runtime.service_user = current_unix_user();
     assert!(export_openid4vc_trust(&value, &output).is_err());
 
     value.install_profile = "standards-full".to_owned();
@@ -360,6 +407,23 @@ fn openid4vc_trust_export_is_release_bound_audited_and_fail_closed() {
     fs::create_dir(&bundle).unwrap();
     assert!(export_openid4vc_trust(&value, &output).is_err());
     fs::remove_dir(&bundle).unwrap();
+    fs::write(&bundle, format!("{OPENID4VC_TEST_LEAF}{OPENID4VC_TEST_CA}")).unwrap();
+
+    fs::set_permissions(&bundle, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(export_openid4vc_trust(&value, &output).is_err());
+    fs::set_permissions(&bundle, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let decoy = keys.join("decoy-certificate-bundle.pem");
+    fs::write(&decoy, format!("{OPENID4VC_TEST_LEAF}{OPENID4VC_TEST_CA}")).unwrap();
+    fs::set_permissions(&decoy, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_file(&bundle).unwrap();
+    symlink(&decoy, &bundle).unwrap();
+    assert!(export_openid4vc_trust(&value, &output).is_err());
+    fs::remove_file(&bundle).unwrap();
+
+    fs::write(&bundle, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    fs::set_permissions(&bundle, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(export_openid4vc_trust(&value, &output).is_err());
     fs::write(&bundle, format!("{OPENID4VC_TEST_LEAF}{OPENID4VC_TEST_CA}")).unwrap();
 
     fs::create_dir_all(&value.deployment_root).unwrap();
@@ -457,6 +521,11 @@ fn write_bootstrap_fixture(
         b"stable-deployment-bootstrap-binding",
     )
     .unwrap();
+    fs::set_permissions(
+        &config.operator.secret_revision_file,
+        fs::Permissions::from_mode(0o400),
+    )
+    .unwrap();
     fs::create_dir(&directory).unwrap();
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
     let token_path = directory.join(BOOTSTRAP_TOKEN_FILE);
@@ -505,6 +574,11 @@ fn write_bootstrap_pending_fixture(
     fs::write(
         &config.operator.secret_revision_file,
         b"stable-deployment-bootstrap-binding",
+    )
+    .unwrap();
+    fs::set_permissions(
+        &config.operator.secret_revision_file,
+        fs::Permissions::from_mode(0o400),
     )
     .unwrap();
     let pending = BootstrapAdminPending {
@@ -643,7 +717,10 @@ fn bootstrap_owner_policy_matches_real_container_and_host_runtime_identities() {
         &mut config,
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-",
     );
-    assert_eq!(bootstrap_state_owner_uid(&config).unwrap(), 10_001);
+    assert_eq!(
+        crate::runtime::runtime_service_owner_uid(&config).unwrap(),
+        10_001
+    );
 
     let actual_uid = fs::metadata(token_path.parent().unwrap()).unwrap().uid();
     assert_eq!(
@@ -659,7 +736,46 @@ fn bootstrap_owner_policy_matches_real_container_and_host_runtime_identities() {
         .unwrap()
         .trim()
         .to_owned();
-    assert_eq!(bootstrap_state_owner_uid(&config).unwrap(), actual_uid);
+    assert_eq!(
+        crate::runtime::runtime_service_owner_uid(&config).unwrap(),
+        actual_uid
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_token_descriptor_rejects_symlink_unsafe_mode_and_oversize_inputs() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+    let work = PrivateTempDir::new("nazoauth-bootstrap-token-descriptor").unwrap();
+    let mut config = config(&work);
+    let token = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+    let token_path = write_bootstrap_fixture(&work, &mut config, token);
+    let owner_uid = fs::metadata(&token_path).unwrap().uid();
+    assert_eq!(
+        read_bootstrap_token(&token_path, Some(owner_uid)).unwrap(),
+        token
+    );
+
+    let decoy = token_path.with_file_name("decoy-token");
+    fs::write(&decoy, token).unwrap();
+    fs::set_permissions(&decoy, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(&token_path).unwrap();
+    symlink(&decoy, &token_path).unwrap();
+    assert!(read_bootstrap_token(&token_path, Some(owner_uid)).is_err());
+
+    fs::remove_file(&token_path).unwrap();
+    fs::write(&token_path, token).unwrap();
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(read_bootstrap_token(&token_path, Some(owner_uid)).is_err());
+
+    fs::write(
+        &token_path,
+        vec![b'x'; MAX_BOOTSTRAP_TOKEN_BYTES as usize + 1],
+    )
+    .unwrap();
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(read_bootstrap_token(&token_path, Some(owner_uid)).is_err());
 }
 
 #[cfg(unix)]
@@ -912,6 +1028,12 @@ fn mfa_totp_runtime_upgrade_keeps_inline_key_sources_unmounted() {
     fs::write(
         config_dir.join(".env.yaml"),
         "MFA_TOTP_ENCRYPTION_KEY: \"inline-key\"\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        config_dir.join(".env.yaml"),
+        fs::Permissions::from_mode(0o640),
     )
     .unwrap();
     let mut value = config(&work);
@@ -1281,6 +1403,13 @@ fn verified_journal_backup_is_opened_only_from_the_configured_root() {
         ),
     )
     .unwrap();
+    crate::filesystem::set_mode(&backup.join("SHA256SUMS"), 0o600).unwrap();
+    let manifest_digest = crate::filesystem::sha256(&backup.join("SHA256SUMS")).unwrap();
+    fs::write(
+        backup.join("BACKUP-COMPLETE"),
+        format!("marker=BACKUP-COMPLETE\nversion=1\nmanifest-sha256={manifest_digest}\n"),
+    )
+    .unwrap();
     value.backup = Some(backup.clone());
 
     assert_eq!(
@@ -1380,9 +1509,26 @@ fn observation_lock_never_creates_persistent_state() {
 }
 
 #[test]
+fn legacy_conformance_locks_overlap_and_exclude_lifecycle_mutation() {
+    let work = PrivateTempDir::new("nazoauth-conformance-legacy-lock").unwrap();
+    let path = work.path().join("lifecycle.lock");
+
+    let conformance_a = acquire_conformance_shared_lock_at(&path).unwrap();
+    let conformance_b = acquire_conformance_shared_lock_at(&path).unwrap();
+    assert!(acquire_lock_at(&path, &Command::Rollback { yes: true }).is_err());
+
+    drop((conformance_a, conformance_b));
+    assert!(acquire_lock_at(&path, &Command::Rollback { yes: true }).is_ok());
+}
+
+#[test]
 fn standards_full_bootstraps_a_bounded_revocation_snapshot_without_overwriting_it() {
     let work = PrivateTempDir::new("openid4vc-revocation-bootstrap").unwrap();
     let mut value = config(&work);
+    #[cfg(unix)]
+    {
+        value.runtime.service_user = current_unix_user();
+    }
     value.install_profile = "standards-full".to_owned();
     value.runtime.expected_issuer = "https://auth.example/".to_owned();
     let keys = work.path().join("app/keys");
@@ -1544,10 +1690,15 @@ fn public_command_dispatch_fails_closed_before_every_confirmed_mutation() {
         assert_eq!(fs::read(&config_path).unwrap(), config_before);
     }
 
+    let recover_journal = update_journal_path(&config);
+    assert!(!recover_journal.exists());
     assert_root_or_error(
         invoke(Command::RecoverUpdate { yes: false }),
-        "no interrupted update",
+        "no interrupted update transaction requires recovery",
     );
+    assert_eq!(fs::read(&config_path).unwrap(), config_before);
+    assert!(!recover_journal.exists());
+
     assert_root_or_error(
         invoke(Command::RecoverIdentity { yes: false }),
         "no interrupted identity",
@@ -1583,7 +1734,7 @@ fn public_command_dispatch_fails_closed_before_every_confirmed_mutation() {
     fs::write(abandoned.join("controller.key"), b"pending-secret").unwrap();
     assert_root_or_error(
         invoke(Command::RecoverUpdate { yes: false }),
-        "identity recovery is pending",
+        "no interrupted update transaction requires recovery",
     );
     assert!(invoke(Command::RecoverIdentity { yes: false }).is_err());
     assert_eq!(fs::read(&config_path).unwrap(), config_before);
@@ -1721,19 +1872,19 @@ fn ui_cache_validation_rejects_missing_non_regular_and_malformed_artifacts() {
     let work = PrivateTempDir::new("nazoauth-frontend-cache-boundaries").unwrap();
     let config = config(&work);
     let value = journal(&config, UpdatePhase::UiActivating);
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
 
     fs::create_dir_all(value.candidate_ui.parent().unwrap()).unwrap();
     fs::write(&value.candidate_ui, b"not a directory").unwrap();
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
     fs::remove_file(&value.candidate_ui).unwrap();
 
     fs::create_dir_all(&value.candidate_ui).unwrap();
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
     fs::write(value.candidate_ui.join("index.html"), b"ui").unwrap();
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
     fs::write(value.candidate_ui.join(".nazoauth-ui.json"), b"not-json").unwrap();
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
 }
 
 fn ui_server(body: &[u8]) -> (String, std::thread::JoinHandle<()>) {
@@ -1777,6 +1928,31 @@ fn ui_verification_binds_the_served_body_to_the_signed_runtime_cache() {
 }
 
 #[test]
+fn public_transport_retry_is_bounded_and_converges_without_masking_failure() {
+    let mut attempts = 0;
+    let value = retry_runtime_transport(3, Duration::ZERO, || {
+        attempts += 1;
+        if attempts < 3 {
+            anyhow::bail!("edge has not observed the ready backend");
+        }
+        Ok("ready")
+    })
+    .unwrap();
+    assert_eq!(value, "ready");
+    assert_eq!(attempts, 3);
+
+    let mut failures = 0;
+    assert!(
+        retry_runtime_transport(2, Duration::ZERO, || -> anyhow::Result<()> {
+            failures += 1;
+            anyhow::bail!("persistent public failure")
+        })
+        .is_err()
+    );
+    assert_eq!(failures, 2);
+}
+
+#[test]
 fn ui_verification_rejects_an_unrelated_success_response_through_curl() {
     let work = PrivateTempDir::new("nazoauth-frontend-http-binding").unwrap();
     let mut config = config(&work);
@@ -1804,7 +1980,7 @@ fn ui_cache_validation_rejects_symlinked_index_and_marker_files() {
     let external_index = work.path().join("external-index.html");
     fs::write(&external_index, b"ui").unwrap();
     std::os::unix::fs::symlink(&external_index, value.candidate_ui.join("index.html")).unwrap();
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
 
     fs::remove_file(value.candidate_ui.join("index.html")).unwrap();
     fs::write(value.candidate_ui.join("index.html"), b"ui").unwrap();
@@ -1815,7 +1991,7 @@ fn ui_cache_validation_rejects_symlinked_index_and_marker_files() {
         value.candidate_ui.join(".nazoauth-ui.json"),
     )
     .unwrap();
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
 }
 
 #[cfg(unix)]
@@ -1951,6 +2127,79 @@ fn fake_container_runtime(
         &config.operator.controller_key_id,
         &config.runtime.network,
     );
+    let network_inspect_json = serde_json::json!({
+        "Name": config.runtime.network.clone(),
+        "Labels": {
+            "io.nazoauth.deployment-id": config.operator.deployment_id.clone(),
+            "io.nazoauth.control-authority": config.operator.controller_key_id.clone(),
+            "io.nazoauth.managed-resource": "network",
+            "io.nazoauth.config-digest": network_digest.clone(),
+        },
+        "subnets": [{"gateway": "10.89.0.1"}],
+    })
+    .to_string();
+    let postgres_inspect_json = serde_json::json!({
+        "Id": "fixture-postgres-container-id",
+        "Name": format!("/{}", config.postgres.container_name),
+        "ImageName": config.postgres.image.clone(),
+        "Config": {
+            "Image": config.postgres.image.clone(),
+            "Labels": {
+                "io.nazoauth.deployment-id": config.operator.deployment_id.clone(),
+                "io.nazoauth.control-authority": config.operator.controller_key_id.clone(),
+                "io.nazoauth.runtime-instance-id": config.runtime.runtime_instance_id.clone(),
+                "io.nazoauth.managed-resource": "postgres",
+                "io.nazoauth.config-digest": identity.postgres_config_digest.clone(),
+            },
+            "Command": ["postgres"],
+        },
+        "State": {"Running": true},
+        "NetworkSettings": {"Ports": {}, "Networks": {}},
+        "Mounts": [],
+    })
+    .to_string();
+    let valkey_inspect_json = serde_json::json!({
+        "Id": "fixture-valkey-container-id",
+        "Name": format!("/{}", config.valkey.container_name),
+        "ImageName": config.valkey.image.clone(),
+        "Config": {
+            "Image": config.valkey.image.clone(),
+            "Labels": {
+                "io.nazoauth.deployment-id": config.operator.deployment_id.clone(),
+                "io.nazoauth.control-authority": config.operator.controller_key_id.clone(),
+                "io.nazoauth.runtime-instance-id": config.runtime.runtime_instance_id.clone(),
+                "io.nazoauth.managed-resource": "valkey",
+                "io.nazoauth.config-digest": identity.valkey_config_digest.clone(),
+            },
+            "Command": ["valkey-server"],
+        },
+        "State": {"Running": true},
+        "NetworkSettings": {"Ports": {}, "Networks": {}},
+        "Mounts": [],
+    })
+    .to_string();
+    let postgres_volume_inspect_json = serde_json::json!({
+        "Name": postgres_volume.clone(),
+        "Labels": {
+            "io.nazoauth.deployment-id": config.operator.deployment_id.clone(),
+            "io.nazoauth.control-authority": config.operator.controller_key_id.clone(),
+            "io.nazoauth.runtime-instance-id": config.runtime.runtime_instance_id.clone(),
+            "io.nazoauth.managed-resource": "postgres-volume",
+            "io.nazoauth.config-digest": identity.postgres_volume_config_digest.clone(),
+        },
+    })
+    .to_string();
+    let valkey_volume_inspect_json = serde_json::json!({
+        "Name": config.valkey.data_volume.clone(),
+        "Labels": {
+            "io.nazoauth.deployment-id": config.operator.deployment_id.clone(),
+            "io.nazoauth.control-authority": config.operator.controller_key_id.clone(),
+            "io.nazoauth.runtime-instance-id": config.runtime.runtime_instance_id.clone(),
+            "io.nazoauth.managed-resource": "valkey-volume",
+            "io.nazoauth.config-digest": identity.valkey_volume_config_digest.clone(),
+        },
+    })
+    .to_string();
     let embedded_identity = serde_json::to_string(&nazo_operator_protocol::EmbeddedIdentity {
         release: "v0.2.0".to_owned(),
         revision: candidate_commit.to_owned(),
@@ -1975,6 +2224,56 @@ fn fake_container_runtime(
         inspect_json = inspect_json,
         embedded_identity = embedded_identity,
     );
+    let raw_identity_override = format!(
+        r#"if [ "${{1:-}}" = network ] && [ "${{2:-}}" = inspect ] && [ "${{3:-}}" = '{network}' ]; then
+  printf '%s\n' '{network_inspect_json}'
+  exit 0
+fi
+if [ "${{1:-}}" = volume ] && [ "${{2:-}}" = inspect ]; then
+  case "${{3:-}}" in
+    '{postgres_volume}') printf '%s\n' '{postgres_volume_inspect_json}' ;;
+    '{valkey_volume}') printf '%s\n' '{valkey_volume_inspect_json}' ;;
+    *) printf '%s\n' 'no such object' >&2; exit 1 ;;
+  esac
+  exit 0
+fi
+if [ "${{1:-}}" = container ] && [ "${{2:-}}" = inspect ]; then
+  if [ "{candidate_active}" != true ]; then printf '%s\n' 'no such object' >&2; exit 1; fi
+  case "${{3:-}}" in
+    '{postgres_object}') printf '%s\n' '{postgres_inspect_json}' ;;
+    '{valkey_object}') printf '%s\n' '{valkey_inspect_json}' ;;
+    *) printf '%s\n' '{application_inspect_json}' ;;
+  esac
+  exit 0
+fi
+if [ "${{1:-}}" = run ]; then
+  case "$*" in
+    *'ALTER DATABASE "{database}" RENAME TO "{database}_previous_'*) : > '{postgres_state}' ; exit 0 ;;
+    *SELECT*pg_database*datname*)
+      case "$*" in
+        *"{database}_previous_"*) if [ -f '{postgres_state}' ]; then printf '%s\n' '1'; fi ;;
+        *"{database}_restore_"*) printf '%s\n' '1' ;;
+        *"datname = '{database}'"*) if [ ! -f '{postgres_state}' ]; then printf '%s\n' '1'; fi ;;
+      esac
+      exit 0 ;;
+  esac
+fi"#,
+        network = config.runtime.network,
+        network_inspect_json = network_inspect_json,
+        postgres_volume = postgres_volume,
+        valkey_volume = config.valkey.data_volume,
+        postgres_volume_inspect_json = postgres_volume_inspect_json,
+        valkey_volume_inspect_json = valkey_volume_inspect_json,
+        candidate_active = candidate_active,
+        postgres_object = config.postgres.container_name,
+        valkey_object = config.valkey.container_name,
+        postgres_inspect_json = postgres_inspect_json,
+        valkey_inspect_json = valkey_inspect_json,
+        application_inspect_json = inspect_json,
+        database = config.postgres.database,
+        postgres_state = work.path().join("postgres-old-quarantined").display(),
+    );
+    let script = format!("{raw_identity_override}\n{script}");
     let legacy_build_identity_case = format!(
         r#"if [ "${{1:-}}" = run ] && [ "${{*: -2}}" = "nazoauth build-identity" ]; then
   printf '%s\n' '{}'
@@ -2057,6 +2356,7 @@ fn materialize_trusted_recovery_release(config: &UpdateConfig, release: &Release
         serde_json::to_vec_pretty(release).unwrap(),
     )
     .unwrap();
+    crate::filesystem::set_mode(&directory.join("server-release-manifest.json"), 0o400).unwrap();
     fs::write(
         directory.join("server-image.tar"),
         b"trusted OCI recovery archive",
@@ -2129,6 +2429,26 @@ fn materialize_verified_backup(config: &UpdateConfig, path: &std::path::Path) {
         ),
     )
     .unwrap();
+    crate::filesystem::set_mode(&path.join("SHA256SUMS"), 0o600).unwrap();
+    let manifest_digest = crate::filesystem::sha256(&path.join("SHA256SUMS")).unwrap();
+    fs::write(
+        path.join("BACKUP-COMPLETE"),
+        format!("marker=BACKUP-COMPLETE\nversion=1\nmanifest-sha256={manifest_digest}\n"),
+    )
+    .unwrap();
+    crate::filesystem::set_mode(&path.join("BACKUP-COMPLETE"), 0o600).unwrap();
+    chown(path, Some(0), Some(10001)).unwrap();
+    crate::filesystem::set_mode(path, 0o750).unwrap();
+    for name in [
+        "state.bin",
+        "update-config.json",
+        "SHA256SUMS",
+        "BACKUP-COMPLETE",
+    ] {
+        let artifact = path.join(name);
+        chown(&artifact, Some(0), Some(10001)).unwrap();
+        crate::filesystem::set_mode(&artifact, 0o440).unwrap();
+    }
 }
 
 #[cfg(unix)]
@@ -2227,6 +2547,9 @@ fn pending_pre_migration_update_restores_previous_artifact_and_closes_the_journa
 #[test]
 fn pending_active_candidate_restores_previous_release_and_closes_the_journal() {
     let work = PrivateTempDir::new("nazoauth-recover-active-unwind").unwrap();
+    if fs::metadata(work.path()).unwrap().uid() != 0 {
+        return;
+    }
     let mut config = config(&work);
     config.postgres.image = format!("postgres@sha256:{}", "a".repeat(64));
     config.postgres.validation_image = config.postgres.image.clone();
@@ -2246,6 +2569,7 @@ fn pending_active_candidate_restores_previous_release_and_closes_the_journal() {
         "postgresql://migrator:recovery-test@database.invalid/oauth",
     )
     .unwrap();
+    crate::filesystem::set_mode(&config.dependencies.migration_database_url_file, 0o400).unwrap();
     let mut value = journal(&config, UpdatePhase::CandidateActive);
     config.runtime.backend = RuntimeBackendKind::Podman;
     config.runtime.backend_command_override = Some(fake_container_runtime(
@@ -2482,7 +2806,7 @@ fn frontend_cache_marker_must_exactly_match_the_signed_release() {
         serde_json::to_vec(&expected).unwrap(),
     )
     .unwrap();
-    assert!(target_ui_is_active(&value));
+    assert!(target_ui_is_active(&config, &value));
 
     let mut changed = expected;
     changed["unexpected"] = serde_json::json!(true);
@@ -2491,7 +2815,7 @@ fn frontend_cache_marker_must_exactly_match_the_signed_release() {
         serde_json::to_vec(&changed).unwrap(),
     )
     .unwrap();
-    assert!(!target_ui_is_active(&value));
+    assert!(!target_ui_is_active(&config, &value));
 }
 
 #[test]

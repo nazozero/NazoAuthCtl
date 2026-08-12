@@ -17,6 +17,15 @@ pub(crate) fn invoke_recovery_driver(
         open_secure_regular_file(recovery_manifest, "recovery manifest", false)?;
     let recovery_manifest_sha256 =
         sha256_file(&mut recovery_file, &recovery_manifest.display().to_string())?;
+    crate::adoption::verify_provider_attestation_for_lifecycle(
+        recovery_manifest,
+        lifecycle,
+        &lifecycle.deployment_id,
+        release,
+        &lifecycle_sha256,
+        operation,
+        true,
+    )?;
     if operation == RecoveryOperation::Rehearse {
         ensure_private_directory(
             &lifecycle.recovery_driver.rehearsal_workspace,

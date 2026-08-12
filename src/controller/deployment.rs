@@ -137,6 +137,31 @@ pub(super) fn acquire_lock(command: &Command) -> anyhow::Result<File> {
     acquire_lock_at(&path, command)
 }
 
+/// The standalone conformance runner does not enter `main_entry`, so a legacy
+/// (unregistered) deployment must explicitly participate in the same
+/// lifecycle lock as update/recovery. Shared mode allows independent
+/// conformance leases to overlap while still excluding every mutation.
+pub(super) fn acquire_conformance_shared_lock() -> anyhow::Result<File> {
+    let path = std::env::var_os("NAZOAUTHCTL_LOCK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/run/lock/nazoauthctl.lock"));
+    acquire_conformance_shared_lock_at(&path)
+}
+
+pub(super) fn acquire_conformance_shared_lock_at(path: &Path) -> anyhow::Result<File> {
+    let file = open_lock_file(path, false, "lifecycle lock")
+        .with_context(|| format!("failed to open lifecycle lock {}", path.display()))?;
+    match file.try_lock_shared() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => {
+            bail!("another nazoauthctl lifecycle operation is already running")
+        }
+        Err(TryLockError::Error(error)) => {
+            Err(error).context("failed to acquire shared lifecycle lock")
+        }
+    }
+}
+
 pub(super) fn acquire_lock_at(path: &Path, command: &Command) -> anyhow::Result<File> {
     let read_only = command_is_read_only(command);
     let file = open_lock_file(path, read_only, "lifecycle lock").with_context(|| {
@@ -168,10 +193,26 @@ pub(super) fn install(
     options: crate::cli::InstallOptions,
 ) -> anyhow::Result<()> {
     require_root()?;
-    if config_path.exists() {
+    let config_present = match fs::symlink_metadata(&config_path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => true,
+        Ok(_) => bail!(
+            "update config must be a regular non-symlink file: {}",
+            config_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {}", config_path.display()));
+        }
+    };
+    if config_present {
         let config = load_config(&config_path)?;
         config.require_managed_lifecycle()?;
+        let managed_secrets_changed = install::reconcile_managed_secrets(&config)?;
         if install_is_complete(&config)? {
+            if managed_secrets_changed {
+                install::start_managed_dependencies(&config)?;
+            }
             if !health_ready(&config) {
                 bail!("managed installation is complete but not healthy; run nazoauthctl doctor");
             }
@@ -191,7 +232,7 @@ pub(super) fn install(
             return Ok(());
         }
         println!("Resuming the existing managed installation");
-        let resume_version = options.version.or_else(|| {
+        let resume_version = options.version.clone().or_else(|| {
             load_active_release(&config)
                 .ok()
                 .map(|release| release.version)
@@ -334,8 +375,13 @@ pub(super) fn install_completion_path(config: &UpdateConfig) -> PathBuf {
 
 pub(super) fn install_is_complete(config: &UpdateConfig) -> anyhow::Result<bool> {
     let path = install_completion_path(config);
-    if !path.exists() {
-        return Ok(false);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => bail!("managed installation completion marker is not a regular non-symlink file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
     }
     let completion = load_install_completion(config)?;
     if !matches!(completion.schema, 1 | 2) {
@@ -361,8 +407,14 @@ pub(super) fn install_is_complete(config: &UpdateConfig) -> anyhow::Result<bool>
 }
 
 pub(super) fn load_install_completion(config: &UpdateConfig) -> anyhow::Result<InstallCompletion> {
-    serde_json::from_slice(&fs::read(install_completion_path(config))?)
-        .context("managed installation completion marker is invalid")
+    let path = install_completion_path(config);
+    let bytes = crate::filesystem::read_secure_regular_file(
+        &path,
+        "managed installation completion marker",
+        true,
+        256 * 1024,
+    )?;
+    serde_json::from_slice(&bytes).context("managed installation completion marker is invalid")
 }
 
 pub(super) fn register_installed_deployment(
@@ -507,27 +559,5 @@ pub(super) fn register_installed_deployment(
         declaration_revision: 1,
     };
     let store = DeploymentStore::system();
-    if store.declaration_path(&record.deployment_id).exists() {
-        let existing = store.load(&record.deployment_id)?;
-        if existing.control_authority != record.control_authority
-            || existing.issuer != record.issuer
-            || existing.runtime_instances.first().map(|runtime| {
-                (
-                    &runtime.runtime_instance_id,
-                    runtime.backend,
-                    &runtime.object_reference,
-                )
-            }) != record.runtime_instances.first().map(|runtime| {
-                (
-                    &runtime.runtime_instance_id,
-                    runtime.backend,
-                    &runtime.object_reference,
-                )
-            })
-        {
-            bail!("installed deployment registry identity differs from the completed installation");
-        }
-        return Ok(());
-    }
     store.persist(&record)
 }

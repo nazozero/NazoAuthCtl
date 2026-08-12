@@ -72,16 +72,13 @@ fn repair_uncommitted_receipt_identity(directory: &Path) -> anyhow::Result<()> {
 }
 
 pub(crate) fn read_active_identity(path: &Path) -> anyhow::Result<ActiveIdentity> {
-    let metadata = fs::symlink_metadata(path).with_context(|| {
-        format!(
-            "failed to inspect active identity record {}",
-            path.display()
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("active identity record must be a regular non-symlink file")
-    }
-    let active: ActiveIdentity = serde_json::from_slice(&fs::read(path)?)?;
+    let bytes = crate::filesystem::read_secure_regular_file(
+        path,
+        "active identity record",
+        true,
+        64 * 1024,
+    )?;
+    let active: ActiveIdentity = serde_json::from_slice(&bytes)?;
     validate_active_identity(&active)?;
     Ok(active)
 }
@@ -133,7 +130,8 @@ pub(crate) fn identity_layout(config: &UpdateConfig) -> anyhow::Result<IdentityL
 }
 
 fn create_private_directory(path: &Path) -> anyhow::Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+    crate::filesystem::ensure_directory_chain(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
     crate::filesystem::set_mode(path, 0o700)
 }
 

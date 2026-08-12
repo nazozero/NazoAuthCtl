@@ -1,0 +1,30 @@
+[package]
+name = "nazoauthctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "nazoauthctl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.103"
+ctrlc = "3.5.2"
+nazoauthctl-core = { path = "../.." }
+nazoauthctl-conformance = { path = "../nazoauthctl-conformance" }
+rand = "0.10.1"
+rpassword = "7.4.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+uuid = "1.23.5"
+zeroize = "1.8.2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

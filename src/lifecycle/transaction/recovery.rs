@@ -19,6 +19,7 @@ pub(crate) fn recover_registered(
     let lifecycle_path = lifecycle_path(record)?;
     let lifecycle = LifecycleManifest::load(lifecycle_path)?;
     validate_lifecycle_record_binding(&lifecycle, record)?;
+    validate_lifecycle_acceptance_record_binding(&lifecycle, record)?;
     let slot = load_recovery_slot(store, record)?;
     let recovery_manifest = slot.recovery_manifest.clone();
     let cache_path =
@@ -37,9 +38,13 @@ pub(crate) fn recover_registered(
     let lifecycle_sha256 = sha256(lifecycle_path)?;
     let cache_sha256 = sha256(&cache_path)?;
     let mut transaction = if transaction_path.exists() {
-        let transaction: RecoveryTransaction =
-            serde_json::from_slice(&fs::read(&transaction_path)?)
-                .context("recovery transaction is invalid")?;
+        let transaction: RecoveryTransaction = serde_json::from_slice(&read_secure_regular_file(
+            &transaction_path,
+            "recovery transaction journal",
+            true,
+            MAX_LIFECYCLE_BYTES,
+        )?)
+        .context("recovery transaction is invalid")?;
         if transaction.schema != 1
             || transaction.deployment_id != record.deployment_id
             || transaction.release != slot.trusted_release.release
@@ -127,6 +132,14 @@ pub(crate) fn recover_registered(
             .insert(runtime.runtime_instance_id.clone());
         transaction.updated_at = Utc::now().timestamp();
         persist_recovery_transaction(&transaction_path, &transaction)?;
+    }
+    for runtime in &lifecycle.runtimes {
+        let artifact = cache
+            .runtimes
+            .get(&runtime.runtime_instance_id)
+            .context("trusted runtime cache omits a lifecycle runtime")?;
+        verify_active_runtime(runtime, &slot.trusted_release, artifact)?;
+        verify_runtime_acceptance(runtime)?;
     }
     transaction.state = RecoveryTransactionState::RuntimesRestored;
     transaction.updated_at = Utc::now().timestamp();

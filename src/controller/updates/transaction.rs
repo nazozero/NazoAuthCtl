@@ -95,7 +95,7 @@ pub(crate) fn update(
         .ui
         .releases_root
         .join(&release.manifest.frontend.artifact.sha256);
-    fs::create_dir_all(&config.deployment_root)?;
+    crate::filesystem::ensure_directory_chain(&config.deployment_root)?;
     let mut journal = UpdateJournal {
         schema: 1,
         transaction_id: format!("update-{}", encode_transaction_id()),
@@ -167,7 +167,7 @@ pub(crate) fn advance_update_transaction(
     if resuming_activated_target {
         activate_candidate(config, &runtime, journal)?;
     }
-    if journal.phase >= UpdatePhase::UiActive && !target_ui_is_active(journal) {
+    if journal.phase >= UpdatePhase::UiActive && !target_ui_is_active(config, journal) {
         bail!("candidate application did not retain its signed frontend cache");
     }
     if journal.phase >= UpdatePhase::HealthVerified {
@@ -207,7 +207,7 @@ pub(crate) fn advance_update_transaction(
         set_update_phase(config, journal, UpdatePhase::UiActivating)?;
         wait_ready(config)?;
         verify_ui(config, &journal.to_release)?;
-        if !target_ui_is_active(journal) {
+        if !target_ui_is_active(config, journal) {
             bail!("candidate application did not materialize its signed frontend cache");
         }
         set_update_phase(config, journal, UpdatePhase::UiActive)?;
@@ -373,8 +373,14 @@ pub(crate) fn load_update_journal(config: &UpdateConfig) -> anyhow::Result<Optio
     if !path.is_file() || path.is_symlink() {
         bail!("update transaction journal must be a regular non-symlink file");
     }
-    let journal: UpdateJournal = serde_json::from_slice(&fs::read(&path)?)
-        .context("update transaction journal is invalid")?;
+    let bytes = crate::filesystem::read_secure_regular_file(
+        &path,
+        "update transaction journal",
+        true,
+        2 * 1024 * 1024,
+    )?;
+    let journal: UpdateJournal =
+        serde_json::from_slice(&bytes).context("update transaction journal is invalid")?;
     validate_update_journal(config, &journal)?;
     Ok(Some(journal))
 }
@@ -424,7 +430,11 @@ pub(crate) fn activate_candidate(
     }
 }
 
-pub(crate) fn frontend_cache_matches(candidate_ui: &Path, release: &ReleaseManifest) -> bool {
+pub(crate) fn frontend_cache_matches(
+    config: &UpdateConfig,
+    candidate_ui: &Path,
+    release: &ReleaseManifest,
+) -> bool {
     fn regular_file(path: &Path) -> bool {
         fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
     }
@@ -440,10 +450,16 @@ pub(crate) fn frontend_cache_matches(candidate_ui: &Path, release: &ReleaseManif
     if !regular_file(&marker) {
         return false;
     }
-    let Ok(actual) = fs::read(&marker).and_then(|bytes| {
-        serde_json::from_slice::<serde_json::Value>(&bytes)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }) else {
+    let Ok(bytes) = crate::runtime::read_runtime_owned_regular_file(
+        config,
+        &marker,
+        "frontend cache marker",
+        false,
+        64 * 1024,
+    ) else {
+        return false;
+    };
+    let Ok(actual) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return false;
     };
     actual
@@ -457,8 +473,8 @@ pub(crate) fn frontend_cache_matches(candidate_ui: &Path, release: &ReleaseManif
         })
 }
 
-pub(crate) fn target_ui_is_active(journal: &UpdateJournal) -> bool {
-    frontend_cache_matches(&journal.candidate_ui, &journal.to_release)
+pub(crate) fn target_ui_is_active(config: &UpdateConfig, journal: &UpdateJournal) -> bool {
+    frontend_cache_matches(config, &journal.candidate_ui, &journal.to_release)
 }
 
 pub(crate) fn finish_update_journal(

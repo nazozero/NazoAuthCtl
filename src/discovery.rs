@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -16,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     deployment::{ArtifactReference, RecoveryConclusion, RuntimeBackendKind},
+    filesystem::read_secure_regular_file,
     process::Process,
     runtime_backend::{RuntimeObservation, installed_backends},
 };
@@ -423,12 +423,8 @@ pub(crate) fn deployment_statement_path(candidate: &DiscoveredDeployment) -> Opt
 }
 
 fn read_bounded(path: &Path, maximum: u64) -> anyhow::Result<String> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect discovery evidence {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > maximum {
-        bail!("discovery evidence is not a bounded regular file");
-    }
-    fs::read_to_string(path).context("discovery evidence is not valid UTF-8")
+    let bytes = read_secure_regular_file(path, "discovery evidence", false, maximum)?;
+    String::from_utf8(bytes.to_vec()).context("discovery evidence is not valid UTF-8")
 }
 
 fn direct_endpoints(runtime: &RuntimeObservation) -> Vec<String> {
@@ -448,17 +444,18 @@ fn direct_endpoints(runtime: &RuntimeObservation) -> Vec<String> {
 }
 
 fn probe_public_service(issuer: &str) -> anyhow::Result<(bool, bool)> {
+    let issuer_url = crate::model::parse_public_origin(issuer, "discovered issuer")?;
+    let issuer = issuer_url.as_str().trim_end_matches('/');
     let discovery = Process::new("curl")
         .args([
             "--silent",
             "--show-error",
             "--fail",
+            "--proto",
+            "=http,https",
             "--max-time",
             "3",
-            &format!(
-                "{}/.well-known/openid-configuration",
-                issuer.trim_end_matches('/')
-            ),
+            &format!("{issuer}/.well-known/openid-configuration"),
         ])
         .stdout()?;
     let document: serde_json::Value = serde_json::from_str(&discovery)?;
@@ -468,9 +465,11 @@ fn probe_public_service(issuer: &str) -> anyhow::Result<(bool, bool)> {
             "--silent",
             "--show-error",
             "--fail",
+            "--proto",
+            "=http,https",
             "--max-time",
             "3",
-            &format!("{}/ready", issuer.trim_end_matches('/')),
+            &format!("{issuer}/ready"),
         ])
         .succeeds();
     Ok((issuer_matches, ready))

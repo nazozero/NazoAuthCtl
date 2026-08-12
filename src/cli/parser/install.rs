@@ -4,12 +4,14 @@ use anyhow::{Context, bail};
 
 use super::super::types::InstallOptions;
 use super::common::validate_version;
+use crate::install::{normalize_public_url_for_profile, normalize_single_host_cidr};
 
 pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOptions> {
     let mut runtime = "auto".to_owned();
     let mut public_url = "http://127.0.0.1:8000".to_owned();
     let mut profile = "baseline".to_owned();
     let mut profile_material = None;
+    let mut trusted_proxy_cidr = None;
     let mut data_root = PathBuf::from("/var/lib/nazoauth");
     let mut control_root = PathBuf::from("/var/lib/nazoauthctl");
     let mut recovery_root = PathBuf::from("/var/lib/nazoauth-recovery");
@@ -58,6 +60,12 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
             "--public-url" => public_url = value,
             "--profile" => profile = value,
             "--profile-material" => profile_material = Some(PathBuf::from(value)),
+            "--trusted-proxy-cidr" => {
+                if trusted_proxy_cidr.is_some() {
+                    bail!("--trusted-proxy-cidr may be supplied only once");
+                }
+                trusted_proxy_cidr = Some(normalize_single_host_cidr(&value)?);
+            }
             "--data-root" => data_root = PathBuf::from(value),
             "--control-root" => control_root = PathBuf::from(value),
             "--recovery-root" => recovery_root = PathBuf::from(value),
@@ -108,8 +116,14 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
     if profile == "standards-full" && profile_material.is_none() {
         bail!("--profile standards-full requires --profile-material PATH");
     }
+    if profile == "standards-full" && trusted_proxy_cidr.is_none() {
+        bail!("--profile standards-full requires --trusted-proxy-cidr HOST/32 or HOST/128");
+    }
     if profile == "baseline" && profile_material.is_some() {
         bail!("--profile-material is accepted only with --profile standards-full");
+    }
+    if profile == "baseline" && trusted_proxy_cidr.is_some() {
+        bail!("--trusted-proxy-cidr is accepted only with --profile standards-full");
     }
     if profile != "standards-full" && (profile_secrets_stdin || profile_secret_fd.is_some()) {
         bail!("secure profile secret input requires --profile standards-full");
@@ -123,11 +137,13 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
     if runtime == "host" && network_subnet.is_some() {
         bail!("container network options are unavailable with --runtime host");
     }
+    public_url = normalize_public_url_for_profile(&public_url, &profile)?;
     Ok(InstallOptions {
         runtime,
         public_url,
         profile,
         profile_material,
+        trusted_proxy_cidr,
         data_root,
         control_root,
         recovery_root,

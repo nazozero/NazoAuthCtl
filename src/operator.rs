@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    deployment::RuntimeBackendKind,
+    deployment::{
+        DeploymentRecord, DeploymentStore, RuntimeBackendKind, SafeReference, TrustState,
+    },
     filesystem::{atomic_write, sha256},
     model::UpdateConfig,
     runtime::Runtime,
@@ -31,12 +33,13 @@ mod audit;
 mod identity;
 #[cfg(test)]
 use audit::{
-    append_audit, audit_entries, audit_head, execute_test_task, load_or_issue_task, operation_name,
+    append_audit, audit_head, execute_test_task, load_or_issue_task, operation_name,
     target_expectation, validate_retirement_probe_audit_evidence, validate_runtime_receipt,
 };
 pub(crate) use audit::{
-    append_management_event, append_management_event_idempotent, execute, expected_release_target,
-    load_management_event, show_audit, verify_audit,
+    append_management_event, append_management_event_idempotent, audit_entries, execute,
+    execute_with_io, expected_release_target, load_management_event, show_audit, verify_audit,
+    verify_audit_chain,
 };
 use audit::{
     canonical_manifest, encode_retirement_probe_audit_evidence, verify_target_expectation,
@@ -44,19 +47,21 @@ use audit::{
 use identity::{
     encode_hex, is_real_directory_or_missing, is_regular_non_symlink, path_present,
     read_signing_key, read_single_line, read_verifying_key, safe_identity_component,
-    trusted_audit_key, trusted_break_glass_key, trusted_controller_key,
+    trusted_break_glass_key, trusted_controller_key,
 };
 #[cfg(test)]
 use identity::{
     ensure_only_expected_generation, ensure_static_identity_files, generation_paths,
-    identity_layout, new_active_identity, read_key, refuse_ambiguous_legacy_adoption,
-    remove_allowlisted_generation_directory, remove_uncommitted_generation, validate_generation,
-    verify_retired_controller_probe_with, write_active_identity, write_generation,
+    identity_layout, new_active_identity, read_active_identity, read_key,
+    refuse_ambiguous_legacy_adoption, remove_allowlisted_generation_directory,
+    remove_uncommitted_generation, validate_generation, verify_retired_controller_probe_with,
+    write_active_identity, write_generation,
 };
 pub(crate) use identity::{
-    identity_recovery_required, initialize_identity_generation, read_active_identity,
+    identity_recovery_required, initialize_identity_generation,
     recover_controller_without_controller_key, recover_pending_rotation, rehearse_controller_loss,
-    report_controller_availability, rotate_controller, verify_retired_controller_probe,
+    report_controller_availability, rotate_controller, trusted_audit_key,
+    verify_retired_controller_probe,
 };
 
 #[derive(Clone, Debug)]
@@ -94,6 +99,36 @@ struct RotationIntent {
     next_break_glass_key_id: String,
     transition_file: String,
     compact_transition: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum IdentityRotationPhase {
+    GenerationCommitted,
+    DeclarationCommitted,
+    ActiveCommitted,
+    AuditCommitted,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IdentityRotationJournal {
+    pub(crate) schema: u32,
+    pub(crate) request_id: String,
+    pub(crate) deployment_id: String,
+    pub(crate) break_glass: bool,
+    pub(crate) reason: String,
+    pub(crate) from_revision: u64,
+    pub(crate) previous_record: DeploymentRecord,
+    pub(crate) next_record: DeploymentRecord,
+    pub(crate) previous: ActiveIdentity,
+    pub(crate) previous_controller_public_sha256: String,
+    pub(crate) next: ActiveIdentity,
+    pub(crate) transition_file: String,
+    pub(crate) compact_transition: String,
+    pub(crate) retirement_probe: Option<String>,
+    pub(crate) phase: IdentityRotationPhase,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -188,6 +223,69 @@ impl ControllerSigningAccess {
             }
         }
     }
+}
+
+pub(crate) fn rotate_registered_controller(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    config_path: &Path,
+    config: &UpdateConfig,
+    break_glass: bool,
+    reason: &str,
+) -> anyhow::Result<RotationResult> {
+    identity::rotate_registered_controller_with_access(
+        store,
+        record,
+        config_path,
+        config,
+        break_glass,
+        reason,
+        ControllerSigningAccess::Available,
+    )
+}
+
+pub(crate) fn rehearse_registered_controller_loss(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    config_path: &Path,
+    config: &UpdateConfig,
+) -> anyhow::Result<RotationResult> {
+    let probe_key = read_signing_key(&config.operator.controller_private_key)?;
+    identity::rotate_registered_controller_with_access(
+        store,
+        record,
+        config_path,
+        config,
+        true,
+        "simulated-unavailable",
+        ControllerSigningAccess::ForbiddenForRehearsal(Box::new(probe_key)),
+    )
+}
+
+pub(crate) fn recover_registered_controller_without_controller_key(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    config_path: &Path,
+    config: &UpdateConfig,
+    reason: &str,
+) -> anyhow::Result<RotationResult> {
+    identity::rotate_registered_controller_with_access(
+        store,
+        record,
+        config_path,
+        config,
+        true,
+        reason,
+        ControllerSigningAccess::Unavailable,
+    )
+}
+
+pub(crate) fn recover_registered_rotation_locked(
+    store: &DeploymentStore,
+    config_path: &Path,
+    expected_record: &DeploymentRecord,
+) -> anyhow::Result<bool> {
+    identity::recover_registered_rotation_locked(store, config_path, expected_record)
 }
 
 #[cfg(test)]

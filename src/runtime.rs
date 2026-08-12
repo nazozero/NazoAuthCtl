@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, ffi::OsString, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, bail};
 use nazo_operator_protocol::{RuntimeTargetClaim, TaskOperation};
@@ -16,6 +21,53 @@ use crate::{
 };
 
 const CONTAINER_SECRET_REVISION_PATH: &str = "/run/nazoauth-operator/secret-revision";
+const NAZOAUTH_CONTAINER_SERVICE_USER: &str = "10001:10001";
+
+pub(crate) fn runtime_service_owner_uid(config: &UpdateConfig) -> anyhow::Result<u32> {
+    if config.runtime.backend != RuntimeBackendKind::Systemd {
+        return Ok(10_001);
+    }
+    crate::process::Process::new("id")
+        .args(["-u", config.runtime.service_user.as_str()])
+        .stdout()?
+        .trim()
+        .parse()
+        .context("managed host service user has no valid numeric UID")
+}
+
+pub(crate) fn read_runtime_owned_regular_file(
+    config: &UpdateConfig,
+    path: &Path,
+    label: &str,
+    private: bool,
+    max_bytes: u64,
+) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+    #[cfg(unix)]
+    {
+        match crate::filesystem::read_secure_regular_file(path, label, private, max_bytes) {
+            Ok(bytes) => Ok(bytes),
+            Err(controller_owner_error) => {
+                crate::filesystem::read_secure_regular_file_for_uid(
+                    path,
+                    label,
+                    private,
+                    max_bytes,
+                    runtime_service_owner_uid(config)?,
+                )
+                .with_context(|| {
+                    format!(
+                        "{label} is neither controller-owned nor owned by the bound runtime service: {controller_owner_error:#}"
+                    )
+                })
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config;
+        crate::filesystem::read_secure_regular_file(path, label, private, max_bytes)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct PreparedAppTask {
@@ -105,6 +157,8 @@ impl<'a> Runtime<'a> {
         image_or_binary: &str,
         operation: &TaskOperation,
         public_jwk: Option<&Path>,
+        conformance_bundle: Option<&Path>,
+        conformance_output_directory: Option<&Path>,
         config_manifest: &[u8],
     ) -> anyhow::Result<PreparedAppTask> {
         self.write_task_context(config_manifest)?;
@@ -137,7 +191,13 @@ impl<'a> Runtime<'a> {
             },
             ArtifactReference::Unknown => bail!("operator task artifact is not verified"),
         };
-        let task = self.one_shot_task(artifact, operation, public_jwk)?;
+        let task = self.one_shot_task(
+            artifact,
+            operation,
+            public_jwk,
+            conformance_bundle,
+            conformance_output_directory,
+        )?;
         Ok(PreparedAppTask {
             backend,
             command_override: self.command_override(),
@@ -165,14 +225,30 @@ impl<'a> Runtime<'a> {
         ))
     }
 
+    fn dependency_backend(&self) -> anyhow::Result<Box<dyn runtime_backend::RuntimeBackend>> {
+        let kind = self
+            .config
+            .container_backend()
+            .context("managed dependencies require an explicit container backend")?;
+        Ok(selected_backend(kind, self.command_override().as_deref()))
+    }
+
     fn one_shot_task(
         &self,
         artifact: ArtifactReference,
         operation: &TaskOperation,
         public_jwk: Option<&Path>,
+        conformance_bundle: Option<&Path>,
+        conformance_output_directory: Option<&Path>,
     ) -> anyhow::Result<OneShotTask> {
         if self.backend_kind()? == RuntimeBackendKind::Systemd {
-            return self.systemd_one_shot_task(artifact, operation, public_jwk);
+            return self.systemd_one_shot_task(
+                artifact,
+                operation,
+                public_jwk,
+                conformance_bundle,
+                conformance_output_directory,
+            );
         }
         let mut mounts = Vec::new();
         let mut environment = BTreeMap::from([
@@ -277,6 +353,62 @@ impl<'a> Runtime<'a> {
                 "/run/nazoauth-operator/public.jwk".to_owned(),
             );
         }
+        if let Some(path) = conformance_bundle {
+            mounts.push(task_mount(
+                path,
+                Path::new("/run/nazoauth-operator/conformance-bundle.json"),
+                true,
+            ));
+            environment.insert(
+                "NAZOAUTH_OPERATOR_CONFORMANCE_BUNDLE_FILE".to_owned(),
+                "/run/nazoauth-operator/conformance-bundle.json".to_owned(),
+            );
+            let client_secret_pepper = self.required_runtime_secret("client-secret-pepper")?;
+            mounts.push(task_mount(
+                &client_secret_pepper,
+                Path::new("/run/nazoauth-operator/client-secret-pepper"),
+                true,
+            ));
+            environment.insert(
+                "NAZOAUTH_OPERATOR_CLIENT_SECRET_PEPPER_FILE".to_owned(),
+                "/run/nazoauth-operator/client-secret-pepper".to_owned(),
+            );
+            if let Some(pairwise_subject_secret) =
+                self.optional_runtime_secret("pairwise-subject-secret")?
+            {
+                mounts.push(task_mount(
+                    &pairwise_subject_secret,
+                    Path::new("/run/nazoauth-operator/pairwise-subject-secret"),
+                    true,
+                ));
+                environment.insert(
+                    "NAZOAUTH_OPERATOR_PAIRWISE_SUBJECT_SECRET_FILE".to_owned(),
+                    "/run/nazoauth-operator/pairwise-subject-secret".to_owned(),
+                );
+            }
+            let openid4vc_data_encryption_key =
+                self.required_mount("/run/nazoauth-secrets/openid4vc-data-encryption-key")?;
+            mounts.push(task_mount(
+                &openid4vc_data_encryption_key.source,
+                Path::new("/run/nazoauth-operator/openid4vc-data-encryption-key"),
+                true,
+            ));
+            environment.insert(
+                "NAZOAUTH_OPERATOR_OPENID4VC_DATA_ENCRYPTION_KEY_FILE".to_owned(),
+                "/run/nazoauth-operator/openid4vc-data-encryption-key".to_owned(),
+            );
+        }
+        if let Some(path) = conformance_output_directory {
+            mounts.push(task_mount(
+                path,
+                Path::new("/run/nazoauth-operator-output"),
+                false,
+            ));
+            environment.insert(
+                "NAZOAUTH_OPERATOR_OUTPUT_DIRECTORY".to_owned(),
+                "/run/nazoauth-operator-output".to_owned(),
+            );
+        }
         Ok(OneShotTask {
             artifact,
             command: match self.backend_kind()? {
@@ -289,10 +421,18 @@ impl<'a> Runtime<'a> {
                 .then(|| self.config.runtime.network.clone()),
             mounts,
             environment,
-            working_directory: (self.backend_kind()? == RuntimeBackendKind::Systemd)
-                .then(|| self.config.runtime.working_directory.clone()),
-            service_user: (self.backend_kind()? == RuntimeBackendKind::Systemd)
-                .then(|| self.config.runtime.service_user.clone()),
+            working_directory: Some(match self.backend_kind()? {
+                RuntimeBackendKind::Systemd => self.config.runtime.working_directory.clone(),
+                RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => PathBuf::from("/app"),
+            }),
+            service_user: Some(if self.backend_kind()? == RuntimeBackendKind::Systemd {
+                self.config.runtime.service_user.clone()
+            } else {
+                // The verified NazoAuth OCI artifact declares this immutable
+                // numeric identity. Operation-scoped tasks must never inherit
+                // engine root merely because the image metadata drifts.
+                NAZOAUTH_CONTAINER_SERVICE_USER.to_owned()
+            }),
             transient_credentials: BTreeMap::new(),
             read_only_paths: Vec::new(),
             read_write_paths: Vec::new(),
@@ -307,6 +447,8 @@ impl<'a> Runtime<'a> {
         artifact: ArtifactReference,
         operation: &TaskOperation,
         public_jwk: Option<&Path>,
+        conformance_bundle: Option<&Path>,
+        conformance_output_directory: Option<&Path>,
     ) -> anyhow::Result<OneShotTask> {
         let key_directory = self
             .config
@@ -417,6 +559,58 @@ impl<'a> Runtime<'a> {
                     path.display().to_string(),
                 );
             }
+        }
+        if let Some(path) = conformance_bundle {
+            transient_credentials.insert("conformance-bundle".to_owned(), path.to_path_buf());
+            environment.insert(
+                "NAZOAUTH_OPERATOR_CONFORMANCE_BUNDLE_FILE".to_owned(),
+                "%d/conformance-bundle".to_owned(),
+            );
+            let client_secret_pepper = app_root.join("secrets/client-secret-pepper");
+            require_real_regular_file(&client_secret_pepper, "conformance client secret pepper")?;
+            transient_credentials.insert("client-secret-pepper".to_owned(), client_secret_pepper);
+            environment.insert(
+                "NAZOAUTH_OPERATOR_CLIENT_SECRET_PEPPER_FILE".to_owned(),
+                "%d/client-secret-pepper".to_owned(),
+            );
+            let pairwise_subject_secret = app_root.join("secrets/pairwise-subject-secret");
+            if real_regular_file_or_missing(
+                &pairwise_subject_secret,
+                "conformance pairwise subject secret",
+            )? {
+                transient_credentials.insert(
+                    "pairwise-subject-secret".to_owned(),
+                    pairwise_subject_secret,
+                );
+                environment.insert(
+                    "NAZOAUTH_OPERATOR_PAIRWISE_SUBJECT_SECRET_FILE".to_owned(),
+                    "%d/pairwise-subject-secret".to_owned(),
+                );
+            }
+            let openid4vc_data_encryption_key = self
+                .config
+                .runtime
+                .working_directory
+                .join("secrets/openid4vc-data-encryption-key");
+            require_real_regular_file(
+                &openid4vc_data_encryption_key,
+                "conformance OpenID4VC data encryption key",
+            )?;
+            transient_credentials.insert(
+                "openid4vc-data-encryption-key".to_owned(),
+                openid4vc_data_encryption_key,
+            );
+            environment.insert(
+                "NAZOAUTH_OPERATOR_OPENID4VC_DATA_ENCRYPTION_KEY_FILE".to_owned(),
+                "%d/openid4vc-data-encryption-key".to_owned(),
+            );
+        }
+        if let Some(path) = conformance_output_directory {
+            read_write_paths.push(path.to_path_buf());
+            environment.insert(
+                "NAZOAUTH_OPERATOR_OUTPUT_DIRECTORY".to_owned(),
+                path.display().to_string(),
+            );
         }
         Ok(OneShotTask {
             artifact,
@@ -770,7 +964,7 @@ impl<'a> Runtime<'a> {
         let parent = archive
             .parent()
             .context("OCI recovery archive has no parent")?;
-        fs::create_dir_all(parent)?;
+        crate::filesystem::ensure_directory_chain(parent)?;
         let temporary = archive.with_extension("oci-archive.tmp");
         if temporary.exists() {
             fs::remove_file(&temporary)?;
@@ -802,8 +996,10 @@ impl<'a> Runtime<'a> {
         postgres_service_file: &Path,
         postgres_password_file: &Path,
     ) -> anyhow::Result<()> {
-        let backend = self.backend()?;
+        let backend = self.dependency_backend()?;
         let identity = self.managed_dependency_identity();
+        let (manifest_digest, completion_marker_digest) =
+            crate::runtime_backend::oci_backup_digests(backup_directory)?;
         backend.restore_managed_postgres(&ManagedPostgresRestore {
             network: self.config.runtime.network.clone(),
             postgres_object: self.config.postgres.container_name.clone(),
@@ -812,6 +1008,8 @@ impl<'a> Runtime<'a> {
             service_file: postgres_service_file.to_path_buf(),
             password_file: postgres_password_file.to_path_buf(),
             image: self.config.postgres.validation_image.clone(),
+            manifest_digest: manifest_digest.clone(),
+            completion_marker_digest: completion_marker_digest.clone(),
             identity: identity.clone(),
         })?;
         backend.restore_managed_valkey(&ManagedValkeyRestore {
@@ -820,13 +1018,15 @@ impl<'a> Runtime<'a> {
             data_volume: self.config.valkey.data_volume.clone(),
             backup_directory: backup_directory.to_path_buf(),
             image: self.config.valkey.image.clone(),
+            manifest_digest,
+            completion_marker_digest,
             identity,
         })
     }
 
     pub(crate) fn execute_managed_postgres(&self, sql: &[u8]) -> anyhow::Result<()> {
         let identity = self.managed_dependency_identity();
-        self.backend()?
+        self.dependency_backend()?
             .execute_managed_postgres(&ManagedPostgresCommand {
                 object_reference: self.config.postgres.container_name.clone(),
                 network: self.config.runtime.network.clone(),
@@ -960,6 +1160,48 @@ impl<'a> Runtime<'a> {
             .find(|mount| mount.target == Path::new(target))
             .with_context(|| format!("runtime mount {target} is unavailable"))
     }
+
+    fn required_runtime_secret(&self, name: &str) -> anyhow::Result<std::path::PathBuf> {
+        let path = self
+            .required_mount("/var/lib/nazo_oauth/secrets")?
+            .source
+            .join(name);
+        require_real_regular_file(&path, "conformance runtime secret")?;
+        Ok(path)
+    }
+
+    fn optional_runtime_secret(&self, name: &str) -> anyhow::Result<Option<std::path::PathBuf>> {
+        let path = self
+            .required_mount("/var/lib/nazo_oauth/secrets")?
+            .source
+            .join(name);
+        if real_regular_file_or_missing(&path, "conformance runtime secret")? {
+            Ok(Some(path))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+fn require_real_regular_file(path: &Path, label: &str) -> anyhow::Result<()> {
+    if !real_regular_file_or_missing(path, label)? {
+        bail!("{label} is unavailable: {}", path.display());
+    }
+    Ok(())
+}
+
+fn real_regular_file_or_missing(path: &Path, label: &str) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => bail!(
+            "{label} is not a regular non-symlink file: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to inspect {label} {}", path.display()))
+        }
+    }
 }
 
 fn selected_backend(
@@ -993,6 +1235,7 @@ fn operation_uses_database(operation: &TaskOperation) -> bool {
     matches!(
         operation,
         TaskOperation::MigrateApply
+            | TaskOperation::ConformanceOnboardingApply { .. }
             | TaskOperation::ConformanceLeaseCreate { .. }
             | TaskOperation::ConformanceLeaseList
             | TaskOperation::ConformanceLeaseRevoke { .. }

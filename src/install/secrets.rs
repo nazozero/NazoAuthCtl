@@ -90,7 +90,7 @@ pub(super) fn normalize_profile_secrets(options: &mut InstallOptions) -> anyhow:
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 struct ExternalDependencySecrets {
     database_url: String,
@@ -102,7 +102,7 @@ pub(super) fn read_external_dependency_secrets(
     options: &mut InstallOptions,
     mut source: impl std::io::Read,
 ) -> anyhow::Result<()> {
-    let mut bytes = Vec::new();
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
     source
         .by_ref()
         .take(64 * 1024 + 1)
@@ -112,9 +112,12 @@ pub(super) fn read_external_dependency_secrets(
     }
     let secrets: ExternalDependencySecrets =
         serde_json::from_slice(&bytes).context("dependency secret input must be strict JSON")?;
-    options.database_url = Some(secrets.database_url);
-    options.migration_database_url = Some(secrets.migration_database_url);
-    options.valkey_url = Some(secrets.valkey_url);
+    // InstallOptions owns the working copies for the duration of the
+    // transaction; the deserialization buffer and temporary input object are
+    // independently wiped on drop.
+    options.database_url = Some(secrets.database_url.clone());
+    options.migration_database_url = Some(secrets.migration_database_url.clone());
+    options.valkey_url = Some(secrets.valkey_url.clone());
     Ok(())
 }
 
@@ -196,14 +199,9 @@ pub(super) fn select_runtime(
     if options.database_url.is_some() {
         return Ok((runtime, None));
     }
-    let dependency_backend = if runtime_backend::backend(RuntimeBackendKind::Podman).available() {
-        RuntimeBackendKind::Podman
-    } else if runtime_backend::backend(RuntimeBackendKind::Docker).available() {
-        RuntimeBackendKind::Docker
-    } else {
-        bail!("host runtime requires Podman or Docker for managed dependencies");
-    };
-    Ok((runtime, Some(dependency_backend)))
+    bail!(
+        "host runtime requires explicit external PostgreSQL and Valkey URLs; managed container dependencies are not network-reachable from the systemd service"
+    )
 }
 
 pub(super) fn write_external_urls(
@@ -245,39 +243,151 @@ pub(super) fn write_managed_secrets(
     postgres_container: &str,
     valkey_container: &str,
 ) -> anyhow::Result<String> {
+    ensure_managed_secrets(secrets, postgres_container, valkey_container)?;
+    Ok("managed".to_owned())
+}
+
+pub(crate) fn reconcile_managed_secrets(config: &UpdateConfig) -> anyhow::Result<bool> {
+    if config.dependencies.mode != "managed" {
+        return Ok(false);
+    }
+    let secrets = config
+        .dependencies
+        .database_url_file
+        .parent()
+        .context("managed database URL has no secret directory")?;
+    for (configured, name) in [
+        (&config.dependencies.database_url_file, "database-url"),
+        (
+            &config.dependencies.migration_database_url_file,
+            "database-migration-url",
+        ),
+        (&config.dependencies.valkey_url_file, "valkey-url"),
+    ] {
+        if configured != &secrets.join(name) {
+            bail!("managed dependency secret paths do not share the installation secret root");
+        }
+    }
+    ensure_managed_secrets(
+        secrets,
+        &config.postgres.container_name,
+        &config.valkey.container_name,
+    )
+}
+
+fn ensure_managed_secrets(
+    secrets: &Path,
+    postgres_container: &str,
+    valkey_container: &str,
+) -> anyhow::Result<bool> {
     let dependencies = secrets.join("dependencies");
     create_directory(&dependencies, 0o700)?;
-    let postgres = generate_secret(&dependencies.join("postgres-password"))?;
-    let runtime_postgres = generate_secret(&dependencies.join("postgres-runtime-password"))?;
-    let valkey = generate_secret(&dependencies.join("valkey-password"))?;
+    let postgres_path = dependencies.join("postgres-password");
+    let runtime_postgres_path = dependencies.join("postgres-runtime-password");
+    let valkey_path = dependencies.join("valkey-password");
+    let valkey_backup_path = dependencies.join("valkey-backup-password");
+    let mut changed = [
+        &postgres_path,
+        &runtime_postgres_path,
+        &valkey_path,
+        &valkey_backup_path,
+    ]
+    .into_iter()
+    .try_fold(false, |changed, path| {
+        Ok::<_, anyhow::Error>(changed | managed_material_is_missing(path)?)
+    })?;
+    let postgres = generate_secret(&postgres_path)?;
+    let runtime_postgres = generate_secret(&runtime_postgres_path)?;
+    let valkey = generate_secret(&valkey_path)?;
+    let valkey_backup = generate_secret(&valkey_backup_path)?;
     // Dependency containers use fixed internal UIDs unrelated to host groups.
     // The dependency-only parent remains root-owned 0700, and these bind mounts
     // are read-only in their containers, so runtime users cannot traverse to them.
-    set_mode(&dependencies.join("postgres-password"), 0o444)?;
-    set_mode(&dependencies.join("valkey-password"), 0o444)?;
-    atomic_write(
+    set_mode(&postgres_path, 0o444)?;
+    set_mode(&valkey_path, 0o444)?;
+    set_mode(&valkey_backup_path, 0o400)?;
+    changed |= write_managed_material(
         &secrets.join("database-url"),
-        format!("postgresql://nazoauth_runtime:{runtime_postgres}@{postgres_container}:5432/oauth")
-            .as_bytes(),
+        format!(
+            "postgresql://nazoauth_runtime:{}@{postgres_container}:5432/oauth",
+            runtime_postgres.as_str()
+        )
+        .as_bytes(),
         0o440,
     )?;
-    atomic_write(
+    changed |= write_managed_material(
         &secrets.join("database-migration-url"),
-        format!("postgresql://nazoauth_migrator:{postgres}@{postgres_container}:5432/oauth")
-            .as_bytes(),
+        format!(
+            "postgresql://nazoauth_migrator:{}@{postgres_container}:5432/oauth",
+            postgres.as_str()
+        )
+        .as_bytes(),
         0o440,
     )?;
-    atomic_write(
+    changed |= write_managed_material(
         &secrets.join("valkey-url"),
-        format!("redis://default:{valkey}@{valkey_container}:6379/0").as_bytes(),
+        format!(
+            "redis://{}:{}@{valkey_container}:6379/0",
+            runtime_backend::MANAGED_VALKEY_RUNTIME_USER,
+            valkey.as_str()
+        )
+        .as_bytes(),
         0o440,
     )?;
-    atomic_write(
+    changed |= write_managed_material(
         &dependencies.join("valkey.acl"),
-        format!("user default on >{valkey} ~* &* +@all\n").as_bytes(),
+        format!(
+            concat!(
+                "user default off\n",
+                "user {} on >{} ~* ",
+                "+get +mget +getdel +set +setnx +del +exists ",
+                "+expire +expireat +expiretime +pexpireat +pexpiretime +ttl ",
+                "+incr +zadd +zrangebyscore +zrem +time +eval ",
+                "+ping +hello +select +client|setname +client|setinfo\n",
+                "user {} on >{} ~* +ping +lastsave +bgsave\n"
+            ),
+            runtime_backend::MANAGED_VALKEY_RUNTIME_USER,
+            valkey.as_str(),
+            runtime_backend::MANAGED_VALKEY_BACKUP_USER,
+            valkey_backup.as_str()
+        )
+        .as_bytes(),
         0o444,
     )?;
-    Ok("managed".to_owned())
+    Ok(changed)
+}
+
+fn managed_material_is_missing(path: &Path) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect managed material {}", path.display())),
+    }
+}
+
+fn write_managed_material(path: &Path, value: &[u8], mode: u32) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let existing = crate::filesystem::read_secure_regular_file(
+                path,
+                "persisted managed material",
+                false,
+                64 * 1024,
+            )?;
+            if existing.as_slice() == value {
+                set_mode(path, mode)?;
+                return Ok(false);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect managed material {}", path.display()));
+        }
+    }
+    atomic_write(path, value, mode)?;
+    Ok(true)
 }
 
 pub(super) fn mfa_totp_key_path(config_dir: &Path) -> PathBuf {
@@ -486,10 +596,10 @@ pub(super) fn ensure_mfa_totp_key(path: &Path) -> anyhow::Result<()> {
                     path.display()
                 );
             }
-            let value = fs::read_to_string(path).with_context(|| {
-                format!("failed to read MFA TOTP encryption key {}", path.display())
-            })?;
-            validate_mfa_totp_key(&value)?;
+            let bytes = read_secure_secret_file(path, "MFA TOTP encryption key", 4 * 1024)?;
+            let value = std::str::from_utf8(&bytes)
+                .context("MFA TOTP encryption key is not valid UTF-8")?;
+            validate_mfa_totp_key(value)?;
             set_mode(path, 0o440)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -516,7 +626,9 @@ pub(super) fn validate_mfa_totp_key(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn read_existing_server_config(target: &Path) -> anyhow::Result<Option<String>> {
+pub(super) fn read_existing_server_config(
+    target: &Path,
+) -> anyhow::Result<Option<zeroize::Zeroizing<String>>> {
     let metadata = match fs::symlink_metadata(target) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -528,14 +640,14 @@ pub(super) fn read_existing_server_config(target: &Path) -> anyhow::Result<Optio
             target.display()
         );
     }
-    fs::read_to_string(target)
-        .with_context(|| {
-            format!(
-                "failed to read existing server configuration {}",
-                target.display()
-            )
-        })
-        .map(Some)
+    let bytes = read_secure_secret_file(target, "existing server configuration", 1024 * 1024)?;
+    let value = String::from_utf8(bytes.to_vec()).with_context(|| {
+        format!(
+            "existing server configuration is not valid UTF-8: {}",
+            target.display()
+        )
+    })?;
+    Ok(Some(zeroize::Zeroizing::new(value)))
 }
 
 pub(super) fn config_key_present(content: &str, key: &str) -> anyhow::Result<bool> {
@@ -584,13 +696,19 @@ pub(super) fn write_server_config(
     runtime: RuntimeBackendKind,
     data_root: &Path,
     trusted_proxy_cidr: Option<&str>,
-    profile: Option<&str>,
+    profile_config: Option<&str>,
 ) -> anyhow::Result<()> {
-    let target = config_dir.join(".env.yaml");
-    if read_existing_server_config(&target)?.is_some() {
-        return Ok(());
+    let standards_full = options.profile == "standards-full";
+    if standards_full != profile_config.is_some() {
+        bail!("server profile selection does not match the validated install profile");
     }
-    ensure_mfa_totp_key(&mfa_totp_key_path(config_dir))?;
+    if standards_full {
+        normalize_single_host_cidr(
+            trusted_proxy_cidr.context("standards-full requires an explicit trusted proxy CIDR")?,
+        )?;
+    } else if trusted_proxy_cidr.is_some() {
+        bail!("server profile and trusted proxy settings are inconsistent");
+    }
     let (bind, data_dir, ui_dir, dependency_files) = if runtime == RuntimeBackendKind::Systemd {
         (
             format!("127.0.0.1:{}", options.port),
@@ -620,6 +738,25 @@ pub(super) fn write_server_config(
     } else {
         "/var/lib/nazo_oauth".to_owned()
     };
+    let rendered_profile = profile_config
+        .unwrap_or_default()
+        .replace(
+            "${TRUSTED_PROXY_CIDR}",
+            trusted_proxy_cidr.unwrap_or_default(),
+        )
+        .replace("${PROFILE_SECRET_ROOT}", &profile_secret_root)
+        .replace("${PROFILE_APP_ROOT}", &profile_app_root);
+    let target = config_dir.join(".env.yaml");
+    if let Some(existing) = read_existing_server_config(&target)? {
+        validate_existing_server_config(
+            &existing,
+            options,
+            trusted_proxy_cidr,
+            profile_config.map(|_| rendered_profile.as_str()),
+        )?;
+        return Ok(());
+    }
+    ensure_mfa_totp_key(&mfa_totp_key_path(config_dir))?;
     let content = format!(
         "# Generated by nazoauthctl install. Explicit operator overrides are preserved.\n\
          BIND: \"{bind}\"\n\
@@ -632,17 +769,128 @@ pub(super) fn write_server_config(
          UI_CACHE_DIR: \"{ui_dir}\"\n\
          RUST_LOG: \"info\"\n\
          {dependency_files}{profile}",
-        public_url = options.public_url,
+        public_url = options.public_url.trim_end_matches('/'),
         mfa_key_file = mfa_totp_config_path(runtime, config_dir),
         mfa_key_id = MFA_TOTP_KEY_ID,
-        profile = profile
-            .unwrap_or_default()
-            .replace(
-                "${TRUSTED_PROXY_CIDR}",
-                trusted_proxy_cidr.unwrap_or_default(),
-            )
-            .replace("${PROFILE_SECRET_ROOT}", &profile_secret_root,)
-            .replace("${PROFILE_APP_ROOT}", &profile_app_root),
+        profile = rendered_profile,
     );
     atomic_write(&target, content.as_bytes(), 0o640)
+}
+
+pub(super) fn validate_existing_server_config(
+    content: &str,
+    options: &InstallOptions,
+    trusted_proxy_cidr: Option<&str>,
+    expected_profile_config: Option<&str>,
+) -> anyhow::Result<()> {
+    let expected_public_url =
+        normalize_public_url_for_profile(&options.public_url, &options.profile)?;
+    let configured_public_url = config_key_value(content, "PUBLIC_BASE_URL")?
+        .context("existing server configuration has no PUBLIC_BASE_URL")?;
+    let normalized_public_url =
+        normalize_public_url_for_profile(&configured_public_url, &options.profile)?;
+    if configured_public_url != normalized_public_url
+        || normalized_public_url != expected_public_url
+    {
+        bail!("existing PUBLIC_BASE_URL does not match the requested issuer origin");
+    }
+
+    if let Some(configured_issuer) = config_key_value(content, "ISSUER")? {
+        let normalized_issuer =
+            normalize_public_url_for_profile(&configured_issuer, &options.profile)?;
+        if configured_issuer != normalized_issuer || normalized_issuer != expected_public_url {
+            bail!("existing ISSUER does not match the requested issuer origin");
+        }
+    }
+
+    if options.profile == "standards-full" {
+        let expected_profile_config = expected_profile_config.context(
+            "standards-full existing configuration validation requires profile material",
+        )?;
+        for key in [
+            "ENABLE_AUTHORIZATION_DETAILS",
+            "ENABLE_NATIVE_SSO",
+            "ENABLE_OPENID4VCI_ISSUER",
+            "ENABLE_OPENID4VP_VERIFIER",
+            "MTLS_ENDPOINT_BASE_URL",
+            "TRUSTED_PROXY_CIDRS",
+            "MTLS_CERTIFICATE_SOURCE",
+            "DYNAMIC_CLIENT_REGISTRATION_INITIAL_ACCESS_TOKEN_FILE",
+            "OPENID4VC_DATA_ENCRYPTION_KEY_FILE",
+            "OPENID4VCI_ISSUER_MANAGEMENT_TOKEN_FILE",
+            "OPENID4VP_VERIFIER_MANAGEMENT_TOKEN_FILE",
+            "OPENID4VC_SIGNING_CERTIFICATE_CHAIN_FILE",
+            "OPENID4VC_TRUST_ANCHORS_FILE",
+            "OPENID4VC_REVOCATION_POLICY",
+            "OPENID4VC_REVOCATION_SNAPSHOT_FILE",
+            "OPENID4VC_CLIENT_ATTESTATION_ISSUER",
+            "OPENID4VC_CLIENT_ATTESTATION_JWKS_JSON",
+            "OPENID4VC_KEY_ATTESTATION_JWKS_JSON",
+            "OPENID4VCI_CREDENTIAL_CONFIGURATIONS_JSON",
+            "OPENID4VP_WALLET_AUTHORIZATION_ORIGINS",
+            "CIBA_NOTIFICATION_PRIVATE_ORIGINS",
+            "BACKCHANNEL_LOGOUT_PRIVATE_ORIGINS",
+        ] {
+            let expected = config_key_value(expected_profile_config, key)?;
+            let configured = config_key_value(content, key)?;
+            if configured != expected {
+                bail!(
+                    "existing standards-full configuration does not match requested profile material for {key}"
+                );
+            }
+        }
+        let configured_mtls_endpoint = config_key_value(content, "MTLS_ENDPOINT_BASE_URL")?
+            .context(
+                "standards-full existing server configuration has no MTLS_ENDPOINT_BASE_URL",
+            )?;
+        let normalized_mtls_endpoint =
+            normalize_public_url_for_profile(&configured_mtls_endpoint, &options.profile)?;
+        if configured_mtls_endpoint != normalized_mtls_endpoint
+            || normalized_mtls_endpoint != expected_public_url
+        {
+            bail!("existing MTLS_ENDPOINT_BASE_URL does not match the requested issuer origin");
+        }
+
+        let configured_source = config_key_value(content, "MTLS_CERTIFICATE_SOURCE")?.context(
+            "standards-full existing server configuration has no MTLS_CERTIFICATE_SOURCE",
+        )?;
+        if configured_source != "rfc9440" {
+            bail!("standards-full requires MTLS_CERTIFICATE_SOURCE=rfc9440");
+        }
+
+        let configured_cidr = config_key_value(content, "TRUSTED_PROXY_CIDRS")?
+            .context("standards-full existing server configuration has no TRUSTED_PROXY_CIDRS")?;
+        let configured_cidr = normalize_single_host_cidr(&configured_cidr)?;
+        let expected_cidr = trusted_proxy_cidr
+            .context("standards-full requires an explicit trusted proxy CIDR")
+            .and_then(normalize_single_host_cidr)?;
+        if configured_cidr != expected_cidr {
+            bail!("existing TRUSTED_PROXY_CIDRS does not match the requested proxy boundary");
+        }
+
+        for key in ["ENABLE_OPENID4VCI_ISSUER", "ENABLE_OPENID4VP_VERIFIER"] {
+            if config_key_value(content, key)?.as_deref() != Some("true") {
+                bail!("standards-full existing server configuration must enable {key}");
+            }
+        }
+    } else {
+        if expected_profile_config.is_some() {
+            bail!("baseline existing configuration validation received profile material");
+        }
+        if trusted_proxy_cidr.is_some() {
+            bail!("server profile and trusted proxy settings are inconsistent");
+        }
+        for key in [
+            "MTLS_ENDPOINT_BASE_URL",
+            "MTLS_CERTIFICATE_SOURCE",
+            "TRUSTED_PROXY_CIDRS",
+            "ENABLE_OPENID4VCI_ISSUER",
+            "ENABLE_OPENID4VP_VERIFIER",
+        ] {
+            if config_key_value(content, key)?.is_some() {
+                bail!("baseline existing server configuration contains standards-full key {key}");
+            }
+        }
+    }
+    Ok(())
 }

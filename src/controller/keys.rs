@@ -6,16 +6,8 @@ pub(super) fn export_openid4vc_trust(config: &UpdateConfig, output: &Path) -> an
     }
     safe_export_destination(output)?;
     let bundle = managed_openid4vc_bundle_path(config)?;
-    let metadata = fs::symlink_metadata(&bundle).with_context(|| {
-        format!(
-            "failed to inspect managed OpenID4VC bundle {}",
-            bundle.display()
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("managed OpenID4VC certificate bundle must be a regular non-symlink file");
-    }
-    let anchors = extract_openid4vc_trust_anchors(&fs::read(&bundle)?)?;
+    let bundle_bytes = read_managed_openid4vc_bundle(config, &bundle)?;
+    let anchors = extract_openid4vc_trust_anchors(&bundle_bytes)?;
     let release = load_active_release(config)?;
     crate::operator::append_management_event(
         config,
@@ -34,7 +26,7 @@ pub(super) fn export_openid4vc_trust(config: &UpdateConfig, output: &Path) -> an
     Ok(())
 }
 
-pub(super) fn managed_openid4vc_bundle_path(config: &UpdateConfig) -> anyhow::Result<PathBuf> {
+pub(crate) fn managed_openid4vc_bundle_path(config: &UpdateConfig) -> anyhow::Result<PathBuf> {
     let key_directories = if config.runtime.backend == RuntimeBackendKind::Systemd {
         config
             .runtime
@@ -68,6 +60,32 @@ pub(super) fn managed_openid4vc_bundle_path(config: &UpdateConfig) -> anyhow::Re
     Ok(keys.join(OPENID4VC_CERTIFICATE_BUNDLE))
 }
 
+pub(crate) fn read_managed_openid4vc_bundle(
+    config: &UpdateConfig,
+    bundle: &Path,
+) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+    #[cfg(unix)]
+    {
+        crate::filesystem::read_secure_regular_file_for_uid(
+            bundle,
+            "managed OpenID4VC certificate bundle",
+            false,
+            MAX_OPENID4VC_CERTIFICATE_BUNDLE_BYTES as u64,
+            crate::runtime::runtime_service_owner_uid(config)?,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config;
+        crate::filesystem::read_secure_regular_file(
+            bundle,
+            "managed OpenID4VC certificate bundle",
+            false,
+            MAX_OPENID4VC_CERTIFICATE_BUNDLE_BYTES as u64,
+        )
+    }
+}
+
 pub(super) fn safe_export_destination(output: &Path) -> anyhow::Result<()> {
     crate::model::safe_absolute(output)?;
     let parent = output
@@ -96,7 +114,7 @@ pub(super) fn safe_export_destination(output: &Path) -> anyhow::Result<()> {
     }
 }
 
-pub(super) fn extract_openid4vc_trust_anchors(bundle: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn extract_openid4vc_trust_anchors(bundle: &[u8]) -> anyhow::Result<Vec<u8>> {
     let certificates = parse_managed_openid4vc_bundle(bundle)?;
     let mut output = Vec::new();
     append_pem_certificate(&mut output, &certificates[1]);
@@ -115,12 +133,8 @@ pub(super) fn bootstrap_openid4vc_revocation_snapshot(config: &UpdateConfig) -> 
         Err(error) => return Err(error).context("failed to inspect OpenID4VC revocation snapshot"),
     }
 
-    let bundle_metadata = fs::symlink_metadata(&bundle)
-        .context("failed to inspect managed OpenID4VC certificate bundle")?;
-    if bundle_metadata.file_type().is_symlink() || !bundle_metadata.is_file() {
-        bail!("managed OpenID4VC certificate bundle must be a regular non-symlink file");
-    }
-    let certificates = parse_managed_openid4vc_bundle(&fs::read(&bundle)?)?;
+    let bundle_bytes = read_managed_openid4vc_bundle(config, &bundle)?;
+    let certificates = parse_managed_openid4vc_bundle(&bundle_bytes)?;
     let issuer = config.runtime.expected_issuer.trim_end_matches('/');
     let now = Utc::now();
     let entries = certificates

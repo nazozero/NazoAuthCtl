@@ -113,7 +113,6 @@ pub(super) fn health_ready(config: &UpdateConfig) -> bool {
             "--fail",
             "--silent",
             "--show-error",
-            "--location",
             "--proto",
             "=http,https",
             "--max-time",
@@ -123,20 +122,43 @@ pub(super) fn health_ready(config: &UpdateConfig) -> bool {
         .succeeds()
 }
 
+pub(super) fn retry_runtime_transport<T>(
+    attempts: u32,
+    interval: Duration,
+    mut operation: impl FnMut() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut last_error = None;
+    for attempt in 0..attempts.max(1) {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < attempts.max(1) {
+            thread::sleep(interval);
+        }
+    }
+    Err(last_error.expect("at least one runtime transport attempt is made"))
+}
+
 pub(super) fn verify_public(config: &UpdateConfig) -> anyhow::Result<()> {
-    let response = Process::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--proto",
-            "=https,http",
-            "--max-time",
-            "10",
-            config.runtime.public_discovery_url.as_str(),
-        ])
-        .stdout()?;
+    let response = retry_runtime_transport(
+        config.runtime.readiness_attempts,
+        Duration::from_secs(config.runtime.readiness_interval_seconds),
+        || {
+            Process::new("curl")
+                .args([
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--proto",
+                    "=http,https",
+                    "--max-time",
+                    "10",
+                    config.runtime.public_discovery_url.as_str(),
+                ])
+                .stdout()
+        },
+    )?;
     let value: serde_json::Value =
         serde_json::from_str(&response).context("Discovery response is not valid JSON")?;
     if value.get("issuer").and_then(serde_json::Value::as_str)
@@ -157,19 +179,21 @@ pub(super) fn signed_ui_index(
         .ui
         .releases_root
         .join(&release.frontend.artifact.sha256);
-    if !frontend_cache_matches(&cache, release) {
+    if !frontend_cache_matches(config, &cache, release) {
         bail!("runtime frontend cache does not match the signed Release descriptor");
     }
     let index = cache.join("index.html");
-    let metadata = fs::metadata(&index)?;
-    if metadata.len() == 0 || metadata.len() > MAX_UI_INDEX_BYTES {
+    let content = crate::runtime::read_runtime_owned_regular_file(
+        config,
+        &index,
+        "signed frontend index",
+        false,
+        MAX_UI_INDEX_BYTES,
+    )?;
+    if content.is_empty() {
         bail!("runtime frontend index is empty or exceeds the verification boundary");
     }
-    let content = fs::read(index)?;
-    if content.len() as u64 != metadata.len() {
-        bail!("runtime frontend index changed during verification");
-    }
-    Ok(content)
+    Ok(content.to_vec())
 }
 
 pub(super) fn verify_ui_binding(
@@ -190,28 +214,30 @@ pub(super) fn verify_ui(config: &UpdateConfig, release: &ReleaseManifest) -> any
         "{}/ui/",
         config.runtime.expected_issuer.trim_end_matches('/')
     );
-    let output = Process::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--proto",
-            "=https,http",
-            "--proto-redir",
-            "=https",
-            "--max-redirs",
-            "5",
-            "--max-time",
-            "10",
-        ])
-        .arg("--max-filesize")
-        .arg(expected.len().to_string())
-        .arg(&url)
-        .output()?;
-    if !output.status.success() {
-        bail!("public frontend verification request failed");
-    }
+    let output = retry_runtime_transport(
+        config.runtime.readiness_attempts,
+        Duration::from_secs(config.runtime.readiness_interval_seconds),
+        || {
+            let output = Process::new("curl")
+                .args([
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--proto",
+                    "=http,https",
+                    "--max-time",
+                    "10",
+                ])
+                .arg("--max-filesize")
+                .arg(expected.len().to_string())
+                .arg(&url)
+                .output()?;
+            if !output.status.success() {
+                bail!("public frontend verification request failed");
+            }
+            Ok(output)
+        },
+    )?;
     verify_ui_binding(config, release, &output.stdout)
 }
 
@@ -224,23 +250,45 @@ pub(super) fn install_host_candidate(
         .runtime
         .binary_releases
         .join(&release.manifest.backend_commit);
-    fs::create_dir_all(&directory)?;
+    crate::filesystem::ensure_directory_chain(&directory)?;
     set_mode(&directory, 0o755)?;
     let target = directory.join("nazoauth");
-    if target.exists() {
-        if crate::filesystem::sha256(&target)? != crate::filesystem::sha256(binary)? {
-            bail!("existing host binary differs from the signed artifact");
+    let mut source =
+        crate::filesystem::open_secure_regular_file(binary, "signed host binary artifact", false)?;
+    let source_sha256 = crate::filesystem::sha256_file(&mut source, "signed host binary artifact")?;
+    match fs::symlink_metadata(&target) {
+        Ok(_) => {
+            let mut existing = crate::filesystem::open_secure_regular_file(
+                &target,
+                "installed host binary",
+                false,
+            )?;
+            if crate::filesystem::sha256_file(&mut existing, "installed host binary")?
+                != source_sha256
+            {
+                bail!("existing host binary differs from the signed artifact");
+            }
         }
-    } else {
-        copy_atomic(binary, &target, 0o755)?;
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::filesystem::copy_atomic_from_file(&mut source, &target, 0o755)?;
+        }
+        Err(error) => return Err(error).context("failed to inspect installed host binary"),
+    }
+    let mut activated =
+        crate::filesystem::open_secure_regular_file(&target, "activated host binary", false)?;
+    if crate::filesystem::sha256_file(&mut activated, "activated host binary")? != source_sha256 {
+        bail!("activated host binary differs from the signed artifact");
     }
     let binary_parent = config
         .runtime
         .binary_path
         .parent()
         .context("host binary path has no parent")?;
-    fs::create_dir_all(binary_parent)?;
+    crate::filesystem::ensure_directory_chain(binary_parent)?;
     set_mode(binary_parent, 0o755)?;
+    // The releases directory is controller-owned and non-writable to the
+    // service account. The descriptor hash above binds the exact file that
+    // was installed before this bounded smoke execution.
     Process::new(&target).arg("--help").run_quiet()?;
     Ok(target)
 }
@@ -251,7 +299,7 @@ pub(super) fn write_record(
     status: &str,
     backup: Option<&Path>,
 ) -> anyhow::Result<()> {
-    fs::create_dir_all(&config.deployment_root)?;
+    crate::filesystem::ensure_directory_chain(&config.deployment_root)?;
     let stamp = Utc::now().format("%Y%m%dT%H%M%S%.6fZ");
     let value = json!({
         "status": status,
@@ -279,7 +327,7 @@ pub(super) fn write_update_record(
     status: &str,
     backup: Option<&Path>,
 ) -> anyhow::Result<()> {
-    fs::create_dir_all(&config.deployment_root)?;
+    crate::filesystem::ensure_directory_chain(&config.deployment_root)?;
     let value = json!({
         "status": status,
         "transaction_id": journal.transaction_id,

@@ -28,9 +28,7 @@ use crate::{
         BootstrapAdminOptions, CandidateTarget, Cli, Command, ConformanceLeaseCommand, KeysCommand,
         UpdateOptions,
     },
-    filesystem::{
-        atomic_write, copy_atomic, open_lock_file, remove_file_durable, set_mode, symlink_atomic,
-    },
+    filesystem::{atomic_write, open_lock_file, remove_file_durable, set_mode, symlink_atomic},
     install::{self, PreparedInstall},
     model::{ReleaseManifest, UpdateConfig},
     operator::{self, ExpectedReleaseTarget},
@@ -44,6 +42,9 @@ mod commands;
 mod deployment;
 mod diagnostics;
 mod keys;
+pub(crate) use keys::{
+    extract_openid4vc_trust_anchors, managed_openid4vc_bundle_path, read_managed_openid4vc_bundle,
+};
 mod self_update;
 mod updates;
 use bootstrap::*;
@@ -55,11 +56,71 @@ use keys::*;
 use self_update::*;
 use updates::*;
 
-struct ControlConfig {
+pub(crate) struct ControlConfig {
     path: PathBuf,
-    config: UpdateConfig,
+    pub(crate) config: UpdateConfig,
+    /// The declaration selected at the same boundary as the configuration.
+    ///
+    /// Registered commands must use this snapshot instead of resolving the
+    /// selector a second time after acquiring capability/deployment locks.  A
+    /// legacy, unregistered configuration has no declaration and therefore
+    /// keeps this field as `None`.
+    record: Option<DeploymentRecord>,
+    _legacy_lock: Option<File>,
     _deployment_lock: Option<FileLock>,
     _shared_capability_locks: Vec<FileLock>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DeploymentLockMode {
+    Exclusive,
+    Shared,
+}
+
+pub(crate) fn conformance_control_context(
+    config_path: &Path,
+    selector: Option<&str>,
+) -> anyhow::Result<(ControlConfig, String, ExpectedReleaseTarget)> {
+    require_root()?;
+    let context = control_config_with_lock_mode(
+        config_path,
+        selector,
+        &[Capability::OperatorTasks],
+        true,
+        false,
+        false,
+        DeploymentLockMode::Shared,
+    )?;
+    let runtime = Runtime::new(&context.config);
+    let target = if context.config.runtime.backend == RuntimeBackendKind::Systemd {
+        context
+            .config
+            .runtime
+            .binary_path
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        runtime.active_image()?
+    };
+    let expected = if let Some(record) = context.record.as_ref()
+        && record.active_release.build_id.starts_with("local:")
+    {
+        commands::validate_local_development_identity(&record.active_release)?;
+        let active = runtime.active_build_target()?;
+        if active.embedded != record.active_release {
+            bail!("active local development identity differs from the deployment declaration");
+        }
+        operator::expected_release_target(
+            &context.config,
+            active.embedded,
+            active.image_digest,
+            active.binary_digest,
+        )?
+    } else {
+        let release = load_active_release(&context.config)?;
+        expected_target(&context.config, &release)?
+    };
+    Ok((context, target, expected))
 }
 
 fn control_config(
@@ -70,8 +131,32 @@ fn control_config(
     core_recovery: bool,
     unsettled: bool,
 ) -> anyhow::Result<ControlConfig> {
+    control_config_with_lock_mode(
+        config_path,
+        selector,
+        capabilities,
+        application_task,
+        core_recovery,
+        unsettled,
+        DeploymentLockMode::Exclusive,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn control_config_with_lock_mode(
+    config_path: &Path,
+    selector: Option<&str>,
+    capabilities: &[Capability],
+    application_task: bool,
+    core_recovery: bool,
+    unsettled: bool,
+    lock_mode: DeploymentLockMode,
+) -> anyhow::Result<ControlConfig> {
     let store = DeploymentStore::system();
-    if !store.registry_path().exists() {
+    if !store.registry_present()? {
+        let legacy_lock = (lock_mode == DeploymentLockMode::Shared)
+            .then(deployment::acquire_conformance_shared_lock)
+            .transpose()?;
         let config = if unsettled {
             load_config_unsettled(config_path)?
         } else {
@@ -80,6 +165,8 @@ fn control_config(
         return Ok(ControlConfig {
             path: config_path.to_path_buf(),
             config,
+            record: None,
+            _legacy_lock: legacy_lock,
             _deployment_lock: None,
             _shared_capability_locks: Vec::new(),
         });
@@ -87,12 +174,75 @@ fn control_config(
 
     let destructive = !capabilities.is_empty() || core_recovery;
     let resolved = store.resolve(selector, destructive)?;
-    let deployment_lock = destructive
-        .then(|| store.deployment_lock(&resolved.deployment_id))
-        .transpose()?;
-    let record = store.load(&resolved.deployment_id)?;
+    let deployment_lock = if destructive {
+        Some(match lock_mode {
+            DeploymentLockMode::Exclusive => store.deployment_lock(&resolved.deployment_id)?,
+            DeploymentLockMode::Shared => store.deployment_shared_lock(&resolved.deployment_id)?,
+        })
+    } else {
+        None
+    };
+    let mut record = store.load(&resolved.deployment_id)?;
+    let rotation_journal = store.identity_rotation_journal_path(&record.deployment_id);
+    let rotation_pending = match fs::symlink_metadata(&rotation_journal) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => true,
+        Ok(_) => {
+            bail!(
+                "identity rotation journal is not a regular non-symlink file: {}",
+                rotation_journal.display()
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect identity rotation journal {}",
+                    rotation_journal.display()
+                )
+            });
+        }
+    };
+    if destructive && rotation_pending && lock_mode == DeploymentLockMode::Shared {
+        bail!(
+            "deployment {} has a pending identity rotation; recover it before conformance",
+            record.deployment_id
+        );
+    }
+    if destructive && rotation_pending {
+        // A registered identity transition owns the declaration/config
+        // boundary.  Resume it while the same deployment lock is held before
+        // validating the controller binding; otherwise a crash between CAS
+        // and active-config commit would make every next command unable to
+        // reach its own recovery path.
+        let recovery_path = match record.resources.get("controller_config") {
+            Some(SafeReference::File { path }) => path,
+            _ => config_path,
+        };
+        crate::operator::recover_registered_rotation_locked(&store, recovery_path, &record)?;
+        record = store.load(&resolved.deployment_id)?;
+    }
+    if destructive
+        && lock_mode == DeploymentLockMode::Shared
+        && crate::governance::management_audit_intent_pending(&store, &record.deployment_id)?
+    {
+        bail!(
+            "deployment {} has a pending management audit intent; recover it before conformance",
+            record.deployment_id
+        );
+    }
+    if destructive && lock_mode == DeploymentLockMode::Exclusive {
+        crate::governance::recover_pending_management_audit_intent_locked(&store, &record)?;
+        record = store.load(&resolved.deployment_id)?;
+    }
     let shared_capability_locks = if destructive {
-        store.shared_capability_locks(&record, capabilities)?
+        match lock_mode {
+            DeploymentLockMode::Exclusive => {
+                store.shared_capability_locks(&record, capabilities)?
+            }
+            DeploymentLockMode::Shared => {
+                store.shared_capability_shared_locks(&record, capabilities)?
+            }
+        }
     } else {
         Vec::new()
     };
@@ -138,6 +288,8 @@ fn control_config(
     Ok(ControlConfig {
         path,
         config,
+        record: Some(record),
+        _legacy_lock: None,
         _deployment_lock: deployment_lock,
         _shared_capability_locks: shared_capability_locks,
     })
@@ -150,6 +302,23 @@ fn verify_control_binding(record: &DeploymentRecord, config: &UpdateConfig) -> a
         bail!("controller configuration is bound to a different deployment authority");
     }
     Ok(())
+}
+
+/// Load a declaration-bound controller configuration for read-only governance
+/// inspection.  Mutation commands use `control_config`, which additionally
+/// acquires capability/deployment locks; audit presentation calls this helper
+/// only after it has selected and loaded the declaration once.
+pub(crate) fn load_bound_control_config(path: &Path) -> anyhow::Result<UpdateConfig> {
+    load_config(path)
+}
+
+/// Recovery must be able to load the declaration-bound file while an
+/// identity journal intentionally leaves non-active private material pending
+/// retirement.  The caller still validates the deployment/key binding before
+/// any mutation; this helper only skips the settled-state guard that would
+/// otherwise block the recovery itself.
+pub(crate) fn load_bound_control_config_unsettled(path: &Path) -> anyhow::Result<UpdateConfig> {
+    load_config_unsettled(path)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -281,6 +450,7 @@ struct ControllerSelfAuditHead {
 const BOOTSTRAP_MOUNT_TARGET: &str = "/var/lib/nazo_oauth/bootstrap";
 const BOOTSTRAP_TOKEN_FILE: &str = "initial-admin-token";
 const MAX_BOOTSTRAP_CREDENTIAL_BYTES: u64 = 8 * 1024;
+#[cfg(unix)]
 const MAX_BOOTSTRAP_TOKEN_BYTES: u64 = 2 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -1,21 +1,27 @@
+#[cfg(unix)]
+use std::fs::File;
 use std::{
     ffi::{OsStr, OsString},
-    fs::File,
+    fs::OpenOptions,
     io::{Read as _, Write as _},
     path::Path,
     process::{Command, Output, Stdio},
+    sync::mpsc::{self, Receiver, SyncSender},
     thread,
     time::Duration,
 };
 
 use anyhow::{Context, bail};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use wait_timeout::ChildExt as _;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_CAPTURE_BYTES: u64 = 1024 * 1024;
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
-#[derive(Clone, Debug)]
-pub(crate) struct Process {
+#[derive(Clone)]
+pub struct Process {
     program: OsString,
     args: Vec<OsString>,
     environment: Vec<(OsString, OsString)>,
@@ -23,7 +29,7 @@ pub(crate) struct Process {
 }
 
 impl Process {
-    pub(crate) fn new(program: impl Into<OsString>) -> Self {
+    pub fn new(program: impl Into<OsString>) -> Self {
         Self {
             program: program.into(),
             args: Vec::new(),
@@ -32,12 +38,12 @@ impl Process {
         }
     }
 
-    pub(crate) fn arg(mut self, value: impl Into<OsString>) -> Self {
+    pub fn arg(mut self, value: impl Into<OsString>) -> Self {
         self.args.push(value.into());
         self
     }
 
-    pub(crate) fn args<I, S>(mut self, values: I) -> Self
+    pub fn args<I, S>(mut self, values: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
@@ -46,18 +52,20 @@ impl Process {
         self
     }
 
-    pub(crate) fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.environment.push((key.into(), value.into()));
         self
     }
 
-    pub(crate) fn timeout(mut self, timeout: Duration) -> Self {
+    pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
+        #[cfg(unix)]
+        command.process_group(0);
         if !test_environment_passthrough() {
             command.env_clear();
             #[cfg(unix)]
@@ -87,7 +95,7 @@ impl Process {
         command
     }
 
-    pub(crate) fn output(&self) -> anyhow::Result<Output> {
+    pub fn output(&self) -> anyhow::Result<Output> {
         let mut command = self.command();
         command
             .stdin(Stdio::null())
@@ -99,7 +107,7 @@ impl Process {
         self.collect_output(child, None)
     }
 
-    pub(crate) fn run_quiet(&self) -> anyhow::Result<()> {
+    pub fn run_quiet(&self) -> anyhow::Result<()> {
         let output = self.output()?;
         if !output.status.success() {
             bail!(
@@ -111,7 +119,7 @@ impl Process {
         Ok(())
     }
 
-    pub(crate) fn stdout(&self) -> anyhow::Result<String> {
+    pub fn stdout(&self) -> anyhow::Result<String> {
         let output = self.output()?;
         if !output.status.success() {
             bail!(
@@ -124,7 +132,7 @@ impl Process {
             .with_context(|| format!("{} produced non-UTF-8 output", self.display_name()))
     }
 
-    pub(crate) fn stdin_stdout(&self, input: &[u8]) -> anyhow::Result<String> {
+    pub fn stdin_stdout(&self, input: &[u8]) -> anyhow::Result<String> {
         let mut command = self.command();
         command
             .stdin(Stdio::piped())
@@ -148,7 +156,7 @@ impl Process {
     /// Returns only a closed classification.  Diagnostic output is deliberately
     /// consumed in-process and is never propagated to the caller, logs, or
     /// audit chain because it may contain deployment details.
-    pub(crate) fn stdin_authorization_rejected(&self, input: &[u8]) -> anyhow::Result<bool> {
+    pub fn stdin_authorization_rejected(&self, input: &[u8]) -> anyhow::Result<bool> {
         let mut command = self.command();
         command
             .stdin(Stdio::piped())
@@ -168,9 +176,20 @@ impl Process {
             .any(|line| line.trim() == "nazoauth-operator-rejection=authorization"))
     }
 
-    pub(crate) fn stdout_file(&self, path: &Path) -> anyhow::Result<()> {
-        let file = File::create(path)
+    pub fn stdout_file(&self, path: &Path) -> anyhow::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(path)
             .with_context(|| format!("failed to create command output {}", path.display()))?;
+        let durable = file
+            .try_clone()
+            .with_context(|| format!("failed to retain command output {}", path.display()))?;
         let mut command = self.command();
         command
             .stdin(Stdio::null())
@@ -183,10 +202,25 @@ impl Process {
         if !status.success() {
             bail!("{} failed with status {status}", self.display_name());
         }
+        durable
+            .sync_all()
+            .with_context(|| format!("failed to persist command output {}", path.display()))?;
+        #[cfg(unix)]
+        File::open(
+            path.parent()
+                .context("command output has no parent directory")?,
+        )
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| {
+            format!(
+                "failed to persist command output directory for {}",
+                path.display()
+            )
+        })?;
         Ok(())
     }
 
-    pub(crate) fn succeeds(&self) -> bool {
+    pub fn succeeds(&self) -> bool {
         let mut command = self.command();
         command
             .stdin(Stdio::null())
@@ -212,29 +246,26 @@ impl Process {
             .stderr
             .take()
             .context("child stderr was unavailable")?;
-        let stdout_reader = thread::spawn(move || read_bounded(stdout));
-        let stderr_reader = thread::spawn(move || read_bounded(stderr));
+        let (stdout_sender, stdout_receiver) = mpsc::sync_channel(1);
+        let (stderr_sender, stderr_receiver) = mpsc::sync_channel(1);
+        spawn_reader(stdout, stdout_sender);
+        spawn_reader(stderr, stderr_sender);
         if let Some(input) = input {
             let mut stdin = child.stdin.take().context("child stdin was unavailable")?;
             if let Err(error) = stdin.write_all(input) {
-                child.kill().ok();
-                child.wait().ok();
-                stdout_reader.join().ok();
-                stderr_reader.join().ok();
+                terminate_and_reap(&mut child);
+                drain_reader(stdout_receiver);
+                drain_reader(stderr_receiver);
                 return Err(error).context("failed to write bounded child stdin");
             }
         }
         let status = wait_or_kill(&mut child, self.timeout, &self.display_name());
-        let stdout = stdout_reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("child stdout reader failed"))??;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("child stderr reader failed"))??;
+        let stdout = receive_reader(stdout_receiver);
+        let stderr = receive_reader(stderr_receiver);
         Ok(Output {
             status: status?,
-            stdout,
-            stderr,
+            stdout: stdout?,
+            stderr: stderr?,
         })
     }
 
@@ -264,19 +295,88 @@ fn wait_or_kill(
     if let Some(status) = child.wait_timeout(timeout)? {
         return Ok(status);
     }
-    child.kill().ok();
-    child.wait().ok();
+    terminate_and_reap(child);
     bail!(
         "{display_name} timed out after {} seconds",
         timeout.as_secs()
     )
 }
 
+impl std::fmt::Debug for Process {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Process")
+            .field("program", &self.display_name())
+            .field("argument_count", &self.args.len())
+            .field("environment_count", &self.environment.len())
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+fn spawn_reader(
+    reader: impl std::io::Read + Send + 'static,
+    sender: SyncSender<anyhow::Result<Vec<u8>>>,
+) {
+    thread::spawn(move || {
+        let _ = sender.send(read_bounded(reader));
+    });
+}
+
+fn receive_reader(receiver: Receiver<anyhow::Result<Vec<u8>>>) -> anyhow::Result<Vec<u8>> {
+    receiver
+        .recv_timeout(OUTPUT_DRAIN_TIMEOUT)
+        .map_err(|error| anyhow::anyhow!("child output drain exceeded bound: {error}"))?
+}
+
+fn drain_reader(receiver: Receiver<anyhow::Result<Vec<u8>>>) {
+    let _ = receiver.recv_timeout(OUTPUT_DRAIN_TIMEOUT);
+}
+
+fn terminate_and_reap(child: &mut std::process::Child) {
+    let pid = child.id();
+    terminate_process_tree(pid);
+    child.kill().ok();
+    if child
+        .wait_timeout(OUTPUT_DRAIN_TIMEOUT)
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        // The caller must still return on the timeout boundary when the
+        // platform process-tree primitive fails. A second group signal is
+        // best-effort; reader draining remains independently bounded.
+        terminate_process_tree(pid);
+    }
+}
+
+/// Terminate descendants that may still hold stdout/stderr after the direct
+/// child timed out. Unix process_group(0) establishes a fresh process group
+/// before exec; rustix issues the native group signal without unsafe FFI in
+/// this crate. Windows taskkill /T provides the equivalent process-tree
+/// operation without introducing unsafe Job Object bindings.
+fn terminate_process_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = i32::try_from(pid)
+            && let Some(pid) = rustix::process::Pid::from_raw(pid)
+        {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
+}
+
 fn test_environment_passthrough() -> bool {
     cfg!(debug_assertions) && std::env::var_os("NAZOAUTHCTL_TESTING").is_some()
 }
 
-pub(crate) fn command_exists(name: &str) -> bool {
+pub fn command_exists(name: &str) -> bool {
     let candidate = Path::new(name);
     if candidate.components().count() > 1 {
         return candidate.is_file();
@@ -302,5 +402,23 @@ pub(crate) fn command_exists(name: &str) -> bool {
 }
 
 #[cfg(all(test, unix))]
-#[path = "../tests/unit/process.rs"]
+#[path = "../../../tests/unit/process.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod descendant_tests {
+    use super::Process;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn timeout_terminates_descendant_holding_output_pipe() {
+        let started = Instant::now();
+        let error = Process::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .timeout(Duration::from_millis(25))
+            .run_quiet()
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+}

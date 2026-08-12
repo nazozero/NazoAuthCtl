@@ -5,7 +5,9 @@ use std::{
 
 use crate::deployment::{Capability, CapabilityGrants, TrustState};
 use anyhow::{Context, bail};
+pub(crate) use nazoauthctl_runtime::runtime_backend::safe_systemd_path;
 use serde::{Deserialize, Serialize};
+use url::{Host, Url};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -246,6 +248,7 @@ impl UpdateConfig {
         if !matches!(self.install_profile.as_str(), "baseline" | "standards-full") {
             bail!("unsupported install profile {}", self.install_profile);
         }
+        validate_public_runtime_urls(&self.runtime)?;
         let repository_parts = self.repository.split('/').collect::<Vec<_>>();
         if repository_parts.len() != 2 || repository_parts.iter().any(|part| !safe_identifier(part))
         {
@@ -361,6 +364,56 @@ impl UpdateConfig {
     }
 }
 
+fn validate_public_runtime_urls(runtime: &Runtime) -> anyhow::Result<()> {
+    let issuer = parse_public_origin(&runtime.expected_issuer, "expected issuer")?;
+    let discovery = Url::parse(&runtime.public_discovery_url)
+        .context("public Discovery URL must be an absolute URL")?;
+    validate_public_transport(&discovery, "public Discovery URL")?;
+    if !discovery.username().is_empty()
+        || discovery.password().is_some()
+        || discovery.query().is_some()
+        || discovery.fragment().is_some()
+    {
+        bail!("public Discovery URL must not contain credentials, query, or fragment");
+    }
+    if discovery.origin() != issuer.origin()
+        || discovery.path() != "/.well-known/openid-configuration"
+    {
+        bail!("public Discovery URL must be the expected issuer origin's OIDC Discovery endpoint");
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_public_origin(value: &str, label: &str) -> anyhow::Result<Url> {
+    let url = Url::parse(value).with_context(|| format!("{label} must be an absolute URL"))?;
+    validate_public_transport(&url, label)?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        bail!("{label} must be an HTTP(S) origin without credentials, path, query, or fragment");
+    }
+    Ok(url)
+}
+
+fn validate_public_transport(url: &Url, label: &str) -> anyhow::Result<()> {
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+        bail!("{label} must use HTTP(S) and include a host");
+    }
+    if url.scheme() == "http"
+        && !url.host().is_some_and(|host| match host {
+            Host::Domain(host) => host.eq_ignore_ascii_case("localhost"),
+            Host::Ipv4(address) => address.is_loopback(),
+            Host::Ipv6(address) => address.is_loopback(),
+        })
+    {
+        bail!("{label} must use HTTPS outside localhost or loopback");
+    }
+    Ok(())
+}
+
 pub(crate) fn safe_absolute(path: &std::path::Path) -> anyhow::Result<()> {
     if !path.is_absolute()
         || path.parent().is_none()
@@ -375,36 +428,6 @@ pub(crate) fn safe_absolute(path: &std::path::Path) -> anyhow::Result<()> {
             "path must be a normalized absolute non-root path: {}",
             path.display()
         );
-    }
-    Ok(())
-}
-
-pub(crate) fn safe_systemd_path(path: &std::path::Path) -> anyhow::Result<()> {
-    let value = path.to_str().context("systemd path must be valid UTF-8")?;
-    let unix_absolute = value.starts_with('/');
-    if unix_absolute {
-        if value == "/"
-            || value
-                .split('/')
-                .skip(1)
-                .any(|component| component.is_empty() || matches!(component, "." | ".."))
-        {
-            bail!("systemd path must be a normalized absolute non-root path: {value}");
-        }
-    } else {
-        // Model and recovery checks are exercised on non-Unix controller hosts even
-        // though the systemd backend itself is Unix-only. Preserve native absolute
-        // path validation there; the renderer still rejects every character that
-        // can alter a unit directive.
-        safe_absolute(path)?;
-    }
-    if value.chars().any(|character| {
-        character.is_control()
-            || character.is_whitespace()
-            || matches!(character, '%' | '\'' | '"')
-            || (unix_absolute && character == '\\')
-    }) {
-        bail!("systemd path contains unsupported whitespace or quoting: {value}");
     }
     Ok(())
 }

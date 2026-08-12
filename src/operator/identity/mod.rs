@@ -1,7 +1,5 @@
 use super::*;
 
-use std::io::Read as _;
-
 mod adoption;
 mod generation;
 mod recovery;
@@ -34,7 +32,8 @@ pub(super) use rotation::{
     rotate_controller_with_access, verify_rotation_intent,
 };
 pub(crate) use rotation::{
-    report_controller_availability, rotate_controller, verify_retired_controller_probe,
+    recover_registered_rotation_locked, report_controller_availability, rotate_controller,
+    rotate_registered_controller_with_access, verify_retired_controller_probe,
 };
 
 pub(super) fn safe_identity_component(value: &str) -> bool {
@@ -129,10 +128,10 @@ pub(super) fn read_key(path: &Path) -> anyhow::Result<Vec<u8>> {
 }
 
 fn read_private_single_line(path: &Path) -> anyhow::Result<String> {
-    let mut file = crate::filesystem::open_secure_regular_file(path, "operator private key", true)?;
-    let mut value = String::new();
-    file.read_to_string(&mut value)
-        .with_context(|| format!("failed to read operator private key {}", path.display()))?;
+    let bytes =
+        crate::filesystem::read_secure_regular_file(path, "operator private key", true, 256)?;
+    let value = String::from_utf8(bytes.to_vec())
+        .with_context(|| format!("operator private key is not UTF-8: {}", path.display()))?;
     if value.is_empty() || value.contains(['\r', '\n']) {
         bail!("operator private key is invalid: {}", path.display());
     }
@@ -140,8 +139,10 @@ fn read_private_single_line(path: &Path) -> anyhow::Result<String> {
 }
 
 pub(super) fn read_single_line(path: &Path) -> anyhow::Result<String> {
-    let value =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes =
+        crate::filesystem::read_secure_regular_file(path, "operator identity file", false, 256)?;
+    let value = String::from_utf8(bytes.to_vec())
+        .with_context(|| format!("operator identity file is not UTF-8: {}", path.display()))?;
     if value.is_empty() || value.contains(['\r', '\n']) {
         bail!("operator identity file is invalid: {}", path.display());
     }
@@ -165,7 +166,7 @@ pub(super) fn trusted_controller_key(
     read_verifying_key(&directory.join(format!("{key_id}.pub")))
 }
 
-pub(super) fn trusted_audit_key(
+pub(crate) fn trusted_audit_key(
     config: &UpdateConfig,
     key_id: &str,
 ) -> anyhow::Result<VerifyingKey> {

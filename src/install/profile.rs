@@ -27,12 +27,13 @@ pub(super) fn write_install_profile(
         .as_deref()
         .context("standards-full profile material is unavailable")?;
     safe_absolute(source)?;
-    let metadata = fs::symlink_metadata(source)
-        .with_context(|| format!("failed to inspect profile material {}", source.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 256 * 1024 {
-        bail!("profile material must be a regular file no larger than 256 KiB");
-    }
-    let material: StandardsFullProfileMaterial = serde_json::from_slice(&fs::read(source)?)
+    let material_bytes = crate::filesystem::read_secure_regular_file(
+        source,
+        "standards-full profile material",
+        false,
+        256 * 1024,
+    )?;
+    let material: StandardsFullProfileMaterial = serde_json::from_slice(&material_bytes)
         .context("standards-full profile material must be strict JSON")?;
     match (
         &material.client_attestation_issuer,
@@ -103,14 +104,11 @@ pub(super) fn write_install_profile(
         provided.map(|secrets| secrets.openid4vp_management_token.as_str()),
     )?;
     let encryption_key_path = secrets.join("openid4vc-data-encryption-key");
-    if !encryption_key_path.exists() {
-        let value = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
-        atomic_write(&encryption_key_path, value.as_bytes(), 0o440)?;
-    }
-    let encryption_key = fs::read_to_string(&encryption_key_path)?;
+    let encryption_key =
+        load_or_create_profile_secret(&encryption_key_path, "OpenID4VC data encryption key", 4096)?;
     if encryption_key.contains(['\n', '\r'])
         || URL_SAFE_NO_PAD
-            .decode(&encryption_key)
+            .decode(encryption_key.as_bytes())
             .ok()
             .is_none_or(|decoded| decoded.len() != 32)
     {
@@ -128,7 +126,7 @@ pub(super) fn write_install_profile(
             scalar(options.public_url.trim_end_matches('/'))
         ),
         "TRUSTED_PROXY_CIDRS: \"${TRUSTED_PROXY_CIDR}\"".to_owned(),
-        "MTLS_CERTIFICATE_SOURCE: \"legacy-verified-headers\"".to_owned(),
+        "MTLS_CERTIFICATE_SOURCE: \"rfc9440\"".to_owned(),
         "DYNAMIC_CLIENT_REGISTRATION_INITIAL_ACCESS_TOKEN_FILE: \"${PROFILE_SECRET_ROOT}/dynamic-registration-token\"".to_owned(),
         "OPENID4VC_DATA_ENCRYPTION_KEY_FILE: \"${PROFILE_SECRET_ROOT}/openid4vc-data-encryption-key\"".to_owned(),
         "OPENID4VCI_ISSUER_MANAGEMENT_TOKEN_FILE: \"${PROFILE_SECRET_ROOT}/openid4vci-management-token\"".to_owned(),
@@ -186,15 +184,7 @@ pub(super) fn write_or_verify_profile_secret(
     if let Some(value) = provided {
         validate_profile_secret_value(name, value)?;
         if path.exists() {
-            let metadata = fs::symlink_metadata(path)
-                .with_context(|| format!("failed to inspect persisted profile secret {name}"))?;
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                bail!("persisted profile secret {name} is not a regular file");
-            }
-            let persisted = zeroize::Zeroizing::new(
-                fs::read_to_string(path)
-                    .with_context(|| format!("failed to read persisted profile secret {name}"))?,
-            );
+            let persisted = load_profile_secret(path, name, MAX_PROFILE_SECRET_VALUE_BYTES)?;
             validate_profile_secret_value(name, &persisted)?;
             if persisted.as_str() != value {
                 bail!(
@@ -207,8 +197,42 @@ pub(super) fn write_or_verify_profile_secret(
         return Ok(());
     }
 
-    let generated_or_persisted = zeroize::Zeroizing::new(generate_secret(path)?);
+    let generated_or_persisted =
+        load_or_create_profile_secret(path, name, MAX_PROFILE_SECRET_VALUE_BYTES as u64)?;
     validate_profile_secret_value(name, &generated_or_persisted)
+}
+pub(super) fn load_profile_secret(
+    path: &Path,
+    name: &str,
+    max_bytes: usize,
+) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    let bytes = crate::filesystem::read_secure_secret_file(
+        path,
+        &format!("persisted profile secret {name}"),
+        max_bytes as u64,
+    )?;
+    let value = String::from_utf8(bytes.to_vec())
+        .with_context(|| format!("persisted profile secret {name} is not UTF-8"))?;
+    Ok(zeroize::Zeroizing::new(value))
+}
+
+fn load_or_create_profile_secret(
+    path: &Path,
+    name: &str,
+    max_bytes: u64,
+) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => load_profile_secret(path, name, max_bytes as usize),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let generated =
+                zeroize::Zeroizing::new(URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>()));
+            atomic_write(path, generated.as_bytes(), 0o440)?;
+            load_profile_secret(path, name, max_bytes as usize)
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to inspect persisted profile secret {name}"))
+        }
+    }
 }
 
 pub(super) fn validate_https_origin(value: &str, label: &str) -> anyhow::Result<()> {
@@ -225,7 +249,6 @@ pub(super) fn validate_https_origin(value: &str, label: &str) -> anyhow::Result<
     }
     Ok(())
 }
-
 pub(super) fn validate_public_jwks(value: &serde_json::Value, label: &str) -> anyhow::Result<()> {
     let keys = value
         .get("keys")
@@ -243,11 +266,4 @@ pub(super) fn validate_public_jwks(value: &serde_json::Value, label: &str) -> an
         bail!("{label} must contain public asymmetric keys only");
     }
     Ok(())
-}
-
-pub(super) fn host_cidr(address: std::net::IpAddr) -> String {
-    match address {
-        std::net::IpAddr::V4(address) => format!("{address}/32"),
-        std::net::IpAddr::V6(address) => format!("{address}/128"),
-    }
 }

@@ -1,6 +1,6 @@
-//! Docker lifecycle, artifact transfer, and replacement operations.
+//! Podman lifecycle and image operations.
 
-use std::ffi::OsStr;
+use std::{ffi::OsStr, path::Path};
 
 use anyhow::{Context as _, bail};
 
@@ -9,14 +9,13 @@ use crate::process::Process;
 #[cfg(debug_assertions)]
 use super::super::DebugArtifactTask;
 use super::super::{
-    ArtifactReference, BlobAttestationVerification, HostServiceInstall, RuntimeReplacement,
-    container_shared,
+    ArtifactReference, BlobAttestationVerification, ContainerRuntimePolicy, HostServiceInstall,
+    RuntimeReplacement, container_shared,
 };
-use super::discovery;
 
 pub(super) fn available(command: &OsStr) -> bool {
     Process::new(command)
-        .args(["info", "--format", "{{.ServerVersion}}"])
+        .args(["info", "--format", "json"])
         .succeeds()
 }
 
@@ -25,15 +24,22 @@ pub(super) fn verify_blob_attestation(
     verification: &BlobAttestationVerification,
 ) -> anyhow::Result<()> {
     Process::new(command)
-        .args(["run", "--rm", "--user", "0:0", "--cap-drop", "ALL"])
-        .args(["--read-only", "--security-opt", "no-new-privileges"])
-        .args(["--pids-limit", "64", "--tmpfs"])
+        .args(["run", "--rm", "--user"])
+        .arg(container_shared::NON_ROOT_ONE_SHOT_USER)
+        .arg("--cap-drop=ALL")
+        .args(["--read-only", "--security-opt=no-new-privileges"])
+        .args([
+            "--pids-limit",
+            "64",
+            "--memory",
+            "256m",
+            "--cpus",
+            "1",
+            "--tmpfs",
+        ])
         .arg("/root/.sigstore:rw,noexec,nosuid,nodev,size=16m")
-        .arg("--mount")
-        .arg(format!(
-            "type=bind,src={},dst=/work,readonly",
-            verification.work.display()
-        ))
+        .arg("-v")
+        .arg(format!("{}:/work:ro,Z", verification.work.display()))
         .arg(&verification.cosign_image)
         .args(["verify-blob-attestation", "--bundle"])
         .arg(format!("/work/{}", verification.bundle))
@@ -66,16 +72,19 @@ pub(super) fn quiesce_for_recovery(command: &OsStr, object_reference: &str) -> a
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-        if stderr.contains("no such object") || stderr.contains("no such container") {
+        if stderr.contains("no such object")
+            || stderr.contains("no such container")
+            || stderr.contains("no container with name or id")
+        {
             return Ok(());
         }
-        bail!("Docker could not prove the recovery runtime is stopped or absent");
+        bail!("Podman could not prove the recovery runtime is stopped or absent");
     }
-    if discovery::inspect(command, object_reference)?.running {
+    if super::discovery::inspect(command, object_reference)?.running {
         stop(command, object_reference)?;
     }
-    if discovery::inspect(command, object_reference)?.running {
-        bail!("Docker recovery runtime remained active after stop");
+    if super::discovery::inspect(command, object_reference)?.running {
+        bail!("Podman recovery runtime remained active after stop");
     }
     Ok(())
 }
@@ -98,7 +107,7 @@ pub(super) fn replace(command: &OsStr, replacement: &RuntimeReplacement) -> anyh
         digest,
     } = &replacement.artifact
     else {
-        bail!("Docker replacement requires a digest-bound OCI artifact");
+        bail!("Podman replacement requires a digest-bound OCI artifact");
     };
     let image = replacement.local_artifact_id.clone().unwrap_or_else(|| {
         format!(
@@ -107,33 +116,33 @@ pub(super) fn replace(command: &OsStr, replacement: &RuntimeReplacement) -> anyh
             digest
         )
     });
-    let policy = replacement
+    let policy: &ContainerRuntimePolicy = replacement
         .container_policy
         .as_ref()
-        .context("Docker replacement has no explicit container policy")?;
-    let mut process = container_shared::append_container_policy(
+        .context("Podman replacement has no explicit container policy")?;
+    let mut command = container_shared::append_container_policy(
         Process::new(command)
             .args(["run", "-d", "--name"])
             .arg(&replacement.object_reference),
         policy,
     );
     for (name, value) in &replacement.labels {
-        process = process.arg("--label").arg(format!("{name}={value}"));
+        command = command.arg("--label").arg(format!("{name}={value}"));
     }
     for (name, value) in &replacement.environment {
-        process = process.arg("--env").arg(format!("{name}={value}"));
+        command = command.arg("--env").arg(format!("{name}={value}"));
     }
     for network in &replacement.networks {
-        process = process.arg("--network").arg(network);
+        command = command.arg("--network").arg(network);
     }
     if let Some(ip_address) = &replacement.ip_address {
-        process = process.arg("--ip").arg(ip_address);
+        command = command.arg("--ip").arg(ip_address);
     }
     for port in &replacement.ports {
-        process = process.arg("--publish").arg(port);
+        command = command.arg("--publish").arg(port);
     }
-    process = container_shared::append_mounts(process, &replacement.mounts);
-    process.arg(image).args(&replacement.command).run_quiet()
+    command = container_shared::append_mounts(command, &replacement.mounts);
+    command.arg(image).args(&replacement.command).run_quiet()
 }
 
 pub(super) fn pull_image(command: &OsStr, image_reference: &str) -> anyhow::Result<()> {
@@ -145,7 +154,7 @@ pub(super) fn pull_image(command: &OsStr, image_reference: &str) -> anyhow::Resu
 pub(super) fn export_image(
     command: &OsStr,
     image_reference: &str,
-    archive: &std::path::Path,
+    archive: &Path,
 ) -> anyhow::Result<()> {
     Process::new(command)
         .args(["image", "save", "--output"])
@@ -154,7 +163,7 @@ pub(super) fn export_image(
         .run_quiet()
 }
 
-pub(super) fn import_image(command: &OsStr, archive: &std::path::Path) -> anyhow::Result<()> {
+pub(super) fn import_image(command: &OsStr, archive: &Path) -> anyhow::Result<()> {
     Process::new(command)
         .args(["image", "load", "--input"])
         .arg(archive)
@@ -162,7 +171,7 @@ pub(super) fn import_image(command: &OsStr, archive: &std::path::Path) -> anyhow
 }
 
 pub(super) fn install_host_service(_install: &HostServiceInstall) -> anyhow::Result<()> {
-    bail!("Docker does not install systemd host services")
+    bail!("Podman does not install systemd host services")
 }
 
 #[cfg(debug_assertions)]

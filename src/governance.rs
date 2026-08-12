@@ -5,17 +5,17 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use nazo_operator_protocol::{
-    Actor, ActorKind, ManagementAuditEvent, PROTOCOL_VERSION, sign_management_event,
-    verify_management_event,
+    Actor, ActorKind, ManagementAuditEvent, PROTOCOL_VERSION, compact_sha256, protected_header,
+    sign_management_event, verify_management_event,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
     deployment::{
         Capability, CapabilityGrant, DeploymentRecord, DeploymentStore, RecoveryConclusion,
-        ResourceScope, Responsibility, TrustState,
+        ResourceScope, Responsibility, SafeReference, TrustState,
     },
-    filesystem::{atomic_write, remove_file_durable, sha256},
+    filesystem::{atomic_write, remove_file_durable},
     runtime_backend::backend,
 };
 
@@ -26,6 +26,30 @@ enum TransitionState {
     DeclarationCommitted,
     Committed,
 }
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum AuditIntentState {
+    Prepared,
+    DeclarationCommitted,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ManagementAuditIntent {
+    schema: u32,
+    state: AuditIntentState,
+    request_id: String,
+    deployment_id: String,
+    previous: DeploymentRecord,
+    target: DeploymentRecord,
+    operation: String,
+    release: String,
+    recovery_boundary: String,
+}
+
+const MANAGEMENT_AUDIT_INTENT_SCHEMA: u32 = 1;
+const MANAGEMENT_AUDIT_INTENT_MAX_BYTES: u64 = 512 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -104,8 +128,14 @@ fn transition(
         .deployment_state_dir(&record.deployment_id)
         .join("transactions")
         .join("capability-transition.json");
-    let mut transaction = if active_path.exists() {
-        let transaction: CapabilityTransition = serde_json::from_slice(&fs::read(&active_path)?)
+    let mut transaction = if path_present(&active_path)? {
+        let transaction_bytes = crate::filesystem::read_secure_regular_file(
+            &active_path,
+            "capability transition journal",
+            true,
+            512 * 1024,
+        )?;
+        let transaction: CapabilityTransition = serde_json::from_slice(&transaction_bytes)
             .context("capability transition is invalid")?;
         if transaction.schema != 1
             || transaction.target.deployment_id != record.deployment_id
@@ -255,48 +285,60 @@ pub(crate) fn append_management_audit(
     operation: &str,
     release: &str,
 ) -> anyhow::Result<()> {
-    let private_path = match record.resources.get("audit_private_key") {
-        Some(crate::deployment::SafeReference::File { path }) => path.clone(),
-        _ => store
-            .deployment_state_dir(&record.deployment_id)
-            .join("identities")
-            .join("audit.key"),
-    };
-    let private = URL_SAFE_NO_PAD
-        .decode(fs::read_to_string(private_path)?.trim())
-        .context("audit private key is invalid")?;
-    let private: [u8; 32] = private
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("audit private key has an invalid length"))?;
-    let signing = SigningKey::from_bytes(&private);
-    let key_id = nazo_operator_protocol::instance_key_id(&signing.verifying_key()).replacen(
-        "instance-",
-        "audit-",
-        1,
-    );
+    // Controller-backed deployments use the operator management chain as
+    // their canonical ledger.  This keeps lifecycle events visible through
+    // the same AuditVerify/AuditShow trust boundary as operator tasks.
+    if let Some(SafeReference::File { path }) = record.resources.get("controller_config") {
+        let config = crate::controller::load_bound_control_config(path)?;
+        if config.operator.deployment_id != record.deployment_id
+            || config.operator.controller_key_id != record.control_authority
+        {
+            bail!("controller configuration is bound to a different deployment authority");
+        }
+        crate::operator::append_management_event_idempotent(
+            &config,
+            request_id,
+            operation,
+            release,
+            "controller-state",
+        )?;
+        return Ok(());
+    }
+
+    let (key_id, signing) = state_audit_signing_key(store, record)?;
     let audit_dir = store
         .deployment_state_dir(&record.deployment_id)
         .join("audit");
-    fs::create_dir_all(&audit_dir)?;
-    let mut entries = fs::read_dir(&audit_dir)?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().is_some_and(|value| value == "jws"))
-        .collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in &entries {
-        let compact = fs::read_to_string(entry.path())?;
-        let event = verify_management_event(compact.trim(), &key_id, &signing.verifying_key())?;
+    ensure_real_directory_or_missing(&audit_dir, "deployment management audit directory")?;
+    crate::filesystem::ensure_directory_chain(&audit_dir)?;
+    let entries = read_management_entries(
+        store,
+        record,
+        &audit_dir,
+        &record.deployment_id,
+        &key_id,
+        &signing.verifying_key(),
+    )?;
+    for (_, _compact, event) in &entries {
         if event.request_id == request_id {
-            if event.operation != operation || event.release != release {
+            if event.operation != operation
+                || event.release != release
+                || event.recovery_boundary
+                    != recovery_boundary_for(record.recovery.conclusion.clone())
+            {
                 bail!("management audit request ID was reused with different content");
             }
             return Ok(());
         }
     }
-    let (sequence, previous_sha256) = if let Some(last) = entries.last() {
-        let compact = fs::read_to_string(last.path())?;
-        let event = verify_management_event(compact.trim(), &key_id, &signing.verifying_key())?;
-        (event.sequence + 1, sha256(&last.path())?)
+    let (sequence, previous_sha256) = if let Some((_, compact, event)) = entries.last() {
+        (
+            event
+                .sequence
+                .checked_add(1)
+                .context("deployment management audit sequence overflow")?,
+            compact_sha256(compact),
+        )
     } else {
         (1, "0".repeat(64))
     };
@@ -313,19 +355,392 @@ pub(crate) fn append_management_audit(
         },
         operation: operation.to_owned(),
         release: release.to_owned(),
-        recovery_boundary: match record.recovery.conclusion {
-            RecoveryConclusion::Proven => "recovery:proven",
-            RecoveryConclusion::RequiresUserEvidence => "recovery:user-required",
-            RecoveryConclusion::Unproven => "recovery:unproven",
-        }
-        .to_owned(),
+        recovery_boundary: recovery_boundary_for(record.recovery.conclusion.clone()).to_owned(),
     };
     let compact = sign_management_event(&event, &key_id, &signing)?;
-    atomic_write(
-        &audit_dir.join(format!("{sequence:020}.jws")),
-        compact.as_bytes(),
-        0o600,
-    )
+    let path = audit_dir.join(format!("{sequence:020}.jws"));
+    if path_present(&path)? {
+        bail!("deployment management audit sequence path is already occupied");
+    }
+    atomic_write(&path, compact.as_bytes(), 0o600)?;
+    Ok(())
+}
+
+fn management_audit_intent_path(
+    store: &DeploymentStore,
+    deployment_id: &str,
+) -> std::path::PathBuf {
+    store
+        .deployment_state_dir(deployment_id)
+        .join("transactions")
+        .join("management-audit.json")
+}
+
+pub(crate) fn management_audit_intent_pending(
+    store: &DeploymentStore,
+    deployment_id: &str,
+) -> anyhow::Result<bool> {
+    path_present(&management_audit_intent_path(store, deployment_id))
+}
+
+/// Persist the smallest declaration-bound intent needed to finish a
+/// management audit after a declaration CAS.  This is a recovery pointer,
+/// not a second audit chain; the signed operator/governance event remains the
+/// only ledger.
+pub(crate) fn prepare_management_audit_intent(
+    store: &DeploymentStore,
+    previous: &DeploymentRecord,
+    target: &DeploymentRecord,
+    request_id: &str,
+    operation: &str,
+    release: &str,
+    recovery_boundary: &str,
+) -> anyhow::Result<()> {
+    previous.validate()?;
+    target.validate()?;
+    let expected_revision = previous
+        .declaration_revision
+        .checked_add(1)
+        .context("management audit declaration revision overflow")?;
+    if target.deployment_id != previous.deployment_id
+        || target.declaration_revision != expected_revision
+    {
+        bail!("management audit intent is not a single declaration revision transition");
+    }
+    let path = management_audit_intent_path(store, &previous.deployment_id);
+    if path_present(&path)? {
+        let bytes = crate::filesystem::read_secure_regular_file(
+            &path,
+            "management audit intent",
+            true,
+            MANAGEMENT_AUDIT_INTENT_MAX_BYTES,
+        )?;
+        let intent: ManagementAuditIntent =
+            serde_json::from_slice(&bytes).context("management audit intent is invalid")?;
+        if intent.schema != MANAGEMENT_AUDIT_INTENT_SCHEMA
+            || intent.deployment_id != previous.deployment_id
+            || intent.previous != *previous
+            || intent.target != *target
+            || intent.request_id != request_id
+            || intent.operation != operation
+            || intent.release != release
+            || intent.recovery_boundary != recovery_boundary
+        {
+            bail!("a different management audit intent is already pending");
+        }
+        return Ok(());
+    }
+    let transactions = path
+        .parent()
+        .context("management audit intent has no transactions directory")?;
+    crate::filesystem::ensure_directory_chain(transactions)?;
+    let intent = ManagementAuditIntent {
+        schema: MANAGEMENT_AUDIT_INTENT_SCHEMA,
+        state: AuditIntentState::Prepared,
+        request_id: request_id.to_owned(),
+        deployment_id: previous.deployment_id.clone(),
+        previous: previous.clone(),
+        target: target.clone(),
+        operation: operation.to_owned(),
+        release: release.to_owned(),
+        recovery_boundary: recovery_boundary.to_owned(),
+    };
+    write_management_audit_intent(&path, &intent)
+}
+
+fn write_management_audit_intent(
+    path: &std::path::Path,
+    intent: &ManagementAuditIntent,
+) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(intent)?;
+    if bytes.len() as u64 > MANAGEMENT_AUDIT_INTENT_MAX_BYTES {
+        bail!("management audit intent exceeds its size limit");
+    }
+    atomic_write(path, &bytes, 0o600)
+}
+
+pub(crate) fn mark_management_audit_intent_committed(
+    store: &DeploymentStore,
+    target: &DeploymentRecord,
+) -> anyhow::Result<()> {
+    let path = management_audit_intent_path(store, &target.deployment_id);
+    let bytes = crate::filesystem::read_secure_regular_file(
+        &path,
+        "management audit intent",
+        true,
+        MANAGEMENT_AUDIT_INTENT_MAX_BYTES,
+    )?;
+    let mut intent: ManagementAuditIntent =
+        serde_json::from_slice(&bytes).context("management audit intent is invalid")?;
+    if intent.schema != MANAGEMENT_AUDIT_INTENT_SCHEMA
+        || intent.deployment_id != target.deployment_id
+        || intent.target != *target
+    {
+        bail!("management audit intent does not match the committed declaration");
+    }
+    intent.state = AuditIntentState::DeclarationCommitted;
+    write_management_audit_intent(&path, &intent)
+}
+
+pub(crate) fn finish_management_audit_intent(
+    store: &DeploymentStore,
+    deployment_id: &str,
+) -> anyhow::Result<()> {
+    let path = management_audit_intent_path(store, deployment_id);
+    if path_present(&path)? {
+        crate::filesystem::remove_file_durable(&path)?;
+    }
+    Ok(())
+}
+
+/// Recover the declaration-bound management audit intent while the caller
+/// holds the deployment lock.  A prepared intent whose declaration never
+/// committed is discarded; an exact target declaration advances idempotently
+/// to the signed audit event.
+pub(crate) fn recover_pending_management_audit_intent_locked(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+) -> anyhow::Result<bool> {
+    let path = management_audit_intent_path(store, &record.deployment_id);
+    if !path_present(&path)? {
+        return Ok(false);
+    }
+    let bytes = crate::filesystem::read_secure_regular_file(
+        &path,
+        "management audit intent",
+        true,
+        MANAGEMENT_AUDIT_INTENT_MAX_BYTES,
+    )?;
+    let mut intent: ManagementAuditIntent =
+        serde_json::from_slice(&bytes).context("management audit intent is invalid")?;
+    if intent.schema != MANAGEMENT_AUDIT_INTENT_SCHEMA
+        || intent.deployment_id != record.deployment_id
+    {
+        bail!("management audit intent crosses deployment boundaries");
+    }
+    let current = store.load(&record.deployment_id)?;
+    match intent.state {
+        AuditIntentState::Prepared if current == intent.previous => {
+            crate::filesystem::remove_file_durable(&path)?;
+            return Ok(false);
+        }
+        AuditIntentState::Prepared if current == intent.target => {
+            intent.state = AuditIntentState::DeclarationCommitted;
+            write_management_audit_intent(&path, &intent)?;
+        }
+        AuditIntentState::Prepared => {
+            bail!("management audit declaration changed before intent recovery");
+        }
+        AuditIntentState::DeclarationCommitted if current != intent.target => {
+            bail!("management audit declaration no longer matches its intent");
+        }
+        AuditIntentState::DeclarationCommitted => {}
+    }
+    append_management_audit(
+        store,
+        &current,
+        &intent.request_id,
+        &intent.operation,
+        &intent.release,
+    )?;
+    finish_management_audit_intent(store, &current.deployment_id)?;
+    Ok(true)
+}
+
+fn recovery_boundary_for(conclusion: RecoveryConclusion) -> &'static str {
+    match conclusion {
+        RecoveryConclusion::Proven => "recovery:proven",
+        RecoveryConclusion::RequiresUserEvidence => "recovery:user-required",
+        RecoveryConclusion::Unproven => "recovery:unproven",
+    }
+}
+
+fn ensure_real_directory_or_missing(
+    path: &std::path::Path,
+    description: &str,
+) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => bail!("{description} is not a real directory: {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect {description} {}", path.display())),
+    }
+}
+
+fn path_present(path: &std::path::Path) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn read_management_entries(
+    _store: &DeploymentStore,
+    record: &DeploymentRecord,
+    directory: &std::path::Path,
+    expected_deployment_id: &str,
+    expected_key_id: &str,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+) -> anyhow::Result<Vec<(std::path::PathBuf, String, ManagementAuditEvent)>> {
+    if !ensure_real_directory_or_missing(directory, "deployment management audit directory")? {
+        return Ok(Vec::new());
+    }
+    let mut paths = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    paths.sort_by_key(std::fs::DirEntry::file_name);
+    let mut entries = Vec::with_capacity(paths.len());
+    let mut previous = "0".repeat(64);
+    let mut sequence = 0_u64;
+    for entry in paths {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || path.extension().and_then(|value| value.to_str()) != Some("jws")
+        {
+            bail!("deployment management audit directory contains an unexpected entry");
+        }
+        let compact = crate::filesystem::read_secure_regular_file(
+            &path,
+            "deployment management audit event",
+            false,
+            256 * 1024,
+        )?;
+        let compact = std::str::from_utf8(&compact)
+            .with_context(|| format!("management audit event is not UTF-8: {}", path.display()))?
+            .trim()
+            .to_owned();
+        let header = protected_header(&compact)?;
+        let event = if header.kid == expected_key_id {
+            verify_management_event(&compact, &header.kid, verifying_key)?
+        } else {
+            let config_path = match record.resources.get("controller_config") {
+                Some(SafeReference::File { path }) => path,
+                _ => bail!(
+                    "deployment management audit uses historical key {} without a declared controller trust archive",
+                    header.kid
+                ),
+            };
+            let config = crate::controller::load_bound_control_config(config_path)?;
+            if config.operator.deployment_id != record.deployment_id
+                || config.operator.controller_key_id != record.control_authority
+            {
+                bail!("controller configuration is bound to a different deployment authority");
+            }
+            let key = crate::operator::trusted_audit_key(&config, &header.kid)?;
+            verify_management_event(&compact, &header.kid, &key)?
+        };
+        let expected_sequence = sequence
+            .checked_add(1)
+            .context("deployment management audit sequence overflow")?;
+        if event.deployment_id != expected_deployment_id
+            || event.sequence != expected_sequence
+            || event.previous_sha256 != previous
+        {
+            bail!(
+                "deployment management audit chain is discontinuous at {}",
+                path.display()
+            );
+        }
+        sequence = event.sequence;
+        previous = compact_sha256(&compact);
+        entries.push((path, compact, event));
+    }
+    Ok(entries)
+}
+
+fn state_audit_signing_key(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+) -> anyhow::Result<(String, SigningKey)> {
+    let private_path = match record.resources.get("audit_private_key") {
+        Some(SafeReference::File { path }) => path.clone(),
+        _ => store
+            .deployment_state_dir(&record.deployment_id)
+            .join("identities")
+            .join("audit.key"),
+    };
+    let encoded =
+        crate::filesystem::read_secure_regular_file(&private_path, "audit private key", true, 256)?;
+    let encoded = std::str::from_utf8(&encoded)
+        .with_context(|| format!("audit private key is not UTF-8: {}", private_path.display()))?;
+    let private = URL_SAFE_NO_PAD
+        .decode(encoded.trim())
+        .context("audit private key is invalid")?;
+    let private: [u8; 32] = private
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("audit private key has an invalid length"))?;
+    let signing = SigningKey::from_bytes(&private);
+    let key_id = nazo_operator_protocol::instance_key_id(&signing.verifying_key()).replacen(
+        "instance-",
+        "audit-",
+        1,
+    );
+    Ok((key_id, signing))
+}
+
+/// Verify the deployment-owned governance chain without repairing any
+/// derived state.  The returned tuple is `(last_sequence, last_hash)`.
+pub(crate) fn verify_management_audit(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+) -> anyhow::Result<(u64, String)> {
+    let directory = store
+        .deployment_state_dir(&record.deployment_id)
+        .join("audit");
+    if !ensure_real_directory_or_missing(&directory, "deployment management audit directory")? {
+        return Ok((0, "0".repeat(64)));
+    }
+    let (key_id, signing) = state_audit_signing_key(store, record)?;
+    let entries = read_management_entries(
+        store,
+        record,
+        &directory,
+        &record.deployment_id,
+        &key_id,
+        &signing.verifying_key(),
+    )?;
+    Ok(entries
+        .last()
+        .map_or((0, "0".repeat(64)), |(_, compact, event)| {
+            (event.sequence, compact_sha256(compact))
+        }))
+}
+
+pub(crate) fn management_audit_entries(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    request_id: Option<&str>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let directory = store
+        .deployment_state_dir(&record.deployment_id)
+        .join("audit");
+    if !ensure_real_directory_or_missing(&directory, "deployment management audit directory")? {
+        return Ok(Vec::new());
+    }
+    let (key_id, signing) = state_audit_signing_key(store, record)?;
+    let entries = read_management_entries(
+        store,
+        record,
+        &directory,
+        &record.deployment_id,
+        &key_id,
+        &signing.verifying_key(),
+    )?;
+    let mut values = Vec::new();
+    for (_, compact, event) in entries {
+        if request_id.is_some_and(|expected| expected != event.request_id) {
+            continue;
+        }
+        let event_key_id = protected_header(&compact)?.kid;
+        values.push(serde_json::json!({
+            "kind": "deployment-management-event",
+            "key_id": event_key_id,
+            "event": event,
+        }));
+    }
+    Ok(values)
 }
 
 fn write_handoff(store: &DeploymentStore, record: &DeploymentRecord) -> anyhow::Result<()> {

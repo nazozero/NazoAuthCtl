@@ -94,7 +94,13 @@ pub(crate) fn recover_pending_rotation(
     apply_active_identity(config, &layout, &active);
     let adoption_path = layout.operator_directory.join("legacy-adoption.json");
     let adoption_pending = if path_present(&adoption_path)? {
-        let adoption: LegacyAdoptionIntent = serde_json::from_slice(&fs::read(&adoption_path)?)?;
+        let adoption_bytes = crate::filesystem::read_secure_regular_file(
+            &adoption_path,
+            "legacy adoption journal",
+            true,
+            64 * 1024,
+        )?;
+        let adoption: LegacyAdoptionIntent = serde_json::from_slice(&adoption_bytes)?;
         if adoption.schema != 1
             || adoption.generation != active.generation
             || adoption.controller_key_id != active.controller_key_id
@@ -112,7 +118,13 @@ pub(crate) fn recover_pending_rotation(
         bail!("legacy adoption and controller rotation cannot be pending together")
     }
     if path_present(&intent_path)? {
-        let intent: RotationIntent = serde_json::from_slice(&fs::read(&intent_path)?)?;
+        let intent_bytes = crate::filesystem::read_secure_regular_file(
+            &intent_path,
+            "identity rotation intent",
+            true,
+            256 * 1024,
+        )?;
+        let intent: RotationIntent = serde_json::from_slice(&intent_bytes)?;
         if intent.schema != 1
             || !safe_identity_component(&intent.next_generation)
             || intent.transition_file.is_empty()
@@ -138,7 +150,7 @@ pub(crate) fn recover_pending_rotation(
             .join("trust-transitions")
             .join(&intent.transition_file);
         if !path_present(&transition_path)? {
-            fs::create_dir_all(
+            crate::filesystem::ensure_directory_chain(
                 transition_path
                     .parent()
                     .context("rotation transition path has no parent")?,

@@ -13,6 +13,7 @@ use crate::{
     filesystem::{PrivateTempDir, sha256},
     runtime_backend::{ContainerRestartPolicy, ContainerRuntimePolicy, RuntimeObservation},
 };
+use ed25519_dalek::SigningKey;
 
 use crate::filesystem::ensure_private_directory;
 #[cfg(unix)]
@@ -72,6 +73,10 @@ fn lifecycle(work: &PrivateTempDir) -> LifecycleManifest {
     fs::write(&driver, b"verified recovery driver").unwrap();
     let credential = work.path().join("database-credential");
     fs::write(&credential, b"not inspected by lifecycle validation").unwrap();
+    let provider_key = work.path().join("provider-verification-key");
+    fs::write(&provider_key, [7_u8; 32]).unwrap();
+    let provider_signing = SigningKey::from_bytes(&[7_u8; 32]);
+    let provider_id = nazo_operator_protocol::instance_key_id(&provider_signing.verifying_key());
     let candidate = candidate(work.path(), "runtime-a");
     LifecycleManifest {
         schema: LIFECYCLE_SCHEMA,
@@ -94,6 +99,7 @@ fn lifecycle(work: &PrivateTempDir) -> LifecycleManifest {
             ports: vec!["127.0.0.1:19000:8000".to_owned()],
             container_policy: Some(ContainerRuntimePolicy {
                 restart: ContainerRestartPolicy::No,
+                service_user: None,
                 read_only_root: false,
                 no_new_privileges: false,
                 drop_all_capabilities: false,
@@ -102,6 +108,16 @@ fn lifecycle(work: &PrivateTempDir) -> LifecycleManifest {
                 cpu_limit_millis: None,
                 tmpfs: Vec::new(),
             }),
+            acceptance: RuntimeAcceptance {
+                readiness_url: "https://issuer.example/ready".to_owned(),
+                expected_issuer: "https://issuer.example".to_owned(),
+                discovery_url: "https://issuer.example/.well-known/openid-configuration".to_owned(),
+                ui_url: "https://issuer.example/ui/".to_owned(),
+                ui_sha256: "a".repeat(64),
+                ui_size: 1,
+                attempts: 1,
+                interval_seconds: 0,
+            },
         }],
         recovery_driver: RecoveryDriver {
             program_sha256: sha256(&driver).unwrap(),
@@ -113,6 +129,19 @@ fn lifecycle(work: &PrivateTempDir) -> LifecycleManifest {
                 CredentialReference::File { path: credential },
             )]),
         },
+        recovery_providers: vec![RecoveryProviderTrust {
+            provider_id,
+            roles: BTreeSet::from([
+                RecoveryArtifactRole::DataSnapshot,
+                RecoveryArtifactRole::DatabaseRestore,
+                RecoveryArtifactRole::LastTrustedArtifact,
+                RecoveryArtifactRole::VerificationMaterial,
+            ]),
+            verification_key: SafeReference::DigestBoundFile {
+                sha256: sha256(&provider_key).unwrap(),
+                path: provider_key,
+            },
+        }],
     }
 }
 
@@ -221,8 +250,106 @@ fn lifecycle_rejects_inline_secret_environment_and_rehearsal_mount_overlap() {
     assert!(value.validate().is_err());
 
     let mut value = lifecycle(&work);
-    value.schema = 1;
+    value.schema = 2;
     assert!(value.validate().is_err());
+}
+
+#[test]
+fn lifecycle_acceptance_contract_has_explicit_same_origin_and_bounded_urls() {
+    let work = PrivateTempDir::new("nazoauth-lifecycle-acceptance-url-boundary").unwrap();
+    let mut value = lifecycle(&work);
+
+    let loopback = &mut value.runtimes[0].acceptance;
+    loopback.expected_issuer = "http://[::1]:19000".to_owned();
+    loopback.readiness_url = "http://[::1]:19000/ready".to_owned();
+    loopback.discovery_url = "http://[::1]:19000/.well-known/openid-configuration".to_owned();
+    loopback.ui_url = "http://[::1]:19000/ui/".to_owned();
+    value.validate().unwrap();
+
+    let mut value = lifecycle(&work);
+
+    value.runtimes[0].acceptance.readiness_url = "http://public.example/ready".to_owned();
+    assert!(value.validate().is_err());
+
+    let mut value = lifecycle(&work);
+    value.runtimes[0].acceptance.discovery_url =
+        "https://other.example/.well-known/openid-configuration".to_owned();
+    assert!(value.validate().is_err());
+
+    let mut value = lifecycle(&work);
+    value.runtimes[0].acceptance.discovery_url =
+        "https://issuer.example/.well-known/openid-configuration?redirect=1".to_owned();
+    assert!(value.validate().is_err());
+
+    let mut value = lifecycle(&work);
+    value.runtimes[0].acceptance.attempts = MAX_ACCEPTANCE_ATTEMPTS + 1;
+    assert!(value.validate().is_err());
+
+    let mut value = lifecycle(&work);
+    value.runtimes[0].acceptance.interval_seconds = MAX_ACCEPTANCE_INTERVAL_SECONDS + 1;
+    assert!(value.validate().is_err());
+
+    let mut value = lifecycle(&work);
+    value.runtimes[0].acceptance.attempts = MAX_ACCEPTANCE_ATTEMPTS;
+    value.runtimes[0].acceptance.interval_seconds = MAX_ACCEPTANCE_INTERVAL_SECONDS;
+    assert!(value.validate().is_err());
+
+    let mut value = lifecycle(&work);
+    value.runtimes[0].acceptance.ui_size = MAX_ACCEPTANCE_UI_BYTES + 1;
+    assert!(value.validate().is_err());
+}
+
+#[test]
+fn lifecycle_acceptance_issuer_must_match_discovery_evidence() {
+    let work = PrivateTempDir::new("nazoauth-lifecycle-acceptance-issuer").unwrap();
+    let mut value = lifecycle(&work);
+    let mut discovered = candidate(work.path(), "runtime-a");
+    discovered.issuer = Some("https://different.example".to_owned());
+    assert!(
+        value
+            .validate_for_adoption(&[discovered], &CapabilityGrants::observed())
+            .is_err()
+    );
+
+    value.runtimes[0].acceptance.expected_issuer = "https://different.example".to_owned();
+    assert!(value.validate().is_err());
+}
+
+#[test]
+fn rollback_progress_journal_is_durable_and_preserves_partial_replica_progress() {
+    let work = PrivateTempDir::new("nazoauth-lifecycle-rollback-journal").unwrap();
+    let path = work
+        .path()
+        .join("transactions/active-lifecycle-rollback.json");
+    let identity = nazo_operator_protocol::EmbeddedIdentity {
+        release: "v0.1.19".to_owned(),
+        revision: "a".repeat(40),
+        protocol: 1,
+        build_id: "build:test".to_owned(),
+    };
+    let mut journal = RollbackExecution {
+        schema: ROLLBACK_EXECUTION_SCHEMA,
+        transaction_id: "rollback-test".to_owned(),
+        deployment_id: "deployment-test".to_owned(),
+        source_release: identity.clone(),
+        target_release: identity.clone(),
+        lifecycle_sha256: "a".repeat(64),
+        cache_sha256: "b".repeat(64),
+        target_release_sha256: embedded_identity_digest(&identity).unwrap(),
+        state: RollbackExecutionState::Prepared,
+        completed_runtimes: BTreeSet::from(["runtime-a".to_owned()]),
+        updated_at: Utc::now().timestamp(),
+    };
+    persist_rollback_execution(&path, &journal).unwrap();
+    let loaded = load_rollback_execution(&path).unwrap();
+    assert_eq!(loaded.completed_runtimes, journal.completed_runtimes);
+
+    journal.state = RollbackExecutionState::RuntimesActivated;
+    journal.completed_runtimes.insert("runtime-b".to_owned());
+    persist_rollback_execution(&path, &journal).unwrap();
+    let resumed = load_rollback_execution(&path).unwrap();
+    assert_eq!(resumed.state, RollbackExecutionState::RuntimesActivated);
+    assert_eq!(resumed.completed_runtimes.len(), 2);
 }
 
 #[cfg(any(unix, windows))]
@@ -377,7 +504,7 @@ fn checkpoint_receipt_requires_a_digest_bound_regular_recovery_manifest() {
 
 #[cfg(unix)]
 #[test]
-fn recovery_driver_process_receipt_is_bound_to_the_closed_request() {
+fn recovery_driver_rejects_legacy_recovery_manifest_before_execution() {
     let work = PrivateTempDir::new("nazoauth-lifecycle-driver-process").unwrap();
     let driver = work.path().join("recovery-driver.py");
     fs::write(
@@ -413,7 +540,7 @@ json.dump(receipt, sys.stdout, separators=(",", ":"))
     value.recovery_driver.arguments.clear();
     fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
 
-    let receipt = invoke_recovery_driver(
+    let error = invoke_recovery_driver(
         &manifest_path,
         &value,
         &recovery_manifest,
@@ -421,8 +548,10 @@ json.dump(receipt, sys.stdout, separators=(",", ":"))
         RecoveryOperation::Rehearse,
         &CapabilityGrants::observed(),
     )
-    .unwrap();
-    assert_eq!(receipt.operation, RecoveryOperation::Rehearse);
-    assert_eq!(receipt.deployment_id, "deployment-test");
-    assert_eq!(receipt.release, "v0.1.19");
+    .expect_err("legacy recovery evidence must fail closed before invoking the driver");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported recovery evidence schema")
+    );
 }

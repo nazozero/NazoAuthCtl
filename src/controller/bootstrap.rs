@@ -9,7 +9,7 @@ pub(super) fn bootstrap_admin(
         config,
         &credentials,
         std::ffi::OsStr::new("curl"),
-        Some(bootstrap_state_owner_uid(config)?),
+        Some(crate::runtime::runtime_service_owner_uid(config)?),
     )?;
     println!(
         "Initial administrator created (request ID: {request_id}). Continue at {}/ui/auth",
@@ -234,11 +234,13 @@ pub(super) fn load_or_create_bootstrap_pending(
     let email_hmac_sha256 = bootstrap_email_hmac(config, normalized_email)?;
     let recovery_epoch = current_bootstrap_recovery_epoch(config)?;
     if path.exists() {
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            bail!("bootstrap-admin pending state is not a regular file");
-        }
-        let pending: BootstrapAdminPending = serde_json::from_slice(&fs::read(&path)?)
+        let pending_bytes = crate::filesystem::read_secure_regular_file(
+            &path,
+            "bootstrap-admin pending state",
+            true,
+            16 * 1024,
+        )?;
+        let pending: BootstrapAdminPending = serde_json::from_slice(&pending_bytes)
             .context("bootstrap-admin pending state is invalid")?;
         if pending.schema != 2 || !valid_bootstrap_request_id(&pending.request_id) {
             bail!("bootstrap-admin pending state does not match this request");
@@ -268,7 +270,7 @@ pub(super) fn load_or_create_bootstrap_pending(
             return Ok(pending);
         }
     }
-    fs::create_dir_all(&config.operator.state_directory)?;
+    crate::filesystem::ensure_directory_chain(&config.operator.state_directory)?;
     let pending = BootstrapAdminPending {
         schema: 2,
         request_id: format!("bootstrap-admin-{:032x}", rand::random::<u128>()),
@@ -294,8 +296,11 @@ pub(super) fn bootstrap_state_hmac(
     use hmac::{Hmac, KeyInit as _, Mac as _};
     use sha2::Sha256;
 
-    let key = fs::read(&config.operator.secret_revision_file)
-        .context("failed to read deployment secret revision for bootstrap binding")?;
+    let key = crate::filesystem::read_secure_secret_file(
+        &config.operator.secret_revision_file,
+        "deployment secret revision for bootstrap binding",
+        4096,
+    )?;
     let mut hmac = Hmac::<Sha256>::new_from_slice(&key)
         .context("deployment secret revision cannot bind bootstrap state")?;
     hmac.update(b"nazoauthctl-bootstrap-admin-v2\0");
@@ -330,20 +335,26 @@ pub(super) fn valid_bootstrap_recovery_epoch(value: &str) -> bool {
 pub(super) fn current_bootstrap_recovery_epoch(config: &UpdateConfig) -> anyhow::Result<String> {
     let path = bootstrap_recovery_epoch_path(config);
     if path.exists() {
-        let value = fs::read_to_string(&path)?;
-        if !valid_bootstrap_recovery_epoch(&value) {
+        let bytes = crate::filesystem::read_secure_regular_file(
+            &path,
+            "bootstrap recovery epoch",
+            true,
+            256,
+        )?;
+        let value = std::str::from_utf8(&bytes).context("bootstrap recovery epoch is not UTF-8")?;
+        if !valid_bootstrap_recovery_epoch(value) {
             bail!("bootstrap recovery epoch is invalid");
         }
-        return Ok(value);
+        return Ok(value.to_owned());
     }
-    fs::create_dir_all(&config.operator.state_directory)?;
+    crate::filesystem::ensure_directory_chain(&config.operator.state_directory)?;
     let value = format!("recovery-{:032x}", rand::random::<u128>());
     atomic_write(&path, value.as_bytes(), 0o400)?;
     Ok(value)
 }
 
 pub(super) fn rotate_bootstrap_recovery_epoch(config: &UpdateConfig) -> anyhow::Result<String> {
-    fs::create_dir_all(&config.operator.state_directory)?;
+    crate::filesystem::ensure_directory_chain(&config.operator.state_directory)?;
     let value = format!("recovery-{:032x}", rand::random::<u128>());
     atomic_write(
         &bootstrap_recovery_epoch_path(config),
@@ -521,23 +532,36 @@ pub(super) fn bootstrap_token_path(
     Ok(source.join(BOOTSTRAP_TOKEN_FILE))
 }
 
+#[cfg(unix)]
 pub(super) fn read_bootstrap_token(
     path: &Path,
     expected_owner_uid: Option<u32>,
 ) -> anyhow::Result<String> {
-    let metadata = fs::symlink_metadata(path)
-        .context("initial administrator token is unavailable or already consumed")?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("initial administrator token is not a regular file");
+    let mut file = match expected_owner_uid {
+        Some(owner_uid) => crate::filesystem::open_secure_regular_file_for_uid(
+            path,
+            "initial administrator token",
+            false,
+            owner_uid,
+        )?,
+        None => {
+            crate::filesystem::open_secure_regular_file(path, "initial administrator token", false)?
+        }
+    };
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = file.metadata()?;
+        if expected_owner_uid.is_some_and(|expected| metadata.uid() != expected) {
+            bail!("initial administrator token has an unexpected runtime owner");
+        }
+        let mode = metadata.mode() & 0o7777;
+        if mode & 0o077 != 0 || mode & 0o111 != 0 || mode & 0o400 == 0 {
+            bail!("initial administrator token must be private and owner-readable");
+        }
     }
-    validate_bootstrap_secret_metadata(&metadata, expected_owner_uid)?;
-    let file = File::open(path).context("failed to open initial administrator token")?;
-    let opened_metadata = file
-        .metadata()
-        .context("failed to inspect opened initial administrator token")?;
-    validate_same_file(&metadata, &opened_metadata, "initial administrator token")?;
-    let mut bytes = Vec::new();
-    file.take(MAX_BOOTSTRAP_TOKEN_BYTES + 1)
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    (&mut file)
+        .take(MAX_BOOTSTRAP_TOKEN_BYTES.saturating_add(1))
         .read_to_end(&mut bytes)
         .context("failed to read initial administrator token")?;
     if bytes.len() as u64 > MAX_BOOTSTRAP_TOKEN_BYTES {
@@ -556,16 +580,13 @@ pub(super) fn read_bootstrap_token(
     Ok(token.to_owned())
 }
 
-pub(super) fn bootstrap_state_owner_uid(config: &UpdateConfig) -> anyhow::Result<u32> {
-    if config.runtime.backend != RuntimeBackendKind::Systemd {
-        return Ok(10_001);
-    }
-    Process::new("id")
-        .args(["-u", config.runtime.service_user.as_str()])
-        .stdout()?
-        .trim()
-        .parse()
-        .context("managed host service user has no valid numeric UID")
+#[cfg(not(unix))]
+pub(super) fn read_bootstrap_token(
+    path: &Path,
+    expected_owner_uid: Option<u32>,
+) -> anyhow::Result<String> {
+    let _ = (path, expected_owner_uid);
+    bail!("bootstrap-admin is supported only on Unix managed hosts")
 }
 
 #[cfg(unix)]
@@ -598,51 +619,4 @@ pub(super) fn validate_bootstrap_directory(
     _expected_owner_uid: Option<u32>,
 ) -> anyhow::Result<()> {
     bail!("bootstrap-admin is supported only on Unix managed hosts")
-}
-
-#[cfg(unix)]
-pub(super) fn validate_bootstrap_secret_metadata(
-    metadata: &fs::Metadata,
-    expected_owner_uid: Option<u32>,
-) -> anyhow::Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    if expected_owner_uid.is_some_and(|expected| metadata.uid() != expected) {
-        bail!("initial administrator token has an unexpected runtime owner");
-    }
-    if metadata.mode() & 0o077 != 0 {
-        bail!("initial administrator token must not be accessible by group or other users");
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-pub(super) fn validate_bootstrap_secret_metadata(
-    _metadata: &fs::Metadata,
-    _expected_owner_uid: Option<u32>,
-) -> anyhow::Result<()> {
-    bail!("bootstrap-admin is supported only on Unix managed hosts")
-}
-
-#[cfg(unix)]
-pub(super) fn validate_same_file(
-    before: &fs::Metadata,
-    opened: &fs::Metadata,
-    description: &str,
-) -> anyhow::Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    if before.dev() != opened.dev() || before.ino() != opened.ino() {
-        bail!("{description} changed while it was being opened");
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-pub(super) fn validate_same_file(
-    _before: &fs::Metadata,
-    _opened: &fs::Metadata,
-    _description: &str,
-) -> anyhow::Result<()> {
-    Ok(())
 }

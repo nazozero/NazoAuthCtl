@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from recovery_evidence import bind_recovery_evidence
+
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -79,13 +81,6 @@ def main() -> None:
     ):
         path.mkdir(parents=True, exist_ok=True)
 
-    recovery_manifest = recovery_root / "manual-manifest.json"
-    write_json(
-        recovery_manifest,
-        {"schema": 1, "fixture": "external resources remain external"},
-    )
-    recovery_sha = sha256(recovery_manifest)
-
     driver = recovery_root / "recovery-driver.py"
     driver.write_text(
         """#!/usr/bin/env python3
@@ -111,8 +106,10 @@ json.dump({
     )
     os.chmod(driver, 0o500)
 
+    acceptance = spec["acceptance"]
+    provider_key = Path(spec["provider_key"])
     lifecycle = {
-        "schema": 2,
+        "schema": 3,
         "deployment_id": deployment_id,
         "runtimes": [
             {
@@ -120,6 +117,7 @@ json.dump({
                 "backend": backend,
                 "object_reference": spec["object_reference"],
                 **spec["runtime"],
+                "acceptance": acceptance,
             }
         ],
         "recovery_driver": {
@@ -129,9 +127,21 @@ json.dump({
             "rehearsal_workspace": str(recovery_root / "rehearsal"),
             "credentials": {},
         },
+        "recovery_providers": [],
     }
     lifecycle_path = recovery_root / "lifecycle.json"
     write_json(lifecycle_path, lifecycle)
+    recovery_manifest = recovery_root / "manual-manifest.json"
+    bind_recovery_evidence(
+        lifecycle_path=lifecycle_path,
+        output_path=recovery_manifest,
+        artifact_root=recovery_root / "provider-artifacts",
+        provider_key_path=provider_key,
+        deployment_id=deployment_id,
+        release=release,
+        operation="restore",
+    )
+    recovery_sha = sha256(recovery_manifest)
 
     audit_key = identity_root / "audit.key"
     audit_key.write_text(

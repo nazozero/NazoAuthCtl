@@ -66,6 +66,35 @@ fn registry_requires_explicit_selection_when_multiple_deployments_exist() {
 }
 
 #[test]
+fn registration_reconciles_an_existing_declaration_without_treating_it_as_complete() {
+    let work = PrivateTempDir::new("nazoauthctl-registration-reconcile").unwrap();
+    let store = store(&work);
+    let deployment = record("deployment-a", "alpha");
+    store.persist(&deployment).unwrap();
+    let registry = store.registry_path();
+    std::fs::remove_file(&registry).unwrap();
+    std::fs::remove_dir_all(store.deployment_state_dir("deployment-a")).unwrap();
+
+    store.persist(&deployment).unwrap();
+
+    assert_eq!(store.load("deployment-a").unwrap(), deployment);
+    assert!(
+        store
+            .load_registry()
+            .unwrap()
+            .deployments
+            .contains_key("deployment-a")
+    );
+    assert!(
+        store
+            .deployment_state_dir("deployment-a")
+            .join("transactions")
+            .is_dir()
+    );
+    assert!(!store.registration_journal_path("deployment-a").exists());
+}
+
+#[test]
 fn observed_state_cannot_smuggle_mutation_capabilities() {
     let mut observed = record("deployment-a", "alpha");
     observed.trust = TrustState::Observed;
@@ -141,6 +170,46 @@ fn locks_are_per_deployment_and_per_shared_resource() {
     let _shared_a = store.shared_resource_lock("database-a").unwrap();
     let _shared_b = store.shared_resource_lock("database-b").unwrap();
     assert!(store.shared_resource_lock("database-a").is_err());
+}
+
+#[test]
+fn conformance_shared_locks_overlap_but_exclude_mutation_and_serialize_writers() {
+    let work = PrivateTempDir::new("nazoauthctl-conformance-shared-locks").unwrap();
+    let store = store(&work);
+
+    let deployment_reader_a = store.deployment_shared_lock("deployment-a").unwrap();
+    let deployment_reader_b = store.deployment_shared_lock("deployment-a").unwrap();
+    assert!(store.deployment_lock("deployment-a").is_err());
+
+    let resource_reader_a = store.shared_resource_shared_lock("database").unwrap();
+    let resource_reader_b = store.shared_resource_shared_lock("database").unwrap();
+    assert!(store.shared_resource_lock("database").is_err());
+
+    let operator_writer = store.operator_task_lock("deployment-a").unwrap();
+    let operator_path = store
+        .state_root
+        .join("locks")
+        .join("operator-task-deployment-a.lock");
+    let timeout_error =
+        match FileLock::acquire_exclusive_bounded(&operator_path, Duration::from_millis(20)) {
+            Ok(_) => panic!("a second operator writer unexpectedly acquired the lock"),
+            Err(error) => error,
+        };
+    assert!(timeout_error.to_string().contains("timed out"));
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        drop(operator_writer);
+    });
+    let waited = Instant::now();
+    let next_writer = store.operator_task_lock("deployment-a").unwrap();
+    assert!(waited.elapsed() >= Duration::from_millis(25));
+    release.join().unwrap();
+    drop(next_writer);
+
+    drop((deployment_reader_a, deployment_reader_b));
+    assert!(store.deployment_lock("deployment-a").is_ok());
+    drop((resource_reader_a, resource_reader_b));
+    assert!(store.shared_resource_lock("database").is_ok());
 }
 
 #[cfg(unix)]

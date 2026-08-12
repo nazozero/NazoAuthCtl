@@ -1,5 +1,15 @@
 use super::*;
 
+use std::{thread, time::Duration};
+
+const MAX_ACCEPTANCE_RESPONSE_BYTES: u64 = 64 * 1024;
+const ACCEPTANCE_REQUEST_TIMEOUT_SECONDS: u64 = 10;
+
+struct HttpProbeResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
 pub(crate) fn activate_cached_runtime(
     record: &DeploymentRecord,
     runtime: &RuntimeLifecycle,
@@ -139,6 +149,125 @@ pub(crate) fn verify_active_runtime(
         bail!("active runtime artifact exposes a different Release identity");
     }
     Ok(())
+}
+
+/// Verify the complete immutable acceptance contract after a runtime has been
+/// activated.  The contract is deliberately explicit: no endpoint is inferred
+/// from the runtime command, issuer, port mapping, or UI cache.
+pub(crate) fn verify_runtime_acceptance(runtime: &RuntimeLifecycle) -> anyhow::Result<()> {
+    runtime.acceptance.validate()?;
+    let acceptance = &runtime.acceptance;
+    let mut readiness_error = None;
+    for attempt in 0..acceptance.attempts {
+        match probe_http(&acceptance.readiness_url, MAX_ACCEPTANCE_RESPONSE_BYTES).and_then(
+            |response| {
+                if (200..300).contains(&response.status) {
+                    Ok(())
+                } else {
+                    bail!("readiness endpoint returned HTTP {}", response.status);
+                }
+            },
+        ) {
+            Ok(()) => {
+                readiness_error = None;
+                break;
+            }
+            Err(error) => {
+                readiness_error = Some(error);
+                if attempt + 1 < acceptance.attempts && acceptance.interval_seconds > 0 {
+                    thread::sleep(Duration::from_secs(acceptance.interval_seconds));
+                }
+            }
+        }
+    }
+    if let Some(error) = readiness_error {
+        return Err(error).context("lifecycle readiness acceptance failed");
+    }
+
+    let discovery = probe_http(&acceptance.discovery_url, MAX_ACCEPTANCE_RESPONSE_BYTES)?;
+    if discovery.status != 200 {
+        bail!(
+            "public Discovery acceptance requires HTTP 200, received {}",
+            discovery.status
+        );
+    }
+    let discovery: serde_json::Value = serde_json::from_slice(&discovery.body)
+        .context("public Discovery acceptance response is not valid JSON")?;
+    if discovery.get("issuer").and_then(serde_json::Value::as_str)
+        != Some(acceptance.expected_issuer.as_str())
+    {
+        bail!("public Discovery issuer does not match the lifecycle acceptance contract");
+    }
+
+    let ui = probe_http(&acceptance.ui_url, acceptance.ui_size)?;
+    if ui.status != 200 {
+        bail!(
+            "served UI acceptance requires HTTP 200, received {}",
+            ui.status
+        );
+    }
+    if ui.body.len() as u64 != acceptance.ui_size {
+        bail!(
+            "served UI size differs from the lifecycle acceptance contract: expected {}, observed {}",
+            acceptance.ui_size,
+            ui.body.len()
+        );
+    }
+    if acceptance_digest_bytes(&ui.body) != acceptance.ui_sha256 {
+        bail!("served UI bytes differ from the lifecycle acceptance digest");
+    }
+    Ok(())
+}
+
+fn probe_http(url: &str, max_body_bytes: u64) -> anyhow::Result<HttpProbeResponse> {
+    let parsed = url::Url::parse(url).context("lifecycle acceptance URL is invalid")?;
+    let proto = if parsed.scheme() == "https" {
+        "=https"
+    } else {
+        "=http"
+    };
+    let output = Process::new("curl")
+        .timeout(Duration::from_secs(ACCEPTANCE_REQUEST_TIMEOUT_SECONDS))
+        .args([
+            "--silent",
+            "--show-error",
+            "--proto",
+            proto,
+            "--max-time",
+            &ACCEPTANCE_REQUEST_TIMEOUT_SECONDS.to_string(),
+            "--max-filesize",
+            &max_body_bytes.to_string(),
+            "--write-out",
+            "%{http_code}",
+        ])
+        .arg(url)
+        .output()
+        .context("lifecycle acceptance HTTP probe failed to execute")?;
+    if !output.status.success() {
+        bail!("lifecycle acceptance HTTP probe failed");
+    }
+    if output.stdout.len() < 3 {
+        bail!("lifecycle acceptance HTTP probe returned no status code");
+    }
+    let status_start = output.stdout.len() - 3;
+    let status = std::str::from_utf8(&output.stdout[status_start..])
+        .context("lifecycle acceptance HTTP probe returned an invalid status code")?
+        .parse::<u16>()
+        .context("lifecycle acceptance HTTP probe returned an invalid status code")?;
+    let body = output.stdout[..status_start].to_vec();
+    if body.len() as u64 > max_body_bytes {
+        bail!("lifecycle acceptance HTTP response exceeds its bounded size");
+    }
+    Ok(HttpProbeResponse { status, body })
+}
+
+fn acceptance_digest_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub(crate) fn artifact_identity_matches(

@@ -15,7 +15,7 @@ use url::Url;
 use crate::{
     cli::{InstallOptions, StandardsProfileSecrets},
     deployment::RuntimeBackendKind,
-    filesystem::{atomic_write, generate_secret, set_mode},
+    filesystem::{atomic_write, generate_secret, read_secure_secret_file, set_mode},
     model::{
         Dependencies, Mount, Operator, Postgres, Runtime, Ui, UpdateConfig, Valkey, safe_absolute,
     },
@@ -35,9 +35,14 @@ mod secrets;
 use config::*;
 use profile::*;
 use runtime::*;
-pub(crate) use runtime::{grant_runtime_database, verify_runtime_no_ddl};
+pub(crate) use runtime::{
+    grant_runtime_database, normalize_public_url_for_profile, normalize_single_host_cidr,
+    verify_runtime_no_ddl,
+};
 use secrets::*;
-pub(crate) use secrets::{ensure_mfa_totp_configuration, ensure_mfa_totp_runtime};
+pub(crate) use secrets::{
+    ensure_mfa_totp_configuration, ensure_mfa_totp_runtime, reconcile_managed_secrets,
+};
 
 pub(crate) const POSTGRES_IMAGE: &str = "docker.io/library/postgres:18@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a";
 pub(crate) const VALKEY_IMAGE: &str = "docker.io/valkey/valkey:8-alpine@sha256:a038175878d66b9d274fbf8be73c0305e93798b83917647f167e18cef3c71eec";
@@ -95,7 +100,16 @@ pub(crate) fn prepare(
             bail!("{label} must be distinct non-nested failure domains");
         }
     }
-    validate_public_url(&options.public_url)?;
+    options.public_url = normalize_public_url_for_profile(&options.public_url, &options.profile)?;
+    if options.profile == "standards-full" {
+        let cidr = options
+            .trusted_proxy_cidr
+            .as_deref()
+            .context("standards-full requires an explicit trusted proxy CIDR")?;
+        options.trusted_proxy_cidr = Some(normalize_single_host_cidr(cidr)?);
+    } else if options.trusted_proxy_cidr.is_some() {
+        bail!("--trusted-proxy-cidr is accepted only with --profile standards-full");
+    }
     normalize_external_dependencies(&mut options)?;
     normalize_profile_secrets(&mut options)?;
     let (runtime_backend, dependency_backend) = select_runtime(&options)?;
@@ -104,6 +118,14 @@ pub(crate) fn prepare(
         .context("update config path has no parent")?;
     let secrets_dir = config_dir.join("secrets");
     let app_root = options.data_root.join("app");
+    crate::deployment::validate_independent_recovery_device(
+        &options.recovery_root,
+        &[
+            ("application root", &options.data_root),
+            ("controller root", &options.control_root),
+        ],
+        "installation recovery root",
+    )?;
     create_directory(config_dir, 0o755)?;
     create_directory(&options.data_root, 0o755)?;
     create_directory(&options.control_root, 0o700)?;
@@ -118,33 +140,18 @@ pub(crate) fn prepare(
     if runtime_backend == RuntimeBackendKind::Systemd && options.network_subnet.is_some() {
         bail!("container network options are unavailable with the selected host runtime");
     }
-    let network_gateway = if runtime_backend != RuntimeBackendKind::Systemd {
-        Some(
-            runtime_backend::backend(runtime_backend).ensure_managed_network(&ManagedNetwork {
-                name: network_name.clone(),
-                subnet: options.network_subnet.clone(),
-                deployment_id: bootstrap_operator.deployment_id.clone(),
-                control_authority: bootstrap_operator.controller_key_id.clone(),
-            })?,
-        )
-    } else {
-        None
-    };
-    let trusted_proxy_cidr = if options.profile == "standards-full" {
-        if runtime_backend == RuntimeBackendKind::Systemd {
-            Some("127.0.0.1/32".to_owned())
-        } else {
-            Some(host_cidr(
-                network_gateway.context("container network gateway was not established")?,
-            ))
-        }
-    } else {
-        None
-    };
+    if runtime_backend != RuntimeBackendKind::Systemd {
+        runtime_backend::backend(runtime_backend).ensure_managed_network(&ManagedNetwork {
+            name: network_name.clone(),
+            subnet: options.network_subnet.clone(),
+            deployment_id: bootstrap_operator.deployment_id.clone(),
+            control_authority: bootstrap_operator.controller_key_id.clone(),
+        })?;
+    }
     create_directory(&secrets_dir, 0o700)?;
     create_directory(&options.data_root.join("ui-releases"), 0o755)?;
+    create_directory(&options.recovery_root.join("backups"), 0o700)?;
     for path in [
-        options.control_root.join("backups"),
         options.control_root.join("deployments"),
         options.control_root.join("audit"),
         options.control_root.join("operator-state"),
@@ -178,7 +185,7 @@ pub(crate) fn prepare(
         &bootstrap_operator.deployment_id,
         runtime_backend,
         &options.data_root,
-        trusted_proxy_cidr.as_deref(),
+        options.trusted_proxy_cidr.as_deref(),
         profile.as_deref(),
     )?;
     let config = build_config(
@@ -323,6 +330,7 @@ pub(crate) fn start_managed_dependencies(config: &UpdateConfig) -> anyhow::Resul
         valkey_image: config.valkey.image.clone(),
         valkey_password_file: secrets.join("valkey-password"),
         valkey_acl_file: secrets.join("valkey.acl"),
+        valkey_user: runtime_backend::MANAGED_VALKEY_RUNTIME_USER.to_owned(),
     })?;
     configure_managed_database_roles(config)
         .context("failed to configure managed PostgreSQL roles after final readiness")

@@ -1,19 +1,25 @@
-use std::{fmt::Write as _, fs, path::Path};
+use std::{fmt::Write as _, fs, io::Read as _, path::Path};
 
 use anyhow::{Context, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
+use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    deployment::{Capability, DeploymentRecord, DeploymentStore},
-    filesystem::{atomic_write, remove_file_durable, sha256},
+    deployment::{Capability, DeploymentRecord, DeploymentStore, SafeReference},
+    filesystem::{atomic_write, open_secure_regular_file, remove_file_durable},
 };
 
 const TRANSACTION_SCHEMA: u32 = 1;
 const EVIDENCE_SCHEMA: u32 = 1;
 const MAX_EVIDENCE_BYTES: u64 = 32 * 1024;
+const MAX_PROVIDER_KEY_BYTES: u64 = 4 * 1024;
+const MAX_EVIDENCE_AGE_SECONDS: i64 = 15 * 60;
+const MAX_EVIDENCE_FUTURE_SKEW_SECONDS: i64 = 60;
+const MAX_EVIDENCE_LIFETIME_SECONDS: i64 = 60 * 60;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -54,6 +60,8 @@ pub(crate) struct CoordinationStep {
     pub(crate) owner: StepOwner,
     pub(crate) capability: String,
     action: String,
+    #[serde(default)]
+    expected_evidence_kind: Option<EvidenceKind>,
     pub(crate) state: StepState,
     evidence_sha256: Option<String>,
 }
@@ -92,9 +100,17 @@ struct EvidenceInput {
     transaction_id: String,
     step_id: String,
     kind: EvidenceKind,
+    action: String,
+    capability: String,
     reference_id: String,
     artifact_sha256: String,
+    plan_sha256: String,
+    target_release: nazo_operator_protocol::EmbeddedIdentity,
     issued_at: i64,
+    expires_at: i64,
+    nonce: String,
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -107,12 +123,32 @@ struct AcceptedEvidence {
     semantic_completion_claimed: bool,
 }
 
+#[derive(Serialize)]
+struct EvidenceSigningPayload<'a> {
+    schema: u32,
+    deployment_id: &'a str,
+    transaction_id: &'a str,
+    step_id: &'a str,
+    kind: EvidenceKind,
+    action: &'a str,
+    capability: &'a str,
+    reference_id: &'a str,
+    artifact_sha256: &'a str,
+    plan_sha256: &'a str,
+    target_release: &'a nazo_operator_protocol::EmbeddedIdentity,
+    issued_at: i64,
+    expires_at: i64,
+    nonce: &'a str,
+}
+
 #[derive(Deserialize)]
 struct PlanStep {
     id: String,
     owner: StepOwner,
     capability: String,
     action: String,
+    #[serde(default)]
+    evidence_kind: Option<EvidenceKind>,
 }
 
 #[cfg(test)]
@@ -171,12 +207,35 @@ pub(crate) fn prepare_update_locked(
         if step.capability.is_empty() || step.action.is_empty() {
             bail!("update plan step is incomplete");
         }
+        validate_identifier(&step.capability, "plan step capability")?;
+        validate_action(&step.action)?;
+        match step.owner {
+            StepOwner::CtlOwned if step.evidence_kind.is_some() => {
+                bail!("controller-owned update steps must not declare an external evidence kind");
+            }
+            StepOwner::UserRequired
+                if step.evidence_kind != Some(EvidenceKind::OperatorConfirmation) =>
+            {
+                bail!("user-required update steps must require operator-confirmation evidence");
+            }
+            StepOwner::ProviderOwned if step.evidence_kind.is_none() => {
+                bail!("provider-owned update steps must declare their evidence kind");
+            }
+            _ => {}
+        }
+        if steps
+            .iter()
+            .any(|existing: &CoordinationStep| existing.id == step.id)
+        {
+            bail!("update plan contains duplicate step IDs");
+        }
         let verified_release = step.id == "verify-release" && step.owner == StepOwner::CtlOwned;
         steps.push(CoordinationStep {
             id: step.id,
             owner: step.owner,
             capability: step.capability,
             action: step.action,
+            expected_evidence_kind: step.evidence_kind,
             state: if verified_release {
                 StepState::ControllerCompleted
             } else {
@@ -255,35 +314,60 @@ pub(crate) fn submit_evidence(
     ) {
         bail!("the update transaction no longer accepts evidence");
     }
-    validate_evidence_file(input_path)?;
-    let input_bytes = fs::read(input_path)?;
+    let input_bytes = read_bounded_secure_file(
+        input_path,
+        "coordination evidence",
+        false,
+        MAX_EVIDENCE_BYTES,
+    )?;
     let input: EvidenceInput =
         serde_json::from_slice(&input_bytes).context("coordination evidence is invalid")?;
-    validate_evidence_input(&input, &transaction)?;
-    let step = transaction
+    let step_index = transaction
         .steps
-        .iter_mut()
-        .find(|step| step.id == input.step_id)
+        .iter()
+        .position(|step| step.id == input.step_id)
         .context("coordination evidence step does not exist")?;
+    let step = &transaction.steps[step_index];
     if !step.owner.requires_external_evidence() {
         bail!("controller-owned steps do not accept user-supplied completion evidence");
     }
-    let source_manifest_sha256 = digest_bytes(&input_bytes);
+    if step.state != StepState::Pending {
+        bail!("coordination evidence for this step was already accepted");
+    }
+    validate_evidence_input(&input, &transaction, step)?;
+    if step.owner == StepOwner::ProviderOwned {
+        verify_provider_evidence(&current, &transaction, step, &input)?;
+    }
+    reject_replayed_nonce(store, &transaction, &input.nonce)?;
+    let source_manifest_sha256 = digest_bytes(&canonical_evidence_bytes(&input)?);
     let accepted = AcceptedEvidence {
         schema: EVIDENCE_SCHEMA,
         evidence: input,
-        source_manifest_sha256: source_manifest_sha256.clone(),
+        source_manifest_sha256,
         accepted_at: Utc::now().timestamp(),
         semantic_completion_claimed: false,
     };
     let evidence_path = evidence_path(store, &transaction.deployment_id, &step.id);
-    atomic_write(
-        &evidence_path,
-        &serde_json::to_vec_pretty(&accepted)?,
-        0o600,
-    )?;
+    match fs::symlink_metadata(&evidence_path) {
+        Ok(_) => bail!("coordination evidence for this step already exists"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect existing coordination evidence {}",
+                    evidence_path.display()
+                )
+            });
+        }
+    }
+    let persisted_bytes = serde_json::to_vec_pretty(&accepted)?;
+    if persisted_bytes.len() as u64 > MAX_EVIDENCE_BYTES {
+        bail!("accepted coordination evidence exceeds the {MAX_EVIDENCE_BYTES}-byte limit");
+    }
+    atomic_write(&evidence_path, &persisted_bytes, 0o600)?;
+    let step = &mut transaction.steps[step_index];
     step.state = StepState::EvidenceAccepted;
-    step.evidence_sha256 = Some(sha256(&evidence_path)?);
+    step.evidence_sha256 = Some(digest_bytes(&persisted_bytes));
     transaction.updated_at = Utc::now().timestamp();
     transaction.state = next_state(&transaction);
     persist(store, &transaction)?;
@@ -312,12 +396,28 @@ pub(crate) fn resume(
             .evidence_sha256
             .as_deref()
             .context("accepted evidence has no persisted digest")?;
-        if sha256(&evidence_path)? != expected {
+        let persisted_bytes = read_bounded_secure_file(
+            &evidence_path,
+            "persisted coordination evidence",
+            true,
+            MAX_EVIDENCE_BYTES,
+        )?;
+        if digest_bytes(&persisted_bytes) != expected {
             bail!("persisted coordination evidence was changed after acceptance");
         }
-        let accepted: AcceptedEvidence = serde_json::from_slice(&fs::read(&evidence_path)?)
+        let accepted: AcceptedEvidence = serde_json::from_slice(&persisted_bytes)
             .context("persisted coordination evidence is invalid")?;
-        validate_evidence_input(&accepted.evidence, &transaction)?;
+        if accepted.schema != EVIDENCE_SCHEMA {
+            bail!("unsupported accepted coordination evidence schema");
+        }
+        validate_evidence_input(&accepted.evidence, &transaction, step)?;
+        if step.owner == StepOwner::ProviderOwned {
+            verify_provider_evidence(&current, &transaction, step, &accepted.evidence)?;
+        }
+        let source_manifest_sha256 = digest_bytes(&canonical_evidence_bytes(&accepted.evidence)?);
+        if accepted.source_manifest_sha256 != source_manifest_sha256 {
+            bail!("accepted coordination evidence source digest does not match its payload");
+        }
         if accepted.semantic_completion_claimed {
             bail!("coordination evidence must not claim semantic completion");
         }
@@ -529,6 +629,7 @@ fn current_record_locked(
 fn validate_evidence_input(
     input: &EvidenceInput,
     transaction: &UpdateCoordination,
+    step: &CoordinationStep,
 ) -> anyhow::Result<()> {
     if input.schema != EVIDENCE_SCHEMA {
         bail!("unsupported coordination evidence schema");
@@ -538,33 +639,232 @@ fn validate_evidence_input(
     {
         bail!("coordination evidence is bound to a different deployment or transaction");
     }
-    validate_identifier(&input.step_id, "evidence step ID")?;
-    validate_identifier(&input.reference_id, "evidence reference ID")?;
-    if input.artifact_sha256.len() != 64
-        || !input
-            .artifact_sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        bail!("evidence artifact SHA-256 must be 64 lowercase hexadecimal characters");
+    if input.step_id != step.id {
+        bail!("coordination evidence step does not match the selected step");
     }
-    if input.issued_at <= 0 {
-        bail!("coordination evidence issued_at is invalid");
+    if input.action != step.action {
+        bail!("coordination evidence action does not match the coordination step");
+    }
+    if input.capability != step.capability {
+        bail!("coordination evidence capability does not match the coordination step");
+    }
+    if input.kind != expected_evidence_kind(step)? {
+        bail!("coordination evidence kind does not match the step owner and action");
+    }
+    validate_identifier(&input.step_id, "evidence step ID")?;
+    validate_identifier(&input.capability, "evidence capability")?;
+    validate_action(&input.action)?;
+    validate_identifier(&input.reference_id, "evidence reference ID")?;
+    validate_digest(&input.artifact_sha256, "evidence artifact SHA-256")?;
+    if input.plan_sha256 != transaction.plan_sha256 {
+        bail!("coordination evidence is bound to a different update plan");
+    }
+    validate_digest(&input.plan_sha256, "evidence plan SHA-256")?;
+    if input.target_release != transaction.target_release {
+        bail!("coordination evidence is bound to a different target release");
+    }
+    validate_freshness(input.issued_at, input.expires_at)?;
+    if input.nonce.is_empty() {
+        bail!("coordination evidence nonce is empty");
+    }
+    validate_identifier(&input.nonce, "evidence nonce")?;
+    if input.nonce.len() > 128 {
+        bail!("coordination evidence nonce is too long");
     }
     Ok(())
 }
 
-fn validate_evidence_file(path: &Path) -> anyhow::Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect evidence {}", path.display()))?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() == 0
-        || metadata.len() > MAX_EVIDENCE_BYTES
-    {
-        bail!("coordination evidence must be a regular file from 1 through 32768 bytes");
+fn expected_evidence_kind(step: &CoordinationStep) -> anyhow::Result<EvidenceKind> {
+    if step.owner == StepOwner::UserRequired {
+        return Ok(EvidenceKind::OperatorConfirmation);
+    }
+    step.expected_evidence_kind
+        .context("provider-owned coordination step predates the signed evidence-kind contract")
+}
+
+fn validate_action(action: &str) -> anyhow::Result<()> {
+    if action.is_empty() || action.len() > 256 || action.chars().any(char::is_control) {
+        bail!("coordination evidence action is invalid");
     }
     Ok(())
+}
+
+fn validate_digest(value: &str, label: &str) -> anyhow::Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("{label} must be 64 lowercase hexadecimal characters");
+    }
+    Ok(())
+}
+
+fn validate_freshness(issued_at: i64, expires_at: i64) -> anyhow::Result<()> {
+    let now = Utc::now().timestamp();
+    if issued_at <= 0 || expires_at <= issued_at {
+        bail!("coordination evidence validity interval is invalid");
+    }
+    if issued_at > now.saturating_add(MAX_EVIDENCE_FUTURE_SKEW_SECONDS) {
+        bail!("coordination evidence is issued too far in the future");
+    }
+    if issued_at < now.saturating_sub(MAX_EVIDENCE_AGE_SECONDS) {
+        bail!("coordination evidence is too old");
+    }
+    if expires_at <= now {
+        bail!("coordination evidence has expired");
+    }
+    if expires_at > issued_at.saturating_add(MAX_EVIDENCE_LIFETIME_SECONDS) {
+        bail!("coordination evidence validity interval is too long");
+    }
+    Ok(())
+}
+
+fn verify_provider_evidence(
+    record: &DeploymentRecord,
+    transaction: &UpdateCoordination,
+    step: &CoordinationStep,
+    input: &EvidenceInput,
+) -> anyhow::Result<()> {
+    let encoded = input
+        .signature
+        .as_deref()
+        .context("provider-owned evidence has no Ed25519 signature")?;
+    let signature_bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .context("provider-owned evidence signature is not canonical base64url")?;
+    if URL_SAFE_NO_PAD.encode(&signature_bytes) != encoded {
+        bail!("provider-owned evidence signature is not canonical base64url");
+    }
+    let signature = Signature::from_slice(&signature_bytes)
+        .context("provider-owned evidence signature has invalid length")?;
+    let verifying_key = load_provider_verifying_key(record, &step.capability)?;
+    let payload = canonical_signing_payload(input, transaction)?;
+    verifying_key
+        .verify(&payload, &signature)
+        .context("provider-owned evidence signature verification failed")
+}
+
+fn load_provider_verifying_key(
+    record: &DeploymentRecord,
+    capability: &str,
+) -> anyhow::Result<VerifyingKey> {
+    let resource_id = format!("provider-evidence:{capability}");
+    let Some(SafeReference::DigestBoundFile { path, sha256: pin }) =
+        record.resources.get(&resource_id)
+    else {
+        bail!("provider-owned evidence has no pinned provider verification key");
+    };
+    validate_digest(pin, "provider evidence verification key pin")?;
+    let file = open_secure_regular_file(path, "provider evidence verification key", false)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_PROVIDER_KEY_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .context("failed to read provider evidence verification key")?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_PROVIDER_KEY_BYTES {
+        bail!("provider evidence verification key exceeds its size limit");
+    }
+    if digest_bytes(&bytes) != pin.as_str() {
+        bail!("provider evidence verification key digest does not match its pin");
+    }
+    let key_bytes = if bytes.len() == 32 {
+        bytes
+    } else {
+        let text = std::str::from_utf8(&bytes)
+            .context("provider evidence verification key is not UTF-8")?;
+        let decoded = URL_SAFE_NO_PAD
+            .decode(text)
+            .context("provider evidence verification key is not canonical base64url")?;
+        if URL_SAFE_NO_PAD.encode(&decoded) != text {
+            bail!("provider evidence verification key is not canonical base64url");
+        }
+        decoded
+    };
+    let key_bytes: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("provider evidence verification key has invalid length"))?;
+    VerifyingKey::from_bytes(&key_bytes).context("provider evidence verification key is invalid")
+}
+
+fn reject_replayed_nonce(
+    store: &DeploymentStore,
+    transaction: &UpdateCoordination,
+    nonce: &str,
+) -> anyhow::Result<()> {
+    for step in transaction
+        .steps
+        .iter()
+        .filter(|step| step.owner.requires_external_evidence())
+    {
+        if step.state != StepState::EvidenceAccepted {
+            continue;
+        }
+        let path = evidence_path(store, &transaction.deployment_id, &step.id);
+        let bytes = read_bounded_secure_file(
+            &path,
+            "persisted coordination evidence",
+            true,
+            MAX_EVIDENCE_BYTES,
+        )?;
+        let accepted: AcceptedEvidence =
+            serde_json::from_slice(&bytes).context("persisted coordination evidence is invalid")?;
+        if accepted.evidence.nonce == nonce {
+            bail!("coordination evidence nonce was already accepted in this transaction");
+        }
+    }
+    Ok(())
+}
+
+fn canonical_signing_payload(
+    input: &EvidenceInput,
+    transaction: &UpdateCoordination,
+) -> anyhow::Result<Vec<u8>> {
+    serde_json::to_vec(&EvidenceSigningPayload {
+        schema: input.schema,
+        deployment_id: &input.deployment_id,
+        transaction_id: &input.transaction_id,
+        step_id: &input.step_id,
+        kind: input.kind,
+        action: &input.action,
+        capability: &input.capability,
+        reference_id: &input.reference_id,
+        artifact_sha256: &input.artifact_sha256,
+        plan_sha256: &input.plan_sha256,
+        target_release: &input.target_release,
+        issued_at: input.issued_at,
+        expires_at: input.expires_at,
+        nonce: &input.nonce,
+    })
+    .context("failed to canonicalize coordination evidence payload")
+    .and_then(|payload| {
+        if input.plan_sha256 != transaction.plan_sha256
+            || input.target_release != transaction.target_release
+        {
+            bail!("coordination evidence signing payload is not bound to this transaction");
+        }
+        Ok(payload)
+    })
+}
+
+fn canonical_evidence_bytes(input: &EvidenceInput) -> anyhow::Result<Vec<u8>> {
+    serde_json::to_vec(input).context("failed to canonicalize coordination evidence")
+}
+
+fn read_bounded_secure_file(
+    path: &Path,
+    label: &str,
+    private: bool,
+    max_bytes: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let file = open_secure_regular_file(path, label, private)?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label} {}", path.display()))?;
+    if bytes.is_empty() || bytes.len() as u64 > max_bytes {
+        bail!("{label} must be a regular file from 1 through {max_bytes} bytes");
+    }
+    Ok(bytes)
 }
 
 fn validate_identifier(value: &str, label: &str) -> anyhow::Result<()> {
@@ -601,10 +901,14 @@ fn evidence_path(
 }
 
 fn load_path(path: &Path) -> anyhow::Result<UpdateCoordination> {
-    let transaction: UpdateCoordination = serde_json::from_slice(
-        &fs::read(path).with_context(|| format!("failed to read {}", path.display()))?,
-    )
-    .context("coordination transaction is invalid")?;
+    let bytes = crate::filesystem::read_secure_regular_file(
+        path,
+        "coordination transaction",
+        true,
+        4 * 1024 * 1024,
+    )?;
+    let transaction: UpdateCoordination =
+        serde_json::from_slice(&bytes).context("coordination transaction is invalid")?;
     if transaction.schema != TRANSACTION_SCHEMA {
         bail!("unsupported coordination transaction schema");
     }

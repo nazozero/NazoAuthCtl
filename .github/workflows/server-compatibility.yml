@@ -141,9 +141,12 @@ jobs:
       - name: Install independent Podman adapter dependency
         run: |
           sudo apt-get update
-          sudo apt-get install --yes podman
+          sudo apt-get install --yes podman python3-cryptography
       - name: Validate the closed recovery fixture generator
-        run: python3 -c 'compile(open(".github/scripts/write_recovery_fixture.py", encoding="utf-8").read(), "write_recovery_fixture.py", "exec")'
+        run: |
+          python3 -m py_compile \
+            .github/scripts/recovery_evidence.py \
+            .github/scripts/write_recovery_fixture.py
       - name: Download and verify the already-built host server
         env:
           GH_TOKEN: ${{ github.token }}
@@ -255,7 +258,7 @@ jobs:
           control_root="/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker"
           config_root="$control_root/controller-config"
           state_root="$control_root/controller-state"
-          break_glass_root="$control_root/controller-break-glass"
+          break_glass_root="/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker-break-glass"
           deployment_id=deployment-ci-recovery
           runtime_id=runtime-ci-recovery
           image=ghcr.io/nazozero/nazoauth:v0.1.20
@@ -287,13 +290,14 @@ jobs:
               postgres:18-alpine psql --host "$postgres" --username postgres --dbname oauth \
               --set ON_ERROR_STOP=1 --single-transaction --file "/migrations/$relative" >/dev/null
           done
+          sudo install -d -o 0 -g 0 -m 0700 "$break_glass_root"
           mkdir -p "$root/docker-live-data" "$root/docker-live-config" \
             "$config_root/deployments/$deployment_id" \
             "$state_root/deployments/$deployment_id/identities" \
             "$state_root/deployments/$deployment_id/audit" \
             "$state_root/deployments/$deployment_id/transactions" \
-            "$state_root/deployments/$deployment_id/recovery/trusted-runtime/v0.1.20/$runtime_id" \
-            "$break_glass_root"
+            "$state_root/deployments/$deployment_id/recovery/trusted-runtime/v0.1.20/$runtime_id"
+          test "$(stat -c %d "$control_root")" != "$(stat -c %d "$break_glass_root")"
           sudo chown -R 10001:10001 "$root/docker-live-data"
           cat >"$root/docker-live-config/.env.yaml" <<YAML
           BIND: "0.0.0.0:8000"
@@ -319,6 +323,11 @@ jobs:
             sleep 2
           done
           test "$ready" = true
+          ui_url=http://127.0.0.1:19081/ui/
+          curl --fail --silent --show-error "$ui_url" >"$root/docker-ui.html"
+          ui_sha="$(sha256sum "$root/docker-ui.html" | cut -d' ' -f1)"
+          ui_size="$(stat -c %s "$root/docker-ui.html")"
+          test "$ui_size" -gt 0
           docker inspect manual-auth-same-name | jq -S '.[0].HostConfig | {
             ReadonlyRootfs, RestartPolicy, CapDrop, Memory, NanoCpus, PidsLimit, Tmpfs
           }' >"$root/docker-policy-before.json"
@@ -328,9 +337,6 @@ jobs:
           archive="$state_root/deployments/$deployment_id/recovery/trusted-runtime/v0.1.20/$runtime_id/image.tar"
           docker image save --output "$archive" "$image@$digest"
           archive_sha="$(sha256sum "$archive" | cut -d' ' -f1)"
-          recovery_manifest="$state_root/deployments/$deployment_id/recovery/manual-manifest.json"
-          printf '%s' '{"schema":1,"fixture":"external resources remain external"}' >"$recovery_manifest"
-          recovery_sha="$(sha256sum "$recovery_manifest" | cut -d' ' -f1)"
           driver="$control_root/recovery-driver.py"
           cat >"$driver" <<'PY'
           #!/usr/bin/env python3
@@ -351,13 +357,15 @@ jobs:
           PY
           chmod 0500 "$driver"
           driver_sha="$(sha256sum "$driver" | cut -d' ' -f1)"
+          provider_key="$control_root/recovery-provider.key"
           lifecycle="$state_root/deployments/$deployment_id/recovery/lifecycle.json"
           jq -n \
             --arg deployment "$deployment_id" --arg runtime "$runtime_id" \
             --arg object manual-auth-same-name --arg data "$root/docker-live-data" \
             --arg config "$root/docker-live-config/.env.yaml" --arg network "$network" \
             --arg driver "$driver" --arg driver_sha "$driver_sha" --arg rehearsal "$control_root/rehearsal" \
-            '{schema:2,deployment_id:$deployment,runtimes:[{
+            --arg ui_url "$ui_url" --arg ui_sha "$ui_sha" --argjson ui_size "$ui_size" \
+            '{schema:3,deployment_id:$deployment,runtimes:[{
               runtime_instance_id:$runtime,backend:"docker",object_reference:$object,
               command:["nazoauth","server"],mounts:[
                 {source:$config,destination:"/app/.env.yaml",read_only:true,selinux_relabel:false,ownership:"external",scope:"deployment"},
@@ -365,9 +373,23 @@ jobs:
               ],environment:{DATA_DIR:"/var/lib/nazo_oauth"},networks:[$network],ip_address:null,
               ports:["127.0.0.1:19081:8000"],container_policy:{restart:"no",read_only_root:false,
                 no_new_privileges:false,drop_all_capabilities:false,pids_limit:null,memory_limit_bytes:null,
-                cpu_limit_millis:null,tmpfs:[]}
-            }],recovery_driver:{program:$driver,program_sha256:$driver_sha,arguments:[],rehearsal_workspace:$rehearsal,credentials:{}}}' \
+                cpu_limit_millis:null,tmpfs:[]},acceptance:{readiness_url:"http://127.0.0.1:19081/ready",
+                expected_issuer:"http://127.0.0.1:19081",
+                discovery_url:"http://127.0.0.1:19081/.well-known/openid-configuration",
+                ui_url:$ui_url,ui_sha256:$ui_sha,ui_size:$ui_size,attempts:90,interval_seconds:2}
+            }],recovery_driver:{program:$driver,program_sha256:$driver_sha,arguments:[],rehearsal_workspace:$rehearsal,credentials:{}},
+              recovery_providers:[]}' \
             >"$lifecycle"
+          recovery_manifest="$state_root/deployments/$deployment_id/recovery/manual-manifest.json"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/recovery_evidence.py" \
+            --lifecycle "$lifecycle" \
+            --output "$recovery_manifest" \
+            --artifact-root "$state_root/deployments/$deployment_id/recovery/provider-artifacts" \
+            --provider-key "$provider_key" \
+            --deployment-id "$deployment_id" \
+            --release v0.1.20 \
+            --operation restore
+          recovery_sha="$(sha256sum "$recovery_manifest" | cut -d' ' -f1)"
           identity="$(cat host-identity.json)"
           declaration="$config_root/deployments/$deployment_id/deployment.json"
           audit_key="$state_root/deployments/$deployment_id/identities/audit.key"
@@ -412,6 +434,7 @@ jobs:
             --arg manifest "$recovery_manifest" --arg manifest_sha "$recovery_sha" \
             '{schema:1,deployment_id:$deployment,trusted_release:$identity,recovery_manifest:$manifest,recovery_manifest_sha256:$manifest_sha}' \
             >"$state_root/deployments/$deployment_id/recovery/rollback-slot.json"
+          chmod 0600 "$state_root/deployments/$deployment_id/recovery/rollback-slot.json"
 
           docker rm --force manual-auth-same-name
           docker image rm "$image"
@@ -419,8 +442,9 @@ jobs:
           # The recovery command is deliberately executed as the controller
           # (root) user.  Its storage-root invariant requires every existing
           # component and every non-sticky ancestor to be owned by that user.
-          # Keep controller storage directly below root-owned sticky /tmp, then
-          # hand ownership over only after all runner-side material is written.
+          # Keep controller storage directly below root-owned sticky /tmp and
+          # break-glass storage on the runner's distinct tmpfs device. Transfer
+          # ownership only after all runner-side material is written.
           sudo chown -R 0:0 "$control_root"
           sudo chmod 0700 "$break_glass_root"
           sudo env \
@@ -454,14 +478,16 @@ jobs:
           control_root="/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-systemd"
           config_root="$control_root/controller-config"
           state_root="$control_root/controller-state"
-          break_glass_root="$control_root/controller-break-glass"
+          break_glass_root="/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-systemd-break-glass"
           deployment_id=deployment-ci-systemd-recovery
           runtime_id=runtime-ci-systemd-recovery
           unit=manual-auth-recovery.service
           target="$control_root/systemd-live/nazoauth"
           cached="$control_root/systemd-cache/nazoauth"
+          sudo install -d -o 0 -g 0 -m 0700 "$break_glass_root"
           mkdir -p "$control_root/systemd-live" "$control_root/systemd-cache" \
-            "$root/live-data" "$root/live-config" "$break_glass_root"
+            "$root/live-data" "$root/live-config"
+          test "$(stat -c %d "$control_root")" != "$(stat -c %d "$break_glass_root")"
           install -m 0755 "$GITHUB_WORKSPACE/signed-server/nazoauth-x86_64-unknown-linux-gnu" "$target"
           install -m 0500 "$target" "$cached"
           cat >"$root/live-config/.env.yaml" <<YAML
@@ -499,6 +525,11 @@ jobs:
             sleep 2
           done
           test "$ready" = true
+          ui_url=http://127.0.0.1:19084/ui/
+          curl --fail --silent --show-error "$ui_url" >"$root/systemd-ui.html"
+          ui_sha="$(sha256sum "$root/systemd-ui.html" | cut -d' ' -f1)"
+          ui_size="$(stat -c %s "$root/systemd-ui.html")"
+          test "$ui_size" -gt 0
 
           binary_sha="$(sha256sum "$cached" | cut -d' ' -f1)"
           jq -n \
@@ -508,11 +539,17 @@ jobs:
             --arg config_root "$config_root" --arg state_root "$state_root" \
             --arg break_glass_root "$break_glass_root" --arg target "$target" \
             --arg cached "$cached" --arg sha "$binary_sha" \
+            --arg provider_key "$control_root/recovery-provider.key" \
+            --arg ui_url "$ui_url" --arg ui_sha "$ui_sha" --argjson ui_size "$ui_size" \
             '{backend:$backend,deployment_id:$deployment,runtime_id:$runtime,object_reference:$object,
               release:$release,alias:$alias,issuer:$issuer,identity_file:$identity,config_root:$config_root,
               state_root:$state_root,break_glass_root:$break_glass_root,
               artifact:{kind:"host",target_path:$target,cached_binary:$cached,sha256:$sha},
               runtime:{command:[$target,"server"],mounts:[],environment:{},networks:[],ip_address:null,ports:[],container_policy:null},
+              acceptance:{readiness_url:"http://127.0.0.1:19084/ready",expected_issuer:"http://127.0.0.1:19084",
+                discovery_url:"http://127.0.0.1:19084/.well-known/openid-configuration",
+                ui_url:$ui_url,ui_sha256:$ui_sha,ui_size:$ui_size,attempts:90,interval_seconds:2},
+              provider_key:$provider_key,
               declared_ports:[],operator_protocol_versions:[999],operator_tasks_responsibility:"delegated",
               database_responsibility:"delegated"}' >"$root/spec.json"
           python3 "$GITHUB_WORKSPACE/.github/scripts/write_recovery_fixture.py" "$root/spec.json"
@@ -523,8 +560,8 @@ jobs:
 
           # The fixture is authored by the runner, while destructive controller
           # operations intentionally run as root.  The controller boundary is
-          # directly below root-owned sticky /tmp, so its complete ancestor
-          # chain satisfies the same invariant as a production installation.
+          # directly below root-owned sticky /tmp, while break-glass recovery
+          # remains on the runner's distinct tmpfs device.
           sudo chown -R 0:0 "$control_root"
           sudo chmod 0700 "$break_glass_root"
 
@@ -606,7 +643,7 @@ jobs:
           control_root="/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman"
           config_root="$control_root/controller-config"
           state_root="$control_root/controller-state"
-          break_glass_root="$control_root/controller-break-glass"
+          break_glass_root="/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman-break-glass"
           deployment_id=deployment-ci-podman-recovery
           runtime_id=runtime-ci-podman-recovery
           object=manual-auth-podman-recovery
@@ -646,7 +683,9 @@ jobs:
           identity|identity
           PATTERNS
           }
-          mkdir -p "$root/live-data" "$root/live-config" "$root/cache" "$break_glass_root"
+          sudo install -d -o 0 -g 0 -m 0700 "$break_glass_root"
+          mkdir -p "$root/live-data" "$root/live-config" "$root/cache"
+          test "$(stat -c %d "$control_root")" != "$(stat -c %d "$break_glass_root")"
           sudo chown -R 10001:10001 "$root/live-data"
           cat >"$root/live-config/.env.yaml" <<YAML
           BIND: "127.0.0.1:19083"
@@ -672,6 +711,11 @@ jobs:
             sleep 2
           done
           test "$ready" = true
+          ui_url=http://127.0.0.1:19083/ui/
+          curl --fail --silent --show-error "$ui_url" >"$root/podman-ui.html"
+          ui_sha="$(sha256sum "$root/podman-ui.html" | cut -d' ' -f1)"
+          ui_size="$(stat -c %s "$root/podman-ui.html")"
+          test "$ui_size" -gt 0
           sudo podman inspect "$object" | jq -S '.[0].HostConfig | {
             ReadonlyRootfs, RestartPolicy, CapDrop, Memory, NanoCpus, PidsLimit, Tmpfs
           }' >"$root/podman-policy-before.json"
@@ -692,6 +736,8 @@ jobs:
             --arg break_glass_root "$break_glass_root" --arg image "$image" \
             --arg digest "$digest" --arg local_image_id "$local_image_id" --arg archive "$archive" \
             --arg config "$root/live-config/.env.yaml" --arg data "$root/live-data" \
+            --arg provider_key "$control_root/recovery-provider.key" \
+            --arg ui_url "$ui_url" --arg ui_sha "$ui_sha" --argjson ui_size "$ui_size" \
             '{backend:$backend,deployment_id:$deployment,runtime_id:$runtime,object_reference:$object,
               release:$release,alias:$alias,issuer:$issuer,identity_file:$identity,config_root:$config_root,
               state_root:$state_root,break_glass_root:$break_glass_root,
@@ -701,7 +747,11 @@ jobs:
                 {source:$data,destination:"/var/lib/nazo_oauth",read_only:false,selinux_relabel:false,ownership:"external",scope:"deployment"}],
                 environment:{DATA_DIR:"/var/lib/nazo_oauth"},networks:["host"],ip_address:null,ports:[],
                 container_policy:{restart:"no",read_only_root:false,no_new_privileges:false,
-                  drop_all_capabilities:false,pids_limit:null,memory_limit_bytes:null,cpu_limit_millis:null,tmpfs:[]}},declared_ports:[]}' \
+                  drop_all_capabilities:false,pids_limit:null,memory_limit_bytes:null,cpu_limit_millis:null,tmpfs:[]}},
+              acceptance:{readiness_url:"http://127.0.0.1:19083/ready",expected_issuer:"http://127.0.0.1:19083",
+                discovery_url:"http://127.0.0.1:19083/.well-known/openid-configuration",
+                ui_url:$ui_url,ui_sha256:$ui_sha,ui_size:$ui_size,attempts:90,interval_seconds:2},
+              provider_key:$provider_key,declared_ports:[]}' \
             >"$root/spec.json"
           python3 "$GITHUB_WORKSPACE/.github/scripts/write_recovery_fixture.py" "$root/spec.json"
 
@@ -711,8 +761,9 @@ jobs:
           printf 'tampered' >>"$archive"
           # The fixture is authored by the runner, while destructive controller
           # operations intentionally run as root.  Keep the controller storage
-          # under root-owned sticky /tmp and transfer the whole boundary after
-          # the tamper mutation; cache restoration remains privileged as well.
+          # under root-owned sticky /tmp, keep break-glass recovery on the
+          # runner's distinct tmpfs device, and transfer the controller boundary
+          # after the tamper mutation; cache restoration remains privileged.
           sudo chown -R 0:0 "$control_root"
           sudo chmod 0700 "$break_glass_root"
           if sudo env \
@@ -770,5 +821,8 @@ jobs:
           sudo rm -rf -- \
             "/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker" \
             "/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-systemd" \
-            "/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman"
+            "/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman" \
+            "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker-break-glass" \
+            "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-systemd-break-glass" \
+            "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman-break-glass"
           sudo systemctl daemon-reload

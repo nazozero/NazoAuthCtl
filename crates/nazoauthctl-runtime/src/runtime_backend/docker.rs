@@ -12,7 +12,7 @@ mod operations;
 
 use std::ffi::OsString;
 
-use crate::deployment::{ArtifactReference, RuntimeBackendKind};
+use crate::{ArtifactReference, RuntimeBackendKind};
 
 #[cfg(debug_assertions)]
 use super::DebugArtifactTask;
@@ -23,7 +23,7 @@ use super::{
     RuntimeReplacement,
 };
 
-pub(crate) struct DockerBackend {
+pub struct DockerBackend {
     command: OsString,
 }
 
@@ -36,8 +36,7 @@ impl Default for DockerBackend {
 }
 
 impl DockerBackend {
-    #[cfg(test)]
-    pub(crate) fn with_command(command: impl Into<OsString>) -> Self {
+    pub fn with_command(command: impl Into<OsString>) -> Self {
         Self {
             command: command.into(),
         }
