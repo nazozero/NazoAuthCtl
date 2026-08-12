@@ -349,6 +349,7 @@ pub(super) fn materialize_vp_config(
     variant: &BTreeMap<String, String>,
     config: Value,
     request_object_trust_anchor_pem: &str,
+    attestation: Option<&GeneratedAttestationMaterial>,
 ) -> Result<Value, MaterializerError> {
     if !plan_name.starts_with("oid4vp-") {
         return Ok(config);
@@ -356,6 +357,35 @@ pub(super) fn materialize_vp_config(
     let Value::Object(mut root) = config else {
         return Err(MaterializerError::InvalidField("plan.config_template"));
     };
+    let attestation = attestation.ok_or(MaterializerError::InvalidField(
+        "generated.vp_credential_signer",
+    ))?;
+    let signing_jwk: Value =
+        serde_json::from_str(attestation.credential_signing_private_jwk.as_str())
+            .map_err(|_| MaterializerError::Encoding)?;
+    let mut credential = match root.remove("credential") {
+        None => serde_json::Map::new(),
+        Some(Value::Object(value)) => value,
+        Some(_) => return Err(MaterializerError::InvalidField("credential")),
+    };
+    if let Some(existing) = credential.get("signing_jwk")
+        && existing != &signing_jwk
+    {
+        return Err(MaterializerError::InvalidField("credential.signing_jwk"));
+    }
+    credential.insert("signing_jwk".to_owned(), signing_jwk);
+    for field in ["trust_anchor_pem", "status_list_trust_anchor_pem"] {
+        if let Some(existing) = credential.get(field)
+            && existing.as_str() != Some(attestation.trust_anchor_pem.as_str())
+        {
+            return Err(MaterializerError::InvalidField("credential.trust_anchor"));
+        }
+        credential.insert(
+            field.to_owned(),
+            Value::String(attestation.trust_anchor_pem.to_string()),
+        );
+    }
+    root.insert("credential".to_owned(), Value::Object(credential));
     let request_method = variant.get("request_method").map(String::as_str);
     // The official verifier HAIP plan is request-URI signed even though its
     // executable Matrix variant does not repeat the transport selector.
