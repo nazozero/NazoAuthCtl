@@ -255,7 +255,7 @@ jobs:
           control_root="/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker"
           config_root="$control_root/controller-config"
           state_root="$control_root/controller-state"
-          break_glass_root="$control_root/controller-break-glass"
+          break_glass_root="/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker-break-glass"
           deployment_id=deployment-ci-recovery
           runtime_id=runtime-ci-recovery
           image=ghcr.io/nazozero/nazoauth:v0.1.20
@@ -294,6 +294,7 @@ jobs:
             "$state_root/deployments/$deployment_id/transactions" \
             "$state_root/deployments/$deployment_id/recovery/trusted-runtime/v0.1.20/$runtime_id" \
             "$break_glass_root"
+          test "$(stat -c %d "$config_root")" != "$(stat -c %d "$break_glass_root")"
           sudo chown -R 10001:10001 "$root/docker-live-data"
           cat >"$root/docker-live-config/.env.yaml" <<YAML
           BIND: "0.0.0.0:8000"
@@ -419,8 +420,9 @@ jobs:
           # The recovery command is deliberately executed as the controller
           # (root) user.  Its storage-root invariant requires every existing
           # component and every non-sticky ancestor to be owned by that user.
-          # Keep controller storage directly below root-owned sticky /tmp, then
-          # hand ownership over only after all runner-side material is written.
+          # Keep controller storage directly below root-owned sticky /tmp and
+          # break-glass storage on the runner's distinct tmpfs device. Transfer
+          # ownership only after all runner-side material is written.
           sudo chown -R 0:0 "$control_root"
           sudo chmod 0700 "$break_glass_root"
           sudo env \
@@ -454,7 +456,7 @@ jobs:
           control_root="/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-systemd"
           config_root="$control_root/controller-config"
           state_root="$control_root/controller-state"
-          break_glass_root="$control_root/controller-break-glass"
+          break_glass_root="/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-systemd-break-glass"
           deployment_id=deployment-ci-systemd-recovery
           runtime_id=runtime-ci-systemd-recovery
           unit=manual-auth-recovery.service
@@ -462,6 +464,7 @@ jobs:
           cached="$control_root/systemd-cache/nazoauth"
           mkdir -p "$control_root/systemd-live" "$control_root/systemd-cache" \
             "$root/live-data" "$root/live-config" "$break_glass_root"
+          test "$(stat -c %d "$config_root")" != "$(stat -c %d "$break_glass_root")"
           install -m 0755 "$GITHUB_WORKSPACE/signed-server/nazoauth-x86_64-unknown-linux-gnu" "$target"
           install -m 0500 "$target" "$cached"
           cat >"$root/live-config/.env.yaml" <<YAML
@@ -523,8 +526,8 @@ jobs:
 
           # The fixture is authored by the runner, while destructive controller
           # operations intentionally run as root.  The controller boundary is
-          # directly below root-owned sticky /tmp, so its complete ancestor
-          # chain satisfies the same invariant as a production installation.
+          # directly below root-owned sticky /tmp, while break-glass recovery
+          # remains on the runner's distinct tmpfs device.
           sudo chown -R 0:0 "$control_root"
           sudo chmod 0700 "$break_glass_root"
 
@@ -606,7 +609,7 @@ jobs:
           control_root="/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman"
           config_root="$control_root/controller-config"
           state_root="$control_root/controller-state"
-          break_glass_root="$control_root/controller-break-glass"
+          break_glass_root="/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman-break-glass"
           deployment_id=deployment-ci-podman-recovery
           runtime_id=runtime-ci-podman-recovery
           object=manual-auth-podman-recovery
@@ -647,6 +650,7 @@ jobs:
           PATTERNS
           }
           mkdir -p "$root/live-data" "$root/live-config" "$root/cache" "$break_glass_root"
+          test "$(stat -c %d "$config_root")" != "$(stat -c %d "$break_glass_root")"
           sudo chown -R 10001:10001 "$root/live-data"
           cat >"$root/live-config/.env.yaml" <<YAML
           BIND: "127.0.0.1:19083"
@@ -711,8 +715,9 @@ jobs:
           printf 'tampered' >>"$archive"
           # The fixture is authored by the runner, while destructive controller
           # operations intentionally run as root.  Keep the controller storage
-          # under root-owned sticky /tmp and transfer the whole boundary after
-          # the tamper mutation; cache restoration remains privileged as well.
+          # under root-owned sticky /tmp, keep break-glass recovery on the
+          # runner's distinct tmpfs device, and transfer the controller boundary
+          # after the tamper mutation; cache restoration remains privileged.
           sudo chown -R 0:0 "$control_root"
           sudo chmod 0700 "$break_glass_root"
           if sudo env \
@@ -770,5 +775,8 @@ jobs:
           sudo rm -rf -- \
             "/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker" \
             "/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-systemd" \
-            "/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman"
+            "/tmp/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman" \
+            "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-docker-break-glass" \
+            "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-systemd-break-glass" \
+            "/dev/shm/nazoauthctl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-podman-break-glass"
           sudo systemctl daemon-reload
