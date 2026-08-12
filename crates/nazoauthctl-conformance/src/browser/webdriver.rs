@@ -582,8 +582,49 @@ fn parse_webdriver_response(
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| BrowserError::Protocol)?;
     if !status.is_success() {
         // WebDriver error payloads often contain page text and selectors.  Do
-        // not echo it; callers only receive a stable error class.
-        return Err(BrowserError::DriverRejected);
+        // not echo it. Preserve only the W3C error token needed by the bounded
+        // browser state machine to distinguish normal DOM races from a driver
+        // or protocol failure.
+        return Err(classify_webdriver_error(&value));
     }
     Ok(value)
+}
+
+fn classify_webdriver_error(value: &Value) -> BrowserError {
+    match value
+        .get("value")
+        .and_then(|value| value.get("error"))
+        .and_then(Value::as_str)
+    {
+        Some("no such element") => BrowserError::ElementNotFound,
+        Some("stale element reference") => BrowserError::StaleElement,
+        _ => BrowserError::DriverRejected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn webdriver_error_tokens_preserve_only_retryable_dom_states() {
+        assert_eq!(
+            classify_webdriver_error(&json!({
+                "value": {"error": "no such element", "message": "sensitive page text"}
+            })),
+            BrowserError::ElementNotFound
+        );
+        assert_eq!(
+            classify_webdriver_error(&json!({
+                "value": {"error": "stale element reference", "message": "sensitive selector"}
+            })),
+            BrowserError::StaleElement
+        );
+        assert_eq!(
+            classify_webdriver_error(&json!({
+                "value": {"error": "invalid session id", "message": "sensitive session"}
+            })),
+            BrowserError::DriverRejected
+        );
+    }
 }

@@ -62,6 +62,8 @@ pub enum BrowserError {
     SessionNotStarted,
     #[error("browser element was not found")]
     ElementNotFound,
+    #[error("browser element became stale")]
+    StaleElement,
     #[error("chromedriver or chromium-driver was not found")]
     DriverUnavailable,
     #[error("managed browser driver failed to start")]
@@ -234,15 +236,25 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             } => {
                 let deadline = self.deadline(*timeout);
                 loop {
-                    if let Ok(element) = self.driver.find_element(selector) {
-                        if let Some(pattern) = text_pattern {
-                            let text = self.driver.element_text(&element)?;
-                            if compile_pattern(pattern)?.is_match(&text) {
+                    match self.driver.find_element(selector) {
+                        Ok(element) => {
+                            if let Some(pattern) = text_pattern {
+                                match self.driver.element_text(&element) {
+                                    Ok(text) if compile_pattern(pattern)?.is_match(&text) => {
+                                        return Ok(());
+                                    }
+                                    Ok(_)
+                                    | Err(
+                                        BrowserError::ElementNotFound | BrowserError::StaleElement,
+                                    ) => {}
+                                    Err(error) => return Err(error),
+                                }
+                            } else {
                                 return Ok(());
                             }
-                        } else {
-                            return Ok(());
                         }
+                        Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {}
+                        Err(error) => return Err(error),
                     }
                     self.sleep_until(deadline)?;
                 }
@@ -250,10 +262,15 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             BrowserCommand::WaitElementVisible { selector, timeout } => {
                 let deadline = self.deadline(*timeout);
                 loop {
-                    if let Ok(element) = self.driver.find_element(selector)
-                        && self.driver.element_displayed(&element)?
-                    {
-                        return Ok(());
+                    match self.driver.find_element(selector) {
+                        Ok(element) => match self.driver.element_displayed(&element) {
+                            Ok(true) => return Ok(()),
+                            Ok(false)
+                            | Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {}
+                            Err(error) => return Err(error),
+                        },
+                        Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {}
+                        Err(error) => return Err(error),
                     }
                     self.sleep_until(deadline)?;
                 }
@@ -275,16 +292,42 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                 }
             }
             BrowserCommand::Text { selector, value } => {
-                let element = self.driver.find_element(selector)?;
-                self.driver.element_send_keys(&element, value.as_str())
+                let deadline = self.deadline(self.policy.limits.max_step_timeout);
+                loop {
+                    match self.driver.find_element(selector) {
+                        Ok(element) => {
+                            match self.driver.element_send_keys(&element, value.as_str()) {
+                                Ok(()) => return Ok(()),
+                                Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {}
+                        Err(error) => return Err(error),
+                    }
+                    self.sleep_until(deadline)?;
+                }
             }
             BrowserCommand::Click { selector, optional } => {
-                let element = match self.driver.find_element(selector) {
-                    Ok(element) => element,
-                    Err(BrowserError::ElementNotFound) if *optional => return Ok(()),
-                    Err(error) => return Err(error),
-                };
-                self.driver.element_click(&element)
+                let deadline = self.deadline(self.policy.limits.max_step_timeout);
+                loop {
+                    match self.driver.find_element(selector) {
+                        Ok(element) => match self.driver.element_click(&element) {
+                            Ok(()) => return Ok(()),
+                            Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {}
+                            Err(error) => return Err(error),
+                        },
+                        Err(BrowserError::ElementNotFound | BrowserError::StaleElement)
+                            if *optional =>
+                        {
+                            return Ok(());
+                        }
+                        Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {}
+                        Err(error) => return Err(error),
+                    }
+                    self.sleep_until(deadline)?;
+                }
             }
         }
     }
