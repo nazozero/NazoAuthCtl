@@ -432,6 +432,7 @@ jobs:
             --arg manifest "$recovery_manifest" --arg manifest_sha "$recovery_sha" \
             '{schema:1,deployment_id:$deployment,trusted_release:$identity,recovery_manifest:$manifest,recovery_manifest_sha256:$manifest_sha}' \
             >"$state_root/deployments/$deployment_id/recovery/rollback-slot.json"
+          chmod 0600 "$state_root/deployments/$deployment_id/recovery/rollback-slot.json"
 
           docker rm --force manual-auth-same-name
           docker image rm "$image"
