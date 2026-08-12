@@ -12,8 +12,10 @@ Current NazoAuth Release manifests use a closed compatibility object:
 }
 ```
 
-The controller accepts a server only when the protocol version equals its pinned
-`nazo-operator-protocol` version and its own SemVer is inside the declared range.
+The controller accepts a server only when the protocol constant (currently `1`)
+equals its pinned `nazo-operator-protocol` constant. The protocol crate itself is
+pinned separately to the exact NazoAuth package version `0.1.34`, and the ctl
+SemVer must be inside the server's declared range.
 Unknown protocol versions and malformed or empty ranges fail closed.
 
 The independent controller validates the current and previous immutable, signed
@@ -21,20 +23,27 @@ server Releases below without rebuilding them:
 
 | Controller artifact | Server Release | Protocol | Status |
 | --- | --- | --- | --- |
-| current NazoAuthCtl v0.1.31 source, built once | v0.1.24 signed host + OCI | 1 | artifact/identity matrix-tested |
-| current NazoAuthCtl v0.1.31 source, built once | v0.1.20 signed host + OCI | 1 | matrix and real-backend tested |
-| current NazoAuthCtl v0.1.31 source, built once | v0.1.19 signed host + OCI | 1 | matrix-tested |
+| current NazoAuthCtl v0.1.45 source, built once | v0.1.34 signed host + OCI | 1 | matrix and real-backend tested |
+| current NazoAuthCtl v0.1.45 source, built once | v0.1.24 signed host + OCI | 1 | artifact/identity matrix-tested |
+| current NazoAuthCtl v0.1.45 source, built once | v0.1.20 signed host + OCI | 1 | artifact/identity matrix-tested |
+| current NazoAuthCtl v0.1.45 source, built once | v0.1.19 signed host + OCI | 1 | artifact/identity matrix-tested |
 | signed independent NazoAuthCtl v0.1.23 | v0.1.24 signed host + OCI | 1 | artifact/identity matrix-tested |
 | signed independent NazoAuthCtl v0.1.23 | v0.1.20 signed host + OCI | 1 | artifact/identity matrix-tested |
 | signed independent NazoAuthCtl v0.1.23 | v0.1.19 signed host + OCI | 1 | artifact/identity matrix-tested |
 
-The v0.1.19 server predates the explicit controller range. Legacy acceptance is
-restricted to that version and protocol 1. The v0.1.20 Release carries the
-explicit range; there is no open-ended legacy fallback.
+The current NazoAuth v0.1.34 Release carries the explicit controller range and
+the latest migration policy. The v0.1.19 server predates that range; legacy
+acceptance is restricted to that version and protocol 1. The v0.1.20 Release
+also carries the explicit range; there is no open-ended legacy fallback.
 
 The previous ctl cell is the signed independent NazoAuthCtl v0.1.23 Release.
 The matrix verifies its provenance from the controller repository, downloads
 already-built signed server binaries, verifies signed OCI images, and executes
-build identity from both server forms. Destructive recovery scenarios run only
-with the current controller and verify Docker, Podman, and systemd independently.
-No matrix job rebuilds the server.
+build identity from both server forms. Destructive recovery scenarios run with
+the current controller against the current NazoAuth v0.1.34 Release and verify
+Docker, Podman, and systemd independently. No matrix job rebuilds the server.
+
+The release workflow invokes this compatibility workflow as a reusable job and
+passes the exact controller commit SHA from the tag. The release build and
+publish jobs depend on that job; a compatibility result from another commit
+cannot satisfy the release gate.

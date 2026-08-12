@@ -19,7 +19,9 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::matrix::{MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix};
+use crate::matrix::{
+    MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix, zeroize_json_value,
+};
 use crate::origin::Origin;
 
 pub const SECURE_BUNDLE_SCHEMA_VERSION: u32 = 3;
@@ -241,6 +243,25 @@ impl PreparedMaterialization {
     pub fn suite_base_url(&self) -> &str {
         &self.suite_base_url
     }
+
+    /// Return the public CA certificates generated for every signed Matrix
+    /// client. Negative mTLS modules deliberately present an alternate Matrix
+    /// client's certificate, so the proxy must authenticate the run-scoped CA
+    /// before the application can reject the client binding. The corresponding
+    /// private keys remain in the prepared records and never enter this bundle.
+    pub fn mtls_trust_anchor_pem(&self) -> Zeroizing<String> {
+        let anchors = self
+            .clients
+            .values()
+            .map(|client| client.mtls_ca_certificate.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut bundle = String::new();
+        for anchor in anchors {
+            bundle.push_str(anchor.trim());
+            bundle.push('\n');
+        }
+        Zeroizing::new(bundle)
+    }
 }
 
 struct PreparedClient {
@@ -267,6 +288,7 @@ impl Zeroize for PreparedClient {
         self.mtls_ca_certificate.zeroize();
         self.mtls_client_certificate.zeroize();
         self.mtls_client_key.zeroize();
+        zeroize_json_value(&mut self.request);
     }
 }
 
@@ -793,6 +815,14 @@ struct SecureBundleRecord {
     clients: Vec<SecureClientRecord>,
 }
 
+impl Drop for SecureBundleRecord {
+    fn drop(&mut self) {
+        for value in self.openid4vc_credential_datasets.values_mut() {
+            zeroize_json_value(value);
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct SecureOpenid4vcConformanceTrust {
     schema: u32,
@@ -800,6 +830,13 @@ struct SecureOpenid4vcConformanceTrust {
     client_attestation_jwks: Value,
     key_attestation_jwks: Value,
     credential_trust_anchor_pem: String,
+}
+
+impl Drop for SecureOpenid4vcConformanceTrust {
+    fn drop(&mut self) {
+        zeroize_json_value(&mut self.client_attestation_jwks);
+        zeroize_json_value(&mut self.key_attestation_jwks);
+    }
 }
 
 #[derive(Serialize)]
@@ -810,6 +847,12 @@ struct SecureClientRecord {
     client_secret: Option<Zeroizing<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mtls_trust_anchor_pem: Option<Zeroizing<String>>,
+}
+
+impl Drop for SecureClientRecord {
+    fn drop(&mut self) {
+        zeroize_json_value(&mut self.request);
+    }
 }
 
 #[derive(Serialize)]
@@ -908,9 +951,10 @@ mod tests {
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
-    use x509_parser::{extensions::GeneralName, parse_x509_certificate};
+    use x509_parser::{extensions::GeneralName, parse_x509_certificate, pem::parse_x509_pem};
 
     use super::*;
+    use crate::materializer::crypto::generate_mtls;
 
     #[test]
     fn empty_optional_mtls_selectors_do_not_create_a_trust_anchor() {
@@ -984,6 +1028,42 @@ mod tests {
             first.mtls_client_key.as_str(),
             second.mtls_client_key.as_str()
         );
+    }
+
+    #[test]
+    fn generated_mtls_leaf_builds_a_strict_chain_to_its_unique_ca() {
+        let (first_ca_pem, first_leaf_pem, _, _) = generate_mtls().expect("first mTLS material");
+        let (second_ca_pem, _, _, _) = generate_mtls().expect("second mTLS material");
+        let (_, first_ca_pem) = parse_x509_pem(first_ca_pem.as_bytes()).expect("first CA PEM");
+        let (_, second_ca_pem) = parse_x509_pem(second_ca_pem.as_bytes()).expect("second CA PEM");
+        let (_, first_leaf_pem) =
+            parse_x509_pem(first_leaf_pem.as_bytes()).expect("first leaf PEM");
+        let (_, first_ca) = parse_x509_certificate(&first_ca_pem.contents).expect("first CA");
+        let (_, second_ca) = parse_x509_certificate(&second_ca_pem.contents).expect("second CA");
+        let (_, first_leaf) = parse_x509_certificate(&first_leaf_pem.contents).expect("first leaf");
+
+        assert_ne!(first_leaf.subject(), first_leaf.issuer());
+        assert_eq!(first_leaf.issuer(), first_ca.subject());
+        assert_ne!(first_ca.subject(), second_ca.subject());
+        first_leaf
+            .verify_signature(Some(first_ca.public_key()))
+            .expect("leaf signature must verify with the generated CA");
+    }
+
+    #[test]
+    fn proxy_trust_bundle_contains_only_public_matrix_client_anchors() {
+        let (prepared, _) = DescriptorMaterializer::prepare(
+            descriptor(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+            test_trust_anchor(),
+        )
+        .expect("prepare");
+        let anchors = prepared.mtls_trust_anchor_pem();
+        assert_eq!(anchors.matches("-----BEGIN CERTIFICATE-----").count(), 1);
+        assert_eq!(anchors.matches("-----END CERTIFICATE-----").count(), 1);
+        assert!(!anchors.contains("PRIVATE KEY"));
     }
 
     fn descriptor_json() -> Value {

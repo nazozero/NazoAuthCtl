@@ -95,6 +95,17 @@ fn registration_reconciles_an_existing_declaration_without_treating_it_as_comple
 }
 
 #[test]
+fn missing_registry_with_registered_artifacts_never_falls_back_to_legacy_mode() {
+    let work = PrivateTempDir::new("nazoauthctl-registry-missing-fail-closed").unwrap();
+    let store = store(&work);
+    store.persist(&record("deployment-a", "alpha")).unwrap();
+    std::fs::remove_file(store.registry_path()).unwrap();
+
+    let error = store.registry_present().unwrap_err().to_string();
+    assert!(error.contains("registered deployment artifacts remain"));
+}
+
+#[test]
 fn observed_state_cannot_smuggle_mutation_capabilities() {
     let mut observed = record("deployment-a", "alpha");
     observed.trust = TrustState::Observed;

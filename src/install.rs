@@ -128,6 +128,9 @@ pub(crate) fn prepare(
     )?;
     create_directory(config_dir, 0o755)?;
     create_directory(&options.data_root, 0o755)?;
+    // Keep the controller root owner-only until the Systemd backend has
+    // created and validated the non-root service account.  The backend then
+    // grants only the traverse/group boundary needed for operator-state.
     create_directory(&options.control_root, 0o700)?;
     create_directory(&options.recovery_root, 0o700)?;
     let operator_dir = config_dir.join("operator");
@@ -208,6 +211,9 @@ fn configure_runtime_permissions(config: &UpdateConfig) -> anyhow::Result<()> {
         return Ok(());
     }
     if config.runtime.backend == RuntimeBackendKind::Systemd {
+        // The service account does not exist until install_systemd invokes the
+        // backend.  Account-specific ownership and the control-root traverse
+        // boundary are applied there, after the UID has been proven non-root.
         return Ok(());
     }
     configure_container_operator_state_permissions(
@@ -314,7 +320,7 @@ pub(crate) fn start_managed_dependencies(config: &UpdateConfig) -> anyhow::Resul
     runtime_backend::backend(backend).ensure_managed_dependencies(&ManagedDependencies {
         network: ManagedNetwork {
             name: config.runtime.network.clone(),
-            subnet: None,
+            subnet: config.runtime.network_subnet.clone(),
             deployment_id: config.operator.deployment_id.clone(),
             control_authority: config.operator.controller_key_id.clone(),
         },

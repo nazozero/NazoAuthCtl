@@ -38,8 +38,8 @@ deployment-locked transaction which:
 
 It does not restart, replace, rename, delete, or relabel the manual runtime.
 Adoption records only the capability grants explicitly supplied by the user.
-The schema-1 recovery evidence manifest proves bounded files, hashes, Release
-binding, and off-host placement. Mutation-capable adoption additionally requires
+The schema-2 recovery evidence manifest proves bounded files, hashes, Release
+binding, provider attestation, and off-host placement. Mutation-capable adoption additionally requires
 `--lifecycle PATH`. That strict JSON contract binds every discovered runtime by
 immutable runtime instance ID and actual object reference, describes neutral
 mount/network/port semantics, and names an absolute recovery-driver program plus

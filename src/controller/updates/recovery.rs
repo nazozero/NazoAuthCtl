@@ -86,6 +86,11 @@ pub(crate) fn restore_previous_transaction(
     // any stop/remove/start operation so a stale or tampered config cannot turn
     // recovery into an unauthorized runtime mutation.
     require_legacy_recovery_capabilities(config)?;
+    if journal.phase >= UpdatePhase::StateCommitting && !journal.rollback_state_captured {
+        bail!(
+            "legacy update journal predates rollback-state preservation; refusing recovery because the previous rollback state cannot be reconstructed safely"
+        );
+    }
     ensure_trusted_runtime_available(config, &journal.from_release, &journal.previous_runtime)?;
     if journal.phase >= UpdatePhase::MigrationRunning {
         let backup = journal_backup(config, journal)?;
@@ -130,7 +135,8 @@ pub(crate) fn restore_previous_transaction(
     }
     verify_public(config)?;
     verify_ui(config, &journal.from_release)?;
-    write_active_release(config, &journal.from_release)
+    write_active_release(config, &journal.from_release)?;
+    restore_previous_rollback_state(config, journal)
 }
 
 pub(crate) fn require_legacy_recovery_capabilities(config: &UpdateConfig) -> anyhow::Result<()> {

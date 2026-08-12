@@ -6,8 +6,8 @@ use base64::{
 use p256::ecdsa::SigningKey;
 use rand_core::{OsRng, RngCore};
 use rcgen::{
-    BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-    KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair, KeyUsagePurpose, SanType,
 };
 use rsa::RsaPrivateKey;
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
@@ -360,6 +360,10 @@ pub(super) fn generate_mtls() -> Result<(String, String, String, String), Materi
     let now = OffsetDateTime::now_utc();
     let mut ca_params =
         CertificateParams::new(Vec::<String>::new()).map_err(|_| MaterializerError::Crypto)?;
+    ca_params.distinguished_name.push(
+        DnType::CommonName,
+        format!("NazoAuthCtl OIDF mTLS Root {}", random_hex(12)),
+    );
     ca_params.not_before = now - TimeDuration::days(1);
     ca_params.not_after = now + TimeDuration::days(365);
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
@@ -372,6 +376,13 @@ pub(super) fn generate_mtls() -> Result<(String, String, String, String), Materi
         CertifiedIssuer::self_signed(ca_params, ca_key).map_err(|_| MaterializerError::Crypto)?;
     let mut client_params = CertificateParams::new(vec![MTLS_CLIENT_SAN_DNS.to_owned()])
         .map_err(|_| MaterializerError::Crypto)?;
+    // A leaf with the same subject and issuer DN is classified as self-signed
+    // by OpenSSL/HAProxy even when its signature was produced by another key.
+    // Keep the identities distinct so strict proxy verification can build the
+    // generated client -> run-scoped CA chain without ignore-error flags.
+    client_params
+        .distinguished_name
+        .push(DnType::CommonName, MTLS_CLIENT_SAN_DNS);
     client_params.not_before = now - TimeDuration::days(1);
     client_params.not_after = now + TimeDuration::days(365);
     client_params.key_usages = vec![

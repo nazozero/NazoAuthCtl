@@ -1164,6 +1164,7 @@ dependencies = [
 name = "nazoauthctl-conformance"
 version = "0.1.45"
 dependencies = [
+ "anyhow",
  "base64",
  "keyring",
  "libc",

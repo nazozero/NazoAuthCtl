@@ -109,6 +109,8 @@ pub(crate) struct Runtime {
     pub(crate) runtime_instance_id: String,
     pub(crate) network: String,
     #[serde(default)]
+    pub(crate) network_subnet: Option<String>,
+    #[serde(default)]
     pub(crate) ip_address: String,
     #[serde(default)]
     pub(crate) publish_address: String,
@@ -366,6 +368,9 @@ impl UpdateConfig {
 
 fn validate_public_runtime_urls(runtime: &Runtime) -> anyhow::Result<()> {
     let issuer = parse_public_origin(&runtime.expected_issuer, "expected issuer")?;
+    let health =
+        Url::parse(&runtime.health_url).context("health URL must be an absolute HTTP(S) URL")?;
+    validate_health_url(&health, &issuer)?;
     let discovery = Url::parse(&runtime.public_discovery_url)
         .context("public Discovery URL must be an absolute URL")?;
     validate_public_transport(&discovery, "public Discovery URL")?;
@@ -380,6 +385,26 @@ fn validate_public_runtime_urls(runtime: &Runtime) -> anyhow::Result<()> {
         || discovery.path() != "/.well-known/openid-configuration"
     {
         bail!("public Discovery URL must be the expected issuer origin's OIDC Discovery endpoint");
+    }
+    Ok(())
+}
+
+fn validate_health_url(health: &Url, issuer: &Url) -> anyhow::Result<()> {
+    validate_public_transport(health, "health URL")?;
+    if !health.username().is_empty()
+        || health.password().is_some()
+        || health.query().is_some()
+        || health.fragment().is_some()
+    {
+        bail!("health URL must not contain credentials, query, or fragment");
+    }
+    let loopback = health.host().is_some_and(|host| match host {
+        Host::Domain(host) => host.eq_ignore_ascii_case("localhost"),
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => address.is_loopback(),
+    });
+    if !loopback && health.origin() != issuer.origin() {
+        bail!("health URL must be loopback or share the expected issuer origin");
     }
     Ok(())
 }

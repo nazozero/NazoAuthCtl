@@ -9,7 +9,6 @@ const SUITE_NON_SUCCESS: &str = "Suite reported a non-success or incomplete modu
 const SCHEDULER_INCOMPLETE: &str =
     "parallel scheduler stopped before every selected Matrix plan was launched";
 
-#[derive(Clone)]
 struct PlanWork {
     index: usize,
     group_index: usize,
@@ -65,9 +64,12 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
         return runner.run_prepared(sink, prepared);
     }
 
-    let work = plan_work(&prepared);
+    let mut prepared = prepared;
+    let work = plan_work(&mut prepared);
     let worker_count = runner.config.jobs.min(work.len());
-    let queue = Arc::new(Mutex::new(VecDeque::from(work.clone())));
+    let queue = Arc::new(Mutex::new(VecDeque::from(
+        (0..work.len()).collect::<Vec<_>>(),
+    )));
     let stop_launching = Arc::new(AtomicBool::new(false));
     let ciba_lane = Arc::new(Mutex::new(()));
     let mut snapshots = vec![None::<ProgressSnapshot>; work.len()];
@@ -75,6 +77,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
     let mut results = vec![None::<RunSummary>; work.len()];
     let mut worker_panicked = false;
 
+    let work_ref = &work;
     thread::scope(|scope| {
         let (sender, receiver) = mpsc::channel::<WorkerMessage>();
         for worker_index in 0..worker_count {
@@ -94,7 +97,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                             Ok(mut queue) => queue.pop_front(),
                             Err(_) => None,
                         };
-                        let Some(next) = next else {
+                        let Some(next_index) = next else {
                             break;
                         };
                         let child = ConformanceRunner {
@@ -116,21 +119,22 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                             },
                         };
                         let mut progress = ChannelSink {
-                            index: next.index,
+                            index: next_index,
                             sender: sender.clone(),
                         };
-                        let _ciba_guard = if next.serialized_ciba {
+                        let _ciba_guard = if work_ref[next_index].serialized_ciba {
                             Some(ciba_lane.lock().map_err(|_| ()).expect("CIBA lane lock"))
                         } else {
                             None
                         };
-                        let summary = child.run_prepared(&mut progress, worker_prepared(&next));
+                        let summary = child
+                            .run_prepared(&mut progress, worker_prepared(&work_ref[next_index]));
                         if has_fatal_orchestration_failure(&summary.report) {
                             stop_launching.store(true, Ordering::SeqCst);
                         }
                         if sender
                             .send(WorkerMessage::Finished {
-                                index: next.index,
+                                index: next_index,
                                 summary: Box::new(summary),
                             })
                             .is_err()
@@ -196,19 +200,21 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
     )
 }
 
-fn plan_work(prepared: &PreparedRun) -> Vec<PlanWork> {
-    prepared
-        .planned
-        .iter()
+fn plan_work(prepared: &mut PreparedRun) -> Vec<PlanWork> {
+    std::mem::take(&mut prepared.planned)
+        .into_iter()
         .enumerate()
-        .map(|(index, plan)| PlanWork {
-            index,
-            group_index: plan.group_index,
-            matrix_plan_id: plan.matrix_plan_id.clone(),
-            group: prepared.groups[plan.group_index].clone(),
-            report: prepared.plans[plan.report_index].clone(),
-            plan: plan.clone(),
-            serialized_ciba: plan.plan_name.contains("ciba"),
+        .map(|(index, plan)| {
+            let serialized_ciba = plan.plan_name.contains("ciba");
+            PlanWork {
+                index,
+                group_index: plan.group_index,
+                matrix_plan_id: plan.matrix_plan_id.clone(),
+                group: prepared.groups[plan.group_index].clone(),
+                report: prepared.plans[plan.report_index].clone(),
+                plan,
+                serialized_ciba,
+            }
         })
         .collect()
 }

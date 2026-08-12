@@ -294,18 +294,41 @@ impl ConformanceSession {
                 Some(request_jti),
             )
         });
-        let bundle_cleanup = remove_file_durable(&bundle_path);
-        let result = match (result, bundle_cleanup) {
-            (Ok(result), Ok(())) => result,
-            (Ok(_), Err(error)) => {
-                return Err(error).context("failed to remove consumed conformance bundle");
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let bundle_cleanup = remove_file_durable(&bundle_path);
+                return match bundle_cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => bail!(
+                        "conformance onboarding failed and bundle cleanup also failed: onboarding={error:#}; bundle_cleanup={cleanup:#}"
+                    ),
+                };
             }
-            (Err(error), _) => return Err(error),
         };
-        let TaskResult::ConformanceOnboardingApplied { onboarding } = result.result else {
-            bail!("operator returned an unexpected onboarding result");
+        let onboarding = match result.result {
+            TaskResult::ConformanceOnboardingApplied { onboarding } => onboarding,
+            _ => {
+                let bundle_cleanup = remove_file_durable(&bundle_path);
+                match bundle_cleanup {
+                    Ok(()) => bail!("operator returned an unexpected onboarding result"),
+                    Err(cleanup) => bail!(
+                        "operator returned an unexpected onboarding result and bundle cleanup also failed: bundle_cleanup={cleanup:#}"
+                    ),
+                }
+            }
         };
         let lease_id = onboarding.lease_id.clone();
+        if let Err(error) = remove_file_durable(&bundle_path) {
+            return match self.cleanup_lease(&lease_id) {
+                Ok(()) => Err(error).context(
+                    "failed to remove consumed conformance bundle; onboarding lease rolled back",
+                ),
+                Err(cleanup) => bail!(
+                    "failed to remove consumed conformance bundle and onboarding lease rollback also failed: bundle_cleanup={error:#}; cleanup={cleanup:#}"
+                ),
+            };
+        }
         let verified = (|| -> anyhow::Result<ConformanceOnboarding> {
             let output_path = self.output_directory.join("conformance-onboarding.json");
             let output_bytes = read_runtime_output(

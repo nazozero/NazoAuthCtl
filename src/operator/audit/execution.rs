@@ -399,6 +399,15 @@ pub(crate) fn execute_test_task(
     })
 }
 
+#[cfg(all(test, not(debug_assertions)))]
+pub(crate) fn execute_test_task(
+    _config: &UpdateConfig,
+    _target: &str,
+    _operation: TaskOperation,
+) -> anyhow::Result<OperationResult> {
+    bail!("test task adapter is unavailable in release builds")
+}
+
 pub(crate) fn canonical_manifest(
     config: &UpdateConfig,
     operation: &TaskOperation,

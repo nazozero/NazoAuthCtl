@@ -424,12 +424,34 @@ fn validate_temporary_valkey(
     restore: &ManagedValkeyRestore,
     volume: &str,
 ) -> anyhow::Result<()> {
-    let container = format!("{}-restore-check", restore.object_reference);
-    let _ = Process::new(command)
-        .args(["rm", "--force", &container])
-        .run_quiet();
-    container_shared::build_identity_process(command)
-        .args(["-d", "--name", &container, "--network", "none"])
+    let container = format!("nazoauthctl-restore-check-{:016x}", rand::random::<u64>());
+    let config_digest =
+        container_shared::valkey_restore_check_config_digest(restore, volume, &container);
+    container_shared::remove_managed_container_by_name(
+        command,
+        &container,
+        &restore.identity.deployment_id,
+        &restore.identity.control_authority,
+        Some(restore.identity.runtime_instance_id.as_str()),
+        container_shared::VALKEY_RESTORE_CHECK_RESOURCE_KIND,
+        &config_digest,
+        "Podman",
+    )?;
+    let create = container_shared::append_managed_labels(
+        container_shared::build_identity_process(command).args([
+            "-d",
+            "--name",
+            &container,
+            "--network",
+            "none",
+        ]),
+        &restore.identity.deployment_id,
+        &restore.identity.control_authority,
+        Some(restore.identity.runtime_instance_id.as_str()),
+        container_shared::VALKEY_RESTORE_CHECK_RESOURCE_KIND,
+        &config_digest,
+    );
+    create
         .arg("--volume")
         .arg(format!("{volume}:/data:Z"))
         .arg(&restore.image)
@@ -445,10 +467,41 @@ fn validate_temporary_valkey(
             "no",
         ])
         .run_quiet()?;
+    let container_id = match container_shared::inspect_managed_container_id(
+        command,
+        &container,
+        &restore.identity.deployment_id,
+        &restore.identity.control_authority,
+        Some(restore.identity.runtime_instance_id.as_str()),
+        container_shared::VALKEY_RESTORE_CHECK_RESOURCE_KIND,
+        &config_digest,
+        "Podman",
+    ) {
+        Ok(Some(container_id)) => container_id,
+        Ok(None) => bail!("temporary Podman Valkey restore disappeared before validation"),
+        Err(error) => {
+            let cleanup = container_shared::remove_managed_container_by_name(
+                command,
+                &container,
+                &restore.identity.deployment_id,
+                &restore.identity.control_authority,
+                Some(restore.identity.runtime_instance_id.as_str()),
+                container_shared::VALKEY_RESTORE_CHECK_RESOURCE_KIND,
+                &config_digest,
+                "Podman",
+            );
+            if let Err(cleanup) = cleanup {
+                return Err(error.context(format!(
+                    "temporary Podman Valkey restore cleanup failed: {cleanup}"
+                )));
+            }
+            return Err(error);
+        }
+    };
     let mut ready = false;
     for _ in 0..30 {
         if Process::new(command)
-            .args(["exec", &container, "valkey-cli", "PING"])
+            .args(["exec", container_id.as_str(), "valkey-cli", "PING"])
             .succeeds()
         {
             ready = true;
@@ -456,13 +509,27 @@ fn validate_temporary_valkey(
         }
         thread::sleep(Duration::from_secs(1));
     }
-    let _ = Process::new(command)
-        .args(["rm", "--force", &container])
-        .run_quiet();
-    if !ready {
-        bail!("temporary Valkey restore failed readiness validation");
+    let validation = ready
+        .then_some(())
+        .ok_or_else(|| anyhow::anyhow!("temporary Valkey restore failed readiness validation"));
+    let cleanup = container_shared::remove_managed_container_by_id(
+        command,
+        &container_id,
+        &restore.identity.deployment_id,
+        &restore.identity.control_authority,
+        Some(restore.identity.runtime_instance_id.as_str()),
+        container_shared::VALKEY_RESTORE_CHECK_RESOURCE_KIND,
+        &config_digest,
+        "Podman",
+    );
+    match (validation, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(error.context(format!(
+            "temporary Podman Valkey restore cleanup failed: {cleanup}"
+        ))),
     }
-    Ok(())
 }
 
 fn copy_valkey_volume(
@@ -845,6 +912,13 @@ pub(super) fn ensure_dependencies(
             ),
         ],
     )?;
+    container_shared::reconcile_bound_file(
+        command,
+        &dependencies.postgres_object,
+        &dependencies.postgres_password_file,
+        "/run/nazoauth-secrets/postgres-password",
+        "Podman PostgreSQL",
+    )?;
 
     let valkey =
         Process::new(command).args(["run", "-d", "--name", dependencies.valkey_object.as_str()]);
@@ -913,6 +987,13 @@ pub(super) fn ensure_dependencies(
             ),
         ],
         &[],
+    )?;
+    container_shared::reconcile_bound_file(
+        command,
+        &dependencies.valkey_object,
+        &dependencies.valkey_password_file,
+        "/run/nazoauth-secrets/valkey-password",
+        "Podman Valkey",
     )?;
     container_shared::reconcile_bound_file(
         command,

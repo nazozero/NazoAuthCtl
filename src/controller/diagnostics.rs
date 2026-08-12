@@ -100,10 +100,7 @@ pub(super) fn wait_ready(config: &UpdateConfig) -> anyhow::Result<()> {
             config.runtime.readiness_interval_seconds,
         ));
     }
-    bail!(
-        "NazoAuth did not become ready at {}",
-        config.runtime.health_url
-    )
+    bail!("NazoAuth did not become ready at the configured health endpoint")
 }
 
 pub(super) fn health_ready(config: &UpdateConfig) -> bool {

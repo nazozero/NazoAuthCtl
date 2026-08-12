@@ -312,6 +312,16 @@ impl ContainerRuntimePolicy {
         }
     }
 
+    /// Policy for the application container.  Dependency containers have
+    /// image-specific service identities, while the application image has a
+    /// controller-owned uid/gid contract that must not inherit a mutable
+    /// image user.
+    pub fn managed_app() -> Self {
+        let mut policy = Self::managed_default();
+        policy.service_user = Some("10001:10001".to_owned());
+        policy
+    }
+
     pub fn managed_postgres() -> Self {
         let mut policy = Self::managed_default();
         policy.service_user = Some("999:999".to_owned());
@@ -450,6 +460,7 @@ impl ManagedDependencies {
             &self.network.control_authority,
             &self.runtime_instance_id,
             &self.network.name,
+            self.network.subnet.as_deref(),
             &self.postgres_object,
             &self.postgres_volume,
             &self.postgres_image,
@@ -494,15 +505,17 @@ pub fn managed_network_config_digest(
     deployment_id: &str,
     control_authority: &str,
     network: &str,
+    subnet: Option<&str>,
 ) -> String {
-    managed_config_digest(
-        "network",
-        &[
-            ("deployment-id", deployment_id),
-            ("control-authority", control_authority),
-            ("network", network),
-        ],
-    )
+    let mut fields = vec![
+        ("deployment-id", deployment_id),
+        ("control-authority", control_authority),
+        ("network", network),
+    ];
+    if let Some(subnet) = subnet {
+        fields.push(("subnet", subnet));
+    }
+    managed_config_digest("network", &fields)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -511,6 +524,7 @@ pub fn managed_dependency_identity(
     control_authority: &str,
     runtime_instance_id: &str,
     network: &str,
+    network_subnet: Option<&str>,
     postgres_object: &str,
     postgres_volume: &str,
     postgres_image: &str,
@@ -530,11 +544,14 @@ pub fn managed_dependency_identity(
     // instance is materialized.  Its immutable digest therefore binds the
     // network's own deployment/authority/name identity; dependency resources
     // additionally bind the runtime instance below.
-    let network_fields = [
+    let mut network_fields = vec![
         ("deployment-id", deployment_id),
         ("control-authority", control_authority),
         ("network", network),
     ];
+    if let Some(subnet) = network_subnet {
+        network_fields.push(("subnet", subnet));
+    }
     let network_config_digest = managed_config_digest("network", &network_fields);
 
     let mut postgres_fields = common.to_vec();

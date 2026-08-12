@@ -12,7 +12,6 @@ pub(crate) fn update(
         config.container_backend(),
     )?;
     enforce_release_trust(&config, &release.manifest)?;
-    release.persist_verification_evidence(&release_cache_dir(&config, &release.manifest))?;
     let active_target = Runtime::new(&config).active_build_target()?;
     let current = active_target.embedded.revision.clone();
     let active = load_active_release(&config)?;
@@ -28,6 +27,7 @@ pub(crate) fn update(
         print_update_plan(&config, &active.version, &current, &release.manifest)?;
         return Ok(());
     }
+    release.persist_verification_evidence(&release_cache_dir(&config, &release.manifest))?;
     if active_target_matches_release(&config, &active, &active_target, &release.manifest)? {
         println!(
             "NazoAuth is already at {} ({})",
@@ -73,6 +73,8 @@ pub(crate) fn update(
     };
     cache_trusted_runtime(&config, &previous_manifest, &previous_runtime)?;
 
+    let previous_rollback_state = load_optional_rollback_state(&config)?;
+
     let candidate = if config.runtime.backend == RuntimeBackendKind::Systemd {
         install_host_candidate(
             &config,
@@ -108,6 +110,8 @@ pub(crate) fn update(
         candidate_runtime: candidate,
         candidate_ui,
         backup: None,
+        rollback_state_captured: true,
+        previous_rollback_state,
     };
     write_update_journal(&config, &journal)?;
     if let Err(error) = advance_update_transaction(config_path, &config, &mut journal) {
@@ -361,6 +365,24 @@ pub(crate) fn validate_update_journal(
     }
     if journal.phase >= UpdatePhase::BackupCreated && journal.backup.is_none() {
         bail!("update transaction lost its committed backup path");
+    }
+    if !journal.rollback_state_captured && journal.previous_rollback_state.is_some() {
+        bail!("update transaction rollback-state snapshot is inconsistent");
+    }
+    if let Some(previous) = &journal.previous_rollback_state {
+        if previous.schema != 1 || previous.to_release != journal.from_release {
+            bail!("update transaction previous rollback state is not bound to its source Release");
+        }
+        let identity = format!(
+            "https://github.com/{}/.github/workflows/release-security.yml@refs/tags/{}",
+            config.repository, previous.from_release.version
+        );
+        previous
+            .from_release
+            .validate(&previous.from_release.version, &identity)?;
+        if !previous.backup.starts_with(&config.backup_root) {
+            bail!("update transaction previous rollback backup is outside the backup root");
+        }
     }
     Ok(())
 }

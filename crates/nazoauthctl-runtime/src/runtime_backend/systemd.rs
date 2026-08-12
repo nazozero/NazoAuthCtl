@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
 };
@@ -31,6 +31,17 @@ const SYSTEMD_MEMORY_MAX: &str = "1G";
 const SYSTEMD_CPU_QUOTA: &str = "200%";
 const SYSTEMD_START_LIMIT_INTERVAL: &str = "60s";
 const SYSTEMD_START_LIMIT_BURST: &str = "5";
+const OPERATOR_CREDENTIAL_ENVIRONMENT: [(&str, &str); 3] = [
+    ("NAZOAUTH_OPERATOR_CONTEXT_FILE", "operator-context"),
+    (
+        "NAZOAUTH_OPERATOR_CONTROLLER_PUBLIC_KEY_FILE",
+        "operator-controller-public-key",
+    ),
+    (
+        "NAZOAUTH_OPERATOR_CONFIG_MANIFEST_FILE",
+        "operator-config-manifest",
+    ),
+];
 
 impl RuntimeBackend for SystemdBackend {
     fn kind(&self) -> RuntimeBackendKind {
@@ -465,6 +476,8 @@ impl RuntimeBackend for SystemdBackend {
                 ])
                 .run_quiet()?;
         }
+        require_non_root_service_user(&install.service_user)?;
+        configure_operator_state_permissions(install)?;
         let secrets_directory = install.working_directory.join("secrets");
         Process::new("chown")
             .arg(format!("root:{}", install.service_user))
@@ -475,11 +488,10 @@ impl RuntimeBackend for SystemdBackend {
         set_mode(&install.working_directory, 0o750)?;
         set_mode(&secrets_directory, 0o750)?;
         set_mode(&install.working_directory.join(".env.yaml"), 0o440)?;
-        Process::new("chown")
-            .arg(format!("root:{}", install.service_user))
-            .arg(&install.operator_directory)
-            .run_quiet()?;
-        set_mode(&install.operator_directory, 0o750)?;
+        // The generation directory contains controller/audit private keys and
+        // remains root-only.  Operator-task public context, controller key,
+        // and config manifest are injected through LoadCredential below; do
+        // not widen this directory merely to make those public files visible.
         for entry in fs::read_dir(&secrets_directory)? {
             let path = entry?.path();
             if path.file_name().is_some_and(|name| name == "dependencies") {
@@ -670,6 +682,9 @@ fn validate_host_service_install(install: &HostServiceInstall) -> anyhow::Result
     ] {
         validate_systemd_scalar(name, value)?;
     }
+    if matches!(install.service_user.as_str(), "root" | "0") {
+        bail!("systemd service user must not be root");
+    }
     for (name, path) in [
         ("working directory", &install.working_directory),
         ("binary path", &install.binary),
@@ -687,6 +702,69 @@ fn validate_host_service_install(install: &HostServiceInstall) -> anyhow::Result
         validate_systemd_scalar("runtime secret name", name)?;
     }
     Ok(())
+}
+
+fn validate_non_root_service_uid(output: &str) -> anyhow::Result<u32> {
+    let uid = output
+        .trim()
+        .parse::<u32>()
+        .context("systemd service user UID is not numeric")?;
+    if uid == 0 {
+        bail!("systemd service user must not resolve to UID 0");
+    }
+    Ok(uid)
+}
+
+fn require_non_root_service_user(user: &str) -> anyhow::Result<u32> {
+    let output = Process::new("id")
+        .args(["-u", user])
+        .stdout()
+        .with_context(|| format!("failed to resolve UID for systemd service user {user}"))?;
+    validate_non_root_service_uid(&output)
+}
+
+fn configure_operator_state_permissions(install: &HostServiceInstall) -> anyhow::Result<()> {
+    let state_parent = install
+        .operator_state
+        .parent()
+        .context("operator state path has no parent directory")?;
+    if install
+        .operator_state
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some("operator-state")
+    {
+        bail!("operator state path must end in operator-state");
+    }
+    validate_secure_directory(state_parent, "operator state parent", false)?;
+    let state_metadata = fs::symlink_metadata(&install.operator_state).with_context(|| {
+        format!(
+            "failed to inspect operator state {}",
+            install.operator_state.display()
+        )
+    })?;
+    if state_metadata.file_type().is_symlink() || !state_metadata.is_dir() {
+        bail!(
+            "operator state must be a real directory: {}",
+            install.operator_state.display()
+        );
+    }
+
+    // The control root contains controller-owned siblings (audit and
+    // deployment state).  Give the service group traverse-only access to the
+    // root and make only the operator-state leaf service-owned.  This avoids
+    // widening any private controller directory while allowing systemd-run's
+    // service UID to reach its read/write state.
+    Process::new("chown")
+        .arg(format!("root:{}", install.service_user))
+        .arg(state_parent)
+        .run_quiet()?;
+    set_mode(state_parent, 0o710)?;
+    Process::new("chown")
+        .arg(format!("{}:{}", install.service_user, install.service_user))
+        .arg(&install.operator_state)
+        .run_quiet()?;
+    set_mode(&install.operator_state, 0o700)
 }
 
 fn validate_systemd_scalar(name: &str, value: &str) -> anyhow::Result<()> {
@@ -726,7 +804,7 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
         bail!("host one-shot binary does not match the authorized digest");
     }
     let unit = format!("nazoauthctl-task-{}", uuid::Uuid::now_v7());
-    let mut process = Process::new("systemd-run")
+    let process = Process::new("systemd-run")
         .timeout(std::time::Duration::from_secs(300))
         .args([
             "--quiet",
@@ -753,6 +831,7 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
             "--property=AmbientCapabilities=",
         ])
         .arg(format!("--unit={unit}"));
+    let (mut process, credential_environment) = add_operator_credentials(process, task)?;
     if task.private_mounts {
         process = process.arg("--property=PrivateMounts=yes");
     }
@@ -763,11 +842,15 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
         process = process.arg(format!("--working-directory={}", directory.display()));
     }
     if let Some(user) = &task.service_user {
+        require_non_root_service_user(user)?;
         process = process
             .arg(format!("--uid={user}"))
             .arg(format!("--gid={user}"));
     }
     for (name, value) in &task.environment {
+        if credential_environment.contains(name.as_str()) {
+            continue;
+        }
         process = process.arg(format!("--setenv={name}={value}"));
     }
     for (name, source) in &task.transient_credentials {
@@ -805,6 +888,48 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
         ));
     }
     Ok(process.arg(path).args(&task.command))
+}
+
+fn add_operator_credentials(
+    mut process: Process,
+    task: &OneShotTask,
+) -> anyhow::Result<(Process, BTreeSet<String>)> {
+    let mut credential_environment = BTreeSet::new();
+    for (environment, _) in OPERATOR_CREDENTIAL_ENVIRONMENT {
+        let credential = operator_credential_name(environment)
+            .expect("operator credential table contains its own environment key");
+        let Some(source) = task.environment.get(environment) else {
+            continue;
+        };
+        // A caller that already supplied a credential-directory locator has
+        // completed this translation.  This keeps the backend compatible with
+        // pre-materialized tasks while ensuring legacy absolute paths are
+        // never exposed to the service process.
+        if source.starts_with("%d/") {
+            let expected = format!("%d/{credential}");
+            if source.as_str() != expected || !task.transient_credentials.contains_key(credential) {
+                bail!("{environment} has an unbound systemd credential locator");
+            }
+            continue;
+        }
+        safe_systemd_path(Path::new(source))
+            .with_context(|| format!("{environment} must be a safe absolute credential source"))?;
+        if task.transient_credentials.contains_key(credential) {
+            bail!("operator credential name is already occupied: {credential}");
+        }
+        process = process
+            .arg(format!("--property=LoadCredential={credential}:{source}"))
+            .arg(format!("--setenv={environment}=%d/{credential}"));
+        credential_environment.insert(environment.to_owned());
+    }
+    Ok((process, credential_environment))
+}
+
+fn operator_credential_name(environment: &str) -> Option<&'static str> {
+    OPERATOR_CREDENTIAL_ENVIRONMENT
+        .iter()
+        .find(|(candidate, _)| *candidate == environment)
+        .map(|(_, credential)| *credential)
 }
 
 fn discover_unmanaged_processes() -> anyhow::Result<Vec<RuntimeObservation>> {
@@ -1132,7 +1257,34 @@ fn validate_mutable_unit(object_reference: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_is_nazoauth_server, parse_systemd_exec_start, systemd_property_matches};
+    use super::{
+        command_is_nazoauth_server, operator_credential_name, parse_systemd_exec_start,
+        systemd_property_matches, validate_non_root_service_uid,
+    };
+
+    #[test]
+    fn operator_identity_files_use_transient_systemd_credentials() {
+        assert_eq!(
+            operator_credential_name("NAZOAUTH_OPERATOR_CONTEXT_FILE"),
+            Some("operator-context")
+        );
+        assert_eq!(
+            operator_credential_name("NAZOAUTH_OPERATOR_CONTROLLER_PUBLIC_KEY_FILE"),
+            Some("operator-controller-public-key")
+        );
+        assert_eq!(
+            operator_credential_name("NAZOAUTH_OPERATOR_CONFIG_MANIFEST_FILE"),
+            Some("operator-config-manifest")
+        );
+        assert_eq!(operator_credential_name("DATABASE_URL_FILE"), None);
+    }
+
+    #[test]
+    fn systemd_service_uid_must_not_be_root() {
+        assert_eq!(validate_non_root_service_uid("10001\n").unwrap(), 10001);
+        assert!(validate_non_root_service_uid("0\n").is_err());
+        assert!(validate_non_root_service_uid("root\n").is_err());
+    }
 
     #[test]
     fn parses_systemd_structured_exec_start_without_shell_splitting() {

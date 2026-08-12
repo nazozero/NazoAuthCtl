@@ -17,7 +17,7 @@ use crate::browser::{
     OpenId4VpVerifier, browser_config_for_module, parse_browser_entries_owned,
 };
 use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
-use crate::matrix::{MatrixError, SelectedMatrix};
+use crate::matrix::{MatrixError, SelectedMatrix, zeroize_json_value};
 use crate::origin::Origin;
 use crate::progress::{
     GroupProgress, GroupStatus, ProgressEvent, ProgressSink, ProgressSnapshot, redacted_variant,
@@ -30,6 +30,8 @@ use crate::report::{
 mod parallel;
 
 pub const MAX_PARALLEL_JOBS: usize = 4;
+pub const MAX_POLL_TIMEOUT_SECONDS: u64 = 86_400;
+pub const MAX_POLL_TIMEOUT: Duration = Duration::from_secs(MAX_POLL_TIMEOUT_SECONDS);
 
 /// One worker-owned interactive automation lane. A lane is never shared by
 /// concurrent plan workers, so WebDriver cookies/navigation and OpenID4VC
@@ -108,6 +110,16 @@ struct PlannedPlan {
     report_index: usize,
 }
 
+impl Drop for PlannedPlan {
+    fn drop(&mut self) {
+        // Suite responses and materialized Matrix configs may contain private
+        // client material. Every worker-owned clone must clear its own config;
+        // clearing only the parent Matrix cannot cover these independent
+        // allocations. ModuleDefinition owns and clears its response Values.
+        zeroize_json_value(&mut self.config);
+    }
+}
+
 struct PreparedRun {
     groups: Vec<GroupProgress>,
     plans: Vec<PlanReport>,
@@ -122,6 +134,7 @@ struct PreparedRun {
 impl ConformanceRunner {
     pub fn new(config: ConformanceRunConfig) -> Result<Self, OrchestrationError> {
         if config.poll_timeout.is_zero()
+            || config.poll_timeout > MAX_POLL_TIMEOUT
             || !(1..=MAX_PARALLEL_JOBS).contains(&config.jobs)
             || (!config.automation.is_empty() && config.automation.len() != config.jobs)
         {
@@ -426,7 +439,7 @@ impl ConformanceRunner {
                     let variant = group.effective_variant(plan);
                     let runtime_variant = group.effective_runtime_variant(plan);
                     current_variant = Some(redacted_variant(&variant));
-                    let created =
+                    let mut created =
                         match self
                             .config
                             .client
@@ -439,6 +452,10 @@ impl ConformanceRunner {
                                 break 'create;
                             }
                         };
+                    // `PlanCreated::raw` is a response-owned Value separate
+                    // from each module's raw copy. Clear it before the
+                    // response wrapper is partially moved below.
+                    zeroize_json_value(&mut created.raw);
                     suite_plan_ids.push(created.id.clone());
                     let defined_modules = created.modules.len();
                     groups[group_index].total += defined_modules;

@@ -28,6 +28,7 @@ pub(crate) fn network_config_digest(network: &ManagedNetwork) -> String {
         &network.deployment_id,
         &network.control_authority,
         &network.name,
+        network.subnet.as_deref(),
     )
 }
 
@@ -374,6 +375,140 @@ pub(crate) fn ensure_container(
     create.run_quiet()
 }
 
+/// Return the immutable id of a temporary managed container only after both
+/// the name lookup and the id lookup carry the complete managed-resource
+/// identity.  A name collision with an unrelated object therefore fails
+/// closed instead of being removed or reused.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn inspect_managed_container_id(
+    command: &OsStr,
+    object_reference: &str,
+    deployment_id: &str,
+    control_authority: &str,
+    runtime_instance_id: Option<&str>,
+    resource_kind: &str,
+    config_digest: &str,
+    backend_name: &str,
+) -> anyhow::Result<Option<String>> {
+    let name_arguments = ["container", "inspect", object_reference];
+    let Some(document) = inspect_document_optional(command, &name_arguments, backend_name)? else {
+        return Ok(None);
+    };
+    assert_managed_labels(
+        command,
+        &name_arguments,
+        deployment_id,
+        control_authority,
+        runtime_instance_id,
+        resource_kind,
+        config_digest,
+        backend_name,
+    )?;
+    let id = object_member_case_insensitive(&document, "id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context(format!(
+            "{backend_name} temporary managed container omitted immutable id"
+        ))?
+        .to_owned();
+    let id_arguments = ["container", "inspect", id.as_str()];
+    let id_document = inspect_document(command, &id_arguments, backend_name)?;
+    let observed_id = object_member_case_insensitive(&id_document, "id")
+        .and_then(serde_json::Value::as_str)
+        .context(format!(
+            "{backend_name} temporary managed container id inspect omitted immutable id"
+        ))?;
+    if observed_id != id {
+        bail!("{backend_name} temporary managed container immutable id changed");
+    }
+    assert_managed_labels(
+        command,
+        &id_arguments,
+        deployment_id,
+        control_authority,
+        runtime_instance_id,
+        resource_kind,
+        config_digest,
+        backend_name,
+    )?;
+    Ok(Some(id))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn remove_managed_container_by_id(
+    command: &OsStr,
+    object_id: &str,
+    deployment_id: &str,
+    control_authority: &str,
+    runtime_instance_id: Option<&str>,
+    resource_kind: &str,
+    config_digest: &str,
+    backend_name: &str,
+) -> anyhow::Result<()> {
+    let arguments = ["container", "inspect", object_id];
+    let Some(document) = inspect_document_optional(command, &arguments, backend_name)? else {
+        return Ok(());
+    };
+    let observed_id = object_member_case_insensitive(&document, "id")
+        .and_then(serde_json::Value::as_str)
+        .context(format!(
+            "{backend_name} temporary managed container id inspect omitted immutable id"
+        ))?;
+    if observed_id != object_id {
+        bail!("{backend_name} temporary managed container immutable id changed");
+    }
+    assert_managed_labels(
+        command,
+        &arguments,
+        deployment_id,
+        control_authority,
+        runtime_instance_id,
+        resource_kind,
+        config_digest,
+        backend_name,
+    )?;
+    Process::new(command)
+        .args(["rm", "--force", object_id])
+        .run_quiet()
+        .with_context(|| format!("failed to remove managed {backend_name} temporary container"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn remove_managed_container_by_name(
+    command: &OsStr,
+    object_reference: &str,
+    deployment_id: &str,
+    control_authority: &str,
+    runtime_instance_id: Option<&str>,
+    resource_kind: &str,
+    config_digest: &str,
+    backend_name: &str,
+) -> anyhow::Result<()> {
+    let Some(object_id) = inspect_managed_container_id(
+        command,
+        object_reference,
+        deployment_id,
+        control_authority,
+        runtime_instance_id,
+        resource_kind,
+        config_digest,
+        backend_name,
+    )?
+    else {
+        return Ok(());
+    };
+    remove_managed_container_by_id(
+        command,
+        &object_id,
+        deployment_id,
+        control_authority,
+        runtime_instance_id,
+        resource_kind,
+        config_digest,
+        backend_name,
+    )
+}
+
 fn inspect_image_environment(
     command: &OsStr,
     image: &str,
@@ -468,11 +603,11 @@ pub(crate) fn inspect_document_optional(
         .with_context(|| format!("{backend_name} engine unavailable"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-        if is_not_found_error(&stderr) {
-            return Ok(None);
-        }
         if stderr_engine_unavailable(&stderr) {
             bail!("{backend_name} engine unavailable while inspecting a managed object");
+        }
+        if is_not_found_error(&stderr) {
+            return Ok(None);
         }
         bail!("{backend_name} object inspection failed");
     }
@@ -535,7 +670,6 @@ fn is_not_found_error(stderr: &str) -> bool {
         || stderr.contains("no container with name or id")
         || stderr.contains("network not found")
         || stderr.contains("volume not found")
-        || stderr.contains("not found")
 }
 
 fn stderr_engine_unavailable(stderr: &str) -> bool {
@@ -564,6 +698,36 @@ pub(crate) fn assert_managed_container_policy(
     let host_config = document
         .get("HostConfig")
         .context("container inspect omitted HostConfig")?;
+
+    if let Some(value) = host_config.get("Privileged")
+        && !value.is_null()
+        && value.as_bool().with_context(|| {
+            format!("{backend_name} inspect returned an invalid Privileged flag")
+        })?
+    {
+        bail!("{backend_name} managed container cannot run privileged");
+    }
+    for field in [
+        "NetworkMode",
+        "PidMode",
+        "IpcMode",
+        "UTSMode",
+        "CgroupnsMode",
+        "UsernsMode",
+    ] {
+        let Some(value) = host_config.get(field) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let mode = value
+            .as_str()
+            .with_context(|| format!("{backend_name} inspect returned an invalid {field}"))?;
+        if mode.eq_ignore_ascii_case("host") {
+            bail!("{backend_name} managed container cannot use the host {field} namespace");
+        }
+    }
 
     let restart = host_config
         .pointer("/RestartPolicy/Name")
@@ -642,15 +806,19 @@ pub(crate) fn assert_managed_container_policy(
     }
     if let Some(limit) = policy.cpu_limit_millis {
         let expected_nano_cpus = u64::from(limit) * 1_000_000;
-        let nano_cpus = host_config
-            .get("NanoCpus")
-            .and_then(serde_json::Value::as_i64)
-            .and_then(|value| u64::try_from(value).ok());
-        let quota = host_config
-            .get("CpuQuota")
-            .and_then(serde_json::Value::as_i64)
-            .and_then(|value| u64::try_from(value).ok());
-        if nano_cpus != Some(expected_nano_cpus) && quota != Some(u64::from(limit) * 100) {
+        let expected_quota = u64::from(limit) * 100;
+        let nano_cpus = inspect_u64_field(host_config, "NanoCpus", backend_name)?;
+        let quota = inspect_u64_field(host_config, "CpuQuota", backend_name)?;
+        let period = inspect_u64_field(host_config, "CpuPeriod", backend_name)?;
+        let nano_matches = nano_cpus == Some(expected_nano_cpus);
+        let quota_matches = quota == Some(expected_quota);
+        let nano_unset = nano_cpus.is_none() || nano_cpus == Some(0);
+        let quota_unset = quota.is_none() || quota == Some(0);
+        if !(nano_matches || quota_matches)
+            || (!nano_unset && !nano_matches)
+            || (!quota_unset && !quota_matches)
+            || (quota_matches && period.is_some_and(|value| value != 0 && value != 100_000))
+        {
             bail!("{backend_name} managed container CPU limit drifted");
         }
     }
@@ -677,25 +845,12 @@ pub(crate) fn assert_managed_container_policy(
             .get("Tmpfs")
             .and_then(serde_json::Value::as_object)
             .and_then(|tmpfses| tmpfses.get(destination.as_ref()));
-        let options = match observed {
-            Some(serde_json::Value::String(value)) => value.to_ascii_lowercase(),
-            Some(serde_json::Value::Array(values)) => values
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .collect::<Vec<_>>()
-                .join(",")
-                .to_ascii_lowercase(),
-            _ => String::new(),
+        let Some(observed) = observed else {
+            bail!("{backend_name} managed container tmpfs policy drifted");
         };
-        let size = format!("size={}", tmpfs.size_bytes);
-        if observed.is_none()
-            || (tmpfs.read_only && !options.contains("ro"))
-            || (!tmpfs.read_only && !options.contains("rw"))
-            || (tmpfs.no_exec && !options.contains("noexec"))
-            || (tmpfs.no_suid && !options.contains("nosuid"))
-            || (tmpfs.no_device && !options.contains("nodev"))
-            || !options.contains(&size)
-        {
+        let observed = parse_tmpfs_options(observed, backend_name, destination.as_ref())?;
+        let expected = expected_tmpfs_options(tmpfs);
+        if observed != expected {
             bail!("{backend_name} managed container tmpfs policy drifted");
         }
     }
@@ -871,4 +1026,81 @@ fn mount_source_matches(observed: &str, expected: &str) -> bool {
             && !expected.contains('\\')
             && (observed.ends_with(&format!("/{expected}/_data"))
                 || observed.ends_with(&format!("\\{expected}\\_data"))))
+}
+
+fn inspect_u64_field(
+    object: &serde_json::Value,
+    field: &str,
+    backend_name: &str,
+) -> anyhow::Result<Option<u64>> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_u64()
+        .map(Some)
+        .with_context(|| format!("{backend_name} inspect returned an invalid {field}"))
+}
+
+fn expected_tmpfs_options(
+    tmpfs: &super::super::NeutralTmpfs,
+) -> std::collections::BTreeSet<String> {
+    let mut options = std::collections::BTreeSet::new();
+    options.insert(if tmpfs.read_only { "ro" } else { "rw" }.to_owned());
+    if tmpfs.no_exec {
+        options.insert("noexec".to_owned());
+    }
+    if tmpfs.no_suid {
+        options.insert("nosuid".to_owned());
+    }
+    if tmpfs.no_device {
+        options.insert("nodev".to_owned());
+    }
+    options.insert(format!("size={}", tmpfs.size_bytes));
+    options
+}
+
+fn parse_tmpfs_options(
+    value: &serde_json::Value,
+    backend_name: &str,
+    destination: &str,
+) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    let mut options = std::collections::BTreeSet::new();
+    let mut add = |option: &str| {
+        let option = option.trim().to_ascii_lowercase();
+        if option.is_empty() || !options.insert(option) {
+            return Err(anyhow::anyhow!(
+                "{backend_name} managed container returned duplicate or empty tmpfs option for {destination}"
+            ));
+        }
+        Ok(())
+    };
+    match value {
+        serde_json::Value::String(value) => {
+            for option in value.split(',') {
+                add(option)?;
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                let value = value.as_str().with_context(|| {
+                    format!(
+                        "{backend_name} managed container returned a non-string tmpfs option for {destination}"
+                    )
+                })?;
+                for option in value.split(',') {
+                    add(option)?;
+                }
+            }
+        }
+        _ => {
+            bail!(
+                "{backend_name} managed container returned an invalid tmpfs option list for {destination}"
+            );
+        }
+    }
+    Ok(options)
 }

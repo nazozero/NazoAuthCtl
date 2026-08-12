@@ -181,7 +181,13 @@ impl SelectedMatrix {
     }
 }
 
-fn zeroize_json_value(value: &mut Value) {
+impl Drop for SelectedMatrix {
+    fn drop(&mut self) {
+        self.zeroize_config();
+    }
+}
+
+pub(crate) fn zeroize_json_value(value: &mut Value) {
     match value {
         Value::String(text) => text.zeroize(),
         Value::Array(values) => values.iter_mut().for_each(zeroize_json_value),
@@ -496,5 +502,38 @@ mod tests {
             MatrixArtifact::from_bytes(review.as_bytes()),
             Err(MatrixError::Malformed)
         ));
+    }
+
+    #[test]
+    fn selected_matrix_zeroizes_nested_configuration_values() {
+        let mut selected = SelectedMatrix::from_materialized(
+            MatrixDocument {
+                schema: MATRIX_SCHEMA_VERSION,
+                name: "sensitive".into(),
+                groups: vec![MatrixGroup {
+                    id: "g".into(),
+                    profile: "oidc".into(),
+                    variant: MatrixVariant {
+                        id: "v".into(),
+                        values: BTreeMap::new(),
+                    },
+                    plans: vec![MatrixPlan {
+                        id: "p".into(),
+                        plan: "plan".into(),
+                        config: serde_json::json!({
+                            "nested": ["secret", {"key": "private-key"}]
+                        }),
+                        variant: BTreeMap::new(),
+                        expected_results: BTreeMap::new(),
+                    }],
+                }],
+            },
+            "digest".into(),
+        );
+        selected.zeroize_config();
+        assert_eq!(
+            selected.document.groups[0].plans[0].config,
+            serde_json::json!({"nested": ["", {"key": ""}]})
+        );
     }
 }

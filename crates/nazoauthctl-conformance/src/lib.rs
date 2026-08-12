@@ -15,6 +15,7 @@ mod matrix;
 mod orchestrator;
 mod origin;
 mod progress;
+mod proxy_trust;
 mod report;
 mod secure_file;
 mod transport;
@@ -45,13 +46,14 @@ pub use matrix::{
 };
 pub use orchestrator::{
     ConformanceAutomation, ConformanceRunConfig, ConformanceRunner, MAX_PARALLEL_JOBS,
-    OrchestrationError, RunControl, RunSummary,
+    MAX_POLL_TIMEOUT, MAX_POLL_TIMEOUT_SECONDS, OrchestrationError, RunControl, RunSummary,
 };
 pub use origin::{Origin, OriginError};
 pub use progress::{
     GroupProgress, GroupStatus, ProgressEvent, ProgressSink, ProgressSnapshot, StableRenderer,
     TtyRenderer, redacted_variant,
 };
+pub use proxy_trust::ProxyTrustGuard;
 pub use report::{
     CleanupFailure, CleanupReport, ConformanceReport, EvidenceError, ModuleReport, PlanReport,
 };

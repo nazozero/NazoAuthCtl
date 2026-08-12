@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, File, TryLockError},
     io::{IsTerminal as _, Read as _, Write as _},
     path::{Path, PathBuf},
@@ -255,6 +256,16 @@ fn control_config_with_lock_mode(
             record.deployment_id
         );
     }
+    if !record
+        .control_protocol_versions
+        .contains(&nazo_operator_protocol::CONTROL_DISCOVERY_SCHEMA)
+    {
+        bail!(
+            "deployment {} does not support controller protocol {}; command refused",
+            record.deployment_id,
+            nazo_operator_protocol::CONTROL_DISCOVERY_SCHEMA
+        );
+    }
     if application_task
         && !record
             .operator_protocol_versions
@@ -300,6 +311,59 @@ fn verify_control_binding(record: &DeploymentRecord, config: &UpdateConfig) -> a
         || config.operator.controller_key_id != record.control_authority
     {
         bail!("controller configuration is bound to a different deployment authority");
+    }
+    let [runtime] = record.runtime_instances.as_slice() else {
+        bail!("controller configuration requires exactly one declaration-bound runtime instance");
+    };
+    let object_reference = if config.runtime.backend == RuntimeBackendKind::Systemd {
+        &config.runtime.service_name
+    } else {
+        &config.runtime.container_name
+    };
+    if runtime.backend != config.runtime.backend
+        || runtime.runtime_instance_id != config.runtime.runtime_instance_id
+        || &runtime.object_reference != object_reference
+    {
+        bail!("controller configuration runtime identity differs from the deployment declaration");
+    }
+    let configured_ports = (!config.runtime.publish_address.is_empty())
+        .then(|| config.runtime.publish_address.clone())
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let configured_networks = (!config.runtime.network.is_empty())
+        .then(|| config.runtime.network.clone())
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let configured_mounts = config
+        .runtime
+        .mounts
+        .iter()
+        .map(|mount| {
+            (
+                mount.source.clone(),
+                mount.target.clone(),
+                mount.read_only,
+                mount.selinux_relabel,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let declared_mounts = runtime
+        .mounts
+        .iter()
+        .map(|mount| {
+            (
+                mount.source.clone(),
+                mount.destination.clone(),
+                mount.read_only,
+                mount.selinux_relabel,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if runtime.ports.iter().cloned().collect::<BTreeSet<_>>() != configured_ports
+        || runtime.networks.iter().cloned().collect::<BTreeSet<_>>() != configured_networks
+        || declared_mounts != configured_mounts
+    {
+        bail!("controller configuration runtime surface differs from the deployment declaration");
     }
     Ok(())
 }
@@ -370,6 +434,10 @@ struct UpdateJournal {
     candidate_runtime: String,
     candidate_ui: PathBuf,
     backup: Option<PathBuf>,
+    #[serde(default)]
+    rollback_state_captured: bool,
+    #[serde(default)]
+    previous_rollback_state: Option<RollbackState>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -39,6 +39,72 @@ pub(crate) fn write_rollback_state(
     )
 }
 
+pub(crate) fn load_optional_rollback_state(
+    config: &UpdateConfig,
+) -> anyhow::Result<Option<RollbackState>> {
+    let path = rollback_state_path(config);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("failed to inspect rollback state"),
+    }
+    let bytes =
+        crate::filesystem::read_secure_regular_file(&path, "rollback state", true, 1024 * 1024)?;
+    let state: RollbackState =
+        serde_json::from_slice(&bytes).context("rollback state is invalid")?;
+    if state.schema != 1 {
+        bail!("unsupported rollback state");
+    }
+    Ok(Some(state))
+}
+
+pub(crate) fn restore_previous_rollback_state(
+    config: &UpdateConfig,
+    journal: &UpdateJournal,
+) -> anyhow::Result<()> {
+    if !journal.rollback_state_captured {
+        return Ok(());
+    }
+    match journal.previous_rollback_state.clone() {
+        Some(state) => write_rollback_state(config, state),
+        None => remove_file_durable(&rollback_state_path(config)),
+    }
+}
+
+pub(crate) fn stage_rollback_state_archive(
+    config: &UpdateConfig,
+    state_bytes: &[u8],
+) -> anyhow::Result<PathBuf> {
+    let history = config.deployment_root.join("rollback-history");
+    crate::filesystem::ensure_directory_chain(&history)?;
+    let digest = encode_controller_digest(&Sha256::digest(state_bytes));
+    let archive = history.join(format!("rollback-{digest}.json"));
+    atomic_write(&archive, state_bytes, 0o600)?;
+    Ok(archive)
+}
+
+pub(crate) fn consume_rollback_state(
+    state_path: &Path,
+    archive: &Path,
+    expected_bytes: &[u8],
+) -> anyhow::Result<()> {
+    let archived = crate::filesystem::read_secure_regular_file(
+        archive,
+        "rollback state archive",
+        true,
+        1024 * 1024,
+    )?;
+    if archived.as_slice() != expected_bytes {
+        bail!("rollback state archive differs from the active state; refusing to consume it");
+    }
+    remove_file_durable(state_path)
+}
+
+fn rollback_request_id(operation: &str, state_bytes: &[u8]) -> String {
+    let digest = encode_controller_digest(&Sha256::digest(state_bytes));
+    format!("legacy-{operation}-{}", &digest[..16])
+}
+
 pub(crate) fn public_rollback(config: &UpdateConfig) -> anyhow::Result<()> {
     config.require_managed_lifecycle()?;
     let state_path = rollback_state_path(config);
@@ -54,7 +120,24 @@ pub(crate) fn public_rollback(config: &UpdateConfig) -> anyhow::Result<()> {
         bail!("unsupported rollback state");
     }
     let active = load_active_release(config)?;
-    if active.version != state.to_release.version
+    if active == state.from_release {
+        if Runtime::new(config).active_revision()? != state.from_release.backend_commit {
+            bail!("completed artifact rollback is not reflected by the active runtime");
+        }
+        verify_public(config)?;
+        verify_ui(config, &state.from_release)?;
+        crate::operator::append_management_event_idempotent(
+            config,
+            &rollback_request_id("artifact-rollback", &state_bytes),
+            "artifact-rollback",
+            &state.from_release.version,
+            "schema-compatible",
+        )?;
+        let archive = stage_rollback_state_archive(config, &state_bytes)?;
+        consume_rollback_state(&state_path, &archive, &state_bytes)?;
+        return Ok(());
+    }
+    if active != state.to_release
         || !active.rollback.schema_compatible
         || active.rollback.irreversible_migration
     {
@@ -65,8 +148,10 @@ pub(crate) fn public_rollback(config: &UpdateConfig) -> anyhow::Result<()> {
     }
     let backup = Backup::open_existing(config, &state.backup)?;
     ensure_trusted_runtime_available(config, &state.from_release, &state.previous_runtime)?;
-    crate::operator::append_management_event(
+    let archive = stage_rollback_state_archive(config, &state_bytes)?;
+    crate::operator::append_management_event_idempotent(
         config,
+        &rollback_request_id("artifact-rollback-intent", &state_bytes),
         "artifact-rollback-intent",
         &state.from_release.version,
         "schema-compatible",
@@ -80,12 +165,14 @@ pub(crate) fn public_rollback(config: &UpdateConfig) -> anyhow::Result<()> {
     verify_public(config)?;
     verify_ui(config, &state.from_release)?;
     write_active_release(config, &state.from_release)?;
-    crate::operator::append_management_event(
+    crate::operator::append_management_event_idempotent(
         config,
+        &rollback_request_id("artifact-rollback", &state_bytes),
         "artifact-rollback",
         &state.from_release.version,
         "schema-compatible",
     )?;
+    consume_rollback_state(&state_path, &archive, &state_bytes)?;
     println!(
         "artifact rollback completed to {}; database was not restored; schema compatibility was verified from the signed Release policy",
         state.from_release.version
@@ -109,10 +196,33 @@ pub(crate) fn recover_from_backup(config: &UpdateConfig) -> anyhow::Result<()> {
     {
         bail!("the signed Release does not declare backup-based database recovery");
     }
+    let active = load_active_release(config)?;
+    if active == state.from_release {
+        if Runtime::new(config).active_revision()? != state.from_release.backend_commit {
+            bail!("completed backup recovery is not reflected by the active runtime");
+        }
+        verify_public(config)?;
+        verify_ui(config, &state.from_release)?;
+        crate::operator::append_management_event_idempotent(
+            config,
+            &rollback_request_id("backup-recovery", &state_bytes),
+            "backup-recovery",
+            &state.from_release.version,
+            "database-backup",
+        )?;
+        let archive = stage_rollback_state_archive(config, &state_bytes)?;
+        consume_rollback_state(&state_path, &archive, &state_bytes)?;
+        return Ok(());
+    }
+    if active != state.to_release {
+        bail!("backup recovery state does not match the active Release");
+    }
     let backup = Backup::open_existing(config, &state.backup)?;
     ensure_trusted_runtime_available(config, &state.from_release, &state.previous_runtime)?;
-    crate::operator::append_management_event(
+    let archive = stage_rollback_state_archive(config, &state_bytes)?;
+    crate::operator::append_management_event_idempotent(
         config,
+        &rollback_request_id("backup-recovery-intent", &state_bytes),
         "backup-recovery-intent",
         &state.from_release.version,
         "database-backup",
@@ -141,12 +251,14 @@ pub(crate) fn recover_from_backup(config: &UpdateConfig) -> anyhow::Result<()> {
     verify_public(config)?;
     verify_ui(config, &state.from_release)?;
     write_active_release(config, &state.from_release)?;
-    crate::operator::append_management_event(
+    crate::operator::append_management_event_idempotent(
         config,
+        &rollback_request_id("backup-recovery", &state_bytes),
         "backup-recovery",
         &state.from_release.version,
         "database-backup",
     )?;
+    consume_rollback_state(&state_path, &archive, &state_bytes)?;
     println!(
         "backup recovery completed from {}; application={} database=restored valkey=restored",
         state.backup.display(),

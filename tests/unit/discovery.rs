@@ -90,6 +90,49 @@ fn secret_mount_sources_are_redacted_without_changing_neutral_mount_authority() 
 }
 
 #[test]
+fn public_discovery_runtime_omits_backend_labels_and_host_mount_sources() {
+    let mut discovered = candidate("podman:public", "deployment-a", "runtime-a");
+    discovered.runtime.labels.insert(
+        "com.example.credentials".to_owned(),
+        "database-password=do-not-print".to_owned(),
+    );
+    discovered.runtime.labels.insert(
+        "io.nazoauth.deployment-id".to_owned(),
+        "deployment-a".to_owned(),
+    );
+    discovered.runtime.mounts.push(NeutralMount {
+        source: PathBuf::from("/srv/private/database-password"),
+        destination: PathBuf::from("/run/credentials/database"),
+        read_only: true,
+        selinux_relabel: false,
+        ownership: Responsibility::External,
+        scope: ResourceScope::Shared,
+    });
+
+    let output = serde_json::to_value(&discovered).expect("discovery DTO should serialize");
+    let runtime = output
+        .get("runtime")
+        .and_then(serde_json::Value::as_object)
+        .expect("public runtime DTO should be an object");
+    assert_eq!(
+        runtime["labels"]["com.example.credentials"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        runtime["labels"]["io.nazoauth.deployment-id"],
+        "deployment-a"
+    );
+    let mount = runtime["mounts"]
+        .as_array()
+        .expect("public mounts should be an array")
+        .first()
+        .expect("fixture should expose one mount");
+    assert_eq!(mount["source"], "<redacted-mount-source>");
+    assert!(!output.to_string().contains("do-not-print"));
+    assert!(!output.to_string().contains("database-password"));
+}
+
+#[test]
 fn offline_statement_path_uses_the_declared_data_mount_not_mount_order() {
     let mut discovered = candidate("podman:runtime-a", "deployment-a", "runtime-a");
     discovered

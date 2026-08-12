@@ -32,34 +32,23 @@ impl Cli {
         let mut args = args.into_iter();
         let _program = args.next();
         let mut values = args.collect::<Vec<_>>();
-        if values.is_empty()
-            || values
-                .iter()
-                .any(|value| matches!(value.as_str(), "-h" | "--help"))
-        {
+        if values.is_empty() {
             return Ok(None);
         }
+        let globals = super::parse_global_options(&values)?;
         let mut config = env::var_os("NAZOAUTH_UPDATE_CONFIG")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG));
-        let mut deployment = None;
-        while values
-            .first()
-            .is_some_and(|value| matches!(value.as_str(), "--config" | "--deployment"))
+        if let Some(global_config) = globals.config {
+            config = global_config;
+        }
+        let deployment = globals.deployment;
+        values.drain(..globals.consumed);
+        if values
+            .iter()
+            .any(|value| matches!(value.as_str(), "-h" | "--help"))
         {
-            if values.len() < 2 {
-                bail!("{} requires a value", values[0]);
-            }
-            let value = values.remove(1);
-            match values.remove(0).as_str() {
-                "--config" => config = PathBuf::from(value),
-                "--deployment" => {
-                    if deployment.replace(value).is_some() {
-                        bail!("--deployment may be specified only once");
-                    }
-                }
-                _ => unreachable!(),
-            }
+            return Ok(None);
         }
         let command = values.first().cloned().context("a command is required")?;
         values.remove(0);
@@ -219,10 +208,18 @@ impl Cli {
                 while index < values.len() {
                     match values[index].as_str() {
                         "--yes" => {
+                            if yes {
+                                bail!(
+                                    "break-glass recover-controller --yes may be specified only once"
+                                );
+                            }
                             yes = true;
                             index += 1;
                         }
                         "--reason" => {
+                            if reason.is_some() {
+                                bail!("--reason may be specified only once");
+                            }
                             reason = Some(
                                 values
                                     .get(index + 1)

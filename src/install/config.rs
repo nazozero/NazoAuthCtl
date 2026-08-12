@@ -163,6 +163,7 @@ pub(super) fn build_config(
             container_name: format!("nazoauth-{name_suffix}-server"),
             runtime_instance_id: uuid::Uuid::now_v7().to_string(),
             network: format!("nazoauth-{name_suffix}-network"),
+            network_subnet: options.network_subnet.clone(),
             ip_address: options.runtime_ip.clone().unwrap_or_default(),
             publish_address,
             health_url: format!("http://127.0.0.1:{}/ready", options.port),

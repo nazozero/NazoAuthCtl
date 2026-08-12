@@ -208,10 +208,51 @@ pub(super) fn install(
     if config_present {
         let config = load_config(&config_path)?;
         config.require_managed_lifecycle()?;
+        let store = DeploymentStore::system();
+        if store.registry_present()?
+            && store
+                .load_registry()?
+                .deployments
+                .contains_key(&config.operator.deployment_id)
+        {
+            let resolved = store.resolve(Some(&config.operator.deployment_id), true)?;
+            let _deployment_lock = store.deployment_lock(&resolved.deployment_id)?;
+            let record = store.load(&resolved.deployment_id)?;
+            match record.resources.get("controller_config") {
+                Some(SafeReference::File { path }) if path == &config_path => {}
+                _ => bail!("registered install config path is not declaration-bound"),
+            }
+            super::verify_control_binding(&record, &config)?;
+            if crate::coordination::active_update_exists(&store, &record) {
+                bail!("install cannot reconcile while a coordinated update transaction is active");
+            }
+            if !install_is_complete(&config)? {
+                bail!(
+                    "registered deployment installation is incomplete; use recover-update or controller-independent recovery instead of replaying install"
+                );
+            }
+            let active = load_active_release(&config)?;
+            if active.embedded != record.active_release {
+                bail!("registered install active release differs from the deployment declaration");
+            }
+            let managed_secrets_changed = install::reconcile_managed_secrets(&config)?;
+            if managed_secrets_changed {
+                install::start_managed_dependencies(&config)?;
+                Runtime::new(&config).restart()?;
+            }
+            if !health_ready(&config) {
+                bail!("managed installation is complete but not healthy; run nazoauthctl doctor");
+            }
+            println!(
+                "NazoAuth is already installed and ready; use nazoauthctl update for releases"
+            );
+            return Ok(());
+        }
         let managed_secrets_changed = install::reconcile_managed_secrets(&config)?;
         if install_is_complete(&config)? {
             if managed_secrets_changed {
                 install::start_managed_dependencies(&config)?;
+                Runtime::new(&config).restart()?;
             }
             if !health_ready(&config) {
                 bail!("managed installation is complete but not healthy; run nazoauthctl doctor");
@@ -466,6 +507,12 @@ pub(super) fn register_installed_deployment(
             },
         ),
         (
+            "audit_public_key".to_owned(),
+            SafeReference::File {
+                path: config.operator.audit_public_key.clone(),
+            },
+        ),
+        (
             "break_glass_private_key".to_owned(),
             SafeReference::File {
                 path: config.operator.break_glass_private_key.clone(),
@@ -518,7 +565,10 @@ pub(super) fn register_installed_deployment(
             object_reference,
             artifact,
             local_artifact_id: None,
-            ports: vec![config.runtime.publish_address.clone()],
+            ports: (!config.runtime.publish_address.is_empty())
+                .then(|| config.runtime.publish_address.clone())
+                .into_iter()
+                .collect(),
             networks: (!config.runtime.network.is_empty())
                 .then(|| config.runtime.network.clone())
                 .into_iter()

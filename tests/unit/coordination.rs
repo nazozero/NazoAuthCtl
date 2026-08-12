@@ -599,3 +599,110 @@ fn controller_steps_commit_the_new_declaration_only_after_final_acceptance() {
             .is_file()
     );
 }
+
+#[test]
+fn resume_repairs_evidence_written_before_the_pending_journal_transition() {
+    let work = PrivateTempDir::new("nazoauthctl-coordination-evidence-replay").unwrap();
+    let store = store(&work);
+    let (record, signing_key) = provider_record(&work, "deployment-a");
+    let prepared = prepare_update(&store, &record, &plan("deployment-a")).unwrap();
+    let input = work.path().join("evidence.json");
+    fs::write(
+        &input,
+        serde_json::to_vec(&evidence(&prepared, "deployment-a", &signing_key)).unwrap(),
+    )
+    .unwrap();
+    let accepted = submit_evidence(&store, &record, &input).unwrap();
+    assert_eq!(accepted.state, CoordinationState::ReadyForController);
+
+    // Simulate a stop after the accepted evidence file was durable but before
+    // the active journal's Pending -> EvidenceAccepted write completed.
+    let active = store
+        .deployment_state_dir("deployment-a")
+        .join("transactions/active-update.json");
+    let mut interrupted: UpdateCoordination =
+        serde_json::from_slice(&fs::read(&active).unwrap()).unwrap();
+    let external = interrupted
+        .steps
+        .iter_mut()
+        .find(|step| step.id == "external-recovery-point")
+        .unwrap();
+    external.state = StepState::Pending;
+    external.evidence_sha256 = None;
+    interrupted.state = CoordinationState::WaitingForEvidence;
+    fs::write(&active, serde_json::to_vec_pretty(&interrupted).unwrap()).unwrap();
+
+    let resumed = resume(&store, &record).unwrap();
+    assert_eq!(resumed.state, CoordinationState::ReadyForController);
+    let external = resumed
+        .steps
+        .iter()
+        .find(|step| step.id == "external-recovery-point")
+        .unwrap();
+    assert_eq!(external.state, StepState::EvidenceAccepted);
+    assert!(external.evidence_sha256.is_some());
+}
+
+#[test]
+fn committed_resume_replays_a_cas_that_preceded_the_old_journal_revision() {
+    let work = PrivateTempDir::new("nazoauthctl-coordination-commit-replay").unwrap();
+    let store = store(&work);
+    let (current, signing_key) = provider_record(&work, "deployment-a");
+    store.persist(&current).unwrap();
+    let prepared = prepare_update(&store, &current, &plan("deployment-a")).unwrap();
+    let input = work.path().join("evidence.json");
+    fs::write(
+        &input,
+        serde_json::to_vec(&evidence(&prepared, "deployment-a", &signing_key)).unwrap(),
+    )
+    .unwrap();
+    submit_evidence(&store, &current, &input).unwrap();
+    complete_controller_step(
+        &store,
+        &current,
+        &prepared.transaction_id,
+        "replace-runtime",
+        &"d".repeat(64),
+    )
+    .unwrap();
+
+    let mut updated = current.clone();
+    updated.active_release = prepared.target_release.clone();
+    updated.declaration_revision = current.declaration_revision + 1;
+
+    // Simulate the new commit protocol after its durable intent was written,
+    // followed by a successful declaration CAS, but before the journal could
+    // record the new declaration revision.
+    let active = store
+        .deployment_state_dir("deployment-a")
+        .join("transactions/active-update.json");
+    let mut interrupted: UpdateCoordination =
+        serde_json::from_slice(&fs::read(&active).unwrap()).unwrap();
+    let acceptance = interrupted
+        .steps
+        .iter_mut()
+        .find(|step| step.id == "acceptance")
+        .unwrap();
+    acceptance.state = StepState::ControllerCompleted;
+    acceptance.evidence_sha256 = Some("e".repeat(64));
+    interrupted.state = CoordinationState::Committed;
+    interrupted.committed_declaration = Some(updated.clone());
+    assert_eq!(
+        interrupted.declaration_revision + 1,
+        updated.declaration_revision
+    );
+    fs::write(&active, serde_json::to_vec_pretty(&interrupted).unwrap()).unwrap();
+    {
+        let _lock = store.deployment_lock("deployment-a").unwrap();
+        store
+            .persist_declaration_cas_locked(&current, &updated)
+            .unwrap();
+    }
+
+    let resumed = resume(&store, &updated).unwrap();
+    assert_eq!(resumed.state, CoordinationState::Committed);
+    assert_eq!(resumed.declaration_revision, updated.declaration_revision);
+    assert_eq!(store.load("deployment-a").unwrap(), updated);
+    finalize_committed_locked(&store, &updated, &prepared.transaction_id).unwrap();
+    assert!(!active.exists());
+}

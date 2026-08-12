@@ -92,11 +92,7 @@ pub(crate) fn resume_config_backed_update_locked(
     if transaction.state != CoordinationState::ReadyForController {
         bail!("update transaction is not ready for controller execution");
     }
-    match record.resources.get("controller_config") {
-        Some(SafeReference::File { path })
-            if fs::canonicalize(path)? == fs::canonicalize(config_path)? => {}
-        _ => bail!("registered update is not bound to this controller configuration"),
-    }
+    validate_config_backed_binding(record, config_path)?;
     if record.resources.contains_key("lifecycle_contract") {
         bail!("config-backed update cannot replace an offline lifecycle update");
     }
@@ -234,6 +230,51 @@ pub(crate) fn resume_config_backed_update_locked(
     )?;
     crate::coordination::finalize_committed_locked(store, &updated, &transaction.transaction_id)?;
     Ok(current)
+}
+
+pub(crate) fn finalize_config_backed_update_locked(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    transaction: &crate::coordination::UpdateCoordination,
+    config_path: &Path,
+) -> anyhow::Result<crate::coordination::UpdateCoordination> {
+    use crate::coordination::CoordinationState;
+
+    if transaction.state != CoordinationState::Committed {
+        bail!("config-backed update is not committed");
+    }
+    validate_config_backed_binding(record, config_path)?;
+    if record.resources.contains_key("lifecycle_contract") {
+        bail!("config-backed update cannot finalize an offline lifecycle update");
+    }
+    if record.active_release != transaction.target_release
+        || record.declaration_revision != transaction.declaration_revision()
+    {
+        bail!("committed config-backed update is not reflected in the DeploymentRecord");
+    }
+    crate::governance::append_management_audit(
+        store,
+        record,
+        &transaction.transaction_id,
+        "config-backed-update",
+        &transaction.target_release.release,
+    )?;
+    crate::coordination::finalize_committed_locked(store, record, &transaction.transaction_id)?;
+    Ok(transaction.clone())
+}
+
+fn validate_config_backed_binding(
+    record: &DeploymentRecord,
+    config_path: &Path,
+) -> anyhow::Result<()> {
+    match record.resources.get("controller_config") {
+        Some(SafeReference::File { path })
+            if fs::canonicalize(path)? == fs::canonicalize(config_path)? =>
+        {
+            Ok(())
+        }
+        _ => bail!("registered update is not bound to this controller configuration"),
+    }
 }
 
 fn validate_config_backed_runtime_observation(

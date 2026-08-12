@@ -285,10 +285,19 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             let store = DeploymentStore::system();
             let record = store.resolve(selector.as_deref(), true)?;
             let transaction = crate::coordination::resume(&store, &record)?;
-            if transaction.state == crate::coordination::CoordinationState::ReadyForController {
-                let transaction = if record.resources.contains_key("lifecycle_contract") {
-                    crate::lifecycle::execute_coordinated_update(&store, &record, &transaction)?
-                } else if record.resources.contains_key("controller_config") {
+            let current_record = store.load(&record.deployment_id)?;
+            if matches!(
+                transaction.state,
+                crate::coordination::CoordinationState::ReadyForController
+                    | crate::coordination::CoordinationState::Committed
+            ) {
+                let transaction = if current_record.resources.contains_key("lifecycle_contract") {
+                    crate::lifecycle::execute_coordinated_update(
+                        &store,
+                        &current_record,
+                        &transaction,
+                    )?
+                } else if current_record.resources.contains_key("controller_config") {
                     let context = control_config(
                         &configured_path,
                         selector.as_deref(),
@@ -305,14 +314,30 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                         true,
                         false,
                     )?;
-                    resume_config_backed_update_locked(
-                        &store,
-                        &record,
-                        &transaction,
-                        &context.path,
-                        &context.config,
-                        accept_migration_barrier,
-                    )?
+                    if transaction.state == crate::coordination::CoordinationState::Committed {
+                        let current_record = context.record.as_ref().context(
+                            "committed config-backed update lost its deployment declaration",
+                        )?;
+                        finalize_config_backed_update_locked(
+                            &store,
+                            current_record,
+                            &transaction,
+                            &context.path,
+                        )?
+                    } else {
+                        let bound_record = context
+                            .record
+                            .as_ref()
+                            .context("config-backed update lost its deployment declaration")?;
+                        resume_config_backed_update_locked(
+                            &store,
+                            bound_record,
+                            &transaction,
+                            &context.path,
+                            &context.config,
+                            accept_migration_barrier,
+                        )?
+                    }
                 } else {
                     bail!("update transaction has no executable lifecycle authority");
                 };
@@ -523,6 +548,12 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
+                require_registered_recovery_authority(
+                    "rollback",
+                    crate::coordination::active_update_exists(&store, &record),
+                    record.resources.contains_key("lifecycle_contract"),
+                    record.resources.contains_key("controller_config"),
+                )?;
                 if record.resources.contains_key("lifecycle_contract") {
                     require_confirmation(
                         yes,
@@ -530,6 +561,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                     )?;
                     return crate::lifecycle::rollback_registered(&store, &record);
                 }
+                unreachable!("registered rollback authority guard returned without a lifecycle");
             }
             let context = control_config(
                 &configured_path,
@@ -554,6 +586,12 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
+                require_registered_recovery_authority(
+                    "recovery",
+                    crate::coordination::active_update_exists(&store, &record),
+                    record.resources.contains_key("lifecycle_contract"),
+                    record.resources.contains_key("controller_config"),
+                )?;
                 if record.resources.contains_key("lifecycle_contract") {
                     require_confirmation(
                         yes,
@@ -561,6 +599,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                     )?;
                     return crate::lifecycle::recover_registered(&store, &record);
                 }
+                unreachable!("registered recovery authority guard returned without a lifecycle");
             }
             let context = control_config(
                 &configured_path,
@@ -587,20 +626,64 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
-                if record.resources.contains_key("lifecycle_contract") {
-                    require_confirmation(
-                        yes,
-                        "resume the deployment-bound interrupted update transaction",
-                    )?;
-                    let transaction = crate::coordination::resume(&store, &record)?;
-                    let transaction = crate::lifecycle::execute_coordinated_update(
+                require_confirmation(
+                    yes,
+                    "resume the deployment-bound interrupted update transaction",
+                )?;
+                let transaction = crate::coordination::resume(&store, &record)?;
+                let current_record = store.load(&record.deployment_id)?;
+                let transaction = if current_record.resources.contains_key("lifecycle_contract") {
+                    crate::lifecycle::execute_coordinated_update(
                         &store,
-                        &record,
+                        &current_record,
                         &transaction,
+                    )?
+                } else if current_record.resources.contains_key("controller_config") {
+                    let context = control_config(
+                        &configured_path,
+                        selector.as_deref(),
+                        &[
+                            Capability::Runtime,
+                            Capability::Artifact,
+                            Capability::ServerConfig,
+                            Capability::Database,
+                            Capability::Valkey,
+                            Capability::Backups,
+                            Capability::OperatorTasks,
+                        ],
+                        true,
+                        true,
+                        false,
                     )?;
-                    println!("{}", serde_json::to_string_pretty(&transaction)?);
-                    return Ok(());
-                }
+                    if transaction.state == crate::coordination::CoordinationState::Committed {
+                        let current_record = context.record.as_ref().context(
+                            "committed config-backed update lost its deployment declaration",
+                        )?;
+                        finalize_config_backed_update_locked(
+                            &store,
+                            current_record,
+                            &transaction,
+                            &context.path,
+                        )?
+                    } else {
+                        let bound_record = context
+                            .record
+                            .as_ref()
+                            .context("config-backed update lost its deployment declaration")?;
+                        resume_config_backed_update_locked(
+                            &store,
+                            bound_record,
+                            &transaction,
+                            &context.path,
+                            &context.config,
+                            true,
+                        )?
+                    }
+                } else {
+                    bail!("registered update recovery has no executable lifecycle authority");
+                };
+                println!("{}", serde_json::to_string_pretty(&transaction)?);
+                return Ok(());
             }
             let context = control_config(
                 &configured_path,
@@ -972,6 +1055,28 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
+fn require_registered_recovery_authority(
+    operation: &str,
+    active_update: bool,
+    has_lifecycle_contract: bool,
+    has_controller_config: bool,
+) -> anyhow::Result<()> {
+    if active_update {
+        bail!(
+            "registered {operation} is forbidden while an update transaction is active; resume or recover the deployment-bound transaction first"
+        );
+    }
+    if has_lifecycle_contract {
+        return Ok(());
+    }
+    if has_controller_config {
+        bail!(
+            "registered config-backed {operation} is not implemented as a deployment transaction; refusing to use the legacy mutator because it cannot update the DeploymentRecord atomically"
+        );
+    }
+    bail!("registered {operation} has no approved lifecycle authority")
+}
+
 /// Select a registered deployment once for audit inspection.  The returned
 /// declaration is the same snapshot used to derive the optional bound
 /// operator configuration; AuditVerify/AuditShow never resolve the selector a
@@ -1029,5 +1134,28 @@ mod development_identity_tests {
         let mut unrelated_prerelease = identity();
         unrelated_prerelease.release = "v0.1.28-dev.unrelated".to_owned();
         assert!(validate_local_development_identity(&unrelated_prerelease).is_err());
+    }
+
+    #[test]
+    fn registered_recovery_never_falls_back_to_legacy_mutation() {
+        for operation in ["rollback", "recovery"] {
+            let active =
+                require_registered_recovery_authority(operation, true, true, false).unwrap_err();
+            assert!(active.to_string().contains("transaction is active"));
+
+            let config_backed =
+                require_registered_recovery_authority(operation, false, false, true).unwrap_err();
+            assert!(config_backed.to_string().contains("legacy mutator"));
+
+            let unbound =
+                require_registered_recovery_authority(operation, false, false, false).unwrap_err();
+            assert!(
+                unbound
+                    .to_string()
+                    .contains("no approved lifecycle authority")
+            );
+
+            require_registered_recovery_authority(operation, false, true, false).unwrap();
+        }
     }
 }

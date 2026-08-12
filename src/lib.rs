@@ -25,7 +25,20 @@ pub use conformance::{ConformanceMatrix, ConformanceOnboarding, ConformanceSessi
 mod test_support;
 
 pub fn main_entry() {
-    let args = std::env::args().collect::<Vec<_>>();
+    let args = match std::env::args_os()
+        .map(|argument| {
+            argument
+                .into_string()
+                .map_err(|_| "command-line arguments must be valid UTF-8")
+        })
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("nazoauthctl: argument parsing failed: {error}");
+            std::process::exit(2);
+        }
+    };
     if let Some(topic) = cli::help_topic(&args) {
         print_help(topic);
         return;

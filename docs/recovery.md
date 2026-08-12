@@ -80,6 +80,21 @@ pre-update checkpoint and old trusted runtime become the rollback slot before
 that atomic commit. Artifact-only rollback never restores provider data; full
 recovery does.
 
+An external proxy provider keeps its own root-only recovery journal. Before a
+reload it retains the previous configuration and CA bundle, records old/new
+digests and the deployment transaction, validates the complete candidate, and
+only then atomically selects it. After a crash, recovery reconciles the active
+worker generation and file digests before deciding whether to finish or restore;
+it never guesses from file names or application health alone. The old bundle is
+retired only after the previous worker has exited. A conformance cleanup is not
+complete until the pre-run proxy generation has been restored and probed.
+
+The file-backed conformance provider records its intent as the private sibling
+`.BUNDLE_NAME.nazoauthctl-restore`. A later run restores it and invokes the same
+validated reload executable before installing new trust. Operators must not
+delete this file or start a second proxy writer; resolve any reload failure and
+rerun the same command.
+
 The signed offline deployment statement identifies a stopped replica from its
 persistent mount. It is not sufficient artifact trust: ctl also verifies the
 cached Release and the retained OCI digest or host-binary SHA-256. An unsupported

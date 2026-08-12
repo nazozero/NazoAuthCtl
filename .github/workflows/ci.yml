@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   controller:
-    name: controller-only / ${{ matrix.os }}
+    name: workspace / ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -47,11 +47,11 @@ jobs:
             exit 1
           fi
       - name: Test controller
-        run: cargo test --locked --all-targets --all-features
+        run: cargo test --locked --workspace --all-targets --all-features
       - name: Lint controller
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Build controller
-        run: cargo build --locked --release --bin nazoauthctl
+        run: cargo build --locked --workspace --all-targets --all-features --release
       - name: Smoke controller
         shell: bash
         run: target/release/nazoauthctl${{ runner.os == 'Windows' && '.exe' || '' }} --help

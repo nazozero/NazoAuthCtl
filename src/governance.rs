@@ -3,7 +3,7 @@ use std::fs;
 use anyhow::{Context as _, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use nazo_operator_protocol::{
     Actor, ActorKind, ManagementAuditEvent, PROTOCOL_VERSION, compact_sha256, protected_header,
     sign_management_event, verify_management_event,
@@ -121,6 +121,9 @@ fn transition(
         .into_iter()
         .map(|resource| store.shared_resource_lock(resource))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    if crate::coordination::active_update_exists(&store, &record) {
+        bail!("capabilities cannot change while a coordinated update transaction is active");
+    }
     if record.trust != TrustState::Adopted {
         bail!("capabilities cannot change until the deployment is adopted");
     }
@@ -680,6 +683,36 @@ fn state_audit_signing_key(
     Ok((key_id, signing))
 }
 
+fn state_audit_verifying_key(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+) -> anyhow::Result<(String, VerifyingKey)> {
+    let public_path = match record.resources.get("audit_public_key") {
+        Some(SafeReference::File { path }) => path.clone(),
+        _ => match record.resources.get("audit_private_key") {
+            Some(SafeReference::File { path }) => path.with_file_name("audit.pub"),
+            _ => store
+                .deployment_state_dir(&record.deployment_id)
+                .join("identities")
+                .join("audit.pub"),
+        },
+    };
+    let encoded =
+        crate::filesystem::read_secure_regular_file(&public_path, "audit public key", false, 256)?;
+    let encoded = std::str::from_utf8(&encoded)
+        .with_context(|| format!("audit public key is not UTF-8: {}", public_path.display()))?;
+    let public = URL_SAFE_NO_PAD
+        .decode(encoded.trim())
+        .context("audit public key is invalid")?;
+    let public: [u8; 32] = public
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("audit public key has an invalid length"))?;
+    let verifying = VerifyingKey::from_bytes(&public).context("audit public key is invalid")?;
+    let key_id =
+        nazo_operator_protocol::instance_key_id(&verifying).replacen("instance-", "audit-", 1);
+    Ok((key_id, verifying))
+}
+
 /// Verify the deployment-owned governance chain without repairing any
 /// derived state.  The returned tuple is `(last_sequence, last_hash)`.
 pub(crate) fn verify_management_audit(
@@ -692,14 +725,14 @@ pub(crate) fn verify_management_audit(
     if !ensure_real_directory_or_missing(&directory, "deployment management audit directory")? {
         return Ok((0, "0".repeat(64)));
     }
-    let (key_id, signing) = state_audit_signing_key(store, record)?;
+    let (key_id, verifying) = state_audit_verifying_key(store, record)?;
     let entries = read_management_entries(
         store,
         record,
         &directory,
         &record.deployment_id,
         &key_id,
-        &signing.verifying_key(),
+        &verifying,
     )?;
     Ok(entries
         .last()
@@ -719,14 +752,14 @@ pub(crate) fn management_audit_entries(
     if !ensure_real_directory_or_missing(&directory, "deployment management audit directory")? {
         return Ok(Vec::new());
     }
-    let (key_id, signing) = state_audit_signing_key(store, record)?;
+    let (key_id, verifying) = state_audit_verifying_key(store, record)?;
     let entries = read_management_entries(
         store,
         record,
         &directory,
         &record.deployment_id,
         &key_id,
-        &signing.verifying_key(),
+        &verifying,
     )?;
     let mut values = Vec::new();
     for (_, compact, event) in entries {

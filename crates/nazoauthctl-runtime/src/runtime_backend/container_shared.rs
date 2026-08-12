@@ -11,7 +11,10 @@ use std::{ffi::OsStr, time::Duration};
 use crate::process::Process;
 use anyhow::{Context as _, bail};
 
-use super::{ContainerRestartPolicy, ContainerRuntimePolicy, NeutralMount, OneShotTask};
+use super::{
+    ContainerRestartPolicy, ContainerRuntimePolicy, ManagedValkeyRestore, NeutralMount,
+    OneShotTask, managed_config_digest,
+};
 
 mod managed_dependencies;
 mod policy;
@@ -25,8 +28,9 @@ pub(crate) use managed_dependencies::{
 pub(crate) use policy::{
     append_container_policy, append_managed_labels, assert_container_image, assert_managed_labels,
     command_stdout, container_is_running, ensure_container, ensure_volume, inspect_document,
-    inspect_document_optional, is_engine_unavailable_error, network_config_digest, network_gateway,
-    prepare_managed_volume_ownership, reconcile_bound_file, require_digest_pinned_image,
+    inspect_document_optional, inspect_managed_container_id, is_engine_unavailable_error,
+    network_config_digest, network_gateway, prepare_managed_volume_ownership, reconcile_bound_file,
+    remove_managed_container_by_id, remove_managed_container_by_name, require_digest_pinned_image,
 };
 #[cfg(all(test, unix))]
 use policy::{assert_managed_container_policy, observed_cap_drop_all};
@@ -35,6 +39,25 @@ use policy::{assert_managed_container_policy, observed_cap_drop_all};
 /// is not an authorization boundary: the caller must provide the explicit
 /// uid:gid contract and the engine must accept it.
 pub(crate) const NON_ROOT_ONE_SHOT_USER: &str = "10001:10001";
+pub(crate) const VALKEY_RESTORE_CHECK_RESOURCE_KIND: &str = "valkey-restore-check";
+
+pub(crate) fn valkey_restore_check_config_digest(
+    restore: &ManagedValkeyRestore,
+    volume: &str,
+    container: &str,
+) -> String {
+    managed_config_digest(
+        VALKEY_RESTORE_CHECK_RESOURCE_KIND,
+        &[
+            ("image", restore.image.as_str()),
+            ("volume", volume),
+            ("container", container),
+            ("network", "none"),
+            ("port", "6379"),
+            ("server-mode", "protected-mode=off;save=;appendonly=no"),
+        ],
+    )
+}
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -585,6 +608,16 @@ mod policy_tests {
         assert_eq!(
             policy.tmpfs[1].destination,
             std::path::Path::new("/run/postgresql")
+        );
+    }
+
+    #[test]
+    fn application_policy_requires_the_controller_owned_uid_and_gid() {
+        assert_eq!(
+            ContainerRuntimePolicy::managed_app()
+                .service_user
+                .as_deref(),
+            Some("10001:10001")
         );
     }
 }

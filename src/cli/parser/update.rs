@@ -12,18 +12,30 @@ pub(super) fn parse_update_options(values: Vec<String>) -> anyhow::Result<Update
     while index < values.len() {
         match values[index].as_str() {
             "--plan" => {
+                if plan {
+                    bail!("--plan may be specified only once");
+                }
                 plan = true;
                 index += 1;
             }
             "--yes" => {
+                if yes {
+                    bail!("--yes may be specified only once");
+                }
                 yes = true;
                 index += 1;
             }
             "--accept-migration-barrier" => {
+                if accept_migration_barrier {
+                    bail!("--accept-migration-barrier may be specified only once");
+                }
                 accept_migration_barrier = true;
                 index += 1;
             }
             "--to" => {
+                if version.is_some() {
+                    bail!("--to may be specified only once");
+                }
                 let value = values.get(index + 1).context("--to requires VERSION")?;
                 validate_version(value)?;
                 version = Some(value.clone());

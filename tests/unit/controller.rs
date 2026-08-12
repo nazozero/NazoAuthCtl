@@ -194,6 +194,7 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
             container_name: "nazoauth".to_owned(),
             runtime_instance_id: "runtime-test".to_owned(),
             network: "nazoauth".to_owned(),
+            network_subnet: None,
             ip_address: String::new(),
             publish_address: String::new(),
             health_url: "http://127.0.0.1:8000/ready".to_owned(),
@@ -257,6 +258,8 @@ fn journal(config: &UpdateConfig, phase: UpdatePhase) -> UpdateJournal {
         candidate_ui: config.ui.releases_root.join("f".repeat(64)),
         backup: (phase >= UpdatePhase::BackupCreated)
             .then(|| config.backup_root.join("v0.2.0-test")),
+        rollback_state_captured: true,
+        previous_rollback_state: None,
     }
 }
 
@@ -1487,6 +1490,117 @@ fn backup_recovery_rejects_provider_mutation_without_reading_rollback_state() {
 }
 
 #[test]
+fn successful_legacy_rollback_consumes_only_after_a_durable_archive_exists() {
+    let work = PrivateTempDir::new("nazoauth-rollback-state-consumption").unwrap();
+    let config = config(&work);
+    let state = RollbackState {
+        schema: 1,
+        from_release: manifest("v0.1.2", 'b'),
+        to_release: manifest("v0.2.0", 'e'),
+        previous_runtime: "trusted-runtime".to_owned(),
+        previous_ui: None,
+        backup: config.backup_root.join("previous"),
+    };
+    write_rollback_state(&config, state).unwrap();
+    let state_path = rollback_state_path(&config);
+    let bytes = fs::read(&state_path).unwrap();
+
+    let first_archive = stage_rollback_state_archive(&config, &bytes).unwrap();
+    let resumed_archive = stage_rollback_state_archive(&config, &bytes).unwrap();
+    assert_eq!(resumed_archive, first_archive);
+    assert_eq!(fs::read(&first_archive).unwrap(), bytes);
+    assert!(state_path.exists());
+
+    consume_rollback_state(&state_path, &first_archive, &bytes).unwrap();
+    assert!(!state_path.exists());
+    assert_eq!(fs::read(first_archive).unwrap(), bytes);
+}
+
+#[test]
+fn update_unwind_restores_the_previous_rollback_state() {
+    let work = PrivateTempDir::new("nazoauth-update-rollback-state-unwind").unwrap();
+    let config = config(&work);
+    let previous = RollbackState {
+        schema: 1,
+        from_release: manifest("v0.1.0", 'a'),
+        to_release: manifest("v0.1.2", 'b'),
+        previous_runtime: "old-trusted-runtime".to_owned(),
+        previous_ui: None,
+        backup: config.backup_root.join("old"),
+    };
+    let replacement = RollbackState {
+        schema: 1,
+        from_release: manifest("v0.1.2", 'b'),
+        to_release: manifest("v0.2.0", 'e'),
+        previous_runtime: "new-trusted-runtime".to_owned(),
+        previous_ui: None,
+        backup: config.backup_root.join("new"),
+    };
+    let mut value = journal(&config, UpdatePhase::StateCommitted);
+    value.previous_rollback_state = Some(previous.clone());
+    write_rollback_state(&config, replacement).unwrap();
+
+    restore_previous_rollback_state(&config, &value).unwrap();
+    let restored = load_optional_rollback_state(&config).unwrap().unwrap();
+    assert_eq!(restored.from_release.version, previous.from_release.version);
+    assert_eq!(restored.to_release.version, previous.to_release.version);
+    assert_eq!(restored.previous_runtime, previous.previous_runtime);
+    assert_eq!(restored.backup, previous.backup);
+}
+
+#[test]
+fn update_unwind_removes_a_new_rollback_state_when_none_existed_before() {
+    let work = PrivateTempDir::new("nazoauth-update-rollback-state-absence").unwrap();
+    let config = config(&work);
+    let replacement = RollbackState {
+        schema: 1,
+        from_release: manifest("v0.1.2", 'b'),
+        to_release: manifest("v0.2.0", 'e'),
+        previous_runtime: "trusted-runtime".to_owned(),
+        previous_ui: None,
+        backup: config.backup_root.join("new"),
+    };
+    let value = journal(&config, UpdatePhase::StateCommitted);
+    write_rollback_state(&config, replacement).unwrap();
+
+    restore_previous_rollback_state(&config, &value).unwrap();
+    assert!(load_optional_rollback_state(&config).unwrap().is_none());
+}
+
+#[test]
+fn old_committing_update_journal_fails_closed_without_a_rollback_snapshot() {
+    let work = PrivateTempDir::new("nazoauth-old-update-rollback-state").unwrap();
+    let config = config(&work);
+    let mut value = journal(&config, UpdatePhase::StateCommitting);
+    value.rollback_state_captured = false;
+
+    let error = restore_previous_transaction(&config, &value).unwrap_err();
+    assert!(error.to_string().contains("cannot be reconstructed safely"));
+}
+
+#[test]
+fn update_journal_rejects_a_rollback_snapshot_for_another_source_release() {
+    let work = PrivateTempDir::new("nazoauth-update-rollback-state-binding").unwrap();
+    let config = config(&work);
+    let mut value = journal(&config, UpdatePhase::Prepared);
+    value.previous_rollback_state = Some(RollbackState {
+        schema: 1,
+        from_release: manifest("v0.0.9", '9'),
+        to_release: manifest("v0.1.1", 'a'),
+        previous_runtime: "unrelated-runtime".to_owned(),
+        previous_ui: None,
+        backup: config.backup_root.join("unrelated"),
+    });
+
+    let error = validate_update_journal(&config, &value).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not bound to its source Release")
+    );
+}
+
+#[test]
 fn observation_lock_never_creates_persistent_state() {
     let work = PrivateTempDir::new("nazoauth-read-only-lock").unwrap();
     let missing = work.path().join("missing/lifecycle.lock");
@@ -2126,6 +2240,7 @@ fn fake_container_runtime(
         &config.operator.deployment_id,
         &config.operator.controller_key_id,
         &config.runtime.network,
+        config.runtime.network_subnet.as_deref(),
     );
     let network_inspect_json = serde_json::json!({
         "Name": config.runtime.network.clone(),

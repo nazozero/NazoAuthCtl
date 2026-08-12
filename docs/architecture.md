@@ -58,6 +58,29 @@ step remains pending until the controller executes it, and final acceptance must
 independently observe the expected result. This permits external operators and
 providers to coordinate without granting ctl authority over their resources.
 
+Proxy TLS remains an external capability. For `standards-full`, application
+configuration (`MTLS_CERTIFICATE_SOURCE` and `TRUSTED_PROXY_CIDRS`) is necessary
+but is not evidence that a proxy requested, validated, and safely forwarded a
+client certificate. Acceptance therefore requires fresh provider evidence bound
+to the deployment and update transaction: the observed proxy configuration
+digest, the active client-CA bundle digest, an exact trusted upstream address,
+RFC 9440 header-overwrite semantics, and TLS/mTLS probes. The provider owns
+configuration validation, atomic reload, rollback, and recovery of its proxy;
+ctl must not synthesize completion from application settings.
+
+Conformance certificates and trust anchors are run-scoped. If a shared proxy is
+used, the provider must atomically install the active lease's public CA bundle
+before Suite modules are created and restore the previous bundle during the same
+cleanup transaction. Such runs are serialized unless they have independent
+listeners and bundles. Private keys never cross this boundary.
+
+For a file-backed provider, `conformance run` accepts the paired
+`--proxy-trust-bundle` and `--proxy-reload-executable` options. The materializer
+supplies only generated public client CAs. ctl atomically installs that bundle,
+invokes a root-owned reload executable, and restores a sibling recovery copy
+after Suite and lease cleanup. Supplying only one option fails before proxy,
+deployment, or Suite mutation.
+
 `nazo-operator-protocol` remains in `nazozero/NazoAuth`. `Cargo.toml` pins both
 the package version and a full Git revision. A protocol change therefore requires
 an explicit dependency update and compatibility review; Cargo cannot silently
