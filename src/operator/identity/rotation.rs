@@ -361,6 +361,9 @@ pub(crate) fn rotate_registered_controller_with_access(
     reason: &str,
     controller_access: ControllerSigningAccess,
 ) -> anyhow::Result<RotationResult> {
+    if crate::coordination::active_update_exists(store, record) {
+        bail!("controller identity cannot rotate while a coordinated update transaction is active");
+    }
     match record.resources.get("controller_config") {
         Some(SafeReference::File { path }) if path == config_path => {}
         _ => bail!("registered identity rotation config path is not declaration-bound"),
@@ -400,6 +403,11 @@ pub(crate) fn recover_registered_rotation_locked(
     let journal_path = store.identity_rotation_journal_path(&expected_record.deployment_id);
     if !path_present(&journal_path)? {
         return Ok(false);
+    }
+    if crate::coordination::active_update_exists(store, expected_record) {
+        bail!(
+            "controller identity recovery cannot continue while a coordinated update transaction is active"
+        );
     }
     let bound_config_path = match expected_record.resources.get("controller_config") {
         Some(SafeReference::File { path }) => path.clone(),
@@ -513,6 +521,12 @@ fn prepare_registered_rotation(
         Some(SafeReference::File { path }) => *path = next_generation.join("audit.key"),
         _ => bail!("registered deployment has no file-bound audit key resource"),
     }
+    next_record.resources.insert(
+        "audit_public_key".to_owned(),
+        SafeReference::File {
+            path: next_generation.join("audit.pub"),
+        },
+    );
     match next_record.resources.get_mut("break_glass_private_key") {
         Some(SafeReference::File { path }) => {
             *path = next_recovery_generation.join("break-glass.key")

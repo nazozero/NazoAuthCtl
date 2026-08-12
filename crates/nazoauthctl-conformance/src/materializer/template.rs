@@ -348,7 +348,9 @@ pub(super) fn materialize_vp_config(
     plan_name: &str,
     variant: &BTreeMap<String, String>,
     config: Value,
+    suite_base_url: &str,
     request_object_trust_anchor_pem: &str,
+    attestation: Option<&GeneratedAttestationMaterial>,
 ) -> Result<Value, MaterializerError> {
     if !plan_name.starts_with("oid4vp-") {
         return Ok(config);
@@ -356,6 +358,36 @@ pub(super) fn materialize_vp_config(
     let Value::Object(mut root) = config else {
         return Err(MaterializerError::InvalidField("plan.config_template"));
     };
+    let attestation = attestation.ok_or(MaterializerError::InvalidField(
+        "generated.vp_credential_signer",
+    ))?;
+    let signing_jwk: Value =
+        serde_json::from_str(attestation.credential_signing_private_jwk.as_str())
+            .map_err(|_| MaterializerError::Encoding)?;
+    let mut credential = match root.remove("credential") {
+        None => serde_json::Map::new(),
+        Some(Value::Object(value)) => value,
+        Some(_) => return Err(MaterializerError::InvalidField("credential")),
+    };
+    if let Some(existing) = credential.get("signing_jwk")
+        && existing != &signing_jwk
+    {
+        return Err(MaterializerError::InvalidField("credential.signing_jwk"));
+    }
+    credential.insert("signing_jwk".to_owned(), signing_jwk);
+    for field in ["trust_anchor_pem", "status_list_trust_anchor_pem"] {
+        if let Some(existing) = credential.get(field)
+            && existing.as_str() != Some(attestation.trust_anchor_pem.as_str())
+        {
+            return Err(MaterializerError::InvalidField("credential.trust_anchor"));
+        }
+        credential.insert(
+            field.to_owned(),
+            Value::String(attestation.trust_anchor_pem.to_string()),
+        );
+    }
+    root.insert("credential".to_owned(), Value::Object(credential));
+    materialize_vp_verification_evidence_browser(&mut root, suite_base_url)?;
     let request_method = variant.get("request_method").map(String::as_str);
     // The official verifier HAIP plan is request-URI signed even though its
     // executable Matrix variant does not repeat the transport selector.
@@ -393,6 +425,37 @@ pub(super) fn materialize_vp_config(
         ));
     }
     Ok(Value::Object(root))
+}
+
+fn materialize_vp_verification_evidence_browser(
+    root: &mut serde_json::Map<String, Value>,
+    suite_base_url: &str,
+) -> Result<(), MaterializerError> {
+    let evidence_url = format!(
+        "{}/test/a/*/verification-evidence",
+        suite_base_url.trim_end_matches('/')
+    );
+    let expected = serde_json::json!([{
+        "comment": "capture the suite-served evidence page to fill the verification-result screenshot placeholder without human interaction",
+        "match": evidence_url,
+        "tasks": [{
+            "task": "Capture verification evidence",
+            "match": evidence_url,
+            "commands": [[
+                "wait", "xpath", "//*", 10,
+                ".*Deferred verification evidence.*",
+                "update-image-placeholder"
+            ]]
+        }]
+    }]);
+    match root.get("browser") {
+        None => {
+            root.insert("browser".to_owned(), expected);
+            Ok(())
+        }
+        Some(existing) if existing == &expected => Ok(()),
+        Some(_) => Err(MaterializerError::InvalidField("browser")),
+    }
 }
 
 fn ensure_vci_field(

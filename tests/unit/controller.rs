@@ -15,7 +15,9 @@ use crate::{
     },
 };
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, chown};
+use std::os::unix::fs::PermissionsExt as _;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{MetadataExt as _, chown};
 
 #[cfg(unix)]
 fn current_unix_user() -> String {
@@ -194,6 +196,7 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
             container_name: "nazoauth".to_owned(),
             runtime_instance_id: "runtime-test".to_owned(),
             network: "nazoauth".to_owned(),
+            network_subnet: None,
             ip_address: String::new(),
             publish_address: String::new(),
             health_url: "http://127.0.0.1:8000/ready".to_owned(),
@@ -257,6 +260,8 @@ fn journal(config: &UpdateConfig, phase: UpdatePhase) -> UpdateJournal {
         candidate_ui: config.ui.releases_root.join("f".repeat(64)),
         backup: (phase >= UpdatePhase::BackupCreated)
             .then(|| config.backup_root.join("v0.2.0-test")),
+        rollback_state_captured: true,
+        previous_rollback_state: None,
     }
 }
 
@@ -571,6 +576,13 @@ fn write_bootstrap_pending_fixture(
     status: BootstrapAdminPendingStatus,
 ) {
     fs::create_dir_all(config.operator.secret_revision_file.parent().unwrap()).unwrap();
+    if config.operator.secret_revision_file.exists() {
+        fs::set_permissions(
+            &config.operator.secret_revision_file,
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
     fs::write(
         &config.operator.secret_revision_file,
         b"stable-deployment-bootstrap-binding",
@@ -1487,6 +1499,117 @@ fn backup_recovery_rejects_provider_mutation_without_reading_rollback_state() {
 }
 
 #[test]
+fn successful_legacy_rollback_consumes_only_after_a_durable_archive_exists() {
+    let work = PrivateTempDir::new("nazoauth-rollback-state-consumption").unwrap();
+    let config = config(&work);
+    let state = RollbackState {
+        schema: 1,
+        from_release: manifest("v0.1.2", 'b'),
+        to_release: manifest("v0.2.0", 'e'),
+        previous_runtime: "trusted-runtime".to_owned(),
+        previous_ui: None,
+        backup: config.backup_root.join("previous"),
+    };
+    write_rollback_state(&config, state).unwrap();
+    let state_path = rollback_state_path(&config);
+    let bytes = fs::read(&state_path).unwrap();
+
+    let first_archive = stage_rollback_state_archive(&config, &bytes).unwrap();
+    let resumed_archive = stage_rollback_state_archive(&config, &bytes).unwrap();
+    assert_eq!(resumed_archive, first_archive);
+    assert_eq!(fs::read(&first_archive).unwrap(), bytes);
+    assert!(state_path.exists());
+
+    consume_rollback_state(&state_path, &first_archive, &bytes).unwrap();
+    assert!(!state_path.exists());
+    assert_eq!(fs::read(first_archive).unwrap(), bytes);
+}
+
+#[test]
+fn update_unwind_restores_the_previous_rollback_state() {
+    let work = PrivateTempDir::new("nazoauth-update-rollback-state-unwind").unwrap();
+    let config = config(&work);
+    let previous = RollbackState {
+        schema: 1,
+        from_release: manifest("v0.1.0", 'a'),
+        to_release: manifest("v0.1.2", 'b'),
+        previous_runtime: "old-trusted-runtime".to_owned(),
+        previous_ui: None,
+        backup: config.backup_root.join("old"),
+    };
+    let replacement = RollbackState {
+        schema: 1,
+        from_release: manifest("v0.1.2", 'b'),
+        to_release: manifest("v0.2.0", 'e'),
+        previous_runtime: "new-trusted-runtime".to_owned(),
+        previous_ui: None,
+        backup: config.backup_root.join("new"),
+    };
+    let mut value = journal(&config, UpdatePhase::StateCommitted);
+    value.previous_rollback_state = Some(previous.clone());
+    write_rollback_state(&config, replacement).unwrap();
+
+    restore_previous_rollback_state(&config, &value).unwrap();
+    let restored = load_optional_rollback_state(&config).unwrap().unwrap();
+    assert_eq!(restored.from_release.version, previous.from_release.version);
+    assert_eq!(restored.to_release.version, previous.to_release.version);
+    assert_eq!(restored.previous_runtime, previous.previous_runtime);
+    assert_eq!(restored.backup, previous.backup);
+}
+
+#[test]
+fn update_unwind_removes_a_new_rollback_state_when_none_existed_before() {
+    let work = PrivateTempDir::new("nazoauth-update-rollback-state-absence").unwrap();
+    let config = config(&work);
+    let replacement = RollbackState {
+        schema: 1,
+        from_release: manifest("v0.1.2", 'b'),
+        to_release: manifest("v0.2.0", 'e'),
+        previous_runtime: "trusted-runtime".to_owned(),
+        previous_ui: None,
+        backup: config.backup_root.join("new"),
+    };
+    let value = journal(&config, UpdatePhase::StateCommitted);
+    write_rollback_state(&config, replacement).unwrap();
+
+    restore_previous_rollback_state(&config, &value).unwrap();
+    assert!(load_optional_rollback_state(&config).unwrap().is_none());
+}
+
+#[test]
+fn old_committing_update_journal_fails_closed_without_a_rollback_snapshot() {
+    let work = PrivateTempDir::new("nazoauth-old-update-rollback-state").unwrap();
+    let config = config(&work);
+    let mut value = journal(&config, UpdatePhase::StateCommitting);
+    value.rollback_state_captured = false;
+
+    let error = restore_previous_transaction(&config, &value).unwrap_err();
+    assert!(error.to_string().contains("cannot be reconstructed safely"));
+}
+
+#[test]
+fn update_journal_rejects_a_rollback_snapshot_for_another_source_release() {
+    let work = PrivateTempDir::new("nazoauth-update-rollback-state-binding").unwrap();
+    let config = config(&work);
+    let mut value = journal(&config, UpdatePhase::Prepared);
+    value.previous_rollback_state = Some(RollbackState {
+        schema: 1,
+        from_release: manifest("v0.0.9", '9'),
+        to_release: manifest("v0.1.1", 'a'),
+        previous_runtime: "unrelated-runtime".to_owned(),
+        previous_ui: None,
+        backup: config.backup_root.join("unrelated"),
+    });
+
+    let error = validate_update_journal(&config, &value).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not bound to its source Release")
+    );
+}
+
+#[test]
 fn observation_lock_never_creates_persistent_state() {
     let work = PrivateTempDir::new("nazoauth-read-only-lock").unwrap();
     let missing = work.path().join("missing/lifecycle.lock");
@@ -1734,7 +1857,7 @@ fn public_command_dispatch_fails_closed_before_every_confirmed_mutation() {
     fs::write(abandoned.join("controller.key"), b"pending-secret").unwrap();
     assert_root_or_error(
         invoke(Command::RecoverUpdate { yes: false }),
-        "no interrupted update transaction requires recovery",
+        "identity recovery is pending",
     );
     assert!(invoke(Command::RecoverIdentity { yes: false }).is_err());
     assert_eq!(fs::read(&config_path).unwrap(), config_before);
@@ -2094,6 +2217,7 @@ fn fake_container_runtime(
         &config.operator.controller_key_id,
         &config.runtime.runtime_instance_id,
         &config.runtime.network,
+        config.runtime.network_subnet.as_deref(),
         &config.postgres.container_name,
         &postgres_volume,
         &config.postgres.image,
@@ -2126,6 +2250,7 @@ fn fake_container_runtime(
         &config.operator.deployment_id,
         &config.operator.controller_key_id,
         &config.runtime.network,
+        config.runtime.network_subnet.as_deref(),
     );
     let network_inspect_json = serde_json::json!({
         "Name": config.runtime.network.clone(),
@@ -2200,6 +2325,8 @@ fn fake_container_runtime(
         },
     })
     .to_string();
+    let restore_check_name = work.path().join("restore-check-name");
+    let restore_check_digest = work.path().join("restore-check-digest");
     let embedded_identity = serde_json::to_string(&nazo_operator_protocol::EmbeddedIdentity {
         release: "v0.2.0".to_owned(),
         revision: candidate_commit.to_owned(),
@@ -2225,7 +2352,59 @@ fn fake_container_runtime(
         embedded_identity = embedded_identity,
     );
     let raw_identity_override = format!(
-        r#"if [ "${{1:-}}" = network ] && [ "${{2:-}}" = inspect ] && [ "${{3:-}}" = '{network}' ]; then
+        r#"restore_check_name_file='{restore_check_name}'
+restore_check_digest_file='{restore_check_digest}'
+restore_check_id='fixture-restore-check-id'
+if [ "${{1:-}}" = container ] && [ "${{2:-}}" = inspect ]; then
+  restore_check_object="${{3:-}}"
+  case "$restore_check_object" in
+    nazoauthctl-restore-check-*|"$restore_check_id")
+      if [ ! -f "$restore_check_name_file" ]; then
+        printf '%s\n' 'no such object' >&2
+        exit 1
+      fi
+      restore_check_name="$(cat "$restore_check_name_file")"
+      if [ "$restore_check_object" != "$restore_check_name" ] && [ "$restore_check_object" != "$restore_check_id" ]; then
+        printf '%s\n' 'no such object' >&2
+        exit 1
+      fi
+      restore_check_digest_value="$(cat "$restore_check_digest_file")"
+      printf '{{"Id":"%s","Name":"/%s","Config":{{"Labels":{{"io.nazoauth.deployment-id":"{deployment}","io.nazoauth.control-authority":"{authority}","io.nazoauth.runtime-instance-id":"{runtime}","io.nazoauth.managed-resource":"valkey-restore-check","io.nazoauth.config-digest":"%s"}}}}}}\n' "$restore_check_id" "$restore_check_name" "$restore_check_digest_value"
+      exit 0 ;;
+  esac
+fi
+if [ "${{1:-}}" = run ]; then
+  restore_check_name_value=''
+  restore_check_digest_value=''
+  capture_restore_check_name=false
+  for restore_check_argument in "$@"; do
+    if [ "$capture_restore_check_name" = true ]; then
+      restore_check_name_value="$restore_check_argument"
+      capture_restore_check_name=false
+      continue
+    fi
+    case "$restore_check_argument" in
+      --name) capture_restore_check_name=true ;;
+      io.nazoauth.config-digest=*) restore_check_digest_value="${{restore_check_argument#*=}}" ;;
+    esac
+  done
+  case "$restore_check_name_value" in
+    nazoauthctl-restore-check-*)
+      test -n "$restore_check_digest_value"
+      printf '%s' "$restore_check_name_value" > "$restore_check_name_file"
+      printf '%s' "$restore_check_digest_value" > "$restore_check_digest_file"
+      printf '%s\n' "$restore_check_id"
+      exit 0 ;;
+  esac
+fi
+if [ "${{1:-}}" = exec ] && [ "${{2:-}}" = "$restore_check_id" ]; then
+  exit 0
+fi
+if [ "${{1:-}}" = rm ] && [ "${{2:-}}" = --force ] && [ "${{3:-}}" = "$restore_check_id" ]; then
+  rm -f -- "$restore_check_name_file" "$restore_check_digest_file"
+  exit 0
+fi
+if [ "${{1:-}}" = network ] && [ "${{2:-}}" = inspect ] && [ "${{3:-}}" = '{network}' ]; then
   printf '%s\n' '{network_inspect_json}'
   exit 0
 fi
@@ -2259,6 +2438,11 @@ if [ "${{1:-}}" = run ]; then
   esac
 fi"#,
         network = config.runtime.network,
+        restore_check_name = restore_check_name.display(),
+        restore_check_digest = restore_check_digest.display(),
+        deployment = config.operator.deployment_id,
+        authority = config.operator.controller_key_id,
+        runtime = config.runtime.runtime_instance_id,
         network_inspect_json = network_inspect_json,
         postgres_volume = postgres_volume,
         valkey_volume = config.valkey.data_volume,

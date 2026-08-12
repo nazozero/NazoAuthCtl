@@ -185,6 +185,7 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
             container_name: "nazoauth".to_owned(),
             runtime_instance_id: "runtime-test".to_owned(),
             network: "nazoauth".to_owned(),
+            network_subnet: None,
             ip_address: String::new(),
             publish_address: String::new(),
             health_url: "http://127.0.0.1:8000/ready".to_owned(),

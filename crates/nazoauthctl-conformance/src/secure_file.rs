@@ -416,22 +416,20 @@ fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 
 #[cfg(unix)]
 fn owner_is_current_or_root(uid: u32) -> bool {
-    if uid == 0 {
-        return true;
-    }
-    let Ok(status) = fs::read_to_string("/proc/self/status") else {
-        return false;
-    };
-    status.lines().find_map(|line| {
-        let values = line
-            .strip_prefix("Uid:")?
-            .split_whitespace()
-            .collect::<Vec<_>>();
-        values.get(1)?.parse::<u32>().ok()
-    }) == Some(uid)
+    uid == 0 || rustix::process::geteuid().as_raw() == uid
 }
 
 #[cfg(unix)]
 fn hex_suffix(bytes: &[u8; 16]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn current_effective_user_is_an_accepted_owner() {
+        let current = rustix::process::geteuid().as_raw();
+        assert!(super::owner_is_current_or_root(current));
+        assert!(super::owner_is_current_or_root(0));
+    }
 }

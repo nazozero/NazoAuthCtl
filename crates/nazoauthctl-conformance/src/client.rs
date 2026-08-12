@@ -8,6 +8,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::credentials::BearerToken;
+use crate::matrix::zeroize_json_value;
 use crate::origin::{Origin, OriginError};
 #[cfg(test)]
 use crate::transport::HttpResponse;
@@ -439,6 +440,15 @@ pub struct ModuleDefinition {
     pub raw: Value,
 }
 
+impl Drop for ModuleDefinition {
+    fn drop(&mut self) {
+        if let Some(variant) = &mut self.variant {
+            zeroize_json_value(variant);
+        }
+        zeroize_json_value(&mut self.raw);
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PlanCreated {
     pub id: String,
@@ -453,6 +463,12 @@ pub struct ModuleInstance {
     pub id: String,
     #[serde(skip)]
     pub raw: Value,
+}
+
+impl Drop for ModuleInstance {
+    fn drop(&mut self) {
+        zeroize_json_value(&mut self.raw);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

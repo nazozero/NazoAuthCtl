@@ -268,6 +268,20 @@ pub(crate) fn reconcile_managed_secrets(config: &UpdateConfig) -> anyhow::Result
             bail!("managed dependency secret paths do not share the installation secret root");
         }
     }
+    for name in [
+        "postgres-password",
+        "postgres-runtime-password",
+        "valkey-password",
+        "valkey-backup-password",
+    ] {
+        let path = secrets.join("dependencies").join(name);
+        if managed_material_is_missing(&path)? {
+            bail!(
+                "managed dependency credential {} is missing; it cannot be regenerated after installation without a bound rotation transaction",
+                path.display()
+            );
+        }
+    }
     ensure_managed_secrets(
         secrets,
         &config.postgres.container_name,

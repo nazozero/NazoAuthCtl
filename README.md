@@ -32,7 +32,7 @@ documented in the [lifecycle contract](docs/lifecycle-contract.md).
 On Linux, install an independently attested Release with GitHub CLI available:
 
 ```sh
-sudo ./scripts/install_nazoauthctl.sh --version v0.1.31
+sudo ./scripts/install_nazoauthctl.sh --version v0.1.45
 ```
 
 The installer verifies the exact tag, repository, hosted release workflow, and
@@ -81,9 +81,11 @@ restore. `recover-update` resumes the interrupted update journal.
 
 ## Development
 
-The repository builds only `nazoauthctl`. The server compatibility workflow
-downloads signed NazoAuth Release binaries and OCI images; it never rebuilds the
-server.
+The published binary is `nazoauthctl`; CI formats, tests, lints, and builds the
+complete Cargo workspace. The server compatibility workflow downloads signed
+NazoAuth Release binaries and OCI images; it never rebuilds the server. Tagged
+controller Releases call that workflow with the exact tag commit and cannot
+publish unless the compatibility jobs succeed.
 
 An adopted deployment with managed runtime and artifact capabilities can also
 activate an unsigned artifact built on the same machine. This is a generic local
@@ -94,7 +96,7 @@ GitHub or on a particular host. For example, from a NazoAuth checkout:
 revision="$(git rev-parse HEAD)"
 short_revision="$(printf '%s' "$revision" | cut -c1-8)"
 podman build \
-  --build-arg "NAZOAUTH_BUILD_RELEASE=v0.1.28-dev.$short_revision" \
+  --build-arg "NAZOAUTH_BUILD_RELEASE=v0.1.34-dev.$short_revision" \
   --build-arg "NAZOAUTH_BUILD_REVISION=$revision" \
   --build-arg "NAZOAUTH_BUILD_ID=local:$revision" \
   --tag "localhost/nazoauth:dev-$short_revision" \
@@ -117,8 +119,9 @@ digest; all other application tasks retain the signed Release expectation.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets --all-features
+cargo build --locked --workspace --all-targets --all-features
 ```
 
 Controller Releases are built, tested, attested, and published only from this

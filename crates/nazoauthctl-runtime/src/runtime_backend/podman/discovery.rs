@@ -25,10 +25,10 @@ pub(super) fn discover(command: &OsStr) -> anyhow::Result<Vec<RuntimeObservation
             Err(error) if container_shared::is_engine_unavailable_error(&error) => {
                 return Err(error);
             }
-            Err(_) => {
-                // A malformed or concurrently removed object is isolated to
-                // that object; it must not hide healthy server candidates.
+            Err(error) if error.to_string().contains("managed object is absent") => {
+                // The object may have been removed between `ls` and inspect.
             }
+            Err(error) => return Err(error),
         }
     }
     Ok(observations)
@@ -86,38 +86,13 @@ pub(super) fn inspect(
             Some("trusted OCI digest could not be resolved".to_owned()),
         ),
     };
-    let ports = value
-        .pointer("/NetworkSettings/Ports")
-        .and_then(serde_json::Value::as_object)
-        .map(|ports| {
-            ports
-                .iter()
-                .flat_map(|(container_port, bindings)| {
-                    bindings
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(move |binding| {
-                            let host_ip = binding.get("HostIp")?.as_str()?;
-                            let host_port = binding.get("HostPort")?.as_str()?;
-                            Some(format!("{host_ip}:{host_port}->{container_port}"))
-                        })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let ports = parse_ports(&value)?;
     let networks = value
         .pointer("/NetworkSettings/Networks")
         .and_then(serde_json::Value::as_object)
         .map(|networks| networks.keys().cloned().collect())
         .unwrap_or_default();
-    let mounts = value
-        .get("Mounts")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(podman_mount)
-        .collect();
+    let mounts = parse_mounts(&value)?;
     let safe_environment = safe_environment(
         config
             .get("Env")
@@ -166,21 +141,106 @@ pub(super) fn inspect(
     })
 }
 
-fn podman_mount(mount: &serde_json::Value) -> Option<super::super::NeutralMount> {
-    let source = mount.get("Source")?.as_str()?;
-    let destination = mount.get("Destination")?.as_str()?;
-    let options = mount
-        .get("Options")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .collect::<Vec<_>>();
-    let read_only = mount
-        .get("RW")
-        .and_then(serde_json::Value::as_bool)
-        .map_or_else(|| options.contains(&"ro"), |read_write| !read_write);
-    Some(super::super::NeutralMount {
+fn parse_ports(value: &serde_json::Value) -> anyhow::Result<Vec<String>> {
+    let Some(raw_ports) = value.pointer("/NetworkSettings/Ports") else {
+        return Ok(Vec::new());
+    };
+    if raw_ports.is_null() {
+        return Ok(Vec::new());
+    }
+    let ports = raw_ports
+        .as_object()
+        .context("Podman inspect returned an invalid port map")?;
+    let mut observed = Vec::new();
+    for (container_port, bindings) in ports {
+        let Some((port, protocol)) = container_port.rsplit_once('/') else {
+            bail!("Podman inspect returned a malformed container port");
+        };
+        if port.parse::<u16>().is_err()
+            || !matches!(
+                protocol.to_ascii_lowercase().as_str(),
+                "tcp" | "udp" | "sctp"
+            )
+        {
+            bail!("Podman inspect returned a malformed container port");
+        }
+        if bindings.is_null() {
+            continue;
+        }
+        let bindings = bindings
+            .as_array()
+            .context("Podman inspect returned invalid port bindings")?;
+        for binding in bindings {
+            let binding = binding
+                .as_object()
+                .context("Podman inspect returned a non-object port binding")?;
+            let host_ip = binding
+                .get("HostIp")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .context("Podman inspect returned a port binding without a host address")?;
+            let host_port = binding
+                .get("HostPort")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .context("Podman inspect returned a port binding without a host port")?;
+            if host_port.parse::<u16>().is_err() {
+                bail!("Podman inspect returned a non-numeric host port");
+            }
+            observed.push(format!("{host_ip}:{host_port}->{container_port}"));
+        }
+    }
+    Ok(observed)
+}
+
+fn parse_mounts(value: &serde_json::Value) -> anyhow::Result<Vec<super::super::NeutralMount>> {
+    let Some(raw_mounts) = value.get("Mounts") else {
+        return Ok(Vec::new());
+    };
+    if raw_mounts.is_null() {
+        return Ok(Vec::new());
+    }
+    let mounts = raw_mounts
+        .as_array()
+        .context("Podman inspect returned an invalid mount list")?;
+    mounts.iter().map(podman_mount).collect()
+}
+
+fn podman_mount(mount: &serde_json::Value) -> anyhow::Result<super::super::NeutralMount> {
+    let source = mount
+        .get("Source")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("Podman inspect returned a mount without a source")?;
+    let destination = mount
+        .get("Destination")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("Podman inspect returned a mount without a destination")?;
+    let options = match mount.get("Options") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .context("Podman inspect returned invalid mount options")?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .context("Podman inspect returned an invalid mount option")
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    };
+    let read_only = match mount.get("RW") {
+        None | Some(serde_json::Value::Null) if options.is_empty() => {
+            bail!("Podman inspect returned a mount without read/write metadata")
+        }
+        None | Some(serde_json::Value::Null) => options.contains(&"ro"),
+        Some(value) => !value
+            .as_bool()
+            .context("Podman inspect returned an invalid mount read/write flag")?,
+    };
+    Ok(super::super::NeutralMount {
         source: PathBuf::from(source),
         destination: PathBuf::from(destination),
         read_only,
@@ -322,5 +382,15 @@ mod tests {
         assert!(observed.read_only);
         assert!(!observed.selinux_relabel);
         assert_eq!(observed.ownership, Responsibility::External);
+    }
+
+    #[test]
+    fn podman_discovery_rejects_malformed_mount_and_port_entries() {
+        let mount = serde_json::json!({"Source": "/host"});
+        assert!(podman_mount(&mount).is_err());
+        let value = serde_json::json!({
+            "NetworkSettings": {"Ports": {"8000/tcp": [{"HostIp": "127.0.0.1"}]}}
+        });
+        assert!(parse_ports(&value).is_err());
     }
 }

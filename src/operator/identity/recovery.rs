@@ -160,6 +160,16 @@ pub(crate) fn recover_pending_rotation(
                 intent.compact_transition.as_bytes(),
                 0o400,
             )?;
+        } else {
+            let existing = crate::filesystem::read_secure_regular_file(
+                &transition_path,
+                "identity rotation transition",
+                false,
+                64 * 1024,
+            )?;
+            if existing.as_slice() != intent.compact_transition.as_bytes() {
+                bail!("identity rotation transition conflicts with its recovery intent");
+            }
         }
         if active.generation != next.generation {
             write_active_identity(&layout, &next)?;

@@ -40,6 +40,7 @@ fn valid_config() -> UpdateConfig {
             container_name: "nazoauth".to_owned(),
             runtime_instance_id: "runtime-test".to_owned(),
             network: "nazoauth-net".to_owned(),
+            network_subnet: None,
             ip_address: String::new(),
             publish_address: "127.0.0.1:8000".to_owned(),
             health_url: "http://127.0.0.1:8000/ready".to_owned(),
@@ -289,7 +290,23 @@ fn public_runtime_urls_are_same_origin_and_never_remote_plaintext() {
         );
     }
 
+    for health in [
+        "ftp://127.0.0.1:8000/ready",
+        "http://127.0.0.1:8000/ready?probe=secret",
+        "http://user:password@127.0.0.1:8000/ready",
+        "https://other.example/ready",
+        "http://10.0.0.8:8000/ready",
+    ] {
+        let mut invalid = config.clone();
+        invalid.runtime.health_url = health.to_owned();
+        assert!(invalid.validate().is_err(), "accepted health URL {health}");
+    }
+
+    config.runtime.health_url = "https://auth.example/ready".to_owned();
+    config.validate().unwrap();
+
     config.runtime.expected_issuer = "http://127.0.0.1:8000".to_owned();
+    config.runtime.health_url = "http://127.0.0.1:8000/ready".to_owned();
     config.runtime.public_discovery_url =
         "http://127.0.0.1:8000/.well-known/openid-configuration".to_owned();
     config.validate().unwrap();

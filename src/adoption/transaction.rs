@@ -271,6 +271,15 @@ pub(super) fn deployment_record(
             },
         ),
         (
+            "audit_public_key".to_owned(),
+            SafeReference::File {
+                path: DeploymentStore::system()
+                    .deployment_state_dir(&plan.deployment_id)
+                    .join("identities")
+                    .join("audit.pub"),
+            },
+        ),
+        (
             "break_glass_private_key".to_owned(),
             SafeReference::File {
                 path: DeploymentStore::system()

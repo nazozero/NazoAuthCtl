@@ -10,10 +10,10 @@ use nazoauthctl_conformance::{
     BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy, BrowserTargetOrigin,
     ClientConfig, ConformanceAutomation, ConformanceBinding, ConformanceRunConfig,
     ConformanceRunner, CredentialStore, DescriptorMaterializer, MAX_PARALLEL_JOBS,
-    ManagedWebDriver, MatrixSelection, OnboardingOutput, OpenId4VciIssuerClient,
-    OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient,
-    Origin, RunControl, StableRenderer, SuiteClient, TtyRenderer, WebDriverClient,
-    WebDriverEndpoint,
+    MAX_POLL_TIMEOUT_SECONDS, ManagedWebDriver, MatrixSelection, OnboardingOutput,
+    OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
+    OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
+    TtyRenderer, WebDriverClient, WebDriverEndpoint,
 };
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
@@ -67,6 +67,8 @@ struct RunInvocation {
     token_fd: Option<u32>,
     webdriver: Vec<String>,
     evidence_directory: Option<PathBuf>,
+    proxy_trust_bundle: Option<PathBuf>,
+    proxy_reload_executable: Option<PathBuf>,
     groups: Vec<String>,
     plans: Vec<String>,
     poll_timeout: Duration,
@@ -128,6 +130,8 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
     let mut token_fd = None;
     let mut webdriver = Vec::new();
     let mut evidence_directory = None;
+    let mut proxy_trust_bundle = None;
+    let mut proxy_reload_executable = None;
     let mut groups = Vec::new();
     let mut plans = Vec::new();
     let mut poll_timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECONDS);
@@ -137,8 +141,18 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
     while index < values.len() {
         let option = values[index].as_str();
         match option {
-            "--suite" | "--token" | "--token-file" | "--token-fd" | "--webdriver"
-            | "--evidence-dir" | "--group" | "--plan" | "--poll-timeout" | "--lease-ttl"
+            "--suite"
+            | "--token"
+            | "--token-file"
+            | "--token-fd"
+            | "--webdriver"
+            | "--evidence-dir"
+            | "--proxy-trust-bundle"
+            | "--proxy-reload-executable"
+            | "--group"
+            | "--plan"
+            | "--poll-timeout"
+            | "--lease-ttl"
             | "--jobs" => {
                 let value = values
                     .get(index + 1)
@@ -157,6 +171,12 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
                     "--webdriver" => webdriver.push(value),
                     "--evidence-dir" => {
                         set_once(&mut evidence_directory, PathBuf::from(value), option)?;
+                    }
+                    "--proxy-trust-bundle" => {
+                        set_once(&mut proxy_trust_bundle, PathBuf::from(value), option)?;
+                    }
+                    "--proxy-reload-executable" => {
+                        set_once(&mut proxy_reload_executable, PathBuf::from(value), option)?;
                     }
                     "--group" => groups.push(value),
                     "--plan" => plans.push(value),
@@ -198,15 +218,19 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
     if token_sources > 1 {
         bail!("--token, --token-file, --token-stdin, and --token-fd are mutually exclusive");
     }
+    if proxy_trust_bundle.is_some() != proxy_reload_executable.is_some() {
+        bail!("--proxy-trust-bundle and --proxy-reload-executable must be specified together");
+    }
     let distinct_webdrivers = webdriver.iter().collect::<std::collections::BTreeSet<_>>();
     if poll_timeout.is_zero()
+        || poll_timeout > Duration::from_secs(MAX_POLL_TIMEOUT_SECONDS)
         || !(300..=86_400).contains(&lease_ttl_seconds)
         || !(1..=MAX_PARALLEL_JOBS).contains(&jobs)
         || (!webdriver.is_empty()
             && (webdriver.len() != jobs || distinct_webdrivers.len() != webdriver.len()))
     {
         bail!(
-            "poll timeout must be positive, lease TTL must be between 300 and 86400 seconds, jobs must be between 1 and {MAX_PARALLEL_JOBS}, and explicit WebDriver endpoints must be distinct and repeated exactly once per job"
+            "poll timeout must be between 1 and {MAX_POLL_TIMEOUT_SECONDS} seconds, lease TTL must be between 300 and 86400 seconds, jobs must be between 1 and {MAX_PARALLEL_JOBS}, and explicit WebDriver endpoints must be distinct and repeated exactly once per job"
         );
     }
     Ok(Some(RunInvocation {
@@ -219,6 +243,8 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
         token_fd,
         webdriver,
         evidence_directory,
+        proxy_trust_bundle,
+        proxy_reload_executable,
         groups,
         plans,
         poll_timeout,
@@ -292,6 +318,32 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let static_tx_code = prepared.tx_code();
     let hosted_email = Zeroizing::new(prepared.applicant_email().to_owned());
     let hosted_password = prepared.applicant_password();
+    let mut proxy_trust = match (
+        invocation.proxy_trust_bundle.as_deref(),
+        invocation.proxy_reload_executable.as_deref(),
+    ) {
+        (Some(bundle_path), Some(reload_executable)) => {
+            match ProxyTrustGuard::install(
+                bundle_path,
+                reload_executable,
+                prepared.mtls_trust_anchor_pem().as_bytes(),
+            ) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    return match session.cleanup_lease(&lease_id) {
+                        Ok(()) => Err(error).context(
+                            "failed to install the run-scoped proxy trust bundle; onboarding lease rolled back",
+                        ),
+                        Err(cleanup) => bail!(
+                            "failed to install the run-scoped proxy trust bundle and onboarding lease rollback also failed: proxy={error:#}; cleanup={cleanup:#}"
+                        ),
+                    };
+                }
+            }
+        }
+        (None, None) => None,
+        _ => unreachable!(),
+    };
 
     let run_result = (|| -> anyhow::Result<RunOutput> {
         let onboarding_output = OnboardingOutput::new(
@@ -408,11 +460,32 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     })();
 
     let lease_cleanup = session.cleanup_lease(&lease_id);
-    let mut output = run_result?;
-    output.deployment.cleanup_complete = lease_cleanup.is_ok();
+    let proxy_cleanup = proxy_trust
+        .as_mut()
+        .map(ProxyTrustGuard::restore)
+        .transpose();
+    let mut errors = Vec::new();
+    let output = match run_result {
+        Ok(output) => Some(output),
+        Err(error) => {
+            errors.push(format!("run={error:#}"));
+            None
+        }
+    };
     if let Err(error) = lease_cleanup {
-        bail!("Suite completed but deployment lease cleanup failed: {error:#}");
+        errors.push(format!("lease-cleanup={error:#}"));
     }
+    if let Err(error) = proxy_cleanup {
+        errors.push(format!("proxy-cleanup={error:#}"));
+    }
+    if !errors.is_empty() {
+        bail!(
+            "conformance run did not complete cleanly: {}",
+            errors.join("; ")
+        );
+    }
+    let mut output = output.context("conformance run returned no output")?;
+    output.deployment.cleanup_complete = true;
     let success = output.report.local_success
         && output.report.suite_pass
         && output.deployment.cleanup_complete;
@@ -554,7 +627,7 @@ struct DeploymentReport {
 
 fn print_run_help() {
     println!(
-        "Usage:\n  nazoauthctl [--deployment ID_OR_ALIAS] [--config PATH] conformance run [options]\n\nOptions:\n  --suite URL             OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN           API token; visible in argv/shell history\n  --token-file PATH       Read token from a private regular file\n  --token-stdin           Read token from stdin\n  --token-fd FD           Read token from an inherited private descriptor\n  --webdriver URL         Dedicated W3C endpoint; repeat exactly once per job\n  --evidence-dir PATH     Persist private raw Suite evidence securely\n  --group ID              Run one Matrix group; repeat to select more\n  --plan ID               Run one Matrix plan; repeat to select more\n  --jobs N                Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS  Per-module Suite wait bound (default: 1800)\n  --lease-ttl SECONDS     Deployment lease lifetime (default: 14400)"
+        "Usage:\n  nazoauthctl [--deployment ID_OR_ALIAS] [--config PATH] conformance run [options]\n\nOptions:\n  --suite URL                    OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN                  API token; visible in argv/shell history\n  --token-file PATH              Read token from a private regular file\n  --token-stdin                  Read token from stdin\n  --token-fd FD                  Read token from an inherited private descriptor\n  --webdriver URL                Dedicated W3C endpoint; repeat exactly once per job\n  --evidence-dir PATH            Persist private raw Suite evidence securely\n  --proxy-trust-bundle PATH      Atomically install this run's public client CAs\n  --proxy-reload-executable PATH Root-owned executable that validates/reloads the proxy\n  --group ID                     Run one Matrix group; repeat to select more\n  --plan ID                      Run one Matrix plan; repeat to select more\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)\n  --lease-ttl SECONDS            Deployment lease lifetime (default: 14400)"
     );
 }
 
@@ -621,6 +694,57 @@ mod tests {
             };
             assert!(error.to_string().contains("jobs must be between 1 and 4"));
         }
+    }
+
+    #[test]
+    fn run_rejects_poll_timeout_above_the_validated_bound() {
+        let error = match parse_run_invocation(&args(&[
+            "nazoauthctl",
+            "conformance",
+            "run",
+            "--poll-timeout",
+            "86401",
+        ])) {
+            Err(error) => error,
+            Ok(_) => panic!("poll timeout above the bound must fail"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("poll timeout must be between 1 and 86400 seconds")
+        );
+    }
+
+    #[test]
+    fn proxy_trust_bundle_and_reload_executable_are_atomic_pair() {
+        let missing_reload = parse_run_invocation(&args(&[
+            "nazoauthctl",
+            "conformance",
+            "run",
+            "--proxy-trust-bundle",
+            "/run/proxy/client-cas.pem",
+        ]));
+        assert!(missing_reload.is_err());
+
+        let parsed = parse_run_invocation(&args(&[
+            "nazoauthctl",
+            "conformance",
+            "run",
+            "--proxy-trust-bundle",
+            "/run/proxy/client-cas.pem",
+            "--proxy-reload-executable",
+            "/usr/local/sbin/reload-nazoauth-proxy",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            parsed.proxy_trust_bundle,
+            Some(PathBuf::from("/run/proxy/client-cas.pem"))
+        );
+        assert_eq!(
+            parsed.proxy_reload_executable,
+            Some(PathBuf::from("/usr/local/sbin/reload-nazoauth-proxy"))
+        );
     }
 
     #[test]

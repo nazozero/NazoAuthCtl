@@ -60,8 +60,12 @@ pub enum BrowserError {
     SessionAlreadyStarted,
     #[error("browser session is not started")]
     SessionNotStarted,
+    #[error("browser session expired or was removed")]
+    InvalidSession,
     #[error("browser element was not found")]
     ElementNotFound,
+    #[error("browser element became stale")]
+    StaleElement,
     #[error("chromedriver or chromium-driver was not found")]
     DriverUnavailable,
     #[error("managed browser driver failed to start")]
@@ -121,6 +125,13 @@ pub(crate) fn browser_config_for_module(
 /// Driver abstraction used both by WebDriver and deterministic tests. A
 /// driver never receives a URL before policy checks.
 pub trait BrowserDriver: Send {
+    /// Confirm that the session is live before another Suite module claims
+    /// this lane. Implementations may recreate only an explicitly expired
+    /// session; other failures remain fail-closed.
+    fn ensure_session(&mut self) -> Result<(), BrowserError> {
+        Ok(())
+    }
+
     /// Remove client-side authentication state before another independent
     /// Suite module uses this worker lane. Implementations must not export or
     /// inspect cookie values.
@@ -234,15 +245,25 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             } => {
                 let deadline = self.deadline(*timeout);
                 loop {
-                    if let Ok(element) = self.driver.find_element(selector) {
-                        if let Some(pattern) = text_pattern {
-                            let text = self.driver.element_text(&element)?;
-                            if compile_pattern(pattern)?.is_match(&text) {
+                    match self.driver.find_element(selector) {
+                        Ok(element) => {
+                            if let Some(pattern) = text_pattern {
+                                match self.driver.element_text(&element) {
+                                    Ok(text) if compile_pattern(pattern)?.is_match(&text) => {
+                                        return Ok(());
+                                    }
+                                    Ok(_)
+                                    | Err(
+                                        BrowserError::ElementNotFound | BrowserError::StaleElement,
+                                    ) => {}
+                                    Err(error) => return Err(error),
+                                }
+                            } else {
                                 return Ok(());
                             }
-                        } else {
-                            return Ok(());
                         }
+                        Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {}
+                        Err(error) => return Err(error),
                     }
                     self.sleep_until(deadline)?;
                 }
@@ -250,10 +271,15 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             BrowserCommand::WaitElementVisible { selector, timeout } => {
                 let deadline = self.deadline(*timeout);
                 loop {
-                    if let Ok(element) = self.driver.find_element(selector)
-                        && self.driver.element_displayed(&element)?
-                    {
-                        return Ok(());
+                    match self.driver.find_element(selector) {
+                        Ok(element) => match self.driver.element_displayed(&element) {
+                            Ok(true) => return Ok(()),
+                            Ok(false)
+                            | Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {}
+                            Err(error) => return Err(error),
+                        },
+                        Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {}
+                        Err(error) => return Err(error),
                     }
                     self.sleep_until(deadline)?;
                 }
@@ -275,16 +301,42 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                 }
             }
             BrowserCommand::Text { selector, value } => {
-                let element = self.driver.find_element(selector)?;
-                self.driver.element_send_keys(&element, value.as_str())
+                let deadline = self.deadline(self.policy.limits.max_step_timeout);
+                loop {
+                    match self.driver.find_element(selector) {
+                        Ok(element) => {
+                            match self.driver.element_send_keys(&element, value.as_str()) {
+                                Ok(()) => return Ok(()),
+                                Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {}
+                        Err(error) => return Err(error),
+                    }
+                    self.sleep_until(deadline)?;
+                }
             }
             BrowserCommand::Click { selector, optional } => {
-                let element = match self.driver.find_element(selector) {
-                    Ok(element) => element,
-                    Err(BrowserError::ElementNotFound) if *optional => return Ok(()),
-                    Err(error) => return Err(error),
-                };
-                self.driver.element_click(&element)
+                let deadline = self.deadline(self.policy.limits.max_step_timeout);
+                loop {
+                    match self.driver.find_element(selector) {
+                        Ok(element) => match self.driver.element_click(&element) {
+                            Ok(()) => return Ok(()),
+                            Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {}
+                            Err(error) => return Err(error),
+                        },
+                        Err(BrowserError::ElementNotFound | BrowserError::StaleElement)
+                            if *optional =>
+                        {
+                            return Ok(());
+                        }
+                        Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {}
+                        Err(error) => return Err(error),
+                    }
+                    self.sleep_until(deadline)?;
+                }
             }
         }
     }
@@ -346,6 +398,7 @@ impl<D: BrowserDriver> BrowserAutomation for BrowserExecutor<D> {
         // cookie domain. Visit and clear each allowed origin independently;
         // validation rejects a redirect from target to Suite (or vice versa)
         // even though both origins are otherwise allowed for a test flow.
+        self.driver.ensure_session()?;
         let target = self.policy.target_origin.as_url().clone();
         let suite = self
             .policy
@@ -575,9 +628,15 @@ mod tests {
         cookie_clear_count: usize,
         navigated: Vec<Url>,
         redirect_to: Option<Url>,
+        session_checks: usize,
     }
 
     impl BrowserDriver for MockDriver {
+        fn ensure_session(&mut self) -> Result<(), BrowserError> {
+            self.session_checks += 1;
+            Ok(())
+        }
+
         fn clear_cookies(&mut self) -> Result<(), BrowserError> {
             self.cookies_cleared = true;
             self.cookie_clear_count += 1;
@@ -681,9 +740,11 @@ mod tests {
             cookie_clear_count: 0,
             navigated: Vec::new(),
             redirect_to: None,
+            session_checks: 0,
         };
         let mut executor = BrowserExecutor::new(driver, policy);
         executor.reset_session().expect("reset browser session");
+        assert_eq!(executor.driver_mut().session_checks, 1);
         assert!(executor.driver_mut().cookies_cleared);
         assert_eq!(executor.driver_mut().cookie_clear_count, 2);
         assert_eq!(executor.driver_mut().navigated.len(), 2);
@@ -722,6 +783,7 @@ mod tests {
             cookie_clear_count: 0,
             navigated: Vec::new(),
             redirect_to: Some(Url::parse("https://suite.example/").expect("redirect")),
+            session_checks: 0,
         };
         let mut executor = BrowserExecutor::new(driver, policy);
         assert_eq!(

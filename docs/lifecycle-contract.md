@@ -79,3 +79,26 @@ Provider credential references identify an external credential resolver; file
 references identify regular files. Neither form stores secret values in the
 lifecycle contract, deployment declaration, transaction, audit event, or CLI
 output.
+
+## External proxy TLS provider
+
+`proxy_tls` remains `external` unless a concrete provider adapter owns it. An
+operator confirmation is authorization to proceed, not proof of semantic
+completion. Provider evidence for an HTTPS or mTLS cutover must be closed,
+fresh, and transaction-bound, and its retained observation must include:
+
+- the public and dedicated mTLS listener origins;
+- the proxy configuration and active public client-CA bundle SHA-256 digests;
+- the exact address seen by NazoAuth and the matching single-host trusted CIDR;
+- proof that inbound `Client-Cert`, `Client-Cert-Chain`, and legacy certificate
+  headers are removed before the proxy writes its verified value;
+- the allowed TLS 1.2 and TLS 1.3 cipher sets and rejection probes;
+- the proxy worker/config generation and a tested previous-generation rollback.
+
+For conformance, the CA bundle is derived only from public
+`mtls_trust_anchor_pem` values owned by the active lease. Installing that bundle,
+reloading, validating, restoring, and retiring the old worker are one journaled
+lifecycle. A shared listener permits only one such lifecycle at a time. A
+provider must fail closed on a stale lease, digest drift, failed validation, or
+ambiguous worker generation. `ca-ignore-err all` and `crt-ignore-err all` are not
+valid production evidence.

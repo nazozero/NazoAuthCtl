@@ -36,7 +36,7 @@ fn backup_secret_validation_rejects_symlink_unsafe_mode_and_oversize_inputs() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
     assert!(validate_secret(&path).is_err());
 
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     fs::write(&path, vec![b'x'; 16 * 1024 + 1]).unwrap();
     assert!(validate_secret(&path).is_err());
 

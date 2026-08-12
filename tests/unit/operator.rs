@@ -90,6 +90,7 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
             container_name: "nazoauth".to_owned(),
             runtime_instance_id: "runtime-test".to_owned(),
             network: "nazoauth".to_owned(),
+            network_subnet: None,
             ip_address: String::new(),
             publish_address: String::new(),
             health_url: "http://127.0.0.1/ready".to_owned(),
@@ -1499,6 +1500,19 @@ fn interrupted_rotation_activates_one_complete_staged_generation() {
         &layout.operator_directory.join("rotation-intent.json"),
         &serde_json::to_vec(&intent).unwrap(),
         0o600,
+    )
+    .unwrap();
+    let transition_path = config
+        .operator
+        .audit_directory
+        .join("trust-transitions")
+        .join(&intent.transition_file);
+    atomic_write(&transition_path, b"conflicting-transition", 0o400).unwrap();
+    assert!(recover_pending_rotation(&config_path, &mut config).is_err());
+    atomic_write(
+        &transition_path,
+        intent.compact_transition.as_bytes(),
+        0o400,
     )
     .unwrap();
     assert!(identity_recovery_required(&config).unwrap());

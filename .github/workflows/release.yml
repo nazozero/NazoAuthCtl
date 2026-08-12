@@ -47,21 +47,40 @@ jobs:
           RELEASE_REF_TYPE: ${{ github.ref_type }}
         run: |
           python - <<'PY'
+          import json
           import os
-          import pathlib
-          import tomllib
+          import subprocess
 
-          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
-          package_version = manifest["package"]["version"]
-          if isinstance(package_version, dict) and package_version.get("workspace") is True:
-              package_version = manifest["workspace"]["package"]["version"]
-          if not isinstance(package_version, str):
-              raise SystemExit("Cargo package version has no concrete workspace value")
+          metadata = json.loads(
+              subprocess.run(
+                  ["cargo", "metadata", "--locked", "--format-version", "1", "--no-deps"],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout
+          )
+          workspace_members = set(metadata["workspace_members"])
+          packages = [
+              package
+              for package in metadata["packages"]
+              if package["id"] in workspace_members
+          ]
+          if not packages:
+              raise SystemExit("cargo metadata returned no workspace packages")
+          versions = {package["name"]: package["version"] for package in packages}
+          workspace_versions = set(versions.values())
+          if len(workspace_versions) != 1:
+              details = ", ".join(f"{name}={version}" for name, version in sorted(versions.items()))
+              raise SystemExit(f"workspace package versions diverge: {details}")
+          package_version = next(iter(workspace_versions))
           expected = f"v{package_version}"
           actual = os.environ["RELEASE_TAG"]
           if os.environ["RELEASE_REF_TYPE"] == "tag" and actual != expected:
               raise SystemExit(f"release tag {actual!r} does not match Cargo package version {expected!r}")
-          print(f"validated controller release input {expected}; publish={os.environ['RELEASE_REF_TYPE'] == 'tag'}")
+          print(
+              f"validated {len(packages)} workspace package versions at {expected}; "
+              f"publish={os.environ['RELEASE_REF_TYPE'] == 'tag'}"
+          )
           PY
       - name: Resolve the previous controller release for self-update validation
         if: github.ref_type == 'tag'
@@ -96,8 +115,19 @@ jobs:
           echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
           echo "self-update transition: $previous_release -> $CURRENT_RELEASE"
 
-  build:
+  server-compatibility:
     needs: policy
+    uses: ./.github/workflows/server-compatibility.yml
+    with:
+      controller_ref: ${{ github.sha }}
+    permissions:
+      actions: read
+      contents: read
+      attestations: read
+      packages: read
+
+  build:
+    needs: [policy, server-compatibility]
     strategy:
       fail-fast: false
       matrix:
@@ -111,8 +141,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: cargo test --locked --all-targets --all-features --target ${{ matrix.target }}
-      - run: cargo build --locked --release --bin nazoauthctl --target ${{ matrix.target }}
+      - run: cargo test --locked --workspace --all-targets --all-features --target ${{ matrix.target }}
+      - run: cargo build --locked --workspace --all-targets --all-features --release --target ${{ matrix.target }}
       - name: Stage controller binary
         shell: bash
         run: |

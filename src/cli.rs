@@ -8,15 +8,64 @@ mod help;
 mod parser;
 mod types;
 
-pub(crate) use help::help_topic;
-#[cfg(test)]
 use std::path::PathBuf;
+
+use anyhow::{Context, bail};
+
+pub(crate) use help::help_topic;
 pub(crate) use types::{
     BootstrapAdminOptions, CandidateTarget, Cli, Command, ConformanceLeaseCommand, HelpTopic,
     InstallOptions, KeysCommand, StandardsProfileSecrets, UpdateOptions,
 };
 #[cfg(test)]
 pub(crate) use types::{ConformanceCommand, RelinquishOptions};
+
+/// Consume the leading options which are shared by every command.
+///
+/// Keeping this boundary in the CLI façade means command parsing and help routing agree on
+/// which token is the command.  Scalar global options are intentionally single-use: accepting
+/// a second value would make a typo silently select a different configuration or deployment.
+pub(crate) struct GlobalOptions {
+    pub(crate) config: Option<PathBuf>,
+    pub(crate) deployment: Option<String>,
+    pub(crate) consumed: usize,
+}
+
+pub(crate) fn parse_global_options(values: &[String]) -> anyhow::Result<GlobalOptions> {
+    let mut config = None;
+    let mut deployment = None;
+    let mut consumed = 0;
+    while consumed < values.len() {
+        let flag = values[consumed].as_str();
+        if !matches!(flag, "--config" | "--deployment") {
+            break;
+        }
+        let value = values
+            .get(consumed + 1)
+            .with_context(|| format!("{flag} requires a value"))?;
+        match flag {
+            "--config" => {
+                if config.is_some() {
+                    bail!("--config may be specified only once");
+                }
+                config = Some(PathBuf::from(value));
+            }
+            "--deployment" => {
+                if deployment.is_some() {
+                    bail!("--deployment may be specified only once");
+                }
+                deployment = Some(value.clone());
+            }
+            _ => unreachable!(),
+        }
+        consumed += 2;
+    }
+    Ok(GlobalOptions {
+        config,
+        deployment,
+        consumed,
+    })
+}
 
 #[cfg(test)]
 #[path = "../tests/unit/cli.rs"]

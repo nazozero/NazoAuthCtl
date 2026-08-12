@@ -12,13 +12,12 @@ use thiserror::Error;
 use url::Url;
 
 use crate::browser::{
-    BrowserAutomation, BrowserError, BrowserPolicy, BrowserRunnerState, BrowserTargetOrigin,
-    ConformanceBinding, OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule,
-    OpenId4VpStartRequest, OpenId4VpVerifier, browser_config_for_module,
-    parse_browser_entries_owned,
+    BrowserAutomation, BrowserPolicy, BrowserRunnerState, BrowserTargetOrigin, ConformanceBinding,
+    OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpStartRequest,
+    OpenId4VpVerifier, browser_config_for_module, parse_browser_entries_owned,
 };
 use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
-use crate::matrix::{MatrixError, SelectedMatrix};
+use crate::matrix::{MatrixError, SelectedMatrix, zeroize_json_value};
 use crate::origin::Origin;
 use crate::progress::{
     GroupProgress, GroupStatus, ProgressEvent, ProgressSink, ProgressSnapshot, redacted_variant,
@@ -31,6 +30,8 @@ use crate::report::{
 mod parallel;
 
 pub const MAX_PARALLEL_JOBS: usize = 4;
+pub const MAX_POLL_TIMEOUT_SECONDS: u64 = 86_400;
+pub const MAX_POLL_TIMEOUT: Duration = Duration::from_secs(MAX_POLL_TIMEOUT_SECONDS);
 
 /// One worker-owned interactive automation lane. A lane is never shared by
 /// concurrent plan workers, so WebDriver cookies/navigation and OpenID4VC
@@ -109,6 +110,16 @@ struct PlannedPlan {
     report_index: usize,
 }
 
+impl Drop for PlannedPlan {
+    fn drop(&mut self) {
+        // Suite responses and materialized Matrix configs may contain private
+        // client material. Every worker-owned clone must clear its own config;
+        // clearing only the parent Matrix cannot cover these independent
+        // allocations. ModuleDefinition owns and clears its response Values.
+        zeroize_json_value(&mut self.config);
+    }
+}
+
 struct PreparedRun {
     groups: Vec<GroupProgress>,
     plans: Vec<PlanReport>,
@@ -123,6 +134,7 @@ struct PreparedRun {
 impl ConformanceRunner {
     pub fn new(config: ConformanceRunConfig) -> Result<Self, OrchestrationError> {
         if config.poll_timeout.is_zero()
+            || config.poll_timeout > MAX_POLL_TIMEOUT
             || !(1..=MAX_PARALLEL_JOBS).contains(&config.jobs)
             || (!config.automation.is_empty() && config.automation.len() != config.jobs)
         {
@@ -368,31 +380,6 @@ impl ConformanceRunner {
         }
     }
 
-    fn wait_for_browser_url_interruptible(
-        &self,
-        browser: &mut dyn BrowserAutomation,
-        expected: &Url,
-        timeout: Duration,
-    ) -> Result<(), String> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| "browser poll timeout is out of range".to_owned())?;
-        loop {
-            if self.config.control.is_interrupted() {
-                return Err("run interrupted".to_owned());
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(BrowserError::Timeout.to_string());
-            }
-            match browser.wait_for_url(expected, remaining.min(Duration::from_secs(5))) {
-                Ok(()) => return Ok(()),
-                Err(BrowserError::Timeout) => continue,
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-    }
-
     pub fn run<S: ProgressSink>(&self, sink: &mut S) -> RunSummary {
         if self.config.jobs == 1 || self.config.matrix.document.plan_count() <= 1 {
             return self.run_serial(sink);
@@ -452,7 +439,7 @@ impl ConformanceRunner {
                     let variant = group.effective_variant(plan);
                     let runtime_variant = group.effective_runtime_variant(plan);
                     current_variant = Some(redacted_variant(&variant));
-                    let created =
+                    let mut created =
                         match self
                             .config
                             .client
@@ -465,6 +452,10 @@ impl ConformanceRunner {
                                 break 'create;
                             }
                         };
+                    // `PlanCreated::raw` is a response-owned Value separate
+                    // from each module's raw copy. Clear it before the
+                    // response wrapper is partially moved below.
+                    zeroize_json_value(&mut created.raw);
                     suite_plan_ids.push(created.id.clone());
                     let defined_modules = created.modules.len();
                     groups[group_index].total += defined_modules;
@@ -673,19 +664,6 @@ impl ConformanceRunner {
                                 }
                             }
                         } else if plan.plan_name.starts_with("oid4vp-1final-verifier") {
-                            let Some(browser) = self
-                                .config
-                                .automation
-                                .first()
-                                .and_then(|automation| automation.browser.as_ref())
-                            else {
-                                errors.push(
-                                    "Suite runner is WAITING but browser automation is unavailable"
-                                        .to_owned(),
-                                );
-                                groups[group_index].status = GroupStatus::Failed;
-                                break 'execute;
-                            };
                             let Some(verifier) = self
                                 .config
                                 .automation
@@ -723,43 +701,24 @@ impl ConformanceRunner {
                                     break 'execute;
                                 }
                             };
-                            let presentation = {
-                                let mut verifier = match verifier.lock() {
-                                    Ok(verifier) => verifier,
-                                    Err(_) => {
-                                        errors.push("OpenID4VP verifier lock failed".to_owned());
-                                        groups[group_index].status = GroupStatus::Failed;
-                                        break 'execute;
-                                    }
-                                };
-                                match verifier.start(&request) {
-                                    Ok(presentation) => presentation,
-                                    Err(error) => {
-                                        errors.push(error.to_string());
-                                        groups[group_index].status = GroupStatus::Failed;
-                                        break 'execute;
-                                    }
-                                }
-                            };
-                            let mut driver = match browser.lock() {
-                                Ok(driver) => driver,
+                            let mut verifier = match verifier.lock() {
+                                Ok(verifier) => verifier,
                                 Err(_) => {
-                                    errors.push("browser automation lock failed".to_owned());
+                                    errors.push("OpenID4VP verifier lock failed".to_owned());
                                     groups[group_index].status = GroupStatus::Failed;
                                     break 'execute;
                                 }
                             };
-                            if let Err(error) = driver.navigate(&presentation.authorization_url) {
+                            let presentation = match verifier.start(&request) {
+                                Ok(presentation) => presentation,
+                                Err(error) => {
+                                    errors.push(error.to_string());
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                }
+                            };
+                            if let Err(error) = verifier.complete(&presentation) {
                                 errors.push(error.to_string());
-                                groups[group_index].status = GroupStatus::Failed;
-                                break 'execute;
-                            }
-                            if let Err(error) = self.wait_for_browser_url_interruptible(
-                                &mut *driver,
-                                &presentation.completion_url,
-                                self.config.poll_timeout.min(Duration::from_secs(300)),
-                            ) {
-                                errors.push(error);
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
                             }
@@ -1127,7 +1086,11 @@ fn validate_value_origins(
         Value::Object(object) => object
             .iter()
             .try_for_each(|(key, value)| validate_value_origins(value, suite, target, Some(key))),
-        Value::String(text) if text.starts_with("//") => Err(()),
+        // Browser command tuples have already passed the command schema. Their
+        // selector argument may be the valid XPath `//*`; treating every `//`
+        // command literal as a protocol-relative URL rejects the official
+        // verification-evidence automation before any Suite resource exists.
+        Value::String(text) if text.starts_with("//") && key != Some("commands") => Err(()),
         Value::String(text) if text.contains("://") => {
             let parsed = Url::parse(text).map_err(|_| ())?;
             let _host = parsed.host_str().ok_or(())?;
@@ -1181,6 +1144,7 @@ fn same_url_origin(origin: &Origin, url: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::BrowserError;
     use crate::client::ClientConfig;
     use crate::credentials::BearerToken;
     use crate::matrix::{MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix};
@@ -1285,6 +1249,28 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn origin_validation_accepts_suite_verification_evidence_glob() {
+        let suite = Origin::parse("https://suite.example").expect("origin");
+        let parsed =
+            Url::parse("https://suite.example/test/a/*/verification-evidence").expect("glob URL");
+        assert!(same_url_origin(&suite, &parsed));
+        let config = serde_json::json!({
+            "browser": [{
+                "match": "https://suite.example/test/a/*/verification-evidence",
+                "tasks": [{
+                    "match": "https://suite.example/test/a/*/verification-evidence",
+                    "commands": [[
+                        "wait", "xpath", "//*", 10,
+                        ".*Deferred verification evidence.*",
+                        "update-image-placeholder"
+                    ]]
+                }]
+            }]
+        });
+        assert_eq!(validate_value_origins(&config, &suite, None, None), Ok(()));
     }
 
     #[test]

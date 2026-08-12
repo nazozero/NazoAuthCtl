@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use anyhow::{Context, bail};
 
@@ -27,26 +27,24 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
     let mut profile_secrets_stdin = false;
     let mut profile_secret_fd = None;
     let mut version = None;
+    let mut seen_options = BTreeSet::new();
     let mut index = 0;
     while index < values.len() {
         let flag = values[index].as_str();
+        if !seen_options.insert(flag) {
+            bail!("{flag} may be supplied only once");
+        }
         if flag == "--external-dependencies" {
             external_dependencies = true;
             index += 1;
             continue;
         }
         if flag == "--secrets-stdin" {
-            if secrets_stdin {
-                bail!("--secrets-stdin may be supplied only once");
-            }
             secrets_stdin = true;
             index += 1;
             continue;
         }
         if flag == "--profile-secrets-stdin" {
-            if profile_secrets_stdin {
-                bail!("--profile-secrets-stdin may be supplied only once");
-            }
             profile_secrets_stdin = true;
             index += 1;
             continue;

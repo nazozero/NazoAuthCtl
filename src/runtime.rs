@@ -687,7 +687,7 @@ impl<'a> Runtime<'a> {
                     self.config.operator.controller_key_id.clone(),
                 ),
             ]),
-            container_policy: Some(runtime_backend::ContainerRuntimePolicy::managed_default()),
+            container_policy: Some(runtime_backend::ContainerRuntimePolicy::managed_app()),
         };
         backend.replace(&replacement)
     }
@@ -851,7 +851,7 @@ impl<'a> Runtime<'a> {
                 ),
             ]),
             container_policy: (kind != RuntimeBackendKind::Systemd)
-                .then(runtime_backend::ContainerRuntimePolicy::managed_default),
+                .then(runtime_backend::ContainerRuntimePolicy::managed_app),
         };
         backend.replace(&replacement)?;
         let observation = backend.inspect(object_reference)?;
@@ -1045,6 +1045,7 @@ impl<'a> Runtime<'a> {
             &self.config.operator.controller_key_id,
             &self.config.runtime.runtime_instance_id,
             &self.config.runtime.network,
+            self.config.runtime.network_subnet.as_deref(),
             &self.config.postgres.container_name,
             &postgres_volume,
             &self.config.postgres.image,

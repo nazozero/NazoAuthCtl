@@ -79,8 +79,19 @@ pub(crate) struct UpdateCoordination {
     pub(crate) state: CoordinationState,
     blockers: Vec<String>,
     pub(crate) steps: Vec<CoordinationStep>,
+    /// Durable commit intent.  The declaration CAS and this journal cannot be
+    /// committed atomically, so the target declaration is recorded before the
+    /// CAS.  A crash on either side of the CAS can then be replayed safely.
+    #[serde(default)]
+    committed_declaration: Option<DeploymentRecord>,
     created_at: i64,
     updated_at: i64,
+}
+
+impl UpdateCoordination {
+    pub(crate) fn declaration_revision(&self) -> u64 {
+        self.declaration_revision
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -268,6 +279,7 @@ pub(crate) fn prepare_update_locked(
         state: CoordinationState::WaitingForEvidence,
         blockers,
         steps,
+        committed_declaration: None,
         created_at: now,
         updated_at: now,
     };
@@ -294,6 +306,9 @@ pub(crate) fn show_locked(
     record: &DeploymentRecord,
 ) -> anyhow::Result<UpdateCoordination> {
     let transaction = load_path(&transaction_path(store, &record.deployment_id))?;
+    if transaction.state == CoordinationState::Committed {
+        return validate_committed_binding(&transaction, record).map(|_| transaction);
+    }
     validate_binding(&transaction, record)?;
     Ok(transaction)
 }
@@ -327,16 +342,16 @@ pub(crate) fn submit_evidence(
         .iter()
         .position(|step| step.id == input.step_id)
         .context("coordination evidence step does not exist")?;
-    let step = &transaction.steps[step_index];
+    let step = transaction.steps[step_index].clone();
     if !step.owner.requires_external_evidence() {
         bail!("controller-owned steps do not accept user-supplied completion evidence");
     }
     if step.state != StepState::Pending {
         bail!("coordination evidence for this step was already accepted");
     }
-    validate_evidence_input(&input, &transaction, step)?;
+    validate_evidence_input(&input, &transaction, &step)?;
     if step.owner == StepOwner::ProviderOwned {
-        verify_provider_evidence(&current, &transaction, step, &input)?;
+        verify_provider_evidence(&current, &transaction, &step, &input)?;
     }
     reject_replayed_nonce(store, &transaction, &input.nonce)?;
     let source_manifest_sha256 = digest_bytes(&canonical_evidence_bytes(&input)?);
@@ -354,7 +369,35 @@ pub(crate) fn submit_evidence(
         &step.id,
     );
     match fs::symlink_metadata(&evidence_path) {
-        Ok(_) => bail!("coordination evidence for this step already exists"),
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("coordination evidence must be a regular non-symlink file");
+            }
+            // The evidence file may have been durably written immediately
+            // before the process stopped, while the active transaction still
+            // says Pending.  Re-validate that exact accepted payload instead
+            // of treating it as a duplicate or overwriting it.
+            let persisted_bytes = read_bounded_secure_file(
+                &evidence_path,
+                "persisted coordination evidence",
+                true,
+                MAX_EVIDENCE_BYTES,
+            )?;
+            let persisted =
+                validate_persisted_evidence(&current, &transaction, &step, &persisted_bytes)?;
+            if persisted.evidence != accepted.evidence {
+                bail!(
+                    "coordination evidence for this step conflicts with the persisted acceptance"
+                );
+            }
+            let step = &mut transaction.steps[step_index];
+            step.state = StepState::EvidenceAccepted;
+            step.evidence_sha256 = Some(digest_bytes(&persisted_bytes));
+            transaction.updated_at = Utc::now().timestamp();
+            transaction.state = next_state(&transaction);
+            persist(store, &transaction)?;
+            return Ok(transaction);
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(error).with_context(|| {
@@ -387,7 +430,40 @@ pub(crate) fn resume(
     let current = current_record_locked(store, record)?;
     let _shared_locks = store.shared_capability_locks(&current, &Capability::ALL)?;
     let mut transaction = load_path(&transaction_path(store, &record.deployment_id))?;
+    if transaction.state == CoordinationState::Committed {
+        return reconcile_committed_locked(store, &current, transaction);
+    }
     validate_binding(&transaction, &current)?;
+    let mut repaired_pending_evidence = false;
+    for step in transaction
+        .steps
+        .iter()
+        .filter(|step| {
+            step.owner.requires_external_evidence()
+                && step.state == StepState::Pending
+                && evidence_path_present(store, &transaction, &step.id)
+        })
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        let evidence_path = accepted_evidence_path(store, &transaction, &step.id)?;
+        let persisted_bytes = read_bounded_secure_file(
+            &evidence_path,
+            "persisted coordination evidence",
+            true,
+            MAX_EVIDENCE_BYTES,
+        )?;
+        let _accepted =
+            validate_persisted_evidence(&current, &transaction, &step, &persisted_bytes)?;
+        let step = transaction
+            .steps
+            .iter_mut()
+            .find(|candidate| candidate.id == step.id)
+            .expect("cloned coordination step exists in transaction");
+        step.state = StepState::EvidenceAccepted;
+        step.evidence_sha256 = Some(digest_bytes(&persisted_bytes));
+        repaired_pending_evidence = true;
+    }
     for step in transaction
         .steps
         .iter()
@@ -407,29 +483,18 @@ pub(crate) fn resume(
             true,
             MAX_EVIDENCE_BYTES,
         )?;
+        let _accepted =
+            validate_persisted_evidence(&current, &transaction, step, &persisted_bytes)?;
         if digest_bytes(&persisted_bytes) != expected {
             bail!("persisted coordination evidence was changed after acceptance");
         }
-        let accepted: AcceptedEvidence = serde_json::from_slice(&persisted_bytes)
-            .context("persisted coordination evidence is invalid")?;
-        if accepted.schema != EVIDENCE_SCHEMA {
-            bail!("unsupported accepted coordination evidence schema");
-        }
-        validate_evidence_input(&accepted.evidence, &transaction, step)?;
-        if step.owner == StepOwner::ProviderOwned {
-            verify_provider_evidence(&current, &transaction, step, &accepted.evidence)?;
-        }
-        let source_manifest_sha256 = digest_bytes(&canonical_evidence_bytes(&accepted.evidence)?);
-        if accepted.source_manifest_sha256 != source_manifest_sha256 {
-            bail!("accepted coordination evidence source digest does not match its payload");
-        }
-        if accepted.semantic_completion_claimed {
-            bail!("coordination evidence must not claim semantic completion");
-        }
     }
-    transaction.updated_at = Utc::now().timestamp();
-    transaction.state = next_state(&transaction);
-    persist(store, &transaction)?;
+    let recomputed_state = next_state(&transaction);
+    if repaired_pending_evidence || transaction.state != recomputed_state {
+        transaction.updated_at = Utc::now().timestamp();
+        transaction.state = recomputed_state;
+        persist(store, &transaction)?;
+    }
     Ok(transaction)
 }
 
@@ -525,6 +590,12 @@ pub(crate) fn commit_controller_update_locked(
     evidence_sha256: &str,
 ) -> anyhow::Result<UpdateCoordination> {
     let mut transaction = load_path(&transaction_path(store, &current.deployment_id))?;
+    if transaction.state == CoordinationState::Committed {
+        if transaction.transaction_id != transaction_id {
+            bail!("committed update is bound to a different deployment transaction");
+        }
+        return reconcile_committed_locked(store, current, transaction);
+    }
     validate_binding(&transaction, current)?;
     let next_revision = current
         .declaration_revision
@@ -559,6 +630,12 @@ pub(crate) fn commit_controller_update_locked(
         bail!("controller update still has incomplete or blocked steps");
     }
     updated.validate()?;
+    transaction.committed_declaration = Some(updated.clone());
+    // Persist the commit intent before changing the declaration.  This is the
+    // durable hand-off point for the two separate files: replay can either
+    // perform the CAS or observe that it already succeeded.
+    transaction.updated_at = Utc::now().timestamp();
+    persist(store, &transaction)?;
     store.persist_declaration_cas_locked(current, updated)?;
     transaction.declaration_revision = updated.declaration_revision;
     transaction.updated_at = Utc::now().timestamp();
@@ -573,7 +650,12 @@ pub(crate) fn finalize_committed_locked(
 ) -> anyhow::Result<()> {
     let active = transaction_path(store, &record.deployment_id);
     let transaction = load_path(&active)?;
-    validate_binding(&transaction, record)?;
+    let transaction = if transaction.state == CoordinationState::Committed {
+        reconcile_committed_locked(store, record, transaction)?
+    } else {
+        validate_binding(&transaction, record)?;
+        transaction
+    };
     if transaction.transaction_id != transaction_id
         || transaction.state != CoordinationState::Committed
     {
@@ -582,6 +664,81 @@ pub(crate) fn finalize_committed_locked(
     let history = active.with_file_name(format!("update-{transaction_id}.json"));
     atomic_write(&history, &serde_json::to_vec_pretty(&transaction)?, 0o600)?;
     remove_file_durable(&active)
+}
+
+/// Replay a committed declaration intent after either side of the declaration
+/// CAS/journal persistence boundary.  This function deliberately leaves the
+/// active transaction in place: the caller still owns audit/finalization.
+fn reconcile_committed_locked(
+    store: &DeploymentStore,
+    current: &DeploymentRecord,
+    mut transaction: UpdateCoordination,
+) -> anyhow::Result<UpdateCoordination> {
+    validate_committed_binding(&transaction, current)?;
+    let Some(target) = transaction.committed_declaration.clone() else {
+        // Transactions written by the pre-intent format can only be safely
+        // resumed when their declaration revision already matches the active
+        // declaration.  There is no durable target from which to reconstruct a
+        // missing CAS, so fail closed otherwise.
+        return Ok(transaction);
+    };
+    if current == &target {
+        if transaction.declaration_revision != target.declaration_revision {
+            transaction.declaration_revision = target.declaration_revision;
+            transaction.updated_at = Utc::now().timestamp();
+            persist(store, &transaction)?;
+        }
+        return Ok(transaction);
+    }
+    if current.declaration_revision != transaction.declaration_revision {
+        bail!("committed deployment declaration differs from its durable update target");
+    }
+    store.persist_declaration_cas_locked(current, &target)?;
+    transaction.declaration_revision = target.declaration_revision;
+    transaction.updated_at = Utc::now().timestamp();
+    persist(store, &transaction)?;
+    Ok(transaction)
+}
+
+fn validate_committed_binding(
+    transaction: &UpdateCoordination,
+    record: &DeploymentRecord,
+) -> anyhow::Result<()> {
+    if transaction.schema != TRANSACTION_SCHEMA || transaction.operation != "update" {
+        bail!("unsupported coordination transaction");
+    }
+    if transaction.deployment_id != record.deployment_id {
+        bail!("coordination transaction is bound to a different deployment");
+    }
+    validate_identifier(
+        &transaction.transaction_id,
+        "coordination transaction identifier",
+    )?;
+    if let Some(target) = &transaction.committed_declaration {
+        target.validate()?;
+        let target_is_next_revision = target.declaration_revision
+            == transaction
+                .declaration_revision
+                .checked_add(1)
+                .context("committed deployment declaration revision overflow")?;
+        let target_is_recorded_revision =
+            target.declaration_revision == transaction.declaration_revision;
+        if target.deployment_id != transaction.deployment_id
+            || target.active_release != transaction.target_release
+            || (!target_is_next_revision && !target_is_recorded_revision)
+        {
+            bail!("committed update intent is not bound to the active transaction");
+        }
+        if record != target
+            && (!target_is_next_revision
+                || record.declaration_revision != transaction.declaration_revision)
+        {
+            bail!("deployment declaration changed during committed update recovery");
+        }
+    } else if transaction.declaration_revision != record.declaration_revision {
+        bail!("deployment declaration changed after the coordination commit");
+    }
+    Ok(())
 }
 
 fn next_state(transaction: &UpdateCoordination) -> CoordinationState {
@@ -859,6 +1016,31 @@ fn canonical_evidence_bytes(input: &EvidenceInput) -> anyhow::Result<Vec<u8>> {
     serde_json::to_vec(input).context("failed to canonicalize coordination evidence")
 }
 
+fn validate_persisted_evidence(
+    current: &DeploymentRecord,
+    transaction: &UpdateCoordination,
+    step: &CoordinationStep,
+    persisted_bytes: &[u8],
+) -> anyhow::Result<AcceptedEvidence> {
+    let accepted: AcceptedEvidence = serde_json::from_slice(persisted_bytes)
+        .context("persisted coordination evidence is invalid")?;
+    if accepted.schema != EVIDENCE_SCHEMA {
+        bail!("unsupported accepted coordination evidence schema");
+    }
+    validate_evidence_input(&accepted.evidence, transaction, step)?;
+    if step.owner == StepOwner::ProviderOwned {
+        verify_provider_evidence(current, transaction, step, &accepted.evidence)?;
+    }
+    let source_manifest_sha256 = digest_bytes(&canonical_evidence_bytes(&accepted.evidence)?);
+    if accepted.source_manifest_sha256 != source_manifest_sha256 {
+        bail!("accepted coordination evidence source digest does not match its payload");
+    }
+    if accepted.semantic_completion_claimed {
+        bail!("coordination evidence must not claim semantic completion");
+    }
+    Ok(accepted)
+}
+
 fn read_bounded_secure_file(
     path: &Path,
     label: &str,
@@ -957,6 +1139,28 @@ fn accepted_evidence_path(
             )
         }),
     }
+}
+
+fn evidence_path_present(
+    store: &DeploymentStore,
+    transaction: &UpdateCoordination,
+    step_id: &str,
+) -> bool {
+    let current = evidence_path(
+        store,
+        &transaction.deployment_id,
+        &transaction.transaction_id,
+        step_id,
+    );
+    if fs::symlink_metadata(&current).is_ok() {
+        return true;
+    }
+    fs::symlink_metadata(legacy_evidence_path(
+        store,
+        &transaction.deployment_id,
+        step_id,
+    ))
+    .is_ok()
 }
 
 fn load_path(path: &Path) -> anyhow::Result<UpdateCoordination> {

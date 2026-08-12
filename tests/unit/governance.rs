@@ -135,6 +135,12 @@ fn management_audit_deduplicates_requests_and_rejects_content_reuse() {
         .join("identities/audit.key");
     fs::create_dir_all(key_path.parent().unwrap()).unwrap();
     fs::write(&key_path, URL_SAFE_NO_PAD.encode(key.to_bytes())).unwrap();
+    let public_path = key_path.with_file_name("audit.pub");
+    fs::write(
+        &public_path,
+        URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -143,6 +149,10 @@ fn management_audit_deduplicates_requests_and_rejects_content_reuse() {
     deployment.resources.insert(
         "audit_private_key".to_owned(),
         SafeReference::File { path: key_path },
+    );
+    deployment.resources.insert(
+        "audit_public_key".to_owned(),
+        SafeReference::File { path: public_path },
     );
 
     append_management_audit(
@@ -196,6 +206,12 @@ fn management_audit_intent_recovers_after_declaration_commit() {
         .join("identities/audit.key");
     fs::create_dir_all(key_path.parent().unwrap()).unwrap();
     fs::write(&key_path, URL_SAFE_NO_PAD.encode(key.to_bytes())).unwrap();
+    let public_path = key_path.with_file_name("audit.pub");
+    fs::write(
+        &public_path,
+        URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -204,6 +220,10 @@ fn management_audit_intent_recovers_after_declaration_commit() {
     previous.resources.insert(
         "audit_private_key".to_owned(),
         SafeReference::File { path: key_path },
+    );
+    previous.resources.insert(
+        "audit_public_key".to_owned(),
+        SafeReference::File { path: public_path },
     );
     store.persist(&previous).unwrap();
     let mut target = previous.clone();
@@ -226,6 +246,11 @@ fn management_audit_intent_recovers_after_declaration_commit() {
     mark_management_audit_intent_committed(&store, &target).unwrap();
     assert!(recover_pending_management_audit_intent_locked(&store, &target).unwrap());
     assert!(!management_audit_intent_path(&store, &target.deployment_id).exists());
+    std::fs::remove_file(match target.resources.get("audit_private_key").unwrap() {
+        SafeReference::File { path } => path,
+        _ => unreachable!(),
+    })
+    .unwrap();
     assert_eq!(verify_management_audit(&store, &target).unwrap().0, 1);
     assert!(!recover_pending_management_audit_intent_locked(&store, &target).unwrap());
 }

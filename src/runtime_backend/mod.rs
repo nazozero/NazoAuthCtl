@@ -19,7 +19,7 @@ pub(crate) use nazoauthctl_runtime::runtime_backend::{
     ContainerRestartPolicy, managed_config_digest, parse_systemd_version, render_host_service_unit,
 };
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) use nazoauthctl_runtime::runtime_backend::managed_network_config_digest;
 
 #[cfg(debug_assertions)]

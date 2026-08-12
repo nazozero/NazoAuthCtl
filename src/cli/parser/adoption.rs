@@ -23,10 +23,16 @@ pub(super) fn parse_adoption(values: Vec<String>) -> anyhow::Result<AdoptionOpti
     while index < values.len() {
         match values[index].as_str() {
             "--plan" => {
+                if plan {
+                    bail!("--plan may be specified only once");
+                }
                 plan = true;
                 index += 1;
             }
             "--yes" => {
+                if yes {
+                    bail!("--yes may be specified only once");
+                }
                 yes = true;
                 index += 1;
             }

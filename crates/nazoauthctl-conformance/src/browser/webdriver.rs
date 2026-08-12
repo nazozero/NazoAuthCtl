@@ -16,8 +16,17 @@ use super::validation::{MAX_TEXT_BYTES, is_loopback_host};
 use super::{BrowserDriver, BrowserError, BrowserSelector};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_SESSION_ID_BYTES: usize = 256;
 const W3C_ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
 const LEGACY_ELEMENT_KEY: &str = "ELEMENT";
+
+fn valid_session_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SESSION_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
 
 /// The browser endpoint may be a local, plaintext chromedriver endpoint.  A
 /// plaintext endpoint on any non-loopback host is rejected to avoid leaking
@@ -148,7 +157,7 @@ impl WebDriverClient {
                     .and_then(Value::as_str)
             })
             .ok_or(BrowserError::Protocol)?;
-        if session.is_empty() || session.len() > 256 || session.chars().any(char::is_control) {
+        if !valid_session_id(session) {
             return Err(BrowserError::Protocol);
         }
         self.session_id = Some(session.to_owned());
@@ -159,6 +168,9 @@ impl WebDriverClient {
         let Some(session) = self.session_id.take() else {
             return Ok(());
         };
+        if !valid_session_id(&session) {
+            return Err(BrowserError::Protocol);
+        }
         let path = format!("/session/{session}");
         let _ = self.delete_value(&path);
         Ok(())
@@ -169,7 +181,11 @@ impl WebDriverClient {
             .session_id
             .as_deref()
             .ok_or(BrowserError::SessionNotStarted)?;
-        if suffix.contains("..") || suffix.contains("//") || !suffix.starts_with('/') {
+        if !valid_session_id(session)
+            || suffix.contains("..")
+            || suffix.contains("//")
+            || !suffix.starts_with('/')
+        {
             return Err(BrowserError::Protocol);
         }
         Ok(format!("/session/{session}{suffix}"))
@@ -212,6 +228,18 @@ impl WebDriverClient {
 }
 
 impl BrowserDriver for WebDriverClient {
+    fn ensure_session(&mut self) -> Result<(), BrowserError> {
+        let path = self.session_path("/url")?;
+        match self.get_value(&path) {
+            Ok(_) => Ok(()),
+            Err(BrowserError::InvalidSession) => {
+                self.session_id = None;
+                self.start_chrome()
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn clear_cookies(&mut self) -> Result<(), BrowserError> {
         self.delete_value(&self.session_path("/cookie")?)
             .map(|_| ())
@@ -449,6 +477,10 @@ fn current_effective_uid() -> Option<u32> {
 }
 
 impl BrowserDriver for ManagedWebDriver {
+    fn ensure_session(&mut self) -> Result<(), BrowserError> {
+        self.client.ensure_session()
+    }
+
     fn clear_cookies(&mut self) -> Result<(), BrowserError> {
         self.client.clear_cookies()
     }
@@ -582,8 +614,65 @@ fn parse_webdriver_response(
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| BrowserError::Protocol)?;
     if !status.is_success() {
         // WebDriver error payloads often contain page text and selectors.  Do
-        // not echo it; callers only receive a stable error class.
-        return Err(BrowserError::DriverRejected);
+        // not echo it. Preserve only the W3C error token needed by the bounded
+        // browser state machine to distinguish normal DOM races from a driver
+        // or protocol failure.
+        return Err(classify_webdriver_error(&value));
     }
     Ok(value)
+}
+
+fn classify_webdriver_error(value: &Value) -> BrowserError {
+    match value
+        .get("value")
+        .and_then(|value| value.get("error"))
+        .and_then(Value::as_str)
+    {
+        Some("no such element") => BrowserError::ElementNotFound,
+        Some("stale element reference") => BrowserError::StaleElement,
+        Some("invalid session id") => BrowserError::InvalidSession,
+        _ => BrowserError::DriverRejected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn webdriver_error_tokens_preserve_only_retryable_dom_states() {
+        assert_eq!(
+            classify_webdriver_error(&json!({
+                "value": {"error": "no such element", "message": "sensitive page text"}
+            })),
+            BrowserError::ElementNotFound
+        );
+        assert_eq!(
+            classify_webdriver_error(&json!({
+                "value": {"error": "stale element reference", "message": "sensitive selector"}
+            })),
+            BrowserError::StaleElement
+        );
+        assert_eq!(
+            classify_webdriver_error(&json!({
+                "value": {"error": "invalid session id", "message": "sensitive session"}
+            })),
+            BrowserError::InvalidSession
+        );
+        assert_eq!(
+            classify_webdriver_error(&json!({
+                "value": {"error": "unknown error", "message": "sensitive driver detail"}
+            })),
+            BrowserError::DriverRejected
+        );
+    }
+
+    #[test]
+    fn session_ids_are_path_safe_and_bounded() {
+        assert!(valid_session_id("session-01._abc"));
+        assert!(!valid_session_id("session/01"));
+        assert!(!valid_session_id("session?01"));
+        assert!(!valid_session_id("session 01"));
+        assert!(!valid_session_id(&"a".repeat(MAX_SESSION_ID_BYTES + 1)));
+    }
 }

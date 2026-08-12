@@ -19,7 +19,9 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::matrix::{MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix};
+use crate::matrix::{
+    MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix, zeroize_json_value,
+};
 use crate::origin::Origin;
 
 pub const SECURE_BUNDLE_SCHEMA_VERSION: u32 = 3;
@@ -165,7 +167,7 @@ pub struct PreparedMaterialization {
     request_jti: String,
     matrix_sha256: String,
     bundle_digest: String,
-    credential_trust_anchor_pem: String,
+    deployment_credential_trust_anchor_pem: String,
     applicant_email: Zeroizing<String>,
     applicant_password: Zeroizing<String>,
     tx_code: Option<Zeroizing<String>>,
@@ -241,6 +243,25 @@ impl PreparedMaterialization {
     pub fn suite_base_url(&self) -> &str {
         &self.suite_base_url
     }
+
+    /// Return the public CA certificates generated for every signed Matrix
+    /// client. Negative mTLS modules deliberately present an alternate Matrix
+    /// client's certificate, so the proxy must authenticate the run-scoped CA
+    /// before the application can reject the client binding. The corresponding
+    /// private keys remain in the prepared records and never enter this bundle.
+    pub fn mtls_trust_anchor_pem(&self) -> Zeroizing<String> {
+        let anchors = self
+            .clients
+            .values()
+            .map(|client| client.mtls_ca_certificate.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut bundle = String::new();
+        for anchor in anchors {
+            bundle.push_str(anchor.trim());
+            bundle.push('\n');
+        }
+        Zeroizing::new(bundle)
+    }
 }
 
 struct PreparedClient {
@@ -267,6 +288,7 @@ impl Zeroize for PreparedClient {
         self.mtls_ca_certificate.zeroize();
         self.mtls_client_certificate.zeroize();
         self.mtls_client_key.zeroize();
+        zeroize_json_value(&mut self.request);
     }
 }
 
@@ -418,14 +440,23 @@ impl DescriptorMaterializer {
         validate_descriptor(&descriptor)?;
         validate_target_issuer(target_issuer)?;
         validate_request_jti(request_jti)?;
-        // The server's run-scoped deployment anchor and the Suite's mdoc root
-        // are distinct trust domains.  Bind both to this raw Matrix and fail
-        // closed if an operator accidentally supplies the same certificate
-        // twice; the bundle must contain exactly these two roots in order.
-        let credential_trust_anchor_pem = combine_openid4vc_credential_trust_anchors(
+        // The deployment issuer root and the Suite mdoc root are independent
+        // trust domains. The deployment root is used only by Suite VCI plans;
+        // the target VP verifier instead receives the fresh run CA that signs
+        // the Suite credential issuer plus the pinned Suite mdoc root.
+        let deployment_der = validate_single_mdoc_trust_anchor(
             credential_trust_anchor_pem,
-            &descriptor.openid4vc_suite_mdoc_trust_anchor_pem,
+            "credential_trust_anchor_pem",
         )?;
+        let suite_der = validate_single_mdoc_trust_anchor(
+            &descriptor.openid4vc_suite_mdoc_trust_anchor_pem,
+            "openid4vc_suite_mdoc_trust_anchor_pem",
+        )?;
+        if deployment_der == suite_der {
+            return Err(MaterializerError::InvalidField(
+                "credential_trust_anchor_pem",
+            ));
+        }
         let matrix_sha256 = descriptor
             .raw_sha256
             .clone()
@@ -444,8 +475,12 @@ impl DescriptorMaterializer {
         // trust object even when a selected subset does not include a VCI
         // plan.  The corresponding private keys remain in `PreparedMaterialization`
         // and are only consumed if a finalized VCI/HAIP plan needs them.
-        let attestation = Some(generate_attestation_material()?);
+        let attestation = Some(generate_attestation_material(&suite_origin.host())?);
         let attestation_ref = attestation.as_ref().ok_or(MaterializerError::Crypto)?;
+        let combined_credential_trust_anchor_pem = combine_openid4vc_credential_trust_anchors(
+            attestation_ref.trust_anchor_pem.as_str(),
+            &descriptor.openid4vc_suite_mdoc_trust_anchor_pem,
+        )?;
         let mut clients = BTreeMap::new();
         for (logical_client_id, policy) in policies {
             let registration = registrations
@@ -500,7 +535,7 @@ impl DescriptorMaterializer {
                     attestation_ref.key_attestation_public_jwks.as_str(),
                 )
                 .map_err(|_| MaterializerError::Encoding)?,
-                credential_trust_anchor_pem: credential_trust_anchor_pem.clone(),
+                credential_trust_anchor_pem: combined_credential_trust_anchor_pem,
             },
             openid4vc_credential_datasets: descriptor.openid4vc_credential_datasets.clone(),
             applicant: SecureApplicantBundle {
@@ -530,7 +565,7 @@ impl DescriptorMaterializer {
             request_jti: request_jti.to_owned(),
             matrix_sha256,
             bundle_digest,
-            credential_trust_anchor_pem,
+            deployment_credential_trust_anchor_pem: credential_trust_anchor_pem.to_owned(),
             applicant_email,
             applicant_password,
             tx_code,
@@ -589,13 +624,15 @@ impl DescriptorMaterializer {
                     &prepared.suite_base_url,
                     prepared.tx_code.as_ref().map(|value| value.as_str()),
                     prepared.attestation.as_ref(),
-                    &prepared.credential_trust_anchor_pem,
+                    &prepared.deployment_credential_trust_anchor_pem,
                 )?;
                 let config = materialize_vp_config(
                     &plan.plan,
                     &plan.variant,
                     config,
+                    &prepared.suite_base_url,
                     &onboarding.openid4vc_request_object_trust_anchor_pem,
+                    prepared.attestation.as_ref(),
                 )?;
                 plans.push(MatrixPlan {
                     id: plan.id.clone(),
@@ -778,6 +815,14 @@ struct SecureBundleRecord {
     clients: Vec<SecureClientRecord>,
 }
 
+impl Drop for SecureBundleRecord {
+    fn drop(&mut self) {
+        for value in self.openid4vc_credential_datasets.values_mut() {
+            zeroize_json_value(value);
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct SecureOpenid4vcConformanceTrust {
     schema: u32,
@@ -785,6 +830,13 @@ struct SecureOpenid4vcConformanceTrust {
     client_attestation_jwks: Value,
     key_attestation_jwks: Value,
     credential_trust_anchor_pem: String,
+}
+
+impl Drop for SecureOpenid4vcConformanceTrust {
+    fn drop(&mut self) {
+        zeroize_json_value(&mut self.client_attestation_jwks);
+        zeroize_json_value(&mut self.key_attestation_jwks);
+    }
 }
 
 #[derive(Serialize)]
@@ -795,6 +847,12 @@ struct SecureClientRecord {
     client_secret: Option<Zeroizing<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mtls_trust_anchor_pem: Option<Zeroizing<String>>,
+}
+
+impl Drop for SecureClientRecord {
+    fn drop(&mut self) {
+        zeroize_json_value(&mut self.request);
+    }
 }
 
 #[derive(Serialize)]
@@ -819,23 +877,22 @@ fn validate_public_certificate_bundle(value: &str) -> Result<(), MaterializerErr
 }
 
 fn combine_openid4vc_credential_trust_anchors(
-    deployment_anchor_pem: &str,
+    run_anchor_pem: &str,
     suite_anchor_pem: &str,
 ) -> Result<String, MaterializerError> {
-    let deployment_der =
-        validate_single_mdoc_trust_anchor(deployment_anchor_pem, "credential_trust_anchor_pem")?;
+    let run_der = validate_single_mdoc_trust_anchor(run_anchor_pem, "credential_trust_anchor_pem")?;
     let suite_der = validate_single_mdoc_trust_anchor(
         suite_anchor_pem,
         "openid4vc_suite_mdoc_trust_anchor_pem",
     )?;
-    if deployment_der == suite_der {
+    if run_der == suite_der {
         return Err(MaterializerError::InvalidField(
             "credential_trust_anchor_pem",
         ));
     }
 
-    let mut combined = String::with_capacity(deployment_anchor_pem.len() + suite_anchor_pem.len());
-    combined.push_str(deployment_anchor_pem.trim_end());
+    let mut combined = String::with_capacity(run_anchor_pem.len() + suite_anchor_pem.len());
+    combined.push_str(run_anchor_pem.trim_end());
     combined.push('\n');
     combined.push_str(suite_anchor_pem.trim_end());
     combined.push('\n');
@@ -892,9 +949,12 @@ fn descriptor_requires_pre_authorized_vci(descriptor: &MatrixDescriptor) -> bool
 mod tests {
     use std::sync::OnceLock;
 
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+    use x509_parser::{extensions::GeneralName, parse_x509_certificate, pem::parse_x509_pem};
 
     use super::*;
+    use crate::materializer::crypto::generate_mtls;
 
     #[test]
     fn empty_optional_mtls_selectors_do_not_create_a_trust_anchor() {
@@ -968,6 +1028,42 @@ mod tests {
             first.mtls_client_key.as_str(),
             second.mtls_client_key.as_str()
         );
+    }
+
+    #[test]
+    fn generated_mtls_leaf_builds_a_strict_chain_to_its_unique_ca() {
+        let (first_ca_pem, first_leaf_pem, _, _) = generate_mtls().expect("first mTLS material");
+        let (second_ca_pem, _, _, _) = generate_mtls().expect("second mTLS material");
+        let (_, first_ca_pem) = parse_x509_pem(first_ca_pem.as_bytes()).expect("first CA PEM");
+        let (_, second_ca_pem) = parse_x509_pem(second_ca_pem.as_bytes()).expect("second CA PEM");
+        let (_, first_leaf_pem) =
+            parse_x509_pem(first_leaf_pem.as_bytes()).expect("first leaf PEM");
+        let (_, first_ca) = parse_x509_certificate(&first_ca_pem.contents).expect("first CA");
+        let (_, second_ca) = parse_x509_certificate(&second_ca_pem.contents).expect("second CA");
+        let (_, first_leaf) = parse_x509_certificate(&first_leaf_pem.contents).expect("first leaf");
+
+        assert_ne!(first_leaf.subject(), first_leaf.issuer());
+        assert_eq!(first_leaf.issuer(), first_ca.subject());
+        assert_ne!(first_ca.subject(), second_ca.subject());
+        first_leaf
+            .verify_signature(Some(first_ca.public_key()))
+            .expect("leaf signature must verify with the generated CA");
+    }
+
+    #[test]
+    fn proxy_trust_bundle_contains_only_public_matrix_client_anchors() {
+        let (prepared, _) = DescriptorMaterializer::prepare(
+            descriptor(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+            test_trust_anchor(),
+        )
+        .expect("prepare");
+        let anchors = prepared.mtls_trust_anchor_pem();
+        assert_eq!(anchors.matches("-----BEGIN CERTIFICATE-----").count(), 1);
+        assert_eq!(anchors.matches("-----END CERTIFICATE-----").count(), 1);
+        assert!(!anchors.contains("PRIVATE KEY"));
     }
 
     fn descriptor_json() -> Value {
@@ -1172,6 +1268,63 @@ mod tests {
             .replace("\r\n", "\n")
     }
 
+    fn assert_vp_credential_signer(config: &Value, suite_host: &str) {
+        let credential = config["credential"]
+            .as_object()
+            .expect("credential configuration");
+        let signing_jwk = credential["signing_jwk"]
+            .as_object()
+            .expect("credential signing JWK");
+        for (field, expected) in [
+            ("kty", "EC"),
+            ("crv", "P-256"),
+            ("alg", "ES256"),
+            ("use", "sig"),
+        ] {
+            assert_eq!(signing_jwk[field], expected);
+        }
+        assert!(
+            signing_jwk["d"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        let leaf_der = STANDARD
+            .decode(signing_jwk["x5c"][0].as_str().expect("credential leaf x5c"))
+            .expect("credential leaf base64");
+        let (remaining, leaf) = parse_x509_certificate(&leaf_der).expect("credential leaf");
+        assert!(remaining.is_empty());
+        let eku = leaf
+            .extended_key_usage()
+            .expect("credential EKU")
+            .expect("credential EKU present");
+        assert!(
+            eku.value
+                .other
+                .iter()
+                .any(|oid| oid.to_id_string() == "1.0.18013.5.1.2")
+        );
+        let san = leaf
+            .subject_alternative_name()
+            .expect("credential SAN")
+            .expect("credential SAN present");
+        assert!(
+            san.value
+                .general_names
+                .iter()
+                .any(|name| matches!(name, GeneralName::DNSName(value) if *value == suite_host))
+        );
+
+        let run_anchor = credential["trust_anchor_pem"]
+            .as_str()
+            .expect("run credential trust anchor");
+        assert_eq!(credential["status_list_trust_anchor_pem"], run_anchor);
+        let (_, root_pem) =
+            x509_parser::pem::parse_x509_pem(run_anchor.as_bytes()).expect("run root PEM");
+        let (_, root) = parse_x509_certificate(&root_pem.contents).expect("run root certificate");
+        leaf.verify_signature(Some(root.public_key()))
+            .expect("credential leaf must chain to the run root");
+    }
+
     fn test_trust_anchor() -> &'static str {
         static ANCHOR: OnceLock<String> = OnceLock::new();
         ANCHOR
@@ -1198,14 +1351,6 @@ mod tests {
                 )
             })
             .as_str()
-    }
-
-    fn combined_test_trust_anchor() -> String {
-        format!(
-            "{}\n{}\n",
-            test_trust_anchor().trim_end(),
-            test_suite_mdoc_trust_anchor().trim_end()
-        )
     }
 
     #[test]
@@ -1413,12 +1558,19 @@ mod tests {
 
     #[test]
     fn vci_materialization_binds_issuer_and_declared_variant() {
-        let first_attestation = generate_attestation_material().expect("first attestation");
-        let second_attestation = generate_attestation_material().expect("second attestation");
+        let first_attestation =
+            generate_attestation_material("suite.example").expect("first attestation");
+        let second_attestation =
+            generate_attestation_material("suite.example").expect("second attestation");
         assert_ne!(
             first_attestation.key_attestation_private_jwks.as_str(),
             second_attestation.key_attestation_private_jwks.as_str(),
             "VCI proof keys must be generated afresh for each run"
+        );
+        assert_ne!(
+            first_attestation.credential_signing_private_jwk.as_str(),
+            second_attestation.credential_signing_private_jwk.as_str(),
+            "VP credential signing keys must be generated afresh for each run"
         );
         let config = serde_json::json!({
             "alias": "nazo-vci-run",
@@ -1926,10 +2078,11 @@ mod tests {
         let trust = &bundle_value["openid4vc_conformance_trust"];
         assert_eq!(trust["schema"], 1);
         assert_eq!(trust["client_attestation_issuer"], "https://suite.example/");
-        assert_eq!(
-            trust["credential_trust_anchor_pem"],
-            combined_test_trust_anchor()
-        );
+        let bundle_anchor = trust["credential_trust_anchor_pem"]
+            .as_str()
+            .expect("combined trust anchor");
+        assert!(!bundle_anchor.contains(test_trust_anchor().trim()));
+        assert!(bundle_anchor.contains(test_suite_mdoc_trust_anchor().trim()));
         assert_eq!(
             trust["credential_trust_anchor_pem"]
                 .as_str()
@@ -1988,6 +2141,14 @@ mod tests {
             config["client_attestation"]["issuer"],
             "https://suite.example/"
         );
+        assert_eq!(
+            config["credential"]["trust_anchor_pem"],
+            test_trust_anchor()
+        );
+        assert_eq!(
+            config["credential"]["status_list_trust_anchor_pem"],
+            test_trust_anchor()
+        );
     }
 
     #[test]
@@ -2026,10 +2187,17 @@ mod tests {
             serde_json::from_slice(second_bundle.bytes().as_bytes()).expect("second bundle");
         let first_trust = &first_value["openid4vc_conformance_trust"];
         let second_trust = &second_value["openid4vc_conformance_trust"];
-        assert_eq!(
-            first_trust["credential_trust_anchor_pem"],
-            combined_test_trust_anchor()
-        );
+        let first_anchor = first_trust["credential_trust_anchor_pem"]
+            .as_str()
+            .expect("first anchor");
+        let second_anchor = second_trust["credential_trust_anchor_pem"]
+            .as_str()
+            .expect("second anchor");
+        assert_ne!(first_anchor, second_anchor);
+        assert!(!first_anchor.contains(test_trust_anchor().trim()));
+        assert!(first_anchor.contains(test_suite_mdoc_trust_anchor().trim()));
+        assert!(!second_anchor.contains(test_trust_anchor().trim()));
+        assert!(second_anchor.contains(test_suite_mdoc_trust_anchor().trim()));
         assert_ne!(
             first_trust["client_attestation_jwks"],
             second_trust["client_attestation_jwks"]
@@ -2095,7 +2263,7 @@ mod tests {
                 "client": {"client_id": "{{target.host}}"}
             }),
         );
-        let (prepared, _bundle) = DescriptorMaterializer::prepare(
+        let (prepared, bundle) = DescriptorMaterializer::prepare(
             signed,
             "https://issuer.example",
             &suite(),
@@ -2112,9 +2280,44 @@ mod tests {
         )
         .expect("output");
         let matrix = DescriptorMaterializer::finalize(prepared, output).expect("signed finalize");
+        let config = &matrix.matrix().document.groups[0].plans[0].config;
         assert_eq!(
-            matrix.matrix().document.groups[0].plans[0].config["client"]["request_object_trust_anchor_pem"],
+            config["client"]["request_object_trust_anchor_pem"],
             test_trust_anchor()
+        );
+        assert_vp_credential_signer(config, "suite.example");
+        assert_eq!(
+            config["browser"][0]["match"],
+            "https://suite.example/test/a/*/verification-evidence"
+        );
+        assert_eq!(
+            config["browser"][0]["tasks"][0]["commands"][0],
+            serde_json::json!([
+                "wait",
+                "xpath",
+                "//*",
+                10,
+                ".*Deferred verification evidence.*",
+                "update-image-placeholder"
+            ])
+        );
+        let bundle_value: Value =
+            serde_json::from_slice(bundle.bytes().as_bytes()).expect("bundle JSON");
+        let public_anchor =
+            bundle_value["openid4vc_conformance_trust"]["credential_trust_anchor_pem"]
+                .as_str()
+                .expect("public credential trust");
+        let run_anchor = config["credential"]["trust_anchor_pem"]
+            .as_str()
+            .expect("run credential trust");
+        assert!(public_anchor.starts_with(run_anchor.trim_end()));
+        assert!(public_anchor.contains(test_suite_mdoc_trust_anchor().trim()));
+        assert!(
+            !bundle
+                .bytes()
+                .as_bytes()
+                .windows(3)
+                .any(|window| window == b"\"d\"")
         );
 
         let query_variant = BTreeMap::from([("request_method".to_owned(), "url_query".to_owned())]);
@@ -2129,7 +2332,9 @@ mod tests {
                 "oid4vp-1final-verifier-test-plan",
                 &query_variant,
                 query_config,
+                "https://suite.example",
                 test_trust_anchor(),
+                Some(&generate_attestation_material("suite.example").expect("attestation")),
             )
             .unwrap_err(),
             MaterializerError::InvalidField("client.request_object_trust_anchor_pem")
@@ -2143,16 +2348,68 @@ mod tests {
             "client": {"client_id": "issuer.example"}
         });
         let variant = BTreeMap::from([("credential_format".to_owned(), "sd_jwt_vc".to_owned())]);
+        let attestation = generate_attestation_material("suite.example").expect("attestation");
         let materialized = materialize_vp_config(
             "oid4vp-1final-verifier-haip-test-plan",
             &variant,
             config,
+            "https://suite.example",
             test_trust_anchor(),
+            Some(&attestation),
         )
         .expect("VP HAIP config");
         assert_eq!(
             materialized["client"]["request_object_trust_anchor_pem"],
             test_trust_anchor()
+        );
+        assert_vp_credential_signer(&materialized, "suite.example");
+        assert_eq!(
+            materialize_vp_config(
+                "oid4vp-1final-verifier-haip-test-plan",
+                &variant,
+                materialized.clone(),
+                "https://suite.example",
+                test_trust_anchor(),
+                Some(&attestation),
+            )
+            .expect("idempotent VP materialization"),
+            materialized
+        );
+
+        let conflicting_browser = serde_json::json!({
+            "alias": "nazo-vp-haip",
+            "client": {"client_id": "issuer.example"},
+            "browser": []
+        });
+        assert_eq!(
+            materialize_vp_config(
+                "oid4vp-1final-verifier-haip-test-plan",
+                &variant,
+                conflicting_browser,
+                "https://suite.example",
+                test_trust_anchor(),
+                Some(&attestation),
+            )
+            .unwrap_err(),
+            MaterializerError::InvalidField("browser")
+        );
+
+        let conflicting = serde_json::json!({
+            "alias": "nazo-vp-haip",
+            "client": {"client_id": "issuer.example"},
+            "credential": {"signing_jwk": {"kty": "RSA"}}
+        });
+        assert_eq!(
+            materialize_vp_config(
+                "oid4vp-1final-verifier-haip-test-plan",
+                &variant,
+                conflicting,
+                "https://suite.example",
+                test_trust_anchor(),
+                Some(&attestation),
+            )
+            .unwrap_err(),
+            MaterializerError::InvalidField("credential.signing_jwk")
         );
     }
 
@@ -2270,7 +2527,8 @@ mod tests {
     fn secure_bundle_writer_is_owner_only() {
         #[cfg(unix)]
         {
-            let root = std::env::temp_dir()
+            let root = fs::canonicalize(std::env::temp_dir())
+                .expect("canonical temporary root")
                 .join(format!("nazoauthctl-materializer-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             crate::secure_file::ensure_directory(&root, true).expect("private root");

@@ -6,13 +6,14 @@ use base64::{
 use p256::ecdsa::SigningKey;
 use rand_core::{OsRng, RngCore};
 use rcgen::{
-    BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-    KeyUsagePurpose,
+    BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair, KeyUsagePurpose, SanType,
 };
 use rsa::RsaPrivateKey;
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::net::IpAddr;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -41,6 +42,7 @@ pub(super) struct GeneratedAttestationMaterial {
     pub(super) attester_public_jwks: Zeroizing<String>,
     pub(super) key_attestation_private_jwks: Zeroizing<String>,
     pub(super) key_attestation_public_jwks: Zeroizing<String>,
+    pub(super) credential_signing_private_jwk: Zeroizing<String>,
 }
 
 impl Zeroize for GeneratedAttestationMaterial {
@@ -50,6 +52,7 @@ impl Zeroize for GeneratedAttestationMaterial {
         self.attester_public_jwks.zeroize();
         self.key_attestation_private_jwks.zeroize();
         self.key_attestation_public_jwks.zeroize();
+        self.credential_signing_private_jwk.zeroize();
     }
 }
 
@@ -112,8 +115,9 @@ pub(super) fn random_tx_code() -> String {
 /// The key material comes from `OsRng`, then is wrapped in a run-local CA so
 /// the Suite can validate x5c chains without deployment secrets.  No generated
 /// private value is returned in the onboarding bundle.
-pub(super) fn generate_attestation_material()
--> Result<GeneratedAttestationMaterial, MaterializerError> {
+pub(super) fn generate_attestation_material(
+    suite_host: &str,
+) -> Result<GeneratedAttestationMaterial, MaterializerError> {
     let now = OffsetDateTime::now_utc();
     let mut ca_params =
         CertificateParams::new(Vec::<String>::new()).map_err(|_| MaterializerError::Crypto)?;
@@ -128,18 +132,20 @@ pub(super) fn generate_attestation_material()
         KeyPair::try_from(ca_key_der.as_slice()).map_err(|_| MaterializerError::Crypto)?;
     let ca = CertifiedIssuer::self_signed(ca_params, ca_key_pair)
         .map_err(|_| MaterializerError::Crypto)?;
-    let trust_anchor_pem = Zeroizing::new(ca.pem());
+    let trust_anchor_pem = Zeroizing::new(ca.pem().replace("\r\n", "\n"));
 
     let (attester_private_jwks, attester_public_jwks) =
         generate_attestation_leaf(&ca, "NazoAuth client attestation")?;
     let (key_attestation_private_jwks, key_attestation_public_jwks) =
         generate_attestation_leaf(&ca, "NazoAuth key attestation")?;
+    let credential_signing_private_jwk = generate_credential_signing_leaf(&ca, suite_host)?;
     Ok(GeneratedAttestationMaterial {
         trust_anchor_pem,
         attester_private_jwks,
         attester_public_jwks,
         key_attestation_private_jwks,
         key_attestation_public_jwks,
+        credential_signing_private_jwk,
     })
 }
 
@@ -196,6 +202,63 @@ fn generate_attestation_leaf<'a>(
     let private_jwks = serde_json::to_string(&serde_json::json!({"keys": [private]}))
         .map_err(|_| MaterializerError::Encoding)?;
     Ok((Zeroizing::new(private_jwks), Zeroizing::new(public_jwks)))
+}
+
+/// Generate the Suite-side credential issuer identity for one conformance
+/// run. This key is independent from client/key attestation identities and is
+/// returned as a single private JWK because that is the Suite's exact wire
+/// contract. It never enters the onboarding bundle.
+fn generate_credential_signing_leaf<'a>(
+    ca: &CertifiedIssuer<'a, KeyPair>,
+    suite_host: &str,
+) -> Result<Zeroizing<String>, MaterializerError> {
+    let mut rng = OsRng;
+    let signing_key = p256::ecdsa::SigningKey::random(&mut rng);
+    let key_der = Zeroizing::new(ec_pkcs8_der(&signing_key));
+    let key_pair = KeyPair::try_from(key_der.as_slice()).map_err(|_| MaterializerError::Crypto)?;
+    let now = OffsetDateTime::now_utc();
+    let mut params =
+        CertificateParams::new(Vec::<String>::new()).map_err(|_| MaterializerError::Crypto)?;
+    params.not_before = now - TimeDuration::days(1);
+    params.not_after = now + TimeDuration::days(2);
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::Other(vec![1, 0, 18013, 5, 1, 2])];
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "NazoAuth credential".to_owned());
+    let canonical_host = suite_host.trim_matches(['[', ']']);
+    let san = match canonical_host.parse::<IpAddr>() {
+        Ok(address) => SanType::IpAddress(address),
+        Err(_) => SanType::DnsName(
+            canonical_host
+                .to_owned()
+                .try_into()
+                .map_err(|_| MaterializerError::Crypto)?,
+        ),
+    };
+    params.subject_alt_names = vec![san];
+    let certificate = params
+        .signed_by(&key_pair, ca)
+        .map_err(|_| MaterializerError::Crypto)?;
+    let encoded_certificate = STANDARD.encode(certificate.der().as_ref());
+    let point = signing_key.verifying_key().to_encoded_point(false);
+    let x = URL_SAFE_NO_PAD.encode(point.x().ok_or(MaterializerError::Crypto)?);
+    let y = URL_SAFE_NO_PAD.encode(point.y().ok_or(MaterializerError::Crypto)?);
+    let d = URL_SAFE_NO_PAD.encode(signing_key.to_bytes());
+    let private = serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "alg": "ES256",
+        "use": "sig",
+        "kid": format!("nazo-openid4vc-credential-{}", random_hex(8)),
+        "x": x,
+        "y": y,
+        "d": d,
+        "x5c": [encoded_certificate]
+    });
+    serde_json::to_string(&private)
+        .map(Zeroizing::new)
+        .map_err(|_| MaterializerError::Encoding)
 }
 
 fn ec_pkcs8_der(signing_key: &p256::ecdsa::SigningKey) -> Vec<u8> {
@@ -297,6 +360,10 @@ pub(super) fn generate_mtls() -> Result<(String, String, String, String), Materi
     let now = OffsetDateTime::now_utc();
     let mut ca_params =
         CertificateParams::new(Vec::<String>::new()).map_err(|_| MaterializerError::Crypto)?;
+    ca_params.distinguished_name.push(
+        DnType::CommonName,
+        format!("NazoAuthCtl OIDF mTLS Root {}", random_hex(12)),
+    );
     ca_params.not_before = now - TimeDuration::days(1);
     ca_params.not_after = now + TimeDuration::days(365);
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
@@ -309,6 +376,13 @@ pub(super) fn generate_mtls() -> Result<(String, String, String, String), Materi
         CertifiedIssuer::self_signed(ca_params, ca_key).map_err(|_| MaterializerError::Crypto)?;
     let mut client_params = CertificateParams::new(vec![MTLS_CLIENT_SAN_DNS.to_owned()])
         .map_err(|_| MaterializerError::Crypto)?;
+    // A leaf with the same subject and issuer DN is classified as self-signed
+    // by OpenSSL/HAProxy even when its signature was produced by another key.
+    // Keep the identities distinct so strict proxy verification can build the
+    // generated client -> run-scoped CA chain without ignore-error flags.
+    client_params
+        .distinguished_name
+        .push(DnType::CommonName, MTLS_CLIENT_SAN_DNS);
     client_params.not_before = now - TimeDuration::days(1);
     client_params.not_after = now + TimeDuration::days(365);
     client_params.key_usages = vec![

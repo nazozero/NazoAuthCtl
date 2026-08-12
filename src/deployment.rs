@@ -408,11 +408,45 @@ impl DeploymentStore {
                 "deployment registry must be a regular non-symlink file: {}",
                 path.display()
             ),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                if self.registered_artifacts_present()? {
+                    bail!(
+                        "deployment registry is missing while registered deployment artifacts remain; restore or reconcile the registry before using legacy commands"
+                    );
+                }
+                Ok(false)
+            }
             Err(error) => Err(error).with_context(|| {
                 format!("failed to inspect deployment registry {}", path.display())
             }),
         }
+    }
+
+    fn registered_artifacts_present(&self) -> anyhow::Result<bool> {
+        for directory in [
+            self.config_root.join("deployments"),
+            self.state_root.join("deployments"),
+            self.break_glass_root.join("deployments"),
+        ] {
+            let metadata = match fs::symlink_metadata(&directory) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to inspect {}", directory.display()));
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!(
+                    "registered deployment artifact root must be a real directory: {}",
+                    directory.display()
+                );
+            }
+            if fs::read_dir(&directory)?.next().transpose()?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn registration_pending(&self) -> anyhow::Result<bool> {

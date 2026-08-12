@@ -20,6 +20,7 @@ use zeroize::Zeroizing;
 
 use super::{BrowserTargetOrigin, validation::MAX_STEP_TIMEOUT};
 use crate::credentials::BearerToken;
+use crate::matrix::zeroize_json_value;
 use crate::origin::Origin;
 use crate::transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, Transport, TransportError,
@@ -195,6 +196,13 @@ pub struct OpenId4VciModule {
     pub variant: BTreeMap<String, String>,
     pub plan_config: Value,
     pub runner: Value,
+}
+
+impl Drop for OpenId4VciModule {
+    fn drop(&mut self) {
+        zeroize_json_value(&mut self.plan_config);
+        zeroize_json_value(&mut self.runner);
+    }
 }
 
 impl fmt::Debug for OpenId4VciModule {
@@ -1085,6 +1093,14 @@ impl OpenId4VciIssuerDriver for OpenId4VciIssuerClient {
 struct Offer {
     credential_offer: Option<Value>,
     credential_offer_uri: Option<String>,
+}
+
+impl Drop for Offer {
+    fn drop(&mut self) {
+        if let Some(value) = &mut self.credential_offer {
+            zeroize_json_value(value);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

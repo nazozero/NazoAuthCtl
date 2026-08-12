@@ -205,6 +205,117 @@ fn help_topics_follow_user_intent_even_with_an_explicit_config() {
 }
 
 #[test]
+fn help_topics_consume_each_global_option_before_the_command() {
+    let values = |parts: &[&str]| {
+        parts
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        help_topic(&values(&[
+            "nazoauthctl",
+            "--deployment",
+            "deployment-a",
+            "update",
+            "--help",
+        ])),
+        Some(HelpTopic::Update)
+    );
+    assert_eq!(
+        help_topic(&values(&[
+            "nazoauthctl",
+            "--config",
+            "/tmp/update.json",
+            "--deployment",
+            "deployment-a",
+            "install",
+            "--help",
+        ])),
+        Some(HelpTopic::Install)
+    );
+    assert_eq!(
+        help_topic(&values(&[
+            "nazoauthctl",
+            "--deployment",
+            "deployment-a",
+            "--config",
+            "/tmp/update.json",
+            "status",
+            "--help",
+        ])),
+        Some(HelpTopic::TopLevel)
+    );
+}
+
+#[test]
+fn duplicate_global_and_command_scalar_options_are_rejected() {
+    for arguments in [
+        &[
+            "nazoauthctl",
+            "--config",
+            "/tmp/one.json",
+            "--config",
+            "/tmp/two.json",
+            "status",
+        ][..],
+        &[
+            "nazoauthctl",
+            "--deployment",
+            "deployment-a",
+            "--deployment",
+            "deployment-b",
+            "status",
+        ][..],
+        &["nazoauthctl", "update", "--plan", "--plan"][..],
+        &["nazoauthctl", "update", "--yes", "--yes"][..],
+        &[
+            "nazoauthctl",
+            "update",
+            "--accept-migration-barrier",
+            "--accept-migration-barrier",
+        ][..],
+        &["nazoauthctl", "update", "--to", "v1.2.3", "--to", "v1.2.4"][..],
+        &[
+            "nazoauthctl",
+            "adopt",
+            "--target",
+            "podman:manual-runtime-a",
+            "--plan",
+            "--plan",
+        ][..],
+        &[
+            "nazoauthctl",
+            "install",
+            "--runtime",
+            "podman",
+            "--runtime",
+            "docker",
+        ][..],
+        &[
+            "nazoauthctl",
+            "install",
+            "--external-dependencies",
+            "--external-dependencies",
+        ][..],
+        &[
+            "nazoauthctl",
+            "break-glass",
+            "recover-controller",
+            "--reason",
+            "lost",
+            "--reason",
+            "stolen",
+        ][..],
+    ] {
+        assert!(
+            parse(arguments).is_err(),
+            "accepted duplicate options {arguments:?}"
+        );
+    }
+}
+
+#[test]
 fn parses_complete_install_contract_and_rejects_invalid_boundaries() {
     let command = parse(&[
         "nazoauthctl",

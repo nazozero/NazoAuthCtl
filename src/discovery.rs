@@ -29,7 +29,7 @@ pub(crate) struct DiscoveryReport {
     pub(crate) candidates: Vec<DiscoveredDeployment>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DiscoveredDeployment {
     pub(crate) target: String,
@@ -54,6 +54,152 @@ pub(crate) struct DiscoveredDeployment {
     pub(crate) missing: Vec<String>,
     #[serde(skip)]
     pub(crate) sensitive_mount_sources: BTreeMap<PathBuf, PathBuf>,
+}
+
+/// The discovery report is public machine-readable output, while the full runtime observation is
+/// an internal ownership/adoption record. Keep those contracts separate so arbitrary backend
+/// labels and raw host mount paths cannot cross the output boundary; only the ownership label
+/// allowlist and already-filtered safe environment metadata are displayed.
+#[derive(Serialize)]
+struct DisplayDiscoveredDeployment<'a> {
+    target: &'a str,
+    deployment_id: &'a Option<String>,
+    runtime_instance_id: &'a Option<String>,
+    issuer: &'a Option<String>,
+    release: &'a Option<String>,
+    revision: &'a Option<String>,
+    build_id: &'a Option<String>,
+    instance_key_id: &'a Option<String>,
+    control_protocol_versions: &'a [u32],
+    operator_protocol_versions: &'a [u32],
+    runtime: DisplayRuntimeObservation<'a>,
+    online_statement: &'a Option<DiscoveryStatement>,
+    offline_statement: &'a Option<DeploymentStatement>,
+    oidc_discovery_verified: bool,
+    readiness_observed: bool,
+    external_database: bool,
+    external_valkey: bool,
+    recovery_conclusion: &'a RecoveryConclusion,
+    evidence: &'a [String],
+    missing: &'a [String],
+}
+
+#[derive(Serialize)]
+struct DisplayRuntimeObservation<'a> {
+    backend: RuntimeBackendKind,
+    object_reference: &'a str,
+    display_name: &'a str,
+    running: bool,
+    server_command_verified: bool,
+    artifact: &'a ArtifactReference,
+    local_artifact_id: &'a Option<String>,
+    ports: &'a [String],
+    networks: &'a [String],
+    mounts: Vec<DisplayMount>,
+    safe_environment: BTreeMap<String, String>,
+    labels: BTreeMap<String, String>,
+    evidence: &'a [String],
+    missing: &'a [String],
+}
+
+#[derive(Serialize)]
+struct DisplayMount {
+    source: &'static str,
+    destination: String,
+    read_only: bool,
+    selinux_relabel: bool,
+    ownership: crate::deployment::Responsibility,
+    scope: crate::deployment::ResourceScope,
+}
+
+impl Serialize for DiscoveredDeployment {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        DisplayDiscoveredDeployment {
+            target: &self.target,
+            deployment_id: &self.deployment_id,
+            runtime_instance_id: &self.runtime_instance_id,
+            issuer: &self.issuer,
+            release: &self.release,
+            revision: &self.revision,
+            build_id: &self.build_id,
+            instance_key_id: &self.instance_key_id,
+            control_protocol_versions: &self.control_protocol_versions,
+            operator_protocol_versions: &self.operator_protocol_versions,
+            runtime: DisplayRuntimeObservation {
+                backend: self.runtime.backend,
+                object_reference: &self.runtime.object_reference,
+                display_name: &self.runtime.display_name,
+                running: self.runtime.running,
+                server_command_verified: self.runtime.server_command_verified,
+                artifact: &self.runtime.artifact,
+                local_artifact_id: &self.runtime.local_artifact_id,
+                ports: &self.runtime.ports,
+                networks: &self.runtime.networks,
+                mounts: self
+                    .runtime
+                    .mounts
+                    .iter()
+                    .map(|mount| DisplayMount {
+                        source: "<redacted-mount-source>",
+                        destination: mount.destination.display().to_string(),
+                        read_only: mount.read_only,
+                        selinux_relabel: mount.selinux_relabel,
+                        ownership: mount.ownership,
+                        scope: mount.scope,
+                    })
+                    .collect(),
+                safe_environment: display_safe_environment(&self.runtime),
+                labels: display_labels(&self.runtime),
+                evidence: &self.runtime.evidence,
+                missing: &self.runtime.missing,
+            },
+            online_statement: &self.online_statement,
+            offline_statement: &self.offline_statement,
+            oidc_discovery_verified: self.oidc_discovery_verified,
+            readiness_observed: self.readiness_observed,
+            external_database: self.external_database,
+            external_valkey: self.external_valkey,
+            recovery_conclusion: &self.recovery_conclusion,
+            evidence: &self.evidence,
+            missing: &self.missing,
+        }
+        .serialize(serializer)
+    }
+}
+
+fn display_labels(runtime: &RuntimeObservation) -> BTreeMap<String, String> {
+    const ALLOWED: [&str; 3] = [
+        "io.nazoauth.deployment-id",
+        "io.nazoauth.control-authority",
+        "io.nazoauth.runtime-instance-id",
+    ];
+    runtime
+        .labels
+        .iter()
+        .filter(|(name, _)| ALLOWED.contains(&name.as_str()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+fn display_safe_environment(runtime: &RuntimeObservation) -> BTreeMap<String, String> {
+    const ALLOWED: [&str; 7] = [
+        "ISSUER",
+        "PUBLIC_BASE_URL",
+        "DATA_DIR",
+        "DEPLOYMENT_ID",
+        "RUNTIME_INSTANCE_ID",
+        "CONTROL_AUTHORITY",
+        "INSTANCE_IDENTITY_DIR",
+    ];
+    runtime
+        .safe_environment
+        .iter()
+        .filter(|(name, _)| ALLOWED.contains(&name.as_str()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
 }
 
 pub(crate) fn discover() -> anyhow::Result<DiscoveryReport> {
