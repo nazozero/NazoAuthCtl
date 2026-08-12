@@ -347,7 +347,12 @@ pub(crate) fn submit_evidence(
         accepted_at: Utc::now().timestamp(),
         semantic_completion_claimed: false,
     };
-    let evidence_path = evidence_path(store, &transaction.deployment_id, &step.id);
+    let evidence_path = evidence_path(
+        store,
+        &transaction.deployment_id,
+        &transaction.transaction_id,
+        &step.id,
+    );
     match fs::symlink_metadata(&evidence_path) {
         Ok(_) => bail!("coordination evidence for this step already exists"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -391,7 +396,7 @@ pub(crate) fn resume(
         if step.state != StepState::EvidenceAccepted {
             continue;
         }
-        let evidence_path = evidence_path(store, &transaction.deployment_id, &step.id);
+        let evidence_path = accepted_evidence_path(store, &transaction, &step.id)?;
         let expected = step
             .evidence_sha256
             .as_deref()
@@ -605,6 +610,10 @@ fn validate_binding(
     if transaction.deployment_id != record.deployment_id {
         bail!("coordination transaction is bound to a different deployment");
     }
+    validate_identifier(
+        &transaction.transaction_id,
+        "coordination transaction identifier",
+    )?;
     if transaction.declaration_revision != record.declaration_revision {
         bail!("deployment declaration changed after the coordination plan was prepared");
     }
@@ -799,7 +808,7 @@ fn reject_replayed_nonce(
         if step.state != StepState::EvidenceAccepted {
             continue;
         }
-        let path = evidence_path(store, &transaction.deployment_id, &step.id);
+        let path = accepted_evidence_path(store, transaction, &step.id)?;
         let bytes = read_bounded_secure_file(
             &path,
             "persisted coordination evidence",
@@ -891,6 +900,20 @@ fn transaction_path(store: &DeploymentStore, deployment_id: &str) -> std::path::
 fn evidence_path(
     store: &DeploymentStore,
     deployment_id: &str,
+    transaction_id: &str,
+    step_id: &str,
+) -> std::path::PathBuf {
+    store
+        .deployment_state_dir(deployment_id)
+        .join("transactions")
+        .join("evidence")
+        .join(transaction_id)
+        .join(format!("{step_id}.json"))
+}
+
+fn legacy_evidence_path(
+    store: &DeploymentStore,
+    deployment_id: &str,
     step_id: &str,
 ) -> std::path::PathBuf {
     store
@@ -898,6 +921,42 @@ fn evidence_path(
         .join("transactions")
         .join("evidence")
         .join(format!("{step_id}.json"))
+}
+
+fn accepted_evidence_path(
+    store: &DeploymentStore,
+    transaction: &UpdateCoordination,
+    step_id: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let current = evidence_path(
+        store,
+        &transaction.deployment_id,
+        &transaction.transaction_id,
+        step_id,
+    );
+    match fs::symlink_metadata(&current) {
+        Ok(_) => return Ok(current),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect transaction-scoped coordination evidence {}",
+                    current.display()
+                )
+            });
+        }
+    }
+    let legacy = legacy_evidence_path(store, &transaction.deployment_id, step_id);
+    match fs::symlink_metadata(&legacy) {
+        Ok(_) => Ok(legacy),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(current),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect legacy coordination evidence {}",
+                legacy.display()
+            )
+        }),
+    }
 }
 
 fn load_path(path: &Path) -> anyhow::Result<UpdateCoordination> {

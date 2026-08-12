@@ -194,17 +194,87 @@ fn external_step_pauses_accepts_bound_evidence_and_resumes_without_claiming_comp
     .unwrap();
     let accepted = submit_evidence(&store, &record, &input).unwrap();
     assert_eq!(accepted.state, CoordinationState::ReadyForController);
+    let legacy = store
+        .deployment_state_dir("deployment-a")
+        .join("transactions/evidence/external-recovery-point.json");
+    fs::write(&legacy, b"{}").unwrap();
     let resumed = resume(&store, &record).unwrap();
     assert_eq!(resumed.state, CoordinationState::ReadyForController);
 
     let stored = fs::read_to_string(
         store
             .deployment_state_dir("deployment-a")
-            .join("transactions/evidence/external-recovery-point.json"),
+            .join("transactions/evidence")
+            .join(&prepared.transaction_id)
+            .join("external-recovery-point.json"),
     )
     .unwrap();
     assert!(stored.contains("\"semantic_completion_claimed\": false"));
     assert!(!stored.contains("password"));
+}
+
+#[test]
+fn completed_transactions_retain_distinct_external_evidence() {
+    let work = PrivateTempDir::new("nazoauthctl-coordination-evidence-history").unwrap();
+    let store = store(&work);
+    let (current, signing_key) = provider_record(&work, "deployment-a");
+    store.persist(&current).unwrap();
+
+    let first = prepare_update(&store, &current, &plan("deployment-a")).unwrap();
+    let first_input = work.path().join("first-evidence.json");
+    fs::write(
+        &first_input,
+        serde_json::to_vec(&evidence(&first, "deployment-a", &signing_key)).unwrap(),
+    )
+    .unwrap();
+    submit_evidence(&store, &current, &first_input).unwrap();
+    complete_controller_step(
+        &store,
+        &current,
+        &first.transaction_id,
+        "replace-runtime",
+        &"d".repeat(64),
+    )
+    .unwrap();
+    let mut updated = current.clone();
+    updated.active_release = first.target_release.clone();
+    updated.declaration_revision += 1;
+    commit_controller_update(
+        &store,
+        &current,
+        &updated,
+        &first.transaction_id,
+        "acceptance",
+        &"e".repeat(64),
+    )
+    .unwrap();
+    finalize_committed_locked(&store, &updated, &first.transaction_id).unwrap();
+
+    let second = prepare_update(&store, &updated, &plan("deployment-a")).unwrap();
+    assert_ne!(first.transaction_id, second.transaction_id);
+    let second_input = work.path().join("second-evidence.json");
+    fs::write(
+        &second_input,
+        serde_json::to_vec(&evidence(&second, "deployment-a", &signing_key)).unwrap(),
+    )
+    .unwrap();
+    submit_evidence(&store, &updated, &second_input).unwrap();
+
+    let evidence_root = store
+        .deployment_state_dir("deployment-a")
+        .join("transactions/evidence");
+    assert!(
+        evidence_root
+            .join(&first.transaction_id)
+            .join("external-recovery-point.json")
+            .is_file()
+    );
+    assert!(
+        evidence_root
+            .join(&second.transaction_id)
+            .join("external-recovery-point.json")
+            .is_file()
+    );
 }
 
 #[test]
@@ -319,7 +389,9 @@ fn resume_recomputes_and_rejects_a_tampered_source_digest() {
 
     let persisted = store
         .deployment_state_dir("deployment-a")
-        .join("transactions/evidence/external-recovery-point.json");
+        .join("transactions/evidence")
+        .join(&prepared.transaction_id)
+        .join("external-recovery-point.json");
     let mut accepted: AcceptedEvidence =
         serde_json::from_slice(&fs::read(&persisted).unwrap()).unwrap();
     accepted.source_manifest_sha256 = "0".repeat(64);
@@ -360,9 +432,41 @@ fn evidence_cannot_cross_deployment_or_survive_persisted_tampering() {
     submit_evidence(&store, &record_a, &input).unwrap();
     let persisted = store
         .deployment_state_dir("deployment-a")
-        .join("transactions/evidence/external-recovery-point.json");
+        .join("transactions/evidence")
+        .join(&prepared.transaction_id)
+        .join("external-recovery-point.json");
     fs::write(&persisted, b"{}").unwrap();
     assert!(resume(&store, &record_a).is_err());
+}
+
+#[test]
+fn accepted_legacy_evidence_remains_resumable() {
+    let work = PrivateTempDir::new("nazoauthctl-coordination-legacy-evidence").unwrap();
+    let store = store(&work);
+    let (record, signing_key) = provider_record(&work, "deployment-a");
+    let prepared = prepare_update(&store, &record, &plan("deployment-a")).unwrap();
+    let input = work.path().join("evidence.json");
+    fs::write(
+        &input,
+        serde_json::to_vec(&evidence(&prepared, "deployment-a", &signing_key)).unwrap(),
+    )
+    .unwrap();
+    submit_evidence(&store, &record, &input).unwrap();
+
+    let evidence_root = store
+        .deployment_state_dir("deployment-a")
+        .join("transactions/evidence");
+    let current = evidence_root
+        .join(&prepared.transaction_id)
+        .join("external-recovery-point.json");
+    let legacy = evidence_root.join("external-recovery-point.json");
+    fs::rename(&current, &legacy).unwrap();
+
+    assert_eq!(
+        resume(&store, &record).unwrap().state,
+        CoordinationState::ReadyForController
+    );
+    assert!(legacy.is_file());
 }
 
 #[test]
