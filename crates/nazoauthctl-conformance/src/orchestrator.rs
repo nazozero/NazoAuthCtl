@@ -12,10 +12,9 @@ use thiserror::Error;
 use url::Url;
 
 use crate::browser::{
-    BrowserAutomation, BrowserError, BrowserPolicy, BrowserRunnerState, BrowserTargetOrigin,
-    ConformanceBinding, OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule,
-    OpenId4VpStartRequest, OpenId4VpVerifier, browser_config_for_module,
-    parse_browser_entries_owned,
+    BrowserAutomation, BrowserPolicy, BrowserRunnerState, BrowserTargetOrigin, ConformanceBinding,
+    OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpStartRequest,
+    OpenId4VpVerifier, browser_config_for_module, parse_browser_entries_owned,
 };
 use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
 use crate::matrix::{MatrixError, SelectedMatrix};
@@ -368,31 +367,6 @@ impl ConformanceRunner {
         }
     }
 
-    fn wait_for_browser_url_interruptible(
-        &self,
-        browser: &mut dyn BrowserAutomation,
-        expected: &Url,
-        timeout: Duration,
-    ) -> Result<(), String> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| "browser poll timeout is out of range".to_owned())?;
-        loop {
-            if self.config.control.is_interrupted() {
-                return Err("run interrupted".to_owned());
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(BrowserError::Timeout.to_string());
-            }
-            match browser.wait_for_url(expected, remaining.min(Duration::from_secs(5))) {
-                Ok(()) => return Ok(()),
-                Err(BrowserError::Timeout) => continue,
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-    }
-
     pub fn run<S: ProgressSink>(&self, sink: &mut S) -> RunSummary {
         if self.config.jobs == 1 || self.config.matrix.document.plan_count() <= 1 {
             return self.run_serial(sink);
@@ -673,19 +647,6 @@ impl ConformanceRunner {
                                 }
                             }
                         } else if plan.plan_name.starts_with("oid4vp-1final-verifier") {
-                            let Some(browser) = self
-                                .config
-                                .automation
-                                .first()
-                                .and_then(|automation| automation.browser.as_ref())
-                            else {
-                                errors.push(
-                                    "Suite runner is WAITING but browser automation is unavailable"
-                                        .to_owned(),
-                                );
-                                groups[group_index].status = GroupStatus::Failed;
-                                break 'execute;
-                            };
                             let Some(verifier) = self
                                 .config
                                 .automation
@@ -723,43 +684,24 @@ impl ConformanceRunner {
                                     break 'execute;
                                 }
                             };
-                            let presentation = {
-                                let mut verifier = match verifier.lock() {
-                                    Ok(verifier) => verifier,
-                                    Err(_) => {
-                                        errors.push("OpenID4VP verifier lock failed".to_owned());
-                                        groups[group_index].status = GroupStatus::Failed;
-                                        break 'execute;
-                                    }
-                                };
-                                match verifier.start(&request) {
-                                    Ok(presentation) => presentation,
-                                    Err(error) => {
-                                        errors.push(error.to_string());
-                                        groups[group_index].status = GroupStatus::Failed;
-                                        break 'execute;
-                                    }
-                                }
-                            };
-                            let mut driver = match browser.lock() {
-                                Ok(driver) => driver,
+                            let mut verifier = match verifier.lock() {
+                                Ok(verifier) => verifier,
                                 Err(_) => {
-                                    errors.push("browser automation lock failed".to_owned());
+                                    errors.push("OpenID4VP verifier lock failed".to_owned());
                                     groups[group_index].status = GroupStatus::Failed;
                                     break 'execute;
                                 }
                             };
-                            if let Err(error) = driver.navigate(&presentation.authorization_url) {
+                            let presentation = match verifier.start(&request) {
+                                Ok(presentation) => presentation,
+                                Err(error) => {
+                                    errors.push(error.to_string());
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                }
+                            };
+                            if let Err(error) = verifier.complete(&presentation) {
                                 errors.push(error.to_string());
-                                groups[group_index].status = GroupStatus::Failed;
-                                break 'execute;
-                            }
-                            if let Err(error) = self.wait_for_browser_url_interruptible(
-                                &mut *driver,
-                                &presentation.completion_url,
-                                self.config.poll_timeout.min(Duration::from_secs(300)),
-                            ) {
-                                errors.push(error);
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
                             }
@@ -1181,6 +1123,7 @@ fn same_url_origin(origin: &Origin, url: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::BrowserError;
     use crate::client::ClientConfig;
     use crate::credentials::BearerToken;
     use crate::matrix::{MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix};

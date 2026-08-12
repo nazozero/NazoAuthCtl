@@ -159,6 +159,11 @@ pub trait OpenId4VpVerifier: Send {
         &mut self,
         request: &OpenId4VpStartRequest,
     ) -> Result<OpenId4VpPresentation, OpenId4VpError>;
+
+    /// Deliver the presentation request to the Suite wallet and require the
+    /// one redirect that proves the target transaction completed. This is an
+    /// HTTP protocol step, not an interactive browser session.
+    fn complete(&mut self, presentation: &OpenId4VpPresentation) -> Result<(), OpenId4VpError>;
 }
 
 /// Rust-native client for NazoAuth's verifier-start endpoint.
@@ -380,6 +385,60 @@ impl OpenId4VpVerifierClient {
         (self.target_origin.allows(url) || self.suite_origin.same_origin_url(url))
             && matches!(url.scheme(), "https" | "http")
     }
+
+    fn complete_presentation(
+        &self,
+        presentation: &OpenId4VpPresentation,
+    ) -> Result<(), OpenId4VpError> {
+        let response = self
+            .transport
+            .send(
+                HttpRequest {
+                    method: HttpMethod::Get,
+                    url: presentation.authorization_url.clone(),
+                    headers: vec![(
+                        "Accept".to_owned(),
+                        "text/html,application/xhtml+xml".to_owned(),
+                    )],
+                    body: None,
+                },
+                self.max_response_bytes,
+            )
+            .map_err(OpenId4VpError::Transport)?;
+        if !matches!(response.status, 302 | 303) {
+            return Err(OpenId4VpError::UnexpectedAuthorizationRedirect);
+        }
+        let location = response
+            .header("Location")
+            .ok_or(OpenId4VpError::UnexpectedAuthorizationRedirect)?;
+        let redirected = presentation
+            .authorization_url
+            .join(location)
+            .map_err(|_| OpenId4VpError::UnexpectedAuthorizationRedirect)?;
+        if redirected != presentation.completion_url {
+            return Err(OpenId4VpError::UnexpectedAuthorizationRedirect);
+        }
+
+        let completed = self
+            .transport
+            .send(
+                HttpRequest {
+                    method: HttpMethod::Get,
+                    url: presentation.completion_url.clone(),
+                    headers: vec![(
+                        "Accept".to_owned(),
+                        "text/html,application/xhtml+xml".to_owned(),
+                    )],
+                    body: None,
+                },
+                self.max_response_bytes,
+            )
+            .map_err(OpenId4VpError::Transport)?;
+        if !(200..300).contains(&completed.status) {
+            return Err(OpenId4VpError::CompletionFailed);
+        }
+        Ok(())
+    }
 }
 
 impl OpenId4VpVerifier for OpenId4VpVerifierClient {
@@ -388,6 +447,10 @@ impl OpenId4VpVerifier for OpenId4VpVerifierClient {
         request: &OpenId4VpStartRequest,
     ) -> Result<OpenId4VpPresentation, OpenId4VpError> {
         self.start_presentation(request)
+    }
+
+    fn complete(&mut self, presentation: &OpenId4VpPresentation) -> Result<(), OpenId4VpError> {
+        self.complete_presentation(presentation)
     }
 }
 
@@ -411,12 +474,17 @@ pub enum OpenId4VpError {
     MalformedResponse,
     #[error("OpenID4VP authorization URL crossed the browser allowlist")]
     CrossOriginNavigation,
+    #[error("OpenID4VP wallet returned an unexpected authorization redirect")]
+    UnexpectedAuthorizationRedirect,
+    #[error("OpenID4VP verifier completion endpoint failed")]
+    CompletionFailed,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport::{HttpResponse, TransportError};
+    use std::collections::VecDeque;
 
     struct VerifierTransport {
         request: std::sync::Mutex<Option<HttpRequest>>,
@@ -434,6 +502,26 @@ mod tests {
                 .lock()
                 .expect("response lock")
                 .take()
+                .ok_or(TransportError::Network)
+        }
+    }
+
+    struct CompletionTransport {
+        requests: std::sync::Mutex<Vec<HttpRequest>>,
+        responses: std::sync::Mutex<VecDeque<HttpResponse>>,
+    }
+
+    impl Transport for CompletionTransport {
+        fn send(
+            &self,
+            request: HttpRequest,
+            _max_response_bytes: usize,
+        ) -> Result<HttpResponse, TransportError> {
+            self.requests.lock().expect("request lock").push(request);
+            self.responses
+                .lock()
+                .expect("response lock")
+                .pop_front()
                 .ok_or(TransportError::Network)
         }
     }
@@ -589,5 +677,103 @@ mod tests {
             OpenId4VpError::BindingMismatch
         );
         assert!(transport.request.lock().expect("request lock").is_none());
+    }
+
+    #[test]
+    fn completes_with_one_exact_redirect_without_browser_automation() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse("https://suite.example").expect("suite");
+        let completion_url = Url::parse(
+            "https://issuer.example/openid4vp/complete/550e8400-e29b-41d4-a716-446655440000",
+        )
+        .expect("completion URL");
+        let transport = Arc::new(CompletionTransport {
+            requests: std::sync::Mutex::new(Vec::new()),
+            responses: std::sync::Mutex::new(VecDeque::from([
+                HttpResponse {
+                    status: 302,
+                    headers: vec![("Location".to_owned(), completion_url.to_string())],
+                    body: Vec::new(),
+                },
+                HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"complete".to_vec(),
+                },
+            ])),
+        });
+        let mut client = OpenId4VpVerifierClient::with_transport(
+            target,
+            suite,
+            Zeroizing::new("management-secret".to_owned()),
+            transport.clone(),
+            binding(),
+        )
+        .expect("client");
+        let presentation = OpenId4VpPresentation {
+            authorization_url: Url::parse(
+                "https://suite.example/test/a/vp/authorize?request_uri=urn%3Aexample",
+            )
+            .expect("authorization URL"),
+            completion_url: completion_url.clone(),
+            transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+                .expect("transaction ID"),
+        };
+
+        client.complete(&presentation).expect("completion");
+
+        let requests = transport.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method(), HttpMethod::Get);
+        assert_eq!(requests[0].url(), &presentation.authorization_url);
+        assert_eq!(requests[1].url(), &completion_url);
+        assert_eq!(
+            requests[0].header("Accept"),
+            Some("text/html,application/xhtml+xml")
+        );
+    }
+
+    #[test]
+    fn rejects_redirect_not_bound_to_the_created_transaction() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse("https://suite.example").expect("suite");
+        let transport = Arc::new(CompletionTransport {
+            requests: std::sync::Mutex::new(Vec::new()),
+            responses: std::sync::Mutex::new(VecDeque::from([HttpResponse {
+                status: 302,
+                headers: vec![(
+                    "Location".to_owned(),
+                    "https://issuer.example/openid4vp/complete/00000000-0000-0000-0000-000000000000"
+                        .to_owned(),
+                )],
+                body: Vec::new(),
+            }])),
+        });
+        let mut client = OpenId4VpVerifierClient::with_transport(
+            target,
+            suite,
+            Zeroizing::new("management-secret".to_owned()),
+            transport.clone(),
+            binding(),
+        )
+        .expect("client");
+        let presentation = OpenId4VpPresentation {
+            authorization_url: Url::parse("https://suite.example/test/a/vp/authorize?x=1")
+                .expect("authorization URL"),
+            completion_url: Url::parse(
+                "https://issuer.example/openid4vp/complete/550e8400-e29b-41d4-a716-446655440000",
+            )
+            .expect("completion URL"),
+            transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+                .expect("transaction ID"),
+        };
+
+        assert_eq!(
+            client
+                .complete(&presentation)
+                .expect_err("redirect mismatch"),
+            OpenId4VpError::UnexpectedAuthorizationRedirect
+        );
+        assert_eq!(transport.requests.lock().expect("request lock").len(), 1);
     }
 }
