@@ -52,7 +52,12 @@ jobs:
           import tomllib
 
           manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
-          expected = f"v{manifest['package']['version']}"
+          package_version = manifest["package"]["version"]
+          if isinstance(package_version, dict) and package_version.get("workspace") is True:
+              package_version = manifest["workspace"]["package"]["version"]
+          if not isinstance(package_version, str):
+              raise SystemExit("Cargo package version has no concrete workspace value")
+          expected = f"v{package_version}"
           actual = os.environ["RELEASE_TAG"]
           if os.environ["RELEASE_REF_TYPE"] == "tag" and actual != expected:
               raise SystemExit(f"release tag {actual!r} does not match Cargo package version {expected!r}")
