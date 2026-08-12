@@ -422,11 +422,13 @@ impl OpenId4VpVerifierClient {
                 self.max_response_bytes,
             )
             .map_err(OpenId4VpError::Transport)?;
-        // OID4VP negative tests explicitly pass when the verifier rejects the
-        // invalid response at response_uri with a 4xx. Only those named tests
-        // may terminate without the transaction completion redirect; positive
-        // tests and deferred verification remain bound to the exact redirect.
-        if (400..500).contains(&response.status) && presentation.immediate_rejection_allowed {
+        // For an OID4VP negative test, the target's response_uri may reject the
+        // invalid presentation with 4xx. The Suite then returns a 2xx result
+        // page from its authorization endpoint instead of redirecting to the
+        // target completion page. Only the named negative tests may terminate
+        // on that Suite 2xx; positive and deferred-verification flows remain
+        // bound to the exact completion redirect.
+        if (200..300).contains(&response.status) && presentation.immediate_rejection_allowed {
             return Ok(());
         }
         if !matches!(response.status, 302 | 303) {
@@ -759,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn negative_test_accepts_immediate_4xx_without_completion_redirect() {
+    fn negative_test_accepts_suite_2xx_after_target_immediate_rejection() {
         let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
         let suite = Origin::parse("https://suite.example").expect("suite");
         let transport = Arc::new(CompletionTransport {
@@ -775,7 +777,7 @@ mod tests {
                     .expect("start response"),
                 },
                 HttpResponse {
-                    status: 400,
+                    status: 200,
                     headers: Vec::new(),
                     body: Vec::new(),
                 },
@@ -806,7 +808,45 @@ mod tests {
     }
 
     #[test]
-    fn positive_test_rejects_4xx_without_completion_redirect() {
+    fn positive_test_rejects_suite_2xx_without_completion_redirect() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse("https://suite.example").expect("suite");
+        let transport = Arc::new(CompletionTransport {
+            requests: std::sync::Mutex::new(Vec::new()),
+            responses: std::sync::Mutex::new(VecDeque::from([HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new(),
+            }])),
+        });
+        let mut client = OpenId4VpVerifierClient::with_transport(
+            target,
+            suite,
+            Zeroizing::new("management-secret".to_owned()),
+            transport,
+            binding(),
+        )
+        .expect("client");
+        let presentation = OpenId4VpPresentation {
+            authorization_url: Url::parse("https://suite.example/test/a/vp/authorize?x=1")
+                .expect("authorization URL"),
+            completion_url: Url::parse(
+                "https://issuer.example/openid4vp/complete/550e8400-e29b-41d4-a716-446655440000",
+            )
+            .expect("completion URL"),
+            transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+                .expect("transaction ID"),
+            immediate_rejection_allowed: false,
+        };
+
+        assert_eq!(
+            client.complete(&presentation).expect_err("positive 4xx"),
+            OpenId4VpError::UnexpectedAuthorizationRedirect
+        );
+    }
+
+    #[test]
+    fn negative_test_rejects_suite_4xx_transport_failure() {
         let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
         let suite = Origin::parse("https://suite.example").expect("suite");
         let transport = Arc::new(CompletionTransport {
@@ -834,11 +874,11 @@ mod tests {
             .expect("completion URL"),
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
-            immediate_rejection_allowed: false,
+            immediate_rejection_allowed: true,
         };
 
         assert_eq!(
-            client.complete(&presentation).expect_err("positive 4xx"),
+            client.complete(&presentation).expect_err("Suite 4xx"),
             OpenId4VpError::UnexpectedAuthorizationRedirect
         );
     }
