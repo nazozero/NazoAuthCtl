@@ -3,17 +3,18 @@ use std::ffi::OsString;
 use std::io::{self, IsTerminal as _, Read as _, Write as _};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, bail};
 use nazoauthctl_conformance::{
-    BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy, BrowserTargetOrigin,
-    ClientConfig, ConformanceAutomation, ConformanceBinding, ConformanceRunConfig,
-    ConformanceRunner, CredentialStore, DescriptorMaterializer, MAX_PARALLEL_JOBS,
-    MAX_POLL_TIMEOUT_SECONDS, ManagedWebDriver, MatrixSelection, OnboardingOutput,
-    OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
-    OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
-    TtyRenderer, WebDriverClient, WebDriverEndpoint,
+    ArtifactTrustPolicy, BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy,
+    BrowserTargetOrigin, ClientConfig, ConformanceAutomation, ConformanceBinding,
+    ConformanceRunConfig, ConformanceRunner, CredentialStore, DescriptorMaterializer,
+    MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT_SECONDS, ManagedWebDriver, MatrixSelection,
+    OnboardingOutput, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
+    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl,
+    StableRenderer, SuiteClient, TtyRenderer, WebDriverClient, WebDriverEndpoint,
+    read_artifact_matrix, read_compact_manifest, verify_oidf_artifact,
 };
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
@@ -26,6 +27,16 @@ const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
 
 fn main() {
     let args = env::args_os().collect::<Vec<_>>();
+    let artifact = match parse_artifact_verify_invocation(&args) {
+        Ok(invocation) => invocation,
+        Err(error) => exit_with_error(&error),
+    };
+    if let Some(invocation) = artifact {
+        match execute_artifact_verify(invocation) {
+            Ok(()) => return,
+            Err(error) => exit_with_error(&error),
+        }
+    }
     let invocation = match parse_run_invocation(&args) {
         Ok(Some(invocation)) => invocation,
         Ok(None) => {
@@ -39,6 +50,112 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(error) => exit_with_error(&error),
     }
+}
+
+struct ArtifactVerifyInvocation {
+    trust_policy: PathBuf,
+    manifest: PathBuf,
+    matrix: PathBuf,
+    capabilities: std::collections::BTreeSet<String>,
+}
+
+fn parse_artifact_verify_invocation(
+    args: &[OsString],
+) -> anyhow::Result<Option<ArtifactVerifyInvocation>> {
+    let mut values = args
+        .iter()
+        .skip(1)
+        .map(|value| {
+            value
+                .to_str()
+                .map(ToOwned::to_owned)
+                .context("artifact verification arguments must be valid UTF-8")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if values.first().map(String::as_str) != Some("conformance")
+        || values.get(1).map(String::as_str) != Some("artifact")
+        || values.get(2).map(String::as_str) != Some("verify")
+    {
+        return Ok(None);
+    }
+    values.drain(..3);
+    if values
+        .iter()
+        .any(|value| matches!(value.as_str(), "-h" | "--help"))
+    {
+        print_artifact_verify_help();
+        std::process::exit(0);
+    }
+    let mut trust_policy = None;
+    let mut manifest = None;
+    let mut matrix = None;
+    let mut capabilities = std::collections::BTreeSet::new();
+    let mut index = 0usize;
+    while index < values.len() {
+        let option = values[index].as_str();
+        if !matches!(
+            option,
+            "--trust-policy" | "--manifest" | "--matrix" | "--capability"
+        ) {
+            bail!("unknown conformance artifact verify option: {option}");
+        }
+        let value = values
+            .get(index + 1)
+            .with_context(|| format!("{option} requires a value"))?
+            .clone();
+        match option {
+            "--trust-policy" => {
+                set_once(&mut trust_policy, PathBuf::from(value), option)?;
+            }
+            "--manifest" => set_once(&mut manifest, PathBuf::from(value), option)?,
+            "--matrix" => set_once(&mut matrix, PathBuf::from(value), option)?,
+            "--capability" => {
+                if !capabilities.insert(value) {
+                    bail!("--capability values must be unique");
+                }
+            }
+            _ => unreachable!(),
+        }
+        index += 2;
+    }
+    Ok(Some(ArtifactVerifyInvocation {
+        trust_policy: trust_policy.context("--trust-policy is required")?,
+        manifest: manifest.context("--manifest is required")?,
+        matrix: matrix.context("--matrix is required")?,
+        capabilities,
+    }))
+}
+
+fn execute_artifact_verify(invocation: ArtifactVerifyInvocation) -> anyhow::Result<()> {
+    let trust = ArtifactTrustPolicy::from_path(&invocation.trust_policy)
+        .context("OIDF artifact trust policy is invalid")?;
+    let manifest = read_compact_manifest(&invocation.manifest)
+        .context("signed OIDF driver manifest is invalid")?;
+    let matrix =
+        read_artifact_matrix(&invocation.matrix).context("OIDF artifact matrix is invalid")?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    let now = i64::try_from(now).context("system clock exceeds the supported range")?;
+    let artifact = verify_oidf_artifact(&manifest, &matrix, &trust, &invocation.capabilities, now)
+        .context("OIDF artifact verification failed")?;
+    serde_json::to_writer_pretty(
+        io::stdout().lock(),
+        &serde_json::json!({
+            "schema": 1,
+            "verified": true,
+            "artifact": artifact,
+        }),
+    )
+    .context("failed to write verified artifact identity")?;
+    writeln!(io::stdout()).context("failed to finish verified artifact identity")
+}
+
+fn print_artifact_verify_help() {
+    println!(
+        "Usage:\n  nazoauthctl conformance artifact verify --trust-policy PATH --manifest PATH --matrix PATH [--capability NAME ...]\n\nThe command performs no NazoAuth or Suite mutation. It emits a verified identity only after the local trust policy, ES256 signature, source, validity window, Suite identity, matrix digest/size/schema, resource bounds, and all required capabilities have been accepted."
+    );
 }
 
 fn exit_with_error(error: &anyhow::Error) -> ! {
@@ -645,6 +762,72 @@ mod tests {
             parse_run_invocation(&args(&["nazoauthctl", "status"]))
                 .expect("parse")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn artifact_verify_is_a_separate_non_deployment_command() {
+        let parsed = parse_artifact_verify_invocation(&args(&[
+            "nazoauthctl",
+            "conformance",
+            "artifact",
+            "verify",
+            "--trust-policy",
+            "/etc/nazoauthctl/oidf-trust.json",
+            "--manifest",
+            "/tmp/driver.jws",
+            "--matrix",
+            "/tmp/matrix.json",
+            "--capability",
+            "nazoauth.client.create",
+        ]))
+        .expect("parse")
+        .expect("artifact verification");
+        assert_eq!(
+            parsed.trust_policy,
+            PathBuf::from("/etc/nazoauthctl/oidf-trust.json")
+        );
+        assert!(parsed.capabilities.contains("nazoauth.client.create"));
+        assert!(
+            parse_run_invocation(&args(
+                &["nazoauthctl", "conformance", "artifact", "verify",]
+            ))
+            .expect("run parser")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn artifact_verify_requires_closed_unique_inputs() {
+        assert!(
+            parse_artifact_verify_invocation(&args(&[
+                "nazoauthctl",
+                "conformance",
+                "artifact",
+                "verify",
+                "--trust-policy",
+                "/trust.json",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_artifact_verify_invocation(&args(&[
+                "nazoauthctl",
+                "conformance",
+                "artifact",
+                "verify",
+                "--trust-policy",
+                "/trust.json",
+                "--manifest",
+                "/driver.jws",
+                "--matrix",
+                "/matrix.json",
+                "--capability",
+                "nazoauth.client.create",
+                "--capability",
+                "nazoauth.client.create",
+            ]))
+            .is_err()
         );
     }
 

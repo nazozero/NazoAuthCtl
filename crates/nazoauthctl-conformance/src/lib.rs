@@ -7,6 +7,7 @@
 //! results are retained verbatim; orchestration only treats `FINISHED` with
 //! the Suite's `PASSED` result as a successful module.
 
+mod artifact;
 mod browser;
 mod client;
 mod credentials;
@@ -20,6 +21,13 @@ mod report;
 mod secure_file;
 mod transport;
 
+pub use artifact::{
+    ArtifactError, ArtifactTrustPolicy, MAX_ARTIFACT_MATRIX_BYTES, MAX_SIGNED_DRIVER_BYTES,
+    OIDF_ARTIFACT_SCHEMA_VERSION, OIDF_DRIVER_ENGINE_PROTOCOL, OIDF_MATRIX_SCHEMA_VERSION,
+    OidfArtifactMatrix, OidfArtifactMatrixGroup, OidfArtifactMatrixPlan, OidfArtifactMatrixVariant,
+    OidfDriverManifest, OidfMatrixIdentity, OidfResourceBounds, OidfSuiteIdentity,
+    VerifiedOidfArtifact, read_artifact_matrix, read_compact_manifest, verify_oidf_artifact,
+};
 pub use browser::{
     BrowserAutomation, BrowserCommand, BrowserDriver, BrowserEntry, BrowserError, BrowserExecutor,
     BrowserLimits, BrowserPolicy, BrowserRunReport, BrowserRunnerState, BrowserSelector,

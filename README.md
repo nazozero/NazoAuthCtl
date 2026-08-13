@@ -25,7 +25,8 @@ NazoAuth commit and an exact package version.
   requires a separately stored, encrypted off-host recovery package.
 
 See [architecture](docs/architecture.md), [recovery boundaries](docs/recovery.md),
-[discovery and adoption](docs/discovery-adoption.md), and
+[discovery and adoption](docs/discovery-adoption.md),
+[signed OIDF driver artifacts](docs/oidf-artifacts.md), and
 [compatibility](docs/compatibility.md). The strict manual-deployment input is
 documented in the [lifecycle contract](docs/lifecycle-contract.md).
 
