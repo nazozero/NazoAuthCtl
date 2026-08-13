@@ -8,6 +8,7 @@
 //! the Suite's `PASSED` result as a successful module.
 
 mod artifact;
+mod artifact_discovery;
 mod browser;
 mod client;
 mod credentials;
@@ -26,8 +27,10 @@ pub use artifact::{
     OIDF_ARTIFACT_SCHEMA_VERSION, OIDF_DRIVER_ENGINE_PROTOCOL, OIDF_MATRIX_SCHEMA_VERSION,
     OidfArtifactMatrix, OidfArtifactMatrixGroup, OidfArtifactMatrixPlan, OidfArtifactMatrixVariant,
     OidfDriverManifest, OidfMatrixIdentity, OidfResourceBounds, OidfSuiteIdentity,
-    VerifiedOidfArtifact, read_artifact_matrix, read_compact_manifest, verify_oidf_artifact,
+    VerifiedOidfArtifact, VerifiedOidfDriverManifest, read_artifact_matrix, read_compact_manifest,
+    verify_oidf_artifact, verify_oidf_driver_manifest, verify_oidf_matrix,
 };
+pub use artifact_discovery::{ArtifactDiscoveryError, ResolvedOidfArtifact, resolve_oidf_artifact};
 pub use browser::{
     BrowserAutomation, BrowserCommand, BrowserDriver, BrowserEntry, BrowserError, BrowserExecutor,
     BrowserLimits, BrowserPolicy, BrowserRunReport, BrowserRunnerState, BrowserSelector,
