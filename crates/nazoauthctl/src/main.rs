@@ -14,7 +14,7 @@ use nazoauthctl_conformance::{
     OnboardingOutput, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
     OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl,
     StableRenderer, SuiteClient, TtyRenderer, WebDriverClient, WebDriverEndpoint,
-    read_artifact_matrix, read_compact_manifest, verify_oidf_artifact,
+    read_artifact_matrix, read_compact_manifest, resolve_oidf_artifact, verify_oidf_artifact,
 };
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
@@ -27,6 +27,16 @@ const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
 
 fn main() {
     let args = env::args_os().collect::<Vec<_>>();
+    let resolution = match parse_artifact_resolve_invocation(&args) {
+        Ok(invocation) => invocation,
+        Err(error) => exit_with_error(&error),
+    };
+    if let Some(invocation) = resolution {
+        match execute_artifact_resolve(invocation) {
+            Ok(()) => return,
+            Err(error) => exit_with_error(&error),
+        }
+    }
     let artifact = match parse_artifact_verify_invocation(&args) {
         Ok(invocation) => invocation,
         Err(error) => exit_with_error(&error),
@@ -50,6 +60,111 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(error) => exit_with_error(&error),
     }
+}
+
+struct ArtifactResolveInvocation {
+    trust_policy: PathBuf,
+    manifest_url: String,
+    cache_directory: PathBuf,
+    capabilities: std::collections::BTreeSet<String>,
+}
+
+fn parse_artifact_resolve_invocation(
+    args: &[OsString],
+) -> anyhow::Result<Option<ArtifactResolveInvocation>> {
+    let mut values = args
+        .iter()
+        .skip(1)
+        .map(|value| {
+            value
+                .to_str()
+                .map(ToOwned::to_owned)
+                .context("artifact resolution arguments must be valid UTF-8")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if values.first().map(String::as_str) != Some("conformance")
+        || values.get(1).map(String::as_str) != Some("artifact")
+        || values.get(2).map(String::as_str) != Some("resolve")
+    {
+        return Ok(None);
+    }
+    values.drain(..3);
+    if values
+        .iter()
+        .any(|value| matches!(value.as_str(), "-h" | "--help"))
+    {
+        print_artifact_resolve_help();
+        std::process::exit(0);
+    }
+    let mut trust_policy = None;
+    let mut manifest_url = None;
+    let mut cache_directory = None;
+    let mut capabilities = std::collections::BTreeSet::new();
+    let mut index = 0usize;
+    while index < values.len() {
+        let option = values[index].as_str();
+        if !matches!(
+            option,
+            "--trust-policy" | "--manifest-url" | "--cache-dir" | "--capability"
+        ) {
+            bail!("unknown conformance artifact resolve option: {option}");
+        }
+        let value = values
+            .get(index + 1)
+            .with_context(|| format!("{option} requires a value"))?
+            .clone();
+        match option {
+            "--trust-policy" => {
+                set_once(&mut trust_policy, PathBuf::from(value), option)?;
+            }
+            "--manifest-url" => set_once(&mut manifest_url, value, option)?,
+            "--cache-dir" => {
+                set_once(&mut cache_directory, PathBuf::from(value), option)?;
+            }
+            "--capability" => {
+                if !capabilities.insert(value) {
+                    bail!("--capability values must be unique");
+                }
+            }
+            _ => unreachable!(),
+        }
+        index += 2;
+    }
+    Ok(Some(ArtifactResolveInvocation {
+        trust_policy: trust_policy.context("--trust-policy is required")?,
+        manifest_url: manifest_url.context("--manifest-url is required")?,
+        cache_directory: cache_directory.context("--cache-dir is required")?,
+        capabilities,
+    }))
+}
+
+fn execute_artifact_resolve(invocation: ArtifactResolveInvocation) -> anyhow::Result<()> {
+    let trust = ArtifactTrustPolicy::from_path(&invocation.trust_policy)
+        .context("OIDF artifact trust policy is invalid")?;
+    let resolution = resolve_oidf_artifact(
+        &invocation.manifest_url,
+        &trust,
+        &invocation.capabilities,
+        &invocation.cache_directory,
+        current_unix_time()?,
+    )
+    .context("OIDF artifact discovery failed")?;
+    serde_json::to_writer_pretty(
+        io::stdout().lock(),
+        &serde_json::json!({
+            "schema": 1,
+            "resolved": true,
+            "resolution": resolution,
+        }),
+    )
+    .context("failed to write resolved artifact identity")?;
+    writeln!(io::stdout()).context("failed to finish resolved artifact identity")
+}
+
+fn print_artifact_resolve_help() {
+    println!(
+        "Usage:\n  nazoauthctl conformance artifact resolve --trust-policy PATH --manifest-url HTTPS_URL --cache-dir PATH [--capability NAME ...]\n\nThe command fetches a bounded manifest without redirects, verifies it before following its signed matrix URL, verifies the exact matrix bytes, and commits an immutable owner-only cache entry with a final verified record marker. It performs no NazoAuth or Suite mutation."
+    );
 }
 
 struct ArtifactVerifyInvocation {
@@ -133,13 +248,14 @@ fn execute_artifact_verify(invocation: ArtifactVerifyInvocation) -> anyhow::Resu
         .context("signed OIDF driver manifest is invalid")?;
     let matrix =
         read_artifact_matrix(&invocation.matrix).context("OIDF artifact matrix is invalid")?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
-        .as_secs();
-    let now = i64::try_from(now).context("system clock exceeds the supported range")?;
-    let artifact = verify_oidf_artifact(&manifest, &matrix, &trust, &invocation.capabilities, now)
-        .context("OIDF artifact verification failed")?;
+    let artifact = verify_oidf_artifact(
+        &manifest,
+        &matrix,
+        &trust,
+        &invocation.capabilities,
+        current_unix_time()?,
+    )
+    .context("OIDF artifact verification failed")?;
     serde_json::to_writer_pretty(
         io::stdout().lock(),
         &serde_json::json!({
@@ -150,6 +266,14 @@ fn execute_artifact_verify(invocation: ArtifactVerifyInvocation) -> anyhow::Resu
     )
     .context("failed to write verified artifact identity")?;
     writeln!(io::stdout()).context("failed to finish verified artifact identity")
+}
+
+fn current_unix_time() -> anyhow::Result<i64> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    i64::try_from(now).context("system clock exceeds the supported range")
 }
 
 fn print_artifact_verify_help() {
@@ -167,10 +291,7 @@ fn exit_with_error(error: &anyhow::Error) -> ! {
     });
     let _ = serde_json::to_writer_pretty(io::stdout().lock(), &output);
     let _ = writeln!(io::stdout());
-    let _ = writeln!(
-        io::stderr(),
-        "nazoauthctl conformance run failed: {error:#}"
-    );
+    let _ = writeln!(io::stderr(), "nazoauthctl failed: {error:#}");
     std::process::exit(1)
 }
 
@@ -822,6 +943,68 @@ mod tests {
                 "/driver.jws",
                 "--matrix",
                 "/matrix.json",
+                "--capability",
+                "nazoauth.client.create",
+                "--capability",
+                "nazoauth.client.create",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn artifact_resolve_requires_trust_channel_cache_and_unique_capabilities() {
+        let parsed = parse_artifact_resolve_invocation(&args(&[
+            "nazoauthctl",
+            "conformance",
+            "artifact",
+            "resolve",
+            "--trust-policy",
+            "/etc/nazoauthctl/oidf-trust.json",
+            "--manifest-url",
+            "https://artifacts.example/oidf/stable/driver.jws",
+            "--cache-dir",
+            "/var/lib/nazoauthctl/oidf-cache",
+            "--capability",
+            "nazoauth.client.create",
+        ]))
+        .expect("parse")
+        .expect("artifact resolution");
+        assert_eq!(
+            parsed.manifest_url,
+            "https://artifacts.example/oidf/stable/driver.jws"
+        );
+        assert_eq!(
+            parsed.cache_directory,
+            PathBuf::from("/var/lib/nazoauthctl/oidf-cache")
+        );
+        assert!(parsed.capabilities.contains("nazoauth.client.create"));
+
+        assert!(
+            parse_artifact_resolve_invocation(&args(&[
+                "nazoauthctl",
+                "conformance",
+                "artifact",
+                "resolve",
+                "--trust-policy",
+                "/trust.json",
+                "--manifest-url",
+                "https://artifacts.example/driver.jws",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_artifact_resolve_invocation(&args(&[
+                "nazoauthctl",
+                "conformance",
+                "artifact",
+                "resolve",
+                "--trust-policy",
+                "/trust.json",
+                "--manifest-url",
+                "https://artifacts.example/driver.jws",
+                "--cache-dir",
+                "/cache",
                 "--capability",
                 "nazoauth.client.create",
                 "--capability",
