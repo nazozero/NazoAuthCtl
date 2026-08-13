@@ -19,6 +19,7 @@ pub(crate) fn help_topic(args: &[String]) -> Option<HelpTopic> {
         ) => HelpTopic::Update,
         Some("keys") => HelpTopic::Keys,
         Some("conformance") => HelpTopic::Conformance,
+        Some("tls") => HelpTopic::Tls,
         Some("audit") => HelpTopic::Audit,
         Some("identity") => HelpTopic::Identity,
         Some("break-glass") => HelpTopic::BreakGlass,

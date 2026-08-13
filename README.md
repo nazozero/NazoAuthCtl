@@ -29,6 +29,8 @@ See [architecture](docs/architecture.md), [recovery boundaries](docs/recovery.md
 [signed OIDF driver artifacts](docs/oidf-artifacts.md), and
 [compatibility](docs/compatibility.md). The strict manual-deployment input is
 documented in the [lifecycle contract](docs/lifecycle-contract.md).
+Deployment-owned public certificate rotation uses the independent
+[TLS certificate provider contract](docs/tls-certificate-provider.md).
 
 On Linux, install an independently attested Release with GitHub CLI available:
 

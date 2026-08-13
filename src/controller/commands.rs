@@ -833,6 +833,12 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 local_development.as_ref(),
             )
         }
+        Command::Tls(command) => crate::tls::run(
+            selector.as_deref(),
+            command,
+            require_root,
+            require_confirmation,
+        ),
         Command::AuditVerify => {
             if let Some((store, record, config)) = registered_audit_context(selector.as_deref())? {
                 let (governance_sequence, governance_head) =
