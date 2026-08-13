@@ -95,6 +95,7 @@ Start here:
   nazoauthctl [--config PATH] update --plan
   nazoauthctl [--config PATH] update --yes
   nazoauthctl [--config PATH] conformance run
+  nazoauthctl conformance artifact verify --trust-policy PATH --manifest PATH --matrix PATH
   nazoauthctl [--deployment ID] development activate --artifact IMAGE_OR_BINARY --yes
 
 Commands:
@@ -118,7 +119,7 @@ Commands:
   recover-identity  Explicitly finish an interrupted identity transition
   migrate       Run the signed migration operation
   keys          List, validate, export OpenID4VC trust, generate, or register signing keys
-  conformance   Run official OIDF tests or manage time-bounded leases
+  conformance   Verify OIDF artifacts, run official tests, or manage time-bounded leases
   audit         Show or verify the management audit chain
   identity      Rotate controller and audit identities
   break-glass   Recover after controller-key loss or suspected theft
@@ -210,6 +211,8 @@ never exports a leaf certificate or private key."
         }
         cli::HelpTopic::Conformance => {
             "Usage:
+  nazoauthctl conformance artifact verify --trust-policy PATH \
+    --manifest PATH --matrix PATH [--capability NAME ...]
   nazoauthctl [--deployment ID] [--config PATH] conformance run [--suite URL]
     [--token TOKEN|--token-file PATH|--token-stdin|--token-fd FD]
     [--webdriver URL] [--evidence-dir PATH] [--group ID] [--plan ID]
@@ -221,6 +224,12 @@ never exports a leaf certificate or private key."
   nazoauthctl [--config PATH] conformance lease list
   nazoauthctl [--config PATH] conformance lease revoke --lease-id UUID --yes
   nazoauthctl [--config PATH] conformance lease cleanup --yes
+
+`conformance artifact verify` is read-only and deployment-independent. It emits a
+verified identity only after checking the local trust policy, ES256 signature,
+source, validity window, Suite identity, strict matrix schema, digest, size,
+resource bounds, and every caller-supplied available capability. It does not
+discover or grant target capabilities and does not execute the Suite.
 
 `conformance run` validates the deployment, authenticates to the official Suite by
 default, obtains the deployment Matrix, creates an atomic lease/onboarding bundle,
