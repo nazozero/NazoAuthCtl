@@ -214,6 +214,55 @@ fn external_step_pauses_accepts_bound_evidence_and_resumes_without_claiming_comp
 }
 
 #[test]
+fn persisted_evidence_is_validated_at_its_durable_acceptance_time() {
+    let work = PrivateTempDir::new("nazoauthctl-coordination-persisted-freshness").unwrap();
+    let store = store(&work);
+    let (record, signing_key) = provider_record(&work, "deployment-a");
+    let transaction = prepare_update(&store, &record, &plan("deployment-a")).unwrap();
+    let step = transaction
+        .steps
+        .iter()
+        .find(|step| step.id == "external-recovery-point")
+        .unwrap();
+    let accepted_at = Utc::now().timestamp() - 7_200;
+    let input = sign_evidence(
+        &transaction,
+        &signing_key,
+        unsigned_evidence(&transaction, "deployment-a", accepted_at - 10),
+    );
+    let source_manifest_sha256 = digest_bytes(&canonical_evidence_bytes(&input).unwrap());
+    let accepted = AcceptedEvidence {
+        schema: EVIDENCE_SCHEMA,
+        evidence: input,
+        source_manifest_sha256,
+        accepted_at,
+        semantic_completion_claimed: false,
+    };
+
+    validate_persisted_evidence(
+        &record,
+        &transaction,
+        step,
+        &serde_json::to_vec(&accepted).unwrap(),
+    )
+    .unwrap();
+
+    let mut expired_on_acceptance = accepted;
+    expired_on_acceptance.accepted_at = expired_on_acceptance.evidence.expires_at;
+    assert!(
+        validate_persisted_evidence(
+            &record,
+            &transaction,
+            step,
+            &serde_json::to_vec(&expired_on_acceptance).unwrap(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("expired")
+    );
+}
+
+#[test]
 fn completed_transactions_retain_distinct_external_evidence() {
     let work = PrivateTempDir::new("nazoauthctl-coordination-evidence-history").unwrap();
     let store = store(&work);
