@@ -1931,6 +1931,39 @@ fn early_update_faults_leave_the_last_durable_phase_for_restart() {
 }
 
 #[test]
+fn persisted_update_resumes_before_observing_the_absent_active_runtime() {
+    let work = PrivateTempDir::new("nazoauth-update-resume-without-active-runtime").unwrap();
+    let config = config(&work);
+    fs::create_dir_all(&config.deployment_root).unwrap();
+    let value = journal(&config, UpdatePhase::WriterStopped);
+    let target = value.to_release.clone();
+    write_update_journal(&config, &value).unwrap();
+
+    let error = resume_persisted_update(
+        &work.path().join("config.json"),
+        &config,
+        &target,
+        &UpdateOptions {
+            version: Some(target.version.clone()),
+            plan: false,
+            yes: true,
+            accept_migration_barrier: true,
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        !error.to_string().contains("managed object is absent"),
+        "resume incorrectly inspected the already-stopped application runtime: {error:#}"
+    );
+    assert_eq!(
+        load_update_journal(&config).unwrap().unwrap().phase,
+        UpdatePhase::BackupCreating,
+        "resume must enter the next durable phase without requiring the already-stopped runtime"
+    );
+}
+
+#[test]
 fn finishing_a_transaction_durably_removes_only_its_journal() {
     let work = PrivateTempDir::new("nazoauth-update-finish").unwrap();
     let config = config(&work);

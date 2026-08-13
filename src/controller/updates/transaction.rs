@@ -12,6 +12,9 @@ pub(crate) fn update(
         config.container_backend(),
     )?;
     enforce_release_trust(&config, &release.manifest)?;
+    if resume_persisted_update(config_path, &config, &release.manifest, &options)? {
+        return Ok(());
+    }
     let active_target = Runtime::new(&config).active_build_target()?;
     let current = active_target.embedded.revision.clone();
     let active = load_active_release(&config)?;
@@ -122,6 +125,45 @@ pub(crate) fn update(
         release.manifest.version, release.manifest.backend_commit
     );
     Ok(())
+}
+
+pub(crate) fn resume_persisted_update(
+    config_path: &Path,
+    config: &UpdateConfig,
+    target: &ReleaseManifest,
+    options: &UpdateOptions,
+) -> anyhow::Result<bool> {
+    if let Some(mut journal) = load_update_journal(config)? {
+        if options.plan {
+            bail!(
+                "update transaction {} is already pending at phase {:?}; inspect or recover the existing transaction instead of creating a new plan",
+                journal.transaction_id,
+                journal.phase
+            );
+        }
+        if journal.to_release != *target {
+            bail!(
+                "pending update transaction targets {}; refusing to resume it with {}",
+                journal.to_release.version,
+                target.version
+            );
+        }
+        require_confirmation(options.yes, "resume the persisted signed Release update")?;
+        if journal.to_release.rollback.irreversible_migration && !options.accept_migration_barrier {
+            bail!(
+                "this Release crosses an irreversible migration barrier; resume with --accept-migration-barrier --yes"
+            );
+        }
+        if let Err(error) = advance_update_transaction(config_path, config, &mut journal) {
+            handle_update_failure(config, &journal, error)?;
+        }
+        println!(
+            "NazoAuth updated to {} ({})",
+            journal.to_release.version, journal.to_release.backend_commit
+        );
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 pub(crate) fn active_target_matches_release(
