@@ -24,10 +24,10 @@ server Releases below without rebuilding them:
 
 | Controller artifact | Server Release | Protocol | Status |
 | --- | --- | --- | --- |
-| current NazoAuthCtl v0.1.45 source, built once | v0.1.34 signed host + OCI | 1 | matrix and real-backend tested |
-| current NazoAuthCtl v0.1.45 source, built once | v0.1.24 signed host + OCI | 1 | artifact/identity matrix-tested |
-| current NazoAuthCtl v0.1.45 source, built once | v0.1.20 signed host + OCI | 1 | artifact/identity matrix-tested |
-| current NazoAuthCtl v0.1.45 source, built once | v0.1.19 signed host + OCI | 1 | artifact/identity matrix-tested |
+| current NazoAuthCtl v0.1.46 source, built once | v0.1.34 signed host + OCI | 1 | matrix and real-backend tested |
+| current NazoAuthCtl v0.1.46 source, built once | v0.1.24 signed host + OCI | 1 | artifact/identity matrix-tested |
+| current NazoAuthCtl v0.1.46 source, built once | v0.1.20 signed host + OCI | 1 | artifact/identity matrix-tested |
+| current NazoAuthCtl v0.1.46 source, built once | v0.1.19 signed host + OCI | 1 | artifact/identity matrix-tested |
 | signed independent NazoAuthCtl v0.1.23 | v0.1.24 signed host + OCI | 1 | artifact/identity matrix-tested |
 | signed independent NazoAuthCtl v0.1.23 | v0.1.20 signed host + OCI | 1 | artifact/identity matrix-tested |
 | signed independent NazoAuthCtl v0.1.23 | v0.1.19 signed host + OCI | 1 | artifact/identity matrix-tested |
