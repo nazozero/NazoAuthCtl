@@ -13,6 +13,7 @@ pub(crate) enum HelpTopic {
     Update,
     Keys,
     Conformance,
+    Tls,
     Audit,
     Identity,
     BreakGlass,
@@ -66,6 +67,7 @@ pub(crate) enum Command {
     },
     Keys(KeysCommand),
     Conformance(ConformanceCommand),
+    Tls(TlsCommand),
     AuditVerify,
     AuditShow {
         request_id: Option<String>,
@@ -88,6 +90,33 @@ pub(crate) enum Command {
     },
     SelfRollback {
         yes: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TlsCertificateInput {
+    pub(crate) provider_config: PathBuf,
+    pub(crate) tenant: String,
+    pub(crate) hostname: String,
+    pub(crate) certificate: PathBuf,
+    pub(crate) private_key: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TlsCommand {
+    Plan(TlsCertificateInput),
+    Apply {
+        input: TlsCertificateInput,
+        yes: bool,
+    },
+    Recover {
+        tenant: String,
+        hostname: String,
+        yes: bool,
+    },
+    Show {
+        tenant: String,
+        hostname: String,
     },
 }
 

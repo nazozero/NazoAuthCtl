@@ -819,14 +819,22 @@ fn set_file_mode(file: &File, mode: u32) -> anyhow::Result<()> {
 }
 
 pub fn symlink_atomic(target: &Path, link: &Path) -> anyhow::Result<()> {
-    let next = link.with_extension(format!("next-{}", std::process::id()));
-    if next.exists() || next.is_symlink() {
-        fs::remove_file(&next)
-            .with_context(|| format!("failed to clear stale symlink {}", next.display()))?;
-    }
+    let next = link.with_extension(format!("next-{}", uuid::Uuid::now_v7()));
     create_symlink(target, &next)?;
-    fs::rename(&next, link)
-        .with_context(|| format!("failed to activate symlink {}", link.display()))?;
+    if let Err(error) = fs::rename(&next, link) {
+        let cleanup = fs::remove_file(&next);
+        if let Err(cleanup) = cleanup {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to activate symlink {} and failed to remove unique staged link {}: {cleanup}",
+                    link.display(),
+                    next.display()
+                )
+            });
+        }
+        return Err(error)
+            .with_context(|| format!("failed to activate symlink {}", link.display()));
+    }
     sync_parent(link)
 }
 

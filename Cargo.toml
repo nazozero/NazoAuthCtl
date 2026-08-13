@@ -41,6 +41,8 @@ nazo-operator-protocol.workspace = true
 nazoauthctl-runtime = { path = "crates/nazoauthctl-runtime" }
 rand = "0.10.1"
 rpassword = "7.4.0"
+rustls = { version = "0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-pemfile = "2.2.0"
 semver = "1.0.27"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -52,6 +54,9 @@ uuid = { version = "1.23.5", features = ["v7"] }
 wait-timeout = "0.2.1"
 x509-parser = "0.18.1"
 zeroize = { version = "1.8.2", features = ["derive"] }
+
+[dev-dependencies]
+rcgen = { version = "0.14.9", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [lints.rust]
 unsafe_code = "forbid"
