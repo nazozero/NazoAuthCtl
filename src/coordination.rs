@@ -797,6 +797,15 @@ fn validate_evidence_input(
     transaction: &UpdateCoordination,
     step: &CoordinationStep,
 ) -> anyhow::Result<()> {
+    validate_evidence_binding(input, transaction, step)?;
+    validate_freshness(input.issued_at, input.expires_at)
+}
+
+fn validate_evidence_binding(
+    input: &EvidenceInput,
+    transaction: &UpdateCoordination,
+    step: &CoordinationStep,
+) -> anyhow::Result<()> {
     if input.schema != EVIDENCE_SCHEMA {
         bail!("unsupported coordination evidence schema");
     }
@@ -829,7 +838,6 @@ fn validate_evidence_input(
     if input.target_release != transaction.target_release {
         bail!("coordination evidence is bound to a different target release");
     }
-    validate_freshness(input.issued_at, input.expires_at)?;
     if input.nonce.is_empty() {
         bail!("coordination evidence nonce is empty");
     }
@@ -868,16 +876,27 @@ fn validate_digest(value: &str, label: &str) -> anyhow::Result<()> {
 
 fn validate_freshness(issued_at: i64, expires_at: i64) -> anyhow::Result<()> {
     let now = Utc::now().timestamp();
+    validate_freshness_at_acceptance(issued_at, expires_at, now)
+}
+
+fn validate_freshness_at_acceptance(
+    issued_at: i64,
+    expires_at: i64,
+    accepted_at: i64,
+) -> anyhow::Result<()> {
+    if accepted_at <= 0 {
+        bail!("coordination evidence acceptance time is invalid");
+    }
     if issued_at <= 0 || expires_at <= issued_at {
         bail!("coordination evidence validity interval is invalid");
     }
-    if issued_at > now.saturating_add(MAX_EVIDENCE_FUTURE_SKEW_SECONDS) {
+    if issued_at > accepted_at.saturating_add(MAX_EVIDENCE_FUTURE_SKEW_SECONDS) {
         bail!("coordination evidence is issued too far in the future");
     }
-    if issued_at < now.saturating_sub(MAX_EVIDENCE_AGE_SECONDS) {
+    if issued_at < accepted_at.saturating_sub(MAX_EVIDENCE_AGE_SECONDS) {
         bail!("coordination evidence is too old");
     }
-    if expires_at <= now {
+    if expires_at <= accepted_at {
         bail!("coordination evidence has expired");
     }
     if expires_at > issued_at.saturating_add(MAX_EVIDENCE_LIFETIME_SECONDS) {
@@ -1027,7 +1046,12 @@ fn validate_persisted_evidence(
     if accepted.schema != EVIDENCE_SCHEMA {
         bail!("unsupported accepted coordination evidence schema");
     }
-    validate_evidence_input(&accepted.evidence, transaction, step)?;
+    validate_evidence_binding(&accepted.evidence, transaction, step)?;
+    validate_freshness_at_acceptance(
+        accepted.evidence.issued_at,
+        accepted.evidence.expires_at,
+        accepted.accepted_at,
+    )?;
     if step.owner == StepOwner::ProviderOwned {
         verify_provider_evidence(current, transaction, step, &accepted.evidence)?;
     }
