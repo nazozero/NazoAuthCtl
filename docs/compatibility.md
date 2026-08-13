@@ -13,9 +13,10 @@ Current NazoAuth Release manifests use a closed compatibility object:
 ```
 
 The controller accepts a server only when the protocol constant (currently `1`)
-equals its pinned `nazo-operator-protocol` constant. The protocol crate itself is
-pinned separately to the exact NazoAuth package version `0.1.34`, and the ctl
-SemVer must be inside the server's declared range.
+equals its pinned `nazo-operator-protocol` constant. The protocol crate source is
+pinned to an immutable Git revision, not to a NazoAuth product version. NazoAuth
+and NazoAuthCtl releases are independent; the ctl SemVer only has to be inside
+the server's declared range.
 Unknown protocol versions and malformed or empty ranges fail closed.
 
 The independent controller validates the current and previous immutable, signed

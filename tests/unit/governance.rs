@@ -98,6 +98,22 @@ fn controller_modules_keep_backend_command_ownership_in_runtime_backend() {
 }
 
 #[test]
+fn operator_protocol_dependency_pins_source_without_coupling_server_version() {
+    let workspace_manifest = include_str!("../../Cargo.toml");
+    let dependency = workspace_manifest
+        .lines()
+        .find(|line| line.starts_with("nazo-operator-protocol = "))
+        .expect("workspace must declare the operator protocol dependency");
+
+    assert!(dependency.contains("git = \"https://github.com/nazozero/NazoAuth.git\""));
+    assert!(dependency.contains("rev = \""));
+    assert!(
+        !dependency.contains("version = "),
+        "the controller must not couple its release to a NazoAuth product version"
+    );
+}
+
+#[test]
 fn core_recovery_requires_a_controller_config_or_lifecycle_reference() {
     let mut deployment = record();
     deployment.trust = TrustState::Adopted;
