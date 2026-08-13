@@ -312,7 +312,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                         ],
                         true,
                         true,
-                        false,
+                        true, // a resumed coordination may already own a config update journal
                     )?;
                     if transaction.state == crate::coordination::CoordinationState::Committed {
                         let current_record = context.record.as_ref().context(
@@ -653,7 +653,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                         ],
                         true,
                         true,
-                        false,
+                        true, // recovery must load the config that owns the interrupted journal
                     )?;
                     if transaction.state == crate::coordination::CoordinationState::Committed {
                         let current_record = context.record.as_ref().context(
