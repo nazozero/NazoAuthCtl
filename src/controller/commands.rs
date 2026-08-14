@@ -670,10 +670,24 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                             .record
                             .as_ref()
                             .context("config-backed update lost its deployment declaration")?;
-                        if load_update_journal(&context.config)?.is_some() {
-                            recover_pending_update(&context.path, &context.config)?;
-                            let _deployment_lock =
-                                store.deployment_lock(&bound_record.deployment_id)?;
+                        let legacy_recovery_pending =
+                            load_update_journal(&context.config)?.is_some();
+                        if legacy_recovery_pending
+                            || matches!(
+                                transaction.state,
+                                crate::coordination::CoordinationState::Aborting
+                                    | crate::coordination::CoordinationState::Aborted
+                            )
+                        {
+                            let transaction =
+                                crate::coordination::mark_controller_update_aborting_locked(
+                                    &store,
+                                    bound_record,
+                                    &transaction.transaction_id,
+                                )?;
+                            if legacy_recovery_pending {
+                                recover_pending_update(&context.path, &context.config)?;
+                            }
                             let current_record = store.reload_locked(bound_record)?;
                             crate::coordination::abort_controller_update_locked(
                                 &store,

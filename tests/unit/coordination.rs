@@ -334,20 +334,37 @@ fn aborted_controller_update_is_archived_without_changing_the_declaration() {
     store.persist(&current).unwrap();
     let prepared = prepare_update(&store, &current, &plan("deployment-a")).unwrap();
 
+    let aborting =
+        mark_controller_update_aborting_locked(&store, &current, &prepared.transaction_id).unwrap();
+    assert_eq!(aborting.state, CoordinationState::Aborting);
+    assert_eq!(
+        resume(&store, &current).unwrap().state,
+        CoordinationState::Aborting
+    );
+
     let aborted =
         abort_controller_update_locked(&store, &current, &prepared.transaction_id).unwrap();
 
     assert_eq!(aborted.state, CoordinationState::Aborted);
     assert_eq!(store.load("deployment-a").unwrap(), current);
     assert!(!active_update_exists(&store, &current));
-    assert!(
-        store
-            .deployment_state_dir("deployment-a")
-            .join("transactions")
-            .join(format!("update-{}.json", prepared.transaction_id))
-            .is_file()
-    );
-    assert!(abort_controller_update_locked(&store, &current, &prepared.transaction_id).is_err());
+    let history = store
+        .deployment_state_dir("deployment-a")
+        .join("transactions")
+        .join(format!("update-{}.json", prepared.transaction_id));
+    assert!(history.is_file());
+
+    // Simulate a crash after the history write but before durable removal of
+    // the active record. The next abort consumes the identical active copy.
+    let active = store
+        .deployment_state_dir("deployment-a")
+        .join("transactions")
+        .join("active-update.json");
+    fs::copy(&history, &active).unwrap();
+    let replayed =
+        abort_controller_update_locked(&store, &current, &prepared.transaction_id).unwrap();
+    assert_eq!(replayed, aborted);
+    assert!(!active.exists());
 }
 
 #[test]
