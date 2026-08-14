@@ -1643,14 +1643,20 @@ fn receipt_sha256(receipt: &CertificateReceipt) -> anyhow::Result<String> {
 }
 
 fn provider_snapshot_sha256(provider: &ProviderConfig) -> anyhow::Result<String> {
+    let material_root = canonical_digest_path(&provider.material_root, "TLS material root")?;
+    let activation_link = canonical_digest_path(&provider.activation_link, "TLS activation link")?;
+    let trust_anchors = canonical_digest_path(&provider.trust_anchors, "TLS trust anchors")?;
+    let validate_program =
+        canonical_digest_path(&provider.validate.program, "TLS validate command")?;
+    let reload_program = canonical_digest_path(&provider.reload.program, "TLS reload command")?;
     let authority = (
         provider.schema,
         &provider.protocol,
         &provider.tenant,
         &provider.hostname,
-        &provider.material_root,
-        &provider.activation_link,
-        &provider.trust_anchors,
+        material_root,
+        activation_link,
+        trust_anchors,
         &provider.public_url,
         &provider.accepted_statuses,
         provider.minimum_validity_seconds,
@@ -1658,14 +1664,38 @@ fn provider_snapshot_sha256(provider: &ProviderConfig) -> anyhow::Result<String>
         provider.request_timeout_seconds,
     );
     let commands = (
-        (&provider.validate.program, &provider.validate.args),
-        (&provider.reload.program, &provider.reload.args),
+        (validate_program, &provider.validate.args),
+        (reload_program, &provider.reload.args),
     );
     Ok(sha256(&serde_json::to_vec(&(
         PROVIDER_SNAPSHOT_DIGEST_PROTOCOL,
         authority,
         commands,
     ))?))
+}
+
+fn canonical_digest_path(path: &Path, label: &str) -> anyhow::Result<Vec<(u8, String)>> {
+    path.components()
+        .map(|component| {
+            let (kind, value) = match component {
+                Component::Prefix(prefix) => (0, Some(prefix.as_os_str())),
+                Component::RootDir => (1, None),
+                Component::CurDir => (2, None),
+                Component::ParentDir => (3, None),
+                Component::Normal(value) => (4, Some(value)),
+            };
+            let value = value
+                .map(|value| {
+                    value
+                        .to_str()
+                        .with_context(|| format!("{label} contains a non-UTF-8 path component"))
+                        .map(str::to_owned)
+                })
+                .transpose()?
+                .unwrap_or_default();
+            Ok((kind, value))
+        })
+        .collect()
 }
 
 fn validate_provider_snapshot(transaction: &CertificateTransaction) -> anyhow::Result<()> {

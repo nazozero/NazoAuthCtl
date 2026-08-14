@@ -49,7 +49,7 @@ fn transaction_provider_snapshot_detects_recovery_command_drift() {
         test_transaction(PathBuf::from("/srv/nazoauth/tls/tenant-a/auth.example"));
     assert_eq!(
         transaction.provider_snapshot_sha256,
-        "455f534fb8541459c53eafd6d6acc63572720e64b744b8f30acaec851e70ceb4"
+        "73acc5226ce093c67966d32c19b36216d019934c735f0111642566123b8dae32"
     );
     assert!(validate_provider_snapshot(&transaction).is_ok());
     transaction
@@ -58,6 +58,15 @@ fn transaction_provider_snapshot_detects_recovery_command_drift() {
         .args
         .push("--changed".to_owned());
     assert!(validate_provider_snapshot(&transaction).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_snapshot_path_encoding_preserves_unix_backslash_components() {
+    assert_ne!(
+        canonical_digest_path(Path::new("/srv/a\\b"), "test path").unwrap(),
+        canonical_digest_path(Path::new("/srv/a/b"), "test path").unwrap()
+    );
 }
 
 #[test]
