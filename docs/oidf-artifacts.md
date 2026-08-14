@@ -130,3 +130,34 @@ input. Offline opening does not claim that NazoAuth granted or negotiated it.
 A deployment-bound runner must pass the set observed from authenticated server
 capability negotiation. Deployment-bound run journals, that negotiation,
 provisioning, Suite execution, and cleanup remain separate later transactions.
+
+## Offline inspection plan
+
+An operator can compile an exact signed Matrix selection from one revalidated
+cache entry without contacting NazoAuth or the Suite:
+
+```text
+nazoauthctl conformance artifact plan \
+  --trust-policy /etc/nazoauthctl/oidf-trust.json \
+  --cache-dir /var/lib/nazoauthctl/oidf-cache \
+  --digest 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --capability nazoauth.client.create \
+  --group oidc \
+  --plan p001
+```
+
+Planning reuses the exact offline-open verification path; it does not trust the
+cache record alone. Group and plan identifiers must be unique, must exist in
+the verified Matrix, and their intersection must be non-empty. The emitted
+entries bind the artifact identity, Suite plan name, variant, required
+capabilities, the caller-declared capability set that allowed verification,
+expected `SKIPPED` exceptions, and the verified JSON config template. The
+artifact and matrix digests remain the sole byte-level identities; planning
+does not create a competing template canonicalization rule.
+
+This output is inspection evidence, not an execution authorization. It carries
+a plan JTI but deliberately records `deployment_bound: false`,
+`capabilities_attested: false`, and `execution_permitted: false`, together with
+the missing authenticated negotiation, ordinary resource provider, and
+deployment-bound crash-safe journal blockers. The command creates no NazoAuth
+resource, Suite plan, execution journal, or cleanup obligation.

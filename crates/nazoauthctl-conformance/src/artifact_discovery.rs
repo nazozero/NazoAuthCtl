@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ArtifactError, ArtifactTrustPolicy, MAX_ARTIFACT_MATRIX_BYTES, MAX_SIGNED_DRIVER_BYTES,
-    VerifiedOidfArtifact, verify_oidf_artifact, verify_oidf_driver_manifest, verify_oidf_matrix,
+    OidfDriverInspectionPlan, OidfPlanError, OidfPlanSelection, VerifiedOidfArtifact,
+    artifact_plan::compile_oidf_driver_inspection_plan, verify_oidf_artifact,
+    verify_oidf_driver_manifest, verify_oidf_matrix,
 };
 
 const CACHE_RECORD_SCHEMA: u32 = 1;
@@ -76,6 +78,8 @@ pub enum ArtifactDiscoveryError {
     InvalidManifestDigest,
     #[error("artifact cache entry failed immutable identity verification")]
     CacheIdentity,
+    #[error("verified artifact driver plan is invalid: {0}")]
+    Plan(#[from] OidfPlanError),
 }
 
 pub fn open_cached_oidf_artifact(
@@ -85,6 +89,47 @@ pub fn open_cached_oidf_artifact(
     available_capabilities: &BTreeSet<String>,
     now: i64,
 ) -> Result<CachedOidfArtifact, ArtifactDiscoveryError> {
+    open_cached_entry(
+        cache_root,
+        manifest_digest,
+        trust,
+        available_capabilities,
+        now,
+    )
+    .map(|(cached, _)| cached)
+}
+
+pub fn open_cached_oidf_driver_plan(
+    cache_root: &Path,
+    manifest_digest: &str,
+    trust: &ArtifactTrustPolicy,
+    available_capabilities: &BTreeSet<String>,
+    selection: OidfPlanSelection,
+    now: i64,
+) -> Result<OidfDriverInspectionPlan, ArtifactDiscoveryError> {
+    let (cached, matrix) = open_cached_entry(
+        cache_root,
+        manifest_digest,
+        trust,
+        available_capabilities,
+        now,
+    )?;
+    Ok(compile_oidf_driver_inspection_plan(
+        cached,
+        &matrix,
+        available_capabilities,
+        selection,
+        now,
+    )?)
+}
+
+fn open_cached_entry(
+    cache_root: &Path,
+    manifest_digest: &str,
+    trust: &ArtifactTrustPolicy,
+    available_capabilities: &BTreeSet<String>,
+    now: i64,
+) -> Result<(CachedOidfArtifact, Vec<u8>), ArtifactDiscoveryError> {
     if !cache_root.is_absolute() || cache_root.file_name().is_none() {
         return Err(ArtifactDiscoveryError::UnsafeCache);
     }
@@ -106,14 +151,17 @@ pub fn open_cached_oidf_artifact(
         now,
     )?;
 
-    Ok(CachedOidfArtifact {
-        schema: 1,
-        manifest_url: record.manifest_url,
-        cached_at: record.resolved_at,
-        opened_at: now,
-        cache_entry,
-        artifact: record.artifact,
-    })
+    Ok((
+        CachedOidfArtifact {
+            schema: 1,
+            manifest_url: record.manifest_url,
+            cached_at: record.resolved_at,
+            opened_at: now,
+            cache_entry,
+            artifact: record.artifact,
+        },
+        matrix,
+    ))
 }
 
 pub fn resolve_oidf_artifact(
@@ -759,6 +807,32 @@ mod tests {
         assert_eq!(opened.artifact, fetched.artifact);
         assert_eq!(
             std::fs::metadata(opened.cache_entry.join("verified.json"))
+                .expect("record metadata")
+                .modified()
+                .expect("record modified time"),
+            before
+        );
+
+        let plan = open_cached_oidf_driver_plan(
+            &root,
+            &opened.artifact.driver_manifest_sha256,
+            &trust(),
+            &capabilities(),
+            OidfPlanSelection {
+                groups: vec!["oidc".to_owned()],
+                plans: vec!["p001".to_owned()],
+            },
+            NOW + 1,
+        )
+        .expect("compile reverified cached plan");
+        assert_eq!(plan.artifact, opened.artifact);
+        assert_eq!(plan.selected_group_count, 1);
+        assert_eq!(plan.selected_plan_count, 1);
+        assert!(!plan.deployment_bound);
+        assert!(!plan.capabilities_attested);
+        assert!(!plan.execution_permitted);
+        assert_eq!(
+            std::fs::metadata(plan.artifact_cache_entry.join("verified.json"))
                 .expect("record metadata")
                 .modified()
                 .expect("record modified time"),
