@@ -14,7 +14,8 @@ use crate::{
     verify_oidf_driver_manifest, verify_oidf_matrix,
 };
 
-const CACHE_RECORD_SCHEMA: u32 = 1;
+pub const OIDF_ARTIFACT_CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_RECORD_SCHEMA: u32 = OIDF_ARTIFACT_CACHE_SCHEMA_VERSION;
 const MAX_CACHE_RECORD_BYTES: usize = 128 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -153,7 +154,7 @@ fn open_cached_entry(
 
     Ok((
         CachedOidfArtifact {
-            schema: 1,
+            schema: OIDF_ARTIFACT_CACHE_SCHEMA_VERSION,
             manifest_url: record.manifest_url,
             cached_at: record.resolved_at,
             opened_at: now,
@@ -186,7 +187,7 @@ pub fn resolve_oidf_artifact(
         now,
     )?;
     Ok(ResolvedOidfArtifact {
-        schema: 1,
+        schema: OIDF_ARTIFACT_CACHE_SCHEMA_VERSION,
         manifest_url: manifest_url.to_owned(),
         resolved_at: now,
         cache_entry,
@@ -304,7 +305,7 @@ fn verify_cached_entry(
     if record.schema != CACHE_RECORD_SCHEMA
         || !trust.accepts_url(&record.manifest_url)
         || record.resolved_at < record.artifact.not_before
-        || record.resolved_at > record.artifact.expires_at
+        || record.resolved_at >= record.artifact.expires_at
         || record.resolved_at > now
     {
         return Err(ArtifactDiscoveryError::CacheRecord);
@@ -413,9 +414,10 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     use crate::{
+        OIDF_ARTIFACT_SCHEMA_VERSION, OIDF_MATRIX_SCHEMA_VERSION, OIDF_TRUST_POLICY_SCHEMA_VERSION,
         OidfArtifactMatrix, OidfArtifactMatrixGroup, OidfArtifactMatrixPlan,
-        OidfArtifactMatrixVariant, OidfDriverManifest, OidfMatrixIdentity, OidfResourceBounds,
-        OidfSuiteIdentity,
+        OidfArtifactMatrixVariant, OidfDriverManifest, OidfMatrixIdentity, OidfPlanResourceBudget,
+        OidfResourceBounds, OidfSuiteIdentity,
     };
 
     use super::*;
@@ -459,7 +461,7 @@ mod tests {
         let key = signing_key();
         let point = key.verifying_key().to_encoded_point(true);
         ArtifactTrustPolicy {
-            schema: 1,
+            schema: OIDF_TRUST_POLICY_SCHEMA_VERSION,
             source: "https://artifacts.example/oidf/".to_owned(),
             signer_identity: "https://artifacts.example/signers/release-v1".to_owned(),
             key_id: format!("oidf-es256-{}", &digest(point.as_bytes())[..32]),
@@ -469,7 +471,7 @@ mod tests {
 
     fn matrix() -> Vec<u8> {
         serde_json::to_vec(&OidfArtifactMatrix {
-            schema: 1,
+            schema: OIDF_MATRIX_SCHEMA_VERSION,
             name: "matrix".to_owned(),
             groups: vec![OidfArtifactMatrixGroup {
                 id: "oidc".to_owned(),
@@ -481,6 +483,11 @@ mod tests {
                 plans: vec![OidfArtifactMatrixPlan {
                     id: "p001".to_owned(),
                     plan: "oidcc-basic-certification-test-plan".to_owned(),
+                    resource_budget: OidfPlanResourceBudget {
+                        modules: 16,
+                        clients: 2,
+                        wall_clock_seconds: 300,
+                    },
                     config_template: serde_json::json!({"alias":"{{run.alias}}"}),
                     variant: BTreeMap::new(),
                     required_capabilities: vec!["nazoauth.client.create".to_owned()],
@@ -493,7 +500,7 @@ mod tests {
 
     fn manifest(matrix: &[u8], expires_at: i64) -> OidfDriverManifest {
         OidfDriverManifest {
-            schema: 1,
+            schema: OIDF_ARTIFACT_SCHEMA_VERSION,
             artifact_id: "official-driver".to_owned(),
             revision: "a".repeat(40),
             source: trust().source,
@@ -509,7 +516,7 @@ mod tests {
             engine_protocol: 1,
             required_capabilities: vec!["nazoauth.client.create".to_owned()],
             matrix: OidfMatrixIdentity {
-                schema: 1,
+                schema: OIDF_MATRIX_SCHEMA_VERSION,
                 url: MATRIX_URL.to_owned(),
                 sha256: digest(matrix),
                 size: matrix.len() as u64,
