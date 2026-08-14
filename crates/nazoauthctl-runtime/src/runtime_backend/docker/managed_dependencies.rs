@@ -618,8 +618,7 @@ fn copy_valkey_volume(
     source: &str,
     destination: &str,
 ) -> anyhow::Result<()> {
-    container_shared::build_identity_process(command)
-    .args(["--network", "none"])
+    container_shared::build_managed_volume_copy_process(command)
     .arg("--volume")
     .arg(format!("{source}:/source:ro"))
     .arg("--volume")
