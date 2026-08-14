@@ -54,6 +54,20 @@ pub struct ConformanceOnboarding {
     pub idempotent_replay: bool,
 }
 
+pub struct ConformanceDeploymentEvidence {
+    pub deployment_id: String,
+    pub target_issuer: String,
+    pub release: String,
+    pub revision: String,
+    pub build_id: String,
+    pub runtime: ConformanceRuntimeEvidence,
+}
+
+pub enum ConformanceRuntimeEvidence {
+    OciImage { digest: String },
+    HostBinary { sha256: String },
+}
+
 /// Holds shared deployment/capability locks for the complete Suite run.
 ///
 /// Independent lease-scoped conformance sessions may overlap. Exclusive
@@ -108,6 +122,30 @@ impl ConformanceSession {
 
     pub fn target_issuer(&self) -> &str {
         &self.context.config.runtime.expected_issuer
+    }
+
+    pub fn deployment_evidence(&self) -> ConformanceDeploymentEvidence {
+        let runtime = match self.context.config.runtime.backend {
+            crate::deployment::RuntimeBackendKind::Podman
+            | crate::deployment::RuntimeBackendKind::Docker => {
+                ConformanceRuntimeEvidence::OciImage {
+                    digest: self.expected.image_digest.clone(),
+                }
+            }
+            crate::deployment::RuntimeBackendKind::Systemd => {
+                ConformanceRuntimeEvidence::HostBinary {
+                    sha256: self.expected.binary_digest.clone(),
+                }
+            }
+        };
+        ConformanceDeploymentEvidence {
+            deployment_id: self.context.config.operator.deployment_id.clone(),
+            target_issuer: self.context.config.runtime.expected_issuer.clone(),
+            release: self.expected.embedded.release.clone(),
+            revision: self.expected.embedded.revision.clone(),
+            build_id: self.expected.embedded.build_id.clone(),
+            runtime,
+        }
     }
 
     /// Load the deployment-owned OpenID4VP verifier management token from the

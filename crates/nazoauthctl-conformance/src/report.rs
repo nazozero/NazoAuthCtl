@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::{collections::BTreeSet, path::Path};
+use std::collections::BTreeSet;
 
 use crate::client::AuthProbe;
 use crate::progress::ProgressSnapshot;
@@ -136,71 +136,7 @@ impl ConformanceReport {
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec_pretty(self)
     }
-
-    /// Persist complete official `/api/info` and `/api/log` objects separately
-    /// from the public report. This is intentionally Unix-only: on platforms
-    /// where owner-only ACLs cannot be proven through the standard library we
-    /// refuse to persist secrets rather than claiming equivalent protection.
-    pub fn write_private_evidence(&self, root: &Path) -> Result<(), EvidenceError> {
-        #[cfg(not(unix))]
-        {
-            let _ = root;
-            Err(EvidenceError::UnsupportedPlatform)
-        }
-        #[cfg(unix)]
-        {
-            let root =
-                crate::secure_file::ensure_directory(root, true).map_err(map_secure_file_error)?;
-            for (index, module) in self.modules.iter().enumerate() {
-                let bytes = serde_json::to_vec(&serde_json::json!({
-                    "info": &module.raw_info,
-                    "log": &module.raw_log,
-                }))
-                .map_err(|_| EvidenceError::Encoding)?;
-                let path = root.join(format!("module-{index:04}.json"));
-                crate::secure_file::write_atomic(&path, &bytes, true)
-                    .map_err(map_secure_file_error)?;
-            }
-            Ok(())
-        }
-    }
 }
-
-#[cfg(unix)]
-fn map_secure_file_error(error: crate::secure_file::SecureFileError) -> EvidenceError {
-    match error {
-        crate::secure_file::SecureFileError::UnsupportedPlatform => {
-            EvidenceError::UnsupportedPlatform
-        }
-        crate::secure_file::SecureFileError::UnsafePath => EvidenceError::UnsafePath,
-        crate::secure_file::SecureFileError::NotFound
-        | crate::secure_file::SecureFileError::Oversize
-        | crate::secure_file::SecureFileError::Io => EvidenceError::Io,
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum EvidenceError {
-    UnsupportedPlatform,
-    UnsafePath,
-    Encoding,
-    Io,
-}
-
-impl std::fmt::Display for EvidenceError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::UnsupportedPlatform => {
-                "private evidence persistence is unavailable on this platform"
-            }
-            Self::UnsafePath => "private evidence path is not owner-only",
-            Self::Encoding => "private evidence could not be encoded",
-            Self::Io => "private evidence persistence failed",
-        })
-    }
-}
-
-impl std::error::Error for EvidenceError {}
 
 impl ModuleReport {
     pub(crate) fn from_info(context: ModuleReportContext, raw_info: Value, raw_log: Value) -> Self {
@@ -253,6 +189,13 @@ impl ModuleReport {
             raw_info,
             raw_log,
         }
+    }
+}
+
+impl Drop for ModuleReport {
+    fn drop(&mut self) {
+        crate::matrix::zeroize_json_value(&mut self.raw_info);
+        crate::matrix::zeroize_json_value(&mut self.raw_log);
     }
 }
 

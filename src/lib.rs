@@ -19,7 +19,10 @@ mod tls;
 pub(crate) use nazoauthctl_runtime::filesystem;
 pub(crate) use nazoauthctl_runtime::process;
 
-pub use conformance::{ConformanceMatrix, ConformanceOnboarding, ConformanceSession};
+pub use conformance::{
+    ConformanceDeploymentEvidence, ConformanceMatrix, ConformanceOnboarding,
+    ConformanceRuntimeEvidence, ConformanceSession,
+};
 
 #[cfg(all(test, unix))]
 #[path = "../tests/unit/support.rs"]

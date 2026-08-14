@@ -14,6 +14,7 @@ mod artifact_plan;
 mod browser;
 mod client;
 mod credentials;
+mod evidence;
 mod materializer;
 mod matrix;
 mod orchestrator;
@@ -59,6 +60,10 @@ pub use client::{
     PlanCreated, SuiteClient, SuiteClientError,
 };
 pub use credentials::{BearerToken, CredentialStore, CredentialStoreError};
+pub use evidence::{
+    EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceDeploymentIdentity, EvidenceError,
+    EvidenceRuntimeIdentity, EvidenceSourceIdentity, write_private_evidence_bundle,
+};
 pub use materializer::{
     CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DescriptorGroup, DescriptorMaterializer,
     DescriptorPlan, DescriptorSource, DescriptorVariant, MAX_DESCRIPTOR_BYTES, MaterializedMatrix,
@@ -80,8 +85,7 @@ pub use progress::{
 };
 pub use proxy_trust::ProxyTrustGuard;
 pub use report::{
-    CleanupFailure, CleanupReport, ConformanceReport, EvidenceError, ModuleOutcome, ModuleReport,
-    PlanReport,
+    CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport, PlanReport,
 };
 pub use transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, Transport, TransportError,

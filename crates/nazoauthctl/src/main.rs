@@ -10,12 +10,14 @@ use nazoauthctl_conformance::{
     ArtifactTrustPolicy, BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy,
     BrowserTargetOrigin, ClientConfig, ConformanceAutomation, ConformanceBinding,
     ConformanceRunConfig, ConformanceRunner, CredentialStore, DescriptorMaterializer,
-    MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT_SECONDS, ManagedWebDriver, MatrixSelection,
-    OidfPlanSelection, OnboardingOutput, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
-    OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard,
-    RunControl, StableRenderer, SuiteClient, TtyRenderer, WebDriverClient, WebDriverEndpoint,
-    open_cached_oidf_artifact, open_cached_oidf_driver_plan, read_artifact_driver,
-    read_artifact_matrix, read_compact_manifest, resolve_oidf_artifact, verify_oidf_artifact,
+    EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceDeploymentIdentity,
+    EvidenceRuntimeIdentity, EvidenceSourceIdentity, MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT_SECONDS,
+    ManagedWebDriver, MatrixSelection, OidfPlanSelection, OnboardingOutput, OpenId4VciIssuerClient,
+    OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient,
+    Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient, TtyRenderer, WebDriverClient,
+    WebDriverEndpoint, open_cached_oidf_artifact, open_cached_oidf_driver_plan,
+    read_artifact_driver, read_artifact_matrix, read_compact_manifest, resolve_oidf_artifact,
+    verify_oidf_artifact, write_private_evidence_bundle,
 };
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
@@ -757,6 +759,7 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         invocation.deployment.as_deref(),
     )
     .context("deployment is not ready for conformance orchestration")?;
+    let deployment_evidence = session.deployment_evidence();
 
     let (token, prompted) = resolve_token(&mut invocation, &suite_origin)?;
     let client = SuiteClient::new(suite_origin.clone(), token.clone(), ClientConfig::default())
@@ -921,12 +924,6 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             let mut renderer = StableRenderer::new(io::stderr().lock());
             runner.run(&mut renderer)
         };
-        if let Some(directory) = &invocation.evidence_directory {
-            summary
-                .report
-                .write_private_evidence(directory)
-                .context("failed to persist private Suite evidence")?;
-        }
         Ok(RunOutput {
             report: summary.report,
             deployment: DeploymentReport {
@@ -943,6 +940,7 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                 idempotent_replay: onboarding.idempotent_replay,
                 cleanup_complete: false,
             },
+            evidence: None,
         })
     })();
 
@@ -952,39 +950,82 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         .map(ProxyTrustGuard::restore)
         .transpose();
     let mut errors = Vec::new();
-    let output = match run_result {
+    let mut output = match run_result {
         Ok(output) => Some(output),
         Err(error) => {
             errors.push(format!("run={error:#}"));
             None
         }
     };
+    let lease_cleanup_complete = lease_cleanup.is_ok();
+    let proxy_cleanup_complete = proxy_cleanup.is_ok();
     if let Err(error) = lease_cleanup {
         errors.push(format!("lease-cleanup={error:#}"));
     }
     if let Err(error) = proxy_cleanup {
         errors.push(format!("proxy-cleanup={error:#}"));
     }
-    if !errors.is_empty() {
-        bail!(
-            "conformance run did not complete cleanly: {}",
-            errors.join("; ")
-        );
+    if let Some(output) = &mut output {
+        output.deployment.cleanup_complete = lease_cleanup_complete && proxy_cleanup_complete;
+        if let Some(directory) = &invocation.evidence_directory {
+            let runtime = match &deployment_evidence.runtime {
+                nazoauthctl_core::ConformanceRuntimeEvidence::OciImage { digest } => {
+                    EvidenceRuntimeIdentity::OciImage {
+                        digest: digest.clone(),
+                    }
+                }
+                nazoauthctl_core::ConformanceRuntimeEvidence::HostBinary { sha256 } => {
+                    EvidenceRuntimeIdentity::HostBinary {
+                        sha256: sha256.clone(),
+                    }
+                }
+            };
+            let identity = EvidenceBundleIdentity {
+                run_jti: request_jti.clone(),
+                deployment: EvidenceDeploymentIdentity {
+                    deployment_id: deployment_evidence.deployment_id.clone(),
+                    target_issuer: deployment_evidence.target_issuer.clone(),
+                    release: deployment_evidence.release.clone(),
+                    revision: deployment_evidence.revision.clone(),
+                    build_id: deployment_evidence.build_id.clone(),
+                    runtime,
+                },
+                source: EvidenceSourceIdentity::LegacyOperatorMatrix {
+                    source_release: matrix.source_release.clone(),
+                    matrix_sha256: matrix.sha256.clone(),
+                    suite_origin: suite_origin.to_string(),
+                },
+                outer_cleanup_complete: output.deployment.cleanup_complete,
+            };
+            match write_private_evidence_bundle(&output.report, directory, &identity) {
+                Ok(receipt) => output.evidence = Some(receipt),
+                Err(error) => errors.push(format!("evidence={error}")),
+            }
+        }
     }
-    let mut output = output.context("conformance run returned no output")?;
-    output.deployment.cleanup_complete = true;
-    let success = output.report.local_success
-        && output.report.suite_pass
-        && output.deployment.cleanup_complete;
-    let final_output = FinalOutput {
-        schema: 1,
-        success,
-        run: output,
-    };
+    let (final_output, exit_code) = finalize_run_output(output, errors);
     serde_json::to_writer_pretty(io::stdout().lock(), &final_output)
         .context("failed to write the structured conformance report")?;
     writeln!(io::stdout()).context("failed to finish the structured conformance report")?;
-    Ok(if success { 0 } else { 1 })
+    Ok(exit_code)
+}
+
+fn finalize_run_output(output: Option<RunOutput>, errors: Vec<String>) -> (FinalOutput, i32) {
+    let success = errors.is_empty()
+        && output.as_ref().is_some_and(|output| {
+            output.report.local_success
+                && output.report.suite_pass
+                && output.deployment.cleanup_complete
+        });
+    (
+        FinalOutput {
+            schema: 2,
+            success,
+            errors,
+            run: output,
+        },
+        if success { 0 } else { 1 },
+    )
 }
 
 fn build_browser(
@@ -1087,13 +1128,15 @@ fn hex(bytes: impl AsRef<[u8]>) -> String {
 struct FinalOutput {
     schema: u32,
     success: bool,
-    run: RunOutput,
+    errors: Vec<String>,
+    run: Option<RunOutput>,
 }
 
 #[derive(Serialize)]
 struct RunOutput {
     deployment: DeploymentReport,
     report: nazoauthctl_conformance::ConformanceReport,
+    evidence: Option<EvidenceBundleReceipt>,
 }
 
 #[derive(Serialize)]
@@ -1114,7 +1157,7 @@ struct DeploymentReport {
 
 fn print_run_help() {
     println!(
-        "Usage:\n  nazoauthctl [--deployment ID_OR_ALIAS] [--config PATH] conformance run [options]\n\nOptions:\n  --suite URL                    OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN                  API token; visible in argv/shell history\n  --token-file PATH              Read token from a private regular file\n  --token-stdin                  Read token from stdin\n  --token-fd FD                  Read token from an inherited private descriptor\n  --webdriver URL                Dedicated W3C endpoint; repeat exactly once per job\n  --evidence-dir PATH            Persist private raw Suite evidence securely\n  --proxy-trust-bundle PATH      Atomically install this run's public client CAs\n  --proxy-reload-executable PATH Root-owned executable that validates/reloads the proxy\n  --group ID                     Run one Matrix group; repeat to select more\n  --plan ID                      Run one Matrix plan; repeat to select more\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)\n  --lease-ttl SECONDS            Deployment lease lifetime (default: 14400)"
+        "Usage:\n  nazoauthctl [--deployment ID_OR_ALIAS] [--config PATH] conformance run [options]\n\nOptions:\n  --suite URL                    OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN                  API token; visible in argv/shell history\n  --token-file PATH              Read token from a private regular file\n  --token-stdin                  Read token from stdin\n  --token-fd FD                  Read token from an inherited private descriptor\n  --webdriver URL                Dedicated W3C endpoint; repeat exactly once per job\n  --evidence-dir PATH            Commit a unique digest-bound private evidence bundle\n  --proxy-trust-bundle PATH      Atomically install this run's public client CAs\n  --proxy-reload-executable PATH Root-owned executable that validates/reloads the proxy\n  --group ID                     Run one Matrix group; repeat to select more\n  --plan ID                      Run one Matrix plan; repeat to select more\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)\n  --lease-ttl SECONDS            Deployment lease lifetime (default: 14400)"
     );
 }
 
@@ -1563,5 +1606,92 @@ mod tests {
             Ok(_) => panic!("must reject"),
         };
         assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn cleanup_failure_preserves_completed_structured_run_as_failed() {
+        let report = serde_json::from_value(serde_json::json!({
+            "schema": 3,
+            "matrix_digest": "a".repeat(64),
+            "suite_origin": "https://suite.example",
+            "auth_probe": null,
+            "errors": [],
+            "local_success": true,
+            "suite_pass": true,
+            "human_review_required": false,
+            "human_review_modules": [],
+            "skipped_modules": [],
+            "failed_modules": [],
+            "incomplete_modules": [],
+            "orchestration_integrity": {
+                "defined_modules": 1,
+                "created_instances": 1,
+                "terminal_modules": 1,
+                "all_modules_instantiated": true,
+                "all_modules_terminal": true,
+                "cleanup_complete": true
+            },
+            "progress": {
+                "completed": 1,
+                "total": 1,
+                "groups": [],
+                "passed_groups": 1,
+                "review_groups": 0,
+                "skipped_groups": 0,
+                "failed_groups": 0,
+                "running_groups": 0,
+                "remaining_groups": 0,
+                "passed": 1,
+                "reviewed": 0,
+                "skipped": 0,
+                "failed": 0,
+                "running": 0,
+                "remaining": 0,
+                "current_profile": null,
+                "current_variant": null,
+                "current_test": null
+            },
+            "plans": [],
+            "modules": [],
+            "cleanup": {
+                "cancelled": [],
+                "deleted_plans": [],
+                "immutable_plans": [],
+                "failures": []
+            }
+        }))
+        .expect("report");
+        let output = RunOutput {
+            deployment: DeploymentReport {
+                matrix_sha256: "a".repeat(64),
+                matrix_source_release: "v1".to_owned(),
+                matrix_groups: 1,
+                matrix_plans: 1,
+                selected_groups: 1,
+                selected_plans: 1,
+                lease_id: "lease-a".to_owned(),
+                applicant_id: uuid::Uuid::nil().to_string(),
+                client_count: 1,
+                expires_at: 1,
+                idempotent_replay: false,
+                cleanup_complete: false,
+            },
+            report,
+            evidence: None,
+        };
+        let (final_output, exit_code) =
+            finalize_run_output(Some(output), vec!["lease-cleanup=failed".to_owned()]);
+
+        assert_eq!(exit_code, 1);
+        assert!(!final_output.success);
+        assert_eq!(final_output.errors, ["lease-cleanup=failed"]);
+        assert!(final_output.run.is_some());
+        assert!(
+            !final_output
+                .run
+                .expect("preserved run")
+                .deployment
+                .cleanup_complete
+        );
     }
 }

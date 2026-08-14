@@ -210,3 +210,11 @@ deployment-bound crash-safe journal blockers. The command creates no NazoAuth
 resource, Suite plan, execution journal, or cleanup obligation. Signed budgets
 are contract ceilings, not proof of runtime enforcement; a future runner must
 enforce them against observed Suite modules, created clients, and elapsed time.
+
+The existing run evidence sink now commits each run into a unique owner-only
+directory with a manifest-last digest envelope, and preserves structured output
+when outer cleanup fails. A future artifact-backed run can place the complete
+verified artifact identity in that same strict envelope. This does not claim a
+Suite signature: obtaining and verifying signed Suite evidence, plus binding it
+to authenticated NazoAuth build/capability receipts, remains an execution-stage
+blocker.

@@ -97,6 +97,24 @@ to `PASSED`. Live progress uses the same outcome classification, so review and
 skipped modules are not counted or rendered as passed. The CLI's final success
 still requires local success, Suite pass, and deployment cleanup completion.
 
+When `--evidence-dir` is supplied, ctl creates a new owner-only `run-<JTI>`
+directory instead of reusing module filenames from an earlier run. Every raw
+module file carries the run and module identity. `report.json` and all raw
+module files are digest-bound by `manifest.json`, which is fsynced and written
+last as the commit marker. A crash can therefore leave only an explicitly
+uncommitted directory; it cannot make a partial set look complete or mix old
+modules into a new run. The manifest also binds the immutable deployment
+release/revision/build/runtime digest, Matrix source, Suite origin, and outer
+lease/proxy cleanup result. This is ctl-generated integrity evidence, not a
+Suite signature; signed Suite evidence remains an external release-stage
+requirement.
+
+Final output schema 2 preserves a completed `RunOutput` even when lease,
+proxy, or evidence cleanup fails. Such failures are listed in `errors`, keep
+`success: false`, and leave `deployment.cleanup_complete: false`; they are no
+longer converted into an unstructured error that discards the collected Suite
+report.
+
 `nazo-operator-protocol` remains in `nazozero/NazoAuth`. `Cargo.toml` pins both
 the package version and a full Git revision. A protocol change therefore requires
 an explicit dependency update and compatibility review; Cargo cannot silently
