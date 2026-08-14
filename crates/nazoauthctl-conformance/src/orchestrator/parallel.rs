@@ -5,7 +5,6 @@ use std::thread;
 
 use super::*;
 
-const SUITE_NON_SUCCESS: &str = "Suite reported a non-success or incomplete module result";
 const SCHEDULER_INCOMPLETE: &str =
     "parallel scheduler stopped before every selected Matrix plan was launched";
 
@@ -22,7 +21,7 @@ struct PlanWork {
 enum WorkerMessage {
     Progress {
         index: usize,
-        snapshot: ProgressSnapshot,
+        snapshot: Box<ProgressSnapshot>,
     },
     Finished {
         index: usize,
@@ -41,7 +40,7 @@ impl ProgressSink for ChannelSink {
     fn update(&mut self, event: &ProgressEvent) {
         let _ = self.sender.send(WorkerMessage::Progress {
             index: self.index,
-            snapshot: event.snapshot.clone(),
+            snapshot: Box::new(event.snapshot.clone()),
         });
     }
 }
@@ -156,7 +155,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
         while stopped_workers < worker_count {
             match receiver.recv() {
                 Ok(WorkerMessage::Progress { index, snapshot }) => {
-                    snapshots[index] = Some(snapshot);
+                    snapshots[index] = Some(*snapshot);
                     sink.update(&ProgressEvent {
                         snapshot: aggregate_progress(
                             &prepared.groups,
@@ -225,6 +224,8 @@ fn worker_prepared(work: &PlanWork) -> PreparedRun {
     group.total = work.plan.modules.len();
     group.status = GroupStatus::Remaining;
     group.passed = 0;
+    group.reviewed = 0;
+    group.skipped = 0;
     group.failed = 0;
     group.running = 0;
     group.remaining = group.total;
@@ -258,6 +259,8 @@ fn aggregate_progress(
         group.completed = 0;
         group.status = GroupStatus::Remaining;
         group.passed = 0;
+        group.reviewed = 0;
+        group.skipped = 0;
         group.failed = 0;
         group.running = 0;
         group.remaining = group.total;
@@ -272,6 +275,8 @@ fn aggregate_progress(
         let target = &mut groups[work[index].group_index];
         target.completed += source.completed;
         target.passed += source.passed;
+        target.reviewed += source.reviewed;
+        target.skipped += source.skipped;
         target.failed += source.failed;
         target.running += source.running;
     }
@@ -290,10 +295,28 @@ fn aggregate_progress(
                 .and_then(|snapshot| snapshot.groups.first())
                 .is_some_and(|group| group.status == GroupStatus::Failed)
         });
+        let any_review = indices.iter().any(|index| {
+            snapshots[*index]
+                .as_ref()
+                .and_then(|snapshot| snapshot.groups.first())
+                .is_some_and(|group| group.status == GroupStatus::Review)
+        });
+        let any_skipped = indices.iter().any(|index| {
+            snapshots[*index]
+                .as_ref()
+                .and_then(|snapshot| snapshot.groups.first())
+                .is_some_and(|group| group.status == GroupStatus::Skipped)
+        });
         group.status = if any_failed {
             GroupStatus::Failed
         } else if indices.iter().all(|index| finished[*index]) {
-            GroupStatus::Passed
+            if any_review {
+                GroupStatus::Review
+            } else if any_skipped {
+                GroupStatus::Skipped
+            } else {
+                GroupStatus::Passed
+            }
         } else if indices.iter().any(|index| snapshots[*index].is_some()) {
             GroupStatus::Running
         } else {
@@ -340,9 +363,6 @@ fn merge_reports(
             plans[work[index].plan.report_index].created_instances = plan_report.created_instances;
         }
         for error in report.errors {
-            if error == SUITE_NON_SUCCESS {
-                continue;
-            }
             if error == "run interrupted" {
                 if !errors.iter().any(|existing| existing == &error) {
                     errors.push(error);
@@ -375,15 +395,8 @@ fn merge_reports(
     let cleanup_complete = cleanup.failures.is_empty();
     let all_modules_instantiated = all_plans_finished && defined_modules == created_instances;
     let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
-    let suite_pass = all_modules_terminal && modules.iter().all(accepted_module_outcome);
-    if !suite_pass && !errors.iter().any(|error| error == SUITE_NON_SUCCESS) {
-        errors.push(SUITE_NON_SUCCESS.to_owned());
-    }
-    let human_review_modules = modules
-        .iter()
-        .filter(|module| module.human_review_required)
-        .map(|module| format!("{}/{}", module.matrix_plan_id, module.test_name))
-        .collect::<Vec<_>>();
+    let outcomes = summarize_module_outcomes(&modules);
+    let suite_pass = defined_modules > 0 && all_modules_terminal && outcomes.all_passed;
     let orchestration_integrity = OrchestrationIntegrity {
         defined_modules,
         created_instances,
@@ -392,22 +405,22 @@ fn merge_reports(
         all_modules_terminal,
         cleanup_complete,
     };
-    let local_success = errors.is_empty()
-        && suite_pass
-        && all_modules_instantiated
-        && all_modules_terminal
-        && cleanup_complete;
+    let local_success =
+        errors.is_empty() && all_modules_instantiated && all_modules_terminal && cleanup_complete;
     RunSummary {
         report: ConformanceReport {
-            schema: 2,
+            schema: 3,
             matrix_digest: runner.config.matrix.digest.clone(),
             suite_origin: runner.config.client.origin().to_string(),
             auth_probe: prepared.auth_probe,
             errors,
             local_success,
             suite_pass,
-            human_review_required: !human_review_modules.is_empty(),
-            human_review_modules,
+            human_review_required: !outcomes.human_review_modules.is_empty(),
+            human_review_modules: outcomes.human_review_modules,
+            skipped_modules: outcomes.skipped_modules,
+            failed_modules: outcomes.failed_modules,
+            incomplete_modules: outcomes.incomplete_modules,
             orchestration_integrity,
             progress,
             plans,
@@ -418,8 +431,7 @@ fn merge_reports(
 }
 
 fn has_fatal_orchestration_failure(report: &ConformanceReport) -> bool {
-    !report.orchestration_integrity.cleanup_complete
-        || report.errors.iter().any(|error| error != SUITE_NON_SUCCESS)
+    !report.orchestration_integrity.cleanup_complete || !report.errors.is_empty()
 }
 
 #[cfg(test)]

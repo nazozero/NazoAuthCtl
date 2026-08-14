@@ -43,15 +43,15 @@ pub struct ModuleReport {
     /// pass/fail result.
     pub official_status: Option<String>,
     /// The Suite's result is preserved verbatim and evaluated separately by
-    /// the explicit acceptance fields below.
+    /// the explicit outcome fields below.
     pub official_result: Option<String>,
     /// The signed Matrix exception applying to this exact module, if any.
     pub expected_result: Option<String>,
-    /// True only when the terminal Suite outcome satisfies the acceptance
-    /// policy and the raw log contains no FAILURE condition result.
-    pub accepted: bool,
-    /// `REVIEW` and `WARNING` count as accepted but must remain visible to a
-    /// human. A PASSED/SKIPPED outcome with a WARNING log is treated the same.
+    /// Controller classification derived from the official status/result and
+    /// raw condition log. Only `PASSED` contributes to an overall Suite pass.
+    pub outcome: ModuleOutcome,
+    /// `REVIEW`, `WARNING`, and a `PASSED` result with a warning log require
+    /// human follow-up. `SKIPPED` remains a separate outcome.
     pub human_review_required: bool,
     /// Blocking FAILURE condition results found in the raw Suite log.
     pub blocking_log_results: Vec<String>,
@@ -65,6 +65,16 @@ pub struct ModuleReport {
     pub raw_info: Value,
     #[serde(skip)]
     pub raw_log: Value,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ModuleOutcome {
+    Passed,
+    Review,
+    Skipped,
+    Failed,
+    Incomplete,
 }
 
 pub(crate) struct ModuleReportContext {
@@ -92,17 +102,29 @@ pub struct ConformanceReport {
     pub matrix_digest: String,
     pub suite_origin: String,
     pub auth_probe: Option<AuthProbe>,
+    /// Local orchestration errors. Official Suite outcomes are represented by
+    /// the outcome fields instead of synthetic error strings.
     pub errors: Vec<String>,
+    /// Local orchestration, evidence collection, and cleanup completed. This
+    /// does not claim that the Suite passed.
     pub local_success: bool,
-    /// Whether every collected official module has an accepted terminal
-    /// outcome: PASSED, REVIEW, WARNING, or the Suite's exact SKIPPED result.
+    /// True only when at least one module was defined and every defined module
+    /// reached the Suite's exact `FINISHED` / `PASSED` outcome without warning
+    /// or failure conditions.
     pub suite_pass: bool,
-    /// True when one or more accepted modules returned REVIEW/WARNING or
+    /// True when one or more modules returned REVIEW/WARNING or
     /// emitted a WARNING condition. These modules remain listed in `modules`
     /// and require explicit human follow-up.
     pub human_review_required: bool,
     /// Exact `matrix_plan_id/test_name` entries requiring human review.
     pub human_review_modules: Vec<String>,
+    /// Exact entries that the Suite classified as `SKIPPED`. An expected skip
+    /// remains skipped and never contributes to `suite_pass`.
+    pub skipped_modules: Vec<String>,
+    /// Exact entries with an explicit failed/unknown result or a blocking log.
+    pub failed_modules: Vec<String>,
+    /// Exact entries that never reached the Suite's `FINISHED` state.
+    pub incomplete_modules: Vec<String>,
     pub orchestration_integrity: OrchestrationIntegrity,
     pub progress: ProgressSnapshot,
     pub plans: Vec<PlanReport>,
@@ -199,16 +221,20 @@ impl ModuleReport {
         );
         let blocking_log_results = blocking_log_results.into_iter().collect::<Vec<_>>();
         let advisory_log_results = advisory_log_results.into_iter().collect::<Vec<_>>();
-        let accepted = context.terminal
-            && official_status.as_deref() == Some("FINISHED")
-            && blocking_log_results.is_empty()
-            && matches!(
-                official_result.as_deref(),
-                Some("PASSED" | "REVIEW" | "WARNING" | "SKIPPED")
-            );
-        let human_review_required = accepted
-            && (matches!(official_result.as_deref(), Some("REVIEW" | "WARNING"))
-                || !advisory_log_results.is_empty());
+        let outcome = if !context.terminal || official_status.as_deref() != Some("FINISHED") {
+            ModuleOutcome::Incomplete
+        } else if !blocking_log_results.is_empty() {
+            ModuleOutcome::Failed
+        } else {
+            match official_result.as_deref() {
+                Some("PASSED") if advisory_log_results.is_empty() => ModuleOutcome::Passed,
+                Some("PASSED" | "REVIEW" | "WARNING") => ModuleOutcome::Review,
+                Some("SKIPPED") => ModuleOutcome::Skipped,
+                _ => ModuleOutcome::Failed,
+            }
+        };
+        let human_review_required = outcome == ModuleOutcome::Review
+            || (outcome == ModuleOutcome::Skipped && !advisory_log_results.is_empty());
         Self {
             matrix_plan_id: context.matrix_plan_id,
             suite_plan_id: context.suite_plan_id,
@@ -218,7 +244,7 @@ impl ModuleReport {
             official_status,
             official_result,
             expected_result: context.expected_result,
-            accepted,
+            outcome,
             human_review_required,
             blocking_log_results,
             advisory_log_results,
@@ -228,6 +254,49 @@ impl ModuleReport {
             raw_log,
         }
     }
+}
+
+pub(crate) struct ModuleOutcomeSummary {
+    pub all_passed: bool,
+    pub human_review_modules: Vec<String>,
+    pub skipped_modules: Vec<String>,
+    pub failed_modules: Vec<String>,
+    pub incomplete_modules: Vec<String>,
+}
+
+pub(crate) fn summarize_module_outcomes(modules: &[ModuleReport]) -> ModuleOutcomeSummary {
+    let mut summary = ModuleOutcomeSummary {
+        all_passed: !modules.is_empty(),
+        human_review_modules: Vec::new(),
+        skipped_modules: Vec::new(),
+        failed_modules: Vec::new(),
+        incomplete_modules: Vec::new(),
+    };
+    for module in modules {
+        let identity = format!("{}/{}", module.matrix_plan_id, module.test_name);
+        if module.human_review_required {
+            summary.human_review_modules.push(identity.clone());
+        }
+        match module.outcome {
+            ModuleOutcome::Passed => {}
+            ModuleOutcome::Review => {
+                summary.all_passed = false;
+            }
+            ModuleOutcome::Skipped => {
+                summary.all_passed = false;
+                summary.skipped_modules.push(identity);
+            }
+            ModuleOutcome::Failed => {
+                summary.all_passed = false;
+                summary.failed_modules.push(identity);
+            }
+            ModuleOutcome::Incomplete => {
+                summary.all_passed = false;
+                summary.incomplete_modules.push(identity);
+            }
+        }
+    }
+    summary
 }
 
 fn collect_condition_log_results(
@@ -304,6 +373,27 @@ fn public_scalar(value: &Value) -> Value {
 mod tests {
     use super::*;
 
+    fn module(
+        test_name: &str,
+        terminal: bool,
+        status: &str,
+        result: &str,
+        log: Value,
+    ) -> ModuleReport {
+        ModuleReport::from_info(
+            ModuleReportContext {
+                matrix_plan_id: "p".into(),
+                suite_plan_id: "s".into(),
+                module_id: Some(format!("m-{test_name}")),
+                test_name: test_name.into(),
+                terminal,
+                expected_result: None,
+            },
+            serde_json::json!({"status":status,"result":result}),
+            log,
+        )
+    }
+
     #[test]
     fn public_report_redacts_config_and_secret_fields() {
         let raw = serde_json::json!({"status":"FINISHED","result":"PASSED","config":{"client_secret":"abc"},"token":"abc"});
@@ -325,5 +415,69 @@ mod tests {
         assert!(!encoded.contains("abc"));
         assert!(!encoded.contains("secret-value"));
         assert_eq!(report.official_result.as_deref(), Some("PASSED"));
+    }
+
+    #[test]
+    fn outcome_summary_never_promotes_review_skipped_or_incomplete_to_passed() {
+        let modules = vec![
+            module("passed", true, "FINISHED", "PASSED", serde_json::json!([])),
+            module("review", true, "FINISHED", "REVIEW", serde_json::json!([])),
+            module(
+                "skipped",
+                true,
+                "FINISHED",
+                "SKIPPED",
+                serde_json::json!([]),
+            ),
+            module(
+                "skipped-warning",
+                true,
+                "FINISHED",
+                "SKIPPED",
+                serde_json::json!([{"result":"WARNING"}]),
+            ),
+            module("failed", true, "FINISHED", "FAILED", serde_json::json!([])),
+            module(
+                "incomplete",
+                true,
+                "INTERRUPTED",
+                "PASSED",
+                serde_json::json!([]),
+            ),
+        ];
+        let summary = summarize_module_outcomes(&modules);
+
+        assert!(!summary.all_passed);
+        assert_eq!(
+            summary.human_review_modules,
+            ["p/review", "p/skipped-warning"]
+        );
+        assert_eq!(summary.skipped_modules, ["p/skipped", "p/skipped-warning"]);
+        assert_eq!(summary.failed_modules, ["p/failed"]);
+        assert_eq!(summary.incomplete_modules, ["p/incomplete"]);
+    }
+
+    #[test]
+    fn passed_with_warning_is_review_and_empty_run_is_not_a_suite_pass() {
+        let warning = module(
+            "warning",
+            true,
+            "FINISHED",
+            "PASSED",
+            serde_json::json!([{"result":"WARNING"}]),
+        );
+        assert_eq!(warning.outcome, ModuleOutcome::Review);
+        assert!(warning.human_review_required);
+        assert!(!summarize_module_outcomes(&[]).all_passed);
+        assert!(
+            summarize_module_outcomes(&[module(
+                "passed",
+                true,
+                "FINISHED",
+                "PASSED",
+                serde_json::json!([]),
+            )])
+            .all_passed
+        );
     }
 }

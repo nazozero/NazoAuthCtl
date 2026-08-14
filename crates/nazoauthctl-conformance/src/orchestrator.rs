@@ -23,8 +23,8 @@ use crate::progress::{
     GroupProgress, GroupStatus, ProgressEvent, ProgressSink, ProgressSnapshot, redacted_variant,
 };
 use crate::report::{
-    CleanupFailure, CleanupReport, ConformanceReport, ModuleReport, ModuleReportContext,
-    OrchestrationIntegrity, PlanReport,
+    CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport,
+    ModuleReportContext, OrchestrationIntegrity, PlanReport, summarize_module_outcomes,
 };
 
 mod parallel;
@@ -401,6 +401,8 @@ impl ConformanceRunner {
                 total: 0,
                 status: GroupStatus::Remaining,
                 passed: 0,
+                reviewed: 0,
+                skipped: 0,
                 failed: 0,
                 running: 0,
                 remaining: 0,
@@ -796,17 +798,23 @@ impl ConformanceRunner {
                         info,
                         log,
                     ));
-                    let module_pass = modules.last().is_some_and(accepted_module_outcome);
+                    let module_outcome = modules.last().map(|module| module.outcome);
                     if terminal {
                         groups[group_index].running = groups[group_index].running.saturating_sub(1);
                         groups[group_index].completed += 1;
-                        if module_pass {
-                            groups[group_index].passed += 1;
-                        } else {
-                            groups[group_index].failed += 1;
+                        match module_outcome {
+                            Some(ModuleOutcome::Passed) => groups[group_index].passed += 1,
+                            Some(ModuleOutcome::Review) => groups[group_index].reviewed += 1,
+                            Some(ModuleOutcome::Skipped) => groups[group_index].skipped += 1,
+                            Some(ModuleOutcome::Failed | ModuleOutcome::Incomplete) | None => {
+                                groups[group_index].failed += 1;
+                            }
                         }
                     }
-                    if !module_pass {
+                    if matches!(
+                        module_outcome,
+                        Some(ModuleOutcome::Failed | ModuleOutcome::Incomplete) | None
+                    ) {
                         groups[group_index].status = GroupStatus::Failed;
                     }
                     emit_progress(
@@ -821,7 +829,13 @@ impl ConformanceRunner {
                     }
                 }
                 if groups[group_index].status == GroupStatus::Running {
-                    groups[group_index].status = GroupStatus::Passed;
+                    groups[group_index].status = if groups[group_index].reviewed > 0 {
+                        GroupStatus::Review
+                    } else if groups[group_index].skipped > 0 {
+                        GroupStatus::Skipped
+                    } else {
+                        GroupStatus::Passed
+                    };
                     emit_progress(
                         sink,
                         &groups,
@@ -848,10 +862,8 @@ impl ConformanceRunner {
         let all_modules_instantiated = defined_modules == created_instances;
         let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
         let cleanup_complete = cleanup.failures.is_empty();
-        let suite_pass = all_modules_terminal && modules.iter().all(accepted_module_outcome);
-        if !suite_pass && errors.is_empty() {
-            errors.push("Suite reported a non-success or incomplete module result".to_owned());
-        }
+        let outcomes = summarize_module_outcomes(&modules);
+        let suite_pass = defined_modules > 0 && all_modules_terminal && outcomes.all_passed;
         let orchestration_integrity = OrchestrationIntegrity {
             defined_modules,
             created_instances,
@@ -861,21 +873,14 @@ impl ConformanceRunner {
             cleanup_complete,
         };
         let local_success = errors.is_empty()
-            && suite_pass
             && orchestration_integrity.all_modules_instantiated
             && orchestration_integrity.all_modules_terminal
             && orchestration_integrity.cleanup_complete;
-        let human_review_modules = modules
-            .iter()
-            .filter(|module| module.human_review_required)
-            .map(|module| format!("{}/{}", module.matrix_plan_id, module.test_name))
-            .collect::<Vec<_>>();
-        let human_review_required = !human_review_modules.is_empty();
+        let human_review_required = !outcomes.human_review_modules.is_empty();
         let snapshot = snapshot(&groups, current_profile, current_variant, current_test);
         let report = ConformanceReport {
-            // Schema 2 adds explicit accepted/reviewed/skipped outcome
-            // semantics; schema 1 treated every non-PASSED result as failure.
-            schema: 2,
+            // Schema 3 separates local execution from exact Suite outcomes.
+            schema: 3,
             matrix_digest: self.config.matrix.digest.clone(),
             suite_origin: self.config.client.origin().to_string(),
             auth_probe,
@@ -883,7 +888,10 @@ impl ConformanceRunner {
             local_success,
             suite_pass,
             human_review_required,
-            human_review_modules,
+            human_review_modules: outcomes.human_review_modules,
+            skipped_modules: outcomes.skipped_modules,
+            failed_modules: outcomes.failed_modules,
+            incomplete_modules: outcomes.incomplete_modules,
             orchestration_integrity,
             progress: snapshot,
             plans,
@@ -933,6 +941,14 @@ fn snapshot(
             .iter()
             .filter(|group| group.status == GroupStatus::Passed)
             .count(),
+        review_groups: groups
+            .iter()
+            .filter(|group| group.status == GroupStatus::Review)
+            .count(),
+        skipped_groups: groups
+            .iter()
+            .filter(|group| group.status == GroupStatus::Skipped)
+            .count(),
         failed_groups: groups
             .iter()
             .filter(|group| group.status == GroupStatus::Failed)
@@ -946,6 +962,8 @@ fn snapshot(
             .filter(|group| group.status == GroupStatus::Remaining)
             .count(),
         passed: groups.iter().map(|group| group.passed).sum(),
+        reviewed: groups.iter().map(|group| group.reviewed).sum(),
+        skipped: groups.iter().map(|group| group.skipped).sum(),
         failed: groups.iter().map(|group| group.failed).sum(),
         running: groups.iter().map(|group| group.running).sum(),
         remaining: groups.iter().map(|group| group.remaining).sum(),
@@ -1053,10 +1071,6 @@ fn is_terminal(value: &Value) -> bool {
         value.get("status").and_then(Value::as_str),
         Some("FINISHED" | "INTERRUPTED")
     )
-}
-
-fn accepted_module_outcome(module: &ModuleReport) -> bool {
-    module.accepted
 }
 
 fn validate_matrix_origins(
@@ -1288,11 +1302,11 @@ mod tests {
             serde_json::json!([]),
         );
         assert_eq!(report.official_result.as_deref(), Some("FAILED"));
-        assert!(!accepted_module_outcome(&report));
+        assert_eq!(report.outcome, ModuleOutcome::Failed);
     }
 
     #[test]
-    fn review_is_accepted_and_requires_human_follow_up() {
+    fn review_is_distinct_from_pass_and_requires_human_follow_up() {
         let report = ModuleReport::from_info(
             ModuleReportContext {
                 matrix_plan_id: "p".into(),
@@ -1305,13 +1319,13 @@ mod tests {
             serde_json::json!({"status":"FINISHED","result":"REVIEW"}),
             serde_json::json!([{"result":"REVIEW"}]),
         );
-        assert!(accepted_module_outcome(&report));
+        assert_eq!(report.outcome, ModuleOutcome::Review);
         assert!(report.human_review_required);
     }
 
     #[test]
-    fn exact_skipped_is_accepted_with_or_without_a_matrix_annotation() {
-        let accepted = ModuleReport::from_info(
+    fn exact_skipped_remains_skipped_with_or_without_a_matrix_annotation() {
+        let expected = ModuleReport::from_info(
             ModuleReportContext {
                 matrix_plan_id: "p".into(),
                 suite_plan_id: "s".into(),
@@ -1323,7 +1337,7 @@ mod tests {
             serde_json::json!({"status":"FINISHED","result":"SKIPPED"}),
             serde_json::json!([]),
         );
-        assert!(accepted_module_outcome(&accepted));
+        assert_eq!(expected.outcome, ModuleOutcome::Skipped);
 
         let unexpected = ModuleReport::from_info(
             ModuleReportContext {
@@ -1337,11 +1351,11 @@ mod tests {
             serde_json::json!({"status":"FINISHED","result":"SKIPPED"}),
             serde_json::json!([]),
         );
-        assert!(accepted_module_outcome(&unexpected));
+        assert_eq!(unexpected.outcome, ModuleOutcome::Skipped);
     }
 
     #[test]
-    fn review_with_a_warning_is_accepted_and_requires_human_follow_up() {
+    fn review_with_a_warning_remains_review_and_requires_human_follow_up() {
         let report = ModuleReport::from_info(
             ModuleReportContext {
                 matrix_plan_id: "p".into(),
@@ -1354,14 +1368,14 @@ mod tests {
             serde_json::json!({"status":"FINISHED","result":"REVIEW"}),
             serde_json::json!([{"result":"WARNING"}]),
         );
-        assert!(accepted_module_outcome(&report));
+        assert_eq!(report.outcome, ModuleOutcome::Review);
         assert!(report.human_review_required);
         assert!(report.blocking_log_results.is_empty());
         assert_eq!(report.advisory_log_results, vec!["WARNING"]);
     }
 
     #[test]
-    fn warning_is_accepted_but_failure_remains_blocking() {
+    fn warning_requires_review_but_failure_log_is_failed() {
         let warning = ModuleReport::from_info(
             ModuleReportContext {
                 matrix_plan_id: "p".into(),
@@ -1374,7 +1388,7 @@ mod tests {
             serde_json::json!({"status":"FINISHED","result":"WARNING"}),
             serde_json::json!([{"result":"WARNING"}]),
         );
-        assert!(accepted_module_outcome(&warning));
+        assert_eq!(warning.outcome, ModuleOutcome::Review);
         assert!(warning.human_review_required);
         assert!(warning.blocking_log_results.is_empty());
         assert_eq!(warning.advisory_log_results, vec!["WARNING"]);
@@ -1391,7 +1405,7 @@ mod tests {
             serde_json::json!({"status":"FINISHED","result":"WARNING"}),
             serde_json::json!([{"result":"WARNING"},{"result":"FAILURE"}]),
         );
-        assert!(!accepted_module_outcome(&failure));
+        assert_eq!(failure.outcome, ModuleOutcome::Failed);
         assert!(!failure.human_review_required);
         assert_eq!(failure.blocking_log_results, vec!["FAILURE"]);
         assert_eq!(failure.advisory_log_results, vec!["WARNING"]);
