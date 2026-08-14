@@ -9,6 +9,7 @@
 
 mod artifact;
 mod artifact_discovery;
+mod artifact_plan;
 mod browser;
 mod client;
 mod credentials;
@@ -32,7 +33,10 @@ pub use artifact::{
 };
 pub use artifact_discovery::{
     ArtifactDiscoveryError, CachedOidfArtifact, ResolvedOidfArtifact, open_cached_oidf_artifact,
-    resolve_oidf_artifact,
+    open_cached_oidf_driver_plan, resolve_oidf_artifact,
+};
+pub use artifact_plan::{
+    OidfDriverInspectionPlan, OidfDriverPlanEntry, OidfPlanError, OidfPlanSelection,
 };
 pub use browser::{
     BrowserAutomation, BrowserCommand, BrowserDriver, BrowserEntry, BrowserError, BrowserExecutor,

@@ -11,11 +11,11 @@ use nazoauthctl_conformance::{
     BrowserTargetOrigin, ClientConfig, ConformanceAutomation, ConformanceBinding,
     ConformanceRunConfig, ConformanceRunner, CredentialStore, DescriptorMaterializer,
     MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT_SECONDS, ManagedWebDriver, MatrixSelection,
-    OnboardingOutput, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
-    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl,
-    StableRenderer, SuiteClient, TtyRenderer, WebDriverClient, WebDriverEndpoint,
-    open_cached_oidf_artifact, read_artifact_matrix, read_compact_manifest, resolve_oidf_artifact,
-    verify_oidf_artifact,
+    OidfPlanSelection, OnboardingOutput, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
+    OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard,
+    RunControl, StableRenderer, SuiteClient, TtyRenderer, WebDriverClient, WebDriverEndpoint,
+    open_cached_oidf_artifact, open_cached_oidf_driver_plan, read_artifact_matrix,
+    read_compact_manifest, resolve_oidf_artifact, verify_oidf_artifact,
 };
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
@@ -28,6 +28,16 @@ const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
 
 fn main() {
     let args = env::args_os().collect::<Vec<_>>();
+    let plan = match parse_artifact_plan_invocation(&args) {
+        Ok(invocation) => invocation,
+        Err(error) => exit_with_error(&error),
+    };
+    if let Some(invocation) = plan {
+        match execute_artifact_plan(invocation) {
+            Ok(()) => return,
+            Err(error) => exit_with_error(&error),
+        }
+    }
     let cached = match parse_artifact_open_invocation(&args) {
         Ok(invocation) => invocation,
         Err(error) => exit_with_error(&error),
@@ -71,6 +81,103 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(error) => exit_with_error(&error),
     }
+}
+
+struct ArtifactPlanInvocation {
+    trust_policy: PathBuf,
+    cache_directory: PathBuf,
+    manifest_digest: String,
+    capabilities: std::collections::BTreeSet<String>,
+    selection: OidfPlanSelection,
+}
+
+fn parse_artifact_plan_invocation(
+    args: &[OsString],
+) -> anyhow::Result<Option<ArtifactPlanInvocation>> {
+    let mut values = args
+        .iter()
+        .skip(1)
+        .map(|value| {
+            value
+                .to_str()
+                .map(ToOwned::to_owned)
+                .context("artifact plan arguments must be valid UTF-8")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if values.first().map(String::as_str) != Some("conformance")
+        || values.get(1).map(String::as_str) != Some("artifact")
+        || values.get(2).map(String::as_str) != Some("plan")
+    {
+        return Ok(None);
+    }
+    values.drain(..3);
+    if values
+        .iter()
+        .any(|value| matches!(value.as_str(), "-h" | "--help"))
+    {
+        print_artifact_plan_help();
+        std::process::exit(0);
+    }
+    let mut trust_policy = None;
+    let mut cache_directory = None;
+    let mut manifest_digest = None;
+    let mut capabilities = std::collections::BTreeSet::new();
+    let mut groups = Vec::new();
+    let mut plans = Vec::new();
+    let mut index = 0usize;
+    while index < values.len() {
+        let option = values[index].as_str();
+        if !matches!(
+            option,
+            "--trust-policy" | "--cache-dir" | "--digest" | "--capability" | "--group" | "--plan"
+        ) {
+            bail!("unknown conformance artifact plan option: {option}");
+        }
+        let value = values
+            .get(index + 1)
+            .with_context(|| format!("{option} requires a value"))?
+            .clone();
+        match option {
+            "--trust-policy" => set_once(&mut trust_policy, PathBuf::from(value), option)?,
+            "--cache-dir" => set_once(&mut cache_directory, PathBuf::from(value), option)?,
+            "--digest" => set_once(&mut manifest_digest, value, option)?,
+            "--capability" => push_unique(&mut capabilities, value, option)?,
+            "--group" => push_unique_vec(&mut groups, value, option)?,
+            "--plan" => push_unique_vec(&mut plans, value, option)?,
+            _ => unreachable!(),
+        }
+        index += 2;
+    }
+    Ok(Some(ArtifactPlanInvocation {
+        trust_policy: trust_policy.context("--trust-policy is required")?,
+        cache_directory: cache_directory.context("--cache-dir is required")?,
+        manifest_digest: manifest_digest.context("--digest is required")?,
+        capabilities,
+        selection: OidfPlanSelection { groups, plans },
+    }))
+}
+
+fn execute_artifact_plan(invocation: ArtifactPlanInvocation) -> anyhow::Result<()> {
+    let trust = ArtifactTrustPolicy::from_path(&invocation.trust_policy)
+        .context("OIDF artifact trust policy is invalid")?;
+    let plan = open_cached_oidf_driver_plan(
+        &invocation.cache_directory,
+        &invocation.manifest_digest,
+        &trust,
+        &invocation.capabilities,
+        invocation.selection,
+        current_unix_time()?,
+    )
+    .context("cached OIDF driver plan compilation failed")?;
+    serde_json::to_writer_pretty(io::stdout().lock(), &plan)
+        .context("failed to write OIDF driver inspection plan")?;
+    writeln!(io::stdout()).context("failed to finish OIDF driver inspection plan")
+}
+
+fn print_artifact_plan_help() {
+    println!(
+        "Usage:\n  nazoauthctl conformance artifact plan --trust-policy PATH --cache-dir PATH --digest SHA256 [--capability NAME ...] [--group ID ...] [--plan ID ...]\n\nThis is a read-only, offline inspection plan. It revalidates one exact cached artifact and compiles exact signed Matrix selections. Caller-supplied capability names are not attested negotiation. The output is explicitly not deployment-bound or executable and creates no run journal or resources."
+    );
 }
 
 struct ArtifactOpenInvocation {
@@ -614,6 +721,25 @@ fn set_once<T>(slot: &mut Option<T>, value: T, option: &str) -> anyhow::Result<(
     Ok(())
 }
 
+fn push_unique(
+    values: &mut std::collections::BTreeSet<String>,
+    value: String,
+    option: &str,
+) -> anyhow::Result<()> {
+    if !values.insert(value) {
+        bail!("{option} values must be unique");
+    }
+    Ok(())
+}
+
+fn push_unique_vec(values: &mut Vec<String>, value: String, option: &str) -> anyhow::Result<()> {
+    if values.contains(&value) {
+        bail!("{option} values must be unique");
+    }
+    values.push(value);
+    Ok(())
+}
+
 fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let suite_origin = Origin::from_suite_arg(invocation.suite.as_deref())
         .context("invalid OpenID Foundation Conformance Suite origin")?;
@@ -1065,6 +1191,80 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn artifact_plan_is_a_separate_read_only_selection_command() {
+        let digest = "a".repeat(64);
+        let parsed = parse_artifact_plan_invocation(&args(&[
+            "nazoauthctl",
+            "conformance",
+            "artifact",
+            "plan",
+            "--trust-policy",
+            "/etc/nazoauthctl/oidf-trust.json",
+            "--cache-dir",
+            "/var/lib/nazoauthctl/oidf-cache",
+            "--digest",
+            &digest,
+            "--capability",
+            "nazoauth.client.create",
+            "--group",
+            "oidc",
+            "--plan",
+            "p001",
+        ]))
+        .expect("parse")
+        .expect("artifact plan");
+        assert_eq!(parsed.manifest_digest, digest);
+        assert_eq!(parsed.selection.groups, ["oidc"]);
+        assert_eq!(parsed.selection.plans, ["p001"]);
+        assert!(parsed.capabilities.contains("nazoauth.client.create"));
+        assert!(
+            parse_run_invocation(&args(&["nazoauthctl", "conformance", "artifact", "plan"]))
+                .expect("run parser")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn artifact_plan_requires_closed_unique_inputs() {
+        let digest = "a".repeat(64);
+        assert!(
+            parse_artifact_plan_invocation(&args(&[
+                "nazoauthctl",
+                "conformance",
+                "artifact",
+                "plan",
+                "--trust-policy",
+                "/trust.json",
+                "--cache-dir",
+                "/cache",
+            ]))
+            .is_err()
+        );
+        for option in ["--capability", "--group", "--plan"] {
+            assert!(
+                parse_artifact_plan_invocation(&args(&[
+                    "nazoauthctl",
+                    "conformance",
+                    "artifact",
+                    "plan",
+                    "--trust-policy",
+                    "/trust.json",
+                    "--cache-dir",
+                    "/cache",
+                    "--digest",
+                    &digest,
+                    option,
+                    "duplicate",
+                    option,
+                    "duplicate",
+                ]))
+                .is_err(),
+                "duplicate {option} must fail"
+            );
+        }
     }
 
     #[test]
