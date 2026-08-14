@@ -95,6 +95,7 @@ Start here:
   nazoauthctl [--config PATH] update --plan
   nazoauthctl [--config PATH] update --yes
   nazoauthctl [--config PATH] conformance run
+  nazoauthctl conformance artifact resolve --trust-policy PATH --manifest-url URL --cache-dir PATH
   nazoauthctl conformance artifact verify --trust-policy PATH --manifest PATH --matrix PATH
   nazoauthctl [--deployment ID] development activate --artifact IMAGE_OR_BINARY --yes
 
@@ -211,6 +212,8 @@ never exports a leaf certificate or private key."
         }
         cli::HelpTopic::Conformance => {
             "Usage:
+  nazoauthctl conformance artifact resolve --trust-policy PATH \
+    --manifest-url HTTPS_URL --cache-dir PATH [--capability NAME ...]
   nazoauthctl conformance artifact verify --trust-policy PATH \
     --manifest PATH --matrix PATH [--capability NAME ...]
   nazoauthctl [--deployment ID] [--config PATH] conformance run [--suite URL]
@@ -224,6 +227,11 @@ never exports a leaf certificate or private key."
   nazoauthctl [--config PATH] conformance lease list
   nazoauthctl [--config PATH] conformance lease revoke --lease-id UUID --yes
   nazoauthctl [--config PATH] conformance lease cleanup --yes
+
+`conformance artifact resolve` fetches a bounded stable-channel manifest without
+redirects, verifies it before following the signed matrix URL, verifies the exact
+matrix bytes, and commits an immutable owner-only cache entry. The verified record
+is written last as the cache commit marker; an incomplete entry is never accepted.
 
 `conformance artifact verify` is read-only and deployment-independent. It emits a
 verified identity only after checking the local trust policy, ES256 signature,

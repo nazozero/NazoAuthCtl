@@ -1,9 +1,8 @@
 # Signed OIDF driver and matrix artifacts
 
 This contract separates OIDF conformance data from both the NazoAuth server
-Release and the NazoAuthCtl Release. It is the trust boundary for future
-dynamic discovery; it is not a NazoAuth management API and it does not execute
-the Suite.
+Release and the NazoAuthCtl Release. It is not a NazoAuth management API and it
+does not execute the Suite.
 
 ## Ownership and trust
 
@@ -79,7 +78,35 @@ NazoAuth capabilities. A future deployment-bound runner must obtain them from
 authenticated capability negotiation and pass that observed set to the same
 verifier.
 
-This phase deliberately does not download artifacts, provision server
-resources, run the Suite, or clean resources. Dynamic HTTPS discovery and
-crash-safe run journals are separate transactions layered on this verifier so
-network retrieval cannot weaken the local trust decision.
+The local verify command deliberately does not download artifacts, provision
+server resources, run the Suite, or clean resources.
+
+## Dynamic HTTPS discovery and immutable cache
+
+```text
+nazoauthctl conformance artifact resolve \
+  --trust-policy /etc/nazoauthctl/oidf-trust.json \
+  --manifest-url https://artifacts.example/oidf/stable/driver.jws \
+  --cache-dir /var/lib/nazoauthctl/oidf-cache \
+  --capability nazoauth.client.create
+```
+
+The stable channel URL must be below the trusted source. The client accepts
+HTTPS only, sends no credentials, follows no redirect, applies connection and
+whole-request timeouts, and bounds the response before parsing. It verifies the
+driver signature, source, expiry, engine protocol, and capabilities before it
+uses the signed matrix URL. The matrix download is then bounded by the signed
+byte size and accepted only after exact digest and schema validation.
+
+Verified bytes are stored under the driver manifest digest in an owner-only
+cache. `driver.jws` and `matrix.json` are individually fsynced and atomically
+replaced. `verified.json` is written last and is the commit marker. A cache hit
+requires the committed manifest, matrix, URL, and verified identity to match
+the newly fetched and verified artifact exactly. Conflicting committed content
+fails closed; it is never overwritten as a recovery shortcut.
+
+The cache is evidence and recovery input, not a new trust root. Resolution
+still verifies the current signed channel and validity window. Offline cache
+selection, deployment-bound run journals, authenticated NazoAuth capability
+negotiation, provisioning, Suite execution, and cleanup remain separate later
+transactions.

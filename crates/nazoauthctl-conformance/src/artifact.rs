@@ -109,7 +109,7 @@ pub struct OidfArtifactMatrixPlan {
     pub expected_results: std::collections::BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifiedOidfArtifact {
     pub artifact_id: String,
@@ -129,6 +129,14 @@ pub struct VerifiedOidfArtifact {
     pub not_before: i64,
     pub expires_at: i64,
     pub resource_bounds: OidfResourceBounds,
+}
+
+#[derive(Clone, Debug)]
+pub struct VerifiedOidfDriverManifest {
+    manifest: OidfDriverManifest,
+    signer_key_id: String,
+    compact_sha256: String,
+    compact_size: u64,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -204,6 +212,14 @@ impl ArtifactTrustPolicy {
         }
         Ok(source)
     }
+
+    pub(crate) fn accepts_url(&self, value: &str) -> bool {
+        let Ok(source) = self.validated_source() else {
+            return false;
+        };
+        validated_https_url(value, false)
+            .is_ok_and(|candidate| url_is_below_source(&candidate, &source))
+    }
 }
 
 pub fn verify_oidf_artifact(
@@ -213,6 +229,16 @@ pub fn verify_oidf_artifact(
     available_capabilities: &BTreeSet<String>,
     now: i64,
 ) -> Result<VerifiedOidfArtifact, ArtifactError> {
+    let driver = verify_oidf_driver_manifest(compact_manifest, trust, available_capabilities, now)?;
+    verify_oidf_matrix(driver, matrix_bytes)
+}
+
+pub fn verify_oidf_driver_manifest(
+    compact_manifest: &str,
+    trust: &ArtifactTrustPolicy,
+    available_capabilities: &BTreeSet<String>,
+    now: i64,
+) -> Result<VerifiedOidfDriverManifest, ArtifactError> {
     if compact_manifest.is_empty() || compact_manifest.len() > MAX_SIGNED_DRIVER_BYTES {
         return Err(ArtifactError::Oversize);
     }
@@ -252,21 +278,34 @@ pub fn verify_oidf_artifact(
     let manifest: OidfDriverManifest =
         serde_json::from_slice(&payload_bytes).map_err(|_| ArtifactError::MalformedManifest)?;
     validate_manifest(&manifest, trust, available_capabilities, now)?;
-    let matrix = validate_matrix(matrix_bytes, &manifest)?;
+    Ok(VerifiedOidfDriverManifest {
+        manifest,
+        signer_key_id: trust.key_id.clone(),
+        compact_sha256: digest(compact_manifest.as_bytes()),
+        compact_size: u64::try_from(compact_manifest.len())
+            .map_err(|_| ArtifactError::ManifestPolicy("driver manifest size exceeds u64"))?,
+    })
+}
+
+pub fn verify_oidf_matrix(
+    driver: VerifiedOidfDriverManifest,
+    matrix_bytes: &[u8],
+) -> Result<VerifiedOidfArtifact, ArtifactError> {
+    let matrix = validate_matrix(matrix_bytes, &driver.manifest)?;
     let matrix_plans = matrix
         .groups
         .iter()
         .map(|group| group.plans.len())
         .sum::<usize>();
+    let manifest = driver.manifest;
     Ok(VerifiedOidfArtifact {
         artifact_id: manifest.artifact_id,
         revision: manifest.revision,
         source: manifest.source,
         signer_identity: manifest.signer_identity,
-        signer_key_id: trust.key_id.clone(),
-        driver_manifest_sha256: digest(compact_manifest.as_bytes()),
-        driver_manifest_size: u64::try_from(compact_manifest.len())
-            .map_err(|_| ArtifactError::ManifestPolicy("driver manifest size exceeds u64"))?,
+        signer_key_id: driver.signer_key_id,
+        driver_manifest_sha256: driver.compact_sha256,
+        driver_manifest_size: driver.compact_size,
         suite: manifest.suite,
         engine_protocol: manifest.engine_protocol,
         required_capabilities: manifest.required_capabilities,
@@ -280,6 +319,20 @@ pub fn verify_oidf_artifact(
         expires_at: manifest.expires_at,
         resource_bounds: manifest.resource_bounds,
     })
+}
+
+impl VerifiedOidfDriverManifest {
+    pub fn matrix_url(&self) -> &str {
+        &self.manifest.matrix.url
+    }
+
+    pub fn matrix_size(&self) -> u64 {
+        self.manifest.matrix.size
+    }
+
+    pub fn compact_sha256(&self) -> &str {
+        &self.compact_sha256
+    }
 }
 
 pub fn read_compact_manifest(path: &Path) -> Result<String, ArtifactError> {
