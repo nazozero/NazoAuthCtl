@@ -4,7 +4,6 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
 };
-#[cfg(unix)]
 use rustls::RootCertStore;
 use std::io::{Cursor, Read as _, Write as _};
 use std::sync::Arc;
@@ -87,8 +86,84 @@ fn recovery_accepts_only_the_exact_previous_or_committed_receipt() {
         transaction.leaf_certificate_sha256.clone(),
     );
     assert!(validate_committed_receipt_binding(&transaction, &committed).is_ok());
+    assert!(ensure_source_not_current(Some(&committed), &transaction.source).is_err());
+    let different_source = CertificateSourceBinding::ExternalFiles {
+        certificate_sha256: "1".repeat(64),
+        private_key_sha256: "2".repeat(64),
+    };
+    assert!(ensure_source_not_current(Some(&committed), &different_source).is_ok());
     committed.provider_config_sha256 = "f".repeat(64);
     assert!(validate_committed_receipt_binding(&transaction, &committed).is_err());
+}
+
+#[test]
+fn certificate_source_binding_is_persistently_verifiable() {
+    let certificate_sha256 = "c".repeat(64);
+    let private_key_sha256 = "d".repeat(64);
+    let leaf_sha256 = "e".repeat(64);
+    let material_sha256 = sha256(format!("{leaf_sha256}:{certificate_sha256}").as_bytes());
+    let external = CertificateSourceBinding::ExternalFiles {
+        certificate_sha256: certificate_sha256.clone(),
+        private_key_sha256: private_key_sha256.clone(),
+    };
+    assert!(valid_certificate_source_binding(
+        &external,
+        7,
+        1_800_000_000,
+        1_900_000_000,
+    ));
+    assert_eq!(
+        source_material_sha256(&external, &leaf_sha256),
+        material_sha256
+    );
+
+    let source = AcmeInstallSource {
+        receipt_sha256: "a".repeat(64),
+        issuance_jti: "0198f5df-4df8-7d9f-8f6a-5c2b2917cc8b".to_owned(),
+        issuance_declaration_revision: 7,
+        issuance_revision: 3,
+        acme_protocol: acme::CONFIG_PROTOCOL.to_owned(),
+        acme_config_sha256: "b".repeat(64),
+        certificate_path: PathBuf::from("/private/fullchain.pem"),
+        private_key_path: PathBuf::from("/private/private-key.pem"),
+        certificate_sha256: certificate_sha256.clone(),
+        private_key_sha256: private_key_sha256.clone(),
+        leaf_certificate_sha256: leaf_sha256.clone(),
+        material_sha256: material_sha256.clone(),
+        certificate_not_after: 1_900_000_000,
+        issued_at: 1_799_999_000,
+    };
+    let material = ValidatedMaterial {
+        certificate_pem: Vec::new(),
+        private_key_pem: zeroize::Zeroizing::new(Vec::new()),
+        certificate_sha256,
+        private_key_sha256,
+        leaf_sha256,
+        material_sha256,
+        not_after: 1_900_000_000,
+        root_store: RootCertStore::empty(),
+    };
+    let binding = bind_certificate_source(
+        &ResolvedCertificateSource::AcmeReceipt(Box::new(source.clone())),
+        &material,
+    )
+    .unwrap();
+    assert!(valid_certificate_source_binding(
+        &binding,
+        7,
+        1_800_000_000,
+        1_900_000_000,
+    ));
+
+    let mut changed = source;
+    changed.material_sha256 = "f".repeat(64);
+    assert!(
+        bind_certificate_source(
+            &ResolvedCertificateSource::AcmeReceipt(Box::new(changed)),
+            &material,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -204,10 +279,20 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
         provider_config: work.path().join("provider.json"),
         tenant: "tenant-a".to_owned(),
         hostname: "auth.example".to_owned(),
-        certificate: certificate_path,
-        private_key: private_key_path.clone(),
+        source: TlsCertificateSource::ExternalFiles {
+            certificate: certificate_path,
+            private_key: private_key_path.clone(),
+        },
     };
-    let validated = load_and_validate_material(&input, &provider).unwrap();
+    let (certificate, private_key) = match &input.source {
+        TlsCertificateSource::ExternalFiles {
+            certificate,
+            private_key,
+        } => (certificate.as_path(), private_key.as_path()),
+        TlsCertificateSource::CurrentAcmeReceipt => unreachable!(),
+    };
+    let validated =
+        load_and_validate_material(certificate, private_key, &input.hostname, &provider).unwrap();
     assert_eq!(validated.leaf_sha256.len(), 64);
     assert!(validated.not_after > Utc::now().timestamp());
 
@@ -218,7 +303,9 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(&private_key_path, fs::Permissions::from_mode(0o600)).unwrap();
     }
-    assert!(load_and_validate_material(&input, &provider).is_err());
+    assert!(
+        load_and_validate_material(certificate, private_key, &input.hostname, &provider).is_err()
+    );
 }
 
 #[test]
@@ -359,6 +446,10 @@ fn activated_generation_rolls_back_without_leaving_private_material_active() {
         capability: "proxy_tls".to_owned(),
         expected_revision: 0,
         target_revision: 1,
+        source: CertificateSourceBinding::ExternalFiles {
+            certificate_sha256: "f".repeat(64),
+            private_key_sha256: "e".repeat(64),
+        },
         material_sha256: "a".repeat(64),
         leaf_certificate_sha256: "b".repeat(64),
         certificate_not_after: Utc::now().timestamp() + 86400,
@@ -377,6 +468,8 @@ fn activated_generation_rolls_back_without_leaving_private_material_active() {
     let material = ValidatedMaterial {
         certificate_pem: b"public certificate".to_vec(),
         private_key_pem: zeroize::Zeroizing::new(b"private key".to_vec()),
+        certificate_sha256: "f".repeat(64),
+        private_key_sha256: "e".repeat(64),
         leaf_sha256: "b".repeat(64),
         material_sha256: "a".repeat(64),
         not_after: transaction.certificate_not_after,
@@ -430,6 +523,10 @@ fn test_transaction(material_root: PathBuf) -> CertificateTransaction {
         capability: "proxy_tls".to_owned(),
         expected_revision: 0,
         target_revision: 1,
+        source: CertificateSourceBinding::ExternalFiles {
+            certificate_sha256: "f".repeat(64),
+            private_key_sha256: "e".repeat(64),
+        },
         material_sha256: "a".repeat(64),
         leaf_certificate_sha256: "b".repeat(64),
         certificate_not_after: now + 86400,
@@ -485,6 +582,7 @@ fn test_receipt(
         hostname: transaction.hostname.clone(),
         capability: transaction.capability.clone(),
         revision,
+        source: transaction.source.clone(),
         material_sha256: transaction.material_sha256.clone(),
         leaf_certificate_sha256,
         certificate_not_after: transaction.certificate_not_after,

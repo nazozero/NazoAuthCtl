@@ -82,15 +82,35 @@ nazoauthctl --deployment DEPLOYMENT tls acme recover \
 7. commits a receipt, retires only the exact digest-bound challenge file, appends
    the management audit record, and removes the pending journal.
 
+Each receipt is committed to a conflict-checked revision archive before the
+binding's `current.json` pointer is replaced. Later renewals therefore cannot
+erase the exact receipt bytes referenced by an installation receipt.
+
 A failure preserves the journal and evidence while retiring the challenge when
 its content still matches the bound digest. `recover` resumes the same account
 and order from private snapshots. An expired transaction is recorded as
 aborted, its challenge is retired, and its pending lock is removed so a new
 attempt can proceed. A crash after receipt commit is finalized idempotently.
 
-`tls acme show` reports the pending journal and current issuance receipt. The
-receipt paths can be supplied to `tls certificate plan/apply`; issuance itself
-does not claim that any live endpoint changed certificates.
+`tls acme show` reports the pending journal and current issuance receipt. Consume
+that authority directly without copying private state paths:
+
+```text
+nazoauthctl --deployment DEPLOYMENT tls certificate plan \
+  --provider-config /etc/nazoauth/tls-provider.json \
+  --tenant tenant-a --hostname auth.example --from-acme-current
+
+nazoauthctl --deployment DEPLOYMENT tls certificate apply \
+  --provider-config /etc/nazoauth/tls-provider.json \
+  --tenant tenant-a --hostname auth.example --from-acme-current --yes
+```
+
+The certificate transaction refuses a pending issuance, a stale declaration
+revision, provider/trust digest drift, receipt or private-artifact tampering, or
+any mismatch between the receipt and its independent offline PKI validation.
+The issuance receipt identity is then carried through the installation plan,
+journal, public-verification receipt, and recovery checks. Issuance itself does
+not claim that any live endpoint changed certificates.
 
 ## Verification boundary
 

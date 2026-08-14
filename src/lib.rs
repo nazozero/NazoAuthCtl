@@ -272,6 +272,10 @@ TTL is 60 through 86400 seconds."
     --tenant TENANT --hostname HOST --certificate PATH --private-key PATH
   nazoauthctl --deployment ID tls certificate apply --provider-config PATH \
     --tenant TENANT --hostname HOST --certificate PATH --private-key PATH --yes
+  nazoauthctl --deployment ID tls certificate plan --provider-config PATH \
+    --tenant TENANT --hostname HOST --from-acme-current
+  nazoauthctl --deployment ID tls certificate apply --provider-config PATH \
+    --tenant TENANT --hostname HOST --from-acme-current --yes
   nazoauthctl --deployment ID tls certificate recover --tenant TENANT --hostname HOST --yes
   nazoauthctl --deployment ID tls certificate show --tenant TENANT --hostname HOST
   nazoauthctl --deployment ID tls acme plan --acme-config PATH --provider-config PATH \
@@ -295,8 +299,10 @@ The acme command family creates or restores a deployment-owned ACME account,
 serves one exact-host HTTP-01 challenge through a preconfigured webroot, persists
 the server private key before finalization, validates the issued chain against
 the provider trust policy, and commits an issuance receipt. Issuance does not
-install or reload the certificate; use the separate certificate transaction for
-that step."
+install or reload the certificate. `--from-acme-current` consumes the exact
+current receipt only after revalidating its deployment/binding/revision,
+provider/trust digests, account authority, and private artifacts; certificate
+installation still uses the separate crash-safe provider transaction."
         }
         cli::HelpTopic::Audit => {
             "Usage:

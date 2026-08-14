@@ -98,8 +98,16 @@ pub(crate) struct TlsCertificateInput {
     pub(crate) provider_config: PathBuf,
     pub(crate) tenant: String,
     pub(crate) hostname: String,
-    pub(crate) certificate: PathBuf,
-    pub(crate) private_key: PathBuf,
+    pub(crate) source: TlsCertificateSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TlsCertificateSource {
+    ExternalFiles {
+        certificate: PathBuf,
+        private_key: PathBuf,
+    },
+    CurrentAcmeReceipt,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
