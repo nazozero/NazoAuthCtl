@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(all(test, unix))]
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nazo_operator_protocol::{
@@ -198,6 +199,15 @@ pub struct PreparedMaterialization {
     attestation: Option<GeneratedAttestationMaterial>,
     dynamic_registration_initial_access_token: Option<Zeroizing<String>>,
     ciba_automated_decision_token: Option<Zeroizing<String>>,
+    /// Ordinary tenant-resource CIBA bindings are keyed by the logical OAuth
+    /// client.  Keeping one token per client prevents a retry or a second
+    /// plan from accidentally sharing a tenant-unique token hash.
+    ciba_decision_tokens: BTreeMap<String, Zeroizing<String>>,
+    /// Every plan which expands a CIBA reference is fenced to exactly one
+    /// CIBA-enabled logical client.  The map is prepared from signed role
+    /// requirements, never from mutable Suite plan names.
+    ciba_plan_clients: BTreeMap<String, String>,
+    ciba_decision_expires_at: Option<i64>,
     clients: BTreeMap<String, PreparedClient>,
 }
 
@@ -209,6 +219,11 @@ impl Zeroize for PreparedMaterialization {
         self.attestation.zeroize();
         self.dynamic_registration_initial_access_token.zeroize();
         self.ciba_automated_decision_token.zeroize();
+        for token in self.ciba_decision_tokens.values_mut() {
+            token.zeroize();
+        }
+        self.ciba_decision_tokens.clear();
+        self.ciba_plan_clients.clear();
         for client in self.clients.values_mut() {
             client.zeroize();
         }
@@ -340,6 +355,7 @@ impl PreparedMaterialization {
             1usize
                 .saturating_add(self.clients.len())
                 .saturating_add(self.clients.len())
+                .saturating_add(self.ciba_decision_tokens.len())
                 .saturating_add(self.descriptor.openid4vc_credential_datasets.len())
                 .saturating_add(1),
         );
@@ -389,6 +405,34 @@ impl PreparedMaterialization {
                     serde_json::json!({
                         "client_resource_id": client_resource_id,
                         "certificate_pem": client.mtls_ca_certificate.as_str(),
+                    }),
+                )?;
+            }
+        }
+
+        if !self.ciba_decision_tokens.is_empty() {
+            let expires_at = self
+                .ciba_decision_expires_at
+                .ok_or(MaterializerError::InvalidField("ciba_decision_expires_at"))?;
+            validate_ciba_decision_expiry(expires_at)?;
+            for (logical_client_id, decision_token) in &self.ciba_decision_tokens {
+                let client_resource_id =
+                    run_scoped_resource_id("oauth-client", logical_client_id, &run_suffix)?;
+                let binding_resource_id = run_scoped_resource_id(
+                    "ciba-decision-binding",
+                    logical_client_id,
+                    &run_suffix,
+                )?;
+                push_ciba_binding_resource(
+                    &mut resources,
+                    &mut payload_total,
+                    binding_resource_id,
+                    serde_json::json!({
+                        "schema": 1,
+                        "client_resource_id": client_resource_id,
+                        "user_resource_id": user_resource_id,
+                        "decision_token": decision_token.as_str(),
+                        "expires_at": expires_at,
                     }),
                 )?;
             }
@@ -839,7 +883,8 @@ fn validate_apply_mappings(
                     return Err(MaterializerError::DuplicateClientMapping);
                 }
             }
-            TenantResourceKind::MtlsTrustAnchor
+            TenantResourceKind::CibaDecisionBinding
+            | TenantResourceKind::MtlsTrustAnchor
             | TenantResourceKind::Openid4vcDataset
             | TenantResourceKind::Openid4vcTrustPolicy => {
                 return Err(MaterializerError::TenantResourceReceiptMismatch(
@@ -886,6 +931,87 @@ fn push_manifest_resource(
     payload_bytes.zeroize();
     resources.push(TenantResourceManifestResource {
         kind,
+        resource_id,
+        payload_base64url,
+        digest,
+    });
+    Ok(())
+}
+
+/// Push the one manifest payload which intentionally contains a short-lived
+/// controller secret.  Generic public-payload validation rejects token-like
+/// keys; this narrow path validates the exact CIBA binding schema instead and
+/// keeps the serialized value inside the zeroizing manifest bytes.
+fn push_ciba_binding_resource(
+    resources: &mut Vec<TenantResourceManifestResource>,
+    payload_total: &mut usize,
+    resource_id: String,
+    mut payload: Value,
+) -> Result<(), MaterializerError> {
+    validate_resource_id(&resource_id)?;
+    let object = payload
+        .as_object()
+        .ok_or(MaterializerError::InvalidField("ciba_decision_binding"))?;
+    if object.get("schema").and_then(Value::as_u64) != Some(1) {
+        return Err(MaterializerError::InvalidField(
+            "ciba_decision_binding.schema",
+        ));
+    }
+    let client_resource_id = object
+        .get("client_resource_id")
+        .and_then(Value::as_str)
+        .ok_or(MaterializerError::InvalidField(
+            "ciba_decision_binding.client_resource_id",
+        ))?;
+    let user_resource_id = object
+        .get("user_resource_id")
+        .and_then(Value::as_str)
+        .ok_or(MaterializerError::InvalidField(
+            "ciba_decision_binding.user_resource_id",
+        ))?;
+    validate_resource_id(client_resource_id)?;
+    validate_resource_id(user_resource_id)?;
+    let decision_token = object.get("decision_token").and_then(Value::as_str).ok_or(
+        MaterializerError::InvalidField("ciba_decision_binding.decision_token"),
+    )?;
+    if decision_token.len() < 32
+        || decision_token.len() > MAX_TENANT_RESOURCE_PASSWORD_BYTES
+        || decision_token.chars().any(char::is_control)
+    {
+        return Err(MaterializerError::InvalidField(
+            "ciba_decision_binding.decision_token",
+        ));
+    }
+    let expires_at =
+        object
+            .get("expires_at")
+            .and_then(Value::as_i64)
+            .ok_or(MaterializerError::InvalidField(
+                "ciba_decision_binding.expires_at",
+            ))?;
+    validate_ciba_decision_expiry(expires_at)?;
+
+    let payload_bytes = serde_json::to_vec(&payload).map_err(|_| MaterializerError::Encoding)?;
+    if payload_bytes.is_empty() || payload_bytes.len() > MAX_TENANT_RESOURCE_PAYLOAD_BYTES {
+        return Err(if payload_bytes.len() > MAX_TENANT_RESOURCE_PAYLOAD_BYTES {
+            MaterializerError::Oversize
+        } else {
+            MaterializerError::InvalidField("tenant_resource_manifest.payload")
+        });
+    }
+    *payload_total = payload_total
+        .checked_add(payload_bytes.len())
+        .ok_or(MaterializerError::Oversize)?;
+    if *payload_total > MAX_TENANT_RESOURCE_PAYLOAD_TOTAL_BYTES {
+        return Err(MaterializerError::Oversize);
+    }
+    let digest = digest_hex(&payload_bytes);
+    let payload_base64url = Zeroizing::new(URL_SAFE_NO_PAD.encode(&payload_bytes));
+    zeroize_json_value(&mut payload);
+    let mut payload_bytes = payload_bytes;
+    payload_bytes.zeroize();
+    resources.push(TenantResourceManifestResource {
+        kind: TenantResourceKind::CibaDecisionBinding,
         resource_id,
         payload_base64url,
         digest,
@@ -1189,6 +1315,11 @@ pub struct ArtifactMaterializationBinding<'a> {
     pub suite_origin: &'a Origin,
     pub request_jti: &'a str,
     pub credential_trust_anchor_pem: &'a str,
+    /// Absolute Unix expiry for ordinary CIBA decision bindings.  It is
+    /// intentionally optional so non-CIBA ordinary runs do not need a clock
+    /// value; a signed descriptor which expands a CIBA decision reference
+    /// must provide it and is validated against the 24-hour provider window.
+    pub ciba_decision_expires_at: Option<i64>,
 }
 
 pub struct DescriptorMaterializer;
@@ -1251,6 +1382,7 @@ impl DescriptorMaterializer {
             binding.request_jti,
             binding.credential_trust_anchor_pem,
             false,
+            binding.ciba_decision_expires_at,
         )
     }
 
@@ -1320,6 +1452,7 @@ impl DescriptorMaterializer {
             request_jti,
             credential_trust_anchor_pem,
             true,
+            None,
         )?;
         let bundle = build_secure_onboarding_bundle(&prepared)?;
         prepared.bundle_digest = Some(bundle.digest().to_owned());
@@ -1333,6 +1466,7 @@ impl DescriptorMaterializer {
         request_jti: &str,
         credential_trust_anchor_pem: &str,
         include_legacy_profile_tokens: bool,
+        ciba_decision_expires_at: Option<i64>,
     ) -> Result<PreparedMaterialization, MaterializerError> {
         validate_descriptor(&descriptor)?;
         validate_target_issuer(target_issuer)?;
@@ -1402,7 +1536,7 @@ impl DescriptorMaterializer {
         let needs_ciba_token =
             descriptor_requires_reference(&descriptor, "generated.ciba_automated_decision_token")
                 || descriptor_requires_reference(&descriptor, "target.ciba_automated_decision_url");
-        if !include_legacy_profile_tokens && (needs_dynamic_token || needs_ciba_token) {
+        if !include_legacy_profile_tokens && needs_dynamic_token {
             return Err(MaterializerError::InvalidField(
                 "ordinary_tenant_resource_profile_tokens",
             ));
@@ -1412,6 +1546,27 @@ impl DescriptorMaterializer {
             .then(|| Zeroizing::new(random_secret(32)));
         let ciba_automated_decision_token = (include_legacy_profile_tokens && needs_ciba_token)
             .then(|| Zeroizing::new(random_secret(32)));
+        let (ciba_decision_tokens, ciba_plan_clients, ciba_decision_expires_at) =
+            if !include_legacy_profile_tokens && needs_ciba_token {
+                let plan_clients = collect_ciba_plan_clients(&descriptor)?;
+                let expires_at = ciba_decision_expires_at
+                    .ok_or(MaterializerError::InvalidField("ciba_decision_expires_at"))?;
+                validate_ciba_decision_expiry(expires_at)?;
+                let mut tokens = BTreeMap::new();
+                for logical_client_id in plan_clients.values() {
+                    if !clients.contains_key(logical_client_id) {
+                        return Err(MaterializerError::UnknownClientReference(
+                            logical_client_id.clone(),
+                        ));
+                    }
+                    tokens
+                        .entry(logical_client_id.clone())
+                        .or_insert_with(|| Zeroizing::new(random_secret(32)));
+                }
+                (tokens, plan_clients, Some(expires_at))
+            } else {
+                (BTreeMap::new(), BTreeMap::new(), None)
+            };
         let prepared = PreparedMaterialization {
             descriptor,
             target_issuer: target_issuer.to_owned(),
@@ -1426,6 +1581,9 @@ impl DescriptorMaterializer {
             attestation,
             dynamic_registration_initial_access_token,
             ciba_automated_decision_token,
+            ciba_decision_tokens,
+            ciba_plan_clients,
+            ciba_decision_expires_at,
             clients,
         };
         Ok(prepared)
@@ -1621,6 +1779,155 @@ fn build_secure_onboarding_bundle(
     })
 }
 
+const CIBA_GRANT_TYPE: &str = "urn:openid:params:grant-type:ciba";
+const MAX_CIBA_DECISION_BINDING_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
+
+/// Resolve the CIBA client for each plan which actually expands an automated
+/// decision reference.  A plan is intentionally not inferred from its name:
+/// only signed role requirements and their registration grant types can make
+/// it CIBA.  Multiple candidates are rejected because choosing one would bind
+/// the decision token to the wrong OAuth client.
+fn collect_ciba_plan_clients(
+    descriptor: &MatrixDescriptor,
+) -> Result<BTreeMap<String, String>, MaterializerError> {
+    let mut plan_clients = BTreeMap::new();
+    for group in &descriptor.groups {
+        for plan in &group.plans {
+            if !plan_references_ciba(group, plan) {
+                continue;
+            }
+            let mut candidates = BTreeSet::new();
+            for role in group.required_roles.iter().chain(&plan.required_roles) {
+                let Some(registration) = &role.registration_template else {
+                    continue;
+                };
+                if !registration_has_ciba_grant(registration) {
+                    continue;
+                }
+                let logical = role
+                    .logical_client_id
+                    .as_deref()
+                    .unwrap_or(role.role.as_str())
+                    .to_owned();
+                candidates.insert(logical);
+            }
+            let logical = match candidates.len() {
+                0 => return Err(MaterializerError::InvalidField("ciba.required_roles")),
+                1 => candidates
+                    .into_iter()
+                    .next()
+                    .ok_or(MaterializerError::InvalidField("ciba.required_roles"))?,
+                _ => return Err(MaterializerError::AmbiguousClientReference),
+            };
+            plan_clients.insert(plan.id.clone(), logical);
+        }
+    }
+    Ok(plan_clients)
+}
+
+fn registration_has_ciba_grant(registration: &Value) -> bool {
+    registration
+        .get("grant_types")
+        .and_then(Value::as_array)
+        .is_some_and(|grants| {
+            grants
+                .iter()
+                .any(|grant| grant.as_str() == Some(CIBA_GRANT_TYPE))
+        })
+}
+
+fn plan_references_ciba(group: &DescriptorGroup, plan: &DescriptorPlan) -> bool {
+    const REFERENCES: [&str; 2] = [
+        "generated.ciba_automated_decision_token",
+        "target.ciba_automated_decision_url",
+    ];
+    REFERENCES.iter().any(|reference| {
+        value_references_ciba(&plan.config_template, &plan.secret_bindings, reference)
+            || plan.secret_bindings.values().any(|value| {
+                value_references_ciba(
+                    &Value::String(value.clone()),
+                    &plan.secret_bindings,
+                    reference,
+                )
+            })
+            || group
+                .required_roles
+                .iter()
+                .chain(&plan.required_roles)
+                .any(|role| {
+                    role.secret_refs.iter().any(|value| {
+                        value_references_ciba(
+                            &Value::String(value.clone()),
+                            &plan.secret_bindings,
+                            reference,
+                        )
+                    })
+                })
+    })
+}
+
+fn value_references_ciba(
+    value: &Value,
+    bindings: &BTreeMap<String, String>,
+    reference: &str,
+) -> bool {
+    fn visit(
+        value: &Value,
+        bindings: &BTreeMap<String, String>,
+        reference: &str,
+        stack: &mut BTreeSet<String>,
+    ) -> bool {
+        match value {
+            Value::Array(values) => values
+                .iter()
+                .any(|value| visit(value, bindings, reference, stack)),
+            Value::Object(values) => values
+                .values()
+                .any(|value| visit(value, bindings, reference, stack)),
+            Value::String(text) if is_placeholder(text) => {
+                let Ok(name) = parse_placeholder(text) else {
+                    return false;
+                };
+                if name == reference {
+                    return true;
+                }
+                let binding_name = name
+                    .strip_prefix("secret.")
+                    .or_else(|| bindings.contains_key(name).then_some(name));
+                let Some(binding_name) = binding_name else {
+                    return false;
+                };
+                if !stack.insert(binding_name.to_owned()) {
+                    return false;
+                }
+                let found = bindings.get(binding_name).is_some_and(|nested| {
+                    visit(&Value::String(nested.clone()), bindings, reference, stack)
+                });
+                stack.remove(binding_name);
+                found
+            }
+            _ => false,
+        }
+    }
+    visit(value, bindings, reference, &mut BTreeSet::new())
+}
+
+fn validate_ciba_decision_expiry(expires_at: i64) -> Result<(), MaterializerError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| MaterializerError::InvalidField("ciba_decision_expires_at"))?
+        .as_secs();
+    let now = i64::try_from(now)
+        .map_err(|_| MaterializerError::InvalidField("ciba_decision_expires_at"))?;
+    let latest = now
+        .checked_add(MAX_CIBA_DECISION_BINDING_LIFETIME_SECONDS)
+        .ok_or(MaterializerError::InvalidField("ciba_decision_expires_at"))?;
+    if expires_at <= now || expires_at > latest {
+        return Err(MaterializerError::InvalidField("ciba_decision_expires_at"));
+    }
+    Ok(())
+}
+
 fn validate_client_mapping_keys(
     prepared: &PreparedMaterialization,
     clients: &BTreeMap<String, String>,
@@ -1644,11 +1951,13 @@ fn materialize_matrix_document(
     for group in &prepared.descriptor.groups {
         let mut plans = Vec::with_capacity(group.plans.len());
         for plan in &group.plans {
+            let ciba_client_logical = prepared.ciba_plan_clients.get(&plan.id).map(String::as_str);
             let config = materialize_value(
                 &plan.config_template,
                 &plan.secret_bindings,
                 prepared,
                 bindings,
+                ciba_client_logical,
                 &mut BTreeSet::new(),
             )?;
             let config = materialize_vci_config(
@@ -2239,7 +2548,8 @@ mod tests {
                     resource_id: resource.resource_id.clone(),
                     public_id: "actual-client".to_owned(),
                 }),
-                TenantResourceKind::MtlsTrustAnchor
+                TenantResourceKind::CibaDecisionBinding
+                | TenantResourceKind::MtlsTrustAnchor
                 | TenantResourceKind::Openid4vcDataset
                 | TenantResourceKind::Openid4vcTrustPolicy => None,
             })
@@ -2703,6 +3013,7 @@ mod tests {
             suite_origin: &suite_origin,
             request_jti: request_jti(),
             credential_trust_anchor_pem: test_trust_anchor(),
+            ciba_decision_expires_at: None,
         };
         let (prepared, bundle) =
             DescriptorMaterializer::prepare_from_artifact_matrix(&matrix, binding)
@@ -2781,6 +3092,7 @@ mod tests {
                 suite_origin: &suite_origin,
                 request_jti: request_jti(),
                 credential_trust_anchor_pem: test_trust_anchor(),
+                ciba_decision_expires_at: None,
             },
         );
         assert!(matches!(
@@ -4247,5 +4559,195 @@ mod tests {
             );
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    fn ciba_descriptor() -> MatrixDescriptor {
+        let mut descriptor = descriptor();
+        let registration = descriptor.groups[0].required_roles[0]
+            .registration_template
+            .as_mut()
+            .expect("registration template")
+            .as_object_mut()
+            .expect("registration object");
+        registration.insert(
+            "grant_types".to_owned(),
+            serde_json::json!(["urn:openid:params:grant-type:ciba"]),
+        );
+        descriptor.groups[0].plans[0].config_template = serde_json::json!({
+            "client_id": "{{client.web.id}}",
+            "automated_ciba_approval_url": "{{target.ciba_automated_decision_url}}"
+        });
+        descriptor
+    }
+
+    fn ordinary_ciba_prepared(descriptor: MatrixDescriptor) -> PreparedMaterialization {
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64
+            + 3600;
+        DescriptorMaterializer::prepare_materialization(
+            descriptor,
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+            test_trust_anchor(),
+            false,
+            Some(expires_at),
+        )
+        .expect("ordinary CIBA preparation")
+    }
+
+    #[test]
+    fn ordinary_ciba_manifest_contains_private_binding_and_expands_matching_token() {
+        let prepared = ordinary_ciba_prepared(ciba_descriptor());
+        let manifest = prepared
+            .tenant_resource_manifest(prepared.request_jti())
+            .expect("manifest");
+        let document: Value = serde_json::from_slice(manifest.bytes().as_bytes()).expect("JSON");
+        let resources = document["resources"].as_array().expect("resources");
+        assert_eq!(
+            resources
+                .iter()
+                .filter(|resource| resource["kind"].as_str() == Some("ciba-decision-binding"))
+                .count(),
+            1
+        );
+        let binding = resources
+            .iter()
+            .find(|resource| resource["kind"].as_str() == Some("ciba-decision-binding"))
+            .expect("CIBA binding");
+        let payload_bytes = URL_SAFE_NO_PAD
+            .decode(binding["payload_base64url"].as_str().expect("payload"))
+            .expect("payload b64");
+        let payload: Value = serde_json::from_slice(&payload_bytes).expect("payload JSON");
+        let token = payload["decision_token"].as_str().expect("token");
+        assert!(token.len() >= 32);
+        assert_eq!(payload["schema"], 1);
+        assert!(
+            payload["client_resource_id"]
+                .as_str()
+                .expect("client ref")
+                .starts_with("oauth-client-web-run-")
+        );
+        assert!(
+            payload["user_resource_id"]
+                .as_str()
+                .expect("user ref")
+                .starts_with("user-applicant-run-")
+        );
+        assert!(!format!("{manifest:?}").contains(token));
+
+        let receipt = tenant_resource_apply_receipt(&manifest);
+        let output = tenant_resource_apply_output(receipt, &manifest).expect("apply output");
+        let finalized = DescriptorMaterializer::finalize_tenant_resources(
+            prepared,
+            output,
+            test_trust_anchor(),
+        )
+        .expect("finalize");
+        let url =
+            finalized.matrix().document.groups[0].plans[0].config["automated_ciba_approval_url"]
+                .as_str()
+                .expect("CIBA URL");
+        assert!(url.ends_with(&format!("decision_token={token}")));
+    }
+
+    #[test]
+    fn ordinary_ciba_allocates_distinct_binding_tokens_per_logical_client() {
+        let mut descriptor = ciba_descriptor();
+        let mut second_group = descriptor.groups[0].clone();
+        second_group.id = "ciba-second".to_owned();
+        second_group.required_roles[0].role = "client2".to_owned();
+        second_group.required_roles[0].logical_client_id = Some("web2".to_owned());
+        let registration = second_group.required_roles[0]
+            .registration_template
+            .as_mut()
+            .expect("registration")
+            .as_object_mut()
+            .expect("registration object");
+        registration.insert(
+            "jwks".to_owned(),
+            serde_json::json!("{{generated.ec.public_jwks}}"),
+        );
+        second_group.plans[0].id = "basic-second".to_owned();
+        descriptor.groups.push(second_group);
+
+        let prepared = ordinary_ciba_prepared(descriptor);
+        let manifest = prepared
+            .tenant_resource_manifest(prepared.request_jti())
+            .expect("manifest");
+        let document: Value = serde_json::from_slice(manifest.bytes().as_bytes()).expect("JSON");
+        let mut tokens = BTreeSet::new();
+        for resource in document["resources"].as_array().expect("resources") {
+            if resource["kind"].as_str() != Some("ciba-decision-binding") {
+                continue;
+            }
+            let payload = URL_SAFE_NO_PAD
+                .decode(resource["payload_base64url"].as_str().expect("payload"))
+                .expect("payload b64");
+            let payload: Value = serde_json::from_slice(&payload).expect("payload JSON");
+            tokens.insert(
+                payload["decision_token"]
+                    .as_str()
+                    .expect("token")
+                    .to_owned(),
+            );
+        }
+        assert_eq!(tokens.len(), 2);
+    }
+
+    #[test]
+    fn ordinary_ciba_requires_unique_role_and_bounded_expiry() {
+        let descriptor = ciba_descriptor();
+        let missing_expiry = DescriptorMaterializer::prepare_materialization(
+            descriptor.clone(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+            test_trust_anchor(),
+            false,
+            None,
+        );
+        assert_eq!(
+            missing_expiry.err().expect("missing expiry must fail"),
+            MaterializerError::InvalidField("ciba_decision_expires_at")
+        );
+
+        let mut ambiguous = descriptor;
+        let mut second_role = ambiguous.groups[0].required_roles[0].clone();
+        second_role.role = "client2".to_owned();
+        second_role.logical_client_id = Some("web2".to_owned());
+        second_role
+            .registration_template
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .expect("registration")
+            .insert(
+                "jwks".to_owned(),
+                serde_json::json!("{{generated.ec.public_jwks}}"),
+            );
+        ambiguous.groups[0].plans[0]
+            .required_roles
+            .push(second_role);
+        let result = DescriptorMaterializer::prepare_materialization(
+            ambiguous,
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+            test_trust_anchor(),
+            false,
+            Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock")
+                    .as_secs() as i64
+                    + 3600,
+            ),
+        );
+        assert_eq!(
+            result.err().expect("ambiguous CIBA client must fail"),
+            MaterializerError::AmbiguousClientReference
+        );
     }
 }

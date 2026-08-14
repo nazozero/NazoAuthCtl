@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
+use crate::OidfDriverLane;
 use crate::browser::{
     BrowserAutomation, BrowserPolicy, BrowserRunnerState, BrowserTargetOrigin, ConformanceBinding,
     OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpStartRequest,
@@ -78,6 +79,10 @@ pub struct ConformanceRunConfig {
     pub binding: ConformanceBinding,
     pub poll_timeout: Duration,
     pub control: RunControl,
+    /// Exact signed execution lane for every selected Matrix plan. The map is
+    /// required to match the selected plan ids one-for-one; the runner never
+    /// derives CIBA semantics from mutable Suite plan names.
+    pub plan_lanes: BTreeMap<String, OidfDriverLane>,
     /// Maximum number of independent Suite plans executed at once. Modules
     /// inside one plan remain strictly ordered. Browser, verifier, and issuer
     /// automation retain their existing mutex-owned sessions, so parallel
@@ -109,6 +114,7 @@ struct PlannedPlan {
     modules: Vec<ModuleDefinition>,
     config: Value,
     report_index: usize,
+    lane: OidfDriverLane,
 }
 
 impl Drop for PlannedPlan {
@@ -139,6 +145,9 @@ impl ConformanceRunner {
             || !(1..=MAX_PARALLEL_JOBS).contains(&config.jobs)
             || (!config.automation.is_empty() && config.automation.len() != config.jobs)
         {
+            return Err(OrchestrationError::InvalidInput);
+        }
+        if !plan_lanes_match_selected(&config.matrix, &config.plan_lanes) {
             return Err(OrchestrationError::InvalidInput);
         }
         validate_matrix_origins(
@@ -482,6 +491,11 @@ impl ConformanceRunner {
                         modules: created.modules,
                         config: plan.config.clone(),
                         report_index,
+                        lane: *self
+                            .config
+                            .plan_lanes
+                            .get(&plan.id)
+                            .expect("selected plan lanes were validated at construction"),
                     });
                 }
             }
@@ -903,6 +917,29 @@ impl ConformanceRunner {
     }
 }
 
+fn plan_lanes_match_selected(
+    matrix: &SelectedMatrix,
+    plan_lanes: &BTreeMap<String, OidfDriverLane>,
+) -> bool {
+    let selected_plan_ids = matrix
+        .document
+        .groups
+        .iter()
+        .flat_map(|group| group.plans.iter().map(|plan| plan.id.as_str()))
+        .collect::<BTreeSet<_>>();
+    let selected_plan_count = matrix
+        .document
+        .groups
+        .iter()
+        .map(|group| group.plans.len())
+        .sum::<usize>();
+    selected_plan_ids.len() == selected_plan_count
+        && selected_plan_ids.len() == plan_lanes.len()
+        && plan_lanes
+            .keys()
+            .all(|plan_id| selected_plan_ids.contains(plan_id.as_str()))
+}
+
 #[derive(Clone)]
 pub struct RunSummary {
     pub report: ConformanceReport,
@@ -1217,8 +1254,7 @@ mod tests {
         .expect("binding")
     }
 
-    #[test]
-    fn origin_validation_rejects_cross_origin_config() {
+    fn one_plan_matrix(config: Value) -> SelectedMatrix {
         let document = MatrixDocument {
             schema: 1,
             name: "matrix".into(),
@@ -1232,16 +1268,35 @@ mod tests {
                 plans: vec![MatrixPlan {
                     id: "p".into(),
                     plan: "plan".into(),
-                    config: serde_json::json!({"audience":"https://evil.example"}),
+                    config,
                     variant: BTreeMap::new(),
                     expected_results: BTreeMap::new(),
                 }],
             }],
         };
-        let selected = SelectedMatrix {
+        SelectedMatrix {
             document,
             digest: "x".into(),
-        };
+        }
+    }
+
+    #[test]
+    fn selected_plans_require_exact_signed_lane_coverage() {
+        let selected = one_plan_matrix(serde_json::json!({}));
+        assert!(plan_lanes_match_selected(
+            &selected,
+            &BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)])
+        ));
+        assert!(!plan_lanes_match_selected(&selected, &BTreeMap::new()));
+        assert!(!plan_lanes_match_selected(
+            &selected,
+            &BTreeMap::from([("other".to_owned(), OidfDriverLane::Parallel)])
+        ));
+    }
+
+    #[test]
+    fn origin_validation_rejects_cross_origin_config() {
+        let selected = one_plan_matrix(serde_json::json!({"audience":"https://evil.example"}));
         let client = SuiteClient::with_transport(
             Origin::parse("https://suite.example").expect("origin"),
             None,
@@ -1259,6 +1314,7 @@ mod tests {
                 binding: test_binding(),
                 poll_timeout: Duration::from_secs(1),
                 control: RunControl::default(),
+                plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
                 jobs: 1,
                 automation: Vec::new(),
             })
@@ -1440,6 +1496,7 @@ mod tests {
             binding: test_binding(),
             poll_timeout: Duration::from_secs(30),
             control,
+            plan_lanes: BTreeMap::new(),
             jobs: 1,
             automation: Vec::new(),
         })
@@ -1512,6 +1569,7 @@ mod tests {
             binding: test_binding(),
             poll_timeout: Duration::from_millis(250),
             control,
+            plan_lanes: BTreeMap::new(),
             jobs: 1,
             automation: Vec::new(),
         })
@@ -1534,6 +1592,7 @@ mod tests {
             modules: Vec::new(),
             config: serde_json::json!({}),
             report_index: 0,
+            lane: OidfDriverLane::Parallel,
         };
         let module = ModuleDefinition {
             test_name: "test".into(),
@@ -1642,6 +1701,7 @@ mod tests {
             binding: test_binding(),
             poll_timeout: Duration::from_secs(2),
             control: RunControl::default(),
+            plan_lanes: BTreeMap::new(),
             jobs: 1,
             automation: Vec::new(),
         })
@@ -1662,6 +1722,7 @@ mod tests {
                 }]
             }),
             report_index: 0,
+            lane: OidfDriverLane::Parallel,
         };
         let browser: Arc<Mutex<dyn BrowserAutomation>> = Arc::new(Mutex::new(CompletingBrowser {
             completed: completed.clone(),

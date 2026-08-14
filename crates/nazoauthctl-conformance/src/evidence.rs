@@ -488,7 +488,7 @@ fn validate_provider_identity(
                                 || saw_revoke
                                 || !saw_apply
                                 || cleanup_enumerate_capability_index
-                                    .is_none_or(|index| capability_index <= index)
+                                    .is_none_or(|index| capability_index < index)
                             {
                                 return Err(EvidenceError::Identity);
                             }
@@ -854,6 +854,14 @@ mod tests {
             validate_ordinary_provider_identity(&report(), &identity()),
             Err(EvidenceError::Identity)
         );
+    }
+
+    #[test]
+    fn ordinary_provider_evidence_accepts_same_capability_cleanup_sequence() {
+        let mut identity = identity();
+        identity.provider = Some(provider());
+        validate_ordinary_provider_identity(&report(), &identity)
+            .expect("cleanup capability may enumerate before its exact revoke");
     }
 
     #[test]

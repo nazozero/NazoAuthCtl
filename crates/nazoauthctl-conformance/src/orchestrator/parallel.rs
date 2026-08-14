@@ -15,7 +15,7 @@ struct PlanWork {
     group: GroupProgress,
     report: PlanReport,
     plan: PlannedPlan,
-    serialized_ciba: bool,
+    lane: OidfDriverLane,
 }
 
 enum WorkerMessage {
@@ -107,6 +107,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                                 binding: runner.config.binding.clone(),
                                 poll_timeout: runner.config.poll_timeout,
                                 control: runner.config.control.clone(),
+                                plan_lanes: runner.config.plan_lanes.clone(),
                                 jobs: 1,
                                 automation: runner
                                     .config
@@ -121,7 +122,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                             index: next_index,
                             sender: sender.clone(),
                         };
-                        let _ciba_guard = if work_ref[next_index].serialized_ciba {
+                        let _ciba_guard = if work_ref[next_index].lane == OidfDriverLane::Ciba {
                             Some(ciba_lane.lock().map_err(|_| ()).expect("CIBA lane lock"))
                         } else {
                             None
@@ -204,7 +205,7 @@ fn plan_work(prepared: &mut PreparedRun) -> Vec<PlanWork> {
         .into_iter()
         .enumerate()
         .map(|(index, plan)| {
-            let serialized_ciba = plan.plan_name.contains("ciba");
+            let lane = plan.lane;
             PlanWork {
                 index,
                 group_index: plan.group_index,
@@ -212,7 +213,7 @@ fn plan_work(prepared: &mut PreparedRun) -> Vec<PlanWork> {
                 group: prepared.groups[plan.group_index].clone(),
                 report: prepared.plans[plan.report_index].clone(),
                 plan,
-                serialized_ciba,
+                lane,
             }
         })
         .collect()

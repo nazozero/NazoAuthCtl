@@ -5,7 +5,7 @@
 //! Suite remains an external test runner. No conformance lease or Suite-only
 //! NazoAuth management endpoint is used here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::io::{self, IsTerminal as _, Read as _, Write as _};
 use std::path::PathBuf;
@@ -21,13 +21,14 @@ use nazoauthctl_conformance::{
     DescriptorMaterializer, EvidenceBundleIdentity, EvidenceBundleReceipt,
     EvidenceDeploymentIdentity, EvidenceProviderCapability, EvidenceProviderIdentity,
     EvidenceProviderReceipt, EvidenceRuntimeIdentity, EvidenceSourceIdentity, ManagedWebDriver,
-    MatrixSelection, OidfArtifactMatrix, OidfPlanSelection, OidfProviderExecutionBinding,
-    OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
-    OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
-    TenantResourceApplyOutput, TenantResourceReceiptIdentity, TenantResourceRecoveryBinding,
-    TtyRenderer, WebDriverClient, WebDriverEndpoint, authorize_oidf_driver_execution,
-    open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
-    read_compact_manifest, verify_oidf_artifact, write_private_provider_evidence_bundle,
+    MatrixSelection, OidfArtifactMatrix, OidfDriverInspectionPlan, OidfDriverLane,
+    OidfPlanSelection, OidfProviderExecutionBinding, OpenId4VciIssuerClient,
+    OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient,
+    Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient, TenantResourceApplyOutput,
+    TenantResourceReceiptIdentity, TenantResourceRecoveryBinding, TtyRenderer, WebDriverClient,
+    WebDriverEndpoint, authorize_oidf_driver_execution, open_cached_oidf_driver_plan,
+    read_artifact_driver, read_artifact_matrix, read_compact_manifest, verify_oidf_artifact,
+    write_private_provider_evidence_bundle,
 };
 use nazoauthctl_core::tenant_resources::{
     TenantResourceCapabilitySession, TenantResourceClient, TenantResourceReceiptResult,
@@ -38,6 +39,7 @@ use zeroize::{Zeroize as _, Zeroizing};
 use super::RunInvocation;
 
 const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
+const MAX_CIBA_DECISION_LIFETIME_SECONDS: u64 = 24 * 60 * 60;
 
 /// Capabilities implemented by this binary's signed-artifact runner. These
 /// are local engine facts, not NazoAuth provider permissions.
@@ -114,6 +116,12 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let matrix: OidfArtifactMatrix = serde_json::from_slice(&matrix_bytes)
         .context("verified cached artifact Matrix is malformed")?;
     let request_jti = format!("request-{}", hex(rand::random::<[u8; 16]>()));
+    let materialization_now = current_unix_time()?;
+    if materialization_now > driver_plan.latest_execution_start_at {
+        bail!("signed artifact no longer has enough validity remaining for the selected run");
+    }
+    let ciba_decision_expires_at =
+        ciba_decision_expires_at(&driver_plan, invocation.poll_timeout, materialization_now)?;
     let deployment_trust_anchor = session
         .openid4vc_request_object_trust_anchor_pem()
         .context("failed to load the deployment OpenID4VC trust anchor")?;
@@ -127,6 +135,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             suite_origin: &suite_origin,
             request_jti: &request_jti,
             credential_trust_anchor_pem: &deployment_trust_anchor,
+            ciba_decision_expires_at,
         },
     )
     .context("failed to prepare ordinary run material from the signed Matrix")?;
@@ -188,8 +197,21 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         artifact_source: binding.artifact_source.clone(),
         suite_origin: binding.suite_origin.clone(),
     };
-    authorize_oidf_driver_execution(&mut driver_plan, &binding, &authorization, now)
-        .context("signed driver plan is not authorized by the selected provider")?;
+    authorize_oidf_driver_execution(
+        &mut driver_plan,
+        &binding,
+        &authorization,
+        current_unix_time()?,
+    )
+    .context("signed driver plan is not authorized by the selected provider")?;
+    let plan_lanes = driver_plan
+        .plans
+        .iter()
+        .map(|plan| (plan.plan_id.clone(), plan.driver_handler.lane))
+        .collect::<BTreeMap<_, _>>();
+    if plan_lanes.len() != driver_plan.plans.len() {
+        bail!("signed driver plan contains duplicate Matrix plan ids");
+    }
 
     let baseline = client
         .enumerate(
@@ -356,6 +378,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         &session,
         &invocation,
         &suite_origin,
+        plan_lanes,
     );
 
     let proxy_cleanup = proxy.as_mut().map(ProxyTrustGuard::restore).transpose();
@@ -494,6 +517,7 @@ fn run_signed_suite(
     session: &nazoauthctl_core::ConformanceSession,
     invocation: &RunInvocation,
     suite_origin: &Origin,
+    plan_lanes: BTreeMap<String, OidfDriverLane>,
 ) -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
     let binding = ConformanceBinding::openid4vc_trust_policy(
         materialized.trust_policy_resource_id(),
@@ -563,6 +587,7 @@ fn run_signed_suite(
         binding,
         poll_timeout: invocation.poll_timeout,
         control,
+        plan_lanes,
         jobs: invocation.jobs,
         automation,
     })?;
@@ -916,10 +941,115 @@ fn current_unix_time() -> anyhow::Result<i64> {
     i64::try_from(seconds).context("system clock exceeds the supported range")
 }
 
+fn ciba_decision_expires_at(
+    plan: &OidfDriverInspectionPlan,
+    poll_timeout: Duration,
+    now: i64,
+) -> anyhow::Result<Option<i64>> {
+    let has_ciba = plan
+        .plans
+        .iter()
+        .any(|entry| entry.driver_handler.lane == OidfDriverLane::Ciba);
+    bounded_ciba_decision_expires_at(
+        has_ciba,
+        plan.selected_resource_budget.modules,
+        plan.selected_resource_budget.wall_clock_seconds,
+        poll_timeout,
+        now,
+        plan.artifact.expires_at,
+    )
+}
+
+fn bounded_ciba_decision_expires_at(
+    has_ciba: bool,
+    selected_modules: u32,
+    signed_wall_clock_seconds: u64,
+    poll_timeout: Duration,
+    now: i64,
+    artifact_expires_at: i64,
+) -> anyhow::Result<Option<i64>> {
+    if !has_ciba {
+        return Ok(None);
+    }
+    let poll_budget = u64::from(selected_modules)
+        .checked_mul(poll_timeout.as_secs())
+        .context("selected CIBA plan poll budget overflows")?;
+    let run_budget = signed_wall_clock_seconds.max(poll_budget);
+    if run_budget == 0 || run_budget > MAX_CIBA_DECISION_LIFETIME_SECONDS {
+        bail!(
+            "selected CIBA run budget must be between 1 second and 24 hours; lower --poll-timeout or narrow the signed plan selection"
+        );
+    }
+    let expires_at = now
+        .checked_add(i64::try_from(run_budget)?)
+        .context("selected CIBA run expiry overflows")?;
+    if expires_at > artifact_expires_at {
+        bail!(
+            "selected CIBA run budget exceeds the signed artifact validity window; lower --poll-timeout or refresh the artifact"
+        );
+    }
+    Ok(Some(expires_at))
+}
+
 fn hex(bytes: impl AsRef<[u8]>) -> String {
     bytes
         .as_ref()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ciba_expiry_covers_poll_budget_without_outliving_signed_authority() {
+        assert_eq!(
+            bounded_ciba_decision_expires_at(
+                false,
+                8,
+                3_600,
+                Duration::from_secs(900),
+                1_000,
+                20_000,
+            )
+            .expect("non-CIBA selection"),
+            None
+        );
+        assert_eq!(
+            bounded_ciba_decision_expires_at(
+                true,
+                8,
+                3_600,
+                Duration::from_secs(900),
+                1_000,
+                20_000,
+            )
+            .expect("bounded CIBA selection"),
+            Some(8_200)
+        );
+        assert!(
+            bounded_ciba_decision_expires_at(
+                true,
+                97,
+                3_600,
+                Duration::from_secs(900),
+                1_000,
+                100_000,
+            )
+            .is_err()
+        );
+        assert!(
+            bounded_ciba_decision_expires_at(
+                true,
+                8,
+                3_600,
+                Duration::from_secs(900),
+                1_000,
+                8_199,
+            )
+            .is_err()
+        );
+    }
 }

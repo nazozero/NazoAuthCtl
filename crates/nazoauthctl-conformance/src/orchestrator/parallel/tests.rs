@@ -159,6 +159,16 @@ fn parallel_fixture_with_result(
     fail_module_for_plan: Option<&str>,
     module_result: &str,
 ) -> (ConformanceRunner, Arc<ParallelFixtureTransport>) {
+    parallel_fixture_with_lanes(config, plan_ids, fail_module_for_plan, module_result, &[])
+}
+
+fn parallel_fixture_with_lanes(
+    config: Value,
+    plan_ids: &[&str],
+    fail_module_for_plan: Option<&str>,
+    module_result: &str,
+    ciba_plan_ids: &[&str],
+) -> (ConformanceRunner, Arc<ParallelFixtureTransport>) {
     let transport = Arc::new(ParallelFixtureTransport {
         active_waits: AtomicUsize::new(0),
         maximum_active_waits: AtomicUsize::new(0),
@@ -186,6 +196,19 @@ fn parallel_fixture_with_result(
             expected_results: BTreeMap::new(),
         })
         .collect();
+    let plan_lanes = plan_ids
+        .iter()
+        .map(|id| {
+            (
+                (*id).to_owned(),
+                if ciba_plan_ids.contains(id) {
+                    OidfDriverLane::Ciba
+                } else {
+                    OidfDriverLane::Parallel
+                },
+            )
+        })
+        .collect();
     let runner = ConformanceRunner::new(ConformanceRunConfig {
         client,
         matrix: SelectedMatrix {
@@ -208,6 +231,7 @@ fn parallel_fixture_with_result(
         binding: test_binding(),
         poll_timeout: Duration::from_secs(2),
         control: RunControl::default(),
+        plan_lanes,
         jobs: 2,
         automation: Vec::new(),
     })
@@ -317,8 +341,13 @@ fn parallel_non_pass_outcomes_complete_locally_without_claiming_suite_pass() {
 
 #[test]
 fn ciba_plans_use_one_global_serial_lane() {
-    let (runner, transport) =
-        parallel_fixture(serde_json::json!({}), &["ciba-plan-a", "ciba-plan-b"], None);
+    let (runner, transport) = parallel_fixture_with_lanes(
+        serde_json::json!({}),
+        &["plan-a", "plan-b"],
+        None,
+        "PASSED",
+        &["plan-a", "plan-b"],
+    );
 
     let summary = runner.run(&mut ());
 
@@ -326,6 +355,20 @@ fn ciba_plans_use_one_global_serial_lane() {
     assert_eq!(transport.maximum_active_waits.load(Ordering::SeqCst), 1);
     assert_eq!(summary.report.orchestration_integrity.terminal_modules, 2);
     assert!(summary.report.cleanup.failures.is_empty());
+}
+
+#[test]
+fn mutable_suite_plan_names_cannot_select_the_ciba_lane() {
+    let (runner, transport) = parallel_fixture(
+        serde_json::json!({}),
+        &["ciba-in-name-a", "ciba-in-name-b"],
+        None,
+    );
+
+    let summary = runner.run(&mut ());
+
+    assert!(summary.report.local_success);
+    assert!(transport.maximum_active_waits.load(Ordering::SeqCst) >= 2);
 }
 
 #[test]
