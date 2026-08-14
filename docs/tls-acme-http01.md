@@ -27,14 +27,19 @@ installation commands are not run during issuance.
 
 Unknown fields, protocols, bindings, unsafe paths, non-HTTPS directory/TOS URLs,
 non-mailto contacts, wildcard hostnames, and out-of-range timeouts fail closed.
+Every ACME HTTP request is also restricted to an explicit operator-owned set of
+canonical HTTPS origins. This is a transport boundary, so it covers directory,
+nonce, account, order, authorization, challenge, finalize and certificate URLs
+returned dynamically by the ACME server.
 
 ```json
 {
-  "schema": 1,
-  "protocol": "nazoauthctl.acme.http01-webroot.v1",
+  "schema": 2,
+  "protocol": "nazoauthctl.acme.http01-webroot.v2",
   "tenant": "tenant-a",
   "hostname": "auth.example",
   "directory_url": "https://acme.example/directory",
+  "allowed_origins": ["https://acme.example"],
   "terms_of_service_url": "https://acme.example/terms",
   "contacts": ["mailto:security@example.com"],
   "challenge_webroot": "/var/www/acme/.well-known/acme-challenge",
@@ -43,6 +48,17 @@ non-mailto contacts, wildcard hostnames, and out-of-range timeouts fail closed.
   "transaction_ttl_seconds": 900
 }
 ```
+
+`allowed_origins` contains one to eight exact origins such as
+`https://acme.example` or `https://acme.example:8443`; paths, credentials,
+queries, fragments, duplicates and non-canonical spellings are rejected. The
+configured directory origin must be present. ACME permits server-provided
+resources on different origins, so a CA that uses them must list each origin
+explicitly instead of relying on an implicit same-origin exception. Literal
+private or loopback origins can be listed for a private test CA, but doing so
+expands that deployment's network authority. This is an application authority
+boundary, not a replacement for an egress firewall: an allowed DNS hostname is
+still resolved by the host's configured resolver.
 
 `directory_trust_anchor` is optional and intended for a private/test ACME
 directory. When present, the certificate is validated and copied into the
@@ -70,8 +86,8 @@ nazoauthctl --deployment DEPLOYMENT tls acme recover \
 `--agree-terms` is mandatory and refers to the exact configured TOS URL. Issue:
 
 1. binds deployment, declaration and issuance revisions, tenant, hostname,
-   capability, JTI, configuration/trust digests, and expiry in a durable
-   journal;
+   capability, JTI, configuration/trust digests, allowed ACME origins, and
+   expiry in a durable journal;
 2. persists and journal-binds the ACME account key before network use, then
    creates or restores the configuration-bound account with that same key;
 3. creates or resumes one exact-identifier order by its server-issued URL;
@@ -91,6 +107,9 @@ its content still matches the bound digest. `recover` resumes the same account
 and order from private snapshots. An expired transaction is recorded as
 aborted, its challenge is retired, and its pending lock is removed so a new
 attempt can proceed. A crash after receipt commit is finalized idempotently.
+Recovery reconstructs the HTTP client from the digest-bound configuration and
+trust-anchor snapshots; a server-provided URL outside the recorded origin set
+is rejected before DNS resolution, connection, or account-signed JWS delivery.
 
 `tls acme show` reports the pending journal and current issuance receipt. Consume
 that authority directly without copying private state paths:
