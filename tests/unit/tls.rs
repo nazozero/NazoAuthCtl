@@ -167,6 +167,48 @@ fn certificate_source_binding_is_persistently_verifiable() {
 }
 
 #[test]
+fn readiness_revalidates_active_material_and_renewal_window() {
+    assert_eq!(effective_warning_window(86_400, None).unwrap(), 86_400);
+    assert_eq!(
+        effective_warning_window(86_400, Some(604_800)).unwrap(),
+        604_800
+    );
+    assert_eq!(
+        effective_warning_window(604_800, Some(86_400)).unwrap(),
+        604_800
+    );
+    assert!(effective_warning_window(86_400, Some(3599)).is_err());
+    assert_eq!(
+        ensure_outside_warning_window(1_800_700_001, 1_800_000_000, 604_800).unwrap(),
+        700_001
+    );
+    assert!(ensure_outside_warning_window(1_800_604_800, 1_800_000_000, 604_800).is_err());
+
+    let transaction = test_transaction(PathBuf::from("/srv/nazoauth/tls/tenant-a/auth.example"));
+    let receipt = test_receipt(
+        &transaction,
+        &transaction.jti,
+        transaction.target_revision,
+        transaction.generation.clone(),
+        transaction.leaf_certificate_sha256.clone(),
+    );
+    let (certificate_sha256, private_key_sha256) = source_file_sha256(&receipt.source);
+    let mut material = ValidatedMaterial {
+        certificate_pem: Vec::new(),
+        private_key_pem: zeroize::Zeroizing::new(Vec::new()),
+        certificate_sha256: certificate_sha256.to_owned(),
+        private_key_sha256: private_key_sha256.to_owned(),
+        leaf_sha256: receipt.leaf_certificate_sha256.clone(),
+        material_sha256: receipt.material_sha256.clone(),
+        not_after: receipt.certificate_not_after,
+        root_store: RootCertStore::empty(),
+    };
+    assert!(validate_installed_material(&receipt, &material).is_ok());
+    material.private_key_sha256 = "0".repeat(64);
+    assert!(validate_installed_material(&receipt, &material).is_err());
+}
+
+#[test]
 fn pending_journal_fences_one_activation_resource_across_deployments() {
     let work = PrivateTempDir::new("nazoauth-tls-provider-fence").unwrap();
     let store = DeploymentStore {
@@ -450,7 +492,7 @@ fn activated_generation_rolls_back_without_leaving_private_material_active() {
             certificate_sha256: "f".repeat(64),
             private_key_sha256: "e".repeat(64),
         },
-        material_sha256: "a".repeat(64),
+        material_sha256: sha256(format!("{}:{}", "b".repeat(64), "f".repeat(64)).as_bytes()),
         leaf_certificate_sha256: "b".repeat(64),
         certificate_not_after: Utc::now().timestamp() + 86400,
         provider_config_sha256: "c".repeat(64),
@@ -471,7 +513,7 @@ fn activated_generation_rolls_back_without_leaving_private_material_active() {
         certificate_sha256: "f".repeat(64),
         private_key_sha256: "e".repeat(64),
         leaf_sha256: "b".repeat(64),
-        material_sha256: "a".repeat(64),
+        material_sha256: transaction.material_sha256.clone(),
         not_after: transaction.certificate_not_after,
         root_store: RootCertStore::empty(),
     };
@@ -527,7 +569,7 @@ fn test_transaction(material_root: PathBuf) -> CertificateTransaction {
             certificate_sha256: "f".repeat(64),
             private_key_sha256: "e".repeat(64),
         },
-        material_sha256: "a".repeat(64),
+        material_sha256: sha256(format!("{}:{}", "b".repeat(64), "f".repeat(64)).as_bytes()),
         leaf_certificate_sha256: "b".repeat(64),
         certificate_not_after: now + 86400,
         provider_config_sha256: "c".repeat(64),

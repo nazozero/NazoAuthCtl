@@ -294,6 +294,34 @@ fn parses_tls_certificate_plan_apply_recover_and_show() {
 
     let missing_source = &acme_current[..acme_current.len() - 1];
     assert!(parse(missing_source).is_err());
+
+    let check = [
+        "nazoauthctl",
+        "tls",
+        "certificate",
+        "check",
+        "--provider-config",
+        "/etc/nazoauth/tls-provider.json",
+        "--tenant",
+        "tenant-a",
+        "--hostname",
+        "auth.example",
+        "--warning-window-seconds",
+        "1209600",
+    ];
+    assert!(matches!(
+        parse(&check).unwrap().unwrap().command,
+        Command::Tls(TlsCommand::Check(TlsCertificateCheckInput {
+            warning_window_seconds: Some(1_209_600),
+            ..
+        }))
+    ));
+    let mut duplicate_warning = check.to_vec();
+    duplicate_warning.extend(["--warning-window-seconds", "2419200"]);
+    assert!(parse(&duplicate_warning).is_err());
+    let mut invalid_warning = check.to_vec();
+    *invalid_warning.last_mut().unwrap() = "not-a-number";
+    assert!(parse(&invalid_warning).is_err());
 }
 
 #[test]

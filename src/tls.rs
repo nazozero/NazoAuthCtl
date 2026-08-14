@@ -18,7 +18,7 @@ use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use crate::{
-    cli::{TlsCertificateInput, TlsCertificateSource, TlsCommand},
+    cli::{TlsCertificateCheckInput, TlsCertificateInput, TlsCertificateSource, TlsCommand},
     deployment::{Capability, DeploymentRecord, DeploymentStore},
     filesystem::{
         atomic_write, ensure_private_directory, read_secure_regular_file, remove_file_durable,
@@ -38,6 +38,8 @@ const MAX_CERTIFICATE_BYTES: u64 = 1024 * 1024;
 const MAX_PRIVATE_KEY_BYTES: u64 = 128 * 1024;
 const MAX_TRUST_ANCHOR_BYTES: u64 = 1024 * 1024;
 const TRANSACTION_TTL_SECONDS: i64 = 15 * 60;
+const MAX_WARNING_WINDOW_SECONDS: u64 = 90 * 24 * 3600;
+const READINESS_EVIDENCE_TTL_SECONDS: i64 = 5 * 60;
 const MAX_HTTP_RESPONSE_BYTES: u64 = 64 * 1024;
 
 mod acme;
@@ -168,6 +170,40 @@ struct CertificatePlan {
     steps: Vec<&'static str>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CertificateReadiness {
+    schema: u32,
+    check_jti: String,
+    checked_at: i64,
+    evidence_expires_at: i64,
+    deployment_id: String,
+    declaration_revision: u64,
+    tenant: String,
+    hostname: String,
+    capability: &'static str,
+    capability_responsibility: String,
+    capability_scope: String,
+    provider_protocol: String,
+    provider_config_sha256: String,
+    trust_anchors_sha256: String,
+    source: CertificateSourceBinding,
+    receipt_jti: String,
+    receipt_revision: u64,
+    material_sha256: String,
+    leaf_certificate_sha256: String,
+    certificate_not_after: i64,
+    renewal_required_at: i64,
+    seconds_remaining: i64,
+    warning_window_seconds: u64,
+    active_generation: PathBuf,
+    public_url: String,
+    active_generation_verified: bool,
+    source_authority_current: bool,
+    public_endpoint_verified: bool,
+    ready: bool,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum TransactionPhase {
@@ -259,6 +295,10 @@ pub(crate) fn run(
     let store = DeploymentStore::system();
     match command {
         TlsCommand::Acme(command) => acme::run(selector, command, require_root, confirm),
+        TlsCommand::Check(input) => {
+            require_root()?;
+            check(&store, selector, &input)
+        }
         TlsCommand::Plan(input) => {
             require_root()?;
             let record = store.resolve(selector, true)?;
@@ -332,6 +372,156 @@ pub(crate) fn run(
             Ok(())
         }
     }
+}
+
+fn check(
+    store: &DeploymentStore,
+    selector: Option<&str>,
+    input: &TlsCertificateCheckInput,
+) -> anyhow::Result<()> {
+    let selected = store.resolve(selector, true)?;
+    let _deployment_lock = store.deployment_shared_lock(&selected.deployment_id)?;
+    let record = store.reload_locked(&selected)?;
+    record.require_mutation(&[Capability::ProxyTls])?;
+    let tenant = canonical_tenant(&input.tenant)?;
+    let hostname = canonical_hostname(&input.hostname)?;
+    let provider = load_provider(store, &input.provider_config, &tenant, &hostname)?;
+    let _provider_lock = store.shared_resource_shared_lock(&provider_lock_id(&provider.config))?;
+    ensure_no_pending(store, &record, &tenant, &hostname)?;
+    ensure_provider_not_pending(
+        store,
+        &record.deployment_id,
+        &provider.config,
+        &tenant,
+        &hostname,
+    )?;
+    let receipt = load_receipt(store, &record, &tenant, &hostname)?
+        .context("no committed TLS certificate receipt exists for this binding")?;
+    validate_active_receipt(&provider.config, Some(&receipt))?;
+    if receipt.provider_config_sha256 != provider.config_sha256
+        || receipt.trust_anchors_sha256 != provider.trust_anchors_sha256
+        || receipt.public_url != provider.public_url.as_str()
+    {
+        bail!("committed TLS receipt differs from the current provider authority");
+    }
+
+    let material = load_and_validate_material(
+        &receipt.generation.join("fullchain.pem"),
+        &receipt.generation.join("private-key.pem"),
+        &hostname,
+        &provider,
+    )?;
+    validate_installed_material(&receipt, &material)?;
+    if matches!(
+        &receipt.source,
+        CertificateSourceBinding::AcmeReceipt { .. }
+    ) {
+        let source = acme::current_install_source(store, &record, &provider, &tenant, &hostname)?;
+        let observed = bind_certificate_source(
+            &ResolvedCertificateSource::AcmeReceipt(Box::new(source)),
+            &material,
+        )?;
+        if observed != receipt.source {
+            bail!("current ACME issuance receipt is not the installed certificate source");
+        }
+    }
+
+    let warning_window_seconds = effective_warning_window(
+        provider.config.minimum_validity_seconds,
+        input.warning_window_seconds,
+    )?;
+    ensure_outside_warning_window(
+        receipt.certificate_not_after,
+        Utc::now().timestamp(),
+        warning_window_seconds,
+    )?;
+    verify_public(
+        &provider.public_url,
+        &hostname,
+        &receipt.leaf_certificate_sha256,
+        material.root_store.clone(),
+        &provider.config,
+    )?;
+    let checked_at = Utc::now().timestamp();
+    let seconds_remaining = ensure_outside_warning_window(
+        receipt.certificate_not_after,
+        checked_at,
+        warning_window_seconds,
+    )?;
+    let renewal_required_at = receipt
+        .certificate_not_after
+        .checked_sub(
+            i64::try_from(warning_window_seconds)
+                .context("TLS certificate warning window does not fit signed time")?,
+        )
+        .context("TLS certificate renewal boundary overflow")?;
+    let evidence_expires_at = checked_at
+        .checked_add(READINESS_EVIDENCE_TTL_SECONDS)
+        .context("TLS readiness evidence expiry overflow")?
+        .min(renewal_required_at);
+    let grant = record.capabilities.grant(Capability::ProxyTls);
+    let readiness = CertificateReadiness {
+        schema: 1,
+        check_jti: uuid::Uuid::now_v7().to_string(),
+        checked_at,
+        evidence_expires_at,
+        deployment_id: record.deployment_id,
+        declaration_revision: record.declaration_revision,
+        tenant,
+        hostname,
+        capability: "proxy_tls",
+        capability_responsibility: format!("{:?}", grant.responsibility).to_ascii_lowercase(),
+        capability_scope: format!("{:?}", grant.scope).to_ascii_lowercase(),
+        provider_protocol: PROVIDER_PROTOCOL.to_owned(),
+        provider_config_sha256: provider.config_sha256,
+        trust_anchors_sha256: provider.trust_anchors_sha256,
+        source: receipt.source,
+        receipt_jti: receipt.jti,
+        receipt_revision: receipt.revision,
+        material_sha256: receipt.material_sha256,
+        leaf_certificate_sha256: receipt.leaf_certificate_sha256,
+        certificate_not_after: receipt.certificate_not_after,
+        renewal_required_at,
+        seconds_remaining,
+        warning_window_seconds,
+        active_generation: receipt.generation,
+        public_url: receipt.public_url,
+        active_generation_verified: true,
+        source_authority_current: true,
+        public_endpoint_verified: true,
+        ready: true,
+    };
+    println!("{}", serde_json::to_string_pretty(&readiness)?);
+    Ok(())
+}
+
+fn effective_warning_window(
+    provider_minimum_seconds: u64,
+    requested_seconds: Option<u64>,
+) -> anyhow::Result<u64> {
+    let requested = requested_seconds.unwrap_or(provider_minimum_seconds);
+    if !(3600..=MAX_WARNING_WINDOW_SECONDS).contains(&requested) {
+        bail!("TLS certificate warning window must be between 3600 and 7776000 seconds");
+    }
+    Ok(requested.max(provider_minimum_seconds))
+}
+
+fn ensure_outside_warning_window(
+    certificate_not_after: i64,
+    checked_at: i64,
+    warning_window_seconds: u64,
+) -> anyhow::Result<i64> {
+    let warning_window = i64::try_from(warning_window_seconds)
+        .context("TLS certificate warning window does not fit signed time")?;
+    let seconds_remaining = certificate_not_after
+        .checked_sub(checked_at)
+        .context("TLS certificate remaining lifetime overflow")?;
+    if seconds_remaining <= warning_window {
+        bail!(
+            "TLS certificate has {seconds_remaining} seconds remaining, within the required {warning_window_seconds}-second renewal window"
+        );
+    }
+    Ok(seconds_remaining)
 }
 
 fn apply(
@@ -610,6 +800,36 @@ fn bind_certificate_source(
                 issued_at: source.issued_at,
             })
         }
+    }
+}
+
+fn validate_installed_material(
+    receipt: &CertificateReceipt,
+    material: &ValidatedMaterial,
+) -> anyhow::Result<()> {
+    let (certificate_sha256, private_key_sha256) = source_file_sha256(&receipt.source);
+    if receipt.material_sha256 != material.material_sha256
+        || receipt.leaf_certificate_sha256 != material.leaf_sha256
+        || receipt.certificate_not_after != material.not_after
+        || certificate_sha256 != material.certificate_sha256
+        || private_key_sha256 != material.private_key_sha256
+    {
+        bail!("active TLS generation differs from the committed certificate receipt");
+    }
+    Ok(())
+}
+
+fn source_file_sha256(source: &CertificateSourceBinding) -> (&str, &str) {
+    match source {
+        CertificateSourceBinding::ExternalFiles {
+            certificate_sha256,
+            private_key_sha256,
+        }
+        | CertificateSourceBinding::AcmeReceipt {
+            certificate_sha256,
+            private_key_sha256,
+            ..
+        } => (certificate_sha256, private_key_sha256),
     }
 }
 
