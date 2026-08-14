@@ -24,6 +24,10 @@ The trust policy is strict JSON:
 }
 ```
 
+Trust-policy schema 1 has an independent lifecycle from the signed artifact and
+Matrix schemas. Upgrading publisher-owned artifact data therefore does not
+silently require an unchanged operator trust policy to change versions.
+
 `key_id` is derived from the first 32 lowercase hexadecimal characters of the
 SHA-256 digest of the compressed SEC1 public key. The source is an exact,
 normalized HTTPS directory. Credentials, query strings, fragments, encoded
@@ -35,29 +39,36 @@ root.
 
 ## Signed driver manifest
 
-The manifest is a compact JWS using ES256 with type
+Manifest schema 2 is a compact JWS using ES256 with type
 `nazoauth-oidf-driver-manifest+jws`. Its strict payload binds:
 
 - artifact ID and immutable 40-character revision;
 - trusted source and signer identity;
-- issuance, not-before, and expiry, with a maximum 30-day lifetime;
+- issuance, not-before, and exclusive expiry, with a maximum 30-day lifetime;
 - exact Suite release, source revision, and OCI image digest;
 - driver engine protocol and required capability names;
 - matrix URL, schema, byte size, and SHA-256 digest;
-- maximum plans, modules, clients, and wall-clock duration.
+- maximum plans, cumulative module/client budgets, and wall-clock duration. The
+  validity window must be long enough to contain the full wall-clock bound.
 
 The JWS signs the original payload bytes. The verifier does not reserialize JSON
 before checking the signature.
 
 ## Matrix schema
 
-Schema 1 is declarative. It contains groups, Suite plan names, variants, config
+Schema 2 is declarative. It contains groups, Suite plan names, variants, config
 templates, required capability names, and exact expected `SKIPPED` module
-exceptions. It cannot contain executable native plugins.
+exceptions. Every plan declares module, client, and wall-clock budgets; the
+verifier safely sums them and rejects a Matrix above any signed manifest bound.
+Expected skip exceptions cannot outnumber the plan's module budget.
+It cannot contain executable native plugins.
 
 Sensitive fields such as passwords, tokens, client secrets, or private keys
 must be exact placeholders in one of the `target`, `suite`, `resource`, or
-`run` namespaces. Literal sensitive material is rejected. `REVIEW` and
+`run` namespaces. Field matching normalizes ASCII case and separators, and the
+same rule applies to group/plan variants. Serialized JSON secrets and private
+key PEM blocks are also rejected; public structured JWK values remain possible
+only when they contain no private or symmetric key members. `REVIEW` and
 `WARNING` cannot be pre-approved by the matrix, and `SKIPPED` remains a distinct
 classification rather than a pass.
 
@@ -76,7 +87,9 @@ identity only after every check succeeds. `--capability` values are the
 capability set supplied by the caller; this command does not discover or grant
 NazoAuth capabilities. A future deployment-bound runner must obtain them from
 authenticated capability negotiation and pass that observed set to the same
-verifier.
+verifier. The public verifier revalidates the complete trust-policy schema,
+source, signer identity, public key, and derived key ID even when a library
+caller constructs the policy value directly instead of using the file parser.
 
 The local verify command deliberately does not download artifacts, provision
 server resources, run the Suite, or clean resources.
@@ -99,8 +112,9 @@ uses the signed matrix URL. The matrix download is then bounded by the signed
 byte size and accepted only after exact digest and schema validation.
 
 Verified bytes are stored under the driver manifest digest in an owner-only
-cache. `driver.jws` and `matrix.json` are individually fsynced and atomically
-replaced. `verified.json` is written last and is the commit marker. A cache hit
+cache. Cache record schema 2 carries the verified Matrix resource totals.
+`driver.jws` and `matrix.json` are individually fsynced and atomically replaced.
+`verified.json` is written last and is the commit marker. A cache hit
 requires the committed manifest, matrix, URL, and verified identity to match
 the newly fetched and verified artifact exactly. Conflicting committed content
 fails closed; it is never overwritten as a recovery shortcut.
@@ -153,11 +167,16 @@ entries bind the artifact identity, Suite plan name, variant, required
 capabilities, the caller-declared capability set that allowed verification,
 expected `SKIPPED` exceptions, and the verified JSON config template. The
 artifact and matrix digests remain the sole byte-level identities; planning
-does not create a competing template canonicalization rule.
+does not create a competing template canonicalization rule. It also sums the
+selected signed resource budgets and rejects a selection that cannot finish
+strictly before the artifact's exclusive expiry.
 
-This output is inspection evidence, not an execution authorization. It carries
+Inspection-plan schema 2 is evidence, not an execution authorization. It carries
 a plan JTI but deliberately records `deployment_bound: false`,
 `capabilities_attested: false`, and `execution_permitted: false`, together with
-the missing authenticated negotiation, ordinary resource provider, and
+the missing signed executable driver/runtime sandbox, authenticated
+negotiation, ordinary resource provider, target/Suite origin policy, and
 deployment-bound crash-safe journal blockers. The command creates no NazoAuth
-resource, Suite plan, execution journal, or cleanup obligation.
+resource, Suite plan, execution journal, or cleanup obligation. Signed budgets
+are contract ceilings, not proof of runtime enforcement; a future runner must
+enforce them against observed Suite modules, created clients, and elapsed time.

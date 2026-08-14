@@ -1,9 +1,10 @@
 //! Pure, offline compilation of a verified artifact Matrix into an inspection plan.
 //!
 //! This boundary intentionally does not create an executable deployment run.
-//! Authenticated capability negotiation, ordinary NazoAuth resource providers,
-//! and a deployment-bound recovery journal do not exist yet; the plan records
-//! those blockers instead of treating caller-supplied capability names as proof.
+//! A signed executable driver and sandbox, authenticated capability negotiation,
+//! ordinary NazoAuth resource providers, target/Suite origin policy, and a
+//! deployment-bound recovery journal do not exist yet; the plan records those
+//! blockers instead of treating caller-supplied capability names as proof.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,9 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use crate::{CachedOidfArtifact, OidfArtifactMatrix};
+use crate::{CachedOidfArtifact, OidfArtifactMatrix, OidfPlanResourceBudget};
 
-pub const OIDF_DRIVER_INSPECTION_PLAN_SCHEMA: u32 = 1;
+pub const OIDF_DRIVER_INSPECTION_PLAN_SCHEMA: u32 = 2;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +37,7 @@ pub struct OidfDriverPlanEntry {
     pub group_variant_values: BTreeMap<String, String>,
     pub plan_id: String,
     pub suite_plan_name: String,
+    pub resource_budget: OidfPlanResourceBudget,
     pub plan_variant_values: BTreeMap<String, String>,
     pub config_template: Value,
     pub required_capabilities: Vec<String>,
@@ -56,6 +58,8 @@ pub struct OidfDriverInspectionPlan {
     pub selection: OidfPlanSelection,
     pub selected_group_count: u32,
     pub selected_plan_count: u32,
+    pub selected_resource_budget: OidfPlanResourceBudget,
+    pub latest_execution_start_at: i64,
     pub plans: Vec<OidfDriverPlanEntry>,
     pub deployment_bound: bool,
     pub capabilities_attested: bool,
@@ -65,6 +69,8 @@ pub struct OidfDriverInspectionPlan {
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum OidfPlanError {
+    #[error("verified artifact cache identity is unsupported")]
+    CacheIdentity,
     #[error("verified artifact Matrix could not be decoded")]
     MalformedMatrix,
     #[error("verified artifact Matrix identity changed before planning")]
@@ -75,8 +81,10 @@ pub enum OidfPlanError {
     UnknownSelection,
     #[error("group and plan filters select no common plan")]
     EmptySelection,
-    #[error("selected plan count exceeds the signed resource bound")]
+    #[error("selected plan resources exceed the signed artifact bounds")]
     ResourceBound,
+    #[error("artifact validity cannot contain the selected resource budget")]
+    ArtifactValidity,
 }
 
 pub(crate) fn compile_oidf_driver_inspection_plan(
@@ -86,6 +94,9 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
     selection: OidfPlanSelection,
     now: i64,
 ) -> Result<OidfDriverInspectionPlan, OidfPlanError> {
+    if cached.schema != crate::OIDF_ARTIFACT_CACHE_SCHEMA_VERSION {
+        return Err(OidfPlanError::CacheIdentity);
+    }
     if matrix_bytes.len() as u64 != cached.artifact.matrix_size
         || sha256(matrix_bytes) != cached.artifact.matrix_sha256
     {
@@ -114,6 +125,11 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
 
     let mut selected_groups = BTreeSet::new();
     let mut entries = Vec::new();
+    let mut selected_resource_budget = OidfPlanResourceBudget {
+        modules: 0,
+        clients: 0,
+        wall_clock_seconds: 0,
+    };
     for group in matrix.groups {
         if !groups.is_empty() && !groups.contains(&group.id) {
             continue;
@@ -122,6 +138,18 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
             if !plans.is_empty() && !plans.contains(&plan.id) {
                 continue;
             }
+            selected_resource_budget.modules = selected_resource_budget
+                .modules
+                .checked_add(plan.resource_budget.modules)
+                .ok_or(OidfPlanError::ResourceBound)?;
+            selected_resource_budget.clients = selected_resource_budget
+                .clients
+                .checked_add(plan.resource_budget.clients)
+                .ok_or(OidfPlanError::ResourceBound)?;
+            selected_resource_budget.wall_clock_seconds = selected_resource_budget
+                .wall_clock_seconds
+                .checked_add(plan.resource_budget.wall_clock_seconds)
+                .ok_or(OidfPlanError::ResourceBound)?;
             selected_groups.insert(group.id.clone());
             entries.push(OidfDriverPlanEntry {
                 group_id: group.id.clone(),
@@ -130,6 +158,7 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
                 group_variant_values: group.variant.values.clone(),
                 plan_id: plan.id,
                 suite_plan_name: plan.plan,
+                resource_budget: plan.resource_budget,
                 plan_variant_values: plan.variant,
                 config_template: plan.config_template,
                 required_capabilities: plan.required_capabilities,
@@ -145,6 +174,27 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
     if selected_plan_count > cached.artifact.resource_bounds.max_plans {
         return Err(OidfPlanError::ResourceBound);
     }
+    if selected_resource_budget.modules > cached.artifact.resource_bounds.max_modules
+        || selected_resource_budget.clients > cached.artifact.resource_bounds.max_clients
+        || selected_resource_budget.wall_clock_seconds
+            > cached.artifact.resource_bounds.max_wall_clock_seconds
+    {
+        return Err(OidfPlanError::ResourceBound);
+    }
+    let selected_wall_clock = i64::try_from(selected_resource_budget.wall_clock_seconds)
+        .map_err(|_| OidfPlanError::ArtifactValidity)?;
+    let latest_execution_start_at = cached
+        .artifact
+        .expires_at
+        .checked_sub(selected_wall_clock)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or(OidfPlanError::ArtifactValidity)?;
+    if now < cached.artifact.not_before
+        || now >= cached.artifact.expires_at
+        || now > latest_execution_start_at
+    {
+        return Err(OidfPlanError::ArtifactValidity);
+    }
     let selected_group_count =
         u32::try_from(selected_groups.len()).map_err(|_| OidfPlanError::ResourceBound)?;
     Ok(OidfDriverInspectionPlan {
@@ -159,13 +209,17 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
         selection,
         selected_group_count,
         selected_plan_count,
+        selected_resource_budget,
+        latest_execution_start_at,
         plans: entries,
         deployment_bound: false,
         capabilities_attested: false,
         execution_permitted: false,
         execution_blockers: vec![
+            "signed-driver-payload-and-runtime-sandbox",
             "authenticated-capability-negotiation",
             "ordinary-resource-provider",
+            "target-and-suite-origin-policy",
             "deployment-bound-crash-safe-execution-journal",
         ],
     })
@@ -199,7 +253,7 @@ mod tests {
     use super::*;
     use crate::{
         OidfArtifactMatrixGroup, OidfArtifactMatrixPlan, OidfArtifactMatrixVariant,
-        OidfResourceBounds, OidfSuiteIdentity, VerifiedOidfArtifact,
+        OidfPlanResourceBudget, OidfResourceBounds, OidfSuiteIdentity, VerifiedOidfArtifact,
     };
 
     #[test]
@@ -220,6 +274,15 @@ mod tests {
         assert_eq!(plan.selected_plan_count, 1);
         assert_eq!(plan.plans[0].plan_id, "p002");
         assert_eq!(
+            plan.selected_resource_budget,
+            OidfPlanResourceBudget {
+                modules: 10,
+                clients: 1,
+                wall_clock_seconds: 100,
+            }
+        );
+        assert_eq!(plan.latest_execution_start_at, 1_800_000_899);
+        assert_eq!(
             plan.caller_declared_capabilities,
             ["nazoauth.client.create"]
         );
@@ -239,7 +302,7 @@ mod tests {
         assert!(!plan.deployment_bound);
         assert!(!plan.capabilities_attested);
         assert!(!plan.execution_permitted);
-        assert_eq!(plan.execution_blockers.len(), 3);
+        assert_eq!(plan.execution_blockers.len(), 5);
     }
 
     #[test]
@@ -284,6 +347,19 @@ mod tests {
     fn rejects_changed_matrix_identity_and_plan_count_above_signed_bound() {
         let matrix = matrix_bytes();
         let capabilities = BTreeSet::from(["nazoauth.client.create".to_owned()]);
+        let mut unsupported_cache = cached(&matrix);
+        unsupported_cache.schema += 1;
+        assert_eq!(
+            compile_oidf_driver_inspection_plan(
+                unsupported_cache,
+                &matrix,
+                &capabilities,
+                OidfPlanSelection::default(),
+                1_800_000_000,
+            )
+            .unwrap_err(),
+            OidfPlanError::CacheIdentity
+        );
         let mut changed = matrix.clone();
         changed.push(b' ');
         assert_eq!(
@@ -325,6 +401,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn planning_requires_time_for_the_selected_budget_before_exclusive_expiry() {
+        let matrix = matrix_bytes();
+        let capabilities = BTreeSet::from(["nazoauth.client.create".to_owned()]);
+        assert_eq!(
+            compile_oidf_driver_inspection_plan(
+                cached(&matrix),
+                &matrix,
+                &capabilities,
+                OidfPlanSelection {
+                    groups: Vec::new(),
+                    plans: vec!["p001".to_owned()],
+                },
+                1_800_000_900,
+            )
+            .unwrap_err(),
+            OidfPlanError::ArtifactValidity
+        );
+        assert_eq!(
+            compile_oidf_driver_inspection_plan(
+                cached(&matrix),
+                &matrix,
+                &capabilities,
+                OidfPlanSelection::default(),
+                1_800_001_000,
+            )
+            .unwrap_err(),
+            OidfPlanError::ArtifactValidity
+        );
+    }
+
     fn matrix_bytes() -> Vec<u8> {
         serde_json::to_vec(&OidfArtifactMatrix {
             schema: crate::OIDF_MATRIX_SCHEMA_VERSION,
@@ -350,6 +457,11 @@ mod tests {
                 .map(|id| OidfArtifactMatrixPlan {
                     id: (*id).to_owned(),
                     plan: format!("suite-{id}"),
+                    resource_budget: OidfPlanResourceBudget {
+                        modules: 10,
+                        clients: 1,
+                        wall_clock_seconds: 100,
+                    },
                     config_template: json!({"alias": "{{run.alias}}", "id": id}),
                     variant: BTreeMap::from([("response_type".to_owned(), "code".to_owned())]),
                     required_capabilities: vec!["nazoauth.client.create".to_owned()],
@@ -365,7 +477,7 @@ mod tests {
 
     fn cached(matrix: &[u8]) -> CachedOidfArtifact {
         CachedOidfArtifact {
-            schema: 1,
+            schema: crate::OIDF_ARTIFACT_CACHE_SCHEMA_VERSION,
             manifest_url: "https://artifacts.example/oidf/driver.jws".to_owned(),
             cached_at: 1_799_999_900,
             opened_at: 1_800_000_000,
@@ -389,6 +501,9 @@ mod tests {
                 matrix_size: matrix.len() as u64,
                 matrix_groups: 2,
                 matrix_plans: 3,
+                matrix_modules: 30,
+                matrix_clients: 3,
+                matrix_wall_clock_seconds: 300,
                 not_before: 1_799_999_000,
                 expires_at: 1_800_001_000,
                 resource_bounds: OidfResourceBounds {
