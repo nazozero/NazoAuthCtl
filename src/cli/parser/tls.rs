@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 
-use super::super::types::{AcmeCertificateInput, AcmeCommand, TlsCertificateInput, TlsCommand};
+use super::super::types::{
+    AcmeCertificateInput, AcmeCommand, TlsCertificateInput, TlsCertificateSource, TlsCommand,
+};
 
 pub(super) fn parse_tls(mut values: Vec<String>) -> anyhow::Result<TlsCommand> {
     let family = values
@@ -154,18 +156,24 @@ fn parse_material_input(
     let mut hostname = None;
     let mut certificate = None;
     let mut private_key = None;
+    let mut from_acme_current = false;
     let mut yes = false;
     let mut index = 0;
     while index < values.len() {
         let option = values[index].as_str();
-        if option == "--yes" {
-            if !allow_yes {
-                bail!("tls certificate plan does not accept --yes");
+        if matches!(option, "--yes" | "--from-acme-current") {
+            let flag = if option == "--yes" {
+                if !allow_yes {
+                    bail!("tls certificate plan does not accept --yes");
+                }
+                &mut yes
+            } else {
+                &mut from_acme_current
+            };
+            if *flag {
+                bail!("{option} may be specified only once");
             }
-            if yes {
-                bail!("--yes may be specified only once");
-            }
-            yes = true;
+            *flag = true;
             index += 1;
             continue;
         }
@@ -187,13 +195,26 @@ fn parse_material_input(
         }
         index += 2;
     }
+    let source = match (certificate, private_key, from_acme_current) {
+        (Some(certificate), Some(private_key), false) => TlsCertificateSource::ExternalFiles {
+            certificate,
+            private_key,
+        },
+        (None, None, true) => TlsCertificateSource::CurrentAcmeReceipt,
+        (Some(_), Some(_), true) => {
+            bail!("--from-acme-current cannot be combined with --certificate/--private-key")
+        }
+        (None, None, false) => {
+            bail!("either --from-acme-current or --certificate with --private-key is required")
+        }
+        _ => bail!("--certificate and --private-key must be supplied together"),
+    };
     Ok((
         TlsCertificateInput {
             provider_config: provider_config.context("--provider-config is required")?,
             tenant: tenant.context("--tenant is required")?,
             hostname: hostname.context("--hostname is required")?,
-            certificate: certificate.context("--certificate is required")?,
-            private_key: private_key.context("--private-key is required")?,
+            source,
         },
         yes,
     ))

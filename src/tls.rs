@@ -18,7 +18,7 @@ use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use crate::{
-    cli::{TlsCertificateInput, TlsCommand},
+    cli::{TlsCertificateInput, TlsCertificateSource, TlsCommand},
     deployment::{Capability, DeploymentRecord, DeploymentStore},
     filesystem::{
         atomic_write, ensure_private_directory, read_secure_regular_file, remove_file_durable,
@@ -29,9 +29,9 @@ use crate::{
 
 const PROVIDER_PROTOCOL: &str = "nazoauthctl.tls.external-generation.v1";
 const PROVIDER_SCHEMA: u32 = 1;
-const TRANSACTION_SCHEMA: u32 = 1;
-const RECEIPT_SCHEMA: u32 = 1;
-const PLAN_SCHEMA: u32 = 1;
+const TRANSACTION_SCHEMA: u32 = 2;
+const RECEIPT_SCHEMA: u32 = 2;
+const PLAN_SCHEMA: u32 = 2;
 const MAX_PROVIDER_BYTES: u64 = 64 * 1024;
 const MAX_TRANSACTION_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CERTIFICATE_BYTES: u64 = 1024 * 1024;
@@ -84,6 +84,65 @@ struct LoadedProvider {
     public_url: Url,
 }
 
+#[derive(Clone, Debug)]
+struct AcmeInstallSource {
+    receipt_sha256: String,
+    issuance_jti: String,
+    issuance_declaration_revision: u64,
+    issuance_revision: u64,
+    acme_protocol: String,
+    acme_config_sha256: String,
+    certificate_path: PathBuf,
+    private_key_path: PathBuf,
+    certificate_sha256: String,
+    private_key_sha256: String,
+    leaf_certificate_sha256: String,
+    material_sha256: String,
+    certificate_not_after: i64,
+    issued_at: i64,
+}
+
+#[derive(Clone, Debug)]
+enum ResolvedCertificateSource {
+    ExternalFiles {
+        certificate: PathBuf,
+        private_key: PathBuf,
+    },
+    AcmeReceipt(Box<AcmeInstallSource>),
+}
+
+impl ResolvedCertificateSource {
+    fn paths(&self) -> (&Path, &Path) {
+        match self {
+            Self::ExternalFiles {
+                certificate,
+                private_key,
+            } => (certificate, private_key),
+            Self::AcmeReceipt(source) => (&source.certificate_path, &source.private_key_path),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum CertificateSourceBinding {
+    ExternalFiles {
+        certificate_sha256: String,
+        private_key_sha256: String,
+    },
+    AcmeReceipt {
+        receipt_sha256: String,
+        issuance_jti: String,
+        issuance_declaration_revision: u64,
+        issuance_revision: u64,
+        acme_protocol: String,
+        acme_config_sha256: String,
+        certificate_sha256: String,
+        private_key_sha256: String,
+        issued_at: i64,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CertificatePlan {
@@ -99,6 +158,7 @@ struct CertificatePlan {
     provider_protocol: String,
     provider_config_sha256: String,
     trust_anchors_sha256: String,
+    source: CertificateSourceBinding,
     material_sha256: String,
     leaf_certificate_sha256: String,
     certificate_not_after: i64,
@@ -147,6 +207,7 @@ struct CertificateTransaction {
     capability: String,
     expected_revision: u64,
     target_revision: u64,
+    source: CertificateSourceBinding,
     material_sha256: String,
     leaf_certificate_sha256: String,
     certificate_not_after: i64,
@@ -174,6 +235,7 @@ struct CertificateReceipt {
     hostname: String,
     capability: String,
     revision: u64,
+    source: CertificateSourceBinding,
     material_sha256: String,
     leaf_certificate_sha256: String,
     certificate_not_after: i64,
@@ -219,9 +281,20 @@ pub(crate) fn run(
                 &tenant,
                 &hostname,
             )?;
-            let material = load_and_validate_material(&input, &provider)?;
+            let resolved_source = resolve_certificate_source(&store, &record, &input, &provider)?;
+            let (certificate, private_key) = resolved_source.paths();
+            let material =
+                load_and_validate_material(certificate, private_key, &input.hostname, &provider)?;
+            let source = bind_certificate_source(&resolved_source, &material)?;
             let receipt = load_receipt(&store, &record, &input.tenant, &input.hostname)?;
-            let plan = build_plan(&record, &input, &provider, &material, receipt.as_ref())?;
+            let plan = build_plan(
+                &record,
+                &input,
+                &provider,
+                &source,
+                &material,
+                receipt.as_ref(),
+            )?;
             println!("{}", serde_json::to_string_pretty(&plan)?);
             Ok(())
         }
@@ -284,9 +357,13 @@ fn apply(
         &tenant,
         &hostname,
     )?;
-    let material = load_and_validate_material(input, &provider)?;
+    let resolved_source = resolve_certificate_source(store, &record, input, &provider)?;
+    let (certificate, private_key) = resolved_source.paths();
+    let material = load_and_validate_material(certificate, private_key, &hostname, &provider)?;
+    let source = bind_certificate_source(&resolved_source, &material)?;
     let previous = load_receipt(store, &record, &tenant, &hostname)?;
     validate_active_receipt(&provider.config, previous.as_ref())?;
+    ensure_source_not_current(previous.as_ref(), &source)?;
     let expected_revision = previous.as_ref().map_or(0, |receipt| receipt.revision);
     let target_revision = expected_revision
         .checked_add(1)
@@ -312,6 +389,7 @@ fn apply(
         capability: "proxy_tls".to_owned(),
         expected_revision,
         target_revision,
+        source: source.clone(),
         material_sha256: material.material_sha256.clone(),
         leaf_certificate_sha256: material.leaf_sha256.clone(),
         certificate_not_after: material.not_after,
@@ -369,6 +447,7 @@ fn apply(
             hostname,
             capability: "proxy_tls".to_owned(),
             revision: target_revision,
+            source: transaction.source.clone(),
             material_sha256: material.material_sha256.clone(),
             leaf_certificate_sha256: material.leaf_sha256.clone(),
             certificate_not_after: material.not_after,
@@ -477,14 +556,73 @@ fn recover(
     Ok(())
 }
 
+fn resolve_certificate_source(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    input: &TlsCertificateInput,
+    provider: &LoadedProvider,
+) -> anyhow::Result<ResolvedCertificateSource> {
+    match &input.source {
+        TlsCertificateSource::ExternalFiles {
+            certificate,
+            private_key,
+        } => Ok(ResolvedCertificateSource::ExternalFiles {
+            certificate: certificate.clone(),
+            private_key: private_key.clone(),
+        }),
+        TlsCertificateSource::CurrentAcmeReceipt => {
+            acme::current_install_source(store, record, provider, &input.tenant, &input.hostname)
+                .map(Box::new)
+                .map(ResolvedCertificateSource::AcmeReceipt)
+        }
+    }
+}
+
+fn bind_certificate_source(
+    source: &ResolvedCertificateSource,
+    material: &ValidatedMaterial,
+) -> anyhow::Result<CertificateSourceBinding> {
+    match source {
+        ResolvedCertificateSource::ExternalFiles { .. } => {
+            Ok(CertificateSourceBinding::ExternalFiles {
+                certificate_sha256: material.certificate_sha256.clone(),
+                private_key_sha256: material.private_key_sha256.clone(),
+            })
+        }
+        ResolvedCertificateSource::AcmeReceipt(source) => {
+            if source.certificate_sha256 != material.certificate_sha256
+                || source.private_key_sha256 != material.private_key_sha256
+                || source.leaf_certificate_sha256 != material.leaf_sha256
+                || source.material_sha256 != material.material_sha256
+                || source.certificate_not_after != material.not_after
+            {
+                bail!("ACME issuance receipt differs from the offline-validated TLS material");
+            }
+            Ok(CertificateSourceBinding::AcmeReceipt {
+                receipt_sha256: source.receipt_sha256.clone(),
+                issuance_jti: source.issuance_jti.clone(),
+                issuance_declaration_revision: source.issuance_declaration_revision,
+                issuance_revision: source.issuance_revision,
+                acme_protocol: source.acme_protocol.clone(),
+                acme_config_sha256: source.acme_config_sha256.clone(),
+                certificate_sha256: source.certificate_sha256.clone(),
+                private_key_sha256: source.private_key_sha256.clone(),
+                issued_at: source.issued_at,
+            })
+        }
+    }
+}
+
 fn build_plan(
     record: &DeploymentRecord,
     input: &TlsCertificateInput,
     provider: &LoadedProvider,
+    source: &CertificateSourceBinding,
     material: &ValidatedMaterial,
     current: Option<&CertificateReceipt>,
 ) -> anyhow::Result<CertificatePlan> {
     validate_active_receipt(&provider.config, current)?;
+    ensure_source_not_current(current, source)?;
     let current_revision = current.map_or(0, |receipt| receipt.revision);
     let grant = record.capabilities.grant(Capability::ProxyTls);
     Ok(CertificatePlan {
@@ -500,6 +638,7 @@ fn build_plan(
         provider_protocol: PROVIDER_PROTOCOL.to_owned(),
         provider_config_sha256: provider.config_sha256.clone(),
         trust_anchors_sha256: provider.trust_anchors_sha256.clone(),
+        source: source.clone(),
         material_sha256: material.material_sha256.clone(),
         leaf_certificate_sha256: material.leaf_sha256.clone(),
         certificate_not_after: material.not_after,
@@ -518,6 +657,16 @@ fn build_plan(
             "receipt-commit-or-rollback",
         ],
     })
+}
+
+fn ensure_source_not_current(
+    current: Option<&CertificateReceipt>,
+    source: &CertificateSourceBinding,
+) -> anyhow::Result<()> {
+    if current.is_some_and(|receipt| &receipt.source == source) {
+        bail!("the selected TLS certificate source is already the active committed revision");
+    }
+    Ok(())
 }
 
 fn load_provider(
@@ -939,6 +1088,7 @@ fn validate_committed_receipt_binding(
         || receipt.hostname != transaction.hostname
         || receipt.capability != transaction.capability
         || receipt.revision != transaction.target_revision
+        || receipt.source != transaction.source
         || receipt.material_sha256 != transaction.material_sha256
         || receipt.leaf_certificate_sha256 != transaction.leaf_certificate_sha256
         || receipt.certificate_not_after != transaction.certificate_not_after
@@ -1202,6 +1352,14 @@ fn load_receipt(
         || !valid_sha256(&receipt.leaf_certificate_sha256)
         || !valid_sha256(&receipt.provider_config_sha256)
         || !valid_sha256(&receipt.trust_anchors_sha256)
+        || !valid_certificate_source_binding(
+            &receipt.source,
+            receipt.declaration_revision,
+            receipt.transaction_created_at,
+            receipt.certificate_not_after,
+        )
+        || receipt.material_sha256
+            != source_material_sha256(&receipt.source, &receipt.leaf_certificate_sha256)
     {
         bail!("TLS certificate receipt binding is invalid");
     }
@@ -1234,6 +1392,14 @@ fn validate_transaction_binding(
         || !valid_sha256(&transaction.leaf_certificate_sha256)
         || !valid_sha256(&transaction.provider_config_sha256)
         || !valid_sha256(&transaction.trust_anchors_sha256)
+        || !valid_certificate_source_binding(
+            &transaction.source,
+            transaction.declaration_revision,
+            transaction.created_at,
+            transaction.certificate_not_after,
+        )
+        || transaction.material_sha256
+            != source_material_sha256(&transaction.source, &transaction.leaf_certificate_sha256)
         || uuid::Uuid::parse_str(&transaction.jti)
             .ok()
             .map(|jti| jti.get_version_num())
@@ -1264,6 +1430,56 @@ fn validate_transaction_binding(
     }
     validate_provider_config(store, &transaction.provider, tenant, hostname)?;
     Ok(())
+}
+
+fn valid_certificate_source_binding(
+    source: &CertificateSourceBinding,
+    declaration_revision: u64,
+    consumed_at: i64,
+    certificate_not_after: i64,
+) -> bool {
+    match source {
+        CertificateSourceBinding::ExternalFiles {
+            certificate_sha256,
+            private_key_sha256,
+        } => valid_sha256(certificate_sha256) && valid_sha256(private_key_sha256),
+        CertificateSourceBinding::AcmeReceipt {
+            receipt_sha256,
+            issuance_jti,
+            issuance_declaration_revision,
+            issuance_revision,
+            acme_protocol,
+            acme_config_sha256,
+            certificate_sha256,
+            private_key_sha256,
+            issued_at,
+        } => {
+            valid_sha256(receipt_sha256)
+                && valid_sha256(acme_config_sha256)
+                && valid_sha256(certificate_sha256)
+                && valid_sha256(private_key_sha256)
+                && acme_protocol == acme::CONFIG_PROTOCOL
+                && *issuance_declaration_revision == declaration_revision
+                && *issuance_revision > 0
+                && *issued_at <= consumed_at
+                && *issued_at < certificate_not_after
+                && uuid::Uuid::parse_str(issuance_jti).ok().is_some_and(|jti| {
+                    jti.get_version_num() == 7 && jti.to_string() == *issuance_jti
+                })
+        }
+    }
+}
+
+fn source_material_sha256(source: &CertificateSourceBinding, leaf_sha256: &str) -> String {
+    let certificate_sha256 = match source {
+        CertificateSourceBinding::ExternalFiles {
+            certificate_sha256, ..
+        }
+        | CertificateSourceBinding::AcmeReceipt {
+            certificate_sha256, ..
+        } => certificate_sha256,
+    };
+    sha256(format!("{leaf_sha256}:{certificate_sha256}").as_bytes())
 }
 
 fn ensure_transaction_fresh(transaction: &CertificateTransaction) -> anyhow::Result<()> {
