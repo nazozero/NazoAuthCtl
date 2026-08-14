@@ -96,8 +96,14 @@ pub(super) fn restore_postgres(
             restore,
             "postgres",
             &format!(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{temporary}'; DROP DATABASE IF EXISTS \"{temporary}\""
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{temporary}'"
             ),
+        )?;
+        run_postgres_psql(
+            command,
+            restore,
+            "postgres",
+            &format!("DROP DATABASE IF EXISTS \"{temporary}\""),
         )?;
         run_postgres_psql(
             command,
@@ -127,8 +133,14 @@ pub(super) fn restore_postgres(
                 restore,
                 "postgres",
                 &format!(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname IN ('{database}', '{temporary}') AND pid <> pg_backend_pid(); ALTER DATABASE \"{database}\" RENAME TO \"{quarantine}\""
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname IN ('{database}', '{temporary}') AND pid <> pg_backend_pid()"
                 ),
+            )?;
+            run_postgres_psql(
+                command,
+                restore,
+                "postgres",
+                &format!("ALTER DATABASE \"{database}\" RENAME TO \"{quarantine}\""),
             )?;
             journal.phase = "postgres-old-quarantined".to_owned();
             container_shared::persist_dependency_restore_journal(&journal_path, &journal)?;
