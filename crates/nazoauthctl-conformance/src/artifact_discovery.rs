@@ -482,7 +482,10 @@ mod tests {
         let fetched =
             fetch_verified_artifact(&transport, MANIFEST_URL, &trust(), &capabilities(), NOW)
                 .expect("verified fetch");
-        let root = std::env::temp_dir().join(format!("nazo-oidf-cache-{}", uuid::Uuid::now_v7()));
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical system temp directory");
+        let root = temp_root.join(format!("nazo-oidf-cache-{}", uuid::Uuid::now_v7()));
         let (entry, hit) = persist_verified_cache(
             &root,
             MANIFEST_URL,
