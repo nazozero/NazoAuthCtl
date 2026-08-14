@@ -105,10 +105,14 @@ still-finishing operator apply from being mistaken for “no lease created”.
 Proxy recovery invokes the same validated reload executable even when no new
 run will install trust. Operators must not delete the journal or sibling
 recovery file and must not start a second proxy writer; resolve any reported
-operator/reload failure and rerun the command. The current journal covers the
-legacy lease/proxy path. Tenant-scoped ordinary-resource enumeration and
-revocation remain gated on the NazoAuth #129/#130 capability contract and must
-be added as journal obligations before artifact-backed execution is enabled.
+operator/reload failure and rerun the command. Schema 1 journals cover the
+legacy lease/proxy path for backward recovery. Schema 2 journals own ordinary
+tenant-resource recovery: the exact signed Apply request and private manifest
+are durable before mutation, the signed receipt is persisted before cleanup,
+enumeration observes only the run identities, and Revoke is digest-fenced.
+Resource and proxy cleanup markers are independent; the journal is removed only
+after both complete and the private manifest has passed the durable
+deletion-intent sequence.
 
 The signed offline deployment statement identifies a stopped replica from its
 persistent mount. It is not sufficient artifact trust: ctl also verifies the

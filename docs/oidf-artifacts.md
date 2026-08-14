@@ -100,9 +100,10 @@ nazoauthctl conformance artifact verify \
 The command reads bounded regular non-symlink files and emits a verified public
 identity only after every check succeeds. `--capability` values are the
 capability set supplied by the caller; this command does not discover or grant
-NazoAuth capabilities. A future deployment-bound runner must obtain them from
-authenticated capability negotiation and pass that observed set to the same
-verifier. The public verifier revalidates the complete trust-policy schema,
+NazoAuth capabilities. `conformance run` separately obtains deployment-bound
+provider actions and resource kinds from authenticated capability negotiation;
+runner capability strings and provider authorization are never treated as the
+same authority. The public verifier revalidates the complete trust-policy schema,
 source, signer identity, public key, and derived key ID even when a library
 caller constructs the policy value directly instead of using the file parser.
 
@@ -206,38 +207,37 @@ Inspection-plan schema 5 is evidence, not an execution authorization. It carries
 a plan JTI but deliberately records `deployment_bound: false`,
 `capabilities_attested: false`, and `execution_permitted: false`, together with
 the authenticated negotiation, ordinary resource provider, target/Suite origin
-policy, and deployment-bound crash-safe journal blockers. NazoAuth's current
-operator wire still exposes the legacy Suite-specific lease operations rather
-than an ordinary tenant-scoped controller contract; the required ownership and
-Suite-removal work remains tracked by NazoAuth #128/#129 and parent #130. The
-command creates no NazoAuth resource, Suite plan, execution journal, or cleanup
-obligation. Signed budgets are contract ceilings, not proof of runtime
-enforcement; a future runner must enforce them against observed Suite modules,
-created clients, and elapsed time.
+policy, and deployment-bound crash-safe journal blockers. The `plan` command
+creates no NazoAuth resource, Suite plan, execution journal, or cleanup
+obligation. `conformance run` reopens and re-verifies the exact cached bytes,
+binds the plan to authenticated deployment and ordinary-provider capabilities,
+and only then clears those blockers. Signed budgets are contract ceilings; the
+runner enforces them against selected Suite modules, created clients, and
+elapsed time.
 
 Schema 5 also binds the delivery contract to
 `nazoauthctl-bounded-plan-runner-v1`, the existing runner whose behavior tests
 cover a frozen plan denominator, worker-owned automation state, a maximum of
 four jobs, a global serialized CIBA lane, stop-launching on fatal failure,
 failure collection, and finally cleanup. Every selected plan receives a unique
-task JTI for future client/state/evidence ownership. A multi-plan selection
+task JTI for client/state/evidence ownership. A multi-plan selection
 requires at least two jobs and permits at most the runner's existing bound;
 there is no second scheduler and the release stage must not downgrade the full
-matrix to serial execution. These are consumption requirements only and do not
-override `execution_permitted: false`.
+matrix to serial execution. Only authenticated execution authorization can set
+`execution_permitted: true`.
 
-The existing run evidence sink now commits each run into a unique owner-only
+The run evidence sink commits each run into a unique owner-only
 directory with a manifest-last digest envelope, and preserves structured output
-when outer cleanup fails. A future artifact-backed run can place the complete
-verified artifact identity in that same strict envelope. This does not claim a
-Suite signature: obtaining and verifying signed Suite evidence, plus binding it
-to authenticated NazoAuth build/capability receipts, remains an execution-stage
-blocker.
+when outer cleanup fails. Provider evidence groups every capability generation
+with its signed receipts, revision and manifest transition, and proves cleanup
+back to the enumerated baseline. This does not claim a Suite signature: Suite
+outcomes and controller/provider evidence remain distinct facts.
 
-The legacy lease/proxy runner now journals cleanup intent before onboarding and
-recovers unlocked interrupted runs on the next invocation, including the crash
-window before ctl records the returned lease ID. Artifact-backed execution is
-still disabled: its future journal must additionally enumerate every ordinary
-tenant-scoped client/trust/user change-set and bind authenticated capability
-receipts. The legacy lease journal is recovery machinery, not evidence that
-those external management capabilities already exist.
+Before ordinary Apply, `conformance run` durably stores the exact capability
+JWS, task JWS, request digest, private manifest path, and proxy recovery input.
+Response loss replays the exact prepared request and JTI. Cleanup first
+enumerates the run identities, then issues a digest-fenced Revoke under a fresh
+capability, persists both receipts, restores the proxy, and removes the private
+manifest only through the journal's deletion-intent state machine. The legacy
+lease journal remains readable solely for recovery of runs created by older
+controllers; it is not used by the ordinary production path.

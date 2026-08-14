@@ -69,7 +69,7 @@ configuration validation, atomic reload, rollback, and recovery of its proxy;
 ctl must not synthesize completion from application settings.
 
 Conformance certificates and trust anchors are run-scoped. If a shared proxy is
-used, the provider must atomically install the active lease's public CA bundle
+used, the provider must atomically install the active run's public CA bundle
 before Suite modules are created and restore the previous bundle during the same
 cleanup transaction. Such runs are serialized unless they have independent
 listeners and bundles. Private keys never cross this boundary.
@@ -78,7 +78,7 @@ For a file-backed provider, `conformance run` accepts the paired
 `--proxy-trust-bundle` and `--proxy-reload-executable` options. The materializer
 supplies only generated public client CAs. ctl atomically installs that bundle,
 invokes a root-owned reload executable, and restores a sibling recovery copy
-after Suite and lease cleanup. Supplying only one option fails before proxy,
+after Suite and ordinary-resource cleanup. Supplying only one option fails before proxy,
 deployment, or Suite mutation.
 
 ## Conformance outcome evidence
@@ -105,11 +105,11 @@ last as the commit marker. A crash can therefore leave only an explicitly
 uncommitted directory; it cannot make a partial set look complete or mix old
 modules into a new run. The manifest also binds the immutable deployment
 release/revision/build/runtime digest, Matrix source, Suite origin, and outer
-lease/proxy cleanup result. This is ctl-generated integrity evidence, not a
+resource/proxy cleanup result. This is ctl-generated integrity evidence, not a
 Suite signature; signed Suite evidence remains an external release-stage
 requirement.
 
-Final output schema 2 preserves a completed `RunOutput` even when lease,
+Final output schema 2 preserves a completed `RunOutput` even when resource,
 proxy, or evidence cleanup fails. Such failures are listed in `errors`, keep
 `success: false`, and leave `deployment.cleanup_complete: false`; they are no
 longer converted into an unstructured error that discards the collected Suite
