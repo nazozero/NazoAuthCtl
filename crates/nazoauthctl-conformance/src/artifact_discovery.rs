@@ -159,11 +159,13 @@ fn open_cached_entry(
     let driver = read_cache(&cache_entry.join("driver.json"), MAX_ARTIFACT_DRIVER_BYTES)?;
     let matrix = read_cache(&cache_entry.join("matrix.json"), MAX_ARTIFACT_MATRIX_BYTES)?;
     let record = verify_cached_entry(
-        &record_bytes,
-        &compact_manifest,
-        &driver,
-        &matrix,
-        manifest_digest,
+        CachedVerificationInput {
+            record: &record_bytes,
+            compact_manifest: &compact_manifest,
+            driver: &driver,
+            matrix: &matrix,
+            manifest_digest,
+        },
         trust,
         available_capabilities,
         now,
@@ -311,35 +313,39 @@ fn compact_manifest(bytes: &[u8]) -> Result<String, ArtifactDiscoveryError> {
     Ok(compact.to_owned())
 }
 
+struct CachedVerificationInput<'a> {
+    record: &'a [u8],
+    compact_manifest: &'a [u8],
+    driver: &'a [u8],
+    matrix: &'a [u8],
+    manifest_digest: &'a str,
+}
+
 fn verify_cached_entry(
-    record_bytes: &[u8],
-    compact_manifest_bytes: &[u8],
-    driver: &[u8],
-    matrix: &[u8],
-    manifest_digest: &str,
+    input: CachedVerificationInput<'_>,
     trust: &ArtifactTrustPolicy,
     available_capabilities: &BTreeSet<String>,
     now: i64,
 ) -> Result<CacheRecord, ArtifactDiscoveryError> {
-    if !is_lowercase_sha256(manifest_digest) {
+    if !is_lowercase_sha256(input.manifest_digest) {
         return Err(ArtifactDiscoveryError::InvalidManifestDigest);
     }
     let record: CacheRecord =
-        serde_json::from_slice(record_bytes).map_err(|_| ArtifactDiscoveryError::CacheRecord)?;
+        serde_json::from_slice(input.record).map_err(|_| ArtifactDiscoveryError::CacheRecord)?;
     if record.schema != CACHE_RECORD_SCHEMA || !trust.accepts_url(&record.manifest_url) {
         return Err(ArtifactDiscoveryError::CacheRecord);
     }
 
-    let compact_manifest = compact_manifest(compact_manifest_bytes)?;
+    let compact_manifest = compact_manifest(input.compact_manifest)?;
     let artifact = verify_oidf_artifact(
         &compact_manifest,
-        driver,
-        matrix,
+        input.driver,
+        input.matrix,
         trust,
         available_capabilities,
         now,
     )?;
-    if artifact.driver_manifest_sha256 != manifest_digest || artifact != record.artifact {
+    if artifact.driver_manifest_sha256 != input.manifest_digest || artifact != record.artifact {
         return Err(ArtifactDiscoveryError::CacheIdentity);
     }
     Ok(record)
@@ -641,11 +647,13 @@ mod tests {
         now: i64,
     ) -> Result<CacheRecord, ArtifactDiscoveryError> {
         super::verify_cached_entry(
-            record_bytes,
-            compact_manifest_bytes,
-            &driver(),
-            matrix,
-            manifest_digest,
+            CachedVerificationInput {
+                record: record_bytes,
+                compact_manifest: compact_manifest_bytes,
+                driver: &driver(),
+                matrix,
+                manifest_digest,
+            },
             trust,
             available_capabilities,
             now,

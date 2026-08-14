@@ -39,7 +39,7 @@ pub enum EvidenceSourceIdentity {
     },
     SignedOidfArtifact {
         suite_origin: String,
-        artifact: VerifiedOidfArtifact,
+        artifact: Box<VerifiedOidfArtifact>,
     },
 }
 
