@@ -3,6 +3,7 @@ use std::{
     fs,
     io::Read as _,
     path::{Path, PathBuf},
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
@@ -27,6 +28,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const CACHE_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const CACHE_LOCK_RETRY: Duration = Duration::from_millis(25);
+static CACHE_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -366,6 +368,12 @@ fn persist_verified_cache(
     matrix: &[u8],
     artifact: &VerifiedOidfArtifact,
 ) -> Result<(PathBuf, bool), ArtifactDiscoveryError> {
+    // Advisory file-lock ownership differs across Unix implementations. Keep
+    // threads in this process ordered, then use the file lock for other
+    // processes that share the cache root.
+    let _process_guard = CACHE_PROCESS_LOCK
+        .lock()
+        .map_err(|_| ArtifactDiscoveryError::CacheIo)?;
     crate::secure_file::ensure_directory(root, true).map_err(map_cache_file_error)?;
     let lock = crate::secure_file::open_lock_file(&root.join(".oidf-cache.lock"), true)
         .map_err(map_cache_file_error)?;
