@@ -257,6 +257,12 @@ TTL is 60 through 86400 seconds."
     --tenant TENANT --hostname HOST --certificate PATH --private-key PATH --yes
   nazoauthctl --deployment ID tls certificate recover --tenant TENANT --hostname HOST --yes
   nazoauthctl --deployment ID tls certificate show --tenant TENANT --hostname HOST
+  nazoauthctl --deployment ID tls acme plan --acme-config PATH --provider-config PATH \
+    --tenant TENANT --hostname HOST
+  nazoauthctl --deployment ID tls acme issue --acme-config PATH --provider-config PATH \
+    --tenant TENANT --hostname HOST --agree-terms --yes
+  nazoauthctl --deployment ID tls acme recover --tenant TENANT --hostname HOST --yes
+  nazoauthctl --deployment ID tls acme show --tenant TENANT --hostname HOST
 
 The external-generation-v1 provider uses an immutable generation directory and
 one atomic `current` symlink. Its strict provider JSON declares material_root,
@@ -266,7 +272,14 @@ reload is followed by a public TLS handshake, exact leaf-certificate digest chec
 and bounded HTTP health request. Interrupted transactions are rolled back by the
 explicit recover command. This provider controls only deployment-owned public TLS
 material under the granted proxy_tls capability; it neither creates NazoAuth
-protocol keys nor claims Direct TLS capability negotiation."
+protocol keys nor claims Direct TLS capability negotiation.
+
+The acme command family creates or restores a deployment-owned ACME account,
+serves one exact-host HTTP-01 challenge through a preconfigured webroot, persists
+the server private key before finalization, validates the issued chain against
+the provider trust policy, and commits an issuance receipt. Issuance does not
+install or reload the certificate; use the separate certificate transaction for
+that step."
         }
         cli::HelpTopic::Audit => {
             "Usage:

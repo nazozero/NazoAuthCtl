@@ -14,9 +14,9 @@ use anyhow::{Context, bail};
 
 pub(crate) use help::help_topic;
 pub(crate) use types::{
-    BootstrapAdminOptions, CandidateTarget, Cli, Command, ConformanceLeaseCommand, HelpTopic,
-    InstallOptions, KeysCommand, StandardsProfileSecrets, TlsCertificateInput, TlsCommand,
-    UpdateOptions,
+    AcmeCertificateInput, AcmeCommand, BootstrapAdminOptions, CandidateTarget, Cli, Command,
+    ConformanceLeaseCommand, HelpTopic, InstallOptions, KeysCommand, StandardsProfileSecrets,
+    TlsCertificateInput, TlsCommand, UpdateOptions,
 };
 #[cfg(test)]
 pub(crate) use types::{ConformanceCommand, RelinquishOptions};

@@ -36,10 +36,12 @@ chrono = "0.4.45"
 ed25519-dalek = "3.0.0"
 fs2 = "0.4.3"
 hmac = "0.13.0"
+instant-acme = { version = "0.8.5", default-features = false, features = ["aws-lc-rs", "hyper-rustls"] }
 libc = "0.2.189"
 nazo-operator-protocol.workspace = true
 nazoauthctl-runtime = { path = "crates/nazoauthctl-runtime" }
 rand = "0.10.1"
+rcgen = { version = "0.14.9", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 rpassword = "7.4.0"
 rustls = { version = "0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-pemfile = "2.2.0"
@@ -48,15 +50,13 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
 tar = "0.4.44"
+tokio = { version = "1.53.1", features = ["rt", "time"] }
 url = "2.5.8"
 urlencoding = "2.1.3"
 uuid = { version = "1.23.5", features = ["v7"] }
 wait-timeout = "0.2.1"
 x509-parser = "0.18.1"
 zeroize = { version = "1.8.2", features = ["derive"] }
-
-[dev-dependencies]
-rcgen = { version = "0.14.9", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [lints.rust]
 unsafe_code = "forbid"
