@@ -9,15 +9,17 @@ use anyhow::{Context as _, bail};
 use nazoauthctl_conformance::{
     ArtifactTrustPolicy, BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy,
     BrowserTargetOrigin, ClientConfig, ConformanceAutomation, ConformanceBinding,
-    ConformanceRunConfig, ConformanceRunner, CredentialStore, DescriptorMaterializer,
-    EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceDeploymentIdentity,
-    EvidenceRuntimeIdentity, EvidenceSourceIdentity, MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT_SECONDS,
-    ManagedWebDriver, MatrixSelection, OidfPlanSelection, OnboardingOutput, OpenId4VciIssuerClient,
-    OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient,
-    Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient, TtyRenderer, WebDriverClient,
-    WebDriverEndpoint, open_cached_oidf_artifact, open_cached_oidf_driver_plan,
-    read_artifact_driver, read_artifact_matrix, read_compact_manifest, resolve_oidf_artifact,
-    verify_oidf_artifact, write_private_evidence_bundle,
+    ConformanceProxyRecovery, ConformanceRecoveryBinding, ConformanceRecoveryGuard,
+    ConformanceRecoveryStore, ConformanceRunConfig, ConformanceRunner, CredentialStore,
+    DescriptorMaterializer, EvidenceBundleIdentity, EvidenceBundleReceipt,
+    EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, MAX_PARALLEL_JOBS,
+    MAX_POLL_TIMEOUT_SECONDS, ManagedWebDriver, MatrixSelection, OidfPlanSelection,
+    OnboardingOutput, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
+    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl,
+    StableRenderer, SuiteClient, TtyRenderer, WebDriverClient, WebDriverEndpoint,
+    open_cached_oidf_artifact, open_cached_oidf_driver_plan, read_artifact_driver,
+    read_artifact_matrix, read_compact_manifest, resolve_oidf_artifact, verify_oidf_artifact,
+    write_private_evidence_bundle,
 };
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
@@ -27,6 +29,7 @@ const DEFAULT_POLL_TIMEOUT_SECONDS: u64 = 1_800;
 const DEFAULT_LEASE_TTL_SECONDS: u64 = 14_400;
 const DEFAULT_JOBS: usize = 4;
 const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
+const RECOVERY_SETTLEMENT_SECONDS: i64 = 300;
 
 fn main() {
     let args = env::args_os().collect::<Vec<_>>();
@@ -760,6 +763,11 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     )
     .context("deployment is not ready for conformance orchestration")?;
     let deployment_evidence = session.deployment_evidence();
+    let recovery_store = ConformanceRecoveryStore::open(
+        &session.recovery_directory()?,
+        &deployment_evidence.deployment_id,
+    )?;
+    recover_pending_conformance_runs(&session, &recovery_store)?;
 
     let (token, prompted) = resolve_token(&mut invocation, &suite_origin)?;
     let client = SuiteClient::new(suite_origin.clone(), token.clone(), ClientConfig::default())
@@ -793,6 +801,33 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     }
     let client_count = u32::try_from(prepared.expected_clients().len())
         .context("Matrix contains too many conformance clients")?;
+    let prepared_at = current_unix_time()?;
+    let requested_expires_at = prepared_at
+        .checked_add(i64::try_from(invocation.lease_ttl_seconds)?)
+        .and_then(|expires_at| expires_at.checked_add(RECOVERY_SETTLEMENT_SECONDS))
+        .context("conformance recovery expiry overflows")?;
+    let proxy_recovery = match (
+        invocation.proxy_trust_bundle.as_ref(),
+        invocation.proxy_reload_executable.as_ref(),
+    ) {
+        (Some(bundle_path), Some(reload_executable)) => Some(ConformanceProxyRecovery {
+            bundle_path: bundle_path.clone(),
+            reload_executable: reload_executable.clone(),
+        }),
+        (None, None) => None,
+        _ => unreachable!(),
+    };
+    let mut recovery = recovery_store.begin(ConformanceRecoveryBinding {
+        deployment_id: deployment_evidence.deployment_id.clone(),
+        target_issuer: deployment_evidence.target_issuer.clone(),
+        deployment_revision: deployment_evidence.revision.clone(),
+        request_jti: request_jti.clone(),
+        matrix_sha256: matrix.sha256.clone(),
+        bundle_sha256: bundle.digest().to_owned(),
+        prepared_at,
+        requested_expires_at,
+        proxy: proxy_recovery,
+    })?;
     let onboarding = session
         .apply_onboarding(
             &request_jti,
@@ -802,6 +837,16 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             invocation.lease_ttl_seconds,
         )
         .context("failed to atomically provision the conformance lease")?;
+    if let Err(error) = recovery.record_lease(&onboarding.lease_id, onboarding.expires_at) {
+        return match session.cleanup_lease(&onboarding.lease_id) {
+            Ok(()) => Err(error).context(
+                "failed to persist the conformance lease recovery receipt; lease rolled back",
+            ),
+            Err(cleanup) => bail!(
+                "failed to persist the conformance lease recovery receipt and rollback also failed: journal={error:#}; cleanup={cleanup:#}"
+            ),
+        };
+    }
     let lease_id = onboarding.lease_id.clone();
     let applicant_id = uuid::Uuid::parse_str(&onboarding.applicant_id)
         .context("operator onboarding returned an invalid applicant identifier")?;
@@ -820,14 +865,24 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             ) {
                 Ok(guard) => Some(guard),
                 Err(error) => {
-                    return match session.cleanup_lease(&lease_id) {
-                        Ok(()) => Err(error).context(
-                            "failed to install the run-scoped proxy trust bundle; onboarding lease rolled back",
-                        ),
-                        Err(cleanup) => bail!(
-                            "failed to install the run-scoped proxy trust bundle and onboarding lease rollback also failed: proxy={error:#}; cleanup={cleanup:#}"
-                        ),
-                    };
+                    let lease_cleanup = session.cleanup_lease(&lease_id);
+                    let proxy_cleanup = ProxyTrustGuard::recover(bundle_path, reload_executable);
+                    let recovery_cleanup =
+                        finalize_recovery(recovery, lease_cleanup.is_ok(), proxy_cleanup.is_ok());
+                    let mut failures = vec![format!("proxy={error:#}")];
+                    if let Err(cleanup) = lease_cleanup {
+                        failures.push(format!("lease-cleanup={cleanup:#}"));
+                    }
+                    if let Err(cleanup) = proxy_cleanup {
+                        failures.push(format!("proxy-recovery={cleanup:#}"));
+                    }
+                    if let Err(cleanup) = recovery_cleanup {
+                        failures.push(format!("journal={cleanup:#}"));
+                    }
+                    bail!(
+                        "failed to install the run-scoped proxy trust bundle: {}",
+                        failures.join("; ")
+                    );
                 }
             }
         }
@@ -965,8 +1020,16 @@ fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     if let Err(error) = proxy_cleanup {
         errors.push(format!("proxy-cleanup={error:#}"));
     }
+    if let Err(error) = finalize_recovery(recovery, lease_cleanup_complete, proxy_cleanup_complete)
+    {
+        errors.push(format!("recovery-journal={error:#}"));
+    }
     if let Some(output) = &mut output {
-        output.deployment.cleanup_complete = lease_cleanup_complete && proxy_cleanup_complete;
+        output.deployment.cleanup_complete = lease_cleanup_complete
+            && proxy_cleanup_complete
+            && !errors
+                .iter()
+                .any(|error| error.starts_with("recovery-journal="));
         if let Some(directory) = &invocation.evidence_directory {
             let runtime = match &deployment_evidence.runtime {
                 nazoauthctl_core::ConformanceRuntimeEvidence::OciImage { digest } => {
@@ -1026,6 +1089,124 @@ fn finalize_run_output(output: Option<RunOutput>, errors: Vec<String>) -> (Final
         },
         if success { 0 } else { 1 },
     )
+}
+
+fn finalize_recovery(
+    mut recovery: ConformanceRecoveryGuard,
+    lease_cleanup_complete: bool,
+    proxy_cleanup_complete: bool,
+) -> anyhow::Result<()> {
+    let mut errors = Vec::new();
+    if lease_cleanup_complete
+        && !recovery.lease_cleanup_complete()
+        && let Err(error) = recovery.mark_lease_cleanup_complete()
+    {
+        errors.push(format!("lease-state={error:#}"));
+    }
+    if proxy_cleanup_complete
+        && !recovery.proxy_cleanup_complete()
+        && let Err(error) = recovery.mark_proxy_cleanup_complete()
+    {
+        errors.push(format!("proxy-state={error:#}"));
+    }
+    if errors.is_empty() && recovery.lease_cleanup_complete() && recovery.proxy_cleanup_complete() {
+        recovery.finish()
+    } else {
+        if errors.is_empty() {
+            errors.push("cleanup obligations remain pending".to_owned());
+        }
+        bail!("{}", errors.join("; "))
+    }
+}
+
+fn recover_pending_conformance_runs(
+    session: &nazoauthctl_core::ConformanceSession,
+    store: &ConformanceRecoveryStore,
+) -> anyhow::Result<()> {
+    let pending = store.claim_pending()?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let now = current_unix_time()?;
+    let mut failures = Vec::new();
+    for mut recovery in pending {
+        let request_jti = recovery.binding().request_jti.clone();
+        let lease_complete = if recovery.lease_cleanup_complete() {
+            true
+        } else {
+            match recover_bound_lease(session, &mut recovery, now) {
+                Ok(complete) => complete,
+                Err(error) => {
+                    failures.push(format!("{request_jti}: lease={error:#}"));
+                    false
+                }
+            }
+        };
+        let proxy_complete = if recovery.proxy_cleanup_complete() {
+            true
+        } else if let Some(proxy) = &recovery.binding().proxy {
+            match ProxyTrustGuard::recover(&proxy.bundle_path, &proxy.reload_executable) {
+                Ok(()) => true,
+                Err(error) => {
+                    failures.push(format!("{request_jti}: proxy={error:#}"));
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        if let Err(error) = finalize_recovery(recovery, lease_complete, proxy_complete) {
+            failures.push(format!("{request_jti}: journal={error:#}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "pending conformance cleanup could not be recovered: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+fn recover_bound_lease(
+    session: &nazoauthctl_core::ConformanceSession,
+    recovery: &mut ConformanceRecoveryGuard,
+    now: i64,
+) -> anyhow::Result<bool> {
+    let leases = session.list_leases()?;
+    let candidate = if let Some(lease_id) = recovery.lease_id() {
+        let lease = leases.into_iter().find(|lease| lease.lease_id == lease_id);
+        if let Some(lease) = &lease
+            && lease.material_sha256 != recovery.binding().bundle_sha256
+        {
+            bail!("recorded lease digest does not match the recovery binding");
+        }
+        lease
+    } else {
+        let mut matching = leases
+            .into_iter()
+            .filter(|lease| lease.material_sha256 == recovery.binding().bundle_sha256)
+            .collect::<Vec<_>>();
+        if matching.len() > 1 {
+            bail!("multiple leases match one recovery bundle digest");
+        }
+        matching.pop()
+    };
+    let Some(lease) = candidate else {
+        if now.saturating_sub(recovery.binding().prepared_at) < RECOVERY_SETTLEMENT_SECONDS {
+            bail!("onboarding settlement window is still open; retry recovery later");
+        }
+        return Ok(true);
+    };
+    if recovery.lease_id().is_none() {
+        recovery.record_lease(&lease.lease_id, lease.expires_at)?;
+    }
+    if lease.cleaned {
+        return Ok(true);
+    }
+    session.cleanup_lease(&lease.lease_id)?;
+    Ok(true)
 }
 
 fn build_browser(

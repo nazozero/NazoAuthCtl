@@ -218,3 +218,11 @@ verified artifact identity in that same strict envelope. This does not claim a
 Suite signature: obtaining and verifying signed Suite evidence, plus binding it
 to authenticated NazoAuth build/capability receipts, remains an execution-stage
 blocker.
+
+The legacy lease/proxy runner now journals cleanup intent before onboarding and
+recovers unlocked interrupted runs on the next invocation, including the crash
+window before ctl records the returned lease ID. Artifact-backed execution is
+still disabled: its future journal must additionally enumerate every ordinary
+tenant-scoped client/trust/user change-set and bind authenticated capability
+receipts. The legacy lease journal is recovery machinery, not evidence that
+those external management capabilities already exist.

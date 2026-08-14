@@ -21,6 +21,7 @@ mod orchestrator;
 mod origin;
 mod progress;
 mod proxy_trust;
+mod recovery;
 mod report;
 mod secure_file;
 mod transport;
@@ -84,6 +85,10 @@ pub use progress::{
     TtyRenderer, redacted_variant,
 };
 pub use proxy_trust::ProxyTrustGuard;
+pub use recovery::{
+    ConformanceProxyRecovery, ConformanceRecoveryBinding, ConformanceRecoveryGuard,
+    ConformanceRecoveryStore,
+};
 pub use report::{
     CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport, PlanReport,
 };

@@ -68,6 +68,14 @@ pub enum ConformanceRuntimeEvidence {
     HostBinary { sha256: String },
 }
 
+pub struct ConformanceLeaseIdentity {
+    pub lease_id: String,
+    pub material_sha256: String,
+    pub expires_at: i64,
+    pub revoked: bool,
+    pub cleaned: bool,
+}
+
 /// Holds shared deployment/capability locks for the complete Suite run.
 ///
 /// Independent lease-scoped conformance sessions may overlap. Exclusive
@@ -146,6 +154,39 @@ impl ConformanceSession {
             build_id: self.expected.embedded.build_id.clone(),
             runtime,
         }
+    }
+
+    pub fn recovery_directory(&self) -> anyhow::Result<PathBuf> {
+        let directory = DeploymentStore::system()
+            .deployment_state_dir(&self.context.config.operator.deployment_id)
+            .join("conformance-recovery");
+        crate::filesystem::ensure_private_directory(&directory, "conformance recovery directory")?;
+        Ok(directory)
+    }
+
+    pub fn list_leases(&self) -> anyhow::Result<Vec<ConformanceLeaseIdentity>> {
+        let result = self.with_operator_task_lock(|| {
+            operator::execute(
+                &self.context.config,
+                &self.target,
+                &self.expected,
+                TaskOperation::ConformanceLeaseList,
+                None,
+            )
+        })?;
+        let TaskResult::ConformanceLeaseList { leases } = result.result else {
+            bail!("operator returned an unexpected conformance lease list result");
+        };
+        Ok(leases
+            .into_iter()
+            .map(|lease| ConformanceLeaseIdentity {
+                lease_id: lease.lease_id,
+                material_sha256: lease.material_sha256,
+                expires_at: lease.expires_at,
+                revoked: lease.revoked_at.is_some(),
+                cleaned: lease.cleaned_at.is_some(),
+            })
+            .collect())
     }
 
     /// Load the deployment-owned OpenID4VP verifier management token from the

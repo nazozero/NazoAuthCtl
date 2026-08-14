@@ -325,8 +325,15 @@ pub(crate) fn remove_file(path: &Path, private: bool) -> Result<(), SecureFileEr
         let file = openat_file(&parent_file, name, OFlags::RDONLY)?;
         validate_file_metadata(&file.metadata().map_err(|_| SecureFileError::Io)?, private)?;
         rustix::fs::unlinkat(&parent_file, name, rustix::fs::AtFlags::empty())
-            .map_err(|_| SecureFileError::Io)
+            .map_err(|_| SecureFileError::Io)?;
+        rustix::fs::fsync(&parent_file).map_err(|_| SecureFileError::Io)
     }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn remove_file(path: &Path, private: bool) -> Result<(), SecureFileError> {
+    let _ = (path, private);
+    Err(SecureFileError::UnsupportedPlatform)
 }
 
 #[cfg(unix)]

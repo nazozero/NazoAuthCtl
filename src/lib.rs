@@ -20,8 +20,8 @@ pub(crate) use nazoauthctl_runtime::filesystem;
 pub(crate) use nazoauthctl_runtime::process;
 
 pub use conformance::{
-    ConformanceDeploymentEvidence, ConformanceMatrix, ConformanceOnboarding,
-    ConformanceRuntimeEvidence, ConformanceSession,
+    ConformanceDeploymentEvidence, ConformanceLeaseIdentity, ConformanceMatrix,
+    ConformanceOnboarding, ConformanceRuntimeEvidence, ConformanceSession,
 };
 
 #[cfg(all(test, unix))]
