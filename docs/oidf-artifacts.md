@@ -111,13 +111,28 @@ driver signature, source, expiry, engine protocol, and capabilities before it
 uses the signed matrix URL. The matrix download is then bounded by the signed
 byte size and accepted only after exact digest and schema validation.
 
-Verified bytes are stored under the driver manifest digest in an owner-only
-cache. Cache record schema 2 carries the verified Matrix resource totals.
-`driver.jws` and `matrix.json` are individually fsynced and atomically replaced.
-`verified.json` is written last and is the commit marker. A cache hit
-requires the committed manifest, matrix, URL, and verified identity to match
-the newly fetched and verified artifact exactly. Conflicting committed content
-fails closed; it is never overwritten as a recovery shortcut.
+Verified bytes are stored under the driver manifest digest. The cache root,
+`artifacts` directory, digest entry, lock, and files are all owner-only. A
+stable cache-wide lock serializes writers for at most ten seconds. Cache record
+schema 3 contains only deterministic commit identity: the trusted discovery URL
+and complete verified artifact. It deliberately does not claim an unauthenticated
+first-resolution timestamp. Schema 2 entries must be re-resolved.
+An existing cache created with broader directory modes must be moved to a new
+owner-only root or have the root and `artifacts` directory explicitly tightened
+by the operator before this version will read or write it.
+
+`driver.jws` and `matrix.json` are individually fsynced and atomically replaced;
+`verified.json` is written and directory-fsynced last as the commit marker. A
+cache hit requires the committed manifest, matrix, URL, and complete record to
+match the newly fetched and verified artifact exactly. Conflicting committed
+content fails closed; it is never overwritten as a recovery shortcut.
+
+The cache accepts at most 64 digest entries and refuses a write unless the
+filesystem will retain at least 512 MiB after the bounded manifest, Matrix, and
+record are written. It never evicts committed evidence automatically, so every
+entry is effectively recovery-pinned. An incomplete crash entry counts toward
+the limit and requires explicit operator inspection/removal instead of being
+silently treated as disposable evidence.
 
 The cache is evidence and recovery input, not a new trust root. Resolution
 still verifies the current signed channel and validity window. Offline cache
@@ -171,7 +186,7 @@ does not create a competing template canonicalization rule. It also sums the
 selected signed resource budgets and rejects a selection that cannot finish
 strictly before the artifact's exclusive expiry.
 
-Inspection-plan schema 2 is evidence, not an execution authorization. It carries
+Inspection-plan schema 3 is evidence, not an execution authorization. It carries
 a plan JTI but deliberately records `deployment_bound: false`,
 `capabilities_attested: false`, and `execution_permitted: false`, together with
 the missing signed executable driver/runtime sandbox, authenticated

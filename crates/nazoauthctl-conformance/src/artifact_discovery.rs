@@ -1,10 +1,13 @@
 use std::{
     collections::BTreeSet,
+    fs,
     io::Read as _,
     path::{Path, PathBuf},
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -14,11 +17,15 @@ use crate::{
     verify_oidf_driver_manifest, verify_oidf_matrix,
 };
 
-pub const OIDF_ARTIFACT_CACHE_SCHEMA_VERSION: u32 = 2;
+pub const OIDF_ARTIFACT_CACHE_SCHEMA_VERSION: u32 = 3;
+pub const OIDF_ARTIFACT_CACHE_MAX_ENTRIES: usize = 64;
+pub const OIDF_ARTIFACT_CACHE_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 const CACHE_RECORD_SCHEMA: u32 = OIDF_ARTIFACT_CACHE_SCHEMA_VERSION;
 const MAX_CACHE_RECORD_BYTES: usize = 128 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const CACHE_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+const CACHE_LOCK_RETRY: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -36,7 +43,6 @@ pub struct ResolvedOidfArtifact {
 pub struct CachedOidfArtifact {
     pub schema: u32,
     pub manifest_url: String,
-    pub cached_at: i64,
     pub opened_at: i64,
     pub cache_entry: PathBuf,
     pub artifact: VerifiedOidfArtifact,
@@ -47,7 +53,6 @@ pub struct CachedOidfArtifact {
 struct CacheRecord {
     schema: u32,
     manifest_url: String,
-    resolved_at: i64,
     artifact: VerifiedOidfArtifact,
 }
 
@@ -71,6 +76,10 @@ pub enum ArtifactDiscoveryError {
     UnsafeCache,
     #[error("artifact cache operation failed")]
     CacheIo,
+    #[error("artifact cache transaction lock could not be acquired in time")]
+    CacheBusy,
+    #[error("artifact cache capacity policy rejects a new write")]
+    CacheCapacity,
     #[error("artifact cache contains a conflicting committed entry")]
     CacheConflict,
     #[error("artifact cache record is malformed")]
@@ -138,7 +147,11 @@ fn open_cached_entry(
         return Err(ArtifactDiscoveryError::InvalidManifestDigest);
     }
 
-    let cache_entry = cache_root.join("artifacts").join(manifest_digest);
+    crate::secure_file::validate_directory(cache_root, true).map_err(map_cache_file_error)?;
+    let artifacts = cache_root.join("artifacts");
+    crate::secure_file::validate_directory(&artifacts, true).map_err(map_cache_file_error)?;
+    let cache_entry = artifacts.join(manifest_digest);
+    crate::secure_file::validate_directory(&cache_entry, true).map_err(map_cache_file_error)?;
     let record_bytes = read_cache(&cache_entry.join("verified.json"), MAX_CACHE_RECORD_BYTES)?;
     let compact_manifest = read_cache(&cache_entry.join("driver.jws"), MAX_SIGNED_DRIVER_BYTES)?;
     let matrix = read_cache(&cache_entry.join("matrix.json"), MAX_ARTIFACT_MATRIX_BYTES)?;
@@ -156,7 +169,6 @@ fn open_cached_entry(
         CachedOidfArtifact {
             schema: OIDF_ARTIFACT_CACHE_SCHEMA_VERSION,
             manifest_url: record.manifest_url,
-            cached_at: record.resolved_at,
             opened_at: now,
             cache_entry,
             artifact: record.artifact,
@@ -184,7 +196,6 @@ pub fn resolve_oidf_artifact(
         &fetched.compact_manifest,
         &fetched.matrix,
         &fetched.artifact,
-        now,
     )?;
     Ok(ResolvedOidfArtifact {
         schema: OIDF_ARTIFACT_CACHE_SCHEMA_VERSION,
@@ -302,12 +313,7 @@ fn verify_cached_entry(
     }
     let record: CacheRecord =
         serde_json::from_slice(record_bytes).map_err(|_| ArtifactDiscoveryError::CacheRecord)?;
-    if record.schema != CACHE_RECORD_SCHEMA
-        || !trust.accepts_url(&record.manifest_url)
-        || record.resolved_at < record.artifact.not_before
-        || record.resolved_at >= record.artifact.expires_at
-        || record.resolved_at > now
-    {
+    if record.schema != CACHE_RECORD_SCHEMA || !trust.accepts_url(&record.manifest_url) {
         return Err(ArtifactDiscoveryError::CacheRecord);
     }
 
@@ -338,11 +344,20 @@ fn persist_verified_cache(
     compact_manifest: &str,
     matrix: &[u8],
     artifact: &VerifiedOidfArtifact,
-    now: i64,
 ) -> Result<(PathBuf, bool), ArtifactDiscoveryError> {
-    let entry = root
-        .join("artifacts")
-        .join(&artifact.driver_manifest_sha256);
+    crate::secure_file::ensure_directory(root, true).map_err(map_cache_file_error)?;
+    let lock = crate::secure_file::open_lock_file(&root.join(".oidf-cache.lock"), true)
+        .map_err(map_cache_file_error)?;
+    acquire_cache_lock(&lock)?;
+
+    let artifacts = root.join("artifacts");
+    crate::secure_file::ensure_directory(&artifacts, true).map_err(map_cache_file_error)?;
+    let (entry_count, entry_exists) =
+        cache_inventory(&artifacts, &artifact.driver_manifest_sha256)?;
+    if !entry_exists && entry_count >= OIDF_ARTIFACT_CACHE_MAX_ENTRIES {
+        return Err(ArtifactDiscoveryError::CacheCapacity);
+    }
+    let entry = artifacts.join(&artifact.driver_manifest_sha256);
     crate::secure_file::ensure_directory(&entry, true).map_err(map_cache_file_error)?;
     let manifest_path = entry.join("driver.jws");
     let matrix_path = entry.join("matrix.json");
@@ -350,38 +365,109 @@ fn persist_verified_cache(
     let expected = CacheRecord {
         schema: CACHE_RECORD_SCHEMA,
         manifest_url: manifest_url.to_owned(),
-        resolved_at: now,
         artifact: artifact.clone(),
     };
+    let record =
+        serde_json::to_vec_pretty(&expected).map_err(|_| ArtifactDiscoveryError::CacheRecord)?;
+    if record.len() > MAX_CACHE_RECORD_BYTES {
+        return Err(ArtifactDiscoveryError::CacheRecord);
+    }
 
-    if record_path.exists() {
+    if let Some(record_bytes) = read_optional_cache(&record_path, MAX_CACHE_RECORD_BYTES)? {
         let cached_manifest = read_cache(&manifest_path, MAX_SIGNED_DRIVER_BYTES)?;
         let cached_matrix = read_cache(&matrix_path, MAX_ARTIFACT_MATRIX_BYTES)?;
-        let record_bytes = read_cache(&record_path, MAX_CACHE_RECORD_BYTES)?;
         let record: CacheRecord = serde_json::from_slice(&record_bytes)
             .map_err(|_| ArtifactDiscoveryError::CacheRecord)?;
         if cached_manifest != compact_manifest.as_bytes()
             || cached_matrix != matrix
-            || record.schema != CACHE_RECORD_SCHEMA
-            || record.manifest_url != manifest_url
-            || record.artifact != *artifact
+            || record != expected
         {
             return Err(ArtifactDiscoveryError::CacheConflict);
         }
         return Ok((entry, true));
     }
 
+    enforce_cache_space(root, compact_manifest.len(), matrix.len(), record.len())?;
     write_cache(&manifest_path, compact_manifest.as_bytes())?;
     write_cache(&matrix_path, matrix)?;
-    let record =
-        serde_json::to_vec_pretty(&expected).map_err(|_| ArtifactDiscoveryError::CacheRecord)?;
-    if record.len() > MAX_CACHE_RECORD_BYTES {
-        return Err(ArtifactDiscoveryError::CacheRecord);
-    }
     // The record is the commit marker. A crash before this write leaves an
     // incomplete entry which is never accepted as verified cache state.
     write_cache(&record_path, &record)?;
     Ok((entry, false))
+}
+
+fn acquire_cache_lock(lock: &fs::File) -> Result<(), ArtifactDiscoveryError> {
+    let started = Instant::now();
+    loop {
+        match FileExt::try_lock_exclusive(lock) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= CACHE_LOCK_TIMEOUT {
+                    return Err(ArtifactDiscoveryError::CacheBusy);
+                }
+                thread::sleep(CACHE_LOCK_RETRY);
+            }
+            Err(_) => return Err(ArtifactDiscoveryError::CacheIo),
+        }
+    }
+}
+
+fn cache_inventory(
+    artifacts: &Path,
+    target_digest: &str,
+) -> Result<(usize, bool), ArtifactDiscoveryError> {
+    let mut count = 0usize;
+    let mut target_exists = false;
+    for entry in fs::read_dir(artifacts).map_err(|_| ArtifactDiscoveryError::CacheIo)? {
+        let entry = entry.map_err(|_| ArtifactDiscoveryError::CacheIo)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| ArtifactDiscoveryError::UnsafeCache)?;
+        let file_type = entry
+            .file_type()
+            .map_err(|_| ArtifactDiscoveryError::CacheIo)?;
+        if !is_lowercase_sha256(&name) || !file_type.is_dir() || file_type.is_symlink() {
+            return Err(ArtifactDiscoveryError::UnsafeCache);
+        }
+        crate::secure_file::validate_directory(&entry.path(), true)
+            .map_err(map_cache_file_error)?;
+        count = count
+            .checked_add(1)
+            .ok_or(ArtifactDiscoveryError::CacheCapacity)?;
+        target_exists |= name == target_digest;
+    }
+    Ok((count, target_exists))
+}
+
+fn enforce_cache_space(
+    root: &Path,
+    manifest_size: usize,
+    matrix_size: usize,
+    record_size: usize,
+) -> Result<(), ArtifactDiscoveryError> {
+    let required = u64::try_from(manifest_size)
+        .ok()
+        .and_then(|value| value.checked_add(u64::try_from(matrix_size).ok()?))
+        .and_then(|value| value.checked_add(u64::try_from(record_size).ok()?))
+        .and_then(|value| value.checked_add(OIDF_ARTIFACT_CACHE_MIN_FREE_BYTES))
+        .ok_or(ArtifactDiscoveryError::CacheCapacity)?;
+    let available = fs2::available_space(root).map_err(|_| ArtifactDiscoveryError::CacheIo)?;
+    if available < required {
+        return Err(ArtifactDiscoveryError::CacheCapacity);
+    }
+    Ok(())
+}
+
+fn read_optional_cache(
+    path: &Path,
+    maximum: usize,
+) -> Result<Option<Vec<u8>>, ArtifactDiscoveryError> {
+    match crate::secure_file::read_bounded(path, maximum, true) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(crate::secure_file::SecureFileError::NotFound) => Ok(None),
+        Err(error) => Err(map_cache_file_error(error)),
+    }
 }
 
 fn read_cache(path: &Path, maximum: usize) -> Result<Vec<u8>, ArtifactDiscoveryError> {
@@ -408,6 +494,9 @@ fn map_cache_file_error(error: crate::secure_file::SecureFileError) -> ArtifactD
 #[cfg(test)]
 mod tests {
     use std::{cell::RefCell, collections::BTreeMap};
+
+    #[cfg(unix)]
+    use std::sync::{Arc, Barrier};
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
@@ -634,7 +723,6 @@ mod tests {
         let record = CacheRecord {
             schema: CACHE_RECORD_SCHEMA,
             manifest_url: MANIFEST_URL.to_owned(),
-            resolved_at: NOW,
             artifact: fetched.artifact.clone(),
         };
         let record_bytes = serde_json::to_vec(&record).expect("cache record");
@@ -720,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_entry_rejects_untrusted_or_impossible_commit_records() {
+    fn cached_entry_rejects_untrusted_or_inconsistent_commit_records() {
         let transport = fake_transport(NOW + 3600);
         let fetched =
             fetch_verified_artifact(&transport, MANIFEST_URL, &trust(), &capabilities(), NOW)
@@ -728,7 +816,6 @@ mod tests {
         let mut record = CacheRecord {
             schema: CACHE_RECORD_SCHEMA,
             manifest_url: "https://attacker.example/driver.jws".to_owned(),
-            resolved_at: NOW,
             artifact: fetched.artifact.clone(),
         };
         let verify = |record: &CacheRecord, now| {
@@ -748,19 +835,21 @@ mod tests {
         ));
 
         record.manifest_url = MANIFEST_URL.to_owned();
-        record.resolved_at = NOW + 2;
+        let mut legacy = serde_json::to_value(&record).expect("cache record");
+        legacy["resolved_at"] = serde_json::json!(NOW);
         assert!(matches!(
-            verify(&record, NOW + 1),
+            verify_cached_entry(
+                &serde_json::to_vec(&legacy).expect("legacy cache record"),
+                fetched.compact_manifest.as_bytes(),
+                &fetched.matrix,
+                &fetched.artifact.driver_manifest_sha256,
+                &trust(),
+                &capabilities(),
+                NOW + 1,
+            ),
             Err(ArtifactDiscoveryError::CacheRecord)
         ));
 
-        record.resolved_at = fetched.artifact.not_before - 1;
-        assert!(matches!(
-            verify(&record, NOW + 1),
-            Err(ArtifactDiscoveryError::CacheRecord)
-        ));
-
-        record.resolved_at = NOW;
         record.schema = CACHE_RECORD_SCHEMA + 1;
         assert!(matches!(
             verify(&record, NOW + 1),
@@ -792,7 +881,6 @@ mod tests {
             &fetched.compact_manifest,
             &fetched.matrix,
             &fetched.artifact,
-            NOW,
         )
         .expect("persist cache");
         let before = std::fs::metadata(entry.join("verified.json"))
@@ -808,7 +896,6 @@ mod tests {
             NOW + 1,
         )
         .expect("open cache");
-        assert_eq!(opened.cached_at, NOW);
         assert_eq!(opened.opened_at, NOW + 1);
         assert_eq!(opened.cache_entry, entry);
         assert_eq!(opened.artifact, fetched.artifact);
@@ -879,11 +966,28 @@ mod tests {
             &fetched.compact_manifest,
             &fetched.matrix,
             &fetched.artifact,
-            NOW,
         )
         .expect("persist cache");
         assert!(!hit);
         assert!(entry.join("verified.json").is_file());
+        for directory in [&root, &root.join("artifacts"), &entry] {
+            assert_eq!(
+                std::fs::metadata(directory)
+                    .expect("private cache directory")
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(root.join(".oidf-cache.lock"))
+                .expect("private cache lock")
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
         assert!(
             persist_verified_cache(
                 &root,
@@ -891,7 +995,6 @@ mod tests {
                 &fetched.compact_manifest,
                 &fetched.matrix,
                 &fetched.artifact,
-                NOW + 1,
             )
             .expect("cache hit")
             .1
@@ -910,10 +1013,97 @@ mod tests {
                 &fetched.compact_manifest,
                 &fetched.matrix,
                 &fetched.artifact,
-                NOW + 2,
             ),
             Err(ArtifactDiscoveryError::CacheConflict)
         ));
+        std::fs::remove_dir_all(root).expect("remove test cache");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_cache_commit_serializes_one_identity_winner() {
+        let transport = fake_transport(NOW + 3600);
+        let fetched = Arc::new(
+            fetch_verified_artifact(&transport, MANIFEST_URL, &trust(), &capabilities(), NOW)
+                .expect("verified fetch"),
+        );
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical system temp directory");
+        let root = temp_root.join(format!("nazo-oidf-race-{}", uuid::Uuid::now_v7()));
+        let barrier = Arc::new(Barrier::new(2));
+        let run = |manifest_url: &'static str| {
+            let root = root.clone();
+            let fetched = Arc::clone(&fetched);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                persist_verified_cache(
+                    &root,
+                    manifest_url,
+                    &fetched.compact_manifest,
+                    &fetched.matrix,
+                    &fetched.artifact,
+                )
+            })
+        };
+        let first = run(MANIFEST_URL);
+        let second = run("https://artifacts.example/oidf/alternate/driver.jws");
+        let outcomes = [
+            first.join().expect("first writer"),
+            second.join().expect("second writer"),
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Ok((_, false))))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Err(ArtifactDiscoveryError::CacheConflict)))
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(root).expect("remove test cache");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_capacity_fails_closed_without_evicting_existing_entries() {
+        let transport = fake_transport(NOW + 3600);
+        let fetched =
+            fetch_verified_artifact(&transport, MANIFEST_URL, &trust(), &capabilities(), NOW)
+                .expect("verified fetch");
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical system temp directory");
+        let root = temp_root.join(format!("nazo-oidf-capacity-{}", uuid::Uuid::now_v7()));
+        let artifacts = root.join("artifacts");
+        crate::secure_file::ensure_directory(&root, true).expect("private cache root");
+        crate::secure_file::ensure_directory(&artifacts, true).expect("private artifacts root");
+        for index in 0..OIDF_ARTIFACT_CACHE_MAX_ENTRIES {
+            crate::secure_file::ensure_directory(&artifacts.join(format!("{index:064x}")), true)
+                .expect("bounded cache entry");
+        }
+        assert!(matches!(
+            persist_verified_cache(
+                &root,
+                MANIFEST_URL,
+                &fetched.compact_manifest,
+                &fetched.matrix,
+                &fetched.artifact,
+            ),
+            Err(ArtifactDiscoveryError::CacheCapacity)
+        ));
+        assert_eq!(
+            std::fs::read_dir(&artifacts)
+                .expect("artifacts root")
+                .count(),
+            OIDF_ARTIFACT_CACHE_MAX_ENTRIES
+        );
         std::fs::remove_dir_all(root).expect("remove test cache");
     }
 }

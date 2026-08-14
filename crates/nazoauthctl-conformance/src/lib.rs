@@ -33,9 +33,9 @@ pub use artifact::{
     verify_oidf_driver_manifest, verify_oidf_matrix,
 };
 pub use artifact_discovery::{
-    ArtifactDiscoveryError, CachedOidfArtifact, OIDF_ARTIFACT_CACHE_SCHEMA_VERSION,
-    ResolvedOidfArtifact, open_cached_oidf_artifact, open_cached_oidf_driver_plan,
-    resolve_oidf_artifact,
+    ArtifactDiscoveryError, CachedOidfArtifact, OIDF_ARTIFACT_CACHE_MAX_ENTRIES,
+    OIDF_ARTIFACT_CACHE_MIN_FREE_BYTES, OIDF_ARTIFACT_CACHE_SCHEMA_VERSION, ResolvedOidfArtifact,
+    open_cached_oidf_artifact, open_cached_oidf_driver_plan, resolve_oidf_artifact,
 };
 pub use artifact_plan::{
     OidfDriverInspectionPlan, OidfDriverPlanEntry, OidfPlanError, OidfPlanSelection,

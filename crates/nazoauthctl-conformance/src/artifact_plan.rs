@@ -17,7 +17,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{CachedOidfArtifact, OidfArtifactMatrix, OidfPlanResourceBudget};
 
-pub const OIDF_DRIVER_INSPECTION_PLAN_SCHEMA: u32 = 2;
+pub const OIDF_DRIVER_INSPECTION_PLAN_SCHEMA: u32 = 3;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -52,7 +52,6 @@ pub struct OidfDriverInspectionPlan {
     pub planned_at: i64,
     pub artifact_cache_entry: PathBuf,
     pub manifest_url: String,
-    pub cached_at: i64,
     pub artifact: crate::VerifiedOidfArtifact,
     pub caller_declared_capabilities: Vec<String>,
     pub selection: OidfPlanSelection,
@@ -203,7 +202,6 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
         planned_at: now,
         artifact_cache_entry: cached.cache_entry,
         manifest_url: cached.manifest_url,
-        cached_at: cached.cached_at,
         artifact: cached.artifact,
         caller_declared_capabilities: caller_declared_capabilities.iter().cloned().collect(),
         selection,
@@ -479,7 +477,6 @@ mod tests {
         CachedOidfArtifact {
             schema: crate::OIDF_ARTIFACT_CACHE_SCHEMA_VERSION,
             manifest_url: "https://artifacts.example/oidf/driver.jws".to_owned(),
-            cached_at: 1_799_999_900,
             opened_at: 1_800_000_000,
             cache_entry: PathBuf::from("/var/lib/nazoauthctl/oidf/artifacts/a"),
             artifact: VerifiedOidfArtifact {

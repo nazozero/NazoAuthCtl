@@ -1259,6 +1259,7 @@ version = "0.1.48"
 dependencies = [
  "anyhow",
  "base64",
+ "fs2",
  "keyring",
  "libc",
  "p256",
