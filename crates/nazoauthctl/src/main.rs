@@ -14,7 +14,8 @@ use nazoauthctl_conformance::{
     OnboardingOutput, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
     OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl,
     StableRenderer, SuiteClient, TtyRenderer, WebDriverClient, WebDriverEndpoint,
-    read_artifact_matrix, read_compact_manifest, resolve_oidf_artifact, verify_oidf_artifact,
+    open_cached_oidf_artifact, read_artifact_matrix, read_compact_manifest, resolve_oidf_artifact,
+    verify_oidf_artifact,
 };
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
@@ -27,6 +28,16 @@ const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
 
 fn main() {
     let args = env::args_os().collect::<Vec<_>>();
+    let cached = match parse_artifact_open_invocation(&args) {
+        Ok(invocation) => invocation,
+        Err(error) => exit_with_error(&error),
+    };
+    if let Some(invocation) = cached {
+        match execute_artifact_open(invocation) {
+            Ok(()) => return,
+            Err(error) => exit_with_error(&error),
+        }
+    }
     let resolution = match parse_artifact_resolve_invocation(&args) {
         Ok(invocation) => invocation,
         Err(error) => exit_with_error(&error),
@@ -60,6 +71,111 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(error) => exit_with_error(&error),
     }
+}
+
+struct ArtifactOpenInvocation {
+    trust_policy: PathBuf,
+    cache_directory: PathBuf,
+    manifest_digest: String,
+    capabilities: std::collections::BTreeSet<String>,
+}
+
+fn parse_artifact_open_invocation(
+    args: &[OsString],
+) -> anyhow::Result<Option<ArtifactOpenInvocation>> {
+    let mut values = args
+        .iter()
+        .skip(1)
+        .map(|value| {
+            value
+                .to_str()
+                .map(ToOwned::to_owned)
+                .context("artifact cache arguments must be valid UTF-8")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if values.first().map(String::as_str) != Some("conformance")
+        || values.get(1).map(String::as_str) != Some("artifact")
+        || values.get(2).map(String::as_str) != Some("open")
+    {
+        return Ok(None);
+    }
+    values.drain(..3);
+    if values
+        .iter()
+        .any(|value| matches!(value.as_str(), "-h" | "--help"))
+    {
+        print_artifact_open_help();
+        std::process::exit(0);
+    }
+    let mut trust_policy = None;
+    let mut cache_directory = None;
+    let mut manifest_digest = None;
+    let mut capabilities = std::collections::BTreeSet::new();
+    let mut index = 0usize;
+    while index < values.len() {
+        let option = values[index].as_str();
+        if !matches!(
+            option,
+            "--trust-policy" | "--cache-dir" | "--digest" | "--capability"
+        ) {
+            bail!("unknown conformance artifact open option: {option}");
+        }
+        let value = values
+            .get(index + 1)
+            .with_context(|| format!("{option} requires a value"))?
+            .clone();
+        match option {
+            "--trust-policy" => {
+                set_once(&mut trust_policy, PathBuf::from(value), option)?;
+            }
+            "--cache-dir" => {
+                set_once(&mut cache_directory, PathBuf::from(value), option)?;
+            }
+            "--digest" => set_once(&mut manifest_digest, value, option)?,
+            "--capability" => {
+                if !capabilities.insert(value) {
+                    bail!("--capability values must be unique");
+                }
+            }
+            _ => unreachable!(),
+        }
+        index += 2;
+    }
+    Ok(Some(ArtifactOpenInvocation {
+        trust_policy: trust_policy.context("--trust-policy is required")?,
+        cache_directory: cache_directory.context("--cache-dir is required")?,
+        manifest_digest: manifest_digest.context("--digest is required")?,
+        capabilities,
+    }))
+}
+
+fn execute_artifact_open(invocation: ArtifactOpenInvocation) -> anyhow::Result<()> {
+    let trust = ArtifactTrustPolicy::from_path(&invocation.trust_policy)
+        .context("OIDF artifact trust policy is invalid")?;
+    let cached = open_cached_oidf_artifact(
+        &invocation.cache_directory,
+        &invocation.manifest_digest,
+        &trust,
+        &invocation.capabilities,
+        current_unix_time()?,
+    )
+    .context("cached OIDF artifact verification failed")?;
+    serde_json::to_writer_pretty(
+        io::stdout().lock(),
+        &serde_json::json!({
+            "schema": 1,
+            "opened": true,
+            "cache": cached,
+        }),
+    )
+    .context("failed to write cached artifact identity")?;
+    writeln!(io::stdout()).context("failed to finish cached artifact identity")
+}
+
+fn print_artifact_open_help() {
+    println!(
+        "Usage:\n  nazoauthctl conformance artifact open --trust-policy PATH --cache-dir PATH --digest SHA256 [--capability NAME ...]\n\nThe command performs no network request or mutation. It opens only the exact immutable digest entry and revalidates its commit record, source, ES256 signature, current validity window, Suite identity, matrix digest/size/schema, resource bounds, engine protocol, and every caller-supplied capability requirement."
+    );
 }
 
 struct ArtifactResolveInvocation {
@@ -883,6 +999,71 @@ mod tests {
             parse_run_invocation(&args(&["nazoauthctl", "status"]))
                 .expect("parse")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn artifact_open_requires_exact_cache_identity_and_unique_capabilities() {
+        let digest = "a".repeat(64);
+        let parsed = parse_artifact_open_invocation(&args(&[
+            "nazoauthctl",
+            "conformance",
+            "artifact",
+            "open",
+            "--trust-policy",
+            "/etc/nazoauthctl/oidf-trust.json",
+            "--cache-dir",
+            "/var/lib/nazoauthctl/oidf-cache",
+            "--digest",
+            &digest,
+            "--capability",
+            "nazoauth.client.create",
+        ]))
+        .expect("parse")
+        .expect("artifact cache open");
+        assert_eq!(parsed.manifest_digest, digest);
+        assert_eq!(
+            parsed.cache_directory,
+            PathBuf::from("/var/lib/nazoauthctl/oidf-cache")
+        );
+        assert!(parsed.capabilities.contains("nazoauth.client.create"));
+        assert!(
+            parse_run_invocation(&args(&["nazoauthctl", "conformance", "artifact", "open",]))
+                .expect("run parser")
+                .is_none()
+        );
+
+        assert!(
+            parse_artifact_open_invocation(&args(&[
+                "nazoauthctl",
+                "conformance",
+                "artifact",
+                "open",
+                "--trust-policy",
+                "/trust.json",
+                "--cache-dir",
+                "/cache",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_artifact_open_invocation(&args(&[
+                "nazoauthctl",
+                "conformance",
+                "artifact",
+                "open",
+                "--trust-policy",
+                "/trust.json",
+                "--cache-dir",
+                "/cache",
+                "--digest",
+                &digest,
+                "--capability",
+                "nazoauth.client.create",
+                "--capability",
+                "nazoauth.client.create",
+            ]))
+            .is_err()
         );
     }
 

@@ -107,6 +107,26 @@ fails closed; it is never overwritten as a recovery shortcut.
 
 The cache is evidence and recovery input, not a new trust root. Resolution
 still verifies the current signed channel and validity window. Offline cache
-selection, deployment-bound run journals, authenticated NazoAuth capability
-negotiation, provisioning, Suite execution, and cleanup remain separate later
-transactions.
+selection is therefore exact and has no moving alias:
+
+```text
+nazoauthctl conformance artifact open \
+  --trust-policy /etc/nazoauthctl/oidf-trust.json \
+  --cache-dir /var/lib/nazoauthctl/oidf-cache \
+  --digest 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --capability nazoauth.client.create
+```
+
+`--digest` is the exact 64-character lowercase manifest SHA-256. The command
+requires the final `verified.json` marker, reads only bounded owner-only regular
+files, and performs no network request or cache write. It re-runs signature,
+source, current validity, engine protocol, capability, matrix digest, size, and
+schema verification, then requires the recomputed identity to equal both the
+requested digest and committed record. Missing, incomplete, expired, tampered,
+future-dated, untrusted, or capability-incompatible entries fail closed.
+
+As with local verification and discovery, `--capability` is an explicit caller
+input. Offline opening does not claim that NazoAuth granted or negotiated it.
+A deployment-bound runner must pass the set observed from authenticated server
+capability negotiation. Deployment-bound run journals, that negotiation,
+provisioning, Suite execution, and cleanup remain separate later transactions.
