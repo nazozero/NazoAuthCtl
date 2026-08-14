@@ -348,7 +348,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn active_run_lock_is_skipped_and_crashed_journal_is_claimed_then_removed() {
-        let root = std::env::temp_dir().join(format!("nazoauth-recovery-{}", uuid::Uuid::now_v7()));
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-recovery-{}", uuid::Uuid::now_v7()));
         let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
         let guard = store.begin(binding()).expect("begin");
         assert!(store.claim_pending().expect("active scan").is_empty());

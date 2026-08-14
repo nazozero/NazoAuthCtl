@@ -429,7 +429,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unique_run_bundle_commits_manifest_last_and_binds_raw_files() {
-        let root = std::env::temp_dir().join(format!("nazoauth-evidence-{}", uuid::Uuid::now_v7()));
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-evidence-{}", uuid::Uuid::now_v7()));
         let receipt =
             write_private_evidence_bundle(&report(), &root, &identity()).expect("evidence bundle");
         assert_eq!(receipt.module_count, 1);
