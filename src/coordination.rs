@@ -666,6 +666,47 @@ pub(crate) fn finalize_committed_locked(
     remove_file_durable(&active)
 }
 
+/// Archive a controller update that was unwound before its declaration commit.
+///
+/// The caller must first restore the previous runtime and database through the
+/// deployment's recovery boundary.  This function owns only the coordination
+/// journal transition; it never mutates the deployment declaration.
+pub(crate) fn abort_controller_update_locked(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    transaction_id: &str,
+) -> anyhow::Result<UpdateCoordination> {
+    let active = transaction_path(store, &record.deployment_id);
+    let mut transaction = load_path(&active)?;
+    validate_binding(&transaction, record)?;
+    if transaction.transaction_id != transaction_id {
+        bail!("active update transaction changed before recovery was archived");
+    }
+    if transaction.state == CoordinationState::Committed {
+        bail!("a committed update cannot be archived as aborted");
+    }
+    transaction.state = CoordinationState::Aborted;
+    transaction.updated_at = Utc::now().timestamp();
+    persist(store, &transaction)?;
+
+    let history = active.with_file_name(format!("update-{transaction_id}.json"));
+    match fs::symlink_metadata(&history) {
+        Ok(_) => bail!("aborted update history already exists"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect aborted update history {}",
+                    history.display()
+                )
+            });
+        }
+    }
+    atomic_write(&history, &serde_json::to_vec_pretty(&transaction)?, 0o600)?;
+    remove_file_durable(&active)?;
+    Ok(transaction)
+}
+
 /// Replay a committed declaration intent after either side of the declaration
 /// CAS/journal persistence boundary.  This function deliberately leaves the
 /// active transaction in place: the caller still owns audit/finalization.

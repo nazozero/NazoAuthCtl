@@ -670,14 +670,26 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                             .record
                             .as_ref()
                             .context("config-backed update lost its deployment declaration")?;
-                        resume_config_backed_update_locked(
-                            &store,
-                            bound_record,
-                            &transaction,
-                            &context.path,
-                            &context.config,
-                            true,
-                        )?
+                        if load_update_journal(&context.config)?.is_some() {
+                            recover_pending_update(&context.path, &context.config)?;
+                            let _deployment_lock =
+                                store.deployment_lock(&bound_record.deployment_id)?;
+                            let current_record = store.reload_locked(bound_record)?;
+                            crate::coordination::abort_controller_update_locked(
+                                &store,
+                                &current_record,
+                                &transaction.transaction_id,
+                            )?
+                        } else {
+                            resume_config_backed_update_locked(
+                                &store,
+                                bound_record,
+                                &transaction,
+                                &context.path,
+                                &context.config,
+                                true,
+                            )?
+                        }
                     }
                 } else {
                     bail!("registered update recovery has no executable lifecycle authority");

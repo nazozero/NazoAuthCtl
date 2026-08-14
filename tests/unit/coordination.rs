@@ -327,6 +327,30 @@ fn completed_transactions_retain_distinct_external_evidence() {
 }
 
 #[test]
+fn aborted_controller_update_is_archived_without_changing_the_declaration() {
+    let work = PrivateTempDir::new("nazoauthctl-coordination-abort").unwrap();
+    let store = store(&work);
+    let current = record("deployment-a");
+    store.persist(&current).unwrap();
+    let prepared = prepare_update(&store, &current, &plan("deployment-a")).unwrap();
+
+    let aborted =
+        abort_controller_update_locked(&store, &current, &prepared.transaction_id).unwrap();
+
+    assert_eq!(aborted.state, CoordinationState::Aborted);
+    assert_eq!(store.load("deployment-a").unwrap(), current);
+    assert!(!active_update_exists(&store, &current));
+    assert!(
+        store
+            .deployment_state_dir("deployment-a")
+            .join("transactions")
+            .join(format!("update-{}.json", prepared.transaction_id))
+            .is_file()
+    );
+    assert!(abort_controller_update_locked(&store, &current, &prepared.transaction_id).is_err());
+}
+
+#[test]
 fn provider_evidence_rejects_forgery_and_wrong_signer() {
     for wrong_signer in [false, true] {
         let work = PrivateTempDir::new("nazoauthctl-coordination-signature").unwrap();
