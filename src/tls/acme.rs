@@ -36,12 +36,12 @@ use crate::{
     },
 };
 
-const CONFIG_SCHEMA: u32 = 1;
-pub(super) const CONFIG_PROTOCOL: &str = "nazoauthctl.acme.http01-webroot.v1";
-const PLAN_SCHEMA: u32 = 1;
-const ACCOUNT_SCHEMA: u32 = 1;
-const TRANSACTION_SCHEMA: u32 = 1;
-const RECEIPT_SCHEMA: u32 = 1;
+const CONFIG_SCHEMA: u32 = 2;
+pub(super) const CONFIG_PROTOCOL: &str = "nazoauthctl.acme.http01-webroot.v2";
+const PLAN_SCHEMA: u32 = 2;
+const ACCOUNT_SCHEMA: u32 = 2;
+const TRANSACTION_SCHEMA: u32 = 2;
+const RECEIPT_SCHEMA: u32 = 2;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_ACCOUNT_BYTES: u64 = 256 * 1024;
 const MAX_TRANSACTION_BYTES: u64 = 256 * 1024;
@@ -57,6 +57,7 @@ struct AcmeConfig {
     tenant: String,
     hostname: String,
     directory_url: String,
+    allowed_origins: Vec<String>,
     terms_of_service_url: String,
     contacts: Vec<String>,
     challenge_webroot: PathBuf,
@@ -71,7 +72,6 @@ struct LoadedAcmeConfig {
     sha256: String,
     source_bytes: Vec<u8>,
     directory_trust_anchor: Option<Vec<u8>>,
-    directory_trust_anchor_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -90,6 +90,7 @@ struct AcmePlan {
     trust_anchors_sha256: String,
     directory_trust_anchor_sha256: Option<String>,
     directory_url: String,
+    allowed_origins: Vec<String>,
     terms_of_service_url: String,
     challenge_webroot: PathBuf,
     account_path: PathBuf,
@@ -130,6 +131,7 @@ struct AcmeTransaction {
     trust_anchors_sha256: String,
     directory_trust_anchor_sha256: Option<String>,
     directory_url: String,
+    allowed_origins: Vec<String>,
     terms_of_service_url: String,
     account_path: PathBuf,
     workspace: PathBuf,
@@ -153,6 +155,7 @@ struct AccountRecord {
     deployment_id: String,
     acme_config_sha256: String,
     directory_url: String,
+    allowed_origins: Vec<String>,
     contacts_sha256: String,
     account_key_sha256: String,
     created_at: i64,
@@ -176,6 +179,7 @@ struct AcmeReceipt {
     trust_anchors_sha256: String,
     directory_trust_anchor_sha256: Option<String>,
     directory_url: String,
+    allowed_origins: Vec<String>,
     terms_of_service_url: String,
     account_id: String,
     account_key_sha256: String,
@@ -205,6 +209,10 @@ struct AbortedTransaction {
     reason: String,
     aborted_at: i64,
 }
+
+mod http_client;
+
+use http_client::{AuthorityPolicy, build_http_client, validate_https_url};
 
 pub(super) fn run(
     selector: Option<&str>,
@@ -336,7 +344,7 @@ fn issue(
         &input.tenant,
         &input.hostname,
     )?;
-    let mut acme = load_config(
+    let acme = load_config(
         store,
         &input.acme_config,
         &provider,
@@ -353,9 +361,6 @@ fn issue(
     let plan = build_plan(store, &record, &provider, &acme, current.as_ref())?;
     ensure_private_directory(&plan.workspace, "ACME issuance workspace")?;
     persist_config_snapshots(input, &provider, &acme, &plan.workspace)?;
-    if acme.directory_trust_anchor.is_some() {
-        acme.directory_trust_anchor_path = Some(plan.workspace.join("directory-trust-anchor.pem"));
-    }
     let mut transaction = AcmeTransaction {
         schema: TRANSACTION_SCHEMA,
         jti: plan.jti,
@@ -371,6 +376,7 @@ fn issue(
         trust_anchors_sha256: plan.trust_anchors_sha256,
         directory_trust_anchor_sha256: plan.directory_trust_anchor_sha256,
         directory_url: plan.directory_url,
+        allowed_origins: plan.allowed_origins,
         terms_of_service_url: plan.terms_of_service_url,
         account_path: plan.account_path,
         workspace: plan.workspace,
@@ -490,8 +496,7 @@ fn load_config(
     let bytes = read_secure_regular_file(path, "ACME configuration", false, MAX_CONFIG_BYTES)?;
     let config: AcmeConfig =
         serde_json::from_slice(&bytes).context("ACME configuration is invalid")?;
-    let (directory_trust_anchor, directory_trust_anchor_path) =
-        load_directory_trust_anchor(&config)?;
+    let directory_trust_anchor = load_directory_trust_anchor(&config)?;
     validate_config(
         store,
         &config,
@@ -504,7 +509,6 @@ fn load_config(
         sha256: sha256(&bytes),
         source_bytes: bytes.to_vec(),
         directory_trust_anchor,
-        directory_trust_anchor_path,
     })
 }
 
@@ -521,9 +525,7 @@ fn load_snapshot_config(
     let config: AcmeConfig =
         serde_json::from_slice(&bytes).context("ACME configuration snapshot is invalid")?;
     let snapshot_path = transaction.workspace.join("directory-trust-anchor.pem");
-    let (directory_trust_anchor, directory_trust_anchor_path) = match &transaction
-        .directory_trust_anchor_sha256
-    {
+    let directory_trust_anchor = match &transaction.directory_trust_anchor_sha256 {
         Some(expected) => {
             if config.directory_trust_anchor.is_none() {
                 bail!("ACME journal binds a directory trust anchor absent from its configuration");
@@ -538,13 +540,13 @@ fn load_snapshot_config(
                 bail!("ACME directory trust anchor snapshot differs from the journal binding");
             }
             super::material::root_store_from_pem(&root)?;
-            (Some(root.to_vec()), Some(snapshot_path))
+            Some(root.to_vec())
         }
         None => {
             if config.directory_trust_anchor.is_some() {
                 bail!("ACME configuration requires an unbound directory trust anchor");
             }
-            (None, None)
+            None
         }
     };
     validate_config(
@@ -559,15 +561,12 @@ fn load_snapshot_config(
         sha256: sha256(&bytes),
         source_bytes: bytes.to_vec(),
         directory_trust_anchor,
-        directory_trust_anchor_path,
     })
 }
 
-fn load_directory_trust_anchor(
-    config: &AcmeConfig,
-) -> anyhow::Result<(Option<Vec<u8>>, Option<PathBuf>)> {
+fn load_directory_trust_anchor(config: &AcmeConfig) -> anyhow::Result<Option<Vec<u8>>> {
     let Some(path) = &config.directory_trust_anchor else {
-        return Ok((None, None));
+        return Ok(None);
     };
     let root = read_secure_regular_file(
         path,
@@ -576,7 +575,7 @@ fn load_directory_trust_anchor(
         MAX_CERTIFICATE_BYTES,
     )?;
     super::material::root_store_from_pem(&root)?;
-    Ok((Some(root.to_vec()), Some(path.clone())))
+    Ok(Some(root.to_vec()))
 }
 
 fn validate_config(
@@ -599,6 +598,8 @@ fn validate_config(
         bail!("ACME, provider, and requested tenant/hostname bindings differ");
     }
     validate_https_url(&config.directory_url, "ACME directory URL")?;
+    let authority = AuthorityPolicy::from_config(&config.allowed_origins)?;
+    authority.require_url(&config.directory_url, "ACME directory URL")?;
     validate_https_url(&config.terms_of_service_url, "ACME terms-of-service URL")?;
     if config.contacts.is_empty() || config.contacts.len() > 8 {
         bail!("ACME contacts must contain between one and eight mailto URIs");
@@ -679,6 +680,7 @@ fn build_plan(
         trust_anchors_sha256: provider.trust_anchors_sha256.clone(),
         directory_trust_anchor_sha256: acme.directory_trust_anchor.as_deref().map(sha256),
         directory_url: acme.config.directory_url.clone(),
+        allowed_origins: acme.config.allowed_origins.clone(),
         terms_of_service_url: acme.config.terms_of_service_url.clone(),
         challenge_webroot: acme.config.challenge_webroot.clone(),
         account_path: account_path(store, record, acme),
@@ -811,6 +813,8 @@ async fn drive_async(
                 .new_order(&NewOrder::new(&identifiers))
                 .await
                 .context("failed to create ACME order")?;
+            AuthorityPolicy::from_config(&acme.config.allowed_origins)?
+                .require_url(order.url(), "server-issued ACME order URL")?;
             transaction.order_url = Some(order.url().to_owned());
             transaction.phase = Phase::OrderCreated;
             persist_pending(store, transaction)?;
@@ -878,20 +882,24 @@ async fn load_or_create_account(
     acme: &LoadedAcmeConfig,
     transaction: &mut AcmeTransaction,
 ) -> anyhow::Result<Account> {
-    let builder = match &acme.directory_trust_anchor_path {
-        Some(path) => Account::builder_with_root(path),
-        None => Account::builder(),
-    }
-    .context("failed to configure ACME directory client")?;
+    let authority = AuthorityPolicy::from_config(&acme.config.allowed_origins)?;
+    let roots = acme
+        .directory_trust_anchor
+        .as_deref()
+        .map(super::material::root_store_from_pem)
+        .transpose()?;
+    let builder = Account::builder_with_http(build_http_client(authority.clone(), roots)?);
     match load_account(&transaction.account_path)? {
         Some(account_record) => {
             validate_account_record(&account_record, transaction, acme)?;
             bind_account_key_digest(store, transaction, &account_record.account_key_sha256)?;
             retire_account_key_draft(&transaction.account_path)?;
-            builder
+            let account = builder
                 .from_credentials(account_record.credentials)
                 .await
-                .context("failed to restore ACME account")
+                .context("failed to restore ACME account")?;
+            authority.require_url(account.id(), "restored ACME account URL")?;
+            Ok(account)
         }
         None => {
             let contacts = acme
@@ -909,6 +917,7 @@ async fn load_or_create_account(
                 )
                 .await
                 .context("failed to create ACME account")?;
+            authority.require_url(account.id(), "server-issued ACME account URL")?;
             account
                 .update_contacts(&contacts)
                 .await
@@ -918,6 +927,7 @@ async fn load_or_create_account(
                 deployment_id: transaction.deployment_id.clone(),
                 acme_config_sha256: acme.sha256.clone(),
                 directory_url: acme.config.directory_url.clone(),
+                allowed_origins: acme.config.allowed_origins.clone(),
                 contacts_sha256: contacts_sha256(&acme.config.contacts),
                 account_key_sha256: key_digest,
                 created_at: Utc::now().timestamp(),
@@ -959,6 +969,7 @@ fn validate_account_record(
         || account.deployment_id != transaction.deployment_id
         || account.acme_config_sha256 != acme.sha256
         || account.directory_url != acme.config.directory_url
+        || account.allowed_origins != acme.config.allowed_origins
         || account.contacts_sha256 != contacts_sha256(&acme.config.contacts)
         || transaction
             .account_key_sha256
@@ -1183,6 +1194,9 @@ fn commit_issued_material(
         &transaction.hostname,
         provider,
     )?;
+    let authority = AuthorityPolicy::from_config(&acme.config.allowed_origins)?;
+    authority.require_url(account.id(), "ACME account URL")?;
+    authority.require_url(order_url, "ACME order URL")?;
     let receipt = AcmeReceipt {
         schema: RECEIPT_SCHEMA,
         jti: transaction.jti.clone(),
@@ -1198,6 +1212,7 @@ fn commit_issued_material(
         trust_anchors_sha256: provider.trust_anchors_sha256.clone(),
         directory_trust_anchor_sha256: transaction.directory_trust_anchor_sha256.clone(),
         directory_url: acme.config.directory_url.clone(),
+        allowed_origins: acme.config.allowed_origins.clone(),
         terms_of_service_url: acme.config.terms_of_service_url.clone(),
         account_id: account.id().to_owned(),
         account_key_sha256: transaction
@@ -1327,12 +1342,15 @@ fn validate_transaction_binding(
         }
     }
     validate_https_url(&transaction.directory_url, "ACME journal directory URL")?;
+    let authority = AuthorityPolicy::from_config(&transaction.allowed_origins)?;
+    authority.require_url(&transaction.directory_url, "ACME journal directory URL")?;
     validate_https_url(
         &transaction.terms_of_service_url,
         "ACME journal terms-of-service URL",
     )?;
     if let Some(order_url) = &transaction.order_url {
         validate_https_url(order_url, "ACME journal order URL")?;
+        authority.require_url(order_url, "ACME journal order URL")?;
     }
     if transaction.challenge_path.is_some() != transaction.challenge_sha256.is_some()
         || transaction.private_key_sha256.is_some() != transaction.csr_sha256.is_some()
@@ -1353,6 +1371,7 @@ fn validate_transaction_config(
         || transaction.directory_trust_anchor_sha256
             != acme.directory_trust_anchor.as_deref().map(sha256)
         || transaction.directory_url != acme.config.directory_url
+        || transaction.allowed_origins != acme.config.allowed_origins
         || transaction.terms_of_service_url != acme.config.terms_of_service_url
         || transaction.tenant != canonical_tenant(&acme.config.tenant)?
         || transaction.hostname != canonical_hostname(&acme.config.hostname)?
@@ -1447,12 +1466,16 @@ fn validate_receipt_shape(store: &DeploymentStore, receipt: &AcmeReceipt) -> any
         validate_digest(digest, "ACME receipt directory trust-anchor digest")?;
     }
     validate_https_url(&receipt.directory_url, "ACME receipt directory URL")?;
+    let authority = AuthorityPolicy::from_config(&receipt.allowed_origins)?;
+    authority.require_url(&receipt.directory_url, "ACME receipt directory URL")?;
     validate_https_url(
         &receipt.terms_of_service_url,
         "ACME receipt terms-of-service URL",
     )?;
     validate_https_url(&receipt.account_id, "ACME receipt account URL")?;
     validate_https_url(&receipt.order_url, "ACME receipt order URL")?;
+    authority.require_url(&receipt.account_id, "ACME receipt account URL")?;
+    authority.require_url(&receipt.order_url, "ACME receipt order URL")?;
     let workspace = acme_binding_directory(
         store,
         &receipt.deployment_id,
@@ -1554,6 +1577,7 @@ fn validate_receipt_transaction(
         || receipt.trust_anchors_sha256 != transaction.trust_anchors_sha256
         || receipt.directory_trust_anchor_sha256 != transaction.directory_trust_anchor_sha256
         || receipt.directory_url != transaction.directory_url
+        || receipt.allowed_origins != transaction.allowed_origins
         || receipt.terms_of_service_url != transaction.terms_of_service_url
         || receipt.account_key_sha256
             != transaction
@@ -1739,6 +1763,7 @@ fn validate_receipt_artifacts(
         || account.deployment_id != receipt.deployment_id
         || account.acme_config_sha256 != receipt.acme_config_sha256
         || account.directory_url != receipt.directory_url
+        || account.allowed_origins != receipt.allowed_origins
         || account.account_key_sha256 != receipt.account_key_sha256
     {
         bail!("ACME receipt account credentials differ from its authority binding");
@@ -1897,20 +1922,6 @@ fn validate_challenge_token(token: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_https_url(value: &str, label: &str) -> anyhow::Result<Url> {
-    let url = Url::parse(value).with_context(|| format!("{label} is invalid"))?;
-    if url.scheme() != "https"
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        bail!("{label} must be HTTPS without credentials or fragment");
-    }
-    Ok(url)
-}
-
 fn validate_absolute_normalized(path: &Path, label: &str) -> anyhow::Result<()> {
     if !path.is_absolute()
         || path
@@ -1940,6 +1951,7 @@ mod tests {
         assert!(validate_challenge_token("abcdefghijklmnop.dot").is_err());
 
         assert!(validate_https_url("https://acme.example/directory", "directory").is_ok());
+        assert!(validate_https_url("https://acme.example/order?id=1", "order").is_ok());
         assert!(validate_https_url("http://acme.example/directory", "directory").is_err());
         assert!(validate_https_url("https://user@acme.example/directory", "directory").is_err());
         config.protocol.push_str(".unknown");
@@ -2031,6 +2043,9 @@ mod tests {
         receipt.provider_config_sha256 = transaction.provider_config_sha256.clone();
         receipt.acme_protocol = "unknown.protocol".to_owned();
         assert!(validate_receipt_transaction(&receipt, &transaction).is_err());
+        receipt = test_receipt(&transaction);
+        receipt.allowed_origins = vec!["https://other-acme.example".to_owned()];
+        assert!(validate_receipt_transaction(&receipt, &transaction).is_err());
 
         assert!(validate_previous_receipt(&transaction, None).is_ok());
         transaction.expected_revision = 1;
@@ -2099,6 +2114,12 @@ mod tests {
             receipt.acme_protocol != CONFIG_PROTOCOL
                 && validate_receipt_transaction(&receipt, &transaction).is_err()
         );
+        receipt = test_receipt(&transaction);
+        receipt.account_id = "https://127.0.0.1/internal-account".to_owned();
+        assert!(validate_receipt_shape(&store, &receipt).is_err());
+        receipt = test_receipt(&transaction);
+        receipt.allowed_origins = Vec::new();
+        assert!(validate_receipt_shape(&store, &receipt).is_err());
     }
 
     #[test]
@@ -2135,6 +2156,7 @@ mod tests {
             tenant: "tenant-a".to_owned(),
             hostname: "auth.example".to_owned(),
             directory_url: "https://acme.example/directory".to_owned(),
+            allowed_origins: vec!["https://acme.example".to_owned()],
             terms_of_service_url: "https://acme.example/terms".to_owned(),
             contacts: vec!["mailto:security@example.com".to_owned()],
             challenge_webroot,
@@ -2161,6 +2183,7 @@ mod tests {
             trust_anchors_sha256: "c".repeat(64),
             directory_trust_anchor_sha256: None,
             directory_url: "https://acme.example/directory".to_owned(),
+            allowed_origins: vec!["https://acme.example".to_owned()],
             terms_of_service_url: "https://acme.example/terms".to_owned(),
             account_path: root.join("account.json"),
             workspace: workspace.clone(),
@@ -2215,6 +2238,7 @@ mod tests {
             trust_anchors_sha256: transaction.trust_anchors_sha256.clone(),
             directory_trust_anchor_sha256: transaction.directory_trust_anchor_sha256.clone(),
             directory_url: transaction.directory_url.clone(),
+            allowed_origins: transaction.allowed_origins.clone(),
             terms_of_service_url: transaction.terms_of_service_url.clone(),
             account_id: "https://acme.example/account/1".to_owned(),
             account_key_sha256: transaction.account_key_sha256.clone().unwrap(),
