@@ -631,7 +631,7 @@ fn url_is_below_source(candidate: &Url, source: &Url) -> bool {
         && candidate.path().len() > source.path().len()
 }
 
-fn validate_identifier(value: &str, maximum: usize) -> Result<(), &'static str> {
+pub(crate) fn validate_identifier(value: &str, maximum: usize) -> Result<(), &'static str> {
     if value.is_empty()
         || value.len() > maximum
         || !value.bytes().all(|byte| {
