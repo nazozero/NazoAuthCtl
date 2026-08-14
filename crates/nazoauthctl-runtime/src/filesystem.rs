@@ -659,7 +659,9 @@ pub fn validate_directory_chain(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn sync_parent(path: &Path) -> anyhow::Result<()> {
+/// Persist the directory entry containing `path` after a create, remove, or
+/// rename performed outside the higher-level atomic file helpers.
+pub fn sync_parent(path: &Path) -> anyhow::Result<()> {
     let parent = path.parent().context("path has no parent directory")?;
     File::open(parent)
         .with_context(|| format!("failed to open {} for synchronization", parent.display()))?
@@ -668,7 +670,7 @@ fn sync_parent(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> anyhow::Result<()> {
+pub fn sync_parent(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
