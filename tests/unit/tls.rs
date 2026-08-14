@@ -44,6 +44,23 @@ fn provider_and_journal_reject_unknown_fields() {
 }
 
 #[test]
+fn transaction_provider_snapshot_detects_recovery_command_drift() {
+    let mut transaction =
+        test_transaction(PathBuf::from("/srv/nazoauth/tls/tenant-a/auth.example"));
+    assert_eq!(
+        transaction.provider_snapshot_sha256,
+        "455f534fb8541459c53eafd6d6acc63572720e64b744b8f30acaec851e70ceb4"
+    );
+    assert!(validate_provider_snapshot(&transaction).is_ok());
+    transaction
+        .provider
+        .reload
+        .args
+        .push("--changed".to_owned());
+    assert!(validate_provider_snapshot(&transaction).is_err());
+}
+
+#[test]
 fn transaction_phase_distinguishes_pre_activation_from_rollback_required() {
     assert!(!TransactionPhase::Prepared.activation_may_have_happened());
     assert!(!TransactionPhase::Staged.activation_may_have_happened());
@@ -403,6 +420,30 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
     assert_eq!(validated.leaf_sha256.len(), 64);
     assert!(validated.not_after > Utc::now().timestamp());
 
+    let mut transaction = test_transaction(provider.config.material_root.clone());
+    transaction.provider = provider.config.clone();
+    transaction.provider_config_sha256 = provider.config_sha256.clone();
+    transaction.provider_snapshot_sha256 = provider_snapshot_sha256(&provider.config).unwrap();
+    transaction.trust_anchors_sha256 = provider.trust_anchors_sha256.clone();
+    transaction.source = CertificateSourceBinding::ExternalFiles {
+        certificate_sha256: validated.certificate_sha256.clone(),
+        private_key_sha256: validated.private_key_sha256.clone(),
+    };
+    transaction.material_sha256 = validated.material_sha256.clone();
+    transaction.leaf_certificate_sha256 = validated.leaf_sha256.clone();
+    transaction.certificate_not_after = validated.not_after;
+    let receipt = test_receipt(
+        &transaction,
+        &transaction.jti,
+        1,
+        work.path().to_path_buf(),
+        validated.leaf_sha256.clone(),
+    );
+    assert!(validate_rollback_material(&receipt, &provider).is_ok());
+    let mut changed_provider = provider.clone();
+    changed_provider.config_sha256 = "c".repeat(64);
+    assert!(validate_rollback_material(&receipt, &changed_provider).is_err());
+
     let wrong_key = KeyPair::generate().unwrap();
     fs::write(&private_key_path, wrong_key.serialize_pem()).unwrap();
     #[cfg(unix)]
@@ -413,6 +454,7 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
     assert!(
         load_and_validate_material(certificate, private_key, &input.hostname, &provider).is_err()
     );
+    assert!(validate_rollback_material(&receipt, &provider).is_err());
 }
 
 #[test]
@@ -431,15 +473,18 @@ fn public_verification_observes_real_tls_leaf_and_http_health() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
-        let (tcp, _) = listener.accept().unwrap();
-        let connection = rustls::ServerConnection::new(Arc::new(server_config)).unwrap();
-        let mut stream = rustls::StreamOwned::new(connection, tcp);
-        let mut request = [0_u8; 1024];
-        let _ = stream.read(&mut request).unwrap();
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
-            .unwrap();
-        stream.flush().unwrap();
+        for _ in 0..3 {
+            let (tcp, _) = listener.accept().unwrap();
+            let connection =
+                rustls::ServerConnection::new(Arc::new(server_config.clone())).unwrap();
+            let mut stream = rustls::StreamOwned::new(connection, tcp);
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .unwrap();
+            stream.flush().unwrap();
+        }
     });
 
     let provider = ProviderConfig {
@@ -473,6 +518,25 @@ fn public_verification_observes_real_tls_leaf_and_http_health() {
         &provider,
     )
     .unwrap();
+    verify_public_address_not_leaf(
+        &Url::parse("https://auth.example/health/ready").unwrap(),
+        "auth.example",
+        address,
+        &"0".repeat(64),
+        root_store_from_pem(ca_pem.as_bytes()).unwrap(),
+        &provider,
+    )
+    .unwrap();
+    let error = verify_public_address_not_leaf(
+        &Url::parse("https://auth.example/health/ready").unwrap(),
+        "auth.example",
+        address,
+        &sha256(leaf_der.as_ref()),
+        root_store_from_pem(ca_pem.as_bytes()).unwrap(),
+        &provider,
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("still presents"));
     server.join().unwrap();
 }
 
@@ -517,7 +581,7 @@ fn public_verification_uses_an_absolute_request_deadline() {
 
 #[cfg(unix)]
 #[test]
-fn activated_generation_rolls_back_without_leaving_private_material_active() {
+fn activated_generation_is_deactivated_before_rollback_public_proof() {
     let work = PrivateTempDir::new("nazoauth-tls-rollback").unwrap();
     let material_root = work.path().join("material");
     let provider = ProviderConfig {
@@ -561,9 +625,10 @@ fn activated_generation_rolls_back_without_leaving_private_material_active() {
         leaf_certificate_sha256: "b".repeat(64),
         certificate_not_after: Utc::now().timestamp() + 86400,
         provider_config_sha256: "c".repeat(64),
+        provider_snapshot_sha256: provider_snapshot_sha256(&provider).unwrap(),
         trust_anchors_sha256: "d".repeat(64),
         trust_anchors_pem: "test public anchor".to_owned(),
-        provider,
+        provider: provider.clone(),
         generation: generation.clone(),
         previous_generation: None,
         previous_leaf_certificate_sha256: None,
@@ -591,8 +656,8 @@ fn activated_generation_rolls_back_without_leaving_private_material_active() {
         active_generation(&transaction.provider).unwrap(),
         Some(generation.clone())
     );
-    rollback_transaction(&mut transaction, None, None).unwrap();
-    assert_eq!(transaction.phase, TransactionPhase::RolledBack);
+    restore_previous_activation(&transaction).unwrap();
+    remove_inactive_generation(&transaction).unwrap();
     assert!(active_generation(&transaction.provider).unwrap().is_none());
     assert!(!generation.exists());
 }
@@ -639,9 +704,10 @@ fn test_transaction(material_root: PathBuf) -> CertificateTransaction {
         leaf_certificate_sha256: "b".repeat(64),
         certificate_not_after: now + 86400,
         provider_config_sha256: "c".repeat(64),
+        provider_snapshot_sha256: provider_snapshot_sha256(&provider).unwrap(),
         trust_anchors_sha256: "d".repeat(64),
         trust_anchors_pem: "test public anchor".to_owned(),
-        provider,
+        provider: provider.clone(),
         generation: material_root.join("generations/1-target"),
         previous_generation: None,
         previous_leaf_certificate_sha256: None,
