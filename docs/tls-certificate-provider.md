@@ -214,10 +214,15 @@ This contract closes external import, file activation, reload, public
 verification, receipt, and crash recovery without inventing a server API.
 ACME HTTP-01 issuance is a separate transaction documented in
 [`tls-acme-http01.md`](tls-acme-http01.md); its receipt can be supplied to this
-provider's plan/apply commands. Direct TLS configuration/reload,
-trusted-proxy/internal transport changes, and Nginx/Angie configuration
-generation remain blocked on the dynamic
-NazoAuth capability/protocol work tracked by NazoAuth #127/#128/#129 and parent
-#130. Those later operations must negotiate capabilities at runtime; they must
-not infer compatibility from a NazoAuth release number. No HTTP fallback is
-implemented or permitted here.
+provider's plan/apply commands. NazoAuth PR #131 established the server's Direct
+TLS transport baseline and #127 is closed, but that stage explicitly does not
+provide atomic certificate/trust reload with last-known-good rollback or real
+trusted-proxy parity. It also is not an authenticated machine-management
+protocol for this controller. Direct TLS configuration/reload,
+trusted-proxy/internal transport changes, multi-tenant authority, and
+Nginx/Angie configuration generation therefore remain outside this provider
+contract and depend on the ordinary capability/protocol work tracked by
+NazoAuth #128/#129 and parent #130. Those later operations must negotiate
+capabilities at runtime; they must not infer compatibility from an issue state
+or a NazoAuth release number. No HTTP fallback is implemented or permitted
+here.

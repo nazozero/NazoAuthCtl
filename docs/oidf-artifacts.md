@@ -205,11 +205,15 @@ strictly before the artifact's exclusive expiry.
 Inspection-plan schema 5 is evidence, not an execution authorization. It carries
 a plan JTI but deliberately records `deployment_bound: false`,
 `capabilities_attested: false`, and `execution_permitted: false`, together with
-the authenticated negotiation, ordinary resource provider, target/Suite origin policy, and
-deployment-bound crash-safe journal blockers. The command creates no NazoAuth
-resource, Suite plan, execution journal, or cleanup obligation. Signed budgets
-are contract ceilings, not proof of runtime enforcement; a future runner must
-enforce them against observed Suite modules, created clients, and elapsed time.
+the authenticated negotiation, ordinary resource provider, target/Suite origin
+policy, and deployment-bound crash-safe journal blockers. NazoAuth's current
+operator wire still exposes the legacy Suite-specific lease operations rather
+than an ordinary tenant-scoped controller contract; the required ownership and
+Suite-removal work remains tracked by NazoAuth #128/#129 and parent #130. The
+command creates no NazoAuth resource, Suite plan, execution journal, or cleanup
+obligation. Signed budgets are contract ceilings, not proof of runtime
+enforcement; a future runner must enforce them against observed Suite modules,
+created clients, and elapsed time.
 
 Schema 5 also binds the delivery contract to
 `nazoauthctl-bounded-plan-runner-v1`, the existing runner whose behavior tests
