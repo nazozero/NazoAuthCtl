@@ -30,7 +30,10 @@ pub use artifact::{
     VerifiedOidfArtifact, VerifiedOidfDriverManifest, read_artifact_matrix, read_compact_manifest,
     verify_oidf_artifact, verify_oidf_driver_manifest, verify_oidf_matrix,
 };
-pub use artifact_discovery::{ArtifactDiscoveryError, ResolvedOidfArtifact, resolve_oidf_artifact};
+pub use artifact_discovery::{
+    ArtifactDiscoveryError, CachedOidfArtifact, ResolvedOidfArtifact, open_cached_oidf_artifact,
+    resolve_oidf_artifact,
+};
 pub use browser::{
     BrowserAutomation, BrowserCommand, BrowserDriver, BrowserEntry, BrowserError, BrowserExecutor,
     BrowserLimits, BrowserPolicy, BrowserRunReport, BrowserRunnerState, BrowserSelector,

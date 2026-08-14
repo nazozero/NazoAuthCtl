@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ArtifactError, ArtifactTrustPolicy, MAX_ARTIFACT_MATRIX_BYTES, MAX_SIGNED_DRIVER_BYTES,
-    VerifiedOidfArtifact, verify_oidf_driver_manifest, verify_oidf_matrix,
+    VerifiedOidfArtifact, verify_oidf_artifact, verify_oidf_driver_manifest, verify_oidf_matrix,
 };
 
 const CACHE_RECORD_SCHEMA: u32 = 1;
@@ -25,6 +25,17 @@ pub struct ResolvedOidfArtifact {
     pub resolved_at: i64,
     pub cache_entry: PathBuf,
     pub cache_hit: bool,
+    pub artifact: VerifiedOidfArtifact,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CachedOidfArtifact {
+    pub schema: u32,
+    pub manifest_url: String,
+    pub cached_at: i64,
+    pub opened_at: i64,
+    pub cache_entry: PathBuf,
     pub artifact: VerifiedOidfArtifact,
 }
 
@@ -61,6 +72,48 @@ pub enum ArtifactDiscoveryError {
     CacheConflict,
     #[error("artifact cache record is malformed")]
     CacheRecord,
+    #[error("artifact manifest digest must be 64 lowercase hexadecimal characters")]
+    InvalidManifestDigest,
+    #[error("artifact cache entry failed immutable identity verification")]
+    CacheIdentity,
+}
+
+pub fn open_cached_oidf_artifact(
+    cache_root: &Path,
+    manifest_digest: &str,
+    trust: &ArtifactTrustPolicy,
+    available_capabilities: &BTreeSet<String>,
+    now: i64,
+) -> Result<CachedOidfArtifact, ArtifactDiscoveryError> {
+    if !cache_root.is_absolute() || cache_root.file_name().is_none() {
+        return Err(ArtifactDiscoveryError::UnsafeCache);
+    }
+    if !is_lowercase_sha256(manifest_digest) {
+        return Err(ArtifactDiscoveryError::InvalidManifestDigest);
+    }
+
+    let cache_entry = cache_root.join("artifacts").join(manifest_digest);
+    let record_bytes = read_cache(&cache_entry.join("verified.json"), MAX_CACHE_RECORD_BYTES)?;
+    let compact_manifest = read_cache(&cache_entry.join("driver.jws"), MAX_SIGNED_DRIVER_BYTES)?;
+    let matrix = read_cache(&cache_entry.join("matrix.json"), MAX_ARTIFACT_MATRIX_BYTES)?;
+    let record = verify_cached_entry(
+        &record_bytes,
+        &compact_manifest,
+        &matrix,
+        manifest_digest,
+        trust,
+        available_capabilities,
+        now,
+    )?;
+
+    Ok(CachedOidfArtifact {
+        schema: 1,
+        manifest_url: record.manifest_url,
+        cached_at: record.resolved_at,
+        opened_at: now,
+        cache_entry,
+        artifact: record.artifact,
+    })
 }
 
 pub fn resolve_oidf_artifact(
@@ -184,6 +237,50 @@ fn compact_manifest(bytes: &[u8]) -> Result<String, ArtifactDiscoveryError> {
         return Err(ArtifactDiscoveryError::ManifestEncoding);
     }
     Ok(compact.to_owned())
+}
+
+fn verify_cached_entry(
+    record_bytes: &[u8],
+    compact_manifest_bytes: &[u8],
+    matrix: &[u8],
+    manifest_digest: &str,
+    trust: &ArtifactTrustPolicy,
+    available_capabilities: &BTreeSet<String>,
+    now: i64,
+) -> Result<CacheRecord, ArtifactDiscoveryError> {
+    if !is_lowercase_sha256(manifest_digest) {
+        return Err(ArtifactDiscoveryError::InvalidManifestDigest);
+    }
+    let record: CacheRecord =
+        serde_json::from_slice(record_bytes).map_err(|_| ArtifactDiscoveryError::CacheRecord)?;
+    if record.schema != CACHE_RECORD_SCHEMA
+        || !trust.accepts_url(&record.manifest_url)
+        || record.resolved_at < record.artifact.not_before
+        || record.resolved_at > record.artifact.expires_at
+        || record.resolved_at > now
+    {
+        return Err(ArtifactDiscoveryError::CacheRecord);
+    }
+
+    let compact_manifest = compact_manifest(compact_manifest_bytes)?;
+    let artifact = verify_oidf_artifact(
+        &compact_manifest,
+        matrix,
+        trust,
+        available_capabilities,
+        now,
+    )?;
+    if artifact.driver_manifest_sha256 != manifest_digest || artifact != record.artifact {
+        return Err(ArtifactDiscoveryError::CacheIdentity);
+    }
+    Ok(record)
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn persist_verified_cache(
@@ -471,6 +568,215 @@ mod tests {
                 Err(ArtifactDiscoveryError::UnsafeCache)
             ));
         }
+    }
+
+    #[test]
+    fn cached_entry_is_reverified_against_current_trust_time_and_capabilities() {
+        let transport = fake_transport(NOW + 3600);
+        let fetched =
+            fetch_verified_artifact(&transport, MANIFEST_URL, &trust(), &capabilities(), NOW)
+                .expect("verified fetch");
+        let record = CacheRecord {
+            schema: CACHE_RECORD_SCHEMA,
+            manifest_url: MANIFEST_URL.to_owned(),
+            resolved_at: NOW,
+            artifact: fetched.artifact.clone(),
+        };
+        let record_bytes = serde_json::to_vec(&record).expect("cache record");
+
+        let verified = verify_cached_entry(
+            &record_bytes,
+            fetched.compact_manifest.as_bytes(),
+            &fetched.matrix,
+            &fetched.artifact.driver_manifest_sha256,
+            &trust(),
+            &capabilities(),
+            NOW + 1,
+        )
+        .expect("reverified cache");
+        assert_eq!(verified, record);
+
+        assert!(matches!(
+            verify_cached_entry(
+                &record_bytes,
+                fetched.compact_manifest.as_bytes(),
+                &fetched.matrix,
+                &fetched.artifact.driver_manifest_sha256.to_uppercase(),
+                &trust(),
+                &capabilities(),
+                NOW + 1,
+            ),
+            Err(ArtifactDiscoveryError::InvalidManifestDigest)
+        ));
+        assert!(matches!(
+            verify_cached_entry(
+                &record_bytes,
+                fetched.compact_manifest.as_bytes(),
+                &fetched.matrix,
+                &"0".repeat(64),
+                &trust(),
+                &capabilities(),
+                NOW + 1,
+            ),
+            Err(ArtifactDiscoveryError::CacheIdentity)
+        ));
+        let mut tampered_matrix = fetched.matrix.clone();
+        tampered_matrix.push(b' ');
+        assert!(matches!(
+            verify_cached_entry(
+                &record_bytes,
+                fetched.compact_manifest.as_bytes(),
+                &tampered_matrix,
+                &fetched.artifact.driver_manifest_sha256,
+                &trust(),
+                &capabilities(),
+                NOW + 1,
+            ),
+            Err(ArtifactDiscoveryError::Artifact(_))
+        ));
+        assert!(matches!(
+            verify_cached_entry(
+                &record_bytes,
+                fetched.compact_manifest.as_bytes(),
+                &fetched.matrix,
+                &fetched.artifact.driver_manifest_sha256,
+                &trust(),
+                &BTreeSet::new(),
+                NOW + 1,
+            ),
+            Err(ArtifactDiscoveryError::Artifact(
+                ArtifactError::UnsupportedCapability(_)
+            ))
+        ));
+        assert!(matches!(
+            verify_cached_entry(
+                &record_bytes,
+                fetched.compact_manifest.as_bytes(),
+                &fetched.matrix,
+                &fetched.artifact.driver_manifest_sha256,
+                &trust(),
+                &capabilities(),
+                NOW + 3601,
+            ),
+            Err(ArtifactDiscoveryError::Artifact(
+                ArtifactError::ManifestPolicy(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn cached_entry_rejects_untrusted_or_impossible_commit_records() {
+        let transport = fake_transport(NOW + 3600);
+        let fetched =
+            fetch_verified_artifact(&transport, MANIFEST_URL, &trust(), &capabilities(), NOW)
+                .expect("verified fetch");
+        let mut record = CacheRecord {
+            schema: CACHE_RECORD_SCHEMA,
+            manifest_url: "https://attacker.example/driver.jws".to_owned(),
+            resolved_at: NOW,
+            artifact: fetched.artifact.clone(),
+        };
+        let verify = |record: &CacheRecord, now| {
+            verify_cached_entry(
+                &serde_json::to_vec(record).expect("cache record"),
+                fetched.compact_manifest.as_bytes(),
+                &fetched.matrix,
+                &fetched.artifact.driver_manifest_sha256,
+                &trust(),
+                &capabilities(),
+                now,
+            )
+        };
+        assert!(matches!(
+            verify(&record, NOW + 1),
+            Err(ArtifactDiscoveryError::CacheRecord)
+        ));
+
+        record.manifest_url = MANIFEST_URL.to_owned();
+        record.resolved_at = NOW + 2;
+        assert!(matches!(
+            verify(&record, NOW + 1),
+            Err(ArtifactDiscoveryError::CacheRecord)
+        ));
+
+        record.resolved_at = fetched.artifact.not_before - 1;
+        assert!(matches!(
+            verify(&record, NOW + 1),
+            Err(ArtifactDiscoveryError::CacheRecord)
+        ));
+
+        record.resolved_at = NOW;
+        record.schema = CACHE_RECORD_SCHEMA + 1;
+        assert!(matches!(
+            verify(&record, NOW + 1),
+            Err(ArtifactDiscoveryError::CacheRecord)
+        ));
+
+        record.schema = CACHE_RECORD_SCHEMA;
+        record.artifact.matrix_groups += 1;
+        assert!(matches!(
+            verify(&record, NOW + 1),
+            Err(ArtifactDiscoveryError::CacheIdentity)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_open_requires_exact_committed_entry_and_performs_no_write() {
+        let transport = fake_transport(NOW + 3600);
+        let fetched =
+            fetch_verified_artifact(&transport, MANIFEST_URL, &trust(), &capabilities(), NOW)
+                .expect("verified fetch");
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical system temp directory");
+        let root = temp_root.join(format!("nazo-oidf-open-{}", uuid::Uuid::now_v7()));
+        let (entry, _) = persist_verified_cache(
+            &root,
+            MANIFEST_URL,
+            &fetched.compact_manifest,
+            &fetched.matrix,
+            &fetched.artifact,
+            NOW,
+        )
+        .expect("persist cache");
+        let before = std::fs::metadata(entry.join("verified.json"))
+            .expect("record metadata")
+            .modified()
+            .expect("record modified time");
+
+        let opened = open_cached_oidf_artifact(
+            &root,
+            &fetched.artifact.driver_manifest_sha256,
+            &trust(),
+            &capabilities(),
+            NOW + 1,
+        )
+        .expect("open cache");
+        assert_eq!(opened.cached_at, NOW);
+        assert_eq!(opened.opened_at, NOW + 1);
+        assert_eq!(opened.cache_entry, entry);
+        assert_eq!(opened.artifact, fetched.artifact);
+        assert_eq!(
+            std::fs::metadata(opened.cache_entry.join("verified.json"))
+                .expect("record metadata")
+                .modified()
+                .expect("record modified time"),
+            before
+        );
+
+        std::fs::remove_file(opened.cache_entry.join("verified.json")).expect("remove marker");
+        assert!(matches!(
+            open_cached_oidf_artifact(
+                &root,
+                &opened.artifact.driver_manifest_sha256,
+                &trust(),
+                &capabilities(),
+                NOW + 2,
+            ),
+            Err(ArtifactDiscoveryError::CacheIo)
+        ));
+        std::fs::remove_dir_all(root).expect("remove test cache");
     }
 
     #[cfg(unix)]
