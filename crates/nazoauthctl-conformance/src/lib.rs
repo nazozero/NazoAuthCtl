@@ -75,7 +75,8 @@ pub use progress::{
 };
 pub use proxy_trust::ProxyTrustGuard;
 pub use report::{
-    CleanupFailure, CleanupReport, ConformanceReport, EvidenceError, ModuleReport, PlanReport,
+    CleanupFailure, CleanupReport, ConformanceReport, EvidenceError, ModuleOutcome, ModuleReport,
+    PlanReport,
 };
 pub use transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, Transport, TransportError,

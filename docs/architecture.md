@@ -81,6 +81,22 @@ invokes a root-owned reload executable, and restores a sibling recovery copy
 after Suite and lease cleanup. Supplying only one option fails before proxy,
 deployment, or Suite mutation.
 
+## Conformance outcome evidence
+
+The conformance report keeps local execution and official Suite outcomes as
+separate facts. `local_success` means that ctl completed orchestration, evidence
+collection, and cleanup without a local error. It is not a protocol result.
+`suite_pass` is true only when at least one module was defined and every defined
+module reached the Suite's exact `FINISHED` / `PASSED` result without warning or
+failure conditions.
+
+`REVIEW`, `WARNING`, `SKIPPED`, failed, and incomplete modules remain distinct
+module outcomes and are listed separately in report schema 3. A signed Matrix
+may explain an expected `SKIPPED` result, but the explanation never promotes it
+to `PASSED`. Live progress uses the same outcome classification, so review and
+skipped modules are not counted or rendered as passed. The CLI's final success
+still requires local success, Suite pass, and deployment cleanup completion.
+
 `nazo-operator-protocol` remains in `nazozero/NazoAuth`. `Cargo.toml` pins both
 the package version and a full Git revision. A protocol change therefore requires
 an explicit dependency update and compatibility review; Cargo cannot silently
