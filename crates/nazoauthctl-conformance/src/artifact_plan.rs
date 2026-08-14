@@ -17,7 +17,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{CachedOidfArtifact, OidfArtifactMatrix, OidfDriverHandler, OidfPlanResourceBudget};
 
-pub const OIDF_DRIVER_INSPECTION_PLAN_SCHEMA: u32 = 4;
+pub const OIDF_DRIVER_INSPECTION_PLAN_SCHEMA: u32 = 5;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +31,7 @@ pub struct OidfPlanSelection {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidfDriverPlanEntry {
+    pub task_jti: String,
     pub group_id: String,
     pub profile: String,
     pub group_variant_id: String,
@@ -43,6 +44,18 @@ pub struct OidfDriverPlanEntry {
     pub config_template: Value,
     pub required_capabilities: Vec<String>,
     pub expected_skipped_modules: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidfBoundedRunnerContract {
+    pub protocol: String,
+    pub minimum_jobs: u32,
+    pub maximum_jobs: u32,
+    pub independent_plan_tasks_required: bool,
+    pub independent_evidence_required: bool,
+    pub failure_collection_required: bool,
+    pub finally_cleanup_required: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -60,6 +73,7 @@ pub struct OidfDriverInspectionPlan {
     pub selected_plan_count: u32,
     pub selected_resource_budget: OidfPlanResourceBudget,
     pub latest_execution_start_at: i64,
+    pub runner: OidfBoundedRunnerContract,
     pub plans: Vec<OidfDriverPlanEntry>,
     pub deployment_bound: bool,
     pub capabilities_attested: bool,
@@ -170,6 +184,7 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
                 .cloned()
                 .ok_or(OidfPlanError::CacheIdentity)?;
             entries.push(OidfDriverPlanEntry {
+                task_jti: uuid::Uuid::now_v7().to_string(),
                 group_id: group.id.clone(),
                 profile: group.profile.clone(),
                 group_variant_id: group.variant.id.clone(),
@@ -216,6 +231,8 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
     }
     let selected_group_count =
         u32::try_from(selected_groups.len()).map_err(|_| OidfPlanError::ResourceBound)?;
+    let maximum_jobs =
+        u32::try_from(crate::MAX_PARALLEL_JOBS).map_err(|_| OidfPlanError::ResourceBound)?;
     Ok(OidfDriverInspectionPlan {
         schema: OIDF_DRIVER_INSPECTION_PLAN_SCHEMA,
         plan_jti: uuid::Uuid::now_v7().to_string(),
@@ -229,6 +246,15 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
         selected_plan_count,
         selected_resource_budget,
         latest_execution_start_at,
+        runner: OidfBoundedRunnerContract {
+            protocol: crate::BOUNDED_PLAN_RUNNER_PROTOCOL.to_owned(),
+            minimum_jobs: if selected_plan_count > 1 { 2 } else { 1 },
+            maximum_jobs,
+            independent_plan_tasks_required: true,
+            independent_evidence_required: true,
+            failure_collection_required: true,
+            finally_cleanup_required: true,
+        },
         plans: entries,
         deployment_bound: false,
         capabilities_attested: false,
@@ -318,10 +344,44 @@ mod tests {
             Some(&"code".to_owned())
         );
         assert_eq!(plan.plans[0].driver_handler.id, "default");
+        assert!(uuid::Uuid::parse_str(&plan.plans[0].task_jti).is_ok());
+        assert_eq!(plan.runner.protocol, crate::BOUNDED_PLAN_RUNNER_PROTOCOL);
+        assert_eq!(plan.runner.minimum_jobs, 1);
+        assert_eq!(plan.runner.maximum_jobs, 4);
+        assert!(plan.runner.independent_plan_tasks_required);
+        assert!(plan.runner.independent_evidence_required);
+        assert!(plan.runner.failure_collection_required);
+        assert!(plan.runner.finally_cleanup_required);
         assert!(!plan.deployment_bound);
         assert!(!plan.capabilities_attested);
         assert!(!plan.execution_permitted);
         assert_eq!(plan.execution_blockers.len(), 4);
+    }
+
+    #[test]
+    fn multi_plan_contract_requires_existing_bounded_parallel_runner() {
+        let matrix = matrix_bytes();
+        let plan = compile_oidf_driver_inspection_plan(
+            cached(&matrix),
+            &matrix,
+            &BTreeSet::from(["nazoauth.client.create".to_owned()]),
+            OidfPlanSelection::default(),
+            1_800_000_000,
+        )
+        .expect("inspection plan");
+
+        assert!(plan.selected_plan_count > 1);
+        assert_eq!(plan.runner.minimum_jobs, 2);
+        assert_eq!(plan.runner.maximum_jobs, crate::MAX_PARALLEL_JOBS as u32);
+        assert!(
+            plan.plans
+                .iter()
+                .map(|entry| entry.task_jti.as_str())
+                .collect::<BTreeSet<_>>()
+                .len()
+                == plan.plans.len()
+        );
+        assert!(!plan.execution_permitted);
     }
 
     #[test]

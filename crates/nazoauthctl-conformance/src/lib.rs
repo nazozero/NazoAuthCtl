@@ -45,7 +45,8 @@ pub use artifact_driver::{
     OidfDriverLane, OidfDriverProgram,
 };
 pub use artifact_plan::{
-    OidfDriverInspectionPlan, OidfDriverPlanEntry, OidfPlanError, OidfPlanSelection,
+    OidfBoundedRunnerContract, OidfDriverInspectionPlan, OidfDriverPlanEntry, OidfPlanError,
+    OidfPlanSelection,
 };
 pub use browser::{
     BrowserAutomation, BrowserCommand, BrowserDriver, BrowserEntry, BrowserError, BrowserExecutor,
@@ -76,8 +77,9 @@ pub use matrix::{
     MatrixGroup, MatrixPlan, MatrixSelection, MatrixVariant, SelectedMatrix,
 };
 pub use orchestrator::{
-    ConformanceAutomation, ConformanceRunConfig, ConformanceRunner, MAX_PARALLEL_JOBS,
-    MAX_POLL_TIMEOUT, MAX_POLL_TIMEOUT_SECONDS, OrchestrationError, RunControl, RunSummary,
+    BOUNDED_PLAN_RUNNER_PROTOCOL, ConformanceAutomation, ConformanceRunConfig, ConformanceRunner,
+    MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT, MAX_POLL_TIMEOUT_SECONDS, OrchestrationError, RunControl,
+    RunSummary,
 };
 pub use origin::{Origin, OriginError};
 pub use progress::{

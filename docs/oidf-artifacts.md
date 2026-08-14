@@ -202,7 +202,7 @@ does not create a competing template canonicalization rule. It also sums the
 selected signed resource budgets and rejects a selection that cannot finish
 strictly before the artifact's exclusive expiry.
 
-Inspection-plan schema 4 is evidence, not an execution authorization. It carries
+Inspection-plan schema 5 is evidence, not an execution authorization. It carries
 a plan JTI but deliberately records `deployment_bound: false`,
 `capabilities_attested: false`, and `execution_permitted: false`, together with
 the authenticated negotiation, ordinary resource provider, target/Suite origin policy, and
@@ -210,6 +210,17 @@ deployment-bound crash-safe journal blockers. The command creates no NazoAuth
 resource, Suite plan, execution journal, or cleanup obligation. Signed budgets
 are contract ceilings, not proof of runtime enforcement; a future runner must
 enforce them against observed Suite modules, created clients, and elapsed time.
+
+Schema 5 also binds the delivery contract to
+`nazoauthctl-bounded-plan-runner-v1`, the existing runner whose behavior tests
+cover a frozen plan denominator, worker-owned automation state, a maximum of
+four jobs, a global serialized CIBA lane, stop-launching on fatal failure,
+failure collection, and finally cleanup. Every selected plan receives a unique
+task JTI for future client/state/evidence ownership. A multi-plan selection
+requires at least two jobs and permits at most the runner's existing bound;
+there is no second scheduler and the release stage must not downgrade the full
+matrix to serial execution. These are consumption requirements only and do not
+override `execution_permitted: false`.
 
 The existing run evidence sink now commits each run into a unique owner-only
 directory with a manifest-last digest envelope, and preserves structured output

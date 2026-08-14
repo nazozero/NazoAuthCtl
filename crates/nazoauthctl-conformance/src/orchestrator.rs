@@ -30,6 +30,7 @@ use crate::report::{
 mod parallel;
 
 pub const MAX_PARALLEL_JOBS: usize = 4;
+pub const BOUNDED_PLAN_RUNNER_PROTOCOL: &str = "nazoauthctl-bounded-plan-runner-v1";
 pub const MAX_POLL_TIMEOUT_SECONDS: u64 = 86_400;
 pub const MAX_POLL_TIMEOUT: Duration = Duration::from_secs(MAX_POLL_TIMEOUT_SECONDS);
 
