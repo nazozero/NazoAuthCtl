@@ -10,6 +10,7 @@ mod common;
 mod conformance;
 mod install;
 mod keys;
+mod tls;
 mod transaction;
 mod update;
 
@@ -24,6 +25,7 @@ use common::{no_arguments, parse_candidate_target, parse_version_option, parse_y
 use conformance::parse_conformance;
 use install::parse_install;
 use keys::parse_keys;
+use tls::parse_tls;
 use transaction::{parse_transaction_evidence, parse_transaction_resume};
 use update::parse_update_options;
 
@@ -150,6 +152,7 @@ impl Cli {
             }
             "keys" => Command::Keys(parse_keys(values)?),
             "conformance" => Command::Conformance(parse_conformance(values)?),
+            "tls" => Command::Tls(parse_tls(values)?),
             "audit" if values == ["verify"] => Command::AuditVerify,
             "audit" if values.first().is_some_and(|value| value == "show") => {
                 values.remove(0);

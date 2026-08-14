@@ -201,7 +201,72 @@ fn help_topics_follow_user_intent_even_with_an_explicit_config() {
         help_topic(&values(&["nazoauthctl", "conformance", "--help"])),
         Some(HelpTopic::Conformance)
     );
+    assert_eq!(
+        help_topic(&values(&["nazoauthctl", "tls", "--help"])),
+        Some(HelpTopic::Tls)
+    );
     assert_eq!(help_topic(&values(&["nazoauthctl", "status"])), None);
+}
+
+#[test]
+fn parses_tls_certificate_plan_apply_recover_and_show() {
+    let material = [
+        "--provider-config",
+        "/etc/nazoauth/tls-provider.json",
+        "--tenant",
+        "tenant-a",
+        "--hostname",
+        "auth.example",
+        "--certificate",
+        "/run/import/fullchain.pem",
+        "--private-key",
+        "/run/import/private-key.pem",
+    ];
+    let mut plan = vec!["nazoauthctl", "tls", "certificate", "plan"];
+    plan.extend(material);
+    assert!(matches!(
+        parse(&plan).unwrap().unwrap().command,
+        Command::Tls(TlsCommand::Plan(_))
+    ));
+
+    let mut apply = vec!["nazoauthctl", "tls", "certificate", "apply"];
+    apply.extend(material);
+    apply.push("--yes");
+    assert!(matches!(
+        parse(&apply).unwrap().unwrap().command,
+        Command::Tls(TlsCommand::Apply { yes: true, .. })
+    ));
+    assert!(
+        parse(&[
+            "nazoauthctl",
+            "tls",
+            "certificate",
+            "recover",
+            "--tenant",
+            "tenant-a",
+            "--hostname",
+            "auth.example",
+            "--yes",
+        ])
+        .is_ok()
+    );
+    assert!(
+        parse(&[
+            "nazoauthctl",
+            "tls",
+            "certificate",
+            "show",
+            "--tenant",
+            "tenant-a",
+            "--hostname",
+            "auth.example",
+        ])
+        .is_ok()
+    );
+    let mut invalid_plan = vec!["nazoauthctl", "tls", "certificate", "plan"];
+    invalid_plan.extend(material);
+    invalid_plan.push("--yes");
+    assert!(parse(&invalid_plan).is_err());
 }
 
 #[test]

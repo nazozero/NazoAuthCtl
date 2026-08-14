@@ -14,6 +14,7 @@ mod release;
 mod runtime;
 mod runtime_backend;
 mod secret_provider;
+mod tls;
 
 pub(crate) use nazoauthctl_runtime::filesystem;
 pub(crate) use nazoauthctl_runtime::process;
@@ -247,6 +248,25 @@ to explicit migration and conformance operations and binds the operator task to 
 exact active OCI digest and embedded identity; ordinary operations still require the
 signed active Release.
 TTL is 60 through 86400 seconds."
+        }
+        cli::HelpTopic::Tls => {
+            "Usage:
+  nazoauthctl --deployment ID tls certificate plan --provider-config PATH \
+    --tenant TENANT --hostname HOST --certificate PATH --private-key PATH
+  nazoauthctl --deployment ID tls certificate apply --provider-config PATH \
+    --tenant TENANT --hostname HOST --certificate PATH --private-key PATH --yes
+  nazoauthctl --deployment ID tls certificate recover --tenant TENANT --hostname HOST --yes
+  nazoauthctl --deployment ID tls certificate show --tenant TENANT --hostname HOST
+
+The external-generation-v1 provider uses an immutable generation directory and
+one atomic `current` symlink. Its strict provider JSON declares material_root,
+activation_link, trust_anchors, public_url, accepted_statuses, and separate
+validate/reload commands. Validation runs against the candidate before activation;
+reload is followed by a public TLS handshake, exact leaf-certificate digest check,
+and bounded HTTP health request. Interrupted transactions are rolled back by the
+explicit recover command. This provider controls only deployment-owned public TLS
+material under the granted proxy_tls capability; it neither creates NazoAuth
+protocol keys nor claims Direct TLS capability negotiation."
         }
         cli::HelpTopic::Audit => {
             "Usage:

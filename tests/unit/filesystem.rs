@@ -201,7 +201,7 @@ fn secure_secret_reader_allows_read_only_group_acl_but_not_world_read() {
 
 #[cfg(unix)]
 #[test]
-fn symlink_activation_replaces_a_stale_staging_link() {
+fn symlink_activation_preserves_foreign_staging_and_commits_only_its_unique_link() {
     use std::os::unix::fs::symlink;
 
     let work = PrivateTempDir::new("nazoauthctl-symlink-test").unwrap();
@@ -215,5 +215,15 @@ fn symlink_activation_replaces_a_stale_staging_link() {
 
     symlink_atomic(&second, &link).unwrap();
     assert_eq!(fs::read_link(&link).unwrap(), second);
-    assert!(!staging.exists());
+    assert_eq!(fs::read_link(&staging).unwrap(), first);
+
+    let staged_links = fs::read_dir(work.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("current.next-"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        staged_links,
+        vec![staging.file_name().unwrap().to_string_lossy().into_owned()]
+    );
 }
