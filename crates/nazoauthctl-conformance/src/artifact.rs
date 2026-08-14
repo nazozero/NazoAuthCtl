@@ -7,9 +7,10 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use url::Url;
 
-pub const OIDF_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+pub const OIDF_TRUST_POLICY_SCHEMA_VERSION: u32 = 1;
+pub const OIDF_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 pub const OIDF_DRIVER_ENGINE_PROTOCOL: u32 = 1;
-pub const OIDF_MATRIX_SCHEMA_VERSION: u32 = 1;
+pub const OIDF_MATRIX_SCHEMA_VERSION: u32 = 2;
 pub const MAX_SIGNED_DRIVER_BYTES: usize = 1024 * 1024;
 pub const MAX_ARTIFACT_MATRIX_BYTES: usize = 8 * 1024 * 1024;
 
@@ -100,6 +101,7 @@ pub struct OidfArtifactMatrixVariant {
 pub struct OidfArtifactMatrixPlan {
     pub id: String,
     pub plan: String,
+    pub resource_budget: OidfPlanResourceBudget,
     pub config_template: Value,
     #[serde(default)]
     pub variant: std::collections::BTreeMap<String, String>,
@@ -107,6 +109,14 @@ pub struct OidfArtifactMatrixPlan {
     pub required_capabilities: Vec<String>,
     #[serde(default)]
     pub expected_results: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidfPlanResourceBudget {
+    pub modules: u32,
+    pub clients: u32,
+    pub wall_clock_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -126,6 +136,9 @@ pub struct VerifiedOidfArtifact {
     pub matrix_size: u64,
     pub matrix_groups: u32,
     pub matrix_plans: u32,
+    pub matrix_modules: u32,
+    pub matrix_clients: u32,
+    pub matrix_wall_clock_seconds: u64,
     pub not_before: i64,
     pub expires_at: i64,
     pub resource_bounds: OidfResourceBounds,
@@ -179,13 +192,7 @@ impl ArtifactTrustPolicy {
             return Err(ArtifactError::TrustPolicy);
         }
         let policy: Self = serde_json::from_slice(bytes).map_err(|_| ArtifactError::TrustPolicy)?;
-        policy.verifying_key()?;
-        policy.validated_source()?;
-        if policy.schema != OIDF_ARTIFACT_SCHEMA_VERSION
-            || !valid_signer_identity(&policy.signer_identity)
-        {
-            return Err(ArtifactError::TrustPolicy);
-        }
+        policy.validate()?;
         Ok(policy)
     }
 
@@ -204,6 +211,17 @@ impl ArtifactTrustPolicy {
         Ok(key)
     }
 
+    fn validate(&self) -> Result<Url, ArtifactError> {
+        self.verifying_key()?;
+        let source = self.validated_source()?;
+        if self.schema != OIDF_TRUST_POLICY_SCHEMA_VERSION
+            || !valid_signer_identity(&self.signer_identity)
+        {
+            return Err(ArtifactError::TrustPolicy);
+        }
+        Ok(source)
+    }
+
     fn validated_source(&self) -> Result<Url, ArtifactError> {
         let source =
             validated_https_url(&self.source, true).map_err(|_| ArtifactError::TrustPolicy)?;
@@ -214,7 +232,7 @@ impl ArtifactTrustPolicy {
     }
 
     pub(crate) fn accepts_url(&self, value: &str) -> bool {
-        let Ok(source) = self.validated_source() else {
+        let Ok(source) = self.validate() else {
             return false;
         };
         validated_https_url(value, false)
@@ -239,6 +257,7 @@ pub fn verify_oidf_driver_manifest(
     available_capabilities: &BTreeSet<String>,
     now: i64,
 ) -> Result<VerifiedOidfDriverManifest, ArtifactError> {
+    trust.validate()?;
     if compact_manifest.is_empty() || compact_manifest.len() > MAX_SIGNED_DRIVER_BYTES {
         return Err(ArtifactError::Oversize);
     }
@@ -291,7 +310,7 @@ pub fn verify_oidf_matrix(
     driver: VerifiedOidfDriverManifest,
     matrix_bytes: &[u8],
 ) -> Result<VerifiedOidfArtifact, ArtifactError> {
-    let matrix = validate_matrix(matrix_bytes, &driver.manifest)?;
+    let (matrix, matrix_budget) = validate_matrix(matrix_bytes, &driver.manifest)?;
     let matrix_plans = matrix
         .groups
         .iter()
@@ -315,6 +334,9 @@ pub fn verify_oidf_matrix(
             .map_err(|_| ArtifactError::MatrixPolicy("matrix group count exceeds u32"))?,
         matrix_plans: u32::try_from(matrix_plans)
             .map_err(|_| ArtifactError::MatrixPolicy("matrix plan count exceeds u32"))?,
+        matrix_modules: matrix_budget.modules,
+        matrix_clients: matrix_budget.clients,
+        matrix_wall_clock_seconds: matrix_budget.wall_clock_seconds,
         not_before: manifest.not_before,
         expires_at: manifest.expires_at,
         resource_bounds: manifest.resource_bounds,
@@ -380,7 +402,7 @@ fn validate_manifest(
         || manifest.expires_at <= manifest.not_before
         || manifest.expires_at - manifest.issued_at > MAX_ARTIFACT_LIFETIME_SECONDS
         || now < manifest.not_before
-        || now > manifest.expires_at
+        || now >= manifest.expires_at
     {
         return Err(ArtifactError::ManifestPolicy(
             "artifact is outside its validity window",
@@ -421,13 +443,21 @@ fn validate_manifest(
             "resource bounds are outside controller policy",
         ));
     }
+    if manifest.expires_at - manifest.not_before
+        <= i64::try_from(bounds.max_wall_clock_seconds)
+            .map_err(|_| ArtifactError::ManifestPolicy("wall-clock bound exceeds i64"))?
+    {
+        return Err(ArtifactError::ManifestPolicy(
+            "artifact validity cannot contain its signed wall-clock bound",
+        ));
+    }
     Ok(())
 }
 
 fn validate_matrix(
     bytes: &[u8],
     manifest: &OidfDriverManifest,
-) -> Result<OidfArtifactMatrix, ArtifactError> {
+) -> Result<(OidfArtifactMatrix, OidfPlanResourceBudget), ArtifactError> {
     if bytes.is_empty()
         || bytes.len() > MAX_ARTIFACT_MATRIX_BYTES
         || bytes.len() as u64 != manifest.matrix.size
@@ -452,6 +482,11 @@ fn validate_matrix(
     let mut group_ids = BTreeSet::new();
     let mut plan_ids = BTreeSet::new();
     let mut plan_count = 0usize;
+    let mut matrix_budget = OidfPlanResourceBudget {
+        modules: 0,
+        clients: 0,
+        wall_clock_seconds: 0,
+    };
     for group in &matrix.groups {
         validate_identifier(&group.id, 128).map_err(ArtifactError::MatrixPolicy)?;
         validate_identifier(&group.profile, 128).map_err(ArtifactError::MatrixPolicy)?;
@@ -466,6 +501,26 @@ fn validate_matrix(
             plan_count = plan_count.saturating_add(1);
             validate_identifier(&plan.id, 128).map_err(ArtifactError::MatrixPolicy)?;
             validate_identifier(&plan.plan, 256).map_err(ArtifactError::MatrixPolicy)?;
+            validate_plan_resource_budget(&plan.resource_budget, &manifest.resource_bounds)
+                .map_err(ArtifactError::MatrixPolicy)?;
+            matrix_budget.modules = matrix_budget
+                .modules
+                .checked_add(plan.resource_budget.modules)
+                .ok_or(ArtifactError::MatrixPolicy(
+                    "matrix module budget overflows",
+                ))?;
+            matrix_budget.clients = matrix_budget
+                .clients
+                .checked_add(plan.resource_budget.clients)
+                .ok_or(ArtifactError::MatrixPolicy(
+                    "matrix client budget overflows",
+                ))?;
+            matrix_budget.wall_clock_seconds = matrix_budget
+                .wall_clock_seconds
+                .checked_add(plan.resource_budget.wall_clock_seconds)
+                .ok_or(ArtifactError::MatrixPolicy(
+                    "matrix wall-clock budget overflows",
+                ))?;
             validate_variant(&plan.variant).map_err(ArtifactError::MatrixPolicy)?;
             validate_capabilities(&plan.required_capabilities)
                 .map_err(ArtifactError::MatrixPolicy)?;
@@ -481,13 +536,14 @@ fn validate_matrix(
                     "matrix plans must be unique and contain object templates",
                 ));
             }
-            if plan.expected_results.len() > 64
+            if plan.expected_results.len() > plan.resource_budget.modules as usize
+                || plan.expected_results.len() > 64
                 || plan.expected_results.iter().any(|(module, result)| {
                     validate_identifier(module, 256).is_err() || result != "SKIPPED"
                 })
             {
                 return Err(ArtifactError::MatrixPolicy(
-                    "only exact SKIPPED exceptions may be declared",
+                    "expected SKIPPED exceptions exceed the plan budget or are invalid",
                 ));
             }
             let mut nodes = 0usize;
@@ -500,7 +556,30 @@ fn validate_matrix(
             "matrix plan count exceeds the signed resource bound",
         ));
     }
-    Ok(matrix)
+    if matrix_budget.modules > manifest.resource_bounds.max_modules
+        || matrix_budget.clients > manifest.resource_bounds.max_clients
+        || matrix_budget.wall_clock_seconds > manifest.resource_bounds.max_wall_clock_seconds
+    {
+        return Err(ArtifactError::MatrixPolicy(
+            "matrix resource budget exceeds the signed artifact bounds",
+        ));
+    }
+    Ok((matrix, matrix_budget))
+}
+
+fn validate_plan_resource_budget(
+    budget: &OidfPlanResourceBudget,
+    bounds: &OidfResourceBounds,
+) -> Result<(), &'static str> {
+    if budget.modules == 0
+        || budget.modules > bounds.max_modules
+        || budget.clients > bounds.max_clients
+        || budget.wall_clock_seconds == 0
+        || budget.wall_clock_seconds > bounds.max_wall_clock_seconds
+    {
+        return Err("plan resource budget is outside the signed artifact bounds");
+    }
+    Ok(())
 }
 
 fn validate_template(value: &Value, depth: usize, nodes: &mut usize) -> Result<(), &'static str> {
@@ -514,10 +593,16 @@ fn validate_template(value: &Value, depth: usize, nodes: &mut usize) -> Result<(
                 if !valid_bounded_text(key, 256) {
                     return Err("matrix template contains an invalid key");
                 }
-                if sensitive_key(key)
-                    && !matches!(child, Value::String(text) if valid_placeholder(text))
-                {
-                    return Err("matrix template embeds sensitive material");
+                match sensitive_field(key) {
+                    Some(SensitiveField::PlaceholderOnly) if !matches!(child, Value::String(text) if valid_placeholder(text)) =>
+                    {
+                        return Err("matrix template embeds sensitive material");
+                    }
+                    Some(SensitiveField::JwkContainer) if matches!(child, Value::String(text) if !valid_placeholder(text)) =>
+                    {
+                        return Err("matrix template embeds serialized sensitive material");
+                    }
+                    _ => {}
                 }
                 validate_template(child, depth + 1, nodes)?;
             }
@@ -530,8 +615,14 @@ fn validate_template(value: &Value, depth: usize, nodes: &mut usize) -> Result<(
         Value::String(text) => {
             if text.len() > 16 * 1024
                 || ((text.contains("{{") || text.contains("}}")) && !valid_placeholder(text))
+                || contains_private_key_pem(text)
             {
                 return Err("matrix template contains an invalid string");
+            }
+            if matches!(text.trim_start().as_bytes().first(), Some(b'{' | b'['))
+                && let Ok(serialized) = serde_json::from_str::<Value>(text)
+            {
+                validate_template(&serialized, depth + 1, nodes)?;
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -546,38 +637,65 @@ fn valid_placeholder(value: &str) -> bool {
     else {
         return false;
     };
-    !inner.is_empty()
-        && inner.len() <= 256
-        && matches!(
-            inner.split_once('.').map(|(namespace, _)| namespace),
-            Some("target" | "suite" | "resource" | "run")
-        )
-        && inner
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    if inner.is_empty() || inner.len() > 256 {
+        return false;
+    }
+    let mut segments = inner.split('.');
+    if !matches!(
+        segments.next(),
+        Some("target" | "suite" | "resource" | "run")
+    ) {
+        return false;
+    }
+    let mut path_segments = 0usize;
+    for segment in segments {
+        if segment.is_empty()
+            || !segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-'))
+        {
+            return false;
+        }
+        path_segments += 1;
+    }
+    path_segments > 0
 }
 
-fn sensitive_key(key: &str) -> bool {
-    matches!(
-        key.to_ascii_lowercase().as_str(),
-        "password"
-            | "password_hash"
-            | "token"
-            | "access_token"
-            | "refresh_token"
-            | "client_secret"
-            | "private_key"
-            | "private_jwk"
-            | "private_jwks"
-            | "d"
-            | "p"
-            | "q"
-            | "dp"
-            | "dq"
-            | "qi"
-            | "oth"
-            | "k"
-    )
+#[derive(Clone, Copy)]
+enum SensitiveField {
+    PlaceholderOnly,
+    JwkContainer,
+}
+
+fn sensitive_field(key: &str) -> Option<SensitiveField> {
+    let normalized = key
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| byte.to_ascii_lowercase() as char)
+        .collect::<String>();
+    match normalized.as_str() {
+        "password" | "passwordhash" | "passwd" | "token" | "accesstoken" | "refreshtoken"
+        | "idtoken" | "clientsecret" | "clientassertion" | "secret" | "apikey" | "privatekey"
+        | "privatejwk" | "privatejwks" | "signingkey" | "d" | "p" | "q" | "dp" | "dq" | "qi"
+        | "oth" | "k" => Some(SensitiveField::PlaceholderOnly),
+        "authorization" | "authorizationheader" | "credential" | "credentials" => {
+            Some(SensitiveField::PlaceholderOnly)
+        }
+        "jwk" | "jwks" => Some(SensitiveField::JwkContainer),
+        _ => None,
+    }
+}
+
+fn contains_private_key_pem(value: &str) -> bool {
+    [
+        "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
 }
 
 fn validate_capabilities(values: &[String]) -> Result<(), &'static str> {
@@ -602,7 +720,13 @@ fn validate_variant(
     }
     for (key, value) in values {
         validate_identifier(key, 128)?;
-        validate_identifier(value, 256)?;
+        if sensitive_field(key).is_some() {
+            if !valid_placeholder(value) {
+                return Err("matrix variant embeds sensitive material");
+            }
+        } else {
+            validate_identifier(value, 256)?;
+        }
     }
     Ok(())
 }
@@ -721,7 +845,7 @@ mod tests {
         let key = signing_key();
         let public = key.verifying_key().to_encoded_point(true);
         ArtifactTrustPolicy {
-            schema: 1,
+            schema: OIDF_TRUST_POLICY_SCHEMA_VERSION,
             source: "https://artifacts.example/oidf/".to_owned(),
             signer_identity:
                 "https://github.com/example/oidf-driver/.github/workflows/release.yml@refs/tags/v1.2.3"
@@ -733,7 +857,7 @@ mod tests {
 
     fn matrix() -> Vec<u8> {
         serde_json::to_vec(&OidfArtifactMatrix {
-            schema: 1,
+            schema: OIDF_MATRIX_SCHEMA_VERSION,
             name: "official-fixed-matrix".to_owned(),
             groups: vec![OidfArtifactMatrixGroup {
                 id: "oidc-core".to_owned(),
@@ -745,6 +869,11 @@ mod tests {
                 plans: vec![OidfArtifactMatrixPlan {
                     id: "oidc-core-p001".to_owned(),
                     plan: "oidcc-basic-certification-test-plan".to_owned(),
+                    resource_budget: OidfPlanResourceBudget {
+                        modules: 32,
+                        clients: 2,
+                        wall_clock_seconds: 600,
+                    },
                     config_template: serde_json::json!({
                         "alias": "{{run.alias}}",
                         "server": {"discoveryUrl": "{{target.discovery_url}}"},
@@ -764,7 +893,7 @@ mod tests {
 
     fn manifest(matrix: &[u8]) -> OidfDriverManifest {
         OidfDriverManifest {
-            schema: 1,
+            schema: OIDF_ARTIFACT_SCHEMA_VERSION,
             artifact_id: "official-oidf-driver".to_owned(),
             revision: "a".repeat(40),
             source: trust().source,
@@ -780,7 +909,7 @@ mod tests {
             engine_protocol: 1,
             required_capabilities: vec!["nazoauth.client.create".to_owned()],
             matrix: OidfMatrixIdentity {
-                schema: 1,
+                schema: OIDF_MATRIX_SCHEMA_VERSION,
                 url: "https://artifacts.example/oidf/v1.2.3/matrix.json".to_owned(),
                 sha256: digest(matrix),
                 size: matrix.len() as u64,
@@ -789,7 +918,7 @@ mod tests {
                 max_plans: 32,
                 max_modules: 512,
                 max_clients: 64,
-                max_wall_clock_seconds: 14_400,
+                max_wall_clock_seconds: 3600,
             },
         }
     }
@@ -825,6 +954,9 @@ mod tests {
         assert_eq!(verified.driver_manifest_sha256, digest(compact.as_bytes()));
         assert_eq!(verified.matrix_groups, 1);
         assert_eq!(verified.matrix_plans, 1);
+        assert_eq!(verified.matrix_modules, 32);
+        assert_eq!(verified.matrix_clients, 2);
+        assert_eq!(verified.matrix_wall_clock_seconds, 600);
         assert_eq!(verified.suite.release, "v5.2.2");
     }
 
@@ -917,6 +1049,42 @@ mod tests {
             verify_oidf_artifact(&sign(&bounded), &matrix, &trust(), &capabilities(), NOW),
             Err(ArtifactError::ManifestPolicy(_))
         ));
+
+        let mut resource_overflow: OidfArtifactMatrix =
+            serde_json::from_slice(&matrix).expect("matrix");
+        resource_overflow.groups[0].plans[0].resource_budget.modules = 513;
+        let resource_overflow = serde_json::to_vec(&resource_overflow).expect("resource overflow");
+        assert!(matches!(
+            verify_oidf_artifact(
+                &sign(&manifest(&resource_overflow)),
+                &resource_overflow,
+                &trust(),
+                &capabilities(),
+                NOW
+            ),
+            Err(ArtifactError::MatrixPolicy(_))
+        ));
+
+        let mut exception_overflow: OidfArtifactMatrix =
+            serde_json::from_slice(&matrix).expect("matrix");
+        exception_overflow.groups[0].plans[0]
+            .resource_budget
+            .modules = 1;
+        exception_overflow.groups[0].plans[0]
+            .expected_results
+            .insert("oidcc-second-skip".to_owned(), "SKIPPED".to_owned());
+        let exception_overflow =
+            serde_json::to_vec(&exception_overflow).expect("exception overflow");
+        assert!(matches!(
+            verify_oidf_artifact(
+                &sign(&manifest(&exception_overflow)),
+                &exception_overflow,
+                &trust(),
+                &capabilities(),
+                NOW
+            ),
+            Err(ArtifactError::MatrixPolicy(_))
+        ));
     }
 
     #[test]
@@ -927,6 +1095,127 @@ mod tests {
         assert_eq!(
             ArtifactTrustPolicy::from_bytes(&bytes),
             Err(ArtifactError::TrustPolicy)
+        );
+    }
+
+    #[test]
+    fn public_verifier_revalidates_trust_policy_and_uses_exclusive_expiry() {
+        let matrix = matrix();
+        let compact = sign(&manifest(&matrix));
+        let mut invalid_trust = trust();
+        invalid_trust.schema = OIDF_TRUST_POLICY_SCHEMA_VERSION + 1;
+        assert_eq!(
+            verify_oidf_artifact(&compact, &matrix, &invalid_trust, &capabilities(), NOW),
+            Err(ArtifactError::TrustPolicy)
+        );
+
+        let mut expired = manifest(&matrix);
+        expired.expires_at = NOW;
+        expired.resource_bounds.max_wall_clock_seconds = 10;
+        assert!(matches!(
+            verify_oidf_driver_manifest(&sign(&expired), &trust(), &capabilities(), NOW),
+            Err(ArtifactError::ManifestPolicy(_))
+        ));
+
+        let mut no_completion_margin = manifest(&matrix);
+        no_completion_margin.resource_bounds.max_wall_clock_seconds =
+            u64::try_from(no_completion_margin.expires_at - no_completion_margin.not_before)
+                .unwrap();
+        assert!(matches!(
+            verify_oidf_driver_manifest(
+                &sign(&no_completion_margin),
+                &trust(),
+                &capabilities(),
+                NOW
+            ),
+            Err(ArtifactError::ManifestPolicy(_))
+        ));
+    }
+
+    #[test]
+    fn sensitive_schema_rejects_normalized_variant_serialized_and_pem_bypasses() {
+        assert!(!valid_placeholder("{{resource.}}"));
+        assert!(!valid_placeholder("{{resource..secret}}"));
+        let rejects = |artifact_matrix: OidfArtifactMatrix| {
+            let bytes = serde_json::to_vec(&artifact_matrix).expect("matrix");
+            let result = verify_oidf_artifact(
+                &sign(&manifest(&bytes)),
+                &bytes,
+                &trust(),
+                &capabilities(),
+                NOW,
+            );
+            assert!(matches!(result, Err(ArtifactError::MatrixPolicy(_))));
+        };
+
+        let baseline = || serde_json::from_slice::<OidfArtifactMatrix>(&matrix()).expect("matrix");
+        let mut camel_case = baseline();
+        camel_case.groups[0].plans[0].config_template["clientSecret"] =
+            Value::String("literal".to_owned());
+        rejects(camel_case);
+
+        let mut variant = baseline();
+        variant.groups[0].plans[0]
+            .variant
+            .insert("privateKey".to_owned(), "literal".to_owned());
+        rejects(variant);
+
+        let mut group_variant = baseline();
+        group_variant.groups[0]
+            .variant
+            .values
+            .insert("secret".to_owned(), "literal".to_owned());
+        rejects(group_variant);
+
+        let mut authorization = baseline();
+        authorization.groups[0].plans[0].config_template["authorization"] =
+            serde_json::json!({"value": "Bearer literal"});
+        rejects(authorization);
+
+        let mut serialized = baseline();
+        serialized.groups[0].plans[0].config_template["opaque"] =
+            Value::String(r#"{"jwk":{"kty":"EC","d":"literal"}}"#.to_owned());
+        rejects(serialized);
+
+        let mut pem = baseline();
+        pem.groups[0].plans[0].config_template["opaque"] =
+            Value::String("-----BEGIN PRIVATE KEY-----\nliteral".to_owned());
+        rejects(pem);
+
+        let mut placeholder_variant = baseline();
+        placeholder_variant.groups[0].plans[0].variant.insert(
+            "clientSecret".to_owned(),
+            "{{resource.client.secret}}".to_owned(),
+        );
+        let bytes = serde_json::to_vec(&placeholder_variant).expect("matrix");
+        assert!(
+            verify_oidf_artifact(
+                &sign(&manifest(&bytes)),
+                &bytes,
+                &trust(),
+                &capabilities(),
+                NOW,
+            )
+            .is_ok()
+        );
+
+        let mut public_jwk = baseline();
+        public_jwk.groups[0].plans[0].config_template["jwk"] = serde_json::json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "x": "public-x",
+            "y": "public-y"
+        });
+        let bytes = serde_json::to_vec(&public_jwk).expect("matrix");
+        assert!(
+            verify_oidf_artifact(
+                &sign(&manifest(&bytes)),
+                &bytes,
+                &trust(),
+                &capabilities(),
+                NOW,
+            )
+            .is_ok()
         );
     }
 }
