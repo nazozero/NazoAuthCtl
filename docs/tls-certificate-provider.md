@@ -101,6 +101,13 @@ nazoauthctl --deployment DEPLOYMENT tls certificate apply \
   --private-key /run/cert-import/private-key.pem --yes
 ```
 
+For the exact current ctl-managed ACME issuance receipt, replace the two material
+paths with `--from-acme-current`. The receipt and its private artifacts are
+revalidated and bound into the certificate plan, journal, and receipt; an
+in-progress issuance, stale deployment declaration, or provider/trust digest
+change fails closed. External paths and `--from-acme-current` are mutually
+exclusive.
+
 Plan is read-only. Both commands re-open bounded regular files and independently
 verify the chain against the explicit trust anchors, exact SAN, serverAuth use,
 validity window, and certificate/private-key match. Apply then:

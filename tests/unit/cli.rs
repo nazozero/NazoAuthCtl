@@ -267,6 +267,33 @@ fn parses_tls_certificate_plan_apply_recover_and_show() {
     invalid_plan.extend(material);
     invalid_plan.push("--yes");
     assert!(parse(&invalid_plan).is_err());
+
+    let acme_current = [
+        "nazoauthctl",
+        "tls",
+        "certificate",
+        "plan",
+        "--provider-config",
+        "/etc/nazoauth/tls-provider.json",
+        "--tenant",
+        "tenant-a",
+        "--hostname",
+        "auth.example",
+        "--from-acme-current",
+    ];
+    assert!(matches!(
+        parse(&acme_current).unwrap().unwrap().command,
+        Command::Tls(TlsCommand::Plan(TlsCertificateInput {
+            source: TlsCertificateSource::CurrentAcmeReceipt,
+            ..
+        }))
+    ));
+    let mut mixed = acme_current.to_vec();
+    mixed.extend(["--certificate", "/tmp/cert", "--private-key", "/tmp/key"]);
+    assert!(parse(&mixed).is_err());
+
+    let missing_source = &acme_current[..acme_current.len() - 1];
+    assert!(parse(missing_source).is_err());
 }
 
 #[test]

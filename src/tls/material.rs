@@ -1,6 +1,6 @@
 //! Offline PKI validation for imported public-server TLS material.
 
-use std::{io::Cursor, sync::Arc};
+use std::{io::Cursor, path::Path, sync::Arc};
 
 use anyhow::{Context, bail};
 use chrono::Utc;
@@ -14,11 +14,13 @@ use x509_parser::{certificate::X509Certificate, prelude::FromDer as _};
 use super::{
     LoadedProvider, MAX_CERTIFICATE_BYTES, MAX_PRIVATE_KEY_BYTES, canonical_hostname, sha256,
 };
-use crate::{cli::TlsCertificateInput, filesystem::read_secure_regular_file};
+use crate::filesystem::read_secure_regular_file;
 
 pub(super) struct ValidatedMaterial {
     pub(super) certificate_pem: Vec<u8>,
     pub(super) private_key_pem: zeroize::Zeroizing<Vec<u8>>,
+    pub(super) certificate_sha256: String,
+    pub(super) private_key_sha256: String,
     pub(super) leaf_sha256: String,
     pub(super) material_sha256: String,
     pub(super) not_after: i64,
@@ -26,17 +28,19 @@ pub(super) struct ValidatedMaterial {
 }
 
 pub(super) fn load_and_validate_material(
-    input: &TlsCertificateInput,
+    certificate_path: &Path,
+    private_key_path: &Path,
+    hostname: &str,
     provider: &LoadedProvider,
 ) -> anyhow::Result<ValidatedMaterial> {
     let certificate_pem = read_secure_regular_file(
-        &input.certificate,
+        certificate_path,
         "TLS certificate chain",
         false,
         MAX_CERTIFICATE_BYTES,
     )?;
     let private_key_pem = read_secure_regular_file(
-        &input.private_key,
+        private_key_path,
         "TLS private key",
         true,
         MAX_PRIVATE_KEY_BYTES,
@@ -66,7 +70,7 @@ pub(super) fn load_and_validate_material(
     )
     .build()
     .context("TLS trust anchor set is invalid")?;
-    let server_name = ServerName::try_from(canonical_hostname(&input.hostname)?)
+    let server_name = ServerName::try_from(canonical_hostname(hostname)?)
         .context("TLS hostname cannot be represented as SNI")?;
     use rustls::client::danger::ServerCertVerifier as _;
     verifier
@@ -89,11 +93,14 @@ pub(super) fn load_and_validate_material(
         bail!("TLS certificate expires before the provider minimum validity window");
     }
     let leaf_sha256 = sha256(certificates[0].as_ref());
-    let chain_sha256 = sha256(&certificate_pem);
-    let material_sha256 = sha256(format!("{leaf_sha256}:{chain_sha256}").as_bytes());
+    let certificate_sha256 = sha256(&certificate_pem);
+    let private_key_sha256 = sha256(&private_key_pem);
+    let material_sha256 = sha256(format!("{leaf_sha256}:{certificate_sha256}").as_bytes());
     Ok(ValidatedMaterial {
         certificate_pem: certificate_pem.to_vec(),
         private_key_pem,
+        certificate_sha256,
+        private_key_sha256,
         leaf_sha256,
         material_sha256,
         not_after,

@@ -24,9 +24,11 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::{LoadedProvider, canonical_hostname, canonical_tenant, load_provider, sha256};
+use super::{
+    AcmeInstallSource, LoadedProvider, canonical_hostname, canonical_tenant, load_provider, sha256,
+};
 use crate::{
-    cli::{AcmeCertificateInput, AcmeCommand, TlsCertificateInput},
+    cli::{AcmeCertificateInput, AcmeCommand},
     deployment::{Capability, DeploymentRecord, DeploymentStore},
     filesystem::{
         atomic_write, ensure_private_directory, read_secure_regular_file, remove_file_durable,
@@ -35,7 +37,7 @@ use crate::{
 };
 
 const CONFIG_SCHEMA: u32 = 1;
-const CONFIG_PROTOCOL: &str = "nazoauthctl.acme.http01-webroot.v1";
+pub(super) const CONFIG_PROTOCOL: &str = "nazoauthctl.acme.http01-webroot.v1";
 const PLAN_SCHEMA: u32 = 1;
 const ACCOUNT_SCHEMA: u32 = 1;
 const TRANSACTION_SCHEMA: u32 = 1;
@@ -190,6 +192,11 @@ struct AcmeReceipt {
     issued_at: i64,
 }
 
+struct LoadedAcmeReceipt {
+    receipt: AcmeReceipt,
+    receipt_sha256: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AbortedTransaction {
@@ -233,6 +240,60 @@ pub(super) fn run(
         }
         AcmeCommand::Show { tenant, hostname } => show(&store, selector, &tenant, &hostname),
     }
+}
+
+pub(super) fn current_install_source(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    provider: &LoadedProvider,
+    tenant: &str,
+    hostname: &str,
+) -> anyhow::Result<AcmeInstallSource> {
+    let tenant = canonical_tenant(tenant)?;
+    let hostname = canonical_hostname(hostname)?;
+    ensure_no_pending(store, record, &tenant, &hostname)?;
+    let loaded = load_receipt_record(store, record, &tenant, &hostname)?
+        .context("no current ACME issuance receipt exists for this binding")?;
+    let receipt = loaded.receipt;
+    validate_install_authority(
+        &receipt,
+        record.declaration_revision,
+        &provider.config_sha256,
+        &provider.trust_anchors_sha256,
+    )?;
+    Ok(AcmeInstallSource {
+        receipt_sha256: loaded.receipt_sha256,
+        issuance_jti: receipt.jti,
+        issuance_declaration_revision: receipt.declaration_revision,
+        issuance_revision: receipt.revision,
+        acme_protocol: receipt.acme_protocol,
+        acme_config_sha256: receipt.acme_config_sha256,
+        certificate_path: receipt.certificate_path,
+        private_key_path: receipt.private_key_path,
+        certificate_sha256: receipt.certificate_sha256,
+        private_key_sha256: receipt.private_key_sha256,
+        leaf_certificate_sha256: receipt.leaf_certificate_sha256,
+        material_sha256: receipt.material_sha256,
+        certificate_not_after: receipt.certificate_not_after,
+        issued_at: receipt.issued_at,
+    })
+}
+
+fn validate_install_authority(
+    receipt: &AcmeReceipt,
+    declaration_revision: u64,
+    provider_config_sha256: &str,
+    trust_anchors_sha256: &str,
+) -> anyhow::Result<()> {
+    if receipt.declaration_revision != declaration_revision {
+        bail!("current ACME receipt declaration revision differs from the deployment");
+    }
+    if receipt.provider_config_sha256 != provider_config_sha256
+        || receipt.trust_anchors_sha256 != trust_anchors_sha256
+    {
+        bail!("current ACME receipt provider authority differs from the install provider");
+    }
+    Ok(())
 }
 
 fn plan(
@@ -1117,13 +1178,9 @@ fn commit_issued_material(
     transaction.certificate_sha256 = Some(sha256(certificate));
     persist_pending(store, transaction)?;
     let material = super::material::load_and_validate_material(
-        &TlsCertificateInput {
-            provider_config: transaction.workspace.join("provider-config.json"),
-            certificate: certificate_path.clone(),
-            private_key: private_key_path.clone(),
-            tenant: transaction.tenant.clone(),
-            hostname: transaction.hostname.clone(),
-        },
+        &certificate_path,
+        &private_key_path,
+        &transaction.hostname,
         provider,
     )?;
     let receipt = AcmeReceipt {
@@ -1410,6 +1467,14 @@ fn validate_receipt_shape(store: &DeploymentStore, receipt: &AcmeReceipt) -> any
         || receipt.transaction_created_at > receipt.issued_at
         || receipt.issued_at > receipt.transaction_expires_at
         || receipt.certificate_not_after <= receipt.issued_at
+        || receipt.material_sha256
+            != sha256(
+                format!(
+                    "{}:{}",
+                    receipt.leaf_certificate_sha256, receipt.certificate_sha256
+                )
+                .as_bytes(),
+            )
     {
         bail!("ACME issuance receipt has invalid paths or time ordering");
     }
@@ -1476,6 +1541,7 @@ fn validate_receipt_transaction(
     transaction: &AcmeTransaction,
 ) -> anyhow::Result<()> {
     if receipt.schema != RECEIPT_SCHEMA
+        || receipt.acme_protocol != CONFIG_PROTOCOL
         || receipt.jti != transaction.jti
         || receipt.deployment_id != transaction.deployment_id
         || receipt.declaration_revision != transaction.declaration_revision
@@ -1581,17 +1647,24 @@ fn persist_receipt(
     transaction: &AcmeTransaction,
     receipt: &AcmeReceipt,
 ) -> anyhow::Result<()> {
-    atomic_write(
-        &acme_binding_directory(
-            store,
-            &transaction.deployment_id,
-            &transaction.tenant,
-            &transaction.hostname,
-        )
-        .join("current.json"),
-        &serde_json::to_vec_pretty(receipt)?,
-        0o600,
-    )
+    let directory = acme_binding_directory(
+        store,
+        &transaction.deployment_id,
+        &transaction.tenant,
+        &transaction.hostname,
+    );
+    let bytes = serde_json::to_vec_pretty(receipt)?;
+    let archive = directory
+        .join("receipts")
+        .join(format!("{}.json", receipt.revision));
+    match read_optional_private(&archive, "ACME issuance receipt archive", MAX_RECEIPT_BYTES)? {
+        Some(existing) if existing != bytes => {
+            bail!("ACME issuance receipt revision archive contains conflicting evidence")
+        }
+        Some(_) => {}
+        None => atomic_write(&archive, &bytes, 0o600)?,
+    }
+    atomic_write(&directory.join("current.json"), &bytes, 0o600)
 }
 
 fn load_receipt(
@@ -1600,6 +1673,15 @@ fn load_receipt(
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<Option<AcmeReceipt>> {
+    Ok(load_receipt_record(store, record, tenant, hostname)?.map(|loaded| loaded.receipt))
+}
+
+fn load_receipt_record(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    tenant: &str,
+    hostname: &str,
+) -> anyhow::Result<Option<LoadedAcmeReceipt>> {
     let path =
         acme_binding_directory(store, &record.deployment_id, tenant, hostname).join("current.json");
     let Some(bytes) = read_optional_private(&path, "ACME issuance receipt", MAX_RECEIPT_BYTES)?
@@ -1609,6 +1691,7 @@ fn load_receipt(
     let receipt: AcmeReceipt =
         serde_json::from_slice(&bytes).context("ACME issuance receipt is invalid")?;
     if receipt.schema != RECEIPT_SCHEMA
+        || receipt.acme_protocol != CONFIG_PROTOCOL
         || receipt.deployment_id != record.deployment_id
         || receipt.tenant != canonical_tenant(tenant)?
         || receipt.hostname != canonical_hostname(hostname)?
@@ -1618,7 +1701,10 @@ fn load_receipt(
     }
     validate_receipt_shape(store, &receipt)?;
     validate_receipt_artifacts(store, &receipt)?;
-    Ok(Some(receipt))
+    Ok(Some(LoadedAcmeReceipt {
+        receipt,
+        receipt_sha256: sha256(&bytes),
+    }))
 }
 
 fn validate_receipt_artifacts(
@@ -1942,6 +2028,9 @@ mod tests {
         assert!(validate_receipt_transaction(&receipt, &transaction).is_ok());
         receipt.provider_config_sha256 = "f".repeat(64);
         assert!(validate_receipt_transaction(&receipt, &transaction).is_err());
+        receipt.provider_config_sha256 = transaction.provider_config_sha256.clone();
+        receipt.acme_protocol = "unknown.protocol".to_owned();
+        assert!(validate_receipt_transaction(&receipt, &transaction).is_err());
 
         assert!(validate_previous_receipt(&transaction, None).is_ok());
         transaction.expected_revision = 1;
@@ -1952,6 +2041,91 @@ mod tests {
         assert!(validate_previous_receipt(&transaction, Some(&previous)).is_ok());
         previous.revision = 2;
         assert!(validate_previous_receipt(&transaction, Some(&previous)).is_err());
+    }
+
+    #[test]
+    fn install_consumption_requires_exact_declaration_and_provider_authority() {
+        let transaction = test_transaction(Path::new("/private/state"));
+        let mut receipt = test_receipt(&transaction);
+        assert!(
+            validate_install_authority(
+                &receipt,
+                transaction.declaration_revision,
+                &transaction.provider_config_sha256,
+                &transaction.trust_anchors_sha256,
+            )
+            .is_ok()
+        );
+
+        receipt.declaration_revision += 1;
+        assert!(
+            validate_install_authority(
+                &receipt,
+                transaction.declaration_revision,
+                &transaction.provider_config_sha256,
+                &transaction.trust_anchors_sha256,
+            )
+            .is_err()
+        );
+        receipt.declaration_revision = transaction.declaration_revision;
+        receipt.provider_config_sha256 = "f".repeat(64);
+        assert!(
+            validate_install_authority(
+                &receipt,
+                transaction.declaration_revision,
+                &transaction.provider_config_sha256,
+                &transaction.trust_anchors_sha256,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn receipt_shape_binds_protocol_and_material_identity() {
+        let work = PrivateTempDir::new("nazoauthctl-acme-receipt-shape").unwrap();
+        let store = DeploymentStore {
+            config_root: work.path().join("config"),
+            state_root: work.path().join("state"),
+            break_glass_root: work.path().join("break-glass"),
+        };
+        let transaction = test_transaction_for_store(&store);
+        let mut receipt = test_receipt(&transaction);
+        assert!(validate_receipt_shape(&store, &receipt).is_ok());
+        receipt.material_sha256 = "f".repeat(64);
+        assert!(validate_receipt_shape(&store, &receipt).is_err());
+        receipt = test_receipt(&transaction);
+        receipt.acme_protocol = "unknown.protocol".to_owned();
+        assert!(
+            receipt.acme_protocol != CONFIG_PROTOCOL
+                && validate_receipt_transaction(&receipt, &transaction).is_err()
+        );
+    }
+
+    #[test]
+    fn receipt_commit_archives_exact_revision_before_current_pointer() {
+        let work = PrivateTempDir::new("nazoauthctl-acme-receipt-archive").unwrap();
+        let store = DeploymentStore {
+            config_root: work.path().join("config"),
+            state_root: work.path().join("state"),
+            break_glass_root: work.path().join("break-glass"),
+        };
+        let transaction = test_transaction_for_store(&store);
+        let receipt = test_receipt(&transaction);
+        persist_receipt(&store, &transaction, &receipt).unwrap();
+        let directory = acme_binding_directory(
+            &store,
+            &transaction.deployment_id,
+            &transaction.tenant,
+            &transaction.hostname,
+        );
+        let archive = fs::read(directory.join("receipts/1.json")).unwrap();
+        let current = fs::read(directory.join("current.json")).unwrap();
+        assert_eq!(archive, current);
+
+        let mut conflicting = receipt;
+        conflicting.order_url = "https://acme.example/order/conflict".to_owned();
+        assert!(persist_receipt(&store, &transaction, &conflicting).is_err());
+        assert_eq!(fs::read(directory.join("current.json")).unwrap(), current);
     }
 
     fn test_config(challenge_webroot: PathBuf) -> AcmeConfig {
@@ -2024,6 +2198,8 @@ mod tests {
     }
 
     fn test_receipt(transaction: &AcmeTransaction) -> AcmeReceipt {
+        let certificate_sha256 = transaction.certificate_sha256.clone().unwrap();
+        let leaf_certificate_sha256 = "1".repeat(64);
         AcmeReceipt {
             schema: RECEIPT_SCHEMA,
             jti: transaction.jti.clone(),
@@ -2045,10 +2221,12 @@ mod tests {
             order_url: transaction.order_url.clone().unwrap(),
             certificate_path: transaction.workspace.join("fullchain.pem"),
             private_key_path: transaction.workspace.join("private-key.pem"),
-            certificate_sha256: transaction.certificate_sha256.clone().unwrap(),
+            certificate_sha256: certificate_sha256.clone(),
             private_key_sha256: transaction.private_key_sha256.clone().unwrap(),
-            leaf_certificate_sha256: "1".repeat(64),
-            material_sha256: "2".repeat(64),
+            leaf_certificate_sha256: leaf_certificate_sha256.clone(),
+            material_sha256: sha256(
+                format!("{leaf_certificate_sha256}:{certificate_sha256}").as_bytes(),
+            ),
             certificate_not_after: 1_900_000_000,
             transaction_created_at: transaction.created_at,
             transaction_expires_at: transaction.expires_at,
