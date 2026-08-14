@@ -45,8 +45,9 @@ pub use artifact_driver::{
     OidfDriverLane, OidfDriverProgram,
 };
 pub use artifact_plan::{
-    OidfBoundedRunnerContract, OidfDriverInspectionPlan, OidfDriverPlanEntry, OidfPlanError,
-    OidfPlanSelection,
+    AuthenticatedProviderAuthorization, OidfBoundedRunnerContract, OidfDriverInspectionPlan,
+    OidfDriverPlanEntry, OidfPlanError, OidfPlanSelection, OidfProviderExecutionBinding,
+    authorize_oidf_driver_execution,
 };
 pub use browser::{
     BrowserAutomation, BrowserCommand, BrowserDriver, BrowserEntry, BrowserError, BrowserExecutor,
@@ -64,13 +65,17 @@ pub use client::{
 pub use credentials::{BearerToken, CredentialStore, CredentialStoreError};
 pub use evidence::{
     EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceDeploymentIdentity, EvidenceError,
-    EvidenceRuntimeIdentity, EvidenceSourceIdentity, write_private_evidence_bundle,
+    EvidenceProviderCapability, EvidenceProviderIdentity, EvidenceProviderReceipt,
+    EvidenceRuntimeIdentity, EvidenceSourceIdentity, validate_ordinary_provider_identity,
+    write_private_evidence_bundle, write_private_provider_evidence_bundle,
 };
 pub use materializer::{
-    CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DescriptorGroup, DescriptorMaterializer,
-    DescriptorPlan, DescriptorSource, DescriptorVariant, MAX_DESCRIPTOR_BYTES, MaterializedMatrix,
-    MaterializerError, MatrixDescriptor, OnboardingOutput, PreparedMaterialization,
-    RoleRequirement, SECURE_BUNDLE_SCHEMA_VERSION, SecureBytes, SecureOnboardingBundle,
+    ArtifactMaterializationBinding, CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DescriptorGroup,
+    DescriptorMaterializer, DescriptorPlan, DescriptorSource, DescriptorVariant,
+    MAX_DESCRIPTOR_BYTES, MaterializedMatrix, MaterializerError, MatrixDescriptor,
+    OnboardingOutput, PreparedMaterialization, RoleRequirement, SECURE_BUNDLE_SCHEMA_VERSION,
+    SecureBytes, SecureOnboardingBundle, TenantResourceApplyOutput, TenantResourceManifest,
+    TenantResourceManifestResource, TenantResourceMaterializedMatrix,
 };
 pub use matrix::{
     MATRIX_SCHEMA_VERSION, MAX_MATRIX_BYTES, MatrixArtifact, MatrixDocument, MatrixError,
@@ -89,7 +94,8 @@ pub use progress::{
 pub use proxy_trust::ProxyTrustGuard;
 pub use recovery::{
     ConformanceProxyRecovery, ConformanceRecoveryBinding, ConformanceRecoveryGuard,
-    ConformanceRecoveryStore,
+    ConformanceRecoveryStore, TenantResourceReceiptIdentity, TenantResourceRecoveryBinding,
+    TenantResourceRevokeOutcome, TenantResourceRevokeRecord,
 };
 pub use report::{
     CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport, PlanReport,

@@ -12,6 +12,11 @@ pub(crate) fn update(
         config.container_backend(),
     )?;
     enforce_release_trust(&config, &release.manifest)?;
+    let tenant_resource_controller_changed = if options.plan {
+        false
+    } else {
+        persist_tenant_resource_controller_runtime_upgrade(config_path, &mut config)?
+    };
     if resume_persisted_update(config_path, &config, &release.manifest, &options)? {
         return Ok(());
     }
@@ -31,7 +36,9 @@ pub(crate) fn update(
         return Ok(());
     }
     release.persist_verification_evidence(&release_cache_dir(&config, &release.manifest))?;
-    if active_target_matches_release(&config, &active, &active_target, &release.manifest)? {
+    if active_target_matches_release(&config, &active, &active_target, &release.manifest)?
+        && !tenant_resource_controller_changed
+    {
         println!(
             "NazoAuth is already at {} ({})",
             release.manifest.version, current
@@ -201,6 +208,20 @@ pub(crate) fn persist_mfa_totp_runtime_upgrade(
     }
     atomic_write(config_path, &serde_json::to_vec_pretty(config)?, 0o600)?;
     Ok(())
+}
+
+pub(crate) fn persist_tenant_resource_controller_runtime_upgrade(
+    config_path: &Path,
+    config: &mut UpdateConfig,
+) -> anyhow::Result<bool> {
+    let config_dir = config_path
+        .parent()
+        .context("update config path has no parent directory")?;
+    if !install::ensure_tenant_resource_controller_runtime(config_dir, config)? {
+        return Ok(false);
+    }
+    atomic_write(config_path, &serde_json::to_vec_pretty(config)?, 0o600)?;
+    Ok(true)
 }
 
 pub(crate) fn advance_update_transaction(

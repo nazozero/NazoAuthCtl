@@ -858,20 +858,26 @@ fn fresh_server_config_persists_bootstrap_deployment_identity_without_rewriting_
     let config_dir = work.path().join("config");
     fs::create_dir(&config_dir).unwrap();
     let options = install_options(work.path().join("data"));
+    let controller_public_key = work.path().join("operator/controller.pub");
 
-    write_server_config(
-        &config_dir,
-        &options,
-        "deployment-bootstrap",
-        RuntimeBackendKind::Podman,
-        &options.data_root,
-        None,
-        None,
-    )
+    write_server_config(ServerConfigWriteRequest {
+        config_dir: &config_dir,
+        options: &options,
+        deployment_id: "deployment-bootstrap",
+        controller_public_key: &controller_public_key,
+        runtime: RuntimeBackendKind::Podman,
+        data_root: &options.data_root,
+        trusted_proxy_cidr: None,
+        profile_config: None,
+    })
     .unwrap();
     let target = config_dir.join(".env.yaml");
     let rendered = fs::read_to_string(&target).unwrap();
     assert!(rendered.contains("DEPLOYMENT_ID: \"deployment-bootstrap\"\n"));
+    assert!(rendered.contains(&format!(
+        "TENANT_RESOURCE_CONTROLLER_PUBLIC_KEY_FILE: \"{}\"\n",
+        TENANT_RESOURCE_CONTROLLER_CONTAINER_KEY_PATH
+    )));
     assert!(rendered.contains(
         "MFA_TOTP_ENCRYPTION_KEY_FILE: \"/run/nazoauth-secrets/mfa-totp-encryption-key\"\n"
     ));
@@ -880,20 +886,25 @@ fn fresh_server_config_persists_bootstrap_deployment_identity_without_rewriting_
     let host_config_dir = work.path().join("host-config");
     fs::create_dir(&host_config_dir).unwrap();
     let host_data_root = work.path().join("host-data");
-    write_server_config(
-        &host_config_dir,
-        &options,
-        "deployment-bootstrap",
-        RuntimeBackendKind::Systemd,
-        &host_data_root,
-        None,
-        None,
-    )
+    write_server_config(ServerConfigWriteRequest {
+        config_dir: &host_config_dir,
+        options: &options,
+        deployment_id: "deployment-bootstrap",
+        controller_public_key: &controller_public_key,
+        runtime: RuntimeBackendKind::Systemd,
+        data_root: &host_data_root,
+        trusted_proxy_cidr: None,
+        profile_config: None,
+    })
     .unwrap();
     let host_rendered = fs::read_to_string(host_config_dir.join(".env.yaml")).unwrap();
     assert!(host_rendered.contains(&format!(
         "MFA_TOTP_ENCRYPTION_KEY_FILE: \"{}\"\n",
         mfa_totp_key_path(&host_config_dir).display()
+    )));
+    assert!(host_rendered.contains(&format!(
+        "TENANT_RESOURCE_CONTROLLER_PUBLIC_KEY_FILE: \"{}\"\n",
+        controller_public_key.display()
     )));
     assert!(managed_mfa_totp_source(&host_config_dir, RuntimeBackendKind::Systemd).unwrap());
 
@@ -903,20 +914,124 @@ fn fresh_server_config_persists_bootstrap_deployment_identity_without_rewriting_
     )
     .unwrap();
     set_server_config_fixture_permissions(&target);
-    write_server_config(
-        &config_dir,
-        &options,
-        "deployment-replacement",
-        RuntimeBackendKind::Podman,
-        &options.data_root,
-        None,
-        None,
-    )
+    write_server_config(ServerConfigWriteRequest {
+        config_dir: &config_dir,
+        options: &options,
+        deployment_id: "deployment-replacement",
+        controller_public_key: &controller_public_key,
+        runtime: RuntimeBackendKind::Podman,
+        data_root: &options.data_root,
+        trusted_proxy_cidr: None,
+        profile_config: None,
+    })
     .unwrap();
     assert_eq!(
         fs::read_to_string(target).unwrap(),
-        "PUBLIC_BASE_URL: \"https://auth.example\"\nDEPLOYMENT_ID: existing\n"
+        format!(
+            "PUBLIC_BASE_URL: \"https://auth.example\"\nDEPLOYMENT_ID: existing\nTENANT_RESOURCE_CONTROLLER_PUBLIC_KEY_FILE: \"{}\"\n",
+            TENANT_RESOURCE_CONTROLLER_CONTAINER_KEY_PATH
+        )
     );
+}
+
+#[test]
+fn tenant_resource_controller_identity_is_stable_and_idempotent() {
+    let work = PrivateTempDir::new("tenant-resource-controller-identity").unwrap();
+    let config_dir = work.path().join("config");
+    fs::create_dir_all(config_dir.join("operator/generations/active")).unwrap();
+    ensure_tenant_resource_controller_identity(&config_dir).unwrap();
+    let private = tenant_resource_controller_private_key_path(&config_dir);
+    let public = tenant_resource_controller_public_key_path(&config_dir);
+    let key_id = tenant_resource_controller_key_id_path(&config_dir);
+    let before = (
+        fs::read(&private).unwrap(),
+        fs::read(&public).unwrap(),
+        fs::read(&key_id).unwrap(),
+    );
+
+    // Normal operator generation rotation writes below generations/ and must
+    // not affect the dedicated management identity.
+    fs::write(
+        config_dir.join("operator/generations/active/controller.pub"),
+        b"rotated-operator-controller",
+    )
+    .unwrap();
+    ensure_tenant_resource_controller_identity(&config_dir).unwrap();
+    assert_eq!(fs::read(private).unwrap(), before.0);
+    assert_eq!(fs::read(public).unwrap(), before.1);
+    assert_eq!(fs::read(key_id).unwrap(), before.2);
+
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::metadata(tenant_resource_controller_private_key_path(&config_dir))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400
+        );
+        assert_eq!(
+            fs::metadata(tenant_resource_controller_public_key_path(&config_dir))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn tenant_resource_controller_upgrade_replaces_only_the_legacy_managed_binding() {
+    let work = PrivateTempDir::new("tenant-resource-controller-upgrade").unwrap();
+    let config_dir = work.path().join("config");
+    let options = install_options(work.path().join("data"));
+    operator::initialize_identity_generation(&config_dir.join("operator"), &options.recovery_root)
+        .unwrap();
+    ensure_tenant_resource_controller_identity(&config_dir).unwrap();
+    fs::create_dir(config_dir.join("secrets")).unwrap();
+    let config_path = config_dir.join("update.json");
+    let mut config = build_config(
+        &config_path,
+        &options,
+        RuntimeBackendKind::Podman,
+        Some(RuntimeBackendKind::Podman),
+        "external",
+    )
+    .unwrap();
+    let target = PathBuf::from(TENANT_RESOURCE_CONTROLLER_CONTAINER_KEY_PATH);
+    let binding = config
+        .runtime
+        .mounts
+        .iter_mut()
+        .find(|mount| mount.target == target)
+        .unwrap();
+    binding.source = config.operator.controller_public_key.clone();
+    fs::write(
+        config_dir.join(".env.yaml"),
+        format!(
+            "PUBLIC_BASE_URL: \"https://auth.example\"\nTENANT_RESOURCE_CONTROLLER_PUBLIC_KEY_FILE: \"{}\"\n",
+            TENANT_RESOURCE_CONTROLLER_CONTAINER_KEY_PATH
+        ),
+    )
+    .unwrap();
+    set_server_config_fixture_permissions(&config_dir.join(".env.yaml"));
+
+    assert!(ensure_tenant_resource_controller_runtime(&config_dir, &mut config).unwrap());
+    let binding = config
+        .runtime
+        .mounts
+        .iter()
+        .find(|mount| mount.target == target)
+        .unwrap();
+    assert_eq!(
+        binding.source,
+        tenant_resource_controller_public_key_path(&config_dir)
+    );
+    assert!(binding.read_only && binding.selinux_relabel);
+    assert!(!ensure_tenant_resource_controller_runtime(&config_dir, &mut config).unwrap());
 }
 
 #[test]

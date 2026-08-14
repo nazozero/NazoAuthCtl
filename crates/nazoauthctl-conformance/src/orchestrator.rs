@@ -71,10 +71,10 @@ pub struct ConformanceRunConfig {
     pub client: SuiteClient,
     pub matrix: SelectedMatrix,
     pub target_origin: Option<BrowserTargetOrigin>,
-    /// The lease and task identity allocated for this run.  OpenID4VP
-    /// verifier starts must carry the complete pair; keeping it on the run
-    /// config lets the request and verifier client be checked against the
-    /// same capability instead of accepting a partial/mixed binding.
+    /// The deployment-owned binding allocated for this run. OpenID4VP
+    /// verifier starts carry either an ordinary trust-policy resource id and
+    /// digest or the complete legacy lease/task pair. Keeping the disjoint
+    /// binding on the run config prevents partial and mixed requests.
     pub binding: ConformanceBinding,
     pub poll_timeout: Duration,
     pub control: RunControl,

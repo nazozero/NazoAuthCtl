@@ -1,35 +1,22 @@
 use std::env;
 use std::ffi::OsString;
-use std::io::{self, IsTerminal as _, Read as _, Write as _};
+use std::io::{self, Write as _};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, bail};
 use nazoauthctl_conformance::{
-    ArtifactTrustPolicy, BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy,
-    BrowserTargetOrigin, ClientConfig, ConformanceAutomation, ConformanceBinding,
-    ConformanceProxyRecovery, ConformanceRecoveryBinding, ConformanceRecoveryGuard,
-    ConformanceRecoveryStore, ConformanceRunConfig, ConformanceRunner, CredentialStore,
-    DescriptorMaterializer, EvidenceBundleIdentity, EvidenceBundleReceipt,
-    EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, MAX_PARALLEL_JOBS,
-    MAX_POLL_TIMEOUT_SECONDS, ManagedWebDriver, MatrixSelection, OidfPlanSelection,
-    OnboardingOutput, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
-    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl,
-    StableRenderer, SuiteClient, TtyRenderer, WebDriverClient, WebDriverEndpoint,
+    ArtifactTrustPolicy, MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT_SECONDS, OidfPlanSelection,
     open_cached_oidf_artifact, open_cached_oidf_driver_plan, read_artifact_driver,
     read_artifact_matrix, read_compact_manifest, resolve_oidf_artifact, verify_oidf_artifact,
-    write_private_evidence_bundle,
 };
-use serde::Serialize;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
+
+mod ordinary_run;
 
 const DEFAULT_CONFIG: &str = "/etc/nazoauth/update.json";
 const DEFAULT_POLL_TIMEOUT_SECONDS: u64 = 1_800;
-const DEFAULT_LEASE_TTL_SECONDS: u64 = 14_400;
 const DEFAULT_JOBS: usize = 4;
-const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
-const RECOVERY_SETTLEMENT_SECONDS: i64 = 300;
 
 fn main() {
     let args = env::args_os().collect::<Vec<_>>();
@@ -82,7 +69,7 @@ fn main() {
         Err(error) => exit_with_error(&error),
     };
 
-    match execute(invocation) {
+    match ordinary_run::execute(invocation) {
         Ok(code) => std::process::exit(code),
         Err(error) => exit_with_error(&error),
     }
@@ -530,23 +517,26 @@ fn exit_with_error(error: &anyhow::Error) -> ! {
     std::process::exit(1)
 }
 
-struct RunInvocation {
-    config: PathBuf,
-    deployment: Option<String>,
-    suite: Option<String>,
-    token: Option<Zeroizing<String>>,
-    token_file: Option<PathBuf>,
-    token_stdin: bool,
-    token_fd: Option<u32>,
-    webdriver: Vec<String>,
-    evidence_directory: Option<PathBuf>,
-    proxy_trust_bundle: Option<PathBuf>,
-    proxy_reload_executable: Option<PathBuf>,
-    groups: Vec<String>,
-    plans: Vec<String>,
-    poll_timeout: Duration,
-    lease_ttl_seconds: u64,
-    jobs: usize,
+pub(crate) struct RunInvocation {
+    pub(crate) config: PathBuf,
+    pub(crate) deployment: Option<String>,
+    pub(crate) trust_policy: PathBuf,
+    pub(crate) artifact_cache: PathBuf,
+    pub(crate) artifact_digest: String,
+    pub(crate) tenant_id: String,
+    pub(crate) suite: Option<String>,
+    pub(crate) token: Option<Zeroizing<String>>,
+    pub(crate) token_file: Option<PathBuf>,
+    pub(crate) token_stdin: bool,
+    pub(crate) token_fd: Option<u32>,
+    pub(crate) webdriver: Vec<String>,
+    pub(crate) evidence_directory: Option<PathBuf>,
+    pub(crate) proxy_trust_bundle: Option<PathBuf>,
+    pub(crate) proxy_reload_executable: Option<PathBuf>,
+    pub(crate) groups: Vec<String>,
+    pub(crate) plans: Vec<String>,
+    pub(crate) poll_timeout: Duration,
+    pub(crate) jobs: usize,
 }
 
 fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocation>> {
@@ -596,6 +586,10 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
         std::process::exit(0);
     }
 
+    let mut trust_policy = None;
+    let mut artifact_cache = None;
+    let mut artifact_digest = None;
+    let mut tenant_id = None;
     let mut suite = None;
     let mut token = None;
     let mut token_file = None;
@@ -608,13 +602,16 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
     let mut groups = Vec::new();
     let mut plans = Vec::new();
     let mut poll_timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECONDS);
-    let mut lease_ttl_seconds = DEFAULT_LEASE_TTL_SECONDS;
     let mut jobs = DEFAULT_JOBS;
     let mut index = 0usize;
     while index < values.len() {
         let option = values[index].as_str();
         match option {
-            "--suite"
+            "--trust-policy"
+            | "--artifact-cache"
+            | "--artifact-digest"
+            | "--tenant-id"
+            | "--suite"
             | "--token"
             | "--token-file"
             | "--token-fd"
@@ -625,13 +622,20 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
             | "--group"
             | "--plan"
             | "--poll-timeout"
-            | "--lease-ttl"
             | "--jobs" => {
                 let value = values
                     .get(index + 1)
                     .with_context(|| format!("{option} requires a value"))?
                     .clone();
                 match option {
+                    "--trust-policy" => {
+                        set_once(&mut trust_policy, PathBuf::from(value), option)?;
+                    }
+                    "--artifact-cache" => {
+                        set_once(&mut artifact_cache, PathBuf::from(value), option)?;
+                    }
+                    "--artifact-digest" => set_once(&mut artifact_digest, value, option)?,
+                    "--tenant-id" => set_once(&mut tenant_id, value, option)?,
                     "--suite" => set_once(&mut suite, value, option)?,
                     "--token" => set_once(&mut token, Zeroizing::new(value), option)?,
                     "--token-file" => set_once(&mut token_file, PathBuf::from(value), option)?,
@@ -659,11 +663,6 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
                                 .parse::<u64>()
                                 .context("--poll-timeout must be an integer")?,
                         );
-                    }
-                    "--lease-ttl" => {
-                        lease_ttl_seconds = value
-                            .parse::<u64>()
-                            .context("--lease-ttl must be an integer")?;
                     }
                     "--jobs" => {
                         jobs = value
@@ -694,21 +693,40 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
     if proxy_trust_bundle.is_some() != proxy_reload_executable.is_some() {
         bail!("--proxy-trust-bundle and --proxy-reload-executable must be specified together");
     }
+    let trust_policy = trust_policy.context("--trust-policy is required")?;
+    let artifact_cache = artifact_cache.context("--artifact-cache is required")?;
+    let artifact_digest = artifact_digest.context("--artifact-digest is required")?;
+    if artifact_digest.len() != 64
+        || !artifact_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("--artifact-digest must be 64 lowercase hexadecimal characters");
+    }
+    let tenant_id = tenant_id.context("--tenant-id is required")?;
+    let parsed_tenant =
+        uuid::Uuid::parse_str(&tenant_id).context("--tenant-id must be a canonical UUID")?;
+    if parsed_tenant.hyphenated().to_string() != tenant_id {
+        bail!("--tenant-id must be a canonical UUID");
+    }
     let distinct_webdrivers = webdriver.iter().collect::<std::collections::BTreeSet<_>>();
     if poll_timeout.is_zero()
         || poll_timeout > Duration::from_secs(MAX_POLL_TIMEOUT_SECONDS)
-        || !(300..=86_400).contains(&lease_ttl_seconds)
         || !(1..=MAX_PARALLEL_JOBS).contains(&jobs)
         || (!webdriver.is_empty()
             && (webdriver.len() != jobs || distinct_webdrivers.len() != webdriver.len()))
     {
         bail!(
-            "poll timeout must be between 1 and {MAX_POLL_TIMEOUT_SECONDS} seconds, lease TTL must be between 300 and 86400 seconds, jobs must be between 1 and {MAX_PARALLEL_JOBS}, and explicit WebDriver endpoints must be distinct and repeated exactly once per job"
+            "poll timeout must be between 1 and {MAX_POLL_TIMEOUT_SECONDS} seconds, jobs must be between 1 and {MAX_PARALLEL_JOBS}, and explicit WebDriver endpoints must be distinct and repeated exactly once per job"
         );
     }
     Ok(Some(RunInvocation {
         config,
         deployment,
+        trust_policy,
+        artifact_cache,
+        artifact_digest,
+        tenant_id,
         suite,
         token,
         token_file,
@@ -721,7 +739,6 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
         groups,
         plans,
         poll_timeout,
-        lease_ttl_seconds,
         jobs,
     }))
 }
@@ -752,593 +769,9 @@ fn push_unique_vec(values: &mut Vec<String>, value: String, option: &str) -> any
     Ok(())
 }
 
-fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
-    let suite_origin = Origin::from_suite_arg(invocation.suite.as_deref())
-        .context("invalid OpenID Foundation Conformance Suite origin")?;
-
-    // Deployment validation and the capability lock precede Suite access.
-    let session = nazoauthctl_core::ConformanceSession::open(
-        &invocation.config,
-        invocation.deployment.as_deref(),
-    )
-    .context("deployment is not ready for conformance orchestration")?;
-    let deployment_evidence = session.deployment_evidence();
-    let recovery_store = ConformanceRecoveryStore::open(
-        &session.recovery_directory()?,
-        &deployment_evidence.deployment_id,
-    )?;
-    recover_pending_conformance_runs(&session, &recovery_store)?;
-
-    let (token, prompted) = resolve_token(&mut invocation, &suite_origin)?;
-    let client = SuiteClient::new(suite_origin.clone(), token.clone(), ClientConfig::default())
-        .context("failed to initialize the Suite client")?;
-    client
-        .probe_auth()
-        .context("Suite API token authentication failed")?;
-    if prompted {
-        offer_credential_persistence(&suite_origin, &token)?;
-    }
-
-    let matrix = session
-        .describe_matrix()
-        .context("failed to load the deployment Matrix")?;
-    let descriptor = DescriptorMaterializer::from_bytes(&matrix.bytes)
-        .context("deployment Matrix cannot be materialized")?;
-    let request_jti = format!("request-{}", hex(rand::random::<[u8; 16]>()));
-    let openid4vc_request_object_trust_anchor_pem = session
-        .openid4vc_request_object_trust_anchor_pem()
-        .context("failed to load the deployment OpenID4VC public trust anchor")?;
-    let (prepared, bundle) = DescriptorMaterializer::prepare(
-        descriptor,
-        session.target_issuer(),
-        &suite_origin,
-        &request_jti,
-        &openid4vc_request_object_trust_anchor_pem,
-    )
-    .context("failed to prepare ephemeral conformance material")?;
-    if prepared.matrix_sha256() != matrix.sha256 {
-        bail!("deployment Matrix digest does not match the signed operator result");
-    }
-    let client_count = u32::try_from(prepared.expected_clients().len())
-        .context("Matrix contains too many conformance clients")?;
-    let prepared_at = current_unix_time()?;
-    let requested_expires_at = prepared_at
-        .checked_add(i64::try_from(invocation.lease_ttl_seconds)?)
-        .and_then(|expires_at| expires_at.checked_add(RECOVERY_SETTLEMENT_SECONDS))
-        .context("conformance recovery expiry overflows")?;
-    let proxy_recovery = match (
-        invocation.proxy_trust_bundle.as_ref(),
-        invocation.proxy_reload_executable.as_ref(),
-    ) {
-        (Some(bundle_path), Some(reload_executable)) => Some(ConformanceProxyRecovery {
-            bundle_path: bundle_path.clone(),
-            reload_executable: reload_executable.clone(),
-        }),
-        (None, None) => None,
-        _ => unreachable!(),
-    };
-    let mut recovery = recovery_store.begin(ConformanceRecoveryBinding {
-        deployment_id: deployment_evidence.deployment_id.clone(),
-        target_issuer: deployment_evidence.target_issuer.clone(),
-        deployment_revision: deployment_evidence.revision.clone(),
-        request_jti: request_jti.clone(),
-        matrix_sha256: matrix.sha256.clone(),
-        bundle_sha256: bundle.digest().to_owned(),
-        prepared_at,
-        requested_expires_at,
-        proxy: proxy_recovery,
-    })?;
-    let onboarding = session
-        .apply_onboarding(
-            &request_jti,
-            &matrix.sha256,
-            bundle.bytes().as_bytes(),
-            client_count,
-            invocation.lease_ttl_seconds,
-        )
-        .context("failed to atomically provision the conformance lease")?;
-    if let Err(error) = recovery.record_lease(&onboarding.lease_id, onboarding.expires_at) {
-        return match session.cleanup_lease(&onboarding.lease_id) {
-            Ok(()) => Err(error).context(
-                "failed to persist the conformance lease recovery receipt; lease rolled back",
-            ),
-            Err(cleanup) => bail!(
-                "failed to persist the conformance lease recovery receipt and rollback also failed: journal={error:#}; cleanup={cleanup:#}"
-            ),
-        };
-    }
-    let lease_id = onboarding.lease_id.clone();
-    let applicant_id = uuid::Uuid::parse_str(&onboarding.applicant_id)
-        .context("operator onboarding returned an invalid applicant identifier")?;
-    let static_tx_code = prepared.tx_code();
-    let hosted_email = Zeroizing::new(prepared.applicant_email().to_owned());
-    let hosted_password = prepared.applicant_password();
-    let mut proxy_trust = match (
-        invocation.proxy_trust_bundle.as_deref(),
-        invocation.proxy_reload_executable.as_deref(),
-    ) {
-        (Some(bundle_path), Some(reload_executable)) => {
-            match ProxyTrustGuard::install(
-                bundle_path,
-                reload_executable,
-                prepared.mtls_trust_anchor_pem().as_bytes(),
-            ) {
-                Ok(guard) => Some(guard),
-                Err(error) => {
-                    let lease_cleanup = session.cleanup_lease(&lease_id);
-                    let proxy_cleanup = ProxyTrustGuard::recover(bundle_path, reload_executable);
-                    let recovery_cleanup =
-                        finalize_recovery(recovery, lease_cleanup.is_ok(), proxy_cleanup.is_ok());
-                    let mut failures = vec![format!("proxy={error:#}")];
-                    if let Err(cleanup) = lease_cleanup {
-                        failures.push(format!("lease-cleanup={cleanup:#}"));
-                    }
-                    if let Err(cleanup) = proxy_cleanup {
-                        failures.push(format!("proxy-recovery={cleanup:#}"));
-                    }
-                    if let Err(cleanup) = recovery_cleanup {
-                        failures.push(format!("journal={cleanup:#}"));
-                    }
-                    bail!(
-                        "failed to install the run-scoped proxy trust bundle: {}",
-                        failures.join("; ")
-                    );
-                }
-            }
-        }
-        (None, None) => None,
-        _ => unreachable!(),
-    };
-
-    let run_result = (|| -> anyhow::Result<RunOutput> {
-        let onboarding_output = OnboardingOutput::new(
-            onboarding.lease_id.clone(),
-            onboarding.request_jti.clone(),
-            onboarding.matrix_sha256.clone(),
-            onboarding.bundle_sha256.clone(),
-            onboarding.applicant_id.clone(),
-            openid4vc_request_object_trust_anchor_pem.clone(),
-            onboarding.client_mappings.clone(),
-        )?;
-        let binding =
-            ConformanceBinding::new(&onboarding.lease_id, onboarding.request_jti.clone())?;
-        let mut materialized = DescriptorMaterializer::finalize(prepared, onboarding_output)
-            .context("operator onboarding result does not match the prepared Matrix")?;
-        let target_origin = BrowserTargetOrigin::parse(session.target_issuer())?;
-        let openid4vci_management_token = session
-            .openid4vci_management_token()
-            .context("failed to load the deployment OpenID4VCI management token")?;
-        let openid4vp_management_token = session
-            .openid4vp_management_token()
-            .context("failed to load the deployment OpenID4VP management token")?;
-        let mut automation = Vec::with_capacity(invocation.jobs);
-        for worker_index in 0..invocation.jobs {
-            let browser = build_browser(
-                invocation.webdriver.get(worker_index).map(String::as_str),
-                session.target_issuer(),
-                &suite_origin,
-            )?;
-            let issuer: Arc<Mutex<dyn OpenId4VciIssuerDriver>> =
-                Arc::new(Mutex::new(OpenId4VciIssuerClient::new(
-                    OpenId4VciIssuerConfig::new(
-                        target_origin.clone(),
-                        suite_origin.clone(),
-                        applicant_id,
-                        static_tx_code.clone(),
-                        hosted_email.clone(),
-                        hosted_password.clone(),
-                        Duration::from_secs(30),
-                    )?,
-                    openid4vci_management_token.clone(),
-                    token.clone(),
-                )?));
-            let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
-                Arc::new(Mutex::new(OpenId4VpVerifierClient::new(
-                    target_origin.clone(),
-                    suite_origin.clone(),
-                    openid4vp_management_token.clone(),
-                    Duration::from_secs(30),
-                    binding.clone(),
-                )?));
-            automation.push(ConformanceAutomation {
-                browser: Some(browser),
-                verifier: Some(verifier),
-                issuer: Some(issuer),
-            });
-        }
-        let control = RunControl::default();
-        let interrupt = control.clone();
-        ctrlc::set_handler(move || interrupt.interrupt())
-            .context("failed to install the conformance interrupt handler")?;
-        let selected_matrix = materialized
-            .take_matrix()
-            .select(&MatrixSelection {
-                groups: invocation.groups.clone(),
-                profiles: Vec::new(),
-                plans: invocation.plans.clone(),
-            })
-            .context("requested conformance Matrix selection is invalid")?;
-        let selected_groups = u32::try_from(selected_matrix.document.groups.len())
-            .context("selected Matrix contains too many groups")?;
-        let selected_plans = u32::try_from(selected_matrix.document.plan_count())
-            .context("selected Matrix contains too many plans")?;
-        let runner = ConformanceRunner::new(ConformanceRunConfig {
-            client,
-            matrix: selected_matrix,
-            target_origin: Some(target_origin),
-            binding,
-            poll_timeout: invocation.poll_timeout,
-            control,
-            jobs: invocation.jobs,
-            automation,
-        })?;
-        let summary = if io::stderr().is_terminal() {
-            let mut renderer = TtyRenderer::new(io::stderr().lock());
-            runner.run(&mut renderer)
-        } else {
-            let mut renderer = StableRenderer::new(io::stderr().lock());
-            runner.run(&mut renderer)
-        };
-        Ok(RunOutput {
-            report: summary.report,
-            deployment: DeploymentReport {
-                matrix_sha256: matrix.sha256.clone(),
-                matrix_source_release: matrix.source_release.clone(),
-                matrix_groups: matrix.group_count,
-                matrix_plans: matrix.plan_count,
-                selected_groups,
-                selected_plans,
-                lease_id: onboarding.lease_id.clone(),
-                applicant_id: onboarding.applicant_id.clone(),
-                client_count,
-                expires_at: onboarding.expires_at,
-                idempotent_replay: onboarding.idempotent_replay,
-                cleanup_complete: false,
-            },
-            evidence: None,
-        })
-    })();
-
-    let lease_cleanup = session.cleanup_lease(&lease_id);
-    let proxy_cleanup = proxy_trust
-        .as_mut()
-        .map(ProxyTrustGuard::restore)
-        .transpose();
-    let mut errors = Vec::new();
-    let mut output = match run_result {
-        Ok(output) => Some(output),
-        Err(error) => {
-            errors.push(format!("run={error:#}"));
-            None
-        }
-    };
-    let lease_cleanup_complete = lease_cleanup.is_ok();
-    let proxy_cleanup_complete = proxy_cleanup.is_ok();
-    if let Err(error) = lease_cleanup {
-        errors.push(format!("lease-cleanup={error:#}"));
-    }
-    if let Err(error) = proxy_cleanup {
-        errors.push(format!("proxy-cleanup={error:#}"));
-    }
-    if let Err(error) = finalize_recovery(recovery, lease_cleanup_complete, proxy_cleanup_complete)
-    {
-        errors.push(format!("recovery-journal={error:#}"));
-    }
-    if let Some(output) = &mut output {
-        output.deployment.cleanup_complete = lease_cleanup_complete
-            && proxy_cleanup_complete
-            && !errors
-                .iter()
-                .any(|error| error.starts_with("recovery-journal="));
-        if let Some(directory) = &invocation.evidence_directory {
-            let runtime = match &deployment_evidence.runtime {
-                nazoauthctl_core::ConformanceRuntimeEvidence::OciImage { digest } => {
-                    EvidenceRuntimeIdentity::OciImage {
-                        digest: digest.clone(),
-                    }
-                }
-                nazoauthctl_core::ConformanceRuntimeEvidence::HostBinary { sha256 } => {
-                    EvidenceRuntimeIdentity::HostBinary {
-                        sha256: sha256.clone(),
-                    }
-                }
-            };
-            let identity = EvidenceBundleIdentity {
-                run_jti: request_jti.clone(),
-                deployment: EvidenceDeploymentIdentity {
-                    deployment_id: deployment_evidence.deployment_id.clone(),
-                    target_issuer: deployment_evidence.target_issuer.clone(),
-                    release: deployment_evidence.release.clone(),
-                    revision: deployment_evidence.revision.clone(),
-                    build_id: deployment_evidence.build_id.clone(),
-                    runtime,
-                },
-                source: EvidenceSourceIdentity::LegacyOperatorMatrix {
-                    source_release: matrix.source_release.clone(),
-                    matrix_sha256: matrix.sha256.clone(),
-                    suite_origin: suite_origin.to_string(),
-                },
-                outer_cleanup_complete: output.deployment.cleanup_complete,
-            };
-            match write_private_evidence_bundle(&output.report, directory, &identity) {
-                Ok(receipt) => output.evidence = Some(receipt),
-                Err(error) => errors.push(format!("evidence={error}")),
-            }
-        }
-    }
-    let (final_output, exit_code) = finalize_run_output(output, errors);
-    serde_json::to_writer_pretty(io::stdout().lock(), &final_output)
-        .context("failed to write the structured conformance report")?;
-    writeln!(io::stdout()).context("failed to finish the structured conformance report")?;
-    Ok(exit_code)
-}
-
-fn finalize_run_output(output: Option<RunOutput>, errors: Vec<String>) -> (FinalOutput, i32) {
-    let success = errors.is_empty()
-        && output.as_ref().is_some_and(|output| {
-            output.report.local_success
-                && output.report.suite_pass
-                && output.deployment.cleanup_complete
-        });
-    (
-        FinalOutput {
-            schema: 2,
-            success,
-            errors,
-            run: output,
-        },
-        if success { 0 } else { 1 },
-    )
-}
-
-fn finalize_recovery(
-    mut recovery: ConformanceRecoveryGuard,
-    lease_cleanup_complete: bool,
-    proxy_cleanup_complete: bool,
-) -> anyhow::Result<()> {
-    let mut errors = Vec::new();
-    if lease_cleanup_complete
-        && !recovery.lease_cleanup_complete()
-        && let Err(error) = recovery.mark_lease_cleanup_complete()
-    {
-        errors.push(format!("lease-state={error:#}"));
-    }
-    if proxy_cleanup_complete
-        && !recovery.proxy_cleanup_complete()
-        && let Err(error) = recovery.mark_proxy_cleanup_complete()
-    {
-        errors.push(format!("proxy-state={error:#}"));
-    }
-    if errors.is_empty() && recovery.lease_cleanup_complete() && recovery.proxy_cleanup_complete() {
-        recovery.finish()
-    } else {
-        if errors.is_empty() {
-            errors.push("cleanup obligations remain pending".to_owned());
-        }
-        bail!("{}", errors.join("; "))
-    }
-}
-
-fn recover_pending_conformance_runs(
-    session: &nazoauthctl_core::ConformanceSession,
-    store: &ConformanceRecoveryStore,
-) -> anyhow::Result<()> {
-    let pending = store.claim_pending()?;
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let now = current_unix_time()?;
-    let mut failures = Vec::new();
-    for mut recovery in pending {
-        let request_jti = recovery.binding().request_jti.clone();
-        let lease_complete = if recovery.lease_cleanup_complete() {
-            true
-        } else {
-            match recover_bound_lease(session, &mut recovery, now) {
-                Ok(complete) => complete,
-                Err(error) => {
-                    failures.push(format!("{request_jti}: lease={error:#}"));
-                    false
-                }
-            }
-        };
-        let proxy_complete = if recovery.proxy_cleanup_complete() {
-            true
-        } else if let Some(proxy) = &recovery.binding().proxy {
-            match ProxyTrustGuard::recover(&proxy.bundle_path, &proxy.reload_executable) {
-                Ok(()) => true,
-                Err(error) => {
-                    failures.push(format!("{request_jti}: proxy={error:#}"));
-                    false
-                }
-            }
-        } else {
-            true
-        };
-        if let Err(error) = finalize_recovery(recovery, lease_complete, proxy_complete) {
-            failures.push(format!("{request_jti}: journal={error:#}"));
-        }
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        bail!(
-            "pending conformance cleanup could not be recovered: {}",
-            failures.join("; ")
-        )
-    }
-}
-
-fn recover_bound_lease(
-    session: &nazoauthctl_core::ConformanceSession,
-    recovery: &mut ConformanceRecoveryGuard,
-    now: i64,
-) -> anyhow::Result<bool> {
-    let leases = session.list_leases()?;
-    let candidate = if let Some(lease_id) = recovery.lease_id() {
-        let lease = leases.into_iter().find(|lease| lease.lease_id == lease_id);
-        if let Some(lease) = &lease
-            && lease.material_sha256 != recovery.binding().bundle_sha256
-        {
-            bail!("recorded lease digest does not match the recovery binding");
-        }
-        lease
-    } else {
-        let mut matching = leases
-            .into_iter()
-            .filter(|lease| lease.material_sha256 == recovery.binding().bundle_sha256)
-            .collect::<Vec<_>>();
-        if matching.len() > 1 {
-            bail!("multiple leases match one recovery bundle digest");
-        }
-        matching.pop()
-    };
-    let Some(lease) = candidate else {
-        if now.saturating_sub(recovery.binding().prepared_at) < RECOVERY_SETTLEMENT_SECONDS {
-            bail!("onboarding settlement window is still open; retry recovery later");
-        }
-        return Ok(true);
-    };
-    if recovery.lease_id().is_none() {
-        recovery.record_lease(&lease.lease_id, lease.expires_at)?;
-    }
-    if lease.cleaned {
-        return Ok(true);
-    }
-    session.cleanup_lease(&lease.lease_id)?;
-    Ok(true)
-}
-
-fn build_browser(
-    endpoint: Option<&str>,
-    target_issuer: &str,
-    suite_origin: &Origin,
-) -> anyhow::Result<Arc<Mutex<dyn BrowserAutomation>>> {
-    let target = BrowserTargetOrigin::parse(target_issuer)?;
-    let policy = BrowserPolicy::new(target, suite_origin.clone())?;
-    if let Some(endpoint) = endpoint {
-        let endpoint = WebDriverEndpoint::parse(endpoint)?;
-        let mut driver = WebDriverClient::connect(endpoint, Duration::from_secs(30))?;
-        driver.start_chrome()?;
-        Ok(Arc::new(Mutex::new(BrowserExecutor::new(driver, policy))))
-    } else {
-        let driver = ManagedWebDriver::start_default(Duration::from_secs(30))?;
-        Ok(Arc::new(Mutex::new(BrowserExecutor::new(driver, policy))))
-    }
-}
-
-fn resolve_token(
-    invocation: &mut RunInvocation,
-    origin: &Origin,
-) -> anyhow::Result<(BearerToken, bool)> {
-    if let Some(mut value) = invocation.token.take() {
-        eprintln!("warning: --token is visible in argv and may be retained by shell history");
-        let token = BearerToken::new(value.as_str().to_owned())?;
-        value.zeroize();
-        return Ok((token, false));
-    }
-    if let Some(path) = &invocation.token_file {
-        return Ok((BearerToken::read_file(path)?, false));
-    }
-    if invocation.token_stdin {
-        let mut bytes = Zeroizing::new(Vec::new());
-        io::stdin()
-            .take(MAX_STDIN_TOKEN_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .context("failed to read the Suite token from stdin")?;
-        if bytes.len() as u64 > MAX_STDIN_TOKEN_BYTES {
-            bail!("Suite token from stdin exceeds the size limit");
-        }
-        let value = std::str::from_utf8(&bytes).context("Suite token from stdin is not UTF-8")?;
-        return Ok((BearerToken::new(value.to_owned())?, false));
-    }
-    if let Some(fd) = invocation.token_fd {
-        return Ok((CredentialStore::read_descriptor(fd)?, false));
-    }
-
-    let store = CredentialStore::new(credential_root()?)?;
-    if let Some(token) = store.load(origin)? {
-        return Ok((token, false));
-    }
-    if !io::stdin().is_terminal() {
-        bail!("no Suite API token is available; use a token option in non-TTY environments");
-    }
-    let value = rpassword::prompt_password("OpenID Foundation Conformance Suite API Token:")?;
-    Ok((BearerToken::new(value)?, true))
-}
-
-fn offer_credential_persistence(origin: &Origin, token: &BearerToken) -> anyhow::Result<()> {
-    if !io::stdin().is_terminal() {
-        return Ok(());
-    }
-    eprint!("Save this token securely for {}? [y/N] ", origin.as_str());
-    io::stderr().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    let save = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
-    answer.zeroize();
-    if save {
-        CredentialStore::new(credential_root()?)?.save(origin, token)?;
-        eprintln!("Token saved for this Suite origin.");
-    }
-    Ok(())
-}
-
-fn credential_root() -> anyhow::Result<PathBuf> {
-    #[cfg(windows)]
-    let root = env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .context("APPDATA is not set")?;
-    #[cfg(not(windows))]
-    let root = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .context("neither XDG_CONFIG_HOME nor HOME is set")?;
-    Ok(root.join("nazoauthctl").join("conformance-credentials"))
-}
-
-fn hex(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-#[derive(Serialize)]
-struct FinalOutput {
-    schema: u32,
-    success: bool,
-    errors: Vec<String>,
-    run: Option<RunOutput>,
-}
-
-#[derive(Serialize)]
-struct RunOutput {
-    deployment: DeploymentReport,
-    report: nazoauthctl_conformance::ConformanceReport,
-    evidence: Option<EvidenceBundleReceipt>,
-}
-
-#[derive(Serialize)]
-struct DeploymentReport {
-    matrix_sha256: String,
-    matrix_source_release: String,
-    matrix_groups: u32,
-    matrix_plans: u32,
-    selected_groups: u32,
-    selected_plans: u32,
-    lease_id: String,
-    applicant_id: String,
-    client_count: u32,
-    expires_at: i64,
-    idempotent_replay: bool,
-    cleanup_complete: bool,
-}
-
 fn print_run_help() {
     println!(
-        "Usage:\n  nazoauthctl [--deployment ID_OR_ALIAS] [--config PATH] conformance run [options]\n\nOptions:\n  --suite URL                    OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN                  API token; visible in argv/shell history\n  --token-file PATH              Read token from a private regular file\n  --token-stdin                  Read token from stdin\n  --token-fd FD                  Read token from an inherited private descriptor\n  --webdriver URL                Dedicated W3C endpoint; repeat exactly once per job\n  --evidence-dir PATH            Commit a unique digest-bound private evidence bundle\n  --proxy-trust-bundle PATH      Atomically install this run's public client CAs\n  --proxy-reload-executable PATH Root-owned executable that validates/reloads the proxy\n  --group ID                     Run one Matrix group; repeat to select more\n  --plan ID                      Run one Matrix plan; repeat to select more\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)\n  --lease-ttl SECONDS            Deployment lease lifetime (default: 14400)"
+        "Usage:\n  nazoauthctl [--deployment ID_OR_ALIAS] [--config PATH] conformance run --trust-policy PATH --artifact-cache PATH --artifact-digest SHA256 --tenant-id UUID [options]\n\nRequired:\n  --trust-policy PATH            Signed-artifact trust policy\n  --artifact-cache PATH          Private immutable artifact cache root\n  --artifact-digest SHA256       Exact cached compact-manifest digest (64 lowercase hex)\n  --tenant-id UUID               Canonical target tenant UUID\n\nOptions:\n  --suite URL                    OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN                  API token; visible in argv/shell history\n  --token-file PATH              Read token from a private regular file\n  --token-stdin                  Read token from stdin\n  --token-fd FD                  Read token from an inherited private descriptor\n  --webdriver URL                Dedicated W3C endpoint; repeat exactly once per job\n  --evidence-dir PATH            Commit a unique provider-bound private evidence bundle\n  --proxy-trust-bundle PATH      Atomically install this run's public client CAs\n  --proxy-reload-executable PATH Root-owned executable that validates/reloads the proxy\n  --group ID                     Run one signed Matrix group; repeat to select more\n  --plan ID                      Run one signed Matrix plan; repeat to select more\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
     );
 }
 
@@ -1641,6 +1074,14 @@ mod tests {
             "/x/update.json",
             "conformance",
             "run",
+            "--trust-policy",
+            "/x/trust.json",
+            "--artifact-cache",
+            "/x/cache",
+            "--artifact-digest",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--tenant-id",
+            "00000000-0000-0000-0000-000000000000",
             "--suite",
             "https://suite.example",
             "--token-fd",
@@ -1656,6 +1097,10 @@ mod tests {
         .expect("run");
         assert_eq!(parsed.deployment.as_deref(), Some("prod"));
         assert_eq!(parsed.config, PathBuf::from("/x/update.json"));
+        assert_eq!(parsed.trust_policy, PathBuf::from("/x/trust.json"));
+        assert_eq!(parsed.artifact_cache, PathBuf::from("/x/cache"));
+        assert_eq!(parsed.artifact_digest, "a".repeat(64));
+        assert_eq!(parsed.tenant_id, uuid::Uuid::nil().to_string());
         assert_eq!(parsed.token_fd, Some(7));
         assert_eq!(parsed.groups, ["oidc"]);
         assert_eq!(parsed.plans, ["oidc-core-p001"]);
@@ -1669,6 +1114,14 @@ mod tests {
                 "nazoauthctl",
                 "conformance",
                 "run",
+                "--trust-policy",
+                "/x/trust.json",
+                "--artifact-cache",
+                "/x/cache",
+                "--artifact-digest",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--tenant-id",
+                "00000000-0000-0000-0000-000000000000",
                 "--jobs",
                 jobs,
             ])) {
@@ -1685,6 +1138,14 @@ mod tests {
             "nazoauthctl",
             "conformance",
             "run",
+            "--trust-policy",
+            "/x/trust.json",
+            "--artifact-cache",
+            "/x/cache",
+            "--artifact-digest",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--tenant-id",
+            "00000000-0000-0000-0000-000000000000",
             "--poll-timeout",
             "86401",
         ])) {
@@ -1699,11 +1160,96 @@ mod tests {
     }
 
     #[test]
+    fn run_requires_exact_ordinary_identity_and_rejects_lease_options() {
+        let missing = parse_run_invocation(&args(&["nazoauthctl", "conformance", "run"]));
+        let missing = match missing {
+            Err(error) => error,
+            Ok(_) => panic!("ordinary identity is required"),
+        };
+        assert!(missing.to_string().contains("--trust-policy is required"));
+
+        let lease = parse_run_invocation(&args(&[
+            "nazoauthctl",
+            "conformance",
+            "run",
+            "--trust-policy",
+            "/x/trust.json",
+            "--artifact-cache",
+            "/x/cache",
+            "--artifact-digest",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--tenant-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--lease-ttl",
+            "14400",
+        ]));
+        let lease = match lease {
+            Err(error) => error,
+            Ok(_) => panic!("lease options must be rejected"),
+        };
+        assert!(
+            lease
+                .to_string()
+                .contains("unknown conformance run option: --lease-ttl")
+        );
+
+        let uppercase_digest = parse_run_invocation(&args(&[
+            "nazoauthctl",
+            "conformance",
+            "run",
+            "--trust-policy",
+            "/x/trust.json",
+            "--artifact-cache",
+            "/x/cache",
+            "--artifact-digest",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "--tenant-id",
+            "00000000-0000-0000-0000-000000000000",
+        ]));
+        let uppercase_digest = match uppercase_digest {
+            Err(error) => error,
+            Ok(_) => panic!("uppercase artifact digest must fail"),
+        };
+        assert!(
+            uppercase_digest
+                .to_string()
+                .contains("64 lowercase hexadecimal characters")
+        );
+
+        let noncanonical_tenant = parse_run_invocation(&args(&[
+            "nazoauthctl",
+            "conformance",
+            "run",
+            "--trust-policy",
+            "/x/trust.json",
+            "--artifact-cache",
+            "/x/cache",
+            "--artifact-digest",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--tenant-id",
+            "00000000000000000000000000000000",
+        ]));
+        let noncanonical_tenant = match noncanonical_tenant {
+            Err(error) => error,
+            Ok(_) => panic!("noncanonical tenant UUID must fail"),
+        };
+        assert!(noncanonical_tenant.to_string().contains("canonical UUID"));
+    }
+
+    #[test]
     fn proxy_trust_bundle_and_reload_executable_are_atomic_pair() {
         let missing_reload = parse_run_invocation(&args(&[
             "nazoauthctl",
             "conformance",
             "run",
+            "--trust-policy",
+            "/x/trust.json",
+            "--artifact-cache",
+            "/x/cache",
+            "--artifact-digest",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--tenant-id",
+            "00000000-0000-0000-0000-000000000000",
             "--proxy-trust-bundle",
             "/run/proxy/client-cas.pem",
         ]));
@@ -1713,6 +1259,14 @@ mod tests {
             "nazoauthctl",
             "conformance",
             "run",
+            "--trust-policy",
+            "/x/trust.json",
+            "--artifact-cache",
+            "/x/cache",
+            "--artifact-digest",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--tenant-id",
+            "00000000-0000-0000-0000-000000000000",
             "--proxy-trust-bundle",
             "/run/proxy/client-cas.pem",
             "--proxy-reload-executable",
@@ -1736,6 +1290,14 @@ mod tests {
             "nazoauthctl",
             "conformance",
             "run",
+            "--trust-policy",
+            "/x/trust.json",
+            "--artifact-cache",
+            "/x/cache",
+            "--artifact-digest",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--tenant-id",
+            "00000000-0000-0000-0000-000000000000",
             "--jobs",
             "2",
             "--webdriver",
@@ -1747,6 +1309,14 @@ mod tests {
             "nazoauthctl",
             "conformance",
             "run",
+            "--trust-policy",
+            "/x/trust.json",
+            "--artifact-cache",
+            "/x/cache",
+            "--artifact-digest",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--tenant-id",
+            "00000000-0000-0000-0000-000000000000",
             "--jobs",
             "2",
             "--webdriver",
@@ -1760,6 +1330,14 @@ mod tests {
             "nazoauthctl",
             "conformance",
             "run",
+            "--trust-policy",
+            "/x/trust.json",
+            "--artifact-cache",
+            "/x/cache",
+            "--artifact-digest",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--tenant-id",
+            "00000000-0000-0000-0000-000000000000",
             "--jobs",
             "2",
             "--webdriver",
@@ -1787,92 +1365,5 @@ mod tests {
             Ok(_) => panic!("must reject"),
         };
         assert!(error.to_string().contains("mutually exclusive"));
-    }
-
-    #[test]
-    fn cleanup_failure_preserves_completed_structured_run_as_failed() {
-        let report = serde_json::from_value(serde_json::json!({
-            "schema": 3,
-            "matrix_digest": "a".repeat(64),
-            "suite_origin": "https://suite.example",
-            "auth_probe": null,
-            "errors": [],
-            "local_success": true,
-            "suite_pass": true,
-            "human_review_required": false,
-            "human_review_modules": [],
-            "skipped_modules": [],
-            "failed_modules": [],
-            "incomplete_modules": [],
-            "orchestration_integrity": {
-                "defined_modules": 1,
-                "created_instances": 1,
-                "terminal_modules": 1,
-                "all_modules_instantiated": true,
-                "all_modules_terminal": true,
-                "cleanup_complete": true
-            },
-            "progress": {
-                "completed": 1,
-                "total": 1,
-                "groups": [],
-                "passed_groups": 1,
-                "review_groups": 0,
-                "skipped_groups": 0,
-                "failed_groups": 0,
-                "running_groups": 0,
-                "remaining_groups": 0,
-                "passed": 1,
-                "reviewed": 0,
-                "skipped": 0,
-                "failed": 0,
-                "running": 0,
-                "remaining": 0,
-                "current_profile": null,
-                "current_variant": null,
-                "current_test": null
-            },
-            "plans": [],
-            "modules": [],
-            "cleanup": {
-                "cancelled": [],
-                "deleted_plans": [],
-                "immutable_plans": [],
-                "failures": []
-            }
-        }))
-        .expect("report");
-        let output = RunOutput {
-            deployment: DeploymentReport {
-                matrix_sha256: "a".repeat(64),
-                matrix_source_release: "v1".to_owned(),
-                matrix_groups: 1,
-                matrix_plans: 1,
-                selected_groups: 1,
-                selected_plans: 1,
-                lease_id: "lease-a".to_owned(),
-                applicant_id: uuid::Uuid::nil().to_string(),
-                client_count: 1,
-                expires_at: 1,
-                idempotent_replay: false,
-                cleanup_complete: false,
-            },
-            report,
-            evidence: None,
-        };
-        let (final_output, exit_code) =
-            finalize_run_output(Some(output), vec!["lease-cleanup=failed".to_owned()]);
-
-        assert_eq!(exit_code, 1);
-        assert!(!final_output.success);
-        assert_eq!(final_output.errors, ["lease-cleanup=failed"]);
-        assert!(final_output.run.is_some());
-        assert!(
-            !final_output
-                .run
-                .expect("preserved run")
-                .deployment
-                .cleanup_complete
-        );
     }
 }

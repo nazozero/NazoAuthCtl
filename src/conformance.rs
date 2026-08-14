@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context as _, bail};
 use nazo_operator_protocol::{
     ConformanceMatrixSummary, ConformanceOnboardingSummary, TaskOperation, TaskResult,
-    validate_conformance_matrix_descriptor,
+    decode_instance_public_key, validate_conformance_matrix_descriptor,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -154,6 +154,77 @@ impl ConformanceSession {
             build_id: self.expected.embedded.build_id.clone(),
             runtime,
         }
+    }
+
+    pub fn tenant_resource_client_config(
+        &self,
+        tenant_id: &str,
+    ) -> anyhow::Result<crate::tenant_resources::TenantResourceClientConfig> {
+        let config_dir = self
+            .config_path
+            .parent()
+            .context("controller configuration has no parent")?;
+        let private = crate::install::tenant_resource_controller_private_key_path(config_dir);
+        let public = crate::install::tenant_resource_controller_public_key_path(config_dir);
+        let key_id_path = crate::install::tenant_resource_controller_key_id_path(config_dir);
+        let signing_key = crate::install::read_tenant_resource_controller_signing_key(&private)?;
+        let actual_public = crate::filesystem::read_secure_regular_file(
+            &public,
+            "tenant-resource controller public key",
+            false,
+            256,
+        )?;
+        let actual_public = std::str::from_utf8(&actual_public)
+            .context("tenant-resource controller public key is not UTF-8")?;
+        let controller_public_key = decode_instance_public_key(actual_public)?;
+        if controller_public_key != signing_key.verifying_key() {
+            bail!("tenant-resource controller public key does not match its private key");
+        }
+        let expected_key_id = nazo_operator_protocol::instance_key_id(&controller_public_key);
+        let actual_key_id = crate::filesystem::read_secure_regular_file(
+            &key_id_path,
+            "tenant-resource controller key identity",
+            false,
+            256,
+        )?;
+        if actual_key_id.as_slice() != expected_key_id.as_bytes() {
+            bail!("tenant-resource controller key identity is inconsistent");
+        }
+        let object_reference = if self.context.config.runtime.backend
+            == crate::deployment::RuntimeBackendKind::Systemd
+        {
+            &self.context.config.runtime.service_name
+        } else {
+            &self.context.config.runtime.container_name
+        };
+        let observation = crate::runtime_backend::backend(self.context.config.runtime.backend)
+            .inspect(object_reference)
+            .context("failed to inspect the bound NazoAuth runtime")?;
+        let runtime_identity = crate::discovery::verified_runtime_identity(&observation)?;
+        if runtime_identity.statement.deployment_id != self.context.config.operator.deployment_id
+            || runtime_identity.statement.runtime_instance_id
+                != self.context.config.runtime.runtime_instance_id
+            || runtime_identity.statement.issuer != self.context.config.runtime.expected_issuer
+            || runtime_identity.statement.release != self.expected.embedded.release
+            || runtime_identity.statement.revision != self.expected.embedded.revision
+            || runtime_identity.statement.build_id != self.expected.embedded.build_id
+        {
+            bail!("bound runtime identity does not match the selected deployment");
+        }
+        Ok(crate::tenant_resources::TenantResourceClientConfig {
+            base_url: url::Url::parse(&self.context.config.runtime.expected_issuer)
+                .context("configured issuer is not a URL")?,
+            deployment_id: self.context.config.operator.deployment_id.clone(),
+            tenant_id: tenant_id.to_owned(),
+            runtime_instance_id: self.context.config.runtime.runtime_instance_id.clone(),
+            runtime_key_id: runtime_identity.statement.instance_key_id,
+            runtime_public_key: runtime_identity.public_key,
+            controller_key_id: expected_key_id,
+            controller_public_key,
+            controller_signing_key: Some(signing_key),
+            actor_id: "nazoauthctl".to_owned(),
+            embedded: self.expected.embedded.clone(),
+        })
     }
 
     pub fn recovery_directory(&self) -> anyhow::Result<PathBuf> {

@@ -117,6 +117,14 @@ pub(super) fn build_config(
         String::new()
     };
     let operator = operator_config(config_dir, &options.control_root, &options.recovery_root)?;
+    if container {
+        mounts.push(mount(
+            tenant_resource_controller_public_key_path(config_dir),
+            TENANT_RESOURCE_CONTROLLER_CONTAINER_KEY_PATH,
+            true,
+            true,
+        ));
+    }
     let name_suffix = object_name_suffix(&operator.deployment_id);
     let (service_name, service_user, binary_path, binary_releases, working_directory) = if container
     {

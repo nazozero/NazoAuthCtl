@@ -19,7 +19,7 @@ use crate::{
     verify_oidf_driver_manifest,
 };
 
-pub const OIDF_ARTIFACT_CACHE_SCHEMA_VERSION: u32 = 4;
+pub const OIDF_ARTIFACT_CACHE_SCHEMA_VERSION: u32 = 5;
 pub const OIDF_ARTIFACT_CACHE_MAX_ENTRIES: usize = 64;
 pub const OIDF_ARTIFACT_CACHE_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 const CACHE_RECORD_SCHEMA: u32 = OIDF_ARTIFACT_CACHE_SCHEMA_VERSION;
@@ -606,6 +606,8 @@ mod tests {
         serde_json::to_vec(&OidfArtifactMatrix {
             schema: OIDF_MATRIX_SCHEMA_VERSION,
             name: "matrix".to_owned(),
+            openid4vc_credential_datasets: BTreeMap::new(),
+            openid4vc_suite_mdoc_trust_anchor_pem: "suite-mdoc-anchor".to_owned(),
             groups: vec![OidfArtifactMatrixGroup {
                 id: "oidc".to_owned(),
                 profile: "oidc".to_owned(),
@@ -613,6 +615,7 @@ mod tests {
                     id: "default".to_owned(),
                     values: BTreeMap::new(),
                 },
+                required_roles: Vec::new(),
                 plans: vec![OidfArtifactMatrixPlan {
                     id: "p001".to_owned(),
                     plan: "oidcc-basic-certification-test-plan".to_owned(),
@@ -626,6 +629,9 @@ mod tests {
                     variant: BTreeMap::new(),
                     required_capabilities: vec!["nazoauth.client.create".to_owned()],
                     expected_results: BTreeMap::new(),
+                    required_roles: Vec::new(),
+                    secret_bindings: BTreeMap::new(),
+                    crypto: crate::CryptoPolicy::default(),
                 }],
             }],
         })
@@ -680,6 +686,7 @@ mod tests {
             not_before: NOW - 30,
             expires_at,
             suite: OidfSuiteIdentity {
+                origin: "https://suite.example".to_owned(),
                 release: "v5.2.2".to_owned(),
                 revision: "b".repeat(40),
                 image_digest: format!("sha256:{}", "c".repeat(64)),
@@ -748,6 +755,7 @@ mod tests {
             fetch_verified_artifact(&transport, MANIFEST_URL, &trust(), &capabilities(), NOW)
                 .expect("verified fetch");
         assert_eq!(fetched.artifact.suite.release, "v5.2.2");
+        assert_eq!(fetched.artifact.suite.origin, "https://suite.example");
         assert_eq!(
             transport.requests.into_inner(),
             vec![

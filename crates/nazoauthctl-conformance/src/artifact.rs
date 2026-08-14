@@ -10,9 +10,9 @@ use url::Url;
 use crate::artifact_driver::OidfDriverProgram;
 
 pub const OIDF_TRUST_POLICY_SCHEMA_VERSION: u32 = 1;
-pub const OIDF_ARTIFACT_SCHEMA_VERSION: u32 = 3;
+pub const OIDF_ARTIFACT_SCHEMA_VERSION: u32 = 4;
 pub const OIDF_DRIVER_ENGINE_PROTOCOL: u32 = 2;
-pub const OIDF_MATRIX_SCHEMA_VERSION: u32 = 2;
+pub const OIDF_MATRIX_SCHEMA_VERSION: u32 = 3;
 pub const MAX_SIGNED_DRIVER_BYTES: usize = 1024 * 1024;
 pub const MAX_ARTIFACT_MATRIX_BYTES: usize = 8 * 1024 * 1024;
 
@@ -51,6 +51,10 @@ pub struct OidfDriverManifest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidfSuiteIdentity {
+    /// Canonical HTTPS origin of the exact Suite deployment covered by the
+    /// signed artifact.  Callers must compare this value byte-for-byte after
+    /// canonical parsing; it must never be inferred from release metadata.
+    pub origin: String,
     pub release: String,
     pub revision: String,
     pub image_digest: String,
@@ -83,20 +87,28 @@ pub struct OidfResourceBounds {
     pub max_wall_clock_seconds: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidfArtifactMatrix {
     pub schema: u32,
     pub name: String,
+    /// Public OpenID4VC claims are matrix authority, not executable-plan
+    /// configuration.  Every VCI plan is bound to one entry by the single
+    /// descriptor validator during materialization.
+    pub openid4vc_credential_datasets: std::collections::BTreeMap<String, Value>,
+    /// The Suite's mdoc trust root is part of the signed Matrix authority.
+    /// It is deliberately required so a missing trust boundary fails closed.
+    pub openid4vc_suite_mdoc_trust_anchor_pem: String,
     pub groups: Vec<OidfArtifactMatrixGroup>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidfArtifactMatrixGroup {
     pub id: String,
     pub profile: String,
     pub variant: OidfArtifactMatrixVariant,
+    pub required_roles: Vec<crate::materializer::RoleRequirement>,
     pub plans: Vec<OidfArtifactMatrixPlan>,
 }
 
@@ -108,7 +120,7 @@ pub struct OidfArtifactMatrixVariant {
     pub values: std::collections::BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidfArtifactMatrixPlan {
     pub id: String,
@@ -122,6 +134,9 @@ pub struct OidfArtifactMatrixPlan {
     pub required_capabilities: Vec<String>,
     #[serde(default)]
     pub expected_results: std::collections::BTreeMap<String, String>,
+    pub required_roles: Vec<crate::materializer::RoleRequirement>,
+    pub secret_bindings: std::collections::BTreeMap<String, String>,
+    pub crypto: crate::materializer::CryptoPolicy,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -478,7 +493,8 @@ fn validate_manifest(
             "artifact is outside its validity window",
         ));
     }
-    if !valid_bounded_text(&manifest.suite.release, 128)
+    if !valid_suite_origin(&manifest.suite.origin)
+        || !valid_bounded_text(&manifest.suite.release, 128)
         || validate_lower_hex(&manifest.suite.revision, 40).is_err()
         || !valid_sha256_digest(&manifest.suite.image_digest)
     {
@@ -529,6 +545,10 @@ fn validate_manifest(
         ));
     }
     Ok(())
+}
+
+fn valid_suite_origin(value: &str) -> bool {
+    crate::origin::Origin::parse_suite(value).is_ok_and(|origin| origin.as_str() == value)
 }
 
 fn validate_matrix(
@@ -957,6 +977,8 @@ mod tests {
         serde_json::to_vec(&OidfArtifactMatrix {
             schema: OIDF_MATRIX_SCHEMA_VERSION,
             name: "official-fixed-matrix".to_owned(),
+            openid4vc_credential_datasets: std::collections::BTreeMap::new(),
+            openid4vc_suite_mdoc_trust_anchor_pem: "suite-mdoc-anchor".to_owned(),
             groups: vec![OidfArtifactMatrixGroup {
                 id: "oidc-core".to_owned(),
                 profile: "oidc".to_owned(),
@@ -964,6 +986,7 @@ mod tests {
                     id: "default".to_owned(),
                     values: Default::default(),
                 },
+                required_roles: Vec::new(),
                 plans: vec![OidfArtifactMatrixPlan {
                     id: "oidc-core-p001".to_owned(),
                     plan: "oidcc-basic-certification-test-plan".to_owned(),
@@ -984,6 +1007,9 @@ mod tests {
                         "oidcc-intentional-skip".to_owned(),
                         "SKIPPED".to_owned(),
                     )]),
+                    required_roles: Vec::new(),
+                    secret_bindings: Default::default(),
+                    crypto: crate::materializer::CryptoPolicy::default(),
                 }],
             }],
         })
@@ -1032,6 +1058,7 @@ mod tests {
             not_before: NOW - 30,
             expires_at: NOW + 3600,
             suite: OidfSuiteIdentity {
+                origin: "https://suite.example".to_owned(),
                 release: "v5.2.2".to_owned(),
                 revision: "b".repeat(40),
                 image_digest: format!("sha256:{}", "c".repeat(64)),
@@ -1096,6 +1123,7 @@ mod tests {
         assert_eq!(verified.driver_schema, crate::OIDF_DRIVER_SCHEMA_VERSION);
         assert_eq!(verified.driver_sha256, digest(&driver()));
         assert_eq!(verified.driver_handlers, 1);
+        assert_eq!(verified.suite.origin, "https://suite.example");
         assert_eq!(verified.suite.release, "v5.2.2");
     }
 
@@ -1171,6 +1199,18 @@ mod tests {
             verify_oidf_artifact(&compact, &matrix, &trust(), &capabilities(), NOW + 7200),
             Err(ArtifactError::ManifestPolicy(_))
         ));
+        let mut invalid_origin = manifest(&matrix);
+        invalid_origin.suite.origin = "https://suite.example/".to_owned();
+        assert!(matches!(
+            verify_oidf_artifact(
+                &sign(&invalid_origin),
+                &matrix,
+                &trust(),
+                &capabilities(),
+                NOW
+            ),
+            Err(ArtifactError::ManifestPolicy(_))
+        ));
         assert!(matches!(
             verify_oidf_artifact(&compact, &matrix, &trust(), &BTreeSet::new(), NOW),
             Err(ArtifactError::UnsupportedCapability(_))
@@ -1194,6 +1234,23 @@ mod tests {
             verify_oidf_artifact(
                 &sign(&manifest(&unknown)),
                 &unknown,
+                &trust(),
+                &capabilities(),
+                NOW
+            ),
+            Err(ArtifactError::MalformedMatrix)
+        ));
+
+        let mut missing: Value = serde_json::from_slice(&matrix).expect("matrix JSON");
+        missing
+            .as_object_mut()
+            .expect("matrix object")
+            .remove("openid4vc_suite_mdoc_trust_anchor_pem");
+        let missing = serde_json::to_vec(&missing).expect("missing matrix field");
+        assert!(matches!(
+            verify_oidf_artifact(
+                &sign(&manifest(&missing)),
+                &missing,
                 &trust(),
                 &capabilities(),
                 NOW

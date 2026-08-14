@@ -14,6 +14,7 @@ mod release;
 mod runtime;
 mod runtime_backend;
 mod secret_provider;
+pub mod tenant_resources;
 mod tls;
 
 pub(crate) use nazoauthctl_runtime::filesystem;

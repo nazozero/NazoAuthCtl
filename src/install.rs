@@ -41,7 +41,11 @@ pub(crate) use runtime::{
 };
 use secrets::*;
 pub(crate) use secrets::{
-    ensure_mfa_totp_configuration, ensure_mfa_totp_runtime, reconcile_managed_secrets,
+    ensure_mfa_totp_configuration, ensure_mfa_totp_runtime,
+    ensure_tenant_resource_controller_identity, ensure_tenant_resource_controller_runtime,
+    read_tenant_resource_controller_signing_key, reconcile_managed_secrets,
+    tenant_resource_controller_key_id_path, tenant_resource_controller_private_key_path,
+    tenant_resource_controller_public_key_path,
 };
 
 pub(crate) const POSTGRES_IMAGE: &str = "docker.io/library/postgres:18@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a";
@@ -59,6 +63,7 @@ const MAX_PROFILE_SECRET_VALUE_BYTES: usize = 4096;
 const MFA_TOTP_KEY_FILE_NAME: &str = "mfa-totp-encryption-key";
 const MFA_TOTP_KEY_ID: &str = "nazoauth-mfa-totp-v1";
 const MFA_TOTP_CONTAINER_KEY_PATH: &str = "/run/nazoauth-secrets/mfa-totp-encryption-key";
+const TENANT_RESOURCE_CONTROLLER_CONTAINER_KEY_PATH: &str = "/run/nazoauth-control/controller.pub";
 
 pub(crate) struct PreparedInstall {
     pub(crate) config: UpdateConfig,
@@ -136,6 +141,7 @@ pub(crate) fn prepare(
     let operator_dir = config_dir.join("operator");
     create_directory(&operator_dir, 0o700)?;
     operator::initialize_identity_generation(&operator_dir, &options.recovery_root)?;
+    ensure_tenant_resource_controller_identity(config_dir)?;
     let bootstrap_operator =
         operator_config(config_dir, &options.control_root, &options.recovery_root)?;
     let name_suffix = object_name_suffix(&bootstrap_operator.deployment_id);
@@ -182,15 +188,16 @@ pub(crate) fn prepare(
             &format!("nazoauth-{name_suffix}-valkey"),
         )?
     };
-    write_server_config(
+    write_server_config(ServerConfigWriteRequest {
         config_dir,
-        &options,
-        &bootstrap_operator.deployment_id,
-        runtime_backend,
-        &options.data_root,
-        options.trusted_proxy_cidr.as_deref(),
-        profile.as_deref(),
-    )?;
+        options: &options,
+        deployment_id: &bootstrap_operator.deployment_id,
+        controller_public_key: &tenant_resource_controller_public_key_path(config_dir),
+        runtime: runtime_backend,
+        data_root: &options.data_root,
+        trusted_proxy_cidr: options.trusted_proxy_cidr.as_deref(),
+        profile_config: profile.as_deref(),
+    })?;
     let config = build_config(
         config_path,
         &options,
@@ -253,6 +260,11 @@ fn configure_runtime_permissions(config: &UpdateConfig) -> anyhow::Result<()> {
         .context("server configuration directory is unavailable")?
         .join("secrets")
         .join(MFA_TOTP_KEY_FILE_NAME);
+    let tenant_resource_controller_public_key = tenant_resource_controller_public_key_path(
+        config_file
+            .parent()
+            .context("server configuration directory is unavailable")?,
+    );
     let mut readable = vec![
         config_file,
         config.dependencies.database_url_file.clone(),
@@ -260,6 +272,7 @@ fn configure_runtime_permissions(config: &UpdateConfig) -> anyhow::Result<()> {
         config.dependencies.valkey_url_file.clone(),
         mfa_key,
         config.operator.receipt_private_key.clone(),
+        tenant_resource_controller_public_key,
         config.operator.secret_revision_file.clone(),
     ];
     for name in STANDARDS_PROFILE_SECRET_NAMES {
