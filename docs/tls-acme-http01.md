@@ -136,5 +136,7 @@ not claim that any live endpoint changed certificates.
 The ACME server performs the authoritative public HTTP-01 fetch. This phase does
 not claim a local loopback request proves public reachability. It also does not
 configure Direct TLS, Nginx/Angie, trusted proxy headers, or NazoAuth transport
-capabilities. Those operations require the dynamically negotiated NazoAuth
-capabilities tracked by NazoAuth #127/#128/#129 and #130.
+capabilities. NazoAuth #127's closed Direct TLS baseline does not provide the
+atomic reload or authenticated controller protocol for those operations; they
+still require the ordinary dynamically negotiated capabilities tracked by
+NazoAuth #128/#129 and parent #130.
