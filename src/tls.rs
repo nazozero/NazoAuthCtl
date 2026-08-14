@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use chrono::Utc;
+use rustls::RootCertStore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use url::Url;
@@ -28,8 +29,9 @@ use crate::{
 };
 
 const PROVIDER_PROTOCOL: &str = "nazoauthctl.tls.external-generation.v1";
+const PROVIDER_SNAPSHOT_DIGEST_PROTOCOL: &str = "nazoauthctl.tls.provider-snapshot-digest.v1";
 const PROVIDER_SCHEMA: u32 = 1;
-const TRANSACTION_SCHEMA: u32 = 3;
+const TRANSACTION_SCHEMA: u32 = 4;
 const RECEIPT_SCHEMA: u32 = 2;
 const PLAN_SCHEMA: u32 = 2;
 const MAX_PROVIDER_BYTES: u64 = 64 * 1024;
@@ -47,9 +49,9 @@ mod material;
 mod public_endpoint;
 
 use material::{ValidatedMaterial, load_and_validate_material, root_store_from_pem};
-use public_endpoint::verify_public;
 #[cfg(test)]
-use public_endpoint::{is_public_ip, verify_public_address};
+use public_endpoint::{is_public_ip, verify_public_address, verify_public_address_not_leaf};
+use public_endpoint::{verify_public, verify_public_not_leaf};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -248,6 +250,7 @@ struct CertificateTransaction {
     leaf_certificate_sha256: String,
     certificate_not_after: i64,
     provider_config_sha256: String,
+    provider_snapshot_sha256: String,
     trust_anchors_sha256: String,
     trust_anchors_pem: String,
     provider: ProviderConfig,
@@ -399,12 +402,7 @@ fn check(
     let receipt = load_receipt(store, &record, &tenant, &hostname)?
         .context("no committed TLS certificate receipt exists for this binding")?;
     validate_active_receipt(&provider.config, Some(&receipt))?;
-    if receipt.provider_config_sha256 != provider.config_sha256
-        || receipt.trust_anchors_sha256 != provider.trust_anchors_sha256
-        || receipt.public_url != provider.public_url.as_str()
-    {
-        bail!("committed TLS receipt differs from the current provider authority");
-    }
+    validate_receipt_provider_authority(&receipt, &provider)?;
 
     let material = load_and_validate_material(
         &receipt.generation.join("fullchain.pem"),
@@ -554,12 +552,16 @@ fn apply(
     let source = bind_certificate_source(&resolved_source, &material)?;
     let previous = load_receipt(store, &record, &tenant, &hostname)?;
     validate_active_receipt(&provider.config, previous.as_ref())?;
+    if let Some(previous) = previous.as_ref() {
+        validate_receipt_provider_authority(previous, &provider)?;
+    }
     ensure_source_not_current(previous.as_ref(), &source)?;
     let expected_revision = previous.as_ref().map_or(0, |receipt| receipt.revision);
     let target_revision = expected_revision
         .checked_add(1)
         .context("TLS material revision overflow")?;
     let previous_receipt_sha256 = previous.as_ref().map(receipt_sha256).transpose()?;
+    let provider_snapshot_sha256 = provider_snapshot_sha256(&provider.config)?;
     ensure_receipt_revision_available(store, &record, &tenant, &hostname, target_revision)?;
     let jti = uuid::Uuid::now_v7().to_string();
     let generation = provider
@@ -587,6 +589,7 @@ fn apply(
         leaf_certificate_sha256: material.leaf_sha256.clone(),
         certificate_not_after: material.not_after,
         provider_config_sha256: provider.config_sha256.clone(),
+        provider_snapshot_sha256,
         trust_anchors_sha256: provider.trust_anchors_sha256.clone(),
         trust_anchors_pem: std::str::from_utf8(&provider.trust_anchors)
             .context("TLS trust anchors are not UTF-8 PEM")?
@@ -675,7 +678,7 @@ fn apply(
         }
         Err(error) => {
             transaction.last_error = Some(format!("{error:#}"));
-            match rollback_transaction(&mut transaction, previous.as_ref(), Some(&provider)) {
+            match rollback_transaction(&mut transaction, previous.as_ref(), &provider) {
                 Ok(()) => {
                     finalize_transaction(store, &transaction)?;
                     bail!(
@@ -758,7 +761,7 @@ fn recover(
     let observed = active_generation(&transaction.provider)?;
     validate_recovery_activation_state(&transaction, observed.as_deref())?;
     let provider = loaded_provider_from_transaction(store, &transaction)?;
-    rollback_transaction(&mut transaction, previous.as_ref(), Some(&provider))?;
+    rollback_transaction(&mut transaction, previous.as_ref(), &provider)?;
     finalize_transaction(store, &transaction)?;
     crate::governance::append_management_audit(
         store,
@@ -844,6 +847,20 @@ fn validate_installed_material(
     Ok(())
 }
 
+fn validate_receipt_provider_authority(
+    receipt: &CertificateReceipt,
+    provider: &LoadedProvider,
+) -> anyhow::Result<()> {
+    if receipt.provider_config_sha256 != provider.config_sha256
+        || receipt.trust_anchors_sha256 != provider.trust_anchors_sha256
+        || receipt.activation_link != provider.config.activation_link
+        || receipt.public_url != provider.public_url.as_str()
+    {
+        bail!("committed TLS receipt differs from the current provider authority");
+    }
+    Ok(())
+}
+
 fn source_file_sha256(source: &CertificateSourceBinding) -> (&str, &str) {
     match source {
         CertificateSourceBinding::ExternalFiles {
@@ -867,6 +884,9 @@ fn build_plan(
     current: Option<&CertificateReceipt>,
 ) -> anyhow::Result<CertificatePlan> {
     validate_active_receipt(&provider.config, current)?;
+    if let Some(current) = current {
+        validate_receipt_provider_authority(current, provider)?;
+    }
     ensure_source_not_current(current, source)?;
     let current_revision = current.map_or(0, |receipt| receipt.revision);
     let grant = record.capabilities.grant(Capability::ProxyTls);
@@ -1112,29 +1132,63 @@ fn activate(transaction: &CertificateTransaction) -> anyhow::Result<()> {
 fn rollback_transaction(
     transaction: &mut CertificateTransaction,
     previous: Option<&CertificateReceipt>,
-    loaded_provider: Option<&LoadedProvider>,
+    provider: &LoadedProvider,
 ) -> anyhow::Result<()> {
     if transaction.phase.activation_may_have_happened() {
-        match &transaction.previous_generation {
-            Some(previous_generation) => {
-                symlink_atomic(previous_generation, &transaction.provider.activation_link)?;
-            }
-            None => remove_file_durable(&transaction.provider.activation_link)?,
-        }
-        execute_provider_command(transaction, &transaction.provider.reload, "rollback reload")?;
-        if let (Some(previous), Some(provider)) = (previous, loaded_provider) {
-            verify_public(
+        let previous_roots = previous
+            .map(|receipt| validate_rollback_material(receipt, provider))
+            .transpose()?;
+        restore_previous_activation(transaction)?;
+        match (previous, previous_roots) {
+            (Some(previous), Some(roots)) => verify_public(
                 &provider.public_url,
                 &transaction.hostname,
                 &previous.leaf_certificate_sha256,
+                roots,
+                &transaction.provider,
+            )?,
+            (None, None) => verify_public_not_leaf(
+                &provider.public_url,
+                &transaction.hostname,
+                &transaction.leaf_certificate_sha256,
                 root_store_from_pem(&provider.trust_anchors)?,
                 &transaction.provider,
-            )?;
+            )?,
+            _ => bail!("TLS rollback proof state is inconsistent"),
         }
     }
     remove_inactive_generation(transaction)?;
     transaction.phase = TransactionPhase::RolledBack;
     Ok(())
+}
+
+fn restore_previous_activation(transaction: &CertificateTransaction) -> anyhow::Result<()> {
+    match &transaction.previous_generation {
+        Some(previous_generation) => {
+            symlink_atomic(previous_generation, &transaction.provider.activation_link)?;
+        }
+        None => remove_file_durable(&transaction.provider.activation_link)?,
+    }
+    execute_provider_command(transaction, &transaction.provider.reload, "rollback reload")?;
+    if active_generation(&transaction.provider)? != transaction.previous_generation {
+        bail!("TLS rollback activation pointer does not match the previous generation");
+    }
+    Ok(())
+}
+
+fn validate_rollback_material(
+    receipt: &CertificateReceipt,
+    provider: &LoadedProvider,
+) -> anyhow::Result<RootCertStore> {
+    validate_receipt_provider_authority(receipt, provider)?;
+    let material = load_and_validate_material(
+        &receipt.generation.join("fullchain.pem"),
+        &receipt.generation.join("private-key.pem"),
+        &receipt.hostname,
+        provider,
+    )?;
+    validate_installed_material(receipt, &material)?;
+    Ok(material.root_store)
 }
 
 fn remove_inactive_generation(transaction: &CertificateTransaction) -> anyhow::Result<()> {
@@ -1588,6 +1642,71 @@ fn receipt_sha256(receipt: &CertificateReceipt) -> anyhow::Result<String> {
     Ok(sha256(&serde_json::to_vec_pretty(receipt)?))
 }
 
+fn provider_snapshot_sha256(provider: &ProviderConfig) -> anyhow::Result<String> {
+    let material_root = canonical_digest_path(&provider.material_root, "TLS material root")?;
+    let activation_link = canonical_digest_path(&provider.activation_link, "TLS activation link")?;
+    let trust_anchors = canonical_digest_path(&provider.trust_anchors, "TLS trust anchors")?;
+    let validate_program =
+        canonical_digest_path(&provider.validate.program, "TLS validate command")?;
+    let reload_program = canonical_digest_path(&provider.reload.program, "TLS reload command")?;
+    let authority = (
+        provider.schema,
+        &provider.protocol,
+        &provider.tenant,
+        &provider.hostname,
+        material_root,
+        activation_link,
+        trust_anchors,
+        &provider.public_url,
+        &provider.accepted_statuses,
+        provider.minimum_validity_seconds,
+        provider.connect_timeout_seconds,
+        provider.request_timeout_seconds,
+    );
+    let commands = (
+        (validate_program, &provider.validate.args),
+        (reload_program, &provider.reload.args),
+    );
+    Ok(sha256(&serde_json::to_vec(&(
+        PROVIDER_SNAPSHOT_DIGEST_PROTOCOL,
+        authority,
+        commands,
+    ))?))
+}
+
+fn canonical_digest_path(path: &Path, label: &str) -> anyhow::Result<Vec<(u8, String)>> {
+    path.components()
+        .map(|component| {
+            let (kind, value) = match component {
+                Component::Prefix(prefix) => (0, Some(prefix.as_os_str())),
+                Component::RootDir => (1, None),
+                Component::CurDir => (2, None),
+                Component::ParentDir => (3, None),
+                Component::Normal(value) => (4, Some(value)),
+            };
+            let value = value
+                .map(|value| {
+                    value
+                        .to_str()
+                        .with_context(|| format!("{label} contains a non-UTF-8 path component"))
+                        .map(str::to_owned)
+                })
+                .transpose()?
+                .unwrap_or_default();
+            Ok((kind, value))
+        })
+        .collect()
+}
+
+fn validate_provider_snapshot(transaction: &CertificateTransaction) -> anyhow::Result<()> {
+    if !valid_sha256(&transaction.provider_snapshot_sha256)
+        || transaction.provider_snapshot_sha256 != provider_snapshot_sha256(&transaction.provider)?
+    {
+        bail!("TLS transaction provider snapshot does not match its bound digest");
+    }
+    Ok(())
+}
+
 fn ensure_receipt_revision_available(
     store: &DeploymentStore,
     record: &DeploymentRecord,
@@ -1725,6 +1844,7 @@ fn validate_transaction_binding(
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<()> {
+    validate_provider_snapshot(transaction)?;
     let target_revision = transaction
         .expected_revision
         .checked_add(1)

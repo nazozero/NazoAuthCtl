@@ -52,6 +52,46 @@ pub(super) fn verify_public(
         .context("TLS public verification failed for every resolved address")
 }
 
+pub(super) fn verify_public_not_leaf(
+    public_url: &Url,
+    hostname: &str,
+    forbidden_leaf_sha256: &str,
+    roots: RootCertStore,
+    provider: &ProviderConfig,
+) -> anyhow::Result<()> {
+    let port = public_url
+        .port_or_known_default()
+        .context("TLS public URL has no port")?;
+    let mut addresses = resolve_public_addresses(
+        hostname,
+        port,
+        Duration::from_secs(provider.connect_timeout_seconds),
+    )?;
+    addresses.sort_unstable();
+    addresses.dedup();
+    if addresses.is_empty() {
+        bail!("TLS public hostname resolved to no addresses");
+    }
+    if addresses.len() > 4 {
+        bail!("TLS public hostname resolved beyond the rollback proof address bound");
+    }
+    if addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        bail!("TLS public hostname resolved to a non-public address");
+    }
+    for address in addresses {
+        verify_public_address_not_leaf(
+            public_url,
+            hostname,
+            address,
+            forbidden_leaf_sha256,
+            roots.clone(),
+            provider,
+        )
+        .with_context(|| format!("TLS rollback proof failed for public address {address}"))?;
+    }
+    Ok(())
+}
+
 fn resolve_public_addresses(
     hostname: &str,
     port: u16,
@@ -79,6 +119,35 @@ pub(super) fn verify_public_address(
     roots: RootCertStore,
     provider: &ProviderConfig,
 ) -> anyhow::Result<()> {
+    let observed = observe_public_address(public_url, hostname, address, roots, provider)?;
+    if observed != expected_leaf_sha256 {
+        bail!("TLS public endpoint leaf certificate digest does not match the activated material");
+    }
+    Ok(())
+}
+
+pub(super) fn verify_public_address_not_leaf(
+    public_url: &Url,
+    hostname: &str,
+    address: SocketAddr,
+    forbidden_leaf_sha256: &str,
+    roots: RootCertStore,
+    provider: &ProviderConfig,
+) -> anyhow::Result<()> {
+    let observed = observe_public_address(public_url, hostname, address, roots, provider)?;
+    if observed == forbidden_leaf_sha256 {
+        bail!("TLS public endpoint still presents the rolled-back candidate certificate");
+    }
+    Ok(())
+}
+
+fn observe_public_address(
+    public_url: &Url,
+    hostname: &str,
+    address: SocketAddr,
+    roots: RootCertStore,
+    provider: &ProviderConfig,
+) -> anyhow::Result<String> {
     let connect_timeout = Duration::from_secs(provider.connect_timeout_seconds);
     let request_timeout = Duration::from_secs(provider.request_timeout_seconds);
     let mut tcp = TcpStream::connect_timeout(&address, connect_timeout)
@@ -113,9 +182,7 @@ pub(super) fn verify_public_address(
         .peer_certificates()
         .and_then(|certificates| certificates.first())
         .context("TLS public endpoint presented no certificate")?;
-    if sha256(peer.as_ref()) != expected_leaf_sha256 {
-        bail!("TLS public endpoint leaf certificate digest does not match the activated material");
-    }
+    let leaf_sha256 = sha256(peer.as_ref());
     let first_line = response
         .split(|byte| *byte == b'\n')
         .next()
@@ -134,7 +201,7 @@ pub(super) fn verify_public_address(
     {
         bail!("TLS public endpoint health status {status} is not accepted");
     }
-    Ok(())
+    Ok(leaf_sha256)
 }
 
 fn drive_tls_until_status_line(

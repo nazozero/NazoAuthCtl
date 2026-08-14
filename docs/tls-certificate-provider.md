@@ -172,7 +172,11 @@ pointer and finishes the audit record. A rollback likewise refuses an activation
 pointer outside the previous and target generations recorded by the journal.
 The transaction journal also binds the complete pre-transaction receipt digest,
 not only its revision and leaf certificate, so recovery cannot replace a changed
-current marker with archived target evidence.
+current marker with archived target evidence. Its schema also binds a versioned,
+canonical digest of the embedded provider snapshot; changing a validate/reload command,
+path, URL, status policy, timeout, or provider binding in a pending journal is
+detected before recovery invokes it. Plan and apply require an existing receipt
+to match the currently loaded provider configuration and trust-anchor authority.
 Conflicting bytes at an occupied revision are never overwritten. A new apply
 also refuses an already occupied target revision before staging or activating
 material, leaving the interrupted evidence for explicit recovery or review.
@@ -182,6 +186,22 @@ addition to synchronizing each staged file and the activation symlink. A durable
 activation pointer therefore cannot legitimately outlive the generation directory
 entry it names after a power loss. Removal of an inactive generation synchronizes
 the same parent directory so interrupted cleanup cannot resurrect an orphan entry.
+
+Before rollback changes the activation symlink, ctl securely reopens the previous
+generation and repeats the complete offline certificate-chain, SAN, serverAuth,
+validity, private-key match, file-permission, source-digest, material-digest, and
+provider-authority checks against its receipt. After reload, ctl requires the
+activation pointer to name the recorded previous generation and publicly verifies
+that exact previous leaf and health status. The failed candidate is deleted only
+after those checks succeed.
+
+An interrupted first installation has no previous receipt to prove. In that case,
+rollback removes the activation link and reloads, but it is considered complete
+only if every bounded public address successfully serves an accepted, trust-valid
+TLS endpoint whose leaf is not the candidate. An unavailable endpoint is not proof
+of absence: ctl retains the pending journal and inactive candidate for a later
+`tls certificate recover` attempt or explicit operator review instead of claiming
+that rollback succeeded.
 
 `tls certificate show` prints the authoritative current receipt. Completed
 transaction journals and revision receipts remain under the deployment state
