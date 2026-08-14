@@ -360,10 +360,15 @@ fn aborted_controller_update_is_archived_without_changing_the_declaration() {
         .deployment_state_dir("deployment-a")
         .join("transactions")
         .join("active-update.json");
-    fs::copy(&history, &active).unwrap();
+    let mut archived: UpdateCoordination =
+        serde_json::from_slice(&fs::read(&history).unwrap()).unwrap();
+    archived.updated_at -= 60;
+    let archived_bytes = serde_json::to_vec_pretty(&archived).unwrap();
+    fs::write(&history, &archived_bytes).unwrap();
+    fs::write(&active, &archived_bytes).unwrap();
     let replayed =
         abort_controller_update_locked(&store, &current, &prepared.transaction_id).unwrap();
-    assert_eq!(replayed, aborted);
+    assert_eq!(replayed, archived);
     assert!(!active.exists());
 }
 

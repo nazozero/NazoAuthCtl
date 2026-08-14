@@ -692,9 +692,11 @@ pub(crate) fn abort_controller_update_locked(
     if transaction.state == CoordinationState::Committed {
         bail!("a committed update cannot be archived as aborted");
     }
-    transaction.state = CoordinationState::Aborted;
-    transaction.updated_at = Utc::now().timestamp();
-    persist(store, &transaction)?;
+    if transaction.state != CoordinationState::Aborted {
+        transaction.state = CoordinationState::Aborted;
+        transaction.updated_at = Utc::now().timestamp();
+        persist(store, &transaction)?;
+    }
 
     let history = active.with_file_name(format!("update-{transaction_id}.json"));
     match fs::symlink_metadata(&history) {
