@@ -259,6 +259,8 @@ TTL is 60 through 86400 seconds."
     --tenant TENANT --hostname HOST --from-acme-current
   nazoauthctl --deployment ID tls certificate apply --provider-config PATH \
     --tenant TENANT --hostname HOST --from-acme-current --yes
+  nazoauthctl --deployment ID tls certificate check --provider-config PATH \
+    --tenant TENANT --hostname HOST [--warning-window-seconds N]
   nazoauthctl --deployment ID tls certificate recover --tenant TENANT --hostname HOST --yes
   nazoauthctl --deployment ID tls certificate show --tenant TENANT --hostname HOST
   nazoauthctl --deployment ID tls acme plan --acme-config PATH --provider-config PATH \
@@ -285,7 +287,14 @@ the provider trust policy, and commits an issuance receipt. Issuance does not
 install or reload the certificate. `--from-acme-current` consumes the exact
 current receipt only after revalidating its deployment/binding/revision,
 provider/trust digests, account authority, and private artifacts; certificate
-installation still uses the separate crash-safe provider transaction."
+installation still uses the separate crash-safe provider transaction.
+
+The certificate check command is read-only and intended for an external
+monitoring scheduler. Success revalidates the active generation, source
+authority, remaining lifetime, and real public TLS/HTTP endpoint before emitting
+a bound readiness receipt. The process fails nonzero on drift, a pending or
+uninstalled ACME issuance, public verification failure, or entry into the larger
+of the provider minimum-validity and requested warning windows."
         }
         cli::HelpTopic::Audit => {
             "Usage:

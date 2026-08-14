@@ -108,6 +108,29 @@ in-progress issuance, stale deployment declaration, or provider/trust digest
 change fails closed. External paths and `--from-acme-current` are mutually
 exclusive.
 
+## Readiness and renewal warning
+
+Run the read-only check from an external monitoring scheduler; ctl does not need
+to remain running between checks:
+
+```text
+nazoauthctl --deployment DEPLOYMENT tls certificate check \
+  --provider-config /etc/nazoauth/tls-provider.json \
+  --tenant tenant-a --hostname auth.example \
+  --warning-window-seconds 1209600
+```
+
+The check reopens the current provider and receipt, proves the active generation
+pointer, independently validates its certificate/private key, requires current
+ACME authority when the installed source is ACME, and performs the same bounded
+public TLS identity and HTTP health proof used after apply. It succeeds only
+when remaining lifetime exceeds the larger of the provider's
+`minimum_validity_seconds` and the explicit warning window. Success emits a
+deployment/declaration/tenant/hostname/revision/source/digest-bound readiness
+document with its own UUIDv7 and a five-minute expiry capped at the renewal
+boundary; drift, pending work, public failure, or the renewal window returns a
+nonzero process result for monitoring alerting.
+
 Plan is read-only. Both commands re-open bounded regular files and independently
 verify the chain against the explicit trust anchors, exact SAN, serverAuth use,
 validity window, and certificate/private-key match. Apply then:
