@@ -11,13 +11,14 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ArtifactError, ArtifactTrustPolicy, MAX_ARTIFACT_MATRIX_BYTES, MAX_SIGNED_DRIVER_BYTES,
-    OidfDriverInspectionPlan, OidfPlanError, OidfPlanSelection, VerifiedOidfArtifact,
+    ArtifactError, ArtifactTrustPolicy, MAX_ARTIFACT_DRIVER_BYTES, MAX_ARTIFACT_MATRIX_BYTES,
+    MAX_SIGNED_DRIVER_BYTES, OidfDriverInspectionPlan, OidfPlanError, OidfPlanSelection,
+    VerifiedOidfArtifact, artifact::verify_oidf_matrix_with_driver,
     artifact_plan::compile_oidf_driver_inspection_plan, verify_oidf_artifact,
-    verify_oidf_driver_manifest, verify_oidf_matrix,
+    verify_oidf_driver_manifest,
 };
 
-pub const OIDF_ARTIFACT_CACHE_SCHEMA_VERSION: u32 = 3;
+pub const OIDF_ARTIFACT_CACHE_SCHEMA_VERSION: u32 = 4;
 pub const OIDF_ARTIFACT_CACHE_MAX_ENTRIES: usize = 64;
 pub const OIDF_ARTIFACT_CACHE_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 const CACHE_RECORD_SCHEMA: u32 = OIDF_ARTIFACT_CACHE_SCHEMA_VERSION;
@@ -106,7 +107,7 @@ pub fn open_cached_oidf_artifact(
         available_capabilities,
         now,
     )
-    .map(|(cached, _)| cached)
+    .map(|(cached, _, _)| cached)
 }
 
 pub fn open_cached_oidf_driver_plan(
@@ -117,7 +118,7 @@ pub fn open_cached_oidf_driver_plan(
     selection: OidfPlanSelection,
     now: i64,
 ) -> Result<OidfDriverInspectionPlan, ArtifactDiscoveryError> {
-    let (cached, matrix) = open_cached_entry(
+    let (cached, driver, matrix) = open_cached_entry(
         cache_root,
         manifest_digest,
         trust,
@@ -126,6 +127,7 @@ pub fn open_cached_oidf_driver_plan(
     )?;
     Ok(compile_oidf_driver_inspection_plan(
         cached,
+        &driver,
         &matrix,
         available_capabilities,
         selection,
@@ -139,7 +141,7 @@ fn open_cached_entry(
     trust: &ArtifactTrustPolicy,
     available_capabilities: &BTreeSet<String>,
     now: i64,
-) -> Result<(CachedOidfArtifact, Vec<u8>), ArtifactDiscoveryError> {
+) -> Result<(CachedOidfArtifact, Vec<u8>, Vec<u8>), ArtifactDiscoveryError> {
     if !cache_root.is_absolute() || cache_root.file_name().is_none() {
         return Err(ArtifactDiscoveryError::UnsafeCache);
     }
@@ -153,11 +155,13 @@ fn open_cached_entry(
     let cache_entry = artifacts.join(manifest_digest);
     crate::secure_file::validate_directory(&cache_entry, true).map_err(map_cache_file_error)?;
     let record_bytes = read_cache(&cache_entry.join("verified.json"), MAX_CACHE_RECORD_BYTES)?;
-    let compact_manifest = read_cache(&cache_entry.join("driver.jws"), MAX_SIGNED_DRIVER_BYTES)?;
+    let compact_manifest = read_cache(&cache_entry.join("manifest.jws"), MAX_SIGNED_DRIVER_BYTES)?;
+    let driver = read_cache(&cache_entry.join("driver.json"), MAX_ARTIFACT_DRIVER_BYTES)?;
     let matrix = read_cache(&cache_entry.join("matrix.json"), MAX_ARTIFACT_MATRIX_BYTES)?;
     let record = verify_cached_entry(
         &record_bytes,
         &compact_manifest,
+        &driver,
         &matrix,
         manifest_digest,
         trust,
@@ -173,6 +177,7 @@ fn open_cached_entry(
             cache_entry,
             artifact: record.artifact,
         },
+        driver,
         matrix,
     ))
 }
@@ -194,6 +199,7 @@ pub fn resolve_oidf_artifact(
         cache_root,
         manifest_url,
         &fetched.compact_manifest,
+        &fetched.driver,
         &fetched.matrix,
         &fetched.artifact,
     )?;
@@ -209,6 +215,7 @@ pub fn resolve_oidf_artifact(
 
 struct FetchedArtifact {
     compact_manifest: String,
+    driver: Vec<u8>,
     matrix: Vec<u8>,
     artifact: VerifiedOidfArtifact,
 }
@@ -273,15 +280,20 @@ fn fetch_verified_artifact(
     let compact_manifest = compact_manifest(&manifest_bytes)?;
     let driver =
         verify_oidf_driver_manifest(&compact_manifest, trust, available_capabilities, now)?;
+    let driver_url = driver.driver_url().to_owned();
+    let driver_size = driver.driver_size();
     let matrix_url = driver.matrix_url().to_owned();
     let matrix_size = driver.matrix_size();
     if matrix_size == 0 || matrix_size > MAX_ARTIFACT_MATRIX_BYTES as u64 {
         return Err(ArtifactDiscoveryError::Oversize);
     }
+    let driver_payload = transport.get(&driver_url, driver_size)?;
+    let driver_program = driver.verify_driver_payload(&driver_payload)?;
     let matrix = transport.get(&matrix_url, matrix_size)?;
-    let artifact = verify_oidf_matrix(driver, &matrix)?;
+    let artifact = verify_oidf_matrix_with_driver(driver, driver_program, &matrix)?;
     Ok(FetchedArtifact {
         compact_manifest,
+        driver: driver_payload,
         matrix,
         artifact,
     })
@@ -302,6 +314,7 @@ fn compact_manifest(bytes: &[u8]) -> Result<String, ArtifactDiscoveryError> {
 fn verify_cached_entry(
     record_bytes: &[u8],
     compact_manifest_bytes: &[u8],
+    driver: &[u8],
     matrix: &[u8],
     manifest_digest: &str,
     trust: &ArtifactTrustPolicy,
@@ -320,6 +333,7 @@ fn verify_cached_entry(
     let compact_manifest = compact_manifest(compact_manifest_bytes)?;
     let artifact = verify_oidf_artifact(
         &compact_manifest,
+        driver,
         matrix,
         trust,
         available_capabilities,
@@ -342,6 +356,7 @@ fn persist_verified_cache(
     root: &Path,
     manifest_url: &str,
     compact_manifest: &str,
+    driver: &[u8],
     matrix: &[u8],
     artifact: &VerifiedOidfArtifact,
 ) -> Result<(PathBuf, bool), ArtifactDiscoveryError> {
@@ -359,7 +374,8 @@ fn persist_verified_cache(
     }
     let entry = artifacts.join(&artifact.driver_manifest_sha256);
     crate::secure_file::ensure_directory(&entry, true).map_err(map_cache_file_error)?;
-    let manifest_path = entry.join("driver.jws");
+    let manifest_path = entry.join("manifest.jws");
+    let driver_path = entry.join("driver.json");
     let matrix_path = entry.join("matrix.json");
     let record_path = entry.join("verified.json");
     let expected = CacheRecord {
@@ -375,10 +391,12 @@ fn persist_verified_cache(
 
     if let Some(record_bytes) = read_optional_cache(&record_path, MAX_CACHE_RECORD_BYTES)? {
         let cached_manifest = read_cache(&manifest_path, MAX_SIGNED_DRIVER_BYTES)?;
+        let cached_driver = read_cache(&driver_path, MAX_ARTIFACT_DRIVER_BYTES)?;
         let cached_matrix = read_cache(&matrix_path, MAX_ARTIFACT_MATRIX_BYTES)?;
         let record: CacheRecord = serde_json::from_slice(&record_bytes)
             .map_err(|_| ArtifactDiscoveryError::CacheRecord)?;
         if cached_manifest != compact_manifest.as_bytes()
+            || cached_driver != driver
             || cached_matrix != matrix
             || record != expected
         {
@@ -387,8 +405,15 @@ fn persist_verified_cache(
         return Ok((entry, true));
     }
 
-    enforce_cache_space(root, compact_manifest.len(), matrix.len(), record.len())?;
+    enforce_cache_space(
+        root,
+        compact_manifest.len(),
+        driver.len(),
+        matrix.len(),
+        record.len(),
+    )?;
     write_cache(&manifest_path, compact_manifest.as_bytes())?;
+    write_cache(&driver_path, driver)?;
     write_cache(&matrix_path, matrix)?;
     // The record is the commit marker. A crash before this write leaves an
     // incomplete entry which is never accepted as verified cache state.
@@ -443,11 +468,13 @@ fn cache_inventory(
 fn enforce_cache_space(
     root: &Path,
     manifest_size: usize,
+    driver_size: usize,
     matrix_size: usize,
     record_size: usize,
 ) -> Result<(), ArtifactDiscoveryError> {
     let required = u64::try_from(manifest_size)
         .ok()
+        .and_then(|value| value.checked_add(u64::try_from(driver_size).ok()?))
         .and_then(|value| value.checked_add(u64::try_from(matrix_size).ok()?))
         .and_then(|value| value.checked_add(u64::try_from(record_size).ok()?))
         .and_then(|value| value.checked_add(OIDF_ARTIFACT_CACHE_MIN_FREE_BYTES))
@@ -503,9 +530,11 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     use crate::{
-        OIDF_ARTIFACT_SCHEMA_VERSION, OIDF_MATRIX_SCHEMA_VERSION, OIDF_TRUST_POLICY_SCHEMA_VERSION,
-        OidfArtifactMatrix, OidfArtifactMatrixGroup, OidfArtifactMatrixPlan,
-        OidfArtifactMatrixVariant, OidfDriverManifest, OidfMatrixIdentity, OidfPlanResourceBudget,
+        OIDF_ARTIFACT_SCHEMA_VERSION, OIDF_DRIVER_ENGINE_PROTOCOL, OIDF_DRIVER_SCHEMA_VERSION,
+        OIDF_MATRIX_SCHEMA_VERSION, OIDF_TRUST_POLICY_SCHEMA_VERSION, OidfArtifactMatrix,
+        OidfArtifactMatrixGroup, OidfArtifactMatrixPlan, OidfArtifactMatrixVariant,
+        OidfDriverAutomation, OidfDriverHandler, OidfDriverIdentity, OidfDriverLane,
+        OidfDriverManifest, OidfDriverProgram, OidfMatrixIdentity, OidfPlanResourceBudget,
         OidfResourceBounds, OidfSuiteIdentity,
     };
 
@@ -513,6 +542,7 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000;
     const MANIFEST_URL: &str = "https://artifacts.example/oidf/stable/driver.jws";
+    const DRIVER_URL: &str = "https://artifacts.example/oidf/v1/driver.json";
     const MATRIX_URL: &str = "https://artifacts.example/oidf/v1/matrix.json";
 
     struct FakeTransport {
@@ -572,6 +602,7 @@ mod tests {
                 plans: vec![OidfArtifactMatrixPlan {
                     id: "p001".to_owned(),
                     plan: "oidcc-basic-certification-test-plan".to_owned(),
+                    driver_handler: "default".to_owned(),
                     resource_budget: OidfPlanResourceBudget {
                         modules: 16,
                         clients: 2,
@@ -587,7 +618,42 @@ mod tests {
         .expect("matrix")
     }
 
+    fn driver() -> Vec<u8> {
+        serde_json::to_vec(&OidfDriverProgram {
+            schema: OIDF_DRIVER_SCHEMA_VERSION,
+            engine_protocol: OIDF_DRIVER_ENGINE_PROTOCOL,
+            handlers: vec![OidfDriverHandler {
+                id: "default".to_owned(),
+                automation: OidfDriverAutomation::None,
+                lane: OidfDriverLane::Parallel,
+            }],
+        })
+        .expect("driver")
+    }
+
+    fn verify_cached_entry(
+        record_bytes: &[u8],
+        compact_manifest_bytes: &[u8],
+        matrix: &[u8],
+        manifest_digest: &str,
+        trust: &ArtifactTrustPolicy,
+        available_capabilities: &BTreeSet<String>,
+        now: i64,
+    ) -> Result<CacheRecord, ArtifactDiscoveryError> {
+        super::verify_cached_entry(
+            record_bytes,
+            compact_manifest_bytes,
+            &driver(),
+            matrix,
+            manifest_digest,
+            trust,
+            available_capabilities,
+            now,
+        )
+    }
+
     fn manifest(matrix: &[u8], expires_at: i64) -> OidfDriverManifest {
+        let driver = driver();
         OidfDriverManifest {
             schema: OIDF_ARTIFACT_SCHEMA_VERSION,
             artifact_id: "official-driver".to_owned(),
@@ -602,8 +668,14 @@ mod tests {
                 revision: "b".repeat(40),
                 image_digest: format!("sha256:{}", "c".repeat(64)),
             },
-            engine_protocol: 1,
+            engine_protocol: OIDF_DRIVER_ENGINE_PROTOCOL,
             required_capabilities: vec!["nazoauth.client.create".to_owned()],
+            driver: OidfDriverIdentity {
+                schema: OIDF_DRIVER_SCHEMA_VERSION,
+                url: DRIVER_URL.to_owned(),
+                sha256: digest(&driver),
+                size: driver.len() as u64,
+            },
             matrix: OidfMatrixIdentity {
                 schema: OIDF_MATRIX_SCHEMA_VERSION,
                 url: MATRIX_URL.to_owned(),
@@ -640,11 +712,13 @@ mod tests {
     }
 
     fn fake_transport(expires_at: i64) -> FakeTransport {
+        let driver = driver();
         let matrix = matrix();
         let compact = sign(&manifest(&matrix, expires_at));
         FakeTransport {
             responses: BTreeMap::from([
                 (MANIFEST_URL.to_owned(), compact.into_bytes()),
+                (DRIVER_URL.to_owned(), driver),
                 (MATRIX_URL.to_owned(), matrix),
             ]),
             requests: RefCell::new(Vec::new()),
@@ -652,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn verifies_manifest_before_downloading_the_signed_matrix_url() {
+    fn verifies_manifest_before_downloading_signed_driver_and_matrix_urls() {
         let transport = fake_transport(NOW + 3600);
         let fetched =
             fetch_verified_artifact(&transport, MANIFEST_URL, &trust(), &capabilities(), NOW)
@@ -662,6 +736,7 @@ mod tests {
             transport.requests.into_inner(),
             vec![
                 (MANIFEST_URL.to_owned(), MAX_SIGNED_DRIVER_BYTES as u64),
+                (DRIVER_URL.to_owned(), fetched.driver.len() as u64),
                 (MATRIX_URL.to_owned(), fetched.matrix.len() as u64),
             ]
         );
@@ -699,6 +774,24 @@ mod tests {
             ))
         ));
         assert_eq!(unsupported.requests.borrow().len(), 1);
+
+        let mut tampered_driver = fake_transport(NOW + 3600);
+        tampered_driver
+            .responses
+            .insert(DRIVER_URL.to_owned(), b"tampered".to_vec());
+        assert!(matches!(
+            fetch_verified_artifact(
+                &tampered_driver,
+                MANIFEST_URL,
+                &trust(),
+                &capabilities(),
+                NOW
+            ),
+            Err(ArtifactDiscoveryError::Artifact(
+                ArtifactError::DriverPolicy(_)
+            ))
+        ));
+        assert_eq!(tampered_driver.requests.borrow().len(), 2);
     }
 
     #[test]
@@ -879,6 +972,7 @@ mod tests {
             &root,
             MANIFEST_URL,
             &fetched.compact_manifest,
+            &fetched.driver,
             &fetched.matrix,
             &fetched.artifact,
         )
@@ -964,6 +1058,7 @@ mod tests {
             &root,
             MANIFEST_URL,
             &fetched.compact_manifest,
+            &fetched.driver,
             &fetched.matrix,
             &fetched.artifact,
         )
@@ -993,6 +1088,7 @@ mod tests {
                 &root,
                 MANIFEST_URL,
                 &fetched.compact_manifest,
+                &fetched.driver,
                 &fetched.matrix,
                 &fetched.artifact,
             )
@@ -1011,6 +1107,7 @@ mod tests {
                 &root,
                 MANIFEST_URL,
                 &fetched.compact_manifest,
+                &fetched.driver,
                 &fetched.matrix,
                 &fetched.artifact,
             ),
@@ -1042,6 +1139,7 @@ mod tests {
                     &root,
                     manifest_url,
                     &fetched.compact_manifest,
+                    &fetched.driver,
                     &fetched.matrix,
                     &fetched.artifact,
                 )
@@ -1093,6 +1191,7 @@ mod tests {
                 &root,
                 MANIFEST_URL,
                 &fetched.compact_manifest,
+                &fetched.driver,
                 &fetched.matrix,
                 &fetched.artifact,
             ),

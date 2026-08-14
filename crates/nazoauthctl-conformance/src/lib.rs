@@ -9,6 +9,7 @@
 
 mod artifact;
 mod artifact_discovery;
+mod artifact_driver;
 mod artifact_plan;
 mod browser;
 mod client;
@@ -27,15 +28,19 @@ pub use artifact::{
     ArtifactError, ArtifactTrustPolicy, MAX_ARTIFACT_MATRIX_BYTES, MAX_SIGNED_DRIVER_BYTES,
     OIDF_ARTIFACT_SCHEMA_VERSION, OIDF_DRIVER_ENGINE_PROTOCOL, OIDF_MATRIX_SCHEMA_VERSION,
     OIDF_TRUST_POLICY_SCHEMA_VERSION, OidfArtifactMatrix, OidfArtifactMatrixGroup,
-    OidfArtifactMatrixPlan, OidfArtifactMatrixVariant, OidfDriverManifest, OidfMatrixIdentity,
-    OidfPlanResourceBudget, OidfResourceBounds, OidfSuiteIdentity, VerifiedOidfArtifact,
-    VerifiedOidfDriverManifest, read_artifact_matrix, read_compact_manifest, verify_oidf_artifact,
-    verify_oidf_driver_manifest, verify_oidf_matrix,
+    OidfArtifactMatrixPlan, OidfArtifactMatrixVariant, OidfDriverIdentity, OidfDriverManifest,
+    OidfMatrixIdentity, OidfPlanResourceBudget, OidfResourceBounds, OidfSuiteIdentity,
+    VerifiedOidfArtifact, VerifiedOidfDriverManifest, read_artifact_driver, read_artifact_matrix,
+    read_compact_manifest, verify_oidf_artifact, verify_oidf_driver_manifest, verify_oidf_matrix,
 };
 pub use artifact_discovery::{
     ArtifactDiscoveryError, CachedOidfArtifact, OIDF_ARTIFACT_CACHE_MAX_ENTRIES,
     OIDF_ARTIFACT_CACHE_MIN_FREE_BYTES, OIDF_ARTIFACT_CACHE_SCHEMA_VERSION, ResolvedOidfArtifact,
     open_cached_oidf_artifact, open_cached_oidf_driver_plan, resolve_oidf_artifact,
+};
+pub use artifact_driver::{
+    MAX_ARTIFACT_DRIVER_BYTES, OIDF_DRIVER_SCHEMA_VERSION, OidfDriverAutomation, OidfDriverHandler,
+    OidfDriverLane, OidfDriverProgram,
 };
 pub use artifact_plan::{
     OidfDriverInspectionPlan, OidfDriverPlanEntry, OidfPlanError, OidfPlanSelection,

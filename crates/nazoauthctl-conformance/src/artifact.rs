@@ -7,9 +7,11 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use url::Url;
 
+use crate::artifact_driver::OidfDriverProgram;
+
 pub const OIDF_TRUST_POLICY_SCHEMA_VERSION: u32 = 1;
-pub const OIDF_ARTIFACT_SCHEMA_VERSION: u32 = 2;
-pub const OIDF_DRIVER_ENGINE_PROTOCOL: u32 = 1;
+pub const OIDF_ARTIFACT_SCHEMA_VERSION: u32 = 3;
+pub const OIDF_DRIVER_ENGINE_PROTOCOL: u32 = 2;
 pub const OIDF_MATRIX_SCHEMA_VERSION: u32 = 2;
 pub const MAX_SIGNED_DRIVER_BYTES: usize = 1024 * 1024;
 pub const MAX_ARTIFACT_MATRIX_BYTES: usize = 8 * 1024 * 1024;
@@ -41,6 +43,7 @@ pub struct OidfDriverManifest {
     pub suite: OidfSuiteIdentity,
     pub engine_protocol: u32,
     pub required_capabilities: Vec<String>,
+    pub driver: OidfDriverIdentity,
     pub matrix: OidfMatrixIdentity,
     pub resource_bounds: OidfResourceBounds,
 }
@@ -56,6 +59,15 @@ pub struct OidfSuiteIdentity {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidfMatrixIdentity {
+    pub schema: u32,
+    pub url: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidfDriverIdentity {
     pub schema: u32,
     pub url: String,
     pub sha256: String,
@@ -101,6 +113,7 @@ pub struct OidfArtifactMatrixVariant {
 pub struct OidfArtifactMatrixPlan {
     pub id: String,
     pub plan: String,
+    pub driver_handler: String,
     pub resource_budget: OidfPlanResourceBudget,
     pub config_template: Value,
     #[serde(default)]
@@ -132,6 +145,10 @@ pub struct VerifiedOidfArtifact {
     pub suite: OidfSuiteIdentity,
     pub engine_protocol: u32,
     pub required_capabilities: Vec<String>,
+    pub driver_schema: u32,
+    pub driver_sha256: String,
+    pub driver_size: u64,
+    pub driver_handlers: u32,
     pub matrix_sha256: String,
     pub matrix_size: u64,
     pub matrix_groups: u32,
@@ -172,6 +189,10 @@ pub enum ArtifactError {
     ManifestPolicy(&'static str),
     #[error("artifact matrix is malformed")]
     MalformedMatrix,
+    #[error("artifact driver is malformed")]
+    MalformedDriver,
+    #[error("artifact driver violates policy: {0}")]
+    DriverPolicy(&'static str),
     #[error("artifact matrix violates policy: {0}")]
     MatrixPolicy(&'static str),
     #[error("artifact requires unsupported capability {0}")]
@@ -242,13 +263,14 @@ impl ArtifactTrustPolicy {
 
 pub fn verify_oidf_artifact(
     compact_manifest: &str,
+    driver_bytes: &[u8],
     matrix_bytes: &[u8],
     trust: &ArtifactTrustPolicy,
     available_capabilities: &BTreeSet<String>,
     now: i64,
 ) -> Result<VerifiedOidfArtifact, ArtifactError> {
     let driver = verify_oidf_driver_manifest(compact_manifest, trust, available_capabilities, now)?;
-    verify_oidf_matrix(driver, matrix_bytes)
+    verify_oidf_matrix(driver, driver_bytes, matrix_bytes)
 }
 
 pub fn verify_oidf_driver_manifest(
@@ -308,9 +330,19 @@ pub fn verify_oidf_driver_manifest(
 
 pub fn verify_oidf_matrix(
     driver: VerifiedOidfDriverManifest,
+    driver_bytes: &[u8],
     matrix_bytes: &[u8],
 ) -> Result<VerifiedOidfArtifact, ArtifactError> {
-    let (matrix, matrix_budget) = validate_matrix(matrix_bytes, &driver.manifest)?;
+    let driver_program = driver.verify_driver_payload(driver_bytes)?;
+    verify_oidf_matrix_with_driver(driver, driver_program, matrix_bytes)
+}
+
+pub(crate) fn verify_oidf_matrix_with_driver(
+    driver: VerifiedOidfDriverManifest,
+    driver_program: OidfDriverProgram,
+    matrix_bytes: &[u8],
+) -> Result<VerifiedOidfArtifact, ArtifactError> {
+    let (matrix, matrix_budget) = validate_matrix(matrix_bytes, &driver.manifest, &driver_program)?;
     let matrix_plans = matrix
         .groups
         .iter()
@@ -328,6 +360,11 @@ pub fn verify_oidf_matrix(
         suite: manifest.suite,
         engine_protocol: manifest.engine_protocol,
         required_capabilities: manifest.required_capabilities,
+        driver_schema: manifest.driver.schema,
+        driver_sha256: manifest.driver.sha256,
+        driver_size: manifest.driver.size,
+        driver_handlers: u32::try_from(driver_program.handlers.len())
+            .map_err(|_| ArtifactError::DriverPolicy("driver handler count exceeds u32"))?,
         matrix_sha256: manifest.matrix.sha256,
         matrix_size: manifest.matrix.size,
         matrix_groups: u32::try_from(matrix.groups.len())
@@ -344,6 +381,27 @@ pub fn verify_oidf_matrix(
 }
 
 impl VerifiedOidfDriverManifest {
+    pub(crate) fn verify_driver_payload(
+        &self,
+        driver_bytes: &[u8],
+    ) -> Result<OidfDriverProgram, ArtifactError> {
+        crate::artifact_driver::validate_oidf_driver(
+            driver_bytes,
+            self.manifest.driver.schema,
+            self.manifest.driver.size,
+            &self.manifest.driver.sha256,
+            self.manifest.engine_protocol,
+        )
+    }
+
+    pub fn driver_url(&self) -> &str {
+        &self.manifest.driver.url
+    }
+
+    pub fn driver_size(&self) -> u64 {
+        self.manifest.driver.size
+    }
+
     pub fn matrix_url(&self) -> &str {
         &self.manifest.matrix.url
     }
@@ -373,6 +431,11 @@ pub fn read_artifact_matrix(path: &Path) -> Result<Vec<u8>, ArtifactError> {
         .map_err(map_secure_file_error)
 }
 
+pub fn read_artifact_driver(path: &Path) -> Result<Vec<u8>, ArtifactError> {
+    crate::secure_file::read_bounded(path, crate::MAX_ARTIFACT_DRIVER_BYTES, false)
+        .map_err(map_secure_file_error)
+}
+
 fn validate_manifest(
     manifest: &OidfDriverManifest,
     trust: &ArtifactTrustPolicy,
@@ -390,6 +453,13 @@ fn validate_manifest(
         ));
     }
     let source = trust.validated_source()?;
+    let driver_url =
+        validated_https_url(&manifest.driver.url, false).map_err(ArtifactError::ManifestPolicy)?;
+    if !url_is_below_source(&driver_url, &source) {
+        return Err(ArtifactError::ManifestPolicy(
+            "driver URL is outside the trusted source",
+        ));
+    }
     let matrix_url =
         validated_https_url(&manifest.matrix.url, false).map_err(ArtifactError::ManifestPolicy)?;
     if !url_is_below_source(&matrix_url, &source) {
@@ -426,6 +496,13 @@ fn validate_manifest(
             return Err(ArtifactError::UnsupportedCapability(capability.clone()));
         }
     }
+    if manifest.driver.schema != crate::OIDF_DRIVER_SCHEMA_VERSION
+        || manifest.driver.size == 0
+        || manifest.driver.size > crate::MAX_ARTIFACT_DRIVER_BYTES as u64
+        || validate_lower_hex(&manifest.driver.sha256, 64).is_err()
+    {
+        return Err(ArtifactError::ManifestPolicy("driver identity is invalid"));
+    }
     if manifest.matrix.schema != OIDF_MATRIX_SCHEMA_VERSION
         || manifest.matrix.size == 0
         || manifest.matrix.size > MAX_ARTIFACT_MATRIX_BYTES as u64
@@ -457,6 +534,7 @@ fn validate_manifest(
 fn validate_matrix(
     bytes: &[u8],
     manifest: &OidfDriverManifest,
+    driver: &crate::OidfDriverProgram,
 ) -> Result<(OidfArtifactMatrix, OidfPlanResourceBudget), ArtifactError> {
     if bytes.is_empty()
         || bytes.len() > MAX_ARTIFACT_MATRIX_BYTES
@@ -481,6 +559,12 @@ fn validate_matrix(
     }
     let mut group_ids = BTreeSet::new();
     let mut plan_ids = BTreeSet::new();
+    let driver_handlers = driver
+        .handlers
+        .iter()
+        .map(|handler| handler.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut used_driver_handlers = BTreeSet::new();
     let mut plan_count = 0usize;
     let mut matrix_budget = OidfPlanResourceBudget {
         modules: 0,
@@ -501,6 +585,13 @@ fn validate_matrix(
             plan_count = plan_count.saturating_add(1);
             validate_identifier(&plan.id, 128).map_err(ArtifactError::MatrixPolicy)?;
             validate_identifier(&plan.plan, 256).map_err(ArtifactError::MatrixPolicy)?;
+            validate_identifier(&plan.driver_handler, 128).map_err(ArtifactError::MatrixPolicy)?;
+            if !driver_handlers.contains(plan.driver_handler.as_str()) {
+                return Err(ArtifactError::MatrixPolicy(
+                    "matrix plan references an unknown driver handler",
+                ));
+            }
+            used_driver_handlers.insert(plan.driver_handler.as_str());
             validate_plan_resource_budget(&plan.resource_budget, &manifest.resource_bounds)
                 .map_err(ArtifactError::MatrixPolicy)?;
             matrix_budget.modules = matrix_budget
@@ -562,6 +653,11 @@ fn validate_matrix(
     {
         return Err(ArtifactError::MatrixPolicy(
             "matrix resource budget exceeds the signed artifact bounds",
+        ));
+    }
+    if used_driver_handlers != driver_handlers {
+        return Err(ArtifactError::MatrixPolicy(
+            "driver contains handlers unused by the signed Matrix",
         ));
     }
     Ok((matrix, matrix_budget))
@@ -833,6 +929,8 @@ fn map_secure_file_error(error: crate::secure_file::SecureFileError) -> Artifact
 mod tests {
     use p256::ecdsa::{SigningKey, signature::Signer as _};
 
+    use crate::{OidfDriverAutomation, OidfDriverHandler, OidfDriverLane, OidfDriverProgram};
+
     use super::*;
 
     const NOW: i64 = 1_800_000_000;
@@ -869,6 +967,7 @@ mod tests {
                 plans: vec![OidfArtifactMatrixPlan {
                     id: "oidc-core-p001".to_owned(),
                     plan: "oidcc-basic-certification-test-plan".to_owned(),
+                    driver_handler: "default".to_owned(),
                     resource_budget: OidfPlanResourceBudget {
                         modules: 32,
                         clients: 2,
@@ -891,7 +990,38 @@ mod tests {
         .expect("matrix")
     }
 
+    fn driver() -> Vec<u8> {
+        serde_json::to_vec(&OidfDriverProgram {
+            schema: crate::OIDF_DRIVER_SCHEMA_VERSION,
+            engine_protocol: OIDF_DRIVER_ENGINE_PROTOCOL,
+            handlers: vec![OidfDriverHandler {
+                id: "default".to_owned(),
+                automation: OidfDriverAutomation::None,
+                lane: OidfDriverLane::Parallel,
+            }],
+        })
+        .expect("driver")
+    }
+
+    fn verify_oidf_artifact(
+        compact_manifest: &str,
+        matrix_bytes: &[u8],
+        trust: &ArtifactTrustPolicy,
+        available_capabilities: &BTreeSet<String>,
+        now: i64,
+    ) -> Result<VerifiedOidfArtifact, ArtifactError> {
+        super::verify_oidf_artifact(
+            compact_manifest,
+            &driver(),
+            matrix_bytes,
+            trust,
+            available_capabilities,
+            now,
+        )
+    }
+
     fn manifest(matrix: &[u8]) -> OidfDriverManifest {
+        let driver = driver();
         OidfDriverManifest {
             schema: OIDF_ARTIFACT_SCHEMA_VERSION,
             artifact_id: "official-oidf-driver".to_owned(),
@@ -906,8 +1036,14 @@ mod tests {
                 revision: "b".repeat(40),
                 image_digest: format!("sha256:{}", "c".repeat(64)),
             },
-            engine_protocol: 1,
+            engine_protocol: OIDF_DRIVER_ENGINE_PROTOCOL,
             required_capabilities: vec!["nazoauth.client.create".to_owned()],
+            driver: OidfDriverIdentity {
+                schema: crate::OIDF_DRIVER_SCHEMA_VERSION,
+                url: "https://artifacts.example/oidf/v1.2.3/driver.json".to_owned(),
+                sha256: digest(&driver),
+                size: driver.len() as u64,
+            },
             matrix: OidfMatrixIdentity {
                 schema: OIDF_MATRIX_SCHEMA_VERSION,
                 url: "https://artifacts.example/oidf/v1.2.3/matrix.json".to_owned(),
@@ -957,7 +1093,60 @@ mod tests {
         assert_eq!(verified.matrix_modules, 32);
         assert_eq!(verified.matrix_clients, 2);
         assert_eq!(verified.matrix_wall_clock_seconds, 600);
+        assert_eq!(verified.driver_schema, crate::OIDF_DRIVER_SCHEMA_VERSION);
+        assert_eq!(verified.driver_sha256, digest(&driver()));
+        assert_eq!(verified.driver_handlers, 1);
         assert_eq!(verified.suite.release, "v5.2.2");
+    }
+
+    #[test]
+    fn matrix_must_reference_every_signed_declarative_driver_handler() {
+        let matrix = matrix();
+        let mut unknown: OidfArtifactMatrix = serde_json::from_slice(&matrix).expect("matrix");
+        unknown.groups[0].plans[0].driver_handler = "missing".to_owned();
+        let unknown = serde_json::to_vec(&unknown).expect("matrix");
+        assert!(matches!(
+            verify_oidf_artifact(
+                &sign(&manifest(&unknown)),
+                &unknown,
+                &trust(),
+                &capabilities(),
+                NOW,
+            ),
+            Err(ArtifactError::MatrixPolicy(_))
+        ));
+
+        let driver = serde_json::to_vec(&OidfDriverProgram {
+            schema: crate::OIDF_DRIVER_SCHEMA_VERSION,
+            engine_protocol: OIDF_DRIVER_ENGINE_PROTOCOL,
+            handlers: vec![
+                OidfDriverHandler {
+                    id: "default".to_owned(),
+                    automation: OidfDriverAutomation::None,
+                    lane: OidfDriverLane::Parallel,
+                },
+                OidfDriverHandler {
+                    id: "unused".to_owned(),
+                    automation: OidfDriverAutomation::None,
+                    lane: OidfDriverLane::Parallel,
+                },
+            ],
+        })
+        .expect("driver");
+        let mut signed = manifest(&matrix);
+        signed.driver.sha256 = digest(&driver);
+        signed.driver.size = driver.len() as u64;
+        assert!(matches!(
+            super::verify_oidf_artifact(
+                &sign(&signed),
+                &driver,
+                &matrix,
+                &trust(),
+                &capabilities(),
+                NOW,
+            ),
+            Err(ArtifactError::MatrixPolicy(_))
+        ));
     }
 
     #[test]

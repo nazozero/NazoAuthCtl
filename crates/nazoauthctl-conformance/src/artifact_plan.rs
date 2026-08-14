@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use crate::{CachedOidfArtifact, OidfArtifactMatrix, OidfPlanResourceBudget};
+use crate::{CachedOidfArtifact, OidfArtifactMatrix, OidfDriverHandler, OidfPlanResourceBudget};
 
-pub const OIDF_DRIVER_INSPECTION_PLAN_SCHEMA: u32 = 3;
+pub const OIDF_DRIVER_INSPECTION_PLAN_SCHEMA: u32 = 4;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +37,7 @@ pub struct OidfDriverPlanEntry {
     pub group_variant_values: BTreeMap<String, String>,
     pub plan_id: String,
     pub suite_plan_name: String,
+    pub driver_handler: OidfDriverHandler,
     pub resource_budget: OidfPlanResourceBudget,
     pub plan_variant_values: BTreeMap<String, String>,
     pub config_template: Value,
@@ -88,6 +89,7 @@ pub enum OidfPlanError {
 
 pub(crate) fn compile_oidf_driver_inspection_plan(
     cached: CachedOidfArtifact,
+    driver_bytes: &[u8],
     matrix_bytes: &[u8],
     caller_declared_capabilities: &BTreeSet<String>,
     selection: OidfPlanSelection,
@@ -96,6 +98,19 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
     if cached.schema != crate::OIDF_ARTIFACT_CACHE_SCHEMA_VERSION {
         return Err(OidfPlanError::CacheIdentity);
     }
+    let driver = crate::artifact_driver::validate_oidf_driver(
+        driver_bytes,
+        cached.artifact.driver_schema,
+        cached.artifact.driver_size,
+        &cached.artifact.driver_sha256,
+        cached.artifact.engine_protocol,
+    )
+    .map_err(|_| OidfPlanError::CacheIdentity)?;
+    let driver_handlers = driver
+        .handlers
+        .into_iter()
+        .map(|handler| (handler.id.clone(), handler))
+        .collect::<BTreeMap<_, _>>();
     if matrix_bytes.len() as u64 != cached.artifact.matrix_size
         || sha256(matrix_bytes) != cached.artifact.matrix_sha256
     {
@@ -150,6 +165,10 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
                 .checked_add(plan.resource_budget.wall_clock_seconds)
                 .ok_or(OidfPlanError::ResourceBound)?;
             selected_groups.insert(group.id.clone());
+            let driver_handler = driver_handlers
+                .get(&plan.driver_handler)
+                .cloned()
+                .ok_or(OidfPlanError::CacheIdentity)?;
             entries.push(OidfDriverPlanEntry {
                 group_id: group.id.clone(),
                 profile: group.profile.clone(),
@@ -157,6 +176,7 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
                 group_variant_values: group.variant.values.clone(),
                 plan_id: plan.id,
                 suite_plan_name: plan.plan,
+                driver_handler,
                 resource_budget: plan.resource_budget,
                 plan_variant_values: plan.variant,
                 config_template: plan.config_template,
@@ -214,7 +234,6 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
         capabilities_attested: false,
         execution_permitted: false,
         execution_blockers: vec![
-            "signed-driver-payload-and-runtime-sandbox",
             "authenticated-capability-negotiation",
             "ordinary-resource-provider",
             "target-and-suite-origin-policy",
@@ -251,6 +270,7 @@ mod tests {
     use super::*;
     use crate::{
         OidfArtifactMatrixGroup, OidfArtifactMatrixPlan, OidfArtifactMatrixVariant,
+        OidfDriverAutomation, OidfDriverHandler, OidfDriverLane, OidfDriverProgram,
         OidfPlanResourceBudget, OidfResourceBounds, OidfSuiteIdentity, VerifiedOidfArtifact,
     };
 
@@ -297,10 +317,11 @@ mod tests {
             plan.plans[0].plan_variant_values.get("response_type"),
             Some(&"code".to_owned())
         );
+        assert_eq!(plan.plans[0].driver_handler.id, "default");
         assert!(!plan.deployment_bound);
         assert!(!plan.capabilities_attested);
         assert!(!plan.execution_permitted);
-        assert_eq!(plan.execution_blockers.len(), 5);
+        assert_eq!(plan.execution_blockers.len(), 4);
     }
 
     #[test]
@@ -455,6 +476,7 @@ mod tests {
                 .map(|id| OidfArtifactMatrixPlan {
                     id: (*id).to_owned(),
                     plan: format!("suite-{id}"),
+                    driver_handler: "default".to_owned(),
                     resource_budget: OidfPlanResourceBudget {
                         modules: 10,
                         clients: 1,
@@ -473,7 +495,38 @@ mod tests {
         }
     }
 
+    fn driver_bytes() -> Vec<u8> {
+        serde_json::to_vec(&OidfDriverProgram {
+            schema: crate::OIDF_DRIVER_SCHEMA_VERSION,
+            engine_protocol: crate::OIDF_DRIVER_ENGINE_PROTOCOL,
+            handlers: vec![OidfDriverHandler {
+                id: "default".to_owned(),
+                automation: OidfDriverAutomation::None,
+                lane: OidfDriverLane::Parallel,
+            }],
+        })
+        .expect("driver")
+    }
+
+    fn compile_oidf_driver_inspection_plan(
+        cached: CachedOidfArtifact,
+        matrix_bytes: &[u8],
+        caller_declared_capabilities: &BTreeSet<String>,
+        selection: OidfPlanSelection,
+        now: i64,
+    ) -> Result<OidfDriverInspectionPlan, OidfPlanError> {
+        super::compile_oidf_driver_inspection_plan(
+            cached,
+            &driver_bytes(),
+            matrix_bytes,
+            caller_declared_capabilities,
+            selection,
+            now,
+        )
+    }
+
     fn cached(matrix: &[u8]) -> CachedOidfArtifact {
+        let driver = driver_bytes();
         CachedOidfArtifact {
             schema: crate::OIDF_ARTIFACT_CACHE_SCHEMA_VERSION,
             manifest_url: "https://artifacts.example/oidf/driver.jws".to_owned(),
@@ -494,6 +547,10 @@ mod tests {
                 },
                 engine_protocol: crate::OIDF_DRIVER_ENGINE_PROTOCOL,
                 required_capabilities: vec!["nazoauth.client.create".to_owned()],
+                driver_schema: crate::OIDF_DRIVER_SCHEMA_VERSION,
+                driver_sha256: sha256(&driver),
+                driver_size: driver.len() as u64,
+                driver_handlers: 1,
                 matrix_sha256: sha256(matrix),
                 matrix_size: matrix.len() as u64,
                 matrix_groups: 2,

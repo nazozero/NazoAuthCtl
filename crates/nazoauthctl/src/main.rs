@@ -14,8 +14,8 @@ use nazoauthctl_conformance::{
     OidfPlanSelection, OnboardingOutput, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
     OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard,
     RunControl, StableRenderer, SuiteClient, TtyRenderer, WebDriverClient, WebDriverEndpoint,
-    open_cached_oidf_artifact, open_cached_oidf_driver_plan, read_artifact_matrix,
-    read_compact_manifest, resolve_oidf_artifact, verify_oidf_artifact,
+    open_cached_oidf_artifact, open_cached_oidf_driver_plan, read_artifact_driver,
+    read_artifact_matrix, read_compact_manifest, resolve_oidf_artifact, verify_oidf_artifact,
 };
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
@@ -281,7 +281,7 @@ fn execute_artifact_open(invocation: ArtifactOpenInvocation) -> anyhow::Result<(
 
 fn print_artifact_open_help() {
     println!(
-        "Usage:\n  nazoauthctl conformance artifact open --trust-policy PATH --cache-dir PATH --digest SHA256 [--capability NAME ...]\n\nThe command performs no network request or mutation. It opens only the exact immutable digest entry and revalidates its commit record, source, ES256 signature, current validity window, Suite identity, matrix digest/size/schema, resource bounds, engine protocol, and every caller-supplied capability requirement."
+        "Usage:\n  nazoauthctl conformance artifact open --trust-policy PATH --cache-dir PATH --digest SHA256 [--capability NAME ...]\n\nThe command performs no network request or mutation. It opens only the exact immutable digest entry and revalidates its commit record, source, ES256 signature, current validity window, Suite identity, declarative driver and Matrix digests/sizes/schemas, resource bounds, engine protocol, and every caller-supplied capability requirement."
     );
 }
 
@@ -386,13 +386,14 @@ fn execute_artifact_resolve(invocation: ArtifactResolveInvocation) -> anyhow::Re
 
 fn print_artifact_resolve_help() {
     println!(
-        "Usage:\n  nazoauthctl conformance artifact resolve --trust-policy PATH --manifest-url HTTPS_URL --cache-dir PATH [--capability NAME ...]\n\nThe command fetches a bounded manifest without redirects, verifies it before following its signed matrix URL, verifies the exact matrix bytes, and commits an immutable owner-only cache entry with a final verified record marker. It performs no NazoAuth or Suite mutation."
+        "Usage:\n  nazoauthctl conformance artifact resolve --trust-policy PATH --manifest-url HTTPS_URL --cache-dir PATH [--capability NAME ...]\n\nThe command fetches a bounded manifest without redirects, verifies it before following the signed declarative driver and Matrix URLs, verifies both exact payloads, and commits an immutable owner-only cache entry with a final verified record marker. It performs no NazoAuth or Suite mutation."
     );
 }
 
 struct ArtifactVerifyInvocation {
     trust_policy: PathBuf,
     manifest: PathBuf,
+    driver: PathBuf,
     matrix: PathBuf,
     capabilities: std::collections::BTreeSet<String>,
 }
@@ -426,6 +427,7 @@ fn parse_artifact_verify_invocation(
     }
     let mut trust_policy = None;
     let mut manifest = None;
+    let mut driver = None;
     let mut matrix = None;
     let mut capabilities = std::collections::BTreeSet::new();
     let mut index = 0usize;
@@ -433,7 +435,7 @@ fn parse_artifact_verify_invocation(
         let option = values[index].as_str();
         if !matches!(
             option,
-            "--trust-policy" | "--manifest" | "--matrix" | "--capability"
+            "--trust-policy" | "--manifest" | "--driver" | "--matrix" | "--capability"
         ) {
             bail!("unknown conformance artifact verify option: {option}");
         }
@@ -446,6 +448,7 @@ fn parse_artifact_verify_invocation(
                 set_once(&mut trust_policy, PathBuf::from(value), option)?;
             }
             "--manifest" => set_once(&mut manifest, PathBuf::from(value), option)?,
+            "--driver" => set_once(&mut driver, PathBuf::from(value), option)?,
             "--matrix" => set_once(&mut matrix, PathBuf::from(value), option)?,
             "--capability" => {
                 if !capabilities.insert(value) {
@@ -459,6 +462,7 @@ fn parse_artifact_verify_invocation(
     Ok(Some(ArtifactVerifyInvocation {
         trust_policy: trust_policy.context("--trust-policy is required")?,
         manifest: manifest.context("--manifest is required")?,
+        driver: driver.context("--driver is required")?,
         matrix: matrix.context("--matrix is required")?,
         capabilities,
     }))
@@ -469,10 +473,13 @@ fn execute_artifact_verify(invocation: ArtifactVerifyInvocation) -> anyhow::Resu
         .context("OIDF artifact trust policy is invalid")?;
     let manifest = read_compact_manifest(&invocation.manifest)
         .context("signed OIDF driver manifest is invalid")?;
+    let driver =
+        read_artifact_driver(&invocation.driver).context("OIDF driver payload is invalid")?;
     let matrix =
         read_artifact_matrix(&invocation.matrix).context("OIDF artifact matrix is invalid")?;
     let artifact = verify_oidf_artifact(
         &manifest,
+        &driver,
         &matrix,
         &trust,
         &invocation.capabilities,
@@ -501,7 +508,7 @@ fn current_unix_time() -> anyhow::Result<i64> {
 
 fn print_artifact_verify_help() {
     println!(
-        "Usage:\n  nazoauthctl conformance artifact verify --trust-policy PATH --manifest PATH --matrix PATH [--capability NAME ...]\n\nThe command performs no NazoAuth or Suite mutation. It emits a verified identity only after the local trust policy, ES256 signature, source, validity window, Suite identity, matrix digest/size/schema, resource bounds, and all required capabilities have been accepted."
+        "Usage:\n  nazoauthctl conformance artifact verify --trust-policy PATH --manifest PATH --driver PATH --matrix PATH [--capability NAME ...]\n\nThe command performs no NazoAuth or Suite mutation. It emits a verified identity only after the local trust policy, ES256 signature, source, validity window, Suite identity, declarative driver digest/size/schema, matrix digest/size/schema, resource bounds, and all required capabilities have been accepted."
     );
 }
 
@@ -1277,7 +1284,9 @@ mod tests {
             "--trust-policy",
             "/etc/nazoauthctl/oidf-trust.json",
             "--manifest",
-            "/tmp/driver.jws",
+            "/tmp/manifest.jws",
+            "--driver",
+            "/tmp/driver.json",
             "--matrix",
             "/tmp/matrix.json",
             "--capability",
@@ -1290,6 +1299,7 @@ mod tests {
             PathBuf::from("/etc/nazoauthctl/oidf-trust.json")
         );
         assert!(parsed.capabilities.contains("nazoauth.client.create"));
+        assert_eq!(parsed.driver, PathBuf::from("/tmp/driver.json"));
         assert!(
             parse_run_invocation(&args(
                 &["nazoauthctl", "conformance", "artifact", "verify",]
@@ -1321,7 +1331,9 @@ mod tests {
                 "--trust-policy",
                 "/trust.json",
                 "--manifest",
-                "/driver.jws",
+                "/manifest.jws",
+                "--driver",
+                "/driver.json",
                 "--matrix",
                 "/matrix.json",
                 "--capability",

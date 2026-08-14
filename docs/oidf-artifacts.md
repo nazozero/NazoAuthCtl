@@ -39,7 +39,7 @@ root.
 
 ## Signed driver manifest
 
-Manifest schema 2 is a compact JWS using ES256 with type
+Manifest schema 3 is a compact JWS using ES256 with type
 `nazoauth-oidf-driver-manifest+jws`. Its strict payload binds:
 
 - artifact ID and immutable 40-character revision;
@@ -47,6 +47,7 @@ Manifest schema 2 is a compact JWS using ES256 with type
 - issuance, not-before, and exclusive expiry, with a maximum 30-day lifetime;
 - exact Suite release, source revision, and OCI image digest;
 - driver engine protocol and required capability names;
+- declarative driver URL, schema, byte size, and SHA-256 digest;
 - matrix URL, schema, byte size, and SHA-256 digest;
 - maximum plans, cumulative module/client budgets, and wall-clock duration. The
   validity window must be long enough to contain the full wall-clock bound.
@@ -54,9 +55,22 @@ Manifest schema 2 is a compact JWS using ES256 with type
 The JWS signs the original payload bytes. The verifier does not reserialize JSON
 before checking the signature.
 
+## Declarative driver schema
+
+Driver schema 1 is a signed-by-digest JSON payload consumed by engine protocol
+2. It is not native code and has no URL, command, filesystem, credential, or
+arbitrary network fields. A bounded handler table selects only controller-owned
+operations already covered by the engine: `none`, `browser`, `openid4vci`, or
+`openid4vp`, plus either the normal bounded-parallel lane or the serialized
+`ciba` lane. A CIBA handler must use real browser approval automation. Unknown
+fields, handlers, operations, or engine protocols fail closed, so publishing a
+new plan/handler mapping does not require a controller release while adding a
+new host capability does.
+
 ## Matrix schema
 
-Schema 2 is declarative. It contains groups, Suite plan names, variants, config
+Schema 2 is declarative. It contains groups, Suite plan names, explicit driver
+handler references, variants, config
 templates, required capability names, and exact expected `SKIPPED` module
 exceptions. Every plan declares module, client, and wall-clock budgets; the
 verifier safely sums them and rejects a Matrix above any signed manifest bound.
@@ -77,7 +91,8 @@ classification rather than a pass.
 ```text
 nazoauthctl conformance artifact verify \
   --trust-policy /etc/nazoauthctl/oidf-trust.json \
-  --manifest ./driver.jws \
+  --manifest ./manifest.jws \
+  --driver ./driver.json \
   --matrix ./matrix.json \
   --capability nazoauth.client.create
 ```
@@ -114,14 +129,14 @@ byte size and accepted only after exact digest and schema validation.
 Verified bytes are stored under the driver manifest digest. The cache root,
 `artifacts` directory, digest entry, lock, and files are all owner-only. A
 stable cache-wide lock serializes writers for at most ten seconds. Cache record
-schema 3 contains only deterministic commit identity: the trusted discovery URL
+schema 4 contains only deterministic commit identity: the trusted discovery URL
 and complete verified artifact. It deliberately does not claim an unauthenticated
-first-resolution timestamp. Schema 2 entries must be re-resolved.
+first-resolution timestamp. Earlier cache schemas must be re-resolved.
 An existing cache created with broader directory modes must be moved to a new
 owner-only root or have the root and `artifacts` directory explicitly tightened
 by the operator before this version will read or write it.
 
-`driver.jws` and `matrix.json` are individually fsynced and atomically replaced;
+`manifest.jws`, `driver.json`, and `matrix.json` are individually fsynced and atomically replaced;
 `verified.json` is written and directory-fsynced last as the commit marker. A
 cache hit requires the committed manifest, matrix, URL, and complete record to
 match the newly fetched and verified artifact exactly. Conflicting committed
@@ -178,7 +193,8 @@ nazoauthctl conformance artifact plan \
 Planning reuses the exact offline-open verification path; it does not trust the
 cache record alone. Group and plan identifiers must be unique, must exist in
 the verified Matrix, and their intersection must be non-empty. The emitted
-entries bind the artifact identity, Suite plan name, variant, required
+entries bind the artifact identity, Suite plan name, resolved declarative
+driver handler/lane, variant, required
 capabilities, the caller-declared capability set that allowed verification,
 expected `SKIPPED` exceptions, and the verified JSON config template. The
 artifact and matrix digests remain the sole byte-level identities; planning
@@ -186,11 +202,10 @@ does not create a competing template canonicalization rule. It also sums the
 selected signed resource budgets and rejects a selection that cannot finish
 strictly before the artifact's exclusive expiry.
 
-Inspection-plan schema 3 is evidence, not an execution authorization. It carries
+Inspection-plan schema 4 is evidence, not an execution authorization. It carries
 a plan JTI but deliberately records `deployment_bound: false`,
 `capabilities_attested: false`, and `execution_permitted: false`, together with
-the missing signed executable driver/runtime sandbox, authenticated
-negotiation, ordinary resource provider, target/Suite origin policy, and
+the authenticated negotiation, ordinary resource provider, target/Suite origin policy, and
 deployment-bound crash-safe journal blockers. The command creates no NazoAuth
 resource, Suite plan, execution journal, or cleanup obligation. Signed budgets
 are contract ceilings, not proof of runtime enforcement; a future runner must
