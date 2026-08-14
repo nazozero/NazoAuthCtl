@@ -362,7 +362,7 @@ fn open_directory_chain(path: &Path, private: bool, create: bool) -> Result<File
         ) {
             Ok(next) => next,
             Err(error) if error.raw_os_error() == libc::ENOENT && create => {
-                rustix::fs::mkdirat(
+                match rustix::fs::mkdirat(
                     &directory,
                     Path::new(name),
                     Mode::from_raw_mode(if private && final_component {
@@ -370,8 +370,14 @@ fn open_directory_chain(path: &Path, private: bool, create: bool) -> Result<File
                     } else {
                         0o755
                     }),
-                )
-                .map_err(map_errno)?;
+                ) {
+                    Ok(()) => {}
+                    // Another creator may win after the ENOENT observation.
+                    // Re-open and validate the winning inode below; a file,
+                    // symlink, unsafe owner, or unsafe mode still fails closed.
+                    Err(error) if error.raw_os_error() == libc::EEXIST => {}
+                    Err(error) => return Err(map_errno(error)),
+                }
                 rustix::fs::openat(
                     &directory,
                     Path::new(name),
