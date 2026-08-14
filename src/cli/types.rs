@@ -111,6 +111,14 @@ pub(crate) enum TlsCertificateSource {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TlsCertificateCheckInput {
+    pub(crate) provider_config: PathBuf,
+    pub(crate) tenant: String,
+    pub(crate) hostname: String,
+    pub(crate) warning_window_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AcmeCertificateInput {
     pub(crate) acme_config: PathBuf,
     pub(crate) provider_config: PathBuf,
@@ -139,6 +147,7 @@ pub(crate) enum AcmeCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TlsCommand {
+    Check(TlsCertificateCheckInput),
     Plan(TlsCertificateInput),
     Apply {
         input: TlsCertificateInput,

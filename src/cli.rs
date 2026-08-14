@@ -16,7 +16,7 @@ pub(crate) use help::help_topic;
 pub(crate) use types::{
     AcmeCertificateInput, AcmeCommand, BootstrapAdminOptions, CandidateTarget, Cli, Command,
     ConformanceLeaseCommand, HelpTopic, InstallOptions, KeysCommand, StandardsProfileSecrets,
-    TlsCertificateInput, TlsCertificateSource, TlsCommand, UpdateOptions,
+    TlsCertificateCheckInput, TlsCertificateInput, TlsCertificateSource, TlsCommand, UpdateOptions,
 };
 #[cfg(test)]
 pub(crate) use types::{ConformanceCommand, RelinquishOptions};

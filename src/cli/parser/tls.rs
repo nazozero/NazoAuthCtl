@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use anyhow::{Context, bail};
 
 use super::super::types::{
-    AcmeCertificateInput, AcmeCommand, TlsCertificateInput, TlsCertificateSource, TlsCommand,
+    AcmeCertificateInput, AcmeCommand, TlsCertificateCheckInput, TlsCertificateInput,
+    TlsCertificateSource, TlsCommand,
 };
 
 pub(super) fn parse_tls(mut values: Vec<String>) -> anyhow::Result<TlsCommand> {
@@ -23,9 +24,10 @@ fn parse_certificate(mut values: Vec<String>) -> anyhow::Result<TlsCommand> {
     let operation = values
         .first()
         .cloned()
-        .context("tls certificate requires plan, apply, recover, or show")?;
+        .context("tls certificate requires check, plan, apply, recover, or show")?;
     values.remove(0);
     match operation.as_str() {
+        "check" => parse_check_input(values).map(TlsCommand::Check),
         "plan" => {
             let (input, yes) = parse_material_input(values, false)?;
             debug_assert!(!yes);
@@ -50,6 +52,45 @@ fn parse_certificate(mut values: Vec<String>) -> anyhow::Result<TlsCommand> {
         }
         other => bail!("unknown tls certificate operation {other}"),
     }
+}
+
+fn parse_check_input(values: Vec<String>) -> anyhow::Result<TlsCertificateCheckInput> {
+    let mut provider_config = None;
+    let mut tenant = None;
+    let mut hostname = None;
+    let mut warning_window_seconds = None;
+    let mut index = 0;
+    while index < values.len() {
+        let option = values[index].as_str();
+        let value = values
+            .get(index + 1)
+            .with_context(|| format!("{option} requires a value"))?
+            .clone();
+        match option {
+            "--provider-config" => set_once(
+                &mut provider_config,
+                PathBuf::from(value),
+                "--provider-config",
+            )?,
+            "--tenant" => set_once(&mut tenant, value, "--tenant")?,
+            "--hostname" => set_once(&mut hostname, value, "--hostname")?,
+            "--warning-window-seconds" => set_once(
+                &mut warning_window_seconds,
+                value
+                    .parse::<u64>()
+                    .context("--warning-window-seconds must be an integer")?,
+                "--warning-window-seconds",
+            )?,
+            other => bail!("unknown tls certificate check option {other}"),
+        }
+        index += 2;
+    }
+    Ok(TlsCertificateCheckInput {
+        provider_config: provider_config.context("--provider-config is required")?,
+        tenant: tenant.context("--tenant is required")?,
+        hostname: hostname.context("--hostname is required")?,
+        warning_window_seconds,
+    })
 }
 
 fn parse_acme(mut values: Vec<String>) -> anyhow::Result<AcmeCommand> {
