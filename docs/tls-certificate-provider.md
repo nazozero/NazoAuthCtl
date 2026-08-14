@@ -140,8 +140,11 @@ process, so stopping or uninstalling the ctl binary does not stop authentication
 
 This contract closes external import, file activation, reload, public
 verification, receipt, and crash recovery without inventing a server API.
-ACME issuance, Direct TLS configuration/reload, trusted-proxy/internal transport
-changes, and Nginx/Angie configuration generation remain blocked on the dynamic
+ACME HTTP-01 issuance is a separate transaction documented in
+[`tls-acme-http01.md`](tls-acme-http01.md); its receipt can be supplied to this
+provider's plan/apply commands. Direct TLS configuration/reload,
+trusted-proxy/internal transport changes, and Nginx/Angie configuration
+generation remain blocked on the dynamic
 NazoAuth capability/protocol work tracked by NazoAuth #127/#128/#129 and parent
 #130. Those later operations must negotiate capabilities at runtime; they must
 not infer compatibility from a NazoAuth release number. No HTTP fallback is

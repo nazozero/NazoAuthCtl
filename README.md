@@ -29,7 +29,9 @@ See [architecture](docs/architecture.md), [recovery boundaries](docs/recovery.md
 [compatibility](docs/compatibility.md). The strict manual-deployment input is
 documented in the [lifecycle contract](docs/lifecycle-contract.md).
 Deployment-owned public certificate rotation uses the independent
-[TLS certificate provider contract](docs/tls-certificate-provider.md).
+[TLS certificate provider contract](docs/tls-certificate-provider.md). Public
+certificate issuance through a preconfigured HTTP-01 webroot is defined by the
+[ACME issuance contract](docs/tls-acme-http01.md).
 
 On Linux, install an independently attested Release with GitHub CLI available:
 

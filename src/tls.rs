@@ -40,6 +40,7 @@ const MAX_TRUST_ANCHOR_BYTES: u64 = 1024 * 1024;
 const TRANSACTION_TTL_SECONDS: i64 = 15 * 60;
 const MAX_HTTP_RESPONSE_BYTES: u64 = 64 * 1024;
 
+mod acme;
 mod material;
 mod public_endpoint;
 
@@ -195,6 +196,7 @@ pub(crate) fn run(
 ) -> anyhow::Result<()> {
     let store = DeploymentStore::system();
     match command {
+        TlsCommand::Acme(command) => acme::run(selector, command, require_root, confirm),
         TlsCommand::Plan(input) => {
             require_root()?;
             let record = store.resolve(selector, true)?;

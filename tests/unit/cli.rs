@@ -270,6 +270,62 @@ fn parses_tls_certificate_plan_apply_recover_and_show() {
 }
 
 #[test]
+fn parses_tls_acme_commands_and_requires_mutation_flags_only_for_issue() {
+    let input = [
+        "--acme-config",
+        "/etc/nazoauth/acme.json",
+        "--provider-config",
+        "/etc/nazoauth/tls-provider.json",
+        "--tenant",
+        "tenant-a",
+        "--hostname",
+        "auth.example",
+    ];
+    let mut plan = vec!["nazoauthctl", "tls", "acme", "plan"];
+    plan.extend(input);
+    assert!(matches!(
+        parse(&plan).unwrap().unwrap().command,
+        Command::Tls(TlsCommand::Acme(AcmeCommand::Plan(_)))
+    ));
+
+    let mut issue = vec!["nazoauthctl", "tls", "acme", "issue"];
+    issue.extend(input);
+    issue.extend(["--agree-terms", "--yes"]);
+    assert!(matches!(
+        parse(&issue).unwrap().unwrap().command,
+        Command::Tls(TlsCommand::Acme(AcmeCommand::Issue {
+            agree_terms: true,
+            yes: true,
+            ..
+        }))
+    ));
+    for command in ["recover", "show"] {
+        let mut args = vec![
+            "nazoauthctl",
+            "tls",
+            "acme",
+            command,
+            "--tenant",
+            "tenant-a",
+            "--hostname",
+            "auth.example",
+        ];
+        if command == "recover" {
+            args.push("--yes");
+        }
+        assert!(parse(&args).is_ok());
+    }
+
+    let mut invalid_plan = vec!["nazoauthctl", "tls", "acme", "plan"];
+    invalid_plan.extend(input);
+    invalid_plan.push("--agree-terms");
+    assert!(parse(&invalid_plan).is_err());
+    let mut duplicate_agreement = issue;
+    duplicate_agreement.push("--agree-terms");
+    assert!(parse(&duplicate_agreement).is_err());
+}
+
+#[test]
 fn help_topics_consume_each_global_option_before_the_command() {
     let values = |parts: &[&str]| {
         parts

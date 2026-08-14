@@ -103,6 +103,33 @@ pub(crate) struct TlsCertificateInput {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AcmeCertificateInput {
+    pub(crate) acme_config: PathBuf,
+    pub(crate) provider_config: PathBuf,
+    pub(crate) tenant: String,
+    pub(crate) hostname: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AcmeCommand {
+    Plan(AcmeCertificateInput),
+    Issue {
+        input: AcmeCertificateInput,
+        agree_terms: bool,
+        yes: bool,
+    },
+    Recover {
+        tenant: String,
+        hostname: String,
+        yes: bool,
+    },
+    Show {
+        tenant: String,
+        hostname: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TlsCommand {
     Plan(TlsCertificateInput),
     Apply {
@@ -118,6 +145,7 @@ pub(crate) enum TlsCommand {
         tenant: String,
         hostname: String,
     },
+    Acme(AcmeCommand),
 }
 
 #[derive(Debug)]
