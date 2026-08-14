@@ -37,6 +37,8 @@ pub fn redacted_variant(values: &BTreeMap<String, String>) -> BTreeMap<String, S
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum GroupStatus {
     Passed,
+    Review,
+    Skipped,
     Failed,
     Running,
     Remaining,
@@ -49,10 +51,14 @@ pub struct GroupProgress {
     pub completed: usize,
     pub total: usize,
     pub status: GroupStatus,
-    /// Item-level counters. `completed == passed + failed`; `running` is the
-    /// currently instantiated Suite module (the runner is serial by design).
+    /// Item-level counters. `completed == passed + reviewed + skipped +
+    /// failed`; `running` is the currently instantiated Suite module.
     #[serde(default)]
     pub passed: usize,
+    #[serde(default)]
+    pub reviewed: usize,
+    #[serde(default)]
+    pub skipped: usize,
     #[serde(default)]
     pub failed: usize,
     #[serde(default)]
@@ -67,6 +73,8 @@ pub struct ProgressSnapshot {
     pub total: usize,
     pub groups: Vec<GroupProgress>,
     pub passed_groups: usize,
+    pub review_groups: usize,
+    pub skipped_groups: usize,
     pub failed_groups: usize,
     pub running_groups: usize,
     pub remaining_groups: usize,
@@ -74,6 +82,10 @@ pub struct ProgressSnapshot {
     /// denominator is frozen from the Matrix modules defined during phase 1.
     #[serde(default)]
     pub passed: usize,
+    #[serde(default)]
+    pub reviewed: usize,
+    #[serde(default)]
+    pub skipped: usize,
     #[serde(default)]
     pub failed: usize,
     #[serde(default)]
@@ -118,11 +130,13 @@ impl<W: Write> ProgressSink for StableRenderer<W> {
     fn update(&mut self, event: &ProgressEvent) {
         let _ = writeln!(
             self.writer,
-            "NazoAuth OIDF Conformance: {}/{} ({:>3}%) Passed {} · Failed {} · Running {} · Remaining {}{}",
+            "NazoAuth OIDF Conformance: {}/{} ({:>3}%) Passed {} · Review {} · Skipped {} · Failed {} · Running {} · Remaining {}{}",
             event.snapshot.completed,
             event.snapshot.total,
             percent(event.snapshot.completed, event.snapshot.total),
             event.snapshot.passed,
+            event.snapshot.reviewed,
+            event.snapshot.skipped,
             event.snapshot.failed,
             event.snapshot.running,
             event.snapshot.remaining,
@@ -169,6 +183,8 @@ impl<W: Write> ProgressSink for TtyRenderer<W> {
         for group in &event.snapshot.groups {
             let symbol = match group.status {
                 GroupStatus::Passed => '✓',
+                GroupStatus::Review => '!',
+                GroupStatus::Skipped => '↷',
                 GroupStatus::Failed => '✗',
                 GroupStatus::Running => '●',
                 GroupStatus::Remaining => '○',
@@ -200,8 +216,10 @@ impl<W: Write> ProgressSink for TtyRenderer<W> {
         let _ = writeln!(self.writer);
         let _ = writeln!(
             self.writer,
-            "Passed {} · Failed {} · Running {} · Remaining {}",
+            "Passed {} · Review {} · Skipped {} · Failed {} · Running {} · Remaining {}",
             event.snapshot.passed,
+            event.snapshot.reviewed,
+            event.snapshot.skipped,
             event.snapshot.failed,
             event.snapshot.running,
             event.snapshot.remaining
@@ -272,10 +290,14 @@ mod tests {
                 total: 2,
                 groups: vec![],
                 passed_groups: 0,
+                review_groups: 0,
+                skipped_groups: 0,
                 failed_groups: 0,
                 running_groups: 0,
                 remaining_groups: 0,
                 passed: 1,
+                reviewed: 0,
+                skipped: 0,
                 failed: 0,
                 running: 0,
                 remaining: 1,
@@ -304,15 +326,21 @@ mod tests {
                     total: 1,
                     status: GroupStatus::Running,
                     passed: 0,
+                    reviewed: 0,
+                    skipped: 0,
                     failed: 0,
                     running: 1,
                     remaining: 0,
                 }],
                 passed_groups: 0,
+                review_groups: 0,
+                skipped_groups: 0,
                 failed_groups: 0,
                 running_groups: 1,
                 remaining_groups: 0,
                 passed: 0,
+                reviewed: 0,
+                skipped: 0,
                 failed: 0,
                 running: 1,
                 remaining: 0,
@@ -341,15 +369,21 @@ mod tests {
                     total: 3,
                     status: GroupStatus::Running,
                     passed: 2,
+                    reviewed: 0,
+                    skipped: 0,
                     failed: 0,
                     running: 1,
                     remaining: 0,
                 }],
                 passed_groups: 0,
+                review_groups: 0,
+                skipped_groups: 0,
                 failed_groups: 0,
                 running_groups: 1,
                 remaining_groups: 0,
                 passed: 2,
+                reviewed: 0,
+                skipped: 0,
                 failed: 0,
                 running: 1,
                 remaining: 0,
@@ -361,7 +395,9 @@ mod tests {
         let text = String::from_utf8(output).expect("utf8");
         assert!(text.contains("NazoAuth OIDF Conformance"));
         assert!(text.contains("Overall"));
-        assert!(text.contains("Passed 2 · Failed 0 · Running 1 · Remaining 0"));
+        assert!(
+            text.contains("Passed 2 · Review 0 · Skipped 0 · Failed 0 · Running 1 · Remaining 0")
+        );
         assert!(text.contains("FAPI 2.0/mode=mTLS"));
         assert!(!text.contains("ETA"));
     }
