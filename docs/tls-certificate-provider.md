@@ -161,6 +161,28 @@ ctl was interrupted, recovery fails closed without invoking an obsolete
 provider task; the deployment declaration must first be reconciled by an
 operator.
 
+Each committed certificate receipt is written first to an immutable
+`receipts/REVISION.json` archive and then to the binding's `receipt.json`
+current pointer. If ctl stops between those two durable writes, recovery accepts
+the archived receipt only when every journal, source, material, provider,
+generation, revision, and expiry binding is exact and that generation is still
+active; the current pointer must still be either the exact pre-transaction
+receipt or the exact committed receipt. Recovery then restores the current
+pointer and finishes the audit record. A rollback likewise refuses an activation
+pointer outside the previous and target generations recorded by the journal.
+The transaction journal also binds the complete pre-transaction receipt digest,
+not only its revision and leaf certificate, so recovery cannot replace a changed
+current marker with archived target evidence.
+Conflicting bytes at an occupied revision are never overwritten. A new apply
+also refuses an already occupied target revision before staging or activating
+material, leaving the interrupted evidence for explicit recovery or review.
+
+The unique generation directory entry is synchronized before activation, in
+addition to synchronizing each staged file and the activation symlink. A durable
+activation pointer therefore cannot legitimately outlive the generation directory
+entry it names after a power loss. Removal of an inactive generation synchronizes
+the same parent directory so interrupted cleanup cannot resurrect an orphan entry.
+
 `tls certificate show` prints the authoritative current receipt. Completed
 transaction journals and revision receipts remain under the deployment state
 directory. The active generation and TLS consumer do not depend on a running ctl

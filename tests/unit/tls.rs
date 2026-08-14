@@ -70,11 +70,16 @@ fn recovery_accepts_only_the_exact_previous_or_committed_receipt() {
         transaction.previous_generation.clone().unwrap(),
         "e".repeat(64),
     );
-    assert!(validate_previous_receipt_binding(&transaction, Some(&previous)).is_err());
+    transaction.previous_receipt_sha256 = Some(receipt_sha256(&previous).unwrap());
+    assert!(validate_previous_receipt_binding(&transaction, Some(&previous)).is_ok());
 
-    // The pure binding check reaches active-provider validation only after all
-    // journal fields match. A changed generation is rejected before any
-    // pointer or provider command can be touched.
+    previous.public_url = "https://auth.example/changed".to_owned();
+    assert!(validate_previous_receipt_binding(&transaction, Some(&previous)).is_err());
+    previous.public_url = transaction.provider.public_url.clone();
+
+    // Receipt identity is independent of the live pointer because the target
+    // may already be active during recovery. A changed generation is still
+    // rejected before any pointer or provider command can be touched.
     previous.generation = material_root.join("generations/1-replaced");
     assert!(validate_previous_receipt_binding(&transaction, Some(&previous)).is_err());
 
@@ -94,6 +99,66 @@ fn recovery_accepts_only_the_exact_previous_or_committed_receipt() {
     assert!(ensure_source_not_current(Some(&committed), &different_source).is_ok());
     committed.provider_config_sha256 = "f".repeat(64);
     assert!(validate_committed_receipt_binding(&transaction, &committed).is_err());
+}
+
+#[test]
+fn recovery_fences_activation_to_the_previous_or_target_generation() {
+    let material_root = PathBuf::from("/srv/nazoauth/tls/tenant-a/auth.example");
+    let mut transaction = test_transaction(material_root.clone());
+    let previous = material_root.join("generations/1-previous");
+    let unrelated = material_root.join("generations/unrelated");
+    transaction.previous_generation = Some(previous.clone());
+
+    transaction.phase = TransactionPhase::Prepared;
+    assert!(validate_recovery_activation_state(&transaction, Some(previous.as_path())).is_ok());
+    assert!(
+        validate_recovery_activation_state(&transaction, Some(transaction.generation.as_path()))
+            .is_err()
+    );
+
+    transaction.phase = TransactionPhase::Activated;
+    assert!(validate_recovery_activation_state(&transaction, Some(previous.as_path())).is_ok());
+    assert!(
+        validate_recovery_activation_state(&transaction, Some(transaction.generation.as_path()))
+            .is_ok()
+    );
+    assert!(validate_recovery_activation_state(&transaction, Some(unrelated.as_path())).is_err());
+}
+
+#[test]
+fn receipt_archive_restores_only_identical_current_evidence_and_never_overwrites() {
+    let work = PrivateTempDir::new("nazoauth-tls-receipt-archive").unwrap();
+    let directory = work.path().join("binding");
+    ensure_private_directory(&directory, "test TLS receipt binding").unwrap();
+    let transaction = test_transaction(work.path().join("material"));
+    let receipt = test_receipt(
+        &transaction,
+        &transaction.jti,
+        transaction.target_revision,
+        transaction.generation.clone(),
+        transaction.leaf_certificate_sha256.clone(),
+    );
+
+    persist_receipt_at(&directory, &receipt).unwrap();
+    let archive_path = receipt_archive_path(&directory, receipt.revision);
+    let current_path = directory.join("receipt.json");
+    let archive = fs::read(&archive_path).unwrap();
+    let current = fs::read(&current_path).unwrap();
+    assert_eq!(archive, current);
+    assert!(ensure_receipt_archive_available(&directory, receipt.revision).is_err());
+
+    // A crash after the immutable revision write but before the current pointer
+    // is recoverable only from those exact archived bytes.
+    fs::remove_file(&current_path).unwrap();
+    persist_receipt_at(&directory, &receipt).unwrap();
+    assert_eq!(fs::read(&archive_path).unwrap(), archive);
+    assert_eq!(fs::read(&current_path).unwrap(), current);
+
+    let mut conflicting = receipt;
+    conflicting.jti = "0198f5df-4df8-7d9f-8f6a-5c2b2917cc8b".to_owned();
+    assert!(persist_receipt_at(&directory, &conflicting).is_err());
+    assert_eq!(fs::read(&archive_path).unwrap(), archive);
+    assert_eq!(fs::read(&current_path).unwrap(), current);
 }
 
 #[test]
@@ -502,6 +567,7 @@ fn activated_generation_rolls_back_without_leaving_private_material_active() {
         generation: generation.clone(),
         previous_generation: None,
         previous_leaf_certificate_sha256: None,
+        previous_receipt_sha256: None,
         created_at: Utc::now().timestamp(),
         expires_at: Utc::now().timestamp() + TRANSACTION_TTL_SECONDS,
         phase: TransactionPhase::Prepared,
@@ -579,6 +645,7 @@ fn test_transaction(material_root: PathBuf) -> CertificateTransaction {
         generation: material_root.join("generations/1-target"),
         previous_generation: None,
         previous_leaf_certificate_sha256: None,
+        previous_receipt_sha256: None,
         created_at: now,
         expires_at: now + TRANSACTION_TTL_SECONDS,
         phase: TransactionPhase::Prepared,

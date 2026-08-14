@@ -22,14 +22,14 @@ use crate::{
     deployment::{Capability, DeploymentRecord, DeploymentStore},
     filesystem::{
         atomic_write, ensure_private_directory, read_secure_regular_file, remove_file_durable,
-        symlink_atomic, validate_secure_directory,
+        symlink_atomic, sync_parent, validate_secure_directory,
     },
     process::Process,
 };
 
 const PROVIDER_PROTOCOL: &str = "nazoauthctl.tls.external-generation.v1";
 const PROVIDER_SCHEMA: u32 = 1;
-const TRANSACTION_SCHEMA: u32 = 2;
+const TRANSACTION_SCHEMA: u32 = 3;
 const RECEIPT_SCHEMA: u32 = 2;
 const PLAN_SCHEMA: u32 = 2;
 const MAX_PROVIDER_BYTES: u64 = 64 * 1024;
@@ -254,6 +254,7 @@ struct CertificateTransaction {
     generation: PathBuf,
     previous_generation: Option<PathBuf>,
     previous_leaf_certificate_sha256: Option<String>,
+    previous_receipt_sha256: Option<String>,
     created_at: i64,
     expires_at: i64,
     phase: TransactionPhase,
@@ -558,6 +559,8 @@ fn apply(
     let target_revision = expected_revision
         .checked_add(1)
         .context("TLS material revision overflow")?;
+    let previous_receipt_sha256 = previous.as_ref().map(receipt_sha256).transpose()?;
+    ensure_receipt_revision_available(store, &record, &tenant, &hostname, target_revision)?;
     let jti = uuid::Uuid::now_v7().to_string();
     let generation = provider
         .config
@@ -594,6 +597,7 @@ fn apply(
         previous_leaf_certificate_sha256: previous
             .as_ref()
             .map(|receipt| receipt.leaf_certificate_sha256.clone()),
+        previous_receipt_sha256,
         created_at: now,
         expires_at: now + TRANSACTION_TTL_SECONDS,
         phase: TransactionPhase::Prepared,
@@ -710,14 +714,34 @@ fn recover(
     validate_transaction_binding(store, &transaction, &record, &tenant, &hostname)?;
     let _provider_lock = store.shared_resource_lock(&provider_lock_id(&transaction.provider))?;
     let previous = load_receipt(store, &record, &tenant, &hostname)?;
-    if let Some(receipt) = previous
+    let committed = if previous
         .as_ref()
-        .filter(|receipt| receipt.jti == transaction.jti)
+        .is_some_and(|receipt| receipt.jti == transaction.jti)
     {
+        previous.clone()
+    } else {
+        // Before accepting an archived target receipt, require the current
+        // marker to still describe the exact pre-transaction state. The
+        // activation pointer may already reference the target generation, so
+        // this check deliberately validates identity rather than liveness.
+        validate_previous_receipt_binding(&transaction, previous.as_ref())?;
+        load_revision_receipt(
+            store,
+            &record,
+            &tenant,
+            &hostname,
+            transaction.target_revision,
+        )?
+    };
+    if let Some(receipt) = committed.as_ref() {
         validate_committed_receipt_binding(&transaction, receipt)?;
         if active_generation(&transaction.provider)?.as_ref() != Some(&transaction.generation) {
             bail!("committed TLS receipt exists but the active generation differs");
         }
+        // Reassert both commit markers. This restores a missing current receipt
+        // only from exact archived bytes and also detects a replaced archive
+        // before the pending transaction is finalized.
+        persist_receipt(store, &record, receipt)?;
         transaction.phase = TransactionPhase::Committed;
         persist_pending(store, &transaction)?;
         crate::governance::append_management_audit(
@@ -731,7 +755,8 @@ fn recover(
         println!("{}", serde_json::to_string_pretty(&transaction)?);
         return Ok(());
     }
-    validate_previous_receipt_binding(&transaction, previous.as_ref())?;
+    let observed = active_generation(&transaction.provider)?;
+    validate_recovery_activation_state(&transaction, observed.as_deref())?;
     let provider = loaded_provider_from_transaction(store, &transaction)?;
     rollback_transaction(&mut transaction, previous.as_ref(), Some(&provider))?;
     finalize_transaction(store, &transaction)?;
@@ -1037,6 +1062,7 @@ fn stage_generation(
         Err(error) => return Err(error).context("failed to inspect TLS target generation"),
     }
     fs::create_dir(&transaction.generation).context("failed to create unique TLS generation")?;
+    sync_parent(&transaction.generation).context("failed to persist unique TLS generation")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1123,7 +1149,8 @@ fn remove_inactive_generation(transaction: &CertificateTransaction) -> anyhow::R
         remove_file_durable(&transaction.generation.join(name))?;
     }
     match fs::remove_dir(&transaction.generation) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_parent(&transaction.generation)
+            .context("failed to persist removal of inactive TLS generation"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).context("failed to remove inactive TLS generation"),
     }
@@ -1280,7 +1307,8 @@ fn validate_previous_receipt_binding(
     match (transaction.expected_revision, receipt) {
         (0, None)
             if transaction.previous_generation.is_none()
-                && transaction.previous_leaf_certificate_sha256.is_none() =>
+                && transaction.previous_leaf_certificate_sha256.is_none()
+                && transaction.previous_receipt_sha256.is_none() =>
         {
             Ok(())
         }
@@ -1291,10 +1319,31 @@ fn validate_previous_receipt_binding(
                 && transaction.previous_leaf_certificate_sha256.as_ref()
                     == Some(&receipt.leaf_certificate_sha256) =>
         {
-            validate_active_receipt(&transaction.provider, Some(receipt))
+            let observed = receipt_sha256(receipt)?;
+            if transaction.previous_receipt_sha256.as_deref() != Some(observed.as_str()) {
+                bail!("TLS previous receipt digest no longer matches the pending transaction");
+            }
+            Ok(())
         }
         _ => bail!("TLS previous receipt no longer matches the pending transaction"),
     }
+}
+
+fn validate_recovery_activation_state(
+    transaction: &CertificateTransaction,
+    observed: Option<&Path>,
+) -> anyhow::Result<()> {
+    let previous = transaction.previous_generation.as_deref();
+    let target = Some(transaction.generation.as_path());
+    let valid = if transaction.phase.activation_may_have_happened() {
+        observed == previous || observed == target
+    } else {
+        observed == previous
+    };
+    if !valid {
+        bail!("TLS activation pointer changed outside the pending transaction");
+    }
+    Ok(())
 }
 
 fn validate_committed_receipt_binding(
@@ -1519,15 +1568,67 @@ fn persist_receipt(
         &receipt.tenant,
         &receipt.hostname,
     );
+    persist_receipt_at(&directory, receipt)
+}
+
+fn persist_receipt_at(directory: &Path, receipt: &CertificateReceipt) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec_pretty(receipt)?;
-    atomic_write(
-        &directory
-            .join("receipts")
-            .join(format!("{}.json", receipt.revision)),
-        &bytes,
-        0o600,
-    )?;
+    let archive = receipt_archive_path(directory, receipt.revision);
+    match read_optional_receipt_bytes(&archive, "TLS certificate receipt archive")? {
+        Some(existing) if existing.as_slice() != bytes.as_slice() => {
+            bail!("TLS certificate receipt revision archive contains conflicting evidence")
+        }
+        Some(_) => {}
+        None => atomic_write(&archive, &bytes, 0o600)?,
+    }
     atomic_write(&directory.join("receipt.json"), &bytes, 0o600)
+}
+
+fn receipt_sha256(receipt: &CertificateReceipt) -> anyhow::Result<String> {
+    Ok(sha256(&serde_json::to_vec_pretty(receipt)?))
+}
+
+fn ensure_receipt_revision_available(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    tenant: &str,
+    hostname: &str,
+    revision: u64,
+) -> anyhow::Result<()> {
+    let directory = binding_directory(store, &record.deployment_id, tenant, hostname);
+    ensure_receipt_archive_available(&directory, revision)
+}
+
+fn ensure_receipt_archive_available(directory: &Path, revision: u64) -> anyhow::Result<()> {
+    if read_optional_receipt_bytes(
+        &receipt_archive_path(directory, revision),
+        "TLS certificate receipt archive",
+    )?
+    .is_some()
+    {
+        bail!(
+            "TLS certificate target revision already has archived evidence; recover or review the interrupted transaction"
+        );
+    }
+    Ok(())
+}
+
+fn receipt_archive_path(directory: &Path, revision: u64) -> PathBuf {
+    directory.join("receipts").join(format!("{revision}.json"))
+}
+
+fn read_optional_receipt_bytes(
+    path: &Path,
+    label: &str,
+) -> anyhow::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            read_secure_regular_file(path, label, true, MAX_PROVIDER_BYTES).map(Some)
+        }
+        Ok(_) => bail!("{label} must be a regular non-symlink file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {label}")),
+    }
 }
 
 fn load_receipt(
@@ -1540,13 +1641,44 @@ fn load_receipt(
     let hostname = canonical_hostname(hostname)?;
     let path =
         binding_directory(store, &record.deployment_id, &tenant, &hostname).join("receipt.json");
-    let bytes = match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-            read_secure_regular_file(&path, "TLS certificate receipt", true, MAX_PROVIDER_BYTES)?
-        }
-        Ok(_) => bail!("TLS receipt must be a regular non-symlink file"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("failed to inspect TLS receipt"),
+    load_receipt_at(&path, "TLS certificate receipt", record, &tenant, &hostname)
+}
+
+fn load_revision_receipt(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    tenant: &str,
+    hostname: &str,
+    revision: u64,
+) -> anyhow::Result<Option<CertificateReceipt>> {
+    let tenant = canonical_tenant(tenant)?;
+    let hostname = canonical_hostname(hostname)?;
+    let directory = binding_directory(store, &record.deployment_id, &tenant, &hostname);
+    let receipt = load_receipt_at(
+        &receipt_archive_path(&directory, revision),
+        "TLS certificate receipt archive",
+        record,
+        &tenant,
+        &hostname,
+    )?;
+    if receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt.revision != revision)
+    {
+        bail!("TLS certificate receipt archive revision does not match its path");
+    }
+    Ok(receipt)
+}
+
+fn load_receipt_at(
+    path: &Path,
+    label: &str,
+    record: &DeploymentRecord,
+    tenant: &str,
+    hostname: &str,
+) -> anyhow::Result<Option<CertificateReceipt>> {
+    let Some(bytes) = read_optional_receipt_bytes(path, label)? else {
+        return Ok(None);
     };
     let receipt: CertificateReceipt =
         serde_json::from_slice(&bytes).context("TLS certificate receipt is invalid")?;
@@ -1597,6 +1729,21 @@ fn validate_transaction_binding(
         .expected_revision
         .checked_add(1)
         .context("TLS transaction revision overflow")?;
+    let valid_previous_shape = if transaction.expected_revision == 0 {
+        transaction.previous_generation.is_none()
+            && transaction.previous_leaf_certificate_sha256.is_none()
+            && transaction.previous_receipt_sha256.is_none()
+    } else {
+        transaction.previous_generation.is_some()
+            && transaction
+                .previous_leaf_certificate_sha256
+                .as_deref()
+                .is_some_and(valid_sha256)
+            && transaction
+                .previous_receipt_sha256
+                .as_deref()
+                .is_some_and(valid_sha256)
+    };
     if transaction.schema != TRANSACTION_SCHEMA
         || transaction.deployment_id != record.deployment_id
         || transaction.declaration_revision != record.declaration_revision
@@ -1606,6 +1753,7 @@ fn validate_transaction_binding(
         || transaction.provider.protocol != PROVIDER_PROTOCOL
         || transaction.provider.schema != PROVIDER_SCHEMA
         || transaction.target_revision != target_revision
+        || !valid_previous_shape
         || transaction.expires_at != transaction.created_at + TRANSACTION_TTL_SECONDS
         || transaction.certificate_not_after <= transaction.created_at
         || !valid_sha256(&transaction.material_sha256)
