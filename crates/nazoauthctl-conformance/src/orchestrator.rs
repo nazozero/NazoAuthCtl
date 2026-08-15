@@ -91,6 +91,18 @@ pub struct ConformanceRunConfig {
     /// Worker-owned automation lanes. HTTP-only test fixtures may leave this
     /// empty; production creates one independent lane per configured job.
     pub automation: Vec<ConformanceAutomation>,
+    /// Durable observer for externally allocated Suite resources.  The
+    /// controller installs this before creating plans so a process crash can
+    /// recover only the opaque Suite IDs it actually allocated.
+    pub suite_resource_observer: Option<Arc<dyn SuiteResourceObserver>>,
+}
+
+/// Receives Suite allocation events synchronously.  A persistence failure is
+/// treated as a run failure: returning an unjournaled plan or module would
+/// make crash cleanup impossible.
+pub trait SuiteResourceObserver: Send + Sync {
+    fn plan_created(&self, origin: &Origin, plan_id: &str) -> Result<(), String>;
+    fn module_created(&self, module_id: &str) -> Result<(), String>;
 }
 
 pub struct ConformanceRunner {
@@ -469,6 +481,14 @@ impl ConformanceRunner {
                     // response wrapper is partially moved below.
                     zeroize_json_value(&mut created.raw);
                     suite_plan_ids.push(created.id.clone());
+                    if let Some(observer) = &self.config.suite_resource_observer
+                        && let Err(error) =
+                            observer.plan_created(self.config.client.origin(), &created.id)
+                    {
+                        errors.push(error);
+                        groups[group_index].status = GroupStatus::Failed;
+                        break 'create;
+                    }
                     let defined_modules = created.modules.len();
                     groups[group_index].total += defined_modules;
                     groups[group_index].remaining += defined_modules;
@@ -590,6 +610,13 @@ impl ConformanceRunner {
                         }
                     };
                     module_ids.push(instance.id.clone());
+                    if let Some(observer) = &self.config.suite_resource_observer
+                        && let Err(error) = observer.module_created(&instance.id)
+                    {
+                        errors.push(error);
+                        groups[group_index].status = GroupStatus::Failed;
+                        break 'execute;
+                    }
                     plans[plan.report_index].created_instances += 1;
                     groups[group_index].running += 1;
                     groups[group_index].remaining = groups[group_index].remaining.saturating_sub(1);
@@ -1059,6 +1086,28 @@ fn cleanup_all(
     }
 }
 
+/// Idempotently clean only Suite resources durably recorded by the controller
+/// before a crash.  The caller must bind the current authenticated Suite
+/// client to the exact journal origin before invoking this function.
+pub fn recover_suite_resources(
+    client: &SuiteClient,
+    state: &crate::recovery::SuiteRecoveryState,
+) -> Result<(), String> {
+    if client.origin().as_str() != state.origin {
+        return Err("Suite recovery origin does not match the authenticated client".to_owned());
+    }
+    let mut report = CleanupReport::default();
+    cleanup_all(client, &state.module_ids, &state.plan_ids, &mut report);
+    if report.failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Suite recovery cleanup failed for {} resource(s)",
+            report.failures.len()
+        ))
+    }
+}
+
 fn cancel_once(client: &SuiteClient, module_id: &str, report: &mut CleanupReport) {
     match client.cancel_module(module_id) {
         Ok(_) => report.cancelled.push(module_id.to_owned()),
@@ -1317,6 +1366,7 @@ mod tests {
                 plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
                 jobs: 1,
                 automation: Vec::new(),
+                suite_resource_observer: None,
             })
             .is_err()
         );
@@ -1499,6 +1549,7 @@ mod tests {
             plan_lanes: BTreeMap::new(),
             jobs: 1,
             automation: Vec::new(),
+            suite_resource_observer: None,
         })
         .expect("runner");
 
@@ -1572,6 +1623,7 @@ mod tests {
             plan_lanes: BTreeMap::new(),
             jobs: 1,
             automation: Vec::new(),
+            suite_resource_observer: None,
         })
         .expect("runner");
         let issuer = Arc::new(Mutex::new(PendingIssuer { drives: 0 }));
@@ -1704,6 +1756,7 @@ mod tests {
             plan_lanes: BTreeMap::new(),
             jobs: 1,
             automation: Vec::new(),
+            suite_resource_observer: None,
         })
         .expect("runner");
         let plan = PlannedPlan {

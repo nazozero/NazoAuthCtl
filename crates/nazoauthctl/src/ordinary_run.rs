@@ -24,10 +24,11 @@ use nazoauthctl_conformance::{
     MatrixSelection, OidfArtifactMatrix, OidfDriverInspectionPlan, OidfDriverLane,
     OidfPlanSelection, OidfProviderExecutionBinding, OpenId4VciIssuerClient,
     OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient,
-    Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient, TenantResourceApplyOutput,
-    TenantResourceReceiptIdentity, TenantResourceRecoveryBinding, TtyRenderer, WebDriverClient,
-    WebDriverEndpoint, authorize_oidf_driver_execution, open_cached_oidf_driver_plan,
-    read_artifact_driver, read_artifact_matrix, read_compact_manifest, verify_oidf_artifact,
+    Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient, SuiteResourceObserver,
+    TenantResourceApplyOutput, TenantResourceReceiptIdentity, TenantResourceRecoveryBinding,
+    TtyRenderer, WebDriverClient, WebDriverEndpoint, authorize_oidf_driver_execution,
+    open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
+    read_compact_manifest, recover_suite_resources, verify_oidf_artifact,
     write_private_provider_evidence_bundle,
 };
 use nazoauthctl_core::tenant_resources::{
@@ -59,8 +60,6 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let recovery_store =
         ConformanceRecoveryStore::open(&recovery_directory, &deployment.deployment_id)?;
 
-    recover_pending_runs(&session, &recovery_store)?;
-
     let trust = ArtifactTrustPolicy::from_path(&invocation.trust_policy)
         .context("signed-artifact trust policy is invalid")?;
     let runner_capabilities = RUNNER_CAPABILITIES
@@ -91,6 +90,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     suite_client
         .probe_auth()
         .context("Suite API token authentication failed")?;
+    recover_pending_runs(&session, &recovery_store, &suite_client)?;
     if prompted {
         offer_credential_persistence(&suite_origin, &token)?;
     }
@@ -293,8 +293,8 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         proxy: proxy_recovery,
         resource_identities: manifest.resource_identities().to_vec(),
     };
-    let mut recovery = match recovery_store.begin_tenant_resource(recovery_binding) {
-        Ok(recovery) => recovery,
+    let recovery = match recovery_store.begin_tenant_resource(recovery_binding) {
+        Ok(recovery) => Arc::new(Mutex::new(recovery)),
         Err(error) => {
             return match std::fs::remove_file(&private_manifest_path) {
                 Ok(()) => Err(error).context(
@@ -312,17 +312,19 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             // Proxy installation is deliberately after receipt persistence,
             // so a pre-receipt rejection proves that no proxy side effect was
             // reached even when the intent carries a future proxy binding.
-            if !recovery.proxy_cleanup_complete() {
-                recovery.mark_proxy_cleanup_complete()?;
+            let mut guard = lock_recovery(&recovery)?;
+            if !guard.proxy_cleanup_complete() {
+                guard.mark_proxy_cleanup_complete()?;
             }
-            recovery.abort_uncommitted_tenant_resource()?;
+            drop(guard);
+            take_recovery(recovery)?.abort_uncommitted_tenant_resource()?;
             return Err(error).context("ordinary tenant-resource Apply was rejected");
         }
         Err(error) => {
             return Err(error).context("ordinary tenant-resource Apply failed");
         }
     };
-    recovery.record_tenant_resource_receipt(
+    lock_recovery(&recovery)?.record_tenant_resource_receipt(
         TenantResourceReceiptIdentity::from_verified_receipt(
             apply_receipt.receipt(),
             &apply_receipt.receipt_sha256(),
@@ -375,9 +377,9 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             Err(install) => {
                 let proxy_cleanup = ProxyTrustGuard::recover(bundle_path, reload_executable);
                 if proxy_cleanup.is_ok() {
-                    recovery.mark_proxy_cleanup_complete()?;
+                    lock_recovery(&recovery)?.mark_proxy_cleanup_complete()?;
                 }
-                let resource_cleanup = cleanup_run_resources(&client, recovery);
+                let resource_cleanup = cleanup_run_resources(&client, take_recovery(recovery)?);
                 bail!(
                     "proxy-install={install:#}; proxy-recovery={}; resource-cleanup={}",
                     proxy_cleanup
@@ -405,7 +407,16 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         &invocation,
         &suite_origin,
         plan_lanes,
+        recovery.clone(),
     );
+
+    let mut recovery = take_recovery(recovery)?;
+    if run_result
+        .as_ref()
+        .is_ok_and(|report| report.orchestration_integrity.cleanup_complete)
+    {
+        recovery.mark_suite_cleanup_complete()?;
+    }
 
     let proxy_cleanup = proxy.as_mut().map(ProxyTrustGuard::restore).transpose();
     if proxy_cleanup.is_ok() && !recovery.proxy_cleanup_complete() {
@@ -544,6 +555,7 @@ fn run_signed_suite(
     invocation: &RunInvocation,
     suite_origin: &Origin,
     plan_lanes: BTreeMap<String, OidfDriverLane>,
+    recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
 ) -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
     let binding = ConformanceBinding::openid4vc_trust_policy(
         materialized.trust_policy_resource_id(),
@@ -616,6 +628,7 @@ fn run_signed_suite(
         plan_lanes,
         jobs: invocation.jobs,
         automation,
+        suite_resource_observer: Some(Arc::new(DurableSuiteObserver { recovery })),
     })?;
     let summary = if io::stderr().is_terminal() {
         let mut renderer = TtyRenderer::new(io::stderr().lock());
@@ -625,6 +638,42 @@ fn run_signed_suite(
         runner.run(&mut renderer)
     };
     Ok(summary.report)
+}
+
+struct DurableSuiteObserver {
+    recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
+}
+
+impl SuiteResourceObserver for DurableSuiteObserver {
+    fn plan_created(&self, origin: &Origin, plan_id: &str) -> Result<(), String> {
+        lock_recovery(&self.recovery)
+            .and_then(|mut recovery| recovery.record_suite_plan(origin.as_str(), plan_id))
+            .map_err(|error| format!("failed to persist Suite plan allocation: {error:#}"))
+    }
+
+    fn module_created(&self, module_id: &str) -> Result<(), String> {
+        lock_recovery(&self.recovery)
+            .and_then(|mut recovery| recovery.record_suite_module(module_id))
+            .map_err(|error| format!("failed to persist Suite module allocation: {error:#}"))
+    }
+}
+
+fn lock_recovery(
+    recovery: &Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
+) -> anyhow::Result<std::sync::MutexGuard<'_, nazoauthctl_conformance::ConformanceRecoveryGuard>> {
+    recovery
+        .lock()
+        .map_err(|_| anyhow::anyhow!("ordinary recovery lock is poisoned"))
+}
+
+fn take_recovery(
+    recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
+) -> anyhow::Result<nazoauthctl_conformance::ConformanceRecoveryGuard> {
+    let recovery = Arc::try_unwrap(recovery)
+        .map_err(|_| anyhow::anyhow!("ordinary recovery is still referenced by Suite execution"))?;
+    recovery
+        .into_inner()
+        .map_err(|_| anyhow::anyhow!("ordinary recovery lock is poisoned"))
 }
 
 fn build_browser(
@@ -767,6 +816,7 @@ where
 fn recover_pending_runs(
     session: &nazoauthctl_core::ConformanceSession,
     store: &ConformanceRecoveryStore,
+    suite_client: &SuiteClient,
 ) -> anyhow::Result<()> {
     let pending = store.claim_pending()?;
     if pending.is_empty() {
@@ -827,6 +877,14 @@ fn recover_pending_runs(
                         &receipt.receipt_sha256(),
                     )?,
                 )?;
+            }
+            if !recovery.suite_cleanup_complete() {
+                let suite = recovery
+                    .suite_recovery()
+                    .context("ordinary recovery Suite state is incomplete")?;
+                recover_suite_resources(suite_client, suite)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                recovery.mark_suite_cleanup_complete()?;
             }
             if !recovery.proxy_cleanup_complete() {
                 let proxy = binding

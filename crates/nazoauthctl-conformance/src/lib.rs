@@ -84,7 +84,7 @@ pub use matrix::{
 pub use orchestrator::{
     BOUNDED_PLAN_RUNNER_PROTOCOL, ConformanceAutomation, ConformanceRunConfig, ConformanceRunner,
     MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT, MAX_POLL_TIMEOUT_SECONDS, OrchestrationError, RunControl,
-    RunSummary,
+    RunSummary, SuiteResourceObserver, recover_suite_resources,
 };
 pub use origin::{Origin, OriginError};
 pub use progress::{
@@ -94,8 +94,8 @@ pub use progress::{
 pub use proxy_trust::ProxyTrustGuard;
 pub use recovery::{
     ConformanceProxyRecovery, ConformanceRecoveryBinding, ConformanceRecoveryGuard,
-    ConformanceRecoveryStore, TenantResourceReceiptIdentity, TenantResourceRecoveryBinding,
-    TenantResourceRevokeOutcome, TenantResourceRevokeRecord,
+    ConformanceRecoveryStore, SuiteRecoveryState, TenantResourceReceiptIdentity,
+    TenantResourceRecoveryBinding, TenantResourceRevokeOutcome, TenantResourceRevokeRecord,
 };
 pub use report::{
     CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport, PlanReport,

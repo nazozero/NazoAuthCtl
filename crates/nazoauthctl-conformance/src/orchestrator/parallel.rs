@@ -116,6 +116,10 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                                     .cloned()
                                     .into_iter()
                                     .collect(),
+                                suite_resource_observer: runner
+                                    .config
+                                    .suite_resource_observer
+                                    .clone(),
                             },
                         };
                         let mut progress = ChannelSink {

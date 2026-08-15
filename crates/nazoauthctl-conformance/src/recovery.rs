@@ -20,6 +20,8 @@ const MAX_RECOVERY_JOURNAL_BYTES: usize = 128 * 1024;
 const MAX_PENDING_RUNS: usize = 64;
 const MAX_PERSISTED_REVISION: u64 = i64::MAX as u64;
 const MAX_TENANT_RESOURCE_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SUITE_RECOVERY_PLANS: usize = 128;
+const MAX_SUITE_RECOVERY_MODULES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -133,6 +135,18 @@ pub struct TenantResourceRevokeRecord {
     pub outcome: Option<TenantResourceRevokeOutcome>,
 }
 
+/// Opaque external Suite resources that must be removed after a controller
+/// crash. The Suite credential is deliberately not journaled: a recovery run
+/// obtains it again from the authenticated controller invocation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuiteRecoveryState {
+    pub origin: String,
+    pub plan_ids: Vec<String>,
+    pub module_ids: Vec<String>,
+    pub cleanup_complete: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyRecoveryJournal {
@@ -170,6 +184,10 @@ struct TenantResourceRecoveryJournal {
     /// both must be complete before the journal can be removed.
     #[serde(default)]
     proxy_cleanup_complete: bool,
+    /// Absent in older schema-2 journals, which could not have recorded a
+    /// Suite allocation and are therefore already settled at this boundary.
+    #[serde(default)]
+    suite: Option<SuiteRecoveryState>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -297,6 +315,7 @@ impl ConformanceRecoveryStore {
                 manifest_cleanup_complete: false,
                 abort_uncommitted_intent: false,
                 proxy_cleanup_complete,
+                suite: None,
             })),
         )
     }
@@ -529,6 +548,92 @@ impl ConformanceRecoveryGuard {
             RecoveryJournal::Legacy(journal) => journal.proxy_cleanup_complete = true,
             RecoveryJournal::TenantResource(journal) => journal.proxy_cleanup_complete = true,
         }
+        self.persist()
+    }
+
+    /// Persist a remote Suite plan immediately after it is allocated.  This
+    /// is intentionally outside NazoAuth: it records only the canonical
+    /// external origin and opaque Suite identifier needed for cancellation.
+    pub fn record_suite_plan(&mut self, origin: &str, plan_id: &str) -> anyhow::Result<()> {
+        let origin = crate::Origin::parse_suite(origin)
+            .map_err(|_| anyhow::anyhow!("Suite recovery origin is invalid"))?;
+        validate_component(plan_id, "Suite plan ID")?;
+        let journal = self
+            .tenant_resource_journal_mut()
+            .context("Suite recovery is not valid for a legacy journal")?;
+        let suite = journal.suite.get_or_insert_with(|| SuiteRecoveryState {
+            origin: origin.as_str().to_owned(),
+            plan_ids: Vec::new(),
+            module_ids: Vec::new(),
+            cleanup_complete: false,
+        });
+        if suite.origin != origin.as_str() {
+            bail!("Suite recovery origin conflicts with the journal");
+        }
+        if suite.cleanup_complete {
+            bail!("Suite recovery is already marked complete");
+        }
+        if !suite.plan_ids.iter().any(|existing| existing == plan_id) {
+            if suite.plan_ids.len() >= MAX_SUITE_RECOVERY_PLANS {
+                bail!("Suite recovery plan count exceeds policy");
+            }
+            suite.plan_ids.push(plan_id.to_owned());
+        }
+        self.persist()
+    }
+
+    /// Persist a Suite module immediately after it is allocated.  A module
+    /// cannot be recorded before its containing plan, preventing a recovery
+    /// journal with unactionable external state.
+    pub fn record_suite_module(&mut self, module_id: &str) -> anyhow::Result<()> {
+        validate_component(module_id, "Suite module ID")?;
+        let journal = self
+            .tenant_resource_journal_mut()
+            .context("Suite recovery is not valid for a legacy journal")?;
+        let suite = journal
+            .suite
+            .as_mut()
+            .context("Suite module has no persisted Suite plan")?;
+        if suite.cleanup_complete {
+            bail!("Suite recovery is already marked complete");
+        }
+        if !suite
+            .module_ids
+            .iter()
+            .any(|existing| existing == module_id)
+        {
+            if suite.module_ids.len() >= MAX_SUITE_RECOVERY_MODULES {
+                bail!("Suite recovery module count exceeds policy");
+            }
+            suite.module_ids.push(module_id.to_owned());
+        }
+        self.persist()
+    }
+
+    pub fn suite_recovery(&self) -> Option<&SuiteRecoveryState> {
+        match &self.journal {
+            RecoveryJournal::Legacy(_) => None,
+            RecoveryJournal::TenantResource(journal) => journal.suite.as_ref(),
+        }
+    }
+
+    pub fn suite_cleanup_complete(&self) -> bool {
+        self.suite_recovery()
+            .is_none_or(|suite| suite.cleanup_complete)
+    }
+
+    /// Mark external cleanup complete only after every persisted module has
+    /// been cancelled and every persisted plan has reached a terminal delete
+    /// outcome.  Repeated calls are safe.
+    pub fn mark_suite_cleanup_complete(&mut self) -> anyhow::Result<()> {
+        let journal = self
+            .tenant_resource_journal_mut()
+            .context("Suite recovery is not valid for a legacy journal")?;
+        let suite = journal
+            .suite
+            .as_mut()
+            .context("Suite cleanup has no persisted allocation")?;
+        suite.cleanup_complete = true;
         self.persist()
     }
 
@@ -772,7 +877,12 @@ impl ConformanceRecoveryGuard {
                 }
             }
             RecoveryJournal::TenantResource(journal) => {
-                if !tenant_resource_obligations_complete(journal) || !journal.proxy_cleanup_complete
+                if !tenant_resource_obligations_complete(journal)
+                    || !journal.proxy_cleanup_complete
+                    || journal
+                        .suite
+                        .as_ref()
+                        .is_some_and(|suite| !suite.cleanup_complete)
                 {
                     bail!("conformance recovery obligations are incomplete");
                 }
@@ -927,6 +1037,31 @@ fn validate_tenant_resource_journal(
     }
     if journal.binding.proxy.is_none() && !journal.proxy_cleanup_complete {
         bail!("tenant-resource proxy cleanup marker is incomplete without a proxy binding");
+    }
+    if let Some(suite) = &journal.suite {
+        let origin = crate::Origin::parse_suite(&suite.origin)
+            .map_err(|_| anyhow::anyhow!("Suite recovery origin is invalid"))?;
+        if origin.as_str() != suite.origin
+            || suite.plan_ids.is_empty()
+            || suite.plan_ids.len() > MAX_SUITE_RECOVERY_PLANS
+            || suite.module_ids.len() > MAX_SUITE_RECOVERY_MODULES
+        {
+            bail!("Suite recovery state is outside policy");
+        }
+        let mut plan_ids = std::collections::BTreeSet::new();
+        for plan_id in &suite.plan_ids {
+            validate_component(plan_id, "Suite plan ID")?;
+            if !plan_ids.insert(plan_id) {
+                bail!("Suite recovery plan identifiers must be unique");
+            }
+        }
+        let mut module_ids = std::collections::BTreeSet::new();
+        for module_id in &suite.module_ids {
+            validate_component(module_id, "Suite module ID")?;
+            if !module_ids.insert(module_id) {
+                bail!("Suite recovery module identifiers must be unique");
+            }
+        }
     }
     if let Some(receipt) = &journal.receipt {
         validate_tenant_resource_receipt_identity(&journal.binding, receipt)?;
@@ -1352,6 +1487,58 @@ mod tests {
         )
         .expect("write tampered journal");
         assert!(store.claim_pending().is_err());
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn suite_allocations_are_durable_origin_bound_and_block_finish_until_cleaned() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-tenant-recovery-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let binding = tenant_resource_binding(&root);
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("persist tenant intent");
+        guard
+            .record_suite_plan("https://suite.example", "plan-1")
+            .expect("persist plan allocation");
+        guard
+            .record_suite_module("module-1")
+            .expect("persist module allocation");
+        assert_eq!(
+            guard.suite_recovery(),
+            Some(&SuiteRecoveryState {
+                origin: "https://suite.example".to_owned(),
+                plan_ids: vec!["plan-1".to_owned()],
+                module_ids: vec!["module-1".to_owned()],
+                cleanup_complete: false,
+            })
+        );
+        assert!(
+            guard
+                .record_suite_plan("https://other.example", "plan-2")
+                .is_err()
+        );
+
+        guard
+            .record_tenant_resource_receipt(tenant_resource_receipt(&binding))
+            .expect("receipt");
+        guard
+            .record_tenant_resource_enumeration(Vec::new())
+            .expect("enumerate already absent");
+        guard.mark_proxy_cleanup_complete().expect("proxy settled");
+        assert!(guard.finish().is_err());
+
+        let mut pending = store.claim_pending().expect("claim pending");
+        let mut guard = pending.pop().expect("recovered guard");
+        guard
+            .mark_suite_cleanup_complete()
+            .expect("Suite cleanup settled");
+        guard.finish().expect("finish after Suite cleanup");
+        assert!(store.claim_pending().expect("journal removed").is_empty());
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 

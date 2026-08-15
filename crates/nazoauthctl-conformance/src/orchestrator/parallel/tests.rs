@@ -234,6 +234,7 @@ fn parallel_fixture_with_lanes(
         plan_lanes,
         jobs: 2,
         automation: Vec::new(),
+        suite_resource_observer: None,
     })
     .expect("runner");
     (runner, transport)
