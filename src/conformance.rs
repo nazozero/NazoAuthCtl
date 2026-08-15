@@ -97,6 +97,7 @@ pub struct ConformanceSession {
 impl ConformanceSession {
     pub fn open(config_path: &Path, selector: Option<&str>) -> anyhow::Result<Self> {
         let (context, target, expected) = conformance_control_context(config_path, selector)?;
+        let resolved_config_path = context.path().to_owned();
         let runtime_uid = crate::runtime::runtime_service_owner_uid(&context.config)?;
         let suffix = hex(rand::random::<[u8; 16]>());
         let run_directory = PathBuf::from(format!("/run/nazoauthctl-conformance-{suffix}"));
@@ -119,7 +120,7 @@ impl ConformanceSession {
 
         Ok(Self {
             context,
-            config_path: config_path.to_path_buf(),
+            config_path: resolved_config_path,
             target,
             expected,
             run_directory,

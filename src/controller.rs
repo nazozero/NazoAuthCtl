@@ -72,6 +72,12 @@ pub(crate) struct ControlConfig {
     _shared_capability_locks: Vec<FileLock>,
 }
 
+impl ControlConfig {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum DeploymentLockMode {
     Exclusive,
