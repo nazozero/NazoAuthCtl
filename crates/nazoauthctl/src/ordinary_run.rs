@@ -115,6 +115,12 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     }
     let matrix: OidfArtifactMatrix = serde_json::from_slice(&matrix_bytes)
         .context("verified cached artifact Matrix is malformed")?;
+    let selected_plan_ids = driver_plan
+        .plans
+        .iter()
+        .map(|plan| (plan.group_id.clone(), plan.plan_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let matrix = select_artifact_matrix_for_run(matrix, &selected_plan_ids)?;
     let request_jti = format!("request-{}", hex(rand::random::<[u8; 16]>()));
     let materialization_now = current_unix_time()?;
     if materialization_now > driver_plan.latest_execution_start_at {
@@ -999,9 +1005,91 @@ fn hex(bytes: impl AsRef<[u8]>) -> String {
         .collect()
 }
 
+fn select_artifact_matrix_for_run(
+    mut matrix: OidfArtifactMatrix,
+    selected_plan_ids: &BTreeSet<(String, String)>,
+) -> anyhow::Result<OidfArtifactMatrix> {
+    let mut retained = BTreeSet::new();
+    matrix.groups.retain_mut(|group| {
+        group.plans.retain(|plan| {
+            let selected = selected_plan_ids.contains(&(group.id.clone(), plan.id.clone()));
+            if selected {
+                retained.insert((group.id.clone(), plan.id.clone()));
+            }
+            selected
+        });
+        !group.plans.is_empty()
+    });
+    if retained != *selected_plan_ids {
+        bail!("selected signed Matrix plans changed before materialization");
+    }
+    Ok(matrix)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nazoauthctl_conformance::{
+        CryptoPolicy, OIDF_MATRIX_SCHEMA_VERSION, OidfArtifactMatrixGroup, OidfArtifactMatrixPlan,
+        OidfArtifactMatrixVariant, OidfPlanResourceBudget,
+    };
+    use serde_json::json;
+
+    fn artifact_group(id: &str, plan_ids: &[&str]) -> OidfArtifactMatrixGroup {
+        OidfArtifactMatrixGroup {
+            id: id.to_owned(),
+            profile: id.to_owned(),
+            variant: OidfArtifactMatrixVariant {
+                id: "default".to_owned(),
+                values: BTreeMap::new(),
+            },
+            required_roles: Vec::new(),
+            plans: plan_ids
+                .iter()
+                .map(|plan_id| OidfArtifactMatrixPlan {
+                    id: (*plan_id).to_owned(),
+                    plan: format!("suite-{plan_id}"),
+                    driver_handler: "default".to_owned(),
+                    resource_budget: OidfPlanResourceBudget {
+                        modules: 1,
+                        clients: 1,
+                        wall_clock_seconds: 60,
+                    },
+                    config_template: json!({"plan": plan_id}),
+                    variant: BTreeMap::new(),
+                    required_capabilities: Vec::new(),
+                    expected_results: BTreeMap::new(),
+                    required_roles: Vec::new(),
+                    secret_bindings: BTreeMap::new(),
+                    crypto: CryptoPolicy::default(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn materialization_matrix_contains_only_the_signed_selected_plans() {
+        let matrix = OidfArtifactMatrix {
+            schema: OIDF_MATRIX_SCHEMA_VERSION,
+            name: "matrix".to_owned(),
+            openid4vc_credential_datasets: BTreeMap::new(),
+            openid4vc_suite_mdoc_trust_anchor_pem: "anchor".to_owned(),
+            groups: vec![
+                artifact_group("oidc", &["p001", "unselected-dcr"]),
+                artifact_group("ciba", &["unselected-ciba"]),
+            ],
+        };
+        let selected = BTreeSet::from([("oidc".to_owned(), "p001".to_owned())]);
+
+        let filtered = select_artifact_matrix_for_run(matrix, &selected).unwrap();
+        assert_eq!(filtered.groups.len(), 1);
+        assert_eq!(filtered.groups[0].id, "oidc");
+        assert_eq!(filtered.groups[0].plans.len(), 1);
+        assert_eq!(filtered.groups[0].plans[0].id, "p001");
+
+        let missing = BTreeSet::from([("oidc".to_owned(), "missing-signed-plan".to_owned())]);
+        assert!(select_artifact_matrix_for_run(filtered, &missing).is_err());
+    }
 
     #[test]
     fn ciba_expiry_covers_poll_budget_without_outliving_signed_authority() {
