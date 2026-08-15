@@ -508,6 +508,28 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             }
             declared.artifact = target.declared_artifact.clone();
             declared.local_artifact_id = target.local_artifact_id.clone();
+            declared.ports = (!context.config.runtime.publish_address.is_empty())
+                .then(|| context.config.runtime.publish_address.clone())
+                .into_iter()
+                .collect();
+            declared.networks = (!context.config.runtime.network.is_empty())
+                .then(|| context.config.runtime.network.clone())
+                .into_iter()
+                .collect();
+            declared.mounts = context
+                .config
+                .runtime
+                .mounts
+                .iter()
+                .map(|mount| MountReference {
+                    source: mount.source.clone(),
+                    destination: mount.target.clone(),
+                    read_only: mount.read_only,
+                    selinux_relabel: mount.selinux_relabel,
+                    scope: ResourceScope::Deployment,
+                    ownership: Responsibility::Managed,
+                })
+                .collect();
             let artifact = declared.artifact.clone();
             let local_artifact_id = declared.local_artifact_id.clone();
             updated.declaration_revision = record

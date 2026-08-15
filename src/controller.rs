@@ -20,8 +20,8 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
 use crate::deployment::{
-    Capability, CapabilityGrant, DeploymentRecord, DeploymentStore, FileLock, RecoveryConclusion,
-    Responsibility, RuntimeBackendKind, SafeReference,
+    Capability, CapabilityGrant, DeploymentRecord, DeploymentStore, FileLock, MountReference,
+    RecoveryConclusion, ResourceScope, Responsibility, RuntimeBackendKind, SafeReference,
 };
 use crate::{
     backup::Backup,
