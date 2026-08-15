@@ -2217,7 +2217,7 @@ impl PreparedClient {
         request_jti: &str,
     ) -> Result<Self, MaterializerError> {
         let generated = generate_client_crypto(policy)?;
-        let request = materialize_registration_template(
+        let mut request = materialize_registration_template(
             registration_template,
             &logical_client_id,
             target_issuer,
@@ -2229,6 +2229,7 @@ impl PreparedClient {
             &generated.mtls_client_certificate_sha256,
             request_jti,
         )?;
+        canonicalize_registration_string_sets(&mut request)?;
         validate_materialized_mtls_registration(
             &request,
             &generated.mtls_client_certificate_sha256,
@@ -2275,6 +2276,35 @@ impl PreparedClient {
             logical_client_id: self.logical_client_id.clone(),
         }
     }
+}
+
+fn canonicalize_registration_string_sets(request: &mut Value) -> Result<(), MaterializerError> {
+    let object = request
+        .as_object_mut()
+        .ok_or(MaterializerError::InvalidField("registration_template"))?;
+    for field in [
+        "scopes",
+        "allowed_audiences",
+        "grant_types",
+        "post_logout_redirect_uris",
+    ] {
+        let Some(value) = object.get_mut(field) else {
+            continue;
+        };
+        let values = value
+            .as_array_mut()
+            .ok_or(MaterializerError::InvalidField("registration_template"))?;
+        if values.iter().any(|value| !value.is_string()) {
+            return Err(MaterializerError::InvalidField("registration_template"));
+        }
+        let mut unique = BTreeSet::new();
+        values.retain(|value| {
+            value
+                .as_str()
+                .is_some_and(|value| unique.insert(value.to_owned()))
+        });
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -2791,6 +2821,33 @@ mod tests {
                 ))
             ));
         }
+    }
+
+    #[test]
+    fn registration_set_metadata_is_stably_deduplicated() {
+        let mut request = serde_json::json!({
+            "scopes": ["openid", "profile", "openid"],
+            "allowed_audiences": ["https://issuer.example/resource", "resource://default", "https://issuer.example/resource"],
+            "grant_types": ["authorization_code", "refresh_token", "authorization_code"],
+            "post_logout_redirect_uris": ["https://suite.example/logout", "https://suite.example/logout"],
+        });
+        canonicalize_registration_string_sets(&mut request).expect("canonical registration sets");
+        assert_eq!(request["scopes"], serde_json::json!(["openid", "profile"]));
+        assert_eq!(
+            request["allowed_audiences"],
+            serde_json::json!(["https://issuer.example/resource", "resource://default"])
+        );
+        assert_eq!(
+            request["grant_types"],
+            serde_json::json!(["authorization_code", "refresh_token"])
+        );
+        assert_eq!(
+            request["post_logout_redirect_uris"],
+            serde_json::json!(["https://suite.example/logout"])
+        );
+
+        request["scopes"] = serde_json::json!(["openid", 1]);
+        assert!(canonicalize_registration_string_sets(&mut request).is_err());
     }
 
     #[test]
