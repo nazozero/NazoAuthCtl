@@ -18,6 +18,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nazo_operator_protocol::{
     Openid4vcTrustPolicy, TenantResourceIdentity, TenantResourceKind, TenantResourceMapping,
     TenantResourceOperation, TenantResourceOutcome, TenantResourceReceipt,
+    validate_openid4vc_trust_policy,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -462,20 +463,21 @@ impl PreparedMaterialization {
         let public_material = Openid4vcTrustPolicy {
             schema: 1,
             client_attestation_issuer: format!("{}/", self.suite_base_url.trim_end_matches('/')),
-            client_attestation_jwks: serde_json::from_str(
+            client_attestation_jwks: strict_openid4vc_trust_jwks(
                 attestation.attester_public_jwks.as_str(),
-            )
-            .map_err(|_| MaterializerError::Encoding)?,
-            key_attestation_jwks: serde_json::from_str(
+            )?,
+            key_attestation_jwks: strict_openid4vc_trust_jwks(
                 attestation.key_attestation_public_jwks.as_str(),
-            )
-            .map_err(|_| MaterializerError::Encoding)?,
+            )?,
             wallet_authorization_origins: vec![self.suite_base_url.clone()],
             credential_trust_anchor_pem: combine_openid4vc_credential_trust_anchors(
                 attestation.trust_anchor_pem.as_str(),
                 &self.descriptor.openid4vc_suite_mdoc_trust_anchor_pem,
             )?,
         };
+        validate_openid4vc_trust_policy(&public_material).map_err(|_| {
+            MaterializerError::InvalidField("tenant_resource_manifest.openid4vc_trust_policy")
+        })?;
         let trust_payload =
             serde_json::to_value(public_material).map_err(|_| MaterializerError::Encoding)?;
         push_manifest_resource(
@@ -488,6 +490,55 @@ impl PreparedMaterialization {
 
         TenantResourceManifest::from_resources(resources)
     }
+}
+
+fn strict_openid4vc_trust_jwks(encoded: &str) -> Result<Value, MaterializerError> {
+    const PUBLIC_MEMBERS: [&str; 6] = ["alg", "crv", "kid", "kty", "x", "y"];
+    const PROVIDER_METADATA_MEMBERS: [&str; 2] = ["use", "x5c"];
+    const PRIVATE_MEMBERS: [&str; 8] = ["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
+
+    let source: Value = serde_json::from_str(encoded).map_err(|_| MaterializerError::Encoding)?;
+    let object = source.as_object().ok_or(MaterializerError::InvalidField(
+        "tenant_resource_manifest.openid4vc_trust_policy_jwks",
+    ))?;
+    if object.keys().any(|name| name != "keys") {
+        return Err(MaterializerError::InvalidField(
+            "tenant_resource_manifest.openid4vc_trust_policy_jwks",
+        ));
+    }
+    let keys = object
+        .get("keys")
+        .and_then(Value::as_array)
+        .filter(|keys| !keys.is_empty())
+        .ok_or(MaterializerError::InvalidField(
+            "tenant_resource_manifest.openid4vc_trust_policy_jwks",
+        ))?;
+    let mut public_keys = Vec::with_capacity(keys.len());
+    for key in keys {
+        let source_key = key.as_object().ok_or(MaterializerError::InvalidField(
+            "tenant_resource_manifest.openid4vc_trust_policy_jwks",
+        ))?;
+        if source_key
+            .keys()
+            .any(|name| PRIVATE_MEMBERS.contains(&name.as_str()))
+            || source_key.keys().any(|name| {
+                !PUBLIC_MEMBERS.contains(&name.as_str())
+                    && !PROVIDER_METADATA_MEMBERS.contains(&name.as_str())
+            })
+        {
+            return Err(MaterializerError::InvalidField(
+                "tenant_resource_manifest.openid4vc_trust_policy_jwks",
+            ));
+        }
+        let mut public_key = serde_json::Map::new();
+        for name in PUBLIC_MEMBERS {
+            if let Some(value) = source_key.get(name) {
+                public_key.insert(name.to_owned(), value.clone());
+            }
+        }
+        public_keys.push(Value::Object(public_key));
+    }
+    Ok(serde_json::json!({ "keys": public_keys }))
 }
 
 struct PreparedClient {
@@ -2693,6 +2744,30 @@ mod tests {
                             .count(),
                         2
                     );
+                    let policy: Openid4vcTrustPolicy =
+                        serde_json::from_value(payload.clone()).expect("trust policy payload");
+                    validate_openid4vc_trust_policy(&policy)
+                        .expect("ordinary trust policy must satisfy the shared wire contract");
+                    for jwks in [
+                        &policy.client_attestation_jwks,
+                        &policy.key_attestation_jwks,
+                    ] {
+                        assert_eq!(
+                            jwks.as_object()
+                                .expect("JWKS object")
+                                .keys()
+                                .collect::<Vec<_>>(),
+                            vec!["keys"]
+                        );
+                        for key in jwks["keys"].as_array().expect("JWKS keys") {
+                            let key = key.as_object().expect("public JWK");
+                            for forbidden in
+                                ["use", "x5c", "d", "p", "q", "dp", "dq", "qi", "oth", "k"]
+                            {
+                                assert!(!key.contains_key(forbidden));
+                            }
+                        }
+                    }
                 }
                 other => panic!("unexpected resource kind {other}"),
             }
@@ -2700,6 +2775,22 @@ mod tests {
         assert_eq!(mtls_client_ref.as_deref(), oauth_id.as_deref());
         assert_eq!(dataset_user_ref.as_deref(), user_id.as_deref());
         assert_eq!(oauth_trust_ref, trust_policy_id);
+    }
+
+    #[test]
+    fn ordinary_trust_policy_jwks_rejects_private_and_unknown_members() {
+        for encoded in [
+            r#"{"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y","d":"secret"}]}"#,
+            r#"{"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y","provider":"state"}]}"#,
+            r#"{"keys":[],"issuer":"https://unexpected.example"}"#,
+        ] {
+            assert!(matches!(
+                strict_openid4vc_trust_jwks(encoded),
+                Err(MaterializerError::InvalidField(
+                    "tenant_resource_manifest.openid4vc_trust_policy_jwks"
+                ))
+            ));
+        }
     }
 
     #[test]
