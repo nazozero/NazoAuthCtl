@@ -159,6 +159,12 @@ struct TenantResourceRecoveryJournal {
     manifest_removal_intent: bool,
     #[serde(default)]
     manifest_cleanup_complete: bool,
+    /// A deterministic provider rejection before any receipt proves that the
+    /// remote transaction did not commit.  Persist this intent before
+    /// deleting the private manifest so a crash cannot strand an unreadable
+    /// journal or cause the rejected request to be replayed forever.
+    #[serde(default)]
+    abort_uncommitted_intent: bool,
     /// A proxy may be installed by the Apply caller before the process dies.
     /// This marker is deliberately separate from ordinary resource cleanup:
     /// both must be complete before the journal can be removed.
@@ -289,6 +295,7 @@ impl ConformanceRecoveryStore {
                 cleanup_complete: false,
                 manifest_removal_intent: false,
                 manifest_cleanup_complete: false,
+                abort_uncommitted_intent: false,
                 proxy_cleanup_complete,
             })),
         )
@@ -696,6 +703,67 @@ impl ConformanceRecoveryGuard {
         }
     }
 
+    pub fn tenant_resource_abort_uncommitted_intent(&self) -> bool {
+        match &self.journal {
+            RecoveryJournal::Legacy(_) => false,
+            RecoveryJournal::TenantResource(journal) => journal.abort_uncommitted_intent,
+        }
+    }
+
+    /// Discard an Apply intent only after the authenticated provider has
+    /// returned a deterministic pre-commit rejection.  Callers must first
+    /// prove that no proxy side effect remains.  Any receipt, enumeration, or
+    /// revoke record makes this operation unavailable; such a journal must go
+    /// through ordinary cleanup instead.
+    pub fn abort_uncommitted_tenant_resource(mut self) -> anyhow::Result<()> {
+        let manifest_path = {
+            let journal = self
+                .tenant_resource_journal_mut()
+                .context("uncommitted abort is not valid for a legacy journal")?;
+            if journal.binding.operation != TenantResourceOperation::Apply
+                || journal.receipt.is_some()
+                || journal.enumeration.is_some()
+                || !journal.revocations.is_empty()
+                || journal.cleanup_complete
+                || !journal.proxy_cleanup_complete
+            {
+                bail!("tenant-resource journal may have committed side effects");
+            }
+            let manifest_path = journal
+                .binding
+                .manifest_path
+                .clone()
+                .context("tenant-resource Apply journal has no private manifest")?;
+            journal.abort_uncommitted_intent = true;
+            journal.manifest_removal_intent = true;
+            manifest_path
+        };
+        self.persist()?;
+
+        let needs_manifest_removal = match &self.journal {
+            RecoveryJournal::TenantResource(journal) => !journal.manifest_cleanup_complete,
+            RecoveryJournal::Legacy(_) => false,
+        };
+        if needs_manifest_removal {
+            match crate::secure_file::remove_file(&manifest_path, true) {
+                Ok(()) | Err(crate::secure_file::SecureFileError::NotFound) => {}
+                Err(error) => {
+                    bail!("failed to remove rejected tenant-resource manifest: {error:?}");
+                }
+            }
+            if let RecoveryJournal::TenantResource(journal) = &mut self.journal {
+                journal.manifest_cleanup_complete = true;
+            }
+            self.persist()?;
+        } else if validate_tenant_resource_manifest_file(match &self.journal {
+            RecoveryJournal::TenantResource(journal) => &journal.binding,
+            RecoveryJournal::Legacy(_) => unreachable!(),
+        })? {
+            bail!("rejected tenant-resource manifest remains after cleanup marker");
+        }
+        self.remove_journal_and_lock()
+    }
+
     pub fn finish(mut self) -> anyhow::Result<()> {
         match &self.journal {
             RecoveryJournal::Legacy(journal) => {
@@ -755,6 +823,10 @@ impl ConformanceRecoveryGuard {
                 bail!("tenant-resource manifest remains after cleanup marker");
             }
         }
+        self.remove_journal_and_lock()
+    }
+
+    fn remove_journal_and_lock(mut self) -> anyhow::Result<()> {
         crate::secure_file::remove_file(&self.journal_path, true)
             .map_err(|error| anyhow::anyhow!("failed to remove recovery journal: {error:?}"))?;
         if let Some(lock) = self.lock.take() {
@@ -833,8 +905,20 @@ fn validate_tenant_resource_journal(
     if journal.cleanup_complete && !tenant_resource_obligations_complete(journal) {
         bail!("tenant-resource cleanup marker is ahead of its obligations");
     }
+    if journal.abort_uncommitted_intent
+        && (journal.binding.operation != TenantResourceOperation::Apply
+            || journal.receipt.is_some()
+            || journal.enumeration.is_some()
+            || !journal.revocations.is_empty()
+            || journal.cleanup_complete
+            || !journal.proxy_cleanup_complete
+            || journal.binding.manifest_path.is_none())
+    {
+        bail!("tenant-resource uncommitted abort state is invalid");
+    }
     if journal.manifest_removal_intent
-        && (!journal.cleanup_complete || journal.binding.manifest_path.is_none())
+        && ((!journal.cleanup_complete && !journal.abort_uncommitted_intent)
+            || journal.binding.manifest_path.is_none())
     {
         bail!("tenant-resource manifest removal intent is invalid");
     }
@@ -1466,6 +1550,71 @@ mod tests {
                 .expect("manifest path")
                 .exists()
         );
+        assert!(store.claim_pending().expect("final scan").is_empty());
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tenant_resource_deterministic_rejection_aborts_only_uncommitted_intent() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-tenant-recovery-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let binding = tenant_resource_binding(&root);
+        let manifest_path = binding.manifest_path.clone().expect("manifest path");
+        let guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("persist rejected intent");
+        guard
+            .abort_uncommitted_tenant_resource()
+            .expect("abort rejected intent");
+        assert!(!manifest_path.exists());
+        assert!(store.claim_pending().expect("final scan").is_empty());
+
+        let mut committed = store
+            .begin_tenant_resource(tenant_resource_binding(&root))
+            .expect("persist committed intent");
+        let committed_binding = committed
+            .tenant_resource_binding()
+            .expect("tenant binding")
+            .clone();
+        committed
+            .record_tenant_resource_receipt(tenant_resource_receipt(&committed_binding))
+            .expect("persist receipt");
+        assert!(committed.abort_uncommitted_tenant_resource().is_err());
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tenant_resource_abort_recovers_after_manifest_unlink_crash() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-tenant-recovery-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let binding = tenant_resource_binding(&root);
+        let manifest_path = binding.manifest_path.clone().expect("manifest path");
+        let mut guard = store
+            .begin_tenant_resource(binding)
+            .expect("persist rejected intent");
+        if let RecoveryJournal::TenantResource(journal) = &mut guard.journal {
+            journal.abort_uncommitted_intent = true;
+            journal.manifest_removal_intent = true;
+        }
+        guard.persist().expect("persist abort intent");
+        crate::secure_file::remove_file(&manifest_path, true).expect("simulate unlink");
+        drop(guard);
+
+        let mut pending = store.claim_pending().expect("recover aborted journal");
+        let guard = pending.pop().expect("claimed aborted journal");
+        assert!(guard.tenant_resource_abort_uncommitted_intent());
+        assert!(guard.tenant_resource_manifest_cleanup_complete());
+        guard
+            .abort_uncommitted_tenant_resource()
+            .expect("finish aborted journal");
         assert!(store.claim_pending().expect("final scan").is_empty());
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }

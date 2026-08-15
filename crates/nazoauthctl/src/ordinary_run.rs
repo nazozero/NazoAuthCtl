@@ -31,7 +31,8 @@ use nazoauthctl_conformance::{
     write_private_provider_evidence_bundle,
 };
 use nazoauthctl_core::tenant_resources::{
-    TenantResourceCapabilitySession, TenantResourceClient, TenantResourceReceiptResult,
+    TenantResourceCapabilitySession, TenantResourceClient, TenantResourceClientError,
+    TenantResourceReceiptResult,
 };
 use serde::Serialize;
 use zeroize::{Zeroize as _, Zeroizing};
@@ -299,9 +300,22 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             };
         }
     };
-    let apply_receipt = client
-        .execute_prepared(&prepared_apply, current_unix_time()?)
-        .context("ordinary tenant-resource Apply failed")?;
+    let apply_receipt = match client.execute_prepared(&prepared_apply, current_unix_time()?) {
+        Ok(receipt) => receipt,
+        Err(error) if is_deterministic_uncommitted_rejection(&error) => {
+            // Proxy installation is deliberately after receipt persistence,
+            // so a pre-receipt rejection proves that no proxy side effect was
+            // reached even when the intent carries a future proxy binding.
+            if !recovery.proxy_cleanup_complete() {
+                recovery.mark_proxy_cleanup_complete()?;
+            }
+            recovery.abort_uncommitted_tenant_resource()?;
+            return Err(error).context("ordinary tenant-resource Apply was rejected");
+        }
+        Err(error) => {
+            return Err(error).context("ordinary tenant-resource Apply failed");
+        }
+    };
     recovery.record_tenant_resource_receipt(
         TenantResourceReceiptIdentity::from_verified_receipt(
             apply_receipt.receipt(),
@@ -762,6 +776,10 @@ fn recover_pending_runs(
             continue;
         };
         let result = (|| -> anyhow::Result<()> {
+            if recovery.tenant_resource_abort_uncommitted_intent() {
+                recovery.abort_uncommitted_tenant_resource()?;
+                return Ok(());
+            }
             let client = TenantResourceClient::with_curl(
                 session.tenant_resource_client_config(&binding.tenant_id)?,
             )?;
@@ -784,7 +802,20 @@ fn recover_pending_runs(
                     &binding.change_set_sha256,
                     Some(&manifest),
                 )?;
-                let receipt = client.execute_prepared(&prepared, current_unix_time()?)?;
+                let receipt = match client.execute_prepared(&prepared, current_unix_time()?) {
+                    Ok(receipt) => receipt,
+                    Err(error) if is_deterministic_uncommitted_rejection(&error) => {
+                        // The ordinary producer installs proxy trust only
+                        // after persisting a receipt.  With no receipt this is
+                        // a marker for an action that was never reached.
+                        if !recovery.proxy_cleanup_complete() {
+                            recovery.mark_proxy_cleanup_complete()?;
+                        }
+                        recovery.abort_uncommitted_tenant_resource()?;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 recovery.record_tenant_resource_receipt(
                     TenantResourceReceiptIdentity::from_verified_receipt(
                         receipt.receipt(),
@@ -814,6 +845,15 @@ fn recover_pending_runs(
             failures.join("; ")
         )
     }
+}
+
+fn is_deterministic_uncommitted_rejection(error: &TenantResourceClientError) -> bool {
+    matches!(
+        error,
+        TenantResourceClientError::InvalidRequest(_)
+            | TenantResourceClientError::Unauthorized(_)
+            | TenantResourceClientError::Forbidden(_)
+    )
 }
 
 fn evidence_runtime(
