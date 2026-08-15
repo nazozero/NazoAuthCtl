@@ -65,8 +65,8 @@ pub use descriptor::{
 };
 use descriptor::{
     collect_client_policies, collect_registrations, descriptor_requires_reference, is_placeholder,
-    parse_placeholder, validate_binding_reference, validate_descriptor, validate_digest,
-    validate_single_mdoc_trust_anchor,
+    parse_placeholder, referenced_openid4vc_credential_dataset_ids, validate_binding_reference,
+    validate_descriptor, validate_digest, validate_single_mdoc_trust_anchor,
 };
 use template::{
     materialize_registration_template, materialize_value, materialize_vci_config,
@@ -1394,7 +1394,7 @@ impl DescriptorMaterializer {
         raw_matrix_sha256: &str,
     ) -> Result<MatrixDescriptor, MaterializerError> {
         validate_digest(raw_matrix_sha256, "matrix_sha256")?;
-        let descriptor = MatrixDescriptor {
+        let mut descriptor = MatrixDescriptor {
             schema: DESCRIPTOR_SCHEMA_VERSION,
             source: DescriptorSource {
                 release: artifact_source_release.to_owned(),
@@ -1433,6 +1433,10 @@ impl DescriptorMaterializer {
                 .collect(),
             raw_sha256: Some(raw_matrix_sha256.to_owned()),
         };
+        let referenced_datasets = referenced_openid4vc_credential_dataset_ids(&descriptor)?;
+        descriptor
+            .openid4vc_credential_datasets
+            .retain(|configuration_id, _| referenced_datasets.contains(configuration_id));
         validate_descriptor(&descriptor)?;
         Ok(descriptor)
     }
@@ -2961,7 +2965,7 @@ mod tests {
     #[test]
     fn artifact_matrix_bridge_validates_descriptor_and_preserves_raw_digest() {
         let descriptor = descriptor();
-        let matrix = crate::artifact::OidfArtifactMatrix {
+        let mut matrix = crate::artifact::OidfArtifactMatrix {
             schema: crate::OIDF_MATRIX_SCHEMA_VERSION,
             name: "official-fixed-matrix".to_owned(),
             openid4vc_credential_datasets: descriptor.openid4vc_credential_datasets.clone(),
@@ -3003,6 +3007,10 @@ mod tests {
                 })
                 .collect(),
         };
+        matrix.openid4vc_credential_datasets.insert(
+            "eu.example.unselected".to_owned(),
+            serde_json::json!({"given_name":"Unselected"}),
+        );
         let raw_digest = "f".repeat(64);
         let artifact_source_digest = "a".repeat(64);
         let suite_origin = suite();
@@ -3022,12 +3030,14 @@ mod tests {
         assert_eq!(prepared.matrix_sha256(), raw_digest);
         assert_eq!(bundle.matrix_sha256(), raw_digest);
         assert!(prepared.bundle_digest.is_some());
+        assert!(prepared.descriptor.openid4vc_credential_datasets.is_empty());
 
         let ordinary =
             DescriptorMaterializer::prepare_tenant_resources_from_artifact_matrix(&matrix, binding)
                 .expect("ordinary artifact matrix preparation");
         assert_eq!(ordinary.matrix_sha256(), raw_digest);
         assert!(ordinary.bundle_digest.is_none());
+        assert!(ordinary.descriptor.openid4vc_credential_datasets.is_empty());
         ordinary
             .tenant_resource_manifest(ordinary.request_jti())
             .expect("ordinary tenant resource manifest");
