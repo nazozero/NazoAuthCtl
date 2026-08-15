@@ -470,7 +470,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if !store.registry_present()? {
                 bail!("development activation requires a registered deployment");
             }
-            let context = control_config(
+            let mut context = control_config(
                 &configured_path,
                 selector.as_deref(),
                 &[Capability::Runtime, Capability::Artifact],
@@ -490,6 +490,11 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             let runtime = Runtime::new(&context.config);
             let target = runtime.inspect_local_development_artifact(&options.artifact)?;
             validate_local_development_identity(&target.embedded)?;
+            crate::controller::updates::persist_tenant_resource_controller_runtime_upgrade(
+                &context.path,
+                &mut context.config,
+            )?;
+            let runtime = Runtime::new(&context.config);
             crate::lifecycle::cache_trusted_runtime(&store, &record)?;
             runtime.activate_local_development_artifact(&target)?;
             let mut updated = record.clone();
