@@ -1,4 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::SigningKey;
@@ -34,6 +38,7 @@ enum FakeMode {
     TamperedReceipt,
     ReplayExpired,
     ExpiredNoReplay,
+    NextSecondReceipt,
     Status(u16),
 }
 
@@ -198,6 +203,15 @@ impl TenantResourceHttpTransport for FakeTransport {
         } else {
             Vec::new()
         };
+        let receipt_time = if matches!(self.mode, FakeMode::NextSecondReceipt) {
+            let target = unix_now() + 1;
+            while unix_now() < target {
+                thread::sleep(Duration::from_millis(5));
+            }
+            target
+        } else {
+            self.now
+        };
         let mut receipt = TenantResourceReceipt {
             ver: nazo_operator_protocol::PROTOCOL_VERSION,
             iss: format!("runtime:{DEPLOYMENT}"),
@@ -219,9 +233,9 @@ impl TenantResourceHttpTransport for FakeTransport {
             resource_mappings,
             baseline_manifest_sha256: task.baseline_manifest_sha256.clone(),
             resource_manifest_sha256: task.resource_manifest_sha256.clone(),
-            started_at: self.now,
-            completed_at: self.now,
-            exp: self.now + 60,
+            started_at: receipt_time,
+            completed_at: receipt_time,
+            exp: receipt_time + 60,
             audit_sequence: 1,
             audit_previous_sha256: "0".repeat(64),
         };
@@ -252,6 +266,16 @@ fn client(
     TenantResourceClient<FakeTransport>,
     Arc<Mutex<Vec<RecordedRequest>>>,
 ) {
+    client_at(mode, NOW)
+}
+
+fn client_at(
+    mode: FakeMode,
+    now: i64,
+) -> (
+    TenantResourceClient<FakeTransport>,
+    Arc<Mutex<Vec<RecordedRequest>>>,
+) {
     let runtime = SigningKey::from_bytes(&[7; 32]);
     let controller = SigningKey::from_bytes(&[8; 32]);
     let runtime_key_id = instance_key_id(&runtime.verifying_key());
@@ -270,7 +294,7 @@ fn client(
         controller_key_id: controller_key_id.clone(),
         embedded: embedded.clone(),
         mode,
-        now: NOW,
+        now,
         requests: requests.clone(),
     };
     let config = TenantResourceClientConfig {
@@ -290,6 +314,13 @@ fn client(
         TenantResourceClient::new(config, transport).unwrap(),
         requests,
     )
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 fn discover(client: &TenantResourceClient<FakeTransport>) -> TenantResourceCapabilitySession {
@@ -376,6 +407,32 @@ fn discovery_and_apply_bind_nonce_actor_revision_and_exact_digests() {
         body["manifest_base64url"].as_str(),
         Some(encoded_manifest.as_str())
     );
+}
+
+#[test]
+fn live_execution_validates_receipt_with_the_post_response_clock() {
+    let now = unix_now();
+    let (client, _) = client_at(FakeMode::NextSecondReceipt, now);
+    let session = client
+        .discover_capability_with_nonce_at(&URL_SAFE_NO_PAD.encode([6; 32]), now)
+        .unwrap();
+    let baseline = identity("user-existing", b"existing");
+    let payload = br#"{"username":"clock","email":"clock@example.com","password":"pass-clock","email_verified":false}"#;
+    let delta = identity("user-clock", payload);
+    let raw_manifest = user_manifest("user-clock", payload);
+    let prepared = client
+        .prepare_apply(
+            &session,
+            "change-clock",
+            &raw_manifest,
+            vec![delta.clone()],
+            vec![baseline, delta],
+            now,
+        )
+        .unwrap();
+
+    let receipt = client.execute_prepared_live(&prepared).unwrap();
+    assert!(receipt.receipt().completed_at > now);
 }
 
 #[test]

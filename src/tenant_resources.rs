@@ -722,7 +722,7 @@ impl<T: TenantResourceHttpTransport> TenantResourceClient<T> {
             final_active_resources,
             now,
         )?;
-        self.execute_prepared(&prepared, now)
+        self.execute_prepared_live(&prepared)
     }
 
     pub fn prepare_apply(
@@ -790,7 +790,7 @@ impl<T: TenantResourceHttpTransport> TenantResourceClient<T> {
         let now = Utc::now().timestamp();
         let prepared =
             self.prepare_enumerate(capability, change_set_id, change_set_sha256, selectors, now)?;
-        self.execute_prepared(&prepared, now)
+        self.execute_prepared_live(&prepared)
     }
 
     pub fn prepare_enumerate(
@@ -846,7 +846,7 @@ impl<T: TenantResourceHttpTransport> TenantResourceClient<T> {
             final_manifest_sha256,
             now,
         )?;
-        self.execute_prepared(&prepared, now)
+        self.execute_prepared_live(&prepared)
     }
 
     pub fn prepare_revoke(
@@ -1137,6 +1137,26 @@ impl<T: TenantResourceHttpTransport> TenantResourceClient<T> {
         prepared: &PreparedTenantResourceRequest,
         now: i64,
     ) -> Result<TenantResourceReceiptResult, TenantResourceClientError> {
+        self.execute_prepared_inner(prepared, now, false)
+    }
+
+    /// Execute against the live runtime clock. Task/capability admission is
+    /// checked immediately before dispatch, while receipt freshness is
+    /// checked after the HTTP response arrives so a legitimate next-second
+    /// completion cannot be rejected with the pre-dispatch timestamp.
+    pub fn execute_prepared_live(
+        &self,
+        prepared: &PreparedTenantResourceRequest,
+    ) -> Result<TenantResourceReceiptResult, TenantResourceClientError> {
+        self.execute_prepared_inner(prepared, Utc::now().timestamp(), true)
+    }
+
+    fn execute_prepared_inner(
+        &self,
+        prepared: &PreparedTenantResourceRequest,
+        now: i64,
+        live_receipt_clock: bool,
+    ) -> Result<TenantResourceReceiptResult, TenantResourceClientError> {
         let capability = verify_tenant_resource_capability_signature(
             &prepared.capability_jws,
             &self.config.runtime_key_id,
@@ -1200,7 +1220,12 @@ impl<T: TenantResourceHttpTransport> TenantResourceClient<T> {
         )
         .map_err(map_signature_error)?;
         if !expired {
-            verify_tenant_resource_receipt_window(&receipt, now)
+            let receipt_now = if live_receipt_clock {
+                Utc::now().timestamp()
+            } else {
+                now
+            };
+            verify_tenant_resource_receipt_window(&receipt, receipt_now)
                 .map_err(|error| TenantResourceClientError::Forbidden(error.to_string()))?;
         }
         validate_tenant_resource_receipt_binding(&task, &receipt)

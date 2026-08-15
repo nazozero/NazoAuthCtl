@@ -306,7 +306,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             };
         }
     };
-    let apply_receipt = match client.execute_prepared(&prepared_apply, current_unix_time()?) {
+    let apply_receipt = match client.execute_prepared_live(&prepared_apply) {
         Ok(receipt) => receipt,
         Err(error) if is_deterministic_uncommitted_rejection(&error) => {
             // Proxy installation is deliberately after receipt persistence,
@@ -808,7 +808,7 @@ fn recover_pending_runs(
                     &binding.change_set_sha256,
                     Some(&manifest),
                 )?;
-                let receipt = match client.execute_prepared(&prepared, current_unix_time()?) {
+                let receipt = match client.execute_prepared_live(&prepared) {
                     Ok(receipt) => receipt,
                     Err(error) if is_deterministic_uncommitted_rejection(&error) => {
                         // The ordinary producer installs proxy trust only
