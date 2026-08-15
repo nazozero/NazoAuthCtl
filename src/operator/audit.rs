@@ -23,10 +23,10 @@ pub(crate) use chain::verify_audit_chain;
 pub(super) use chain::{append_audit, audit_head, repair_audit_head_for_append};
 pub(crate) use chain::{show_audit, verify_audit};
 
+#[cfg(test)]
+pub(super) use execution::load_or_issue_task;
 pub(super) use execution::{canonical_manifest, verify_target_expectation};
 pub(crate) use execution::{execute, expected_release_target};
-#[cfg(test)]
-pub(super) use execution::{execute_test_task, load_or_issue_task};
 #[cfg(test)]
 pub(super) use execution::{operation_name, target_expectation, validate_runtime_receipt};
 

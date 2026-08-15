@@ -33,8 +33,8 @@ mod audit;
 mod identity;
 #[cfg(test)]
 use audit::{
-    append_audit, audit_head, execute_test_task, load_or_issue_task, operation_name,
-    target_expectation, validate_retirement_probe_audit_evidence, validate_runtime_receipt,
+    append_audit, audit_head, load_or_issue_task, operation_name, target_expectation,
+    validate_retirement_probe_audit_evidence, validate_runtime_receipt,
 };
 pub(crate) use audit::{
     append_management_event, append_management_event_idempotent, audit_entries, execute,
