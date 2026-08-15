@@ -210,6 +210,31 @@ fn runtime_environment_requires_normalized_file_locators() {
     valid_locator
         .validate()
         .expect("normalized *_FILE locators should remain valid");
+
+    let mut exact_identity = valid_config();
+    exact_identity.runtime.environment.extend([
+        (
+            "DEPLOYMENT_ID".to_owned(),
+            exact_identity.operator.deployment_id.clone(),
+        ),
+        (
+            "RUNTIME_INSTANCE_ID".to_owned(),
+            exact_identity.runtime.runtime_instance_id.clone(),
+        ),
+    ]);
+    exact_identity
+        .validate()
+        .expect("exact persisted runtime identity bindings should remain valid");
+
+    let mut drifted_identity = exact_identity;
+    drifted_identity.runtime.environment.insert(
+        "RUNTIME_INSTANCE_ID".to_owned(),
+        "runtime-substitution".to_owned(),
+    );
+    assert!(
+        drifted_identity.validate().is_err(),
+        "runtime identity environment must not drift from persisted authority"
+    );
 }
 
 #[test]
