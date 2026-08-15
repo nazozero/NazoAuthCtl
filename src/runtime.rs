@@ -1065,15 +1065,7 @@ fn task_mount(source: &Path, destination: &Path, read_only: bool) -> NeutralMoun
 }
 
 fn operation_uses_database(operation: &TaskOperation) -> bool {
-    matches!(
-        operation,
-        TaskOperation::MigrateApply
-            | TaskOperation::ConformanceOnboardingApply { .. }
-            | TaskOperation::ConformanceLeaseCreate { .. }
-            | TaskOperation::ConformanceLeaseList
-            | TaskOperation::ConformanceLeaseRevoke { .. }
-            | TaskOperation::ConformanceLeaseCleanup
-    )
+    matches!(operation, TaskOperation::MigrateApply)
 }
 
 fn operation_database_url_file<'a>(

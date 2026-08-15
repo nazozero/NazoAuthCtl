@@ -72,7 +72,7 @@ DECLARE
         'openid4vp_transactions', 'openid4vci_credential_datasets',
         'oauth_client_mtls_trust_anchor_requests',
         'runtime_module_default_policy', 'initial_admin_bootstrap',
-        'conformance_leases', 'openid4vci_issuance_responses',
+        'openid4vci_issuance_responses',
         'oauth_token_issuances',
         'tenant_resource_states', 'tenant_resource_bindings',
         'tenant_resource_operations', 'openid4vc_trust_policies',
@@ -82,8 +82,7 @@ DECLARE
     -- explicit allowlist: if present they receive the exact runtime grant,
     -- while their absence on an older supported Release is not schema drift.
     optional_full_dml_tables CONSTANT text[] := ARRAY[
-        'openid4vci_pre_authorized_code_consumptions',
-        'conformance_lease_applicants', 'conformance_lease_clients'
+        'openid4vci_pre_authorized_code_consumptions'
     ];
     append_tables CONSTANT text[] := ARRAY[
         'scim_audit_events', 'scim_security_events',
@@ -229,8 +228,6 @@ BEGIN
     REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM nazoauth_runtime;
     GRANT EXECUTE ON FUNCTION
         public.nazo_oauth_cleanup_expired_security_state(),
-        public.nazo_oauth_conformance_lease_is_active(UUID, UUID),
-        public.nazo_oauth_cleanup_expired_conformance_leases(),
         public.nazo_security_audit_privilege_preflight(BOOLEAN, BOOLEAN, BOOLEAN),
         public.nazo_security_audit_chain_head_for_update(),
         public.nazo_append_security_audit_event(UUID, TEXT, TEXT, JSONB, TIMESTAMPTZ, BYTEA, BYTEA),

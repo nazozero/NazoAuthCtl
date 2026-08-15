@@ -7,17 +7,6 @@ pub(crate) fn execute(
     operation: TaskOperation,
     public_jwk: Option<&Path>,
 ) -> anyhow::Result<OperationResult> {
-    if matches!(
-        &operation,
-        TaskOperation::ConformanceMatrixDescribe
-            | TaskOperation::ConformanceOnboardingApply { .. }
-            | TaskOperation::ConformanceLeaseCreate { .. }
-            | TaskOperation::ConformanceLeaseList
-            | TaskOperation::ConformanceLeaseRevoke { .. }
-            | TaskOperation::ConformanceLeaseCleanup
-    ) {
-        bail!("legacy conformance management is disabled");
-    }
     // A privileged operation is admissible only while the existing audit,
     // intent and trust-transition state is verifiably intact.  Checking after
     // the runtime side effect would be too late: the mutation could succeed
@@ -318,14 +307,7 @@ pub(crate) fn execute_test_task(
         TaskOperation::KeysGenerateLocal { .. } | TaskOperation::KeysRegisterExternal { .. } => {
             bail!("test task adapter does not implement key mutation")
         }
-        TaskOperation::ConformanceMatrixDescribe
-        | TaskOperation::ConformanceOnboardingApply { .. }
-        | TaskOperation::ConformanceLeaseCreate { .. }
-        | TaskOperation::ConformanceLeaseList
-        | TaskOperation::ConformanceLeaseRevoke { .. }
-        | TaskOperation::ConformanceLeaseCleanup => {
-            bail!("legacy conformance management is disabled")
-        }
+        _ => bail!("test task adapter does not implement this operator operation"),
     };
     crate::runtime_backend::backend(config.runtime.backend).run_debug_artifact_task(
         &crate::runtime_backend::DebugArtifactTask {
@@ -349,13 +331,10 @@ pub(crate) fn execute_test_task(
                 keyset_revision: "test".to_owned(),
             },
             TaskOperation::KeysGenerateLocal { .. }
-            | TaskOperation::KeysRegisterExternal { .. }
-            | TaskOperation::ConformanceMatrixDescribe
-            | TaskOperation::ConformanceOnboardingApply { .. }
-            | TaskOperation::ConformanceLeaseCreate { .. }
-            | TaskOperation::ConformanceLeaseList
-            | TaskOperation::ConformanceLeaseRevoke { .. }
-            | TaskOperation::ConformanceLeaseCleanup => unreachable!(),
+            | TaskOperation::KeysRegisterExternal { .. } => {
+                unreachable!()
+            }
+            _ => unreachable!(),
         },
         final_receipt: receipt,
     })
@@ -402,16 +381,11 @@ pub(crate) fn canonical_manifest(
 pub(crate) fn operation_name(operation: &TaskOperation) -> &'static str {
     match operation {
         TaskOperation::MigrateApply => "migrate-apply",
-        TaskOperation::ConformanceMatrixDescribe => "conformance-matrix-describe",
-        TaskOperation::ConformanceOnboardingApply { .. } => "conformance-onboarding-apply",
-        TaskOperation::ConformanceLeaseCreate { .. } => "conformance-lease-create",
-        TaskOperation::ConformanceLeaseList => "conformance-lease-list",
-        TaskOperation::ConformanceLeaseRevoke { .. } => "conformance-lease-revoke",
-        TaskOperation::ConformanceLeaseCleanup => "conformance-lease-cleanup",
         TaskOperation::KeysList => "keys-list",
         TaskOperation::KeysValidate => "keys-validate",
         TaskOperation::KeysGenerateLocal { .. } => "keys-generate-local",
         TaskOperation::KeysRegisterExternal { .. } => "keys-register-external",
+        _ => "unsupported-operator-operation",
     }
 }
 

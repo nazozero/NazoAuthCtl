@@ -1350,8 +1350,6 @@ fn managed_runtime_database_grants_keep_the_audit_ledger_api_least_privileged() 
         "scim_tokens",
         "oauth_client_mtls_trust_anchor_requests",
         "openid4vci_credential_dataset_events",
-        "conformance_lease_applicants",
-        "conformance_lease_clients",
         "tenant_resource_states",
         "tenant_resource_bindings",
         "tenant_resource_operations",
@@ -1379,8 +1377,8 @@ fn managed_runtime_database_grants_keep_the_audit_ledger_api_least_privileged() 
     assert!(sql.contains("REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM nazoauth_runtime;"));
     assert!(sql.contains("REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM nazoauth_runtime;"));
     assert!(sql.contains("nazo_oauth_cleanup_expired_security_state()"));
-    assert!(sql.contains("nazo_oauth_conformance_lease_is_active(UUID, UUID)"));
-    assert!(sql.contains("nazo_oauth_cleanup_expired_conformance_leases()"));
+    assert!(!sql.contains("nazo_oauth_conformance_lease_is_active(UUID, UUID)"));
+    assert!(!sql.contains("nazo_oauth_cleanup_expired_conformance_leases()"));
     for function in [
         "public.nazo_security_audit_privilege_preflight(BOOLEAN, BOOLEAN, BOOLEAN)",
         "public.nazo_security_audit_chain_head_for_update()",
