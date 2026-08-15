@@ -552,6 +552,16 @@ fn validate_snapshot_archive(
                 path.display()
             );
         }
+        let mode = entry
+            .header()
+            .mode()
+            .context("snapshot archive entry has an invalid mode")?;
+        if mode & 0o7000 != 0 {
+            bail!(
+                "snapshot archive entry has forbidden special permission bits: {}",
+                path.display()
+            );
+        }
         if !seen.insert(path.clone()) {
             bail!(
                 "snapshot archive contains a duplicate entry: {}",
@@ -704,8 +714,21 @@ fn restore_snapshot_archive_journaled(
             .rewind()
             .context("failed to rewind validated snapshot archive")?;
         let mut archive = Archive::new(&mut *archive_file);
-        archive.set_preserve_ownerships(false);
-        archive.set_preserve_permissions(false);
+        // The archive is a controller-created, root-owned artifact whose path,
+        // checksum, entry types, and permission bits were validated above.
+        // Runtime state relies on numeric ownership (notably UID/GID 10001 for
+        // OCI application state and runtime-readable secrets), so discarding
+        // this metadata makes a successfully restored runtime unbootable.
+        #[cfg(unix)]
+        {
+            archive.set_preserve_ownerships(true);
+            archive.set_preserve_permissions(true);
+        }
+        #[cfg(not(unix))]
+        {
+            archive.set_preserve_ownerships(false);
+            archive.set_preserve_permissions(false);
+        }
         archive.set_overwrite(false);
         archive
             .unpack(&staging)

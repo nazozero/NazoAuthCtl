@@ -1,4 +1,217 @@
 use super::*;
+use ed25519_dalek::SigningKey;
+
+const TENANT_RESOURCE_CONTROLLER_PRIVATE_FILE: &str = "tenant-resource-controller.key";
+const TENANT_RESOURCE_CONTROLLER_PUBLIC_FILE: &str = "tenant-resource-controller.pub";
+const TENANT_RESOURCE_CONTROLLER_KEY_ID_FILE: &str = "tenant-resource-controller.kid";
+
+pub(crate) fn tenant_resource_controller_private_key_path(config_dir: &Path) -> PathBuf {
+    config_dir
+        .join("operator")
+        .join(TENANT_RESOURCE_CONTROLLER_PRIVATE_FILE)
+}
+
+pub(crate) fn tenant_resource_controller_public_key_path(config_dir: &Path) -> PathBuf {
+    config_dir
+        .join("operator")
+        .join(TENANT_RESOURCE_CONTROLLER_PUBLIC_FILE)
+}
+
+pub(crate) fn tenant_resource_controller_key_id_path(config_dir: &Path) -> PathBuf {
+    config_dir
+        .join("operator")
+        .join(TENANT_RESOURCE_CONTROLLER_KEY_ID_FILE)
+}
+
+pub(crate) fn ensure_tenant_resource_controller_identity(config_dir: &Path) -> anyhow::Result<()> {
+    let private = tenant_resource_controller_private_key_path(config_dir);
+    let public = tenant_resource_controller_public_key_path(config_dir);
+    let key_id = tenant_resource_controller_key_id_path(config_dir);
+    let private_present = path_present(&private)?;
+    let public_present = path_present(&public)?;
+    let key_id_present = path_present(&key_id)?;
+    if !private_present && (public_present || key_id_present) {
+        bail!("incomplete tenant-resource controller identity requires review");
+    }
+    if !private_present {
+        let signing = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
+        atomic_write(
+            &private,
+            URL_SAFE_NO_PAD.encode(signing.to_bytes()).as_bytes(),
+            0o400,
+        )?;
+    }
+    let signing = read_tenant_resource_controller_signing_key(&private)?;
+    let public_bytes = signing.verifying_key().to_bytes();
+    let expected_public = URL_SAFE_NO_PAD.encode(public_bytes);
+    let expected_key_id = nazo_operator_protocol::instance_key_id(&signing.verifying_key());
+    reconcile_public_identity_file(&public, expected_public.as_bytes(), 0o444)?;
+    reconcile_public_identity_file(&key_id, expected_key_id.as_bytes(), 0o444)
+}
+
+/// Migrate an installed deployment from the rotating operator controller key
+/// to the deployment-stable tenant-resource controller identity. Callers must
+/// run this only inside an explicit install/update transaction whose normal
+/// activation phase restarts or recreates the runtime.
+pub(crate) fn ensure_tenant_resource_controller_runtime(
+    config_dir: &Path,
+    config: &mut UpdateConfig,
+) -> anyhow::Result<bool> {
+    ensure_tenant_resource_controller_identity(config_dir)?;
+    let stable_public = tenant_resource_controller_public_key_path(config_dir);
+    let configured_value = if config.runtime.backend == RuntimeBackendKind::Systemd {
+        stable_public.display().to_string()
+    } else {
+        TENANT_RESOURCE_CONTROLLER_CONTAINER_KEY_PATH.to_owned()
+    };
+    let old_value = if config.runtime.backend == RuntimeBackendKind::Systemd {
+        Some(config.operator.controller_public_key.display().to_string())
+    } else {
+        None
+    };
+    let server_config_changed = migrate_server_config_key(
+        &config_dir.join(".env.yaml"),
+        "TENANT_RESOURCE_CONTROLLER_PUBLIC_KEY_FILE",
+        &configured_value,
+        old_value.as_deref(),
+    )?;
+
+    if config.runtime.backend == RuntimeBackendKind::Systemd {
+        return Ok(server_config_changed);
+    }
+    let target = PathBuf::from(TENANT_RESOURCE_CONTROLLER_CONTAINER_KEY_PATH);
+    if let Some(existing) = config
+        .runtime
+        .mounts
+        .iter_mut()
+        .find(|mount| mount.target == target)
+    {
+        if existing.source != stable_public
+            && existing.source != config.operator.controller_public_key
+        {
+            bail!(
+                "tenant-resource controller mount conflicts with {}",
+                existing.source.display()
+            );
+        }
+        let changed =
+            existing.source != stable_public || !existing.read_only || !existing.selinux_relabel;
+        existing.source = stable_public;
+        existing.read_only = true;
+        existing.selinux_relabel = true;
+        return Ok(server_config_changed || changed);
+    }
+    config.runtime.mounts.push(mount(
+        stable_public,
+        TENANT_RESOURCE_CONTROLLER_CONTAINER_KEY_PATH,
+        true,
+        true,
+    ));
+    Ok(true)
+}
+
+fn migrate_server_config_key(
+    path: &Path,
+    key: &str,
+    expected: &str,
+    allowed_previous: Option<&str>,
+) -> anyhow::Result<bool> {
+    let mut content =
+        read_existing_server_config(path)?.context("installed server configuration is missing")?;
+    match config_key_value(&content, key)? {
+        Some(value) if value == expected => Ok(false),
+        Some(value) if Some(value.as_str()) != allowed_previous => {
+            bail!("existing {key} is not managed by this deployment")
+        }
+        Some(_) => {
+            let mut replaced = false;
+            let mut updated = String::new();
+            for line in content.lines() {
+                let name = line
+                    .trim_start()
+                    .split_once(':')
+                    .map(|(name, _)| name.trim());
+                if name == Some(key) {
+                    updated.push_str(&format!("{key}: \"{expected}\"\n"));
+                    replaced = true;
+                } else {
+                    updated.push_str(line);
+                    updated.push('\n');
+                }
+            }
+            if !replaced {
+                bail!("existing {key} could not be migrated");
+            }
+            atomic_write(path, updated.as_bytes(), 0o640)?;
+            Ok(true)
+        }
+        None => {
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str(&format!("{key}: \"{expected}\"\n"));
+            atomic_write(path, content.as_bytes(), 0o640)?;
+            Ok(true)
+        }
+    }
+}
+
+fn reconcile_public_identity_file(path: &Path, expected: &[u8], mode: u32) -> anyhow::Result<()> {
+    if !path_present(path)? {
+        return atomic_write(path, expected, mode);
+    }
+    let actual = crate::filesystem::read_secure_regular_file(
+        path,
+        "tenant-resource controller public identity",
+        false,
+        256,
+    )?;
+    if actual.as_slice() != expected {
+        bail!(
+            "tenant-resource controller identity is inconsistent: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn read_tenant_resource_controller_signing_key(
+    path: &Path,
+) -> anyhow::Result<SigningKey> {
+    let encoded = crate::filesystem::read_secure_regular_file(
+        path,
+        "tenant-resource controller private key",
+        true,
+        256,
+    )?;
+    if encoded.is_empty() || encoded.contains(&b'\n') || encoded.contains(&b'\r') {
+        bail!("tenant-resource controller private key is invalid");
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded.as_slice())
+        .context("tenant-resource controller private key is not canonical base64url")?;
+    if URL_SAFE_NO_PAD.encode(&decoded).as_bytes() != encoded.as_slice() {
+        bail!("tenant-resource controller private key is not canonical base64url");
+    }
+    let bytes: [u8; 32] = decoded.try_into().map_err(|_| {
+        anyhow::anyhow!("tenant-resource controller private key has invalid length")
+    })?;
+    Ok(SigningKey::from_bytes(&bytes))
+}
+
+fn path_present(path: &Path) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!(
+                "tenant-resource controller identity path must be a regular file: {}",
+                path.display()
+            )
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
 
 pub(super) fn normalize_external_dependencies(options: &mut InstallOptions) -> anyhow::Result<()> {
     if !options.external_dependencies && (options.secrets_stdin || options.secret_fd.is_some()) {
@@ -703,15 +916,28 @@ pub(super) fn config_key_value(content: &str, key: &str) -> anyhow::Result<Optio
     Ok(value)
 }
 
-pub(super) fn write_server_config(
-    config_dir: &Path,
-    options: &InstallOptions,
-    deployment_id: &str,
-    runtime: RuntimeBackendKind,
-    data_root: &Path,
-    trusted_proxy_cidr: Option<&str>,
-    profile_config: Option<&str>,
-) -> anyhow::Result<()> {
+pub(super) struct ServerConfigWriteRequest<'a> {
+    pub config_dir: &'a Path,
+    pub options: &'a InstallOptions,
+    pub deployment_id: &'a str,
+    pub controller_public_key: &'a Path,
+    pub runtime: RuntimeBackendKind,
+    pub data_root: &'a Path,
+    pub trusted_proxy_cidr: Option<&'a str>,
+    pub profile_config: Option<&'a str>,
+}
+
+pub(super) fn write_server_config(request: ServerConfigWriteRequest<'_>) -> anyhow::Result<()> {
+    let ServerConfigWriteRequest {
+        config_dir,
+        options,
+        deployment_id,
+        controller_public_key,
+        runtime,
+        data_root,
+        trusted_proxy_cidr,
+        profile_config,
+    } = request;
     let standards_full = options.profile == "standards-full";
     if standards_full != profile_config.is_some() {
         bail!("server profile selection does not match the validated install profile");
@@ -752,6 +978,11 @@ pub(super) fn write_server_config(
     } else {
         "/var/lib/nazo_oauth".to_owned()
     };
+    let tenant_resource_controller_key_file = if runtime == RuntimeBackendKind::Systemd {
+        controller_public_key.display().to_string()
+    } else {
+        TENANT_RESOURCE_CONTROLLER_CONTAINER_KEY_PATH.to_owned()
+    };
     let rendered_profile = profile_config
         .unwrap_or_default()
         .replace(
@@ -761,14 +992,30 @@ pub(super) fn write_server_config(
         .replace("${PROFILE_SECRET_ROOT}", &profile_secret_root)
         .replace("${PROFILE_APP_ROOT}", &profile_app_root);
     let target = config_dir.join(".env.yaml");
-    if let Some(existing) = read_existing_server_config(&target)? {
+    if let Some(mut existing) = read_existing_server_config(&target)? {
         validate_existing_server_config(
             &existing,
             options,
             trusted_proxy_cidr,
             profile_config.map(|_| rendered_profile.as_str()),
         )?;
-        return Ok(());
+        match config_key_value(&existing, "TENANT_RESOURCE_CONTROLLER_PUBLIC_KEY_FILE")? {
+            Some(configured) if configured != tenant_resource_controller_key_file => {
+                bail!(
+                    "existing TENANT_RESOURCE_CONTROLLER_PUBLIC_KEY_FILE does not match the active controller key"
+                );
+            }
+            Some(_) => return Ok(()),
+            None => {
+                if !existing.ends_with('\n') {
+                    existing.push('\n');
+                }
+                existing.push_str(&format!(
+                    "TENANT_RESOURCE_CONTROLLER_PUBLIC_KEY_FILE: \"{tenant_resource_controller_key_file}\"\n"
+                ));
+                return atomic_write(&target, existing.as_bytes(), 0o640);
+            }
+        }
     }
     ensure_mfa_totp_key(&mfa_totp_key_path(config_dir))?;
     let content = format!(
@@ -776,6 +1023,7 @@ pub(super) fn write_server_config(
          BIND: \"{bind}\"\n\
          PUBLIC_BASE_URL: \"{public_url}\"\n\
          DEPLOYMENT_ID: \"{deployment_id}\"\n\
+         TENANT_RESOURCE_CONTROLLER_PUBLIC_KEY_FILE: \"{tenant_resource_controller_key_file}\"\n\
          MFA_TOTP_ENCRYPTION_KEY_FILE: \"{mfa_key_file}\"\n\
          MFA_TOTP_ENCRYPTION_KEY_ID: \"{mfa_key_id}\"\n\
          DATABASE_MAX_CONNECTIONS: 32\n\

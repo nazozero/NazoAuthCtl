@@ -25,9 +25,14 @@ NazoAuth commit and an exact package version.
   requires a separately stored, encrypted off-host recovery package.
 
 See [architecture](docs/architecture.md), [recovery boundaries](docs/recovery.md),
-[discovery and adoption](docs/discovery-adoption.md), and
+[discovery and adoption](docs/discovery-adoption.md),
+[signed OIDF driver artifacts](docs/oidf-artifacts.md), and
 [compatibility](docs/compatibility.md). The strict manual-deployment input is
 documented in the [lifecycle contract](docs/lifecycle-contract.md).
+Deployment-owned public certificate rotation uses the independent
+[TLS certificate provider contract](docs/tls-certificate-provider.md). Public
+certificate issuance through a preconfigured HTTP-01 webroot is defined by the
+[ACME issuance contract](docs/tls-acme-http01.md).
 
 On Linux, install an independently attested Release with GitHub CLI available:
 

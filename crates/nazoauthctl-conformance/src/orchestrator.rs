@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
+use crate::OidfDriverLane;
 use crate::browser::{
     BrowserAutomation, BrowserPolicy, BrowserRunnerState, BrowserTargetOrigin, ConformanceBinding,
     OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpStartRequest,
@@ -23,13 +24,14 @@ use crate::progress::{
     GroupProgress, GroupStatus, ProgressEvent, ProgressSink, ProgressSnapshot, redacted_variant,
 };
 use crate::report::{
-    CleanupFailure, CleanupReport, ConformanceReport, ModuleReport, ModuleReportContext,
-    OrchestrationIntegrity, PlanReport,
+    CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport,
+    ModuleReportContext, OrchestrationIntegrity, PlanReport, summarize_module_outcomes,
 };
 
 mod parallel;
 
 pub const MAX_PARALLEL_JOBS: usize = 4;
+pub const BOUNDED_PLAN_RUNNER_PROTOCOL: &str = "nazoauthctl-bounded-plan-runner-v1";
 pub const MAX_POLL_TIMEOUT_SECONDS: u64 = 86_400;
 pub const MAX_POLL_TIMEOUT: Duration = Duration::from_secs(MAX_POLL_TIMEOUT_SECONDS);
 
@@ -70,13 +72,17 @@ pub struct ConformanceRunConfig {
     pub client: SuiteClient,
     pub matrix: SelectedMatrix,
     pub target_origin: Option<BrowserTargetOrigin>,
-    /// The lease and task identity allocated for this run.  OpenID4VP
-    /// verifier starts must carry the complete pair; keeping it on the run
-    /// config lets the request and verifier client be checked against the
-    /// same capability instead of accepting a partial/mixed binding.
+    /// The deployment-owned binding allocated for this run. OpenID4VP
+    /// verifier starts carry either an ordinary trust-policy resource id and
+    /// digest or the complete legacy lease/task pair. Keeping the disjoint
+    /// binding on the run config prevents partial and mixed requests.
     pub binding: ConformanceBinding,
     pub poll_timeout: Duration,
     pub control: RunControl,
+    /// Exact signed execution lane for every selected Matrix plan. The map is
+    /// required to match the selected plan ids one-for-one; the runner never
+    /// derives CIBA semantics from mutable Suite plan names.
+    pub plan_lanes: BTreeMap<String, OidfDriverLane>,
     /// Maximum number of independent Suite plans executed at once. Modules
     /// inside one plan remain strictly ordered. Browser, verifier, and issuer
     /// automation retain their existing mutex-owned sessions, so parallel
@@ -108,6 +114,7 @@ struct PlannedPlan {
     modules: Vec<ModuleDefinition>,
     config: Value,
     report_index: usize,
+    lane: OidfDriverLane,
 }
 
 impl Drop for PlannedPlan {
@@ -138,6 +145,9 @@ impl ConformanceRunner {
             || !(1..=MAX_PARALLEL_JOBS).contains(&config.jobs)
             || (!config.automation.is_empty() && config.automation.len() != config.jobs)
         {
+            return Err(OrchestrationError::InvalidInput);
+        }
+        if !plan_lanes_match_selected(&config.matrix, &config.plan_lanes) {
             return Err(OrchestrationError::InvalidInput);
         }
         validate_matrix_origins(
@@ -401,6 +411,8 @@ impl ConformanceRunner {
                 total: 0,
                 status: GroupStatus::Remaining,
                 passed: 0,
+                reviewed: 0,
+                skipped: 0,
                 failed: 0,
                 running: 0,
                 remaining: 0,
@@ -479,6 +491,11 @@ impl ConformanceRunner {
                         modules: created.modules,
                         config: plan.config.clone(),
                         report_index,
+                        lane: *self
+                            .config
+                            .plan_lanes
+                            .get(&plan.id)
+                            .expect("selected plan lanes were validated at construction"),
                     });
                 }
             }
@@ -796,17 +813,23 @@ impl ConformanceRunner {
                         info,
                         log,
                     ));
-                    let module_pass = modules.last().is_some_and(accepted_module_outcome);
+                    let module_outcome = modules.last().map(|module| module.outcome);
                     if terminal {
                         groups[group_index].running = groups[group_index].running.saturating_sub(1);
                         groups[group_index].completed += 1;
-                        if module_pass {
-                            groups[group_index].passed += 1;
-                        } else {
-                            groups[group_index].failed += 1;
+                        match module_outcome {
+                            Some(ModuleOutcome::Passed) => groups[group_index].passed += 1,
+                            Some(ModuleOutcome::Review) => groups[group_index].reviewed += 1,
+                            Some(ModuleOutcome::Skipped) => groups[group_index].skipped += 1,
+                            Some(ModuleOutcome::Failed | ModuleOutcome::Incomplete) | None => {
+                                groups[group_index].failed += 1;
+                            }
                         }
                     }
-                    if !module_pass {
+                    if matches!(
+                        module_outcome,
+                        Some(ModuleOutcome::Failed | ModuleOutcome::Incomplete) | None
+                    ) {
                         groups[group_index].status = GroupStatus::Failed;
                     }
                     emit_progress(
@@ -821,7 +844,13 @@ impl ConformanceRunner {
                     }
                 }
                 if groups[group_index].status == GroupStatus::Running {
-                    groups[group_index].status = GroupStatus::Passed;
+                    groups[group_index].status = if groups[group_index].reviewed > 0 {
+                        GroupStatus::Review
+                    } else if groups[group_index].skipped > 0 {
+                        GroupStatus::Skipped
+                    } else {
+                        GroupStatus::Passed
+                    };
                     emit_progress(
                         sink,
                         &groups,
@@ -848,10 +877,8 @@ impl ConformanceRunner {
         let all_modules_instantiated = defined_modules == created_instances;
         let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
         let cleanup_complete = cleanup.failures.is_empty();
-        let suite_pass = all_modules_terminal && modules.iter().all(accepted_module_outcome);
-        if !suite_pass && errors.is_empty() {
-            errors.push("Suite reported a non-success or incomplete module result".to_owned());
-        }
+        let outcomes = summarize_module_outcomes(&modules);
+        let suite_pass = defined_modules > 0 && all_modules_terminal && outcomes.all_passed;
         let orchestration_integrity = OrchestrationIntegrity {
             defined_modules,
             created_instances,
@@ -861,21 +888,14 @@ impl ConformanceRunner {
             cleanup_complete,
         };
         let local_success = errors.is_empty()
-            && suite_pass
             && orchestration_integrity.all_modules_instantiated
             && orchestration_integrity.all_modules_terminal
             && orchestration_integrity.cleanup_complete;
-        let human_review_modules = modules
-            .iter()
-            .filter(|module| module.human_review_required)
-            .map(|module| format!("{}/{}", module.matrix_plan_id, module.test_name))
-            .collect::<Vec<_>>();
-        let human_review_required = !human_review_modules.is_empty();
+        let human_review_required = !outcomes.human_review_modules.is_empty();
         let snapshot = snapshot(&groups, current_profile, current_variant, current_test);
         let report = ConformanceReport {
-            // Schema 2 adds explicit accepted/reviewed/skipped outcome
-            // semantics; schema 1 treated every non-PASSED result as failure.
-            schema: 2,
+            // Schema 3 separates local execution from exact Suite outcomes.
+            schema: 3,
             matrix_digest: self.config.matrix.digest.clone(),
             suite_origin: self.config.client.origin().to_string(),
             auth_probe,
@@ -883,7 +903,10 @@ impl ConformanceRunner {
             local_success,
             suite_pass,
             human_review_required,
-            human_review_modules,
+            human_review_modules: outcomes.human_review_modules,
+            skipped_modules: outcomes.skipped_modules,
+            failed_modules: outcomes.failed_modules,
+            incomplete_modules: outcomes.incomplete_modules,
             orchestration_integrity,
             progress: snapshot,
             plans,
@@ -892,6 +915,29 @@ impl ConformanceRunner {
         };
         RunSummary { report }
     }
+}
+
+fn plan_lanes_match_selected(
+    matrix: &SelectedMatrix,
+    plan_lanes: &BTreeMap<String, OidfDriverLane>,
+) -> bool {
+    let selected_plan_ids = matrix
+        .document
+        .groups
+        .iter()
+        .flat_map(|group| group.plans.iter().map(|plan| plan.id.as_str()))
+        .collect::<BTreeSet<_>>();
+    let selected_plan_count = matrix
+        .document
+        .groups
+        .iter()
+        .map(|group| group.plans.len())
+        .sum::<usize>();
+    selected_plan_ids.len() == selected_plan_count
+        && selected_plan_ids.len() == plan_lanes.len()
+        && plan_lanes
+            .keys()
+            .all(|plan_id| selected_plan_ids.contains(plan_id.as_str()))
 }
 
 #[derive(Clone)]
@@ -933,6 +979,14 @@ fn snapshot(
             .iter()
             .filter(|group| group.status == GroupStatus::Passed)
             .count(),
+        review_groups: groups
+            .iter()
+            .filter(|group| group.status == GroupStatus::Review)
+            .count(),
+        skipped_groups: groups
+            .iter()
+            .filter(|group| group.status == GroupStatus::Skipped)
+            .count(),
         failed_groups: groups
             .iter()
             .filter(|group| group.status == GroupStatus::Failed)
@@ -946,6 +1000,8 @@ fn snapshot(
             .filter(|group| group.status == GroupStatus::Remaining)
             .count(),
         passed: groups.iter().map(|group| group.passed).sum(),
+        reviewed: groups.iter().map(|group| group.reviewed).sum(),
+        skipped: groups.iter().map(|group| group.skipped).sum(),
         failed: groups.iter().map(|group| group.failed).sum(),
         running: groups.iter().map(|group| group.running).sum(),
         remaining: groups.iter().map(|group| group.remaining).sum(),
@@ -1053,10 +1109,6 @@ fn is_terminal(value: &Value) -> bool {
         value.get("status").and_then(Value::as_str),
         Some("FINISHED" | "INTERRUPTED")
     )
-}
-
-fn accepted_module_outcome(module: &ModuleReport) -> bool {
-    module.accepted
 }
 
 fn validate_matrix_origins(
@@ -1202,8 +1254,7 @@ mod tests {
         .expect("binding")
     }
 
-    #[test]
-    fn origin_validation_rejects_cross_origin_config() {
+    fn one_plan_matrix(config: Value) -> SelectedMatrix {
         let document = MatrixDocument {
             schema: 1,
             name: "matrix".into(),
@@ -1217,16 +1268,35 @@ mod tests {
                 plans: vec![MatrixPlan {
                     id: "p".into(),
                     plan: "plan".into(),
-                    config: serde_json::json!({"audience":"https://evil.example"}),
+                    config,
                     variant: BTreeMap::new(),
                     expected_results: BTreeMap::new(),
                 }],
             }],
         };
-        let selected = SelectedMatrix {
+        SelectedMatrix {
             document,
             digest: "x".into(),
-        };
+        }
+    }
+
+    #[test]
+    fn selected_plans_require_exact_signed_lane_coverage() {
+        let selected = one_plan_matrix(serde_json::json!({}));
+        assert!(plan_lanes_match_selected(
+            &selected,
+            &BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)])
+        ));
+        assert!(!plan_lanes_match_selected(&selected, &BTreeMap::new()));
+        assert!(!plan_lanes_match_selected(
+            &selected,
+            &BTreeMap::from([("other".to_owned(), OidfDriverLane::Parallel)])
+        ));
+    }
+
+    #[test]
+    fn origin_validation_rejects_cross_origin_config() {
+        let selected = one_plan_matrix(serde_json::json!({"audience":"https://evil.example"}));
         let client = SuiteClient::with_transport(
             Origin::parse("https://suite.example").expect("origin"),
             None,
@@ -1244,6 +1314,7 @@ mod tests {
                 binding: test_binding(),
                 poll_timeout: Duration::from_secs(1),
                 control: RunControl::default(),
+                plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
                 jobs: 1,
                 automation: Vec::new(),
             })
@@ -1288,11 +1359,11 @@ mod tests {
             serde_json::json!([]),
         );
         assert_eq!(report.official_result.as_deref(), Some("FAILED"));
-        assert!(!accepted_module_outcome(&report));
+        assert_eq!(report.outcome, ModuleOutcome::Failed);
     }
 
     #[test]
-    fn review_is_accepted_and_requires_human_follow_up() {
+    fn review_is_distinct_from_pass_and_requires_human_follow_up() {
         let report = ModuleReport::from_info(
             ModuleReportContext {
                 matrix_plan_id: "p".into(),
@@ -1305,13 +1376,13 @@ mod tests {
             serde_json::json!({"status":"FINISHED","result":"REVIEW"}),
             serde_json::json!([{"result":"REVIEW"}]),
         );
-        assert!(accepted_module_outcome(&report));
+        assert_eq!(report.outcome, ModuleOutcome::Review);
         assert!(report.human_review_required);
     }
 
     #[test]
-    fn exact_skipped_is_accepted_with_or_without_a_matrix_annotation() {
-        let accepted = ModuleReport::from_info(
+    fn exact_skipped_remains_skipped_with_or_without_a_matrix_annotation() {
+        let expected = ModuleReport::from_info(
             ModuleReportContext {
                 matrix_plan_id: "p".into(),
                 suite_plan_id: "s".into(),
@@ -1323,7 +1394,7 @@ mod tests {
             serde_json::json!({"status":"FINISHED","result":"SKIPPED"}),
             serde_json::json!([]),
         );
-        assert!(accepted_module_outcome(&accepted));
+        assert_eq!(expected.outcome, ModuleOutcome::Skipped);
 
         let unexpected = ModuleReport::from_info(
             ModuleReportContext {
@@ -1337,11 +1408,11 @@ mod tests {
             serde_json::json!({"status":"FINISHED","result":"SKIPPED"}),
             serde_json::json!([]),
         );
-        assert!(accepted_module_outcome(&unexpected));
+        assert_eq!(unexpected.outcome, ModuleOutcome::Skipped);
     }
 
     #[test]
-    fn review_with_a_warning_is_accepted_and_requires_human_follow_up() {
+    fn review_with_a_warning_remains_review_and_requires_human_follow_up() {
         let report = ModuleReport::from_info(
             ModuleReportContext {
                 matrix_plan_id: "p".into(),
@@ -1354,14 +1425,14 @@ mod tests {
             serde_json::json!({"status":"FINISHED","result":"REVIEW"}),
             serde_json::json!([{"result":"WARNING"}]),
         );
-        assert!(accepted_module_outcome(&report));
+        assert_eq!(report.outcome, ModuleOutcome::Review);
         assert!(report.human_review_required);
         assert!(report.blocking_log_results.is_empty());
         assert_eq!(report.advisory_log_results, vec!["WARNING"]);
     }
 
     #[test]
-    fn warning_is_accepted_but_failure_remains_blocking() {
+    fn warning_requires_review_but_failure_log_is_failed() {
         let warning = ModuleReport::from_info(
             ModuleReportContext {
                 matrix_plan_id: "p".into(),
@@ -1374,7 +1445,7 @@ mod tests {
             serde_json::json!({"status":"FINISHED","result":"WARNING"}),
             serde_json::json!([{"result":"WARNING"}]),
         );
-        assert!(accepted_module_outcome(&warning));
+        assert_eq!(warning.outcome, ModuleOutcome::Review);
         assert!(warning.human_review_required);
         assert!(warning.blocking_log_results.is_empty());
         assert_eq!(warning.advisory_log_results, vec!["WARNING"]);
@@ -1391,7 +1462,7 @@ mod tests {
             serde_json::json!({"status":"FINISHED","result":"WARNING"}),
             serde_json::json!([{"result":"WARNING"},{"result":"FAILURE"}]),
         );
-        assert!(!accepted_module_outcome(&failure));
+        assert_eq!(failure.outcome, ModuleOutcome::Failed);
         assert!(!failure.human_review_required);
         assert_eq!(failure.blocking_log_results, vec!["FAILURE"]);
         assert_eq!(failure.advisory_log_results, vec!["WARNING"]);
@@ -1425,6 +1496,7 @@ mod tests {
             binding: test_binding(),
             poll_timeout: Duration::from_secs(30),
             control,
+            plan_lanes: BTreeMap::new(),
             jobs: 1,
             automation: Vec::new(),
         })
@@ -1497,6 +1569,7 @@ mod tests {
             binding: test_binding(),
             poll_timeout: Duration::from_millis(250),
             control,
+            plan_lanes: BTreeMap::new(),
             jobs: 1,
             automation: Vec::new(),
         })
@@ -1519,6 +1592,7 @@ mod tests {
             modules: Vec::new(),
             config: serde_json::json!({}),
             report_index: 0,
+            lane: OidfDriverLane::Parallel,
         };
         let module = ModuleDefinition {
             test_name: "test".into(),
@@ -1627,6 +1701,7 @@ mod tests {
             binding: test_binding(),
             poll_timeout: Duration::from_secs(2),
             control: RunControl::default(),
+            plan_lanes: BTreeMap::new(),
             jobs: 1,
             automation: Vec::new(),
         })
@@ -1647,6 +1722,7 @@ mod tests {
                 }]
             }),
             report_index: 0,
+            lane: OidfDriverLane::Parallel,
         };
         let browser: Arc<Mutex<dyn BrowserAutomation>> = Arc::new(Mutex::new(CompletingBrowser {
             completed: completed.clone(),

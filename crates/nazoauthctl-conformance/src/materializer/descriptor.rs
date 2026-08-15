@@ -260,7 +260,7 @@ fn validate_openid4vc_credential_datasets(
     if descriptor.openid4vc_credential_datasets.len() > MAX_OPENID4VC_DATASETS {
         return Err(MaterializerError::Oversize);
     }
-    let mut referenced = BTreeMap::<String, Option<Value>>::new();
+    let referenced = referenced_openid4vc_credential_dataset_ids(descriptor)?;
     for group in &descriptor.groups {
         for plan in &group.plans {
             if !plan.plan.starts_with("oid4vci-") {
@@ -287,15 +287,6 @@ fn validate_openid4vc_credential_datasets(
             {
                 return Err(MaterializerError::InvalidField("nazo.credential_dataset"));
             }
-
-            if let Some(previous) = referenced.get(&configuration_id)
-                && previous.as_ref() != Some(dataset)
-            {
-                return Err(MaterializerError::InvalidField(
-                    "openid4vc_credential_datasets",
-                ));
-            }
-            referenced.insert(configuration_id, Some(dataset.clone()));
         }
     }
 
@@ -303,7 +294,7 @@ fn validate_openid4vc_credential_datasets(
         || descriptor
             .openid4vc_credential_datasets
             .keys()
-            .any(|key| !referenced.contains_key(key))
+            .any(|key| !referenced.contains(key))
     {
         return Err(MaterializerError::InvalidField(
             "openid4vc_credential_datasets",
@@ -322,6 +313,20 @@ fn validate_openid4vc_credential_datasets(
         }
     }
     Ok(())
+}
+
+pub(super) fn referenced_openid4vc_credential_dataset_ids(
+    descriptor: &MatrixDescriptor,
+) -> Result<BTreeSet<String>, MaterializerError> {
+    let mut referenced = BTreeSet::new();
+    for group in &descriptor.groups {
+        for plan in &group.plans {
+            if plan.plan.starts_with("oid4vci-") {
+                referenced.insert(descriptor_vci_configuration_id(plan)?);
+            }
+        }
+    }
+    Ok(referenced)
 }
 
 fn descriptor_vci_configuration_id(plan: &DescriptorPlan) -> Result<String, MaterializerError> {
@@ -864,6 +869,20 @@ pub(super) fn parse_placeholder(value: &str) -> Result<&str, MaterializerError> 
 
 pub(super) fn is_placeholder(value: &str) -> bool {
     value.starts_with("{{") && value.ends_with("}}") && parse_placeholder(value).is_ok()
+}
+
+/// Validate a signed-artifact placeholder against the same reference grammar
+/// used by descriptor validation and runtime materialization.  The artifact
+/// layer must not maintain a second, narrower list: real matrices contain
+/// target URL paths as well as client, generated, onboarding, and chained
+/// secret references.
+pub(crate) fn artifact_placeholder_is_valid(
+    value: &str,
+    bindings: &BTreeMap<String, String>,
+) -> bool {
+    parse_placeholder(value).is_ok_and(|reference| {
+        validate_binding_reference(reference, bindings, &mut BTreeSet::new()).is_ok()
+    })
 }
 
 fn validate_crypto_policy(policy: &CryptoPolicy) -> Result<(), MaterializerError> {

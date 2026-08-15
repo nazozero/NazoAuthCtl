@@ -26,6 +26,32 @@ pub struct ProxyTrustGuard {
 }
 
 impl ProxyTrustGuard {
+    pub fn recover(
+        bundle_path: impl AsRef<Path>,
+        reload_executable: impl AsRef<Path>,
+    ) -> anyhow::Result<()> {
+        let bundle_path = bundle_path.as_ref();
+        let reload_executable = reload_executable.as_ref();
+        validate_reload_executable(reload_executable)?;
+        let file_name = bundle_path
+            .file_name()
+            .context("proxy trust bundle path has no file name")?
+            .to_string_lossy();
+        let recovery_path = bundle_path.with_file_name(format!(".{file_name}.nazoauthctl-restore"));
+        let lock_path = bundle_path.with_file_name(format!(".{file_name}.nazoauthctl-lock"));
+        let _lock = open_provider_lock(&lock_path)?;
+        match fs::symlink_metadata(&recovery_path) {
+            Ok(_) => {
+                let recovery = read_private(&recovery_path, "proxy trust recovery bundle")?;
+                write_private(bundle_path, &recovery, "proxy trust recovery")?;
+                reload(reload_executable, "recover stale proxy trust transaction")?;
+                remove_recovery(&recovery_path)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("failed to inspect proxy trust recovery bundle"),
+        }
+    }
+
     pub fn install(
         bundle_path: impl AsRef<Path>,
         reload_executable: impl AsRef<Path>,

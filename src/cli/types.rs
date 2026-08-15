@@ -13,6 +13,7 @@ pub(crate) enum HelpTopic {
     Update,
     Keys,
     Conformance,
+    Tls,
     Audit,
     Identity,
     BreakGlass,
@@ -65,7 +66,7 @@ pub(crate) enum Command {
         candidate: Option<CandidateTarget>,
     },
     Keys(KeysCommand),
-    Conformance(ConformanceCommand),
+    Tls(TlsCommand),
     AuditVerify,
     AuditShow {
         request_id: Option<String>,
@@ -91,6 +92,78 @@ pub(crate) enum Command {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TlsCertificateInput {
+    pub(crate) provider_config: PathBuf,
+    pub(crate) tenant: String,
+    pub(crate) hostname: String,
+    pub(crate) source: TlsCertificateSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TlsCertificateSource {
+    ExternalFiles {
+        certificate: PathBuf,
+        private_key: PathBuf,
+    },
+    CurrentAcmeReceipt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TlsCertificateCheckInput {
+    pub(crate) provider_config: PathBuf,
+    pub(crate) tenant: String,
+    pub(crate) hostname: String,
+    pub(crate) warning_window_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AcmeCertificateInput {
+    pub(crate) acme_config: PathBuf,
+    pub(crate) provider_config: PathBuf,
+    pub(crate) tenant: String,
+    pub(crate) hostname: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AcmeCommand {
+    Plan(AcmeCertificateInput),
+    Issue {
+        input: AcmeCertificateInput,
+        agree_terms: bool,
+        yes: bool,
+    },
+    Recover {
+        tenant: String,
+        hostname: String,
+        yes: bool,
+    },
+    Show {
+        tenant: String,
+        hostname: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TlsCommand {
+    Check(TlsCertificateCheckInput),
+    Plan(TlsCertificateInput),
+    Apply {
+        input: TlsCertificateInput,
+        yes: bool,
+    },
+    Recover {
+        tenant: String,
+        hostname: String,
+        yes: bool,
+    },
+    Show {
+        tenant: String,
+        hostname: String,
+    },
+    Acme(AcmeCommand),
+}
+
 #[derive(Debug)]
 pub(crate) struct DevelopmentActivateOptions {
     pub(crate) artifact: String,
@@ -107,12 +180,6 @@ pub(crate) struct PermissionOptions {
 pub(crate) struct RelinquishOptions {
     pub(crate) capabilities: Vec<Capability>,
     pub(crate) yes: bool,
-}
-
-#[derive(Debug)]
-pub(crate) struct ConformanceCommand {
-    pub(crate) lease: ConformanceLeaseCommand,
-    pub(crate) candidate: Option<CandidateTarget>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,26 +207,6 @@ pub(crate) enum KeysCommand {
         alg: String,
         key_ref: String,
         public_jwk: PathBuf,
-        yes: bool,
-    },
-}
-
-#[derive(Debug)]
-pub(crate) enum ConformanceLeaseCommand {
-    Create {
-        profile: String,
-        material: PathBuf,
-        dynamic_registration_token_file: Option<PathBuf>,
-        ciba_automated_decision_token_file: Option<PathBuf>,
-        ttl_seconds: u64,
-        yes: bool,
-    },
-    List,
-    Revoke {
-        lease_id: String,
-        yes: bool,
-    },
-    Cleanup {
         yes: bool,
     },
 }

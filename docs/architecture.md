@@ -69,7 +69,7 @@ configuration validation, atomic reload, rollback, and recovery of its proxy;
 ctl must not synthesize completion from application settings.
 
 Conformance certificates and trust anchors are run-scoped. If a shared proxy is
-used, the provider must atomically install the active lease's public CA bundle
+used, the provider must atomically install the active run's public CA bundle
 before Suite modules are created and restore the previous bundle during the same
 cleanup transaction. Such runs are serialized unless they have independent
 listeners and bundles. Private keys never cross this boundary.
@@ -78,8 +78,42 @@ For a file-backed provider, `conformance run` accepts the paired
 `--proxy-trust-bundle` and `--proxy-reload-executable` options. The materializer
 supplies only generated public client CAs. ctl atomically installs that bundle,
 invokes a root-owned reload executable, and restores a sibling recovery copy
-after Suite and lease cleanup. Supplying only one option fails before proxy,
+after Suite and ordinary-resource cleanup. Supplying only one option fails before proxy,
 deployment, or Suite mutation.
+
+## Conformance outcome evidence
+
+The conformance report keeps local execution and official Suite outcomes as
+separate facts. `local_success` means that ctl completed orchestration, evidence
+collection, and cleanup without a local error. It is not a protocol result.
+`suite_pass` is true only when at least one module was defined and every defined
+module reached the Suite's exact `FINISHED` / `PASSED` result without warning or
+failure conditions.
+
+`REVIEW`, `WARNING`, `SKIPPED`, failed, and incomplete modules remain distinct
+module outcomes and are listed separately in report schema 3. A signed Matrix
+may explain an expected `SKIPPED` result, but the explanation never promotes it
+to `PASSED`. Live progress uses the same outcome classification, so review and
+skipped modules are not counted or rendered as passed. The CLI's final success
+still requires local success, Suite pass, and deployment cleanup completion.
+
+When `--evidence-dir` is supplied, ctl creates a new owner-only `run-<JTI>`
+directory instead of reusing module filenames from an earlier run. Every raw
+module file carries the run and module identity. `report.json` and all raw
+module files are digest-bound by `manifest.json`, which is fsynced and written
+last as the commit marker. A crash can therefore leave only an explicitly
+uncommitted directory; it cannot make a partial set look complete or mix old
+modules into a new run. The manifest also binds the immutable deployment
+release/revision/build/runtime digest, Matrix source, Suite origin, and outer
+resource/proxy cleanup result. This is ctl-generated integrity evidence, not a
+Suite signature; signed Suite evidence remains an external release-stage
+requirement.
+
+Final output schema 2 preserves a completed `RunOutput` even when resource,
+proxy, or evidence cleanup fails. Such failures are listed in `errors`, keep
+`success: false`, and leave `deployment.cleanup_complete: false`; they are no
+longer converted into an unstructured error that discards the collected Suite
+report.
 
 `nazo-operator-protocol` remains in `nazozero/NazoAuth`. `Cargo.toml` pins both
 the package version and a full Git revision. A protocol change therefore requires

@@ -508,8 +508,6 @@ fn host_task_uses_transient_credentials_and_hides_unrelated_state() {
             &binary.to_string_lossy(),
             &TaskOperation::MigrateApply,
             None,
-            None,
-            None,
             b"{}",
         )
         .unwrap();
@@ -534,31 +532,6 @@ fn host_task_uses_transient_credentials_and_hides_unrelated_state() {
     assert!(joined.contains(&app.join("bootstrap").display().to_string()));
     assert!(!joined.contains("postgresql://migration.invalid/db"));
     assert!(!joined.contains(&config.dependencies.database_url_file.display().to_string()));
-
-    let prepared = Runtime::new(&config)
-        .prepare_app_task(
-            &binary.to_string_lossy(),
-            &TaskOperation::ConformanceLeaseCleanup,
-            None,
-            None,
-            None,
-            b"{}",
-        )
-        .unwrap();
-    let joined = format!("{prepared:?}").replace("\\\\", "\\");
-    assert!(joined.contains("operator-database-url"));
-    assert!(joined.contains(&config.dependencies.database_url_file.display().to_string()));
-    assert!(joined.contains("%d/operator-database-url"));
-    assert!(!joined.contains("postgresql://runtime.invalid/db"));
-    assert!(
-        !joined.contains(
-            &config
-                .dependencies
-                .migration_database_url_file
-                .display()
-                .to_string()
-        )
-    );
 }
 
 #[test]

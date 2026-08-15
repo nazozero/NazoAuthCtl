@@ -6,12 +6,16 @@ use std::{
 use anyhow::{Context as _, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
+use ed25519_dalek::VerifyingKey;
 use nazo_operator_protocol::{
     CONTROL_DISCOVERY_SCHEMA, DeploymentStatement, DiscoveryRequest, DiscoveryResponse,
     DiscoveryStatement, decode_instance_public_key, protected_header, verify_deployment_statement,
     verify_discovery_statement,
 };
 use serde::{Deserialize, Serialize};
+
+#[cfg(unix)]
+use crate::filesystem::read_secure_regular_file_for_uid;
 
 use crate::{
     deployment::{ArtifactReference, RecoveryConclusion, RuntimeBackendKind},
@@ -54,6 +58,60 @@ pub(crate) struct DiscoveredDeployment {
     pub(crate) missing: Vec<String>,
     #[serde(skip)]
     pub(crate) sensitive_mount_sources: BTreeMap<PathBuf, PathBuf>,
+}
+
+pub(crate) struct VerifiedRuntimeIdentity {
+    pub(crate) statement: DeploymentStatement,
+    pub(crate) public_key: VerifyingKey,
+}
+
+/// Load the runtime identity only from its descriptor-bound host projection.
+/// The network discovery response is intentionally not a trust root: the
+/// long-lived deployment statement must verify under the locally mounted
+/// instance public key.
+pub(crate) fn verified_runtime_identity_for_uid(
+    runtime: &RuntimeObservation,
+    expected_owner_uid: u32,
+) -> anyhow::Result<VerifiedRuntimeIdentity> {
+    let host_identity_dir = runtime_identity_host_directory(runtime)?
+        .context("runtime exposes no descriptor-bound instance identity directory")?;
+    load_verified_runtime_identity(&host_identity_dir, Some(expected_owner_uid))
+}
+
+fn load_verified_runtime_identity(
+    host_identity_dir: &Path,
+    expected_owner_uid: Option<u32>,
+) -> anyhow::Result<VerifiedRuntimeIdentity> {
+    let statement_path = host_identity_dir.join("deployment-statement.jws");
+    let public_key_path = host_identity_dir.join("identity.pub");
+    let statement = read_bounded_for_owner(&statement_path, 64 * 1024, expected_owner_uid)?;
+    let public_key = read_bounded_for_owner(&public_key_path, 1024, expected_owner_uid)?;
+    let public_key = decode_instance_public_key(public_key.trim())?;
+    let header = protected_header(statement.trim())?;
+    let statement = verify_deployment_statement(statement.trim(), &header.kid, &public_key)?;
+    Ok(VerifiedRuntimeIdentity {
+        statement,
+        public_key,
+    })
+}
+
+fn runtime_identity_host_directory(
+    runtime: &RuntimeObservation,
+) -> anyhow::Result<Option<PathBuf>> {
+    let data_dir = runtime.safe_environment.get("DATA_DIR").map(PathBuf::from);
+    let Some(identity_dir) = runtime
+        .safe_environment
+        .get("INSTANCE_IDENTITY_DIR")
+        .map(PathBuf::from)
+        .or_else(|| data_dir.map(|path| path.join("instance")))
+        .or_else(|| {
+            (runtime.backend != RuntimeBackendKind::Systemd)
+                .then(|| PathBuf::from("/var/lib/nazo_oauth/instance"))
+        })
+    else {
+        return Ok(None);
+    };
+    Ok(map_runtime_path(runtime, &identity_dir))
 }
 
 /// The discovery report is public machine-readable output, while the full runtime observation is
@@ -505,29 +563,12 @@ fn online_statement(runtime: &RuntimeObservation) -> anyhow::Result<Option<Disco
 }
 
 fn offline_statement(runtime: &RuntimeObservation) -> anyhow::Result<Option<DeploymentStatement>> {
-    let data_dir = runtime.safe_environment.get("DATA_DIR").map(PathBuf::from);
-    let identity_dir = runtime
-        .safe_environment
-        .get("INSTANCE_IDENTITY_DIR")
-        .map(PathBuf::from)
-        .or_else(|| data_dir.map(|path| path.join("instance")));
-    let Some(identity_dir) = identity_dir else {
+    let Some(directory) = runtime_identity_host_directory(runtime)? else {
         return Ok(None);
     };
-    let Some(host_identity_dir) = map_runtime_path(runtime, &identity_dir) else {
-        return Ok(None);
-    };
-    let statement_path = host_identity_dir.join("deployment-statement.jws");
-    let public_key_path = host_identity_dir.join("identity.pub");
-    let statement = read_bounded(&statement_path, 64 * 1024)?;
-    let public_key = read_bounded(&public_key_path, 1024)?;
-    let public_key = decode_instance_public_key(public_key.trim())?;
-    let header = protected_header(statement.trim())?;
-    Ok(Some(verify_deployment_statement(
-        statement.trim(),
-        &header.kid,
-        &public_key,
-    )?))
+    Ok(Some(
+        load_verified_runtime_identity(&directory, None)?.statement,
+    ))
 }
 
 fn map_runtime_path(runtime: &RuntimeObservation, runtime_path: &Path) -> Option<PathBuf> {
@@ -568,8 +609,27 @@ pub(crate) fn deployment_statement_path(candidate: &DiscoveredDeployment) -> Opt
         })
 }
 
-fn read_bounded(path: &Path, maximum: u64) -> anyhow::Result<String> {
-    let bytes = read_secure_regular_file(path, "discovery evidence", false, maximum)?;
+fn read_bounded_for_owner(
+    path: &Path,
+    maximum: u64,
+    expected_owner_uid: Option<u32>,
+) -> anyhow::Result<String> {
+    #[cfg(unix)]
+    let bytes = match expected_owner_uid {
+        Some(expected_owner_uid) => read_secure_regular_file_for_uid(
+            path,
+            "discovery evidence",
+            false,
+            maximum,
+            expected_owner_uid,
+        )?,
+        None => read_secure_regular_file(path, "discovery evidence", false, maximum)?,
+    };
+    #[cfg(not(unix))]
+    let bytes = {
+        let _ = expected_owner_uid;
+        read_secure_regular_file(path, "discovery evidence", false, maximum)?
+    };
     String::from_utf8(bytes.to_vec()).context("discovery evidence is not valid UTF-8")
 }
 

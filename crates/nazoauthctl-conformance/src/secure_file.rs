@@ -85,6 +85,67 @@ pub(crate) fn ensure_directory(path: &Path, private: bool) -> Result<PathBuf, Se
     }
 }
 
+/// Validate an existing directory without creating or changing it.
+pub(crate) fn validate_directory(path: &Path, private: bool) -> Result<PathBuf, SecureFileError> {
+    let absolute = normalize_absolute(path)?;
+    #[cfg(all(not(unix), windows))]
+    if private {
+        return Err(SecureFileError::UnsupportedPlatform);
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = private;
+        return Err(SecureFileError::UnsupportedPlatform);
+    }
+    #[cfg(windows)]
+    {
+        let metadata = fs::symlink_metadata(&absolute).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                SecureFileError::NotFound
+            } else {
+                SecureFileError::Io
+            }
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(SecureFileError::UnsafePath);
+        }
+        Ok(absolute)
+    }
+    #[cfg(unix)]
+    {
+        let _ = open_directory_chain(&absolute, private, false)?;
+        Ok(absolute)
+    }
+}
+
+/// Open a stable lock inode without following links. The caller owns locking
+/// and timeout policy; this primitive only establishes path and file identity.
+pub(crate) fn open_lock_file(path: &Path, private: bool) -> Result<fs::File, SecureFileError> {
+    let absolute = normalize_absolute(path)?;
+    let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
+    validate_directory(parent, private)?;
+    #[cfg(not(unix))]
+    {
+        let _ = private;
+        Err(SecureFileError::UnsupportedPlatform)
+    }
+    #[cfg(unix)]
+    {
+        let parent_file = open_directory_chain(parent, private, false)?;
+        let name = absolute.file_name().ok_or(SecureFileError::UnsafePath)?;
+        let owned = rustix::fs::openat(
+            &parent_file,
+            name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(if private { 0o600 } else { 0o644 }),
+        )
+        .map_err(map_errno)?;
+        let file = File::from(owned);
+        validate_file_metadata(&file.metadata().map_err(|_| SecureFileError::Io)?, private)?;
+        Ok(file)
+    }
+}
+
 /// Atomically replace a regular file.  The temporary is random, owner-only,
 /// fsynced before rename, and its parent is fsynced after rename.
 pub(crate) fn write_atomic(
@@ -264,8 +325,15 @@ pub(crate) fn remove_file(path: &Path, private: bool) -> Result<(), SecureFileEr
         let file = openat_file(&parent_file, name, OFlags::RDONLY)?;
         validate_file_metadata(&file.metadata().map_err(|_| SecureFileError::Io)?, private)?;
         rustix::fs::unlinkat(&parent_file, name, rustix::fs::AtFlags::empty())
-            .map_err(|_| SecureFileError::Io)
+            .map_err(|_| SecureFileError::Io)?;
+        rustix::fs::fsync(&parent_file).map_err(|_| SecureFileError::Io)
     }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn remove_file(path: &Path, private: bool) -> Result<(), SecureFileError> {
+    let _ = (path, private);
+    Err(SecureFileError::UnsupportedPlatform)
 }
 
 #[cfg(unix)]
@@ -294,7 +362,7 @@ fn open_directory_chain(path: &Path, private: bool, create: bool) -> Result<File
         ) {
             Ok(next) => next,
             Err(error) if error.raw_os_error() == libc::ENOENT && create => {
-                rustix::fs::mkdirat(
+                match rustix::fs::mkdirat(
                     &directory,
                     Path::new(name),
                     Mode::from_raw_mode(if private && final_component {
@@ -302,8 +370,14 @@ fn open_directory_chain(path: &Path, private: bool, create: bool) -> Result<File
                     } else {
                         0o755
                     }),
-                )
-                .map_err(map_errno)?;
+                ) {
+                    Ok(()) => {}
+                    // Another creator may win after the ENOENT observation.
+                    // Re-open and validate the winning inode below; a file,
+                    // symlink, unsafe owner, or unsafe mode still fails closed.
+                    Err(error) if error.raw_os_error() == libc::EEXIST => {}
+                    Err(error) => return Err(map_errno(error)),
+                }
                 rustix::fs::openat(
                     &directory,
                     Path::new(name),

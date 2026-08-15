@@ -24,12 +24,22 @@ pub(super) fn materialize_value(
     bindings: &BTreeMap<String, String>,
     prepared: &PreparedMaterialization,
     onboarding: &OnboardingOutput,
+    ciba_client_logical: Option<&str>,
     stack: &mut BTreeSet<String>,
 ) -> Result<Value, MaterializerError> {
     match value {
         Value::Array(values) => values
             .iter()
-            .map(|value| materialize_value(value, bindings, prepared, onboarding, stack))
+            .map(|value| {
+                materialize_value(
+                    value,
+                    bindings,
+                    prepared,
+                    onboarding,
+                    ciba_client_logical,
+                    stack,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array),
         Value::Object(values) => {
@@ -37,7 +47,14 @@ pub(super) fn materialize_value(
             for (key, value) in values {
                 output.insert(
                     key.clone(),
-                    materialize_value(value, bindings, prepared, onboarding, stack)?,
+                    materialize_value(
+                        value,
+                        bindings,
+                        prepared,
+                        onboarding,
+                        ciba_client_logical,
+                        stack,
+                    )?,
                 );
             }
             Ok(Value::Object(output))
@@ -47,6 +64,7 @@ pub(super) fn materialize_value(
             bindings,
             prepared,
             onboarding,
+            ciba_client_logical,
             stack,
         ),
         Value::String(text)
@@ -500,6 +518,7 @@ fn resolve_reference(
     bindings: &BTreeMap<String, String>,
     prepared: &PreparedMaterialization,
     onboarding: &OnboardingOutput,
+    ciba_client_logical: Option<&str>,
     stack: &mut BTreeSet<String>,
 ) -> Result<Value, MaterializerError> {
     validate_binding_reference(name, bindings, &mut BTreeSet::new())?;
@@ -512,7 +531,14 @@ fn resolve_reference(
                 .get(binding_name)
                 .ok_or(MaterializerError::InvalidPlaceholder)?,
         )?;
-        let result = resolve_reference(nested, bindings, prepared, onboarding, stack);
+        let result = resolve_reference(
+            nested,
+            bindings,
+            prepared,
+            onboarding,
+            ciba_client_logical,
+            stack,
+        );
         stack.remove(binding_name);
         return result;
     }
@@ -522,6 +548,7 @@ fn resolve_reference(
             bindings,
             prepared,
             onboarding,
+            ciba_client_logical,
             stack,
         );
     }
@@ -572,9 +599,9 @@ fn resolve_reference(
         )));
     }
     if name == "target.ciba_automated_decision_url" {
-        let token = prepared
-            .ciba_automated_decision_token
-            .as_ref()
+        let token = ciba_client_logical
+            .and_then(|logical| prepared.ciba_decision_tokens.get(logical))
+            .or(prepared.ciba_automated_decision_token.as_ref())
             .ok_or_else(|| MaterializerError::UnknownSecretReference(name.to_owned()))?;
         return Ok(Value::String(format!(
             "{}/auth/ciba-automated-decision?token={{auth_req_id}}&type={{action}}&decision_token={}",
@@ -609,9 +636,10 @@ fn resolve_reference(
             .ok_or(MaterializerError::UnknownSecretReference(name.to_owned()));
     }
     if name == "generated.ciba_automated_decision_token" {
-        return prepared
-            .ciba_automated_decision_token
-            .as_ref()
+        let token = ciba_client_logical
+            .and_then(|logical| prepared.ciba_decision_tokens.get(logical))
+            .or(prepared.ciba_automated_decision_token.as_ref());
+        return token
             .map(|value| Value::String(value.to_string()))
             .ok_or(MaterializerError::UnknownSecretReference(name.to_owned()));
     }

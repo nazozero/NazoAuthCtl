@@ -8,14 +8,14 @@ default-members = ["crates/nazoauthctl"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.48"
+version = "0.1.49"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/nazozero/NazoAuthCtl"
 rust-version = "1.97"
 
 [workspace.dependencies]
-nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", rev = "cab7a44897bf64fd864b53cb744b460081c14ef6" }
+nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", rev = "8adf7f42" }
 
 [package]
 name = "nazoauthctl-core"
@@ -32,20 +32,29 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1.0.103"
 base64 = "0.22.1"
+bytes = "1.12.1"
 chrono = "0.4.45"
 ed25519-dalek = "3.0.0"
 fs2 = "0.4.3"
 hmac = "0.13.0"
+http = "1.5.0"
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "native-tokio", "tls12", "rustls-platform-verifier"] }
+hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+instant-acme = { version = "0.8.5", default-features = false, features = ["aws-lc-rs", "hyper-rustls"] }
 libc = "0.2.189"
 nazo-operator-protocol.workspace = true
 nazoauthctl-runtime = { path = "crates/nazoauthctl-runtime" }
 rand = "0.10.1"
+rcgen = { version = "0.14.9", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 rpassword = "7.4.0"
+rustls = { version = "0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-pemfile = "2.2.0"
 semver = "1.0.27"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
 tar = "0.4.44"
+tokio = { version = "1.53.1", features = ["rt", "time"] }
 url = "2.5.8"
 urlencoding = "2.1.3"
 uuid = { version = "1.23.5", features = ["v7"] }

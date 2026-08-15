@@ -21,40 +21,6 @@ pub(crate) fn app_command(
     Ok(())
 }
 
-pub(crate) fn conformance_app_command(
-    config: &UpdateConfig,
-    operation: TaskOperation,
-    candidate: Option<&CandidateTarget>,
-    local_development: Option<&EmbeddedIdentity>,
-) -> anyhow::Result<()> {
-    let runtime = Runtime::new(config);
-    let target = if config.runtime.backend == RuntimeBackendKind::Systemd {
-        config.runtime.binary_path.to_string_lossy().into_owned()
-    } else {
-        runtime.active_image()?
-    };
-    let expected = if let Some(candidate) = candidate {
-        candidate_expected_target(config, candidate)?
-    } else if let Some(local_development) = local_development {
-        let active = runtime.active_build_target()?;
-        if &active.embedded != local_development {
-            bail!("active local development identity differs from the deployment declaration");
-        }
-        operator::expected_release_target(
-            config,
-            active.embedded,
-            active.image_digest,
-            active.binary_digest,
-        )?
-    } else {
-        let release = load_active_release(config)?;
-        expected_target(config, &release)?
-    };
-    let result = operator::execute(config, &target, &expected, operation, None)?;
-    println!("{}", operation_result_json(&result)?);
-    Ok(())
-}
-
 pub(crate) fn candidate_app_command(
     config: &UpdateConfig,
     operation: TaskOperation,

@@ -264,8 +264,7 @@ pub(crate) fn verify_retired_controller_probe(
         // This must create and execute the same constrained application task
         // used by public key validation.  A local verifier alone cannot
         // establish the runtime mount/context boundary.
-        let prepared =
-            runtime.prepare_app_task(&target, &operation, None, None, None, &manifest_bytes)?;
+        let prepared = runtime.prepare_app_task(&target, &operation, None, &manifest_bytes)?;
         verify_target_expectation(&prepared.target, expected)?;
         let embedded = runtime.embedded_identity(&target)?;
         if embedded != expected.embedded {

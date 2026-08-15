@@ -384,9 +384,9 @@ pub(crate) fn temporary_postgres_credentials(
     let password_path = directory.join("pgpass");
     if let Err(error) = (|| -> anyhow::Result<()> {
         atomic_write(&service_path, &service, 0o440)?;
-        atomic_write(&password_path, &password, 0o440)?;
+        atomic_write(&password_path, &password, 0o400)?;
         prepare_non_root_readable(&service_path)?;
-        prepare_non_root_readable(&password_path)?;
+        prepare_non_root_password_file(&password_path)?;
         Ok(())
     })() {
         let _ = fs::remove_dir_all(&directory);
@@ -420,10 +420,46 @@ fn prepare_non_root_readable(path: &Path) -> anyhow::Result<()> {
         })
 }
 
+#[cfg(unix)]
+fn prepare_non_root_password_file(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::chown;
+    // libpq deliberately ignores a password file with any group or world
+    // permissions.  The one-shot container runs as 10001:10001, so make that
+    // identity the sole reader instead of relying on the group-readable
+    // contract used by the non-secret service file.
+    chown(path, Some(10001), Some(10001)).with_context(|| {
+        format!(
+            "failed to assign PostgreSQL restore password ownership for {}",
+            path.display()
+        )
+    })?;
+    set_mode(path, 0o400)?;
+    File::open(path)
+        .with_context(|| {
+            format!(
+                "failed to reopen PostgreSQL restore password file {}",
+                path.display()
+            )
+        })?
+        .sync_all()
+        .with_context(|| {
+            format!(
+                "failed to synchronize PostgreSQL restore password file {}",
+                path.display()
+            )
+        })
+}
+
 #[cfg(not(unix))]
 fn prepare_non_root_readable(path: &Path) -> anyhow::Result<()> {
     let _ = path;
     bail!("OCI restore credentials require a host group readable by UID:GID 10001:10001")
+}
+
+#[cfg(not(unix))]
+fn prepare_non_root_password_file(path: &Path) -> anyhow::Result<()> {
+    let _ = path;
+    bail!("OCI restore password requires ownership by UID:GID 10001:10001")
 }
 
 fn prepare_non_root_directory(path: &Path) -> anyhow::Result<()> {

@@ -327,6 +327,52 @@ fn completed_transactions_retain_distinct_external_evidence() {
 }
 
 #[test]
+fn aborted_controller_update_is_archived_without_changing_the_declaration() {
+    let work = PrivateTempDir::new("nazoauthctl-coordination-abort").unwrap();
+    let store = store(&work);
+    let current = record("deployment-a");
+    store.persist(&current).unwrap();
+    let prepared = prepare_update(&store, &current, &plan("deployment-a")).unwrap();
+
+    let aborting =
+        mark_controller_update_aborting_locked(&store, &current, &prepared.transaction_id).unwrap();
+    assert_eq!(aborting.state, CoordinationState::Aborting);
+    assert_eq!(
+        resume(&store, &current).unwrap().state,
+        CoordinationState::Aborting
+    );
+
+    let aborted =
+        abort_controller_update_locked(&store, &current, &prepared.transaction_id).unwrap();
+
+    assert_eq!(aborted.state, CoordinationState::Aborted);
+    assert_eq!(store.load("deployment-a").unwrap(), current);
+    assert!(!active_update_exists(&store, &current));
+    let history = store
+        .deployment_state_dir("deployment-a")
+        .join("transactions")
+        .join(format!("update-{}.json", prepared.transaction_id));
+    assert!(history.is_file());
+
+    // Simulate a crash after the history write but before durable removal of
+    // the active record. The next abort consumes the identical active copy.
+    let active = store
+        .deployment_state_dir("deployment-a")
+        .join("transactions")
+        .join("active-update.json");
+    let mut archived: UpdateCoordination =
+        serde_json::from_slice(&fs::read(&history).unwrap()).unwrap();
+    archived.updated_at -= 60;
+    let archived_bytes = serde_json::to_vec_pretty(&archived).unwrap();
+    atomic_write(&history, &archived_bytes, 0o600).unwrap();
+    atomic_write(&active, &archived_bytes, 0o600).unwrap();
+    let replayed =
+        abort_controller_update_locked(&store, &current, &prepared.transaction_id).unwrap();
+    assert_eq!(replayed, archived);
+    assert!(!active.exists());
+}
+
+#[test]
 fn provider_evidence_rejects_forgery_and_wrong_signer() {
     for wrong_signer in [false, true] {
         let work = PrivateTempDir::new("nazoauthctl-coordination-signature").unwrap();

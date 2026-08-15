@@ -38,16 +38,17 @@ const IMMEDIATE_REJECTION_TESTS: [&str; 8] = [
     "oid4vp-1final-verifier-kb-jwt-iat-in-future",
 ];
 
-/// The deployment capability binding that must accompany every target-side
-/// verifier start.  Keeping the two values in one validated type makes a
-/// partial binding unrepresentable at the HTTP boundary.
+/// The deployment-owned trust binding that must accompany every target-side
+/// verifier start. The variants are intentionally disjoint so an ordinary
+/// tenant-resource run cannot manufacture legacy conformance lease fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConformanceBinding {
-    lease_id: Uuid,
-    task_jti: String,
+pub enum ConformanceBinding {
+    LegacyLease { lease_id: Uuid, task_jti: String },
+    OpenId4VcTrustPolicy { resource_id: String, digest: String },
 }
 
 impl ConformanceBinding {
+    /// Construct the legacy Suite-specific lease binding.
     pub fn new(
         lease_id: impl AsRef<str>,
         task_jti: impl Into<String>,
@@ -65,15 +66,48 @@ impl ConformanceBinding {
         {
             return Err(OpenId4VpError::InvalidBinding);
         }
-        Ok(Self { lease_id, task_jti })
+        Ok(Self::LegacyLease { lease_id, task_jti })
     }
 
-    pub fn lease_id(&self) -> Uuid {
-        self.lease_id
+    /// Construct an ordinary deployment trust-policy binding. Only the
+    /// immutable logical resource id and exact applied payload digest cross
+    /// the verifier-create boundary.
+    pub fn openid4vc_trust_policy(
+        resource_id: impl Into<String>,
+        digest: impl Into<String>,
+    ) -> Result<Self, OpenId4VpError> {
+        let resource_id = resource_id.into();
+        let digest = digest.into();
+        if resource_id.is_empty()
+            || resource_id.len() > 128
+            || !resource_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || ".:_+-".contains(character))
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(OpenId4VpError::InvalidBinding);
+        }
+        Ok(Self::OpenId4VcTrustPolicy {
+            resource_id,
+            digest,
+        })
     }
 
-    pub fn task_jti(&self) -> &str {
-        &self.task_jti
+    pub fn trust_policy_resource_id(&self) -> Option<&str> {
+        match self {
+            Self::OpenId4VcTrustPolicy { resource_id, .. } => Some(resource_id),
+            Self::LegacyLease { .. } => None,
+        }
+    }
+
+    pub fn trust_policy_digest(&self) -> Option<&str> {
+        match self {
+            Self::OpenId4VcTrustPolicy { digest, .. } => Some(digest),
+            Self::LegacyLease { .. } => None,
+        }
     }
 }
 
@@ -324,7 +358,7 @@ impl OpenId4VpVerifierClient {
         endpoint.set_path("/openid4vp/presentations");
         endpoint.set_query(None);
         endpoint.set_fragment(None);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "wallet_authorization_endpoint": wallet_authorization_endpoint.as_str(),
             "dcql_query": {
                 "credentials": [{
@@ -338,9 +372,33 @@ impl OpenId4VpVerifierClient {
             "client_id_prefix": client_id_prefix,
             "request_method": request_method,
             "response_mode": response_mode,
-            "conformance_lease_id": self.binding.lease_id().to_string(),
-            "conformance_task_jti": self.binding.task_jti(),
         });
+        let body_object = body.as_object_mut().ok_or(OpenId4VpError::InvalidInput)?;
+        match &self.binding {
+            ConformanceBinding::LegacyLease { lease_id, task_jti } => {
+                body_object.insert(
+                    "conformance_lease_id".to_owned(),
+                    Value::String(lease_id.to_string()),
+                );
+                body_object.insert(
+                    "conformance_task_jti".to_owned(),
+                    Value::String(task_jti.clone()),
+                );
+            }
+            ConformanceBinding::OpenId4VcTrustPolicy {
+                resource_id,
+                digest,
+            } => {
+                body_object.insert(
+                    "openid4vc_trust_policy_resource_id".to_owned(),
+                    Value::String(resource_id.clone()),
+                );
+                body_object.insert(
+                    "openid4vc_trust_policy_digest".to_owned(),
+                    Value::String(digest.clone()),
+                );
+            }
+        }
         let body = serde_json::to_vec(&body).map_err(|_| OpenId4VpError::InvalidInput)?;
         let response = self
             .transport
@@ -560,6 +618,14 @@ mod tests {
         .expect("binding")
     }
 
+    fn trust_policy_binding() -> ConformanceBinding {
+        ConformanceBinding::openid4vc_trust_policy(
+            "openid4vc-trust-policy:provider:0123456789abcdef",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect("trust policy binding")
+    }
+
     #[test]
     fn maps_sd_jwt_and_post_method_without_leaking_token() {
         let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
@@ -621,6 +687,62 @@ mod tests {
             body["conformance_task_jti"],
             "request-0123456789abcdef0123456789abcdef"
         );
+        assert!(body.get("openid4vc_trust_policy_resource_id").is_none());
+        assert!(body.get("openid4vc_trust_policy_digest").is_none());
+    }
+
+    #[test]
+    fn ordinary_start_sends_only_the_exact_trust_policy_binding() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse("https://suite.example").expect("suite");
+        let transport = Arc::new(VerifierTransport {
+            request: std::sync::Mutex::new(None),
+            response: std::sync::Mutex::new(Some(HttpResponse {
+                status: 201,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&serde_json::json!({
+                    "authorization_url": "https://suite.example/test/a/vp/authorize?x=1",
+                    "transaction_id": "550e8400-e29b-41d4-a716-446655440000"
+                }))
+                .expect("response"),
+            })),
+        });
+        let mut client = OpenId4VpVerifierClient::with_transport(
+            target,
+            suite,
+            Zeroizing::new("management-secret".to_owned()),
+            transport.clone(),
+            trust_policy_binding(),
+        )
+        .expect("client");
+        let request = OpenId4VpStartRequest::new(
+            "vp",
+            "happy",
+            BTreeMap::new(),
+            false,
+            trust_policy_binding(),
+        )
+        .expect("request");
+
+        client.start(&request).expect("start");
+
+        let captured = transport
+            .request
+            .lock()
+            .expect("request lock")
+            .take()
+            .expect("request");
+        let body: Value = serde_json::from_slice(captured.body().expect("body")).expect("body");
+        assert_eq!(
+            body["openid4vc_trust_policy_resource_id"],
+            "openid4vc-trust-policy:provider:0123456789abcdef"
+        );
+        assert_eq!(
+            body["openid4vc_trust_policy_digest"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert!(body.get("conformance_lease_id").is_none());
+        assert!(body.get("conformance_task_jti").is_none());
     }
 
     #[test]
@@ -670,6 +792,22 @@ mod tests {
                 "request-0123456789abcdef0123456789ABCDEf",
             )
             .expect_err("uppercase task jti"),
+            OpenId4VpError::InvalidBinding
+        );
+        assert_eq!(
+            ConformanceBinding::openid4vc_trust_policy(
+                "openid4vc trust policy",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .expect_err("invalid resource id"),
+            OpenId4VpError::InvalidBinding
+        );
+        assert_eq!(
+            ConformanceBinding::openid4vc_trust_policy(
+                "openid4vc-trust-policy:provider",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            )
+            .expect_err("uppercase digest"),
             OpenId4VpError::InvalidBinding
         );
     }

@@ -90,10 +90,29 @@ retired only after the previous worker has exited. A conformance cleanup is not
 complete until the pre-run proxy generation has been restored and probed.
 
 The file-backed conformance provider records its intent as the private sibling
-`.BUNDLE_NAME.nazoauthctl-restore`. A later run restores it and invokes the same
-validated reload executable before installing new trust. Operators must not
-delete this file or start a second proxy writer; resolve any reload failure and
-rerun the same command.
+`.BUNDLE_NAME.nazoauthctl-restore`. Before onboarding, ctl also commits a
+deployment-local, owner-only run journal bound to deployment/revision, target
+issuer, request JTI, Matrix digest, random onboarding-bundle digest, expiry, and
+the exact proxy paths. The active process holds that run's lock, so recovery
+skips live parallel runs. After a crash, the next `conformance run` claims only
+unlocked journals, lists leases through the authenticated operator protocol,
+and identifies a pre-receipt lease by the random bundle digest. It independently
+retries lease revoke/cleanup and proxy restoration; completion of one side is
+persisted before retrying the other, and the journal is durably removed only
+after both obligations finish. A five-minute settlement window prevents a
+still-finishing operator apply from being mistaken for “no lease created”.
+
+Proxy recovery invokes the same validated reload executable even when no new
+run will install trust. Operators must not delete the journal or sibling
+recovery file and must not start a second proxy writer; resolve any reported
+operator/reload failure and rerun the command. Schema 1 journals cover the
+legacy lease/proxy path for backward recovery. Schema 2 journals own ordinary
+tenant-resource recovery: the exact signed Apply request and private manifest
+are durable before mutation, the signed receipt is persisted before cleanup,
+enumeration observes only the run identities, and Revoke is digest-fenced.
+Resource and proxy cleanup markers are independent; the journal is removed only
+after both complete and the private manifest has passed the durable
+deletion-intent sequence.
 
 The signed offline deployment statement identifies a stopped replica from its
 persistent mount. It is not sufficient artifact trust: ctl also verifies the

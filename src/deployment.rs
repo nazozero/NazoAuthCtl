@@ -1,11 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    fs::{self, File, TryLockError},
+    fs::{self, File},
     io::ErrorKind,
     path::{Path, PathBuf},
-    thread,
-    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, bail};
@@ -20,8 +18,6 @@ const REGISTRATION_JOURNAL_SCHEMA: u32 = 1;
 const REGISTRY_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const DEPLOYMENT_DECLARATION_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const REGISTRATION_JOURNAL_MAX_BYTES: u64 = 512 * 1024;
-const OPERATOR_TASK_LOCK_TIMEOUT: Duration = Duration::from_secs(120);
-const OPERATOR_TASK_LOCK_RETRY: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -984,21 +980,6 @@ impl DeploymentStore {
         )
     }
 
-    /// Serialize the short controller-side operator task transaction (intent,
-    /// runtime receipt and audit-chain append) without serializing the remote
-    /// Suite execution that happens between onboarding and cleanup.
-    pub(crate) fn operator_task_lock(&self, deployment_id: &str) -> anyhow::Result<FileLock> {
-        self.ensure_storage_roots()?;
-        validate_identifier(deployment_id, "deployment ID")?;
-        FileLock::acquire_exclusive_bounded(
-            &self
-                .state_root
-                .join("locks")
-                .join(format!("operator-task-{deployment_id}.lock")),
-            OPERATOR_TASK_LOCK_TIMEOUT,
-        )
-    }
-
     pub(crate) fn shared_resource_lock(&self, resource_id: &str) -> anyhow::Result<FileLock> {
         self.ensure_storage_roots()?;
         validate_identifier(resource_id, "shared resource ID")?;
@@ -1370,32 +1351,6 @@ impl FileLock {
         file.try_lock_shared()
             .with_context(|| format!("another operation holds {}", path.display()))?;
         Ok(Self { file })
-    }
-
-    fn acquire_exclusive_bounded(path: &Path, timeout: Duration) -> anyhow::Result<Self> {
-        let file = open_lock_file(path, false, "operator task lock")?;
-        let started = Instant::now();
-        loop {
-            let elapsed = started.elapsed();
-            match file.try_lock() {
-                Ok(()) => return Ok(Self { file }),
-                Err(TryLockError::WouldBlock) if elapsed < timeout => {
-                    thread::sleep(OPERATOR_TASK_LOCK_RETRY.min(timeout.saturating_sub(elapsed)));
-                }
-                Err(TryLockError::WouldBlock) => {
-                    bail!(
-                        "timed out after {} seconds waiting for the operator task writer {}",
-                        timeout.as_secs(),
-                        path.display()
-                    );
-                }
-                Err(TryLockError::Error(error)) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to acquire operator task writer {}", path.display())
-                    });
-                }
-            }
-        }
     }
 }
 

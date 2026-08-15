@@ -13,12 +13,13 @@ use std::path::PathBuf;
 use anyhow::{Context, bail};
 
 pub(crate) use help::help_topic;
-pub(crate) use types::{
-    BootstrapAdminOptions, CandidateTarget, Cli, Command, ConformanceLeaseCommand, HelpTopic,
-    InstallOptions, KeysCommand, StandardsProfileSecrets, UpdateOptions,
-};
 #[cfg(test)]
-pub(crate) use types::{ConformanceCommand, RelinquishOptions};
+pub(crate) use types::RelinquishOptions;
+pub(crate) use types::{
+    AcmeCertificateInput, AcmeCommand, BootstrapAdminOptions, CandidateTarget, Cli, Command,
+    HelpTopic, InstallOptions, KeysCommand, StandardsProfileSecrets, TlsCertificateCheckInput,
+    TlsCertificateInput, TlsCertificateSource, TlsCommand, UpdateOptions,
+};
 
 /// Consume the leading options which are shared by every command.
 ///

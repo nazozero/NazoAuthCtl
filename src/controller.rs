@@ -20,15 +20,12 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
 use crate::deployment::{
-    Capability, CapabilityGrant, DeploymentRecord, DeploymentStore, FileLock, RecoveryConclusion,
-    Responsibility, RuntimeBackendKind, SafeReference,
+    Capability, CapabilityGrant, DeploymentRecord, DeploymentStore, FileLock, MountReference,
+    RecoveryConclusion, ResourceScope, Responsibility, RuntimeBackendKind, SafeReference,
 };
 use crate::{
     backup::Backup,
-    cli::{
-        BootstrapAdminOptions, CandidateTarget, Cli, Command, ConformanceLeaseCommand, KeysCommand,
-        UpdateOptions,
-    },
+    cli::{BootstrapAdminOptions, CandidateTarget, Cli, Command, KeysCommand, UpdateOptions},
     filesystem::{atomic_write, open_lock_file, remove_file_durable, set_mode, symlink_atomic},
     install::{self, PreparedInstall},
     model::{ReleaseManifest, UpdateConfig},
@@ -49,8 +46,6 @@ pub(crate) use keys::{
 mod self_update;
 mod updates;
 use bootstrap::*;
-#[cfg(test)]
-pub(crate) use commands::conformance_operation;
 use deployment::*;
 use diagnostics::*;
 use keys::*;
@@ -70,6 +65,12 @@ pub(crate) struct ControlConfig {
     _legacy_lock: Option<File>,
     _deployment_lock: Option<FileLock>,
     _shared_capability_locks: Vec<FileLock>,
+}
+
+impl ControlConfig {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -156,7 +157,7 @@ fn control_config_with_lock_mode(
     let store = DeploymentStore::system();
     if !store.registry_present()? {
         let legacy_lock = (lock_mode == DeploymentLockMode::Shared)
-            .then(deployment::acquire_conformance_shared_lock)
+            .then(deployment::acquire_oidf_run_shared_lock)
             .transpose()?;
         let config = if unsettled {
             load_config_unsettled(config_path)?

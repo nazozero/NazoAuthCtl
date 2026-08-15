@@ -8,6 +8,7 @@ fn every_public_help_topic_is_complete_without_runtime_state() {
         (cli::HelpTopic::BootstrapAdmin, "--credentials-stdin"),
         (cli::HelpTopic::Update, "--accept-migration-barrier"),
         (cli::HelpTopic::Keys, "register-external"),
+        (cli::HelpTopic::Tls, "external-generation-v1"),
         (cli::HelpTopic::Audit, "audit verify"),
         (cli::HelpTopic::Identity, "identity rotate"),
         (cli::HelpTopic::BreakGlass, "recover-controller"),

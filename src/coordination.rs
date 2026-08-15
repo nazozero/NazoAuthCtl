@@ -27,6 +27,7 @@ pub(crate) enum CoordinationState {
     WaitingForEvidence,
     ReadyForController,
     Blocked,
+    Aborting,
     Committed,
     Aborted,
 }
@@ -325,7 +326,7 @@ pub(crate) fn submit_evidence(
     validate_binding(&transaction, &current)?;
     if matches!(
         transaction.state,
-        CoordinationState::Committed | CoordinationState::Aborted
+        CoordinationState::Aborting | CoordinationState::Committed | CoordinationState::Aborted
     ) {
         bail!("the update transaction no longer accepts evidence");
     }
@@ -434,6 +435,12 @@ pub(crate) fn resume(
         return reconcile_committed_locked(store, &current, transaction);
     }
     validate_binding(&transaction, &current)?;
+    if matches!(
+        transaction.state,
+        CoordinationState::Aborting | CoordinationState::Aborted
+    ) {
+        return Ok(transaction);
+    }
     let mut repaired_pending_evidence = false;
     for step in transaction
         .steps
@@ -664,6 +671,82 @@ pub(crate) fn finalize_committed_locked(
     let history = active.with_file_name(format!("update-{transaction_id}.json"));
     atomic_write(&history, &serde_json::to_vec_pretty(&transaction)?, 0o600)?;
     remove_file_durable(&active)
+}
+
+/// Archive a controller update that was unwound before its declaration commit.
+///
+/// The caller must first restore the previous runtime and database through the
+/// deployment's recovery boundary.  This function owns only the coordination
+/// journal transition; it never mutates the deployment declaration.
+pub(crate) fn abort_controller_update_locked(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    transaction_id: &str,
+) -> anyhow::Result<UpdateCoordination> {
+    let active = transaction_path(store, &record.deployment_id);
+    let mut transaction = load_path(&active)?;
+    validate_binding(&transaction, record)?;
+    if transaction.transaction_id != transaction_id {
+        bail!("active update transaction changed before recovery was archived");
+    }
+    if transaction.state == CoordinationState::Committed {
+        bail!("a committed update cannot be archived as aborted");
+    }
+    if transaction.state != CoordinationState::Aborted {
+        transaction.state = CoordinationState::Aborted;
+        transaction.updated_at = Utc::now().timestamp();
+        persist(store, &transaction)?;
+    }
+
+    let history = active.with_file_name(format!("update-{transaction_id}.json"));
+    match fs::symlink_metadata(&history) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            let archived = load_path(&history)?;
+            if archived != transaction {
+                bail!("aborted update history conflicts with the active transaction");
+            }
+            remove_file_durable(&active)?;
+            return Ok(transaction);
+        }
+        Ok(_) => bail!("aborted update history is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect aborted update history {}",
+                    history.display()
+                )
+            });
+        }
+    }
+    atomic_write(&history, &serde_json::to_vec_pretty(&transaction)?, 0o600)?;
+    remove_file_durable(&active)?;
+    Ok(transaction)
+}
+
+/// Persist the unwind decision before touching the legacy runtime/database
+/// journal.  A crash after that journal is consumed must resume the abort, not
+/// reinterpret its absence as permission to continue the update forward.
+pub(crate) fn mark_controller_update_aborting_locked(
+    store: &DeploymentStore,
+    record: &DeploymentRecord,
+    transaction_id: &str,
+) -> anyhow::Result<UpdateCoordination> {
+    let active = transaction_path(store, &record.deployment_id);
+    let mut transaction = load_path(&active)?;
+    validate_binding(&transaction, record)?;
+    if transaction.transaction_id != transaction_id {
+        bail!("active update transaction changed before recovery intent was persisted");
+    }
+    match transaction.state {
+        CoordinationState::Committed => bail!("a committed update cannot enter abort recovery"),
+        CoordinationState::Aborting | CoordinationState::Aborted => return Ok(transaction),
+        _ => {}
+    }
+    transaction.state = CoordinationState::Aborting;
+    transaction.updated_at = Utc::now().timestamp();
+    persist(store, &transaction)?;
+    Ok(transaction)
 }
 
 /// Replay a committed declaration intent after either side of the declaration

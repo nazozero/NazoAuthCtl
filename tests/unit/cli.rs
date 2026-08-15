@@ -201,7 +201,183 @@ fn help_topics_follow_user_intent_even_with_an_explicit_config() {
         help_topic(&values(&["nazoauthctl", "conformance", "--help"])),
         Some(HelpTopic::Conformance)
     );
+    assert_eq!(
+        help_topic(&values(&["nazoauthctl", "tls", "--help"])),
+        Some(HelpTopic::Tls)
+    );
     assert_eq!(help_topic(&values(&["nazoauthctl", "status"])), None);
+}
+
+#[test]
+fn parses_tls_certificate_plan_apply_recover_and_show() {
+    let material = [
+        "--provider-config",
+        "/etc/nazoauth/tls-provider.json",
+        "--tenant",
+        "tenant-a",
+        "--hostname",
+        "auth.example",
+        "--certificate",
+        "/run/import/fullchain.pem",
+        "--private-key",
+        "/run/import/private-key.pem",
+    ];
+    let mut plan = vec!["nazoauthctl", "tls", "certificate", "plan"];
+    plan.extend(material);
+    assert!(matches!(
+        parse(&plan).unwrap().unwrap().command,
+        Command::Tls(TlsCommand::Plan(_))
+    ));
+
+    let mut apply = vec!["nazoauthctl", "tls", "certificate", "apply"];
+    apply.extend(material);
+    apply.push("--yes");
+    assert!(matches!(
+        parse(&apply).unwrap().unwrap().command,
+        Command::Tls(TlsCommand::Apply { yes: true, .. })
+    ));
+    assert!(
+        parse(&[
+            "nazoauthctl",
+            "tls",
+            "certificate",
+            "recover",
+            "--tenant",
+            "tenant-a",
+            "--hostname",
+            "auth.example",
+            "--yes",
+        ])
+        .is_ok()
+    );
+    assert!(
+        parse(&[
+            "nazoauthctl",
+            "tls",
+            "certificate",
+            "show",
+            "--tenant",
+            "tenant-a",
+            "--hostname",
+            "auth.example",
+        ])
+        .is_ok()
+    );
+    let mut invalid_plan = vec!["nazoauthctl", "tls", "certificate", "plan"];
+    invalid_plan.extend(material);
+    invalid_plan.push("--yes");
+    assert!(parse(&invalid_plan).is_err());
+
+    let acme_current = [
+        "nazoauthctl",
+        "tls",
+        "certificate",
+        "plan",
+        "--provider-config",
+        "/etc/nazoauth/tls-provider.json",
+        "--tenant",
+        "tenant-a",
+        "--hostname",
+        "auth.example",
+        "--from-acme-current",
+    ];
+    assert!(matches!(
+        parse(&acme_current).unwrap().unwrap().command,
+        Command::Tls(TlsCommand::Plan(TlsCertificateInput {
+            source: TlsCertificateSource::CurrentAcmeReceipt,
+            ..
+        }))
+    ));
+    let mut mixed = acme_current.to_vec();
+    mixed.extend(["--certificate", "/tmp/cert", "--private-key", "/tmp/key"]);
+    assert!(parse(&mixed).is_err());
+
+    let missing_source = &acme_current[..acme_current.len() - 1];
+    assert!(parse(missing_source).is_err());
+
+    let check = [
+        "nazoauthctl",
+        "tls",
+        "certificate",
+        "check",
+        "--provider-config",
+        "/etc/nazoauth/tls-provider.json",
+        "--tenant",
+        "tenant-a",
+        "--hostname",
+        "auth.example",
+        "--warning-window-seconds",
+        "1209600",
+    ];
+    assert!(matches!(
+        parse(&check).unwrap().unwrap().command,
+        Command::Tls(TlsCommand::Check(TlsCertificateCheckInput {
+            warning_window_seconds: Some(1_209_600),
+            ..
+        }))
+    ));
+    let mut duplicate_warning = check.to_vec();
+    duplicate_warning.extend(["--warning-window-seconds", "2419200"]);
+    assert!(parse(&duplicate_warning).is_err());
+    let mut invalid_warning = check.to_vec();
+    *invalid_warning.last_mut().unwrap() = "not-a-number";
+    assert!(parse(&invalid_warning).is_err());
+}
+
+#[test]
+fn parses_tls_acme_commands_and_requires_mutation_flags_only_for_issue() {
+    let input = [
+        "--acme-config",
+        "/etc/nazoauth/acme.json",
+        "--provider-config",
+        "/etc/nazoauth/tls-provider.json",
+        "--tenant",
+        "tenant-a",
+        "--hostname",
+        "auth.example",
+    ];
+    let mut plan = vec!["nazoauthctl", "tls", "acme", "plan"];
+    plan.extend(input);
+    assert!(matches!(
+        parse(&plan).unwrap().unwrap().command,
+        Command::Tls(TlsCommand::Acme(AcmeCommand::Plan(_)))
+    ));
+
+    let mut issue = vec!["nazoauthctl", "tls", "acme", "issue"];
+    issue.extend(input);
+    issue.extend(["--agree-terms", "--yes"]);
+    assert!(matches!(
+        parse(&issue).unwrap().unwrap().command,
+        Command::Tls(TlsCommand::Acme(AcmeCommand::Issue {
+            agree_terms: true,
+            yes: true,
+            ..
+        }))
+    ));
+    for command in ["recover", "show"] {
+        let mut args = vec![
+            "nazoauthctl",
+            "tls",
+            "acme",
+            command,
+            "--tenant",
+            "tenant-a",
+            "--hostname",
+            "auth.example",
+        ];
+        if command == "recover" {
+            args.push("--yes");
+        }
+        assert!(parse(&args).is_ok());
+    }
+
+    let mut invalid_plan = vec!["nazoauthctl", "tls", "acme", "plan"];
+    invalid_plan.extend(input);
+    invalid_plan.push("--agree-terms");
+    assert!(parse(&invalid_plan).is_err());
+    let mut duplicate_agreement = issue;
+    duplicate_agreement.push("--agree-terms");
+    assert!(parse(&duplicate_agreement).is_err());
 }
 
 #[test]
@@ -928,89 +1104,10 @@ fn parses_key_mutations_identity_rotation_and_break_glass() {
 }
 
 #[test]
-fn parses_time_bounded_conformance_lease_operations() {
-    let command = parse(&[
-        "nazoauthctl",
-        "conformance",
-        "lease",
-        "create",
-        "--profile",
-        "oidf-full",
-        "--material",
-        "/run/oidf-onboarding-manifest.json",
-        "--ttl-seconds",
-        "28800",
-        "--yes",
-    ])
-    .unwrap()
-    .unwrap()
-    .command;
-    assert!(matches!(
-        command,
-        Command::Conformance(ConformanceCommand {
-            lease: ConformanceLeaseCommand::Create {
-                profile,
-                material,
-                dynamic_registration_token_file: None,
-                ciba_automated_decision_token_file: None,
-                ttl_seconds: 28_800,
-                yes: true,
-            },
-            candidate: None,
-        }) if profile == "oidf-full"
-            && material == std::path::Path::new("/run/oidf-onboarding-manifest.json")
-    ));
-
-    let with_token_file = parse(&[
-        "nazoauthctl",
-        "conformance",
-        "lease",
-        "create",
-        "--profile",
-        "oidc-fapi-ciba",
-        "--material",
-        "/run/oidf-onboarding-manifest.json",
-        "--dynamic-registration-token-file",
-        "/run/oidf-dcr-token",
-        "--ciba-automated-decision-token-file",
-        "/run/oidf-ciba-decision-token",
-        "--ttl-seconds",
-        "300",
-        "--yes",
-    ])
-    .unwrap()
-    .unwrap()
-    .command;
-    assert!(matches!(
-        with_token_file,
-        Command::Conformance(ConformanceCommand {
-            lease: ConformanceLeaseCommand::Create {
-                profile,
-                material,
-                dynamic_registration_token_file: Some(token_file),
-                ciba_automated_decision_token_file: Some(ciba_token_file),
-                ttl_seconds: 300,
-                yes: true,
-            },
-            candidate: None,
-        }) if profile == "oidc-fapi-ciba"
-            && material == std::path::Path::new("/run/oidf-onboarding-manifest.json")
-            && token_file == std::path::Path::new("/run/oidf-dcr-token")
-            && ciba_token_file == std::path::Path::new("/run/oidf-ciba-decision-token")
-    ));
-
-    assert!(matches!(
-        parse(&["nazoauthctl", "conformance", "lease", "list"])
-            .unwrap()
-            .unwrap()
-            .command,
-        Command::Conformance(ConformanceCommand {
-            lease: ConformanceLeaseCommand::List,
-            candidate: None,
-        })
-    ));
-    assert!(matches!(
-        parse(&[
+fn legacy_conformance_lease_commands_are_not_part_of_the_controller_cli() {
+    for arguments in [
+        &["nazoauthctl", "conformance", "lease", "list"][..],
+        &[
             "nazoauthctl",
             "conformance",
             "lease",
@@ -1018,64 +1115,8 @@ fn parses_time_bounded_conformance_lease_operations() {
             "--lease-id",
             "018f3f2a-7b55-7a25-8f20-6d526f8f44e1",
             "--yes",
-        ])
-        .unwrap()
-        .unwrap()
-        .command,
-        Command::Conformance(ConformanceCommand {
-            lease: ConformanceLeaseCommand::Revoke { yes: true, .. },
-            candidate: None,
-        })
-    ));
-    assert!(
-        parse(&[
-            "nazoauthctl",
-            "conformance",
-            "lease",
-            "create",
-            "--profile",
-            "oidf-full",
-            "--material",
-            "/run/manifest.json",
-            "--ttl-seconds",
-            "86401",
-        ])
-        .is_err()
-    );
-
-    let candidate = parse(&[
-        "nazoauthctl",
-        "conformance",
-        "--candidate-release",
-        "v0.1.19",
-        "--candidate-revision",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "--candidate-build-id",
-        "private-pre-release:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "--candidate-oci-digest",
-        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "lease",
-        "list",
-    ])
-    .unwrap()
-    .unwrap()
-    .command;
-    assert!(matches!(
-        candidate,
-        Command::Conformance(ConformanceCommand {
-            lease: ConformanceLeaseCommand::List,
-            candidate: Some(CandidateTarget { release, .. }),
-        }) if release == "v0.1.19"
-    ));
-    assert!(
-        parse(&[
-            "nazoauthctl",
-            "conformance",
-            "--candidate-release",
-            "v0.1.19",
-            "lease",
-            "list",
-        ])
-        .is_err()
-    );
+        ][..],
+    ] {
+        assert!(parse(arguments).is_err(), "accepted {arguments:?}");
+    }
 }

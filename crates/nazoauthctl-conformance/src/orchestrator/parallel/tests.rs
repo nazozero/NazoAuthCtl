@@ -21,6 +21,7 @@ struct ParallelFixtureTransport {
     requests: Mutex<Vec<(HttpMethod, String)>>,
     created_plans: Mutex<Vec<String>>,
     fail_module_for_plan: Option<String>,
+    module_result: String,
 }
 
 impl ParallelFixtureTransport {
@@ -117,7 +118,7 @@ impl Transport for ParallelFixtureTransport {
             return Self::response(
                 200,
                 if finished {
-                    serde_json::json!({"status":"FINISHED","result":"PASSED"})
+                    serde_json::json!({"status":"FINISHED","result":self.module_result})
                 } else {
                     serde_json::json!({"status":"RUNNING"})
                 },
@@ -149,6 +150,25 @@ fn parallel_fixture(
     plan_ids: &[&str],
     fail_module_for_plan: Option<&str>,
 ) -> (ConformanceRunner, Arc<ParallelFixtureTransport>) {
+    parallel_fixture_with_result(config, plan_ids, fail_module_for_plan, "PASSED")
+}
+
+fn parallel_fixture_with_result(
+    config: Value,
+    plan_ids: &[&str],
+    fail_module_for_plan: Option<&str>,
+    module_result: &str,
+) -> (ConformanceRunner, Arc<ParallelFixtureTransport>) {
+    parallel_fixture_with_lanes(config, plan_ids, fail_module_for_plan, module_result, &[])
+}
+
+fn parallel_fixture_with_lanes(
+    config: Value,
+    plan_ids: &[&str],
+    fail_module_for_plan: Option<&str>,
+    module_result: &str,
+    ciba_plan_ids: &[&str],
+) -> (ConformanceRunner, Arc<ParallelFixtureTransport>) {
     let transport = Arc::new(ParallelFixtureTransport {
         active_waits: AtomicUsize::new(0),
         maximum_active_waits: AtomicUsize::new(0),
@@ -156,6 +176,7 @@ fn parallel_fixture(
         requests: Mutex::new(Vec::new()),
         created_plans: Mutex::new(Vec::new()),
         fail_module_for_plan: fail_module_for_plan.map(ToOwned::to_owned),
+        module_result: module_result.to_owned(),
     });
     let client = SuiteClient::with_transport(
         Origin::parse("https://suite.example").expect("origin"),
@@ -173,6 +194,19 @@ fn parallel_fixture(
             config: config.clone(),
             variant: BTreeMap::new(),
             expected_results: BTreeMap::new(),
+        })
+        .collect();
+    let plan_lanes = plan_ids
+        .iter()
+        .map(|id| {
+            (
+                (*id).to_owned(),
+                if ciba_plan_ids.contains(id) {
+                    OidfDriverLane::Ciba
+                } else {
+                    OidfDriverLane::Parallel
+                },
+            )
         })
         .collect();
     let runner = ConformanceRunner::new(ConformanceRunConfig {
@@ -197,6 +231,7 @@ fn parallel_fixture(
         binding: test_binding(),
         poll_timeout: Duration::from_secs(2),
         control: RunControl::default(),
+        plan_lanes,
         jobs: 2,
         automation: Vec::new(),
     })
@@ -262,9 +297,57 @@ fn independent_plans_overlap_but_reports_remain_in_matrix_order() {
 }
 
 #[test]
+fn parallel_non_pass_outcomes_complete_locally_without_claiming_suite_pass() {
+    let (review_runner, _) =
+        parallel_fixture_with_result(serde_json::json!({}), &["plan-a", "plan-b"], None, "REVIEW");
+    let review = review_runner.run(&mut ()).report;
+    assert!(review.local_success);
+    assert!(!review.suite_pass);
+    assert!(review.errors.is_empty());
+    assert!(review.human_review_required);
+    assert_eq!(review.human_review_modules.len(), 2);
+    assert!(review.skipped_modules.is_empty());
+    assert_eq!(review.progress.reviewed, 2);
+    assert_eq!(review.progress.review_groups, 1);
+    assert_eq!(review.progress.groups[0].status, GroupStatus::Review);
+
+    let (skipped_runner, _) = parallel_fixture_with_result(
+        serde_json::json!({}),
+        &["plan-a", "plan-b"],
+        None,
+        "SKIPPED",
+    );
+    let skipped = skipped_runner.run(&mut ()).report;
+    assert!(skipped.local_success);
+    assert!(!skipped.suite_pass);
+    assert!(skipped.errors.is_empty());
+    assert!(!skipped.human_review_required);
+    assert_eq!(skipped.skipped_modules.len(), 2);
+    assert_eq!(skipped.progress.skipped, 2);
+    assert_eq!(skipped.progress.skipped_groups, 1);
+    assert_eq!(skipped.progress.groups[0].status, GroupStatus::Skipped);
+
+    let (failed_runner, _) =
+        parallel_fixture_with_result(serde_json::json!({}), &["plan-a", "plan-b"], None, "FAILED");
+    let failed = failed_runner.run(&mut ()).report;
+    assert!(failed.local_success);
+    assert!(!failed.suite_pass);
+    assert!(failed.errors.is_empty());
+    assert_eq!(failed.failed_modules.len(), 2);
+    assert_eq!(failed.progress.failed, 2);
+    assert_eq!(failed.progress.failed_groups, 1);
+    assert_eq!(failed.progress.groups[0].status, GroupStatus::Failed);
+}
+
+#[test]
 fn ciba_plans_use_one_global_serial_lane() {
-    let (runner, transport) =
-        parallel_fixture(serde_json::json!({}), &["ciba-plan-a", "ciba-plan-b"], None);
+    let (runner, transport) = parallel_fixture_with_lanes(
+        serde_json::json!({}),
+        &["plan-a", "plan-b"],
+        None,
+        "PASSED",
+        &["plan-a", "plan-b"],
+    );
 
     let summary = runner.run(&mut ());
 
@@ -272,6 +355,20 @@ fn ciba_plans_use_one_global_serial_lane() {
     assert_eq!(transport.maximum_active_waits.load(Ordering::SeqCst), 1);
     assert_eq!(summary.report.orchestration_integrity.terminal_modules, 2);
     assert!(summary.report.cleanup.failures.is_empty());
+}
+
+#[test]
+fn mutable_suite_plan_names_cannot_select_the_ciba_lane() {
+    let (runner, transport) = parallel_fixture(
+        serde_json::json!({}),
+        &["ciba-in-name-a", "ciba-in-name-b"],
+        None,
+    );
+
+    let summary = runner.run(&mut ());
+
+    assert!(summary.report.local_success);
+    assert!(transport.maximum_active_waits.load(Ordering::SeqCst) >= 2);
 }
 
 #[test]

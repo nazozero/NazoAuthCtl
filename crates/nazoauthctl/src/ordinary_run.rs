@@ -1,0 +1,1205 @@
+//! Ordinary tenant-resource backed OIDF orchestration.
+//!
+//! This is the only producer path for `conformance run`. The signed artifact
+//! owns executable Matrix facts; NazoAuth owns ordinary tenant resources; the
+//! Suite remains an external test runner. No conformance lease or Suite-only
+//! NazoAuth management endpoint is used here.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::io::{self, IsTerminal as _, Read as _, Write as _};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context as _, bail};
+use nazoauthctl_conformance::{
+    ArtifactMaterializationBinding, ArtifactTrustPolicy, AuthenticatedProviderAuthorization,
+    BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy, BrowserTargetOrigin,
+    ClientConfig, ConformanceAutomation, ConformanceBinding, ConformanceProxyRecovery,
+    ConformanceRecoveryStore, ConformanceRunConfig, ConformanceRunner, CredentialStore,
+    DescriptorMaterializer, EvidenceBundleIdentity, EvidenceBundleReceipt,
+    EvidenceDeploymentIdentity, EvidenceProviderCapability, EvidenceProviderIdentity,
+    EvidenceProviderReceipt, EvidenceRuntimeIdentity, EvidenceSourceIdentity, ManagedWebDriver,
+    MatrixSelection, OidfArtifactMatrix, OidfDriverInspectionPlan, OidfDriverLane,
+    OidfPlanSelection, OidfProviderExecutionBinding, OpenId4VciIssuerClient,
+    OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient,
+    Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient, TenantResourceApplyOutput,
+    TenantResourceReceiptIdentity, TenantResourceRecoveryBinding, TtyRenderer, WebDriverClient,
+    WebDriverEndpoint, authorize_oidf_driver_execution, open_cached_oidf_driver_plan,
+    read_artifact_driver, read_artifact_matrix, read_compact_manifest, verify_oidf_artifact,
+    write_private_provider_evidence_bundle,
+};
+use nazoauthctl_core::tenant_resources::{
+    TenantResourceCapabilitySession, TenantResourceClient, TenantResourceClientError,
+    TenantResourceReceiptResult,
+};
+use serde::Serialize;
+use zeroize::{Zeroize as _, Zeroizing};
+
+use super::RunInvocation;
+
+const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
+const MAX_CIBA_DECISION_LIFETIME_SECONDS: u64 = 24 * 60 * 60;
+
+/// Capabilities implemented by this binary's signed-artifact runner. These
+/// are local engine facts, not NazoAuth provider permissions.
+const RUNNER_CAPABILITIES: &[&str] = &["nazoauth.client.create"];
+
+pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
+    let suite_origin = Origin::from_suite_arg(invocation.suite.as_deref())
+        .context("invalid OpenID Foundation Conformance Suite origin")?;
+    let session = nazoauthctl_core::ConformanceSession::open(
+        &invocation.config,
+        invocation.deployment.as_deref(),
+    )
+    .context("deployment is not ready for ordinary conformance orchestration")?;
+    let deployment = session.deployment_evidence();
+    let recovery_directory = session.recovery_directory()?;
+    let recovery_store =
+        ConformanceRecoveryStore::open(&recovery_directory, &deployment.deployment_id)?;
+
+    recover_pending_runs(&session, &recovery_store)?;
+
+    let trust = ArtifactTrustPolicy::from_path(&invocation.trust_policy)
+        .context("signed-artifact trust policy is invalid")?;
+    let runner_capabilities = RUNNER_CAPABILITIES
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<BTreeSet<_>>();
+    let now = current_unix_time()?;
+    let mut driver_plan = open_cached_oidf_driver_plan(
+        &invocation.artifact_cache,
+        &invocation.artifact_digest,
+        &trust,
+        &runner_capabilities,
+        OidfPlanSelection {
+            groups: invocation.groups.clone(),
+            plans: invocation.plans.clone(),
+        },
+        now,
+    )
+    .context("exact cached signed OIDF artifact cannot be opened")?;
+    if driver_plan.artifact.suite.origin != suite_origin.as_str() {
+        bail!("--suite does not match the origin signed by the OIDF artifact");
+    }
+
+    let (token, prompted) = resolve_token(&mut invocation, &suite_origin)?;
+    let suite_client =
+        SuiteClient::new(suite_origin.clone(), token.clone(), ClientConfig::default())
+            .context("failed to initialize the Suite client")?;
+    suite_client
+        .probe_auth()
+        .context("Suite API token authentication failed")?;
+    if prompted {
+        offer_credential_persistence(&suite_origin, &token)?;
+    }
+
+    let compact_manifest =
+        read_compact_manifest(&driver_plan.artifact_cache_entry.join("manifest.jws"))
+            .context("failed to reread the cached signed artifact manifest")?;
+    let driver_bytes = read_artifact_driver(&driver_plan.artifact_cache_entry.join("driver.json"))
+        .context("failed to reread the cached artifact driver")?;
+    let matrix_bytes = read_artifact_matrix(&driver_plan.artifact_cache_entry.join("matrix.json"))
+        .context("failed to reread the cached artifact Matrix")?;
+    let consumed_artifact = verify_oidf_artifact(
+        &compact_manifest,
+        &driver_bytes,
+        &matrix_bytes,
+        &trust,
+        &runner_capabilities,
+        current_unix_time()?,
+    )
+    .context("cached signed artifact changed before materialization")?;
+    if consumed_artifact != driver_plan.artifact {
+        bail!("cached signed artifact identity changed before materialization");
+    }
+    let matrix: OidfArtifactMatrix = serde_json::from_slice(&matrix_bytes)
+        .context("verified cached artifact Matrix is malformed")?;
+    let selected_plan_ids = driver_plan
+        .plans
+        .iter()
+        .map(|plan| (plan.group_id.clone(), plan.plan_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let matrix = select_artifact_matrix_for_run(matrix, &selected_plan_ids)?;
+    let request_jti = format!("request-{}", hex(rand::random::<[u8; 16]>()));
+    let materialization_now = current_unix_time()?;
+    if materialization_now > driver_plan.latest_execution_start_at {
+        bail!("signed artifact no longer has enough validity remaining for the selected run");
+    }
+    let ciba_decision_expires_at =
+        ciba_decision_expires_at(&driver_plan, invocation.poll_timeout, materialization_now)?;
+    let deployment_trust_anchor = session
+        .openid4vc_request_object_trust_anchor_pem()
+        .context("failed to load the deployment OpenID4VC trust anchor")?;
+    let dynamic_registration_initial_access_token = session
+        .dynamic_registration_initial_access_token()
+        .context("failed to load the deployment RFC 7591 initial access token")?;
+    let prepared = DescriptorMaterializer::prepare_tenant_resources_from_artifact_matrix(
+        &matrix,
+        ArtifactMaterializationBinding {
+            artifact_source_release: &driver_plan.artifact.revision,
+            artifact_source_digest: &invocation.artifact_digest,
+            raw_matrix_sha256: &driver_plan.artifact.matrix_sha256,
+            target_issuer: session.target_issuer(),
+            suite_origin: &suite_origin,
+            request_jti: &request_jti,
+            credential_trust_anchor_pem: &deployment_trust_anchor,
+            dynamic_registration_initial_access_token: Some(
+                dynamic_registration_initial_access_token.as_str(),
+            ),
+            ciba_decision_expires_at,
+        },
+    )
+    .context("failed to prepare ordinary run material from the signed Matrix")?;
+    let manifest = prepared
+        .tenant_resource_manifest(&request_jti)
+        .context("failed to materialize run-unique tenant resources")?;
+    let run_secrets = RunSecrets {
+        tx_code: prepared.tx_code(),
+        applicant_email: Zeroizing::new(prepared.applicant_email().to_owned()),
+        applicant_password: prepared.applicant_password(),
+        mtls_trust_anchor_pem: prepared.mtls_trust_anchor_pem(),
+    };
+
+    let client = TenantResourceClient::with_curl(
+        session
+            .tenant_resource_client_config(&invocation.tenant_id)
+            .context("failed to bind the tenant-resource client to the selected runtime")?,
+    )?;
+    let capability = client
+        .discover_capability()
+        .context("failed to discover the signed tenant-resource capability")?;
+
+    let provider_actions = capability.capability.actions.iter().copied().collect();
+    let provider_resource_kinds = capability
+        .capability
+        .resource_kinds
+        .iter()
+        .copied()
+        .collect();
+    let binding = OidfProviderExecutionBinding {
+        deployment_id: capability.capability.deployment_id.clone(),
+        tenant_id: capability.capability.tenant_id.clone(),
+        runtime_instance_id: capability.capability.runtime_instance_id.clone(),
+        runtime_build_id: capability.capability.embedded.build_id.clone(),
+        capability_jti: capability.capability.jti.clone(),
+        capability_sha256: capability.compact_sha256(),
+        runner_capabilities: runner_capabilities.clone(),
+        provider_actions,
+        provider_resource_kinds,
+        current_revision: capability.capability.revision,
+        current_manifest_sha256: capability.capability.resource_manifest_sha256.clone(),
+        artifact_source: driver_plan.artifact.source.clone(),
+        suite_origin: suite_origin.to_string(),
+    };
+    let authorization = AuthenticatedProviderAuthorization {
+        deployment_id: binding.deployment_id.clone(),
+        tenant_id: binding.tenant_id.clone(),
+        runtime_instance_id: binding.runtime_instance_id.clone(),
+        runtime_build_id: binding.runtime_build_id.clone(),
+        capability_jti: binding.capability_jti.clone(),
+        capability_sha256: binding.capability_sha256.clone(),
+        capability_issued_at: capability.capability.issued_at,
+        capability_expires_at: capability.capability.expires_at,
+        runner_capabilities: binding.runner_capabilities.clone(),
+        provider_actions: binding.provider_actions.clone(),
+        provider_resource_kinds: binding.provider_resource_kinds.clone(),
+        current_revision: binding.current_revision,
+        current_manifest_sha256: binding.current_manifest_sha256.clone(),
+        artifact_source: binding.artifact_source.clone(),
+        suite_origin: binding.suite_origin.clone(),
+    };
+    authorize_oidf_driver_execution(
+        &mut driver_plan,
+        &binding,
+        &authorization,
+        current_unix_time()?,
+    )
+    .context("signed driver plan is not authorized by the selected provider")?;
+    let plan_lanes = driver_plan
+        .plans
+        .iter()
+        .map(|plan| (plan.plan_id.clone(), plan.driver_handler.lane))
+        .collect::<BTreeMap<_, _>>();
+    if plan_lanes.len() != driver_plan.plans.len() {
+        bail!("signed driver plan contains duplicate Matrix plan ids");
+    }
+
+    let baseline = client
+        .enumerate(
+            &capability,
+            &format!("{request_jti}-baseline"),
+            &invocation.artifact_digest,
+            Vec::new(),
+        )
+        .context("failed to enumerate the tenant-resource baseline")?;
+    let mut final_active = baseline.receipt().resources.clone();
+    for delta in manifest.resource_identities() {
+        if let Some(existing) = final_active.iter().find(|existing| {
+            existing.kind == delta.kind && existing.resource_id == delta.resource_id
+        }) {
+            if existing.digest != delta.digest {
+                bail!("run-unique tenant resource conflicts with the active baseline");
+            }
+        } else {
+            final_active.push(delta.clone());
+        }
+    }
+    final_active.sort_by(|left, right| {
+        (left.kind, left.resource_id.as_str()).cmp(&(right.kind, right.resource_id.as_str()))
+    });
+
+    let prepared_apply = client
+        .prepare_apply(
+            &capability,
+            &format!("{request_jti}-apply"),
+            manifest.bytes().as_bytes(),
+            manifest.resource_identities().to_vec(),
+            final_active.clone(),
+            current_unix_time()?,
+        )
+        .context("failed to freeze the exact tenant-resource Apply request")?;
+    let private_manifest_path = recovery_directory.join(format!("manifest-{request_jti}.json"));
+    manifest
+        .write_private(&private_manifest_path)
+        .context("failed to durably persist the private Apply manifest")?;
+    let prepared_identity = prepared_apply.recovery_binding();
+    let proxy_recovery = match (
+        invocation.proxy_trust_bundle.as_ref(),
+        invocation.proxy_reload_executable.as_ref(),
+    ) {
+        (Some(bundle_path), Some(reload_executable)) => Some(ConformanceProxyRecovery {
+            bundle_path: bundle_path.clone(),
+            reload_executable: reload_executable.clone(),
+        }),
+        (None, None) => None,
+        _ => unreachable!("CLI validates proxy arguments as an atomic pair"),
+    };
+    let recovery_binding = TenantResourceRecoveryBinding {
+        deployment_id: deployment.deployment_id.clone(),
+        tenant_id: invocation.tenant_id.clone(),
+        request_jti: prepared_identity.jti().to_owned(),
+        capability_jws: prepared_identity.capability_jws().to_owned(),
+        capability_sha256: prepared_identity.capability_sha256().to_owned(),
+        task_jws: prepared_identity.task_jws().to_owned(),
+        task_sha256: prepared_identity.task_sha256().to_owned(),
+        change_set_id: prepared_identity.change_set_id().to_owned(),
+        change_set_sha256: prepared_identity.change_set_sha256().to_owned(),
+        request_sha256: prepared_identity.request_sha256().to_owned(),
+        operation: prepared_identity.operation(),
+        expected_revision: prepared_apply.task().expected_revision,
+        manifest_path: Some(private_manifest_path.clone()),
+        proxy: proxy_recovery,
+        resource_identities: manifest.resource_identities().to_vec(),
+    };
+    let mut recovery = match recovery_store.begin_tenant_resource(recovery_binding) {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            return match std::fs::remove_file(&private_manifest_path) {
+                Ok(()) => Err(error).context(
+                    "failed to persist the ordinary recovery intent; private manifest removed",
+                ),
+                Err(removal) => bail!(
+                    "failed to persist the ordinary recovery intent and remove its private manifest: journal={error:#}; manifest-removal={removal:#}"
+                ),
+            };
+        }
+    };
+    let apply_receipt = match client.execute_prepared_live(&prepared_apply) {
+        Ok(receipt) => receipt,
+        Err(error) if is_deterministic_uncommitted_rejection(&error) => {
+            // Proxy installation is deliberately after receipt persistence,
+            // so a pre-receipt rejection proves that no proxy side effect was
+            // reached even when the intent carries a future proxy binding.
+            if !recovery.proxy_cleanup_complete() {
+                recovery.mark_proxy_cleanup_complete()?;
+            }
+            recovery.abort_uncommitted_tenant_resource()?;
+            return Err(error).context("ordinary tenant-resource Apply was rejected");
+        }
+        Err(error) => {
+            return Err(error).context("ordinary tenant-resource Apply failed");
+        }
+    };
+    recovery.record_tenant_resource_receipt(
+        TenantResourceReceiptIdentity::from_verified_receipt(
+            apply_receipt.receipt(),
+            &apply_receipt.receipt_sha256(),
+        )?,
+    )?;
+    let apply_output = TenantResourceApplyOutput::from_verified_receipt(
+        apply_receipt.receipt().clone(),
+        prepared_apply.task().jti.as_str(),
+        prepared_apply.task().change_set_id.as_str(),
+        &prepared_apply.request_sha256(),
+        &manifest,
+        final_active,
+    )?;
+    let ordinary = DescriptorMaterializer::finalize_tenant_resources(
+        prepared,
+        apply_output,
+        deployment_trust_anchor,
+    )
+    .context("provider Apply mappings do not match the prepared signed Matrix")?;
+    let mut deployment_report = DeploymentReport {
+        deployment_id: deployment.deployment_id.clone(),
+        tenant_id: invocation.tenant_id.clone(),
+        target_issuer: deployment.target_issuer.clone(),
+        artifact_digest: invocation.artifact_digest.clone(),
+        artifact_revision: driver_plan.artifact.revision.clone(),
+        matrix_sha256: ordinary.matrix_sha256().to_owned(),
+        selected_groups: driver_plan.selected_group_count,
+        selected_plans: driver_plan.selected_plan_count,
+        apply_task_jti: ordinary.task_jti().to_owned(),
+        change_set_id: ordinary.change_set_id().to_owned(),
+        resource_manifest_sha256: ordinary.resource_manifest_sha256().to_owned(),
+        trust_policy_resource_id: ordinary.trust_policy_resource_id().to_owned(),
+        trust_policy_digest: ordinary.trust_policy_digest().to_owned(),
+        applicant_id: ordinary.applicant_id().to_string(),
+        client_count: u32::try_from(ordinary.clients().len())
+            .context("ordinary client mapping count exceeds the report bound")?,
+        cleanup_complete: false,
+    };
+
+    let mut proxy = match (
+        invocation.proxy_trust_bundle.as_deref(),
+        invocation.proxy_reload_executable.as_deref(),
+    ) {
+        (Some(bundle_path), Some(reload_executable)) => match ProxyTrustGuard::install(
+            bundle_path,
+            reload_executable,
+            run_secrets.mtls_trust_anchor_pem.as_bytes(),
+        ) {
+            Ok(proxy) => Some(proxy),
+            Err(install) => {
+                let proxy_cleanup = ProxyTrustGuard::recover(bundle_path, reload_executable);
+                if proxy_cleanup.is_ok() {
+                    recovery.mark_proxy_cleanup_complete()?;
+                }
+                let resource_cleanup = cleanup_run_resources(&client, recovery);
+                bail!(
+                    "proxy-install={install:#}; proxy-recovery={}; resource-cleanup={}",
+                    proxy_cleanup
+                        .err()
+                        .map_or_else(|| "ok".to_owned(), |error| format!("{error:#}")),
+                    resource_cleanup
+                        .err()
+                        .map_or_else(|| "ok".to_owned(), |error| format!("{error:#}"))
+                );
+            }
+        },
+        (None, None) => None,
+        _ => unreachable!("CLI validates proxy arguments as an atomic pair"),
+    };
+
+    // The OpenID4VP client and runner are being generalized in the adjacent
+    // slice. Keep this typed boundary ordinary-only: a lease-shaped adapter is
+    // deliberately impossible here.
+    let run_result = run_signed_suite(
+        ordinary,
+        suite_client,
+        token,
+        run_secrets,
+        &session,
+        &invocation,
+        &suite_origin,
+        plan_lanes,
+    );
+
+    let proxy_cleanup = proxy.as_mut().map(ProxyTrustGuard::restore).transpose();
+    if proxy_cleanup.is_ok() && !recovery.proxy_cleanup_complete() {
+        recovery.mark_proxy_cleanup_complete()?;
+    }
+    let cleanup = cleanup_run_resources(&client, recovery);
+    let mut errors = Vec::new();
+    let report = match run_result {
+        Ok(report) => Some(report),
+        Err(error) => {
+            errors.push(format!("run={error:#}"));
+            None
+        }
+    };
+    let proxy_cleanup_complete = proxy_cleanup.is_ok();
+    if let Err(error) = proxy_cleanup {
+        errors.push(format!("proxy-cleanup={error:#}"));
+    }
+    let cleanup_evidence = match cleanup {
+        Ok(evidence) => Some(evidence),
+        Err(error) => {
+            errors.push(format!("resource-cleanup={error:#}"));
+            None
+        }
+    };
+    let cleanup_complete = cleanup_evidence.is_some()
+        && proxy_cleanup_complete
+        && !errors
+            .iter()
+            .any(|error| error.starts_with("resource-cleanup="));
+    deployment_report.cleanup_complete = cleanup_complete;
+    let mut evidence = None;
+    if let (Some(report), Some(directory), Some(cleanup_evidence)) = (
+        report.as_ref(),
+        invocation.evidence_directory.as_ref(),
+        cleanup_evidence.as_ref(),
+    ) {
+        let runtime = evidence_runtime(&deployment.runtime);
+        let identity = EvidenceBundleIdentity {
+            run_jti: request_jti.clone(),
+            deployment: EvidenceDeploymentIdentity {
+                deployment_id: deployment.deployment_id.clone(),
+                target_issuer: deployment.target_issuer.clone(),
+                release: deployment.release.clone(),
+                revision: deployment.revision.clone(),
+                build_id: deployment.build_id.clone(),
+                runtime: runtime.clone(),
+            },
+            source: EvidenceSourceIdentity::SignedOidfArtifact {
+                suite_origin: suite_origin.to_string(),
+                artifact: Box::new(driver_plan.artifact.clone()),
+            },
+            provider: Some(EvidenceProviderIdentity {
+                deployment_id: deployment.deployment_id.clone(),
+                runtime_instance_id: capability.capability.runtime_instance_id.clone(),
+                runtime,
+                release: capability.capability.embedded.release.clone(),
+                runtime_revision: capability.capability.embedded.revision.clone(),
+                protocol: capability.capability.embedded.protocol,
+                build_id: capability.capability.embedded.build_id.clone(),
+                capabilities: vec![
+                    evidence_capability(&capability, &[baseline.clone(), apply_receipt.clone()]),
+                    evidence_capability(&cleanup_evidence.capability, &cleanup_evidence.receipts),
+                ],
+                cleanup_complete,
+            }),
+            outer_cleanup_complete: cleanup_complete,
+        };
+        match write_private_provider_evidence_bundle(report, directory, &identity) {
+            Ok(receipt) => evidence = Some(receipt),
+            Err(error) => errors.push(format!("evidence={error}")),
+        }
+    }
+    let success = errors.is_empty()
+        && report
+            .as_ref()
+            .is_some_and(|report| report.local_success && report.suite_pass);
+    let output = FinalOutput {
+        schema: 3,
+        success,
+        errors,
+        report,
+        evidence,
+        deployment: deployment_report,
+    };
+    serde_json::to_writer_pretty(io::stdout().lock(), &output)
+        .context("failed to write the structured ordinary conformance report")?;
+    writeln!(io::stdout()).context("failed to finish the structured conformance report")?;
+    Ok(if success { 0 } else { 1 })
+}
+
+#[derive(Serialize)]
+struct FinalOutput {
+    schema: u32,
+    success: bool,
+    errors: Vec<String>,
+    report: Option<nazoauthctl_conformance::ConformanceReport>,
+    evidence: Option<EvidenceBundleReceipt>,
+    deployment: DeploymentReport,
+}
+
+#[derive(Serialize)]
+struct DeploymentReport {
+    deployment_id: String,
+    tenant_id: String,
+    target_issuer: String,
+    artifact_digest: String,
+    artifact_revision: String,
+    matrix_sha256: String,
+    selected_groups: u32,
+    selected_plans: u32,
+    apply_task_jti: String,
+    change_set_id: String,
+    resource_manifest_sha256: String,
+    trust_policy_resource_id: String,
+    trust_policy_digest: String,
+    applicant_id: String,
+    client_count: u32,
+    cleanup_complete: bool,
+}
+
+struct RunSecrets {
+    tx_code: Option<Zeroizing<String>>,
+    applicant_email: Zeroizing<String>,
+    applicant_password: Zeroizing<String>,
+    mtls_trust_anchor_pem: Zeroizing<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_signed_suite(
+    mut materialized: nazoauthctl_conformance::TenantResourceMaterializedMatrix,
+    suite_client: SuiteClient,
+    token: BearerToken,
+    secrets: RunSecrets,
+    session: &nazoauthctl_core::ConformanceSession,
+    invocation: &RunInvocation,
+    suite_origin: &Origin,
+    plan_lanes: BTreeMap<String, OidfDriverLane>,
+) -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
+    let binding = ConformanceBinding::openid4vc_trust_policy(
+        materialized.trust_policy_resource_id(),
+        materialized.trust_policy_digest(),
+    )?;
+    let target_origin = BrowserTargetOrigin::parse(session.target_issuer())?;
+    let applicant_id = *materialized.applicant_id();
+    let openid4vci_management_token = session
+        .openid4vci_management_token()
+        .context("failed to load the deployment OpenID4VCI management token")?;
+    let openid4vp_management_token = session
+        .openid4vp_management_token()
+        .context("failed to load the deployment OpenID4VP management token")?;
+
+    let mut automation = Vec::with_capacity(invocation.jobs);
+    for worker_index in 0..invocation.jobs {
+        let browser = build_browser(
+            invocation.webdriver.get(worker_index).map(String::as_str),
+            session.target_issuer(),
+            suite_origin,
+        )?;
+        let issuer: Arc<Mutex<dyn OpenId4VciIssuerDriver>> =
+            Arc::new(Mutex::new(OpenId4VciIssuerClient::new(
+                OpenId4VciIssuerConfig::new(
+                    target_origin.clone(),
+                    suite_origin.clone(),
+                    applicant_id,
+                    secrets.tx_code.clone(),
+                    secrets.applicant_email.clone(),
+                    secrets.applicant_password.clone(),
+                    Duration::from_secs(30),
+                )?,
+                openid4vci_management_token.clone(),
+                token.clone(),
+            )?));
+        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
+            Arc::new(Mutex::new(OpenId4VpVerifierClient::new(
+                target_origin.clone(),
+                suite_origin.clone(),
+                openid4vp_management_token.clone(),
+                Duration::from_secs(30),
+                binding.clone(),
+            )?));
+        automation.push(ConformanceAutomation {
+            browser: Some(browser),
+            verifier: Some(verifier),
+            issuer: Some(issuer),
+        });
+    }
+
+    let selected = materialized
+        .take_matrix()
+        .select(&MatrixSelection {
+            groups: invocation.groups.clone(),
+            profiles: Vec::new(),
+            plans: invocation.plans.clone(),
+        })
+        .context("requested selection is outside the signed artifact Matrix")?;
+    let control = RunControl::default();
+    let interrupt = control.clone();
+    ctrlc::set_handler(move || interrupt.interrupt())
+        .context("failed to install the conformance interrupt handler")?;
+    let runner = ConformanceRunner::new(ConformanceRunConfig {
+        client: suite_client,
+        matrix: selected,
+        target_origin: Some(target_origin),
+        binding,
+        poll_timeout: invocation.poll_timeout,
+        control,
+        plan_lanes,
+        jobs: invocation.jobs,
+        automation,
+    })?;
+    let summary = if io::stderr().is_terminal() {
+        let mut renderer = TtyRenderer::new(io::stderr().lock());
+        runner.run(&mut renderer)
+    } else {
+        let mut renderer = StableRenderer::new(io::stderr().lock());
+        runner.run(&mut renderer)
+    };
+    Ok(summary.report)
+}
+
+fn build_browser(
+    endpoint: Option<&str>,
+    target_issuer: &str,
+    suite_origin: &Origin,
+) -> anyhow::Result<Arc<Mutex<dyn BrowserAutomation>>> {
+    let target = BrowserTargetOrigin::parse(target_issuer)?;
+    let policy = BrowserPolicy::new(target, suite_origin.clone())?;
+    if let Some(endpoint) = endpoint {
+        let endpoint = WebDriverEndpoint::parse(endpoint)?;
+        let mut driver = WebDriverClient::connect(endpoint, Duration::from_secs(30))?;
+        driver.start_chrome()?;
+        Ok(Arc::new(Mutex::new(BrowserExecutor::new(driver, policy))))
+    } else {
+        let driver = ManagedWebDriver::start_default(Duration::from_secs(30))?;
+        Ok(Arc::new(Mutex::new(BrowserExecutor::new(driver, policy))))
+    }
+}
+
+struct CleanupEvidence {
+    capability: TenantResourceCapabilitySession,
+    receipts: Vec<TenantResourceReceiptResult>,
+}
+
+fn cleanup_change_set_id(request_jti: &str, phase: &str, capability_sha256: &str) -> String {
+    let generation = capability_sha256.chars().take(16).collect::<String>();
+    format!("{request_jti}-cleanup-{phase}-{generation}")
+}
+
+fn cleanup_run_resources<T>(
+    client: &TenantResourceClient<T>,
+    mut recovery: nazoauthctl_conformance::ConformanceRecoveryGuard,
+) -> anyhow::Result<CleanupEvidence>
+where
+    T: nazoauthctl_core::tenant_resources::TenantResourceHttpTransport,
+{
+    let capability = client.discover_capability()?;
+    let cleanup_capability_sha256 = capability.compact_sha256();
+    let request_jti = recovery
+        .tenant_resource_binding()
+        .context("missing ordinary recovery binding")?
+        .request_jti
+        .clone();
+    let listed = client.enumerate(
+        &capability,
+        &cleanup_change_set_id(&request_jti, "observe", &cleanup_capability_sha256),
+        recovery
+            .tenant_resource_binding()
+            .context("missing ordinary recovery binding")?
+            .change_set_sha256
+            .as_str(),
+        Vec::new(),
+    )?;
+    let mut receipts = vec![listed.clone()];
+    let bound = recovery
+        .tenant_resource_binding()
+        .context("missing ordinary recovery binding")?
+        .resource_identities
+        .clone();
+    if listed.receipt().resources.iter().any(|candidate| {
+        bound.iter().any(|identity| {
+            identity.kind == candidate.kind
+                && identity.resource_id == candidate.resource_id
+                && identity.digest != candidate.digest
+        })
+    }) {
+        bail!("run-scoped tenant resource identity reappeared with a different digest");
+    }
+    let present = listed
+        .receipt()
+        .resources
+        .iter()
+        .filter(|candidate| {
+            bound.iter().any(|identity| {
+                identity.kind == candidate.kind
+                    && identity.resource_id == candidate.resource_id
+                    && identity.digest == candidate.digest
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    recovery.record_tenant_resource_enumeration(present.clone())?;
+    if !present.is_empty() {
+        let current = listed.receipt().resources.clone();
+        let final_active = current
+            .iter()
+            .filter(|candidate| {
+                !present.iter().any(|identity| {
+                    identity.kind == candidate.kind
+                        && identity.resource_id == candidate.resource_id
+                        && identity.digest == candidate.digest
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let revoke_change_set_sha256 =
+            nazoauthctl_core::tenant_resources::tenant_resource_manifest_sha256(&present)?;
+        let final_digest =
+            nazoauthctl_core::tenant_resources::tenant_resource_manifest_sha256(&final_active)?;
+        let revoke = client.revoke(
+            &capability,
+            &cleanup_change_set_id(&request_jti, "revoke", &cleanup_capability_sha256),
+            &revoke_change_set_sha256,
+            present.clone(),
+            &final_digest,
+        )?;
+        if revoke.receipt().resources.len() != present.len()
+            || revoke
+                .receipt()
+                .resources
+                .iter()
+                .any(|received| !present.iter().any(|expected| expected == received))
+        {
+            bail!("tenant-resource Revoke receipt does not match the observed run resources");
+        }
+        for identity in &present {
+            recovery.record_tenant_resource_revoke(
+                identity,
+                nazoauthctl_conformance::TenantResourceRevokeOutcome::Revoked,
+            )?;
+        }
+        receipts.push(revoke);
+    }
+    if recovery.tenant_resource_cleanup_complete() {
+        // Recovery owns deletion of the bound private manifest before it
+        // removes the journal, preventing an orphaned secret-bearing file.
+        // `finish` durably marks removal intent, removes the bound private
+        // manifest, then removes the journal/lock.
+        recovery.finish()?;
+    } else {
+        bail!("ordinary cleanup obligations remain pending");
+    }
+    Ok(CleanupEvidence {
+        capability,
+        receipts,
+    })
+}
+
+fn recover_pending_runs(
+    session: &nazoauthctl_core::ConformanceSession,
+    store: &ConformanceRecoveryStore,
+) -> anyhow::Result<()> {
+    let pending = store.claim_pending()?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut failures = Vec::new();
+    for mut recovery in pending {
+        let Some(binding) = recovery.tenant_resource_binding().cloned() else {
+            // Legacy journals remain readable, but this ordinary command must
+            // never revive the removed lease management API.
+            failures.push("legacy-read-only: use the release that created this journal".to_owned());
+            continue;
+        };
+        let result = (|| -> anyhow::Result<()> {
+            if recovery.tenant_resource_abort_uncommitted_intent() {
+                recovery.abort_uncommitted_tenant_resource()?;
+                return Ok(());
+            }
+            let client = TenantResourceClient::with_curl(
+                session.tenant_resource_client_config(&binding.tenant_id)?,
+            )?;
+            if recovery.tenant_resource_receipt().is_none() {
+                let manifest = binding
+                    .manifest_path
+                    .as_ref()
+                    .context("pending Apply recovery has no private manifest path")?;
+                let manifest = std::fs::read(manifest)
+                    .context("failed to read the persisted private Apply manifest")?;
+                let prepared = client.restore_from_persisted(
+                    &binding.capability_jws,
+                    &binding.task_jws,
+                    &binding.capability_sha256,
+                    &binding.task_sha256,
+                    &binding.request_sha256,
+                    binding.operation,
+                    &binding.request_jti,
+                    &binding.change_set_id,
+                    &binding.change_set_sha256,
+                    Some(&manifest),
+                )?;
+                let receipt = match client.execute_prepared_live(&prepared) {
+                    Ok(receipt) => receipt,
+                    Err(error) if is_deterministic_uncommitted_rejection(&error) => {
+                        // The ordinary producer installs proxy trust only
+                        // after persisting a receipt.  With no receipt this is
+                        // a marker for an action that was never reached.
+                        if !recovery.proxy_cleanup_complete() {
+                            recovery.mark_proxy_cleanup_complete()?;
+                        }
+                        recovery.abort_uncommitted_tenant_resource()?;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                recovery.record_tenant_resource_receipt(
+                    TenantResourceReceiptIdentity::from_verified_receipt(
+                        receipt.receipt(),
+                        &receipt.receipt_sha256(),
+                    )?,
+                )?;
+            }
+            if !recovery.proxy_cleanup_complete() {
+                let proxy = binding
+                    .proxy
+                    .as_ref()
+                    .context("ordinary recovery proxy state is incomplete")?;
+                ProxyTrustGuard::recover(&proxy.bundle_path, &proxy.reload_executable)?;
+                recovery.mark_proxy_cleanup_complete()?;
+            }
+            cleanup_run_resources(&client, recovery).map(|_| ())
+        })();
+        if let Err(error) = result {
+            failures.push(format!("{}: {error:#}", binding.request_jti));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "pending conformance cleanup could not be recovered: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+fn is_deterministic_uncommitted_rejection(error: &TenantResourceClientError) -> bool {
+    matches!(
+        error,
+        TenantResourceClientError::InvalidRequest(_)
+            | TenantResourceClientError::Unauthorized(_)
+            | TenantResourceClientError::Forbidden(_)
+    )
+}
+
+fn evidence_runtime(
+    runtime: &nazoauthctl_core::ConformanceRuntimeEvidence,
+) -> EvidenceRuntimeIdentity {
+    match runtime {
+        nazoauthctl_core::ConformanceRuntimeEvidence::OciImage { digest } => {
+            EvidenceRuntimeIdentity::OciImage {
+                digest: digest.clone(),
+            }
+        }
+        nazoauthctl_core::ConformanceRuntimeEvidence::HostBinary { sha256 } => {
+            EvidenceRuntimeIdentity::HostBinary {
+                sha256: sha256.clone(),
+            }
+        }
+    }
+}
+
+fn evidence_capability(
+    capability: &TenantResourceCapabilitySession,
+    receipts: &[TenantResourceReceiptResult],
+) -> EvidenceProviderCapability {
+    EvidenceProviderCapability {
+        capability_compact_sha256: capability.compact_sha256(),
+        capability_jti: capability.capability.jti.clone(),
+        tenant_id: capability.capability.tenant_id.clone(),
+        revision: capability.capability.revision,
+        resource_manifest_sha256: capability.capability.resource_manifest_sha256.clone(),
+        receipts: receipts
+            .iter()
+            .map(|result| {
+                let receipt = result.receipt();
+                EvidenceProviderReceipt {
+                    action: receipt.operation,
+                    compact_sha256: result.receipt_sha256(),
+                    jti: receipt.jti.clone(),
+                    request_sha256: receipt.request_sha256.clone(),
+                    deployment_id: receipt.deployment_id.clone(),
+                    tenant_id: receipt.tenant_id.clone(),
+                    capability_jti: receipt.capability_jti.clone(),
+                    capability_compact_sha256: receipt.capability_sha256.clone(),
+                    expected_revision: receipt.expected_revision,
+                    revision: receipt.revision,
+                    change_set_id: receipt.change_set_id.clone(),
+                    change_set_sha256: receipt.change_set_sha256.clone(),
+                    baseline_manifest_sha256: receipt.baseline_manifest_sha256.clone(),
+                    resource_manifest_sha256: receipt.resource_manifest_sha256.clone(),
+                    outcome: receipt.outcome.clone(),
+                    audit_sequence: receipt.audit_sequence,
+                    audit_previous_sha256: receipt.audit_previous_sha256.clone(),
+                }
+            })
+            .collect(),
+    }
+}
+
+fn resolve_token(
+    invocation: &mut RunInvocation,
+    origin: &Origin,
+) -> anyhow::Result<(BearerToken, bool)> {
+    if let Some(mut value) = invocation.token.take() {
+        eprintln!("warning: --token is visible in argv and may be retained by shell history");
+        let token = BearerToken::new(value.as_str().to_owned())?;
+        value.zeroize();
+        return Ok((token, false));
+    }
+    if let Some(path) = &invocation.token_file {
+        return Ok((BearerToken::read_file(path)?, false));
+    }
+    if invocation.token_stdin {
+        let mut bytes = Zeroizing::new(Vec::new());
+        io::stdin()
+            .take(MAX_STDIN_TOKEN_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .context("failed to read the Suite token from stdin")?;
+        if bytes.len() as u64 > MAX_STDIN_TOKEN_BYTES {
+            bail!("Suite token from stdin exceeds the size limit");
+        }
+        let value = std::str::from_utf8(&bytes).context("Suite token from stdin is not UTF-8")?;
+        return Ok((BearerToken::new(value.to_owned())?, false));
+    }
+    if let Some(fd) = invocation.token_fd {
+        return Ok((CredentialStore::read_descriptor(fd)?, false));
+    }
+    let store = CredentialStore::new(credential_root()?)?;
+    if let Some(token) = store.load(origin)? {
+        return Ok((token, false));
+    }
+    if !io::stdin().is_terminal() {
+        bail!("no Suite API token is available; use a token option in non-TTY environments");
+    }
+    let value = rpassword::prompt_password("OpenID Foundation Conformance Suite API Token:")?;
+    Ok((BearerToken::new(value)?, true))
+}
+
+fn offer_credential_persistence(origin: &Origin, token: &BearerToken) -> anyhow::Result<()> {
+    if !io::stdin().is_terminal() {
+        return Ok(());
+    }
+    eprint!("Save this token securely for {}? [y/N] ", origin.as_str());
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    let save = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    answer.zeroize();
+    if save {
+        CredentialStore::new(credential_root()?)?.save(origin, token)?;
+    }
+    Ok(())
+}
+
+fn credential_root() -> anyhow::Result<PathBuf> {
+    #[cfg(windows)]
+    let root = env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .context("APPDATA is not set")?;
+    #[cfg(not(windows))]
+    let root = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .context("neither XDG_CONFIG_HOME nor HOME is set")?;
+    Ok(root.join("nazoauthctl").join("conformance-credentials"))
+}
+
+fn current_unix_time() -> anyhow::Result<i64> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    i64::try_from(seconds).context("system clock exceeds the supported range")
+}
+
+fn ciba_decision_expires_at(
+    plan: &OidfDriverInspectionPlan,
+    poll_timeout: Duration,
+    now: i64,
+) -> anyhow::Result<Option<i64>> {
+    let has_ciba = plan
+        .plans
+        .iter()
+        .any(|entry| entry.driver_handler.lane == OidfDriverLane::Ciba);
+    bounded_ciba_decision_expires_at(
+        has_ciba,
+        plan.selected_resource_budget.modules,
+        plan.selected_resource_budget.wall_clock_seconds,
+        poll_timeout,
+        now,
+        plan.artifact.expires_at,
+    )
+}
+
+fn bounded_ciba_decision_expires_at(
+    has_ciba: bool,
+    selected_modules: u32,
+    signed_wall_clock_seconds: u64,
+    poll_timeout: Duration,
+    now: i64,
+    artifact_expires_at: i64,
+) -> anyhow::Result<Option<i64>> {
+    if !has_ciba {
+        return Ok(None);
+    }
+    let poll_budget = u64::from(selected_modules)
+        .checked_mul(poll_timeout.as_secs())
+        .context("selected CIBA plan poll budget overflows")?;
+    let run_budget = signed_wall_clock_seconds.max(poll_budget);
+    if run_budget == 0 || run_budget > MAX_CIBA_DECISION_LIFETIME_SECONDS {
+        bail!(
+            "selected CIBA run budget must be between 1 second and 24 hours; lower --poll-timeout or narrow the signed plan selection"
+        );
+    }
+    let expires_at = now
+        .checked_add(i64::try_from(run_budget)?)
+        .context("selected CIBA run expiry overflows")?;
+    if expires_at > artifact_expires_at {
+        bail!(
+            "selected CIBA run budget exceeds the signed artifact validity window; lower --poll-timeout or refresh the artifact"
+        );
+    }
+    Ok(Some(expires_at))
+}
+
+fn hex(bytes: impl AsRef<[u8]>) -> String {
+    bytes
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn select_artifact_matrix_for_run(
+    mut matrix: OidfArtifactMatrix,
+    selected_plan_ids: &BTreeSet<(String, String)>,
+) -> anyhow::Result<OidfArtifactMatrix> {
+    let mut retained = BTreeSet::new();
+    matrix.groups.retain_mut(|group| {
+        group.plans.retain(|plan| {
+            let selected = selected_plan_ids.contains(&(group.id.clone(), plan.id.clone()));
+            if selected {
+                retained.insert((group.id.clone(), plan.id.clone()));
+            }
+            selected
+        });
+        !group.plans.is_empty()
+    });
+    if retained != *selected_plan_ids {
+        bail!("selected signed Matrix plans changed before materialization");
+    }
+    Ok(matrix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nazoauthctl_conformance::{
+        CryptoPolicy, OIDF_MATRIX_SCHEMA_VERSION, OidfArtifactMatrixGroup, OidfArtifactMatrixPlan,
+        OidfArtifactMatrixVariant, OidfPlanResourceBudget,
+    };
+    use serde_json::json;
+
+    fn artifact_group(id: &str, plan_ids: &[&str]) -> OidfArtifactMatrixGroup {
+        OidfArtifactMatrixGroup {
+            id: id.to_owned(),
+            profile: id.to_owned(),
+            variant: OidfArtifactMatrixVariant {
+                id: "default".to_owned(),
+                values: BTreeMap::new(),
+            },
+            required_roles: Vec::new(),
+            plans: plan_ids
+                .iter()
+                .map(|plan_id| OidfArtifactMatrixPlan {
+                    id: (*plan_id).to_owned(),
+                    plan: format!("suite-{plan_id}"),
+                    driver_handler: "default".to_owned(),
+                    resource_budget: OidfPlanResourceBudget {
+                        modules: 1,
+                        clients: 1,
+                        wall_clock_seconds: 60,
+                    },
+                    config_template: json!({"plan": plan_id}),
+                    variant: BTreeMap::new(),
+                    required_capabilities: Vec::new(),
+                    expected_results: BTreeMap::new(),
+                    required_roles: Vec::new(),
+                    secret_bindings: BTreeMap::new(),
+                    crypto: CryptoPolicy::default(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn materialization_matrix_contains_only_the_signed_selected_plans() {
+        let matrix = OidfArtifactMatrix {
+            schema: OIDF_MATRIX_SCHEMA_VERSION,
+            name: "matrix".to_owned(),
+            openid4vc_credential_datasets: BTreeMap::new(),
+            openid4vc_suite_mdoc_trust_anchor_pem: "anchor".to_owned(),
+            groups: vec![
+                artifact_group("oidc", &["p001", "unselected-dcr"]),
+                artifact_group("ciba", &["unselected-ciba"]),
+            ],
+        };
+        let selected = BTreeSet::from([("oidc".to_owned(), "p001".to_owned())]);
+
+        let filtered = select_artifact_matrix_for_run(matrix, &selected).unwrap();
+        assert_eq!(filtered.groups.len(), 1);
+        assert_eq!(filtered.groups[0].id, "oidc");
+        assert_eq!(filtered.groups[0].plans.len(), 1);
+        assert_eq!(filtered.groups[0].plans[0].id, "p001");
+
+        let missing = BTreeSet::from([("oidc".to_owned(), "missing-signed-plan".to_owned())]);
+        assert!(select_artifact_matrix_for_run(filtered, &missing).is_err());
+    }
+
+    #[test]
+    fn cleanup_change_sets_are_scoped_to_the_discovered_capability_generation() {
+        let first = cleanup_change_set_id(
+            "tenant-resource-01a00401-6fee-7063-94bd-26c86029d4c2",
+            "observe",
+            &"1".repeat(64),
+        );
+        let second = cleanup_change_set_id(
+            "tenant-resource-01a00401-6fee-7063-94bd-26c86029d4c2",
+            "observe",
+            &"2".repeat(64),
+        );
+
+        assert_ne!(first, second);
+        assert!(first.len() <= 128);
+    }
+
+    #[test]
+    fn ciba_expiry_covers_poll_budget_without_outliving_signed_authority() {
+        assert_eq!(
+            bounded_ciba_decision_expires_at(
+                false,
+                8,
+                3_600,
+                Duration::from_secs(900),
+                1_000,
+                20_000,
+            )
+            .expect("non-CIBA selection"),
+            None
+        );
+        assert_eq!(
+            bounded_ciba_decision_expires_at(
+                true,
+                8,
+                3_600,
+                Duration::from_secs(900),
+                1_000,
+                20_000,
+            )
+            .expect("bounded CIBA selection"),
+            Some(8_200)
+        );
+        assert!(
+            bounded_ciba_decision_expires_at(
+                true,
+                97,
+                3_600,
+                Duration::from_secs(900),
+                1_000,
+                100_000,
+            )
+            .is_err()
+        );
+        assert!(
+            bounded_ciba_decision_expires_at(
+                true,
+                8,
+                3_600,
+                Duration::from_secs(900),
+                1_000,
+                8_199,
+            )
+            .is_err()
+        );
+    }
+}

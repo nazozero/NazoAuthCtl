@@ -205,6 +205,35 @@ mod tests {
     }
 
     #[test]
+    fn managed_volume_copy_has_only_offline_filesystem_capabilities() {
+        let work = PrivateTempDir::new("runtime-managed-volume-copy").unwrap();
+        let engine = work.path().join("fake-engine");
+        let arguments = work.path().join("arguments");
+        write_shell_executable(
+            &engine,
+            &format!("printf '%s\\n' \"$@\" > '{}'", arguments.display()),
+        );
+
+        super::build_managed_volume_copy_process(engine.as_os_str())
+            .arg("example.invalid/valkey@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .args(["sh", "-c", "cp -a /source/. /destination/"])
+            .run_quiet()
+            .unwrap();
+
+        let arguments = fs::read_to_string(arguments).unwrap();
+        assert!(arguments.contains("--user\n0:0\n"));
+        assert!(arguments.contains("--network\nnone\n"));
+        assert!(arguments.contains("--read-only\n"));
+        assert!(arguments.contains("--cap-drop\nALL\n"));
+        assert!(arguments.contains("--cap-add\nCHOWN\n"));
+        assert!(arguments.contains("--cap-add\nDAC_OVERRIDE\n"));
+        assert!(arguments.contains("--cap-add\nFOWNER\n"));
+        assert!(arguments.contains("--security-opt\nno-new-privileges\n"));
+        assert!(!arguments.contains("NET_ADMIN"));
+        assert!(!arguments.contains("SYS_ADMIN"));
+    }
+
+    #[test]
     fn podman_expanded_cap_drop_all_is_recognized_without_accepting_partial_sets() {
         let complete = [
             "CAP_CHOWN",
@@ -515,6 +544,40 @@ pub(crate) fn build_identity_process(command: &OsStr) -> Process {
     append_container_policy(Process::new(command).args(["run", "--rm"]), &policy)
         .arg("--user")
         .arg(NON_ROOT_ONE_SHOT_USER)
+}
+
+/// Build the narrowly privileged process used to copy an already-validated
+/// managed data volume.  Dependency images write their data as image-specific
+/// UIDs (for example Valkey uses 999:1000), so the fixed non-root identity used
+/// by ordinary one-shot probes cannot read a mode-0600 source or preserve its
+/// ownership.  The copy remains offline, read-only at the container root, and
+/// receives only the filesystem capabilities required by `cp -a`.
+pub(crate) fn build_managed_volume_copy_process(command: &OsStr) -> Process {
+    Process::new(command).args([
+        "run",
+        "--rm",
+        "--user",
+        "0:0",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "CHOWN",
+        "--cap-add",
+        "DAC_OVERRIDE",
+        "--cap-add",
+        "FOWNER",
+        "--security-opt",
+        "no-new-privileges",
+        "--pids-limit",
+        "64",
+        "--memory",
+        "134217728",
+        "--cpus",
+        "1.000",
+    ])
 }
 
 fn validate_non_root_user(user: &str, backend_name: &str) -> anyhow::Result<()> {

@@ -1,123 +1,6 @@
 use super::*;
-pub(crate) fn conformance_operation(
-    command: ConformanceLeaseCommand,
-) -> anyhow::Result<TaskOperation> {
-    Ok(match command {
-        ConformanceLeaseCommand::Create {
-            profile,
-            material,
-            dynamic_registration_token_file,
-            ciba_automated_decision_token_file,
-            ttl_seconds,
-            yes,
-        } => {
-            require_confirmation(yes, "create a temporary conformance lease")?;
-            let (material_sha256, material_bytes) =
-                read_conformance_material(&material, profile == "openid4vc")?;
-            let dynamic_registration_initial_access_token_sha256 = if let Some(path) =
-                dynamic_registration_token_file
-            {
-                if profile != "oidc-fapi-ciba" {
-                    bail!(
-                        "--dynamic-registration-token-file is supported only for the oidc-fapi-ciba profile"
-                    );
-                }
-                Some(read_conformance_token_sha256(&path)?)
-            } else {
-                None
-            };
-            let ciba_automated_decision_token_sha256 = if let Some(path) =
-                ciba_automated_decision_token_file
-            {
-                if profile != "oidc-fapi-ciba" {
-                    bail!(
-                        "--ciba-automated-decision-token-file is supported only for the oidc-fapi-ciba profile"
-                    );
-                }
-                Some(read_conformance_token_sha256(&path)?)
-            } else {
-                None
-            };
-            let public_material = if profile == "openid4vc" {
-                Some(
-                    serde_json::from_slice::<nazo_operator_protocol::Openid4vcConformanceTrust>(
-                        material_bytes
-                            .as_deref()
-                            .context("OpenID4VC conformance material was not retained")?,
-                    )
-                    .context("OpenID4VC conformance material must be strict JSON")?,
-                )
-            } else {
-                None
-            };
-            TaskOperation::ConformanceLeaseCreate {
-                profile,
-                material_sha256,
-                public_material,
-                dynamic_registration_initial_access_token_sha256,
-                ciba_automated_decision_token_sha256,
-                ttl_seconds,
-            }
-        }
-        ConformanceLeaseCommand::List => TaskOperation::ConformanceLeaseList,
-        ConformanceLeaseCommand::Revoke { lease_id, yes } => {
-            require_confirmation(
-                yes,
-                "revoke the conformance lease and deactivate its clients",
-            )?;
-            TaskOperation::ConformanceLeaseRevoke { lease_id }
-        }
-        ConformanceLeaseCommand::Cleanup { yes } => {
-            require_confirmation(yes, "delete revoked and expired conformance clients")?;
-            TaskOperation::ConformanceLeaseCleanup
-        }
-    })
-}
-
-const MAX_CONFORMANCE_TOKEN_FILE_BYTES: u64 = 4096;
-const MAX_CONFORMANCE_MATERIAL_BYTES: u64 = 4 * 1024 * 1024;
 
 const MAX_EXTERNAL_PUBLIC_JWK_BYTES: u64 = 1024 * 1024;
-
-fn read_conformance_material(
-    path: &Path,
-    retain_bytes: bool,
-) -> anyhow::Result<(String, Option<Vec<u8>>)> {
-    let mut file =
-        crate::filesystem::open_secure_regular_file(path, "conformance material", false)?;
-    let mut digest = Sha256::new();
-    let mut retained = if retain_bytes { Some(Vec::new()) } else { None };
-    let mut buffer = [0_u8; 8192];
-    let mut total = 0_usize;
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("failed to read conformance material {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-        total = total.saturating_add(read);
-        if total as u64 > MAX_CONFORMANCE_MATERIAL_BYTES {
-            bail!(
-                "conformance material exceeds the {} MiB limit",
-                MAX_CONFORMANCE_MATERIAL_BYTES / (1024 * 1024)
-            );
-        }
-        if let Some(bytes) = retained.as_mut() {
-            if total > 32 * 1024 {
-                bail!(
-                    "OpenID4VC conformance material must be a regular file from 1 through 32768 bytes"
-                );
-            }
-            bytes.extend_from_slice(&buffer[..read]);
-        }
-    }
-    if total == 0 {
-        bail!("conformance material must not be empty");
-    }
-    Ok((encode_controller_digest(&digest.finalize()), retained))
-}
 
 /// Read an external public JWK through one secure descriptor, hash those exact
 /// bytes, and stage them under the declaration-bound operator state directory.
@@ -154,60 +37,6 @@ fn stage_external_public_jwk(
     // state.  It is removed immediately after the task returns.
     atomic_write(&staged, &bytes, 0o444)?;
     Ok((staged, encode_controller_digest(&Sha256::digest(&bytes))))
-}
-
-fn read_conformance_token_sha256(path: &Path) -> anyhow::Result<String> {
-    let file = crate::filesystem::open_secure_regular_file(path, "conformance token file", true)?;
-    let opened_metadata = file.metadata().with_context(|| {
-        format!(
-            "failed to inspect opened conformance token file {}",
-            path.display()
-        )
-    })?;
-    validate_conformance_token_metadata(&opened_metadata)?;
-
-    let mut bytes = zeroize::Zeroizing::new(Vec::new());
-    file.take(MAX_CONFORMANCE_TOKEN_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read conformance token file {}", path.display()))?;
-    if bytes.is_empty() {
-        bail!("conformance token file must not be empty");
-    }
-    if bytes.len() as u64 > MAX_CONFORMANCE_TOKEN_FILE_BYTES {
-        bail!(
-            "conformance token file exceeds the {} byte limit",
-            MAX_CONFORMANCE_TOKEN_FILE_BYTES
-        );
-    }
-    Ok(encode_controller_digest(&Sha256::digest(bytes.as_slice())))
-}
-
-#[cfg(unix)]
-fn validate_conformance_token_metadata(metadata: &fs::Metadata) -> anyhow::Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let current_uid = Process::new("id")
-        .arg("-u")
-        .stdout()?
-        .trim()
-        .parse::<u32>()
-        .context("current process has no valid numeric UID")?;
-    if metadata.uid() != 0 && metadata.uid() != current_uid {
-        bail!("conformance token file has an unexpected owner");
-    }
-    if metadata.nlink() != 1 {
-        bail!("conformance token file must have exactly one hard link");
-    }
-    let mode = metadata.mode() & 0o7777;
-    if mode & !0o600 != 0 || mode & 0o400 == 0 {
-        bail!("conformance token file permissions must be 0400 or 0600");
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn validate_conformance_token_metadata(_metadata: &fs::Metadata) -> anyhow::Result<()> {
-    Ok(())
 }
 
 pub(super) fn validate_local_development_identity(
@@ -470,7 +299,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if !store.registry_present()? {
                 bail!("development activation requires a registered deployment");
             }
-            let context = control_config(
+            let mut context = control_config(
                 &configured_path,
                 selector.as_deref(),
                 &[Capability::Runtime, Capability::Artifact],
@@ -490,6 +319,11 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             let runtime = Runtime::new(&context.config);
             let target = runtime.inspect_local_development_artifact(&options.artifact)?;
             validate_local_development_identity(&target.embedded)?;
+            crate::controller::updates::persist_tenant_resource_controller_runtime_upgrade(
+                &context.path,
+                &mut context.config,
+            )?;
+            let runtime = Runtime::new(&context.config);
             crate::lifecycle::cache_trusted_runtime(&store, &record)?;
             runtime.activate_local_development_artifact(&target)?;
             let mut updated = record.clone();
@@ -503,6 +337,28 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             }
             declared.artifact = target.declared_artifact.clone();
             declared.local_artifact_id = target.local_artifact_id.clone();
+            declared.ports = (!context.config.runtime.publish_address.is_empty())
+                .then(|| context.config.runtime.publish_address.clone())
+                .into_iter()
+                .collect();
+            declared.networks = (!context.config.runtime.network.is_empty())
+                .then(|| context.config.runtime.network.clone())
+                .into_iter()
+                .collect();
+            declared.mounts = context
+                .config
+                .runtime
+                .mounts
+                .iter()
+                .map(|mount| MountReference {
+                    source: mount.source.clone(),
+                    destination: mount.target.clone(),
+                    read_only: mount.read_only,
+                    selinux_relabel: mount.selinux_relabel,
+                    scope: ResourceScope::Deployment,
+                    ownership: Responsibility::Managed,
+                })
+                .collect();
             let artifact = declared.artifact.clone();
             let local_artifact_id = declared.local_artifact_id.clone();
             updated.declaration_revision = record
@@ -670,14 +526,40 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                             .record
                             .as_ref()
                             .context("config-backed update lost its deployment declaration")?;
-                        resume_config_backed_update_locked(
-                            &store,
-                            bound_record,
-                            &transaction,
-                            &context.path,
-                            &context.config,
-                            true,
-                        )?
+                        let legacy_recovery_pending =
+                            load_update_journal(&context.config)?.is_some();
+                        if legacy_recovery_pending
+                            || matches!(
+                                transaction.state,
+                                crate::coordination::CoordinationState::Aborting
+                                    | crate::coordination::CoordinationState::Aborted
+                            )
+                        {
+                            let transaction =
+                                crate::coordination::mark_controller_update_aborting_locked(
+                                    &store,
+                                    bound_record,
+                                    &transaction.transaction_id,
+                                )?;
+                            if legacy_recovery_pending {
+                                recover_pending_update(&context.path, &context.config)?;
+                            }
+                            let current_record = store.reload_locked(bound_record)?;
+                            crate::coordination::abort_controller_update_locked(
+                                &store,
+                                &current_record,
+                                &transaction.transaction_id,
+                            )?
+                        } else {
+                            resume_config_backed_update_locked(
+                                &store,
+                                bound_record,
+                                &transaction,
+                                &context.path,
+                                &context.config,
+                                true,
+                            )?
+                        }
                     }
                 } else {
                     bail!("registered update recovery has no executable lifecycle authority");
@@ -802,37 +684,12 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             }
             result
         }
-        Command::Conformance(command) => {
-            require_root()?;
-            let context = control_config(
-                &configured_path,
-                selector.as_deref(),
-                &[Capability::OperatorTasks],
-                true,
-                false,
-                false,
-            )?;
-            let operation = conformance_operation(command.lease)?;
-            let local_development =
-                if command.candidate.is_none() && DeploymentStore::system().registry_present()? {
-                    if let Some(record) = context.record.as_ref()
-                        && record.active_release.build_id.starts_with("local:")
-                    {
-                        validate_local_development_identity(&record.active_release)?;
-                        Some(record.active_release.clone())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-            conformance_app_command(
-                &context.config,
-                operation,
-                command.candidate.as_ref(),
-                local_development.as_ref(),
-            )
-        }
+        Command::Tls(command) => crate::tls::run(
+            selector.as_deref(),
+            command,
+            require_root,
+            require_confirmation,
+        ),
         Command::AuditVerify => {
             if let Some((store, record, config)) = registered_audit_context(selector.as_deref())? {
                 let (governance_sequence, governance_head) =

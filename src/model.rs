@@ -348,8 +348,21 @@ impl UpdateConfig {
             safe_absolute(path)?;
         }
         for (key, value) in &self.runtime.environment {
-            if !valid_environment_key(key) || !key.ends_with("_FILE") {
-                bail!("runtime environment is limited to non-secret *_FILE locators");
+            if !valid_environment_key(key) {
+                bail!("runtime environment key is invalid");
+            }
+            match key.as_str() {
+                "DEPLOYMENT_ID" if value == &self.operator.deployment_id => continue,
+                "RUNTIME_INSTANCE_ID" if value == &self.runtime.runtime_instance_id => continue,
+                "DEPLOYMENT_ID" | "RUNTIME_INSTANCE_ID" => {
+                    bail!("runtime identity environment does not match its persisted authority")
+                }
+                _ if key.ends_with("_FILE") => {}
+                _ => {
+                    bail!(
+                        "runtime environment is limited to exact identity bindings and non-secret *_FILE locators"
+                    )
+                }
             }
             safe_absolute(std::path::Path::new(value))?;
         }

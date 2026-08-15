@@ -7,47 +7,16 @@ pub(crate) fn execute(
     operation: TaskOperation,
     public_jwk: Option<&Path>,
 ) -> anyhow::Result<OperationResult> {
-    execute_with_io(
-        config, target, expected, operation, public_jwk, None, None, None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_with_io(
-    config: &UpdateConfig,
-    target: &str,
-    expected: &ExpectedReleaseTarget,
-    operation: TaskOperation,
-    public_jwk: Option<&Path>,
-    conformance_bundle: Option<&Path>,
-    conformance_output_directory: Option<&Path>,
-    requested_jti: Option<&str>,
-) -> anyhow::Result<OperationResult> {
-    match &operation {
-        TaskOperation::ConformanceMatrixDescribe => {
-            if conformance_bundle.is_some()
-                || conformance_output_directory.is_none()
-                || requested_jti.is_some()
-            {
-                bail!("conformance matrix task I/O contract is invalid");
-            }
-        }
-        TaskOperation::ConformanceOnboardingApply { .. } => {
-            if conformance_bundle.is_none()
-                || conformance_output_directory.is_none()
-                || requested_jti.is_none()
-            {
-                bail!("conformance onboarding task I/O contract is invalid");
-            }
-        }
-        _ => {
-            if conformance_bundle.is_some()
-                || conformance_output_directory.is_some()
-                || requested_jti.is_some()
-            {
-                bail!("operator task does not accept conformance I/O");
-            }
-        }
+    if matches!(
+        &operation,
+        TaskOperation::ConformanceMatrixDescribe
+            | TaskOperation::ConformanceOnboardingApply { .. }
+            | TaskOperation::ConformanceLeaseCreate { .. }
+            | TaskOperation::ConformanceLeaseList
+            | TaskOperation::ConformanceLeaseRevoke { .. }
+            | TaskOperation::ConformanceLeaseCleanup
+    ) {
+        bail!("legacy conformance management is disabled");
     }
     // A privileged operation is admissible only while the existing audit,
     // intent and trust-transition state is verifiably intact.  Checking after
@@ -64,14 +33,7 @@ pub(crate) fn execute_with_io(
 
     // Runtime/image, network, mounts, task context and sandbox are prepared before issuance.
     let runtime = Runtime::new(config);
-    let prepared = runtime.prepare_app_task(
-        target,
-        &operation,
-        public_jwk,
-        conformance_bundle,
-        conformance_output_directory,
-        &manifest_bytes,
-    )?;
+    let prepared = runtime.prepare_app_task(target, &operation, public_jwk, &manifest_bytes)?;
     verify_target_expectation(&prepared.target, expected)?;
 
     let secret_revision = read_single_line(&config.operator.secret_revision_file)?;
@@ -88,7 +50,7 @@ pub(crate) fn execute_with_io(
         expected.embedded.clone(),
         config_binding.clone(),
         operation,
-        requested_jti,
+        None,
     )?;
     let request_id = task.jti.clone();
     if let Some(result) = existing_final_result(config, &task, &compact_task)? {
@@ -362,7 +324,7 @@ pub(crate) fn execute_test_task(
         | TaskOperation::ConformanceLeaseList
         | TaskOperation::ConformanceLeaseRevoke { .. }
         | TaskOperation::ConformanceLeaseCleanup => {
-            bail!("test task adapter does not implement conformance lease operations")
+            bail!("legacy conformance management is disabled")
         }
     };
     crate::runtime_backend::backend(config.runtime.backend).run_debug_artifact_task(
