@@ -73,7 +73,10 @@ DECLARE
         'oauth_client_mtls_trust_anchor_requests',
         'runtime_module_default_policy', 'initial_admin_bootstrap',
         'conformance_leases', 'openid4vci_issuance_responses',
-        'oauth_token_issuances'
+        'oauth_token_issuances',
+        'tenant_resource_states', 'tenant_resource_bindings',
+        'tenant_resource_operations', 'openid4vc_trust_policies',
+        'openid4vc_trust_policy_clients', 'ciba_decision_bindings'
     ];
     -- These tables are introduced by newer signed Releases. They remain an
     -- explicit allowlist: if present they receive the exact runtime grant,

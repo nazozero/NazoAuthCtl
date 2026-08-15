@@ -1344,6 +1344,12 @@ fn managed_runtime_database_grants_keep_the_audit_ledger_api_least_privileged() 
         "openid4vci_credential_dataset_events",
         "conformance_lease_applicants",
         "conformance_lease_clients",
+        "tenant_resource_states",
+        "tenant_resource_bindings",
+        "tenant_resource_operations",
+        "openid4vc_trust_policies",
+        "openid4vc_trust_policy_clients",
+        "ciba_decision_bindings",
         "security_audit_event_outbox",
     ] {
         assert!(
