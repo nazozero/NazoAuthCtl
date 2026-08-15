@@ -38,8 +38,7 @@ use audit::{
 };
 pub(crate) use audit::{
     append_management_event, append_management_event_idempotent, audit_entries, execute,
-    execute_with_io, expected_release_target, load_management_event, show_audit, verify_audit,
-    verify_audit_chain,
+    expected_release_target, load_management_event, show_audit, verify_audit, verify_audit_chain,
 };
 use audit::{
     canonical_manifest, encode_retirement_probe_audit_evidence, verify_target_expectation,

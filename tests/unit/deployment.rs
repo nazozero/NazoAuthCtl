@@ -184,7 +184,7 @@ fn locks_are_per_deployment_and_per_shared_resource() {
 }
 
 #[test]
-fn conformance_shared_locks_overlap_but_exclude_mutation_and_serialize_writers() {
+fn shared_locks_overlap_but_exclude_mutation() {
     let work = PrivateTempDir::new("nazoauthctl-conformance-shared-locks").unwrap();
     let store = store(&work);
 
@@ -195,27 +195,6 @@ fn conformance_shared_locks_overlap_but_exclude_mutation_and_serialize_writers()
     let resource_reader_a = store.shared_resource_shared_lock("database").unwrap();
     let resource_reader_b = store.shared_resource_shared_lock("database").unwrap();
     assert!(store.shared_resource_lock("database").is_err());
-
-    let operator_writer = store.operator_task_lock("deployment-a").unwrap();
-    let operator_path = store
-        .state_root
-        .join("locks")
-        .join("operator-task-deployment-a.lock");
-    let timeout_error =
-        match FileLock::acquire_exclusive_bounded(&operator_path, Duration::from_millis(20)) {
-            Ok(_) => panic!("a second operator writer unexpectedly acquired the lock"),
-            Err(error) => error,
-        };
-    assert!(timeout_error.to_string().contains("timed out"));
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(50));
-        drop(operator_writer);
-    });
-    let waited = Instant::now();
-    let next_writer = store.operator_task_lock("deployment-a").unwrap();
-    assert!(waited.elapsed() >= Duration::from_millis(25));
-    release.join().unwrap();
-    drop(next_writer);
 
     drop((deployment_reader_a, deployment_reader_b));
     assert!(store.deployment_lock("deployment-a").is_ok());

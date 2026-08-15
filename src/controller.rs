@@ -25,10 +25,7 @@ use crate::deployment::{
 };
 use crate::{
     backup::Backup,
-    cli::{
-        BootstrapAdminOptions, CandidateTarget, Cli, Command, ConformanceLeaseCommand, KeysCommand,
-        UpdateOptions,
-    },
+    cli::{BootstrapAdminOptions, CandidateTarget, Cli, Command, KeysCommand, UpdateOptions},
     filesystem::{atomic_write, open_lock_file, remove_file_durable, set_mode, symlink_atomic},
     install::{self, PreparedInstall},
     model::{ReleaseManifest, UpdateConfig},
@@ -49,8 +46,6 @@ pub(crate) use keys::{
 mod self_update;
 mod updates;
 use bootstrap::*;
-#[cfg(test)]
-pub(crate) use commands::conformance_operation;
 use deployment::*;
 use diagnostics::*;
 use keys::*;
@@ -162,7 +157,7 @@ fn control_config_with_lock_mode(
     let store = DeploymentStore::system();
     if !store.registry_present()? {
         let legacy_lock = (lock_mode == DeploymentLockMode::Shared)
-            .then(deployment::acquire_conformance_shared_lock)
+            .then(deployment::acquire_oidf_run_shared_lock)
             .transpose()?;
         let config = if unsettled {
             load_config_unsettled(config_path)?

@@ -66,7 +66,6 @@ pub(crate) enum Command {
         candidate: Option<CandidateTarget>,
     },
     Keys(KeysCommand),
-    Conformance(ConformanceCommand),
     Tls(TlsCommand),
     AuditVerify,
     AuditShow {
@@ -183,12 +182,6 @@ pub(crate) struct RelinquishOptions {
     pub(crate) yes: bool,
 }
 
-#[derive(Debug)]
-pub(crate) struct ConformanceCommand {
-    pub(crate) lease: ConformanceLeaseCommand,
-    pub(crate) candidate: Option<CandidateTarget>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CandidateTarget {
     pub(crate) release: String,
@@ -214,26 +207,6 @@ pub(crate) enum KeysCommand {
         alg: String,
         key_ref: String,
         public_jwk: PathBuf,
-        yes: bool,
-    },
-}
-
-#[derive(Debug)]
-pub(crate) enum ConformanceLeaseCommand {
-    Create {
-        profile: String,
-        material: PathBuf,
-        dynamic_registration_token_file: Option<PathBuf>,
-        ciba_automated_decision_token_file: Option<PathBuf>,
-        ttl_seconds: u64,
-        yes: bool,
-    },
-    List,
-    Revoke {
-        lease_id: String,
-        yes: bool,
-    },
-    Cleanup {
         yes: bool,
     },
 }

@@ -7,7 +7,6 @@
 mod admin;
 mod adoption;
 mod common;
-mod conformance;
 mod install;
 mod keys;
 mod tls;
@@ -22,7 +21,6 @@ use super::types::*;
 use admin::parse_bootstrap_admin;
 use adoption::{parse_adoption, parse_permission_options, parse_relinquish_options};
 use common::{no_arguments, parse_candidate_target, parse_version_option, parse_yes, take_yes};
-use conformance::parse_conformance;
 use install::parse_install;
 use keys::parse_keys;
 use tls::parse_tls;
@@ -151,7 +149,6 @@ impl Cli {
                 }
             }
             "keys" => Command::Keys(parse_keys(values)?),
-            "conformance" => Command::Conformance(parse_conformance(values)?),
             "tls" => Command::Tls(parse_tls(values)?),
             "audit" if values == ["verify"] => Command::AuditVerify,
             "audit" if values.first().is_some_and(|value| value == "show") => {

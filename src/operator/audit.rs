@@ -23,7 +23,6 @@ pub(crate) use chain::verify_audit_chain;
 pub(super) use chain::{append_audit, audit_head, repair_audit_head_for_append};
 pub(crate) use chain::{show_audit, verify_audit};
 
-pub(crate) use execution::execute_with_io;
 pub(super) use execution::{canonical_manifest, verify_target_expectation};
 pub(crate) use execution::{execute, expected_release_target};
 #[cfg(test)]

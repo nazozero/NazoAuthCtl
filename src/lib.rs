@@ -21,8 +21,7 @@ pub(crate) use nazoauthctl_runtime::filesystem;
 pub(crate) use nazoauthctl_runtime::process;
 
 pub use conformance::{
-    ConformanceDeploymentEvidence, ConformanceLeaseIdentity, ConformanceMatrix,
-    ConformanceOnboarding, ConformanceRuntimeEvidence, ConformanceSession,
+    ConformanceDeploymentEvidence, ConformanceRuntimeEvidence, ConformanceSession,
 };
 
 #[cfg(all(test, unix))]
@@ -125,7 +124,7 @@ Commands:
   recover-identity  Explicitly finish an interrupted identity transition
   migrate       Run the signed migration operation
   keys          List, validate, export OpenID4VC trust, generate, or register signing keys
-  conformance   Verify OIDF artifacts, run official tests, or manage time-bounded leases
+  conformance   Verify signed OIDF artifacts and run official tests through ordinary resources
   audit         Show or verify the management audit chain
   identity      Rotate controller and audit identities
   break-glass   Recover after controller-key loss or suspected theft
@@ -224,15 +223,6 @@ never exports a leaf certificate or private key."
   nazoauthctl [--deployment ID] [--config PATH] conformance run [--suite URL]
     [--token TOKEN|--token-file PATH|--token-stdin|--token-fd FD]
     [--webdriver URL] [--evidence-dir PATH] [--group ID] [--plan ID]
-  nazoauthctl [--config PATH] conformance lease create --profile PROFILE \
-    --material PUBLIC_MANIFEST \
-    [--dynamic-registration-token-file PATH] \
-    [--ciba-automated-decision-token-file PATH] \
-    --ttl-seconds SECONDS --yes
-  nazoauthctl [--config PATH] conformance lease list
-  nazoauthctl [--config PATH] conformance lease revoke --lease-id UUID --yes
-  nazoauthctl [--config PATH] conformance lease cleanup --yes
-
 `conformance artifact resolve` fetches a bounded stable-channel manifest without
 redirects, verifies it before following the signed matrix URL, verifies the exact
 matrix bytes, and commits an immutable owner-only cache entry. The verified record
@@ -244,31 +234,17 @@ source, validity window, Suite identity, strict matrix schema, digest, size,
 resource bounds, and every caller-supplied available capability. It does not
 discover or grant target capabilities and does not execute the Suite.
 
-`conformance run` validates the deployment, authenticates to the official Suite by
-default, obtains the deployment Matrix, creates an atomic lease/onboarding bundle,
-runs the Matrix-selected official plans, preserves official PASS/FAIL values, and
-always attempts Suite and deployment cleanup. In a TTY, a missing API token is read
+`conformance run` validates the deployment and signed artifact, authenticates to the
+official Suite by default, applies an auditable ordinary tenant-resource change set,
+runs the selected official plans, preserves official PASS/FAIL values, and always
+attempts Suite and resource cleanup. In a TTY, a missing API token is read
 without echo and can be stored securely per Suite origin. `--token` is supported for
 automation but is visible in argv and shell history. Progress is item-count based on
 stderr; the final structured report is written to stdout without secrets.
-
-For an unreleased OCI candidate, insert all four target bindings before `lease`:
-  --candidate-release vX.Y.Z --candidate-revision GIT_SHA \
-  --candidate-build-id BUILD_ID --candidate-oci-digest sha256:HEX
-
-The lease stores only the SHA-256 digest of the public onboarding manifest. When
-`--dynamic-registration-token-file` is supplied, nazoauthctl reads a bounded private
-file and sends only its lowercase SHA-256 digest; the token plaintext and digest are
-not printed or included in receipt summaries. The optional
-`--ciba-automated-decision-token-file` follows the same rule and is only valid for
-`oidc-fapi-ciba`. Private keys and plaintext client secrets remain with the
-conformance runner. Expired or
-revoked clients fail closed immediately; cleanup physically deletes their database
-records and retains only the non-secret lease tombstone. Candidate mode is limited
-to explicit migration and conformance operations and binds the operator task to the
-exact active OCI digest and embedded identity; ordinary operations still require the
-signed active Release.
-TTL is 60 through 86400 seconds."
+Private credentials remain in controller-owned files or zeroizing memory; provider
+receipts expose only signed resource identities and public mappings. Recovery replays
+the exact prepared request and cleanup is digest-fenced against the observed run
+resources."
         }
         cli::HelpTopic::Tls => {
             "Usage:

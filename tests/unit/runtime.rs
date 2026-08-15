@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf};
+
+#[cfg(unix)]
+use std::fs;
 
 #[cfg(unix)]
 use crate::test_support::write_shell_executable;
@@ -411,44 +414,14 @@ fn managed_backup_rejects_config_digest_drift_before_dump() {
 #[test]
 fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
     let work = PrivateTempDir::new("runtime-task-mounts").unwrap();
-    let mut config = config(&work);
-    let runtime_secret_directory = work.path().join("app/secrets");
-    fs::create_dir_all(&runtime_secret_directory).unwrap();
-    fs::write(
-        runtime_secret_directory.join("client-secret-pepper"),
-        "fixture-pepper",
-    )
-    .unwrap();
-    let openid4vc_data_encryption_key = work
-        .path()
-        .join("config/secrets/openid4vc-data-encryption-key");
-    fs::create_dir_all(openid4vc_data_encryption_key.parent().unwrap()).unwrap();
-    fs::write(&openid4vc_data_encryption_key, "fixture-encryption-key").unwrap();
-    config.runtime.mounts.push(Mount {
-        source: runtime_secret_directory.clone(),
-        target: PathBuf::from("/var/lib/nazo_oauth/secrets"),
-        read_only: true,
-        selinux_relabel: true,
-    });
-    config.runtime.mounts.push(Mount {
-        source: openid4vc_data_encryption_key.clone(),
-        target: PathBuf::from("/run/nazoauth-secrets/openid4vc-data-encryption-key"),
-        read_only: true,
-        selinux_relabel: true,
-    });
+    let config = config(&work);
     let runtime = Runtime::new(&config);
     let artifact = ArtifactReference::Oci {
         image_reference: "fixture.invalid/nazoauth".to_owned(),
         digest: format!("sha256:{}", "a".repeat(64)),
     };
     let migration = runtime
-        .one_shot_task(
-            artifact.clone(),
-            &TaskOperation::MigrateApply,
-            None,
-            None,
-            None,
-        )
+        .one_shot_task(artifact.clone(), &TaskOperation::MigrateApply, None)
         .unwrap();
 
     assert_eq!(
@@ -477,71 +450,9 @@ fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
             .any(|mount| mount.destination == Path::new("/var/lib/nazo_oauth/keys"))
     );
 
-    let conformance = runtime
-        .one_shot_task(
-            artifact.clone(),
-            &TaskOperation::ConformanceLeaseCleanup,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-    assert!(conformance.mounts.iter().any(|mount| {
-        mount.source == config.dependencies.database_url_file
-            && mount.destination == Path::new("/run/nazoauth-secrets/database-url")
-    }));
-    assert!(
-        !conformance
-            .mounts
-            .iter()
-            .any(|mount| mount.source == config.dependencies.migration_database_url_file)
-    );
-    assert!(
-        !conformance
-            .mounts
-            .iter()
-            .any(|mount| mount.destination == Path::new("/var/lib/nazo_oauth/keys"))
-    );
-
-    let onboarding = runtime
-        .one_shot_task(
-            artifact.clone(),
-            &TaskOperation::ConformanceOnboardingApply {
-                profile: "nazoauth-full".to_owned(),
-                bundle_schema: 3,
-                bundle_sha256: "b".repeat(64),
-                matrix_sha256: "c".repeat(64),
-                client_count: 1,
-                ttl_seconds: 600,
-            },
-            None,
-            Some(&work.path().join("conformance-bundle.json")),
-            Some(&work.path().join("conformance-output")),
-        )
-        .unwrap();
-    assert_eq!(onboarding.working_directory, Some(PathBuf::from("/app")));
-    assert_eq!(
-        onboarding
-            .environment
-            .get("NAZOAUTH_OPERATOR_OPENID4VC_DATA_ENCRYPTION_KEY_FILE"),
-        Some(&"/run/nazoauth-operator/openid4vc-data-encryption-key".to_owned())
-    );
-    assert!(onboarding.mounts.iter().any(|mount| {
-        mount.source == openid4vc_data_encryption_key
-            && mount.destination
-                == Path::new("/run/nazoauth-operator/openid4vc-data-encryption-key")
-            && mount.read_only
-    }));
-
     let public_jwk = work.path().join("public.jwk");
     let keys = runtime
-        .one_shot_task(
-            artifact,
-            &TaskOperation::KeysValidate,
-            Some(&public_jwk),
-            None,
-            None,
-        )
+        .one_shot_task(artifact, &TaskOperation::KeysValidate, Some(&public_jwk))
         .unwrap();
 
     assert!(
@@ -570,8 +481,6 @@ fn privileged_systemd_task_uses_a_read_only_secret_revision_credential() {
                 sha256: "a".repeat(64),
             },
             &TaskOperation::KeysValidate,
-            None,
-            None,
             None,
         )
         .unwrap();
@@ -687,8 +596,6 @@ fn privileged_task_fails_closed_without_required_config_mount() {
                 digest: format!("sha256:{}", "a".repeat(64)),
             },
             &TaskOperation::KeysList,
-            None,
-            None,
             None,
         )
         .unwrap_err();
