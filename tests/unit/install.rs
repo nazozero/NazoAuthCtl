@@ -1001,6 +1001,14 @@ fn tenant_resource_controller_upgrade_replaces_only_the_legacy_managed_binding()
         "external",
     )
     .unwrap();
+    assert_eq!(
+        config.runtime.environment.get("DEPLOYMENT_ID"),
+        Some(&config.operator.deployment_id)
+    );
+    assert_eq!(
+        config.runtime.environment.get("RUNTIME_INSTANCE_ID"),
+        Some(&config.runtime.runtime_instance_id)
+    );
     let target = PathBuf::from(TENANT_RESOURCE_CONTROLLER_CONTAINER_KEY_PATH);
     let binding = config
         .runtime

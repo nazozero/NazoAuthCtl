@@ -97,8 +97,15 @@ pub(super) fn build_config(
             )
         }));
     }
+    let operator = operator_config(config_dir, &options.control_root, &options.recovery_root)?;
+    let runtime_instance_id = uuid::Uuid::now_v7().to_string();
     let environment = if container {
         BTreeMap::from([
+            ("DEPLOYMENT_ID".to_owned(), operator.deployment_id.clone()),
+            (
+                "RUNTIME_INSTANCE_ID".to_owned(),
+                runtime_instance_id.clone(),
+            ),
             (
                 "DATABASE_URL_FILE".to_owned(),
                 "/run/nazoauth-secrets/database-url".to_owned(),
@@ -116,7 +123,6 @@ pub(super) fn build_config(
     } else {
         String::new()
     };
-    let operator = operator_config(config_dir, &options.control_root, &options.recovery_root)?;
     if container {
         mounts.push(mount(
             tenant_resource_controller_public_key_path(config_dir),
@@ -169,7 +175,7 @@ pub(super) fn build_config(
             dependency_backend,
             backend_command_override: None,
             container_name: format!("nazoauth-{name_suffix}-server"),
-            runtime_instance_id: uuid::Uuid::now_v7().to_string(),
+            runtime_instance_id,
             network: format!("nazoauth-{name_suffix}-network"),
             network_subnet: options.network_subnet.clone(),
             ip_address: options.runtime_ip.clone().unwrap_or_default(),

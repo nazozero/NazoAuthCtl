@@ -202,9 +202,19 @@ impl ConformanceSession {
             .context("failed to inspect the bound NazoAuth runtime")?;
         let runtime_identity =
             crate::discovery::verified_runtime_identity_for_uid(&observation, self.runtime_uid)?;
+        let runtime_identity_is_explicit = self.context.config.runtime.backend
+            == crate::deployment::RuntimeBackendKind::Systemd
+            || self
+                .context
+                .config
+                .runtime
+                .environment
+                .get("RUNTIME_INSTANCE_ID")
+                == Some(&self.context.config.runtime.runtime_instance_id);
         if runtime_identity.statement.deployment_id != self.context.config.operator.deployment_id
-            || runtime_identity.statement.runtime_instance_id
-                != self.context.config.runtime.runtime_instance_id
+            || (runtime_identity_is_explicit
+                && runtime_identity.statement.runtime_instance_id
+                    != self.context.config.runtime.runtime_instance_id)
             || runtime_identity.statement.issuer != self.context.config.runtime.expected_issuer
             || runtime_identity.statement.release != self.expected.embedded.release
             || runtime_identity.statement.revision != self.expected.embedded.revision
@@ -217,7 +227,7 @@ impl ConformanceSession {
                 .context("configured issuer is not a URL")?,
             deployment_id: self.context.config.operator.deployment_id.clone(),
             tenant_id: tenant_id.to_owned(),
-            runtime_instance_id: self.context.config.runtime.runtime_instance_id.clone(),
+            runtime_instance_id: runtime_identity.statement.runtime_instance_id,
             runtime_key_id: runtime_identity.statement.instance_key_id,
             runtime_public_key: runtime_identity.public_key,
             controller_key_id: expected_key_id,
