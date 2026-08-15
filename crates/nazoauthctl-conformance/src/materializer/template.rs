@@ -609,6 +609,13 @@ fn resolve_reference(
             token.as_str()
         )));
     }
+    if name == "target.ciba_user_approval_callback_url" {
+        return prepared
+            .ciba_user_approval_callback_url
+            .as_ref()
+            .map(|value| Value::String(value.to_string()))
+            .ok_or_else(|| MaterializerError::UnknownSecretReference(name.to_owned()));
+    }
     if name == "generated.applicant_email" {
         return Ok(Value::String(prepared.applicant_email.to_string()));
     }

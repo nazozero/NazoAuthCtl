@@ -161,10 +161,9 @@ const REQUIRED_PROVIDER_ACTIONS: [TenantResourceOperation; 3] = [
     TenantResourceOperation::Enumerate,
     TenantResourceOperation::Revoke,
 ];
-const REQUIRED_PROVIDER_RESOURCE_KINDS: [TenantResourceKind; 6] = [
+const REQUIRED_PROVIDER_RESOURCE_KINDS: [TenantResourceKind; 5] = [
     TenantResourceKind::OauthClient,
     TenantResourceKind::MtlsTrustAnchor,
-    TenantResourceKind::CibaDecisionBinding,
     TenantResourceKind::Openid4vcDataset,
     TenantResourceKind::Openid4vcTrustPolicy,
     TenantResourceKind::User,
@@ -624,7 +623,6 @@ mod tests {
             provider_resource_kinds: BTreeSet::from([
                 nazo_operator_protocol::TenantResourceKind::OauthClient,
                 nazo_operator_protocol::TenantResourceKind::MtlsTrustAnchor,
-                nazo_operator_protocol::TenantResourceKind::CibaDecisionBinding,
                 nazo_operator_protocol::TenantResourceKind::Openid4vcDataset,
                 nazo_operator_protocol::TenantResourceKind::Openid4vcTrustPolicy,
                 nazo_operator_protocol::TenantResourceKind::User,

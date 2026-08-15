@@ -796,6 +796,7 @@ fn is_builtin_reference(name: &str) -> bool {
             | "target.issuer"
             | "target.host"
             | "target.ciba_automated_decision_url"
+            | "target.ciba_user_approval_callback_url"
             | "target.suite"
             | "suite.origin"
     ) || name.starts_with("client.")

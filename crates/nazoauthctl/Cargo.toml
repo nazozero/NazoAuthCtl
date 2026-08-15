@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.103"
+base64 = "0.22.1"
 ctrlc = "3.5.2"
 nazoauthctl-core = { path = "../.." }
 nazoauthctl-conformance = { path = "../nazoauthctl-conformance" }
@@ -20,6 +21,7 @@ rand = "0.10.1"
 rpassword = "7.4.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+url = "2.5.8"
 uuid = "1.23.5"
 zeroize = "1.8.2"
 

@@ -1248,6 +1248,7 @@ name = "nazoauthctl"
 version = "0.1.50"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "ctrlc",
  "nazoauthctl-conformance",
  "nazoauthctl-core",
@@ -1255,6 +1256,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "url",
  "uuid",
  "zeroize",
 ]
@@ -1279,6 +1281,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "subtle",
  "thiserror",
  "time",
  "url",

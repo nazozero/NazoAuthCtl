@@ -533,6 +533,8 @@ pub(crate) struct RunInvocation {
     pub(crate) evidence_directory: Option<PathBuf>,
     pub(crate) proxy_trust_bundle: Option<PathBuf>,
     pub(crate) proxy_reload_executable: Option<PathBuf>,
+    pub(crate) ciba_user_approval_callback_url: Option<String>,
+    pub(crate) ciba_user_approval_listen: Option<std::net::SocketAddr>,
     pub(crate) groups: Vec<String>,
     pub(crate) plans: Vec<String>,
     pub(crate) poll_timeout: Duration,
@@ -599,6 +601,8 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
     let mut evidence_directory = None;
     let mut proxy_trust_bundle = None;
     let mut proxy_reload_executable = None;
+    let mut ciba_user_approval_callback_url = None;
+    let mut ciba_user_approval_listen = None;
     let mut groups = Vec::new();
     let mut plans = Vec::new();
     let mut poll_timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECONDS);
@@ -619,6 +623,8 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
             | "--evidence-dir"
             | "--proxy-trust-bundle"
             | "--proxy-reload-executable"
+            | "--ciba-user-approval-callback-url"
+            | "--ciba-user-approval-listen"
             | "--group"
             | "--plan"
             | "--poll-timeout"
@@ -654,6 +660,15 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
                     }
                     "--proxy-reload-executable" => {
                         set_once(&mut proxy_reload_executable, PathBuf::from(value), option)?;
+                    }
+                    "--ciba-user-approval-callback-url" => {
+                        set_once(&mut ciba_user_approval_callback_url, value, option)?;
+                    }
+                    "--ciba-user-approval-listen" => {
+                        let address = value.parse::<std::net::SocketAddr>().context(
+                            "--ciba-user-approval-listen must be an IP address and port",
+                        )?;
+                        set_once(&mut ciba_user_approval_listen, address, option)?;
                     }
                     "--group" => groups.push(value),
                     "--plan" => plans.push(value),
@@ -692,6 +707,11 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
     }
     if proxy_trust_bundle.is_some() != proxy_reload_executable.is_some() {
         bail!("--proxy-trust-bundle and --proxy-reload-executable must be specified together");
+    }
+    if ciba_user_approval_callback_url.is_some() != ciba_user_approval_listen.is_some() {
+        bail!(
+            "--ciba-user-approval-callback-url and --ciba-user-approval-listen must be specified together"
+        );
     }
     let trust_policy = trust_policy.context("--trust-policy is required")?;
     let artifact_cache = artifact_cache.context("--artifact-cache is required")?;
@@ -736,6 +756,8 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
         evidence_directory,
         proxy_trust_bundle,
         proxy_reload_executable,
+        ciba_user_approval_callback_url,
+        ciba_user_approval_listen,
         groups,
         plans,
         poll_timeout,
@@ -772,6 +794,9 @@ fn push_unique_vec(values: &mut Vec<String>, value: String, option: &str) -> any
 fn print_run_help() {
     println!(
         "Usage:\n  nazoauthctl [--deployment ID_OR_ALIAS] [--config PATH] conformance run --trust-policy PATH --artifact-cache PATH --artifact-digest SHA256 --tenant-id UUID [options]\n\nRequired:\n  --trust-policy PATH            Signed-artifact trust policy\n  --artifact-cache PATH          Private immutable artifact cache root\n  --artifact-digest SHA256       Exact cached compact-manifest digest (64 lowercase hex)\n  --tenant-id UUID               Canonical target tenant UUID\n\nOptions:\n  --suite URL                    OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN                  API token; visible in argv/shell history\n  --token-file PATH              Read token from a private regular file\n  --token-stdin                  Read token from stdin\n  --token-fd FD                  Read token from an inherited private descriptor\n  --webdriver URL                Dedicated W3C endpoint; repeat exactly once per job\n  --evidence-dir PATH            Commit a unique provider-bound private evidence bundle\n  --proxy-trust-bundle PATH      Atomically install this run's public client CAs\n  --proxy-reload-executable PATH Root-owned executable that validates/reloads the proxy\n  --group ID                     Run one signed Matrix group; repeat to select more\n  --plan ID                      Run one signed Matrix plan; repeat to select more\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
+    );
+    println!(
+        "  --ciba-user-approval-callback-url URL  Public HTTPS callback forwarded only to the local Ctl listener\n  --ciba-user-approval-listen ADDR       Loopback IP:port for that callback"
     );
 }
 
