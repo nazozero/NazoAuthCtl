@@ -642,20 +642,28 @@ impl<T: TenantResourceHttpTransport> TenantResourceClient<T> {
         &self,
     ) -> Result<TenantResourceCapabilitySession, TenantResourceClientError> {
         let nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
-        self.discover_capability_with_nonce_at(&nonce, Utc::now().timestamp())
+        self.discover_capability_inner(&nonce, None)
     }
 
     pub fn discover_capability_with_nonce(
         &self,
         nonce: &str,
     ) -> Result<TenantResourceCapabilitySession, TenantResourceClientError> {
-        self.discover_capability_with_nonce_at(nonce, Utc::now().timestamp())
+        self.discover_capability_inner(nonce, None)
     }
 
     pub fn discover_capability_with_nonce_at(
         &self,
         nonce: &str,
         now: i64,
+    ) -> Result<TenantResourceCapabilitySession, TenantResourceClientError> {
+        self.discover_capability_inner(nonce, Some(now))
+    }
+
+    fn discover_capability_inner(
+        &self,
+        nonce: &str,
+        fixed_now: Option<i64>,
     ) -> Result<TenantResourceCapabilitySession, TenantResourceClientError> {
         validate_discovery_request(&DiscoveryRequest {
             schema: nazo_operator_protocol::CONTROL_DISCOVERY_SCHEMA,
@@ -680,7 +688,8 @@ impl<T: TenantResourceHttpTransport> TenantResourceClient<T> {
             &self.config.runtime_public_key,
         )
         .map_err(map_signature_error)?;
-        validate_tenant_resource_capability(&capability, now)
+        let validation_now = fixed_now.unwrap_or_else(|| Utc::now().timestamp());
+        validate_tenant_resource_capability(&capability, validation_now)
             .map_err(|error| TenantResourceClientError::Forbidden(error.to_string()))?;
         validate_tenant_resource_capability_request_binding(
             &capability,

@@ -38,6 +38,7 @@ enum FakeMode {
     TamperedReceipt,
     ReplayExpired,
     ExpiredNoReplay,
+    NextSecondCapability,
     NextSecondReceipt,
     Status(u16),
 }
@@ -93,8 +94,19 @@ impl TenantResourceHttpTransport for FakeTransport {
             };
             let baseline_manifest =
                 canonical_tenant_resource_manifest_sha256(&[baseline_identity]).unwrap();
+            let capability_now = if matches!(self.mode, FakeMode::NextSecondCapability) {
+                let target = unix_now() + 1;
+                while unix_now() < target {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                target
+            } else {
+                self.now
+            };
             let (issued_at, expires_at) = if matches!(self.mode, FakeMode::ExpiredCapability) {
                 (self.now - 120, self.now - 60)
+            } else if matches!(self.mode, FakeMode::NextSecondCapability) {
+                (capability_now, capability_now + 60)
             } else {
                 (self.now - 1, self.now + 59)
             };
@@ -433,6 +445,18 @@ fn live_execution_validates_receipt_with_the_post_response_clock() {
 
     let receipt = client.execute_prepared_live(&prepared).unwrap();
     assert!(receipt.receipt().completed_at > now);
+}
+
+#[test]
+fn live_discovery_validates_capability_with_the_post_response_clock() {
+    let now = unix_now();
+    let (client, _) = client_at(FakeMode::NextSecondCapability, now);
+
+    let session = client
+        .discover_capability_with_nonce(&URL_SAFE_NO_PAD.encode([9; 32]))
+        .unwrap();
+
+    assert!(session.capability.issued_at > now);
 }
 
 #[test]
