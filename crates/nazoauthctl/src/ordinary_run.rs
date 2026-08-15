@@ -650,6 +650,11 @@ struct CleanupEvidence {
     receipts: Vec<TenantResourceReceiptResult>,
 }
 
+fn cleanup_change_set_id(request_jti: &str, phase: &str, capability_sha256: &str) -> String {
+    let generation = capability_sha256.chars().take(16).collect::<String>();
+    format!("{request_jti}-cleanup-{phase}-{generation}")
+}
+
 fn cleanup_run_resources<T>(
     client: &TenantResourceClient<T>,
     mut recovery: nazoauthctl_conformance::ConformanceRecoveryGuard,
@@ -658,15 +663,15 @@ where
     T: nazoauthctl_core::tenant_resources::TenantResourceHttpTransport,
 {
     let capability = client.discover_capability()?;
+    let cleanup_capability_sha256 = capability.compact_sha256();
+    let request_jti = recovery
+        .tenant_resource_binding()
+        .context("missing ordinary recovery binding")?
+        .request_jti
+        .clone();
     let listed = client.enumerate(
         &capability,
-        &format!(
-            "{}-cleanup-observe",
-            recovery
-                .tenant_resource_binding()
-                .context("missing ordinary recovery binding")?
-                .request_jti
-        ),
+        &cleanup_change_set_id(&request_jti, "observe", &cleanup_capability_sha256),
         recovery
             .tenant_resource_binding()
             .context("missing ordinary recovery binding")?
@@ -722,13 +727,7 @@ where
             nazoauthctl_core::tenant_resources::tenant_resource_manifest_sha256(&final_active)?;
         let revoke = client.revoke(
             &capability,
-            &format!(
-                "{}-cleanup-revoke",
-                recovery
-                    .tenant_resource_binding()
-                    .context("missing ordinary recovery binding")?
-                    .request_jti
-            ),
+            &cleanup_change_set_id(&request_jti, "revoke", &cleanup_capability_sha256),
             &revoke_change_set_sha256,
             present.clone(),
             &final_digest,
@@ -1135,6 +1134,23 @@ mod tests {
 
         let missing = BTreeSet::from([("oidc".to_owned(), "missing-signed-plan".to_owned())]);
         assert!(select_artifact_matrix_for_run(filtered, &missing).is_err());
+    }
+
+    #[test]
+    fn cleanup_change_sets_are_scoped_to_the_discovered_capability_generation() {
+        let first = cleanup_change_set_id(
+            "tenant-resource-01a00401-6fee-7063-94bd-26c86029d4c2",
+            "observe",
+            &"1".repeat(64),
+        );
+        let second = cleanup_change_set_id(
+            "tenant-resource-01a00401-6fee-7063-94bd-26c86029d4c2",
+            "observe",
+            &"2".repeat(64),
+        );
+
+        assert_ne!(first, second);
+        assert!(first.len() <= 128);
     }
 
     #[test]
