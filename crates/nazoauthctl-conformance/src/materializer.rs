@@ -1367,6 +1367,10 @@ pub struct ArtifactMaterializationBinding<'a> {
     pub suite_origin: &'a Origin,
     pub request_jti: &'a str,
     pub credential_trust_anchor_pem: &'a str,
+    /// Deployment-owned RFC 7591 initial access token.  Ordinary runs may
+    /// expose this existing standards profile credential to a signed plan,
+    /// but must never mint a lease-scoped replacement for it.
+    pub dynamic_registration_initial_access_token: Option<&'a str>,
     /// Absolute Unix expiry for ordinary CIBA decision bindings.  It is
     /// intentionally optional so non-CIBA ordinary runs do not need a clock
     /// value; a signed descriptor which expands a CIBA decision reference
@@ -1375,6 +1379,14 @@ pub struct ArtifactMaterializationBinding<'a> {
 }
 
 pub struct DescriptorMaterializer;
+
+enum ProfileMaterialization<'a> {
+    Legacy,
+    Ordinary {
+        dynamic_registration_initial_access_token: Option<&'a str>,
+        ciba_decision_expires_at: Option<i64>,
+    },
+}
 
 impl DescriptorMaterializer {
     pub fn from_bytes(bytes: &[u8]) -> Result<MatrixDescriptor, MaterializerError> {
@@ -1433,8 +1445,11 @@ impl DescriptorMaterializer {
             binding.suite_origin,
             binding.request_jti,
             binding.credential_trust_anchor_pem,
-            false,
-            binding.ciba_decision_expires_at,
+            ProfileMaterialization::Ordinary {
+                dynamic_registration_initial_access_token: binding
+                    .dynamic_registration_initial_access_token,
+                ciba_decision_expires_at: binding.ciba_decision_expires_at,
+            },
         )
     }
 
@@ -1507,8 +1522,7 @@ impl DescriptorMaterializer {
             suite_origin,
             request_jti,
             credential_trust_anchor_pem,
-            true,
-            None,
+            ProfileMaterialization::Legacy,
         )?;
         let bundle = build_secure_onboarding_bundle(&prepared)?;
         prepared.bundle_digest = Some(bundle.digest().to_owned());
@@ -1521,9 +1535,23 @@ impl DescriptorMaterializer {
         suite_origin: &Origin,
         request_jti: &str,
         credential_trust_anchor_pem: &str,
-        include_legacy_profile_tokens: bool,
-        ciba_decision_expires_at: Option<i64>,
+        profile_materialization: ProfileMaterialization<'_>,
     ) -> Result<PreparedMaterialization, MaterializerError> {
+        let (
+            include_legacy_profile_tokens,
+            ordinary_dynamic_registration_initial_access_token,
+            ciba_decision_expires_at,
+        ) = match profile_materialization {
+            ProfileMaterialization::Legacy => (true, None, None),
+            ProfileMaterialization::Ordinary {
+                dynamic_registration_initial_access_token,
+                ciba_decision_expires_at,
+            } => (
+                false,
+                dynamic_registration_initial_access_token,
+                ciba_decision_expires_at,
+            ),
+        };
         validate_descriptor(&descriptor)?;
         validate_target_issuer(target_issuer)?;
         validate_request_jti(request_jti)?;
@@ -1592,14 +1620,22 @@ impl DescriptorMaterializer {
         let needs_ciba_token =
             descriptor_requires_reference(&descriptor, "generated.ciba_automated_decision_token")
                 || descriptor_requires_reference(&descriptor, "target.ciba_automated_decision_url");
-        if !include_legacy_profile_tokens && needs_dynamic_token {
+        if !include_legacy_profile_tokens
+            && needs_dynamic_token
+            && ordinary_dynamic_registration_initial_access_token.is_none()
+        {
             return Err(MaterializerError::InvalidField(
-                "ordinary_tenant_resource_profile_tokens",
+                "dynamic_registration_initial_access_token",
             ));
         }
-        let dynamic_registration_initial_access_token = (include_legacy_profile_tokens
-            && needs_dynamic_token)
-            .then(|| Zeroizing::new(random_secret(32)));
+        let dynamic_registration_initial_access_token = if include_legacy_profile_tokens {
+            needs_dynamic_token.then(|| Zeroizing::new(random_secret(32)))
+        } else if needs_dynamic_token {
+            ordinary_dynamic_registration_initial_access_token
+                .map(|token| Zeroizing::new(token.to_owned()))
+        } else {
+            None
+        };
         let ciba_automated_decision_token = (include_legacy_profile_tokens && needs_ciba_token)
             .then(|| Zeroizing::new(random_secret(32)));
         let (ciba_decision_tokens, ciba_plan_clients, ciba_decision_expires_at) =
@@ -3170,6 +3206,7 @@ mod tests {
             suite_origin: &suite_origin,
             request_jti: request_jti(),
             credential_trust_anchor_pem: test_trust_anchor(),
+            dynamic_registration_initial_access_token: None,
             ciba_decision_expires_at: None,
         };
         let (prepared, bundle) =
@@ -3192,7 +3229,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_artifact_preparation_rejects_legacy_profile_tokens() {
+    fn ordinary_artifact_preparation_uses_only_the_deployment_dcr_token() {
         let descriptor = descriptor();
         let mut matrix = crate::artifact::OidfArtifactMatrix {
             schema: crate::OIDF_MATRIX_SCHEMA_VERSION,
@@ -3251,15 +3288,39 @@ mod tests {
                 suite_origin: &suite_origin,
                 request_jti: request_jti(),
                 credential_trust_anchor_pem: test_trust_anchor(),
+                dynamic_registration_initial_access_token: None,
                 ciba_decision_expires_at: None,
             },
         );
         assert!(matches!(
             result,
             Err(MaterializerError::InvalidField(
-                "ordinary_tenant_resource_profile_tokens"
+                "dynamic_registration_initial_access_token"
             ))
         ));
+
+        let prepared = DescriptorMaterializer::prepare_tenant_resources_from_artifact_matrix(
+            &matrix,
+            ArtifactMaterializationBinding {
+                artifact_source_release: "test",
+                artifact_source_digest: &artifact_source_digest,
+                raw_matrix_sha256: &raw_matrix_sha256,
+                target_issuer: "https://issuer.example",
+                suite_origin: &suite_origin,
+                request_jti: request_jti(),
+                credential_trust_anchor_pem: test_trust_anchor(),
+                dynamic_registration_initial_access_token: Some("deployment-dcr-token"),
+                ciba_decision_expires_at: None,
+            },
+        )
+        .expect("ordinary DCR preparation");
+        assert_eq!(
+            prepared
+                .dynamic_registration_initial_access_token
+                .as_ref()
+                .map(|token| token.as_str()),
+            Some("deployment-dcr-token")
+        );
     }
 
     fn descriptor_with_openid4vc_plan(
@@ -4751,8 +4812,10 @@ mod tests {
             &suite(),
             request_jti(),
             test_trust_anchor(),
-            false,
-            Some(expires_at),
+            ProfileMaterialization::Ordinary {
+                dynamic_registration_initial_access_token: None,
+                ciba_decision_expires_at: Some(expires_at),
+            },
         )
         .expect("ordinary CIBA preparation")
     }
@@ -4865,8 +4928,10 @@ mod tests {
             &suite(),
             request_jti(),
             test_trust_anchor(),
-            false,
-            None,
+            ProfileMaterialization::Ordinary {
+                dynamic_registration_initial_access_token: None,
+                ciba_decision_expires_at: None,
+            },
         );
         assert_eq!(
             missing_expiry.err().expect("missing expiry must fail"),
@@ -4895,14 +4960,16 @@ mod tests {
             &suite(),
             request_jti(),
             test_trust_anchor(),
-            false,
-            Some(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("clock")
-                    .as_secs() as i64
-                    + 3600,
-            ),
+            ProfileMaterialization::Ordinary {
+                dynamic_registration_initial_access_token: None,
+                ciba_decision_expires_at: Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("clock")
+                        .as_secs() as i64
+                        + 3600,
+                ),
+            },
         );
         assert_eq!(
             result.err().expect("ambiguous CIBA client must fail"),

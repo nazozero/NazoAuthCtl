@@ -132,6 +132,9 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let deployment_trust_anchor = session
         .openid4vc_request_object_trust_anchor_pem()
         .context("failed to load the deployment OpenID4VC trust anchor")?;
+    let dynamic_registration_initial_access_token = session
+        .dynamic_registration_initial_access_token()
+        .context("failed to load the deployment RFC 7591 initial access token")?;
     let prepared = DescriptorMaterializer::prepare_tenant_resources_from_artifact_matrix(
         &matrix,
         ArtifactMaterializationBinding {
@@ -142,6 +145,9 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             suite_origin: &suite_origin,
             request_jti: &request_jti,
             credential_trust_anchor_pem: &deployment_trust_anchor,
+            dynamic_registration_initial_access_token: Some(
+                dynamic_registration_initial_access_token.as_str(),
+            ),
             ciba_decision_expires_at,
         },
     )
