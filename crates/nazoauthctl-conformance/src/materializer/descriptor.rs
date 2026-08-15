@@ -866,6 +866,20 @@ pub(super) fn is_placeholder(value: &str) -> bool {
     value.starts_with("{{") && value.ends_with("}}") && parse_placeholder(value).is_ok()
 }
 
+/// Validate a signed-artifact placeholder against the same reference grammar
+/// used by descriptor validation and runtime materialization.  The artifact
+/// layer must not maintain a second, narrower list: real matrices contain
+/// target URL paths as well as client, generated, onboarding, and chained
+/// secret references.
+pub(crate) fn artifact_placeholder_is_valid(
+    value: &str,
+    bindings: &BTreeMap<String, String>,
+) -> bool {
+    parse_placeholder(value).is_ok_and(|reference| {
+        validate_binding_reference(reference, bindings, &mut BTreeSet::new()).is_ok()
+    })
+}
+
 fn validate_crypto_policy(policy: &CryptoPolicy) -> Result<(), MaterializerError> {
     if !matches!(policy.rsa_bits, 2048 | 3072 | 4096)
         || policy.ec_curve != "P-256"

@@ -58,6 +58,7 @@ use crypto::{
     generate_client_crypto, random_hex, random_secret, random_tx_code, registration_requires_mtls,
     validate_materialized_mtls_registration,
 };
+pub(crate) use descriptor::artifact_placeholder_is_valid;
 pub use descriptor::{
     CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DescriptorGroup, DescriptorPlan, DescriptorSource,
     DescriptorVariant, MAX_DESCRIPTOR_BYTES, MatrixDescriptor, RoleRequirement,

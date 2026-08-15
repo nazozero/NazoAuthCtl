@@ -625,7 +625,7 @@ mod tests {
                         clients: 2,
                         wall_clock_seconds: 300,
                     },
-                    config_template: serde_json::json!({"alias":"{{run.alias}}"}),
+                    config_template: serde_json::json!({"alias":"{{run.alias.oidc-core-p001}}"}),
                     variant: BTreeMap::new(),
                     required_capabilities: vec!["nazoauth.client.create".to_owned()],
                     expected_results: BTreeMap::new(),

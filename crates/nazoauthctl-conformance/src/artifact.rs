@@ -595,7 +595,8 @@ fn validate_matrix(
         validate_identifier(&group.id, 128).map_err(ArtifactError::MatrixPolicy)?;
         validate_identifier(&group.profile, 128).map_err(ArtifactError::MatrixPolicy)?;
         validate_identifier(&group.variant.id, 128).map_err(ArtifactError::MatrixPolicy)?;
-        validate_variant(&group.variant.values).map_err(ArtifactError::MatrixPolicy)?;
+        validate_variant(&group.variant.values, &Default::default())
+            .map_err(ArtifactError::MatrixPolicy)?;
         if !group_ids.insert(group.id.as_str()) || group.plans.is_empty() {
             return Err(ArtifactError::MatrixPolicy(
                 "matrix groups must be unique and non-empty",
@@ -632,7 +633,8 @@ fn validate_matrix(
                 .ok_or(ArtifactError::MatrixPolicy(
                     "matrix wall-clock budget overflows",
                 ))?;
-            validate_variant(&plan.variant).map_err(ArtifactError::MatrixPolicy)?;
+            validate_variant(&plan.variant, &plan.secret_bindings)
+                .map_err(ArtifactError::MatrixPolicy)?;
             validate_capabilities(&plan.required_capabilities)
                 .map_err(ArtifactError::MatrixPolicy)?;
             for capability in &plan.required_capabilities {
@@ -658,7 +660,7 @@ fn validate_matrix(
                 ));
             }
             let mut nodes = 0usize;
-            validate_template(&plan.config_template, 0, &mut nodes)
+            validate_template(&plan.config_template, &plan.secret_bindings, 0, &mut nodes)
                 .map_err(ArtifactError::MatrixPolicy)?;
         }
     }
@@ -698,7 +700,12 @@ fn validate_plan_resource_budget(
     Ok(())
 }
 
-fn validate_template(value: &Value, depth: usize, nodes: &mut usize) -> Result<(), &'static str> {
+fn validate_template(
+    value: &Value,
+    bindings: &std::collections::BTreeMap<String, String>,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<(), &'static str> {
     *nodes = nodes.saturating_add(1);
     if depth > 16 || *nodes > 4096 {
         return Err("matrix template structure is too large");
@@ -710,27 +717,28 @@ fn validate_template(value: &Value, depth: usize, nodes: &mut usize) -> Result<(
                     return Err("matrix template contains an invalid key");
                 }
                 match sensitive_field(key) {
-                    Some(SensitiveField::PlaceholderOnly) if !matches!(child, Value::String(text) if valid_placeholder(text)) =>
+                    Some(SensitiveField::PlaceholderOnly) if !matches!(child, Value::String(text) if valid_placeholder(text, bindings)) =>
                     {
                         return Err("matrix template embeds sensitive material");
                     }
-                    Some(SensitiveField::JwkContainer) if matches!(child, Value::String(text) if !valid_placeholder(text)) =>
+                    Some(SensitiveField::JwkContainer) if matches!(child, Value::String(text) if !valid_placeholder(text, bindings)) =>
                     {
                         return Err("matrix template embeds serialized sensitive material");
                     }
                     _ => {}
                 }
-                validate_template(child, depth + 1, nodes)?;
+                validate_template(child, bindings, depth + 1, nodes)?;
             }
         }
         Value::Array(array) => {
             for child in array {
-                validate_template(child, depth + 1, nodes)?;
+                validate_template(child, bindings, depth + 1, nodes)?;
             }
         }
         Value::String(text) => {
             if text.len() > 16 * 1024
-                || ((text.contains("{{") || text.contains("}}")) && !valid_placeholder(text))
+                || ((text.contains("{{") || text.contains("}}"))
+                    && !valid_placeholder(text, bindings))
                 || contains_private_key_pem(text)
             {
                 return Err("matrix template contains an invalid string");
@@ -738,7 +746,7 @@ fn validate_template(value: &Value, depth: usize, nodes: &mut usize) -> Result<(
             if matches!(text.trim_start().as_bytes().first(), Some(b'{' | b'['))
                 && let Ok(serialized) = serde_json::from_str::<Value>(text)
             {
-                validate_template(&serialized, depth + 1, nodes)?;
+                validate_template(&serialized, bindings, depth + 1, nodes)?;
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -746,35 +754,8 @@ fn validate_template(value: &Value, depth: usize, nodes: &mut usize) -> Result<(
     Ok(())
 }
 
-fn valid_placeholder(value: &str) -> bool {
-    let Some(inner) = value
-        .strip_prefix("{{")
-        .and_then(|value| value.strip_suffix("}}"))
-    else {
-        return false;
-    };
-    if inner.is_empty() || inner.len() > 256 {
-        return false;
-    }
-    let mut segments = inner.split('.');
-    if !matches!(
-        segments.next(),
-        Some("target" | "suite" | "resource" | "run")
-    ) {
-        return false;
-    }
-    let mut path_segments = 0usize;
-    for segment in segments {
-        if segment.is_empty()
-            || !segment
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-'))
-        {
-            return false;
-        }
-        path_segments += 1;
-    }
-    path_segments > 0
+fn valid_placeholder(value: &str, bindings: &std::collections::BTreeMap<String, String>) -> bool {
+    value.len() <= 260 && crate::materializer::artifact_placeholder_is_valid(value, bindings)
 }
 
 #[derive(Clone, Copy)]
@@ -830,6 +811,7 @@ fn validate_capabilities(values: &[String]) -> Result<(), &'static str> {
 
 fn validate_variant(
     values: &std::collections::BTreeMap<String, String>,
+    bindings: &std::collections::BTreeMap<String, String>,
 ) -> Result<(), &'static str> {
     if values.len() > 64 {
         return Err("matrix variant exceeds policy");
@@ -837,7 +819,7 @@ fn validate_variant(
     for (key, value) in values {
         validate_identifier(key, 128)?;
         if sensitive_field(key).is_some() {
-            if !valid_placeholder(value) {
+            if !valid_placeholder(value, bindings) {
                 return Err("matrix variant embeds sensitive material");
             }
         } else {
@@ -997,9 +979,9 @@ mod tests {
                         wall_clock_seconds: 600,
                     },
                     config_template: serde_json::json!({
-                        "alias": "{{run.alias}}",
-                        "server": {"discoveryUrl": "{{target.discovery_url}}"},
-                        "client_secret": "{{resource.client.secret}}"
+                        "alias": "{{run.alias.oidc-core-p001}}",
+                        "server": {"discoveryUrl": "{{target.url./.well-known/openid-configuration}}"},
+                        "client_secret": "{{client.oidf-basic-client.client_secret}}"
                     }),
                     variant: Default::default(),
                     required_capabilities: vec!["nazoauth.client.create".to_owned()],
@@ -1380,8 +1362,25 @@ mod tests {
 
     #[test]
     fn sensitive_schema_rejects_normalized_variant_serialized_and_pem_bypasses() {
-        assert!(!valid_placeholder("{{resource.}}"));
-        assert!(!valid_placeholder("{{resource..secret}}"));
+        let empty_bindings = std::collections::BTreeMap::new();
+        assert!(!valid_placeholder("{{resource.}}", &empty_bindings));
+        assert!(!valid_placeholder("{{resource..secret}}", &empty_bindings));
+        assert!(valid_placeholder(
+            "{{target.url./.well-known/openid-configuration}}",
+            &empty_bindings
+        ));
+        assert!(valid_placeholder(
+            "{{client.oidf-basic-client.client_secret}}",
+            &empty_bindings
+        ));
+        assert!(valid_placeholder(
+            "{{generated.applicant_password}}",
+            &empty_bindings
+        ));
+        assert!(!valid_placeholder(
+            "{{generated.unknown_private_value}}",
+            &empty_bindings
+        ));
         let rejects = |artifact_matrix: OidfArtifactMatrix| {
             let bytes = serde_json::to_vec(&artifact_matrix).expect("matrix");
             let result = verify_oidf_artifact(
@@ -1431,7 +1430,7 @@ mod tests {
         let mut placeholder_variant = baseline();
         placeholder_variant.groups[0].plans[0].variant.insert(
             "clientSecret".to_owned(),
-            "{{resource.client.secret}}".to_owned(),
+            "{{client.oidf-basic-client.client_secret}}".to_owned(),
         );
         let bytes = serde_json::to_vec(&placeholder_variant).expect("matrix");
         assert!(
