@@ -66,16 +66,8 @@ fn operation_results_are_machine_readable_json() {
     let value: serde_json::Value = serde_json::from_str(
         &operation_result_json(&operator::OperationResult {
             request_id: "request-test".to_owned(),
-            result: nazo_operator_protocol::TaskResult::ConformanceLeaseCreated {
-                lease: nazo_operator_protocol::ConformanceLeaseSummary {
-                    lease_id: "0198f5df-4df8-7d9f-8f6a-5c2b2917cc8a".to_owned(),
-                    profile: "openid4vc".to_owned(),
-                    material_sha256: "a".repeat(64),
-                    created_at: 1,
-                    expires_at: 2,
-                    revoked_at: None,
-                    cleaned_at: None,
-                },
+            result: nazo_operator_protocol::TaskResult::KeyList {
+                keyset_revision: "test-keyset".to_owned(),
             },
             final_receipt: PathBuf::from("/audit/request-test.json"),
         })
@@ -85,10 +77,7 @@ fn operation_results_are_machine_readable_json() {
 
     assert_eq!(value["request_id"], "request-test");
     assert_eq!(value["receipt"], "/audit/request-test.json");
-    assert_eq!(
-        value["result"]["lease"]["lease_id"],
-        "0198f5df-4df8-7d9f-8f6a-5c2b2917cc8a"
-    );
+    assert_eq!(value["result"]["keyset_revision"], "test-keyset");
 }
 
 fn manifest(version: &str, revision: char) -> ReleaseManifest {
