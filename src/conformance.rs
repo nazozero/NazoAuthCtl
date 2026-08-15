@@ -200,7 +200,8 @@ impl ConformanceSession {
         let observation = crate::runtime_backend::backend(self.context.config.runtime.backend)
             .inspect(object_reference)
             .context("failed to inspect the bound NazoAuth runtime")?;
-        let runtime_identity = crate::discovery::verified_runtime_identity(&observation)?;
+        let runtime_identity =
+            crate::discovery::verified_runtime_identity_for_uid(&observation, self.runtime_uid)?;
         if runtime_identity.statement.deployment_id != self.context.config.operator.deployment_id
             || runtime_identity.statement.runtime_instance_id
                 != self.context.config.runtime.runtime_instance_id
