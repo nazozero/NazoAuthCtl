@@ -206,8 +206,7 @@ impl TenantResourceHttpTransport for FakeTransport {
                         resource_id: resource.resource_id.clone(),
                         public_id: format!("client-{}", resource.resource_id),
                     }),
-                    TenantResourceKind::CibaDecisionBinding
-                    | TenantResourceKind::MtlsTrustAnchor
+                    TenantResourceKind::MtlsTrustAnchor
                     | TenantResourceKind::Openid4vcDataset
                     | TenantResourceKind::Openid4vcTrustPolicy => None,
                 })

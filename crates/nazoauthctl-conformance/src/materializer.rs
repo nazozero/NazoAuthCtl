@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(all(test, unix))]
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nazo_operator_protocol::{
@@ -201,12 +200,15 @@ pub struct PreparedMaterialization {
     attestation: Option<GeneratedAttestationMaterial>,
     dynamic_registration_initial_access_token: Option<Zeroizing<String>>,
     ciba_automated_decision_token: Option<Zeroizing<String>>,
+    /// Controller-owned external callback URL for ordinary CIBA approval. It
+    /// is intentionally private because it carries a run-scoped capability
+    /// token in its query string; NazoAuth never receives or stores it.
+    ciba_user_approval_callback_url: Option<Zeroizing<String>>,
     /// Ordinary tenant-resource CIBA bindings are keyed by the logical OAuth
     /// client. Every client keeps an independent provider-side binding, while
     /// all selected CIBA clients share the same run-scoped transport token so
     /// one Suite decision URL can be fenced by the actual auth request client.
     ciba_decision_tokens: BTreeMap<String, Zeroizing<String>>,
-    ciba_decision_expires_at: Option<i64>,
     clients: BTreeMap<String, PreparedClient>,
 }
 
@@ -218,6 +220,7 @@ impl Zeroize for PreparedMaterialization {
         self.attestation.zeroize();
         self.dynamic_registration_initial_access_token.zeroize();
         self.ciba_automated_decision_token.zeroize();
+        self.ciba_user_approval_callback_url.zeroize();
         for token in self.ciba_decision_tokens.values_mut() {
             token.zeroize();
         }
@@ -353,7 +356,6 @@ impl PreparedMaterialization {
             1usize
                 .saturating_add(self.clients.len())
                 .saturating_add(self.clients.len())
-                .saturating_add(self.ciba_decision_tokens.len())
                 .saturating_add(self.descriptor.openid4vc_credential_datasets.len())
                 .saturating_add(1),
         );
@@ -403,34 +405,6 @@ impl PreparedMaterialization {
                     serde_json::json!({
                         "client_resource_id": client_resource_id,
                         "certificate_pem": client.mtls_ca_certificate.as_str(),
-                    }),
-                )?;
-            }
-        }
-
-        if !self.ciba_decision_tokens.is_empty() {
-            let expires_at = self
-                .ciba_decision_expires_at
-                .ok_or(MaterializerError::InvalidField("ciba_decision_expires_at"))?;
-            validate_ciba_decision_expiry(expires_at)?;
-            for (logical_client_id, decision_token) in &self.ciba_decision_tokens {
-                let client_resource_id =
-                    run_scoped_resource_id("oauth-client", logical_client_id, &run_suffix)?;
-                let binding_resource_id = run_scoped_resource_id(
-                    "ciba-decision-binding",
-                    logical_client_id,
-                    &run_suffix,
-                )?;
-                push_ciba_binding_resource(
-                    &mut resources,
-                    &mut payload_total,
-                    binding_resource_id,
-                    serde_json::json!({
-                        "schema": 1,
-                        "client_resource_id": client_resource_id,
-                        "user_resource_id": user_resource_id,
-                        "decision_token": decision_token.as_str(),
-                        "expires_at": expires_at,
                     }),
                 )?;
             }
@@ -931,8 +905,7 @@ fn validate_apply_mappings(
                     return Err(MaterializerError::DuplicateClientMapping);
                 }
             }
-            TenantResourceKind::CibaDecisionBinding
-            | TenantResourceKind::MtlsTrustAnchor
+            TenantResourceKind::MtlsTrustAnchor
             | TenantResourceKind::Openid4vcDataset
             | TenantResourceKind::Openid4vcTrustPolicy => {
                 return Err(MaterializerError::TenantResourceReceiptMismatch(
@@ -979,87 +952,6 @@ fn push_manifest_resource(
     payload_bytes.zeroize();
     resources.push(TenantResourceManifestResource {
         kind,
-        resource_id,
-        payload_base64url,
-        digest,
-    });
-    Ok(())
-}
-
-/// Push the one manifest payload which intentionally contains a short-lived
-/// controller secret.  Generic public-payload validation rejects token-like
-/// keys; this narrow path validates the exact CIBA binding schema instead and
-/// keeps the serialized value inside the zeroizing manifest bytes.
-fn push_ciba_binding_resource(
-    resources: &mut Vec<TenantResourceManifestResource>,
-    payload_total: &mut usize,
-    resource_id: String,
-    mut payload: Value,
-) -> Result<(), MaterializerError> {
-    validate_resource_id(&resource_id)?;
-    let object = payload
-        .as_object()
-        .ok_or(MaterializerError::InvalidField("ciba_decision_binding"))?;
-    if object.get("schema").and_then(Value::as_u64) != Some(1) {
-        return Err(MaterializerError::InvalidField(
-            "ciba_decision_binding.schema",
-        ));
-    }
-    let client_resource_id = object
-        .get("client_resource_id")
-        .and_then(Value::as_str)
-        .ok_or(MaterializerError::InvalidField(
-            "ciba_decision_binding.client_resource_id",
-        ))?;
-    let user_resource_id = object
-        .get("user_resource_id")
-        .and_then(Value::as_str)
-        .ok_or(MaterializerError::InvalidField(
-            "ciba_decision_binding.user_resource_id",
-        ))?;
-    validate_resource_id(client_resource_id)?;
-    validate_resource_id(user_resource_id)?;
-    let decision_token = object.get("decision_token").and_then(Value::as_str).ok_or(
-        MaterializerError::InvalidField("ciba_decision_binding.decision_token"),
-    )?;
-    if decision_token.len() < 32
-        || decision_token.len() > MAX_TENANT_RESOURCE_PASSWORD_BYTES
-        || decision_token.chars().any(char::is_control)
-    {
-        return Err(MaterializerError::InvalidField(
-            "ciba_decision_binding.decision_token",
-        ));
-    }
-    let expires_at =
-        object
-            .get("expires_at")
-            .and_then(Value::as_i64)
-            .ok_or(MaterializerError::InvalidField(
-                "ciba_decision_binding.expires_at",
-            ))?;
-    validate_ciba_decision_expiry(expires_at)?;
-
-    let payload_bytes = serde_json::to_vec(&payload).map_err(|_| MaterializerError::Encoding)?;
-    if payload_bytes.is_empty() || payload_bytes.len() > MAX_TENANT_RESOURCE_PAYLOAD_BYTES {
-        return Err(if payload_bytes.len() > MAX_TENANT_RESOURCE_PAYLOAD_BYTES {
-            MaterializerError::Oversize
-        } else {
-            MaterializerError::InvalidField("tenant_resource_manifest.payload")
-        });
-    }
-    *payload_total = payload_total
-        .checked_add(payload_bytes.len())
-        .ok_or(MaterializerError::Oversize)?;
-    if *payload_total > MAX_TENANT_RESOURCE_PAYLOAD_TOTAL_BYTES {
-        return Err(MaterializerError::Oversize);
-    }
-    let digest = digest_hex(&payload_bytes);
-    let payload_base64url = Zeroizing::new(URL_SAFE_NO_PAD.encode(&payload_bytes));
-    zeroize_json_value(&mut payload);
-    let mut payload_bytes = payload_bytes;
-    payload_bytes.zeroize();
-    resources.push(TenantResourceManifestResource {
-        kind: TenantResourceKind::CibaDecisionBinding,
         resource_id,
         payload_base64url,
         digest,
@@ -1367,11 +1259,11 @@ pub struct ArtifactMaterializationBinding<'a> {
     /// expose this existing standards profile credential to a signed plan,
     /// but must never mint a lease-scoped replacement for it.
     pub dynamic_registration_initial_access_token: Option<&'a str>,
-    /// Absolute Unix expiry for ordinary CIBA decision bindings.  It is
-    /// intentionally optional so non-CIBA ordinary runs do not need a clock
-    /// value; a signed descriptor which expands a CIBA decision reference
-    /// must provide it and is validated against the 24-hour provider window.
-    pub ciba_decision_expires_at: Option<i64>,
+    /// Controller-owned HTTPS callback used only by the external driver for
+    /// a normal user CIBA decision. Ordinary materialization rejects legacy
+    /// server-side automated-decision placeholders instead of translating
+    /// them.
+    pub ciba_user_approval_callback_url: Option<&'a str>,
 }
 
 pub struct DescriptorMaterializer;
@@ -1380,7 +1272,7 @@ enum ProfileMaterialization<'a> {
     Legacy,
     Ordinary {
         dynamic_registration_initial_access_token: Option<&'a str>,
-        ciba_decision_expires_at: Option<i64>,
+        ciba_user_approval_callback_url: Option<&'a str>,
     },
 }
 
@@ -1444,7 +1336,7 @@ impl DescriptorMaterializer {
             ProfileMaterialization::Ordinary {
                 dynamic_registration_initial_access_token: binding
                     .dynamic_registration_initial_access_token,
-                ciba_decision_expires_at: binding.ciba_decision_expires_at,
+                ciba_user_approval_callback_url: binding.ciba_user_approval_callback_url,
             },
         )
     }
@@ -1536,16 +1428,16 @@ impl DescriptorMaterializer {
         let (
             include_legacy_profile_tokens,
             ordinary_dynamic_registration_initial_access_token,
-            ciba_decision_expires_at,
+            ciba_user_approval_callback_url,
         ) = match profile_materialization {
             ProfileMaterialization::Legacy => (true, None, None),
             ProfileMaterialization::Ordinary {
                 dynamic_registration_initial_access_token,
-                ciba_decision_expires_at,
+                ciba_user_approval_callback_url,
             } => (
                 false,
                 dynamic_registration_initial_access_token,
-                ciba_decision_expires_at,
+                ciba_user_approval_callback_url,
             ),
         };
         validate_descriptor(&descriptor)?;
@@ -1616,6 +1508,8 @@ impl DescriptorMaterializer {
         let needs_ciba_token =
             descriptor_requires_reference(&descriptor, "generated.ciba_automated_decision_token")
                 || descriptor_requires_reference(&descriptor, "target.ciba_automated_decision_url");
+        let needs_ciba_user_approval_callback =
+            descriptor_requires_reference(&descriptor, "target.ciba_user_approval_callback_url");
         if !include_legacy_profile_tokens
             && needs_dynamic_token
             && ordinary_dynamic_registration_initial_access_token.is_none()
@@ -1635,26 +1529,25 @@ impl DescriptorMaterializer {
         let legacy_ciba_automated_decision_token = (include_legacy_profile_tokens
             && needs_ciba_token)
             .then(|| Zeroizing::new(random_secret(32)));
-        let (ciba_decision_tokens, ordinary_ciba_token, ciba_decision_expires_at) =
-            if !include_legacy_profile_tokens && needs_ciba_token {
-                let ciba_clients = collect_ciba_clients(&descriptor)?;
-                let expires_at = ciba_decision_expires_at
-                    .ok_or(MaterializerError::InvalidField("ciba_decision_expires_at"))?;
-                validate_ciba_decision_expiry(expires_at)?;
-                let shared_token = Zeroizing::new(random_secret(32));
-                let mut tokens = BTreeMap::new();
-                for logical_client_id in ciba_clients {
-                    if !clients.contains_key(&logical_client_id) {
-                        return Err(MaterializerError::UnknownClientReference(logical_client_id));
-                    }
-                    tokens.insert(logical_client_id, shared_token.clone());
-                }
-                (tokens, Some(shared_token), Some(expires_at))
-            } else {
-                (BTreeMap::new(), None, None)
-            };
-        let ciba_automated_decision_token =
-            legacy_ciba_automated_decision_token.or(ordinary_ciba_token);
+        let ciba_decision_tokens = BTreeMap::new();
+        let ciba_automated_decision_token = legacy_ciba_automated_decision_token;
+        if !include_legacy_profile_tokens && needs_ciba_token {
+            return Err(MaterializerError::InvalidField(
+                "target.ciba_automated_decision_url",
+            ));
+        }
+        let ciba_user_approval_callback_url = if needs_ciba_user_approval_callback {
+            if collect_ciba_clients(&descriptor)?.is_empty() {
+                return Err(MaterializerError::InvalidField("ciba.required_roles"));
+            }
+            let value = ciba_user_approval_callback_url.ok_or(MaterializerError::InvalidField(
+                "ciba_user_approval_callback_url",
+            ))?;
+            validate_ciba_user_approval_callback_url(value)?;
+            Some(Zeroizing::new(value.to_owned()))
+        } else {
+            None
+        };
         let prepared = PreparedMaterialization {
             descriptor,
             target_issuer: target_issuer.to_owned(),
@@ -1669,8 +1562,8 @@ impl DescriptorMaterializer {
             attestation,
             dynamic_registration_initial_access_token,
             ciba_automated_decision_token,
+            ciba_user_approval_callback_url,
             ciba_decision_tokens,
-            ciba_decision_expires_at,
             clients,
         };
         Ok(prepared)
@@ -1867,8 +1760,6 @@ fn build_secure_onboarding_bundle(
 }
 
 const CIBA_GRANT_TYPE: &str = "urn:openid:params:grant-type:ciba";
-const MAX_CIBA_DECISION_BINDING_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
-
 /// Resolve every CIBA client for plans which expand an automated
 /// decision reference.  A plan is intentionally not inferred from its name:
 /// only signed role requirements and their registration grant types can make
@@ -1919,9 +1810,10 @@ fn registration_has_ciba_grant(registration: &Value) -> bool {
 }
 
 fn plan_references_ciba(group: &DescriptorGroup, plan: &DescriptorPlan) -> bool {
-    const REFERENCES: [&str; 2] = [
+    const REFERENCES: [&str; 3] = [
         "generated.ciba_automated_decision_token",
         "target.ciba_automated_decision_url",
+        "target.ciba_user_approval_callback_url",
     ];
     REFERENCES.iter().any(|reference| {
         value_references_ciba(&plan.config_template, &plan.secret_bindings, reference)
@@ -1994,18 +1886,25 @@ fn value_references_ciba(
     visit(value, bindings, reference, &mut BTreeSet::new())
 }
 
-fn validate_ciba_decision_expiry(expires_at: i64) -> Result<(), MaterializerError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| MaterializerError::InvalidField("ciba_decision_expires_at"))?
-        .as_secs();
-    let now = i64::try_from(now)
-        .map_err(|_| MaterializerError::InvalidField("ciba_decision_expires_at"))?;
-    let latest = now
-        .checked_add(MAX_CIBA_DECISION_BINDING_LIFETIME_SECONDS)
-        .ok_or(MaterializerError::InvalidField("ciba_decision_expires_at"))?;
-    if expires_at <= now || expires_at > latest {
-        return Err(MaterializerError::InvalidField("ciba_decision_expires_at"));
+fn validate_ciba_user_approval_callback_url(value: &str) -> Result<(), MaterializerError> {
+    let parsed = url::Url::parse(value)
+        .map_err(|_| MaterializerError::InvalidField("ciba_user_approval_callback_url"))?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || parsed.path() == "/"
+        || parsed.query().is_none()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed
+            .query_pairs()
+            .filter(|(name, _)| name == "approval_token")
+            .count()
+            != 1
+    {
+        return Err(MaterializerError::InvalidField(
+            "ciba_user_approval_callback_url",
+        ));
     }
     Ok(())
 }
@@ -2659,8 +2558,7 @@ mod tests {
                     resource_id: resource.resource_id.clone(),
                     public_id: "actual-client".to_owned(),
                 }),
-                TenantResourceKind::CibaDecisionBinding
-                | TenantResourceKind::MtlsTrustAnchor
+                TenantResourceKind::MtlsTrustAnchor
                 | TenantResourceKind::Openid4vcDataset
                 | TenantResourceKind::Openid4vcTrustPolicy => None,
             })
@@ -3196,7 +3094,7 @@ mod tests {
             request_jti: request_jti(),
             credential_trust_anchor_pem: test_trust_anchor(),
             dynamic_registration_initial_access_token: None,
-            ciba_decision_expires_at: None,
+            ciba_user_approval_callback_url: None,
         };
         let (prepared, bundle) =
             DescriptorMaterializer::prepare_from_artifact_matrix(&matrix, binding)
@@ -3278,7 +3176,7 @@ mod tests {
                 request_jti: request_jti(),
                 credential_trust_anchor_pem: test_trust_anchor(),
                 dynamic_registration_initial_access_token: None,
-                ciba_decision_expires_at: None,
+                ciba_user_approval_callback_url: None,
             },
         );
         assert!(matches!(
@@ -3299,7 +3197,7 @@ mod tests {
                 request_jti: request_jti(),
                 credential_trust_anchor_pem: test_trust_anchor(),
                 dynamic_registration_initial_access_token: Some("deployment-dcr-token"),
-                ciba_decision_expires_at: None,
+                ciba_user_approval_callback_url: None,
             },
         )
         .expect("ordinary DCR preparation");
@@ -4784,17 +4682,12 @@ mod tests {
         );
         descriptor.groups[0].plans[0].config_template = serde_json::json!({
             "client_id": "{{client.web.id}}",
-            "automated_ciba_approval_url": "{{target.ciba_automated_decision_url}}"
+            "automated_ciba_approval_url": "{{target.ciba_user_approval_callback_url}}"
         });
         descriptor
     }
 
     fn ordinary_ciba_prepared(descriptor: MatrixDescriptor) -> PreparedMaterialization {
-        let expires_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_secs() as i64
-            + 3600;
         DescriptorMaterializer::prepare_materialization(
             descriptor,
             "https://issuer.example",
@@ -4803,51 +4696,27 @@ mod tests {
             test_trust_anchor(),
             ProfileMaterialization::Ordinary {
                 dynamic_registration_initial_access_token: None,
-                ciba_decision_expires_at: Some(expires_at),
+                ciba_user_approval_callback_url: Some(
+                    "https://callback.example/ciba/approve?approval_token=0123456789abcdef0123456789abcdef",
+                ),
             },
         )
         .expect("ordinary CIBA preparation")
     }
 
     #[test]
-    fn ordinary_ciba_manifest_contains_private_binding_and_expands_matching_token() {
+    fn ordinary_ciba_manifest_has_no_server_automation_resource_and_expands_callback() {
         let prepared = ordinary_ciba_prepared(ciba_descriptor());
         let manifest = prepared
             .tenant_resource_manifest(prepared.request_jti())
             .expect("manifest");
         let document: Value = serde_json::from_slice(manifest.bytes().as_bytes()).expect("JSON");
         let resources = document["resources"].as_array().expect("resources");
-        assert_eq!(
+        assert!(
             resources
                 .iter()
-                .filter(|resource| resource["kind"].as_str() == Some("ciba-decision-binding"))
-                .count(),
-            1
+                .all(|resource| resource["kind"].as_str() != Some("ciba-decision-binding"))
         );
-        let binding = resources
-            .iter()
-            .find(|resource| resource["kind"].as_str() == Some("ciba-decision-binding"))
-            .expect("CIBA binding");
-        let payload_bytes = URL_SAFE_NO_PAD
-            .decode(binding["payload_base64url"].as_str().expect("payload"))
-            .expect("payload b64");
-        let payload: Value = serde_json::from_slice(&payload_bytes).expect("payload JSON");
-        let token = payload["decision_token"].as_str().expect("token");
-        assert!(token.len() >= 32);
-        assert_eq!(payload["schema"], 1);
-        assert!(
-            payload["client_resource_id"]
-                .as_str()
-                .expect("client ref")
-                .starts_with("oauth-client-web-run-")
-        );
-        assert!(
-            payload["user_resource_id"]
-                .as_str()
-                .expect("user ref")
-                .starts_with("user-applicant-run-")
-        );
-        assert!(!format!("{manifest:?}").contains(token));
 
         let receipt = tenant_resource_apply_receipt(&manifest);
         let output = tenant_resource_apply_output(receipt, &manifest).expect("apply output");
@@ -4861,11 +4730,14 @@ mod tests {
             finalized.matrix().document.groups[0].plans[0].config["automated_ciba_approval_url"]
                 .as_str()
                 .expect("CIBA URL");
-        assert!(url.ends_with(&format!("decision_token={token}")));
+        assert_eq!(
+            url,
+            "https://callback.example/ciba/approve?approval_token=0123456789abcdef0123456789abcdef"
+        );
     }
 
     #[test]
-    fn ordinary_ciba_shares_one_run_token_across_client_fenced_bindings() {
+    fn ordinary_ciba_keeps_multiple_signed_client_roles_without_server_bindings() {
         let mut descriptor = ciba_descriptor();
         let mut second_group = descriptor.groups[0].clone();
         second_group.id = "ciba-second".to_owned();
@@ -4889,32 +4761,28 @@ mod tests {
             .tenant_resource_manifest(prepared.request_jti())
             .expect("manifest");
         let document: Value = serde_json::from_slice(manifest.bytes().as_bytes()).expect("JSON");
-        let mut tokens = BTreeSet::new();
-        let mut bindings = 0;
-        for resource in document["resources"].as_array().expect("resources") {
-            if resource["kind"].as_str() != Some("ciba-decision-binding") {
-                continue;
-            }
-            bindings += 1;
-            let payload = URL_SAFE_NO_PAD
-                .decode(resource["payload_base64url"].as_str().expect("payload"))
-                .expect("payload b64");
-            let payload: Value = serde_json::from_slice(&payload).expect("payload JSON");
-            tokens.insert(
-                payload["decision_token"]
-                    .as_str()
-                    .expect("token")
-                    .to_owned(),
-            );
-        }
-        assert_eq!(bindings, 2);
-        assert_eq!(tokens.len(), 1);
+        assert_eq!(
+            document["resources"]
+                .as_array()
+                .expect("resources")
+                .iter()
+                .filter(|resource| resource["kind"].as_str() == Some("oauth-client"))
+                .count(),
+            2
+        );
+        assert!(
+            document["resources"]
+                .as_array()
+                .expect("resources")
+                .iter()
+                .all(|resource| resource["kind"].as_str() != Some("ciba-decision-binding"))
+        );
     }
 
     #[test]
-    fn ordinary_ciba_requires_bounded_expiry_and_keeps_all_signed_roles() {
+    fn ordinary_ciba_requires_callback_and_keeps_all_signed_roles() {
         let descriptor = ciba_descriptor();
-        let missing_expiry = DescriptorMaterializer::prepare_materialization(
+        let missing_callback = DescriptorMaterializer::prepare_materialization(
             descriptor.clone(),
             "https://issuer.example",
             &suite(),
@@ -4922,12 +4790,12 @@ mod tests {
             test_trust_anchor(),
             ProfileMaterialization::Ordinary {
                 dynamic_registration_initial_access_token: None,
-                ciba_decision_expires_at: None,
+                ciba_user_approval_callback_url: None,
             },
         );
         assert_eq!(
-            missing_expiry.err().expect("missing expiry must fail"),
-            MaterializerError::InvalidField("ciba_decision_expires_at")
+            missing_callback.err().expect("missing callback must fail"),
+            MaterializerError::InvalidField("ciba_user_approval_callback_url")
         );
 
         let mut ambiguous = descriptor;
@@ -4954,25 +4822,12 @@ mod tests {
             test_trust_anchor(),
             ProfileMaterialization::Ordinary {
                 dynamic_registration_initial_access_token: None,
-                ciba_decision_expires_at: Some(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .expect("clock")
-                        .as_secs() as i64
-                        + 3600,
+                ciba_user_approval_callback_url: Some(
+                    "https://callback.example/ciba/approve?approval_token=0123456789abcdef0123456789abcdef",
                 ),
             },
         )
-        .expect("multiple signed CIBA clients must remain independently fenced");
-        assert_eq!(prepared.ciba_decision_tokens.len(), 2);
-        assert_eq!(
-            prepared
-                .ciba_decision_tokens
-                .values()
-                .map(|token| token.as_str())
-                .collect::<BTreeSet<_>>()
-                .len(),
-            1
-        );
+        .expect("multiple signed CIBA clients must retain their ordinary roles");
+        assert!(prepared.ciba_decision_tokens.is_empty());
     }
 }
