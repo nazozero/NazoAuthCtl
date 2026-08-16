@@ -137,7 +137,7 @@ jobs:
       id-token: none
     env:
       SECRET_MARKER: nazoauthctl-ci-secret-must-not-leak
-      CURRENT_SERVER_RELEASE: v0.1.41
+      CURRENT_SERVER_RELEASE: v0.1.34
     steps:
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
