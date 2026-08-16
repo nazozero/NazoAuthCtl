@@ -271,7 +271,7 @@ pub(crate) fn verify_retired_controller_probe(
             bail!("runtime embedded build identity does not match the active signed Release")
         }
         prepared.expect_authorization_rejection(probe)?;
-        runtime.verify_prepared_target(&prepared.target)?;
+        runtime.verify_prepared_target(prepared.post_execution_target())?;
         Ok(RetirementProbeExecution {
             controller_verified_target: prepared.target.clone(),
             application_reported_embedded_identity: embedded,

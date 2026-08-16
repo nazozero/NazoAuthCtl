@@ -60,7 +60,7 @@ pub(crate) fn execute(
         &receipt_key,
     )?;
     validate_runtime_receipt(&runtime_receipt, &task, &compact_task)?;
-    runtime.verify_prepared_target(&prepared.target)?;
+    runtime.verify_prepared_target(prepared.post_execution_target())?;
 
     // Revalidate immediately before reading the head and appending.  The
     // lifecycle lock excludes another ctl writer; this second check also

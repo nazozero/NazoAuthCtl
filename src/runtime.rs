@@ -75,6 +75,7 @@ pub(crate) struct PreparedAppTask {
     command_override: Option<OsString>,
     task: OneShotTask,
     pub(crate) target: RuntimeTargetClaim,
+    post_execution_target: RuntimeTargetClaim,
 }
 
 impl PreparedAppTask {
@@ -82,6 +83,16 @@ impl PreparedAppTask {
         let mut task = self.task.clone();
         task.stdin = compact_envelope.as_bytes().to_vec();
         selected_backend(self.backend, self.command_override.as_deref()).run_one_shot(&task)
+    }
+
+    /// Returns the immutable target handle captured before task execution.
+    ///
+    /// OCI tasks remain bound to their signed registry digest in `target`, but
+    /// a container engine is free to drop the registry-shaped reference after
+    /// a one-shot `--rm` task.  The post-execution check therefore uses the
+    /// verified local image identity captured from that same engine beforehand.
+    pub(crate) fn post_execution_target(&self) -> &RuntimeTargetClaim {
+        &self.post_execution_target
     }
 
     /// Starts the already prepared task and accepts only the runtime's closed
@@ -161,19 +172,40 @@ impl<'a> Runtime<'a> {
     ) -> anyhow::Result<PreparedAppTask> {
         self.write_task_context(config_manifest)?;
         let backend = self.backend_kind()?;
-        let artifact = match backend {
+        let (artifact, post_execution_target) = match backend {
             RuntimeBackendKind::Systemd => {
                 let path = fs::canonicalize(image_or_binary)
                     .context("failed to resolve host task binary")?;
-                ArtifactReference::HostBinary {
-                    sha256: sha256(&path)?,
-                    path,
-                }
+                let sha256 = sha256(&path)?;
+                (
+                    ArtifactReference::HostBinary {
+                        sha256: sha256.clone(),
+                        path: path.clone(),
+                    },
+                    RuntimeTargetClaim::HostBinary {
+                        path: path.display().to_string(),
+                        sha256,
+                    },
+                )
             }
-            RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => ArtifactReference::Oci {
-                image_reference: image_or_binary.to_owned(),
-                digest: self.backend()?.resolve_image_digest(image_or_binary)?,
-            },
+            RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
+                let backend = self.backend()?;
+                let digest = backend.resolve_image_digest(image_or_binary)?;
+                let local_image_id = backend.resolve_local_image_id(image_or_binary)?;
+                if self.image_digest(&local_image_id)? != digest {
+                    bail!("container engine changed the verified OCI image before task execution");
+                }
+                (
+                    ArtifactReference::Oci {
+                        image_reference: image_or_binary.to_owned(),
+                        digest: digest.clone(),
+                    },
+                    RuntimeTargetClaim::OciImage {
+                        image_ref: local_image_id,
+                        image_digest: digest,
+                    },
+                )
+            }
         };
         let target = match &artifact {
             ArtifactReference::Oci {
@@ -195,6 +227,7 @@ impl<'a> Runtime<'a> {
             command_override: self.command_override(),
             task,
             target,
+            post_execution_target,
         })
     }
 
