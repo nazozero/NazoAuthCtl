@@ -133,6 +133,26 @@ impl Process {
     }
 
     pub fn stdin_stdout(&self, input: &[u8]) -> anyhow::Result<String> {
+        let (status, stdout) = self.stdin_stdout_with_status(input)?;
+        if !status.success() {
+            bail!("{} failed with status {status}", self.display_name());
+        }
+        Ok(stdout)
+    }
+
+    /// Captures UTF-8 stdout together with the child status.
+    ///
+    /// Most callers must use [`Self::stdin_stdout`] so a failed executable is
+    /// rejected before its output is consumed.  A small number of protocol
+    /// transports deliberately authenticate their stdout independently (for
+    /// example an idempotent runtime task receipt).  Those callers need the
+    /// status for diagnostics, but must not discard an already durable,
+    /// cryptographically verifiable response merely because the container
+    /// engine reports a later non-zero cleanup status.
+    pub fn stdin_stdout_with_status(
+        &self,
+        input: &[u8],
+    ) -> anyhow::Result<(std::process::ExitStatus, String)> {
         let mut command = self.command();
         command
             .stdin(Stdio::piped())
@@ -142,15 +162,9 @@ impl Process {
             .spawn()
             .with_context(|| format!("failed to execute {}", self.display_name()))?;
         let output = self.collect_output(child, Some(input))?;
-        if !output.status.success() {
-            bail!(
-                "{} failed with status {}",
-                self.display_name(),
-                output.status
-            );
-        }
-        String::from_utf8(output.stdout)
-            .with_context(|| format!("{} produced non-UTF-8 output", self.display_name()))
+        let stdout = String::from_utf8(output.stdout)
+            .with_context(|| format!("{} produced non-UTF-8 output", self.display_name()))?;
+        Ok((output.status, stdout))
     }
 
     /// Returns only a closed classification.  Diagnostic output is deliberately
@@ -420,5 +434,34 @@ mod descendant_tests {
             .unwrap_err();
         assert!(error.to_string().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::Process;
+
+    #[cfg(unix)]
+    #[test]
+    fn captures_stdout_when_the_child_exits_nonzero() {
+        let (status, stdout) = Process::new("/bin/sh")
+            .args(["-c", "printf durable-receipt; exit 3"])
+            .stdin_stdout_with_status(b"")
+            .expect("the process output is still captured");
+
+        assert!(!status.success());
+        assert_eq!(stdout.trim_end(), "durable-receipt");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn captures_stdout_when_the_child_exits_nonzero() {
+        let (status, stdout) = Process::new("cmd")
+            .args(["/C", "<nul set /p =durable-receipt & exit /b 3"])
+            .stdin_stdout_with_status(b"")
+            .expect("the process output is still captured");
+
+        assert!(!status.success());
+        assert_eq!(stdout.trim_end(), "durable-receipt");
     }
 }
