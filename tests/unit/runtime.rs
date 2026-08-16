@@ -641,6 +641,7 @@ fn retirement_probe_accepts_only_the_closed_runtime_authorization_marker() {
             stdin: Vec::new(),
         },
         target: target.clone(),
+        post_execution_target: target.clone(),
     };
     prepared
         .expect_authorization_rejection("signed-envelope")
@@ -677,6 +678,7 @@ fn retirement_probe_accepts_only_the_closed_runtime_authorization_marker() {
                 stdin: Vec::new(),
             },
             target: target.clone(),
+            post_execution_target: target.clone(),
         };
         assert!(
             prepared
@@ -808,6 +810,44 @@ fn image_digest_accepts_an_exact_immutable_local_image_id() {
     assert_eq!(
         Runtime::new(&config).image_digest(&local_id).unwrap(),
         manifest_digest
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn prepared_oci_task_rechecks_the_verified_local_image_identity() {
+    let work = PrivateTempDir::new("runtime-prepared-local-image").unwrap();
+    let mut config = config(&work);
+    fs::create_dir_all(config.operator.controller_public_key.parent().unwrap()).unwrap();
+    let engine = work.path().join("fake-engine");
+    let registry_digest = format!("sha256:{}", "a".repeat(64));
+    let local_id = format!("sha256:{}", "b".repeat(64));
+    let image = format!("ghcr.io/nazozero/nazoauth@{registry_digest}");
+    write_shell_executable(
+        &engine,
+        &format!(
+            "case \"$*\" in\n  *'{{.Id}}'*) printf '%s\\n' '{local_id}' ;;\n  *'{{json .RepoDigests}}'*) printf '%s\\n' '[\"ghcr.io/nazozero/nazoauth@{registry_digest}\"]' ;;\n  *) exit 1 ;;\nesac"
+        ),
+    );
+    config.runtime.backend_command_override = Some(engine);
+
+    let prepared = Runtime::new(&config)
+        .prepare_app_task(&image, &TaskOperation::KeysValidate, None, b"{}")
+        .unwrap();
+
+    assert_eq!(
+        prepared.target,
+        RuntimeTargetClaim::OciImage {
+            image_ref: image,
+            image_digest: registry_digest.clone(),
+        }
+    );
+    assert_eq!(
+        prepared.post_execution_target(),
+        &RuntimeTargetClaim::OciImage {
+            image_ref: local_id,
+            image_digest: registry_digest,
+        }
     );
 }
 
