@@ -1318,6 +1318,43 @@ fn nonempty_receipt_chain_and_public_audit_rendering_are_verified() {
 }
 
 #[test]
+fn signed_legacy_conformance_receipt_remains_verifiable_for_audit_retention() {
+    let work = PrivateTempDir::new("nazoauth-legacy-audit-receipt-test").unwrap();
+    let config = config(&work);
+    let (target, embedded, binding, operation) = task_parts();
+    let (task, compact_task, _) =
+        load_or_issue_task(&config, target, embedded, binding, operation, None).unwrap();
+    let receipt = nazo_operator_protocol::FinalReceipt {
+        ver: nazo_operator_protocol::PROTOCOL_VERSION,
+        iss: task.iss.clone(),
+        aud: "operator-audit".to_owned(),
+        jti: task.jti.clone(),
+        request_sha256: compact_sha256(&compact_task),
+        deployment_id: task.deployment_id.clone(),
+        actor: task.actor.clone(),
+        operation: "conformance-lease-list".to_owned(),
+        completed_at: task.iat + 1,
+        audit_sequence: 1,
+        audit_previous_sha256: "0".repeat(64),
+        controller_verified_target: RuntimeTargetClaim::HostBinary {
+            path: test_binary_path(),
+            sha256: "a".repeat(64),
+        },
+        embedded: task.embedded,
+        config: task.config,
+        runtime_receipt_sha256: "d".repeat(64),
+        outcome: TaskOutcome::Succeeded {
+            result: TaskResult::ConformanceLeaseList { leases: Vec::new() },
+        },
+    };
+    let key = read_signing_key(&config.operator.audit_private_key).unwrap();
+    let compact = sign_final_receipt(&receipt, &config.operator.audit_key_id, &key).unwrap();
+    append_audit(&config, 1, &task.jti, &compact).unwrap();
+
+    verify_audit(&config).unwrap();
+}
+
+#[test]
 fn duplicate_management_request_ids_fail_before_untrusted_files_are_parsed() {
     let work = PrivateTempDir::new("nazoauth-management-duplicate-test").unwrap();
     let config = config(&work);
