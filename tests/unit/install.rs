@@ -1363,6 +1363,22 @@ fn managed_runtime_database_grants_keep_the_audit_ledger_api_least_privileged() 
             "missing runtime table allowlist entry: {table}"
         );
     }
+    let full_dml_tables = sql
+        .split("full_dml_tables CONSTANT text[]")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("optional_full_dml_tables CONSTANT text[]")
+                .next()
+        })
+        .expect("full DML table section");
+    let optional_full_dml_tables = sql
+        .split("optional_full_dml_tables CONSTANT text[]")
+        .nth(1)
+        .and_then(|section| section.split("append_tables CONSTANT text[]").next())
+        .expect("optional full DML table section");
+    assert!(!full_dml_tables.contains("ciba_decision_bindings"));
+    assert!(optional_full_dml_tables.contains("ciba_decision_bindings"));
     assert!(
         sql.contains("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO nazoauth_runtime")
     );

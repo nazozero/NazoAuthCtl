@@ -76,13 +76,14 @@ DECLARE
         'oauth_token_issuances',
         'tenant_resource_states', 'tenant_resource_bindings',
         'tenant_resource_operations', 'openid4vc_trust_policies',
-        'openid4vc_trust_policy_clients', 'ciba_decision_bindings'
+        'openid4vc_trust_policy_clients'
     ];
     -- These tables are introduced by newer signed Releases. They remain an
     -- explicit allowlist: if present they receive the exact runtime grant,
     -- while their absence on an older supported Release is not schema drift.
     optional_full_dml_tables CONSTANT text[] := ARRAY[
-        'openid4vci_pre_authorized_code_consumptions'
+        'openid4vci_pre_authorized_code_consumptions',
+        'ciba_decision_bindings'
     ];
     append_tables CONSTANT text[] := ARRAY[
         'scim_audit_events', 'scim_security_events',
