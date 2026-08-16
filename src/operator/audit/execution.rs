@@ -307,7 +307,6 @@ pub(crate) fn execute_test_task(
         TaskOperation::KeysGenerateLocal { .. } | TaskOperation::KeysRegisterExternal { .. } => {
             bail!("test task adapter does not implement key mutation")
         }
-        _ => bail!("test task adapter does not implement this operator operation"),
     };
     crate::runtime_backend::backend(config.runtime.backend).run_debug_artifact_task(
         &crate::runtime_backend::DebugArtifactTask {
@@ -334,7 +333,6 @@ pub(crate) fn execute_test_task(
             | TaskOperation::KeysRegisterExternal { .. } => {
                 unreachable!()
             }
-            _ => unreachable!(),
         },
         final_receipt: receipt,
     })
@@ -385,7 +383,6 @@ pub(crate) fn operation_name(operation: &TaskOperation) -> &'static str {
         TaskOperation::KeysValidate => "keys-validate",
         TaskOperation::KeysGenerateLocal { .. } => "keys-generate-local",
         TaskOperation::KeysRegisterExternal { .. } => "keys-register-external",
-        _ => "unsupported-operator-operation",
     }
 }
 
