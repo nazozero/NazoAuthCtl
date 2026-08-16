@@ -24,7 +24,7 @@ use nazoauthctl_conformance::{
     EvidenceBundleReceipt, EvidenceDeploymentIdentity, EvidenceProviderCapability,
     EvidenceProviderIdentity, EvidenceProviderReceipt, EvidenceRuntimeIdentity,
     EvidenceSourceIdentity, HttpTransport, ManagedWebDriver, MatrixSelection, OidfArtifactMatrix,
-    OidfDriverInspectionPlan, OidfDriverLane, OidfPlanSelection, OidfProviderExecutionBinding,
+    OidfDriverLane, OidfPlanSelection, OidfProviderExecutionBinding,
     OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
     OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
     SuiteResourceObserver, TenantResourceApplyOutput, TenantResourceReceiptIdentity,
