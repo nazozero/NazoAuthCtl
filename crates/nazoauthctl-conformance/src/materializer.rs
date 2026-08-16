@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(all(test, unix))]
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nazo_operator_protocol::{
