@@ -2122,7 +2122,14 @@ mod tests {
                 .expect("plan-create failure requests")
                 .push((method, path.clone()));
             let (status, body) = match (method, path.as_str()) {
-                (HttpMethod::Get, "/api/plan") => (200, serde_json::json!({})),
+                (HttpMethod::Get, "/api/plan") => (
+                    if request.header("Authorization").is_some() {
+                        200
+                    } else {
+                        401
+                    },
+                    serde_json::json!({}),
+                ),
                 (HttpMethod::Post, "/api/plan") => (500, serde_json::json!({})),
                 _ => (500, serde_json::json!({})),
             };
@@ -2142,7 +2149,7 @@ mod tests {
         let client = SuiteClient::with_transport(
             Origin::parse("https://suite.example").expect("origin"),
             Some(BearerToken::new("suite-token").expect("token")),
-            transport,
+            transport.clone(),
             ClientConfig::default(),
         )
         .expect("client");
@@ -2168,6 +2175,16 @@ mod tests {
         assert!(!report.acceptance_pass);
         assert!(report.unknown_declared_skip_modules.is_empty());
         assert!(report.errors.iter().any(|error| error.contains("500")));
+        let requests = transport
+            .requests
+            .lock()
+            .expect("plan-create failure requests");
+        assert!(requests.iter().any(|(method, path)| {
+            *method == HttpMethod::Post && path == "/api/plan"
+        }));
+        assert!(!requests.iter().any(|(method, path)| {
+            *method == HttpMethod::Delete && path.starts_with("/api/plan/")
+        }));
     }
 
     #[test]
