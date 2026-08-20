@@ -14,7 +14,6 @@ use crate::{
         OperatorProtocolCompatibility, Postgres, Rollback, Runtime as RuntimeConfig, Ui, Valkey,
     },
 };
-use sha2::Digest as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 #[cfg(target_os = "linux")]
