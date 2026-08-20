@@ -569,7 +569,7 @@ fn ensure_managed_secrets(
                 "user {} on >{} ~* ",
                 "+get +mget +getdel +set +setnx +del +exists ",
                 "+expire +expireat +expiretime +pexpireat +pexpiretime +ttl ",
-                "+incr +zadd +zrangebyscore +zrem +time +eval ",
+                "+incr +zadd +zrangebyscore +zrem +time +dbsize +eval ",
                 "+ping +hello +select +client|setname +client|setinfo\n",
                 "user {} on >{} ~* +ping +lastsave +bgsave\n"
             ),

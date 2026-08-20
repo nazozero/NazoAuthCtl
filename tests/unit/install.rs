@@ -136,9 +136,34 @@ fn managed_dependency_credentials_are_outside_runtime_secret_directory() {
     );
     assert_ne!(runtime_url, migration_url);
     let valkey_acl = fs::read_to_string(dependencies.join("valkey.acl")).unwrap();
-    assert!(valkey_acl.contains("user nazoauth_runtime on"));
-    assert!(valkey_acl.contains("user nazoauth_backup on"));
-    assert!(valkey_acl.contains("+lastsave +bgsave"));
+    let mut valkey_acl_lines = valkey_acl.lines();
+    assert_eq!(valkey_acl_lines.next(), Some("user default off"));
+    let runtime_acl = valkey_acl_lines.next().unwrap();
+    assert!(runtime_acl.starts_with("user nazoauth_runtime on"));
+    assert!(runtime_acl.split_whitespace().any(|token| token == "+dbsize"));
+    for forbidden in [
+        "+flushall",
+        "+flushdb",
+        "+config",
+        "+acl",
+        "@all",
+        "allcommands",
+    ] {
+        assert!(!runtime_acl.split_whitespace().any(|token| token == forbidden));
+    }
+    let backup_acl = valkey_acl_lines.next().unwrap();
+    assert!(backup_acl.starts_with("user nazoauth_backup on"));
+    assert!(backup_acl.ends_with("~* +ping +lastsave +bgsave"));
+    assert_eq!(valkey_acl_lines.next(), None);
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(dependencies.join("valkey.acl"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o444
+    );
 
     fs::remove_file(dependencies.join("valkey-backup-password")).unwrap();
     crate::filesystem::atomic_write(
