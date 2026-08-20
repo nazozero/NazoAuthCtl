@@ -85,6 +85,8 @@ def expected_provenance() -> dict[str, object]:
         "generator": {
             "path": "scripts/oidf/generate_oidf_artifact.py",
             "predecessor_sha256": GENERATOR_PREDECESSOR_SHA256,
+            "reviewed_parent_commit": "cac041f0773058dbd3050593ca2361f20a04ed91",
+            "host_checkout": "inject the exact reviewed generator commit from independent task evidence",
         },
         "expected_output": {
             "driver": {"sha256": EXPECTED_DRIVER_SHA256, "size": EXPECTED_DRIVER_SIZE},
@@ -240,24 +242,35 @@ def prepare_public_directory(path: pathlib.Path) -> None:
         raise ValueError(f"public output contains unexpected entries: {sorted(unexpected)}")
 
 
+def reject_symlink_components(path: pathlib.Path, label: str) -> pathlib.Path:
+    absolute = pathlib.Path(os.path.abspath(path))
+    for component in (absolute, *absolute.parents):
+        try:
+            current = component.lstat()
+        except OSError as error:
+            raise ValueError(f"could not inspect {label} path component: {component}") from error
+        if stat.S_ISLNK(current.st_mode):
+            raise ValueError(f"{label} path must not contain symlink components")
+    return absolute
+
+
 def verify_private_directory(path: pathlib.Path) -> None:
     if os.name != "posix":
         raise ValueError("artifact signing is supported only on a Unix host")
-    if not path.exists() or path.is_symlink():
-        raise ValueError("private output directory must pre-exist and must not be a symlink")
-    current = path.lstat()
+    absolute = reject_symlink_components(path, "private directory")
+    current = absolute.lstat()
     if not stat.S_ISDIR(current.st_mode) or current.st_uid != os.geteuid():
         raise ValueError("private output directory must be owned by the current Unix user")
-    if stat.S_IMODE(current.st_mode) & 0o077:
-        raise ValueError("private output directory must be owner-only")
+    if stat.S_IMODE(current.st_mode) != 0o700:
+        raise ValueError("private output directory mode must be exactly 0700")
 
 
 def verify_signing_key(path: pathlib.Path) -> None:
     if os.name != "posix":
         raise ValueError("artifact signing is supported only on a Unix host")
-    if not path.exists() or path.is_symlink():
-        raise ValueError("signing key must pre-exist and must not be a symlink")
-    current = path.lstat()
+    absolute = reject_symlink_components(path, "signing key")
+    verify_private_directory(absolute.parent)
+    current = absolute.lstat()
     if not stat.S_ISREG(current.st_mode) or current.st_uid != os.geteuid():
         raise ValueError("signing key must be a regular file owned by the current Unix user")
     if stat.S_IMODE(current.st_mode) & 0o077:
@@ -346,9 +359,16 @@ def parse_der_integer(value: bytes, offset: int) -> tuple[int, int]:
     length = value[offset + 1]
     start = offset + 2
     end = start + length
-    if length == 0 or end > len(value):
+    if length == 0 or length > 33 or end > len(value):
         raise ValueError("ECDSA signature contains an invalid INTEGER")
-    return int.from_bytes(value[start:end], "big"), end
+    encoded = value[start:end]
+    if encoded[0] & 0x80:
+        raise ValueError("ECDSA signature contains a negative INTEGER")
+    if len(encoded) > 1 and encoded[0] == 0 and not encoded[1] & 0x80:
+        raise ValueError("ECDSA signature contains a redundant INTEGER prefix")
+    if encoded == b"\x00":
+        raise ValueError("ECDSA signature contains a zero INTEGER")
+    return int.from_bytes(encoded, "big"), end
 
 
 def p1363_signature(der: bytes) -> bytes:

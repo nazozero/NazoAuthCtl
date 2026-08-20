@@ -14,18 +14,28 @@ archives or files from an earlier candidate run.
 ```sh
 set -eu
 prefix=/opt/nazoauth-e2e/candidate-deps-oidf-20260820T1300Z
+ctl="$prefix/source/v4/nazoauthctl"
+nazo="$prefix/source/v6/nazoauth"
 
-git -C "$prefix/source/nazoauthctl" fetch origin agent/oidf-ciunblock-fullmatrix-20260820
-ctl_commit=$(git -C "$prefix/source/nazoauthctl" rev-parse origin/agent/oidf-ciunblock-fullmatrix-20260820)
-git -C "$prefix/source/nazoauthctl" checkout --detach "$ctl_commit"
+: "${REVIEWED_CTL_COMMIT:?set this from the independently reviewed task evidence}"
+test "${#REVIEWED_CTL_COMMIT}" -eq 40
+case "$REVIEWED_CTL_COMMIT" in *[!0-9a-f]*) exit 2;; esac
 
-git -C "$prefix/source/nazoauth" fetch origin agent/spec-coverage-audit-20260820
-git -C "$prefix/source/nazoauth" checkout --detach 45959681bf1a093793f5d23cd78f583862b8b167
-git -C "$prefix/source/nazoauth" cat-file -e 77c362f9fc62e5114f3c61e2b4420f864d7112ab^{commit}
+git -C "$ctl" fetch origin agent/oidf-ciunblock-fullmatrix-20260820
+git -C "$ctl" cat-file -e "$REVIEWED_CTL_COMMIT^{commit}"
+git -C "$ctl" merge-base --is-ancestor "$REVIEWED_CTL_COMMIT" FETCH_HEAD
+git -C "$ctl" checkout --detach "$REVIEWED_CTL_COMMIT"
+test "$(git -C "$ctl" rev-parse HEAD)" = "$REVIEWED_CTL_COMMIT"
+
+git -C "$nazo" fetch origin agent/spec-coverage-audit-20260820
+git -C "$nazo" checkout --detach 45959681bf1a093793f5d23cd78f583862b8b167
+test "$(git -C "$nazo" rev-parse HEAD)" = 45959681bf1a093793f5d23cd78f583862b8b167
+git -C "$nazo" cat-file -e 77c362f9fc62e5114f3c61e2b4420f864d7112ab^{commit}
 ```
 
-Record `ctl_commit` with the generated evidence and require it to equal the reviewed generator
-commit before use. The generator itself independently requires the NazoAuth checkout's `origin` to be
+Record `REVIEWED_CTL_COMMIT` with the generated evidence. Its value comes from the independent
+review/task evidence, never from the moving branch itself. The generator independently requires
+the NazoAuth checkout's `origin` to be
 `https://github.com/nazozero/NazoAuth.git` and reads the source matrix with native Git object
 commands, not from the checked-out filesystem.
 
@@ -45,6 +55,8 @@ owner-only path with mode `0600`.
 ```sh
 set -eu
 prefix=/opt/nazoauth-e2e/candidate-deps-oidf-20260820T1300Z
+ctl="$prefix/source/v4/nazoauthctl"
+nazo="$prefix/source/v6/nazoauth"
 private="$prefix/state/oidf-artifact-private"
 public="$prefix/evidence/oidf-artifact-public"
 
@@ -52,8 +64,8 @@ install -d -m 0700 "$private"
 # Provision $private/signer.pem out of band, then enforce:
 chmod 0600 "$private/signer.pem"
 
-python3 "$prefix/source/nazoauthctl/scripts/oidf/generate_oidf_artifact.py" \
-  --nazoauth-repo "$prefix/source/nazoauth" \
+python3 "$ctl/scripts/oidf/generate_oidf_artifact.py" \
+  --nazoauth-repo "$nazo" \
   --output "$public" \
   --trust-policy-output "$private/trust-policy.json" \
   --signing-key "$private/signer.pem" \
