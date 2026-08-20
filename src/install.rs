@@ -91,7 +91,10 @@ pub(crate) fn local_oci_candidate_prepare_intent_path(config_path: &Path) -> Pat
 }
 
 fn candidate_intent_config_digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub(crate) fn load_local_oci_candidate_prepare_intent(
@@ -330,7 +333,7 @@ pub(crate) fn prepare(
     Ok(PreparedInstall {
         config,
         config_path: config_path.to_owned(),
-        local_oci_candidate: options.local_oci_candidate,
+        local_oci_candidate: options.local_oci_candidate.clone(),
     })
 }
 

@@ -3188,7 +3188,10 @@ fn candidate_prepare_intent_binds_the_exact_existing_config_and_can_restore_it()
         "schema": 1,
         "candidate": &candidate,
         "config": &config,
-        "config_sha256": format!("{:x}", Sha256::digest(&config_bytes)),
+        "config_sha256": Sha256::digest(&config_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
     });
     atomic_write(
         &crate::install::local_oci_candidate_prepare_intent_path(&config_path),

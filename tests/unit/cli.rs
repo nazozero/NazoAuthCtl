@@ -609,7 +609,11 @@ fn local_oci_candidate_install_requires_an_exact_complete_source_binding() {
     let Command::Install(options) = command else {
         panic!("expected install");
     };
-    let candidate = options.local_oci_candidate.expect("candidate input");
+    let candidate = options
+        .local_oci_candidate
+        .as_ref()
+        .expect("candidate input")
+        .clone();
     assert_eq!(candidate.image, "nazoauth-candidate:459");
     assert_eq!(candidate.target.revision, revision);
     assert_eq!(candidate.target.oci_digest, digest);
