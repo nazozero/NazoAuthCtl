@@ -103,7 +103,12 @@ def expected_provenance() -> dict[str, object]:
         "generator": {
             "path": GENERATOR_REPO_PATH,
             "predecessor_sha256": GENERATOR_PREDECESSOR_SHA256,
-            "reviewed_parent_commit": "35d885cdbe2341a1d99684140c698499a638d1a2",
+            "integration_base_commit": "eddc35a59e2cded9582d102e2cf2899bcec651e8",
+            "amendment_source_commits": [
+                "35d885cdbe2341a1d99684140c698499a638d1a2",
+                "d879398f99793b5f6cf06855473d69ee4d71e66a",
+            ],
+            "integrated_commit": "861b1a334ae7c2a17265529c3dec6a2d582580b4",
             "host_checkout": "inject the exact reviewed generator commit from independent task evidence",
             "runtime_commit_argument": "--reviewed-generator-commit",
             "runtime_import_isolation": "python3 -I",
