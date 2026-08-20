@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 #[cfg(unix)]
-use rand_core::{OsRng, RngCore as _};
+use rand::{TryRng as _, rngs::SysRng};
 #[cfg(unix)]
 use rustix::fs::{CWD, Mode, OFlags};
 #[cfg(unix)]
@@ -187,8 +187,10 @@ pub(crate) fn write_atomic(
         }
         let file_name = target_name.to_string_lossy();
         let mut random = [0u8; 16];
+        let mut rng = SysRng;
         for _ in 0..16 {
-            OsRng.fill_bytes(&mut random);
+            rng.try_fill_bytes(&mut random)
+                .map_err(|_| SecureFileError::Io)?;
             let temporary = parent.join(format!(".{file_name}.tmp-{}", hex_suffix(&random)));
             let temp_name = temporary
                 .file_name()

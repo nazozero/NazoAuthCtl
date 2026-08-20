@@ -757,15 +757,29 @@ struct DurableSuiteObserver {
 }
 
 impl SuiteResourceObserver for DurableSuiteObserver {
-    fn plan_created(&self, origin: &Origin, plan_id: &str) -> Result<(), String> {
+    fn plan_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String> {
         lock_recovery(&self.recovery)
-            .and_then(|mut recovery| recovery.record_suite_plan(origin.as_str(), plan_id))
+            .and_then(|mut recovery| recovery.begin_suite_create(origin.as_str(), intent_id))
+            .map_err(|error| format!("failed to persist Suite plan create intent: {error:#}"))
+    }
+
+    fn plan_created(&self, origin: &Origin, intent_id: &str, plan_id: &str) -> Result<(), String> {
+        lock_recovery(&self.recovery)
+            .and_then(|mut recovery| {
+                recovery.record_suite_plan(origin.as_str(), intent_id, plan_id)
+            })
             .map_err(|error| format!("failed to persist Suite plan allocation: {error:#}"))
     }
 
-    fn module_created(&self, module_id: &str) -> Result<(), String> {
+    fn module_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String> {
         lock_recovery(&self.recovery)
-            .and_then(|mut recovery| recovery.record_suite_module(module_id))
+            .and_then(|mut recovery| recovery.begin_suite_create(origin.as_str(), intent_id))
+            .map_err(|error| format!("failed to persist Suite module create intent: {error:#}"))
+    }
+
+    fn module_created(&self, intent_id: &str, module_id: &str) -> Result<(), String> {
+        lock_recovery(&self.recovery)
+            .and_then(|mut recovery| recovery.record_suite_module(intent_id, module_id))
             .map_err(|error| format!("failed to persist Suite module allocation: {error:#}"))
     }
 }

@@ -91,18 +91,23 @@ pub struct ConformanceRunConfig {
     /// Worker-owned automation lanes. HTTP-only test fixtures may leave this
     /// empty; production creates one independent lane per configured job.
     pub automation: Vec<ConformanceAutomation>,
-    /// Durable observer for externally allocated Suite resources.  The
+    /// Durable observer for externally allocated Suite resources. The
     /// controller installs this before creating plans so a process crash can
-    /// recover only the opaque Suite IDs it actually allocated.
+    /// recover recorded opaque IDs and fail closed for an unresolved create
+    /// request.
     pub suite_resource_observer: Option<Arc<dyn SuiteResourceObserver>>,
 }
 
-/// Receives Suite allocation events synchronously.  A persistence failure is
-/// treated as a run failure: returning an unjournaled plan or module would
-/// make crash cleanup impossible.
+/// Receives Suite allocation intents and outcomes synchronously.  An intent
+/// is durably persisted before the remote create request; its opaque resource
+/// ID atomically replaces the intent after a successful response. A surviving
+/// intent deliberately blocks recovery completion because the current Suite
+/// API cannot enumerate or deduplicate an unknown create outcome.
 pub trait SuiteResourceObserver: Send + Sync {
-    fn plan_created(&self, origin: &Origin, plan_id: &str) -> Result<(), String>;
-    fn module_created(&self, module_id: &str) -> Result<(), String>;
+    fn plan_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String>;
+    fn plan_created(&self, origin: &Origin, intent_id: &str, plan_id: &str) -> Result<(), String>;
+    fn module_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String>;
+    fn module_created(&self, intent_id: &str, module_id: &str) -> Result<(), String>;
 }
 
 pub struct ConformanceRunner {
@@ -463,6 +468,20 @@ impl ConformanceRunner {
                     let variant = group.effective_variant(plan);
                     let runtime_variant = group.effective_runtime_variant(plan);
                     current_variant = Some(redacted_variant(&variant));
+                    let plan_create_intent =
+                        if let Some(observer) = &self.config.suite_resource_observer {
+                            let intent_id = uuid::Uuid::now_v7().to_string();
+                            if let Err(error) =
+                                observer.plan_create_intent(self.config.client.origin(), &intent_id)
+                            {
+                                errors.push(error);
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'create;
+                            }
+                            Some(intent_id)
+                        } else {
+                            None
+                        };
                     let mut created =
                         match self
                             .config
@@ -481,9 +500,13 @@ impl ConformanceRunner {
                     // response wrapper is partially moved below.
                     zeroize_json_value(&mut created.raw);
                     suite_plan_ids.push(created.id.clone());
-                    if let Some(observer) = &self.config.suite_resource_observer
-                        && let Err(error) =
-                            observer.plan_created(self.config.client.origin(), &created.id)
+                    if let (Some(observer), Some(intent_id)) =
+                        (&self.config.suite_resource_observer, &plan_create_intent)
+                        && let Err(error) = observer.plan_created(
+                            self.config.client.origin(),
+                            intent_id,
+                            &created.id,
+                        )
                     {
                         errors.push(error);
                         groups[group_index].status = GroupStatus::Failed;
@@ -597,6 +620,20 @@ impl ConformanceRunner {
                         current_variant.clone(),
                         current_test.clone(),
                     );
+                    let module_create_intent =
+                        if let Some(observer) = &self.config.suite_resource_observer {
+                            let intent_id = uuid::Uuid::now_v7().to_string();
+                            if let Err(error) = observer
+                                .module_create_intent(self.config.client.origin(), &intent_id)
+                            {
+                                errors.push(error);
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            }
+                            Some(intent_id)
+                        } else {
+                            None
+                        };
                     let instance = match self
                         .config
                         .client
@@ -610,8 +647,9 @@ impl ConformanceRunner {
                         }
                     };
                     module_ids.push(instance.id.clone());
-                    if let Some(observer) = &self.config.suite_resource_observer
-                        && let Err(error) = observer.module_created(&instance.id)
+                    if let (Some(observer), Some(intent_id)) =
+                        (&self.config.suite_resource_observer, &module_create_intent)
+                        && let Err(error) = observer.module_created(intent_id, &instance.id)
                     {
                         errors.push(error);
                         groups[group_index].status = GroupStatus::Failed;
@@ -889,9 +927,14 @@ impl ConformanceRunner {
             }
         }
 
+        // A terminal Suite module is already owned by its plan deletion.  A
+        // cancellation after a terminal result can race the Suite's final
+        // callback, while an unreported allocation still needs cancellation
+        // before its plan is deleted.
+        let cancellable_module_ids = cancellable_module_ids(&module_ids, &modules);
         cleanup_all(
             &self.config.client,
-            &module_ids,
+            &cancellable_module_ids,
             &suite_plan_ids,
             &mut cleanup,
         );
@@ -1056,7 +1099,16 @@ fn cleanup_all(
             ) => {
                 report.deleted_plans.push(plan_id.clone());
             }
-            Ok(DeleteOutcome::Immutable) => report.immutable_plans.push(plan_id.clone()),
+            Ok(DeleteOutcome::Immutable) => {
+                report.immutable_plans.push(plan_id.clone());
+                report.failures.push(CleanupFailure {
+                    operation: "delete-plan".to_owned(),
+                    target: plan_id.clone(),
+                    error:
+                        "Suite retained an immutable plan without an authoritative cleanup receipt"
+                            .to_owned(),
+                });
+            }
             Err(first_error) => {
                 // The official Suite can race plan finalisation with DELETE;
                 // retry once after cancellation before reporting a failure.
@@ -1070,7 +1122,15 @@ fn cleanup_all(
                     ) => {
                         report.deleted_plans.push(plan_id.clone());
                     }
-                    Ok(DeleteOutcome::Immutable) => report.immutable_plans.push(plan_id.clone()),
+                    Ok(DeleteOutcome::Immutable) => {
+                        report.immutable_plans.push(plan_id.clone());
+                        report.failures.push(CleanupFailure {
+                            operation: "delete-plan".to_owned(),
+                            target: plan_id.clone(),
+                            error: "Suite retained an immutable plan without an authoritative cleanup receipt"
+                                .to_owned(),
+                        });
+                    }
                     Err(retry_error) => report.failures.push(CleanupFailure {
                         operation: "delete-plan".to_owned(),
                         target: plan_id.clone(),
@@ -1086,6 +1146,19 @@ fn cleanup_all(
     }
 }
 
+fn cancellable_module_ids(module_ids: &[String], reports: &[ModuleReport]) -> Vec<String> {
+    let terminal_module_ids = reports
+        .iter()
+        .filter(|module| module.terminal)
+        .filter_map(|module| module.module_id.as_deref())
+        .collect::<BTreeSet<_>>();
+    module_ids
+        .iter()
+        .filter(|module_id| !terminal_module_ids.contains(module_id.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Idempotently clean only Suite resources durably recorded by the controller
 /// before a crash.  The caller must bind the current authenticated Suite
 /// client to the exact journal origin before invoking this function.
@@ -1096,8 +1169,38 @@ pub fn recover_suite_resources(
     if client.origin().as_str() != state.origin {
         return Err("Suite recovery origin does not match the authenticated client".to_owned());
     }
+    if !state.pending_create_intents.is_empty() {
+        return Err(format!(
+            "Suite recovery has {} unknown create allocation(s); the Suite API cannot safely reconcile them",
+            state.pending_create_intents.len()
+        ));
+    }
+    let mut cancellable_module_ids = Vec::with_capacity(state.module_ids.len());
+    for module_id in &state.module_ids {
+        match client.module_info(module_id) {
+            Ok(info) if is_terminal(&info) => {}
+            Ok(info) if status(&info).is_some() => cancellable_module_ids.push(module_id.clone()),
+            Ok(_) => {
+                return Err(format!(
+                    "Suite recovery refused to cancel module {module_id}: current Suite state is missing"
+                ));
+            }
+            Err(SuiteClientError::HttpStatus(404)) => {}
+            Err(error) => {
+                return Err(format!(
+                    "Suite recovery refused to cancel module {module_id}: cannot read current Suite state: {}",
+                    safe_error(&error)
+                ));
+            }
+        }
+    }
     let mut report = CleanupReport::default();
-    cleanup_all(client, &state.module_ids, &state.plan_ids, &mut report);
+    cleanup_all(
+        client,
+        &cancellable_module_ids,
+        &state.plan_ids,
+        &mut report,
+    );
     if report.failures.is_empty() {
         Ok(())
     } else {
@@ -1154,10 +1257,7 @@ fn needs_interactive_or_terminal_wait(value: Option<&Value>) -> bool {
 }
 
 fn is_terminal(value: &Value) -> bool {
-    matches!(
-        value.get("status").and_then(Value::as_str),
-        Some("FINISHED" | "INTERRUPTED")
-    )
+    is_terminal_state(value)
 }
 
 fn validate_matrix_origins(
@@ -1249,12 +1349,42 @@ mod tests {
     use crate::client::ClientConfig;
     use crate::credentials::BearerToken;
     use crate::matrix::{MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix};
-    use crate::transport::{HttpRequest, HttpResponse, Transport, TransportError};
+    use crate::transport::{HttpMethod, HttpRequest, HttpResponse, Transport, TransportError};
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
     struct FixtureTransport {
         requests: Mutex<Vec<HttpRequest>>,
+    }
+
+    struct RecoveryTransport {
+        module_state: Value,
+        module_status: u16,
+        plan_status: u16,
+        requests: Mutex<Vec<(HttpMethod, String)>>,
+    }
+
+    impl Transport for RecoveryTransport {
+        fn send(&self, request: HttpRequest, _max: usize) -> Result<HttpResponse, TransportError> {
+            let path = request.url().path().to_owned();
+            self.requests
+                .lock()
+                .expect("recovery requests")
+                .push((request.method(), path.clone()));
+            let (status, body) = match (request.method(), path.as_str()) {
+                (HttpMethod::Get, "/api/info/module-1") => {
+                    (self.module_status, self.module_state.clone())
+                }
+                (HttpMethod::Delete, "/api/runner/module-1") => (200, serde_json::json!({})),
+                (HttpMethod::Delete, "/api/plan/plan-1") => (self.plan_status, Value::Null),
+                _ => (404, serde_json::json!({})),
+            };
+            Ok(HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("recovery json"),
+            })
+        }
     }
 
     impl Transport for FixtureTransport {
@@ -1327,6 +1457,161 @@ mod tests {
             document,
             digest: "x".into(),
         }
+    }
+
+    #[test]
+    fn cleanup_cancels_only_modules_without_terminal_reports() {
+        let terminal = ModuleReport::from_info(
+            ModuleReportContext {
+                matrix_plan_id: "plan".into(),
+                suite_plan_id: "suite-plan".into(),
+                module_id: Some("terminal".into()),
+                test_name: "terminal-test".into(),
+                terminal: true,
+                expected_result: None,
+            },
+            serde_json::json!({"status":"FINISHED","result":"PASSED"}),
+            serde_json::json!([]),
+        );
+        let incomplete = ModuleReport::from_info(
+            ModuleReportContext {
+                matrix_plan_id: "plan".into(),
+                suite_plan_id: "suite-plan".into(),
+                module_id: Some("incomplete".into()),
+                test_name: "incomplete-test".into(),
+                terminal: false,
+                expected_result: None,
+            },
+            serde_json::json!({"status":"RUNNING"}),
+            serde_json::json!([]),
+        );
+
+        assert_eq!(
+            cancellable_module_ids(
+                &["terminal".into(), "incomplete".into(), "unobserved".into()],
+                &[terminal, incomplete],
+            ),
+            vec!["incomplete", "unobserved"],
+        );
+    }
+
+    fn recovery_client(transport: Arc<RecoveryTransport>) -> SuiteClient {
+        SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport,
+            ClientConfig::default(),
+        )
+        .expect("client")
+    }
+
+    #[test]
+    fn recovery_queries_state_and_skips_terminal_modules() {
+        let transport = Arc::new(RecoveryTransport {
+            module_state: serde_json::json!({"state":"FINISHED"}),
+            module_status: 200,
+            plan_status: 204,
+            requests: Mutex::new(Vec::new()),
+        });
+        let state = crate::recovery::SuiteRecoveryState {
+            origin: "https://suite.example".to_owned(),
+            plan_ids: vec!["plan-1".to_owned()],
+            module_ids: vec!["module-1".to_owned()],
+            pending_create_intents: Vec::new(),
+            cleanup_complete: false,
+        };
+
+        recover_suite_resources(&recovery_client(transport.clone()), &state)
+            .expect("terminal recovery cleanup");
+
+        assert_eq!(
+            *transport.requests.lock().expect("recovery requests"),
+            vec![
+                (HttpMethod::Get, "/api/info/module-1".to_owned()),
+                (HttpMethod::Delete, "/api/plan/plan-1".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_fails_closed_when_module_state_cannot_be_observed() {
+        let transport = Arc::new(RecoveryTransport {
+            module_state: serde_json::json!({}),
+            module_status: 200,
+            plan_status: 204,
+            requests: Mutex::new(Vec::new()),
+        });
+        let state = crate::recovery::SuiteRecoveryState {
+            origin: "https://suite.example".to_owned(),
+            plan_ids: vec!["plan-1".to_owned()],
+            module_ids: vec!["module-1".to_owned()],
+            pending_create_intents: Vec::new(),
+            cleanup_complete: false,
+        };
+
+        let error = recover_suite_resources(&recovery_client(transport.clone()), &state)
+            .expect_err("unobservable module state must retain the recovery journal");
+
+        assert!(error.contains("current Suite state is missing"));
+        assert_eq!(
+            *transport.requests.lock().expect("recovery requests"),
+            vec![(HttpMethod::Get, "/api/info/module-1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn recovery_fails_closed_for_unknown_create_intent() {
+        let transport = Arc::new(RecoveryTransport {
+            module_state: serde_json::json!({"state":"RUNNING"}),
+            module_status: 200,
+            plan_status: 204,
+            requests: Mutex::new(Vec::new()),
+        });
+        let state = crate::recovery::SuiteRecoveryState {
+            origin: "https://suite.example".to_owned(),
+            plan_ids: vec!["plan-1".to_owned()],
+            module_ids: vec!["module-1".to_owned()],
+            pending_create_intents: vec!["019ff000-8190-7393-8c33-ab4339c3d85e".to_owned()],
+            cleanup_complete: false,
+        };
+
+        let error = recover_suite_resources(&recovery_client(transport.clone()), &state)
+            .expect_err("unknown remote allocation must block recovery completion");
+
+        assert!(error.contains("unknown create allocation"));
+        assert!(
+            transport
+                .requests
+                .lock()
+                .expect("recovery requests")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_treat_immutable_plan_as_cleanup_complete() {
+        let transport = Arc::new(RecoveryTransport {
+            module_state: serde_json::json!({}),
+            module_status: 200,
+            plan_status: 405,
+            requests: Mutex::new(Vec::new()),
+        });
+        let state = crate::recovery::SuiteRecoveryState {
+            origin: "https://suite.example".to_owned(),
+            plan_ids: vec!["plan-1".to_owned()],
+            module_ids: Vec::new(),
+            pending_create_intents: Vec::new(),
+            cleanup_complete: false,
+        };
+
+        let error = recover_suite_resources(&recovery_client(transport.clone()), &state)
+            .expect_err("an immutable plan has no authoritative cleanup receipt");
+
+        assert!(error.contains("cleanup failed"));
+        assert_eq!(
+            *transport.requests.lock().expect("recovery requests"),
+            vec![(HttpMethod::Delete, "/api/plan/plan-1".to_owned())]
+        );
     }
 
     #[test]
@@ -1808,5 +2093,12 @@ mod tests {
         assert!(needs_interactive_or_terminal_wait(Some(&running)));
         assert!(!needs_interactive_or_terminal_wait(Some(&waiting)));
         assert!(!needs_interactive_or_terminal_wait(Some(&finished)));
+    }
+
+    #[test]
+    fn terminal_detection_accepts_state_only_suite_responses() {
+        assert!(is_terminal(&serde_json::json!({"state":"FINISHED"})));
+        assert!(is_terminal(&serde_json::json!({"state":"INTERRUPTED"})));
+        assert!(!is_terminal(&serde_json::json!({"state":"RUNNING"})));
     }
 }

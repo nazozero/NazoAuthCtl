@@ -24,6 +24,31 @@ struct ParallelFixtureTransport {
     module_result: String,
 }
 
+struct RejectCreatedPlanObserver;
+
+impl SuiteResourceObserver for RejectCreatedPlanObserver {
+    fn plan_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn plan_created(
+        &self,
+        _origin: &Origin,
+        _intent_id: &str,
+        _plan_id: &str,
+    ) -> Result<(), String> {
+        Err("simulated durable plan persistence failure".to_owned())
+    }
+
+    fn module_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn module_created(&self, _intent_id: &str, _module_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 impl ParallelFixtureTransport {
     fn response(status: u16, body: Value) -> Result<HttpResponse, TransportError> {
         Ok(HttpResponse {
@@ -277,6 +302,17 @@ fn independent_plans_overlap_but_reports_remain_in_matrix_order() {
     assert_eq!(summary.report.orchestration_integrity.defined_modules, 2);
     assert_eq!(summary.report.orchestration_integrity.terminal_modules, 2);
     assert!(summary.report.cleanup.failures.is_empty());
+    assert!(
+        transport
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .all(|(method, path)| {
+                !(*method == HttpMethod::Delete && path.starts_with("/api/runner/"))
+            }),
+        "parallel cleanup must use observed terminal reports instead of re-cancelling them"
+    );
     assert!(!progress.0.is_empty());
     assert!(
         progress.0.iter().all(|snapshot| snapshot.total == 2),
@@ -419,4 +455,30 @@ fn orchestration_error_stops_queued_plans_and_drains_in_flight_cleanup() {
             .iter()
             .any(|deleted| deleted == plan)
     }));
+}
+
+#[test]
+fn observer_failure_still_cleans_up_the_in_memory_plan_id() {
+    let (mut runner, transport) = parallel_fixture(serde_json::json!({}), &["plan-a"], None);
+    runner.config.suite_resource_observer = Some(Arc::new(RejectCreatedPlanObserver));
+
+    let summary = runner.run(&mut ());
+
+    assert!(!summary.report.local_success);
+    assert!(
+        summary
+            .report
+            .errors
+            .iter()
+            .any(|error| error == "simulated durable plan persistence failure")
+    );
+    assert_eq!(summary.report.cleanup.deleted_plans, vec!["plan-a"]);
+    assert!(
+        transport
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .any(|(method, path)| *method == HttpMethod::Delete && path == "/api/plan/plan-a")
+    );
 }

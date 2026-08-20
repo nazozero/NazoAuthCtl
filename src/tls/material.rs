@@ -1,6 +1,6 @@
 //! Offline PKI validation for imported public-server TLS material.
 
-use std::{io::Cursor, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use anyhow::{Context, bail};
 use chrono::Utc;
@@ -9,6 +9,7 @@ use rustls::{
     pki_types::{ServerName, UnixTime},
     sign::CertifiedKey,
 };
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use x509_parser::{certificate::X509Certificate, prelude::FromDer as _};
 
 use super::{
@@ -45,13 +46,15 @@ pub(super) fn load_and_validate_material(
         true,
         MAX_PRIVATE_KEY_BYTES,
     )?;
-    let certificates = rustls_pemfile::certs(&mut Cursor::new(certificate_pem.as_slice()))
+    let certificates = CertificateDer::pem_slice_iter(certificate_pem.as_slice())
         .collect::<Result<Vec<_>, _>>()
         .context("TLS certificate PEM is invalid")?;
     if certificates.is_empty() {
         bail!("TLS certificate chain contains no certificate");
     }
-    let private_key = rustls_pemfile::private_key(&mut Cursor::new(private_key_pem.as_slice()))
+    let private_key = PrivateKeyDer::pem_slice_iter(private_key_pem.as_slice())
+        .next()
+        .transpose()
         .context("TLS private key PEM is invalid")?
         .context("TLS private key PEM contains no supported private key")?;
     let crypto = rustls::crypto::aws_lc_rs::default_provider();
@@ -109,7 +112,7 @@ pub(super) fn load_and_validate_material(
 }
 
 pub(super) fn root_store_from_pem(pem: &[u8]) -> anyhow::Result<RootCertStore> {
-    let certificates = rustls_pemfile::certs(&mut Cursor::new(pem))
+    let certificates = CertificateDer::pem_slice_iter(pem)
         .collect::<Result<Vec<_>, _>>()
         .context("TLS trust anchor PEM is invalid")?;
     if certificates.is_empty() {

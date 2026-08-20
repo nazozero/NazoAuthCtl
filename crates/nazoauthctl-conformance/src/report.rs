@@ -16,9 +16,9 @@ pub struct CleanupFailure {
 pub struct CleanupReport {
     pub cancelled: Vec<String>,
     pub deleted_plans: Vec<String>,
-    /// Plans which the Suite owns immutably. This is an explicit outcome, not
-    /// an orchestration failure: the client cannot delete what the Suite
-    /// deliberately retains.
+    /// Plans which the Suite reported immutable. Without an authoritative
+    /// Suite cleanup receipt this remains an orchestration failure and is
+    /// retained alongside the corresponding cleanup failure for review.
     pub immutable_plans: Vec<String>,
     pub failures: Vec<CleanupFailure>,
 }

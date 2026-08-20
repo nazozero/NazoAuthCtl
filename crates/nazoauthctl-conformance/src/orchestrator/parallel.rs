@@ -384,9 +384,14 @@ fn merge_reports(
     // Phase 1 owns every Suite plan. Deletion is deliberately centralized
     // after all workers stop so one worker can never delete a plan another
     // worker still needs, and queued plans are cleaned even if never run.
+    let observed_module_ids = modules
+        .iter()
+        .filter_map(|module| module.module_id.clone())
+        .collect::<Vec<_>>();
+    let cancellable_module_ids = cancellable_module_ids(&observed_module_ids, &modules);
     cleanup_all(
         &runner.config.client,
-        &[],
+        &cancellable_module_ids,
         &prepared.suite_plan_ids,
         &mut cleanup,
     );
@@ -397,7 +402,7 @@ fn merge_reports(
     let defined_modules = plans.iter().map(|plan| plan.defined_modules).sum();
     let created_instances = plans.iter().map(|plan| plan.created_instances).sum();
     let terminal_modules = modules.iter().filter(|module| module.terminal).count();
-    let cleanup_complete = cleanup.failures.is_empty();
+    let cleanup_complete = !worker_panicked && cleanup.failures.is_empty();
     let all_modules_instantiated = all_plans_finished && defined_modules == created_instances;
     let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
     let outcomes = summarize_module_outcomes(&modules);
