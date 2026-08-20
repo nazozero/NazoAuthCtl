@@ -39,6 +39,7 @@ fn install_options(data_root: PathBuf) -> InstallOptions {
         profile_secret_fd: None,
         profile_secrets: None,
         version: Some("v0.2.0".to_owned()),
+        local_oci_candidate: None,
     }
 }
 
@@ -300,6 +301,7 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
         profile_secret_fd: None,
         profile_secrets: None,
         version: Some("v1.2.3".to_owned()),
+        local_oci_candidate: None,
     };
 
     let rendered = write_install_profile(&config, &options).unwrap().unwrap();

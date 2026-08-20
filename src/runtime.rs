@@ -130,6 +130,10 @@ pub(crate) struct ActiveBuildTarget {
     pub(crate) embedded: nazo_operator_protocol::EmbeddedIdentity,
     pub(crate) image_digest: String,
     pub(crate) binary_digest: String,
+    /// Container runtimes expose an engine-local immutable object ID in
+    /// addition to the registry manifest digest.  Local-candidate
+    /// conformance binds both so a mutable tag cannot redirect a task.
+    pub(crate) local_artifact_id: Option<String>,
 }
 
 impl<'a> Runtime<'a> {
@@ -634,6 +638,7 @@ impl<'a> Runtime<'a> {
             embedded,
             image_digest,
             binary_digest,
+            local_artifact_id: observation.local_artifact_id,
         })
     }
 

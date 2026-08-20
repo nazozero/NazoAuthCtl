@@ -5,6 +5,7 @@ use std::{
 };
 
 use super::*;
+use sha2::Digest as _;
 #[cfg(unix)]
 use crate::test_support::write_shell_executable;
 use crate::{
@@ -2840,6 +2841,7 @@ fn update_noop_requires_exact_signed_state_identity_and_artifact() {
         embedded: target.embedded.clone(),
         image_digest: String::new(),
         binary_digest: expected_digest,
+        local_artifact_id: None,
     };
 
     assert!(active_target_matches_release(&config, &target, &exact, &target).unwrap());
@@ -2853,6 +2855,7 @@ fn update_noop_requires_exact_signed_state_identity_and_artifact() {
         embedded: target.embedded.clone(),
         image_digest: String::new(),
         binary_digest: "c".repeat(64),
+        local_artifact_id: None,
     };
     assert!(!active_target_matches_release(&config, &target, &substituted, &target).unwrap());
 
@@ -3043,4 +3046,166 @@ fn candidate_target_is_oci_only_and_keeps_exact_embedded_identity() {
     assert_eq!(expected.embedded.build_id, candidate.build_id);
     assert_eq!(expected.image_digest, candidate.oci_digest);
     assert!(expected.binary_digest.is_empty());
+}
+
+#[test]
+fn local_oci_candidate_identity_accepts_only_the_exact_source_revision() {
+    let revision = "a".repeat(40);
+    let candidate = CandidateTarget {
+        release: "v0.1.41-candidate.459".to_owned(),
+        revision: revision.clone(),
+        build_id: format!("source:{revision}"),
+        oci_digest: format!("sha256:{}", "b".repeat(64)),
+    };
+    let identity = nazo_operator_protocol::EmbeddedIdentity {
+        release: candidate.release.clone(),
+        revision: candidate.revision.clone(),
+        protocol: nazo_operator_protocol::PROTOCOL_VERSION,
+        build_id: candidate.build_id.clone(),
+    };
+    assert!(commands::validate_local_oci_candidate_identity(&candidate, &identity).is_ok());
+
+    let mut wrong_digest_identity = identity.clone();
+    wrong_digest_identity.build_id = format!("source:{}", "c".repeat(40));
+    assert!(commands::validate_local_oci_candidate_identity(&candidate, &wrong_digest_identity)
+        .is_err());
+
+    let mut non_source = candidate.clone();
+    non_source.build_id = format!("local:{}", candidate.revision);
+    assert!(commands::validate_local_oci_candidate_identity(&non_source, &identity).is_err());
+
+    let local_id = format!("sha256:{}", "c".repeat(64));
+    assert!(commands::validate_local_oci_candidate_observation(
+        &candidate,
+        &identity,
+        &local_id,
+        &candidate.oci_digest,
+    )
+    .is_ok());
+    assert!(commands::validate_local_oci_candidate_observation(
+        &candidate,
+        &identity,
+        &local_id,
+        &format!("sha256:{}", "d".repeat(64)),
+    )
+    .is_err());
+}
+
+#[test]
+fn signed_release_with_a_source_build_id_is_not_classified_as_a_local_candidate() {
+    let record = DeploymentRecord {
+        schema: crate::deployment::DEPLOYMENT_SCHEMA,
+        deployment_id: "signed-source-build".to_owned(),
+        control_authority: "controller-source-build".to_owned(),
+        alias: None,
+        issuer: "https://issuer.example".to_owned(),
+        active_release: nazo_operator_protocol::EmbeddedIdentity {
+            release: "v0.2.0".to_owned(),
+            revision: "a".repeat(40),
+            protocol: nazo_operator_protocol::PROTOCOL_VERSION,
+            build_id: format!("source:{}", "a".repeat(40)),
+        },
+        trust: crate::deployment::TrustState::Adopted,
+        capabilities: crate::deployment::CapabilityGrants::controller_installed(),
+        runtime_instances: Vec::new(),
+        resources: BTreeMap::new(),
+        recovery: crate::deployment::RecoveryAssessment {
+            conclusion: RecoveryConclusion::Proven,
+            evidence: Vec::new(),
+            off_host_package_required_for_machine_loss: true,
+        },
+        operator_protocol_versions: std::collections::BTreeSet::new(),
+        control_protocol_versions: std::collections::BTreeSet::new(),
+        declaration_revision: 1,
+    };
+    assert!(!commands::is_local_oci_candidate_record(&record));
+}
+
+#[test]
+fn pending_local_oci_candidate_state_is_distinct_from_completed_state() {
+    let work = PrivateTempDir::new("nazoauth-local-candidate-state").unwrap();
+    let config = config(&work);
+    fs::create_dir_all(&config.deployment_root).unwrap();
+    let revision = "a".repeat(40);
+    let mut state = LocalOciCandidateInstallState {
+        schema: 1,
+        candidate: LocalOciCandidateInstall {
+            image: "candidate:local".to_owned(),
+            target: CandidateTarget {
+                release: "v0.2.0-candidate.1".to_owned(),
+                revision: revision.clone(),
+                build_id: format!("source:{revision}"),
+                oci_digest: format!("sha256:{}", "b".repeat(64)),
+            },
+        },
+        local_artifact_id: format!("sha256:{}", "c".repeat(64)),
+        recovery_backup: None,
+        management_event_file: None,
+        management_event_sha256: None,
+        completed: false,
+    };
+    atomic_write(
+        &deployment::local_oci_candidate_install_resource_path(&config),
+        &serde_json::to_vec_pretty(&state).unwrap(),
+        0o600,
+    )
+    .unwrap();
+    assert!(deployment::local_oci_candidate_install_is_pending(&config).unwrap());
+    state.completed = true;
+    atomic_write(
+        &deployment::local_oci_candidate_install_resource_path(&config),
+        &serde_json::to_vec_pretty(&state).unwrap(),
+        0o600,
+    )
+    .unwrap();
+    assert!(!deployment::local_oci_candidate_install_is_pending(&config).unwrap());
+    assert!(deployment::local_oci_candidate_install_is_completed(&config).unwrap());
+}
+
+#[test]
+fn candidate_prepare_intent_binds_the_exact_existing_config_and_can_restore_it() {
+    let work = PrivateTempDir::new("nazoauth-local-candidate-prepare-intent").unwrap();
+    let config = config(&work);
+    let config_path = work.path().join("nazoauthctl.json");
+    let revision = "a".repeat(40);
+    let candidate = LocalOciCandidateInstall {
+        image: "candidate:local".to_owned(),
+        target: CandidateTarget {
+            release: "v0.2.0-candidate.1".to_owned(),
+            revision: revision.clone(),
+            build_id: format!("source:{revision}"),
+            oci_digest: format!("sha256:{}", "b".repeat(64)),
+        },
+    };
+    let config_bytes = serde_json::to_vec_pretty(&config).unwrap();
+    let intent = serde_json::json!({
+        "schema": 1,
+        "candidate": &candidate,
+        "config": &config,
+        "config_sha256": format!("{:x}", Sha256::digest(&config_bytes)),
+    });
+    atomic_write(
+        &crate::install::local_oci_candidate_prepare_intent_path(&config_path),
+        &serde_json::to_vec_pretty(&intent).unwrap(),
+        0o600,
+    )
+    .unwrap();
+
+    crate::install::restore_local_oci_candidate_prepare_intent(&config_path, &candidate).unwrap();
+    let restored = load_config(&config_path).unwrap();
+    crate::install::validate_existing_local_oci_candidate_prepare_intent(
+        &config_path,
+        &restored,
+        &candidate,
+    )
+    .unwrap();
+
+    let mut different = candidate.clone();
+    different.target.oci_digest = format!("sha256:{}", "c".repeat(64));
+    assert!(crate::install::validate_existing_local_oci_candidate_prepare_intent(
+        &config_path,
+        &restored,
+        &different,
+    )
+    .is_err());
 }

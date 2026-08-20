@@ -25,7 +25,10 @@ use crate::deployment::{
 };
 use crate::{
     backup::Backup,
-    cli::{BootstrapAdminOptions, CandidateTarget, Cli, Command, KeysCommand, UpdateOptions},
+    cli::{
+        BootstrapAdminOptions, CandidateTarget, Cli, Command, KeysCommand, LocalOciCandidateInstall,
+        UpdateOptions,
+    },
     filesystem::{atomic_write, open_lock_file, remove_file_durable, set_mode, symlink_atomic},
     install::{self, PreparedInstall},
     model::{ReleaseManifest, UpdateConfig},
@@ -105,8 +108,44 @@ pub(crate) fn conformance_control_context(
         runtime.active_image()?
     };
     let expected = if let Some(record) = context.record.as_ref()
+        && commands::is_local_oci_candidate_record(record)
+    {
+        commands::validate_declared_local_artifact(record, &context.config)?;
+        let active = runtime.active_build_target()?;
+        if active.embedded != record.active_release {
+            bail!("active local OCI identity differs from the deployment declaration");
+        }
+        let expected_oci_digest = record
+            .runtime_instances
+            .first()
+            .and_then(|runtime| match &runtime.artifact {
+                crate::deployment::ArtifactReference::Oci { digest, .. } => Some(digest),
+                _ => None,
+            })
+            .context("local OCI deployment declaration has no OCI artifact binding")?;
+        if active.image_digest != *expected_oci_digest {
+            bail!("active local OCI image digest differs from the deployment declaration");
+        }
+        let expected_local_artifact_id = record
+            .runtime_instances
+            .first()
+            .and_then(|runtime| runtime.local_artifact_id.as_deref())
+            .context("local OCI deployment declaration has no immutable local image ID")?;
+        if active.local_artifact_id.as_deref() != Some(expected_local_artifact_id) {
+            bail!("active local OCI image ID differs from the deployment declaration");
+        }
+        operator::expected_release_target(
+            &context.config,
+            active.embedded,
+            expected_oci_digest.to_owned(),
+            active.binary_digest,
+        )?
+    } else if let Some(record) = context.record.as_ref()
         && record.active_release.build_id.starts_with("local:")
     {
+        // Development activation retains its established host-or-container
+        // semantics.  It is deliberately not inferred from `source:`: the
+        // candidate path above has explicit durable provenance.
         commands::validate_local_development_identity(&record.active_release)?;
         let active = runtime.active_build_target()?;
         if active.embedded != record.active_release {
@@ -123,6 +162,49 @@ pub(crate) fn conformance_control_context(
         expected_target(&context.config, &release)?
     };
     Ok((context, target, expected))
+}
+
+/// Mutation entry points that operate directly on a registered declaration
+/// (rather than through `control_config`) must observe the same candidate
+/// unsettled-state guard.  Read-only status/transaction presentation remains
+/// available for diagnosis.
+pub(crate) fn reject_pending_local_oci_candidate_record(
+    record: &DeploymentRecord,
+) -> anyhow::Result<()> {
+    let Some(SafeReference::File { path }) = record.resources.get("controller_config") else {
+        return Ok(());
+    };
+    let config = load_config_unsettled(path)?;
+    if deployment::local_oci_candidate_install_is_pending(&config)? {
+        bail!(
+            "local OCI candidate installation is pending; repeat its exact install command before mutating the registered deployment"
+        );
+    }
+    Ok(())
+}
+
+/// A completed local OCI candidate is an immutable conformance artifact, not
+/// an unsigned release channel.  Promotion must be an explicit future
+/// transaction; controller mutations must not silently replace its runtime,
+/// active release, or provenance.
+pub(crate) fn reject_completed_local_oci_candidate_transition(
+    record: &DeploymentRecord,
+) -> anyhow::Result<()> {
+    if !commands::is_local_oci_candidate_record(record) {
+        return Ok(());
+    }
+    let path = match record.resources.get("controller_config") {
+        Some(SafeReference::File { path }) => path,
+        _ => bail!("local OCI candidate declaration has no controller configuration binding"),
+    };
+    let config = load_config_unsettled(path)?;
+    if !deployment::local_oci_candidate_install_is_completed(&config)? {
+        bail!("local OCI candidate transition is unavailable until its completed state is durably verified");
+    }
+    deployment::validate_completed_local_oci_candidate_provenance(&config, record)?;
+    bail!(
+        "completed local OCI candidate deployments are frozen; use conformance/read-only diagnostics or an explicit future promotion transaction"
+    )
 }
 
 fn control_config(
@@ -164,6 +246,11 @@ fn control_config_with_lock_mode(
         } else {
             load_config(config_path)?
         };
+        if deployment::local_oci_candidate_install_is_pending(&config)? {
+            bail!(
+                "local OCI candidate installation is pending; repeat its exact install command or inspect status before running controller commands"
+            );
+        }
         return Ok(ControlConfig {
             path: config_path.to_path_buf(),
             config,
@@ -290,6 +377,14 @@ fn control_config_with_lock_mode(
     } else {
         load_config(&path)?
     };
+    if deployment::local_oci_candidate_install_is_pending(&config)? {
+        bail!(
+            "local OCI candidate installation is pending; repeat its exact install command or inspect status before running controller commands"
+        );
+    }
+    if lock_mode == DeploymentLockMode::Exclusive {
+        reject_completed_local_oci_candidate_transition(&record)?;
+    }
     verify_control_binding(&record, &config)?;
     // The declaration is the authoritative capability state.  Keep the
     // in-memory legacy config aligned after the lock/reload boundary so a
@@ -456,6 +551,24 @@ struct InstallCompletion {
     management_event_sha256: String,
     #[serde(default)]
     recovery_backup: PathBuf,
+}
+
+/// Durable state for the explicit local-OCI install path.  It exists before
+/// the first privileged operator task, so a crash can only be resumed with the
+/// same four identity bindings and immutable local image ID.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LocalOciCandidateInstallState {
+    schema: u32,
+    candidate: LocalOciCandidateInstall,
+    local_artifact_id: String,
+    #[serde(default)]
+    recovery_backup: Option<PathBuf>,
+    #[serde(default)]
+    management_event_file: Option<String>,
+    #[serde(default)]
+    management_event_sha256: Option<String>,
+    completed: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -27,10 +27,13 @@ pub(crate) fn cache_trusted_runtime(
                 validate_oci_digest(digest)?;
                 let runtime_backend = backend(runtime.backend);
                 let local_image_id = runtime_backend.resolve_local_image_id(image_reference)?;
-                let local_development = record.active_release.build_id.starts_with("local:");
-                if local_development {
+                let local_artifact = runtime.local_artifact_id.is_some();
+                if local_artifact {
                     if runtime.local_artifact_id.as_deref() != Some(local_image_id.as_str()) {
-                        bail!("local development runtime no longer matches its immutable image ID");
+                        bail!("local OCI runtime no longer matches its immutable image ID");
+                    }
+                    if runtime_backend.resolve_image_digest(image_reference)? != *digest {
+                        bail!("local OCI runtime no longer matches its declared manifest digest");
                     }
                 } else if runtime_backend.resolve_image_digest(image_reference)? != *digest {
                     bail!("runtime OCI artifact no longer matches its signed Release digest");
@@ -42,7 +45,7 @@ pub(crate) fn cache_trusted_runtime(
                         fs::remove_file(stale)?;
                     }
                 }
-                let export_reference = if local_development {
+                let export_reference = if local_artifact {
                     local_image_id.clone()
                 } else {
                     format!(

@@ -151,6 +151,12 @@ Options:
   --network-subnet CIDR               Optional fixed container subnet; requires --runtime-ip
   --runtime-ip ADDRESS                Optional fixed application IP; requires --network-subnet
   --to VERSION                        Immutable vSemVer Release; default: latest
+  --candidate-image IMAGE             Explicitly use an already-present local OCI image; requires
+                                      all four --candidate-* identity bindings below
+  --candidate-release VERSION         Candidate vSemVer release identity
+  --candidate-revision SHA            Full lowercase Git revision
+  --candidate-build-id source:SHA     Must exactly bind the full candidate revision
+  --candidate-oci-digest sha256:DIGEST Expected local OCI manifest digest
   --external-dependencies             Use operator-owned PostgreSQL and Valkey
   --secrets-stdin                     Read the three dependency URLs as strict JSON from stdin
   --secret-fd FD                      Read the same JSON from an already-open FD (Linux)
@@ -333,7 +339,7 @@ server Release cannot replace the controller."
     }
 }
 
-mod controller;
+pub(crate) mod controller;
 
 #[cfg(test)]
 #[path = "../tests/unit/entrypoint.rs"]

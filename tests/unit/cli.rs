@@ -576,6 +576,142 @@ fn parses_complete_install_contract_and_rejects_invalid_boundaries() {
 }
 
 #[test]
+fn local_oci_candidate_install_requires_an_exact_complete_source_binding() {
+    let revision = "a".repeat(40);
+    let digest = format!("sha256:{}", "b".repeat(64));
+    let source = format!("source:{revision}");
+    let command = parse(&[
+        "nazoauthctl",
+        "install",
+        "--runtime",
+        "podman",
+        "--external-dependencies",
+        "--profile",
+        "standards-full",
+        "--profile-material",
+        "/srv/profile.json",
+        "--trusted-proxy-cidr",
+        "192.0.2.10/32",
+        "--candidate-image",
+        "nazoauth-candidate:459",
+        "--candidate-release",
+        "v0.1.41-candidate.459",
+        "--candidate-revision",
+        &revision,
+        "--candidate-build-id",
+        &source,
+        "--candidate-oci-digest",
+        &digest,
+    ])
+    .unwrap()
+    .unwrap()
+    .command;
+    let Command::Install(options) = command else {
+        panic!("expected install");
+    };
+    let candidate = options.local_oci_candidate.expect("candidate input");
+    assert_eq!(candidate.image, "nazoauth-candidate:459");
+    assert_eq!(candidate.target.revision, revision);
+    assert_eq!(candidate.target.oci_digest, digest);
+
+    for arguments in [
+        &[
+            "nazoauthctl",
+            "install",
+            "--external-dependencies",
+            "--candidate-image",
+            "candidate",
+            "--candidate-release",
+            "v0.1.41-candidate.459",
+            "--candidate-revision",
+            &revision,
+            "--candidate-build-id",
+            &source,
+        ][..],
+        &[
+            "nazoauthctl",
+            "install",
+            "--runtime",
+            "host",
+            "--external-dependencies",
+            "--candidate-image",
+            "candidate",
+            "--candidate-release",
+            "v0.1.41-candidate.459",
+            "--candidate-revision",
+            &revision,
+            "--candidate-build-id",
+            &source,
+            "--candidate-oci-digest",
+            &digest,
+        ][..],
+        &[
+            "nazoauthctl",
+            "install",
+            "--external-dependencies",
+            "--candidate-image",
+            "candidate",
+            "--candidate-release",
+            "v0.1.41-candidate.459",
+            "--candidate-revision",
+            &revision,
+            "--candidate-build-id",
+            "local:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--candidate-oci-digest",
+            &digest,
+        ][..],
+        &[
+            "nazoauthctl",
+            "install",
+            "--external-dependencies",
+            "--candidate-image",
+            "candidate",
+            "--candidate-release",
+            "v0.1.41-candidate.459",
+            "--candidate-revision",
+            &revision,
+            "--candidate-build-id",
+            &source,
+            "--candidate-oci-digest",
+            &digest,
+            "--to",
+            "v0.1.41",
+        ][..],
+        &[
+            "nazoauthctl",
+            "install",
+            "--candidate-image",
+            "candidate",
+            "--candidate-release",
+            "v0.1.41-candidate.459",
+            "--candidate-revision",
+            &revision,
+            "--candidate-build-id",
+            &source,
+            "--candidate-oci-digest",
+            &digest,
+        ][..],
+        &[
+            "nazoauthctl",
+            "install",
+            "--external-dependencies",
+            "--candidate-image",
+            "candidate",
+            "--candidate-release",
+            "v0.1.41",
+            "--candidate-revision",
+            &revision,
+            "--candidate-build-id",
+            &source,
+            "--candidate-oci-digest",
+            &digest,
+        ][..],
+    ] {
+        assert!(parse(arguments).is_err(), "accepted {arguments:?}");
+    }
+}
+
+#[test]
 fn parses_pinned_container_network_and_rejects_incomplete_or_host_assignments() {
     let command = parse(&[
         "nazoauthctl",

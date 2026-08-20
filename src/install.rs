@@ -68,6 +68,97 @@ const TENANT_RESOURCE_CONTROLLER_CONTAINER_KEY_PATH: &str = "/run/nazoauth-contr
 pub(crate) struct PreparedInstall {
     pub(crate) config: UpdateConfig,
     pub(crate) config_path: PathBuf,
+    pub(crate) local_oci_candidate: Option<crate::cli::LocalOciCandidateInstall>,
+}
+
+/// Durable sibling intent for the otherwise unjournaled interval between
+/// preparing a fresh configuration and the first candidate runtime check.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalOciCandidatePrepareIntent {
+    schema: u32,
+    candidate: crate::cli::LocalOciCandidateInstall,
+    config: UpdateConfig,
+    config_sha256: String,
+}
+
+pub(crate) fn local_oci_candidate_prepare_intent_path(config_path: &Path) -> PathBuf {
+    let name = config_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("nazoauthctl.json");
+    config_path.with_file_name(format!(".{name}.local-oci-candidate-intent.json"))
+}
+
+fn candidate_intent_config_digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+pub(crate) fn load_local_oci_candidate_prepare_intent(
+    config_path: &Path,
+) -> anyhow::Result<Option<LocalOciCandidatePrepareIntent>> {
+    let path = local_oci_candidate_prepare_intent_path(config_path);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => bail!(
+            "local OCI candidate prepare intent must be a regular non-symlink file: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect local OCI candidate prepare intent {}", path.display())
+            });
+        }
+    }
+    let bytes = crate::filesystem::read_secure_regular_file(
+        &path,
+        "local OCI candidate prepare intent",
+        true,
+        1024 * 1024,
+    )?;
+    Ok(Some(
+        serde_json::from_slice(&bytes).context("local OCI candidate prepare intent is invalid")?,
+    ))
+}
+
+pub(crate) fn restore_local_oci_candidate_prepare_intent(
+    config_path: &Path,
+    candidate: &crate::cli::LocalOciCandidateInstall,
+) -> anyhow::Result<()> {
+    let intent = load_local_oci_candidate_prepare_intent(config_path)?
+        .context("local OCI candidate config is absent and no durable prepare intent exists")?;
+    validate_local_oci_candidate_prepare_intent(&intent, candidate)?;
+    let bytes = serde_json::to_vec_pretty(&intent.config)?;
+    if candidate_intent_config_digest(&bytes) != intent.config_sha256 {
+        bail!("local OCI candidate prepare intent config digest is inconsistent");
+    }
+    atomic_write(config_path, &bytes, 0o600)
+}
+
+pub(crate) fn validate_existing_local_oci_candidate_prepare_intent(
+    config_path: &Path,
+    config: &UpdateConfig,
+    candidate: &crate::cli::LocalOciCandidateInstall,
+) -> anyhow::Result<()> {
+    let intent = load_local_oci_candidate_prepare_intent(config_path)?
+        .context("local OCI candidate install has no durable fresh-prepare intent")?;
+    validate_local_oci_candidate_prepare_intent(&intent, candidate)?;
+    let bytes = serde_json::to_vec_pretty(config)?;
+    if candidate_intent_config_digest(&bytes) != intent.config_sha256 {
+        bail!("existing controller config differs from its local OCI candidate prepare intent");
+    }
+    Ok(())
+}
+
+fn validate_local_oci_candidate_prepare_intent(
+    intent: &LocalOciCandidatePrepareIntent,
+    candidate: &crate::cli::LocalOciCandidateInstall,
+) -> anyhow::Result<()> {
+    if intent.schema != 1 || intent.candidate != *candidate {
+        bail!("local OCI candidate prepare intent does not match the exact requested candidate");
+    }
+    Ok(())
 }
 
 pub(crate) fn prepare(
@@ -118,6 +209,14 @@ pub(crate) fn prepare(
     normalize_external_dependencies(&mut options)?;
     normalize_profile_secrets(&mut options)?;
     let (runtime_backend, dependency_backend) = select_runtime(&options)?;
+    if options.local_oci_candidate.is_some() {
+        if runtime_backend == RuntimeBackendKind::Systemd {
+            bail!("a local OCI candidate install requires a Podman or Docker runtime");
+        }
+        if options.profile != "standards-full" {
+            bail!("a local OCI candidate install requires --profile standards-full");
+        }
+    }
     let config_dir = config_path
         .parent()
         .context("update config path has no parent")?;
@@ -206,10 +305,29 @@ pub(crate) fn prepare(
         &dependency_mode,
     )?;
     configure_runtime_permissions(&config)?;
-    atomic_write(config_path, &(serde_json::to_vec_pretty(&config)?), 0o600)?;
+    let config_bytes = serde_json::to_vec_pretty(&config)?;
+    if let Some(candidate) = options.local_oci_candidate.as_ref() {
+        let intent = LocalOciCandidatePrepareIntent {
+            schema: 1,
+            candidate: candidate.clone(),
+            config: config.clone(),
+            config_sha256: candidate_intent_config_digest(&config_bytes),
+        };
+        // Write and fsync the candidate provenance before publishing the
+        // config.  If the next rename or first image inspection fails, retry
+        // can restore exactly this prepared deployment rather than creating a
+        // second controller identity.
+        atomic_write(
+            &local_oci_candidate_prepare_intent_path(config_path),
+            &serde_json::to_vec_pretty(&intent)?,
+            0o600,
+        )?;
+    }
+    atomic_write(config_path, &config_bytes, 0o600)?;
     Ok(PreparedInstall {
         config,
         config_path: config_path.to_owned(),
+        local_oci_candidate: options.local_oci_candidate,
     })
 }
 

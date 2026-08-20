@@ -182,12 +182,24 @@ pub(crate) struct RelinquishOptions {
     pub(crate) yes: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct CandidateTarget {
     pub(crate) release: String,
     pub(crate) revision: String,
     pub(crate) build_id: String,
     pub(crate) oci_digest: String,
+}
+
+/// A deliberately local-only OCI target for a fresh standards installation.
+///
+/// This is not an unsigned replacement for `update` or `development activate`:
+/// the caller supplies the release identity and the expected OCI manifest digest,
+/// and install proves them against an image that is already present in the
+/// selected container runtime.  No registry resolution or pull is performed.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct LocalOciCandidateInstall {
+    pub(crate) image: String,
+    pub(crate) target: CandidateTarget,
 }
 
 #[derive(Debug)]
@@ -241,6 +253,7 @@ pub(crate) struct InstallOptions {
     pub(crate) profile_secret_fd: Option<u32>,
     pub(crate) profile_secrets: Option<StandardsProfileSecrets>,
     pub(crate) version: Option<String>,
+    pub(crate) local_oci_candidate: Option<LocalOciCandidateInstall>,
 }
 
 impl Drop for InstallOptions {
