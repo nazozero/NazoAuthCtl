@@ -3201,7 +3201,12 @@ fn candidate_prepare_intent_binds_the_exact_existing_config_and_can_restore_it()
     .unwrap();
 
     crate::install::restore_local_oci_candidate_prepare_intent(&config_path, &candidate).unwrap();
-    let restored = load_config(&config_path).unwrap();
+    // This fixture intentionally contains no generated identity material.
+    // The intent check validates config bytes only; production install still
+    // uses `load_config` first and therefore retains the pending-identity
+    // fail-closed boundary.
+    let restored = load_config_unsettled(&config_path).unwrap();
+    assert!(crate::operator::identity_recovery_required(&restored).unwrap());
     crate::install::validate_existing_local_oci_candidate_prepare_intent(
         &config_path,
         &restored,
