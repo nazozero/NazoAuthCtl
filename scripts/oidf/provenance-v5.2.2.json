@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "artifact": {
+    "artifact_id": "nazoauth-oidf-v5.2.2-ordinary-provider",
+    "revision": "ac846e9080a86e30210de84289488e312e27f35e"
+  },
+  "source_matrix": {
+    "repository": "https://github.com/nazozero/NazoAuth.git",
+    "commit": "77c362f9fc62e5114f3c61e2b4420f864d7112ab",
+    "path": "crates/authorization-server/resources/nazoauth-conformance-matrix-v1.json",
+    "git_blob": "2539e92a02651259eedc5002b6e0cbfbedb16e68"
+  },
+  "suite": {
+    "release": "release-v5.2.2",
+    "revision": "321bc5bc53601b9690b54c023c0cbfac0f0230f2",
+    "image_digest": "sha256:ca3fb5be36fc2f471942f474ad7ff40677f29d40ce7a9f7525db1102b89b0415"
+  },
+  "generator": {
+    "path": "scripts/oidf/generate_oidf_artifact.py",
+    "predecessor_sha256": "dadd1d8c0dbe87b0c40a7ae8ec6569e3875d02a6aa5874d4ac307dab2d816ae9"
+  },
+  "expected_output": {
+    "driver": {
+      "sha256": "62b54d229e01bfb4a1b93c340a2e71839e492b83f53aff1b9792b38b71ea7a1a",
+      "size": 461
+    },
+    "matrix": {
+      "sha256": "93806b506e2e10c1dc261389d47f3f3a83dec56e68f3c1e3a3dbd6b29d9a4bc6",
+      "size": 481746
+    },
+    "resource_bounds": {
+      "max_plans": 44,
+      "max_modules": 1408,
+      "max_clients": 66,
+      "max_wall_clock_seconds": 79200
+    }
+  }
+}
