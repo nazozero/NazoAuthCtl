@@ -79,14 +79,13 @@ pub(super) fn validate_local_oci_candidate_identity(
     candidate: &CandidateTarget,
     identity: &EmbeddedIdentity,
 ) -> anyhow::Result<()> {
-    if identity.protocol != nazo_operator_protocol::PROTOCOL_VERSION
-        || identity != &EmbeddedIdentity {
-            release: candidate.release.clone(),
-            revision: candidate.revision.clone(),
-            protocol: nazo_operator_protocol::PROTOCOL_VERSION,
-            build_id: candidate.build_id.clone(),
-        }
-    {
+    let expected = EmbeddedIdentity {
+        release: candidate.release.clone(),
+        revision: candidate.revision.clone(),
+        protocol: nazo_operator_protocol::PROTOCOL_VERSION,
+        build_id: candidate.build_id.clone(),
+    };
+    if identity.protocol != nazo_operator_protocol::PROTOCOL_VERSION || identity != &expected {
         bail!("local OCI candidate embedded identity does not match the exact candidate binding");
     }
     if candidate.build_id != format!("source:{}", candidate.revision) {
