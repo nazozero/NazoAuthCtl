@@ -527,6 +527,22 @@ impl ConformanceRunner {
                     // response wrapper is partially moved below.
                     zeroize_json_value(&mut created.raw);
                     suite_plan_ids.push(created.id.clone());
+                    // Persist the opaque ID before evaluating any returned
+                    // definition or budget. A local rejection must never
+                    // strand a durable create intent after the remote plan
+                    // already exists.
+                    if let (Some(observer), Some(intent_id)) =
+                        (&self.config.suite_resource_observer, &plan_create_intent)
+                        && let Err(error) = observer.plan_created(
+                            self.config.client.origin(),
+                            intent_id,
+                            &created.id,
+                        )
+                    {
+                        errors.push(error);
+                        groups[group_index].status = GroupStatus::Failed;
+                        break 'create;
+                    }
                     let defined_modules = created.modules.len();
                     groups[group_index].total += defined_modules;
                     groups[group_index].remaining += defined_modules;
@@ -605,18 +621,6 @@ impl ConformanceRunner {
                     }
                     observed_modules = next_observed_modules
                         .expect("validated Suite module count must remain in range");
-                    if let (Some(observer), Some(intent_id)) =
-                        (&self.config.suite_resource_observer, &plan_create_intent)
-                        && let Err(error) = observer.plan_created(
-                            self.config.client.origin(),
-                            intent_id,
-                            &created.id,
-                        )
-                    {
-                        errors.push(error);
-                        groups[group_index].status = GroupStatus::Failed;
-                        break 'create;
-                    }
                     planned.push(PlannedPlan {
                         group_index,
                         matrix_plan_id: plan.id.clone(),
@@ -2054,6 +2058,10 @@ mod tests {
         matrix.document.groups[0].plans[0]
             .expected_results
             .insert("declared-skip".to_owned(), "SKIPPED".to_owned());
+        let observer = Arc::new(RecordingPlanObserver {
+            persisted_plans: AtomicUsize::new(0),
+            module_intents: AtomicUsize::new(0),
+        });
         let runner = ConformanceRunner::new(ConformanceRunConfig {
             client,
             matrix,
@@ -2066,7 +2074,7 @@ mod tests {
             selected_resource_budget: budget(1, 1, 60),
             jobs: 1,
             automation: Vec::new(),
-            suite_resource_observer: None,
+            suite_resource_observer: Some(observer.clone()),
         })
         .expect("runner");
 
@@ -2087,6 +2095,8 @@ mod tests {
         }));
         assert_eq!(report.cleanup.deleted_plans, ["suite-plan"]);
         assert!(report.modules.is_empty());
+        assert_eq!(observer.persisted_plans.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.module_intents.load(Ordering::SeqCst), 0);
         assert_eq!(
             transport
                 .requests
