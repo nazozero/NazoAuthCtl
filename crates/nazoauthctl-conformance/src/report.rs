@@ -112,6 +112,12 @@ pub struct ConformanceReport {
     /// reached the Suite's exact `FINISHED` / `PASSED` outcome without warning
     /// or failure conditions.
     pub suite_pass: bool,
+    /// True when every terminal Suite outcome is acceptable under the signed
+    /// Matrix: `PASSED`, or an exact declared `SKIPPED`, with no review,
+    /// warning, failed, or incomplete outcome. `suite_pass` intentionally
+    /// remains stricter and only represents all-PASSED Suite execution.
+    #[serde(default)]
+    pub acceptance_pass: bool,
     /// True when one or more modules returned REVIEW/WARNING or
     /// emitted a WARNING condition. These modules remain listed in `modules`
     /// and require explicit human follow-up.
@@ -121,6 +127,24 @@ pub struct ConformanceReport {
     /// Exact entries that the Suite classified as `SKIPPED`. An expected skip
     /// remains skipped and never contributes to `suite_pass`.
     pub skipped_modules: Vec<String>,
+    /// Exact `matrix_plan_id/test_name` entries that actually finished
+    /// `SKIPPED` and were explicitly allowed by the signed Matrix.
+    #[serde(default)]
+    pub expected_skipped_modules: Vec<String>,
+    /// Exact `matrix_plan_id/test_name` entries that actually finished
+    /// `SKIPPED` without an exact signed Matrix allowance.
+    #[serde(default)]
+    pub unexpected_skipped_modules: Vec<String>,
+    /// Signed `SKIPPED` declarations whose test name was absent from, or was
+    /// duplicated in, the Suite's definition of that Matrix plan.
+    #[serde(default)]
+    pub unknown_declared_skip_modules: Vec<String>,
+    /// Whether every declared Matrix skip was unambiguously enumerated by the
+    /// Suite and no module unexpectedly finished `SKIPPED`. This is separate
+    /// from local orchestration success so evidence can distinguish a clean
+    /// execution from an unacceptable signed-expectation mismatch.
+    #[serde(default = "matrix_expectations_satisfied_default")]
+    pub matrix_expectations_satisfied: bool,
     /// Exact entries with an explicit failed/unknown result or a blocking log.
     pub failed_modules: Vec<String>,
     /// Exact entries that never reached the Suite's `FINISHED` state.
@@ -201,15 +225,22 @@ impl Drop for ModuleReport {
 
 pub(crate) struct ModuleOutcomeSummary {
     pub all_passed: bool,
+    pub acceptance_pass: bool,
     pub human_review_modules: Vec<String>,
     pub skipped_modules: Vec<String>,
     pub failed_modules: Vec<String>,
     pub incomplete_modules: Vec<String>,
 }
 
+pub(crate) struct MatrixExpectationSummary {
+    pub expected_skipped_modules: Vec<String>,
+    pub unexpected_skipped_modules: Vec<String>,
+}
+
 pub(crate) fn summarize_module_outcomes(modules: &[ModuleReport]) -> ModuleOutcomeSummary {
     let mut summary = ModuleOutcomeSummary {
         all_passed: !modules.is_empty(),
+        acceptance_pass: !modules.is_empty(),
         human_review_modules: Vec::new(),
         skipped_modules: Vec::new(),
         failed_modules: Vec::new(),
@@ -224,22 +255,55 @@ pub(crate) fn summarize_module_outcomes(modules: &[ModuleReport]) -> ModuleOutco
             ModuleOutcome::Passed => {}
             ModuleOutcome::Review => {
                 summary.all_passed = false;
+                summary.acceptance_pass = false;
             }
             ModuleOutcome::Skipped => {
                 summary.all_passed = false;
                 summary.skipped_modules.push(identity);
+                if module.expected_result.as_deref() != Some("SKIPPED")
+                    || module.human_review_required
+                {
+                    summary.acceptance_pass = false;
+                }
             }
             ModuleOutcome::Failed => {
                 summary.all_passed = false;
+                summary.acceptance_pass = false;
                 summary.failed_modules.push(identity);
             }
             ModuleOutcome::Incomplete => {
                 summary.all_passed = false;
+                summary.acceptance_pass = false;
                 summary.incomplete_modules.push(identity);
             }
         }
     }
     summary
+}
+
+pub(crate) fn summarize_matrix_expectations(
+    modules: &[ModuleReport],
+) -> MatrixExpectationSummary {
+    let mut summary = MatrixExpectationSummary {
+        expected_skipped_modules: Vec::new(),
+        unexpected_skipped_modules: Vec::new(),
+    };
+    for module in modules {
+        if module.outcome != ModuleOutcome::Skipped {
+            continue;
+        }
+        let identity = format!("{}/{}", module.matrix_plan_id, module.test_name);
+        if module.expected_result.as_deref() == Some("SKIPPED") {
+            summary.expected_skipped_modules.push(identity);
+        } else {
+            summary.unexpected_skipped_modules.push(identity);
+        }
+    }
+    summary
+}
+
+const fn matrix_expectations_satisfied_default() -> bool {
+    true
 }
 
 fn collect_condition_log_results(
@@ -398,6 +462,7 @@ mod tests {
         assert_eq!(summary.skipped_modules, ["p/skipped", "p/skipped-warning"]);
         assert_eq!(summary.failed_modules, ["p/failed"]);
         assert_eq!(summary.incomplete_modules, ["p/incomplete"]);
+        assert!(!summary.acceptance_pass);
     }
 
     #[test]
@@ -422,5 +487,34 @@ mod tests {
             )])
             .all_passed
         );
+    }
+
+    #[test]
+    fn skipped_modules_require_an_exact_signed_allowance() {
+        let modules = vec![
+            ModuleReport::from_info(
+                ModuleReportContext {
+                    matrix_plan_id: "p".into(),
+                    suite_plan_id: "s".into(),
+                    module_id: Some("expected".into()),
+                    test_name: "expected-skip".into(),
+                    terminal: true,
+                    expected_result: Some("SKIPPED".into()),
+                },
+                serde_json::json!({"status":"FINISHED","result":"SKIPPED"}),
+                serde_json::json!([]),
+            ),
+            module("unexpected-skip", true, "FINISHED", "SKIPPED", serde_json::json!([])),
+        ];
+
+        let summary = summarize_matrix_expectations(&modules);
+
+        assert_eq!(summary.expected_skipped_modules, ["p/expected-skip"]);
+        assert_eq!(summary.unexpected_skipped_modules, ["p/unexpected-skip"]);
+        assert!(!summarize_module_outcomes(&modules).acceptance_pass);
+
+        let expected_only = summarize_module_outcomes(&modules[..1]);
+        assert!(expected_only.acceptance_pass);
+        assert!(!expected_only.all_passed);
     }
 }

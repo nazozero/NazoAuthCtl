@@ -255,6 +255,8 @@ fn worker_prepared(work: &PlanWork) -> PreparedRun {
         // deletes every plan after all workers have drained.
         suite_plan_ids: Vec::new(),
         errors: Vec::new(),
+        unknown_declared_skip_modules: Vec::new(),
+        matrix_expectations_satisfied: true,
         auth_probe: None,
         current_profile: Some(group.profile),
         current_variant: Some(redacted_variant(&work.plan.variant)),
@@ -414,6 +416,10 @@ fn merge_reports(
     let all_modules_instantiated = all_plans_finished && defined_modules == created_instances;
     let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
     let outcomes = summarize_module_outcomes(&modules);
+    let matrix_expectations = summarize_matrix_expectations(&modules);
+    let matrix_expectations_satisfied = prepared.matrix_expectations_satisfied
+        && matrix_expectations.unexpected_skipped_modules.is_empty()
+        && prepared.unknown_declared_skip_modules.is_empty();
     let suite_pass = defined_modules > 0 && all_modules_terminal && outcomes.all_passed;
     let orchestration_integrity = OrchestrationIntegrity {
         defined_modules,
@@ -434,9 +440,14 @@ fn merge_reports(
             errors,
             local_success,
             suite_pass,
+            acceptance_pass: outcomes.acceptance_pass && matrix_expectations_satisfied,
             human_review_required: !outcomes.human_review_modules.is_empty(),
             human_review_modules: outcomes.human_review_modules,
             skipped_modules: outcomes.skipped_modules,
+            expected_skipped_modules: matrix_expectations.expected_skipped_modules,
+            unexpected_skipped_modules: matrix_expectations.unexpected_skipped_modules,
+            unknown_declared_skip_modules: prepared.unknown_declared_skip_modules,
+            matrix_expectations_satisfied,
             failed_modules: outcomes.failed_modules,
             incomplete_modules: outcomes.incomplete_modules,
             orchestration_integrity,

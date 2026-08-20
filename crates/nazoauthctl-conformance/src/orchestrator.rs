@@ -26,6 +26,7 @@ use crate::progress::{
 use crate::report::{
     CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport,
     ModuleReportContext, OrchestrationIntegrity, PlanReport, summarize_module_outcomes,
+    summarize_matrix_expectations,
 };
 
 mod parallel;
@@ -155,6 +156,8 @@ struct PreparedRun {
     planned: Vec<PlannedPlan>,
     suite_plan_ids: Vec<String>,
     errors: Vec<String>,
+    unknown_declared_skip_modules: Vec<String>,
+    matrix_expectations_satisfied: bool,
     auth_probe: Option<crate::client::AuthProbe>,
     current_profile: Option<String>,
     current_variant: Option<BTreeMap<String, String>>,
@@ -450,6 +453,8 @@ impl ConformanceRunner {
         let mut planned = Vec::<PlannedPlan>::new();
         let mut suite_plan_ids = Vec::<String>::new();
         let mut errors = Vec::<String>::new();
+        let mut unknown_declared_skip_modules = Vec::<String>::new();
+        let mut matrix_expectations_satisfied = true;
         let mut auth_probe = None;
         let mut current_profile = None;
         let mut current_variant = None;
@@ -557,6 +562,44 @@ impl ConformanceRunner {
                     observed_modules = next_observed_modules
                         .expect("validated Suite module count must remain in range");
                     let report_index = plans.len() - 1;
+                    let mut module_name_counts = BTreeMap::<&str, usize>::new();
+                    for module in &created.modules {
+                        *module_name_counts
+                            .entry(module.test_name.as_str())
+                            .or_default() += 1;
+                    }
+                    let duplicate_module_names = module_name_counts
+                        .iter()
+                        .filter_map(|(test_name, count)| (*count > 1).then_some(*test_name))
+                        .collect::<Vec<_>>();
+                    let unknown_expected_skips = plan
+                        .expected_results
+                        .keys()
+                        .filter(|test_name| {
+                            module_name_counts
+                                .get(test_name.as_str())
+                                .copied()
+                                != Some(1)
+                        })
+                        .map(|test_name| format!("{}/{}", plan.id, test_name))
+                        .collect::<Vec<_>>();
+                    if !duplicate_module_names.is_empty() || !unknown_expected_skips.is_empty() {
+                        matrix_expectations_satisfied = false;
+                        for test_name in duplicate_module_names {
+                            errors.push(format!(
+                                "Suite plan defines duplicate test_name: {}/{}",
+                                plan.id, test_name
+                            ));
+                        }
+                        for identity in unknown_expected_skips {
+                            errors.push(format!(
+                                "signed Matrix expected SKIPPED module is not uniquely defined by Suite plan: {identity}"
+                            ));
+                            unknown_declared_skip_modules.push(identity);
+                        }
+                        groups[group_index].status = GroupStatus::Failed;
+                        break 'create;
+                    }
                     planned.push(PlannedPlan {
                         group_index,
                         matrix_plan_id: plan.id.clone(),
@@ -584,6 +627,8 @@ impl ConformanceRunner {
             planned,
             suite_plan_ids,
             errors,
+            unknown_declared_skip_modules,
+            matrix_expectations_satisfied,
             auth_probe,
             current_profile,
             current_variant,
@@ -601,6 +646,8 @@ impl ConformanceRunner {
             mut planned,
             suite_plan_ids,
             mut errors,
+            unknown_declared_skip_modules,
+            matrix_expectations_satisfied,
             auth_probe,
             mut current_profile,
             mut current_variant,
@@ -982,6 +1029,10 @@ impl ConformanceRunner {
         let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
         let cleanup_complete = cleanup.failures.is_empty();
         let outcomes = summarize_module_outcomes(&modules);
+        let matrix_expectations = summarize_matrix_expectations(&modules);
+        let matrix_expectations_satisfied = matrix_expectations_satisfied
+            && matrix_expectations.unexpected_skipped_modules.is_empty()
+            && unknown_declared_skip_modules.is_empty();
         let suite_pass = defined_modules > 0 && all_modules_terminal && outcomes.all_passed;
         let orchestration_integrity = OrchestrationIntegrity {
             defined_modules,
@@ -1006,9 +1057,14 @@ impl ConformanceRunner {
             errors,
             local_success,
             suite_pass,
+            acceptance_pass: outcomes.acceptance_pass && matrix_expectations_satisfied,
             human_review_required,
             human_review_modules: outcomes.human_review_modules,
             skipped_modules: outcomes.skipped_modules,
+            expected_skipped_modules: matrix_expectations.expected_skipped_modules,
+            unexpected_skipped_modules: matrix_expectations.unexpected_skipped_modules,
+            unknown_declared_skip_modules,
+            matrix_expectations_satisfied,
             failed_modules: outcomes.failed_modules,
             incomplete_modules: outcomes.incomplete_modules,
             orchestration_integrity,
@@ -1441,6 +1497,11 @@ mod tests {
         requests: Mutex<Vec<(HttpMethod, String)>>,
     }
 
+    struct DefinitionTransport {
+        modules: Value,
+        requests: Mutex<Vec<(HttpMethod, String)>>,
+    }
+
     struct RecordingPlanObserver {
         persisted_plans: AtomicUsize,
         module_intents: AtomicUsize,
@@ -1574,6 +1635,42 @@ mod tests {
                 status,
                 headers: Vec::new(),
                 body: serde_json::to_vec(&body).expect("budget drift json"),
+            })
+        }
+    }
+
+    impl Transport for DefinitionTransport {
+        fn send(&self, request: HttpRequest, _max: usize) -> Result<HttpResponse, TransportError> {
+            let method = request.method();
+            let path = request.url().path().to_owned();
+            self.requests
+                .lock()
+                .expect("definition requests")
+                .push((method, path.clone()));
+            let (status, body) = match (method, path.as_str()) {
+                (HttpMethod::Get, "/api/plan") => (
+                    if request.header("Authorization").is_some() {
+                        200
+                    } else {
+                        401
+                    },
+                    serde_json::json!({}),
+                ),
+                (HttpMethod::Post, "/api/plan") => (
+                    201,
+                    serde_json::json!({
+                        "id": "suite-plan",
+                        "name": "plan",
+                        "modules": self.modules.clone(),
+                    }),
+                ),
+                (HttpMethod::Delete, "/api/plan/suite-plan") => (204, Value::Null),
+                _ => (500, serde_json::json!({})),
+            };
+            Ok(HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("definition json"),
             })
         }
     }
@@ -1915,6 +2012,68 @@ mod tests {
         assert!(requests.iter().any(|(method, path)| {
             *method == HttpMethod::Delete && path == "/api/plan/suite-plan"
         }));
+    }
+
+    #[test]
+    fn duplicate_or_unknown_signed_skip_definition_stops_before_module_creation() {
+        let transport = Arc::new(DefinitionTransport {
+            modules: serde_json::json!([
+                {"testModule": "declared-skip"},
+                {"testModule": "declared-skip"}
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let mut matrix = one_plan_matrix(serde_json::json!({}));
+        matrix.document.groups[0].plans[0]
+            .expected_results
+            .insert("declared-skip".to_owned(), "SKIPPED".to_owned());
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix,
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
+            selected_resource_budget: budget(2, 1, 60),
+            jobs: 1,
+            automation: Vec::new(),
+            suite_resource_observer: None,
+        })
+        .expect("runner");
+
+        let report = runner.run(&mut ()).report;
+
+        assert!(!report.matrix_expectations_satisfied);
+        assert!(!report.acceptance_pass);
+        assert_eq!(report.unknown_declared_skip_modules, ["p/declared-skip"]);
+        assert!(report.errors.iter().any(|error| {
+            error == "Suite plan defines duplicate test_name: p/declared-skip"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error
+                == "signed Matrix expected SKIPPED module is not uniquely defined by Suite plan: p/declared-skip"
+        }));
+        assert_eq!(report.cleanup.deleted_plans, ["suite-plan"]);
+        assert!(report.modules.is_empty());
+        assert_eq!(
+            transport
+                .requests
+                .lock()
+                .expect("definition requests")
+                .iter()
+                .filter(|(method, path)| *method == HttpMethod::Post && path == "/api/runner")
+                .count(),
+            0,
+        );
     }
 
     #[test]

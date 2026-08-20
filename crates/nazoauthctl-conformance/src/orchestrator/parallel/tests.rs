@@ -397,6 +397,32 @@ fn parallel_non_pass_outcomes_complete_locally_without_claiming_suite_pass() {
 }
 
 #[test]
+fn parallel_expected_skips_are_preserved_and_acceptance_is_exact() {
+    let (mut runner, _) = parallel_fixture_with_result(
+        serde_json::json!({}),
+        &["plan-a", "plan-b"],
+        None,
+        "SKIPPED",
+    );
+    for plan in &mut runner.config.matrix.document.groups[0].plans {
+        plan.expected_results.insert(
+            format!("test-{}", plan.plan),
+            "SKIPPED".to_owned(),
+        );
+    }
+
+    let report = runner.run(&mut ()).report;
+
+    assert!(report.local_success);
+    assert!(!report.suite_pass, "SKIPPED must not be relabeled PASSED");
+    assert!(report.acceptance_pass);
+    assert!(report.matrix_expectations_satisfied);
+    assert_eq!(report.expected_skipped_modules, ["plan-a/test-plan-a", "plan-b/test-plan-b"]);
+    assert!(report.unexpected_skipped_modules.is_empty());
+    assert!(report.unknown_declared_skip_modules.is_empty());
+}
+
+#[test]
 fn ciba_plans_use_one_global_serial_lane() {
     let (runner, transport) = parallel_fixture_with_lanes(
         serde_json::json!({}),

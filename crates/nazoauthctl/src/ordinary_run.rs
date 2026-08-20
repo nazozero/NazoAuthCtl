@@ -516,7 +516,11 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let success = errors.is_empty()
         && report
             .as_ref()
-            .is_some_and(|report| report.local_success && report.suite_pass);
+            .is_some_and(|report| {
+                report.local_success
+                    && report.acceptance_pass
+                    && report.matrix_expectations_satisfied
+            });
     let output = FinalOutput {
         schema: 3,
         success,
