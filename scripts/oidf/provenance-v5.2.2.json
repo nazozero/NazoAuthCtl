@@ -13,12 +13,19 @@
   "suite": {
     "release": "release-v5.2.2",
     "revision": "321bc5bc53601b9690b54c023c0cbfac0f0230f2",
-    "image_digest": "sha256:ca3fb5be36fc2f471942f474ad7ff40677f29d40ce7a9f7525db1102b89b0415"
+    "image_digest": "sha256:ca3fb5be36fc2f471942f474ad7ff40677f29d40ce7a9f7525db1102b89b0415",
+    "source_semantics": {
+      "path": "src/main/java/net/openid/conformance/vci10issuer/VCIIssuerFailOnUnsupportedEncryptionAlgorithm.java",
+      "module": "oid4vci-1_0-issuer-fail-unsupported-encryption-algorithm",
+      "skip_when": "vciCredentialEncryption != VCICredentialEncryption.ENCRYPTED",
+      "outcome": "fireTestSkipped",
+      "reason": "the module requires vci_credential_encryption=encrypted"
+    }
   },
   "generator": {
     "path": "scripts/oidf/generate_oidf_artifact.py",
     "predecessor_sha256": "dadd1d8c0dbe87b0c40a7ae8ec6569e3875d02a6aa5874d4ac307dab2d816ae9",
-    "reviewed_parent_commit": "8b601db963f6e0326f331533d419a06946452b3c",
+    "reviewed_parent_commit": "06929424c7946ed13c382aca0bfec642a5a3fed9",
     "host_checkout": "inject the exact reviewed generator commit from independent task evidence",
     "runtime_commit_argument": "--reviewed-generator-commit",
     "runtime_import_isolation": "python3 -I",
@@ -28,6 +35,35 @@
       "scripts/oidf/provenance-v5.2.2.json"
     ]
   },
+  "reviewed_amendments": [
+    {
+      "plan_id": "openid4vc-vci-p028",
+      "precondition": {
+        "vci_credential_encryption": "plain"
+      },
+      "expected_results": {
+        "oid4vci-1_0-issuer-fail-unsupported-encryption-algorithm": "SKIPPED"
+      }
+    },
+    {
+      "plan_id": "openid4vc-vci-p031",
+      "precondition": {
+        "vci_credential_encryption": "plain"
+      },
+      "expected_results": {
+        "oid4vci-1_0-issuer-fail-unsupported-encryption-algorithm": "SKIPPED"
+      }
+    },
+    {
+      "plan_id": "openid4vc-vci-p032",
+      "precondition": {
+        "vci_credential_encryption": "plain"
+      },
+      "expected_results": {
+        "oid4vci-1_0-issuer-fail-unsupported-encryption-algorithm": "SKIPPED"
+      }
+    }
+  ],
   "expected_output": {
     "driver": {
       "sha256": "62b54d229e01bfb4a1b93c340a2e71839e492b83f53aff1b9792b38b71ea7a1a",

@@ -44,6 +44,14 @@ EXPECTED_BOUNDS = {
 RUNNER_CAPABILITY = "nazoauth.client.create"
 PLAN_MODULE_BUDGET = 32
 PLAN_WALL_CLOCK_SECONDS = 1800
+VCI_UNSUPPORTED_ENCRYPTION_MODULE = (
+    "oid4vci-1_0-issuer-fail-unsupported-encryption-algorithm"
+)
+VCI_PLAIN_ENCRYPTION_SKIP_PLANS = (
+    "openid4vc-vci-p028",
+    "openid4vc-vci-p031",
+    "openid4vc-vci-p032",
+)
 P256_COMPRESSED_SPKI_PREFIX = bytes.fromhex(
     "3039301306072a8648ce3d020106082a8648ce3d030107032200"
 )
@@ -84,17 +92,32 @@ def expected_provenance() -> dict[str, object]:
             "release": SUITE_RELEASE,
             "revision": SUITE_REVISION,
             "image_digest": SUITE_IMAGE,
+            "source_semantics": {
+                "path": "src/main/java/net/openid/conformance/vci10issuer/VCIIssuerFailOnUnsupportedEncryptionAlgorithm.java",
+                "module": VCI_UNSUPPORTED_ENCRYPTION_MODULE,
+                "skip_when": "vciCredentialEncryption != VCICredentialEncryption.ENCRYPTED",
+                "outcome": "fireTestSkipped",
+                "reason": "the module requires vci_credential_encryption=encrypted",
+            },
         },
         "generator": {
             "path": GENERATOR_REPO_PATH,
             "predecessor_sha256": GENERATOR_PREDECESSOR_SHA256,
-            "reviewed_parent_commit": "8b601db963f6e0326f331533d419a06946452b3c",
+            "reviewed_parent_commit": "06929424c7946ed13c382aca0bfec642a5a3fed9",
             "host_checkout": "inject the exact reviewed generator commit from independent task evidence",
             "runtime_commit_argument": "--reviewed-generator-commit",
             "runtime_import_isolation": "python3 -I",
             "runtime_cleanliness": "operator requires an entirely clean checkout; generator rechecks scripts/oidf including untracked files",
             "runtime_verified_paths": [GENERATOR_REPO_PATH, PROVENANCE_REPO_PATH],
         },
+        "reviewed_amendments": [
+            {
+                "plan_id": plan_id,
+                "precondition": {"vci_credential_encryption": "plain"},
+                "expected_results": {VCI_UNSUPPORTED_ENCRYPTION_MODULE: "SKIPPED"},
+            }
+            for plan_id in VCI_PLAIN_ENCRYPTION_SKIP_PLANS
+        ],
         "expected_output": {
             "driver": {"sha256": EXPECTED_DRIVER_SHA256, "size": EXPECTED_DRIVER_SIZE},
             "matrix": {"sha256": EXPECTED_MATRIX_SHA256, "size": EXPECTED_MATRIX_SIZE},
@@ -360,6 +383,44 @@ def handler_for(group_id: str) -> tuple[str, dict[str, object]]:
     }
 
 
+def apply_reviewed_amendments(groups: list[dict[str, object]]) -> None:
+    amendments = set(VCI_PLAIN_ENCRYPTION_SKIP_PLANS)
+    found: set[str] = set()
+    for group in groups:
+        plans = group.get("plans")
+        if not isinstance(plans, list):
+            raise ValueError("transformed matrix group plans must be an array")
+        for plan in plans:
+            if not isinstance(plan, dict):
+                raise ValueError("transformed matrix plans must be objects")
+            plan_id = plan.get("id")
+            if plan_id not in amendments:
+                continue
+            if plan_id in found:
+                raise ValueError(f"reviewed amendment plan is duplicated: {plan_id}")
+            variant = plan.get("variant")
+            if not isinstance(variant, dict) or variant.get("vci_credential_encryption") != "plain":
+                raise ValueError(
+                    f"reviewed amendment plan must have vci_credential_encryption=plain: {plan_id}"
+                )
+            expected_results = plan.get("expected_results")
+            if not isinstance(expected_results, dict):
+                raise ValueError(f"reviewed amendment plan expected_results must be an object: {plan_id}")
+            if (
+                VCI_UNSUPPORTED_ENCRYPTION_MODULE in expected_results
+                and expected_results[VCI_UNSUPPORTED_ENCRYPTION_MODULE] != "SKIPPED"
+            ):
+                raise ValueError(
+                    f"reviewed amendment would overwrite a different expected result: {plan_id}"
+                )
+            expected_results[VCI_UNSUPPORTED_ENCRYPTION_MODULE] = "SKIPPED"
+            found.add(plan_id)
+
+    missing = amendments - found
+    if missing:
+        raise ValueError(f"reviewed amendment plans are missing: {sorted(missing)}")
+
+
 def transform_matrix(source: dict[str, object]) -> tuple[dict[str, object], dict[str, object], dict[str, int]]:
     groups: list[dict[str, object]] = []
     handlers: dict[str, dict[str, object]] = {}
@@ -386,6 +447,8 @@ def transform_matrix(source: dict[str, object]) -> tuple[dict[str, object], dict
             client_count += len(required_roles)
         group["plans"] = plans
         groups.append(group)
+
+    apply_reviewed_amendments(groups)
 
     matrix = {
         "schema": 3,
@@ -486,25 +549,31 @@ def sign(key_path: pathlib.Path, signing_input: bytes) -> bytes:
     return p1363_signature(signature_der)
 
 
-def validate_deterministic_output(
+def derived_metadata(
     driver_bytes: bytes, matrix_bytes: bytes, revision: str, bounds: dict[str, int]
-) -> None:
-    actual = {
-        "driver_sha256": sha256(driver_bytes),
-        "driver_size": len(driver_bytes),
-        "matrix_sha256": sha256(matrix_bytes),
-        "matrix_size": len(matrix_bytes),
+) -> dict[str, object]:
+    return {
+        "driver": {"sha256": sha256(driver_bytes), "size": len(driver_bytes)},
+        "matrix": {"sha256": sha256(matrix_bytes), "size": len(matrix_bytes)},
         "revision": revision,
         "bounds": bounds,
     }
-    expected = {
-        "driver_sha256": EXPECTED_DRIVER_SHA256,
-        "driver_size": EXPECTED_DRIVER_SIZE,
-        "matrix_sha256": EXPECTED_MATRIX_SHA256,
-        "matrix_size": EXPECTED_MATRIX_SIZE,
+
+
+def expected_derived_metadata() -> dict[str, object]:
+    return {
+        "driver": {"sha256": EXPECTED_DRIVER_SHA256, "size": EXPECTED_DRIVER_SIZE},
+        "matrix": {"sha256": EXPECTED_MATRIX_SHA256, "size": EXPECTED_MATRIX_SIZE},
         "revision": ARTIFACT_REVISION,
         "bounds": EXPECTED_BOUNDS,
     }
+
+
+def validate_deterministic_output(
+    driver_bytes: bytes, matrix_bytes: bytes, revision: str, bounds: dict[str, int]
+) -> None:
+    actual = derived_metadata(driver_bytes, matrix_bytes, revision, bounds)
+    expected = expected_derived_metadata()
     if actual != expected:
         raise ValueError(f"deterministic artifact output drifted: expected {expected}, got {actual}")
 
@@ -512,17 +581,53 @@ def validate_deterministic_output(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--nazoauth-repo", required=True, type=pathlib.Path)
-    parser.add_argument("--output", required=True, type=pathlib.Path)
-    parser.add_argument("--trust-policy-output", required=True, type=pathlib.Path)
-    parser.add_argument("--signing-key", required=True, type=pathlib.Path)
-    parser.add_argument("--expected-key-id", required=True)
+    parser.add_argument("--output", type=pathlib.Path)
+    parser.add_argument("--trust-policy-output", type=pathlib.Path)
+    parser.add_argument("--signing-key", type=pathlib.Path)
+    parser.add_argument("--expected-key-id")
     parser.add_argument("--reviewed-generator-commit", required=True)
-    parser.add_argument("--source", required=True)
-    parser.add_argument("--suite-origin", required=True)
+    parser.add_argument("--source")
+    parser.add_argument("--suite-origin")
+    parser.add_argument("--print-derived-metadata", action="store_true")
     args = parser.parse_args()
+
+    signing_arguments = {
+        "--output": args.output,
+        "--trust-policy-output": args.trust_policy_output,
+        "--signing-key": args.signing_key,
+        "--expected-key-id": args.expected_key_id,
+        "--source": args.source,
+        "--suite-origin": args.suite_origin,
+    }
+    if args.print_derived_metadata:
+        supplied = sorted(name for name, value in signing_arguments.items() if value is not None)
+        if supplied:
+            parser.error(f"--print-derived-metadata forbids signing/output arguments: {', '.join(supplied)}")
+    else:
+        missing = sorted(name for name, value in signing_arguments.items() if value is None)
+        if missing:
+            parser.error(f"normal signing mode requires: {', '.join(missing)}")
 
     verify_generator_checkout(args.reviewed_generator_commit)
     validate_provenance()
+    source_matrix = read_source_matrix(args.nazoauth_repo)
+    matrix, driver, bounds = transform_matrix(source_matrix)
+    matrix_bytes = compact_json(matrix)
+    driver_bytes = compact_json(driver)
+    artifact_revision = sha256(driver_bytes + matrix_bytes)[:40]
+    computed = derived_metadata(driver_bytes, matrix_bytes, artifact_revision, bounds)
+    if args.print_derived_metadata:
+        print(
+            json.dumps(
+                {**computed, "expected_match": computed == expected_derived_metadata()},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return
+
+    validate_deterministic_output(driver_bytes, matrix_bytes, artifact_revision, bounds)
+
     source_url = canonical_https(args.source, directory=True)
     suite_origin = canonical_https(args.suite_origin, directory=False)
     verify_signing_key(args.signing_key)
@@ -535,13 +640,6 @@ def main() -> None:
         raise ValueError("private trust-policy output must be outside the public output directory")
     if signing_key == private_policy or signing_key == public_root or public_root in signing_key.parents:
         raise ValueError("signing key must be separate from all artifact outputs")
-
-    source_matrix = read_source_matrix(args.nazoauth_repo)
-    matrix, driver, bounds = transform_matrix(source_matrix)
-    matrix_bytes = compact_json(matrix)
-    driver_bytes = compact_json(driver)
-    artifact_revision = sha256(driver_bytes + matrix_bytes)[:40]
-    validate_deterministic_output(driver_bytes, matrix_bytes, artifact_revision, bounds)
 
     public_key = compressed_public_key(signing_key)
     key_id = f"oidf-es256-{sha256(public_key)[:32]}"
