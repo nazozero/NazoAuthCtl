@@ -476,9 +476,9 @@ impl DeploymentStore {
                 if metadata.file_type().is_symlink() || !metadata.is_file() {
                     bail!("registration journal must be a regular non-symlink file");
                 }
-                if permitted_deployment_id
-                    .is_some_and(|deployment_id| name == format!("registration-{deployment_id}.json"))
-                {
+                if permitted_deployment_id.is_some_and(|deployment_id| {
+                    name == format!("registration-{deployment_id}.json")
+                }) {
                     continue;
                 }
                 return Ok(true);

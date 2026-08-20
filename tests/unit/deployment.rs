@@ -123,16 +123,20 @@ fn candidate_registration_may_reconcile_only_its_own_pending_journal() {
     store.persist(&record("deployment-a", "alpha")).unwrap();
     let own = store.registration_journal_path("deployment-a");
     std::fs::write(&own, b"{}").unwrap();
-    assert!(!store
-        .registration_pending_except(Some("deployment-a"))
-        .unwrap());
+    assert!(
+        !store
+            .registration_pending_except(Some("deployment-a"))
+            .unwrap()
+    );
     assert!(store.registration_pending_except(None).unwrap());
 
     let other = store.registration_journal_path("deployment-b");
     std::fs::write(&other, b"{}").unwrap();
-    assert!(store
-        .registration_pending_except(Some("deployment-a"))
-        .unwrap());
+    assert!(
+        store
+            .registration_pending_except(Some("deployment-a"))
+            .unwrap()
+    );
 }
 
 #[test]

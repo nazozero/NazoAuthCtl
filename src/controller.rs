@@ -26,8 +26,8 @@ use crate::deployment::{
 use crate::{
     backup::Backup,
     cli::{
-        BootstrapAdminOptions, CandidateTarget, Cli, Command, KeysCommand, LocalOciCandidateInstall,
-        UpdateOptions,
+        BootstrapAdminOptions, CandidateTarget, Cli, Command, KeysCommand,
+        LocalOciCandidateInstall, UpdateOptions,
     },
     filesystem::{atomic_write, open_lock_file, remove_file_durable, set_mode, symlink_atomic},
     install::{self, PreparedInstall},
@@ -199,7 +199,9 @@ pub(crate) fn reject_completed_local_oci_candidate_transition(
     };
     let config = load_config_unsettled(path)?;
     if !deployment::local_oci_candidate_install_is_completed(&config)? {
-        bail!("local OCI candidate transition is unavailable until its completed state is durably verified");
+        bail!(
+            "local OCI candidate transition is unavailable until its completed state is durably verified"
+        );
     }
     deployment::validate_completed_local_oci_candidate_provenance(&config, record)?;
     bail!(

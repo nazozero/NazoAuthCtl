@@ -107,7 +107,10 @@ pub(crate) fn load_local_oci_candidate_prepare_intent(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| {
-                format!("failed to inspect local OCI candidate prepare intent {}", path.display())
+                format!(
+                    "failed to inspect local OCI candidate prepare intent {}",
+                    path.display()
+                )
             });
         }
     }
@@ -117,9 +120,9 @@ pub(crate) fn load_local_oci_candidate_prepare_intent(
         true,
         1024 * 1024,
     )?;
-    Ok(Some(
-        serde_json::from_slice(&bytes).context("local OCI candidate prepare intent is invalid")?,
-    ))
+    Ok(Some(serde_json::from_slice(&bytes).context(
+        "local OCI candidate prepare intent is invalid",
+    )?))
 }
 
 pub(crate) fn restore_local_oci_candidate_prepare_intent(

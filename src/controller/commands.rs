@@ -101,12 +101,15 @@ pub(super) fn validate_local_oci_candidate_observation(
     actual_oci_digest: &str,
 ) -> anyhow::Result<()> {
     validate_local_oci_candidate_identity(candidate, identity)?;
-    if !local_artifact_id.strip_prefix("sha256:").is_some_and(|value| {
-        value.len() == 64
-            && value
-                .chars()
-                .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
-    }) {
+    if !local_artifact_id
+        .strip_prefix("sha256:")
+        .is_some_and(|value| {
+            value.len() == 64
+                && value.chars().all(|character| {
+                    character.is_ascii_hexdigit() && !character.is_ascii_uppercase()
+                })
+        })
+    {
         bail!("local OCI candidate did not resolve to an immutable local image ID");
     }
     if actual_oci_digest != candidate.oci_digest {
@@ -135,15 +138,19 @@ pub(super) fn validate_declared_local_artifact(
         .context("deployment does not declare an explicit local OCI candidate provenance marker")?;
     match marker {
         crate::deployment::SafeReference::File { path }
-            if path == &crate::controller::deployment::local_oci_candidate_install_resource_path(config) => {}
+            if path
+                == &crate::controller::deployment::local_oci_candidate_install_resource_path(
+                    config,
+                ) => {}
         _ => bail!("local OCI candidate provenance marker is not bound to the controller state"),
     }
-    crate::controller::deployment::validate_completed_local_oci_candidate_provenance(config, record)?;
+    crate::controller::deployment::validate_completed_local_oci_candidate_provenance(
+        config, record,
+    )?;
     if !record.active_release.build_id.starts_with("source:") {
         bail!("local OCI candidate build ID is not source-bound");
     }
-    if record.runtime_instances.len() != 1
-        || config.runtime.backend == RuntimeBackendKind::Systemd
+    if record.runtime_instances.len() != 1 || config.runtime.backend == RuntimeBackendKind::Systemd
     {
         bail!("local OCI candidate declaration must bind exactly one container runtime");
     }
@@ -161,9 +168,9 @@ pub(super) fn validate_declared_local_artifact(
     if runtime.local_artifact_id.is_none()
         || !digest.strip_prefix("sha256:").is_some_and(|value| {
             value.len() == 64
-                && value
-                    .chars()
-                    .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+                && value.chars().all(|character| {
+                    character.is_ascii_hexdigit() && !character.is_ascii_uppercase()
+                })
         })
     {
         bail!("local OCI candidate declaration is missing its immutable local artifact binding");

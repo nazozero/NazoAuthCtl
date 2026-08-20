@@ -160,7 +160,9 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
             bail!("--to cannot be combined with a local OCI candidate install");
         }
         if !external_dependencies {
-            bail!("a local OCI candidate install requires --external-dependencies and secure dependency input");
+            bail!(
+                "a local OCI candidate install requires --external-dependencies and secure dependency input"
+            );
         }
     }
     public_url = normalize_public_url_for_profile(&public_url, &profile)?;
@@ -259,9 +261,9 @@ fn parse_local_oci_candidate(
 fn validate_local_oci_image(value: &str) -> anyhow::Result<String> {
     if value.is_empty()
         || value.len() > 512
-        || !value.chars().all(|character| {
-            character.is_ascii_alphanumeric() || "._:/@+-".contains(character)
-        })
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._:/@+-".contains(character))
     {
         bail!("--candidate-image must be a safe local OCI image reference");
     }

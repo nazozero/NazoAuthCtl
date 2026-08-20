@@ -5,7 +5,6 @@ use std::{
 };
 
 use super::*;
-use sha2::Digest as _;
 #[cfg(unix)]
 use crate::test_support::write_shell_executable;
 use crate::{
@@ -15,6 +14,7 @@ use crate::{
         OperatorProtocolCompatibility, Postgres, Rollback, Runtime as RuntimeConfig, Ui, Valkey,
     },
 };
+use sha2::Digest as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 #[cfg(target_os = "linux")]
@@ -3067,28 +3067,34 @@ fn local_oci_candidate_identity_accepts_only_the_exact_source_revision() {
 
     let mut wrong_digest_identity = identity.clone();
     wrong_digest_identity.build_id = format!("source:{}", "c".repeat(40));
-    assert!(commands::validate_local_oci_candidate_identity(&candidate, &wrong_digest_identity)
-        .is_err());
+    assert!(
+        commands::validate_local_oci_candidate_identity(&candidate, &wrong_digest_identity)
+            .is_err()
+    );
 
     let mut non_source = candidate.clone();
     non_source.build_id = format!("local:{}", candidate.revision);
     assert!(commands::validate_local_oci_candidate_identity(&non_source, &identity).is_err());
 
     let local_id = format!("sha256:{}", "c".repeat(64));
-    assert!(commands::validate_local_oci_candidate_observation(
-        &candidate,
-        &identity,
-        &local_id,
-        &candidate.oci_digest,
-    )
-    .is_ok());
-    assert!(commands::validate_local_oci_candidate_observation(
-        &candidate,
-        &identity,
-        &local_id,
-        &format!("sha256:{}", "d".repeat(64)),
-    )
-    .is_err());
+    assert!(
+        commands::validate_local_oci_candidate_observation(
+            &candidate,
+            &identity,
+            &local_id,
+            &candidate.oci_digest,
+        )
+        .is_ok()
+    );
+    assert!(
+        commands::validate_local_oci_candidate_observation(
+            &candidate,
+            &identity,
+            &local_id,
+            &format!("sha256:{}", "d".repeat(64)),
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -3202,10 +3208,12 @@ fn candidate_prepare_intent_binds_the_exact_existing_config_and_can_restore_it()
 
     let mut different = candidate.clone();
     different.target.oci_digest = format!("sha256:{}", "c".repeat(64));
-    assert!(crate::install::validate_existing_local_oci_candidate_prepare_intent(
-        &config_path,
-        &restored,
-        &different,
-    )
-    .is_err());
+    assert!(
+        crate::install::validate_existing_local_oci_candidate_prepare_intent(
+            &config_path,
+            &restored,
+            &different,
+        )
+        .is_err()
+    );
 }
