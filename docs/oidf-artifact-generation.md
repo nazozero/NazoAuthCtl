@@ -42,6 +42,8 @@ commands, not from the checked-out filesystem.
 `--reviewed-generator-commit` is also mandatory at runtime. Before touching any output, the
 generator locates its Ctl Git root from `__file__`, requires exact `HEAD`, clean tracked/index
 state, and matches the current generator and provenance Git blobs to that reviewed commit.
+Invoke it with Python isolated mode so the script directory, working directory, user site and
+`PYTHONPATH` cannot shadow its standard-library imports.
 
 ## Private inputs and output layout
 
@@ -75,8 +77,10 @@ chmod 0600 "$private/signer.pem"
 test "$(git -C "$ctl" rev-parse HEAD)" = "$REVIEWED_CTL_COMMIT"
 git -C "$ctl" diff --quiet --
 git -C "$ctl" diff --cached --quiet --
+ctl_status=$(git -C "$ctl" status --porcelain=v1 --untracked-files=all)
+test -z "$ctl_status"
 
-python3 "$ctl/scripts/oidf/generate_oidf_artifact.py" \
+python3 -I "$ctl/scripts/oidf/generate_oidf_artifact.py" \
   --nazoauth-repo "$nazo" \
   --output "$public" \
   --trust-policy-output "$private/trust-policy.json" \

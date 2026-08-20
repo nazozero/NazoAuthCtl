@@ -88,9 +88,11 @@ def expected_provenance() -> dict[str, object]:
         "generator": {
             "path": GENERATOR_REPO_PATH,
             "predecessor_sha256": GENERATOR_PREDECESSOR_SHA256,
-            "reviewed_parent_commit": "ec763436cbf3fcf3774d9bbb65e2c1c483af2cad",
+            "reviewed_parent_commit": "8b601db963f6e0326f331533d419a06946452b3c",
             "host_checkout": "inject the exact reviewed generator commit from independent task evidence",
             "runtime_commit_argument": "--reviewed-generator-commit",
+            "runtime_import_isolation": "python3 -I",
+            "runtime_cleanliness": "operator requires an entirely clean checkout; generator rechecks scripts/oidf including untracked files",
             "runtime_verified_paths": [GENERATOR_REPO_PATH, PROVENANCE_REPO_PATH],
         },
         "expected_output": {
@@ -211,6 +213,12 @@ def verify_generator_checkout(reviewed_commit: str) -> None:
     head = run_git(root, ["rev-parse", "--verify", "HEAD^{commit}"]).decode().strip()
     if resolved_commit != reviewed_commit or head != reviewed_commit:
         raise ValueError("generator checkout HEAD does not equal the reviewed commit")
+    oidf_status = run_git(
+        root,
+        ["status", "--porcelain=v1", "--untracked-files=all", "--", "scripts/oidf"],
+    )
+    if oidf_status:
+        raise ValueError("generator directory contains tracked, staged, or untracked changes")
     require_git_clean(root, ["diff", "--quiet", "--"], "generator checkout has tracked worktree changes")
     require_git_clean(root, ["diff", "--cached", "--quiet", "--"], "generator checkout has staged changes")
 
