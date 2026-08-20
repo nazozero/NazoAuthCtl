@@ -328,7 +328,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             match store.registry_present() {
                 Ok(true) => {
                     let record = store.resolve(cli.deployment.as_deref(), false)?;
-                    return registered_status(&record, false);
+                    registered_status(&record, false)
                 }
                 Ok(false) => status(&load_config(&cli.config)?),
                 Err(error) => {
@@ -345,7 +345,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             match store.registry_present() {
                 Ok(true) => {
                     let record = store.resolve(cli.deployment.as_deref(), false)?;
-                    return registered_status(&record, true);
+                    registered_status(&record, true)
                 }
                 Ok(false) => doctor(&load_config(&cli.config)?),
                 Err(error) => {
