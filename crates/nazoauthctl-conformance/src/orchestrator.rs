@@ -1557,7 +1557,7 @@ mod tests {
                     serde_json::json!({}),
                 ),
                 (HttpMethod::Post, "/api/plan") => (
-                    200,
+                    201,
                     serde_json::json!({
                         "id": "suite-plan",
                         "name": "plan",
