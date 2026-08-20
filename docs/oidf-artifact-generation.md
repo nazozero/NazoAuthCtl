@@ -21,7 +21,7 @@ nazo="$prefix/source/v6/nazoauth"
 test "${#REVIEWED_CTL_COMMIT}" -eq 40
 case "$REVIEWED_CTL_COMMIT" in *[!0-9a-f]*) exit 2;; esac
 
-git -C "$ctl" fetch origin agent/oidf-ciunblock-fullmatrix-20260820
+git -C "$ctl" fetch origin agent/oidf-vci-skip-amendment-20260821
 git -C "$ctl" cat-file -e "$REVIEWED_CTL_COMMIT^{commit}"
 git -C "$ctl" merge-base --is-ancestor "$REVIEWED_CTL_COMMIT" FETCH_HEAD
 git -C "$ctl" checkout --detach "$REVIEWED_CTL_COMMIT"
@@ -44,6 +44,49 @@ generator locates its Ctl Git root from `__file__`, requires exact `HEAD`, clean
 state, and matches the current generator and provenance Git blobs to that reviewed commit.
 Invoke it with Python isolated mode so the script directory, working directory, user site and
 `PYTHONPATH` cannot shadow its standard-library imports.
+
+## Reviewed matrix amendments and metadata derivation
+
+At Suite revision `321bc5bc53601b9690b54c023c0cbfac0f0230f2`,
+`VCIIssuerFailOnUnsupportedEncryptionAlgorithm.start()` calls `fireTestSkipped(...)` and returns
+when `vci_credential_encryption` is not `encrypted`. The pinned NazoAuth source blob declares
+`plain` for plans `openid4vc-vci-p028`, `openid4vc-vci-p031` and `openid4vc-vci-p032`. The
+generator therefore adds exactly one `SKIPPED` expectation for that Suite module to each of
+those plans. It fails closed if a plan is missing or duplicated, its variant is not `plain`, or
+the module already has a different expected result.
+
+Before changing the pinned output constants, derive the amended deterministic metadata only on
+Hostinger from the exact independently reviewed commit. This mode still verifies the generator
+HEAD, clean checkout and committed blobs, pinned provenance, NazoAuth origin/commit/blob and all
+three amendment preconditions. It rejects signing/output arguments, does not read a signing key
+and does not create an output directory or artifact file.
+
+```sh
+set -eu
+prefix=/opt/nazoauth-e2e/candidate-deps-oidf-20260820T1300Z
+ctl="$prefix/source/v4/nazoauthctl"
+nazo="$prefix/source/v6/nazoauth"
+
+: "${REVIEWED_CTL_COMMIT:?set this to the exact reviewed amendment commit}"
+test "${#REVIEWED_CTL_COMMIT}" -eq 40
+case "$REVIEWED_CTL_COMMIT" in *[!0-9a-f]*) exit 2;; esac
+
+git -C "$ctl" fetch origin agent/oidf-vci-skip-amendment-20260821
+git -C "$ctl" cat-file -e "$REVIEWED_CTL_COMMIT^{commit}"
+git -C "$ctl" checkout --detach "$REVIEWED_CTL_COMMIT"
+test "$(git -C "$ctl" rev-parse HEAD)" = "$REVIEWED_CTL_COMMIT"
+
+python3 -I "$ctl/scripts/oidf/generate_oidf_artifact.py" \
+  --nazoauth-repo "$nazo" \
+  --reviewed-generator-commit "$REVIEWED_CTL_COMMIT" \
+  --print-derived-metadata
+```
+
+The JSON result contains the computed driver and matrix SHA-256 digests and byte sizes, artifact
+revision, resource bounds and `expected_match`. During the first review phase
+`expected_match=false` is intentional: normal signing mode continues to enforce the previous
+fixed output constants and cannot sign until a separately reviewed follow-up commit pins the new
+values in both the generator and provenance.
 
 ## Private inputs and output layout
 
