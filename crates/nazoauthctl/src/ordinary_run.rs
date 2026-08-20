@@ -25,8 +25,9 @@ use nazoauthctl_conformance::{
     EvidenceProviderIdentity, EvidenceProviderReceipt, EvidenceRuntimeIdentity,
     EvidenceSourceIdentity, HttpTransport, ManagedWebDriver, MatrixSelection, OidfArtifactMatrix,
     OidfDriverLane, OidfPlanSelection, OidfProviderExecutionBinding, OpenId4VciIssuerClient,
-    OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient,
-    Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient, SuiteResourceObserver,
+    OidfPlanResourceBudget, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
+    OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
+    SuiteResourceObserver,
     TenantResourceApplyOutput, TenantResourceReceiptIdentity, TenantResourceRecoveryBinding,
     TtyRenderer, WebDriverClient, WebDriverEndpoint, authorize_oidf_driver_execution,
     open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
@@ -234,6 +235,15 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     if plan_lanes.len() != driver_plan.plans.len() {
         bail!("signed driver plan contains duplicate Matrix plan ids");
     }
+    let plan_resource_budgets = driver_plan
+        .plans
+        .iter()
+        .map(|plan| (plan.plan_id.clone(), plan.resource_budget.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if plan_resource_budgets.len() != driver_plan.plans.len() {
+        bail!("signed driver plan contains duplicate Matrix plan ids");
+    }
+    let selected_resource_budget = driver_plan.selected_resource_budget.clone();
 
     let baseline = client
         .enumerate(
@@ -417,6 +427,8 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         &invocation,
         &suite_origin,
         plan_lanes,
+        plan_resource_budgets,
+        selected_resource_budget,
         recovery.clone(),
         ciba_bridge,
     );
@@ -566,6 +578,8 @@ fn run_signed_suite(
     invocation: &RunInvocation,
     suite_origin: &Origin,
     plan_lanes: BTreeMap<String, OidfDriverLane>,
+    plan_resource_budgets: BTreeMap<String, OidfPlanResourceBudget>,
+    selected_resource_budget: OidfPlanResourceBudget,
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
     ciba_bridge: Option<CibaUserApprovalBridge>,
 ) -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
@@ -643,6 +657,8 @@ fn run_signed_suite(
         poll_timeout: invocation.poll_timeout,
         control,
         plan_lanes,
+        plan_resource_budgets,
+        selected_resource_budget,
         jobs: invocation.jobs,
         automation,
         suite_resource_observer: Some(Arc::new(DurableSuiteObserver { recovery })),

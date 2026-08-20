@@ -234,6 +234,20 @@ fn parallel_fixture_with_lanes(
             )
         })
         .collect();
+    let plan_resource_budgets = plan_ids
+        .iter()
+        .map(|id| {
+            (
+                (*id).to_owned(),
+                OidfPlanResourceBudget {
+                    modules: 1,
+                    clients: 1,
+                    wall_clock_seconds: 60,
+                },
+            )
+        })
+        .collect();
+    let selected_plan_count = u32::try_from(plan_ids.len()).expect("fixture plan count");
     let runner = ConformanceRunner::new(ConformanceRunConfig {
         client,
         matrix: SelectedMatrix {
@@ -257,6 +271,12 @@ fn parallel_fixture_with_lanes(
         poll_timeout: Duration::from_secs(2),
         control: RunControl::default(),
         plan_lanes,
+        plan_resource_budgets,
+        selected_resource_budget: OidfPlanResourceBudget {
+            modules: selected_plan_count,
+            clients: selected_plan_count,
+            wall_clock_seconds: u64::from(selected_plan_count) * 60,
+        },
         jobs: 2,
         automation: Vec::new(),
         suite_resource_observer: None,

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
-use crate::OidfDriverLane;
+use crate::{OidfDriverLane, OidfPlanResourceBudget};
 use crate::browser::{
     BrowserAutomation, BrowserPolicy, BrowserRunnerState, BrowserTargetOrigin, ConformanceBinding,
     OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpStartRequest,
@@ -83,6 +83,11 @@ pub struct ConformanceRunConfig {
     /// required to match the selected plan ids one-for-one; the runner never
     /// derives CIBA semantics from mutable Suite plan names.
     pub plan_lanes: BTreeMap<String, OidfDriverLane>,
+    /// Exact signed resource budget for every selected Matrix plan. The map
+    /// must cover the selected plan ids one-for-one.
+    pub plan_resource_budgets: BTreeMap<String, OidfPlanResourceBudget>,
+    /// Signed aggregate budget for exactly the selected Matrix plans.
+    pub selected_resource_budget: OidfPlanResourceBudget,
     /// Maximum number of independent Suite plans executed at once. Modules
     /// inside one plan remain strictly ordered. Browser, verifier, and issuer
     /// automation retain their existing mutex-owned sessions, so parallel
@@ -164,7 +169,13 @@ impl ConformanceRunner {
         {
             return Err(OrchestrationError::InvalidInput);
         }
-        if !plan_lanes_match_selected(&config.matrix, &config.plan_lanes) {
+        if !plan_lanes_match_selected(&config.matrix, &config.plan_lanes)
+            || !resource_budgets_match_selected(
+                &config.matrix,
+                &config.plan_resource_budgets,
+                &config.selected_resource_budget,
+            )
+        {
             return Err(OrchestrationError::InvalidInput);
         }
         validate_matrix_origins(
@@ -442,6 +453,7 @@ impl ConformanceRunner {
         let mut auth_probe = None;
         let mut current_profile = None;
         let mut current_variant = None;
+        let mut observed_modules = 0u32;
 
         match self.config.client.probe_auth() {
             Ok(probe) => auth_probe = Some(probe),
@@ -522,6 +534,28 @@ impl ConformanceRunner {
                         defined_modules,
                         created_instances: 0,
                     });
+                    let actual_modules = u32::try_from(defined_modules).ok();
+                    let plan_budget = self
+                        .config
+                        .plan_resource_budgets
+                        .get(&plan.id)
+                        .expect("selected plan resource budgets were validated at construction");
+                    let next_observed_modules = actual_modules
+                        .and_then(|count| observed_modules.checked_add(count));
+                    if actual_modules.is_none_or(|count| count > plan_budget.modules)
+                        || next_observed_modules.is_none_or(|count| {
+                            count > self.config.selected_resource_budget.modules
+                        })
+                    {
+                        errors.push(
+                            "Suite plan module allocation exceeds signed resource budget"
+                                .to_owned(),
+                        );
+                        groups[group_index].status = GroupStatus::Failed;
+                        break 'create;
+                    }
+                    observed_modules = next_observed_modules
+                        .expect("validated Suite module count must remain in range");
                     let report_index = plans.len() - 1;
                     planned.push(PlannedPlan {
                         group_index,
@@ -1010,6 +1044,51 @@ fn plan_lanes_match_selected(
             .all(|plan_id| selected_plan_ids.contains(plan_id.as_str()))
 }
 
+fn resource_budgets_match_selected(
+    matrix: &SelectedMatrix,
+    plan_resource_budgets: &BTreeMap<String, OidfPlanResourceBudget>,
+    selected_resource_budget: &OidfPlanResourceBudget,
+) -> bool {
+    let selected_plan_ids = matrix
+        .document
+        .groups
+        .iter()
+        .flat_map(|group| group.plans.iter().map(|plan| plan.id.as_str()))
+        .collect::<BTreeSet<_>>();
+    let selected_plan_count = matrix
+        .document
+        .groups
+        .iter()
+        .map(|group| group.plans.len())
+        .sum::<usize>();
+    if selected_plan_ids.len() != selected_plan_count
+        || selected_plan_ids.len() != plan_resource_budgets.len()
+        || !plan_resource_budgets
+            .keys()
+            .all(|plan_id| selected_plan_ids.contains(plan_id.as_str()))
+    {
+        return false;
+    }
+
+    let summed = plan_resource_budgets.values().try_fold(
+        OidfPlanResourceBudget {
+            modules: 0,
+            clients: 0,
+            wall_clock_seconds: 0,
+        },
+        |sum, budget| {
+            Some(OidfPlanResourceBudget {
+                modules: sum.modules.checked_add(budget.modules)?,
+                clients: sum.clients.checked_add(budget.clients)?,
+                wall_clock_seconds: sum
+                    .wall_clock_seconds
+                    .checked_add(budget.wall_clock_seconds)?,
+            })
+        },
+    );
+    summed.as_ref() == Some(selected_resource_budget)
+}
+
 #[derive(Clone)]
 pub struct RunSummary {
     pub report: ConformanceReport,
@@ -1351,10 +1430,45 @@ mod tests {
     use crate::matrix::{MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix};
     use crate::transport::{HttpMethod, HttpRequest, HttpResponse, Transport, TransportError};
     use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
 
     struct FixtureTransport {
         requests: Mutex<Vec<HttpRequest>>,
+    }
+
+    struct BudgetDriftTransport {
+        requests: Mutex<Vec<(HttpMethod, String)>>,
+    }
+
+    struct RecordingPlanObserver {
+        persisted_plans: AtomicUsize,
+        module_intents: AtomicUsize,
+    }
+
+    impl SuiteResourceObserver for RecordingPlanObserver {
+        fn plan_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn plan_created(
+            &self,
+            _origin: &Origin,
+            _intent_id: &str,
+            _plan_id: &str,
+        ) -> Result<(), String> {
+            self.persisted_plans.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn module_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+            self.module_intents.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn module_created(&self, _intent_id: &str, _module_id: &str) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     struct RecoveryTransport {
@@ -1425,6 +1539,45 @@ mod tests {
         }
     }
 
+    impl Transport for BudgetDriftTransport {
+        fn send(&self, request: HttpRequest, _max: usize) -> Result<HttpResponse, TransportError> {
+            let method = request.method();
+            let path = request.url().path().to_owned();
+            self.requests
+                .lock()
+                .expect("budget drift requests")
+                .push((method, path.clone()));
+            let (status, body) = match (method, path.as_str()) {
+                (HttpMethod::Get, "/api/plan") => (
+                    if request.header("Authorization").is_some() {
+                        200
+                    } else {
+                        401
+                    },
+                    serde_json::json!({}),
+                ),
+                (HttpMethod::Post, "/api/plan") => (
+                    200,
+                    serde_json::json!({
+                        "id": "suite-plan",
+                        "name": "plan",
+                        "modules": [
+                            {"testModule": "test-1"},
+                            {"testModule": "test-2"}
+                        ]
+                    }),
+                ),
+                (HttpMethod::Delete, "/api/plan/suite-plan") => (204, Value::Null),
+                _ => (500, serde_json::json!({})),
+            };
+            Ok(HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("budget drift json"),
+            })
+        }
+    }
+
     fn test_binding() -> ConformanceBinding {
         ConformanceBinding::new(
             "019ff000-8190-7393-8c33-ab4339c3d85e",
@@ -1457,6 +1610,18 @@ mod tests {
             document,
             digest: "x".into(),
         }
+    }
+
+    fn budget(modules: u32, clients: u32, wall_clock_seconds: u64) -> OidfPlanResourceBudget {
+        OidfPlanResourceBudget {
+            modules,
+            clients,
+            wall_clock_seconds,
+        }
+    }
+
+    fn one_plan_budgets() -> BTreeMap<String, OidfPlanResourceBudget> {
+        BTreeMap::from([("p".to_owned(), budget(1, 1, 60))])
     }
 
     #[test]
@@ -1629,6 +1794,130 @@ mod tests {
     }
 
     #[test]
+    fn runner_construction_rejects_inexact_signed_resource_budgets() {
+        let selected = one_plan_matrix(serde_json::json!({}));
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            Arc::new(FixtureTransport {
+                requests: Mutex::new(Vec::new()),
+            }),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let make_config = |plan_resource_budgets, selected_resource_budget| ConformanceRunConfig {
+            client: client.clone(),
+            matrix: selected.clone(),
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets,
+            selected_resource_budget,
+            jobs: 1,
+            automation: Vec::new(),
+            suite_resource_observer: None,
+        };
+
+        assert!(ConformanceRunner::new(make_config(BTreeMap::new(), budget(0, 0, 0))).is_err());
+        for inexact_total in [budget(2, 1, 60), budget(1, 2, 60), budget(1, 1, 61)] {
+            assert!(
+                ConformanceRunner::new(make_config(one_plan_budgets(), inexact_total)).is_err()
+            );
+        }
+
+        let mut overflow_matrix = selected.clone();
+        let mut second_plan = overflow_matrix.document.groups[0].plans[0].clone();
+        second_plan.id = "q".to_owned();
+        overflow_matrix.document.groups[0].plans.push(second_plan);
+        assert!(
+            ConformanceRunner::new(ConformanceRunConfig {
+                client,
+                matrix: overflow_matrix,
+                target_origin: None,
+                binding: test_binding(),
+                poll_timeout: Duration::from_secs(1),
+                control: RunControl::default(),
+                plan_lanes: BTreeMap::from([
+                    ("p".to_owned(), OidfDriverLane::Parallel),
+                    ("q".to_owned(), OidfDriverLane::Parallel),
+                ]),
+                plan_resource_budgets: BTreeMap::from([
+                    ("p".to_owned(), budget(u32::MAX, 1, 60)),
+                    ("q".to_owned(), budget(1, 1, 60)),
+                ]),
+                selected_resource_budget: budget(u32::MAX, 2, 120),
+                jobs: 1,
+                automation: Vec::new(),
+                suite_resource_observer: None,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn suite_module_count_over_budget_fails_before_runner_creation_and_cleans_plan() {
+        let transport = Arc::new(BudgetDriftTransport {
+            requests: Mutex::new(Vec::new()),
+        });
+        let observer = Arc::new(RecordingPlanObserver {
+            persisted_plans: AtomicUsize::new(0),
+            module_intents: AtomicUsize::new(0),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix: one_plan_matrix(serde_json::json!({})),
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: one_plan_budgets(),
+            selected_resource_budget: budget(1, 1, 60),
+            jobs: 1,
+            automation: Vec::new(),
+            suite_resource_observer: Some(observer.clone()),
+        })
+        .expect("runner");
+
+        let report = runner.run(&mut ()).report;
+
+        assert_eq!(
+            report.errors,
+            vec!["Suite plan module allocation exceeds signed resource budget".to_owned()]
+        );
+        assert_eq!(report.progress.groups[0].status, GroupStatus::Failed);
+        assert_eq!(report.plans.len(), 1);
+        assert_eq!(report.plans[0].defined_modules, 2);
+        assert_eq!(report.plans[0].created_instances, 0);
+        assert_eq!(report.orchestration_integrity.created_instances, 0);
+        assert!(report.modules.is_empty());
+        assert_eq!(report.cleanup.deleted_plans, vec!["suite-plan".to_owned()]);
+        assert!(report.cleanup.failures.is_empty());
+        assert_eq!(observer.persisted_plans.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.module_intents.load(Ordering::SeqCst), 0);
+        let requests = transport.requests.lock().expect("budget drift requests");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(method, path)| *method == HttpMethod::Post && path == "/api/runner")
+                .count(),
+            0
+        );
+        assert!(requests.iter().any(|(method, path)| {
+            *method == HttpMethod::Delete && path == "/api/plan/suite-plan"
+        }));
+    }
+
+    #[test]
     fn origin_validation_rejects_cross_origin_config() {
         let selected = one_plan_matrix(serde_json::json!({"audience":"https://evil.example"}));
         let client = SuiteClient::with_transport(
@@ -1649,6 +1938,8 @@ mod tests {
                 poll_timeout: Duration::from_secs(1),
                 control: RunControl::default(),
                 plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+                plan_resource_budgets: one_plan_budgets(),
+                selected_resource_budget: budget(1, 1, 60),
                 jobs: 1,
                 automation: Vec::new(),
                 suite_resource_observer: None,
@@ -1832,6 +2123,8 @@ mod tests {
             poll_timeout: Duration::from_secs(30),
             control,
             plan_lanes: BTreeMap::new(),
+            plan_resource_budgets: BTreeMap::new(),
+            selected_resource_budget: budget(0, 0, 0),
             jobs: 1,
             automation: Vec::new(),
             suite_resource_observer: None,
@@ -1906,6 +2199,8 @@ mod tests {
             poll_timeout: Duration::from_millis(250),
             control,
             plan_lanes: BTreeMap::new(),
+            plan_resource_budgets: BTreeMap::new(),
+            selected_resource_budget: budget(0, 0, 0),
             jobs: 1,
             automation: Vec::new(),
             suite_resource_observer: None,
@@ -2039,6 +2334,8 @@ mod tests {
             poll_timeout: Duration::from_secs(2),
             control: RunControl::default(),
             plan_lanes: BTreeMap::new(),
+            plan_resource_budgets: BTreeMap::new(),
+            selected_resource_budget: budget(0, 0, 0),
             jobs: 1,
             automation: Vec::new(),
             suite_resource_observer: None,
