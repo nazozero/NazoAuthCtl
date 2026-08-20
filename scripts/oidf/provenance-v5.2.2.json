@@ -18,8 +18,13 @@
   "generator": {
     "path": "scripts/oidf/generate_oidf_artifact.py",
     "predecessor_sha256": "dadd1d8c0dbe87b0c40a7ae8ec6569e3875d02a6aa5874d4ac307dab2d816ae9",
-    "reviewed_parent_commit": "cac041f0773058dbd3050593ca2361f20a04ed91",
-    "host_checkout": "inject the exact reviewed generator commit from independent task evidence"
+    "reviewed_parent_commit": "ec763436cbf3fcf3774d9bbb65e2c1c483af2cad",
+    "host_checkout": "inject the exact reviewed generator commit from independent task evidence",
+    "runtime_commit_argument": "--reviewed-generator-commit",
+    "runtime_verified_paths": [
+      "scripts/oidf/generate_oidf_artifact.py",
+      "scripts/oidf/provenance-v5.2.2.json"
+    ]
   },
   "expected_output": {
     "driver": {

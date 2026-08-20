@@ -39,6 +39,10 @@ the NazoAuth checkout's `origin` to be
 `https://github.com/nazozero/NazoAuth.git` and reads the source matrix with native Git object
 commands, not from the checked-out filesystem.
 
+`--reviewed-generator-commit` is also mandatory at runtime. Before touching any output, the
+generator locates its Ctl Git root from `__file__`, requires exact `HEAD`, clean tracked/index
+state, and matches the current generator and provenance Git blobs to that reviewed commit.
+
 ## Private inputs and output layout
 
 Provision the signing key out of band. The generator never creates or rotates it. The key must
@@ -60,9 +64,17 @@ nazo="$prefix/source/v6/nazoauth"
 private="$prefix/state/oidf-artifact-private"
 public="$prefix/evidence/oidf-artifact-public"
 
+: "${REVIEWED_CTL_COMMIT:?set this from the independently reviewed task evidence}"
+test "${#REVIEWED_CTL_COMMIT}" -eq 40
+case "$REVIEWED_CTL_COMMIT" in *[!0-9a-f]*) exit 2;; esac
+
 install -d -m 0700 "$private"
 # Provision $private/signer.pem out of band, then enforce:
 chmod 0600 "$private/signer.pem"
+
+test "$(git -C "$ctl" rev-parse HEAD)" = "$REVIEWED_CTL_COMMIT"
+git -C "$ctl" diff --quiet --
+git -C "$ctl" diff --cached --quiet --
 
 python3 "$ctl/scripts/oidf/generate_oidf_artifact.py" \
   --nazoauth-repo "$nazo" \
@@ -70,6 +82,7 @@ python3 "$ctl/scripts/oidf/generate_oidf_artifact.py" \
   --trust-policy-output "$private/trust-policy.json" \
   --signing-key "$private/signer.pem" \
   --expected-key-id 'oidf-es256-REPLACE_WITH_PREAPPROVED_KEY_ID' \
+  --reviewed-generator-commit "$REVIEWED_CTL_COMMIT" \
   --source 'https://artifacts.example.invalid/oidf/v5.2.2/' \
   --suite-origin 'https://suite.example.invalid:30444'
 ```

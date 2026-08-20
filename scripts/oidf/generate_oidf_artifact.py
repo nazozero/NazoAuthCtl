@@ -50,9 +50,12 @@ P256_COMPRESSED_SPKI_PREFIX = bytes.fromhex(
 PUBLIC_OUTPUT_NAMES = frozenset(
     {"driver.json", "matrix.json", "manifest.jws", "trust-policy.json", "metadata.json"}
 )
+GENERATOR_REPO_PATH = "scripts/oidf/generate_oidf_artifact.py"
+PROVENANCE_REPO_PATH = "scripts/oidf/provenance-v5.2.2.json"
 PROVENANCE_PATH = pathlib.Path(__file__).with_name("provenance-v5.2.2.json")
 DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 CANONICAL_PATH = re.compile(r"/[A-Za-z0-9._~/-]*")
+LOWER_HEX_COMMIT = re.compile(r"[0-9a-f]{40}")
 
 
 def compact_json(value: object) -> bytes:
@@ -83,10 +86,12 @@ def expected_provenance() -> dict[str, object]:
             "image_digest": SUITE_IMAGE,
         },
         "generator": {
-            "path": "scripts/oidf/generate_oidf_artifact.py",
+            "path": GENERATOR_REPO_PATH,
             "predecessor_sha256": GENERATOR_PREDECESSOR_SHA256,
-            "reviewed_parent_commit": "cac041f0773058dbd3050593ca2361f20a04ed91",
+            "reviewed_parent_commit": "ec763436cbf3fcf3774d9bbb65e2c1c483af2cad",
             "host_checkout": "inject the exact reviewed generator commit from independent task evidence",
+            "runtime_commit_argument": "--reviewed-generator-commit",
+            "runtime_verified_paths": [GENERATOR_REPO_PATH, PROVENANCE_REPO_PATH],
         },
         "expected_output": {
             "driver": {"sha256": EXPECTED_DRIVER_SHA256, "size": EXPECTED_DRIVER_SIZE},
@@ -173,7 +178,49 @@ def run_git(repo: pathlib.Path, arguments: list[str]) -> bytes:
             stderr=subprocess.PIPE,
         ).stdout
     except (OSError, subprocess.CalledProcessError) as error:
-        raise ValueError(f"Git could not read the pinned NazoAuth source: {error}") from error
+        raise ValueError(f"Git could not read the required repository state: {error}") from error
+
+
+def require_git_clean(repo: pathlib.Path, arguments: list[str], message: str) -> None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *arguments],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        raise ValueError("Git could not verify the generator checkout") from error
+    if result.returncode != 0:
+        raise ValueError(message)
+
+
+def verify_generator_checkout(reviewed_commit: str) -> None:
+    if LOWER_HEX_COMMIT.fullmatch(reviewed_commit) is None:
+        raise ValueError("--reviewed-generator-commit must be 40 lowercase hexadecimal characters")
+
+    script_path = reject_symlink_components(pathlib.Path(__file__), "generator")
+    provenance_path = reject_symlink_components(PROVENANCE_PATH, "generator provenance")
+    root_text = run_git(script_path.parent, ["rev-parse", "--show-toplevel"]).decode("utf-8").strip()
+    root = pathlib.Path(root_text).resolve(strict=True)
+    if script_path.relative_to(root).as_posix() != GENERATOR_REPO_PATH:
+        raise ValueError("generator is not running from its fixed repository path")
+    if provenance_path.relative_to(root).as_posix() != PROVENANCE_REPO_PATH:
+        raise ValueError("generator provenance is not at its fixed repository path")
+
+    resolved_commit = run_git(root, ["rev-parse", "--verify", f"{reviewed_commit}^{{commit}}"]).decode().strip()
+    head = run_git(root, ["rev-parse", "--verify", "HEAD^{commit}"]).decode().strip()
+    if resolved_commit != reviewed_commit or head != reviewed_commit:
+        raise ValueError("generator checkout HEAD does not equal the reviewed commit")
+    require_git_clean(root, ["diff", "--quiet", "--"], "generator checkout has tracked worktree changes")
+    require_git_clean(root, ["diff", "--cached", "--quiet", "--"], "generator checkout has staged changes")
+
+    for repository_path in (GENERATOR_REPO_PATH, PROVENANCE_REPO_PATH):
+        committed_blob = run_git(
+            root, ["rev-parse", "--verify", f"{reviewed_commit}:{repository_path}"]
+        ).decode().strip()
+        working_blob = run_git(root, ["hash-object", "--", repository_path]).decode().strip()
+        if committed_blob != working_blob:
+            raise ValueError(f"reviewed generator input does not match its commit blob: {repository_path}")
 
 
 def read_source_matrix(repo: pathlib.Path) -> dict[str, object]:
@@ -461,10 +508,12 @@ def main() -> None:
     parser.add_argument("--trust-policy-output", required=True, type=pathlib.Path)
     parser.add_argument("--signing-key", required=True, type=pathlib.Path)
     parser.add_argument("--expected-key-id", required=True)
+    parser.add_argument("--reviewed-generator-commit", required=True)
     parser.add_argument("--source", required=True)
     parser.add_argument("--suite-origin", required=True)
     args = parser.parse_args()
 
+    verify_generator_checkout(args.reviewed_generator_commit)
     validate_provenance()
     source_url = canonical_https(args.source, directory=True)
     suite_origin = canonical_https(args.suite_origin, directory=False)
