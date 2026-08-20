@@ -140,7 +140,11 @@ fn managed_dependency_credentials_are_outside_runtime_secret_directory() {
     assert_eq!(valkey_acl_lines.next(), Some("user default off"));
     let runtime_acl = valkey_acl_lines.next().unwrap();
     assert!(runtime_acl.starts_with("user nazoauth_runtime on"));
-    assert!(runtime_acl.split_whitespace().any(|token| token == "+dbsize"));
+    assert!(
+        runtime_acl
+            .split_whitespace()
+            .any(|token| token == "+dbsize")
+    );
     for forbidden in [
         "+flushall",
         "+flushdb",
@@ -149,7 +153,11 @@ fn managed_dependency_credentials_are_outside_runtime_secret_directory() {
         "@all",
         "allcommands",
     ] {
-        assert!(!runtime_acl.split_whitespace().any(|token| token == forbidden));
+        assert!(
+            !runtime_acl
+                .split_whitespace()
+                .any(|token| token == forbidden)
+        );
     }
     let backup_acl = valkey_acl_lines.next().unwrap();
     assert!(backup_acl.starts_with("user nazoauth_backup on"));
