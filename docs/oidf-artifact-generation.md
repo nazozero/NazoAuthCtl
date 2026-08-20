@@ -83,10 +83,10 @@ python3 -I "$ctl/scripts/oidf/generate_oidf_artifact.py" \
 ```
 
 The JSON result contains the computed driver and matrix SHA-256 digests and byte sizes, artifact
-revision, resource bounds and `expected_match`. During the first review phase
-`expected_match=false` is intentional: normal signing mode continues to enforce the previous
-fixed output constants and cannot sign until a separately reviewed follow-up commit pins the new
-values in both the generator and provenance.
+revision, resource bounds and `expected_match`. The reviewed final generator pins the Hostinger-
+derived values in both the generator and provenance, so `expected_match` must be `true`. A false
+value is output drift; normal signing mode enforces the same constants and fails closed before it
+reads the signing key or mutates an output path.
 
 ## Private inputs and output layout
 

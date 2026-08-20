@@ -20,7 +20,7 @@ import urllib.parse
 
 
 ARTIFACT_ID = "nazoauth-oidf-v5.2.2-ordinary-provider"
-ARTIFACT_REVISION = "ac846e9080a86e30210de84289488e312e27f35e"
+ARTIFACT_REVISION = "608e85321d5297f3ecac9a11227a806e34c5c505"
 SOURCE_REPOSITORY = "https://github.com/nazozero/NazoAuth.git"
 SOURCE_COMMIT = "77c362f9fc62e5114f3c61e2b4420f864d7112ab"
 SOURCE_PATH = "crates/authorization-server/resources/nazoauth-conformance-matrix-v1.json"
@@ -33,8 +33,8 @@ GENERATOR_PREDECESSOR_SHA256 = (
 )
 EXPECTED_DRIVER_SHA256 = "62b54d229e01bfb4a1b93c340a2e71839e492b83f53aff1b9792b38b71ea7a1a"
 EXPECTED_DRIVER_SIZE = 461
-EXPECTED_MATRIX_SHA256 = "93806b506e2e10c1dc261389d47f3f3a83dec56e68f3c1e3a3dbd6b29d9a4bc6"
-EXPECTED_MATRIX_SIZE = 481746
+EXPECTED_MATRIX_SHA256 = "9bd0c0b3d015f83a1168a4a2941b1b3280f53d845393935731dd991802608825"
+EXPECTED_MATRIX_SIZE = 481950
 EXPECTED_BOUNDS = {
     "max_plans": 44,
     "max_modules": 1408,
@@ -103,7 +103,7 @@ def expected_provenance() -> dict[str, object]:
         "generator": {
             "path": GENERATOR_REPO_PATH,
             "predecessor_sha256": GENERATOR_PREDECESSOR_SHA256,
-            "reviewed_parent_commit": "06929424c7946ed13c382aca0bfec642a5a3fed9",
+            "reviewed_parent_commit": "35d885cdbe2341a1d99684140c698499a638d1a2",
             "host_checkout": "inject the exact reviewed generator commit from independent task evidence",
             "runtime_commit_argument": "--reviewed-generator-commit",
             "runtime_import_isolation": "python3 -I",
