@@ -11,7 +11,6 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
-use crate::{OidfDriverLane, OidfPlanResourceBudget};
 use crate::browser::{
     BrowserAutomation, BrowserPolicy, BrowserRunnerState, BrowserTargetOrigin, ConformanceBinding,
     OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpStartRequest,
@@ -25,9 +24,10 @@ use crate::progress::{
 };
 use crate::report::{
     CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport,
-    ModuleReportContext, OrchestrationIntegrity, PlanReport, summarize_module_outcomes,
-    summarize_matrix_expectations,
+    ModuleReportContext, OrchestrationIntegrity, PlanReport, summarize_matrix_expectations,
+    summarize_module_outcomes,
 };
+use crate::{OidfDriverLane, OidfPlanResourceBudget};
 
 mod parallel;
 
@@ -572,10 +572,7 @@ impl ConformanceRunner {
                         .expected_results
                         .keys()
                         .filter(|test_name| {
-                            module_name_counts
-                                .get(test_name.as_str())
-                                .copied()
-                                != Some(1)
+                            module_name_counts.get(test_name.as_str()).copied() != Some(1)
                         })
                         .map(|test_name| format!("{}/{}", plan.id, test_name))
                         .collect::<Vec<_>>();
@@ -598,14 +595,14 @@ impl ConformanceRunner {
                     }
                     enumerated_plan_count += 1;
                     let actual_modules = u32::try_from(defined_modules).ok();
-                    let plan_budget = self
-                        .config
-                        .plan_resource_budgets
-                        .get(&plan.id)
-                        .expect("selected plan resource budgets were validated at construction");
-                    let next_observed_modules = actual_modules
-                        .and_then(|count| observed_modules.checked_add(count));
-                    let over_budget = actual_modules.is_none_or(|count| count > plan_budget.modules)
+                    let plan_budget =
+                        self.config.plan_resource_budgets.get(&plan.id).expect(
+                            "selected plan resource budgets were validated at construction",
+                        );
+                    let next_observed_modules =
+                        actual_modules.and_then(|count| observed_modules.checked_add(count));
+                    let over_budget = actual_modules
+                        .is_none_or(|count| count > plan_budget.modules)
                         || next_observed_modules.is_none_or(|count| {
                             count > self.config.selected_resource_budget.modules
                         });
@@ -2083,9 +2080,11 @@ mod tests {
         assert!(!report.matrix_expectations_satisfied);
         assert!(!report.acceptance_pass);
         assert_eq!(report.unknown_declared_skip_modules, ["p/declared-skip"]);
-        assert!(report.errors.iter().any(|error| {
-            error == "Suite plan defines duplicate test_name: p/declared-skip"
-        }));
+        assert!(
+            report.errors.iter().any(|error| {
+                error == "Suite plan defines duplicate test_name: p/declared-skip"
+            })
+        );
         assert!(report.errors.iter().any(|error| {
             error
                 == "signed Matrix expected SKIPPED module is not uniquely defined by Suite plan: p/declared-skip"
@@ -2179,9 +2178,11 @@ mod tests {
             .requests
             .lock()
             .expect("plan-create failure requests");
-        assert!(requests.iter().any(|(method, path)| {
-            *method == HttpMethod::Post && path == "/api/plan"
-        }));
+        assert!(
+            requests
+                .iter()
+                .any(|(method, path)| { *method == HttpMethod::Post && path == "/api/plan" })
+        );
         assert!(!requests.iter().any(|(method, path)| {
             *method == HttpMethod::Delete && path.starts_with("/api/plan/")
         }));

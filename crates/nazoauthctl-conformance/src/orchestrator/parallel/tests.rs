@@ -405,10 +405,8 @@ fn parallel_expected_skips_are_preserved_and_acceptance_is_exact() {
         "SKIPPED",
     );
     for plan in &mut runner.config.matrix.document.groups[0].plans {
-        plan.expected_results.insert(
-            format!("test-{}", plan.plan),
-            "SKIPPED".to_owned(),
-        );
+        plan.expected_results
+            .insert(format!("test-{}", plan.plan), "SKIPPED".to_owned());
     }
 
     let report = runner.run(&mut ()).report;
@@ -417,7 +415,10 @@ fn parallel_expected_skips_are_preserved_and_acceptance_is_exact() {
     assert!(!report.suite_pass, "SKIPPED must not be relabeled PASSED");
     assert!(report.acceptance_pass);
     assert!(report.matrix_expectations_satisfied);
-    assert_eq!(report.expected_skipped_modules, ["plan-a/test-plan-a", "plan-b/test-plan-b"]);
+    assert_eq!(
+        report.expected_skipped_modules,
+        ["plan-a/test-plan-a", "plan-b/test-plan-b"]
+    );
     assert!(report.unexpected_skipped_modules.is_empty());
     assert!(report.unknown_declared_skip_modules.is_empty());
 }

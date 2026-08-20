@@ -108,10 +108,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                                 poll_timeout: runner.config.poll_timeout,
                                 control: runner.config.control.clone(),
                                 plan_lanes: runner.config.plan_lanes.clone(),
-                                plan_resource_budgets: runner
-                                    .config
-                                    .plan_resource_budgets
-                                    .clone(),
+                                plan_resource_budgets: runner.config.plan_resource_budgets.clone(),
                                 selected_resource_budget: runner
                                     .config
                                     .selected_resource_budget

@@ -281,9 +281,7 @@ pub(crate) fn summarize_module_outcomes(modules: &[ModuleReport]) -> ModuleOutco
     summary
 }
 
-pub(crate) fn summarize_matrix_expectations(
-    modules: &[ModuleReport],
-) -> MatrixExpectationSummary {
+pub(crate) fn summarize_matrix_expectations(modules: &[ModuleReport]) -> MatrixExpectationSummary {
     let mut summary = MatrixExpectationSummary {
         expected_skipped_modules: Vec::new(),
         unexpected_skipped_modules: Vec::new(),
@@ -504,7 +502,13 @@ mod tests {
                 serde_json::json!({"status":"FINISHED","result":"SKIPPED"}),
                 serde_json::json!([]),
             ),
-            module("unexpected-skip", true, "FINISHED", "SKIPPED", serde_json::json!([])),
+            module(
+                "unexpected-skip",
+                true,
+                "FINISHED",
+                "SKIPPED",
+                serde_json::json!([]),
+            ),
         ];
 
         let summary = summarize_matrix_expectations(&modules);
@@ -578,10 +582,7 @@ mod tests {
             "unknown_declared_skip_modules",
             "matrix_expectations_satisfied",
         ] {
-            legacy
-                .as_object_mut()
-                .expect("report object")
-                .remove(field);
+            legacy.as_object_mut().expect("report object").remove(field);
         }
 
         let restored: ConformanceReport = serde_json::from_value(legacy).expect("legacy report");

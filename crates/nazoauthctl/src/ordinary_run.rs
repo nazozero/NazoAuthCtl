@@ -24,14 +24,13 @@ use nazoauthctl_conformance::{
     EvidenceBundleReceipt, EvidenceDeploymentIdentity, EvidenceProviderCapability,
     EvidenceProviderIdentity, EvidenceProviderReceipt, EvidenceRuntimeIdentity,
     EvidenceSourceIdentity, HttpTransport, ManagedWebDriver, MatrixSelection, OidfArtifactMatrix,
-    OidfDriverLane, OidfPlanSelection, OidfProviderExecutionBinding, OpenId4VciIssuerClient,
-    OidfPlanResourceBudget, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
+    OidfDriverLane, OidfPlanResourceBudget, OidfPlanSelection, OidfProviderExecutionBinding,
+    OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
     OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
-    SuiteResourceObserver,
-    TenantResourceApplyOutput, TenantResourceReceiptIdentity, TenantResourceRecoveryBinding,
-    TtyRenderer, WebDriverClient, WebDriverEndpoint, authorize_oidf_driver_execution,
-    open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
-    read_compact_manifest, recover_suite_resources, verify_oidf_artifact,
+    SuiteResourceObserver, TenantResourceApplyOutput, TenantResourceReceiptIdentity,
+    TenantResourceRecoveryBinding, TtyRenderer, WebDriverClient, WebDriverEndpoint,
+    authorize_oidf_driver_execution, open_cached_oidf_driver_plan, read_artifact_driver,
+    read_artifact_matrix, read_compact_manifest, recover_suite_resources, verify_oidf_artifact,
     write_private_provider_evidence_bundle,
 };
 use nazoauthctl_core::tenant_resources::{
@@ -514,15 +513,13 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         }
     }
     let success = errors.is_empty()
-        && report
-            .as_ref()
-            .is_some_and(|report| {
-                conformance_acceptance_succeeds(
-                    report.local_success,
-                    report.acceptance_pass,
-                    report.matrix_expectations_satisfied,
-                )
-            });
+        && report.as_ref().is_some_and(|report| {
+            conformance_acceptance_succeeds(
+                report.local_success,
+                report.acceptance_pass,
+                report.matrix_expectations_satisfied,
+            )
+        });
     let output = FinalOutput {
         schema: 3,
         success,

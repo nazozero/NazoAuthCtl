@@ -715,8 +715,14 @@ mod tests {
 
         assert_eq!(value["expected_skipped_modules"], serde_json::json!([]));
         assert_eq!(value["unexpected_skipped_modules"], serde_json::json!([]));
-        assert_eq!(value["unknown_declared_skip_modules"], serde_json::json!([]));
-        assert_eq!(value["matrix_expectations_satisfied"], serde_json::json!(true));
+        assert_eq!(
+            value["unknown_declared_skip_modules"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            value["matrix_expectations_satisfied"],
+            serde_json::json!(true)
+        );
         assert_eq!(value["acceptance_pass"], serde_json::json!(true));
     }
 
