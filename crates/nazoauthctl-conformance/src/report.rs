@@ -303,7 +303,7 @@ pub(crate) fn summarize_matrix_expectations(
 }
 
 const fn matrix_expectations_satisfied_default() -> bool {
-    true
+    false
 }
 
 fn collect_condition_log_results(
@@ -516,5 +516,80 @@ mod tests {
         let expected_only = summarize_module_outcomes(&modules[..1]);
         assert!(expected_only.acceptance_pass);
         assert!(!expected_only.all_passed);
+    }
+
+    #[test]
+    fn legacy_schema_three_report_without_skip_gate_fields_fails_closed() {
+        let current = ConformanceReport {
+            schema: 3,
+            matrix_digest: "d".repeat(64),
+            suite_origin: "https://suite.example".to_owned(),
+            auth_probe: None,
+            errors: Vec::new(),
+            local_success: true,
+            suite_pass: true,
+            acceptance_pass: true,
+            human_review_required: false,
+            human_review_modules: Vec::new(),
+            skipped_modules: Vec::new(),
+            expected_skipped_modules: Vec::new(),
+            unexpected_skipped_modules: Vec::new(),
+            unknown_declared_skip_modules: Vec::new(),
+            matrix_expectations_satisfied: true,
+            failed_modules: Vec::new(),
+            incomplete_modules: Vec::new(),
+            orchestration_integrity: OrchestrationIntegrity {
+                defined_modules: 0,
+                created_instances: 0,
+                terminal_modules: 0,
+                all_modules_instantiated: true,
+                all_modules_terminal: true,
+                cleanup_complete: true,
+            },
+            progress: ProgressSnapshot {
+                completed: 0,
+                total: 0,
+                groups: Vec::new(),
+                passed_groups: 0,
+                review_groups: 0,
+                skipped_groups: 0,
+                failed_groups: 0,
+                running_groups: 0,
+                remaining_groups: 0,
+                passed: 0,
+                reviewed: 0,
+                skipped: 0,
+                failed: 0,
+                running: 0,
+                remaining: 0,
+                current_profile: None,
+                current_variant: None,
+                current_test: None,
+            },
+            plans: Vec::new(),
+            modules: Vec::new(),
+            cleanup: CleanupReport::default(),
+        };
+        let mut legacy = serde_json::to_value(current).expect("current report");
+        for field in [
+            "acceptance_pass",
+            "expected_skipped_modules",
+            "unexpected_skipped_modules",
+            "unknown_declared_skip_modules",
+            "matrix_expectations_satisfied",
+        ] {
+            legacy
+                .as_object_mut()
+                .expect("report object")
+                .remove(field);
+        }
+
+        let restored: ConformanceReport = serde_json::from_value(legacy).expect("legacy report");
+
+        assert!(!restored.acceptance_pass);
+        assert!(!restored.matrix_expectations_satisfied);
+        assert!(restored.expected_skipped_modules.is_empty());
+        assert!(restored.unexpected_skipped_modules.is_empty());
+        assert!(restored.unknown_declared_skip_modules.is_empty());
     }
 }

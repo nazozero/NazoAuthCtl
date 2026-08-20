@@ -158,6 +158,7 @@ struct PreparedRun {
     errors: Vec<String>,
     unknown_declared_skip_modules: Vec<String>,
     matrix_expectations_satisfied: bool,
+    all_selected_plan_definitions_enumerated: bool,
     auth_probe: Option<crate::client::AuthProbe>,
     current_profile: Option<String>,
     current_variant: Option<BTreeMap<String, String>>,
@@ -455,6 +456,15 @@ impl ConformanceRunner {
         let mut errors = Vec::<String>::new();
         let mut unknown_declared_skip_modules = Vec::<String>::new();
         let mut matrix_expectations_satisfied = true;
+        let selected_plan_count = self
+            .config
+            .matrix
+            .document
+            .groups
+            .iter()
+            .map(|group| group.plans.len())
+            .sum::<usize>();
+        let mut enumerated_plan_count = 0usize;
         let mut auth_probe = None;
         let mut current_profile = None;
         let mut current_variant = None;
@@ -517,18 +527,6 @@ impl ConformanceRunner {
                     // response wrapper is partially moved below.
                     zeroize_json_value(&mut created.raw);
                     suite_plan_ids.push(created.id.clone());
-                    if let (Some(observer), Some(intent_id)) =
-                        (&self.config.suite_resource_observer, &plan_create_intent)
-                        && let Err(error) = observer.plan_created(
-                            self.config.client.origin(),
-                            intent_id,
-                            &created.id,
-                        )
-                    {
-                        errors.push(error);
-                        groups[group_index].status = GroupStatus::Failed;
-                        break 'create;
-                    }
                     let defined_modules = created.modules.len();
                     groups[group_index].total += defined_modules;
                     groups[group_index].remaining += defined_modules;
@@ -539,29 +537,11 @@ impl ConformanceRunner {
                         defined_modules,
                         created_instances: 0,
                     });
-                    let actual_modules = u32::try_from(defined_modules).ok();
-                    let plan_budget = self
-                        .config
-                        .plan_resource_budgets
-                        .get(&plan.id)
-                        .expect("selected plan resource budgets were validated at construction");
-                    let next_observed_modules = actual_modules
-                        .and_then(|count| observed_modules.checked_add(count));
-                    if actual_modules.is_none_or(|count| count > plan_budget.modules)
-                        || next_observed_modules.is_none_or(|count| {
-                            count > self.config.selected_resource_budget.modules
-                        })
-                    {
-                        errors.push(
-                            "Suite plan module allocation exceeds signed resource budget"
-                                .to_owned(),
-                        );
-                        groups[group_index].status = GroupStatus::Failed;
-                        break 'create;
-                    }
-                    observed_modules = next_observed_modules
-                        .expect("validated Suite module count must remain in range");
                     let report_index = plans.len() - 1;
+                    // Validate the full Suite definition before any budget
+                    // failure can stop phase 1. This keeps every signed skip
+                    // declaration observable in the public evidence even
+                    // when the Suite also exceeds a resource bound.
                     let mut module_name_counts = BTreeMap::<&str, usize>::new();
                     for module in &created.modules {
                         *module_name_counts
@@ -583,7 +563,9 @@ impl ConformanceRunner {
                         })
                         .map(|test_name| format!("{}/{}", plan.id, test_name))
                         .collect::<Vec<_>>();
-                    if !duplicate_module_names.is_empty() || !unknown_expected_skips.is_empty() {
+                    let definition_mismatch =
+                        !duplicate_module_names.is_empty() || !unknown_expected_skips.is_empty();
+                    if definition_mismatch {
                         matrix_expectations_satisfied = false;
                         for test_name in duplicate_module_names {
                             errors.push(format!(
@@ -597,6 +579,41 @@ impl ConformanceRunner {
                             ));
                             unknown_declared_skip_modules.push(identity);
                         }
+                    }
+                    enumerated_plan_count += 1;
+                    let actual_modules = u32::try_from(defined_modules).ok();
+                    let plan_budget = self
+                        .config
+                        .plan_resource_budgets
+                        .get(&plan.id)
+                        .expect("selected plan resource budgets were validated at construction");
+                    let next_observed_modules = actual_modules
+                        .and_then(|count| observed_modules.checked_add(count));
+                    let over_budget = actual_modules.is_none_or(|count| count > plan_budget.modules)
+                        || next_observed_modules.is_none_or(|count| {
+                            count > self.config.selected_resource_budget.modules
+                        });
+                    if over_budget {
+                        errors.push(
+                            "Suite plan module allocation exceeds signed resource budget"
+                                .to_owned(),
+                        );
+                    }
+                    if definition_mismatch || over_budget {
+                        groups[group_index].status = GroupStatus::Failed;
+                        break 'create;
+                    }
+                    observed_modules = next_observed_modules
+                        .expect("validated Suite module count must remain in range");
+                    if let (Some(observer), Some(intent_id)) =
+                        (&self.config.suite_resource_observer, &plan_create_intent)
+                        && let Err(error) = observer.plan_created(
+                            self.config.client.origin(),
+                            intent_id,
+                            &created.id,
+                        )
+                    {
+                        errors.push(error);
                         groups[group_index].status = GroupStatus::Failed;
                         break 'create;
                     }
@@ -629,6 +646,7 @@ impl ConformanceRunner {
             errors,
             unknown_declared_skip_modules,
             matrix_expectations_satisfied,
+            all_selected_plan_definitions_enumerated: enumerated_plan_count == selected_plan_count,
             auth_probe,
             current_profile,
             current_variant,
@@ -648,6 +666,7 @@ impl ConformanceRunner {
             mut errors,
             unknown_declared_skip_modules,
             matrix_expectations_satisfied,
+            all_selected_plan_definitions_enumerated,
             auth_probe,
             mut current_profile,
             mut current_variant,
@@ -1031,6 +1050,7 @@ impl ConformanceRunner {
         let outcomes = summarize_module_outcomes(&modules);
         let matrix_expectations = summarize_matrix_expectations(&modules);
         let matrix_expectations_satisfied = matrix_expectations_satisfied
+            && all_selected_plan_definitions_enumerated
             && matrix_expectations.unexpected_skipped_modules.is_empty()
             && unknown_declared_skip_modules.is_empty();
         let suite_pass = defined_modules > 0 && all_modules_terminal && outcomes.all_passed;
@@ -2042,8 +2062,8 @@ mod tests {
             poll_timeout: Duration::from_secs(1),
             control: RunControl::default(),
             plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
-            plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
-            selected_resource_budget: budget(2, 1, 60),
+            plan_resource_budgets: one_plan_budgets(),
+            selected_resource_budget: budget(1, 1, 60),
             jobs: 1,
             automation: Vec::new(),
             suite_resource_observer: None,
@@ -2062,6 +2082,9 @@ mod tests {
             error
                 == "signed Matrix expected SKIPPED module is not uniquely defined by Suite plan: p/declared-skip"
         }));
+        assert!(report.errors.iter().any(|error| {
+            error == "Suite plan module allocation exceeds signed resource budget"
+        }));
         assert_eq!(report.cleanup.deleted_plans, ["suite-plan"]);
         assert!(report.modules.is_empty());
         assert_eq!(
@@ -2074,6 +2097,67 @@ mod tests {
                 .count(),
             0,
         );
+    }
+
+    struct PlanCreateFailureTransport {
+        requests: Mutex<Vec<(HttpMethod, String)>>,
+    }
+
+    impl Transport for PlanCreateFailureTransport {
+        fn send(&self, request: HttpRequest, _max: usize) -> Result<HttpResponse, TransportError> {
+            let method = request.method();
+            let path = request.url().path().to_owned();
+            self.requests
+                .lock()
+                .expect("plan-create failure requests")
+                .push((method, path.clone()));
+            let (status, body) = match (method, path.as_str()) {
+                (HttpMethod::Get, "/api/plan") => (200, serde_json::json!({})),
+                (HttpMethod::Post, "/api/plan") => (500, serde_json::json!({})),
+                _ => (500, serde_json::json!({})),
+            };
+            Ok(HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("plan-create failure json"),
+            })
+        }
+    }
+
+    #[test]
+    fn plan_creation_failure_marks_matrix_expectations_unverifiable() {
+        let transport = Arc::new(PlanCreateFailureTransport {
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport,
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix: one_plan_matrix(serde_json::json!({})),
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: one_plan_budgets(),
+            selected_resource_budget: budget(1, 1, 60),
+            jobs: 1,
+            automation: Vec::new(),
+            suite_resource_observer: None,
+        })
+        .expect("runner");
+
+        let report = runner.run(&mut ()).report;
+
+        assert!(!report.matrix_expectations_satisfied);
+        assert!(!report.acceptance_pass);
+        assert!(report.unknown_declared_skip_modules.is_empty());
+        assert!(report.errors.iter().any(|error| error.contains("500")));
     }
 
     #[test]

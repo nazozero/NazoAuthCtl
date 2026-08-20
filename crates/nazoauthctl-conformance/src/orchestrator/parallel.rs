@@ -257,6 +257,7 @@ fn worker_prepared(work: &PlanWork) -> PreparedRun {
         errors: Vec::new(),
         unknown_declared_skip_modules: Vec::new(),
         matrix_expectations_satisfied: true,
+        all_selected_plan_definitions_enumerated: true,
         auth_probe: None,
         current_profile: Some(group.profile),
         current_variant: Some(redacted_variant(&work.plan.variant)),
@@ -418,6 +419,7 @@ fn merge_reports(
     let outcomes = summarize_module_outcomes(&modules);
     let matrix_expectations = summarize_matrix_expectations(&modules);
     let matrix_expectations_satisfied = prepared.matrix_expectations_satisfied
+        && prepared.all_selected_plan_definitions_enumerated
         && matrix_expectations.unexpected_skipped_modules.is_empty()
         && prepared.unknown_declared_skip_modules.is_empty();
     let suite_pass = defined_modules > 0 && all_modules_terminal && outcomes.all_passed;
