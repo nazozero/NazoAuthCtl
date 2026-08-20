@@ -517,9 +517,11 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         && report
             .as_ref()
             .is_some_and(|report| {
-                report.local_success
-                    && report.acceptance_pass
-                    && report.matrix_expectations_satisfied
+                conformance_acceptance_succeeds(
+                    report.local_success,
+                    report.acceptance_pass,
+                    report.matrix_expectations_satisfied,
+                )
             });
     let output = FinalOutput {
         schema: 3,
@@ -533,6 +535,14 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         .context("failed to write the structured ordinary conformance report")?;
     writeln!(io::stdout()).context("failed to finish the structured conformance report")?;
     Ok(if success { 0 } else { 1 })
+}
+
+fn conformance_acceptance_succeeds(
+    local_success: bool,
+    acceptance_pass: bool,
+    matrix_expectations_satisfied: bool,
+) -> bool {
+    local_success && acceptance_pass && matrix_expectations_satisfied
 }
 
 #[derive(Serialize)]
@@ -1305,5 +1315,13 @@ mod tests {
 
         assert_ne!(first, second);
         assert!(first.len() <= 128);
+    }
+
+    #[test]
+    fn ordinary_success_requires_accepted_suite_outcomes_and_matrix_expectations() {
+        assert!(conformance_acceptance_succeeds(true, true, true));
+        assert!(!conformance_acceptance_succeeds(false, true, true));
+        assert!(!conformance_acceptance_succeeds(true, false, true));
+        assert!(!conformance_acceptance_succeeds(true, true, false));
     }
 }

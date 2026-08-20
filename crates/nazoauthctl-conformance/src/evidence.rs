@@ -708,6 +708,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn public_report_includes_stable_skip_expectation_summary() {
+        let encoded = report().to_json_bytes().expect("report JSON");
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("report value");
+
+        assert_eq!(value["expected_skipped_modules"], serde_json::json!([]));
+        assert_eq!(value["unexpected_skipped_modules"], serde_json::json!([]));
+        assert_eq!(value["unknown_declared_skip_modules"], serde_json::json!([]));
+        assert_eq!(value["matrix_expectations_satisfied"], serde_json::json!(true));
+        assert_eq!(value["acceptance_pass"], serde_json::json!(true));
+    }
+
     struct ReceiptSpec<'a> {
         action: TenantResourceOperation,
         capability_jti: &'a str,
