@@ -55,6 +55,26 @@ fn install_options(data_root: PathBuf) -> InstallOptions {
     }
 }
 
+fn standards_full_profile_material() -> serde_json::Value {
+    serde_json::json!({
+        "credential_configurations": {
+            "example": {
+                "format": "dc+sd-jwt",
+                "scope": "example",
+                "cryptographic_binding_methods_supported": ["jwk"],
+                "credential_signing_alg_values_supported": ["ES256"],
+                "proof_types_supported": {
+                    "jwt": {"proof_signing_alg_values_supported": ["ES256"]}
+                },
+                "vct": "https://issuer.example/credentials/example"
+            }
+        },
+        "wallet_authorization_origins": ["https://suite.example"],
+        "ciba_notification_private_origins": ["https://suite.example"],
+        "backchannel_logout_private_origins": ["https://suite.example"]
+    })
+}
+
 fn bind_external_dependency_fixture(options: &mut InstallOptions) {
     let binding = crate::secret_provider::bind_external_dependency_credentials(
         "postgresql://runtime:runtime-secret@db.example/oauth?sslmode=require",
@@ -304,16 +324,7 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
     let material = work.path().join("profile.json");
     fs::write(
         &material,
-        serde_json::to_vec(&serde_json::json!({
-            "client_attestation_issuer": "https://attester.example/",
-            "client_attestation_jwks": {"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y"}]},
-            "key_attestation_jwks": {"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y"}]},
-            "credential_configurations": {"example":{"format":"dc+sd-jwt","scope":"example"}},
-            "wallet_authorization_origins": ["https://suite.example"],
-            "ciba_notification_private_origins": ["https://suite.example"],
-            "backchannel_logout_private_origins": ["https://suite.example"]
-        }))
-        .unwrap(),
+        serde_json::to_vec(&standards_full_profile_material()).unwrap(),
     )
     .unwrap();
     let options = InstallOptions {
@@ -378,7 +389,35 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
         rendered.matches("openid4vc-certificate-bundle.pem").count(),
         2
     );
+    assert!(rendered.contains(
+        "OPENID4VCI_CREDENTIAL_CONFIGURATIONS_JSON: \"{\\\"example\\\":{\\\"format\\\":\\\"dc+sd-jwt\\\",\\\"scope\\\":\\\"example\\\",\\\"cryptographic_binding_methods_supported\\\":[\\\"jwk\\\"],\\\"credential_signing_alg_values_supported\\\":[\\\"ES256\\\"],\\\"proof_types_supported\\\":{\\\"jwt\\\":{\\\"proof_signing_alg_values_supported\\\":[\\\"ES256\\\"]}},\\\"vct\\\":\\\"https://issuer.example/credentials/example\\\"}}\""
+    ));
     assert!(!rendered.contains("PRIVATE KEY"));
+}
+
+#[test]
+fn oidf_profile_missing_credential_signing_algorithms_fails_before_prepare_mutation() {
+    let work = PrivateTempDir::new("oidf-profile-preflight").unwrap();
+    let material = work.path().join("profile.json");
+    let mut material_value = standards_full_profile_material();
+    material_value["credential_configurations"]["example"]
+        .as_object_mut()
+        .unwrap()
+        .remove("credential_signing_alg_values_supported");
+    fs::write(&material, serde_json::to_vec(&material_value).unwrap()).unwrap();
+
+    let mut options = install_options(work.path().join("data"));
+    options.profile = "standards-full".to_owned();
+    options.profile_material = Some(material);
+    options.trusted_proxy_cidr = Some("192.0.2.10/32".to_owned());
+    let config = work.path().join("config/nazoauthctl.json");
+
+    let error = prepare(&config, options).unwrap_err();
+    assert!(error.to_string().contains("strict JSON"));
+    assert!(!config.exists());
+    assert!(!work.path().join("data").exists());
+    assert!(!work.path().join("control").exists());
+    assert!(!work.path().join("recovery").exists());
 }
 
 #[test]
@@ -390,16 +429,7 @@ fn oidf_profile_secret_override_is_strict_private_and_resumable() {
     let material = work.path().join("profile.json");
     fs::write(
         &material,
-        serde_json::to_vec(&serde_json::json!({
-            "client_attestation_issuer": "https://attester.example/",
-            "client_attestation_jwks": {"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y"}]},
-            "key_attestation_jwks": {"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y"}]},
-            "credential_configurations": {"example":{"format":"dc+sd-jwt","scope":"example"}},
-            "wallet_authorization_origins": ["https://suite.example"],
-            "ciba_notification_private_origins": ["https://suite.example"],
-            "backchannel_logout_private_origins": ["https://suite.example"]
-        }))
-        .unwrap(),
+        serde_json::to_vec(&standards_full_profile_material()).unwrap(),
     )
     .unwrap();
     let canary = "x".repeat(32);
@@ -556,8 +586,8 @@ fn profile_secret_input_is_closed_bounded_and_never_echoed() {
     let valid = serde_json::json!({
         "dynamic_registration_initial_access_token": canary,
         "ciba_automated_decision_token": canary,
-        "openid4vci_management_token": canary,
-        "openid4vp_management_token": canary,
+        "openid4vci_management_token": format!("{canary}-issuer"),
+        "openid4vp_management_token": format!("{canary}-verifier"),
     });
     let mut options = install_options(work.path().join("data"));
     options.profile = "standards-full".to_owned();
@@ -572,8 +602,23 @@ fn profile_secret_input_is_closed_bounded_and_never_echoed() {
             .as_ref()
             .unwrap()
             .openid4vci_management_token,
-        canary
+        format!("{canary}-issuer")
     );
+
+    let duplicate_management_tokens = serde_json::json!({
+        "dynamic_registration_initial_access_token": format!("{canary}-dynamic"),
+        "ciba_automated_decision_token": format!("{canary}-ciba"),
+        "openid4vci_management_token": format!("{canary}-shared"),
+        "openid4vp_management_token": format!("{canary}-shared"),
+    });
+    let mut duplicate_options = install_options(work.path().join("duplicate-data"));
+    let error = read_profile_secrets(
+        &mut duplicate_options,
+        std::io::Cursor::new(serde_json::to_vec(&duplicate_management_tokens).unwrap()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("must differ"));
+    assert!(duplicate_options.profile_secrets.is_none());
 
     for invalid in [
         br#"{"dynamic_registration_initial_access_token":"profile-secret-canary-that-is-long-enough","ciba_automated_decision_token":"profile-secret-canary-that-is-long-enough","openid4vci_management_token":"profile-secret-canary-that-is-long-enough","openid4vp_management_token":"profile-secret-canary-that-is-long-enough","unexpected":"profile-secret-canary-that-is-long-enough"}"#.as_slice(),
@@ -648,21 +693,10 @@ fn oidf_profile_rejects_legacy_external_openid4vc_trust_anchors() {
     fs::create_dir(&config).unwrap();
     fs::create_dir(config.join("secrets")).unwrap();
     let material = work.path().join("profile.json");
-    fs::write(
-        &material,
-        serde_json::to_vec(&serde_json::json!({
-            "client_attestation_issuer": "https://attester.example/",
-            "client_attestation_jwks": {"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y"}]},
-            "key_attestation_jwks": {"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y"}]},
-            "credential_configurations": {"example":{"format":"dc+sd-jwt","scope":"example"}},
-            "wallet_authorization_origins": ["https://suite.example"],
-            "ciba_notification_private_origins": ["https://suite.example"],
-            "backchannel_logout_private_origins": ["https://suite.example"],
-            "trust_anchors_pem": "-----BEGIN CERTIFICATE-----\\nlegacy\\n-----END CERTIFICATE-----\\n"
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    let mut material_value = standards_full_profile_material();
+    material_value["trust_anchors_pem"] =
+        serde_json::json!("-----BEGIN CERTIFICATE-----\\nlegacy\\n-----END CERTIFICATE-----\\n");
+    fs::write(&material, serde_json::to_vec(&material_value).unwrap()).unwrap();
     let mut options = install_options(work.path().join("data"));
     options.profile = "standards-full".to_owned();
     options.profile_material = Some(material);
@@ -680,6 +714,42 @@ fn oidf_profile_rejects_private_jwk_material() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn oidf_profile_attestation_jwks_match_nazoauth_runtime_contract() {
+    let valid_client = serde_json::json!({
+        "keys": [{"kid":"client-1","kty":"EC","crv":"P-256","x":"x","y":"y"}]
+    });
+    validate_attestation_jwks(
+        &valid_client,
+        "client attestation JWKS",
+        AttestationJwkPurpose::Client,
+    )
+    .unwrap();
+    let valid_holder = serde_json::json!({
+        "keys": [{"kid":"holder-1","kty":"OKP","crv":"Ed25519","x":"x"}]
+    });
+    validate_attestation_jwks(
+        &valid_holder,
+        "key attestation JWKS",
+        AttestationJwkPurpose::HolderKey,
+    )
+    .unwrap();
+    for invalid in [
+        serde_json::json!({"keys":[{"kid":"","kty":"EC","crv":"P-256","x":"x","y":"y"}]}),
+        serde_json::json!({"keys":[{"kid":"same","kty":"EC","crv":"P-256","x":"x","y":"y"},{"kid":"same","kty":"EC","crv":"P-256","x":"x","y":"y"}]}),
+        serde_json::json!({"keys":[{"kid":"wrong","kty":"OKP","crv":"Ed25519","x":"x"}]}),
+    ] {
+        assert!(
+            validate_attestation_jwks(
+                &invalid,
+                "client attestation JWKS",
+                AttestationJwkPurpose::Client,
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]

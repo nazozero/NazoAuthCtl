@@ -217,6 +217,9 @@ pub(crate) fn prepare(
     }
     normalize_external_dependencies(&mut options)?;
     normalize_profile_secrets(&mut options)?;
+    // Validate the exact NazoAuth standards-full schema before this fresh
+    // install creates controller state, config, or managed dependencies.
+    let profile_material = load_and_validate_install_profile(&options)?;
     let (runtime_backend, dependency_backend) = select_runtime(&options)?;
     if options.local_oci_candidate.is_some() {
         if runtime_backend == RuntimeBackendKind::Systemd {
@@ -285,7 +288,8 @@ pub(crate) fn prepare(
         create_directory(&path, 0o700)?;
     }
     ensure_mfa_totp_configuration(config_dir, runtime_backend)?;
-    let profile = write_install_profile(config_dir, &options)?;
+    let profile =
+        write_prevalidated_install_profile(config_dir, &options, profile_material.as_ref())?;
 
     let dependency_mode = if options.database_url.is_some() {
         write_external_urls(&secrets_dir, &options)?

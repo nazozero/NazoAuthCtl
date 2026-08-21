@@ -29,6 +29,45 @@ The candidate path rejects `--to`, the host runtime, and
 the ordinary Ctl-managed PostgreSQL, Valkey, generated secret material, and
 managed backup flow. It therefore requires a fresh deployment root and does
 not adopt, share, or infer credentials for hand-created dependency containers.
+
+`--profile-material` is strict, non-secret JSON and is validated before Ctl
+creates any config, controller identity, or managed object. Its required
+top-level fields are `credential_configurations`,
+`wallet_authorization_origins`, `ciba_notification_private_origins`, and
+`backchannel_logout_private_origins`; client/key-attestation material is
+optional. Every credential configuration accepts only the NazoAuth 45959681
+schema: `format` is `dc+sd-jwt` or `mso_mdoc`,
+`credential_signing_alg_values_supported` is exactly `["ES256"]`, and the
+optional binding/proof declarations obey NazoAuth's `jwk` plus
+`jwt`/`attestation` rules. For example:
+
+```json
+{
+  "credential_configurations": {
+    "example": {
+      "format": "dc+sd-jwt",
+      "scope": "example",
+      "cryptographic_binding_methods_supported": ["jwk"],
+      "credential_signing_alg_values_supported": ["ES256"],
+      "proof_types_supported": {
+        "jwt": {"proof_signing_alg_values_supported": ["ES256"]}
+      },
+      "vct": "https://issuer.example/credentials/example"
+    }
+  },
+  "wallet_authorization_origins": ["https://suite.example"],
+  "ciba_notification_private_origins": ["https://suite.example"],
+  "backchannel_logout_private_origins": ["https://suite.example"]
+}
+```
+
+Ctl writes this as the single quoted JSON string in
+`OPENID4VCI_CREDENTIAL_CONFIGURATIONS_JSON`; it does not treat the YAML value
+as a nested object. Optional client-attestation JWKS may contain only unique,
+non-empty `kid` EC P-256 public keys with string `x`/`y`; optional holder-key
+attestation JWKS additionally permits OKP Ed25519 with string `x`. Imported
+VCI and VP management tokens must be distinct.
+
 Before a migration, key task, or runtime replacement,
 the controller resolves the supplied image only from the selected local runtime,
 then proves its immutable local image ID, OCI manifest digest, and embedded

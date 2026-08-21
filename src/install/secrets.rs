@@ -471,6 +471,14 @@ pub(super) fn read_profile_secrets(
     }
     let input: StandardsProfileSecrets =
         serde_json::from_slice(&bytes).context("profile secret input must be strict JSON")?;
+    validate_explicit_profile_secrets(&input)?;
+    options.profile_secrets = Some(input);
+    Ok(())
+}
+
+pub(super) fn validate_explicit_profile_secrets(
+    input: &StandardsProfileSecrets,
+) -> anyhow::Result<()> {
     for (name, value) in [
         (
             "dynamic_registration_initial_access_token",
@@ -491,7 +499,9 @@ pub(super) fn read_profile_secrets(
     ] {
         validate_profile_secret_value(name, value)?;
     }
-    options.profile_secrets = Some(input);
+    if input.openid4vci_management_token == input.openid4vp_management_token {
+        bail!("openid4vci_management_token and openid4vp_management_token must differ");
+    }
     Ok(())
 }
 
