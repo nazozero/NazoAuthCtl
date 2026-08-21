@@ -517,11 +517,18 @@ pub(crate) fn one_shot_process(
             .timeout(Duration::from_secs(300))
             .args(["run", "--rm", "--interactive"]),
         &policy,
-    )
-    .arg("--user")
-    .arg(user)
-    .arg("--network")
-    .arg(task.network.as_deref().unwrap_or("none"));
+    );
+    if let Some(identity) = &task.managed_identity {
+        process = process.arg("--name").arg(&identity.name);
+        for (key, value) in &identity.labels {
+            process = process.arg("--label").arg(format!("{key}={value}"));
+        }
+    }
+    let process = process
+        .arg("--user")
+        .arg(user)
+        .arg("--network")
+        .arg(task.network.as_deref().unwrap_or("none"));
     if let Some(directory) = &task.working_directory {
         process = process.arg("--workdir").arg(directory);
     }

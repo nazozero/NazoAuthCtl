@@ -336,6 +336,15 @@ impl ContainerRuntimePolicy {
 }
 
 #[derive(Clone, Debug)]
+pub struct ManagedOneShotIdentity {
+    /// Engine/unit name. It is derived solely from a durable task JTI.
+    pub name: String,
+    /// Full ownership and task bindings; container backends pass every entry
+    /// as an immutable engine label before the image positional.
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct OneShotTask {
     pub artifact: ArtifactReference,
     pub command: Vec<String>,
@@ -350,6 +359,7 @@ pub struct OneShotTask {
     pub inaccessible_paths: Vec<PathBuf>,
     pub private_mounts: bool,
     pub stdin: Vec<u8>,
+    pub managed_identity: Option<ManagedOneShotIdentity>,
 }
 
 #[derive(Clone, Debug)]

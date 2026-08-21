@@ -15,8 +15,8 @@ use crate::{
     filesystem::{atomic_write, sha256},
     model::{Mount, UpdateConfig},
     runtime_backend::{
-        self, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount,
-        OneShotTask, managed_dependency_identity,
+        self, ManagedOneShotIdentity, ManagedPostgresCommand, ManagedPostgresRestore,
+        ManagedValkeyRestore, NeutralMount, OneShotTask, managed_dependency_identity,
     },
 };
 
@@ -79,6 +79,10 @@ pub(crate) struct PreparedAppTask {
 }
 
 impl PreparedAppTask {
+    pub(crate) fn bind_managed_identity(&mut self, identity: ManagedOneShotIdentity) {
+        self.task.managed_identity = Some(identity);
+    }
+
     pub(crate) fn execute(&self, compact_envelope: &str) -> anyhow::Result<String> {
         let mut task = self.task.clone();
         task.stdin = compact_envelope.as_bytes().to_vec();
@@ -404,6 +408,7 @@ impl<'a> Runtime<'a> {
             inaccessible_paths: Vec::new(),
             private_mounts: false,
             stdin: Vec::new(),
+            managed_identity: None,
         })
     }
 
@@ -537,6 +542,7 @@ impl<'a> Runtime<'a> {
             inaccessible_paths,
             private_mounts: true,
             stdin: Vec::new(),
+            managed_identity: None,
         })
     }
 

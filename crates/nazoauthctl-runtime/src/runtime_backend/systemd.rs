@@ -813,7 +813,11 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
     if sha256(path)? != *expected {
         bail!("host one-shot binary does not match the authorized digest");
     }
-    let unit = format!("nazoauthctl-task-{}", uuid::Uuid::now_v7());
+    let unit = task
+        .managed_identity
+        .as_ref()
+        .map(|identity| identity.name.clone())
+        .unwrap_or_else(|| format!("nazoauthctl-task-{}", uuid::Uuid::now_v7()));
     let process = Process::new("systemd-run")
         .timeout(std::time::Duration::from_secs(300))
         .args([

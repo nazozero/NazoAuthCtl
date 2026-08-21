@@ -877,7 +877,47 @@ fn install_local_oci_candidate_transaction(
         );
     }
 
-    if state.phase != LocalOciCandidatePhase::Prepared {
+    let expected = local_oci_candidate_expected_target(config, candidate)?;
+    match state.phase {
+        LocalOciCandidatePhase::MigrationStarted => {
+            if let Some(receipt) = crate::operator::reconcile_final_receipt(
+                config,
+                &expected,
+                &TaskOperation::MigrateApply,
+                &state.migration_jti,
+            )? {
+                state.migration_receipt_sha256 =
+                    Some(crate::filesystem::sha256(&receipt.final_receipt)?);
+                state.phase = LocalOciCandidatePhase::MigrationApplied;
+                persist_local_oci_candidate_install_state(config, &state)?;
+            } else {
+                recover_local_oci_candidate_attempt(config_path, config, &mut state)?;
+            }
+        }
+        LocalOciCandidatePhase::KeysStarted => {
+            let operation = local_oci_candidate_keys_operation();
+            if let Some(receipt) = crate::operator::reconcile_final_receipt(
+                config,
+                &expected,
+                &operation,
+                &state.keys_jti,
+            )? {
+                state.keys_receipt_sha256 =
+                    Some(crate::filesystem::sha256(&receipt.final_receipt)?);
+                state.phase = LocalOciCandidatePhase::KeysApplied;
+                persist_local_oci_candidate_install_state(config, &state)?;
+            } else {
+                recover_local_oci_candidate_attempt(config_path, config, &mut state)?;
+            }
+        }
+        _ => {}
+    }
+    if !matches!(
+        state.phase,
+        LocalOciCandidatePhase::Prepared
+            | LocalOciCandidatePhase::MigrationApplied
+            | LocalOciCandidatePhase::KeysApplied
+    ) {
         recover_local_oci_candidate_attempt(config_path, config, &mut state)?;
     }
 
@@ -896,51 +936,51 @@ fn install_local_oci_candidate_transaction(
         state.rollback_backup = Some(backup.path().to_owned());
         persist_local_oci_candidate_install_state(config, &state)?;
     }
-    let expected = local_oci_candidate_expected_target(config, candidate)?;
-    state.phase = LocalOciCandidatePhase::MigrationStarted;
-    persist_local_oci_candidate_install_state(config, &state)?;
-    let migration = crate::operator::execute_with_requested_jti(
-        config,
-        local_artifact_id,
-        &expected,
-        TaskOperation::MigrateApply,
-        None,
-        Some(&state.migration_jti),
-    );
-    let migration = match migration {
-        Ok(result) => result,
-        Err(error) => {
-            recover_local_oci_candidate_attempt(config_path, config, &mut state)?;
-            return Err(error).context("local OCI candidate migration failed; managed state was restored and the next retry has a new task identity");
-        }
-    };
-    state.migration_receipt_sha256 = Some(crate::filesystem::sha256(&migration.final_receipt)?);
-    state.phase = LocalOciCandidatePhase::MigrationApplied;
-    persist_local_oci_candidate_install_state(config, &state)?;
+    if state.phase == LocalOciCandidatePhase::Prepared {
+        state.phase = LocalOciCandidatePhase::MigrationStarted;
+        persist_local_oci_candidate_install_state(config, &state)?;
+        let migration = crate::operator::execute_with_requested_jti(
+            config,
+            local_artifact_id,
+            &expected,
+            TaskOperation::MigrateApply,
+            None,
+            Some(&state.migration_jti),
+        );
+        let migration = match migration {
+            Ok(result) => result,
+            Err(error) => {
+                recover_local_oci_candidate_attempt(config_path, config, &mut state)?;
+                return Err(error).context("local OCI candidate migration failed; managed state was restored and the next retry has a new task identity");
+            }
+        };
+        state.migration_receipt_sha256 = Some(crate::filesystem::sha256(&migration.final_receipt)?);
+        state.phase = LocalOciCandidatePhase::MigrationApplied;
+        persist_local_oci_candidate_install_state(config, &state)?;
+    }
     install::grant_runtime_database(config)?;
-    state.phase = LocalOciCandidatePhase::KeysStarted;
-    persist_local_oci_candidate_install_state(config, &state)?;
-    let keys = crate::operator::execute_with_requested_jti(
-        config,
-        local_artifact_id,
-        &expected,
-        TaskOperation::KeysGenerateLocal {
-            alg: "ES256".to_owned(),
-            purposes: vec!["credential".to_owned(), "presentation_request".to_owned()],
-        },
-        None,
-        Some(&state.keys_jti),
-    );
-    let keys = match keys {
-        Ok(result) => result,
-        Err(error) => {
-            recover_local_oci_candidate_attempt(config_path, config, &mut state)?;
-            return Err(error).context("local OCI candidate key initialization failed; managed state was restored and the next retry has a new task identity");
-        }
-    };
-    state.keys_receipt_sha256 = Some(crate::filesystem::sha256(&keys.final_receipt)?);
-    state.phase = LocalOciCandidatePhase::KeysApplied;
-    persist_local_oci_candidate_install_state(config, &state)?;
+    if state.phase == LocalOciCandidatePhase::MigrationApplied {
+        state.phase = LocalOciCandidatePhase::KeysStarted;
+        persist_local_oci_candidate_install_state(config, &state)?;
+        let keys = crate::operator::execute_with_requested_jti(
+            config,
+            local_artifact_id,
+            &expected,
+            local_oci_candidate_keys_operation(),
+            None,
+            Some(&state.keys_jti),
+        );
+        let keys = match keys {
+            Ok(result) => result,
+            Err(error) => {
+                recover_local_oci_candidate_attempt(config_path, config, &mut state)?;
+                return Err(error).context("local OCI candidate key initialization failed; managed state was restored and the next retry has a new task identity");
+            }
+        };
+        state.keys_receipt_sha256 = Some(crate::filesystem::sha256(&keys.final_receipt)?);
+        state.phase = LocalOciCandidatePhase::KeysApplied;
+        persist_local_oci_candidate_install_state(config, &state)?;
+    }
     bootstrap_openid4vc_revocation_snapshot(config)?;
     state.phase = LocalOciCandidatePhase::RuntimeStarted;
     persist_local_oci_candidate_install_state(config, &state)?;
@@ -1062,6 +1102,13 @@ fn local_oci_candidate_task_jti(
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("request-{suffix}")
+}
+
+fn local_oci_candidate_keys_operation() -> TaskOperation {
+    TaskOperation::KeysGenerateLocal {
+        alg: "ES256".to_owned(),
+        purposes: vec!["credential".to_owned(), "presentation_request".to_owned()],
+    }
 }
 
 fn local_oci_candidate_recovery_directory(
