@@ -224,6 +224,45 @@ pub(crate) fn write_atomic(
     }
 }
 
+/// Promote a previously fsynced private file in the same private directory.
+/// The caller must verify the content before calling this; this primitive
+/// refuses replacement of an existing destination and fsyncs the directory.
+pub(crate) fn promote_private_file(from: &Path, to: &Path) -> Result<(), SecureFileError> {
+    let from = normalize_absolute(from)?;
+    let to = normalize_absolute(to)?;
+    let parent = from.parent().ok_or(SecureFileError::UnsafePath)?;
+    if to.parent() != Some(parent) {
+        return Err(SecureFileError::UnsafePath);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (from, to, parent);
+        Err(SecureFileError::UnsupportedPlatform)
+    }
+    #[cfg(unix)]
+    {
+        let parent_file = open_directory_chain(parent, true, false)?;
+        let from_name = from.file_name().ok_or(SecureFileError::UnsafePath)?;
+        let to_name = to.file_name().ok_or(SecureFileError::UnsafePath)?;
+        let source = openat_file(&parent_file, from_name, OFlags::RDONLY)?;
+        validate_file_metadata(&source.metadata().map_err(|_| SecureFileError::Io)?, true)?;
+        match openat_file(&parent_file, to_name, OFlags::RDONLY) {
+            Ok(existing) => {
+                validate_file_metadata(
+                    &existing.metadata().map_err(|_| SecureFileError::Io)?,
+                    true,
+                )?;
+                return Err(SecureFileError::UnsafePath);
+            }
+            Err(SecureFileError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        rustix::fs::renameat(&parent_file, from_name, &parent_file, to_name)
+            .map_err(|_| SecureFileError::Io)?;
+        rustix::fs::fsync(&parent_file).map_err(|_| SecureFileError::Io)
+    }
+}
+
 /// Open and read a bounded regular file with O_NOFOLLOW.  Metadata is checked
 /// both before and after reading, preventing replacement races from being
 /// mistaken for a successful read.

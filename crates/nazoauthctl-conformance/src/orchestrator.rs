@@ -110,6 +110,13 @@ pub struct ConformanceRunConfig {
 /// intent deliberately blocks recovery completion because the current Suite
 /// API cannot enumerate or deduplicate an unknown create outcome.
 pub trait SuiteResourceObserver: Send + Sync {
+    /// An explicitly authenticated operator request may retain fully terminal
+    /// Suite plans for certification review.  The default preserves normal
+    /// cleanup for every existing observer.
+    fn retain_suite_plans_for_certification(&self) -> bool {
+        false
+    }
+
     fn plan_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String>;
     fn plan_created(&self, origin: &Origin, intent_id: &str, plan_id: &str) -> Result<(), String>;
     fn module_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String>;
@@ -1039,13 +1046,6 @@ impl ConformanceRunner {
         // cancellation after a terminal result can race the Suite's final
         // callback, while an unreported allocation still needs cancellation
         // before its plan is deleted.
-        let cancellable_module_ids = cancellable_module_ids(&module_ids, &modules);
-        cleanup_all(
-            &self.config.client,
-            &cancellable_module_ids,
-            &suite_plan_ids,
-            &mut cleanup,
-        );
         let defined_modules = plans.iter().map(|plan| plan.defined_modules).sum::<usize>();
         let created_instances = plans
             .iter()
@@ -1054,7 +1054,22 @@ impl ConformanceRunner {
         let terminal_modules = modules.iter().filter(|module| module.terminal).count();
         let all_modules_instantiated = defined_modules == created_instances;
         let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
-        let cleanup_complete = cleanup.failures.is_empty();
+        let retention_requested = self
+            .config
+            .suite_resource_observer
+            .as_ref()
+            .is_some_and(|observer| observer.retain_suite_plans_for_certification());
+        let retain_suite_plans = retention_requested && errors.is_empty() && all_modules_terminal;
+        if !retain_suite_plans {
+            let cancellable_module_ids = cancellable_module_ids(&module_ids, &modules);
+            cleanup_all(
+                &self.config.client,
+                &cancellable_module_ids,
+                &suite_plan_ids,
+                &mut cleanup,
+            );
+        }
+        let cleanup_complete = !retain_suite_plans && cleanup.failures.is_empty();
         let outcomes = summarize_module_outcomes(&modules);
         let matrix_expectations = summarize_matrix_expectations(&modules);
         let matrix_expectations_satisfied = matrix_expectations_satisfied
@@ -1069,11 +1084,14 @@ impl ConformanceRunner {
             all_modules_instantiated,
             all_modules_terminal,
             cleanup_complete,
+            retention_requested,
+            retention_eligible: retain_suite_plans,
+            suite_resources_settled: cleanup_complete,
         };
         let local_success = errors.is_empty()
             && orchestration_integrity.all_modules_instantiated
             && orchestration_integrity.all_modules_terminal
-            && orchestration_integrity.cleanup_complete;
+            && orchestration_integrity.suite_resources_settled;
         let human_review_required = !outcomes.human_review_modules.is_empty();
         let snapshot = snapshot(&groups, current_profile, current_variant, current_test);
         let report = ConformanceReport {

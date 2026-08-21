@@ -284,6 +284,27 @@ pub fn validate_ordinary_provider_identity(
     Ok(())
 }
 
+/// Retention evidence must target an existing root-owned safe directory before
+/// Suite allocation begins; unlike ordinary evidence this preflight never
+/// creates an operator-selected path.
+pub fn validate_private_evidence_directory(root: &Path) -> Result<(), EvidenceError> {
+    let root = crate::secure_file::validate_directory(root, true).map_err(map_secure_file_error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::metadata(root).map_err(|_| EvidenceError::Io)?;
+        if metadata.uid() != 0 {
+            return Err(EvidenceError::UnsafePath);
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        Err(EvidenceError::UnsupportedPlatform)
+    }
+}
+
 fn validate_identity(
     report: &ConformanceReport,
     identity: &EvidenceBundleIdentity,
@@ -641,6 +662,9 @@ mod tests {
                 all_modules_instantiated: true,
                 all_modules_terminal: true,
                 cleanup_complete: true,
+                retention_requested: false,
+                retention_eligible: false,
+                suite_resources_settled: true,
             },
             progress: ProgressSnapshot {
                 completed: 1,

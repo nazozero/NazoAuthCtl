@@ -22,6 +22,8 @@ const MAX_PERSISTED_REVISION: u64 = i64::MAX as u64;
 const MAX_TENANT_RESOURCE_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SUITE_RECOVERY_PLANS: usize = 128;
 const MAX_SUITE_RECOVERY_MODULES: usize = 16 * 1024;
+const SUITE_RETENTION_MANIFEST_SCHEMA: u32 = 1;
+const MAX_SUITE_RETENTION_MANIFEST_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -153,6 +155,63 @@ pub struct SuiteRecoveryState {
     pub cleanup_complete: bool,
 }
 
+/// Non-secret ownership evidence for an explicitly retained Suite plan.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuiteRetentionPlan {
+    pub matrix_plan_id: String,
+    pub suite_plan_id: String,
+    pub plan_name: String,
+    pub plan_alias_sha256: String,
+}
+
+/// Root-owned certification-review evidence. It deliberately contains no
+/// module logs, Suite credentials, client config, or tenant secrets.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuiteRetentionManifest {
+    pub schema: u32,
+    pub suite_origin: String,
+    pub artifact_digest: String,
+    pub matrix_sha256: String,
+    pub deployment_id: String,
+    pub tenant_id: String,
+    pub run_id: String,
+    pub plans: Vec<SuiteRetentionPlan>,
+}
+
+impl SuiteRetentionManifest {
+    pub fn plan_alias_sha256(matrix_plan_id: &str) -> String {
+        sha256_hex(matrix_plan_id.as_bytes())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SuiteRetentionRecord {
+    manifest: SuiteRetentionManifest,
+    manifest_sha256: String,
+    manifest_path: PathBuf,
+}
+
+/// Suite plan ownership remains active until all non-Suite cleanup succeeds.
+/// `RetentionPrepared` is intentionally recoverable as ordinary deletion;
+/// only `Retained` transfers plan ownership to the verified manifest.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "disposition", rename_all = "kebab-case", deny_unknown_fields)]
+enum SuiteRetentionDisposition {
+    Active { requested: bool },
+    RetentionPrepared { record: SuiteRetentionRecord },
+    Retained { record: SuiteRetentionRecord },
+    Cleaned,
+}
+
+impl Default for SuiteRetentionDisposition {
+    fn default() -> Self {
+        Self::Active { requested: false }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyRecoveryJournal {
@@ -194,6 +253,8 @@ struct TenantResourceRecoveryJournal {
     /// Suite allocation and are therefore already settled at this boundary.
     #[serde(default)]
     suite: Option<SuiteRecoveryState>,
+    #[serde(default)]
+    suite_retention: SuiteRetentionDisposition,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -322,6 +383,7 @@ impl ConformanceRecoveryStore {
                 abort_uncommitted_intent: false,
                 proxy_cleanup_complete,
                 suite: None,
+                suite_retention: SuiteRetentionDisposition::default(),
             })),
         )
     }
@@ -418,7 +480,58 @@ impl ConformanceRecoveryStore {
             {
                 suite.plan_ids.clear();
                 suite.module_ids.clear();
+                if matches!(
+                    tenant_journal.suite_retention,
+                    SuiteRetentionDisposition::Active { .. }
+                ) {
+                    tenant_journal.suite_retention = SuiteRetentionDisposition::Cleaned;
+                }
                 normalized_suite_cleanup = true;
+            }
+            let mut recovered_retention_manifest = false;
+            if let RecoveryJournal::TenantResource(tenant_journal) = &journal
+                && let SuiteRetentionDisposition::Retained { record } =
+                    &tenant_journal.suite_retention
+            {
+                let final_path = record.manifest_path.clone();
+                let name = final_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .context("retained Suite manifest path is invalid")?;
+                let pending_path = final_path.with_file_name(format!(".{name}.pending"));
+                match crate::secure_file::read_bounded(
+                    &final_path,
+                    MAX_SUITE_RETENTION_MANIFEST_BYTES,
+                    true,
+                ) {
+                    Ok(bytes) if sha256_hex(&bytes) == record.manifest_sha256 => {}
+                    Ok(_) => bail!("retained Suite manifest conflicts with recovery journal"),
+                    Err(crate::secure_file::SecureFileError::NotFound) => {
+                        let pending = crate::secure_file::read_bounded(
+                            &pending_path,
+                            MAX_SUITE_RETENTION_MANIFEST_BYTES,
+                            true,
+                        )
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "retained Suite pending manifest is not secure: {error:?}"
+                            )
+                        })?;
+                        if sha256_hex(&pending) != record.manifest_sha256 {
+                            bail!(
+                                "retained Suite pending manifest conflicts with recovery journal"
+                            );
+                        }
+                        crate::secure_file::promote_private_file(&pending_path, &final_path)
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "failed to recover retained Suite manifest: {error:?}"
+                                )
+                            })?;
+                        recovered_retention_manifest = true;
+                    }
+                    Err(error) => bail!("retained Suite manifest is not secure: {error:?}"),
+                }
             }
             let mut recovered_manifest_removal = false;
             if let RecoveryJournal::TenantResource(tenant_journal) = &mut journal
@@ -437,7 +550,11 @@ impl ConformanceRecoveryStore {
                     recovered_manifest_removal = true;
                 }
             }
-            if recovered_manifest_removal || normalized_proxy_cleanup || normalized_suite_cleanup {
+            if recovered_manifest_removal
+                || normalized_proxy_cleanup
+                || normalized_suite_cleanup
+                || recovered_retention_manifest
+            {
                 validate_journal(&journal, &self.deployment_id, request_jti)?;
                 write_journal(&journal_path, &journal)?;
             }
@@ -617,12 +734,41 @@ impl ConformanceRecoveryGuard {
     /// so recovery must retain this marker if the process dies before the
     /// returned opaque resource ID is journaled.
     pub fn begin_suite_create(&mut self, origin: &str, intent_id: &str) -> anyhow::Result<()> {
+        self.begin_suite_create_with_retention(origin, intent_id, false)
+    }
+
+    /// Bind the requested retention policy before any remote Suite create
+    /// request. Once persisted, retries cannot silently change it.
+    pub fn begin_suite_create_with_retention(
+        &mut self,
+        origin: &str,
+        intent_id: &str,
+        retain_suite_plans_for_certification: bool,
+    ) -> anyhow::Result<()> {
         let origin = crate::Origin::parse_suite(origin)
             .map_err(|_| anyhow::anyhow!("Suite recovery origin is invalid"))?;
         validate_component(intent_id, "Suite create intent ID")?;
         let journal = self
             .tenant_resource_journal_mut()
             .context("Suite recovery is not valid for a legacy journal")?;
+        match &journal.suite_retention {
+            SuiteRetentionDisposition::Active { requested }
+                if *requested != retain_suite_plans_for_certification
+                    && journal.suite.is_some() =>
+            {
+                bail!("Suite retention policy conflicts with the recovery journal");
+            }
+            SuiteRetentionDisposition::Active { .. } => {
+                journal.suite_retention = SuiteRetentionDisposition::Active {
+                    requested: retain_suite_plans_for_certification,
+                };
+            }
+            SuiteRetentionDisposition::RetentionPrepared { .. }
+            | SuiteRetentionDisposition::Retained { .. }
+            | SuiteRetentionDisposition::Cleaned => {
+                bail!("Suite resources are already settled for this recovery journal");
+            }
+        }
         let suite = journal.suite.get_or_insert_with(|| SuiteRecoveryState {
             origin: origin.as_str().to_owned(),
             plan_ids: Vec::new(),
@@ -705,8 +851,17 @@ impl ConformanceRecoveryGuard {
     }
 
     pub fn suite_cleanup_complete(&self) -> bool {
-        self.suite_recovery()
-            .is_none_or(|suite| suite.cleanup_complete && suite.pending_create_intents.is_empty())
+        match &self.journal {
+            RecoveryJournal::Legacy(_) => true,
+            RecoveryJournal::TenantResource(journal) => {
+                matches!(
+                    journal.suite_retention,
+                    SuiteRetentionDisposition::Retained { .. } | SuiteRetentionDisposition::Cleaned
+                ) || journal.suite.as_ref().is_none_or(|suite| {
+                    suite.cleanup_complete && suite.pending_create_intents.is_empty()
+                })
+            }
+        }
     }
 
     /// Mark external cleanup complete only after every persisted module has
@@ -716,17 +871,223 @@ impl ConformanceRecoveryGuard {
         let journal = self
             .tenant_resource_journal_mut()
             .context("Suite recovery is not valid for a legacy journal")?;
+        if !matches!(
+            &journal.suite_retention,
+            SuiteRetentionDisposition::Active { .. }
+                | SuiteRetentionDisposition::RetentionPrepared { .. }
+        ) {
+            bail!("retained Suite resources cannot be marked as cleanup complete");
+        }
+        {
+            let suite = journal
+                .suite
+                .as_mut()
+                .context("Suite cleanup has no persisted allocation")?;
+            if !suite.pending_create_intents.is_empty() {
+                bail!("Suite cleanup cannot complete with unresolved Suite create intent");
+            }
+            suite.cleanup_complete = true;
+            suite.plan_ids.clear();
+            suite.module_ids.clear();
+        }
+        journal.suite_retention = SuiteRetentionDisposition::Cleaned;
+        self.persist()
+    }
+
+    /// Durably record exact retained plan ownership before publishing its
+    /// root-owned manifest. A later crash can recreate the manifest without
+    /// deleting the plans.
+    pub fn prepare_suite_plan_retention(
+        &mut self,
+        manifest: SuiteRetentionManifest,
+        manifest_path: PathBuf,
+    ) -> anyhow::Result<()> {
+        let journal = self
+            .tenant_resource_journal_mut()
+            .context("Suite retention is not valid for a legacy journal")?;
+        if !matches!(
+            &journal.suite_retention,
+            SuiteRetentionDisposition::Active { requested: true }
+        ) {
+            bail!("Suite retention was not requested before allocation");
+        }
         let suite = journal
             .suite
             .as_mut()
-            .context("Suite cleanup has no persisted allocation")?;
-        if !suite.pending_create_intents.is_empty() {
-            bail!("Suite cleanup cannot complete with unresolved Suite create intent");
+            .context("Suite retention has no persisted allocation")?;
+        if suite.cleanup_complete || !suite.pending_create_intents.is_empty() {
+            bail!("Suite retention requires a settled allocation");
         }
-        suite.cleanup_complete = true;
-        suite.plan_ids.clear();
-        suite.module_ids.clear();
+        validate_suite_retention_manifest(&manifest, &journal.binding, suite)?;
+        let bytes = canonical_suite_retention_manifest(&manifest)?;
+        let record = SuiteRetentionRecord {
+            manifest,
+            manifest_sha256: sha256_hex(&bytes),
+            manifest_path,
+        };
+        journal.suite_retention = SuiteRetentionDisposition::RetentionPrepared { record };
         self.persist()
+    }
+
+    /// Write a non-final pending manifest only after all non-Suite cleanup
+    /// obligations have completed. The journal remains `Prepared`, so a
+    /// crash here still defaults to deletion of the Suite allocation.
+    pub fn stage_suite_retention_manifest(&self) -> anyhow::Result<PathBuf> {
+        let record = match &self.journal {
+            RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
+                SuiteRetentionDisposition::RetentionPrepared { record } => record,
+                _ => bail!("Suite retention has not been prepared"),
+            },
+            RecoveryJournal::Legacy(_) => {
+                bail!("Suite retention is not valid for a legacy journal")
+            }
+        };
+        let bytes = canonical_suite_retention_manifest(&record.manifest)?;
+        if sha256_hex(&bytes) != record.manifest_sha256 {
+            bail!("Suite retention manifest digest conflicts with the journal");
+        }
+        let path = self.suite_retention_pending_path()?;
+        match crate::secure_file::read_bounded(&path, MAX_SUITE_RETENTION_MANIFEST_BYTES, true) {
+            Ok(existing) if sha256_hex(&existing) == record.manifest_sha256 => return Ok(path),
+            Ok(_) => bail!("retained Suite manifest conflicts with the recovery journal"),
+            Err(crate::secure_file::SecureFileError::NotFound) => {}
+            Err(error) => bail!("retained Suite manifest is not secure: {error:?}"),
+        }
+        crate::secure_file::write_atomic(&path, &bytes, true).map_err(|error| {
+            anyhow::anyhow!("failed to stage retained Suite manifest: {error:?}")
+        })?;
+        Ok(path)
+    }
+
+    /// Transfer ownership only after a complete pending manifest has been
+    /// fsynced. This is the sole transition that compacts module IDs.
+    pub fn commit_suite_plan_retention(&mut self) -> anyhow::Result<()> {
+        let pending = self.suite_retention_pending_path()?;
+        let record = match &self.journal {
+            RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
+                SuiteRetentionDisposition::RetentionPrepared { record } => record.clone(),
+                _ => bail!("Suite retention has not been prepared"),
+            },
+            RecoveryJournal::Legacy(_) => {
+                bail!("Suite retention is not valid for a legacy journal")
+            }
+        };
+        let bytes =
+            crate::secure_file::read_bounded(&pending, MAX_SUITE_RETENTION_MANIFEST_BYTES, true)
+                .map_err(|error| {
+                    anyhow::anyhow!("retained Suite pending manifest is not secure: {error:?}")
+                })?;
+        if sha256_hex(&bytes) != record.manifest_sha256 {
+            bail!("retained Suite pending manifest conflicts with the journal");
+        }
+        let journal = self
+            .tenant_resource_journal_mut()
+            .expect("tenant-resource journal was just verified");
+        {
+            let suite = journal
+                .suite
+                .as_mut()
+                .context("Suite retention has no persisted allocation")?;
+            suite.plan_ids.clear();
+            suite.module_ids.clear();
+        }
+        journal.suite_retention = SuiteRetentionDisposition::Retained { record };
+        self.persist()
+    }
+
+    /// Finalize a journal-authorized pending manifest. A missing or altered
+    /// final/pending file fails closed and never triggers Suite deletion.
+    pub fn publish_committed_suite_retention_manifest(&self) -> anyhow::Result<PathBuf> {
+        let record = match &self.journal {
+            RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
+                SuiteRetentionDisposition::Retained { record } => record,
+                _ => bail!("Suite retention has not been committed"),
+            },
+            RecoveryJournal::Legacy(_) => {
+                bail!("Suite retention is not valid for a legacy journal")
+            }
+        };
+        let final_path = record.manifest_path.clone();
+        match crate::secure_file::read_bounded(
+            &final_path,
+            MAX_SUITE_RETENTION_MANIFEST_BYTES,
+            true,
+        ) {
+            Ok(existing) if sha256_hex(&existing) == record.manifest_sha256 => {
+                return Ok(final_path);
+            }
+            Ok(_) => bail!("retained Suite manifest conflicts with the recovery journal"),
+            Err(crate::secure_file::SecureFileError::NotFound) => {}
+            Err(error) => bail!("retained Suite manifest is not secure: {error:?}"),
+        }
+        let pending = self.suite_retention_pending_path()?;
+        crate::secure_file::promote_private_file(&pending, &final_path).map_err(|error| {
+            anyhow::anyhow!("failed to publish retained Suite manifest: {error:?}")
+        })?;
+        Ok(final_path)
+    }
+
+    pub fn suite_retention_manifest(&self) -> Option<&SuiteRetentionManifest> {
+        match &self.journal {
+            RecoveryJournal::Legacy(_) => None,
+            RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
+                SuiteRetentionDisposition::RetentionPrepared { record }
+                | SuiteRetentionDisposition::Retained { record } => Some(&record.manifest),
+                SuiteRetentionDisposition::Active { .. } | SuiteRetentionDisposition::Cleaned => {
+                    None
+                }
+            },
+        }
+    }
+
+    pub fn suite_retention_committed(&self) -> bool {
+        matches!(
+            &self.journal,
+            RecoveryJournal::TenantResource(journal)
+                if matches!(&journal.suite_retention, SuiteRetentionDisposition::Retained { .. })
+        )
+    }
+
+    /// A prepared-but-uncommitted retention is ordinary cleanup state. Remove
+    /// only its non-final staging file before deleting the journal-owned plans.
+    pub fn discard_prepared_suite_retention_staging(&self) -> anyhow::Result<()> {
+        let prepared = matches!(
+            &self.journal,
+            RecoveryJournal::TenantResource(journal)
+                if matches!(
+                    &journal.suite_retention,
+                    SuiteRetentionDisposition::RetentionPrepared { .. }
+                )
+        );
+        if !prepared {
+            return Ok(());
+        }
+        let pending = self.suite_retention_pending_path()?;
+        match crate::secure_file::remove_file(&pending, true) {
+            Ok(()) | Err(crate::secure_file::SecureFileError::NotFound) => Ok(()),
+            Err(error) => bail!("failed to discard staged Suite retention manifest: {error:?}"),
+        }
+    }
+
+    fn suite_retention_pending_path(&self) -> anyhow::Result<PathBuf> {
+        let record = match &self.journal {
+            RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
+                SuiteRetentionDisposition::RetentionPrepared { record }
+                | SuiteRetentionDisposition::Retained { record } => record,
+                _ => bail!("Suite retention has no manifest path"),
+            },
+            RecoveryJournal::Legacy(_) => {
+                bail!("Suite retention is not valid for a legacy journal")
+            }
+        };
+        let name = record
+            .manifest_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("Suite retention manifest path is invalid")?;
+        Ok(record
+            .manifest_path
+            .with_file_name(format!(".{name}.pending")))
     }
 
     /// Persist the verified signed apply receipt identity.  This is the only
@@ -962,6 +1323,9 @@ impl ConformanceRecoveryGuard {
     }
 
     pub fn finish(mut self) -> anyhow::Result<()> {
+        if self.suite_retention_committed() {
+            self.publish_committed_suite_retention_manifest()?;
+        }
         match &self.journal {
             RecoveryJournal::Legacy(journal) => {
                 if !journal.lease_cleanup_complete || !journal.proxy_cleanup_complete {
@@ -971,10 +1335,7 @@ impl ConformanceRecoveryGuard {
             RecoveryJournal::TenantResource(journal) => {
                 if !tenant_resource_obligations_complete(journal)
                     || !journal.proxy_cleanup_complete
-                    || journal
-                        .suite
-                        .as_ref()
-                        .is_some_and(|suite| !suite.cleanup_complete)
+                    || !suite_resources_settled(journal)
                 {
                     bail!("conformance recovery obligations are incomplete");
                 }
@@ -1059,6 +1420,16 @@ impl ConformanceRecoveryGuard {
         }
         write_journal(&self.journal_path, &self.journal)
     }
+}
+
+fn suite_resources_settled(journal: &TenantResourceRecoveryJournal) -> bool {
+    matches!(
+        &journal.suite_retention,
+        SuiteRetentionDisposition::Retained { .. } | SuiteRetentionDisposition::Cleaned
+    ) || journal
+        .suite
+        .as_ref()
+        .is_none_or(|suite| suite.cleanup_complete)
 }
 
 fn write_journal(path: &Path, journal: &RecoveryJournal) -> anyhow::Result<()> {
@@ -1167,6 +1538,46 @@ fn validate_tenant_resource_journal(
             }
         }
     }
+    match &journal.suite_retention {
+        SuiteRetentionDisposition::Active { .. } => {}
+        SuiteRetentionDisposition::Cleaned => {
+            let suite = journal
+                .suite
+                .as_ref()
+                .context("Suite cleanup disposition has no Suite state")?;
+            if !suite.cleanup_complete
+                || !suite.pending_create_intents.is_empty()
+                || !suite.plan_ids.is_empty()
+                || !suite.module_ids.is_empty()
+            {
+                bail!("Suite cleaned disposition is outside policy");
+            }
+        }
+        SuiteRetentionDisposition::RetentionPrepared { record } => {
+            let suite = journal
+                .suite
+                .as_ref()
+                .context("prepared Suite retention has no Suite state")?;
+            if suite.cleanup_complete || !suite.pending_create_intents.is_empty() {
+                bail!("prepared Suite retention has unsettled allocation state");
+            }
+            validate_suite_retention_record(record, &journal.binding, suite)?;
+        }
+        SuiteRetentionDisposition::Retained { record } => {
+            let suite = journal
+                .suite
+                .as_ref()
+                .context("retained Suite disposition has no Suite state")?;
+            if suite.cleanup_complete
+                || !suite.pending_create_intents.is_empty()
+                || !suite.plan_ids.is_empty()
+                || !suite.module_ids.is_empty()
+            {
+                bail!("retained Suite disposition must transfer all allocation IDs");
+            }
+            validate_suite_retention_record_without_inventory(record, &journal.binding)?;
+        }
+    }
     if let Some(receipt) = &journal.receipt {
         validate_tenant_resource_receipt_identity(&journal.binding, receipt)?;
     }
@@ -1203,6 +1614,142 @@ fn validate_tenant_resource_journal(
         }
     }
     Ok(())
+}
+
+fn canonical_suite_retention_manifest(
+    manifest: &SuiteRetentionManifest,
+) -> anyhow::Result<Vec<u8>> {
+    serde_json::to_vec(manifest).context("failed to serialize Suite retention manifest")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        output.push(HEX[usize::from(byte >> 4)] as char);
+        output.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    output
+}
+
+fn validate_suite_retention_record(
+    record: &SuiteRetentionRecord,
+    binding: &TenantResourceRecoveryBinding,
+    suite: &SuiteRecoveryState,
+) -> anyhow::Result<()> {
+    validate_suite_retention_manifest(&record.manifest, binding, Some(suite))?;
+    if sha256_hex(&canonical_suite_retention_manifest(&record.manifest)?) != record.manifest_sha256
+    {
+        bail!("Suite retention manifest digest is invalid");
+    }
+    validate_suite_retention_manifest_path(record, binding)?;
+    Ok(())
+}
+
+fn validate_suite_retention_record_without_inventory(
+    record: &SuiteRetentionRecord,
+    binding: &TenantResourceRecoveryBinding,
+) -> anyhow::Result<()> {
+    validate_suite_retention_manifest(&record.manifest, binding, None)?;
+    if sha256_hex(&canonical_suite_retention_manifest(&record.manifest)?) != record.manifest_sha256
+    {
+        bail!("Suite retention manifest digest is invalid");
+    }
+    validate_suite_retention_manifest_path(record, binding)?;
+    Ok(())
+}
+
+fn validate_suite_retention_manifest(
+    manifest: &SuiteRetentionManifest,
+    binding: &TenantResourceRecoveryBinding,
+    suite: Option<&SuiteRecoveryState>,
+) -> anyhow::Result<()> {
+    if manifest.schema != SUITE_RETENTION_MANIFEST_SCHEMA
+        || crate::Origin::parse_suite(&manifest.suite_origin)
+            .map_err(|_| anyhow::anyhow!("retained Suite origin is invalid"))?
+            .as_str()
+            != "https://www.certification.openid.net"
+        || manifest.deployment_id != binding.deployment_id
+        || manifest.tenant_id != binding.tenant_id
+        || manifest.run_id != binding.request_jti
+        || !lower_hex(&manifest.artifact_digest, 64)
+        || !lower_hex(&manifest.matrix_sha256, 64)
+        || manifest.plans.is_empty()
+        || manifest.plans.len() > MAX_SUITE_RECOVERY_PLANS
+    {
+        bail!("Suite retention manifest is outside policy");
+    }
+    let mut matrix_ids = std::collections::BTreeSet::new();
+    let mut suite_ids = std::collections::BTreeSet::new();
+    for plan in &manifest.plans {
+        validate_component(&plan.matrix_plan_id, "retained Matrix plan ID")?;
+        validate_component(&plan.suite_plan_id, "retained Suite plan ID")?;
+        if plan.plan_name.is_empty()
+            || plan.plan_name.len() > 256
+            || plan.plan_name.bytes().any(|byte| byte.is_ascii_control())
+            || !lower_hex(&plan.plan_alias_sha256, 64)
+            || SuiteRetentionManifest::plan_alias_sha256(&plan.matrix_plan_id)
+                != plan.plan_alias_sha256
+            || !matrix_ids.insert(&plan.matrix_plan_id)
+            || !suite_ids.insert(&plan.suite_plan_id)
+        {
+            bail!("Suite retention plan ownership is invalid");
+        }
+    }
+    if let Some(suite) = suite {
+        let suite_ids = suite
+            .plan_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let manifest_ids = manifest
+            .plans
+            .iter()
+            .map(|plan| &plan.suite_plan_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        if suite_ids != manifest_ids {
+            bail!("Suite retention manifest does not cover the journal plan IDs");
+        }
+        if suite.origin != manifest.suite_origin {
+            bail!("Suite retention origin conflicts with the recovery journal");
+        }
+    }
+    Ok(())
+}
+
+fn validate_suite_retention_manifest_path(
+    record: &SuiteRetentionRecord,
+    binding: &TenantResourceRecoveryBinding,
+) -> anyhow::Result<()> {
+    let expected_name = format!("retained-suite-{}.json", binding.request_jti);
+    if record_path_is_invalid(&record.manifest_path, &expected_name) {
+        bail!("Suite retention manifest path is outside policy");
+    }
+    Ok(())
+}
+
+fn record_path_is_invalid(path: &Path, expected_name: &str) -> bool {
+    !retention_manifest_parent_is_root_owned(path)
+        || !path.is_absolute()
+        || path.file_name().and_then(|value| value.to_str()) != Some(expected_name)
+        || crate::secure_file::normalize_absolute(path).is_err()
+        || path.parent().is_none()
+        || crate::secure_file::validate_directory(path.parent().unwrap_or(Path::new(".")), true)
+            .is_err()
+}
+
+fn retention_manifest_parent_is_root_owned(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        path.parent()
+            .and_then(|parent| std::fs::metadata(parent).ok())
+            .is_some_and(|metadata| metadata.uid() == 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 fn tenant_resource_obligations_complete(journal: &TenantResourceRecoveryJournal) -> bool {
@@ -2275,6 +2822,75 @@ mod tests {
         assert!(guard.proxy_cleanup_complete());
         guard.finish().expect("complete journal");
         assert!(store.claim_pending().expect("final scan").is_empty());
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_suite_manifest_transfers_plan_ownership_only_after_pending_write() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!("nazoauth-retention-{}", uuid::Uuid::now_v7()));
+        let evidence = root.join("evidence");
+        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let binding = tenant_resource_binding(&root);
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("intent");
+        guard
+            .begin_suite_create_with_retention(
+                "https://www.certification.openid.net",
+                "suite-intent-1",
+                true,
+            )
+            .expect("Suite intent");
+        guard
+            .record_suite_plan(
+                "https://www.certification.openid.net",
+                "suite-intent-1",
+                "suite-plan-1",
+            )
+            .expect("Suite plan");
+        let manifest = SuiteRetentionManifest {
+            schema: SUITE_RETENTION_MANIFEST_SCHEMA,
+            suite_origin: "https://www.certification.openid.net".to_owned(),
+            artifact_digest: "a".repeat(64),
+            matrix_sha256: "b".repeat(64),
+            deployment_id: binding.deployment_id.clone(),
+            tenant_id: binding.tenant_id.clone(),
+            run_id: binding.request_jti.clone(),
+            plans: vec![SuiteRetentionPlan {
+                matrix_plan_id: "matrix-plan-1".to_owned(),
+                suite_plan_id: "suite-plan-1".to_owned(),
+                plan_name: "Certification plan".to_owned(),
+                plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256("matrix-plan-1"),
+            }],
+        };
+        let final_path = evidence.join(format!("retained-suite-{}.json", binding.request_jti));
+        guard
+            .prepare_suite_plan_retention(manifest, final_path.clone())
+            .expect("prepare retention");
+        assert_eq!(
+            guard.suite_recovery().expect("suite").plan_ids,
+            vec!["suite-plan-1".to_owned()]
+        );
+        guard
+            .stage_suite_retention_manifest()
+            .expect("stage manifest");
+        assert!(!final_path.exists());
+        guard
+            .commit_suite_plan_retention()
+            .expect("transfer ownership");
+        assert!(guard.suite_recovery().expect("suite").plan_ids.is_empty());
+        guard
+            .publish_committed_suite_retention_manifest()
+            .expect("publish manifest");
+        let manifest_bytes =
+            crate::secure_file::read_bounded(&final_path, MAX_SUITE_RETENTION_MANIFEST_BYTES, true)
+                .expect("read manifest");
+        assert!(!String::from_utf8_lossy(&manifest_bytes).contains("capability.header.payload"));
+        drop(guard);
+        assert_eq!(store.claim_pending().expect("retained recovery").len(), 1);
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 }

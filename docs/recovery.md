@@ -114,6 +114,18 @@ Resource and proxy cleanup markers are independent; the journal is removed only
 after both complete and the private manifest has passed the durable
 deletion-intent sequence.
 
+An explicitly requested certification retention is a separate disposition, not
+`cleanup_complete`. It is accepted only for the canonical official Suite and
+only after all created modules are terminal and ordinary resource, listener,
+and proxy cleanup have succeeded. The journal first records `RetentionPrepared`
+while it still owns every Suite plan, then writes a root-owned owner-only pending manifest
+in the requested evidence directory, transfers ownership as `Retained`, and
+finally promotes that manifest. A crash before transfer defaults to normal plan
+deletion; a retained journal with a missing or digest-mismatched manifest fails
+closed and never deletes the recorded plans. Operators review/publish retained
+plans in the official UI and must use a later controlled deletion procedure;
+ctl does not roll them back when unrelated cleanup subsequently fails.
+
 The signed offline deployment statement identifies a stopped replica from its
 persistent mount. It is not sufficient artifact trust: ctl also verifies the
 cached Release and the retained OCI digest or host-binary SHA-256. An unsupported

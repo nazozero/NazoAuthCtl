@@ -27,10 +27,11 @@ use nazoauthctl_conformance::{
     OidfDriverLane, OidfPlanResourceBudget, OidfPlanSelection, OidfProviderExecutionBinding,
     OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
     OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
-    SuiteResourceObserver, TenantResourceApplyOutput, TenantResourceReceiptIdentity,
-    TenantResourceRecoveryBinding, TtyRenderer, WebDriverClient, WebDriverEndpoint,
-    authorize_oidf_driver_execution, open_cached_oidf_driver_plan, read_artifact_driver,
-    read_artifact_matrix, read_compact_manifest, recover_suite_resources, verify_oidf_artifact,
+    SuiteResourceObserver, SuiteRetentionManifest, SuiteRetentionPlan, TenantResourceApplyOutput,
+    TenantResourceReceiptIdentity, TenantResourceRecoveryBinding, TtyRenderer, WebDriverClient,
+    WebDriverEndpoint, authorize_oidf_driver_execution, open_cached_oidf_driver_plan,
+    read_artifact_driver, read_artifact_matrix, read_compact_manifest, recover_suite_resources,
+    validate_private_evidence_directory, verify_oidf_artifact,
     write_private_provider_evidence_bundle,
 };
 use nazoauthctl_core::tenant_resources::{
@@ -83,6 +84,20 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     .context("exact cached signed OIDF artifact cannot be opened")?;
     if driver_plan.artifact.suite.origin != suite_origin.as_str() {
         bail!("--suite does not match the origin signed by the OIDF artifact");
+    }
+    if invocation.retain_suite_plans_for_certification {
+        if suite_origin != Origin::official() {
+            bail!(
+                "--retain-suite-plans-for-certification is restricted to the canonical official Suite origin"
+            );
+        }
+        let evidence_directory = invocation
+            .evidence_directory
+            .as_deref()
+            .context("--retain-suite-plans-for-certification requires --evidence-dir")?;
+        validate_private_evidence_directory(evidence_directory).context(
+            "retention evidence directory must be an existing root-owned private directory",
+        )?;
     }
 
     let (token, prompted) = resolve_token(&mut invocation, &suite_origin)?;
@@ -397,7 +412,14 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                 if proxy_cleanup.is_ok() {
                     lock_recovery(&recovery)?.mark_proxy_cleanup_complete()?;
                 }
-                let resource_cleanup = cleanup_run_resources(&client, take_recovery(recovery)?);
+                let mut recovery = take_recovery(recovery)?;
+                let resource_cleanup = cleanup_run_resources(&client, &mut recovery);
+                if resource_cleanup.is_ok()
+                    && proxy_cleanup.is_ok()
+                    && recovery.suite_cleanup_complete()
+                {
+                    recovery.finish()?;
+                }
                 bail!(
                     "proxy-install={install:#}; proxy-recovery={}; resource-cleanup={}",
                     proxy_cleanup
@@ -419,7 +441,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let ciba_bridge = start_ciba_user_approval_bridge(ciba_callback, &session, &run_secrets)?;
     let run_result = run_signed_suite(
         ordinary,
-        suite_client,
+        suite_client.clone(),
         token,
         run_secrets,
         &session,
@@ -433,20 +455,45 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     );
 
     let mut recovery = take_recovery(recovery)?;
+    let mut retention_eligible = run_result
+        .as_ref()
+        .is_ok_and(|report| report.orchestration_integrity.retention_eligible);
+    let mut errors = Vec::new();
     if run_result
         .as_ref()
         .is_ok_and(|report| report.orchestration_integrity.cleanup_complete)
     {
         recovery.mark_suite_cleanup_complete()?;
+    } else if retention_eligible {
+        let prepared = (|| -> anyhow::Result<()> {
+            let manifest = suite_retention_manifest(
+                &recovery,
+                run_result
+                    .as_ref()
+                    .expect("retention eligibility requires report"),
+                &invocation.artifact_digest,
+                &deployment_report.matrix_sha256,
+            )?;
+            let evidence_directory = invocation
+                .evidence_directory
+                .as_ref()
+                .expect("retention preflight requires evidence directory");
+            recovery.prepare_suite_plan_retention(
+                manifest,
+                evidence_directory.join(format!("retained-suite-{request_jti}.json")),
+            )
+        })();
+        if let Err(error) = prepared {
+            retention_eligible = false;
+            errors.push(format!("suite-retention-prepare={error:#}"));
+        }
     }
-
     let proxy_cleanup = proxy.as_mut().map(ProxyTrustGuard::restore).transpose();
     if proxy_cleanup.is_ok() && !recovery.proxy_cleanup_complete() {
         recovery.mark_proxy_cleanup_complete()?;
     }
-    let cleanup = cleanup_run_resources(&client, recovery);
-    let mut errors = Vec::new();
-    let report = match run_result {
+    let cleanup = cleanup_run_resources(&client, &mut recovery);
+    let mut report = match run_result {
         Ok(report) => Some(report),
         Err(error) => {
             errors.push(format!("run={error:#}"));
@@ -464,6 +511,55 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             None
         }
     };
+    let retention_committed = if retention_eligible
+        && proxy_cleanup_complete
+        && cleanup_evidence.is_some()
+    {
+        match (|| -> anyhow::Result<()> {
+            recovery.stage_suite_retention_manifest()?;
+            recovery.commit_suite_plan_retention()?;
+            let manifest_path = recovery.publish_committed_suite_retention_manifest()?;
+            eprintln!(
+                "Suite plans retained for certification review: review/publish them in the official Suite UI, then use a controlled deletion procedure; manifest={}",
+                manifest_path.display()
+            );
+            Ok(())
+        })() {
+            Ok(()) => true,
+            Err(error) => {
+                errors.push(format!("suite-retention={error:#}"));
+                cleanup_unretained_suite(&mut recovery, &suite_client)?;
+                false
+            }
+        }
+    } else {
+        cleanup_unretained_suite(&mut recovery, &suite_client)?;
+        false
+    };
+    if let Some(report) = report.as_mut() {
+        report.orchestration_integrity.retention_eligible = retention_eligible;
+        report.orchestration_integrity.suite_resources_settled = recovery.suite_cleanup_complete();
+        report.orchestration_integrity.cleanup_complete =
+            !retention_committed && report.orchestration_integrity.suite_resources_settled;
+        if errors
+            .iter()
+            .any(|error| error.starts_with("suite-retention"))
+        {
+            report.errors.extend(
+                errors
+                    .iter()
+                    .filter(|error| error.starts_with("suite-retention"))
+                    .cloned(),
+            );
+        }
+        report.local_success = report.errors.is_empty()
+            && report.orchestration_integrity.all_modules_instantiated
+            && report.orchestration_integrity.all_modules_terminal
+            && report.orchestration_integrity.suite_resources_settled;
+    }
+    if cleanup_evidence.is_some() && proxy_cleanup_complete && recovery.suite_cleanup_complete() {
+        recovery.finish()?;
+    }
     let cleanup_complete = cleanup_evidence.is_some()
         && proxy_cleanup_complete
         && !errors
@@ -672,7 +768,10 @@ fn run_signed_suite(
         selected_resource_budget,
         jobs: invocation.jobs,
         automation,
-        suite_resource_observer: Some(Arc::new(DurableSuiteObserver { recovery })),
+        suite_resource_observer: Some(Arc::new(DurableSuiteObserver {
+            recovery,
+            retain_suite_plans_for_certification: invocation.retain_suite_plans_for_certification,
+        })),
     })?;
     let summary = if io::stderr().is_terminal() {
         let mut renderer = TtyRenderer::new(io::stderr().lock());
@@ -781,12 +880,23 @@ fn random_urlsafe_token(bytes: usize) -> String {
 
 struct DurableSuiteObserver {
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
+    retain_suite_plans_for_certification: bool,
 }
 
 impl SuiteResourceObserver for DurableSuiteObserver {
+    fn retain_suite_plans_for_certification(&self) -> bool {
+        self.retain_suite_plans_for_certification
+    }
+
     fn plan_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String> {
         lock_recovery(&self.recovery)
-            .and_then(|mut recovery| recovery.begin_suite_create(origin.as_str(), intent_id))
+            .and_then(|mut recovery| {
+                recovery.begin_suite_create_with_retention(
+                    origin.as_str(),
+                    intent_id,
+                    self.retain_suite_plans_for_certification,
+                )
+            })
             .map_err(|error| format!("failed to persist Suite plan create intent: {error:#}"))
     }
 
@@ -800,7 +910,13 @@ impl SuiteResourceObserver for DurableSuiteObserver {
 
     fn module_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String> {
         lock_recovery(&self.recovery)
-            .and_then(|mut recovery| recovery.begin_suite_create(origin.as_str(), intent_id))
+            .and_then(|mut recovery| {
+                recovery.begin_suite_create_with_retention(
+                    origin.as_str(),
+                    intent_id,
+                    self.retain_suite_plans_for_certification,
+                )
+            })
             .map_err(|error| format!("failed to persist Suite module create intent: {error:#}"))
     }
 
@@ -857,9 +973,61 @@ fn cleanup_change_set_id(request_jti: &str, phase: &str, capability_sha256: &str
     format!("{request_jti}-cleanup-{phase}-{generation}")
 }
 
+fn suite_retention_manifest(
+    recovery: &nazoauthctl_conformance::ConformanceRecoveryGuard,
+    report: &nazoauthctl_conformance::ConformanceReport,
+    artifact_digest: &str,
+    matrix_sha256: &str,
+) -> anyhow::Result<SuiteRetentionManifest> {
+    let binding = recovery
+        .tenant_resource_binding()
+        .context("missing ordinary recovery binding")?;
+    let plans = report
+        .plans
+        .iter()
+        .map(|plan| {
+            let suite_plan_id = plan
+                .suite_plan_id
+                .clone()
+                .context("terminal retained report has no Suite plan ID")?;
+            Ok(SuiteRetentionPlan {
+                matrix_plan_id: plan.matrix_plan_id.clone(),
+                suite_plan_id,
+                plan_name: plan.plan_name.clone(),
+                plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256(&plan.matrix_plan_id),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(SuiteRetentionManifest {
+        schema: 1,
+        suite_origin: report.suite_origin.clone(),
+        artifact_digest: artifact_digest.to_owned(),
+        matrix_sha256: matrix_sha256.to_owned(),
+        deployment_id: binding.deployment_id.clone(),
+        tenant_id: binding.tenant_id.clone(),
+        run_id: binding.request_jti.clone(),
+        plans,
+    })
+}
+
+fn cleanup_unretained_suite(
+    recovery: &mut nazoauthctl_conformance::ConformanceRecoveryGuard,
+    suite_client: &SuiteClient,
+) -> anyhow::Result<()> {
+    if recovery.suite_cleanup_complete() {
+        return Ok(());
+    }
+    recovery.discard_prepared_suite_retention_staging()?;
+    let suite = recovery
+        .suite_recovery()
+        .context("ordinary Suite recovery state is incomplete")?;
+    recover_suite_resources(suite_client, suite).map_err(|error| anyhow::anyhow!(error))?;
+    recovery.mark_suite_cleanup_complete()
+}
+
 fn cleanup_run_resources<T>(
     client: &TenantResourceClient<T>,
-    mut recovery: nazoauthctl_conformance::ConformanceRecoveryGuard,
+    recovery: &mut nazoauthctl_conformance::ConformanceRecoveryGuard,
 ) -> anyhow::Result<CleanupEvidence>
 where
     T: nazoauthctl_core::tenant_resources::TenantResourceHttpTransport,
@@ -951,13 +1119,7 @@ where
         }
         receipts.push(revoke);
     }
-    if recovery.tenant_resource_cleanup_complete() {
-        // Recovery owns deletion of the bound private manifest before it
-        // removes the journal, preventing an orphaned secret-bearing file.
-        // `finish` durably marks removal intent, removes the bound private
-        // manifest, then removes the journal/lock.
-        recovery.finish()?;
-    } else {
+    if !recovery.tenant_resource_cleanup_complete() {
         bail!("ordinary cleanup obligations remain pending");
     }
     Ok(CleanupEvidence {
@@ -1032,6 +1194,7 @@ fn recover_pending_runs(
                 )?;
             }
             if !recovery.suite_cleanup_complete() {
+                recovery.discard_prepared_suite_retention_staging()?;
                 let suite = recovery
                     .suite_recovery()
                     .context("ordinary recovery Suite state is incomplete")?;
@@ -1047,7 +1210,11 @@ fn recover_pending_runs(
                 ProxyTrustGuard::recover(&proxy.bundle_path, &proxy.reload_executable)?;
                 recovery.mark_proxy_cleanup_complete()?;
             }
-            cleanup_run_resources(&client, recovery).map(|_| ())
+            cleanup_run_resources(&client, &mut recovery)?;
+            if recovery.suite_cleanup_complete() && recovery.proxy_cleanup_complete() {
+                recovery.finish()?;
+            }
+            Ok(())
         })();
         if let Err(error) = result {
             failures.push(format!("{}: {error:#}", binding.request_jti));

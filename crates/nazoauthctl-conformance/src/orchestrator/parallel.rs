@@ -396,23 +396,31 @@ fn merge_reports(
         .iter()
         .filter_map(|module| module.module_id.clone())
         .collect::<Vec<_>>();
-    let cancellable_module_ids = cancellable_module_ids(&observed_module_ids, &modules);
-    cleanup_all(
-        &runner.config.client,
-        &cancellable_module_ids,
-        &prepared.suite_plan_ids,
-        &mut cleanup,
-    );
-
     if !all_plans_finished && !errors.iter().any(|error| error == "run interrupted") {
         errors.push(SCHEDULER_INCOMPLETE.to_owned());
     }
     let defined_modules = plans.iter().map(|plan| plan.defined_modules).sum();
     let created_instances = plans.iter().map(|plan| plan.created_instances).sum();
     let terminal_modules = modules.iter().filter(|module| module.terminal).count();
-    let cleanup_complete = !worker_panicked && cleanup.failures.is_empty();
     let all_modules_instantiated = all_plans_finished && defined_modules == created_instances;
     let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
+    let retention_requested = runner
+        .config
+        .suite_resource_observer
+        .as_ref()
+        .is_some_and(|observer| observer.retain_suite_plans_for_certification());
+    let retention_eligible =
+        retention_requested && !worker_panicked && errors.is_empty() && all_modules_terminal;
+    if !retention_eligible {
+        let cancellable_module_ids = cancellable_module_ids(&observed_module_ids, &modules);
+        cleanup_all(
+            &runner.config.client,
+            &cancellable_module_ids,
+            &prepared.suite_plan_ids,
+            &mut cleanup,
+        );
+    }
+    let cleanup_complete = !retention_eligible && !worker_panicked && cleanup.failures.is_empty();
     let outcomes = summarize_module_outcomes(&modules);
     let matrix_expectations = summarize_matrix_expectations(&modules);
     let matrix_expectations_satisfied = prepared.matrix_expectations_satisfied
@@ -427,6 +435,9 @@ fn merge_reports(
         all_modules_instantiated,
         all_modules_terminal,
         cleanup_complete,
+        retention_requested,
+        retention_eligible,
+        suite_resources_settled: cleanup_complete,
     };
     let local_success =
         errors.is_empty() && all_modules_instantiated && all_modules_terminal && cleanup_complete;

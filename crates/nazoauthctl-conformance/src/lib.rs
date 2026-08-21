@@ -71,7 +71,8 @@ pub use evidence::{
     EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceDeploymentIdentity, EvidenceError,
     EvidenceProviderCapability, EvidenceProviderIdentity, EvidenceProviderReceipt,
     EvidenceRuntimeIdentity, EvidenceSourceIdentity, validate_ordinary_provider_identity,
-    write_private_evidence_bundle, write_private_provider_evidence_bundle,
+    validate_private_evidence_directory, write_private_evidence_bundle,
+    write_private_provider_evidence_bundle,
 };
 pub use materializer::{
     ArtifactMaterializationBinding, CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DescriptorGroup,
@@ -98,8 +99,9 @@ pub use progress::{
 pub use proxy_trust::ProxyTrustGuard;
 pub use recovery::{
     ConformanceProxyRecovery, ConformanceRecoveryBinding, ConformanceRecoveryGuard,
-    ConformanceRecoveryStore, SuiteRecoveryState, TenantResourceReceiptIdentity,
-    TenantResourceRecoveryBinding, TenantResourceRevokeOutcome, TenantResourceRevokeRecord,
+    ConformanceRecoveryStore, SuiteRecoveryState, SuiteRetentionManifest, SuiteRetentionPlan,
+    TenantResourceReceiptIdentity, TenantResourceRecoveryBinding, TenantResourceRevokeOutcome,
+    TenantResourceRevokeRecord,
 };
 pub use report::{
     CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport, PlanReport,

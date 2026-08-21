@@ -100,6 +100,15 @@ pub struct OrchestrationIntegrity {
     pub all_modules_instantiated: bool,
     pub all_modules_terminal: bool,
     pub cleanup_complete: bool,
+    /// A requested certification retention path is deliberately not cleanup.
+    #[serde(default)]
+    pub retention_requested: bool,
+    /// Every created module reached a terminal state with no orchestration error.
+    #[serde(default)]
+    pub retention_eligible: bool,
+    /// Set only after ordinary cleanup transfers exact plan ownership.
+    #[serde(default)]
+    pub suite_resources_settled: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -602,6 +611,9 @@ mod tests {
                 all_modules_instantiated: true,
                 all_modules_terminal: true,
                 cleanup_complete: true,
+                retention_requested: false,
+                retention_eligible: false,
+                suite_resources_settled: true,
             },
             progress: ProgressSnapshot {
                 completed: 0,
