@@ -14,8 +14,7 @@ use tar::{Archive, Builder};
 
 use crate::{
     filesystem::{
-        atomic_write, open_secure_regular_file, read_secure_regular_file, read_secure_secret_file,
-        set_mode, sha256_file,
+        atomic_write, open_secure_regular_file, read_secure_regular_file, set_mode, sha256_file,
     },
     model::UpdateConfig,
     process::{Process, command_exists},
@@ -988,16 +987,6 @@ fn dependency_identity_for_config(
         &config.valkey.data_volume,
         &config.valkey.image,
     )
-}
-
-fn validate_secret(path: &Path) -> anyhow::Result<()> {
-    let bytes = read_secure_secret_file(path, "backup dependency secret", 16 * 1024)?;
-    let value = std::str::from_utf8(&bytes)
-        .with_context(|| format!("failed to read secret {}", path.display()))?;
-    if value.is_empty() || value.contains(['\n', '\r']) {
-        bail!("secret file is empty or multiline: {}", path.display());
-    }
-    Ok(())
 }
 
 fn secure_file_digest(path: &Path, label: &str) -> anyhow::Result<String> {

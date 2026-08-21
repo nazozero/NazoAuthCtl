@@ -62,9 +62,9 @@ impl PostgresProvider {
         reject_credential_controls(password.as_str(), "PostgreSQL password")?;
         atomic_write(&service_path, service.as_bytes(), 0o400)?;
         let mut pass = zeroize::Zeroizing::new(String::new());
-        write!(
+        writeln!(
             &mut *pass,
-            "{}:{}:{}:{}:{}\n",
+            "{}:{}:{}:{}:{}",
             pgpass_escape(host).as_str(),
             pgpass_escape(&port).as_str(),
             pgpass_escape(database.as_str()).as_str(),
@@ -94,12 +94,6 @@ pub(crate) struct ValkeyProvider {
 }
 
 impl ValkeyProvider {
-    pub(crate) fn from_url_file(path: &Path) -> anyhow::Result<Self> {
-        let raw = read_single_line(path)?;
-        let url = parse_dependency_url(raw.as_str(), "Valkey secret provider")?;
-        Self::from_dependency_url(url)
-    }
-
     fn from_dependency_url(url: DependencyUrl) -> anyhow::Result<Self> {
         if !matches!(url.scheme.as_str(), "redis" | "rediss") || !url.query.is_empty() {
             bail!("Valkey secret provider has an unsupported URL");
@@ -429,7 +423,7 @@ fn postgres_binding_from_url(url: DependencyUrl, label: &str) -> anyhow::Result<
             url.database.as_str()
         ),
         username: url.username,
-        tls_policy: tls_policy.unwrap_or_else(|| "default".to_owned()),
+        tls_policy: tls_policy.unwrap_or("default".to_owned()),
     })
 }
 

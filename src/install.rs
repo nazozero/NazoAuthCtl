@@ -15,7 +15,7 @@ use url::Url;
 use crate::{
     cli::{InstallOptions, StandardsProfileSecrets},
     deployment::RuntimeBackendKind,
-    filesystem::{atomic_write, generate_secret, read_secure_secret_file, set_mode},
+    filesystem::{atomic_write, generate_secret, set_mode},
     model::{
         Dependencies, Mount, Operator, Postgres, Runtime, Ui, UpdateConfig, Valkey, safe_absolute,
     },
@@ -520,17 +520,17 @@ pub(crate) fn install_systemd(config: &UpdateConfig) -> anyhow::Result<()> {
                 .context("host runtime has no recovery directory")?
                 .to_owned(),
             migration_url: config.dependencies.migration_database_url_file.clone(),
-            restricted_secret_paths: (config.dependencies.mode == "external")
-                .then(|| {
-                    [
-                        config.dependencies.database_backup_url_file.clone(),
-                        config.dependencies.valkey_backup_url_file.clone(),
-                    ]
-                    .into_iter()
-                    .filter(|path| !path.as_os_str().is_empty())
-                    .collect()
-                })
-                .unwrap_or_default(),
+            restricted_secret_paths: if config.dependencies.mode == "external" {
+                [
+                    config.dependencies.database_backup_url_file.clone(),
+                    config.dependencies.valkey_backup_url_file.clone(),
+                ]
+                .into_iter()
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect()
+            } else {
+                Vec::new()
+            },
             receipt_private_key: config.operator.receipt_private_key.clone(),
             runtime_readable_secret_names: ["database-url", "valkey-url", MFA_TOTP_KEY_FILE_NAME]
                 .into_iter()

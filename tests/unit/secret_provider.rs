@@ -26,7 +26,8 @@ fn providers_split_secrets_from_non_secret_connection_parameters() {
     let valkey = work.path().join("valkey");
     fs::write(&valkey, "rediss://default:s%3Aecret@cache.example:6380/2").unwrap();
     crate::filesystem::set_mode(&valkey, 0o600).unwrap();
-    let provider = ValkeyProvider::from_url_file(&valkey).unwrap();
+    let providers = read_external_backup_providers(&postgres, &valkey).unwrap();
+    let provider = providers.valkey;
     assert_eq!(provider.host, "cache.example");
     assert_eq!(provider.password_stdin().as_slice(), b"s:ecret\n");
     assert!(provider.tls);
@@ -187,7 +188,8 @@ fn providers_pass_bare_canonical_ipv6_hosts_to_postgres_and_valkey() {
     let valkey = work.path().join("valkey");
     fs::write(&valkey, "rediss://backup:secret@[2001:0DB8:0:0:0:0:0:1]/0").unwrap();
     crate::filesystem::set_mode(&valkey, 0o600).unwrap();
-    let provider = ValkeyProvider::from_url_file(&valkey).unwrap();
+    let providers = read_external_backup_providers(&postgres, &valkey).unwrap();
+    let provider = providers.valkey;
     assert_eq!(provider.host, "2001:db8::1");
     assert!(provider.tls);
 }
@@ -294,16 +296,19 @@ fn provider_rejects_symlink_and_group_writable_input() {
     use std::os::unix::fs::symlink;
 
     let work = PrivateTempDir::new("nazoauth-provider-secure-input-test").unwrap();
+    let postgres = work.path().join("postgres");
+    fs::write(&postgres, "postgresql://backup:secret@db.example/oauth").unwrap();
+    crate::filesystem::set_mode(&postgres, 0o600).unwrap();
     let target = work.path().join("target");
     fs::write(&target, "rediss://default:secret@cache.example/1").unwrap();
     crate::filesystem::set_mode(&target, 0o600).unwrap();
     let link = work.path().join("link");
     symlink(&target, &link).unwrap();
-    assert!(ValkeyProvider::from_url_file(&link).is_err());
+    assert!(read_external_backup_providers(&postgres, &link).is_err());
 
     crate::filesystem::set_mode(&target, 0o644).unwrap();
-    assert!(ValkeyProvider::from_url_file(&target).is_err());
+    assert!(read_external_backup_providers(&postgres, &target).is_err());
 
     crate::filesystem::set_mode(&target, 0o640).unwrap();
-    assert!(ValkeyProvider::from_url_file(&target).is_ok());
+    assert!(read_external_backup_providers(&postgres, &target).is_ok());
 }
