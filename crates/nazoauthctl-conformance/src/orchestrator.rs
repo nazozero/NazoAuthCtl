@@ -1059,7 +1059,11 @@ impl ConformanceRunner {
             .suite_resource_observer
             .as_ref()
             .is_some_and(|observer| observer.retain_suite_plans_for_certification());
-        let retain_suite_plans = retention_requested && errors.is_empty() && all_modules_terminal;
+        let retain_suite_plans = retention_requested
+            && errors.is_empty()
+            && all_selected_plan_definitions_enumerated
+            && defined_modules > 0
+            && all_modules_terminal;
         if !retain_suite_plans {
             let cancellable_module_ids = cancellable_module_ids(&module_ids, &modules);
             cleanup_all(

@@ -14,7 +14,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 const LEGACY_RECOVERY_JOURNAL_SCHEMA: u32 = 1;
+/// The ordinary default journal remains schema 2 byte-for-byte compatible.
 const TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 2;
+/// Schema 3 is emitted only after an explicit certification-retention policy
+/// is durably bound. Older binaries reject it rather than deleting plans.
+const RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 3;
 const TENANT_RESOURCE_RECOVERY_KIND: &str = "tenant-resource";
 const MAX_RECOVERY_JOURNAL_BYTES: usize = 128 * 1024;
 const MAX_PENDING_RUNS: usize = 64;
@@ -212,6 +216,12 @@ impl Default for SuiteRetentionDisposition {
     }
 }
 
+impl SuiteRetentionDisposition {
+    fn is_default(value: &Self) -> bool {
+        matches!(value, Self::Active { requested: false })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyRecoveryJournal {
@@ -253,7 +263,7 @@ struct TenantResourceRecoveryJournal {
     /// Suite allocation and are therefore already settled at this boundary.
     #[serde(default)]
     suite: Option<SuiteRecoveryState>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "SuiteRetentionDisposition::is_default")]
     suite_retention: SuiteRetentionDisposition,
 }
 
@@ -287,15 +297,19 @@ impl<'de> Deserialize<'de> for RecoveryJournal {
             .ok_or_else(|| serde::de::Error::custom("recovery journal has no schema"))?;
         const LEGACY_SCHEMA: u64 = LEGACY_RECOVERY_JOURNAL_SCHEMA as u64;
         const TENANT_RESOURCE_SCHEMA: u64 = TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA as u64;
+        const RETAINING_TENANT_RESOURCE_SCHEMA: u64 =
+            RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA as u64;
         match schema {
             LEGACY_SCHEMA => serde_json::from_value(value)
                 .map(Box::new)
                 .map(Self::Legacy)
                 .map_err(serde::de::Error::custom),
-            TENANT_RESOURCE_SCHEMA => serde_json::from_value(value)
-                .map(Box::new)
-                .map(Self::TenantResource)
-                .map_err(serde::de::Error::custom),
+            TENANT_RESOURCE_SCHEMA | RETAINING_TENANT_RESOURCE_SCHEMA => {
+                serde_json::from_value(value)
+                    .map(Box::new)
+                    .map(Self::TenantResource)
+                    .map_err(serde::de::Error::custom)
+            }
             _ => Err(serde::de::Error::custom(
                 "unsupported recovery journal schema",
             )),
@@ -480,10 +494,12 @@ impl ConformanceRecoveryStore {
             {
                 suite.plan_ids.clear();
                 suite.module_ids.clear();
-                if matches!(
-                    tenant_journal.suite_retention,
-                    SuiteRetentionDisposition::Active { .. }
-                ) {
+                if tenant_journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                    && matches!(
+                        &tenant_journal.suite_retention,
+                        SuiteRetentionDisposition::Active { .. }
+                    )
+                {
                     tenant_journal.suite_retention = SuiteRetentionDisposition::Cleaned;
                 }
                 normalized_suite_cleanup = true;
@@ -762,6 +778,9 @@ impl ConformanceRecoveryGuard {
                 journal.suite_retention = SuiteRetentionDisposition::Active {
                     requested: retain_suite_plans_for_certification,
                 };
+                if retain_suite_plans_for_certification {
+                    journal.schema = RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA;
+                }
             }
             SuiteRetentionDisposition::RetentionPrepared { .. }
             | SuiteRetentionDisposition::Retained { .. }
@@ -855,7 +874,7 @@ impl ConformanceRecoveryGuard {
             RecoveryJournal::Legacy(_) => true,
             RecoveryJournal::TenantResource(journal) => {
                 matches!(
-                    journal.suite_retention,
+                    &journal.suite_retention,
                     SuiteRetentionDisposition::Retained { .. } | SuiteRetentionDisposition::Cleaned
                 ) || journal.suite.as_ref().is_none_or(|suite| {
                     suite.cleanup_complete && suite.pending_create_intents.is_empty()
@@ -890,7 +909,9 @@ impl ConformanceRecoveryGuard {
             suite.plan_ids.clear();
             suite.module_ids.clear();
         }
-        journal.suite_retention = SuiteRetentionDisposition::Cleaned;
+        if journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA {
+            journal.suite_retention = SuiteRetentionDisposition::Cleaned;
+        }
         self.persist()
     }
 
@@ -925,6 +946,11 @@ impl ConformanceRecoveryGuard {
             manifest_sha256: sha256_hex(&bytes),
             manifest_path,
         };
+        // Retention eligibility is evaluated only after every allocated
+        // module has reached a terminal state. Prepared fallback cleanup
+        // therefore needs exact plan IDs, not the potentially 16k module ID
+        // inventory: plan deletion removes the terminal modules with it.
+        suite.module_ids.clear();
         journal.suite_retention = SuiteRetentionDisposition::RetentionPrepared { record };
         self.persist()
     }
@@ -962,6 +988,11 @@ impl ConformanceRecoveryGuard {
     /// Transfer ownership only after a complete pending manifest has been
     /// fsynced. This is the sole transition that compacts module IDs.
     pub fn commit_suite_plan_retention(&mut self) -> anyhow::Result<()> {
+        if let RecoveryJournal::TenantResource(journal) = &self.journal
+            && (!tenant_resource_obligations_complete(journal) || !journal.proxy_cleanup_complete)
+        {
+            bail!("Suite retention cannot commit before ordinary and proxy cleanup complete");
+        }
         let pending = self.suite_retention_pending_path()?;
         let record = match &self.journal {
             RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
@@ -1460,8 +1491,11 @@ fn validate_journal(
             validate_binding(&journal.binding, deployment_id)
         }
         RecoveryJournal::TenantResource(journal) => {
-            if journal.schema != TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
-                || journal.kind != TENANT_RESOURCE_RECOVERY_KIND
+            if !matches!(
+                journal.schema,
+                TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                    | RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+            ) || journal.kind != TENANT_RESOURCE_RECOVERY_KIND
             {
                 bail!("tenant-resource recovery journal discriminator is invalid");
             }
@@ -1475,6 +1509,16 @@ fn validate_tenant_resource_journal(
     deployment_id: &str,
 ) -> anyhow::Result<()> {
     validate_tenant_resource_binding(&journal.binding, deployment_id)?;
+    if journal.schema == TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+        && !SuiteRetentionDisposition::is_default(&journal.suite_retention)
+    {
+        bail!("schema-2 recovery journal cannot retain Suite plans");
+    }
+    if journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+        && SuiteRetentionDisposition::is_default(&journal.suite_retention)
+    {
+        bail!("schema-3 recovery journal has no explicit retention policy");
+    }
     if journal.cleanup_complete && !tenant_resource_obligations_complete(journal) {
         bail!("tenant-resource cleanup marker is ahead of its obligations");
     }
@@ -2386,6 +2430,41 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn default_suite_cleanup_remains_a_schema_two_journal_without_retention_fields() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-tenant-recovery-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let binding = tenant_resource_binding(&root);
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("persist tenant intent");
+        guard
+            .begin_suite_create("https://suite.example", "intent-plan-1")
+            .expect("persist plan intent");
+        guard
+            .record_suite_plan("https://suite.example", "intent-plan-1", "plan-1")
+            .expect("persist plan allocation");
+        let journal_path = root.join(format!("run-{}.json", binding.request_jti));
+        let before_cleanup =
+            std::fs::read_to_string(&journal_path).expect("read schema-two journal");
+        assert!(before_cleanup.contains("\"schema\": 2"));
+        assert!(!before_cleanup.contains("suite_retention"));
+
+        guard
+            .mark_suite_cleanup_complete()
+            .expect("settle default Suite cleanup");
+        let after_cleanup =
+            std::fs::read_to_string(&journal_path).expect("read normalized journal");
+        assert!(after_cleanup.contains("\"schema\": 2"));
+        assert!(!after_cleanup.contains("suite_retention"));
+        drop(guard);
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn tenant_resource_binding_rejects_jws_digest_and_manifest_path_drift() {
         let temp_root = std::env::temp_dir()
             .canonicalize()
@@ -2851,6 +2930,21 @@ mod tests {
                 "suite-plan-1",
             )
             .expect("Suite plan");
+        guard
+            .begin_suite_create_with_retention(
+                "https://www.certification.openid.net",
+                "suite-intent-module-1",
+                true,
+            )
+            .expect("Suite module intent");
+        guard
+            .record_suite_module("suite-intent-module-1", "suite-module-1")
+            .expect("Suite module");
+        let journal_path = root.join(format!("run-{}.json", binding.request_jti));
+        let retention_journal =
+            std::fs::read_to_string(&journal_path).expect("read schema-three journal");
+        assert!(retention_journal.contains("\"schema\": 3"));
+        assert!(retention_journal.contains("suite_retention"));
         let manifest = SuiteRetentionManifest {
             schema: SUITE_RETENTION_MANIFEST_SCHEMA,
             suite_origin: "https://www.certification.openid.net".to_owned(),
@@ -2874,10 +2968,18 @@ mod tests {
             guard.suite_recovery().expect("suite").plan_ids,
             vec!["suite-plan-1".to_owned()]
         );
+        assert!(guard.suite_recovery().expect("suite").module_ids.is_empty());
         guard
             .stage_suite_retention_manifest()
             .expect("stage manifest");
         assert!(!final_path.exists());
+        assert!(guard.commit_suite_plan_retention().is_err());
+        guard
+            .record_tenant_resource_receipt(tenant_resource_receipt(&binding))
+            .expect("receipt");
+        guard
+            .record_tenant_resource_enumeration(Vec::new())
+            .expect("enumeration");
         guard
             .commit_suite_plan_retention()
             .expect("transfer ownership");
@@ -2891,6 +2993,87 @@ mod tests {
         assert!(!String::from_utf8_lossy(&manifest_bytes).contains("capability.header.payload"));
         drop(guard);
         assert_eq!(store.claim_pending().expect("retained recovery").len(), 1);
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_retention_compacts_terminal_module_inventory_below_the_journal_cap() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!("nazoauth-retention-{}", uuid::Uuid::now_v7()));
+        let evidence = root.join("evidence");
+        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let binding = tenant_resource_binding(&root);
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("intent");
+        guard
+            .begin_suite_create_with_retention(
+                "https://www.certification.openid.net",
+                "suite-intent-1",
+                true,
+            )
+            .expect("Suite intent");
+        guard
+            .record_suite_plan(
+                "https://www.certification.openid.net",
+                "suite-intent-1",
+                "suite-plan-0",
+            )
+            .expect("Suite plan");
+        let suite = guard
+            .tenant_resource_journal_mut()
+            .expect("tenant journal")
+            .suite
+            .as_mut()
+            .expect("Suite recovery");
+        suite.plan_ids = (0..44).map(|index| format!("suite-plan-{index}")).collect();
+        suite.module_ids = (0..1408)
+            .map(|index| format!("suite-module-{index}"))
+            .collect();
+        let plans = (0..44)
+            .map(|index| {
+                let matrix_plan_id = format!("matrix-plan-{index}");
+                SuiteRetentionPlan {
+                    plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256(&matrix_plan_id),
+                    matrix_plan_id,
+                    suite_plan_id: format!("suite-plan-{index}"),
+                    plan_name: format!("Certification plan {index}"),
+                }
+            })
+            .collect();
+        let manifest = SuiteRetentionManifest {
+            schema: SUITE_RETENTION_MANIFEST_SCHEMA,
+            suite_origin: "https://www.certification.openid.net".to_owned(),
+            artifact_digest: "a".repeat(64),
+            matrix_sha256: "b".repeat(64),
+            deployment_id: binding.deployment_id.clone(),
+            tenant_id: binding.tenant_id.clone(),
+            run_id: binding.request_jti.clone(),
+            plans,
+        };
+        let final_path = evidence.join(format!("retained-suite-{}.json", binding.request_jti));
+        guard
+            .prepare_suite_plan_retention(manifest, final_path)
+            .expect("prepare retention");
+        let suite = guard.suite_recovery().expect("prepared Suite recovery");
+        assert_eq!(suite.plan_ids.len(), 44);
+        assert!(suite.module_ids.is_empty());
+        let journal_path = root.join(format!("run-{}.json", binding.request_jti));
+        assert!(
+            std::fs::metadata(&journal_path)
+                .expect("prepared journal metadata")
+                .len()
+                < MAX_RECOVERY_JOURNAL_BYTES as u64
+        );
+        drop(guard);
+        let mut pending = store.claim_pending().expect("claim prepared journal");
+        let claimed = pending.pop().expect("prepared guard");
+        let suite = claimed.suite_recovery().expect("prepared Suite recovery");
+        assert_eq!(suite.plan_ids.len(), 44);
+        assert!(suite.module_ids.is_empty());
+        drop(claimed);
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 }

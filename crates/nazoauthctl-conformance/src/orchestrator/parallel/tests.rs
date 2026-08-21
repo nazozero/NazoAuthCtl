@@ -26,6 +26,35 @@ struct ParallelFixtureTransport {
 
 struct RejectCreatedPlanObserver;
 
+struct RetainSuiteObserver;
+
+impl SuiteResourceObserver for RetainSuiteObserver {
+    fn retain_suite_plans_for_certification(&self) -> bool {
+        true
+    }
+
+    fn plan_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn plan_created(
+        &self,
+        _origin: &Origin,
+        _intent_id: &str,
+        _plan_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn module_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn module_created(&self, _intent_id: &str, _module_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 impl SuiteResourceObserver for RejectCreatedPlanObserver {
     fn plan_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
         Ok(())
@@ -350,6 +379,40 @@ fn independent_plans_overlap_but_reports_remain_in_matrix_order() {
             .count(),
         2,
         "every selected plan must be created before module execution begins"
+    );
+}
+
+#[test]
+fn retained_parallel_run_launches_work_after_the_first_worker_finishes() {
+    let (mut runner, transport) = parallel_fixture(
+        serde_json::json!({}),
+        &["plan-a", "plan-b", "plan-c", "plan-d", "plan-e"],
+        None,
+    );
+    runner.config.jobs = 4;
+    runner.config.suite_resource_observer = Some(Arc::new(RetainSuiteObserver));
+
+    let summary = runner.run(&mut ());
+
+    assert!(summary.report.errors.is_empty());
+    assert!(summary.report.orchestration_integrity.retention_eligible);
+    assert!(!summary.report.orchestration_integrity.cleanup_complete);
+    assert_eq!(summary.report.orchestration_integrity.terminal_modules, 5);
+    assert_eq!(
+        transport.created_plans.lock().expect("plans").len(),
+        5,
+        "retention must not make the first finished worker stop the remaining queue"
+    );
+    assert!(
+        transport
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .all(|(method, path)| {
+                !(*method == HttpMethod::Delete && path.starts_with("/api/plan/"))
+            }),
+        "eligible retained plans remain for the caller's durable retention handoff"
     );
 }
 

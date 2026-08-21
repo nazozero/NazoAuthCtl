@@ -539,8 +539,9 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     if let Some(report) = report.as_mut() {
         report.orchestration_integrity.retention_eligible = retention_eligible;
         report.orchestration_integrity.suite_resources_settled = recovery.suite_cleanup_complete();
-        report.orchestration_integrity.cleanup_complete =
-            !retention_committed && report.orchestration_integrity.suite_resources_settled;
+        report.orchestration_integrity.cleanup_complete = !recovery.suite_retention_committed()
+            && !retention_committed
+            && report.orchestration_integrity.suite_resources_settled;
         if errors
             .iter()
             .any(|error| error.starts_with("suite-retention"))

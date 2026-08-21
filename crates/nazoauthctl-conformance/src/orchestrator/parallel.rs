@@ -409,8 +409,12 @@ fn merge_reports(
         .suite_resource_observer
         .as_ref()
         .is_some_and(|observer| observer.retain_suite_plans_for_certification());
-    let retention_eligible =
-        retention_requested && !worker_panicked && errors.is_empty() && all_modules_terminal;
+    let retention_eligible = retention_requested
+        && !worker_panicked
+        && errors.is_empty()
+        && prepared.all_selected_plan_definitions_enumerated
+        && defined_modules > 0
+        && all_modules_terminal;
     if !retention_eligible {
         let cancellable_module_ids = cancellable_module_ids(&observed_module_ids, &modules);
         cleanup_all(
@@ -470,7 +474,9 @@ fn merge_reports(
 }
 
 fn has_fatal_orchestration_failure(report: &ConformanceReport) -> bool {
-    !report.orchestration_integrity.cleanup_complete || !report.errors.is_empty()
+    (!report.orchestration_integrity.cleanup_complete
+        && !report.orchestration_integrity.retention_eligible)
+        || !report.errors.is_empty()
 }
 
 #[cfg(test)]

@@ -125,6 +125,10 @@ deletion; a retained journal with a missing or digest-mismatched manifest fails
 closed and never deletes the recorded plans. Operators review/publish retained
 plans in the official UI and must use a later controlled deletion procedure;
 ctl does not roll them back when unrelated cleanup subsequently fails.
+Default ordinary runs continue to write schema-2 journals without retention
+fields. A requested retention upgrades that live journal to schema 3; an older
+ctl binary rejects schema 3 fail-closed, so operators must not downgrade the
+binary until the retained journal has finished and been removed.
 
 The signed offline deployment statement identifies a stopped replica from its
 persistent mount. It is not sufficient artifact trust: ctl also verifies the
