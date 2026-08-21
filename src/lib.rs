@@ -167,7 +167,8 @@ With managed dependencies and standards-full profile, identities and service-own
 secrets are generated automatically and persisted in the installation secret store.
 Profile secret input is optional and is intended only for importing an existing
 secret during a controlled recovery or migration.
-External JSON keys: database_url, migration_database_url, valkey_url.
+External JSON keys: database_url, migration_database_url, database_backup_url,
+valkey_url, valkey_backup_url, valkey_backup_scope (must be dedicated-instance).
 Profile JSON keys: dynamic_registration_initial_access_token,
 ciba_automated_decision_token, openid4vci_management_token,
 openid4vp_management_token. Profile secret input is accepted only for standards-full.

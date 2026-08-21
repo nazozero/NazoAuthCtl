@@ -45,7 +45,7 @@ pub(crate) use secrets::{
     ensure_tenant_resource_controller_identity, ensure_tenant_resource_controller_runtime,
     read_tenant_resource_controller_signing_key, reconcile_managed_secrets,
     tenant_resource_controller_key_id_path, tenant_resource_controller_private_key_path,
-    tenant_resource_controller_public_key_path,
+    tenant_resource_controller_public_key_path, verify_live_external_dependencies,
 };
 
 pub(crate) const POSTGRES_IMAGE: &str = "docker.io/library/postgres:18@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a";
@@ -520,21 +520,23 @@ pub(crate) fn install_systemd(config: &UpdateConfig) -> anyhow::Result<()> {
                 .context("host runtime has no recovery directory")?
                 .to_owned(),
             migration_url: config.dependencies.migration_database_url_file.clone(),
-            restricted_secret_paths: vec![
-                config.dependencies.database_backup_url_file.clone(),
-                config.dependencies.valkey_backup_url_file.clone(),
-            ],
+            restricted_secret_paths: (config.dependencies.mode == "external")
+                .then(|| {
+                    [
+                        config.dependencies.database_backup_url_file.clone(),
+                        config.dependencies.valkey_backup_url_file.clone(),
+                    ]
+                    .into_iter()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .collect()
+                })
+                .unwrap_or_default(),
             receipt_private_key: config.operator.receipt_private_key.clone(),
-            runtime_readable_secret_names: [
-                "database-url",
-                "database-migration-url",
-                "valkey-url",
-                MFA_TOTP_KEY_FILE_NAME,
-            ]
-            .into_iter()
-            .chain(STANDARDS_PROFILE_SECRET_NAMES.iter().copied())
-            .map(ToOwned::to_owned)
-            .collect(),
+            runtime_readable_secret_names: ["database-url", "valkey-url", MFA_TOTP_KEY_FILE_NAME]
+                .into_iter()
+                .chain(STANDARDS_PROFILE_SECRET_NAMES.iter().copied())
+                .map(ToOwned::to_owned)
+                .collect(),
         },
     )?;
     Ok(())

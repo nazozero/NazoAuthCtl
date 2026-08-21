@@ -284,6 +284,34 @@ pub(super) fn normalize_external_dependencies(options: &mut InstallOptions) -> a
     Ok(())
 }
 
+/// Re-read the live external dependency contract before a controller can
+/// replay a privileged task.  The config only records non-secret endpoint
+/// identities, so changing a credential file after prepare must never redirect
+/// a retry to a different provider endpoint or principal.
+pub(crate) fn verify_live_external_dependencies(config: &UpdateConfig) -> anyhow::Result<()> {
+    if config.dependencies.mode != "external" {
+        return Ok(());
+    }
+    if config.dependencies.external_valkey_backup_scope != "dedicated-instance" {
+        bail!("external Valkey backup must declare dedicated-instance scope");
+    }
+    let binding = crate::secret_provider::bind_external_dependency_url_files(
+        &config.dependencies.database_url_file,
+        &config.dependencies.migration_database_url_file,
+        &config.dependencies.database_backup_url_file,
+        &config.dependencies.valkey_url_file,
+        &config.dependencies.valkey_backup_url_file,
+    )?;
+    if binding.database_endpoint_sha256 != config.dependencies.database_backup_endpoint_sha256
+        || binding.valkey_endpoint_sha256 != config.dependencies.valkey_backup_endpoint_sha256
+    {
+        bail!(
+            "live external dependency endpoints no longer match the persisted deployment binding"
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn normalize_profile_secrets(options: &mut InstallOptions) -> anyhow::Result<()> {
     if options.profile != "standards-full"
         && (options.profile_secrets_stdin || options.profile_secret_fd.is_some())

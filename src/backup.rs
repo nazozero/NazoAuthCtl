@@ -215,20 +215,10 @@ impl Backup {
         }
         let (database_backup_url, valkey_backup_url) =
             external_backup_url_files(&config.dependencies);
-        let binding = crate::secret_provider::bind_external_dependency_url_files(
-            &config.dependencies.database_url_file,
-            &config.dependencies.migration_database_url_file,
-            database_backup_url,
-            &config.dependencies.valkey_url_file,
-            valkey_backup_url,
-        )?;
-        if binding.database_endpoint_sha256 != config.dependencies.database_backup_endpoint_sha256
-            || binding.valkey_endpoint_sha256 != config.dependencies.valkey_backup_endpoint_sha256
-        {
-            bail!(
-                "external backup credential endpoints no longer match the persisted deployment binding"
-            );
-        }
+        // The controller validates the complete live five-credential contract
+        // before it can replay any migration.  Backup execution deliberately
+        // reads only its two dedicated credentials; runtime and migration
+        // secrets never enter this provider process.
         validate_secret(database_backup_url)?;
         validate_secret(valkey_backup_url)?;
         let postgres = self.path.join("postgresql.dump");
@@ -257,7 +247,7 @@ impl Backup {
             .arg("-n")
             .arg(valkey_provider.database.to_string());
         if let Some(username) = &valkey_provider.username {
-            command = command.arg("--user").arg(username);
+            command = command.arg("--user").arg(username.as_str());
         }
         if valkey_provider.tls {
             command = command.arg("--tls");

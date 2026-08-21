@@ -254,6 +254,56 @@ fn journal(config: &UpdateConfig, phase: UpdatePhase) -> UpdateJournal {
     }
 }
 
+fn configure_external_dependency_fixture(config: &mut UpdateConfig) {
+    let secrets = config.runtime.working_directory.join("external-secrets");
+    fs::create_dir_all(&secrets).unwrap();
+    config.schema = 3;
+    config.dependencies.mode = "external".to_owned();
+    config.dependencies.database_url_file = secrets.join("database-url");
+    config.dependencies.migration_database_url_file = secrets.join("database-migration-url");
+    config.dependencies.database_backup_url_file = secrets.join("database-backup-url");
+    config.dependencies.valkey_url_file = secrets.join("valkey-url");
+    config.dependencies.valkey_backup_url_file = secrets.join("valkey-backup-url");
+    config.dependencies.external_valkey_backup_scope = "dedicated-instance".to_owned();
+    let values = [
+        (
+            "database-url",
+            "postgresql://runtime:runtime-secret@db.example/oauth?sslmode=require",
+        ),
+        (
+            "database-migration-url",
+            "postgresql://migrator:migration-secret@db.example:5432/oauth",
+        ),
+        (
+            "database-backup-url",
+            "postgres://backup:backup-secret@DB.EXAMPLE/oauth",
+        ),
+        (
+            "valkey-url",
+            "rediss://runtime:runtime-secret@cache.example/0",
+        ),
+        (
+            "valkey-backup-url",
+            "rediss://backup:backup-secret@CACHE.EXAMPLE:6379/0",
+        ),
+    ];
+    for (name, value) in values {
+        let path = secrets.join(name);
+        fs::write(&path, value).unwrap();
+        crate::filesystem::set_mode(&path, 0o600).unwrap();
+    }
+    let binding = crate::secret_provider::bind_external_dependency_credentials(
+        "postgresql://runtime:runtime-secret@db.example/oauth?sslmode=require",
+        "postgresql://migrator:migration-secret@db.example:5432/oauth",
+        "postgres://backup:backup-secret@DB.EXAMPLE/oauth",
+        "rediss://runtime:runtime-secret@cache.example/0",
+        "rediss://backup:backup-secret@CACHE.EXAMPLE:6379/0",
+    )
+    .unwrap();
+    config.dependencies.database_backup_endpoint_sha256 = binding.database_endpoint_sha256;
+    config.dependencies.valkey_backup_endpoint_sha256 = binding.valkey_endpoint_sha256;
+}
+
 const OPENID4VC_TEST_LEAF: &str = "-----BEGIN CERTIFICATE-----\nMIIFWzCCBEOgAwIBAgISAyBIAwu7NBD5CTxX8suDCMgFMA0GCSqGSIb3DQEBCwUA\nMEoxCzAJBgNVBAYTAlVTMRYwFAYDVQQKEw1MZXQncyBFbmNyeXB0MSMwIQYDVQQD\nExpMZXQncyBFbmNyeXB0IEF1dGhvcml0eSBYMzAeFw0xOTA3MTIxMTEyMzBaFw0x\nOTEwMTAxMTEyMzBaMB0xGzAZBgNVBAMTEmxpc3RzLmZvci1vdXIuaW5mbzCCASIw\nDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMVoti34X46DaI2nX24C+aZ2Ofkm\nhKbidiXiRTon1MLSMGl1oNW9MyRyYYCzP4j6DNKChJnr8ZnVShh2oZD+yHWP9lpn\nXMGkbsUxejRMU9hnaAB50pXRIDAzavkVFCguFlJ8nKkv/Y1Avlw7tc2aZOd3lOZB\nEr8gJ8mRDGqqsNU+Z12I6slEstzGMpsq6AewCVw4lMjdWWgugzUrxQTRAsG87on6\ngOiQH2cMODN3L7Fq4KOLQIjb3/luQhAQhpdKmEGFLin3c+f5or3thCDuwwDtOU1l\nZf+8t9S8pZPLrZrIs6H2xjXqCRuUY7iRNbO18Ukc6rlDYhBj9LT+cpmBbHECAwEA\nAaOCAmYwggJiMA4GA1UdDwEB/wQEAwIFoDAdBgNVHSUEFjAUBggrBgEFBQcDAQYI\nKwYBBQUHAwIwDAYDVR0TAQH/BAIwADAdBgNVHQ4EFgQUJj2pvRtl3GloH3He6FX1\nds3X0VEwHwYDVR0jBBgwFoAUqEpqYwR93brm0Tm3pkVl7/Oo7KEwbwYIKwYBBQUH\nAQEEYzBhMC4GCCsGAQUFBzABhiJodHRwOi8vb2NzcC5pbnQteDMubGV0c2VuY3J5\ncHQub3JnMC8GCCsGAQUFBzAChiNodHRwOi8vY2VydC5pbnQteDMubGV0c2VuY3J5\ncHQub3JnLzAdBgNVHREEFjAUghJsaXN0cy5mb3Itb3VyLmluZm8wTAYDVR0gBEUw\nQzAIBgZngQwBAgEwNwYLKwYBBAGC3xMBAQEwKDAmBggrBgEFBQcCARYaaHR0cDov\nL2Nwcy5sZXRzZW5jcnlwdC5vcmcwggEDBgorBgEEAdZ5AgQCBIH0BIHxAO8AdgAp\nPFGWVMg5ZbqqUPxYB9S3b79Yeily3KTDDPTlRUf0eAAAAWvmGV7yAAAEAwBHMEUC\nICQL2Sm14aCMLxX9a9RbySgyBfichMRdbu6QA2Mbrl4eAiEA1vgJ7snqUWCgoqEE\n3SEfK3ioMopzWBsPvG6LdCuCMRAAdQBvU3asMfAxGdiZAKRRFf93FRwR2QLBACkG\njbIImjfZEwAAAWvmGV9oAAAEAwBGMEQCIExGqw3Lo0nSCyUuTRf92FgGASwWYji5\nUGnXuYnpJrAvAiBw8AWVag8fzZ4ogAhY9EFRNdLrUcBjStipL888vyuxKzANBgkq\nhkiG9w0BAQsFAAOCAQEAF8BBLDvSWZg57B6aDtzfUTSGetCYs3k0vJqCJlL+Pz7/\nUruCSsojQzp5R6jvvgYQ83MaIdwe2mgt+OCQB5v7ylctyBzBmYIw9nPnxEC7HlcJ\nL2K/k5ZjJFRnv4kV1Si8+TIpEAV0ksf39KGKemG8kGi4GXV1v03zSv0p8aCarpuo\nSKBJ4qlB0CvmS2MqV4KnzO0O2h0c/ZQ4jg7l53eiN7VPdRMMO1DRw+MaW6I/hEZp\n+oZQ7hhKXgKUBvF4IGwyrfyIZ8AeWKG4IP98COgyRbz7qtrAVevRKCM0ZC2t04A2\nFcix40FKEeiE093Aj3cweMYxNLPgwgQP8Xu3kA5QEw==\n-----END CERTIFICATE-----\n";
 
 const OPENID4VC_TEST_CA: &str = "-----BEGIN CERTIFICATE-----\nMIIC5DCCAcygAwIBAgIULPew9IlvsTLtEgLZKaBAbHMWN6kwDQYJKoZIhvcNAQEL\nBQAwEjEQMA4GA1UEAwwHdGVzdC1jYTAeFw0yNjA4MDExMTQ0MjNaFw0yNjA4MDIx\nMTQ0MjNaMBIxEDAOBgNVBAMMB3Rlc3QtY2EwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQDdFDwuha9KOic60ADk6zfGqrLTu4cXMVqs21lSP9mRrrNMfxpx\nVHw3flH8dxwVKGEr7ekAtnyceSApK/zmfnzaR9yrAyRtxIpWnSK1mMG01s4GKEsV\nFDeQPWZoEeHTMN6OfJ0PIzjNYIU060Ek2Yv0PPwEscjLZYyDaMtIQyEmPo3HB2/K\nGGMXzPN4uyvGOvKhX9hj7+Mpazfiz7uiX5U0ddeUkKm0pmLL3CrRtrq9sEZhRaVp\nYqJd4t7rnMSe3Xvrq6t+RFvlKrWj8hRe902vqGdglIqiNllRH6x7HJbhf2iixVDM\nrS6K2MgtnCi5Eb6zL9TC+5bW7aSXc3bS95qZAgMBAAGjMjAwMB0GA1UdDgQWBBS9\nUVt3endltN1shOipGpPp4CJNkjAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEB\nCwUAA4IBAQA4m2pWKEmz2YssnnyuZL7FHEVjlsDj0i8jGxHPUDbkeS0XLNCiY4NA\nPKZTjA9WJrcvgNcPaCC3GvWMRXLwNdUNjv4dF5VvscH9A3jo3HXl0Ht2zV7+g/lA\nCPSgIh58j6Tvduvl0TfplYnYFkKHq5+wjffZio5fqZ5heqxnREoJGTKtmUr0xJYj\nF3jUGLrX0QSqVaWloAbxR082dOJMHDcYosw0V/8cUuaHCWv2/wnH+RELG5tK59QS\nNgHe7Cd3DspxYA3jVdDINdFM10mklS8Di0twdoeAsrxyWYTR84RV5A/tHe1Zuxfb\n6P3fmVV6Dhj+M+skGJHFtiEap366e847\n-----END CERTIFICATE-----\n";
@@ -1920,6 +1970,33 @@ fn early_update_faults_leave_the_last_durable_phase_for_restart() {
 }
 
 #[test]
+fn external_secret_drift_blocks_a_signed_update_before_journal_mutation() {
+    let work = PrivateTempDir::new("nazoauth-update-external-secret-drift").unwrap();
+    let mut config = config(&work);
+    configure_external_dependency_fixture(&mut config);
+    fs::create_dir_all(&config.deployment_root).unwrap();
+    let mut value = journal(&config, UpdatePhase::Prepared);
+    write_update_journal(&config, &value).unwrap();
+    let journal_before = fs::read(update_journal_path(&config)).unwrap();
+    let runtime_url = &config.dependencies.database_url_file;
+    fs::write(
+        runtime_url,
+        "postgresql://runtime:runtime-secret@different.example/oauth?sslmode=require",
+    )
+    .unwrap();
+    crate::filesystem::set_mode(runtime_url, 0o600).unwrap();
+
+    assert!(
+        advance_update_transaction(&work.path().join("config.json"), &config, &mut value).is_err()
+    );
+    assert_eq!(value.phase, UpdatePhase::Prepared);
+    assert_eq!(
+        fs::read(update_journal_path(&config)).unwrap(),
+        journal_before
+    );
+}
+
+#[test]
 fn persisted_update_resumes_before_observing_the_absent_active_runtime() {
     let work = PrivateTempDir::new("nazoauth-update-resume-without-active-runtime").unwrap();
     let config = config(&work);
@@ -3165,6 +3242,49 @@ fn pending_local_oci_candidate_state_is_distinct_from_completed_state() {
     .unwrap();
     assert!(!deployment::local_oci_candidate_install_is_pending(&config).unwrap());
     assert!(deployment::local_oci_candidate_install_is_completed(&config).unwrap());
+}
+
+#[test]
+fn external_secret_drift_does_not_mutate_pending_candidate_state() {
+    let work = PrivateTempDir::new("nazoauth-candidate-external-secret-drift").unwrap();
+    let mut config = config(&work);
+    configure_external_dependency_fixture(&mut config);
+    fs::create_dir_all(&config.deployment_root).unwrap();
+    let revision = "a".repeat(40);
+    let state = LocalOciCandidateInstallState {
+        schema: 1,
+        candidate: LocalOciCandidateInstall {
+            image: "candidate:local".to_owned(),
+            target: CandidateTarget {
+                release: "v0.2.0-candidate.1".to_owned(),
+                revision: revision.clone(),
+                build_id: format!("source:{revision}"),
+                oci_digest: format!("sha256:{}", "b".repeat(64)),
+            },
+        },
+        local_artifact_id: format!("sha256:{}", "c".repeat(64)),
+        recovery_backup: None,
+        management_event_file: None,
+        management_event_sha256: None,
+        completed: false,
+    };
+    let state_path = deployment::local_oci_candidate_install_resource_path(&config);
+    atomic_write(
+        &state_path,
+        &serde_json::to_vec_pretty(&state).unwrap(),
+        0o600,
+    )
+    .unwrap();
+    let before = fs::read(&state_path).unwrap();
+    fs::write(
+        &config.dependencies.valkey_backup_url_file,
+        "rediss://backup:backup-secret@different-cache.example/0",
+    )
+    .unwrap();
+    crate::filesystem::set_mode(&config.dependencies.valkey_backup_url_file, 0o600).unwrap();
+
+    assert!(install::verify_live_external_dependencies(&config).is_err());
+    assert_eq!(fs::read(&state_path).unwrap(), before);
 }
 
 #[test]

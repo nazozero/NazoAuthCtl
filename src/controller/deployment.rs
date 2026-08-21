@@ -683,6 +683,12 @@ fn install_local_oci_candidate_transaction(
         return Ok(());
     }
 
+    // Re-read the durable external contract before recording a retry intent
+    // or touching any registration, task, or runtime state.  A config records
+    // only non-secret endpoint identities, so a changed secret file must fail
+    // closed.
+    install::verify_live_external_dependencies(config)?;
+
     let registration_recovery =
         ensure_local_oci_candidate_retry_is_unregistered(config, state.recovery_backup.is_some())?;
     if registration_recovery {
@@ -806,6 +812,7 @@ fn finish_local_oci_candidate_registration_recovery(
         .recovery_backup
         .as_deref()
         .context("local OCI candidate registration recovery has no durable backup")?;
+    Backup::open_existing(config, backup)?;
     register_local_oci_candidate_deployment(
         config_path,
         config,

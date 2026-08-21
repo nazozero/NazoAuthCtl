@@ -35,7 +35,7 @@ fn providers_split_secrets_from_non_secret_connection_parameters() {
 #[test]
 fn external_dependency_binding_canonicalizes_ports_and_rejects_alias_bypasses() {
     let binding = bind_external_dependency_credentials(
-        "postgresql://runtime:runtime-secret@db.example/oauth",
+        "postgresql://runtime:runtime-secret@db.example/oauth?sslmode=require",
         "postgresql://migrator:migration-secret@db.example:5432/oauth",
         "postgres://backup:backup-secret@DB.EXAMPLE/oauth",
         "rediss://runtime:runtime-secret@cache.example/0",
@@ -44,6 +44,18 @@ fn external_dependency_binding_canonicalizes_ports_and_rejects_alias_bypasses() 
     .unwrap();
     assert_eq!(binding.database_endpoint_sha256.len(), 64);
     assert_eq!(binding.valkey_endpoint_sha256.len(), 64);
+    let without_tls_query = bind_external_dependency_credentials(
+        "postgresql://runtime:runtime-secret@db.example/oauth",
+        "postgresql://migrator:migration-secret@db.example:5432/oauth",
+        "postgres://backup:backup-secret@DB.EXAMPLE/oauth",
+        "rediss://runtime:runtime-secret@cache.example/0",
+        "rediss://backup:backup-secret@CACHE.EXAMPLE:6379/0",
+    )
+    .unwrap();
+    assert_eq!(
+        binding.database_endpoint_sha256,
+        without_tls_query.database_endpoint_sha256
+    );
 
     for input in [
         (
@@ -54,7 +66,7 @@ fn external_dependency_binding_canonicalizes_ports_and_rejects_alias_bypasses() 
             "rediss://backup:backup-secret@cache.example/0",
         ),
         (
-            "postgresql://runtime:runtime-secret@db.example/oauth?sslmode=require",
+            "postgresql://runtime:runtime-secret@db.example/oauth?application_name=nazoauth",
             "postgresql://migrator:migration-secret@db.example/oauth",
             "postgresql://backup:backup-secret@db.example/oauth",
             "rediss://runtime:runtime-secret@cache.example/0",

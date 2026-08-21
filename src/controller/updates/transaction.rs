@@ -229,6 +229,9 @@ pub(crate) fn advance_update_transaction(
     config: &UpdateConfig,
     journal: &mut UpdateJournal,
 ) -> anyhow::Result<()> {
+    // An update journal can resume at any phase.  Verify the live external
+    // contract before it can change a phase, runtime, or audit state.
+    install::verify_live_external_dependencies(config)?;
     let runtime = Runtime::new(config);
     let resuming_activated_target = journal.phase >= UpdatePhase::CandidateActive;
     if resuming_activated_target {
@@ -254,6 +257,12 @@ pub(crate) fn advance_update_transaction(
         set_update_phase(config, journal, UpdatePhase::BackupCreated)?;
     }
     if journal.phase < UpdatePhase::MigrationApplied {
+        // A durable update journal may be replayed after external provider
+        // credentials have changed.  Verify both the live five-secret binding
+        // and the committed backup before advancing a phase or running DDL.
+        if journal.phase >= UpdatePhase::BackupCreated {
+            journal_backup(config, journal)?;
+        }
         set_update_phase(config, journal, UpdatePhase::MigrationRunning)?;
         execute_manifest_task(
             config,

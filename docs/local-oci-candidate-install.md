@@ -43,8 +43,9 @@ non-secret ownership assertion:
 ```
 
 Unknown or missing fields are rejected. Runtime PostgreSQL and Valkey URLs are
-the only dependency credentials mounted into the long-lived server; migration
-and both backup URLs remain root-only. Backups use only the two backup URLs.
+the only dependency credentials mounted into the long-lived server; the
+migration URL is available only to the isolated non-root migration task and
+both backup URLs remain root-only. Backups use only the two backup URLs.
 `valkey_backup_scope` is an operator assertion that the raw RDB export target
 is a deployment-dedicated Valkey instance; shared instances are rejected and
 must not be used for this path. Ctl canonicalizes the PostgreSQL and Valkey

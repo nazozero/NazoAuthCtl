@@ -1,4 +1,4 @@
-use std::{fmt::Write as _, path::Path};
+use std::{fmt::Write as _, ops::Deref, path::Path};
 
 use anyhow::{Context, bail};
 use sha2::{Digest as _, Sha256};
@@ -15,9 +15,11 @@ pub(crate) struct PostgresProvider {
 impl PostgresProvider {
     pub(crate) fn from_url_file(path: &Path) -> anyhow::Result<Self> {
         let raw = read_single_line(path)?;
-        // `Url` necessarily owns the parsed source while this scope is active;
-        // the source is Zeroizing and no URL/string clone outlives parsing.
-        let url = Url::parse(raw.as_str()).context("PostgreSQL secret provider URL is invalid")?;
+        // The source is Zeroizing and the URL wrapper scrubs its credential
+        // components before the parser allocation is released.
+        let url = SensitiveUrl(
+            Url::parse(raw.as_str()).context("PostgreSQL secret provider URL is invalid")?,
+        );
         if !matches!(url.scheme(), "postgres" | "postgresql") {
             bail!("PostgreSQL secret provider has an unsupported scheme");
         }
@@ -89,7 +91,7 @@ impl PostgresProvider {
 pub(crate) struct ValkeyProvider {
     pub(crate) host: String,
     pub(crate) port: u16,
-    pub(crate) username: Option<String>,
+    pub(crate) username: Option<zeroize::Zeroizing<String>>,
     pub(crate) database: u32,
     pub(crate) tls: bool,
     password: zeroize::Zeroizing<String>,
@@ -98,14 +100,16 @@ pub(crate) struct ValkeyProvider {
 impl ValkeyProvider {
     pub(crate) fn from_url_file(path: &Path) -> anyhow::Result<Self> {
         let raw = read_single_line(path)?;
-        let url = Url::parse(raw.as_str()).context("Valkey secret provider URL is invalid")?;
+        let url = SensitiveUrl(
+            Url::parse(raw.as_str()).context("Valkey secret provider URL is invalid")?,
+        );
         if !matches!(url.scheme(), "redis" | "rediss") || url.query().is_some() {
             bail!("Valkey secret provider has an unsupported URL");
         }
         let username = (!url.username().is_empty())
             .then(|| decode(url.username(), "Valkey user"))
             .transpose()?
-            .map(|value| value.to_string());
+            .map(|value| value);
         let password = decode(
             url.password().context("Valkey URL has no password")?,
             "Valkey password",
@@ -195,18 +199,63 @@ pub(crate) fn bind_external_dependency_url_files(
 
 struct ProviderBinding {
     endpoint: String,
-    username: String,
+    username: zeroize::Zeroizing<String>,
+}
+
+/// `url::Url` owns user-info while parsing. Keep it inside a wrapper that
+/// removes credential-bearing components even on an error path before the URL
+/// allocation is dropped.
+struct SensitiveUrl(Url);
+
+impl Deref for SensitiveUrl {
+    type Target = Url;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for SensitiveUrl {
+    fn drop(&mut self) {
+        let _ = self.0.set_password(None);
+        let _ = self.0.set_username("");
+        self.0.set_path("");
+        self.0.set_query(None);
+        self.0.set_fragment(None);
+    }
 }
 
 fn postgres_binding(value: &str, label: &str) -> anyhow::Result<ProviderBinding> {
-    let url = Url::parse(value).with_context(|| format!("{label} URL is invalid"))?;
-    if !matches!(url.scheme(), "postgres" | "postgresql") || url.query().is_some() {
-        bail!("{label} URL must use a canonical PostgreSQL endpoint without query options");
+    let url = SensitiveUrl(Url::parse(value).with_context(|| format!("{label} URL is invalid"))?);
+    if !matches!(url.scheme(), "postgres" | "postgresql") {
+        bail!("{label} URL must use a PostgreSQL endpoint");
+    }
+    for (key, value) in url.query_pairs() {
+        // `sslmode` is transport policy, rather than endpoint or principal
+        // identity.  Preserve the existing supported TLS form without making
+        // equivalent TLS policy spellings change the durable endpoint hash.
+        if key != "sslmode"
+            || !matches!(
+                value.as_ref(),
+                "disable" | "allow" | "prefer" | "require" | "verify-ca" | "verify-full"
+            )
+        {
+            bail!("{label} URL has an unsupported PostgreSQL query option");
+        }
     }
     let host = url.host_str().context("PostgreSQL URL has no host")?;
     let username = decode(url.username(), "PostgreSQL user")?;
+    let password = decode(
+        url.password().context("PostgreSQL URL has no password")?,
+        "PostgreSQL password",
+    )?;
     let database = decode(url.path().trim_start_matches('/'), "PostgreSQL database")?;
-    if username.is_empty() || database.is_empty() || database.contains('/') {
+    if username.is_empty()
+        || password.is_empty()
+        || database.is_empty()
+        || database.contains('/')
+        || host.contains(['\0', '\r', '\n'])
+    {
         bail!("{label} URL has an invalid canonical PostgreSQL endpoint");
     }
     Ok(ProviderBinding {
@@ -216,19 +265,29 @@ fn postgres_binding(value: &str, label: &str) -> anyhow::Result<ProviderBinding>
             url.port().unwrap_or(5432),
             database.as_str()
         ),
-        username: username.to_string(),
+        username,
     })
 }
 
 fn valkey_binding(value: &str, label: &str) -> anyhow::Result<ProviderBinding> {
-    let url = Url::parse(value).with_context(|| format!("{label} URL is invalid"))?;
+    let url = SensitiveUrl(Url::parse(value).with_context(|| format!("{label} URL is invalid"))?);
     if !matches!(url.scheme(), "redis" | "rediss") || url.query().is_some() {
         bail!("{label} URL must use a canonical Valkey endpoint without query options");
     }
     let host = url.host_str().context("Valkey URL has no host")?;
     let username = decode(url.username(), "Valkey user")?;
+    let password = decode(
+        url.password().context("Valkey URL has no password")?,
+        "Valkey password",
+    )?;
     let database = decode(url.path().trim_start_matches('/'), "Valkey database")?;
-    if username.is_empty() || database.is_empty() || database.contains('/') {
+    if username.is_empty()
+        || password.is_empty()
+        || database.is_empty()
+        || database.contains('/')
+        || database.parse::<u32>().is_err()
+        || host.contains(['\0', '\r', '\n'])
+    {
         bail!("{label} URL has an invalid canonical Valkey endpoint");
     }
     Ok(ProviderBinding {
@@ -239,7 +298,7 @@ fn valkey_binding(value: &str, label: &str) -> anyhow::Result<ProviderBinding> {
             url.port().unwrap_or(6379),
             database.as_str()
         ),
-        username: username.to_string(),
+        username,
     })
 }
 
@@ -252,20 +311,23 @@ fn endpoint_sha256(endpoint: &str) -> String {
 
 fn read_single_line(path: &Path) -> anyhow::Result<zeroize::Zeroizing<String>> {
     let bytes = read_secure_secret_file(path, "secret provider", MAX_SECRET_PROVIDER_BYTES)?;
-    let value = String::from_utf8(bytes.to_vec())
+    let value = std::str::from_utf8(&bytes)
         .with_context(|| format!("secret provider is not valid UTF-8: {}", path.display()))?;
+    let value = zeroize::Zeroizing::new(value.to_owned());
     if value.is_empty() || value.contains(['\r', '\n']) {
         bail!("secret provider input must be one non-empty line");
     }
-    Ok(zeroize::Zeroizing::new(value))
+    Ok(value)
 }
 
 fn decode(value: &str, label: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
-    let decoded = urlencoding::decode(value)
-        .with_context(|| format!("{label} has invalid percent encoding"))?
-        .into_owned();
+    let decoded = zeroize::Zeroizing::new(
+        urlencoding::decode(value)
+            .with_context(|| format!("{label} has invalid percent encoding"))?
+            .into_owned(),
+    );
     reject_credential_controls(&decoded, label)?;
-    Ok(zeroize::Zeroizing::new(decoded))
+    Ok(decoded)
 }
 
 fn reject_credential_controls(value: &str, label: &str) -> anyhow::Result<()> {
