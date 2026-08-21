@@ -165,6 +165,11 @@ pub(crate) fn reject_pending_local_oci_candidate_record(
             "local OCI candidate installation is pending; repeat its exact install command before mutating the registered deployment"
         );
     }
+    if deployment::local_oci_candidate_registered_recovery_is_pending(&config)? {
+        bail!(
+            "registered local OCI candidate recovery is pending; run its dedicated recover command before mutating the deployment"
+        );
+    }
     Ok(())
 }
 
@@ -367,6 +372,11 @@ fn control_config_with_lock_mode(
     if deployment::local_oci_candidate_install_is_pending(&config)? {
         bail!(
             "local OCI candidate installation is pending; repeat its exact install command or inspect status before running controller commands"
+        );
+    }
+    if deployment::local_oci_candidate_registered_recovery_is_pending(&config)? {
+        bail!(
+            "registered local OCI candidate recovery is pending; only its dedicated recover command may proceed"
         );
     }
     if lock_mode == DeploymentLockMode::Exclusive {
@@ -594,6 +604,13 @@ struct LocalOciCandidateInstallState {
     management_event_file: Option<String>,
     #[serde(default)]
     management_event_sha256: Option<String>,
+    /// Distinguishes initial completion from a registered-recovery generation.
+    #[serde(default)]
+    completion_kind: Option<String>,
+    #[serde(default)]
+    completion_generation: Option<u64>,
+    #[serde(default)]
+    management_event_sequence: Option<u64>,
     completed: bool,
 }
 

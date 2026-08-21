@@ -432,7 +432,9 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 Ok(false) => status(&load_config(&cli.config)?),
                 Err(error) => {
                     let config = load_config_unsettled(&cli.config)?;
-                    if deployment::local_oci_candidate_install_is_pending(&config)? {
+                    if deployment::local_oci_candidate_install_is_pending(&config)?
+                        || deployment::local_oci_candidate_registered_recovery_is_pending(&config)?
+                    {
                         return status(&config);
                     }
                     Err(error)
@@ -449,7 +451,9 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 Ok(false) => doctor(&load_config(&cli.config)?),
                 Err(error) => {
                     let config = load_config_unsettled(&cli.config)?;
-                    if deployment::local_oci_candidate_install_is_pending(&config)? {
+                    if deployment::local_oci_candidate_install_is_pending(&config)?
+                        || deployment::local_oci_candidate_registered_recovery_is_pending(&config)?
+                    {
                         return doctor(&config);
                     }
                     Err(error)
