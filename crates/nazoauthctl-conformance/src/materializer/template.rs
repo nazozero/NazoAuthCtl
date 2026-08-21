@@ -599,6 +599,13 @@ fn resolve_reference(
         )));
     }
     if name == "target.ciba_automated_decision_url" {
+        if prepared.bundle_digest.is_none() {
+            return prepared
+                .ciba_user_approval_callback_url
+                .as_ref()
+                .map(|value| Value::String(value.to_string()))
+                .ok_or_else(|| MaterializerError::UnknownSecretReference(name.to_owned()));
+        }
         let token = ciba_client_logical
             .and_then(|logical| prepared.ciba_decision_tokens.get(logical))
             .or(prepared.ciba_automated_decision_token.as_ref())
