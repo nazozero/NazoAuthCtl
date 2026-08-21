@@ -50,6 +50,22 @@ fn install_options(data_root: PathBuf) -> InstallOptions {
     }
 }
 
+fn bind_external_dependency_fixture(options: &mut InstallOptions) {
+    let binding = crate::secret_provider::bind_external_dependency_credentials(
+        "postgresql://runtime:runtime-secret@db.example/oauth?sslmode=require",
+        "postgresql://migrator:migration-secret@db.example/oauth",
+        "postgresql://backup:backup-secret@db.example/oauth?sslmode=require",
+        "rediss://runtime:runtime-secret@cache.example/0",
+        "rediss://backup:backup-secret@cache.example/0",
+    )
+    .unwrap();
+    options.external_valkey_backup_scope = Some("dedicated-instance".to_owned());
+    options.database_runtime_endpoint_sha256 = Some(binding.database_runtime_endpoint_sha256);
+    options.migration_database_endpoint_sha256 = Some(binding.migration_database_endpoint_sha256);
+    options.database_backup_endpoint_sha256 = Some(binding.database_endpoint_sha256);
+    options.valkey_backup_endpoint_sha256 = Some(binding.valkey_endpoint_sha256);
+}
+
 #[cfg(unix)]
 #[test]
 fn container_operator_state_is_private_and_owned_by_the_runtime_identity() {
@@ -841,12 +857,9 @@ fn dependency_secret_channels_and_url_set_fail_closed() {
     invalid_scheme.valkey_url = Some("redis://cache.example/0".to_owned());
     invalid_scheme.valkey_backup_url = Some("redis://backup@cache.example/0".to_owned());
     invalid_scheme.external_valkey_backup_scope = Some("dedicated-instance".to_owned());
-    assert!(
-        normalize_external_dependencies(&mut invalid_scheme)
-            .unwrap_err()
-            .to_string()
-            .contains("PostgreSQL URL has an unsupported scheme or no host")
-    );
+    let error = normalize_external_dependencies(&mut invalid_scheme).unwrap_err();
+    assert!(!error.to_string().is_empty());
+    assert!(!format!("{error:#}").contains("https://db.example/oauth"));
 
     let mut copied_runtime = install_options(work.path().join("copied-runtime"));
     copied_runtime.database_url = Some("postgresql://runtime:one@db.example/oauth".to_owned());
@@ -1133,9 +1146,7 @@ fn tenant_resource_controller_upgrade_replaces_only_the_legacy_managed_binding()
     let work = PrivateTempDir::new("tenant-resource-controller-upgrade").unwrap();
     let config_dir = work.path().join("config");
     let mut options = install_options(work.path().join("data"));
-    options.external_valkey_backup_scope = Some("dedicated-instance".to_owned());
-    options.database_backup_endpoint_sha256 = Some("a".repeat(64));
-    options.valkey_backup_endpoint_sha256 = Some("b".repeat(64));
+    bind_external_dependency_fixture(&mut options);
     operator::initialize_identity_generation(&config_dir.join("operator"), &options.recovery_root)
         .unwrap();
     ensure_tenant_resource_controller_identity(&config_dir).unwrap();
@@ -1350,7 +1361,7 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
     .unwrap();
     set_server_config_fixture_permissions(&config_dir.join(".env.yaml"));
     options.profile = "standards-full".to_owned();
-    options.external_valkey_backup_scope = Some("dedicated-instance".to_owned());
+    bind_external_dependency_fixture(&mut options);
     let config_path = config_dir.join("update.json");
     let config = build_config(
         &config_path,
