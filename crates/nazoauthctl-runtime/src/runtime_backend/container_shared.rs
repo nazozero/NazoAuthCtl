@@ -549,9 +549,12 @@ pub(crate) fn one_shot_process(
 pub(crate) fn build_identity_process(command: &OsStr) -> Process {
     let mut policy = ContainerRuntimePolicy::managed_default();
     policy.restart = ContainerRestartPolicy::No;
-    append_container_policy(Process::new(command).args(["run", "--rm"]), &policy)
-        .arg("--user")
-        .arg(NON_ROOT_ONE_SHOT_USER)
+    append_container_policy(
+        Process::new(command).args(["run", "--rm", "--pull=never"]),
+        &policy,
+    )
+    .arg("--user")
+    .arg(NON_ROOT_ONE_SHOT_USER)
 }
 
 /// Build the narrowly privileged process used to copy an already-validated
@@ -564,6 +567,7 @@ pub(crate) fn build_managed_volume_copy_process(command: &OsStr) -> Process {
     Process::new(command).args([
         "run",
         "--rm",
+        "--pull=never",
         "--user",
         "0:0",
         "--network",

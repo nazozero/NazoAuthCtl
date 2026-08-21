@@ -506,7 +506,7 @@ fn validate_local_oci_candidate_install_state(
         value.len() == 64
             && value
                 .bytes()
-                .all(|byte| byte.is_ascii_digit() || (byte >= b'a' && byte <= b'f'))
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     };
     for value in [
         state.migration_receipt_sha256.as_deref(),
@@ -882,10 +882,8 @@ pub(super) fn recover_registered_local_oci_candidate(
                     // CAS has not happened.  The locked predecessor remains
                     // the only declaration this journal may advance.
                 } else if record.declaration_revision == committed_revision
-                    && journal.staged_state.as_ref().is_some_and(|state| {
-                        validate_local_oci_candidate_recovery_resources(&config, &record, state)
-                            .is_ok()
-                    })
+                    && journal.intended_successor_record_sha256.as_deref()
+                        == Some(expected_record_sha256.as_str())
                 {
                     // CAS succeeded before the next durable journal write.
                     // The exact staged resource bindings prove that this is
@@ -898,9 +896,8 @@ pub(super) fn recover_registered_local_oci_candidate(
                     );
                 }
             } else if record.declaration_revision != committed_revision
-                || !journal.staged_state.as_ref().is_some_and(|state| {
-                    validate_local_oci_candidate_recovery_resources(&config, &record, state).is_ok()
-                })
+                || journal.intended_successor_record_sha256.as_deref()
+                    != Some(expected_record_sha256.as_str())
             {
                 bail!(
                     "local OCI candidate recovery committed declaration no longer matches its staged generation"
@@ -911,12 +908,13 @@ pub(super) fn recover_registered_local_oci_candidate(
         None => {
             validate_completed_local_oci_candidate_provenance(&config, &record)?;
             let journal = LocalOciCandidateRecoveryJournal {
-                schema: 1,
+                schema: 2,
                 deployment_id: record.deployment_id.clone(),
                 runtime_instance_id: config.runtime.runtime_instance_id.clone(),
                 generation,
                 expected_declaration_revision: record.declaration_revision,
                 expected_record_sha256,
+                intended_successor_record_sha256: None,
                 phase: LocalOciCandidateRecoveryPhase::Prepared,
                 staged_state: None,
             };
@@ -931,6 +929,10 @@ pub(super) fn recover_registered_local_oci_candidate(
         },
         Ok,
     )?;
+    // A journal embeds the staged state so it can outlive replacement of the
+    // ordinary state file.  Treat it as untrusted durable input and apply the
+    // same schema/JTI/receipt invariants before deriving a successor record.
+    validate_local_oci_candidate_install_state(&config, &state)?;
     if journal.phase < LocalOciCandidateRecoveryPhase::DeclarationCommitted {
         validate_completed_local_oci_candidate_provenance(&config, &record)?;
     }
@@ -1069,6 +1071,80 @@ pub(super) fn recover_registered_local_oci_candidate(
         .staged_state
         .clone()
         .context("staged local OCI candidate recovery has no durable state")?;
+    if journal.phase < LocalOciCandidateRecoveryPhase::DeclarationCommitted {
+        let successor = register_local_oci_candidate_deployment_locked(
+            config_path,
+            &config,
+            &state.candidate,
+            &state.local_artifact_id,
+            state.rollback_backup.as_deref().expect("set above"),
+            state.baseline_backup.as_deref().expect("set above"),
+            state.recovery_package.as_deref().expect("set above"),
+            state.recovery_archive_sha256.as_deref().expect("set above"),
+            state.recovery_cache_sha256.as_deref().expect("set above"),
+            Some(&record),
+            false,
+        )?;
+        let successor_sha256 = local_oci_candidate_record_sha256(&successor)?;
+        match journal.intended_successor_record_sha256.as_deref() {
+            Some(expected) if expected == successor_sha256.as_str() => {}
+            Some(_) => bail!("candidate recovery journal successor declaration changed"),
+            None => {
+                journal.intended_successor_record_sha256 = Some(successor_sha256);
+                write_local_oci_candidate_recovery_journal(&config, &journal)?;
+            }
+        }
+    }
+    if journal.phase == LocalOciCandidateRecoveryPhase::Staged {
+        // A reboot after staging may have lost every managed runtime object.
+        // The new baseline is the only restore source for this generation;
+        // never reuse the earlier rollback backup whose restore journal was
+        // consumed before staging.
+        let package = state
+            .recovery_package
+            .as_deref()
+            .context("staged local OCI candidate recovery has no package")?;
+        let package_sha256 = state
+            .recovery_cache_sha256
+            .as_deref()
+            .context("staged local OCI candidate recovery has no package digest")?;
+        if crate::filesystem::sha256(package)? != package_sha256 {
+            bail!("staged local OCI candidate recovery package changed");
+        }
+        let directory = package
+            .parent()
+            .context("staged local OCI candidate recovery package has no parent")?;
+        for (name, image, digest) in [
+            (
+                "postgres-image.tar",
+                config.postgres.image.as_str(),
+                state.recovery_postgres_archive_sha256.as_deref(),
+            ),
+            (
+                "valkey-image.tar",
+                config.valkey.image.as_str(),
+                state.recovery_valkey_archive_sha256.as_deref(),
+            ),
+        ] {
+            let archive = directory.join(name);
+            let digest =
+                digest.context("staged local OCI candidate has no dependency archive digest")?;
+            if crate::filesystem::sha256(&archive)? != digest {
+                bail!("staged local OCI candidate dependency archive changed");
+            }
+            runtime.import_image(&archive, image)?;
+        }
+        install::start_managed_dependencies(&config)?;
+        let baseline = Backup::open_existing(
+            &config,
+            state
+                .baseline_backup
+                .as_deref()
+                .context("staged local OCI candidate recovery has no baseline")?,
+        )?;
+        baseline.restore_databases(&config)?;
+        baseline.restore_snapshots(&config.runtime.snapshot_paths)?;
+    }
     // A crash after staging can coincide with loss of the runtime image
     // cache. Re-import the staged generation by immutable archive before the
     // active-image observation; import is idempotent and never pulls.
@@ -1096,7 +1172,7 @@ pub(super) fn recover_registered_local_oci_candidate(
         write_local_oci_candidate_recovery_journal(&config, &journal)?;
     }
     if journal.phase < LocalOciCandidateRecoveryPhase::DeclarationCommitted {
-        register_local_oci_candidate_deployment_locked(
+        let successor = register_local_oci_candidate_deployment_locked(
             config_path,
             &config,
             &state.candidate,
@@ -1107,7 +1183,12 @@ pub(super) fn recover_registered_local_oci_candidate(
             state.recovery_archive_sha256.as_deref().expect("set above"),
             state.recovery_cache_sha256.as_deref().expect("set above"),
             Some(&record),
+            true,
         )?;
+        let successor_sha256 = local_oci_candidate_record_sha256(&successor)?;
+        if journal.intended_successor_record_sha256.as_deref() != Some(successor_sha256.as_str()) {
+            bail!("candidate recovery CAS did not persist its intended successor declaration");
+        }
         journal.phase = LocalOciCandidateRecoveryPhase::DeclarationCommitted;
         write_local_oci_candidate_recovery_journal(&config, &journal)?;
     }
@@ -1701,7 +1782,7 @@ fn load_local_oci_candidate_recovery_journal(
             true,
             256 * 1024,
         )?)?;
-    if journal.schema != 1
+    if journal.schema != 2
         || journal.generation != generation
         || journal.deployment_id != config.operator.deployment_id
         || journal.runtime_instance_id != config.runtime.runtime_instance_id
@@ -1710,6 +1791,15 @@ fn load_local_oci_candidate_recovery_journal(
             .expected_record_sha256
             .bytes()
             .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+        || journal
+            .intended_successor_record_sha256
+            .as_ref()
+            .is_some_and(|digest| {
+                digest.len() != 64
+                    || !digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
     {
         bail!("local OCI candidate recovery journal has an unsupported schema or binding");
     }
@@ -2400,7 +2490,9 @@ fn register_local_oci_candidate_deployment(
         recovery_archive_sha256,
         recovery_cache_sha256,
         None,
-    )
+        true,
+    )?;
+    Ok(())
 }
 
 fn register_local_oci_candidate_deployment_locked(
@@ -2414,7 +2506,8 @@ fn register_local_oci_candidate_deployment_locked(
     recovery_archive_sha256: &str,
     recovery_cache_sha256: &str,
     expected_existing: Option<&DeploymentRecord>,
-) -> anyhow::Result<()> {
+    persist: bool,
+) -> anyhow::Result<DeploymentRecord> {
     use crate::deployment::{
         ArtifactReference, DEPLOYMENT_SCHEMA, DeploymentRecord, DeploymentStore, MountReference,
         RecoveryAssessment, RecoveryConclusion, ResourceScope, Responsibility, RuntimeInstance,
@@ -2615,15 +2708,18 @@ fn register_local_oci_candidate_deployment_locked(
             .unwrap_or(1),
     };
     let store = DeploymentStore::system();
-    if let Some(expected) = expected_existing {
-        // Registered recovery is a new declaration generation.  It must not
-        // masquerade as a fresh exact persistence: the record loaded under
-        // the deployment lock is the CAS predecessor and every rotated
-        // baseline/package binding advances its revision exactly once.
-        store.persist_declaration_cas_locked(expected, &record)
-    } else {
-        store.persist_exact_locked(&record)
+    if persist {
+        if let Some(expected) = expected_existing {
+            // Registered recovery is a new declaration generation.  It must not
+            // masquerade as a fresh exact persistence: the record loaded under
+            // the deployment lock is the CAS predecessor and every rotated
+            // baseline/package binding advances its revision exactly once.
+            store.persist_declaration_cas_locked(expected, &record)?;
+        } else {
+            store.persist_exact_locked(&record)?;
+        }
     }
+    Ok(record)
 }
 
 fn installed_deployment_resources(

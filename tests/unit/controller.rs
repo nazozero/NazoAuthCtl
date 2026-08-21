@@ -1552,7 +1552,7 @@ fn successful_legacy_rollback_consumes_only_after_a_durable_archive_exists() {
     let work = PrivateTempDir::new("nazoauth-rollback-state-consumption").unwrap();
     let config = config(&work);
     let state = RollbackState {
-        schema: 1,
+        schema: 2,
         from_release: manifest("v0.1.2", 'b'),
         to_release: manifest("v0.2.0", 'e'),
         previous_runtime: "trusted-runtime".to_owned(),
@@ -3344,12 +3344,13 @@ fn registered_candidate_recovery_journal_is_an_unsettled_global_guard() {
         .join(&config.runtime.runtime_instance_id);
     fs::create_dir_all(&root).unwrap();
     let journal = LocalOciCandidateRecoveryJournal {
-        schema: 1,
+        schema: 2,
         deployment_id: config.operator.deployment_id.clone(),
         runtime_instance_id: config.runtime.runtime_instance_id.clone(),
         generation: 1,
         expected_declaration_revision: 1,
         expected_record_sha256: "a".repeat(64),
+        intended_successor_record_sha256: None,
         phase: LocalOciCandidateRecoveryPhase::Accepted,
         staged_state: None,
     };

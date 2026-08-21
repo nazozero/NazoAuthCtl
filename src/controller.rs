@@ -639,6 +639,7 @@ struct LocalOciCandidateRecoveryJournal {
     generation: u64,
     expected_declaration_revision: u64,
     expected_record_sha256: String,
+    intended_successor_record_sha256: Option<String>,
     phase: LocalOciCandidateRecoveryPhase,
     #[serde(default)]
     staged_state: Option<LocalOciCandidateInstallState>,
