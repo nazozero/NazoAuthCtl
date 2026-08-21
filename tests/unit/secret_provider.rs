@@ -148,7 +148,7 @@ fn dependency_url_parser_is_strict_about_percent_encoding_and_hosts() {
         "PostgreSQL runtime",
     )
     .unwrap();
-    assert_eq!(ipv6.host, "[2001:db8::1]");
+    assert_eq!(ipv6.host, "2001:db8::1");
     let dns = parse_dependency_url(
         "postgresql://runtime:secret@DB.EXAMPLE/oauth",
         "PostgreSQL runtime",
@@ -165,6 +165,31 @@ fn dependency_url_parser_is_strict_about_percent_encoding_and_hosts() {
     ] {
         assert!(parse_dependency_url(input, "PostgreSQL runtime").is_err());
     }
+}
+
+#[test]
+fn providers_pass_bare_canonical_ipv6_hosts_to_postgres_and_valkey() {
+    let work = PrivateTempDir::new("nazoauth-provider-ipv6-host").unwrap();
+    let postgres = work.path().join("postgres");
+    fs::write(
+        &postgres,
+        "postgresql://alice:secret@[2001:0DB8:0:0:0:0:0:1]/oauth?sslmode=require",
+    )
+    .unwrap();
+    crate::filesystem::set_mode(&postgres, 0o600).unwrap();
+    let provider = PostgresProvider::from_url_file(&postgres).unwrap();
+    assert!(
+        fs::read_to_string(provider.service_file())
+            .unwrap()
+            .contains("host=2001:db8::1\n")
+    );
+
+    let valkey = work.path().join("valkey");
+    fs::write(&valkey, "rediss://backup:secret@[2001:0DB8:0:0:0:0:0:1]/0").unwrap();
+    crate::filesystem::set_mode(&valkey, 0o600).unwrap();
+    let provider = ValkeyProvider::from_url_file(&valkey).unwrap();
+    assert_eq!(provider.host, "2001:db8::1");
+    assert!(provider.tls);
 }
 
 #[test]

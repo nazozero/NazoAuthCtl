@@ -340,7 +340,7 @@ fn parse_host_port(value: &str, label: &str) -> anyhow::Result<(String, Option<u
         let address = host
             .parse::<Ipv6Addr>()
             .with_context(|| format!("{label} URL host is invalid"))?;
-        (format!("[{address}]"), port)
+        (address.to_string(), port)
     } else {
         match value.split_once(':') {
             Some((host, port)) if !port.contains(':') => (host.to_owned(), Some(port.to_owned())),
@@ -348,9 +348,10 @@ fn parse_host_port(value: &str, label: &str) -> anyhow::Result<(String, Option<u
             None => (value.to_owned(), None),
         }
     };
-    let host = if host.starts_with('[') {
-        // Only the branch above can construct bracketed text, after parsing it
-        // as Ipv6Addr. Never accept brackets in the DNS/IPv4 path.
+    let host = if value.starts_with('[') {
+        // The branch above accepts this only after parsing it as Ipv6Addr.
+        // Keep the internal representation bare; brackets belong only to URI
+        // authority serialization, never service files or `valkey-cli -h`.
         host
     } else {
         normalize_host(&host, label)?
@@ -423,7 +424,7 @@ fn postgres_binding_from_url(url: DependencyUrl, label: &str) -> anyhow::Result<
     Ok(ProviderBinding {
         endpoint: format!(
             "postgresql://{}:{}/{}",
-            url.host.to_ascii_lowercase(),
+            uri_authority_host(&url.host),
             url.port.unwrap_or(5432),
             url.database.as_str()
         ),
@@ -449,7 +450,7 @@ fn valkey_binding_from_url(url: DependencyUrl, label: &str) -> anyhow::Result<Pr
         endpoint: format!(
             "{}://{}:{}/{}",
             tls_policy.as_str(),
-            url.host.to_ascii_lowercase(),
+            uri_authority_host(&url.host),
             url.port.unwrap_or(6379),
             url.database.as_str()
         ),
@@ -490,7 +491,7 @@ fn postgres_endpoint_sha256(url: &DependencyUrl, label: &str) -> anyhow::Result<
     }
     Ok(endpoint_sha256(&format!(
         "postgresql://{}:{}/{};tls-policy={}",
-        url.host,
+        uri_authority_host(&url.host),
         url.port.unwrap_or(5432),
         url.database.as_str(),
         tls_policy.unwrap_or("default")
@@ -507,11 +508,19 @@ fn valkey_endpoint_sha256(url: &DependencyUrl, label: &str) -> anyhow::Result<St
     Ok(endpoint_sha256(&format!(
         "{}://{}:{}/{};tls-policy={}",
         url.scheme,
-        url.host,
+        uri_authority_host(&url.host),
         url.port.unwrap_or(6379),
         url.database.as_str(),
         url.scheme
     )))
+}
+
+fn uri_authority_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    }
 }
 
 fn read_single_line(path: &Path) -> anyhow::Result<zeroize::Zeroizing<String>> {
