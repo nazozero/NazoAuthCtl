@@ -10,7 +10,8 @@ use crate::process::Process;
 use anyhow::{Context as _, bail};
 
 use super::super::{
-    ContainerRestartPolicy, ContainerRuntimePolicy, ManagedNetwork, managed_network_config_digest,
+    ContainerRestartPolicy, ContainerRuntimePolicy, ManagedNetwork, ManagedOneShotIdentity,
+    managed_network_config_digest,
 };
 
 const ENGINE_FIXED_MOUNT_DESTINATIONS: &[&str] =
@@ -507,6 +508,100 @@ pub(crate) fn remove_managed_container_by_name(
         config_digest,
         backend_name,
     )
+}
+
+/// Quiesce the exact named candidate task, if an engine retained one despite
+/// `--rm`.  Name lookup is never enough: both lookup forms must retain every
+/// label from the signed/durable task identity before the immutable container
+/// id may be force-removed.  A normal `--rm` absence is idempotent.
+pub(crate) fn quiesce_managed_one_shot(
+    command: &OsStr,
+    identity: &ManagedOneShotIdentity,
+    backend_name: &str,
+) -> anyhow::Result<()> {
+    let deployment = identity
+        .labels
+        .get(DEPLOYMENT_LABEL)
+        .context("managed one-shot identity has no deployment label")?;
+    let authority = identity
+        .labels
+        .get(AUTHORITY_LABEL)
+        .context("managed one-shot identity has no control-authority label")?;
+    let runtime = identity
+        .labels
+        .get(RUNTIME_INSTANCE_LABEL)
+        .context("managed one-shot identity has no runtime-instance label")?;
+    let resource = identity
+        .labels
+        .get(RESOURCE_KIND_LABEL)
+        .context("managed one-shot identity has no managed-resource label")?;
+    let digest = identity
+        .labels
+        .get(CONFIG_DIGEST_LABEL)
+        .context("managed one-shot identity has no config-digest label")?;
+    let Some(id) = inspect_managed_container_id(
+        command,
+        &identity.name,
+        deployment,
+        authority,
+        Some(runtime),
+        resource,
+        digest,
+        backend_name,
+    )?
+    else {
+        return Ok(());
+    };
+    assert_exact_one_shot_labels(command, &id, identity, backend_name)?;
+    // `rm --force` is the engine's atomic stop/remove primitive.  It is
+    // issued by immutable id only after both name and id checks above.
+    remove_managed_container_by_id(
+        command,
+        &id,
+        deployment,
+        authority,
+        Some(runtime),
+        resource,
+        digest,
+        backend_name,
+    )?;
+    for _ in 0..3 {
+        if inspect_document_optional(
+            command,
+            &["container", "inspect", identity.name.as_str()],
+            backend_name,
+        )?
+        .is_none()
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    bail!("{backend_name} managed one-shot task remains present after force removal")
+}
+
+fn assert_exact_one_shot_labels(
+    command: &OsStr,
+    object_id: &str,
+    identity: &ManagedOneShotIdentity,
+    backend_name: &str,
+) -> anyhow::Result<()> {
+    let document = inspect_document(command, &["container", "inspect", object_id], backend_name)?;
+    let labels = object_member_case_insensitive(&document, "config")
+        .and_then(|config| object_member_case_insensitive(config, "labels"))
+        .or_else(|| object_member_case_insensitive(&document, "labels"))
+        .and_then(serde_json::Value::as_object)
+        .context("managed one-shot task has no labels")?;
+    if labels.len() < identity.labels.len()
+        || identity.labels.iter().any(|(key, value)| {
+            labels.get(key).and_then(serde_json::Value::as_str) != Some(value.as_str())
+        })
+    {
+        bail!(
+            "refusing to quiesce a {backend_name} task whose full managed identity labels differ"
+        );
+    }
+    Ok(())
 }
 
 fn inspect_image_environment(

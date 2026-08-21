@@ -86,11 +86,8 @@ pub(crate) fn verify_public_candidate_control_identity(
             &request,
             &endpoint,
         ])
-        .stdout()
+        .stdout_bounded(64 * 1024)
         .context("candidate public control endpoint is unavailable")?;
-    if output.len() > 64 * 1024 {
-        bail!("candidate public control response exceeds the verification limit");
-    }
     let response: DiscoveryResponse =
         serde_json::from_str(&output).context("candidate public control response is invalid")?;
     let public_key = decode_instance_public_key(&response.instance_public_key)

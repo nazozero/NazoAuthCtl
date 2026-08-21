@@ -672,6 +672,7 @@ pub trait RuntimeBackend {
     fn replace(&self, replacement: &RuntimeReplacement) -> anyhow::Result<()>;
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String>;
     fn run_one_shot_authorization_probe(&self, task: &OneShotTask) -> anyhow::Result<bool>;
+    fn quiesce_managed_one_shot(&self, identity: &ManagedOneShotIdentity) -> anyhow::Result<()>;
     fn pull_image(&self, image_reference: &str) -> anyhow::Result<()>;
     fn export_image(&self, image_reference: &str, archive: &std::path::Path) -> anyhow::Result<()>;
     fn import_image(&self, archive: &std::path::Path) -> anyhow::Result<()>;

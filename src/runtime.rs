@@ -822,13 +822,27 @@ impl<'a> Runtime<'a> {
         if self.backend_kind()? == RuntimeBackendKind::Systemd {
             bail!("local OCI candidate recovery requires a container runtime");
         }
-        if self.container_exists() {
+        let backend = self.backend()?;
+        if backend
+            .inspect_optional(&self.config.runtime.container_name)?
+            .is_some()
+        {
             self.remove_container()?;
         }
-        if self.container_exists() {
+        if backend
+            .inspect_optional(&self.config.runtime.container_name)?
+            .is_some()
+        {
             bail!("local OCI candidate runtime remains present after quiesce");
         }
         Ok(())
+    }
+
+    pub(crate) fn quiesce_managed_one_shot(
+        &self,
+        identity: &ManagedOneShotIdentity,
+    ) -> anyhow::Result<()> {
+        self.backend()?.quiesce_managed_one_shot(identity)
     }
 
     pub(crate) fn restart(&self) -> anyhow::Result<()> {

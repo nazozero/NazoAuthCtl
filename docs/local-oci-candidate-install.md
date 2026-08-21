@@ -58,10 +58,11 @@ therefore carries `RecoveryConclusion::Proven` plus the package and baseline
 digest bindings; off-host recovery remains required.
 
 Once completed, this deployment is permanently frozen as that exact candidate.
-`update --yes`, development activation, migrations, and capability/provenance
-transitions cannot replace its active release or runtime. Conformance,
-read-only status/doctor diagnostics, and a safe explicit relinquish remain
-available. Promotion to a signed Release is intentionally not implicit and
+`update --yes`, development activation, migrations, `rollback --yes`, and
+capability/provenance transitions cannot replace its active release or runtime.
+`recover --yes` is the sole mutation path: it runs the candidate-specific
+managed baseline/package transaction. Conformance, read-only status/doctor
+diagnostics, and a safe explicit relinquish remain available. Promotion to a signed Release is intentionally not implicit and
 requires a future explicit promotion transaction.
 
 The digest is the local OCI manifest digest reported by the chosen runtime, not

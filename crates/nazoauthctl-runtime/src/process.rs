@@ -96,6 +96,10 @@ impl Process {
     }
 
     pub fn output(&self) -> anyhow::Result<Output> {
+        self.output_bounded(MAX_CAPTURE_BYTES)
+    }
+
+    fn output_bounded(&self, capture_limit: u64) -> anyhow::Result<Output> {
         let mut command = self.command();
         command
             .stdin(Stdio::null())
@@ -104,7 +108,7 @@ impl Process {
         let child = command
             .spawn()
             .with_context(|| format!("failed to execute {}", self.display_name()))?;
-        self.collect_output(child, None)
+        self.collect_output_bounded(child, None, capture_limit)
     }
 
     pub fn run_quiet(&self) -> anyhow::Result<()> {
@@ -120,7 +124,16 @@ impl Process {
     }
 
     pub fn stdout(&self) -> anyhow::Result<String> {
-        let output = self.output()?;
+        self.stdout_bounded(MAX_CAPTURE_BYTES)
+    }
+
+    /// Return bounded UTF-8 stdout.  Protocol callers use this when a remote
+    /// response has a tighter wire-size contract than general command output.
+    pub fn stdout_bounded(&self, capture_limit: u64) -> anyhow::Result<String> {
+        if capture_limit == 0 {
+            bail!("command stdout capture limit must be positive");
+        }
+        let output = self.output_bounded(capture_limit)?;
         if !output.status.success() {
             bail!(
                 "{} failed with status {}",
@@ -161,7 +174,7 @@ impl Process {
         let child = command
             .spawn()
             .with_context(|| format!("failed to execute {}", self.display_name()))?;
-        let output = self.collect_output(child, Some(input))?;
+        let output = self.collect_output_bounded(child, Some(input), MAX_CAPTURE_BYTES)?;
         let stdout = String::from_utf8(output.stdout)
             .with_context(|| format!("{} produced non-UTF-8 output", self.display_name()))?;
         Ok((output.status, stdout))
@@ -181,7 +194,7 @@ impl Process {
         let child = command
             .spawn()
             .with_context(|| format!("failed to execute {}", self.display_name()))?;
-        let output = self.collect_output(child, Some(input))?;
+        let output = self.collect_output_bounded(child, Some(input), MAX_CAPTURE_BYTES)?;
         if output.status.success() {
             return Ok(false);
         }
@@ -247,10 +260,11 @@ impl Process {
             .is_ok_and(|status| status.success())
     }
 
-    fn collect_output(
+    fn collect_output_bounded(
         &self,
         mut child: std::process::Child,
         input: Option<&[u8]>,
+        capture_limit: u64,
     ) -> anyhow::Result<Output> {
         let stdout = child
             .stdout
@@ -262,8 +276,8 @@ impl Process {
             .context("child stderr was unavailable")?;
         let (stdout_sender, stdout_receiver) = mpsc::sync_channel(1);
         let (stderr_sender, stderr_receiver) = mpsc::sync_channel(1);
-        spawn_reader(stdout, stdout_sender);
-        spawn_reader(stderr, stderr_sender);
+        spawn_reader(stdout, stdout_sender, capture_limit);
+        spawn_reader(stderr, stderr_sender, capture_limit);
         if let Some(input) = input {
             let mut stdin = child.stdin.take().context("child stdin was unavailable")?;
             if let Err(error) = stdin.write_all(input) {
@@ -292,10 +306,13 @@ impl Process {
     }
 }
 
-fn read_bounded(reader: impl std::io::Read) -> anyhow::Result<Vec<u8>> {
+fn read_bounded(reader: impl std::io::Read, capture_limit: u64) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    reader.take(MAX_CAPTURE_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_CAPTURE_BYTES {
+    let probe_limit = capture_limit
+        .checked_add(1)
+        .context("child output capture limit overflow")?;
+    reader.take(probe_limit).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > capture_limit {
         bail!("child output exceeded the capture limit");
     }
     Ok(bytes)
@@ -331,9 +348,10 @@ impl std::fmt::Debug for Process {
 fn spawn_reader(
     reader: impl std::io::Read + Send + 'static,
     sender: SyncSender<anyhow::Result<Vec<u8>>>,
+    capture_limit: u64,
 ) {
     thread::spawn(move || {
-        let _ = sender.send(read_bounded(reader));
+        let _ = sender.send(read_bounded(reader, capture_limit));
     });
 }
 

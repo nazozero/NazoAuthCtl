@@ -62,29 +62,12 @@ pub(crate) fn execute_with_requested_jti(
         requested_jti,
     )?;
     if requested_jti.is_some() {
-        let mut labels = std::collections::BTreeMap::new();
-        labels.insert(
-            "io.nazoauth.deployment-id".to_owned(),
-            config.operator.deployment_id.clone(),
-        );
-        labels.insert(
-            "io.nazoauth.control-authority".to_owned(),
-            config.operator.controller_key_id.clone(),
-        );
-        labels.insert(
-            "io.nazoauth.runtime-instance-id".to_owned(),
-            config.runtime.runtime_instance_id.clone(),
-        );
-        labels.insert(
-            "io.nazoauth.task-kind".to_owned(),
-            operation_name(&task.operation).to_owned(),
-        );
-        labels.insert("io.nazoauth.task-jti".to_owned(), task.jti.clone());
-        labels.insert("io.nazoauth.config-sha256".to_owned(), config_sha256);
-        prepared.bind_managed_identity(crate::runtime_backend::ManagedOneShotIdentity {
-            name: format!("nazoauthctl-task-{}", task.jti),
-            labels,
-        });
+        prepared.bind_managed_identity(managed_one_shot_identity(
+            config,
+            &task.operation,
+            &task.jti,
+            &config_sha256,
+        ));
     }
     let request_id = task.jti.clone();
     if let Some(result) = existing_final_result(config, &task, &compact_task)? {
@@ -156,6 +139,62 @@ pub(crate) fn execute_with_requested_jti(
             final_path.display()
         ),
     }
+}
+
+pub(crate) fn managed_one_shot_identity(
+    config: &UpdateConfig,
+    operation: &TaskOperation,
+    task_jti: &str,
+    config_sha256: &str,
+) -> crate::runtime_backend::ManagedOneShotIdentity {
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert(
+        "io.nazoauth.deployment-id".to_owned(),
+        config.operator.deployment_id.clone(),
+    );
+    labels.insert(
+        "io.nazoauth.control-authority".to_owned(),
+        config.operator.controller_key_id.clone(),
+    );
+    labels.insert(
+        "io.nazoauth.runtime-instance-id".to_owned(),
+        config.runtime.runtime_instance_id.clone(),
+    );
+    labels.insert(
+        "io.nazoauth.managed-resource".to_owned(),
+        "operator-task".to_owned(),
+    );
+    labels.insert(
+        "io.nazoauth.task-kind".to_owned(),
+        operation_name(operation).to_owned(),
+    );
+    labels.insert("io.nazoauth.task-jti".to_owned(), task_jti.to_owned());
+    labels.insert(
+        "io.nazoauth.config-digest".to_owned(),
+        config_sha256.to_owned(),
+    );
+    labels.insert(
+        "io.nazoauth.config-sha256".to_owned(),
+        config_sha256.to_owned(),
+    );
+    crate::runtime_backend::ManagedOneShotIdentity {
+        name: format!("nazoauthctl-task-{task_jti}"),
+        labels,
+    }
+}
+
+pub(crate) fn managed_one_shot_identity_for_task(
+    config: &UpdateConfig,
+    operation: &TaskOperation,
+    task_jti: &str,
+) -> anyhow::Result<crate::runtime_backend::ManagedOneShotIdentity> {
+    let manifest = canonical_manifest(config, operation)?;
+    Ok(managed_one_shot_identity(
+        config,
+        operation,
+        task_jti,
+        &canonical_config_sha256(&manifest)?,
+    ))
 }
 
 /// Look up an already-finalized operator task without issuing a new intent or

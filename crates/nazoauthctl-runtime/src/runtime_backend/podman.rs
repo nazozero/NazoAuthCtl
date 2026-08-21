@@ -18,8 +18,8 @@ use crate::{ArtifactReference, RuntimeBackendKind};
 use super::DebugArtifactTask;
 use super::{
     BlobAttestationVerification, HostServiceInstall, ManagedDependencies, ManagedDependencyBackup,
-    ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount,
-    OneShotTask, RuntimeBackend, RuntimeDatabasePrivilegeProbe, RuntimeObservation,
+    ManagedOneShotIdentity, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore,
+    NeutralMount, OneShotTask, RuntimeBackend, RuntimeDatabasePrivilegeProbe, RuntimeObservation,
     RuntimeReplacement,
 };
 
@@ -97,6 +97,10 @@ impl RuntimeBackend for PodmanBackend {
 
     fn run_one_shot_authorization_probe(&self, task: &OneShotTask) -> anyhow::Result<bool> {
         one_shot::run_authorization_probe(&self.command, task)
+    }
+
+    fn quiesce_managed_one_shot(&self, identity: &ManagedOneShotIdentity) -> anyhow::Result<()> {
+        container_shared::quiesce_managed_one_shot(&self.command, identity, "Podman")
     }
 
     fn pull_image(&self, image_reference: &str) -> anyhow::Result<()> {
