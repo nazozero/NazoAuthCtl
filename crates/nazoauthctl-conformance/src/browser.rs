@@ -714,11 +714,11 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                             capture,
                             index,
                             &trigger_url,
-                            *marker,
+                            marker,
                             report,
                         )?;
                     }
-                    None if *marker == ReviewScreenshotMarker::Required => {
+                    None if marker == ReviewScreenshotMarker::Required => {
                         return Err(BrowserError::ReviewScreenshotRequired);
                     }
                     None => {
