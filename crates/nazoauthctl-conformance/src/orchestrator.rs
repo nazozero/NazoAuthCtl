@@ -1763,7 +1763,7 @@ mod tests {
                     201,
                     serde_json::json!({
                         "id": "suite-plan",
-                        "name": "plan",
+                        "name": "oid4vci-issuer-test-plan",
                         "modules": [
                             {"testModule": "happy-flow", "variant": {
                                 "credential_configuration": "plain",
