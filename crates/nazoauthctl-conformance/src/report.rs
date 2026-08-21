@@ -62,6 +62,15 @@ pub struct ModuleReport {
     pub blocking_log_results: Vec<String>,
     /// Non-blocking WARNING condition results found in the raw Suite log.
     pub advisory_log_results: Vec<String>,
+    /// Locally captured, root-private screenshots requested by a signed
+    /// browser placeholder command. They are evidence references only; image
+    /// bytes, browser URLs, and page content never enter this report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_screenshots: Vec<ReviewScreenshotReport>,
+    /// Optional signed screenshot markers that could not be captured. A
+    /// required marker instead fails local orchestration before reporting.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub review_screenshots_missing: usize,
     /// Public evidence omits config/owner/secret-bearing fields. The complete
     /// objects are retained in the in-memory fields below for evidence sinks.
     pub info: Value,
@@ -70,6 +79,17 @@ pub struct ModuleReport {
     pub raw_info: Value,
     #[serde(skip)]
     pub raw_log: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ReviewScreenshotReport {
+    pub path: std::path::PathBuf,
+    pub sha256: String,
+    pub size: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -224,6 +244,8 @@ impl ModuleReport {
             human_review_required,
             blocking_log_results,
             advisory_log_results,
+            review_screenshots: Vec::new(),
+            review_screenshots_missing: 0,
             info: public_info_summary(&raw_info),
             log: public_log_summary(&raw_log),
             raw_info,

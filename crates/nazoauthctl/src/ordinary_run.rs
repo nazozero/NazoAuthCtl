@@ -17,22 +17,23 @@ use anyhow::{Context as _, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nazoauthctl_conformance::{
     ArtifactMaterializationBinding, ArtifactTrustPolicy, AuthenticatedProviderAuthorization,
-    BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy, BrowserTargetOrigin,
-    CibaUserApprovalBridge, CibaUserApprovalClient, ClientConfig, ConformanceAutomation,
-    ConformanceBinding, ConformanceProxyRecovery, ConformanceRecoveryStore, ConformanceRunConfig,
-    ConformanceRunner, CredentialStore, DescriptorMaterializer, EvidenceBundleIdentity,
-    EvidenceBundleReceipt, EvidenceDeploymentIdentity, EvidenceProviderCapability,
-    EvidenceProviderIdentity, EvidenceProviderReceipt, EvidenceRuntimeIdentity,
-    EvidenceSourceIdentity, HttpTransport, ManagedWebDriver, MatrixSelection, OidfArtifactMatrix,
-    OidfDriverLane, OidfPlanResourceBudget, OidfPlanSelection, OidfProviderExecutionBinding,
-    OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
-    OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
-    SuiteResourceObserver, SuiteRetentionManifest, SuiteRetentionPlan, TenantResourceApplyOutput,
-    TenantResourceReceiptIdentity, TenantResourceRecoveryBinding, TtyRenderer, WebDriverClient,
-    WebDriverEndpoint, authorize_oidf_driver_execution, open_cached_oidf_driver_plan,
-    read_artifact_driver, read_artifact_matrix, read_compact_manifest, recover_suite_resources,
+    BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy, BrowserReviewScreenshotCapture,
+    BrowserTargetOrigin, CibaUserApprovalBridge, CibaUserApprovalClient, ClientConfig,
+    ConformanceAutomation, ConformanceBinding, ConformanceProxyRecovery, ConformanceRecoveryStore,
+    ConformanceRunConfig, ConformanceRunner, CredentialStore, DescriptorMaterializer,
+    EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceDeploymentIdentity,
+    EvidenceProviderCapability, EvidenceProviderIdentity, EvidenceProviderReceipt,
+    EvidenceRuntimeIdentity, EvidenceSourceIdentity, HttpTransport, ManagedWebDriver,
+    MatrixSelection, OidfArtifactMatrix, OidfDriverLane, OidfPlanResourceBudget, OidfPlanSelection,
+    OidfProviderExecutionBinding, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
+    OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard,
+    RunControl, StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionManifest,
+    SuiteRetentionPlan, TenantResourceApplyOutput, TenantResourceReceiptIdentity,
+    TenantResourceRecoveryBinding, TtyRenderer, WebDriverClient, WebDriverEndpoint,
+    authorize_oidf_driver_execution, open_cached_oidf_driver_plan, read_artifact_driver,
+    read_artifact_matrix, read_compact_manifest, recover_suite_resources,
     validate_private_evidence_directory, verify_oidf_artifact,
-    write_private_provider_evidence_bundle,
+    write_private_provider_evidence_bundle, write_review_screenshot_manifest,
 };
 use nazoauthctl_core::tenant_resources::{
     TenantResourceCapabilitySession, TenantResourceClient, TenantResourceClientError,
@@ -98,6 +99,14 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         validate_private_evidence_directory(evidence_directory).context(
             "retention evidence directory must be an existing root-owned private directory",
         )?;
+    }
+    if invocation.capture_review_screenshots {
+        let evidence_directory = invocation
+            .evidence_directory
+            .as_ref()
+            .expect("CLI requires --evidence-dir for review screenshots");
+        BrowserReviewScreenshotCapture::new(evidence_directory.clone())
+            .context("review screenshot evidence directory must be root-owned and private")?;
     }
 
     let (token, prompted) = resolve_token(&mut invocation, &suite_origin)?;
@@ -509,6 +518,22 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             None
         }
     };
+    if invocation.capture_review_screenshots
+        && retention_eligible
+        && proxy_cleanup_complete
+        && cleanup_evidence.is_some()
+    {
+        let manifest = match (report.as_ref(), invocation.evidence_directory.as_ref()) {
+            (Some(report), Some(directory)) => {
+                write_review_screenshot_manifest(report, directory, &request_jti)
+            }
+            _ => Err(nazoauthctl_conformance::EvidenceError::Identity),
+        };
+        if let Err(error) = manifest {
+            retention_eligible = false;
+            errors.push(format!("review-screenshot-manifest={error}"));
+        }
+    }
     let retention_committed = if retention_eligible
         && proxy_cleanup_complete
         && cleanup_evidence.is_some()
@@ -706,6 +731,19 @@ fn run_signed_suite(
     let openid4vp_management_token = session
         .openid4vp_management_token()
         .context("failed to load the deployment OpenID4VP management token")?;
+    let review_screenshot_capture = invocation
+        .capture_review_screenshots
+        .then(|| {
+            BrowserReviewScreenshotCapture::new(
+                invocation
+                    .evidence_directory
+                    .as_ref()
+                    .expect("CLI requires --evidence-dir for review screenshots")
+                    .clone(),
+            )
+        })
+        .transpose()
+        .context("review screenshot evidence directory must be root-owned and private")?;
 
     let mut automation = Vec::with_capacity(invocation.jobs);
     for worker_index in 0..invocation.jobs {
@@ -738,6 +776,7 @@ fn run_signed_suite(
             )?));
         automation.push(ConformanceAutomation {
             browser: Some(browser),
+            review_screenshot_capture: review_screenshot_capture.clone(),
             verifier: Some(verifier),
             issuer: Some(issuer),
         });

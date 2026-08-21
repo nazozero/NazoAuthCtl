@@ -52,12 +52,13 @@ pub use artifact_plan::{
 };
 pub use browser::{
     BrowserAutomation, BrowserCommand, BrowserDriver, BrowserEntry, BrowserError, BrowserExecutor,
-    BrowserLimits, BrowserPolicy, BrowserRunReport, BrowserRunnerState, BrowserSelector,
+    BrowserLimits, BrowserPolicy, BrowserReviewCaptureContext, BrowserReviewScreenshotCapture,
+    BrowserReviewScreenshotReceipt, BrowserRunReport, BrowserRunnerState, BrowserSelector,
     BrowserTargetOrigin, BrowserTask, ConformanceBinding, ManagedWebDriver, OpenId4VcBrowserState,
     OpenId4VciError, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
     OpenId4VciModule, OpenId4VpError, OpenId4VpPresentation, OpenId4VpStartRequest,
-    OpenId4VpVerifier, OpenId4VpVerifierClient, WebDriverClient, WebDriverEndpoint,
-    parse_browser_entries, parse_browser_entries_owned,
+    OpenId4VpVerifier, OpenId4VpVerifierClient, ReviewScreenshotMarker, WebDriverClient,
+    WebDriverEndpoint, parse_browser_entries, parse_browser_entries_owned,
 };
 pub use ciba_approval::{
     CibaApprovalFailureStage, CibaUserApprovalBridge, CibaUserApprovalClient, CibaUserApprovalError,
@@ -72,7 +73,7 @@ pub use evidence::{
     EvidenceProviderCapability, EvidenceProviderIdentity, EvidenceProviderReceipt,
     EvidenceRuntimeIdentity, EvidenceSourceIdentity, validate_ordinary_provider_identity,
     validate_private_evidence_directory, write_private_evidence_bundle,
-    write_private_provider_evidence_bundle,
+    write_private_provider_evidence_bundle, write_review_screenshot_manifest,
 };
 pub use materializer::{
     ArtifactMaterializationBinding, CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DescriptorGroup,
@@ -105,6 +106,7 @@ pub use recovery::{
 };
 pub use report::{
     CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport, PlanReport,
+    ReviewScreenshotReport,
 };
 pub use transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, Transport, TransportError,

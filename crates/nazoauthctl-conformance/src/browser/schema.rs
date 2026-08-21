@@ -42,11 +42,12 @@ impl fmt::Debug for BrowserTask {
 }
 
 /// A parsed selector accepted by WebDriver. `contains` is handled by the
-/// parser as text/URL matching and is never passed to a driver as CSS.
+/// parser as text/URL matching and is never passed to a driver.
 #[derive(Clone, Eq, PartialEq)]
 pub enum BrowserSelector {
     Id(String),
     Css(String),
+    XPath(String),
 }
 
 impl fmt::Debug for BrowserSelector {
@@ -54,6 +55,7 @@ impl fmt::Debug for BrowserSelector {
         formatter.write_str(match self {
             Self::Id(_) => "Id(<redacted>)",
             Self::Css(_) => "Css(<redacted>)",
+            Self::XPath(_) => "XPath(<redacted>)",
         })
     }
 }
@@ -64,6 +66,11 @@ pub enum BrowserCommand {
         selector: BrowserSelector,
         timeout: std::time::Duration,
         text_pattern: Option<String>,
+        /// The official Suite's image-placeholder marker is a signed browser
+        /// instruction, not a generic wait modifier.  The executor keeps it
+        /// intact until it can either capture bounded local evidence or fail
+        /// the required instruction closed.
+        review_screenshot: Option<ReviewScreenshotMarker>,
     },
     WaitElementVisible {
         selector: BrowserSelector,
@@ -81,6 +88,12 @@ pub enum BrowserCommand {
         selector: BrowserSelector,
         optional: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewScreenshotMarker {
+    Required,
+    Optional,
 }
 
 impl fmt::Debug for BrowserCommand {

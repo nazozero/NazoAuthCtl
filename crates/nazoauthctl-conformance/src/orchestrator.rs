@@ -12,9 +12,10 @@ use thiserror::Error;
 use url::Url;
 
 use crate::browser::{
-    BrowserAutomation, BrowserPolicy, BrowserRunnerState, BrowserTargetOrigin, ConformanceBinding,
-    OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpStartRequest,
-    OpenId4VpVerifier, browser_config_for_module, parse_browser_entries_owned,
+    BrowserAutomation, BrowserPolicy, BrowserReviewScreenshotCapture, BrowserRunnerState,
+    BrowserTargetOrigin, ConformanceBinding, MAX_REVIEW_SCREENSHOTS_PER_RUN, OpenId4VciError,
+    OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpStartRequest, OpenId4VpVerifier,
+    browser_config_for_module, parse_browser_entries_owned,
 };
 use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
 use crate::matrix::{MatrixError, SelectedMatrix, zeroize_json_value};
@@ -24,8 +25,8 @@ use crate::progress::{
 };
 use crate::report::{
     CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport,
-    ModuleReportContext, OrchestrationIntegrity, PlanReport, summarize_matrix_expectations,
-    summarize_module_outcomes,
+    ModuleReportContext, OrchestrationIntegrity, PlanReport, ReviewScreenshotReport,
+    summarize_matrix_expectations, summarize_module_outcomes,
 };
 use crate::{OidfDriverLane, OidfPlanResourceBudget};
 
@@ -42,8 +43,17 @@ pub const MAX_POLL_TIMEOUT: Duration = Duration::from_secs(MAX_POLL_TIMEOUT_SECO
 #[derive(Clone, Default)]
 pub struct ConformanceAutomation {
     pub browser: Option<Arc<Mutex<dyn BrowserAutomation>>>,
+    /// Explicit local-only capture capability. It is cloned into worker-owned
+    /// lanes but every resulting filename remains bound to the current module.
+    pub review_screenshot_capture: Option<BrowserReviewScreenshotCapture>,
     pub verifier: Option<Arc<Mutex<dyn OpenId4VpVerifier>>>,
     pub issuer: Option<Arc<Mutex<dyn OpenId4VciIssuerDriver>>>,
+}
+
+#[derive(Default)]
+struct BrowserReviewEvidence {
+    screenshots: Vec<ReviewScreenshotReport>,
+    missing: usize,
 }
 
 #[derive(Clone)]
@@ -341,7 +351,7 @@ impl ConformanceRunner {
         module: &ModuleDefinition,
         module_id: &str,
         initial: Value,
-    ) -> Result<Value, String> {
+    ) -> Result<(Value, BrowserReviewEvidence), String> {
         let browser_config = browser_config_for_module(&plan.config, &module.test_name)
             .map_err(|error| error.to_string())?;
         let entries =
@@ -357,6 +367,7 @@ impl ConformanceRunner {
         let mut observed = initial;
         let mut first_round = true;
         let mut completed_url_digests = BTreeSet::<[u8; 32]>::new();
+        let mut review_evidence = BrowserReviewEvidence::default();
 
         loop {
             if self.config.control.is_interrupted() {
@@ -372,7 +383,7 @@ impl ConformanceRunner {
                     .module_info(module_id)
                     .map_err(|error| safe_error(&error))?;
                 if is_terminal_state(&observed) {
-                    return Ok(observed);
+                    return Ok((observed, review_evidence));
                 }
                 if !is_waiting(&observed) {
                     observed = self.wait_for_state_until(
@@ -381,13 +392,13 @@ impl ConformanceRunner {
                         deadline,
                     )?;
                     if is_terminal_state(&observed) {
-                        return Ok(observed);
+                        return Ok((observed, review_evidence));
                     }
                 }
             }
             first_round = false;
             if !is_waiting(&observed) {
-                return Ok(observed);
+                return Ok((observed, review_evidence));
             }
 
             let runner = match self.config.client.runner_info(module_id) {
@@ -420,9 +431,44 @@ impl ConformanceRunner {
                 let mut driver = browser
                     .lock()
                     .map_err(|_| "browser automation lock failed".to_owned())?;
-                driver
-                    .execute(pending_url, &entries)
+                let capture = self
+                    .config
+                    .automation
+                    .first()
+                    .and_then(|automation| automation.review_screenshot_capture.as_ref())
+                    .map(|capture| {
+                        capture.context(
+                            &plan.matrix_plan_id,
+                            &plan.suite_plan_id,
+                            module_id,
+                            review_evidence
+                                .screenshots
+                                .len()
+                                .saturating_add(review_evidence.missing),
+                        )
+                    })
+                    .transpose()
                     .map_err(|error| error.to_string())?;
+                let report = driver
+                    .execute_with_review_capture(pending_url, &entries, capture.as_ref())
+                    .map_err(|error| error.to_string())?;
+                for receipt in report.review_screenshots {
+                    if receipt.suite_plan_id != plan.suite_plan_id || receipt.module_id != module_id
+                    {
+                        return Err("browser review evidence context mismatch".to_owned());
+                    }
+                    if review_evidence.screenshots.len() >= MAX_REVIEW_SCREENSHOTS_PER_RUN {
+                        return Err("browser review screenshot limit exceeded".to_owned());
+                    }
+                    review_evidence.screenshots.push(ReviewScreenshotReport {
+                        path: receipt.path,
+                        sha256: receipt.sha256,
+                        size: receipt.size,
+                    });
+                }
+                review_evidence.missing = review_evidence
+                    .missing
+                    .saturating_add(report.review_screenshots_missing);
             }
             completed_url_digests.insert(Sha256::digest(pending_url.as_str().as_bytes()).into());
             self.wait_for_runner_refresh(deadline, "browser")?;
@@ -797,6 +843,7 @@ impl ConformanceRunner {
                         },
                     };
                     let mut observed = initial;
+                    let mut browser_review_evidence = BrowserReviewEvidence::default();
                     if observed.as_ref().is_some_and(is_configured) {
                         emit_progress(
                             sink,
@@ -918,6 +965,39 @@ impl ConformanceRunner {
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
                             }
+                            drop(verifier);
+                            if plan.config.get("browser").is_some() {
+                                let Some(browser) = self
+                                    .config
+                                    .automation
+                                    .first()
+                                    .and_then(|automation| automation.browser.as_ref())
+                                else {
+                                    errors.push(
+                                        "OpenID4VP review browser automation is unavailable"
+                                            .to_owned(),
+                                    );
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                };
+                                match self.drive_browser_waiting_interruptible(
+                                    browser,
+                                    plan,
+                                    module,
+                                    &instance.id,
+                                    observed.clone().expect("waiting runner state"),
+                                ) {
+                                    Ok((state, evidence)) => {
+                                        observed = Some(state);
+                                        browser_review_evidence = evidence;
+                                    }
+                                    Err(error) => {
+                                        errors.push(error);
+                                        groups[group_index].status = GroupStatus::Failed;
+                                        break 'execute;
+                                    }
+                                }
+                            }
                         } else if plan.config.get("browser").is_some() {
                             let Some(browser) = self
                                 .config
@@ -939,7 +1019,10 @@ impl ConformanceRunner {
                                 &instance.id,
                                 observed.clone().expect("waiting runner state"),
                             ) {
-                                Ok(state) => observed = Some(state),
+                                Ok((state, evidence)) => {
+                                    observed = Some(state);
+                                    browser_review_evidence = evidence;
+                                }
                                 Err(error) => {
                                     errors.push(error);
                                     groups[group_index].status = GroupStatus::Failed;
@@ -980,7 +1063,7 @@ impl ConformanceRunner {
                         errors.push("Suite module did not reach a terminal status".to_owned());
                         groups[group_index].status = GroupStatus::Failed;
                     }
-                    modules.push(ModuleReport::from_info(
+                    let mut module_report = ModuleReport::from_info(
                         ModuleReportContext {
                             matrix_plan_id: plan.matrix_plan_id.clone(),
                             suite_plan_id: plan.suite_plan_id.clone(),
@@ -992,7 +1075,10 @@ impl ConformanceRunner {
                         },
                         info,
                         log,
-                    ));
+                    );
+                    module_report.review_screenshots = browser_review_evidence.screenshots;
+                    module_report.review_screenshots_missing = browser_review_evidence.missing;
+                    modules.push(module_report);
                     let module_outcome = modules.last().map(|module| module.outcome);
                     if terminal {
                         groups[group_index].running = groups[group_index].running.saturating_sub(1);
@@ -2905,6 +2991,9 @@ mod tests {
                 tasks: 0,
                 entry_index: 0,
                 final_origin: "https://target.example".into(),
+                review_screenshots: Vec::new(),
+                review_screenshot_attempts: 0,
+                review_screenshots_missing: 0,
             })
         }
 
@@ -2976,7 +3065,7 @@ mod tests {
             raw: Value::Null,
         };
 
-        let observed = runner
+        let (observed, review_evidence) = runner
             .drive_browser_waiting_interruptible(
                 &browser,
                 &plan,
@@ -2986,6 +3075,7 @@ mod tests {
             )
             .expect("browser drive");
         assert_eq!(status(&observed), Some("FINISHED"));
+        assert!(review_evidence.screenshots.is_empty());
         assert!(completed.load(Ordering::SeqCst));
     }
 

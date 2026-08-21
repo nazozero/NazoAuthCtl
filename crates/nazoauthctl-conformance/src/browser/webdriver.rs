@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 use super::validation::{MAX_TEXT_BYTES, is_loopback_host};
-use super::{BrowserDriver, BrowserError, BrowserSelector};
+use super::{BrowserDriver, BrowserError, BrowserSelector, decode_webdriver_png};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_SESSION_ID_BYTES: usize = 256;
@@ -276,6 +276,7 @@ impl BrowserDriver for WebDriverClient {
         let (using, value) = match selector {
             BrowserSelector::Id(value) => ("id", value.as_str()),
             BrowserSelector::Css(value) => ("css selector", value.as_str()),
+            BrowserSelector::XPath(value) => ("xpath", value.as_str()),
         };
         let result = self.post_value(
             &self.session_path("/element")?,
@@ -337,6 +338,11 @@ impl BrowserDriver for WebDriverClient {
             &json!({}),
         )
         .map(|_| ())
+    }
+
+    fn screenshot_png(&mut self) -> Result<zeroize::Zeroizing<Vec<u8>>, BrowserError> {
+        let value = self.get_value(&self.session_path("/screenshot")?)?;
+        parse_screenshot_response(&value)
     }
 }
 
@@ -509,6 +515,10 @@ impl BrowserDriver for ManagedWebDriver {
     fn element_click(&mut self, element: &str) -> Result<(), BrowserError> {
         self.client.element_click(element)
     }
+
+    fn screenshot_png(&mut self) -> Result<zeroize::Zeroizing<Vec<u8>>, BrowserError> {
+        self.client.screenshot_png()
+    }
 }
 
 impl Drop for ManagedWebDriver {
@@ -635,9 +645,18 @@ fn classify_webdriver_error(value: &Value) -> BrowserError {
     }
 }
 
+fn parse_screenshot_response(value: &Value) -> Result<zeroize::Zeroizing<Vec<u8>>, BrowserError> {
+    let encoded = value
+        .get("value")
+        .and_then(Value::as_str)
+        .ok_or(BrowserError::Protocol)?;
+    decode_webdriver_png(encoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     #[test]
     fn webdriver_error_tokens_preserve_only_retryable_dom_states() {
@@ -674,5 +693,29 @@ mod tests {
         assert!(!valid_session_id("session?01"));
         assert!(!valid_session_id("session 01"));
         assert!(!valid_session_id(&"a".repeat(MAX_SESSION_ID_BYTES + 1)));
+    }
+
+    #[test]
+    fn w3c_screenshot_response_accepts_only_bounded_canonical_png() {
+        let png = b"\x89PNG\r\n\x1a\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+        assert_eq!(
+            parse_screenshot_response(&json!({"value": encoded}))
+                .expect("w3c screenshot")
+                .as_slice(),
+            png
+        );
+        assert_eq!(
+            parse_screenshot_response(&json!({"value": "not-base64"}))
+                .expect_err("strict encoding"),
+            BrowserError::InvalidScreenshot
+        );
+        assert_eq!(
+            parse_screenshot_response(
+                &json!({"value": base64::engine::general_purpose::STANDARD.encode(b"not png")})
+            )
+            .expect_err("png signature"),
+            BrowserError::InvalidScreenshot
+        );
     }
 }

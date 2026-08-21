@@ -1,3 +1,7 @@
+#[cfg(unix)]
+use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use nazo_operator_protocol::{PROTOCOL_VERSION, TenantResourceOperation, TenantResourceOutcome};
@@ -11,7 +15,7 @@ use zeroize::Zeroizing;
 use crate::{ConformanceReport, VerifiedOidfArtifact};
 
 #[cfg(unix)]
-const EVIDENCE_BUNDLE_SCHEMA: u32 = 2;
+const EVIDENCE_BUNDLE_SCHEMA: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
@@ -140,6 +144,33 @@ struct EvidenceManifest<'a> {
     public_report_file: &'static str,
     public_report_sha256: String,
     modules: Vec<EvidenceModuleManifest>,
+    screenshots: Vec<EvidenceScreenshotManifest>,
+}
+
+#[cfg(unix)]
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct EvidenceScreenshotManifest {
+    matrix_plan_id: String,
+    suite_plan_id: String,
+    module_id: String,
+    path: PathBuf,
+    sha256: String,
+    size: usize,
+    receipt_sha256: String,
+}
+
+#[cfg(unix)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewScreenshotAudit {
+    suite_plan_id: String,
+    module_id: String,
+    path: PathBuf,
+    sha256: String,
+    size: usize,
+    trigger_origin: String,
+    trigger_url_sha256: String,
 }
 
 #[cfg(unix)]
@@ -204,6 +235,8 @@ pub fn write_private_evidence_bundle(
             .map_err(map_secure_file_error)?;
 
         let mut modules = Vec::with_capacity(report.modules.len());
+        let mut screenshots = Vec::new();
+        let mut screenshot_paths = BTreeSet::new();
         for (index, module) in report.modules.iter().enumerate() {
             let index = u32::try_from(index).map_err(|_| EvidenceError::Encoding)?;
             let file = format!("module-{index:04}.json");
@@ -232,6 +265,56 @@ pub fn write_private_evidence_bundle(
                 file,
                 sha256: sha256(bytes.as_slice()),
             });
+            for screenshot in &module.review_screenshots {
+                let module_id = module.module_id.as_deref().ok_or(EvidenceError::Identity)?;
+                if !screenshot_paths.insert(screenshot.path.clone()) {
+                    return Err(EvidenceError::Identity);
+                }
+                validate_review_screenshot_path(&screenshot.path)?;
+                let source = root.join(&screenshot.path);
+                let screenshot_bytes = crate::secure_file::read_bounded(&source, 500 * 1024, true)
+                    .map_err(map_secure_file_error)?;
+                crate::browser::validate_png_screenshot(&screenshot_bytes)
+                    .map_err(|_| EvidenceError::Identity)?;
+                if screenshot_bytes.len() != screenshot.size
+                    || sha256(&screenshot_bytes) != screenshot.sha256
+                {
+                    return Err(EvidenceError::Identity);
+                }
+                let receipt_source = source.with_extension("png.receipt.json");
+                let receipt = crate::secure_file::read_bounded(&receipt_source, 16 * 1024, true)
+                    .map_err(map_secure_file_error)?;
+                let audit: ReviewScreenshotAudit =
+                    serde_json::from_slice(&receipt).map_err(|_| EvidenceError::Identity)?;
+                if audit.suite_plan_id != module.suite_plan_id
+                    || audit.module_id != module_id
+                    || audit.path != screenshot.path
+                    || audit.sha256 != screenshot.sha256
+                    || audit.size != screenshot.size
+                    || !valid_origin(&audit.trigger_origin)
+                    || !lower_hex(&audit.trigger_url_sha256, 64)
+                {
+                    return Err(EvidenceError::Identity);
+                }
+                let destination = directory.join(&screenshot.path);
+                crate::secure_file::write_atomic(&destination, &screenshot_bytes, true)
+                    .map_err(map_secure_file_error)?;
+                crate::secure_file::write_atomic(
+                    &destination.with_extension("png.receipt.json"),
+                    &receipt,
+                    true,
+                )
+                .map_err(map_secure_file_error)?;
+                screenshots.push(EvidenceScreenshotManifest {
+                    matrix_plan_id: module.matrix_plan_id.clone(),
+                    suite_plan_id: module.suite_plan_id.clone(),
+                    module_id: module_id.to_owned(),
+                    path: screenshot.path.clone(),
+                    sha256: screenshot.sha256.clone(),
+                    size: screenshot.size,
+                    receipt_sha256: sha256(&receipt),
+                });
+            }
         }
 
         let module_count = u32::try_from(modules.len()).map_err(|_| EvidenceError::Encoding)?;
@@ -242,6 +325,7 @@ pub fn write_private_evidence_bundle(
             public_report_file: "report.json",
             public_report_sha256: sha256(&public_report),
             modules,
+            screenshots,
         })
         .map_err(|_| EvidenceError::Encoding)?;
         crate::secure_file::write_atomic(&directory.join("manifest.json"), &manifest, true)
@@ -256,6 +340,36 @@ pub fn write_private_evidence_bundle(
     }
 }
 
+#[cfg(unix)]
+fn valid_origin(value: &str) -> bool {
+    url::Url::parse(value)
+        .ok()
+        .is_some_and(|url| matches!(url.scheme(), "https" | "http") && url.host_str().is_some())
+}
+
+#[cfg(unix)]
+fn validate_review_screenshot_path(path: &Path) -> Result<(), EvidenceError> {
+    let mut components = path.components();
+    let Some(Component::Normal(directory)) = components.next() else {
+        return Err(EvidenceError::UnsafePath);
+    };
+    let Some(Component::Normal(file)) = components.next() else {
+        return Err(EvidenceError::UnsafePath);
+    };
+    if components.next().is_some()
+        || directory != "review-screenshots"
+        || !file.to_string_lossy().ends_with(".png")
+        || file.len() > 240
+        || !file
+            .as_encoded_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.'))
+    {
+        return Err(EvidenceError::UnsafePath);
+    }
+    Ok(())
+}
+
 /// Writes evidence for an ordinary tenant-resource provider run.  Legacy
 /// Suite-only callers continue to use [`write_private_evidence_bundle`], but
 /// this entry point refuses to commit a bundle without the signed capability
@@ -267,6 +381,87 @@ pub fn write_private_provider_evidence_bundle(
 ) -> Result<EvidenceBundleReceipt, EvidenceError> {
     validate_ordinary_provider_identity(report, identity)?;
     write_private_evidence_bundle(report, root, identity)
+}
+
+/// Commits the screenshot-to-current-module binding before Suite plan
+/// ownership can be retained. It intentionally references the root-private
+/// image files in place; the full provider evidence bundle later copies and
+/// rebinds the same verified files into its own committed directory.
+pub fn write_review_screenshot_manifest(
+    report: &ConformanceReport,
+    root: &Path,
+    run_jti: &str,
+) -> Result<PathBuf, EvidenceError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (report, root, run_jti);
+        Err(EvidenceError::UnsupportedPlatform)
+    }
+    #[cfg(unix)]
+    {
+        if crate::artifact::validate_identifier(run_jti, 128).is_err() {
+            return Err(EvidenceError::Identity);
+        }
+        let root =
+            crate::secure_file::validate_directory(root, true).map_err(map_secure_file_error)?;
+        let mut screenshots = Vec::new();
+        let mut paths = BTreeSet::new();
+        for module in &report.modules {
+            for screenshot in &module.review_screenshots {
+                let module_id = module.module_id.as_deref().ok_or(EvidenceError::Identity)?;
+                if !paths.insert(screenshot.path.clone()) {
+                    return Err(EvidenceError::Identity);
+                }
+                validate_review_screenshot_path(&screenshot.path)?;
+                let source = root.join(&screenshot.path);
+                let image = crate::secure_file::read_bounded(&source, 500 * 1024, true)
+                    .map_err(map_secure_file_error)?;
+                crate::browser::validate_png_screenshot(&image)
+                    .map_err(|_| EvidenceError::Identity)?;
+                if image.len() != screenshot.size || sha256(&image) != screenshot.sha256 {
+                    return Err(EvidenceError::Identity);
+                }
+                let receipt = crate::secure_file::read_bounded(
+                    &source.with_extension("png.receipt.json"),
+                    16 * 1024,
+                    true,
+                )
+                .map_err(map_secure_file_error)?;
+                let audit: ReviewScreenshotAudit =
+                    serde_json::from_slice(&receipt).map_err(|_| EvidenceError::Identity)?;
+                if audit.suite_plan_id != module.suite_plan_id
+                    || audit.module_id != module_id
+                    || audit.path != screenshot.path
+                    || audit.sha256 != screenshot.sha256
+                    || audit.size != screenshot.size
+                    || !valid_origin(&audit.trigger_origin)
+                    || !lower_hex(&audit.trigger_url_sha256, 64)
+                {
+                    return Err(EvidenceError::Identity);
+                }
+                screenshots.push(EvidenceScreenshotManifest {
+                    matrix_plan_id: module.matrix_plan_id.clone(),
+                    suite_plan_id: module.suite_plan_id.clone(),
+                    module_id: module_id.to_owned(),
+                    path: screenshot.path.clone(),
+                    sha256: screenshot.sha256.clone(),
+                    size: screenshot.size,
+                    receipt_sha256: sha256(&receipt),
+                });
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": 1,
+            "run_jti": run_jti,
+            "screenshots": screenshots,
+        }))
+        .map_err(|_| EvidenceError::Encoding)?;
+        let path = root
+            .join("review-screenshot-manifests")
+            .join(format!("{run_jti}.json"));
+        crate::secure_file::write_atomic(&path, &bytes, true).map_err(map_secure_file_error)?;
+        Ok(path)
+    }
 }
 
 /// Validates ordinary provider evidence without touching the filesystem.  A
@@ -701,6 +896,8 @@ mod tests {
                 human_review_required: false,
                 blocking_log_results: Vec::new(),
                 advisory_log_results: Vec::new(),
+                review_screenshots: Vec::new(),
+                review_screenshots_missing: 0,
                 info: serde_json::json!({"status":"FINISHED","result":"PASSED"}),
                 log: serde_json::json!({"entries":1,"present":true}),
                 raw_info: serde_json::json!({"status":"FINISHED","secret":"private"}),

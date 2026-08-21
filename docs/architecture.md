@@ -109,6 +109,18 @@ resource/proxy cleanup result. This is ctl-generated integrity evidence, not a
 Suite signature; signed Suite evidence remains an external release-stage
 requirement.
 
+`--capture-review-screenshots` is an explicit, local-only companion to
+`--evidence-dir`. It recognizes only signed browser commands marked
+`update-image-placeholder` or `update-image-placeholder-optional`; it never
+calls a Suite image API. A required marker fails local orchestration if a
+bounded W3C PNG screenshot cannot be captured, while an optional marker is
+reported as missing. Captures are written owner-only under
+`review-screenshots/`, are bounded to 500 KiB, and are named from the current
+Matrix plan, newly-created Suite module ID, and module-local index. Module
+reports contain only the relative path, SHA-256, and size. Existing terminal
+Suite modules are never targeted: a retained plan must be repeated to collect
+new local evidence, which can then be attached manually in the official UI.
+
 Final output schema 2 preserves a completed `RunOutput` even when resource,
 proxy, or evidence cleanup fails. Such failures are listed in `errors`, keep
 `success: false`, and leave `deployment.cleanup_complete: false`; they are no

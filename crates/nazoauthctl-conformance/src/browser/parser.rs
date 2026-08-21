@@ -125,6 +125,7 @@ impl BrowserSelector {
         match kind {
             "id" => Ok(Self::Id(value.to_owned())),
             "css" => Ok(Self::Css(value.to_owned())),
+            "xpath" => Ok(Self::XPath(value.to_owned())),
             _ => Err(BrowserError::UnsupportedCommand),
         }
     }
@@ -174,11 +175,17 @@ impl TryFrom<&Value> for BrowserCommand {
                         }
                         _ => return Err(BrowserError::InvalidSchema),
                     };
-                    if values.len() == 6
-                        && values[5].as_str() != Some("update-image-placeholder-optional")
-                    {
-                        return Err(BrowserError::UnsupportedCommand);
-                    }
+                    let review_screenshot = match values.get(5) {
+                        None => None,
+                        Some(Value::String(value)) => match value.as_str() {
+                            "update-image-placeholder" => Some(ReviewScreenshotMarker::Required),
+                            "update-image-placeholder-optional" => {
+                                Some(ReviewScreenshotMarker::Optional)
+                            }
+                            _ => return Err(BrowserError::UnsupportedCommand),
+                        },
+                        Some(_) => return Err(BrowserError::InvalidSchema),
+                    };
                     if values.len() > 6 {
                         return Err(BrowserError::InvalidSchema);
                     }
@@ -186,6 +193,7 @@ impl TryFrom<&Value> for BrowserCommand {
                         selector,
                         timeout,
                         text_pattern,
+                        review_screenshot,
                     })
                 }
             }
