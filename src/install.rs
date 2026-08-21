@@ -212,6 +212,9 @@ pub(crate) fn prepare(
     } else if options.trusted_proxy_cidr.is_some() {
         bail!("--trusted-proxy-cidr is accepted only with --profile standards-full");
     }
+    if options.local_oci_candidate.is_some() && options.external_dependencies {
+        bail!("a local OCI candidate install is managed-only and rejects external dependencies");
+    }
     normalize_external_dependencies(&mut options)?;
     normalize_profile_secrets(&mut options)?;
     let (runtime_backend, dependency_backend) = select_runtime(&options)?;

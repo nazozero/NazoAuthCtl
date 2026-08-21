@@ -157,6 +157,8 @@ Options:
   --candidate-revision SHA            Full lowercase Git revision
   --candidate-build-id source:SHA     Must exactly bind the full candidate revision
   --candidate-oci-digest sha256:DIGEST Expected local OCI manifest digest
+                                      Local OCI candidates are managed-only and reject
+                                      --external-dependencies
   --external-dependencies             Use operator-owned runtime, migration, and backup PostgreSQL/Valkey
   --secrets-stdin                     Read five dependency URLs plus dedicated-instance Valkey backup scope as strict JSON from stdin; binds canonical endpoints and usernames, never passwords
   --secret-fd FD                      Read the same JSON from an already-open FD (Linux)
@@ -202,10 +204,12 @@ rollback, backup/PITR recovery, and any irreversible migration barrier separatel
 `recover` restores a declared database backup; it is not update-journal recovery.
 Interrupted update and identity transitions are changed only by their explicit
 recovery commands. Other commands fail closed while either transition is pending.
-An unreleased OCI candidate migration requires all four candidate target bindings
-shown by `nazoauthctl conformance --help`; the active digest and embedded identity
-must match exactly. `--yes` skips only the prompt; it never skips verification, backup, health, replay,
-audit, or rollback protection."
+An unreleased OCI candidate install requires all five candidate target bindings
+shown above, uses only fresh Ctl-managed dependencies, and rejects external
+dependencies. Its active digest and embedded identity must match exactly, and
+public completion additionally requires a nonce-bound control JWS verified
+against the descriptor-mounted instance identity. `--yes` skips only the prompt;
+it never skips verification, backup, health, replay, audit, or rollback protection."
         }
         cli::HelpTopic::Keys => {
             "Usage:

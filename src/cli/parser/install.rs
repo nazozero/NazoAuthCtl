@@ -171,9 +171,9 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
         if version.is_some() {
             bail!("--to cannot be combined with a local OCI candidate install");
         }
-        if !external_dependencies {
+        if external_dependencies {
             bail!(
-                "a local OCI candidate install requires --external-dependencies and secure dependency input"
+                "a local OCI candidate install is managed-only and rejects --external-dependencies"
             );
         }
     }

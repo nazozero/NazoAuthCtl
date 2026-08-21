@@ -505,6 +505,8 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), !options.plan)?;
+                super::reject_pending_local_oci_candidate_record(&record)?;
+                super::reject_completed_local_oci_candidate_transition(&record)?;
                 if options.plan {
                     registered_update_plan(&record, &options)
                 } else {
@@ -513,8 +515,6 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                         options.yes,
                         "prepare a deployment-bound update transaction",
                     )?;
-                    super::reject_pending_local_oci_candidate_record(&record)?;
-                    super::reject_completed_local_oci_candidate_transition(&record)?;
                     registered_update_prepare(&store, &record, &options)
                 }
             } else {
@@ -653,6 +653,8 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
+                super::reject_pending_local_oci_candidate_record(&record)?;
+                super::reject_completed_local_oci_candidate_transition(&record)?;
                 require_registered_recovery_authority(
                     "rollback",
                     crate::coordination::active_update_exists(&store, &record),
@@ -691,6 +693,8 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
+                super::reject_pending_local_oci_candidate_record(&record)?;
+                super::reject_completed_local_oci_candidate_transition(&record)?;
                 require_registered_recovery_authority(
                     "recovery",
                     crate::coordination::active_update_exists(&store, &record),
@@ -731,6 +735,8 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
+                super::reject_pending_local_oci_candidate_record(&record)?;
+                super::reject_completed_local_oci_candidate_transition(&record)?;
                 require_confirmation(
                     yes,
                     "resume the deployment-bound interrupted update transaction",

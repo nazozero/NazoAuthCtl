@@ -585,7 +585,6 @@ fn local_oci_candidate_install_requires_an_exact_complete_source_binding() {
         "install",
         "--runtime",
         "podman",
-        "--external-dependencies",
         "--profile",
         "standards-full",
         "--profile-material",
@@ -609,6 +608,7 @@ fn local_oci_candidate_install_requires_an_exact_complete_source_binding() {
     let Command::Install(options) = command else {
         panic!("expected install");
     };
+    assert!(!options.external_dependencies);
     let candidate = options
         .local_oci_candidate
         .as_ref()
@@ -619,6 +619,21 @@ fn local_oci_candidate_install_requires_an_exact_complete_source_binding() {
     assert_eq!(candidate.target.oci_digest, digest);
 
     for arguments in [
+        &[
+            "nazoauthctl",
+            "install",
+            "--external-dependencies",
+            "--candidate-image",
+            "candidate",
+            "--candidate-release",
+            "v0.1.41-candidate.459",
+            "--candidate-revision",
+            &revision,
+            "--candidate-build-id",
+            &source,
+            "--candidate-oci-digest",
+            &digest,
+        ][..],
         &[
             "nazoauthctl",
             "install",

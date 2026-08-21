@@ -14,6 +14,7 @@ use crate::{
         OperatorProtocolCompatibility, Postgres, Rollback, Runtime as RuntimeConfig, Ui, Valkey,
     },
 };
+use base64::Engine as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 #[cfg(target_os = "linux")]
@@ -3193,6 +3194,79 @@ fn local_oci_candidate_identity_accepts_only_the_exact_source_revision() {
             &identity,
             &local_id,
             &format!("sha256:{}", "d".repeat(64)),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn local_oci_candidate_public_statement_must_match_the_descriptor_and_candidate() {
+    let work = PrivateTempDir::new("nazoauth-local-candidate-public-proof").unwrap();
+    let config = config(&work);
+    let revision = "a".repeat(40);
+    let candidate = CandidateTarget {
+        release: "v0.1.41-candidate.459".to_owned(),
+        revision: revision.clone(),
+        build_id: format!("source:{revision}"),
+        oci_digest: format!("sha256:{}", "b".repeat(64)),
+    };
+    let offline = nazo_operator_protocol::DeploymentStatement {
+        schema: nazo_operator_protocol::CONTROL_DISCOVERY_SCHEMA,
+        product: nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT.to_owned(),
+        deployment_id: config.operator.deployment_id.clone(),
+        runtime_instance_id: config.runtime.runtime_instance_id.clone(),
+        issuer: config.runtime.expected_issuer.clone(),
+        release: candidate.release.clone(),
+        revision: candidate.revision.clone(),
+        build_id: candidate.build_id.clone(),
+        control_protocol_versions: vec![nazo_operator_protocol::CONTROL_DISCOVERY_SCHEMA],
+        operator_protocol_versions: vec![nazo_operator_protocol::PROTOCOL_VERSION],
+        instance_key_id: "instance-key-test".to_owned(),
+        issued_at: 1,
+    };
+    let online = nazo_operator_protocol::DiscoveryStatement {
+        schema: offline.schema,
+        product: offline.product.clone(),
+        deployment_id: offline.deployment_id.clone(),
+        runtime_instance_id: offline.runtime_instance_id.clone(),
+        issuer: offline.issuer.clone(),
+        release: offline.release.clone(),
+        revision: offline.revision.clone(),
+        build_id: offline.build_id.clone(),
+        control_protocol_versions: offline.control_protocol_versions.clone(),
+        operator_protocol_versions: offline.operator_protocol_versions.clone(),
+        instance_key_id: offline.instance_key_id.clone(),
+        nonce: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7; 32]),
+        issued_at: 1,
+        expires_at: 2,
+    };
+    assert!(
+        crate::discovery::validate_local_oci_candidate_public_statement(
+            &config, &candidate, &offline, &online,
+        )
+        .is_ok()
+    );
+
+    let mut wrong_public = online.clone();
+    wrong_public.build_id = format!("source:{}", "c".repeat(40));
+    assert!(
+        crate::discovery::validate_local_oci_candidate_public_statement(
+            &config,
+            &candidate,
+            &offline,
+            &wrong_public,
+        )
+        .is_err()
+    );
+
+    let mut wrong_descriptor = offline.clone();
+    wrong_descriptor.runtime_instance_id = "another-runtime".to_owned();
+    assert!(
+        crate::discovery::validate_local_oci_candidate_public_statement(
+            &config,
+            &candidate,
+            &wrong_descriptor,
+            &online,
         )
         .is_err()
     );

@@ -18,8 +18,10 @@ use serde::{Deserialize, Serialize};
 use crate::filesystem::read_secure_regular_file_for_uid;
 
 use crate::{
+    cli::CandidateTarget,
     deployment::{ArtifactReference, RecoveryConclusion, RuntimeBackendKind},
     filesystem::read_secure_regular_file,
+    model::UpdateConfig,
     process::Process,
     runtime_backend::{RuntimeObservation, installed_backends},
 };
@@ -560,6 +562,131 @@ fn online_statement(runtime: &RuntimeObservation) -> anyhow::Result<Option<Disco
         return Ok(Some(statement));
     }
     Ok(None)
+}
+
+/// Prove that the configured public listener serves a fresh control statement
+/// for the descriptor-bound instance identity. The response's advertised key
+/// is only a consistency check: signature verification is rooted in the
+/// controller-visible `identity.pub` mount, never in network data.
+pub(crate) fn verify_public_local_oci_candidate_control(
+    config: &UpdateConfig,
+    candidate: &CandidateTarget,
+) -> anyhow::Result<()> {
+    let identity_mounts = config
+        .runtime
+        .mounts
+        .iter()
+        .filter(|mount| mount.target == Path::new("/var/lib/nazo_oauth/instance"))
+        .collect::<Vec<_>>();
+    let [identity_mount] = identity_mounts.as_slice() else {
+        bail!(
+            "local OCI candidate runtime must expose exactly one descriptor-bound instance identity mount"
+        );
+    };
+    let identity = load_verified_runtime_identity(&identity_mount.source, None)?;
+    let public_origin = config
+        .runtime
+        .public_discovery_url
+        .strip_suffix("/.well-known/openid-configuration")
+        .context("local OCI candidate public discovery URL has an unexpected path")?;
+    let public_origin = crate::model::parse_public_origin(
+        public_origin,
+        "local OCI candidate public control endpoint",
+    )?;
+    if public_origin.scheme() != "https" {
+        bail!("local OCI candidate public control endpoint must use HTTPS");
+    }
+    let nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let request = serde_json::to_string(&DiscoveryRequest {
+        schema: CONTROL_DISCOVERY_SCHEMA,
+        nonce: nonce.clone(),
+    })?;
+    let endpoint = format!(
+        "{}/.well-known/nazoauth-control",
+        public_origin.as_str().trim_end_matches('/')
+    );
+    let response = Process::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--proto",
+            "=https",
+            "--max-time",
+            "10",
+            "--max-filesize",
+            "65536",
+            "--request",
+            "POST",
+            "--header",
+            "Content-Type: application/json",
+            "--data-binary",
+            &request,
+            &endpoint,
+        ])
+        .stdout()
+        .context("local OCI candidate public control request failed")?;
+    if response.len() > 64 * 1024 {
+        bail!("local OCI candidate public control response exceeds 64 KiB");
+    }
+    let response: DiscoveryResponse = serde_json::from_str(&response)
+        .context("local OCI candidate public control response is invalid")?;
+    let response_key = decode_instance_public_key(&response.instance_public_key)
+        .context("local OCI candidate public control response has an invalid instance key")?;
+    if response_key.to_bytes() != identity.public_key.to_bytes() {
+        bail!("local OCI candidate public control key differs from descriptor-bound identity.pub");
+    }
+    let header = protected_header(&response.statement)
+        .context("local OCI candidate public control statement has an invalid protected header")?;
+    let statement = verify_discovery_statement(
+        &response.statement,
+        &identity.statement.instance_key_id,
+        &identity.public_key,
+        &nonce,
+        Utc::now().timestamp(),
+    )
+    .context("local OCI candidate public control statement did not verify")?;
+    validate_local_oci_candidate_public_statement(
+        config,
+        candidate,
+        &identity.statement,
+        &statement,
+    )
+}
+
+/// Keep the semantic comparison separate from transport/signature handling so
+/// every public completion path uses the same exact candidate binding.
+pub(crate) fn validate_local_oci_candidate_public_statement(
+    config: &UpdateConfig,
+    candidate: &CandidateTarget,
+    offline: &DeploymentStatement,
+    online: &DiscoveryStatement,
+) -> anyhow::Result<()> {
+    if offline.deployment_id != config.operator.deployment_id
+        || offline.runtime_instance_id != config.runtime.runtime_instance_id
+        || offline.issuer != config.runtime.expected_issuer
+        || offline.release != candidate.release
+        || offline.revision != candidate.revision
+        || offline.build_id != candidate.build_id
+        || offline.schema != CONTROL_DISCOVERY_SCHEMA
+        || offline.product != nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT
+        || !offline
+            .control_protocol_versions
+            .contains(&CONTROL_DISCOVERY_SCHEMA)
+        || !offline
+            .operator_protocol_versions
+            .contains(&nazo_operator_protocol::PROTOCOL_VERSION)
+    {
+        bail!(
+            "descriptor-bound local OCI candidate identity differs from the exact candidate binding"
+        );
+    }
+    if !statements_match(online, offline) {
+        bail!(
+            "public local OCI candidate control statement differs from descriptor-bound identity"
+        );
+    }
+    Ok(())
 }
 
 fn offline_statement(runtime: &RuntimeObservation) -> anyhow::Result<Option<DeploymentStatement>> {

@@ -24,45 +24,11 @@ Use all five candidate options together:
 --candidate-oci-digest sha256:LOWERCASE_MANIFEST_DIGEST
 ```
 
-The candidate path rejects `--to` and the host runtime. It requires the
-`standards-full` profile and `--external-dependencies` with secure dependency
-input, so it cannot pull managed PostgreSQL or Valkey images as a side effect.
-The dependency input is strict JSON supplied only through `--secrets-stdin` or
-`--secret-fd`; it must contain five independent credential URLs and one
-non-secret ownership assertion:
-
-```json
-{
-  "database_url": "postgresql://runtime:...@db.example/oauth",
-  "migration_database_url": "postgresql://migrator:...@db.example/oauth",
-  "database_backup_url": "postgresql://backup:...@db.example/oauth",
-  "valkey_url": "rediss://runtime:...@cache.example/0",
-  "valkey_backup_url": "rediss://backup:...@cache.example/0",
-  "valkey_backup_scope": "dedicated-instance"
-}
-```
-
-Unknown or missing fields are rejected. Runtime PostgreSQL and Valkey URLs are
-the only dependency credentials mounted into the long-lived server; the
-migration URL is available only to the isolated non-root migration task and
-both backup URLs remain root-only. Backups use only the two backup URLs.
-`valkey_backup_scope` is an operator assertion that the raw RDB export target
-is a deployment-dedicated Valkey instance; shared instances are rejected and
-must not be used for this path. Ctl canonicalizes the PostgreSQL and Valkey
-backup endpoints (host, effective port, database and Valkey TLS scheme),
-requires the runtime/migration/backup roles to use separate decoded usernames,
-and persists only SHA-256 endpoint identities and domain-separated SHA-256
-identities of the decoded role usernames (never passwords), plus the scope in
-the config, candidate intent and backup identity. PostgreSQL permits at most one `sslmode`;
-that TLS policy is part of each persisted PostgreSQL binding, while all other
-query options are rejected for this contract. Each runtime, migration, and backup
-PostgreSQL URL has its own persisted endpoint-plus-TLS identity, so changing
-any `sslmode` (including a downgrade) blocks replay.
-Changing any dependency username also blocks replay; rotating only a password
-does not change the persisted binding.
-Existing schema-2 managed deployments remain
-readable, while a legacy external configuration without these dedicated backup
-credentials fails closed and is never rewritten during candidate retry.
+The candidate path rejects `--to`, the host runtime, and
+`--external-dependencies`. It requires the `standards-full` profile and uses
+the ordinary Ctl-managed PostgreSQL, Valkey, generated secret material, and
+managed backup flow. It therefore requires a fresh deployment root and does
+not adopt, share, or infer credentials for hand-created dependency containers.
 Before a migration, key task, or runtime replacement,
 the controller resolves the supplied image only from the selected local runtime,
 then proves its immutable local image ID, OCI manifest digest, and embedded
@@ -78,23 +44,33 @@ The resulting DeploymentRecord binds the controller config, runtime ownership,
 local image ID, expected OCI digest, and the complete embedded identity, so an
 ordinary conformance session rechecks all of them before tenant-resource work.
 
+Before registration and on an exact completed-install retry, Ctl also checks
+the public HTTPS `/.well-known/nazoauth-control` endpoint. It sends a fresh
+nonce and accepts at most 64 KiB; the returned JWS must verify under the
+descriptor-bound `identity.pub` mounted for this runtime. Its deployment ID,
+runtime ID, issuer, release, revision, build ID, protocol versions, and key ID
+must exactly match the local descriptor and candidate binding. An unavailable,
+expired, wrong-key, wrong-nonce, or mismatched public statement leaves the
+install pending and does not register a completed deployment.
+
 Once completed, this deployment is permanently frozen as that exact candidate.
 `update --yes`, development activation, migrations, and capability/provenance
-transitions cannot replace its active release or runtime. Conformance,
-read-only status/doctor diagnostics, and a safe explicit relinquish remain
-available. Promotion to a signed Release is intentionally not implicit and
-requires a future explicit promotion transaction.
+transitions cannot replace its active release or runtime. Conformance and
+read-only status/doctor diagnostics remain available. Promotion to a signed
+Release is intentionally not implicit and requires a future explicit promotion
+transaction.
 
 The digest is the local OCI manifest digest reported by the chosen runtime, not
 a mutable image tag and not the local image ID. Retagging `IMAGE` therefore
 cannot change a resumed candidate: the stored local image ID, the reported
 manifest digest, and the embedded identity must all still match.
 
-This is an isolated candidate recovery boundary, not a signed Release rollback
-contract; it never synthesizes an automatic signed-Release rollback. Pending
-candidate state blocks conformance, update, development activation, and other
-controller mutations. `status` and read-only diagnostics remain available for
-evidence. If registration is already visible while the candidate state remains
-incomplete, it stays fail-closed for operator recovery rather than silently
-running or replacing that deployment. Do not use `development activate`,
-`adopt`, or `update` to bypass that binding.
+This is an isolated candidate preflight boundary, not a recovery contract.
+Its record remains `RequiresUserEvidence`: Ctl does not claim automated
+rollback, registered recovery, or clean-machine reconstruction. Pending state
+blocks conformance, update, development activation, and other controller
+mutations. Once completed, `recover`, `rollback`, `update`, development
+activation, adoption, and migration remain fail-closed; only conformance and
+read-only diagnostics are available. `status` and `doctor` retain evidence for
+an explicit operator decision rather than silently restoring or replacing the
+candidate.

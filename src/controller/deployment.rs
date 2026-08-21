@@ -684,10 +684,9 @@ fn install_local_oci_candidate_transaction(
         return Ok(());
     }
 
-    // Re-read the durable external contract before recording a retry intent
-    // or touching any registration, task, or runtime state.  A config records
-    // only non-secret endpoint identities, so a changed secret file must fail
-    // closed.
+    // Re-open any existing managed backup before recording a retry intent or
+    // touching runtime state. Candidate installation is deliberately
+    // managed-only, so there is no external provider contract to replay.
     verify_local_oci_candidate_retry_preconditions(config, &state)?;
 
     let registration_recovery =
@@ -738,8 +737,21 @@ fn install_local_oci_candidate_transaction(
     )?;
     bootstrap_openid4vc_revocation_snapshot(config)?;
     runtime.activate_local_development_artifact(&local)?;
-    wait_ready(config)?;
-    verify_public(config)?;
+    let active = runtime.active_build_target()?;
+    let active_local_artifact_id = active
+        .local_artifact_id
+        .as_deref()
+        .context("active local OCI candidate exposes no immutable local image ID")?;
+    crate::controller::commands::validate_local_oci_candidate_observation(
+        &candidate.target,
+        &active.embedded,
+        active_local_artifact_id,
+        &active.image_digest,
+    )?;
+    if active_local_artifact_id != local_artifact_id {
+        bail!("active local OCI candidate image ID differs from the inspected local image ID");
+    }
+    verify_local_oci_candidate_public_preconditions(config, candidate)?;
 
     let backup = state
         .recovery_backup
@@ -796,7 +808,6 @@ pub(super) fn verify_local_oci_candidate_retry_preconditions(
     config: &UpdateConfig,
     state: &LocalOciCandidateInstallState,
 ) -> anyhow::Result<()> {
-    install::verify_live_external_dependencies(config)?;
     if let Some(backup) = state.recovery_backup.as_deref() {
         Backup::open_existing(config, backup)?;
     }
@@ -878,8 +889,20 @@ fn verify_local_oci_candidate_completion_preconditions(
         &candidate.target,
         local_artifact_id,
     )?;
+    verify_local_oci_candidate_public_preconditions(config, candidate)
+}
+
+/// The ordinary discovery check establishes the public issuer. The candidate
+/// path additionally requires a fresh control statement signed by the
+/// descriptor-mounted instance key for this exact public candidate. Run this
+/// before registration so a bad proof remains a retryable pending install.
+fn verify_local_oci_candidate_public_preconditions(
+    config: &UpdateConfig,
+    candidate: &LocalOciCandidateInstall,
+) -> anyhow::Result<()> {
     wait_ready(config)?;
-    verify_public(config)
+    verify_public(config)?;
+    crate::discovery::verify_public_local_oci_candidate_control(config, &candidate.target)
 }
 
 fn validate_completed_local_oci_candidate_install(
