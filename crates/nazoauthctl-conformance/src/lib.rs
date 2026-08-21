@@ -59,7 +59,9 @@ pub use browser::{
     OpenId4VpVerifier, OpenId4VpVerifierClient, WebDriverClient, WebDriverEndpoint,
     parse_browser_entries, parse_browser_entries_owned,
 };
-pub use ciba_approval::{CibaUserApprovalBridge, CibaUserApprovalClient, CibaUserApprovalError};
+pub use ciba_approval::{
+    CibaApprovalFailureStage, CibaUserApprovalBridge, CibaUserApprovalClient, CibaUserApprovalError,
+};
 pub use client::{
     AuthProbe, CancelOutcome, ClientConfig, DeleteOutcome, ModuleDefinition, ModuleInstance,
     PlanCreated, SuiteClient, SuiteClientError,

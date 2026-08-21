@@ -217,7 +217,7 @@ pub struct CibaUserApprovalBridge {
 #[derive(Clone, Copy)]
 enum CallbackHealth {
     ListenerUnhealthy,
-    ApprovalTransport(TransportError),
+    ApprovalFailure(CibaApprovalFailureStage),
 }
 
 impl std::fmt::Debug for CibaUserApprovalBridge {
@@ -291,8 +291,8 @@ impl CibaUserApprovalBridge {
             .as_ref()
             .map_or(Ok(()), |health| match health {
                 CallbackHealth::ListenerUnhealthy => Err(CibaUserApprovalError::CallbackUnhealthy),
-                CallbackHealth::ApprovalTransport(error) => {
-                    Err(CibaUserApprovalError::CallbackApprovalTransport(*error))
+                CallbackHealth::ApprovalFailure(stage) => {
+                    Err(CibaUserApprovalError::CallbackApprovalFailure(*stage))
                 }
             })
     }
@@ -400,12 +400,12 @@ fn handle_callback(
             write_callback_response(stream, 204)?;
         }
         Err(error) => {
-            if let CibaUserApprovalError::Transport(error) = error {
-                health
-                    .lock()
-                    .map_err(|_| CibaUserApprovalError::CallbackUnhealthy)?
-                    .get_or_insert(CallbackHealth::ApprovalTransport(error));
-            }
+            health
+                .lock()
+                .map_err(|_| CibaUserApprovalError::CallbackUnhealthy)?
+                .get_or_insert(CallbackHealth::ApprovalFailure(
+                    error.approval_failure_stage(),
+                ));
             write_callback_response(stream, 404)?;
         }
     }
@@ -558,8 +558,8 @@ pub enum CibaUserApprovalError {
     CallbackSpawn(std::io::Error),
     #[error("CIBA callback listener is unhealthy")]
     CallbackUnhealthy,
-    #[error("CIBA approval callback transport failed: {0}")]
-    CallbackApprovalTransport(TransportError),
+    #[error("CIBA approval callback failed during {0}")]
+    CallbackApprovalFailure(CibaApprovalFailureStage),
     #[error("CIBA callback request is malformed")]
     MalformedCallbackRequest,
     #[error("CIBA callback request exceeds the size limit")]
@@ -568,6 +568,70 @@ pub enum CibaUserApprovalError {
     CallbackRead(std::io::Error),
     #[error("CIBA callback response could not be written: {0}")]
     CallbackWrite(std::io::Error),
+}
+
+/// A non-sensitive CIBA approval phase retained by the callback bridge.
+///
+/// The bridge deliberately discards HTTP statuses, response contents, issuer
+/// URLs, callback capabilities, and credentials before reporting this phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CibaApprovalFailureStage {
+    Client,
+    Login,
+    Csrf,
+    Verify,
+    Decision,
+    Transport(TransportError),
+}
+
+impl std::fmt::Display for CibaApprovalFailureStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client => formatter.write_str("client"),
+            Self::Login => formatter.write_str("login"),
+            Self::Csrf => formatter.write_str("csrf"),
+            Self::Verify => formatter.write_str("verify"),
+            Self::Decision => formatter.write_str("decision"),
+            Self::Transport(TransportError::InvalidConfiguration) => {
+                formatter.write_str("transport-configuration")
+            }
+            Self::Transport(TransportError::Network(stage)) => {
+                write!(formatter, "transport-{stage}")
+            }
+            Self::Transport(TransportError::Oversize) => formatter.write_str("transport-oversize"),
+        }
+    }
+}
+
+impl CibaUserApprovalError {
+    fn approval_failure_stage(&self) -> CibaApprovalFailureStage {
+        match self {
+            Self::InvalidIssuer
+            | Self::InvalidCredentials
+            | Self::InvalidAuthRequestId
+            | Self::RequestEncoding
+            | Self::CallbackMustBindLoopback
+            | Self::InvalidCallbackPath
+            | Self::InvalidCallbackToken
+            | Self::CallbackBind(_)
+            | Self::CallbackSpawn(_)
+            | Self::CallbackUnhealthy
+            | Self::CallbackApprovalFailure(_)
+            | Self::MalformedCallbackRequest
+            | Self::CallbackRequestTooLarge
+            | Self::CallbackRead(_)
+            | Self::CallbackWrite(_) => CibaApprovalFailureStage::Client,
+            Self::LoginRejected(_) | Self::MalformedLoginResponse | Self::MfaRequired => {
+                CibaApprovalFailureStage::Login
+            }
+            Self::MissingSessionCookies => CibaApprovalFailureStage::Csrf,
+            Self::VerificationRejected(_) | Self::MalformedVerificationResponse => {
+                CibaApprovalFailureStage::Verify
+            }
+            Self::DecisionRejected(_) => CibaApprovalFailureStage::Decision,
+            Self::Transport(error) => CibaApprovalFailureStage::Transport(*error),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -745,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn callback_keeps_suite_404_but_records_only_static_transport_stage() {
+    fn callback_keeps_suite_404_but_records_only_static_failure_stage() {
         let approval_token = "0123456789abcdef0123456789abcdef";
         let auth_req_id = "private-auth-request";
         let bridge = CibaUserApprovalBridge::start(
@@ -787,17 +851,70 @@ mod tests {
             .expect("approval transport failure must be retained");
         assert!(matches!(
             error,
-            CibaUserApprovalError::CallbackApprovalTransport(TransportError::Network(
-                TransportFailureStage::SendConnectOrTls
+            CibaUserApprovalError::CallbackApprovalFailure(CibaApprovalFailureStage::Transport(
+                TransportError::Network(TransportFailureStage::SendConnectOrTls)
             ))
         ));
         let rendered = error.to_string();
         assert_eq!(
             rendered,
-            "CIBA approval callback transport failed: HTTP transport failed during send-connect-or-tls"
+            "CIBA approval callback failed during transport-send-connect-or-tls"
         );
         for secret in [approval_token, auth_req_id, "correct horse battery staple"] {
             assert!(!rendered.contains(secret));
         }
+    }
+
+    #[test]
+    fn approval_failure_stages_are_static_and_cover_each_protocol_phase() {
+        let cases = [
+            (
+                CibaUserApprovalError::LoginRejected(503),
+                CibaApprovalFailureStage::Login,
+            ),
+            (
+                CibaUserApprovalError::MissingSessionCookies,
+                CibaApprovalFailureStage::Csrf,
+            ),
+            (
+                CibaUserApprovalError::VerificationRejected(403),
+                CibaApprovalFailureStage::Verify,
+            ),
+            (
+                CibaUserApprovalError::DecisionRejected(418),
+                CibaApprovalFailureStage::Decision,
+            ),
+            (
+                CibaUserApprovalError::Transport(TransportError::Network(
+                    TransportFailureStage::SendTimeout,
+                )),
+                CibaApprovalFailureStage::Transport(TransportError::Network(
+                    TransportFailureStage::SendTimeout,
+                )),
+            ),
+        ];
+        for (error, stage) in cases {
+            assert_eq!(error.approval_failure_stage(), stage);
+            let rendered = stage.to_string();
+            for sensitive_or_dynamic in [
+                "503",
+                "403",
+                "418",
+                "private-auth-request",
+                "csrf-value",
+                "correct horse battery staple",
+                "approval_token",
+                "auth_req_id",
+            ] {
+                assert!(!rendered.contains(sensitive_or_dynamic));
+            }
+        }
+        assert_eq!(
+            CibaApprovalFailureStage::Transport(TransportError::Network(
+                TransportFailureStage::SendTimeout
+            ))
+            .to_string(),
+            "transport-send-timeout"
+        );
     }
 }
