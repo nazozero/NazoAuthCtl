@@ -643,6 +643,7 @@ pub(crate) fn prepare_managed_volume_ownership(
         .args([
             "run",
             "--rm",
+            "--pull=never",
             "--user",
             "0:0",
             "--network",

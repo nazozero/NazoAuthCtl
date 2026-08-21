@@ -3235,7 +3235,7 @@ fn local_oci_candidate_state_rejects_completed_flag_without_completed_phase() {
     fs::create_dir_all(&config.deployment_root).unwrap();
     let revision = "a".repeat(40);
     let mut state = LocalOciCandidateInstallState {
-        schema: 4,
+        schema: 5,
         candidate: LocalOciCandidateInstall {
             image: "candidate:local".to_owned(),
             target: CandidateTarget {
@@ -3370,7 +3370,7 @@ fn external_secret_drift_does_not_mutate_pending_candidate_state() {
     fs::create_dir_all(&config.deployment_root).unwrap();
     let revision = "a".repeat(40);
     let state = LocalOciCandidateInstallState {
-        schema: 4,
+        schema: 5,
         candidate: LocalOciCandidateInstall {
             image: "candidate:local".to_owned(),
             target: CandidateTarget {
@@ -3427,7 +3427,7 @@ fn external_principal_drift_rejects_each_role_without_state_mutation() {
     configure_external_dependency_fixture(&mut config);
     fs::create_dir_all(&config.deployment_root).unwrap();
     let state = LocalOciCandidateInstallState {
-        schema: 4,
+        schema: 5,
         candidate: LocalOciCandidateInstall {
             image: "candidate:local".to_owned(),
             target: CandidateTarget {
@@ -3558,7 +3558,7 @@ fn candidate_retry_rejects_bad_backup_evidence_before_state_mutation() {
             _ => unreachable!(),
         }
         let state = LocalOciCandidateInstallState {
-            schema: 4,
+            schema: 5,
             candidate: LocalOciCandidateInstall {
                 image: "candidate:local".to_owned(),
                 target: CandidateTarget {

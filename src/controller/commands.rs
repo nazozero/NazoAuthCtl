@@ -765,6 +765,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
+                super::reject_pending_local_oci_candidate_record(&record)?;
                 require_confirmation(
                     yes,
                     "resume the deployment-bound interrupted update transaction",

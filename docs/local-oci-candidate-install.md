@@ -79,9 +79,10 @@ incomplete, it stays fail-closed for operator recovery rather than silently
 running or replacing that deployment. Do not use `development activate`,
 `adopt`, or `update` to bypass that binding.
 
-Candidate install-state schemas 1 through 3 are intentionally not replayed or
+Candidate install-state schemas 1 through 4 are intentionally not replayed or
 migrated: they predate either generation-bound dependency-image recovery
-evidence or exact completion-audit classification required by the current
-schema 4 contract. Preserve old state for incident evidence and create a fresh
+evidence, exact completion-audit classification, or deployment-bound task
+identities required by the current schema 5 contract. Preserve old state for
+incident evidence and create a fresh
 managed candidate deployment instead. Hostinger's candidate rollout began from
 zero candidate state, so no in-place migration is performed.

@@ -462,7 +462,7 @@ fn load_local_oci_candidate_install_state(
     )?;
     let state: LocalOciCandidateInstallState = serde_json::from_slice(&bytes)
         .context("local OCI candidate installation state is invalid")?;
-    validate_local_oci_candidate_install_state(&state)?;
+    validate_local_oci_candidate_install_state(config, &state)?;
     Ok(Some(state))
 }
 
@@ -471,6 +471,7 @@ fn load_local_oci_candidate_install_state(
 /// place without inventing evidence, so an old pending state is deliberately
 /// an operator-visible, fail-closed boundary rather than a best-effort retry.
 fn validate_local_oci_candidate_install_state(
+    config: &UpdateConfig,
     state: &LocalOciCandidateInstallState,
 ) -> anyhow::Result<()> {
     if state.schema == 1 {
@@ -488,7 +489,12 @@ fn validate_local_oci_candidate_install_state(
             "local OCI candidate state schema 3 predates exact completion audit classification; preserve it for evidence and recreate a fresh managed candidate deployment"
         );
     }
-    if state.schema != 4
+    if state.schema == 4 {
+        bail!(
+            "local OCI candidate state schema 4 predates deployment-bound task identities; preserve it for evidence and recreate a fresh managed candidate deployment"
+        );
+    }
+    if state.schema != 5
         || state.local_artifact_id.is_empty()
         || state.attempt == 0
         || state.migration_jti.is_empty()
@@ -500,7 +506,7 @@ fn validate_local_oci_candidate_install_state(
         value.len() == 64
             && value
                 .bytes()
-                .all(|byte| byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte >= b'a'))
+                .all(|byte| byte.is_ascii_digit() || (byte >= b'a' && byte <= b'f'))
     };
     for value in [
         state.migration_receipt_sha256.as_deref(),
@@ -539,6 +545,54 @@ fn validate_local_oci_candidate_install_state(
         || (state.completed != (state.phase == LocalOciCandidatePhase::Completed))
     {
         bail!("local OCI candidate state phase and receipts are inconsistent");
+    }
+    if state.migration_jti
+        != local_oci_candidate_task_jti(
+            config,
+            &state.candidate,
+            &state.local_artifact_id,
+            state.attempt,
+            "migration",
+        )
+        || state.keys_jti
+            != local_oci_candidate_task_jti(
+                config,
+                &state.candidate,
+                &state.local_artifact_id,
+                state.attempt,
+                "keys",
+            )
+    {
+        bail!(
+            "local OCI candidate state task identity does not match its exact deployment binding"
+        );
+    }
+    let expected = local_oci_candidate_expected_target(config, &state.candidate)?;
+    for (committed, operation, jti, stored_digest) in [
+        (
+            migration_committed,
+            TaskOperation::MigrateApply,
+            state.migration_jti.as_str(),
+            state.migration_receipt_sha256.as_deref(),
+        ),
+        (
+            keys_committed,
+            local_oci_candidate_keys_operation(),
+            state.keys_jti.as_str(),
+            state.keys_receipt_sha256.as_deref(),
+        ),
+    ] {
+        if committed {
+            let receipt =
+                crate::operator::reconcile_final_receipt(config, &expected, &operation, jti)?
+                    .context(
+                        "local OCI candidate committed task has no exact successful final receipt",
+                    )?;
+            let actual_digest = crate::filesystem::sha256(&receipt.final_receipt)?;
+            if Some(actual_digest.as_str()) != stored_digest {
+                bail!("local OCI candidate committed task receipt digest changed");
+            }
+        }
     }
     let recovery_material_required = matches!(
         state.phase,
@@ -626,7 +680,11 @@ pub(super) fn validate_completed_local_oci_candidate_provenance(
         (Some("install"), Some(generation)) if generation == state.attempt => {
             "local-oci-candidate-install"
         }
-        (Some("registered-recover"), Some(_)) => "local-oci-candidate-registered-recover",
+        (Some("registered-recover"), Some(generation))
+            if generation == record.declaration_revision =>
+        {
+            "local-oci-candidate-registered-recover"
+        }
         _ => {
             bail!("completed local OCI candidate state has no exact completion kind and generation")
         }
@@ -1233,18 +1291,19 @@ fn install_local_oci_candidate_transaction(
             state
         }
         None => LocalOciCandidateInstallState {
-            schema: 4,
+            schema: 5,
             candidate: candidate.clone(),
             local_artifact_id: local_artifact_id.to_owned(),
             phase: LocalOciCandidatePhase::Prepared,
             attempt: 1,
             migration_jti: local_oci_candidate_task_jti(
+                config,
                 candidate,
                 local_artifact_id,
                 1,
                 "migration",
             ),
-            keys_jti: local_oci_candidate_task_jti(candidate, local_artifact_id, 1, "keys"),
+            keys_jti: local_oci_candidate_task_jti(config, candidate, local_artifact_id, 1, "keys"),
             migration_receipt_sha256: None,
             keys_receipt_sha256: None,
             rollback_backup: None,
@@ -1480,10 +1539,27 @@ fn install_local_oci_candidate_transaction(
         local_artifact_id,
     )?;
     crate::lifecycle::cache_trusted_runtime(&store, &record)?;
+    finalize_local_oci_candidate_install_completion(config, &mut state)?;
+    validate_completed_local_oci_candidate_install(config_path, config, &state)?;
+    println!(
+        "NazoAuth local OCI candidate installed at {} ({})",
+        candidate.target.release, candidate.target.revision
+    );
+    Ok(())
+}
+
+/// Complete either the normal post-registration path or its exact retry with
+/// one durable state shape.  In particular, a crash after declaration
+/// persistence must not produce a `Completed` state that lacks the schema-4
+/// provenance fields required by later status, conformance, or recovery.
+fn finalize_local_oci_candidate_install_completion(
+    config: &UpdateConfig,
+    state: &mut LocalOciCandidateInstallState,
+) -> anyhow::Result<()> {
     let management_event = crate::operator::append_management_event(
         config,
         "local-oci-candidate-install",
-        &candidate.target.release,
+        &state.candidate.target.release,
         "backup",
     )?;
     state.management_event_file = management_event
@@ -1502,16 +1578,11 @@ fn install_local_oci_candidate_transaction(
     );
     state.phase = LocalOciCandidatePhase::Completed;
     state.completed = true;
-    persist_local_oci_candidate_install_state(config, &state)?;
-    validate_completed_local_oci_candidate_install(config_path, config, &state)?;
-    println!(
-        "NazoAuth local OCI candidate installed at {} ({})",
-        candidate.target.release, candidate.target.revision
-    );
-    Ok(())
+    persist_local_oci_candidate_install_state(config, state)
 }
 
 fn local_oci_candidate_task_jti(
+    config: &UpdateConfig,
     candidate: &LocalOciCandidateInstall,
     local_artifact_id: &str,
     attempt: u64,
@@ -1520,6 +1591,8 @@ fn local_oci_candidate_task_jti(
     let digest = Sha256::digest(
         serde_json::to_vec(&serde_json::json!({
             "candidate": candidate,
+            "deployment_id": config.operator.deployment_id,
+            "runtime_instance_id": config.runtime.runtime_instance_id,
             "local_artifact_id": local_artifact_id,
             "attempt": attempt,
             "operation": operation,
@@ -1717,11 +1790,24 @@ fn cache_local_oci_candidate_recovery_package(
             // may leave only these deterministic, unreferenced work files;
             // discard precisely that incomplete generation and build it
             // again.  A manifest is never overwritten: it is open-or-verify.
-            for name in ["image.tar", "postgres-image.tar", "valkey-image.tar"] {
+            // `Runtime::export_image` writes `with_extension("oci-archive.tmp")`
+            // beside each fixed archive before rename.  These names are not
+            // caller-controlled and are accepted only as regular files in
+            // this exact generation directory; every other entry fails
+            // closed rather than being removed.
+            for name in [
+                "image.tar",
+                "postgres-image.tar",
+                "valkey-image.tar",
+                "image.oci-archive.tmp",
+                "postgres-image.oci-archive.tmp",
+                "valkey-image.oci-archive.tmp",
+            ] {
                 let file = directory.join(name);
                 match fs::symlink_metadata(&file) {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                        validate_incomplete_local_oci_candidate_recovery_file(&file, &metadata)?;
                         fs::remove_file(&file).with_context(|| {
                             format!(
                                 "failed to discard incomplete candidate recovery artifact {}",
@@ -1790,6 +1876,27 @@ fn cache_local_oci_candidate_recovery_package(
     state.recovery_cache_sha256 = Some(crate::filesystem::sha256(
         state.recovery_package.as_deref().expect("set above"),
     )?);
+    Ok(())
+}
+
+fn validate_incomplete_local_oci_candidate_recovery_file(
+    _file: &Path,
+    metadata: &fs::Metadata,
+) -> anyhow::Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("candidate recovery temporary artifact is not a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            bail!(
+                "candidate recovery temporary artifact has unsafe owner or permissions: {}",
+                _file.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1920,12 +2027,14 @@ fn recover_local_oci_candidate_attempt(
         .checked_add(1)
         .context("local OCI candidate attempt counter overflow")?;
     state.migration_jti = local_oci_candidate_task_jti(
+        config,
         &state.candidate,
         &state.local_artifact_id,
         state.attempt,
         "migration",
     );
     state.keys_jti = local_oci_candidate_task_jti(
+        config,
         &state.candidate,
         &state.local_artifact_id,
         state.attempt,
@@ -2015,20 +2124,7 @@ fn finish_local_oci_candidate_registration_recovery(
         local_artifact_id,
     )?;
     crate::lifecycle::cache_trusted_runtime(&store, &record)?;
-    let management_event = crate::operator::append_management_event(
-        config,
-        "local-oci-candidate-install",
-        &candidate.target.release,
-        "backup",
-    )?;
-    state.management_event_file = management_event
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(ToOwned::to_owned);
-    state.management_event_sha256 = Some(crate::filesystem::sha256(&management_event)?);
-    state.phase = LocalOciCandidatePhase::Completed;
-    state.completed = true;
-    persist_local_oci_candidate_install_state(config, state)?;
+    finalize_local_oci_candidate_install_completion(config, state)?;
     validate_completed_local_oci_candidate_install(config_path, config, state)?;
     println!(
         "NazoAuth local OCI candidate registration recovery completed at {} ({})",
