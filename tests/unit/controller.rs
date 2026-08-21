@@ -3380,7 +3380,9 @@ fn candidate_retry_rejects_bad_backup_evidence_before_state_mutation() {
         )
         .unwrap();
         let before = fs::read(&state_path).unwrap();
-        assert!(verify_local_oci_candidate_retry_preconditions(&config, &state).is_err());
+        assert!(
+            deployment::verify_local_oci_candidate_retry_preconditions(&config, &state).is_err()
+        );
         assert_eq!(fs::read(&state_path).unwrap(), before, "{kind}");
     }
 }

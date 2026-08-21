@@ -792,7 +792,7 @@ fn install_local_oci_candidate_transaction(
 
 /// This is deliberately called before a retry can persist state, append audit
 /// evidence, start dependencies, or replay an operator task.
-fn verify_local_oci_candidate_retry_preconditions(
+pub(super) fn verify_local_oci_candidate_retry_preconditions(
     config: &UpdateConfig,
     state: &LocalOciCandidateInstallState,
 ) -> anyhow::Result<()> {
