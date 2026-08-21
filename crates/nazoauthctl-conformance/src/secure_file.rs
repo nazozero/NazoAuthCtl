@@ -371,6 +371,58 @@ pub(crate) fn promote_private_file(from: &Path, to: &Path) -> Result<(), SecureF
     }
 }
 
+/// Atomically publish a completed private directory without replacing an
+/// existing evidence directory. Both parent directories must already be
+/// root-owned/private and on the same filesystem; callers verify the content
+/// digest after promotion.
+#[cfg(unix)]
+pub(crate) fn promote_private_directory(from: &Path, to: &Path) -> Result<(), SecureFileError> {
+    let from = normalize_absolute(from)?;
+    let to = normalize_absolute(to)?;
+    let from_parent = from.parent().ok_or(SecureFileError::UnsafePath)?;
+    let to_parent = to.parent().ok_or(SecureFileError::UnsafePath)?;
+    validate_directory(&from, true)?;
+    validate_directory(to_parent, true)?;
+    let from_parent_file = open_directory_chain(from_parent, true, false)?;
+    let to_parent_file = open_directory_chain(to_parent, true, false)?;
+    let from_name = from.file_name().ok_or(SecureFileError::UnsafePath)?;
+    let to_name = to.file_name().ok_or(SecureFileError::UnsafePath)?;
+    match rustix::fs::renameat_with(
+        &from_parent_file,
+        from_name,
+        &to_parent_file,
+        to_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {
+            rustix::fs::fsync(&from_parent_file).map_err(|_| SecureFileError::Io)?;
+            rustix::fs::fsync(&to_parent_file).map_err(|_| SecureFileError::Io)
+        }
+        Err(error) if error.raw_os_error() == libc::EEXIST => Err(SecureFileError::Io),
+        Err(_) => Err(SecureFileError::Io),
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn promote_private_directory(_from: &Path, _to: &Path) -> Result<(), SecureFileError> {
+    Err(SecureFileError::UnsupportedPlatform)
+}
+
+/// Remove an already-verified empty private directory and durably record the
+/// unlink in its parent. Callers must remove only manifest-authorized files
+/// first; this helper never performs a broad recursive deletion.
+#[cfg(unix)]
+pub(crate) fn remove_private_empty_directory(path: &Path) -> Result<(), SecureFileError> {
+    let path = normalize_absolute(path)?;
+    validate_directory(&path, true)?;
+    let parent = path.parent().ok_or(SecureFileError::UnsafePath)?;
+    let parent_file = open_directory_chain(parent, true, false)?;
+    let name = path.file_name().ok_or(SecureFileError::UnsafePath)?;
+    rustix::fs::unlinkat(&parent_file, name, rustix::fs::AtFlags::REMOVEDIR)
+        .map_err(|_| SecureFileError::Io)?;
+    rustix::fs::fsync(&parent_file).map_err(|_| SecureFileError::Io)
+}
+
 /// Open and read a bounded regular file with O_NOFOLLOW.  Metadata is checked
 /// both before and after reading, preventing replacement races from being
 /// mistaken for a successful read.

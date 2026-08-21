@@ -32,8 +32,9 @@ use nazoauthctl_conformance::{
     TenantResourceApplyOutput, TenantResourceReceiptIdentity, TenantResourceRecoveryBinding,
     TtyRenderer, WebDriverClient, WebDriverEndpoint, authorize_oidf_driver_execution,
     open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
-    read_compact_manifest, recover_suite_resources, validate_private_evidence_directory,
-    verify_oidf_artifact, write_private_provider_evidence_bundle, write_review_screenshot_manifest,
+    read_compact_manifest, recover_suite_resources, stage_private_provider_evidence_bundle,
+    validate_private_evidence_directory, verify_oidf_artifact,
+    write_private_provider_evidence_bundle, write_review_screenshot_manifest,
 };
 use nazoauthctl_core::tenant_resources::{
     TenantResourceCapabilitySession, TenantResourceClient, TenantResourceClientError,
@@ -472,6 +473,10 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let mut retention_eligible = run_result
         .as_ref()
         .is_ok_and(|report| report.orchestration_integrity.retention_eligible);
+    // Once this run elects certification retention, a provider bundle is only
+    // a staged input to that transaction. No later failure may expose it as a
+    // standalone successful receipt.
+    let retention_attempted = retention_eligible;
     let mut errors = Vec::new();
     let review_screenshot_manifest = if invocation.capture_review_screenshots && retention_eligible
     {
@@ -618,7 +623,21 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             }),
             outer_cleanup_complete: cleanup_complete,
         };
-        match write_private_provider_evidence_bundle(report, directory, &identity) {
+        let staged = if retention_commit_possible {
+            stage_private_provider_evidence_bundle(
+                report,
+                directory,
+                &identity,
+                recovery
+                    .tenant_resource_binding()
+                    .context("missing ordinary recovery binding")?
+                    .request_jti
+                    .as_str(),
+            )
+        } else {
+            write_private_provider_evidence_bundle(report, directory, &identity)
+        };
+        match staged {
             Ok(receipt) => staged_evidence = Some(receipt),
             Err(error) => {
                 retention_eligible = false;
@@ -650,6 +669,17 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         match (|| -> anyhow::Result<()> {
             recovery.stage_suite_retention_manifest()?;
             recovery.commit_suite_plan_retention()?;
+            let provider = recovery.publish_retained_provider_evidence()?;
+            if let Some(receipt) = staged_evidence.as_mut() {
+                receipt.directory = provider.directory;
+                receipt.manifest_sha256 = provider.manifest_sha256;
+            } else {
+                anyhow::bail!("retained Suite journal lost its provider evidence receipt");
+            }
+            // The provider directory is part of the signed retention manifest.
+            // Re-stage the journal-owned pending manifest after its atomic
+            // promotion, before the final Suite manifest becomes visible.
+            recovery.stage_suite_retention_manifest()?;
             let manifest_path = recovery.publish_committed_suite_retention_manifest()?;
             eprintln!(
                 "Suite plans retained for certification review: review/publish them in the official Suite UI, then use a controlled deletion procedure; manifest={}",
@@ -680,7 +710,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     // after Suite ownership has been durably transferred and its manifest has
     // been published. Retained publication failures keep the journal for
     // recovery but return no stale success evidence to this invocation.
-    let evidence = if retention_commit_possible {
+    let evidence = if retention_attempted {
         retention_committed.then_some(staged_evidence).flatten()
     } else {
         staged_evidence
