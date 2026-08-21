@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::io::{self, IsTerminal as _, Read as _, Write as _};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -478,10 +478,8 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                 .evidence_directory
                 .as_ref()
                 .expect("retention preflight requires evidence directory");
-            recovery.prepare_suite_plan_retention(
-                manifest,
-                evidence_directory.join(format!("retained-suite-{request_jti}.json")),
-            )
+            let manifest_path = suite_retention_manifest_path(evidence_directory, &manifest);
+            recovery.prepare_suite_plan_retention(manifest, manifest_path)
         })();
         if let Err(error) = prepared {
             retention_eligible = false;
@@ -1011,6 +1009,13 @@ fn suite_retention_manifest(
     })
 }
 
+fn suite_retention_manifest_path(
+    evidence_directory: &Path,
+    manifest: &SuiteRetentionManifest,
+) -> PathBuf {
+    evidence_directory.join(format!("retained-suite-{}.json", manifest.run_id))
+}
+
 fn cleanup_unretained_suite(
     recovery: &mut nazoauthctl_conformance::ConformanceRecoveryGuard,
     suite_client: &SuiteClient,
@@ -1488,5 +1493,30 @@ mod tests {
         assert!(!conformance_acceptance_succeeds(false, true, true));
         assert!(!conformance_acceptance_succeeds(true, false, true));
         assert!(!conformance_acceptance_succeeds(true, true, false));
+    }
+
+    #[test]
+    fn retained_suite_manifest_path_uses_the_recovery_binding_jti() {
+        let local_request_jti = "request-local-0123456789abcdef";
+        let binding_request_jti = "tenant-request-0123456789abcdef";
+        assert_ne!(local_request_jti, binding_request_jti);
+        let manifest = SuiteRetentionManifest {
+            schema: 1,
+            suite_origin: "https://www.certification.openid.net".to_owned(),
+            artifact_digest: "a".repeat(64),
+            matrix_sha256: "b".repeat(64),
+            deployment_id: "deployment-a".to_owned(),
+            tenant_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            run_id: binding_request_jti.to_owned(),
+            plans: Vec::new(),
+        };
+
+        let path = suite_retention_manifest_path(Path::new("/evidence"), &manifest);
+
+        assert_eq!(
+            path,
+            Path::new("/evidence").join(format!("retained-suite-{binding_request_jti}.json"))
+        );
+        assert!(!path.to_string_lossy().contains(local_request_jti));
     }
 }
