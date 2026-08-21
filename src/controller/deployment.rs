@@ -938,6 +938,17 @@ pub(super) fn recover_registered_local_oci_candidate(
         .staged_state
         .clone()
         .context("staged local OCI candidate recovery has no durable state")?;
+    // A crash after staging can coincide with loss of the runtime image
+    // cache. Re-import the staged generation by immutable archive before the
+    // active-image observation; import is idempotent and never pulls.
+    let staged_archive = state
+        .recovery_package
+        .as_deref()
+        .context("staged local OCI candidate recovery has no package")?
+        .parent()
+        .context("staged local OCI candidate recovery package has no parent")?
+        .join("image.tar");
+    runtime.import_image(&staged_archive, &state.local_artifact_id)?;
     let local = runtime.inspect_local_development_artifact(&state.local_artifact_id)?;
     let actual_digest = runtime.image_digest(&state.local_artifact_id)?;
     crate::controller::commands::validate_local_oci_candidate_observation(
