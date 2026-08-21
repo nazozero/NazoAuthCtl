@@ -279,10 +279,16 @@ pub(super) fn normalize_external_dependencies(options: &mut InstallOptions) -> a
         }
         let binding = external_dependency_endpoint_binding(options)?;
         options.database_runtime_endpoint_sha256 = Some(binding.database_runtime_endpoint_sha256);
+        options.database_runtime_principal_sha256 = Some(binding.database_runtime_principal_sha256);
         options.migration_database_endpoint_sha256 =
             Some(binding.migration_database_endpoint_sha256);
+        options.migration_database_principal_sha256 =
+            Some(binding.migration_database_principal_sha256);
         options.database_backup_endpoint_sha256 = Some(binding.database_endpoint_sha256);
+        options.database_backup_principal_sha256 = Some(binding.database_principal_sha256);
+        options.valkey_runtime_principal_sha256 = Some(binding.valkey_runtime_principal_sha256);
         options.valkey_backup_endpoint_sha256 = Some(binding.valkey_endpoint_sha256);
+        options.valkey_backup_principal_sha256 = Some(binding.valkey_principal_sha256);
     }
     Ok(())
 }
@@ -307,13 +313,21 @@ pub(crate) fn verify_live_external_dependencies(config: &UpdateConfig) -> anyhow
     )?;
     if binding.database_runtime_endpoint_sha256
         != config.dependencies.database_runtime_endpoint_sha256
+        || binding.database_runtime_principal_sha256
+            != config.dependencies.database_runtime_principal_sha256
         || binding.migration_database_endpoint_sha256
             != config.dependencies.migration_database_endpoint_sha256
+        || binding.migration_database_principal_sha256
+            != config.dependencies.migration_database_principal_sha256
         || binding.database_endpoint_sha256 != config.dependencies.database_backup_endpoint_sha256
+        || binding.database_principal_sha256 != config.dependencies.database_backup_principal_sha256
+        || binding.valkey_runtime_principal_sha256
+            != config.dependencies.valkey_runtime_principal_sha256
         || binding.valkey_endpoint_sha256 != config.dependencies.valkey_backup_endpoint_sha256
+        || binding.valkey_principal_sha256 != config.dependencies.valkey_backup_principal_sha256
     {
         bail!(
-            "live external dependency endpoints no longer match the persisted deployment binding"
+            "live external dependency endpoints or principals no longer match the persisted deployment binding"
         );
     }
     Ok(())
@@ -389,9 +403,14 @@ pub(super) fn read_external_dependency_secrets(
     options.external_valkey_backup_scope = Some(secrets.valkey_backup_scope.clone());
     let binding = external_dependency_endpoint_binding(options)?;
     options.database_runtime_endpoint_sha256 = Some(binding.database_runtime_endpoint_sha256);
+    options.database_runtime_principal_sha256 = Some(binding.database_runtime_principal_sha256);
     options.migration_database_endpoint_sha256 = Some(binding.migration_database_endpoint_sha256);
+    options.migration_database_principal_sha256 = Some(binding.migration_database_principal_sha256);
     options.database_backup_endpoint_sha256 = Some(binding.database_endpoint_sha256);
+    options.database_backup_principal_sha256 = Some(binding.database_principal_sha256);
+    options.valkey_runtime_principal_sha256 = Some(binding.valkey_runtime_principal_sha256);
     options.valkey_backup_endpoint_sha256 = Some(binding.valkey_endpoint_sha256);
+    options.valkey_backup_principal_sha256 = Some(binding.valkey_principal_sha256);
     Ok(())
 }
 

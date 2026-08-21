@@ -182,16 +182,36 @@ pub(super) fn build_config(
                 .database_runtime_endpoint_sha256
                 .clone()
                 .unwrap_or_default(),
+            database_runtime_principal_sha256: options
+                .database_runtime_principal_sha256
+                .clone()
+                .unwrap_or_default(),
             migration_database_endpoint_sha256: options
                 .migration_database_endpoint_sha256
+                .clone()
+                .unwrap_or_default(),
+            migration_database_principal_sha256: options
+                .migration_database_principal_sha256
                 .clone()
                 .unwrap_or_default(),
             database_backup_endpoint_sha256: options
                 .database_backup_endpoint_sha256
                 .clone()
                 .unwrap_or_default(),
+            database_backup_principal_sha256: options
+                .database_backup_principal_sha256
+                .clone()
+                .unwrap_or_default(),
+            valkey_runtime_principal_sha256: options
+                .valkey_runtime_principal_sha256
+                .clone()
+                .unwrap_or_default(),
             valkey_backup_endpoint_sha256: options
                 .valkey_backup_endpoint_sha256
+                .clone()
+                .unwrap_or_default(),
+            valkey_backup_principal_sha256: options
+                .valkey_backup_principal_sha256
                 .clone()
                 .unwrap_or_default(),
         },

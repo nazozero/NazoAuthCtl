@@ -221,11 +221,15 @@ impl Backup {
         let providers = read_external_backup_providers(database_backup_url, valkey_backup_url)?;
         if providers.binding.database_endpoint_sha256
             != config.dependencies.database_backup_endpoint_sha256
+            || providers.binding.database_principal_sha256
+                != config.dependencies.database_backup_principal_sha256
             || providers.binding.valkey_endpoint_sha256
                 != config.dependencies.valkey_backup_endpoint_sha256
+            || providers.binding.valkey_principal_sha256
+                != config.dependencies.valkey_backup_principal_sha256
         {
             bail!(
-                "external backup credential endpoints or TLS policy no longer match the persisted deployment binding"
+                "external backup credential endpoints, TLS policy, or principals no longer match the persisted deployment binding"
             );
         }
         let postgres = self.path.join("postgresql.dump");
@@ -338,12 +342,22 @@ impl Backup {
                 != config.dependencies.external_valkey_backup_scope
                 || archived.dependencies.database_runtime_endpoint_sha256
                     != config.dependencies.database_runtime_endpoint_sha256
+                || archived.dependencies.database_runtime_principal_sha256
+                    != config.dependencies.database_runtime_principal_sha256
                 || archived.dependencies.migration_database_endpoint_sha256
                     != config.dependencies.migration_database_endpoint_sha256
+                || archived.dependencies.migration_database_principal_sha256
+                    != config.dependencies.migration_database_principal_sha256
                 || archived.dependencies.database_backup_endpoint_sha256
                     != config.dependencies.database_backup_endpoint_sha256
+                || archived.dependencies.database_backup_principal_sha256
+                    != config.dependencies.database_backup_principal_sha256
+                || archived.dependencies.valkey_runtime_principal_sha256
+                    != config.dependencies.valkey_runtime_principal_sha256
                 || archived.dependencies.valkey_backup_endpoint_sha256
-                    != config.dependencies.valkey_backup_endpoint_sha256)
+                    != config.dependencies.valkey_backup_endpoint_sha256
+                || archived.dependencies.valkey_backup_principal_sha256
+                    != config.dependencies.valkey_backup_principal_sha256)
         {
             bail!("backup external dependency binding does not match the selected deployment");
         }

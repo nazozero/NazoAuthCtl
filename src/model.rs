@@ -84,11 +84,21 @@ pub(crate) struct Dependencies {
     #[serde(default)]
     pub(crate) database_runtime_endpoint_sha256: String,
     #[serde(default)]
+    pub(crate) database_runtime_principal_sha256: String,
+    #[serde(default)]
     pub(crate) migration_database_endpoint_sha256: String,
+    #[serde(default)]
+    pub(crate) migration_database_principal_sha256: String,
     #[serde(default)]
     pub(crate) database_backup_endpoint_sha256: String,
     #[serde(default)]
+    pub(crate) database_backup_principal_sha256: String,
+    #[serde(default)]
+    pub(crate) valkey_runtime_principal_sha256: String,
+    #[serde(default)]
     pub(crate) valkey_backup_endpoint_sha256: String,
+    #[serde(default)]
+    pub(crate) valkey_backup_principal_sha256: String,
 }
 
 fn default_dependency_mode() -> String {
@@ -106,9 +116,14 @@ impl Default for Dependencies {
             valkey_backup_url_file: PathBuf::new(),
             external_valkey_backup_scope: String::new(),
             database_runtime_endpoint_sha256: String::new(),
+            database_runtime_principal_sha256: String::new(),
             migration_database_endpoint_sha256: String::new(),
+            migration_database_principal_sha256: String::new(),
             database_backup_endpoint_sha256: String::new(),
+            database_backup_principal_sha256: String::new(),
+            valkey_runtime_principal_sha256: String::new(),
             valkey_backup_endpoint_sha256: String::new(),
+            valkey_backup_principal_sha256: String::new(),
         }
     }
 }
@@ -383,16 +398,36 @@ impl UpdateConfig {
                     &self.dependencies.database_runtime_endpoint_sha256,
                 ),
                 (
+                    "external PostgreSQL runtime principal identity",
+                    &self.dependencies.database_runtime_principal_sha256,
+                ),
+                (
                     "external PostgreSQL migration endpoint identity",
                     &self.dependencies.migration_database_endpoint_sha256,
+                ),
+                (
+                    "external PostgreSQL migration principal identity",
+                    &self.dependencies.migration_database_principal_sha256,
                 ),
                 (
                     "external PostgreSQL backup endpoint identity",
                     &self.dependencies.database_backup_endpoint_sha256,
                 ),
                 (
+                    "external PostgreSQL backup principal identity",
+                    &self.dependencies.database_backup_principal_sha256,
+                ),
+                (
+                    "external Valkey runtime principal identity",
+                    &self.dependencies.valkey_runtime_principal_sha256,
+                ),
+                (
                     "external Valkey backup endpoint identity",
                     &self.dependencies.valkey_backup_endpoint_sha256,
+                ),
+                (
+                    "external Valkey backup principal identity",
+                    &self.dependencies.valkey_backup_principal_sha256,
                 ),
             ] {
                 if identity.len() != 64

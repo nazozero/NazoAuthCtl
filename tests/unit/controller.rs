@@ -301,10 +301,17 @@ fn configure_external_dependency_fixture(config: &mut UpdateConfig) {
     )
     .unwrap();
     config.dependencies.database_runtime_endpoint_sha256 = binding.database_runtime_endpoint_sha256;
+    config.dependencies.database_runtime_principal_sha256 =
+        binding.database_runtime_principal_sha256;
     config.dependencies.migration_database_endpoint_sha256 =
         binding.migration_database_endpoint_sha256;
+    config.dependencies.migration_database_principal_sha256 =
+        binding.migration_database_principal_sha256;
     config.dependencies.database_backup_endpoint_sha256 = binding.database_endpoint_sha256;
+    config.dependencies.database_backup_principal_sha256 = binding.database_principal_sha256;
+    config.dependencies.valkey_runtime_principal_sha256 = binding.valkey_runtime_principal_sha256;
     config.dependencies.valkey_backup_endpoint_sha256 = binding.valkey_endpoint_sha256;
+    config.dependencies.valkey_backup_principal_sha256 = binding.valkey_principal_sha256;
 }
 
 const OPENID4VC_TEST_LEAF: &str = "-----BEGIN CERTIFICATE-----\nMIIFWzCCBEOgAwIBAgISAyBIAwu7NBD5CTxX8suDCMgFMA0GCSqGSIb3DQEBCwUA\nMEoxCzAJBgNVBAYTAlVTMRYwFAYDVQQKEw1MZXQncyBFbmNyeXB0MSMwIQYDVQQD\nExpMZXQncyBFbmNyeXB0IEF1dGhvcml0eSBYMzAeFw0xOTA3MTIxMTEyMzBaFw0x\nOTEwMTAxMTEyMzBaMB0xGzAZBgNVBAMTEmxpc3RzLmZvci1vdXIuaW5mbzCCASIw\nDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMVoti34X46DaI2nX24C+aZ2Ofkm\nhKbidiXiRTon1MLSMGl1oNW9MyRyYYCzP4j6DNKChJnr8ZnVShh2oZD+yHWP9lpn\nXMGkbsUxejRMU9hnaAB50pXRIDAzavkVFCguFlJ8nKkv/Y1Avlw7tc2aZOd3lOZB\nEr8gJ8mRDGqqsNU+Z12I6slEstzGMpsq6AewCVw4lMjdWWgugzUrxQTRAsG87on6\ngOiQH2cMODN3L7Fq4KOLQIjb3/luQhAQhpdKmEGFLin3c+f5or3thCDuwwDtOU1l\nZf+8t9S8pZPLrZrIs6H2xjXqCRuUY7iRNbO18Ukc6rlDYhBj9LT+cpmBbHECAwEA\nAaOCAmYwggJiMA4GA1UdDwEB/wQEAwIFoDAdBgNVHSUEFjAUBggrBgEFBQcDAQYI\nKwYBBQUHAwIwDAYDVR0TAQH/BAIwADAdBgNVHQ4EFgQUJj2pvRtl3GloH3He6FX1\nds3X0VEwHwYDVR0jBBgwFoAUqEpqYwR93brm0Tm3pkVl7/Oo7KEwbwYIKwYBBQUH\nAQEEYzBhMC4GCCsGAQUFBzABhiJodHRwOi8vb2NzcC5pbnQteDMubGV0c2VuY3J5\ncHQub3JnMC8GCCsGAQUFBzAChiNodHRwOi8vY2VydC5pbnQteDMubGV0c2VuY3J5\ncHQub3JnLzAdBgNVHREEFjAUghJsaXN0cy5mb3Itb3VyLmluZm8wTAYDVR0gBEUw\nQzAIBgZngQwBAgEwNwYLKwYBBAGC3xMBAQEwKDAmBggrBgEFBQcCARYaaHR0cDov\nL2Nwcy5sZXRzZW5jcnlwdC5vcmcwggEDBgorBgEEAdZ5AgQCBIH0BIHxAO8AdgAp\nPFGWVMg5ZbqqUPxYB9S3b79Yeily3KTDDPTlRUf0eAAAAWvmGV7yAAAEAwBHMEUC\nICQL2Sm14aCMLxX9a9RbySgyBfichMRdbu6QA2Mbrl4eAiEA1vgJ7snqUWCgoqEE\n3SEfK3ioMopzWBsPvG6LdCuCMRAAdQBvU3asMfAxGdiZAKRRFf93FRwR2QLBACkG\njbIImjfZEwAAAWvmGV9oAAAEAwBGMEQCIExGqw3Lo0nSCyUuTRf92FgGASwWYji5\nUGnXuYnpJrAvAiBw8AWVag8fzZ4ogAhY9EFRNdLrUcBjStipL888vyuxKzANBgkq\nhkiG9w0BAQsFAAOCAQEAF8BBLDvSWZg57B6aDtzfUTSGetCYs3k0vJqCJlL+Pz7/\nUruCSsojQzp5R6jvvgYQ83MaIdwe2mgt+OCQB5v7ylctyBzBmYIw9nPnxEC7HlcJ\nL2K/k5ZjJFRnv4kV1Si8+TIpEAV0ksf39KGKemG8kGi4GXV1v03zSv0p8aCarpuo\nSKBJ4qlB0CvmS2MqV4KnzO0O2h0c/ZQ4jg7l53eiN7VPdRMMO1DRw+MaW6I/hEZp\n+oZQ7hhKXgKUBvF4IGwyrfyIZ8AeWKG4IP98COgyRbz7qtrAVevRKCM0ZC2t04A2\nFcix40FKEeiE093Aj3cweMYxNLPgwgQP8Xu3kA5QEw==\n-----END CERTIFICATE-----\n";
@@ -3302,6 +3309,78 @@ fn external_secret_drift_does_not_mutate_pending_candidate_state() {
     crate::filesystem::set_mode(&config.dependencies.valkey_backup_url_file, 0o600).unwrap();
 
     assert!(install::verify_live_external_dependencies(&config).is_err());
+    assert_eq!(fs::read(&state_path).unwrap(), before);
+}
+
+#[test]
+fn external_principal_drift_rejects_each_role_without_state_mutation() {
+    let work = PrivateTempDir::new("nazoauth-candidate-external-principal-drift").unwrap();
+    let mut config = config(&work);
+    configure_external_dependency_fixture(&mut config);
+    fs::create_dir_all(&config.deployment_root).unwrap();
+    let state = LocalOciCandidateInstallState {
+        schema: 1,
+        candidate: LocalOciCandidateInstall {
+            image: "candidate:local".to_owned(),
+            target: CandidateTarget {
+                release: "v0.2.0-candidate.1".to_owned(),
+                revision: "a".repeat(40),
+                build_id: format!("source:{}", "a".repeat(40)),
+                oci_digest: format!("sha256:{}", "b".repeat(64)),
+            },
+        },
+        local_artifact_id: format!("sha256:{}", "c".repeat(64)),
+        recovery_backup: None,
+        management_event_file: None,
+        management_event_sha256: None,
+        completed: false,
+    };
+    let state_path = deployment::local_oci_candidate_install_resource_path(&config);
+    atomic_write(
+        &state_path,
+        &serde_json::to_vec_pretty(&state).unwrap(),
+        0o600,
+    )
+    .unwrap();
+    let before = fs::read(&state_path).unwrap();
+    let cases = [
+        (
+            &config.dependencies.database_url_file,
+            "postgresql://runtime-rotated:runtime-secret@db.example/oauth?sslmode=require",
+        ),
+        (
+            &config.dependencies.migration_database_url_file,
+            "postgresql://migrator-rotated:migration-secret@db.example:5432/oauth",
+        ),
+        (
+            &config.dependencies.database_backup_url_file,
+            "postgres://backup-rotated:backup-secret@DB.EXAMPLE/oauth",
+        ),
+        (
+            &config.dependencies.valkey_url_file,
+            "rediss://runtime-rotated:runtime-secret@cache.example/0",
+        ),
+        (
+            &config.dependencies.valkey_backup_url_file,
+            "rediss://backup-rotated:backup-secret@CACHE.EXAMPLE:6379/0",
+        ),
+    ];
+    for (path, replacement) in cases {
+        let original = fs::read(path).unwrap();
+        fs::write(path, replacement).unwrap();
+        crate::filesystem::set_mode(path, 0o600).unwrap();
+        assert!(install::verify_live_external_dependencies(&config).is_err());
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+        fs::write(path, original).unwrap();
+        crate::filesystem::set_mode(path, 0o600).unwrap();
+    }
+    fs::write(
+        &config.dependencies.database_url_file,
+        "postgresql://runtime:rotated-password@db.example/oauth?sslmode=require",
+    )
+    .unwrap();
+    crate::filesystem::set_mode(&config.dependencies.database_url_file, 0o600).unwrap();
+    assert!(install::verify_live_external_dependencies(&config).is_ok());
     assert_eq!(fs::read(&state_path).unwrap(), before);
 }
 

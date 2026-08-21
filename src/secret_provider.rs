@@ -122,9 +122,14 @@ impl ValkeyProvider {
 
 pub(crate) struct ExternalDependencyBackupBinding {
     pub(crate) database_runtime_endpoint_sha256: String,
+    pub(crate) database_runtime_principal_sha256: String,
     pub(crate) migration_database_endpoint_sha256: String,
+    pub(crate) migration_database_principal_sha256: String,
     pub(crate) database_endpoint_sha256: String,
+    pub(crate) database_principal_sha256: String,
+    pub(crate) valkey_runtime_principal_sha256: String,
     pub(crate) valkey_endpoint_sha256: String,
+    pub(crate) valkey_principal_sha256: String,
 }
 
 /// The two backup credentials are read and parsed exactly once.  The binding
@@ -167,15 +172,23 @@ pub(crate) fn bind_external_dependency_credentials(
     }
     Ok(ExternalDependencyBackupBinding {
         database_runtime_endpoint_sha256: postgres_binding_sha256(&database),
+        database_runtime_principal_sha256: principal_sha256("postgres", database.username.as_str()),
         migration_database_endpoint_sha256: postgres_binding_sha256(&migration),
+        migration_database_principal_sha256: principal_sha256(
+            "postgres",
+            migration.username.as_str(),
+        ),
         database_endpoint_sha256: endpoint_sha256(&format!(
             "{};tls-policy={}",
             backup.endpoint, backup.tls_policy
         )),
+        database_principal_sha256: principal_sha256("postgres", backup.username.as_str()),
+        valkey_runtime_principal_sha256: principal_sha256("valkey", valkey.username.as_str()),
         valkey_endpoint_sha256: endpoint_sha256(&format!(
             "{};tls-policy={}",
             valkey_backup.endpoint, valkey_backup.tls_policy
         )),
+        valkey_principal_sha256: principal_sha256("valkey", valkey_backup.username.as_str()),
     })
 }
 
@@ -188,13 +201,20 @@ pub(crate) fn read_external_backup_providers(
     let database = parse_dependency_url(database_raw.as_str(), "PostgreSQL backup")?;
     let valkey = parse_dependency_url(valkey_raw.as_str(), "Valkey backup")?;
     let database_endpoint_sha256 = postgres_endpoint_sha256(&database, "PostgreSQL backup")?;
+    let database_principal_sha256 = principal_sha256("postgres", database.username.as_str());
     let valkey_hash = valkey_endpoint_sha256(&valkey, "Valkey backup")?;
+    let valkey_principal_sha256 = principal_sha256("valkey", valkey.username.as_str());
     Ok(ExternalBackupProviders {
         binding: ExternalDependencyBackupBinding {
             database_runtime_endpoint_sha256: String::new(),
+            database_runtime_principal_sha256: String::new(),
             migration_database_endpoint_sha256: String::new(),
+            migration_database_principal_sha256: String::new(),
             database_endpoint_sha256,
+            database_principal_sha256,
+            valkey_runtime_principal_sha256: String::new(),
             valkey_endpoint_sha256: valkey_hash,
+            valkey_principal_sha256,
         },
         postgres: PostgresProvider::from_dependency_url(database)?,
         valkey: ValkeyProvider::from_dependency_url(valkey)?,
@@ -455,6 +475,19 @@ fn valkey_binding_from_url(url: DependencyUrl, label: &str) -> anyhow::Result<Pr
 
 fn endpoint_sha256(endpoint: &str) -> String {
     Sha256::digest(endpoint.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn principal_sha256(provider: &str, username: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"nazoauthctl/external-dependency-principal/v1\0");
+    digest.update(provider.as_bytes());
+    digest.update([0]);
+    digest.update(username.as_bytes());
+    digest
+        .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()

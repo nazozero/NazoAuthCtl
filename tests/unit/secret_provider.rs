@@ -45,6 +45,76 @@ fn external_dependency_binding_canonicalizes_ports_and_rejects_alias_bypasses() 
     .unwrap();
     assert_eq!(binding.database_endpoint_sha256.len(), 64);
     assert_eq!(binding.valkey_endpoint_sha256.len(), 64);
+    for principal in [
+        &binding.database_runtime_principal_sha256,
+        &binding.migration_database_principal_sha256,
+        &binding.database_principal_sha256,
+        &binding.valkey_runtime_principal_sha256,
+        &binding.valkey_principal_sha256,
+    ] {
+        assert_eq!(principal.len(), 64);
+        assert!(
+            principal
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+    }
+    let password_rotated = bind_external_dependency_credentials(
+        "postgresql://runtime:rotated-runtime@db.example/oauth?sslmode=require",
+        "postgresql://migrator:rotated-migration@db.example:5432/oauth",
+        "postgres://backup:rotated-backup@DB.EXAMPLE/oauth?sslmode=require",
+        "rediss://runtime:rotated-runtime@cache.example/0",
+        "rediss://backup:rotated-backup@CACHE.EXAMPLE:6379/0",
+    )
+    .unwrap();
+    assert_eq!(
+        binding.database_runtime_endpoint_sha256,
+        password_rotated.database_runtime_endpoint_sha256
+    );
+    assert_eq!(
+        binding.migration_database_endpoint_sha256,
+        password_rotated.migration_database_endpoint_sha256
+    );
+    assert_eq!(
+        binding.database_endpoint_sha256,
+        password_rotated.database_endpoint_sha256
+    );
+    assert_eq!(
+        binding.valkey_endpoint_sha256,
+        password_rotated.valkey_endpoint_sha256
+    );
+    assert_eq!(
+        binding.database_runtime_principal_sha256,
+        password_rotated.database_runtime_principal_sha256
+    );
+    assert_eq!(
+        binding.migration_database_principal_sha256,
+        password_rotated.migration_database_principal_sha256
+    );
+    assert_eq!(
+        binding.database_principal_sha256,
+        password_rotated.database_principal_sha256
+    );
+    assert_eq!(
+        binding.valkey_runtime_principal_sha256,
+        password_rotated.valkey_runtime_principal_sha256
+    );
+    assert_eq!(
+        binding.valkey_principal_sha256,
+        password_rotated.valkey_principal_sha256
+    );
+    let percent_decoded_username = bind_external_dependency_credentials(
+        "postgresql://run%74ime:runtime-secret@db.example/oauth?sslmode=require",
+        "postgresql://migrator:migration-secret@db.example:5432/oauth",
+        "postgres://backup:backup-secret@DB.EXAMPLE/oauth?sslmode=require",
+        "rediss://runtime:runtime-secret@cache.example/0",
+        "rediss://backup:backup-secret@CACHE.EXAMPLE:6379/0",
+    )
+    .unwrap();
+    assert_eq!(
+        binding.database_runtime_principal_sha256,
+        percent_decoded_username.database_runtime_principal_sha256
+    );
     let downgraded_tls = bind_external_dependency_credentials(
         "postgresql://runtime:runtime-secret@db.example/oauth",
         "postgresql://migrator:migration-secret@db.example:5432/oauth",

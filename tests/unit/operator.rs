@@ -806,10 +806,17 @@ fn direct_migrate_rejects_external_secret_drift_before_creating_an_audit_intent(
     )
     .unwrap();
     config.dependencies.database_runtime_endpoint_sha256 = binding.database_runtime_endpoint_sha256;
+    config.dependencies.database_runtime_principal_sha256 =
+        binding.database_runtime_principal_sha256;
     config.dependencies.migration_database_endpoint_sha256 =
         binding.migration_database_endpoint_sha256;
+    config.dependencies.migration_database_principal_sha256 =
+        binding.migration_database_principal_sha256;
     config.dependencies.database_backup_endpoint_sha256 = binding.database_endpoint_sha256;
+    config.dependencies.database_backup_principal_sha256 = binding.database_principal_sha256;
+    config.dependencies.valkey_runtime_principal_sha256 = binding.valkey_runtime_principal_sha256;
     config.dependencies.valkey_backup_endpoint_sha256 = binding.valkey_endpoint_sha256;
+    config.dependencies.valkey_backup_principal_sha256 = binding.valkey_principal_sha256;
     fs::write(
         &config.dependencies.database_backup_url_file,
         "postgresql://backup:backup-secret@db.example/oauth?sslmode=disable",

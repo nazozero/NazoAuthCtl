@@ -51,12 +51,15 @@ is a deployment-dedicated Valkey instance; shared instances are rejected and
 must not be used for this path. Ctl canonicalizes the PostgreSQL and Valkey
 backup endpoints (host, effective port, database and Valkey TLS scheme),
 requires the runtime/migration/backup roles to use separate decoded usernames,
-and persists only SHA-256 endpoint identities plus the scope in the config,
-candidate intent and backup identity. PostgreSQL permits at most one `sslmode`;
+and persists only SHA-256 endpoint identities and domain-separated SHA-256
+identities of the decoded role usernames (never passwords), plus the scope in
+the config, candidate intent and backup identity. PostgreSQL permits at most one `sslmode`;
 that TLS policy is part of each persisted PostgreSQL binding, while all other
 query options are rejected for this contract. Each runtime, migration, and backup
 PostgreSQL URL has its own persisted endpoint-plus-TLS identity, so changing
 any `sslmode` (including a downgrade) blocks replay.
+Changing any dependency username also blocks replay; rotating only a password
+does not change the persisted binding.
 Existing schema-2 managed deployments remain
 readable, while a legacy external configuration without these dedicated backup
 credentials fails closed and is never rewritten during candidate retry.

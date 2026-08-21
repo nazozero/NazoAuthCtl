@@ -36,9 +36,14 @@ fn install_options(data_root: PathBuf) -> InstallOptions {
         valkey_backup_url: None,
         external_valkey_backup_scope: None,
         database_runtime_endpoint_sha256: None,
+        database_runtime_principal_sha256: None,
         migration_database_endpoint_sha256: None,
+        migration_database_principal_sha256: None,
         database_backup_endpoint_sha256: None,
+        database_backup_principal_sha256: None,
+        valkey_runtime_principal_sha256: None,
         valkey_backup_endpoint_sha256: None,
+        valkey_backup_principal_sha256: None,
         external_dependencies: false,
         secrets_stdin: false,
         secret_fd: None,
@@ -61,9 +66,14 @@ fn bind_external_dependency_fixture(options: &mut InstallOptions) {
     .unwrap();
     options.external_valkey_backup_scope = Some("dedicated-instance".to_owned());
     options.database_runtime_endpoint_sha256 = Some(binding.database_runtime_endpoint_sha256);
+    options.database_runtime_principal_sha256 = Some(binding.database_runtime_principal_sha256);
     options.migration_database_endpoint_sha256 = Some(binding.migration_database_endpoint_sha256);
+    options.migration_database_principal_sha256 = Some(binding.migration_database_principal_sha256);
     options.database_backup_endpoint_sha256 = Some(binding.database_endpoint_sha256);
+    options.database_backup_principal_sha256 = Some(binding.database_principal_sha256);
+    options.valkey_runtime_principal_sha256 = Some(binding.valkey_runtime_principal_sha256);
     options.valkey_backup_endpoint_sha256 = Some(binding.valkey_endpoint_sha256);
+    options.valkey_backup_principal_sha256 = Some(binding.valkey_principal_sha256);
 }
 
 #[cfg(unix)]
@@ -325,9 +335,14 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
         valkey_backup_url: None,
         external_valkey_backup_scope: None,
         database_runtime_endpoint_sha256: None,
+        database_runtime_principal_sha256: None,
         migration_database_endpoint_sha256: None,
+        migration_database_principal_sha256: None,
         database_backup_endpoint_sha256: None,
+        database_backup_principal_sha256: None,
+        valkey_runtime_principal_sha256: None,
         valkey_backup_endpoint_sha256: None,
+        valkey_backup_principal_sha256: None,
         external_dependencies: false,
         secrets_stdin: false,
         secret_fd: None,
@@ -771,6 +786,20 @@ fn external_dependency_secret_input_is_bounded_closed_and_value_opaque() {
             .as_deref()
             .is_some_and(|value| value.len() == 64)
     );
+    for principal in [
+        options.database_runtime_principal_sha256.as_deref(),
+        options.migration_database_principal_sha256.as_deref(),
+        options.database_backup_principal_sha256.as_deref(),
+        options.valkey_runtime_principal_sha256.as_deref(),
+        options.valkey_backup_principal_sha256.as_deref(),
+    ] {
+        assert!(principal.is_some_and(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }));
+    }
 
     let required = [
         "database_url",
