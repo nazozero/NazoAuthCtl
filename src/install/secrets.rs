@@ -233,24 +233,46 @@ pub(super) fn normalize_external_dependencies(options: &mut InstallOptions) -> a
             #[cfg(not(unix))]
             bail!("--secret-fd requires Linux");
         } else {
-            options.database_url = Some(rpassword::prompt_password("PostgreSQL runtime URL: ")?);
-            options.migration_database_url =
-                Some(rpassword::prompt_password("PostgreSQL migration URL: ")?);
-            options.valkey_url = Some(rpassword::prompt_password("Valkey URL: ")?);
+            bail!(
+                "external dependencies require strict JSON through --secrets-stdin or --secret-fd"
+            );
         }
     }
-    if (options.database_url.is_some()
+    let has_any_external_credential = options.database_url.is_some()
         || options.migration_database_url.is_some()
-        || options.valkey_url.is_some())
-        && (options.database_url.is_none()
-            || options.migration_database_url.is_none()
-            || options.valkey_url.is_none())
-    {
+        || options.database_backup_url.is_some()
+        || options.valkey_url.is_some()
+        || options.valkey_backup_url.is_some()
+        || options.external_valkey_backup_scope.is_some();
+    let has_complete_external_contract = options.database_url.is_some()
+        && options.migration_database_url.is_some()
+        && options.database_backup_url.is_some()
+        && options.valkey_url.is_some()
+        && options.valkey_backup_url.is_some()
+        && options.external_valkey_backup_scope.as_deref() == Some("dedicated-instance");
+    if has_any_external_credential && !has_complete_external_contract {
         bail!(
-            "external dependencies require runtime PostgreSQL, migration PostgreSQL, and Valkey URLs"
+            "external dependencies require distinct runtime, migration, backup PostgreSQL/Valkey URLs and dedicated-instance Valkey backup scope"
         );
     }
     if let Some(database) = &options.database_url {
+        let credentials = [
+            database.as_str(),
+            options
+                .migration_database_url
+                .as_deref()
+                .unwrap_or_default(),
+            options.database_backup_url.as_deref().unwrap_or_default(),
+            options.valkey_url.as_deref().unwrap_or_default(),
+            options.valkey_backup_url.as_deref().unwrap_or_default(),
+        ];
+        if credentials
+            .iter()
+            .enumerate()
+            .any(|(index, credential)| credentials[..index].contains(credential))
+        {
+            bail!("external dependency credential URLs must be distinct");
+        }
         validate_dependency_url(database, &["postgres", "postgresql"], "PostgreSQL")?;
         validate_dependency_url(
             options
@@ -261,9 +283,19 @@ pub(super) fn normalize_external_dependencies(options: &mut InstallOptions) -> a
             "PostgreSQL migration",
         )?;
         validate_dependency_url(
+            options.database_backup_url.as_deref().unwrap_or_default(),
+            &["postgres", "postgresql"],
+            "PostgreSQL backup",
+        )?;
+        validate_dependency_url(
             options.valkey_url.as_deref().unwrap_or_default(),
             &["redis", "rediss"],
             "Valkey",
+        )?;
+        validate_dependency_url(
+            options.valkey_backup_url.as_deref().unwrap_or_default(),
+            &["redis", "rediss"],
+            "Valkey backup",
         )?;
     }
     Ok(())
@@ -308,7 +340,10 @@ pub(super) fn normalize_profile_secrets(options: &mut InstallOptions) -> anyhow:
 struct ExternalDependencySecrets {
     database_url: String,
     migration_database_url: String,
+    database_backup_url: String,
     valkey_url: String,
+    valkey_backup_url: String,
+    valkey_backup_scope: String,
 }
 
 pub(super) fn read_external_dependency_secrets(
@@ -330,7 +365,10 @@ pub(super) fn read_external_dependency_secrets(
     // independently wiped on drop.
     options.database_url = Some(secrets.database_url.clone());
     options.migration_database_url = Some(secrets.migration_database_url.clone());
+    options.database_backup_url = Some(secrets.database_backup_url.clone());
     options.valkey_url = Some(secrets.valkey_url.clone());
+    options.valkey_backup_url = Some(secrets.valkey_backup_url.clone());
+    options.external_valkey_backup_scope = Some(secrets.valkey_backup_scope.clone());
     Ok(())
 }
 
@@ -428,7 +466,16 @@ pub(super) fn write_external_urls(
             .as_deref()
             .context("missing PostgreSQL migration URL")?
             .as_bytes(),
-        0o440,
+        0o400,
+    )?;
+    atomic_write(
+        &secrets.join("database-backup-url"),
+        options
+            .database_backup_url
+            .as_deref()
+            .context("missing PostgreSQL backup URL")?
+            .as_bytes(),
+        0o400,
     )?;
     atomic_write(
         &secrets.join("database-url"),
@@ -447,6 +494,15 @@ pub(super) fn write_external_urls(
             .context("missing Valkey URL")?
             .as_bytes(),
         0o440,
+    )?;
+    atomic_write(
+        &secrets.join("valkey-backup-url"),
+        options
+            .valkey_backup_url
+            .as_deref()
+            .context("missing Valkey backup URL")?
+            .as_bytes(),
+        0o400,
     )?;
     Ok("external".to_owned())
 }

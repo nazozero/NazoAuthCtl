@@ -390,7 +390,15 @@ impl<'a> Runtime<'a> {
                 RuntimeBackendKind::Systemd => self.config.runtime.working_directory.clone(),
                 RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => PathBuf::from("/app"),
             }),
-            service_user: Some(if self.backend_kind()? == RuntimeBackendKind::Systemd {
+            service_user: Some(if operation_uses_database(operation) {
+                // The migration credential remains root-only on the host and
+                // is mounted solely into this dedicated operator task.
+                if self.backend_kind()? == RuntimeBackendKind::Systemd {
+                    "root".to_owned()
+                } else {
+                    "0".to_owned()
+                }
+            } else if self.backend_kind()? == RuntimeBackendKind::Systemd {
                 self.config.runtime.service_user.clone()
             } else {
                 // The verified NazoAuth OCI artifact declares this immutable
@@ -530,7 +538,11 @@ impl<'a> Runtime<'a> {
             mounts: Vec::new(),
             environment,
             working_directory: Some(self.config.runtime.working_directory.clone()),
-            service_user: Some(self.config.runtime.service_user.clone()),
+            service_user: Some(if operation_uses_database(operation) {
+                "root".to_owned()
+            } else {
+                self.config.runtime.service_user.clone()
+            }),
             transient_credentials,
             read_only_paths,
             read_write_paths,

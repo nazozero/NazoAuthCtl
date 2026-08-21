@@ -20,7 +20,10 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
     let mut runtime_ip = None;
     let database_url = None;
     let migration_database_url = None;
+    let database_backup_url = None;
     let valkey_url = None;
+    let valkey_backup_url = None;
+    let external_valkey_backup_scope = None;
     let mut external_dependencies = false;
     let mut secrets_stdin = false;
     let mut secret_fd = None;
@@ -180,7 +183,10 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
         runtime_ip,
         database_url,
         migration_database_url,
+        database_backup_url,
         valkey_url,
+        valkey_backup_url,
+        external_valkey_backup_scope,
         external_dependencies,
         secrets_stdin,
         secret_fd,

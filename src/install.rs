@@ -392,7 +392,6 @@ fn configure_runtime_permissions(config: &UpdateConfig) -> anyhow::Result<()> {
     let mut readable = vec![
         config_file,
         config.dependencies.database_url_file.clone(),
-        config.dependencies.migration_database_url_file.clone(),
         config.dependencies.valkey_url_file.clone(),
         mfa_key,
         config.operator.receipt_private_key.clone(),

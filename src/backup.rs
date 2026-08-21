@@ -213,11 +213,12 @@ impl Backup {
                 bail!("required command is missing: {command}");
             }
         }
-        validate_secret(&config.dependencies.database_url_file)?;
-        validate_secret(&config.dependencies.valkey_url_file)?;
+        let (database_backup_url, valkey_backup_url) =
+            external_backup_url_files(&config.dependencies);
+        validate_secret(database_backup_url)?;
+        validate_secret(valkey_backup_url)?;
         let postgres = self.path.join("postgresql.dump");
-        let postgres_provider =
-            PostgresProvider::from_url_file(&config.dependencies.database_url_file)?;
+        let postgres_provider = PostgresProvider::from_url_file(database_backup_url)?;
         Process::new("pg_dump")
             .env("PGSERVICEFILE", postgres_provider.service_file())
             .env("PGPASSFILE", postgres_provider.password_file())
@@ -233,7 +234,7 @@ impl Backup {
             .arg(&postgres)
             .run_quiet()?;
         let valkey = self.path.join("valkey-dump.rdb");
-        let valkey_provider = ValkeyProvider::from_url_file(&config.dependencies.valkey_url_file)?;
+        let valkey_provider = ValkeyProvider::from_url_file(valkey_backup_url)?;
         let mut command = Process::new("valkey-cli")
             .args(["--no-auth-warning", "--askpass", "-h"])
             .arg(&valkey_provider.host)
@@ -474,6 +475,13 @@ impl Backup {
         }
         Ok(())
     }
+}
+
+fn external_backup_url_files(dependencies: &crate::model::Dependencies) -> (&Path, &Path) {
+    (
+        &dependencies.database_backup_url_file,
+        &dependencies.valkey_backup_url_file,
+    )
 }
 
 fn require_real_directory(path: &Path, label: &str) -> anyhow::Result<()> {

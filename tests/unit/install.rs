@@ -31,7 +31,10 @@ fn install_options(data_root: PathBuf) -> InstallOptions {
         runtime_ip: None,
         database_url: None,
         migration_database_url: None,
+        database_backup_url: None,
         valkey_url: None,
+        valkey_backup_url: None,
+        external_valkey_backup_scope: None,
         external_dependencies: false,
         secrets_stdin: false,
         secret_fd: None,
@@ -293,7 +296,10 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
         runtime_ip: None,
         database_url: None,
         migration_database_url: None,
+        database_backup_url: None,
         valkey_url: None,
+        valkey_backup_url: None,
+        external_valkey_backup_scope: None,
         external_dependencies: false,
         secrets_stdin: false,
         secret_fd: None,
@@ -694,7 +700,10 @@ fn external_dependency_secret_input_is_bounded_closed_and_value_opaque() {
     let valid = br#"{
         "database_url":"postgresql://runtime:runtime-secret@db.example/oauth",
         "migration_database_url":"postgresql://migrator:migration-secret@db.example/oauth",
-        "valkey_url":"rediss://default:valkey-secret@cache.example/0"
+        "database_backup_url":"postgresql://backup:backup-secret@db.example/oauth",
+        "valkey_url":"rediss://default:valkey-secret@cache.example/0",
+        "valkey_backup_url":"rediss://backup:backup-secret@cache.example/0",
+        "valkey_backup_scope":"dedicated-instance"
     }"#;
     let mut options = install_options(work.path().join("data"));
     read_external_dependency_secrets(&mut options, std::io::Cursor::new(valid)).unwrap();
@@ -707,14 +716,48 @@ fn external_dependency_secret_input_is_bounded_closed_and_value_opaque() {
         Some("postgresql://migrator:migration-secret@db.example/oauth")
     );
     assert_eq!(
+        options.database_backup_url.as_deref(),
+        Some("postgresql://backup:backup-secret@db.example/oauth")
+    );
+    assert_eq!(
         options.valkey_url.as_deref(),
         Some("rediss://default:valkey-secret@cache.example/0")
     );
+    assert_eq!(
+        options.valkey_backup_url.as_deref(),
+        Some("rediss://backup:backup-secret@cache.example/0")
+    );
+    assert_eq!(
+        options.external_valkey_backup_scope.as_deref(),
+        Some("dedicated-instance")
+    );
 
+    let required = [
+        "database_url",
+        "migration_database_url",
+        "database_backup_url",
+        "valkey_url",
+        "valkey_backup_url",
+        "valkey_backup_scope",
+    ];
+    for omitted in required {
+        let mut input: serde_json::Value = serde_json::from_slice(valid).unwrap();
+        input.as_object_mut().unwrap().remove(omitted);
+        let mut options = install_options(work.path().join("invalid-data"));
+        let error = read_external_dependency_secrets(
+            &mut options,
+            std::io::Cursor::new(serde_json::to_vec(&input).unwrap()),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("dependency secret input must be strict JSON"));
+        assert!(options.database_url.is_none());
+        assert!(options.migration_database_url.is_none());
+        assert!(options.valkey_url.is_none());
+    }
     for invalid in [
-        br#"{"database_url":"postgresql://db.example/oauth","migration_database_url":"postgresql://db.example/oauth"}"#.as_slice(),
-        br#"{"database_url":"postgresql://db.example/oauth","migration_database_url":"postgresql://db.example/oauth","valkey_url":"redis://cache.example/0","unexpected":"secret-canary"}"#.as_slice(),
-        br#"{"database_url":"postgresql://db.example/oauth","migration_database_url":"postgresql://db.example/oauth","valkey_url":"redis://cache.example/0"} trailing"#.as_slice(),
+        br#"{"database_url":"postgresql://db.example/oauth","migration_database_url":"postgresql://db.example/oauth","database_backup_url":"postgresql://db.example/oauth","valkey_url":"redis://cache.example/0","valkey_backup_url":"redis://cache.example/0","valkey_backup_scope":"dedicated-instance","unexpected":"secret-canary"}"#.as_slice(),
+        br#"{"database_url":"postgresql://db.example/oauth","migration_database_url":"postgresql://db.example/oauth","database_backup_url":"postgresql://db.example/oauth","valkey_url":"redis://cache.example/0","valkey_backup_url":"redis://cache.example/0","valkey_backup_scope":"dedicated-instance"} trailing"#.as_slice(),
     ] {
         let mut options = install_options(work.path().join("invalid-data"));
         let error = read_external_dependency_secrets(&mut options, std::io::Cursor::new(invalid))
@@ -722,9 +765,6 @@ fn external_dependency_secret_input_is_bounded_closed_and_value_opaque() {
         let message = format!("{error:#}");
         assert!(message.contains("dependency secret input must be strict JSON"));
         assert!(!message.contains("secret-canary"));
-        assert!(options.database_url.is_none());
-        assert!(options.migration_database_url.is_none());
-        assert!(options.valkey_url.is_none());
     }
 
     let mut options = install_options(work.path().join("oversized-data"));
@@ -766,19 +806,38 @@ fn dependency_secret_channels_and_url_set_fail_closed() {
         normalize_external_dependencies(&mut partial)
             .unwrap_err()
             .to_string()
-            .contains("require runtime PostgreSQL, migration PostgreSQL, and Valkey URLs")
+            .contains("require distinct runtime, migration, backup PostgreSQL/Valkey URLs")
     );
 
     let mut invalid_scheme = install_options(work.path().join("invalid-scheme"));
     invalid_scheme.database_url = Some("https://db.example/oauth".to_owned());
     invalid_scheme.migration_database_url =
         Some("postgresql://migrator@db.example/oauth".to_owned());
+    invalid_scheme.database_backup_url = Some("postgresql://backup@db.example/oauth".to_owned());
     invalid_scheme.valkey_url = Some("redis://cache.example/0".to_owned());
+    invalid_scheme.valkey_backup_url = Some("redis://backup@cache.example/0".to_owned());
+    invalid_scheme.external_valkey_backup_scope = Some("dedicated-instance".to_owned());
     assert!(
         normalize_external_dependencies(&mut invalid_scheme)
             .unwrap_err()
             .to_string()
             .contains("PostgreSQL URL has an unsupported scheme or no host")
+    );
+
+    let mut copied_runtime = install_options(work.path().join("copied-runtime"));
+    copied_runtime.database_url = Some("postgresql://runtime:one@db.example/oauth".to_owned());
+    copied_runtime.migration_database_url =
+        Some("postgresql://migrator:two@db.example/oauth".to_owned());
+    copied_runtime.database_backup_url =
+        Some("postgresql://runtime:one@db.example/oauth".to_owned());
+    copied_runtime.valkey_url = Some("rediss://runtime:three@cache.example/0".to_owned());
+    copied_runtime.valkey_backup_url = Some("rediss://backup:four@cache.example/0".to_owned());
+    copied_runtime.external_valkey_backup_scope = Some("dedicated-instance".to_owned());
+    assert_eq!(
+        normalize_external_dependencies(&mut copied_runtime)
+            .unwrap_err()
+            .to_string(),
+        "external dependency credential URLs must be distinct"
     );
 }
 
@@ -858,7 +917,10 @@ fn external_urls_are_persisted_only_as_private_secret_files() {
     let mut options = install_options(work.path().join("data"));
     options.database_url = Some("postgresql://runtime:one@db.example/oauth".to_owned());
     options.migration_database_url = Some("postgresql://migrator:two@db.example/oauth".to_owned());
+    options.database_backup_url = Some("postgresql://backup:three@db.example/oauth".to_owned());
     options.valkey_url = Some("rediss://default:three@cache.example/0".to_owned());
+    options.valkey_backup_url = Some("rediss://backup:four@cache.example/0".to_owned());
+    options.external_valkey_backup_scope = Some("dedicated-instance".to_owned());
 
     assert_eq!(write_external_urls(&secrets, &options).unwrap(), "external");
     assert_eq!(
@@ -870,11 +932,19 @@ fn external_urls_are_persisted_only_as_private_secret_files() {
         options.migration_database_url.as_deref().unwrap()
     );
     assert_eq!(
+        fs::read_to_string(secrets.join("database-backup-url")).unwrap(),
+        options.database_backup_url.as_deref().unwrap()
+    );
+    assert_eq!(
         fs::read_to_string(secrets.join("valkey-url")).unwrap(),
         options.valkey_url.as_deref().unwrap()
     );
+    assert_eq!(
+        fs::read_to_string(secrets.join("valkey-backup-url")).unwrap(),
+        options.valkey_backup_url.as_deref().unwrap()
+    );
     #[cfg(unix)]
-    for name in ["database-url", "database-migration-url", "valkey-url"] {
+    for name in ["database-url", "valkey-url"] {
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(
             fs::metadata(secrets.join(name))
@@ -883,6 +953,22 @@ fn external_urls_are_persisted_only_as_private_secret_files() {
                 .mode()
                 & 0o777,
             0o440
+        );
+    }
+    #[cfg(unix)]
+    for name in [
+        "database-migration-url",
+        "database-backup-url",
+        "valkey-backup-url",
+    ] {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(secrets.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400
         );
     }
 }
@@ -1237,6 +1323,7 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
     .unwrap();
     set_server_config_fixture_permissions(&config_dir.join(".env.yaml"));
     options.profile = "standards-full".to_owned();
+    options.external_valkey_backup_scope = Some("dedicated-instance".to_owned());
     let config_path = config_dir.join("update.json");
     let config = build_config(
         &config_path,
@@ -1265,6 +1352,11 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
     assert!(!config.runtime.mounts.iter().any(|mount| {
         mount.target == Path::new("/run/nazoauth-secrets/database-migration-url")
     }));
+    for name in ["database-backup-url", "valkey-backup-url"] {
+        assert!(!config.runtime.mounts.iter().any(|mount| {
+            mount.target == PathBuf::from(format!("/run/nazoauth-secrets/{name}"))
+        }));
+    }
     for name in STANDARDS_PROFILE_SECRET_NAMES {
         let expected = PathBuf::from(format!("/run/nazoauth-secrets/{name}"));
         assert!(

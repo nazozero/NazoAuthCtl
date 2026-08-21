@@ -245,7 +245,10 @@ pub(crate) struct InstallOptions {
     pub(crate) runtime_ip: Option<String>,
     pub(crate) database_url: Option<String>,
     pub(crate) migration_database_url: Option<String>,
+    pub(crate) database_backup_url: Option<String>,
     pub(crate) valkey_url: Option<String>,
+    pub(crate) valkey_backup_url: Option<String>,
+    pub(crate) external_valkey_backup_scope: Option<String>,
     pub(crate) external_dependencies: bool,
     pub(crate) secrets_stdin: bool,
     pub(crate) secret_fd: Option<u32>,
@@ -261,7 +264,9 @@ impl Drop for InstallOptions {
         for value in [
             &mut self.database_url,
             &mut self.migration_database_url,
+            &mut self.database_backup_url,
             &mut self.valkey_url,
+            &mut self.valkey_backup_url,
         ] {
             if let Some(value) = value.as_mut() {
                 zeroize::Zeroize::zeroize(value);

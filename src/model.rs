@@ -74,7 +74,13 @@ pub(crate) struct Dependencies {
     #[serde(default)]
     pub(crate) migration_database_url_file: PathBuf,
     #[serde(default)]
+    pub(crate) database_backup_url_file: PathBuf,
+    #[serde(default)]
     pub(crate) valkey_url_file: PathBuf,
+    #[serde(default)]
+    pub(crate) valkey_backup_url_file: PathBuf,
+    #[serde(default)]
+    pub(crate) external_valkey_backup_scope: String,
 }
 
 fn default_dependency_mode() -> String {
@@ -87,7 +93,10 @@ impl Default for Dependencies {
             mode: default_dependency_mode(),
             database_url_file: PathBuf::new(),
             migration_database_url_file: PathBuf::new(),
+            database_backup_url_file: PathBuf::new(),
             valkey_url_file: PathBuf::new(),
+            valkey_backup_url_file: PathBuf::new(),
+            external_valkey_backup_scope: String::new(),
         }
     }
 }
@@ -233,7 +242,7 @@ impl UpdateConfig {
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        if self.schema != 2 {
+        if !matches!(self.schema, 2 | 3) {
             bail!("unsupported update config schema");
         }
         self.capabilities.validate()?;
@@ -333,9 +342,34 @@ impl UpdateConfig {
             }
         }
         if self.dependencies.mode == "external" {
-            safe_absolute(&self.dependencies.database_url_file)?;
-            safe_absolute(&self.dependencies.migration_database_url_file)?;
-            safe_absolute(&self.dependencies.valkey_url_file)?;
+            if self.schema != 3 {
+                bail!(
+                    "external dependencies require update config schema 3 with dedicated backup credentials"
+                );
+            }
+            let paths = [
+                &self.dependencies.database_url_file,
+                &self.dependencies.migration_database_url_file,
+                &self.dependencies.database_backup_url_file,
+                &self.dependencies.valkey_url_file,
+                &self.dependencies.valkey_backup_url_file,
+            ];
+            for path in paths {
+                if path.as_os_str().is_empty() {
+                    bail!(
+                        "external dependencies require distinct runtime, migration, and backup credential paths"
+                    );
+                }
+                safe_absolute(path)?;
+            }
+            if self.dependencies.external_valkey_backup_scope != "dedicated-instance" {
+                bail!("external Valkey backup must declare dedicated-instance scope");
+            }
+            for (index, path) in paths.iter().enumerate() {
+                if paths[..index].contains(path) {
+                    bail!("external dependency credential paths must be distinct");
+                }
+            }
         }
         if self.runtime.readiness_attempts == 0 {
             bail!("readiness_attempts must be positive");

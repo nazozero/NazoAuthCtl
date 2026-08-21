@@ -341,13 +341,17 @@ fn public_runtime_urls_are_same_origin_and_never_remote_plaintext() {
 fn external_and_container_dependency_modes_resolve_explicitly() {
     let mut config = valid_config();
     config.runtime.backend = crate::deployment::RuntimeBackendKind::Docker;
+    config.schema = 3;
     config.runtime.service_name.clear();
     config.runtime.service_user.clear();
     config.dependencies.mode = "external".to_owned();
     let root = std::env::temp_dir().join("nazoauthctl-external-model-test");
     config.dependencies.database_url_file = root.join("database-url");
     config.dependencies.migration_database_url_file = root.join("migration-database-url");
+    config.dependencies.database_backup_url_file = root.join("database-backup-url");
     config.dependencies.valkey_url_file = root.join("valkey-url");
+    config.dependencies.valkey_backup_url_file = root.join("valkey-backup-url");
+    config.dependencies.external_valkey_backup_scope = "dedicated-instance".to_owned();
     config.validate().unwrap();
     assert_eq!(
         config.container_backend(),
@@ -359,6 +363,30 @@ fn external_and_container_dependency_modes_resolve_explicitly() {
     assert!(safe_absolute(std::path::Path::new("relative")).is_err());
     assert!(safe_absolute(std::path::Path::new(&std::path::MAIN_SEPARATOR.to_string())).is_err());
     assert!(safe_absolute(std::path::Path::new("/var/lib/../nazoauthctl")).is_err());
+}
+
+#[test]
+fn schema_two_keeps_managed_configs_readable_but_rejects_legacy_external_credentials() {
+    let managed = valid_config();
+    let mut managed_json = serde_json::to_value(&managed).unwrap();
+    let dependencies = managed_json
+        .get_mut("dependencies")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap();
+    dependencies.remove("database_backup_url_file");
+    dependencies.remove("valkey_backup_url_file");
+    dependencies.remove("external_valkey_backup_scope");
+    let managed_legacy: UpdateConfig = serde_json::from_value(managed_json.clone()).unwrap();
+    managed_legacy.validate().unwrap();
+
+    managed_json["dependencies"]["mode"] = serde_json::Value::String("external".to_owned());
+    let external_legacy: UpdateConfig = serde_json::from_value(managed_json).unwrap();
+    let error = external_legacy.validate().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("external dependencies require update config schema 3")
+    );
 }
 
 #[test]

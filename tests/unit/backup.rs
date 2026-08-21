@@ -6,12 +6,29 @@ use std::{
 };
 
 #[cfg(unix)]
-use super::{Backup, Builder, validate_secret};
+use super::{Backup, Builder, external_backup_url_files, validate_secret};
 #[cfg(unix)]
 use tar::{EntryType, Header};
 
 #[cfg(unix)]
 use crate::filesystem::PrivateTempDir;
+
+#[cfg(unix)]
+#[test]
+fn external_backup_selects_dedicated_credential_paths_not_runtime_paths() {
+    let mut dependencies = crate::model::Dependencies::default();
+    dependencies.mode = "external".to_owned();
+    dependencies.database_url_file = "/runtime-postgres-canary".into();
+    dependencies.valkey_url_file = "/runtime-valkey-canary".into();
+    dependencies.database_backup_url_file = "/backup-postgres-canary".into();
+    dependencies.valkey_backup_url_file = "/backup-valkey-canary".into();
+
+    let (database, valkey) = external_backup_url_files(&dependencies);
+    assert_eq!(database, std::path::Path::new("/backup-postgres-canary"));
+    assert_eq!(valkey, std::path::Path::new("/backup-valkey-canary"));
+    assert_ne!(database, dependencies.database_url_file.as_path());
+    assert_ne!(valkey, dependencies.valkey_url_file.as_path());
+}
 
 #[cfg(unix)]
 fn complete_backup(path: &std::path::Path) {

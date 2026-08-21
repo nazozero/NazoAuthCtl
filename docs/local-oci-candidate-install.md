@@ -27,6 +27,29 @@ Use all five candidate options together:
 The candidate path rejects `--to` and the host runtime. It requires the
 `standards-full` profile and `--external-dependencies` with secure dependency
 input, so it cannot pull managed PostgreSQL or Valkey images as a side effect.
+The dependency input is strict JSON supplied only through `--secrets-stdin` or
+`--secret-fd`; it must contain five independent credential URLs and one
+non-secret ownership assertion:
+
+```json
+{
+  "database_url": "postgresql://runtime:...@db.example/oauth",
+  "migration_database_url": "postgresql://migrator:...@db.example/oauth",
+  "database_backup_url": "postgresql://backup:...@db.example/oauth",
+  "valkey_url": "rediss://runtime:...@cache.example/0",
+  "valkey_backup_url": "rediss://backup:...@cache.example/0",
+  "valkey_backup_scope": "dedicated-instance"
+}
+```
+
+Unknown or missing fields are rejected. Runtime PostgreSQL and Valkey URLs are
+the only dependency credentials mounted into the long-lived server; migration
+and both backup URLs remain root-only. Backups use only the two backup URLs.
+`valkey_backup_scope` is an operator assertion that the raw RDB export target
+is a deployment-dedicated Valkey instance; shared instances are rejected and
+must not be used for this path. Existing schema-2 managed deployments remain
+readable, while a legacy external configuration without these dedicated backup
+credentials fails closed and is never rewritten during candidate retry.
 Before a migration, key task, or runtime replacement,
 the controller resolves the supplied image only from the selected local runtime,
 then proves its immutable local image ID, OCI manifest digest, and embedded
