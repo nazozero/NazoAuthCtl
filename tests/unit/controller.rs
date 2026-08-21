@@ -225,7 +225,7 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
 
 fn journal(config: &UpdateConfig, phase: UpdatePhase) -> UpdateJournal {
     UpdateJournal {
-        schema: 2,
+        schema: 1,
         transaction_id: "update-test".to_owned(),
         started_at: "2026-08-01T00:00:00Z".to_owned(),
         phase,
@@ -1552,7 +1552,7 @@ fn successful_legacy_rollback_consumes_only_after_a_durable_archive_exists() {
     let work = PrivateTempDir::new("nazoauth-rollback-state-consumption").unwrap();
     let config = config(&work);
     let state = RollbackState {
-        schema: 2,
+        schema: 1,
         from_release: manifest("v0.1.2", 'b'),
         to_release: manifest("v0.2.0", 'e'),
         previous_runtime: "trusted-runtime".to_owned(),
@@ -3229,13 +3229,13 @@ fn signed_release_with_a_source_build_id_is_not_classified_as_a_local_candidate(
 }
 
 #[test]
-fn local_oci_candidate_state_rejects_completed_flag_without_completed_phase() {
+fn pending_local_oci_candidate_state_is_distinct_from_completed_state() {
     let work = PrivateTempDir::new("nazoauth-local-candidate-state").unwrap();
     let config = config(&work);
     fs::create_dir_all(&config.deployment_root).unwrap();
     let revision = "a".repeat(40);
     let mut state = LocalOciCandidateInstallState {
-        schema: 5,
+        schema: 1,
         candidate: LocalOciCandidateInstall {
             image: "candidate:local".to_owned(),
             target: CandidateTarget {
@@ -3246,24 +3246,9 @@ fn local_oci_candidate_state_rejects_completed_flag_without_completed_phase() {
             },
         },
         local_artifact_id: format!("sha256:{}", "c".repeat(64)),
-        phase: LocalOciCandidatePhase::Prepared,
-        attempt: 1,
-        migration_jti: "request-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-        keys_jti: "request-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
-        migration_receipt_sha256: None,
-        keys_receipt_sha256: None,
-        rollback_backup: None,
-        baseline_backup: None,
-        recovery_package: None,
-        recovery_archive_sha256: None,
-        recovery_cache_sha256: None,
-        recovery_postgres_archive_sha256: None,
-        recovery_valkey_archive_sha256: None,
+        recovery_backup: None,
         management_event_file: None,
         management_event_sha256: None,
-        completion_kind: None,
-        completion_generation: None,
-        management_event_sequence: None,
         completed: false,
     };
     atomic_write(
@@ -3280,14 +3265,15 @@ fn local_oci_candidate_state_rejects_completed_flag_without_completed_phase() {
         0o600,
     )
     .unwrap();
-    assert!(deployment::local_oci_candidate_install_is_pending(&config).is_err());
-    assert!(deployment::local_oci_candidate_install_is_completed(&config).is_err());
+    assert!(!deployment::local_oci_candidate_install_is_pending(&config).unwrap());
+    assert!(deployment::local_oci_candidate_install_is_completed(&config).unwrap());
 }
 
 #[test]
-fn local_oci_candidate_schema_one_is_explicitly_fail_closed() {
-    let work = PrivateTempDir::new("nazoauth-local-candidate-schema-one").unwrap();
-    let config = config(&work);
+fn external_secret_drift_does_not_mutate_pending_candidate_state() {
+    let work = PrivateTempDir::new("nazoauth-candidate-external-secret-drift").unwrap();
+    let mut config = config(&work);
+    configure_external_dependency_fixture(&mut config);
     fs::create_dir_all(&config.deployment_root).unwrap();
     let revision = "a".repeat(40);
     let state = LocalOciCandidateInstallState {
@@ -3302,104 +3288,9 @@ fn local_oci_candidate_schema_one_is_explicitly_fail_closed() {
             },
         },
         local_artifact_id: format!("sha256:{}", "c".repeat(64)),
-        phase: LocalOciCandidatePhase::Prepared,
-        attempt: 1,
-        migration_jti: "request-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-        keys_jti: "request-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
-        migration_receipt_sha256: None,
-        keys_receipt_sha256: None,
-        rollback_backup: None,
-        baseline_backup: None,
-        recovery_package: None,
-        recovery_archive_sha256: None,
-        recovery_cache_sha256: None,
-        recovery_postgres_archive_sha256: None,
-        recovery_valkey_archive_sha256: None,
+        recovery_backup: None,
         management_event_file: None,
         management_event_sha256: None,
-        completion_kind: None,
-        completion_generation: None,
-        management_event_sequence: None,
-        completed: false,
-    };
-    atomic_write(
-        &deployment::local_oci_candidate_install_resource_path(&config),
-        &serde_json::to_vec_pretty(&state).unwrap(),
-        0o600,
-    )
-    .unwrap();
-    assert!(deployment::local_oci_candidate_install_is_pending(&config).is_err());
-}
-
-#[test]
-fn registered_candidate_recovery_journal_is_an_unsettled_global_guard() {
-    let work = PrivateTempDir::new("nazoauth-registered-candidate-recovery-guard").unwrap();
-    let config = config(&work);
-    let root = config
-        .backup_root
-        .parent()
-        .unwrap()
-        .join("local-oci-candidate-recovery-control")
-        .join(&config.operator.deployment_id)
-        .join(&config.runtime.runtime_instance_id);
-    fs::create_dir_all(&root).unwrap();
-    let journal = LocalOciCandidateRecoveryJournal {
-        schema: 2,
-        deployment_id: config.operator.deployment_id.clone(),
-        runtime_instance_id: config.runtime.runtime_instance_id.clone(),
-        generation: 1,
-        expected_declaration_revision: 1,
-        expected_record_sha256: "a".repeat(64),
-        intended_successor_record_sha256: None,
-        phase: LocalOciCandidateRecoveryPhase::Accepted,
-        staged_state: None,
-    };
-    atomic_write(
-        &root.join("generation-1.json"),
-        &serde_json::to_vec_pretty(&journal).unwrap(),
-        0o600,
-    )
-    .unwrap();
-    assert!(deployment::local_oci_candidate_registered_recovery_is_pending(&config).unwrap());
-}
-
-#[test]
-fn external_secret_drift_does_not_mutate_pending_candidate_state() {
-    let work = PrivateTempDir::new("nazoauth-candidate-external-secret-drift").unwrap();
-    let mut config = config(&work);
-    configure_external_dependency_fixture(&mut config);
-    fs::create_dir_all(&config.deployment_root).unwrap();
-    let revision = "a".repeat(40);
-    let state = LocalOciCandidateInstallState {
-        schema: 5,
-        candidate: LocalOciCandidateInstall {
-            image: "candidate:local".to_owned(),
-            target: CandidateTarget {
-                release: "v0.2.0-candidate.1".to_owned(),
-                revision: revision.clone(),
-                build_id: format!("source:{revision}"),
-                oci_digest: format!("sha256:{}", "b".repeat(64)),
-            },
-        },
-        local_artifact_id: format!("sha256:{}", "c".repeat(64)),
-        phase: LocalOciCandidatePhase::Prepared,
-        attempt: 1,
-        migration_jti: "request-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-        keys_jti: "request-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
-        migration_receipt_sha256: None,
-        keys_receipt_sha256: None,
-        rollback_backup: None,
-        baseline_backup: None,
-        recovery_package: None,
-        recovery_archive_sha256: None,
-        recovery_cache_sha256: None,
-        recovery_postgres_archive_sha256: None,
-        recovery_valkey_archive_sha256: None,
-        management_event_file: None,
-        management_event_sha256: None,
-        completion_kind: None,
-        completion_generation: None,
-        management_event_sequence: None,
         completed: false,
     };
     let state_path = deployment::local_oci_candidate_install_resource_path(&config);
@@ -3428,7 +3319,7 @@ fn external_principal_drift_rejects_each_role_without_state_mutation() {
     configure_external_dependency_fixture(&mut config);
     fs::create_dir_all(&config.deployment_root).unwrap();
     let state = LocalOciCandidateInstallState {
-        schema: 5,
+        schema: 1,
         candidate: LocalOciCandidateInstall {
             image: "candidate:local".to_owned(),
             target: CandidateTarget {
@@ -3439,24 +3330,9 @@ fn external_principal_drift_rejects_each_role_without_state_mutation() {
             },
         },
         local_artifact_id: format!("sha256:{}", "c".repeat(64)),
-        phase: LocalOciCandidatePhase::Prepared,
-        attempt: 1,
-        migration_jti: "request-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-        keys_jti: "request-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
-        migration_receipt_sha256: None,
-        keys_receipt_sha256: None,
-        rollback_backup: None,
-        baseline_backup: None,
-        recovery_package: None,
-        recovery_archive_sha256: None,
-        recovery_cache_sha256: None,
-        recovery_postgres_archive_sha256: None,
-        recovery_valkey_archive_sha256: None,
+        recovery_backup: None,
         management_event_file: None,
         management_event_sha256: None,
-        completion_kind: None,
-        completion_generation: None,
-        management_event_sequence: None,
         completed: false,
     };
     let state_path = deployment::local_oci_candidate_install_resource_path(&config);
@@ -3559,7 +3435,7 @@ fn candidate_retry_rejects_bad_backup_evidence_before_state_mutation() {
             _ => unreachable!(),
         }
         let state = LocalOciCandidateInstallState {
-            schema: 5,
+            schema: 1,
             candidate: LocalOciCandidateInstall {
                 image: "candidate:local".to_owned(),
                 target: CandidateTarget {
@@ -3570,24 +3446,9 @@ fn candidate_retry_rejects_bad_backup_evidence_before_state_mutation() {
                 },
             },
             local_artifact_id: format!("sha256:{}", "c".repeat(64)),
-            phase: LocalOciCandidatePhase::Prepared,
-            attempt: 1,
-            migration_jti: "request-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            keys_jti: "request-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
-            migration_receipt_sha256: None,
-            keys_receipt_sha256: None,
-            rollback_backup: Some(backup),
-            baseline_backup: None,
-            recovery_package: None,
-            recovery_archive_sha256: None,
-            recovery_cache_sha256: None,
-            recovery_postgres_archive_sha256: None,
-            recovery_valkey_archive_sha256: None,
+            recovery_backup: Some(backup),
             management_event_file: None,
             management_event_sha256: None,
-            completion_kind: None,
-            completion_generation: None,
-            management_event_sequence: None,
             completed: false,
         };
         let state_path = deployment::local_oci_candidate_install_resource_path(&config);

@@ -432,9 +432,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 Ok(false) => status(&load_config(&cli.config)?),
                 Err(error) => {
                     let config = load_config_unsettled(&cli.config)?;
-                    if deployment::local_oci_candidate_install_is_pending(&config)?
-                        || deployment::local_oci_candidate_registered_recovery_is_pending(&config)?
-                    {
+                    if deployment::local_oci_candidate_install_is_pending(&config)? {
                         return status(&config);
                     }
                     Err(error)
@@ -451,9 +449,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 Ok(false) => doctor(&load_config(&cli.config)?),
                 Err(error) => {
                     let config = load_config_unsettled(&cli.config)?;
-                    if deployment::local_oci_candidate_install_is_pending(&config)?
-                        || deployment::local_oci_candidate_registered_recovery_is_pending(&config)?
-                    {
+                    if deployment::local_oci_candidate_install_is_pending(&config)? {
                         return doctor(&config);
                     }
                     Err(error)
@@ -657,11 +653,6 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
-                if is_local_oci_candidate_record(&record) {
-                    bail!(
-                        "local OCI candidates are frozen; use nazoauthctl recover --yes for their dedicated managed recovery transaction"
-                    );
-                }
                 require_registered_recovery_authority(
                     "rollback",
                     crate::coordination::active_update_exists(&store, &record),
@@ -700,31 +691,6 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
-                if is_local_oci_candidate_record(&record) {
-                    require_confirmation(
-                        yes,
-                        "restore the exact local OCI candidate from its controller-managed baseline and recovery package",
-                    )?;
-                    record.require_mutation(&[
-                        Capability::Runtime,
-                        Capability::Artifact,
-                        Capability::Database,
-                        Capability::Valkey,
-                        Capability::Backups,
-                        Capability::OperatorTasks,
-                    ])?;
-                    let path = match record.resources.get("controller_config") {
-                        Some(crate::deployment::SafeReference::File { path }) => path,
-                        _ => {
-                            bail!("registered local OCI candidate has no controller configuration")
-                        }
-                    };
-                    let config = load_config_unsettled(path)?;
-                    super::verify_control_binding(&record, &config)?;
-                    return super::deployment::recover_registered_local_oci_candidate(
-                        path, &config, &record,
-                    );
-                }
                 require_registered_recovery_authority(
                     "recovery",
                     crate::coordination::active_update_exists(&store, &record),
@@ -765,7 +731,6 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
-                super::reject_pending_local_oci_candidate_record(&record)?;
                 require_confirmation(
                     yes,
                     "resume the deployment-bound interrupted update transaction",

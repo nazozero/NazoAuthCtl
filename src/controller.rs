@@ -165,11 +165,6 @@ pub(crate) fn reject_pending_local_oci_candidate_record(
             "local OCI candidate installation is pending; repeat its exact install command before mutating the registered deployment"
         );
     }
-    if deployment::local_oci_candidate_registered_recovery_is_pending(&config)? {
-        bail!(
-            "registered local OCI candidate recovery is pending; run its dedicated recover command before mutating the deployment"
-        );
-    }
     Ok(())
 }
 
@@ -374,11 +369,6 @@ fn control_config_with_lock_mode(
             "local OCI candidate installation is pending; repeat its exact install command or inspect status before running controller commands"
         );
     }
-    if deployment::local_oci_candidate_registered_recovery_is_pending(&config)? {
-        bail!(
-            "registered local OCI candidate recovery is pending; only its dedicated recover command may proceed"
-        );
-    }
     if lock_mode == DeploymentLockMode::Exclusive {
         reject_completed_local_oci_candidate_transition(&record)?;
     }
@@ -550,99 +540,22 @@ struct InstallCompletion {
     recovery_backup: PathBuf,
 }
 
-/// Durable state for the explicit local-OCI install path.  This deliberately
-/// is not an update journal: a candidate has no signed predecessor to roll
-/// forward to.  Every mutation is therefore fenced by a managed rollback
-/// backup and an immutable, per-attempt operator request identity.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum LocalOciCandidatePhase {
-    Prepared,
-    MigrationStarted,
-    MigrationApplied,
-    KeysStarted,
-    KeysApplied,
-    RuntimeStarted,
-    BaselineCreated,
-    Registered,
-    Completed,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Durable state for the explicit local-OCI install path.  It exists before
+/// the first privileged operator task, so a crash can only be resumed with the
+/// same four identity bindings and immutable local image ID.
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LocalOciCandidateInstallState {
     schema: u32,
     candidate: LocalOciCandidateInstall,
     local_artifact_id: String,
-    phase: LocalOciCandidatePhase,
-    attempt: u64,
-    /// A new attempt gets new request identifiers.  The identifier remains
-    /// stable while its receipt is being persisted; an interrupted started
-    /// task is otherwise treated as unknown and rolled back rather than
-    /// forwarded under a fresh authorization.
-    migration_jti: String,
-    keys_jti: String,
     #[serde(default)]
-    migration_receipt_sha256: Option<String>,
-    #[serde(default)]
-    keys_receipt_sha256: Option<String>,
-    #[serde(default)]
-    rollback_backup: Option<PathBuf>,
-    #[serde(default)]
-    baseline_backup: Option<PathBuf>,
-    #[serde(default)]
-    recovery_package: Option<PathBuf>,
-    #[serde(default)]
-    recovery_archive_sha256: Option<String>,
-    #[serde(default)]
-    recovery_cache_sha256: Option<String>,
-    #[serde(default)]
-    recovery_postgres_archive_sha256: Option<String>,
-    #[serde(default)]
-    recovery_valkey_archive_sha256: Option<String>,
+    recovery_backup: Option<PathBuf>,
     #[serde(default)]
     management_event_file: Option<String>,
     #[serde(default)]
     management_event_sha256: Option<String>,
-    /// Distinguishes initial completion from a registered-recovery generation.
-    #[serde(default)]
-    completion_kind: Option<String>,
-    #[serde(default)]
-    completion_generation: Option<u64>,
-    #[serde(default)]
-    management_event_sequence: Option<u64>,
     completed: bool,
-}
-
-/// Independent transaction for a completed candidate's recovery.  It lives
-/// under the recovery control root, never in a generation directory that a
-/// restore may replace.  The journal is the authority for resuming the
-/// external side effects between baseline restore and declaration CAS.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum LocalOciCandidateRecoveryPhase {
-    Prepared,
-    Quiesced,
-    Restored,
-    Staged,
-    Accepted,
-    DeclarationCommitted,
-    StateCommitted,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct LocalOciCandidateRecoveryJournal {
-    schema: u32,
-    deployment_id: String,
-    runtime_instance_id: String,
-    generation: u64,
-    expected_declaration_revision: u64,
-    expected_record_sha256: String,
-    intended_successor_record_sha256: Option<String>,
-    phase: LocalOciCandidateRecoveryPhase,
-    #[serde(default)]
-    staged_state: Option<LocalOciCandidateInstallState>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

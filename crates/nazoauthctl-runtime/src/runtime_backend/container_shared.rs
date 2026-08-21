@@ -29,9 +29,8 @@ pub(crate) use policy::{
     append_container_policy, append_managed_labels, assert_container_image, assert_managed_labels,
     command_stdout, container_is_running, ensure_container, ensure_volume, inspect_document,
     inspect_document_optional, inspect_managed_container_id, is_engine_unavailable_error,
-    network_config_digest, network_gateway, prepare_managed_volume_ownership,
-    quiesce_managed_one_shot, reconcile_bound_file, remove_managed_container_by_id,
-    remove_managed_container_by_name, require_digest_pinned_image,
+    network_config_digest, network_gateway, prepare_managed_volume_ownership, reconcile_bound_file,
+    remove_managed_container_by_id, remove_managed_container_by_name, require_digest_pinned_image,
 };
 #[cfg(all(test, unix))]
 use policy::{assert_managed_container_policy, observed_cap_drop_all};
@@ -518,18 +517,11 @@ pub(crate) fn one_shot_process(
             .timeout(Duration::from_secs(300))
             .args(["run", "--rm", "--interactive"]),
         &policy,
-    );
-    if let Some(identity) = &task.managed_identity {
-        process = process.arg("--name").arg(&identity.name);
-        for (key, value) in &identity.labels {
-            process = process.arg("--label").arg(format!("{key}={value}"));
-        }
-    }
-    let process = process
-        .arg("--user")
-        .arg(user)
-        .arg("--network")
-        .arg(task.network.as_deref().unwrap_or("none"));
+    )
+    .arg("--user")
+    .arg(user)
+    .arg("--network")
+    .arg(task.network.as_deref().unwrap_or("none"));
     if let Some(directory) = &task.working_directory {
         process = process.arg("--workdir").arg(directory);
     }
@@ -549,12 +541,9 @@ pub(crate) fn one_shot_process(
 pub(crate) fn build_identity_process(command: &OsStr) -> Process {
     let mut policy = ContainerRuntimePolicy::managed_default();
     policy.restart = ContainerRestartPolicy::No;
-    append_container_policy(
-        Process::new(command).args(["run", "--rm", "--pull=never"]),
-        &policy,
-    )
-    .arg("--user")
-    .arg(NON_ROOT_ONE_SHOT_USER)
+    append_container_policy(Process::new(command).args(["run", "--rm"]), &policy)
+        .arg("--user")
+        .arg(NON_ROOT_ONE_SHOT_USER)
 }
 
 /// Build the narrowly privileged process used to copy an already-validated
@@ -567,7 +556,6 @@ pub(crate) fn build_managed_volume_copy_process(command: &OsStr) -> Process {
     Process::new(command).args([
         "run",
         "--rm",
-        "--pull=never",
         "--user",
         "0:0",
         "--network",

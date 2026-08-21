@@ -548,7 +548,6 @@ fn privileged_container_task_attaches_the_signed_envelope_stdin() {
         inaccessible_paths: Vec::new(),
         private_mounts: false,
         stdin: b"signed-envelope".to_vec(),
-        managed_identity: None,
     };
     runtime_backend::backend_with_command(RuntimeBackendKind::Podman, engine)
         .run_one_shot(&task)
@@ -591,7 +590,6 @@ fn privileged_container_task_runs_an_immutable_local_image_id_directly() {
         inaccessible_paths: Vec::new(),
         private_mounts: false,
         stdin: b"signed-envelope".to_vec(),
-        managed_identity: None,
     };
 
     runtime_backend::backend_with_command(RuntimeBackendKind::Podman, engine)
@@ -661,7 +659,6 @@ fn retirement_probe_accepts_only_the_closed_runtime_authorization_marker() {
             inaccessible_paths: Vec::new(),
             private_mounts: false,
             stdin: Vec::new(),
-            managed_identity: None,
         },
         target: target.clone(),
         post_execution_target: target.clone(),
@@ -699,7 +696,6 @@ fn retirement_probe_accepts_only_the_closed_runtime_authorization_marker() {
                 inaccessible_paths: Vec::new(),
                 private_mounts: false,
                 stdin: Vec::new(),
-                managed_identity: None,
             },
             target: target.clone(),
             post_execution_target: target.clone(),

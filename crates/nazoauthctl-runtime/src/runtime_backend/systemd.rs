@@ -19,9 +19,9 @@ use crate::{
 use super::DebugArtifactTask;
 use super::{
     BlobAttestationVerification, HostServiceInstall, ManagedDependencies, ManagedDependencyBackup,
-    ManagedNetwork, ManagedOneShotIdentity, ManagedPostgresCommand, ManagedPostgresRestore,
-    ManagedValkeyRestore, OneShotTask, RuntimeBackend, RuntimeDatabasePrivilegeProbe,
-    RuntimeObservation, RuntimeReplacement, safe_environment, safe_systemd_path,
+    ManagedNetwork, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore,
+    OneShotTask, RuntimeBackend, RuntimeDatabasePrivilegeProbe, RuntimeObservation,
+    RuntimeReplacement, safe_environment, safe_systemd_path,
 };
 
 pub struct SystemdBackend;
@@ -405,28 +405,6 @@ impl RuntimeBackend for SystemdBackend {
 
     fn run_one_shot_authorization_probe(&self, task: &OneShotTask) -> anyhow::Result<bool> {
         systemd_one_shot_process(task)?.stdin_authorization_rejected(&task.stdin)
-    }
-
-    fn quiesce_managed_one_shot(&self, identity: &ManagedOneShotIdentity) -> anyhow::Result<()> {
-        // `systemd-run --collect` makes an already collected transient unit
-        // indistinguishable from a never-created one, which is the only
-        // idempotent success case.  Do not turn an unavailable manager or a
-        // malformed unit into absence: inspect_optional propagates both.
-        let Some(observation) = self.inspect_optional(&identity.name)? else {
-            return Ok(());
-        };
-        if observation.running {
-            Process::new("systemctl")
-                .args(["stop", identity.name.as_str()])
-                .run_quiet()?;
-        }
-        Process::new("systemctl")
-            .args(["reset-failed", identity.name.as_str()])
-            .run_quiet()?;
-        if self.inspect_optional(&identity.name)?.is_some() {
-            bail!("systemd managed one-shot task remains present after quiesce")
-        }
-        Ok(())
     }
 
     fn pull_image(&self, _image_reference: &str) -> anyhow::Result<()> {
@@ -835,11 +813,7 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
     if sha256(path)? != *expected {
         bail!("host one-shot binary does not match the authorized digest");
     }
-    let unit = task
-        .managed_identity
-        .as_ref()
-        .map(|identity| identity.name.clone())
-        .unwrap_or_else(|| format!("nazoauthctl-task-{}", uuid::Uuid::now_v7()));
+    let unit = format!("nazoauthctl-task-{}", uuid::Uuid::now_v7());
     let process = Process::new("systemd-run")
         .timeout(std::time::Duration::from_secs(300))
         .args([

@@ -336,15 +336,6 @@ impl ContainerRuntimePolicy {
 }
 
 #[derive(Clone, Debug)]
-pub struct ManagedOneShotIdentity {
-    /// Engine/unit name. It is derived solely from a durable task JTI.
-    pub name: String,
-    /// Full ownership and task bindings; container backends pass every entry
-    /// as an immutable engine label before the image positional.
-    pub labels: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug)]
 pub struct OneShotTask {
     pub artifact: ArtifactReference,
     pub command: Vec<String>,
@@ -359,7 +350,6 @@ pub struct OneShotTask {
     pub inaccessible_paths: Vec<PathBuf>,
     pub private_mounts: bool,
     pub stdin: Vec<u8>,
-    pub managed_identity: Option<ManagedOneShotIdentity>,
 }
 
 #[derive(Clone, Debug)]
@@ -672,7 +662,6 @@ pub trait RuntimeBackend {
     fn replace(&self, replacement: &RuntimeReplacement) -> anyhow::Result<()>;
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String>;
     fn run_one_shot_authorization_probe(&self, task: &OneShotTask) -> anyhow::Result<bool>;
-    fn quiesce_managed_one_shot(&self, identity: &ManagedOneShotIdentity) -> anyhow::Result<()>;
     fn pull_image(&self, image_reference: &str) -> anyhow::Result<()>;
     fn export_image(&self, image_reference: &str, archive: &std::path::Path) -> anyhow::Result<()>;
     fn import_image(&self, archive: &std::path::Path) -> anyhow::Result<()>;

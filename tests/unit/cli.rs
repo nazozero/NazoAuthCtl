@@ -585,6 +585,7 @@ fn local_oci_candidate_install_requires_an_exact_complete_source_binding() {
         "install",
         "--runtime",
         "podman",
+        "--external-dependencies",
         "--profile",
         "standards-full",
         "--profile-material",

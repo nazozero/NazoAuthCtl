@@ -24,12 +24,45 @@ Use all five candidate options together:
 --candidate-oci-digest sha256:LOWERCASE_MANIFEST_DIGEST
 ```
 
-The candidate path rejects `--to`, the host runtime,
-`--external-dependencies`, `--secrets-stdin`, and `--secret-fd`. It requires
-the `standards-full` profile and creates controller-managed PostgreSQL, Valkey,
-roles, volumes, and root-owned secrets. This is intentional: interrupted
-candidate work is restored only from a controller-owned managed backup, never
-from an operator-provided endpoint.
+The candidate path rejects `--to` and the host runtime. It requires the
+`standards-full` profile and `--external-dependencies` with secure dependency
+input, so it cannot pull managed PostgreSQL or Valkey images as a side effect.
+The dependency input is strict JSON supplied only through `--secrets-stdin` or
+`--secret-fd`; it must contain five independent credential URLs and one
+non-secret ownership assertion:
+
+```json
+{
+  "database_url": "postgresql://runtime:...@db.example/oauth",
+  "migration_database_url": "postgresql://migrator:...@db.example/oauth",
+  "database_backup_url": "postgresql://backup:...@db.example/oauth",
+  "valkey_url": "rediss://runtime:...@cache.example/0",
+  "valkey_backup_url": "rediss://backup:...@cache.example/0",
+  "valkey_backup_scope": "dedicated-instance"
+}
+```
+
+Unknown or missing fields are rejected. Runtime PostgreSQL and Valkey URLs are
+the only dependency credentials mounted into the long-lived server; the
+migration URL is available only to the isolated non-root migration task and
+both backup URLs remain root-only. Backups use only the two backup URLs.
+`valkey_backup_scope` is an operator assertion that the raw RDB export target
+is a deployment-dedicated Valkey instance; shared instances are rejected and
+must not be used for this path. Ctl canonicalizes the PostgreSQL and Valkey
+backup endpoints (host, effective port, database and Valkey TLS scheme),
+requires the runtime/migration/backup roles to use separate decoded usernames,
+and persists only SHA-256 endpoint identities and domain-separated SHA-256
+identities of the decoded role usernames (never passwords), plus the scope in
+the config, candidate intent and backup identity. PostgreSQL permits at most one `sslmode`;
+that TLS policy is part of each persisted PostgreSQL binding, while all other
+query options are rejected for this contract. Each runtime, migration, and backup
+PostgreSQL URL has its own persisted endpoint-plus-TLS identity, so changing
+any `sslmode` (including a downgrade) blocks replay.
+Changing any dependency username also blocks replay; rotating only a password
+does not change the persisted binding.
+Existing schema-2 managed deployments remain
+readable, while a legacy external configuration without these dedicated backup
+credentials fails closed and is never rewritten during candidate retry.
 Before a migration, key task, or runtime replacement,
 the controller resolves the supplied image only from the selected local runtime,
 then proves its immutable local image ID, OCI manifest digest, and embedded
@@ -41,28 +74,15 @@ before the fresh controller config is published; the intent can restore that
 config after an interruption only for the same five inputs. The immutable local
 image ID is then persisted before privileged work. A retry must repeat all five
 inputs and resolve the same local object.
-Each attempt records a phase, immutable task JTIs, receipt digests, a rollback
-backup, and (after initialization) a stopped-writer baseline backup. A task
-that was merely started is treated as unknown: ctl quiesces the exact owned
-runtime, restores PostgreSQL/Valkey/filesystem snapshots, audits the restore,
-rotates the backup and JTI, and retries only as a new attempt. It does not
-blindly replay an unknown migration or key task.
-
-Before registration the exact local OCI is exported to a digest-bound package
-under the independent recovery root. Registration is permitted only after the
-package, baseline marker/checksum, active local image identity, OCI digest,
-embedded quartet, readiness, discovery issuer, and the nonce-bound Ed25519
-JWS from public `/.well-known/nazoauth-control` all agree with the
-descriptor-bound instance public key and deployment statement. The record
-therefore carries `RecoveryConclusion::Proven` plus the package and baseline
-digest bindings; off-host recovery remains required.
+The resulting DeploymentRecord binds the controller config, runtime ownership,
+local image ID, expected OCI digest, and the complete embedded identity, so an
+ordinary conformance session rechecks all of them before tenant-resource work.
 
 Once completed, this deployment is permanently frozen as that exact candidate.
-`update --yes`, development activation, migrations, `rollback --yes`, and
-capability/provenance transitions cannot replace its active release or runtime.
-`recover --yes` is the sole mutation path: it runs the candidate-specific
-managed baseline/package transaction. Conformance, read-only status/doctor
-diagnostics, and a safe explicit relinquish remain available. Promotion to a signed Release is intentionally not implicit and
+`update --yes`, development activation, migrations, and capability/provenance
+transitions cannot replace its active release or runtime. Conformance,
+read-only status/doctor diagnostics, and a safe explicit relinquish remain
+available. Promotion to a signed Release is intentionally not implicit and
 requires a future explicit promotion transaction.
 
 The digest is the local OCI manifest digest reported by the chosen runtime, not
@@ -78,11 +98,3 @@ evidence. If registration is already visible while the candidate state remains
 incomplete, it stays fail-closed for operator recovery rather than silently
 running or replacing that deployment. Do not use `development activate`,
 `adopt`, or `update` to bypass that binding.
-
-Candidate install-state schemas 1 through 4 are intentionally not replayed or
-migrated: they predate either generation-bound dependency-image recovery
-evidence, exact completion-audit classification, or deployment-bound task
-identities required by the current schema 5 contract. Preserve old state for
-incident evidence and create a fresh
-managed candidate deployment instead. Hostinger's candidate rollout began from
-zero candidate state, so no in-place migration is performed.

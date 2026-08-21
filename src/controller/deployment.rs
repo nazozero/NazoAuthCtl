@@ -462,167 +462,10 @@ fn load_local_oci_candidate_install_state(
     )?;
     let state: LocalOciCandidateInstallState = serde_json::from_slice(&bytes)
         .context("local OCI candidate installation state is invalid")?;
-    validate_local_oci_candidate_install_state(config, &state)?;
-    Ok(Some(state))
-}
-
-/// Candidate schema 1 predates durable task receipts, immutable recovery
-/// packages, and the completion provenance checks.  It cannot be upgraded in
-/// place without inventing evidence, so an old pending state is deliberately
-/// an operator-visible, fail-closed boundary rather than a best-effort retry.
-fn validate_local_oci_candidate_install_state(
-    config: &UpdateConfig,
-    state: &LocalOciCandidateInstallState,
-) -> anyhow::Result<()> {
-    if state.schema == 1 {
-        bail!(
-            "local OCI candidate state schema 1 is not recoverable; preserve it for evidence and recreate the deployment with a fresh managed candidate install"
-        );
-    }
-    if state.schema == 2 {
-        bail!(
-            "local OCI candidate state schema 2 predates generation-bound dependency-image recovery evidence; preserve it for incident evidence and recreate a fresh managed candidate deployment"
-        );
-    }
-    if state.schema == 3 {
-        bail!(
-            "local OCI candidate state schema 3 predates exact completion audit classification; preserve it for evidence and recreate a fresh managed candidate deployment"
-        );
-    }
-    if state.schema == 4 {
-        bail!(
-            "local OCI candidate state schema 4 predates deployment-bound task identities; preserve it for evidence and recreate a fresh managed candidate deployment"
-        );
-    }
-    if state.schema != 5
-        || state.local_artifact_id.is_empty()
-        || state.attempt == 0
-        || state.migration_jti.is_empty()
-        || state.keys_jti.is_empty()
-    {
+    if state.schema != 1 || state.local_artifact_id.is_empty() {
         bail!("local OCI candidate installation state has an unsupported schema or identity");
     }
-    let receipt_digest = |value: &str| {
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    };
-    for value in [
-        state.migration_receipt_sha256.as_deref(),
-        state.keys_receipt_sha256.as_deref(),
-        state.recovery_archive_sha256.as_deref(),
-        state.recovery_cache_sha256.as_deref(),
-        state.management_event_sha256.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !receipt_digest(value) {
-            bail!("local OCI candidate state contains an invalid digest");
-        }
-    }
-    let migration_committed = matches!(
-        state.phase,
-        LocalOciCandidatePhase::MigrationApplied
-            | LocalOciCandidatePhase::KeysStarted
-            | LocalOciCandidatePhase::KeysApplied
-            | LocalOciCandidatePhase::RuntimeStarted
-            | LocalOciCandidatePhase::BaselineCreated
-            | LocalOciCandidatePhase::Registered
-            | LocalOciCandidatePhase::Completed
-    );
-    let keys_committed = matches!(
-        state.phase,
-        LocalOciCandidatePhase::KeysApplied
-            | LocalOciCandidatePhase::RuntimeStarted
-            | LocalOciCandidatePhase::BaselineCreated
-            | LocalOciCandidatePhase::Registered
-            | LocalOciCandidatePhase::Completed
-    );
-    if state.migration_receipt_sha256.is_some() != migration_committed
-        || state.keys_receipt_sha256.is_some() != keys_committed
-        || (state.completed != (state.phase == LocalOciCandidatePhase::Completed))
-    {
-        bail!("local OCI candidate state phase and receipts are inconsistent");
-    }
-    if state.migration_jti
-        != local_oci_candidate_task_jti(
-            config,
-            &state.candidate,
-            &state.local_artifact_id,
-            state.attempt,
-            "migration",
-        )
-        || state.keys_jti
-            != local_oci_candidate_task_jti(
-                config,
-                &state.candidate,
-                &state.local_artifact_id,
-                state.attempt,
-                "keys",
-            )
-    {
-        bail!(
-            "local OCI candidate state task identity does not match its exact deployment binding"
-        );
-    }
-    let expected = local_oci_candidate_expected_target(config, &state.candidate)?;
-    for (committed, operation, jti, stored_digest) in [
-        (
-            migration_committed,
-            TaskOperation::MigrateApply,
-            state.migration_jti.as_str(),
-            state.migration_receipt_sha256.as_deref(),
-        ),
-        (
-            keys_committed,
-            local_oci_candidate_keys_operation(),
-            state.keys_jti.as_str(),
-            state.keys_receipt_sha256.as_deref(),
-        ),
-    ] {
-        if committed {
-            let receipt =
-                crate::operator::reconcile_final_receipt(config, &expected, &operation, jti)?
-                    .context(
-                        "local OCI candidate committed task has no exact successful final receipt",
-                    )?;
-            let actual_digest = crate::filesystem::sha256(&receipt.final_receipt)?;
-            if Some(actual_digest.as_str()) != stored_digest {
-                bail!("local OCI candidate committed task receipt digest changed");
-            }
-        }
-    }
-    let recovery_material_required = matches!(
-        state.phase,
-        LocalOciCandidatePhase::BaselineCreated
-            | LocalOciCandidatePhase::Registered
-            | LocalOciCandidatePhase::Completed
-    );
-    let has_recovery_material = state.baseline_backup.is_some()
-        && state.recovery_package.is_some()
-        && state.recovery_archive_sha256.is_some()
-        && state.recovery_cache_sha256.is_some()
-        && state.recovery_postgres_archive_sha256.is_some()
-        && state.recovery_valkey_archive_sha256.is_some();
-    if recovery_material_required != has_recovery_material {
-        if recovery_material_required
-            && (state.recovery_postgres_archive_sha256.is_none()
-                || state.recovery_valkey_archive_sha256.is_none())
-        {
-            bail!(
-                "local OCI candidate state predates dependency-image recovery evidence; preserve it for incident evidence and recreate a fresh managed candidate deployment"
-            );
-        }
-        bail!("local OCI candidate state recovery package does not match its phase");
-    }
-    if state.completed
-        && (state.management_event_file.is_none() || state.management_event_sha256.is_none())
-    {
-        bail!("completed local OCI candidate state has no management audit binding");
-    }
-    Ok(())
+    Ok(Some(state))
 }
 
 pub(super) fn local_oci_candidate_install_is_pending(
@@ -637,15 +480,6 @@ pub(super) fn local_oci_candidate_install_is_completed(
     Ok(load_local_oci_candidate_install_state(config)?.is_some_and(|state| state.completed))
 }
 
-/// A registered candidate recovery journal is an unsettled global mutation
-/// boundary.  Only its dedicated recovery transaction may load config through
-/// the explicit unsettled helper while holding the matching locks.
-pub(super) fn local_oci_candidate_registered_recovery_is_pending(
-    config: &UpdateConfig,
-) -> anyhow::Result<bool> {
-    Ok(find_local_oci_candidate_recovery_journal(config)?.is_some())
-}
-
 pub(super) fn validate_completed_local_oci_candidate_provenance(
     config: &UpdateConfig,
     record: &DeploymentRecord,
@@ -655,7 +489,21 @@ pub(super) fn validate_completed_local_oci_candidate_provenance(
     if !state.completed {
         bail!("local OCI candidate deployment is not complete");
     }
-    validate_local_oci_candidate_recovery_resources(config, record, &state)?;
+    let runtime = record
+        .runtime_instances
+        .first()
+        .context("local OCI candidate deployment has no runtime binding")?;
+    let crate::deployment::ArtifactReference::Oci { digest, .. } = &runtime.artifact else {
+        bail!("local OCI candidate deployment artifact is not OCI");
+    };
+    if record.active_release.release != state.candidate.target.release
+        || record.active_release.revision != state.candidate.target.revision
+        || record.active_release.build_id != state.candidate.target.build_id
+        || runtime.local_artifact_id.as_deref() != Some(&state.local_artifact_id)
+        || digest != &state.candidate.target.oci_digest
+    {
+        bail!("local OCI candidate deployment does not match its completed durable state");
+    }
     let event_file = state
         .management_event_file
         .as_deref()
@@ -673,145 +521,10 @@ pub(super) fn validate_completed_local_oci_candidate_provenance(
         bail!("completed local OCI candidate install management audit digest mismatch");
     }
     let event = operator::load_management_event(config, event_file)?;
-    let expected_operation = match (
-        state.completion_kind.as_deref(),
-        state.completion_generation,
-    ) {
-        (Some("install"), Some(generation)) if generation == state.attempt => {
-            "local-oci-candidate-install"
-        }
-        (Some("registered-recover"), Some(generation))
-            if generation == record.declaration_revision =>
-        {
-            "local-oci-candidate-registered-recover"
-        }
-        _ => {
-            bail!("completed local OCI candidate state has no exact completion kind and generation")
-        }
-    };
-    if event.operation != expected_operation
+    if event.operation != "local-oci-candidate-install"
         || event.release != state.candidate.target.release
-        || state.management_event_sequence != Some(event.sequence)
     {
         bail!("completed local OCI candidate install management audit event is inconsistent");
-    }
-    Ok(())
-}
-
-/// Check the candidate target and immutable recovery evidence which are part
-/// of the deployment declaration.  Registered recovery uses this before its
-/// state file has been atomically switched to the newly staged generation.
-fn validate_local_oci_candidate_recovery_resources(
-    config: &UpdateConfig,
-    record: &DeploymentRecord,
-    state: &LocalOciCandidateInstallState,
-) -> anyhow::Result<()> {
-    let runtime = record
-        .runtime_instances
-        .first()
-        .context("local OCI candidate deployment has no runtime binding")?;
-    let crate::deployment::ArtifactReference::Oci { digest, .. } = &runtime.artifact else {
-        bail!("local OCI candidate deployment artifact is not OCI");
-    };
-    if record.active_release.release != state.candidate.target.release
-        || record.active_release.revision != state.candidate.target.revision
-        || record.active_release.build_id != state.candidate.target.build_id
-        || runtime.local_artifact_id.as_deref() != Some(&state.local_artifact_id)
-        || digest != &state.candidate.target.oci_digest
-    {
-        bail!("local OCI candidate deployment does not match its completed durable state");
-    }
-    if record.recovery.conclusion != RecoveryConclusion::Proven
-        || !record.recovery.off_host_package_required_for_machine_loss
-    {
-        bail!("local OCI candidate deployment has no proven recovery conclusion");
-    }
-    let package = state
-        .recovery_package
-        .as_deref()
-        .context("completed local OCI candidate install has no recovery package")?;
-    let package_digest = state
-        .recovery_cache_sha256
-        .as_deref()
-        .context("completed local OCI candidate install has no recovery package digest")?;
-    match record.resources.get("candidate_recovery_package") {
-        Some(SafeReference::DigestBoundFile { path, sha256 })
-            if path == package && sha256 == package_digest => {}
-        _ => {
-            bail!("completed local OCI candidate install recovery package is not declaration-bound")
-        }
-    }
-    if crate::filesystem::sha256(package)? != package_digest {
-        bail!("completed local OCI candidate install recovery package digest mismatch");
-    }
-    let archive = package
-        .parent()
-        .context("completed local OCI candidate recovery package has no parent")?
-        .join("image.tar");
-    let archive_digest = state
-        .recovery_archive_sha256
-        .as_deref()
-        .context("completed local OCI candidate install has no recovery archive digest")?;
-    match record.resources.get("candidate_recovery_archive") {
-        Some(SafeReference::DigestBoundFile { path, sha256 })
-            if path == &archive && sha256 == archive_digest => {}
-        _ => bail!("completed local OCI candidate archive is not declaration-bound"),
-    }
-    if crate::filesystem::sha256(&archive)? != archive_digest {
-        bail!("completed local OCI candidate recovery archive digest mismatch");
-    }
-    for (name, file, expected) in [
-        (
-            "candidate_recovery_postgres_archive",
-            package
-                .parent()
-                .context("completed local OCI candidate recovery package has no parent")?
-                .join("postgres-image.tar"),
-            state.recovery_postgres_archive_sha256.as_deref(),
-        ),
-        (
-            "candidate_recovery_valkey_archive",
-            package
-                .parent()
-                .context("completed local OCI candidate recovery package has no parent")?
-                .join("valkey-image.tar"),
-            state.recovery_valkey_archive_sha256.as_deref(),
-        ),
-    ] {
-        let expected =
-            expected.context("completed local OCI candidate has no dependency archive digest")?;
-        match record.resources.get(name) {
-            Some(SafeReference::DigestBoundFile { path, sha256 })
-                if path == &file && sha256 == expected => {}
-            _ => bail!("completed local OCI candidate {name} is not declaration-bound"),
-        }
-        if crate::filesystem::sha256(&file)? != expected {
-            bail!("completed local OCI candidate {name} digest mismatch");
-        }
-    }
-    let baseline = state
-        .baseline_backup
-        .as_deref()
-        .context("completed local OCI candidate install has no baseline backup")?;
-    Backup::open_existing(config, baseline)?;
-    for (name, file) in [
-        (
-            "candidate_baseline_checksum_manifest",
-            baseline.join("SHA256SUMS"),
-        ),
-        (
-            "candidate_baseline_completion_marker",
-            baseline.join("BACKUP-COMPLETE"),
-        ),
-    ] {
-        match record.resources.get(name) {
-            Some(SafeReference::DigestBoundFile { path, sha256 }) if path == &file => {
-                if crate::filesystem::sha256(&file)? != *sha256 {
-                    bail!("completed local OCI candidate {name} digest mismatch");
-                }
-            }
-            _ => bail!("completed local OCI candidate {name} is not declaration-bound"),
-        }
     }
     Ok(())
 }
@@ -821,416 +534,6 @@ pub(super) fn local_oci_candidate_install_resource_path(config: &UpdateConfig) -
 }
 
 pub(super) const LOCAL_OCI_CANDIDATE_INSTALL_RESOURCE: &str = "local_oci_candidate_install";
-
-/// Candidate deployments are permanently frozen to their exact image, but
-/// they retain this dedicated, managed-only recovery transaction.  It never
-/// enters signed update/development/adoption machinery and rotates the
-/// recoverable baseline before replacing the declaration.
-pub(super) fn recover_registered_local_oci_candidate(
-    config_path: &Path,
-    _config: &UpdateConfig,
-    record: &DeploymentRecord,
-) -> anyhow::Result<()> {
-    let store = DeploymentStore::system();
-    // Match declaration persistence's global-to-specific lock ordering for
-    // the complete restore/activation/CAS transaction.
-    let _registry_lock = store.registry_lock()?;
-    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
-    let record = store.load(&record.deployment_id)?;
-    let config = super::load_bound_control_config_unsettled(config_path)?;
-    match record.resources.get("controller_config") {
-        Some(SafeReference::File { path }) if path == config_path => {}
-        _ => bail!("registered local OCI candidate has no exact controller config binding"),
-    }
-    super::verify_control_binding(&record, &config)?;
-    record.require_mutation(&[
-        Capability::Runtime,
-        Capability::Artifact,
-        Capability::Database,
-        Capability::Valkey,
-        Capability::Backups,
-        Capability::OperatorTasks,
-    ])?;
-    if crate::coordination::active_update_exists_for_deployment(&store, &record.deployment_id)
-        || store.registration_pending_except(Some(&record.deployment_id))?
-    {
-        bail!(
-            "registered local OCI candidate recovery is blocked by an unsettled declaration or update transaction"
-        );
-    }
-    let pending_journal = find_local_oci_candidate_recovery_journal(&config)?;
-    let generation = pending_journal.as_ref().map_or_else(
-        || {
-            record
-                .declaration_revision
-                .checked_add(1)
-                .context("local OCI candidate recovery generation overflow")
-        },
-        |journal| Ok(journal.generation),
-    )?;
-    let expected_record_sha256 = local_oci_candidate_record_sha256(&record)?;
-    let mut journal = match pending_journal {
-        Some(mut journal) => {
-            let committed_revision = journal
-                .expected_declaration_revision
-                .checked_add(1)
-                .context("candidate recovery declaration revision overflow")?;
-            if journal.phase < LocalOciCandidateRecoveryPhase::DeclarationCommitted {
-                if record.declaration_revision == journal.expected_declaration_revision
-                    && journal.expected_record_sha256 == expected_record_sha256
-                {
-                    // CAS has not happened.  The locked predecessor remains
-                    // the only declaration this journal may advance.
-                } else if record.declaration_revision == committed_revision
-                    && journal.intended_successor_record_sha256.as_deref()
-                        == Some(expected_record_sha256.as_str())
-                {
-                    // CAS succeeded before the next durable journal write.
-                    // The exact staged resource bindings prove that this is
-                    // this generation's declaration, not another mutation.
-                    journal.phase = LocalOciCandidateRecoveryPhase::DeclarationCommitted;
-                    write_local_oci_candidate_recovery_journal(&config, &journal)?;
-                } else {
-                    bail!(
-                        "local OCI candidate recovery journal does not bind the locked declaration"
-                    );
-                }
-            } else if record.declaration_revision != committed_revision
-                || journal.intended_successor_record_sha256.as_deref()
-                    != Some(expected_record_sha256.as_str())
-            {
-                bail!(
-                    "local OCI candidate recovery committed declaration no longer matches its staged generation"
-                );
-            }
-            journal
-        }
-        None => {
-            validate_completed_local_oci_candidate_provenance(&config, &record)?;
-            let journal = LocalOciCandidateRecoveryJournal {
-                schema: 2,
-                deployment_id: record.deployment_id.clone(),
-                runtime_instance_id: config.runtime.runtime_instance_id.clone(),
-                generation,
-                expected_declaration_revision: record.declaration_revision,
-                expected_record_sha256,
-                intended_successor_record_sha256: None,
-                phase: LocalOciCandidateRecoveryPhase::Prepared,
-                staged_state: None,
-            };
-            write_local_oci_candidate_recovery_journal(&config, &journal)?;
-            journal
-        }
-    };
-    let mut state = journal.staged_state.clone().map_or_else(
-        || {
-            load_local_oci_candidate_install_state(&config)?
-                .context("registered local OCI candidate has no durable state")
-        },
-        Ok,
-    )?;
-    // A journal embeds the staged state so it can outlive replacement of the
-    // ordinary state file.  Treat it as untrusted durable input and apply the
-    // same schema/JTI/receipt invariants before deriving a successor record.
-    validate_local_oci_candidate_install_state(&config, &state)?;
-    if journal.phase < LocalOciCandidateRecoveryPhase::DeclarationCommitted {
-        validate_completed_local_oci_candidate_provenance(&config, &record)?;
-    }
-    let runtime = Runtime::new(&config);
-    if journal.phase < LocalOciCandidateRecoveryPhase::Quiesced {
-        runtime.quiesce_local_oci_candidate()?;
-        journal.phase = LocalOciCandidateRecoveryPhase::Quiesced;
-        write_local_oci_candidate_recovery_journal(&config, &journal)?;
-    }
-    if journal.phase < LocalOciCandidateRecoveryPhase::Restored {
-        // Before staging, the completed declaration/state remains the only
-        // recovery authority.  Once Staged is durable, never mix its new
-        // generation package path with digest fields from that old state.
-        let state_from_record = load_local_oci_candidate_install_state(&config)?
-            .context("registered local OCI candidate has no durable state")?;
-        let baseline_path = state_from_record
-            .baseline_backup
-            .as_deref()
-            .context("registered local OCI candidate has no baseline backup")?;
-        let baseline = Backup::open_existing(&config, baseline_path)?;
-        let package = state_from_record
-            .recovery_package
-            .as_deref()
-            .context("registered local OCI candidate has no recovery package")?;
-        let package_sha256 = state_from_record
-            .recovery_cache_sha256
-            .as_deref()
-            .context("registered local OCI candidate has no recovery package digest")?;
-        if crate::filesystem::sha256(package)? != package_sha256 {
-            bail!("registered local OCI candidate recovery package changed");
-        }
-        let package_value: serde_json::Value =
-            serde_json::from_slice(&crate::filesystem::read_secure_regular_file(
-                package,
-                "local OCI candidate recovery package",
-                true,
-                128 * 1024,
-            )?)?;
-        if package_value
-            .get("schema")
-            .and_then(serde_json::Value::as_u64)
-            != Some(2)
-        {
-            bail!("local OCI candidate recovery package has an unsupported schema");
-        }
-        let archive = package
-            .parent()
-            .context("local OCI candidate recovery package has no parent")?
-            .join("image.tar");
-        let archive_sha256 = package_value
-            .get("archive_sha256")
-            .and_then(serde_json::Value::as_str)
-            .context("local OCI candidate recovery package has no archive digest")?;
-        if state_from_record.recovery_archive_sha256.as_deref() != Some(archive_sha256)
-            || crate::filesystem::sha256(&archive)? != archive_sha256
-        {
-            bail!("registered local OCI candidate recovery archive changed");
-        }
-        let dependency_archive = |name: &str,
-                                  field: &str,
-                                  image_field: &str,
-                                  expected_image: &str,
-                                  expected_digest: Option<&str>| {
-            let archive = package
-                .parent()
-                .context("local OCI candidate recovery package has no parent")?
-                .join(name);
-            let declared = package_value
-                .get(field)
-                .and_then(serde_json::Value::as_str)
-                .with_context(|| format!("local OCI candidate recovery package has no {field}"))?;
-            if package_value
-                .get(image_field)
-                .and_then(serde_json::Value::as_str)
-                != Some(expected_image)
-                || expected_digest != Some(declared)
-                || crate::filesystem::sha256(&archive)? != declared
-            {
-                bail!("registered local OCI candidate {name} archive changed");
-            }
-            Ok::<_, anyhow::Error>((archive, expected_image.to_owned()))
-        };
-        let (postgres_archive, postgres_image) = dependency_archive(
-            "postgres-image.tar",
-            "postgres_archive_sha256",
-            "postgres_image",
-            &config.postgres.image,
-            state_from_record
-                .recovery_postgres_archive_sha256
-                .as_deref(),
-        )?;
-        let (valkey_archive, valkey_image) = dependency_archive(
-            "valkey-image.tar",
-            "valkey_archive_sha256",
-            "valkey_image",
-            &config.valkey.image,
-            state_from_record.recovery_valkey_archive_sha256.as_deref(),
-        )?;
-        runtime.import_image(&postgres_archive, &postgres_image)?;
-        runtime.import_image(&valkey_archive, &valkey_image)?;
-        install::start_managed_dependencies(&config)?;
-        baseline.restore_databases(&config)?;
-        baseline.restore_snapshots(&config.runtime.snapshot_paths)?;
-        runtime.import_image(&archive, &state.local_artifact_id)?;
-        crate::operator::append_management_event(
-            &config,
-            "local-oci-candidate-registered-restore",
-            &state.candidate.target.release,
-            "backup",
-        )?;
-        journal.phase = LocalOciCandidateRecoveryPhase::Restored;
-        write_local_oci_candidate_recovery_journal(&config, &journal)?;
-    }
-    if journal.phase < LocalOciCandidateRecoveryPhase::Staged {
-        // Both backups are made with the writer absent. The journal, rather
-        // than the old completed state, owns this new immutable generation
-        // until declaration CAS commits it.
-        let rollback = Backup::create(config_path, &config, &state.candidate.target.release)?;
-        let baseline = Backup::create(config_path, &config, &state.candidate.target.release)?;
-        state.rollback_backup = Some(rollback.path().to_owned());
-        state.baseline_backup = Some(baseline.path().to_owned());
-        let staged_candidate = state.candidate.clone();
-        let staged_local_artifact_id = state.local_artifact_id.clone();
-        cache_local_oci_candidate_recovery_package(
-            &config,
-            &staged_candidate,
-            &staged_local_artifact_id,
-            &mut state,
-            &format!("registered-recovery-{}", journal.generation),
-        )?;
-        journal.staged_state = Some(state.clone());
-        journal.phase = LocalOciCandidateRecoveryPhase::Staged;
-        write_local_oci_candidate_recovery_journal(&config, &journal)?;
-    }
-    state = journal
-        .staged_state
-        .clone()
-        .context("staged local OCI candidate recovery has no durable state")?;
-    if journal.phase < LocalOciCandidateRecoveryPhase::DeclarationCommitted {
-        let successor = register_local_oci_candidate_deployment_locked(
-            config_path,
-            &config,
-            &state.candidate,
-            &state.local_artifact_id,
-            state.rollback_backup.as_deref().expect("set above"),
-            state.baseline_backup.as_deref().expect("set above"),
-            state.recovery_package.as_deref().expect("set above"),
-            state.recovery_archive_sha256.as_deref().expect("set above"),
-            state.recovery_cache_sha256.as_deref().expect("set above"),
-            Some(&record),
-            false,
-        )?;
-        let successor_sha256 = local_oci_candidate_record_sha256(&successor)?;
-        match journal.intended_successor_record_sha256.as_deref() {
-            Some(expected) if expected == successor_sha256.as_str() => {}
-            Some(_) => bail!("candidate recovery journal successor declaration changed"),
-            None => {
-                journal.intended_successor_record_sha256 = Some(successor_sha256);
-                write_local_oci_candidate_recovery_journal(&config, &journal)?;
-            }
-        }
-    }
-    if journal.phase == LocalOciCandidateRecoveryPhase::Staged {
-        // A reboot after staging may have lost every managed runtime object.
-        // The new baseline is the only restore source for this generation;
-        // never reuse the earlier rollback backup whose restore journal was
-        // consumed before staging.
-        let package = state
-            .recovery_package
-            .as_deref()
-            .context("staged local OCI candidate recovery has no package")?;
-        let package_sha256 = state
-            .recovery_cache_sha256
-            .as_deref()
-            .context("staged local OCI candidate recovery has no package digest")?;
-        if crate::filesystem::sha256(package)? != package_sha256 {
-            bail!("staged local OCI candidate recovery package changed");
-        }
-        let directory = package
-            .parent()
-            .context("staged local OCI candidate recovery package has no parent")?;
-        for (name, image, digest) in [
-            (
-                "postgres-image.tar",
-                config.postgres.image.as_str(),
-                state.recovery_postgres_archive_sha256.as_deref(),
-            ),
-            (
-                "valkey-image.tar",
-                config.valkey.image.as_str(),
-                state.recovery_valkey_archive_sha256.as_deref(),
-            ),
-        ] {
-            let archive = directory.join(name);
-            let digest =
-                digest.context("staged local OCI candidate has no dependency archive digest")?;
-            if crate::filesystem::sha256(&archive)? != digest {
-                bail!("staged local OCI candidate dependency archive changed");
-            }
-            runtime.import_image(&archive, image)?;
-        }
-        install::start_managed_dependencies(&config)?;
-        let baseline = Backup::open_existing(
-            &config,
-            state
-                .baseline_backup
-                .as_deref()
-                .context("staged local OCI candidate recovery has no baseline")?,
-        )?;
-        baseline.restore_databases(&config)?;
-        baseline.restore_snapshots(&config.runtime.snapshot_paths)?;
-    }
-    // A crash after staging can coincide with loss of the runtime image
-    // cache. Re-import the staged generation by immutable archive before the
-    // active-image observation; import is idempotent and never pulls.
-    let staged_archive = state
-        .recovery_package
-        .as_deref()
-        .context("staged local OCI candidate recovery has no package")?
-        .parent()
-        .context("staged local OCI candidate recovery package has no parent")?
-        .join("image.tar");
-    runtime.import_image(&staged_archive, &state.local_artifact_id)?;
-    let local = runtime.inspect_local_development_artifact(&state.local_artifact_id)?;
-    let actual_digest = runtime.image_digest(&state.local_artifact_id)?;
-    crate::controller::commands::validate_local_oci_candidate_observation(
-        &state.candidate.target,
-        &local.embedded,
-        &state.local_artifact_id,
-        &actual_digest,
-    )?;
-    if journal.phase < LocalOciCandidateRecoveryPhase::Accepted {
-        runtime.activate_local_development_artifact(&local)?;
-        wait_ready(&config)?;
-        verify_public_local_oci_candidate(&config, &state.candidate.target)?;
-        journal.phase = LocalOciCandidateRecoveryPhase::Accepted;
-        write_local_oci_candidate_recovery_journal(&config, &journal)?;
-    }
-    if journal.phase < LocalOciCandidateRecoveryPhase::DeclarationCommitted {
-        let successor = register_local_oci_candidate_deployment_locked(
-            config_path,
-            &config,
-            &state.candidate,
-            &state.local_artifact_id,
-            state.rollback_backup.as_deref().expect("set above"),
-            state.baseline_backup.as_deref().expect("set above"),
-            state.recovery_package.as_deref().expect("set above"),
-            state.recovery_archive_sha256.as_deref().expect("set above"),
-            state.recovery_cache_sha256.as_deref().expect("set above"),
-            Some(&record),
-            true,
-        )?;
-        let successor_sha256 = local_oci_candidate_record_sha256(&successor)?;
-        if journal.intended_successor_record_sha256.as_deref() != Some(successor_sha256.as_str()) {
-            bail!("candidate recovery CAS did not persist its intended successor declaration");
-        }
-        journal.phase = LocalOciCandidateRecoveryPhase::DeclarationCommitted;
-        write_local_oci_candidate_recovery_journal(&config, &journal)?;
-    }
-    let record = DeploymentStore::system().load(&config.operator.deployment_id)?;
-    verify_local_oci_candidate_completion_preconditions(
-        &config,
-        &record,
-        &state.candidate,
-        &state.local_artifact_id,
-    )?;
-    if journal.phase < LocalOciCandidateRecoveryPhase::StateCommitted {
-        let management_event = crate::operator::append_management_event(
-            &config,
-            "local-oci-candidate-registered-recover",
-            &state.candidate.target.release,
-            "backup",
-        )?;
-        state.management_event_file = management_event
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(ToOwned::to_owned);
-        state.management_event_sha256 = Some(crate::filesystem::sha256(&management_event)?);
-        state.completion_kind = Some("registered-recover".to_owned());
-        state.completion_generation = Some(journal.generation);
-        state.management_event_sequence = Some(
-            crate::operator::load_management_event(
-                &config,
-                state.management_event_file.as_deref().expect("set above"),
-            )?
-            .sequence,
-        );
-        persist_local_oci_candidate_install_state(&config, &state)?;
-        journal.staged_state = Some(state.clone());
-        journal.phase = LocalOciCandidateRecoveryPhase::StateCommitted;
-        write_local_oci_candidate_recovery_journal(&config, &journal)?;
-    }
-    validate_completed_local_oci_candidate_provenance(&config, &record)?;
-    remove_file_durable(&local_oci_candidate_registered_recovery_journal_path(
-        &config,
-        journal.generation,
-    )?)
-}
 
 fn candidate_registration_journal_present(
     store: &DeploymentStore,
@@ -1323,14 +626,6 @@ fn local_oci_candidate_expected_target(
     )
 }
 
-fn verify_public_local_oci_candidate(
-    config: &UpdateConfig,
-    candidate: &CandidateTarget,
-) -> anyhow::Result<()> {
-    verify_public(config)?;
-    crate::discovery::verify_public_candidate_control_identity(config, candidate)
-}
-
 fn install_local_oci_candidate_transaction(
     config_path: &Path,
     config: &UpdateConfig,
@@ -1357,11 +652,6 @@ fn install_local_oci_candidate_transaction(
         &actual_digest,
     )?;
 
-    if config.dependencies.mode != "managed" {
-        bail!(
-            "local OCI candidate installation requires controller-managed PostgreSQL and Valkey dependencies"
-        );
-    }
     let mut state = match persisted {
         Some(state) => {
             if state.candidate != *candidate || state.local_artifact_id != local_artifact_id {
@@ -1372,33 +662,12 @@ fn install_local_oci_candidate_transaction(
             state
         }
         None => LocalOciCandidateInstallState {
-            schema: 5,
+            schema: 1,
             candidate: candidate.clone(),
             local_artifact_id: local_artifact_id.to_owned(),
-            phase: LocalOciCandidatePhase::Prepared,
-            attempt: 1,
-            migration_jti: local_oci_candidate_task_jti(
-                config,
-                candidate,
-                local_artifact_id,
-                1,
-                "migration",
-            ),
-            keys_jti: local_oci_candidate_task_jti(config, candidate, local_artifact_id, 1, "keys"),
-            migration_receipt_sha256: None,
-            keys_receipt_sha256: None,
-            rollback_backup: None,
-            baseline_backup: None,
-            recovery_package: None,
-            recovery_archive_sha256: None,
-            recovery_cache_sha256: None,
-            recovery_postgres_archive_sha256: None,
-            recovery_valkey_archive_sha256: None,
+            recovery_backup: None,
             management_event_file: None,
             management_event_sha256: None,
-            completion_kind: None,
-            completion_generation: None,
-            management_event_sequence: None,
             completed: false,
         },
     };
@@ -1415,16 +684,14 @@ fn install_local_oci_candidate_transaction(
         return Ok(());
     }
 
-    // A started task without a durably recorded receipt is deliberately
-    // unknown.  It is never replayed forward: stop the exact managed runtime,
-    // restore the pre-mutation backup, rotate to a new backup and task JTI,
-    // and only then start a new attempt.
+    // Re-read the durable external contract before recording a retry intent
+    // or touching any registration, task, or runtime state.  A config records
+    // only non-secret endpoint identities, so a changed secret file must fail
+    // closed.
     verify_local_oci_candidate_retry_preconditions(config, &state)?;
 
-    let registration_recovery = ensure_local_oci_candidate_retry_is_unregistered(
-        config,
-        state.phase == LocalOciCandidatePhase::Registered,
-    )?;
+    let registration_recovery =
+        ensure_local_oci_candidate_retry_is_unregistered(config, state.recovery_backup.is_some())?;
     if registration_recovery {
         return finish_local_oci_candidate_registration_recovery(
             config_path,
@@ -1433,50 +700,6 @@ fn install_local_oci_candidate_transaction(
             local_artifact_id,
             &mut state,
         );
-    }
-
-    let expected = local_oci_candidate_expected_target(config, candidate)?;
-    match state.phase {
-        LocalOciCandidatePhase::MigrationStarted => {
-            if let Some(receipt) = crate::operator::reconcile_final_receipt(
-                config,
-                &expected,
-                &TaskOperation::MigrateApply,
-                &state.migration_jti,
-            )? {
-                state.migration_receipt_sha256 =
-                    Some(crate::filesystem::sha256(&receipt.final_receipt)?);
-                state.phase = LocalOciCandidatePhase::MigrationApplied;
-                persist_local_oci_candidate_install_state(config, &state)?;
-            } else {
-                recover_local_oci_candidate_attempt(config_path, config, &mut state)?;
-            }
-        }
-        LocalOciCandidatePhase::KeysStarted => {
-            let operation = local_oci_candidate_keys_operation();
-            if let Some(receipt) = crate::operator::reconcile_final_receipt(
-                config,
-                &expected,
-                &operation,
-                &state.keys_jti,
-            )? {
-                state.keys_receipt_sha256 =
-                    Some(crate::filesystem::sha256(&receipt.final_receipt)?);
-                state.phase = LocalOciCandidatePhase::KeysApplied;
-                persist_local_oci_candidate_install_state(config, &state)?;
-            } else {
-                recover_local_oci_candidate_attempt(config_path, config, &mut state)?;
-            }
-        }
-        _ => {}
-    }
-    if !matches!(
-        state.phase,
-        LocalOciCandidatePhase::Prepared
-            | LocalOciCandidatePhase::MigrationApplied
-            | LocalOciCandidatePhase::KeysApplied
-    ) {
-        recover_local_oci_candidate_attempt(config_path, config, &mut state)?;
     }
 
     // Persist the exact image ID before any task, database mutation, or
@@ -1489,124 +712,45 @@ fn install_local_oci_candidate_transaction(
         "backup",
     )?;
     install::start_managed_dependencies(config)?;
-    if state.rollback_backup.is_none() {
+    if state.recovery_backup.is_none() {
         let backup = Backup::create(config_path, config, &candidate.target.release)?;
-        state.rollback_backup = Some(backup.path().to_owned());
+        state.recovery_backup = Some(backup.path().to_owned());
         persist_local_oci_candidate_install_state(config, &state)?;
     }
-    if state.phase == LocalOciCandidatePhase::Prepared {
-        state.phase = LocalOciCandidatePhase::MigrationStarted;
-        persist_local_oci_candidate_install_state(config, &state)?;
-        let migration = crate::operator::execute_with_requested_jti(
-            config,
-            local_artifact_id,
-            &expected,
-            TaskOperation::MigrateApply,
-            None,
-            Some(&state.migration_jti),
-        );
-        let migration = match migration {
-            Ok(result) => result,
-            Err(error) => {
-                recover_local_oci_candidate_attempt(config_path, config, &mut state)?;
-                return Err(error).context("local OCI candidate migration failed; managed state was restored and the next retry has a new task identity");
-            }
-        };
-        state.migration_receipt_sha256 = Some(crate::filesystem::sha256(&migration.final_receipt)?);
-        state.phase = LocalOciCandidatePhase::MigrationApplied;
-        persist_local_oci_candidate_install_state(config, &state)?;
-    }
-    install::grant_runtime_database(config)?;
-    if state.phase == LocalOciCandidatePhase::MigrationApplied {
-        state.phase = LocalOciCandidatePhase::KeysStarted;
-        persist_local_oci_candidate_install_state(config, &state)?;
-        let keys = crate::operator::execute_with_requested_jti(
-            config,
-            local_artifact_id,
-            &expected,
-            local_oci_candidate_keys_operation(),
-            None,
-            Some(&state.keys_jti),
-        );
-        let keys = match keys {
-            Ok(result) => result,
-            Err(error) => {
-                recover_local_oci_candidate_attempt(config_path, config, &mut state)?;
-                return Err(error).context("local OCI candidate key initialization failed; managed state was restored and the next retry has a new task identity");
-            }
-        };
-        state.keys_receipt_sha256 = Some(crate::filesystem::sha256(&keys.final_receipt)?);
-        state.phase = LocalOciCandidatePhase::KeysApplied;
-        persist_local_oci_candidate_install_state(config, &state)?;
-    }
-    bootstrap_openid4vc_revocation_snapshot(config)?;
-    state.phase = LocalOciCandidatePhase::RuntimeStarted;
-    persist_local_oci_candidate_install_state(config, &state)?;
-    if let Err(error) = (|| {
-        runtime.activate_local_development_artifact(&local)?;
-        wait_ready(config)?;
-        verify_public_local_oci_candidate(config, &candidate.target)
-    })() {
-        recover_local_oci_candidate_attempt(config_path, config, &mut state)?;
-        return Err(error)
-            .context("local OCI candidate runtime acceptance failed; managed state was restored");
-    }
-
-    // A baseline is written only while the application is absent.  This is
-    // the package registered deployments use for their candidate-only
-    // recovery transaction.
-    runtime.quiesce_local_oci_candidate()?;
-    let baseline = Backup::create(config_path, config, &candidate.target.release)?;
-    state.baseline_backup = Some(baseline.path().to_owned());
-    let generation = format!("install-attempt-{}", state.attempt);
-    cache_local_oci_candidate_recovery_package(
+    let expected = local_oci_candidate_expected_target(config, candidate)?;
+    operator::execute(
         config,
-        candidate,
         local_artifact_id,
-        &mut state,
-        &generation,
+        &expected,
+        TaskOperation::MigrateApply,
+        None,
     )?;
-    state.phase = LocalOciCandidatePhase::BaselineCreated;
-    persist_local_oci_candidate_install_state(config, &state)?;
-    if let Err(error) = (|| {
-        runtime.activate_local_development_artifact(&local)?;
-        wait_ready(config)?;
-        verify_public_local_oci_candidate(config, &candidate.target)
-    })() {
-        recover_local_oci_candidate_attempt(config_path, config, &mut state)?;
-        return Err(error).context(
-            "local OCI candidate post-baseline acceptance failed; managed state was restored",
-        );
-    }
+    install::grant_runtime_database(config)?;
+    operator::execute(
+        config,
+        local_artifact_id,
+        &expected,
+        TaskOperation::KeysGenerateLocal {
+            alg: "ES256".to_owned(),
+            purposes: vec!["credential".to_owned(), "presentation_request".to_owned()],
+        },
+        None,
+    )?;
+    bootstrap_openid4vc_revocation_snapshot(config)?;
+    runtime.activate_local_development_artifact(&local)?;
+    wait_ready(config)?;
+    verify_public(config)?;
 
     let backup = state
-        .rollback_backup
+        .recovery_backup
         .as_deref()
         .context("local OCI candidate installation lost its recovery backup path")?;
-    state.phase = LocalOciCandidatePhase::Registered;
-    persist_local_oci_candidate_install_state(config, &state)?;
     register_local_oci_candidate_deployment(
         config_path,
         config,
         candidate,
         local_artifact_id,
         backup,
-        state
-            .baseline_backup
-            .as_deref()
-            .context("local OCI candidate installation lost its baseline backup")?,
-        state
-            .recovery_package
-            .as_deref()
-            .context("local OCI candidate installation lost its recovery package")?,
-        state
-            .recovery_archive_sha256
-            .as_deref()
-            .context("local OCI candidate installation lost its recovery archive digest")?,
-        state
-            .recovery_cache_sha256
-            .as_deref()
-            .context("local OCI candidate installation lost its recovery cache digest")?,
     )?;
     let store = DeploymentStore::system();
     // `register_local_oci_candidate_deployment` uses `persist_exact_locked`;
@@ -1620,27 +764,10 @@ fn install_local_oci_candidate_transaction(
         local_artifact_id,
     )?;
     crate::lifecycle::cache_trusted_runtime(&store, &record)?;
-    finalize_local_oci_candidate_install_completion(config, &mut state)?;
-    validate_completed_local_oci_candidate_install(config_path, config, &state)?;
-    println!(
-        "NazoAuth local OCI candidate installed at {} ({})",
-        candidate.target.release, candidate.target.revision
-    );
-    Ok(())
-}
-
-/// Complete either the normal post-registration path or its exact retry with
-/// one durable state shape.  In particular, a crash after declaration
-/// persistence must not produce a `Completed` state that lacks the schema-4
-/// provenance fields required by later status, conformance, or recovery.
-fn finalize_local_oci_candidate_install_completion(
-    config: &UpdateConfig,
-    state: &mut LocalOciCandidateInstallState,
-) -> anyhow::Result<()> {
     let management_event = crate::operator::append_management_event(
         config,
         "local-oci-candidate-install",
-        &state.candidate.target.release,
+        &candidate.target.release,
         "backup",
     )?;
     state.management_event_file = management_event
@@ -1648,501 +775,19 @@ fn finalize_local_oci_candidate_install_completion(
         .and_then(|name| name.to_str())
         .map(ToOwned::to_owned);
     state.management_event_sha256 = Some(crate::filesystem::sha256(&management_event)?);
-    state.completion_kind = Some("install".to_owned());
-    state.completion_generation = Some(state.attempt);
-    state.management_event_sequence = Some(
-        crate::operator::load_management_event(
-            config,
-            state.management_event_file.as_deref().expect("set above"),
-        )?
-        .sequence,
-    );
-    state.phase = LocalOciCandidatePhase::Completed;
     state.completed = true;
-    persist_local_oci_candidate_install_state(config, state)
-}
-
-fn local_oci_candidate_task_jti(
-    config: &UpdateConfig,
-    candidate: &LocalOciCandidateInstall,
-    local_artifact_id: &str,
-    attempt: u64,
-    operation: &str,
-) -> String {
-    let digest = Sha256::digest(
-        serde_json::to_vec(&serde_json::json!({
-            "candidate": candidate,
-            "deployment_id": config.operator.deployment_id,
-            "runtime_instance_id": config.runtime.runtime_instance_id,
-            "local_artifact_id": local_artifact_id,
-            "attempt": attempt,
-            "operation": operation,
-        }))
-        .expect("candidate task identity is serializable"),
-    );
-    let suffix = digest[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("request-{suffix}")
-}
-
-fn local_oci_candidate_keys_operation() -> TaskOperation {
-    TaskOperation::KeysGenerateLocal {
-        alg: "ES256".to_owned(),
-        purposes: vec!["credential".to_owned(), "presentation_request".to_owned()],
-    }
-}
-
-fn local_oci_candidate_recovery_directory(
-    config: &UpdateConfig,
-    candidate: &LocalOciCandidateInstall,
-    generation: &str,
-) -> anyhow::Result<PathBuf> {
-    let root = config
-        .backup_root
-        .parent()
-        .context("candidate recovery root is unavailable")?;
-    let digest = candidate
-        .target
-        .oci_digest
-        .strip_prefix("sha256:")
-        .context("candidate OCI digest is invalid")?;
-    if generation.is_empty()
-        || generation.len() > 128
-        || !generation
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    {
-        bail!("local OCI candidate recovery generation is invalid");
-    }
-    // Recovery artifacts are immutable generations.  Sharing a digest-only
-    // directory lets a later retry overwrite the archive referenced by a
-    // previously durable state or declaration.
-    Ok(root
-        .join("local-oci-candidate-recovery")
-        .join(&config.operator.deployment_id)
-        .join(&config.runtime.runtime_instance_id)
-        .join(digest)
-        .join(generation))
-}
-
-fn local_oci_candidate_registered_recovery_journal_path(
-    config: &UpdateConfig,
-    generation: u64,
-) -> anyhow::Result<PathBuf> {
-    if generation == 0 {
-        bail!("local OCI candidate registered recovery generation is invalid");
-    }
-    let root = config
-        .backup_root
-        .parent()
-        .context("candidate recovery root is unavailable")?;
-    Ok(root
-        .join("local-oci-candidate-recovery-control")
-        .join(&config.operator.deployment_id)
-        .join(&config.runtime.runtime_instance_id)
-        .join(format!("generation-{generation}.json")))
-}
-
-fn local_oci_candidate_record_sha256(record: &DeploymentRecord) -> anyhow::Result<String> {
-    let digest = Sha256::digest(serde_json::to_vec(record)?);
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
-fn write_local_oci_candidate_recovery_journal(
-    config: &UpdateConfig,
-    journal: &LocalOciCandidateRecoveryJournal,
-) -> anyhow::Result<()> {
-    let path = local_oci_candidate_registered_recovery_journal_path(config, journal.generation)?;
-    let parent = path
-        .parent()
-        .context("candidate recovery journal has no parent")?;
-    crate::filesystem::ensure_directory_chain(parent)?;
-    atomic_write(&path, &serde_json::to_vec_pretty(journal)?, 0o600)
-}
-
-fn load_local_oci_candidate_recovery_journal(
-    config: &UpdateConfig,
-    generation: u64,
-) -> anyhow::Result<Option<LocalOciCandidateRecoveryJournal>> {
-    let path = local_oci_candidate_registered_recovery_journal_path(config, generation)?;
-    match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
-        Ok(_) => bail!("local OCI candidate recovery journal is not a regular file"),
-        Err(error) => {
-            return Err(error).context("failed to inspect local OCI candidate recovery journal");
-        }
-    }
-    let journal: LocalOciCandidateRecoveryJournal =
-        serde_json::from_slice(&crate::filesystem::read_secure_regular_file(
-            &path,
-            "local OCI candidate recovery journal",
-            true,
-            256 * 1024,
-        )?)?;
-    if journal.schema != 2
-        || journal.generation != generation
-        || journal.deployment_id != config.operator.deployment_id
-        || journal.runtime_instance_id != config.runtime.runtime_instance_id
-        || journal.expected_record_sha256.len() != 64
-        || !journal
-            .expected_record_sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
-        || journal
-            .intended_successor_record_sha256
-            .as_ref()
-            .is_some_and(|digest| {
-                digest.len() != 64
-                    || !digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
-    {
-        bail!("local OCI candidate recovery journal has an unsupported schema or binding");
-    }
-    Ok(Some(journal))
-}
-
-fn find_local_oci_candidate_recovery_journal(
-    config: &UpdateConfig,
-) -> anyhow::Result<Option<LocalOciCandidateRecoveryJournal>> {
-    let root = config
-        .backup_root
-        .parent()
-        .context("candidate recovery root is unavailable")?
-        .join("local-oci-candidate-recovery-control")
-        .join(&config.operator.deployment_id)
-        .join(&config.runtime.runtime_instance_id);
-    let entries = match fs::read_dir(&root) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Ok(entries) => entries,
-        Err(error) => {
-            return Err(error).context("failed to inspect candidate recovery journal root");
-        }
-    };
-    let mut found = None;
-    for entry in entries {
-        let entry = entry?;
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            bail!("candidate recovery journal root contains an unsafe entry");
-        }
-        let name = entry.file_name();
-        let name = name
-            .to_str()
-            .context("candidate recovery journal name is not UTF-8")?;
-        let Some(number) = name
-            .strip_prefix("generation-")
-            .and_then(|value| value.strip_suffix(".json"))
-        else {
-            bail!("candidate recovery journal root contains an unexpected entry");
-        };
-        let generation: u64 = number
-            .parse()
-            .context("candidate recovery journal generation is invalid")?;
-        let journal = load_local_oci_candidate_recovery_journal(config, generation)?
-            .context("candidate recovery journal disappeared during inspection")?;
-        if found.replace(journal).is_some() {
-            bail!("multiple candidate recovery journals are pending");
-        }
-    }
-    Ok(found)
-}
-
-/// Write the exact local image to the independent recovery root before it is
-/// declared recoverable.  The small package is digest-bound and contains no
-/// secrets; database and filesystem material remains in the managed backup.
-fn cache_local_oci_candidate_recovery_package(
-    config: &UpdateConfig,
-    candidate: &LocalOciCandidateInstall,
-    local_artifact_id: &str,
-    state: &mut LocalOciCandidateInstallState,
-    generation: &str,
-) -> anyhow::Result<()> {
-    let directory = local_oci_candidate_recovery_directory(config, candidate, generation)?;
-    let package = directory.join("package.json");
-    match fs::symlink_metadata(&directory) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            if fs::symlink_metadata(&package).is_ok() {
-                return open_local_oci_candidate_recovery_package(
-                    config,
-                    candidate,
-                    local_artifact_id,
-                    state,
-                    &directory,
-                );
-            }
-            // The journal was durable before staging.  An interrupted export
-            // may leave only these deterministic, unreferenced work files;
-            // discard precisely that incomplete generation and build it
-            // again.  A manifest is never overwritten: it is open-or-verify.
-            // `Runtime::export_image` writes `with_extension("oci-archive.tmp")`
-            // beside each fixed archive before rename.  These names are not
-            // caller-controlled and are accepted only as regular files in
-            // this exact generation directory; every other entry fails
-            // closed rather than being removed.
-            for name in [
-                "image.tar",
-                "postgres-image.tar",
-                "valkey-image.tar",
-                "image.oci-archive.tmp",
-                "postgres-image.oci-archive.tmp",
-                "valkey-image.oci-archive.tmp",
-            ] {
-                let file = directory.join(name);
-                match fs::symlink_metadata(&file) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-                        validate_incomplete_local_oci_candidate_recovery_file(&file, &metadata)?;
-                        fs::remove_file(&file).with_context(|| {
-                            format!(
-                                "failed to discard incomplete candidate recovery artifact {}",
-                                file.display()
-                            )
-                        })?;
-                    }
-                    Ok(_) => bail!(
-                        "candidate recovery generation contains an unsafe incomplete artifact"
-                    ),
-                    Err(error) => {
-                        return Err(error)
-                            .context("failed to inspect incomplete candidate recovery artifact");
-                    }
-                }
-            }
-            if fs::read_dir(&directory)?.next().transpose()?.is_some() {
-                bail!("candidate recovery generation contains unexpected incomplete files");
-            }
-        }
-        Ok(_) => bail!("local OCI candidate recovery generation is not a safe directory"),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to inspect local OCI candidate recovery generation {}",
-                    directory.display()
-                )
-            });
-        }
-    }
-    crate::filesystem::ensure_directory_chain(&directory)?;
-    let archive = directory.join("image.tar");
-    let runtime = Runtime::new(config);
-    runtime.export_image(local_artifact_id, &archive)?;
-    let archive_sha256 = crate::filesystem::sha256(&archive)?;
-    // A Proven package must also bootstrap the exact managed dependency
-    // images. The package deliberately contains only image blobs and digest
-    // bindings; passwords remain in their controller-owned secret files.
-    let postgres_archive = directory.join("postgres-image.tar");
-    runtime.export_image(&config.postgres.image, &postgres_archive)?;
-    let postgres_archive_sha256 = crate::filesystem::sha256(&postgres_archive)?;
-    let valkey_archive = directory.join("valkey-image.tar");
-    runtime.export_image(&config.valkey.image, &valkey_archive)?;
-    let valkey_archive_sha256 = crate::filesystem::sha256(&valkey_archive)?;
-    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
-        "schema": 2,
-        "deployment_id": config.operator.deployment_id,
-        "control_authority": config.operator.controller_key_id,
-        "runtime_instance_id": config.runtime.runtime_instance_id,
-        "candidate": candidate,
-        "local_artifact_id": local_artifact_id,
-        "archive": archive,
-        "archive_sha256": archive_sha256,
-        "postgres_image": config.postgres.image,
-        "postgres_archive": postgres_archive,
-        "postgres_archive_sha256": postgres_archive_sha256,
-        "valkey_image": config.valkey.image,
-        "valkey_archive": valkey_archive,
-        "valkey_archive_sha256": valkey_archive_sha256,
-    }))?;
-    atomic_write(&package, &bytes, 0o600)?;
-    state.recovery_package = Some(package);
-    state.recovery_archive_sha256 = Some(archive_sha256);
-    state.recovery_postgres_archive_sha256 = Some(postgres_archive_sha256);
-    state.recovery_valkey_archive_sha256 = Some(valkey_archive_sha256);
-    state.recovery_cache_sha256 = Some(crate::filesystem::sha256(
-        state.recovery_package.as_deref().expect("set above"),
-    )?);
-    Ok(())
-}
-
-fn validate_incomplete_local_oci_candidate_recovery_file(
-    _file: &Path,
-    metadata: &fs::Metadata,
-) -> anyhow::Result<()> {
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("candidate recovery temporary artifact is not a regular file");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-            bail!(
-                "candidate recovery temporary artifact has unsafe owner or permissions: {}",
-                _file.display()
-            );
-        }
-    }
-    Ok(())
-}
-
-/// A generation manifest commits all immutable archive bytes.  Once it
-/// exists, retries may only re-open and verify it; they never export over it.
-fn open_local_oci_candidate_recovery_package(
-    config: &UpdateConfig,
-    candidate: &LocalOciCandidateInstall,
-    local_artifact_id: &str,
-    state: &mut LocalOciCandidateInstallState,
-    directory: &Path,
-) -> anyhow::Result<()> {
-    let package = directory.join("package.json");
-    let value: serde_json::Value =
-        serde_json::from_slice(&crate::filesystem::read_secure_regular_file(
-            &package,
-            "local OCI candidate recovery package",
-            true,
-            128 * 1024,
-        )?)?;
-    if value.get("schema").and_then(serde_json::Value::as_u64) != Some(2)
-        || value
-            .get("deployment_id")
-            .and_then(serde_json::Value::as_str)
-            != Some(config.operator.deployment_id.as_str())
-        || value
-            .get("control_authority")
-            .and_then(serde_json::Value::as_str)
-            != Some(config.operator.controller_key_id.as_str())
-        || value
-            .get("runtime_instance_id")
-            .and_then(serde_json::Value::as_str)
-            != Some(config.runtime.runtime_instance_id.as_str())
-        || value.get("candidate") != Some(&serde_json::to_value(candidate)?)
-        || value
-            .get("local_artifact_id")
-            .and_then(serde_json::Value::as_str)
-            != Some(local_artifact_id)
-        || value
-            .get("postgres_image")
-            .and_then(serde_json::Value::as_str)
-            != Some(config.postgres.image.as_str())
-        || value
-            .get("valkey_image")
-            .and_then(serde_json::Value::as_str)
-            != Some(config.valkey.image.as_str())
-    {
-        bail!("local OCI candidate recovery package does not bind this exact generation");
-    }
-    let verify_archive = |file: &str, field: &str| -> anyhow::Result<String> {
-        let digest = value
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .context("local OCI candidate recovery package has no archive digest")?;
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
-            || crate::filesystem::sha256(&directory.join(file))? != digest
-        {
-            bail!("local OCI candidate recovery package archive digest mismatch");
-        }
-        Ok(digest.to_owned())
-    };
-    let archive_sha256 = verify_archive("image.tar", "archive_sha256")?;
-    let postgres_archive_sha256 = verify_archive("postgres-image.tar", "postgres_archive_sha256")?;
-    let valkey_archive_sha256 = verify_archive("valkey-image.tar", "valkey_archive_sha256")?;
-    state.recovery_package = Some(package.clone());
-    state.recovery_archive_sha256 = Some(archive_sha256);
-    state.recovery_postgres_archive_sha256 = Some(postgres_archive_sha256);
-    state.recovery_valkey_archive_sha256 = Some(valkey_archive_sha256);
-    state.recovery_cache_sha256 = Some(crate::filesystem::sha256(&package)?);
-    Ok(())
-}
-
-/// A candidate task that might have reached the runtime is never retried in
-/// place.  The app is first proven absent, then the immutable managed backup
-/// restores PostgreSQL, Valkey and every snapshot.  A fresh backup and fresh
-/// request IDs fence the next attempt from both the old task and its restore
-/// journal.
-fn recover_local_oci_candidate_attempt(
-    config_path: &Path,
-    config: &UpdateConfig,
-    state: &mut LocalOciCandidateInstallState,
-) -> anyhow::Result<()> {
-    let backup_path = state
-        .rollback_backup
-        .as_deref()
-        .context("local OCI candidate recovery has no pre-mutation managed backup")?;
-    // A Started phase has an uncertain runtime-side effect.  Its exact
-    // durable JTI determines the only task object we may remove.  Quiesce it
-    // before the application, and prove both absent before restoring managed
-    // database/Valkey/snapshot state.  A normal `--rm` task absence is safe;
-    // a label, CID, or engine-inspection mismatch is not.
-    let runtime = Runtime::new(config);
-    match state.phase {
-        LocalOciCandidatePhase::MigrationStarted => {
-            let identity = crate::operator::managed_one_shot_identity_for_task(
-                config,
-                &TaskOperation::MigrateApply,
-                &state.migration_jti,
-            )?;
-            runtime.quiesce_managed_one_shot(&identity)?;
-        }
-        LocalOciCandidatePhase::KeysStarted => {
-            let operation = local_oci_candidate_keys_operation();
-            let identity = crate::operator::managed_one_shot_identity_for_task(
-                config,
-                &operation,
-                &state.keys_jti,
-            )?;
-            runtime.quiesce_managed_one_shot(&identity)?;
-        }
-        _ => {}
-    }
-    runtime.quiesce_local_oci_candidate()?;
-    let backup = Backup::open_existing(config, backup_path)?;
-    backup.restore_databases(config)?;
-    backup.restore_snapshots(&config.runtime.snapshot_paths)?;
-    crate::operator::append_management_event(
+    persist_local_oci_candidate_install_state(config, &state)?;
+    validate_registered_local_oci_candidate_deployment(
+        config_path,
         config,
-        "local-oci-candidate-restore",
-        &state.candidate.target.release,
-        "backup",
+        candidate,
+        local_artifact_id,
     )?;
-    state.attempt = state
-        .attempt
-        .checked_add(1)
-        .context("local OCI candidate attempt counter overflow")?;
-    state.migration_jti = local_oci_candidate_task_jti(
-        config,
-        &state.candidate,
-        &state.local_artifact_id,
-        state.attempt,
-        "migration",
+    println!(
+        "NazoAuth local OCI candidate installed at {} ({})",
+        candidate.target.release, candidate.target.revision
     );
-    state.keys_jti = local_oci_candidate_task_jti(
-        config,
-        &state.candidate,
-        &state.local_artifact_id,
-        state.attempt,
-        "keys",
-    );
-    state.migration_receipt_sha256 = None;
-    state.keys_receipt_sha256 = None;
-    state.phase = LocalOciCandidatePhase::Prepared;
-    state.baseline_backup = None;
-    state.recovery_package = None;
-    state.recovery_archive_sha256 = None;
-    state.recovery_cache_sha256 = None;
-    state.recovery_postgres_archive_sha256 = None;
-    state.recovery_valkey_archive_sha256 = None;
-    // Do not reuse the backup whose restore journal has just been consumed.
-    let backup = Backup::create(config_path, config, &state.candidate.target.release)?;
-    state.rollback_backup = Some(backup.path().to_owned());
-    persist_local_oci_candidate_install_state(config, state)
+    Ok(())
 }
 
 /// This is deliberately called before a retry can persist state, append audit
@@ -2151,10 +796,8 @@ pub(super) fn verify_local_oci_candidate_retry_preconditions(
     config: &UpdateConfig,
     state: &LocalOciCandidateInstallState,
 ) -> anyhow::Result<()> {
-    if config.dependencies.mode != "managed" {
-        bail!("local OCI candidate retry requires managed dependencies");
-    }
-    if let Some(backup) = state.rollback_backup.as_deref() {
+    install::verify_live_external_dependencies(config)?;
+    if let Some(backup) = state.recovery_backup.as_deref() {
         Backup::open_existing(config, backup)?;
     }
     Ok(())
@@ -2173,37 +816,16 @@ fn finish_local_oci_candidate_registration_recovery(
     state: &mut LocalOciCandidateInstallState,
 ) -> anyhow::Result<()> {
     let backup = state
-        .rollback_backup
+        .recovery_backup
         .as_deref()
         .context("local OCI candidate registration recovery has no durable backup")?;
     Backup::open_existing(config, backup)?;
-    let baseline = state
-        .baseline_backup
-        .as_deref()
-        .context("local OCI candidate registration recovery has no durable baseline")?;
-    Backup::open_existing(config, baseline)?;
-    let package = state
-        .recovery_package
-        .as_deref()
-        .context("local OCI candidate registration recovery has no recovery package")?;
-    let archive_sha256 = state
-        .recovery_archive_sha256
-        .as_deref()
-        .context("local OCI candidate registration recovery has no recovery archive digest")?;
-    let cache_sha256 = state
-        .recovery_cache_sha256
-        .as_deref()
-        .context("local OCI candidate registration recovery has no recovery cache digest")?;
     register_local_oci_candidate_deployment(
         config_path,
         config,
         candidate,
         local_artifact_id,
         backup,
-        baseline,
-        package,
-        archive_sha256,
-        cache_sha256,
     )?;
     let store = DeploymentStore::system();
     let record = store.load(&config.operator.deployment_id)?;
@@ -2214,8 +836,25 @@ fn finish_local_oci_candidate_registration_recovery(
         local_artifact_id,
     )?;
     crate::lifecycle::cache_trusted_runtime(&store, &record)?;
-    finalize_local_oci_candidate_install_completion(config, state)?;
-    validate_completed_local_oci_candidate_install(config_path, config, state)?;
+    let management_event = crate::operator::append_management_event(
+        config,
+        "local-oci-candidate-install",
+        &candidate.target.release,
+        "backup",
+    )?;
+    state.management_event_file = management_event
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned);
+    state.management_event_sha256 = Some(crate::filesystem::sha256(&management_event)?);
+    state.completed = true;
+    persist_local_oci_candidate_install_state(config, state)?;
+    validate_registered_local_oci_candidate_deployment(
+        config_path,
+        config,
+        candidate,
+        local_artifact_id,
+    )?;
     println!(
         "NazoAuth local OCI candidate registration recovery completed at {} ({})",
         candidate.target.release, candidate.target.revision
@@ -2240,7 +879,7 @@ fn verify_local_oci_candidate_completion_preconditions(
         local_artifact_id,
     )?;
     wait_ready(config)?;
-    verify_public_local_oci_candidate(config, &candidate.target)
+    verify_public(config)
 }
 
 fn validate_completed_local_oci_candidate_install(
@@ -2248,16 +887,13 @@ fn validate_completed_local_oci_candidate_install(
     config: &UpdateConfig,
     state: &LocalOciCandidateInstallState,
 ) -> anyhow::Result<()> {
-    if !state.completed {
-        bail!("local OCI candidate completion validation requires completed state");
-    }
-    let record = validate_registered_local_oci_candidate_deployment(
+    validate_registered_local_oci_candidate_deployment(
         config_path,
         config,
         &state.candidate,
         &state.local_artifact_id,
     )?;
-    validate_completed_local_oci_candidate_provenance(config, &record)
+    Ok(())
 }
 
 fn validate_registered_local_oci_candidate_deployment(
@@ -2470,44 +1106,8 @@ fn register_local_oci_candidate_deployment(
     config: &UpdateConfig,
     candidate: &LocalOciCandidateInstall,
     local_artifact_id: &str,
-    rollback_backup: &Path,
-    baseline_backup: &Path,
-    recovery_package: &Path,
-    recovery_archive_sha256: &str,
-    recovery_cache_sha256: &str,
+    backup: &Path,
 ) -> anyhow::Result<()> {
-    let store = DeploymentStore::system();
-    let _registry_lock = store.registry_lock()?;
-    let _deployment_lock = store.deployment_lock(&config.operator.deployment_id)?;
-    register_local_oci_candidate_deployment_locked(
-        config_path,
-        config,
-        candidate,
-        local_artifact_id,
-        rollback_backup,
-        baseline_backup,
-        recovery_package,
-        recovery_archive_sha256,
-        recovery_cache_sha256,
-        None,
-        true,
-    )?;
-    Ok(())
-}
-
-fn register_local_oci_candidate_deployment_locked(
-    config_path: &Path,
-    config: &UpdateConfig,
-    candidate: &LocalOciCandidateInstall,
-    local_artifact_id: &str,
-    rollback_backup: &Path,
-    baseline_backup: &Path,
-    recovery_package: &Path,
-    recovery_archive_sha256: &str,
-    recovery_cache_sha256: &str,
-    expected_existing: Option<&DeploymentRecord>,
-    persist: bool,
-) -> anyhow::Result<DeploymentRecord> {
     use crate::deployment::{
         ArtifactReference, DEPLOYMENT_SCHEMA, DeploymentRecord, DeploymentStore, MountReference,
         RecoveryAssessment, RecoveryConclusion, ResourceScope, Responsibility, RuntimeInstance,
@@ -2519,207 +1119,84 @@ fn register_local_oci_candidate_deployment_locked(
     if backend == RuntimeBackendKind::Systemd {
         bail!("local OCI candidate deployment cannot use the host runtime");
     }
-    // A registered recovery has no authority to reconstruct the declaration
-    // from a mutable config file.  Its predecessor was reloaded under the
-    // deployment lock; retain every non-recovery declaration field exactly
-    // and replace only the newly staged recovery evidence below.
-    let mut resources = match expected_existing {
-        Some(existing) => existing.resources.clone(),
-        None => installed_deployment_resources(config_path, config)?,
-    };
+    let mut resources = installed_deployment_resources(config_path, config)?;
     resources.insert(
         LOCAL_OCI_CANDIDATE_INSTALL_RESOURCE.to_owned(),
         SafeReference::File {
             path: local_oci_candidate_install_resource_path(config),
         },
     );
-    let baseline_manifest = baseline_backup.join("SHA256SUMS");
-    let baseline_completion = baseline_backup.join("BACKUP-COMPLETE");
-    let recovery_archive = recovery_package
-        .parent()
-        .context("local OCI candidate recovery package has no parent")?
-        .join("image.tar");
-    let recovery_package_value: serde_json::Value =
-        serde_json::from_slice(&crate::filesystem::read_secure_regular_file(
-            recovery_package,
-            "local OCI candidate recovery package",
-            true,
-            128 * 1024,
-        )?)?;
-    if recovery_package_value
-        .get("schema")
-        .and_then(serde_json::Value::as_u64)
-        != Some(2)
-    {
-        bail!("local OCI candidate recovery package has an unsupported schema");
-    }
-    let postgres_recovery_archive = recovery_package
-        .parent()
-        .context("local OCI candidate recovery package has no parent")?
-        .join("postgres-image.tar");
-    let postgres_recovery_digest = recovery_package_value
-        .get("postgres_archive_sha256")
-        .and_then(serde_json::Value::as_str)
-        .context("local OCI candidate recovery package has no PostgreSQL archive digest")?;
-    let valkey_recovery_archive = recovery_package
-        .parent()
-        .context("local OCI candidate recovery package has no parent")?
-        .join("valkey-image.tar");
-    let valkey_recovery_digest = recovery_package_value
-        .get("valkey_archive_sha256")
-        .and_then(serde_json::Value::as_str)
-        .context("local OCI candidate recovery package has no Valkey archive digest")?;
-    let baseline_manifest_sha256 = crate::filesystem::sha256(&baseline_manifest)?;
-    let baseline_completion_sha256 = crate::filesystem::sha256(&baseline_completion)?;
-    for (name, path, digest) in [
-        (
-            "candidate_recovery_package",
-            recovery_package,
-            recovery_cache_sha256,
-        ),
-        (
-            "candidate_recovery_archive",
-            &recovery_archive,
-            recovery_archive_sha256,
-        ),
-        (
-            "candidate_recovery_postgres_archive",
-            &postgres_recovery_archive,
-            postgres_recovery_digest,
-        ),
-        (
-            "candidate_recovery_valkey_archive",
-            &valkey_recovery_archive,
-            valkey_recovery_digest,
-        ),
-        (
-            "candidate_baseline_checksum_manifest",
-            &baseline_manifest,
-            &baseline_manifest_sha256,
-        ),
-        (
-            "candidate_baseline_completion_marker",
-            &baseline_completion,
-            &baseline_completion_sha256,
-        ),
-    ] {
-        resources.insert(
-            name.to_owned(),
-            SafeReference::DigestBoundFile {
-                path: path.to_owned(),
-                sha256: digest.to_owned(),
-            },
-        );
-    }
     let record = DeploymentRecord {
         schema: DEPLOYMENT_SCHEMA,
         deployment_id: config.operator.deployment_id.clone(),
         control_authority: config.operator.controller_key_id.clone(),
-        alias: expected_existing.and_then(|existing| existing.alias.clone()),
-        issuer: expected_existing.map_or_else(
-            || config.runtime.expected_issuer.clone(),
-            |existing| existing.issuer.clone(),
-        ),
-        active_release: expected_existing.map_or_else(
-            || nazo_operator_protocol::EmbeddedIdentity {
-                release: candidate.target.release.clone(),
-                revision: candidate.target.revision.clone(),
-                protocol: nazo_operator_protocol::PROTOCOL_VERSION,
-                build_id: candidate.target.build_id.clone(),
+        alias: None,
+        issuer: config.runtime.expected_issuer.clone(),
+        active_release: nazo_operator_protocol::EmbeddedIdentity {
+            release: candidate.target.release.clone(),
+            revision: candidate.target.revision.clone(),
+            protocol: nazo_operator_protocol::PROTOCOL_VERSION,
+            build_id: candidate.target.build_id.clone(),
+        },
+        trust: TrustState::Adopted,
+        capabilities: config.capabilities.clone(),
+        runtime_instances: vec![RuntimeInstance {
+            runtime_instance_id: config.runtime.runtime_instance_id.clone(),
+            backend,
+            object_reference: config.runtime.container_name.clone(),
+            artifact: ArtifactReference::Oci {
+                image_reference: local_artifact_id.to_owned(),
+                digest: candidate.target.oci_digest.clone(),
             },
-            |existing| existing.active_release.clone(),
-        ),
-        trust: expected_existing.map_or(TrustState::Adopted, |existing| existing.trust),
-        capabilities: expected_existing.map_or_else(
-            || config.capabilities.clone(),
-            |existing| existing.capabilities.clone(),
-        ),
-        runtime_instances: expected_existing.map_or_else(
-            || {
-                vec![RuntimeInstance {
-                    runtime_instance_id: config.runtime.runtime_instance_id.clone(),
-                    backend,
-                    object_reference: config.runtime.container_name.clone(),
-                    artifact: ArtifactReference::Oci {
-                        image_reference: local_artifact_id.to_owned(),
-                        digest: candidate.target.oci_digest.clone(),
-                    },
-                    local_artifact_id: Some(local_artifact_id.to_owned()),
-                    ports: (!config.runtime.publish_address.is_empty())
-                        .then(|| config.runtime.publish_address.clone())
-                        .into_iter()
-                        .collect(),
-                    networks: (!config.runtime.network.is_empty())
-                        .then(|| config.runtime.network.clone())
-                        .into_iter()
-                        .collect(),
-                    mounts: config
-                        .runtime
-                        .mounts
-                        .iter()
-                        .map(|mount| MountReference {
-                            source: mount.source.clone(),
-                            destination: mount.target.clone(),
-                            read_only: mount.read_only,
-                            selinux_relabel: mount.selinux_relabel,
-                            scope: ResourceScope::Deployment,
-                            ownership: Responsibility::Managed,
-                        })
-                        .collect(),
-                    instance_key_id: None,
-                    deployment_statement: config.runtime.mounts.iter().find_map(|mount| {
-                        (mount.target == Path::new("/var/lib/nazo_oauth/instance"))
-                            .then(|| mount.source.join("deployment-statement.jws"))
-                    }),
-                }]
-            },
-            |existing| existing.runtime_instances.clone(),
-        ),
+            local_artifact_id: Some(local_artifact_id.to_owned()),
+            ports: (!config.runtime.publish_address.is_empty())
+                .then(|| config.runtime.publish_address.clone())
+                .into_iter()
+                .collect(),
+            networks: (!config.runtime.network.is_empty())
+                .then(|| config.runtime.network.clone())
+                .into_iter()
+                .collect(),
+            mounts: config
+                .runtime
+                .mounts
+                .iter()
+                .map(|mount| MountReference {
+                    source: mount.source.clone(),
+                    destination: mount.target.clone(),
+                    read_only: mount.read_only,
+                    selinux_relabel: mount.selinux_relabel,
+                    scope: ResourceScope::Deployment,
+                    ownership: Responsibility::Managed,
+                })
+                .collect(),
+            instance_key_id: None,
+            deployment_statement: config.runtime.mounts.iter().find_map(|mount| {
+                (mount.target == Path::new("/var/lib/nazo_oauth/instance"))
+                    .then(|| mount.source.join("deployment-statement.jws"))
+            }),
+        }],
         resources,
         recovery: RecoveryAssessment {
-            conclusion: RecoveryConclusion::Proven,
+            conclusion: RecoveryConclusion::RequiresUserEvidence,
             evidence: vec![
-                format!("rollback-backup:{}", rollback_backup.display()),
-                format!("candidate-baseline:{}", baseline_backup.display()),
-                format!("candidate-recovery-package:{}", recovery_package.display()),
+                format!("backup:{}", backup.display()),
                 format!("local-oci-image-id:{local_artifact_id}"),
                 format!("local-oci-digest:{}", candidate.target.oci_digest),
-                format!("candidate-recovery-archive-sha256:{recovery_archive_sha256}"),
-                format!("candidate-recovery-cache-sha256:{recovery_cache_sha256}"),
             ],
             off_host_package_required_for_machine_loss: true,
         },
-        operator_protocol_versions: expected_existing.map_or_else(
-            || BTreeSet::from([nazo_operator_protocol::PROTOCOL_VERSION]),
-            |existing| existing.operator_protocol_versions.clone(),
-        ),
-        control_protocol_versions: expected_existing.map_or_else(
-            || BTreeSet::from([1]),
-            |existing| existing.control_protocol_versions.clone(),
-        ),
-        declaration_revision: expected_existing
-            .map(|existing| {
-                existing
-                    .declaration_revision
-                    .checked_add(1)
-                    .context("local OCI candidate declaration revision overflow")
-            })
-            .transpose()?
-            .unwrap_or(1),
+        operator_protocol_versions: BTreeSet::from([nazo_operator_protocol::PROTOCOL_VERSION]),
+        control_protocol_versions: BTreeSet::from([1]),
+        declaration_revision: 1,
     };
     let store = DeploymentStore::system();
-    if persist {
-        if let Some(expected) = expected_existing {
-            // Registered recovery is a new declaration generation.  It must not
-            // masquerade as a fresh exact persistence: the record loaded under
-            // the deployment lock is the CAS predecessor and every rotated
-            // baseline/package binding advances its revision exactly once.
-            store.persist_declaration_cas_locked(expected, &record)?;
-        } else {
-            store.persist_exact_locked(&record)?;
-        }
-    }
-    Ok(record)
+    // Match DeploymentStore::persist lock ordering explicitly: registry first,
+    // then this deployment.  Candidate registration cannot race an ordinary
+    // declaration write into a retained older record.
+    let _registry_lock = store.registry_lock()?;
+    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
+    store.persist_exact_locked(&record)
 }
 
 fn installed_deployment_resources(

@@ -7,20 +7,6 @@ pub(crate) fn execute(
     operation: TaskOperation,
     public_jwk: Option<&Path>,
 ) -> anyhow::Result<OperationResult> {
-    execute_with_requested_jti(config, target, expected, operation, public_jwk, None)
-}
-
-/// Run a task with an explicitly durable request identity.  Only recovery
-/// state machines use this: ordinary signed-release operations retain their
-/// existing random request allocation semantics.
-pub(crate) fn execute_with_requested_jti(
-    config: &UpdateConfig,
-    target: &str,
-    expected: &ExpectedReleaseTarget,
-    operation: TaskOperation,
-    public_jwk: Option<&Path>,
-    requested_jti: Option<&str>,
-) -> anyhow::Result<OperationResult> {
     // This is the unique privileged task execution boundary.  Re-read the
     // entire external provider contract immediately before any audit intent
     // or runtime preparation for DDL, including direct candidate commands.
@@ -34,7 +20,7 @@ pub(crate) fn execute_with_requested_jti(
     verify_audit(config).context("operator audit preflight failed")?;
     #[cfg(debug_assertions)]
     if std::env::var_os("NAZOAUTHCTL_TESTING").is_some() {
-        return execute_test_task(config, target, operation, requested_jti);
+        return execute_test_task(config, target, operation);
     }
     let manifest = canonical_manifest(config, &operation)?;
     let manifest_bytes = serde_json::to_vec(&manifest)?;
@@ -42,13 +28,13 @@ pub(crate) fn execute_with_requested_jti(
 
     // Runtime/image, network, mounts, task context and sandbox are prepared before issuance.
     let runtime = Runtime::new(config);
-    let mut prepared = runtime.prepare_app_task(target, &operation, public_jwk, &manifest_bytes)?;
+    let prepared = runtime.prepare_app_task(target, &operation, public_jwk, &manifest_bytes)?;
     verify_target_expectation(&prepared.target, expected)?;
 
     let secret_revision = read_single_line(&config.operator.secret_revision_file)?;
     let config_binding = ConfigBinding {
         manifest_version: nazo_operator_protocol::CONFIG_MANIFEST_VERSION,
-        config_sha256: config_sha256.clone(),
+        config_sha256,
         secret_binding: SecretBinding::OpaqueRevision {
             revision: secret_revision,
         },
@@ -59,16 +45,8 @@ pub(crate) fn execute_with_requested_jti(
         expected.embedded.clone(),
         config_binding.clone(),
         operation,
-        requested_jti,
+        None,
     )?;
-    if requested_jti.is_some() {
-        prepared.bind_managed_identity(managed_one_shot_identity(
-            config,
-            &task.operation,
-            &task.jti,
-            &config_sha256,
-        ));
-    }
     let request_id = task.jti.clone();
     if let Some(result) = existing_final_result(config, &task, &compact_task)? {
         if path_present(&intent_path)? {
@@ -138,140 +116,6 @@ pub(crate) fn execute_with_requested_jti(
             "operator task failed with code {code}; request_id={request_id}; receipt={}",
             final_path.display()
         ),
-    }
-}
-
-pub(crate) fn managed_one_shot_identity(
-    config: &UpdateConfig,
-    operation: &TaskOperation,
-    task_jti: &str,
-    config_sha256: &str,
-) -> crate::runtime_backend::ManagedOneShotIdentity {
-    let mut labels = std::collections::BTreeMap::new();
-    labels.insert(
-        "io.nazoauth.deployment-id".to_owned(),
-        config.operator.deployment_id.clone(),
-    );
-    labels.insert(
-        "io.nazoauth.control-authority".to_owned(),
-        config.operator.controller_key_id.clone(),
-    );
-    labels.insert(
-        "io.nazoauth.runtime-instance-id".to_owned(),
-        config.runtime.runtime_instance_id.clone(),
-    );
-    labels.insert(
-        "io.nazoauth.managed-resource".to_owned(),
-        "operator-task".to_owned(),
-    );
-    labels.insert(
-        "io.nazoauth.task-kind".to_owned(),
-        operation_name(operation).to_owned(),
-    );
-    labels.insert("io.nazoauth.task-jti".to_owned(), task_jti.to_owned());
-    labels.insert(
-        "io.nazoauth.config-digest".to_owned(),
-        config_sha256.to_owned(),
-    );
-    labels.insert(
-        "io.nazoauth.config-sha256".to_owned(),
-        config_sha256.to_owned(),
-    );
-    crate::runtime_backend::ManagedOneShotIdentity {
-        name: format!("nazoauthctl-task-{task_jti}"),
-        labels,
-    }
-}
-
-pub(crate) fn managed_one_shot_identity_for_task(
-    config: &UpdateConfig,
-    operation: &TaskOperation,
-    task_jti: &str,
-) -> anyhow::Result<crate::runtime_backend::ManagedOneShotIdentity> {
-    let manifest = canonical_manifest(config, operation)?;
-    Ok(managed_one_shot_identity(
-        config,
-        operation,
-        task_jti,
-        &canonical_config_sha256(&manifest)?,
-    ))
-}
-
-/// Look up an already-finalized operator task without issuing a new intent or
-/// invoking the runtime.  Candidate recovery uses this before deciding
-/// whether a durable `*_started` phase is known-complete or must be restored.
-pub(crate) fn reconcile_final_receipt(
-    config: &UpdateConfig,
-    expected: &ExpectedReleaseTarget,
-    operation: &TaskOperation,
-    requested_jti: &str,
-) -> anyhow::Result<Option<OperationResult>> {
-    validate_requested_jti(requested_jti)?;
-    verify_audit(config).context("operator audit preflight failed")?;
-    let manifest = canonical_manifest(config, operation)?;
-    let config_binding = ConfigBinding {
-        manifest_version: nazo_operator_protocol::CONFIG_MANIFEST_VERSION,
-        config_sha256: canonical_config_sha256(&manifest)?,
-        secret_binding: SecretBinding::OpaqueRevision {
-            revision: read_single_line(&config.operator.secret_revision_file)?,
-        },
-    };
-    let directory = config.operator.audit_directory.join("receipts");
-    if !is_real_directory_or_missing(&directory, "audit receipt directory")? {
-        return Ok(None);
-    }
-    let suffix = format!("-{requested_jti}.jws");
-    let mut matches = fs::read_dir(&directory)?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|entry| entry.file_name().to_string_lossy().ends_with(&suffix))
-        .collect::<Vec<_>>();
-    if matches.len() > 1 {
-        bail!("audit contains duplicate final receipts for one request ID");
-    }
-    let Some(entry) = matches.pop() else {
-        return Ok(None);
-    };
-    let compact = read_audit_text(&entry.path(), "audit receipt")?;
-    let header = protected_header(&compact)?;
-    let receipt = verify_final_receipt(
-        &compact,
-        &header.kid,
-        &trusted_audit_key(config, &header.kid)?,
-    )?;
-    let target_matches = match &receipt.controller_verified_target {
-        RuntimeTargetClaim::OciImage { image_digest, .. } => image_digest == &expected.image_digest,
-        RuntimeTargetClaim::HostBinary { sha256, .. } => sha256 == &expected.binary_digest,
-    };
-    if receipt.jti != requested_jti
-        || receipt.deployment_id != config.operator.deployment_id
-        || receipt.operation != operation_name(operation)
-        || receipt.embedded != expected.embedded
-        || receipt.config != config_binding
-        || !target_matches
-    {
-        bail!("persisted final receipt is not bound to the candidate task identity");
-    }
-    match receipt.outcome {
-        TaskOutcome::Succeeded { result } => {
-            let expected_result = matches!(
-                (operation, &result),
-                (TaskOperation::MigrateApply, TaskResult::Migration { .. })
-                    | (
-                        TaskOperation::KeysGenerateLocal { .. },
-                        TaskResult::KeyGenerated { .. }
-                    )
-            );
-            if !expected_result {
-                bail!("persisted final receipt result is not valid for the candidate task");
-            }
-            Ok(Some(OperationResult {
-                request_id: requested_jti.to_owned(),
-                result,
-                final_receipt: entry.path(),
-            }))
-        }
-        TaskOutcome::Failed { .. } => Ok(None),
     }
 }
 
@@ -461,7 +305,6 @@ pub(crate) fn execute_test_task(
     config: &UpdateConfig,
     target: &str,
     operation: TaskOperation,
-    requested_jti: Option<&str>,
 ) -> anyhow::Result<OperationResult> {
     let arguments = match &operation {
         TaskOperation::MigrateApply => vec!["migrate".to_owned()],
@@ -477,10 +320,7 @@ pub(crate) fn execute_test_task(
             arguments,
         },
     )?;
-    let request_id = requested_jti.map(str::to_owned).unwrap_or_else(|| {
-        let suffix = encode_hex(&rand::random::<[u8; 8]>());
-        format!("request-test-{suffix}")
-    });
+    let request_id = format!("request-test-{}", encode_hex(&rand::random::<[u8; 8]>()));
     let directory = config.operator.audit_directory.join("test-receipts");
     crate::filesystem::ensure_directory_chain(&directory)?;
     let receipt = directory.join(format!("{request_id}.txt"));
@@ -509,7 +349,6 @@ pub(crate) fn execute_test_task(
     _config: &UpdateConfig,
     _target: &str,
     _operation: TaskOperation,
-    _requested_jti: Option<&str>,
 ) -> anyhow::Result<OperationResult> {
     bail!("test task adapter is unavailable in release builds")
 }

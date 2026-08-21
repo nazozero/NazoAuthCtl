@@ -786,13 +786,8 @@ pub(super) fn ensure_dependencies(
         .postgres_password_file
         .to_string_lossy()
         .into_owned();
-    let postgres = Process::new(command).args([
-        "run",
-        "-d",
-        "--pull=never",
-        "--name",
-        dependencies.postgres_object.as_str(),
-    ]);
+    let postgres =
+        Process::new(command).args(["run", "-d", "--name", dependencies.postgres_object.as_str()]);
     let postgres = container_shared::append_container_policy(
         container_shared::append_managed_labels(
             postgres,
@@ -865,13 +860,8 @@ pub(super) fn ensure_dependencies(
         "Docker PostgreSQL",
     )?;
 
-    let valkey = Process::new(command).args([
-        "run",
-        "-d",
-        "--pull=never",
-        "--name",
-        dependencies.valkey_object.as_str(),
-    ]);
+    let valkey =
+        Process::new(command).args(["run", "-d", "--name", dependencies.valkey_object.as_str()]);
     let valkey_password_source = dependencies
         .valkey_password_file
         .to_string_lossy()

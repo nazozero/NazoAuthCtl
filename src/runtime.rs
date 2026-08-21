@@ -15,8 +15,8 @@ use crate::{
     filesystem::{atomic_write, sha256},
     model::{Mount, UpdateConfig},
     runtime_backend::{
-        self, ManagedOneShotIdentity, ManagedPostgresCommand, ManagedPostgresRestore,
-        ManagedValkeyRestore, NeutralMount, OneShotTask, managed_dependency_identity,
+        self, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount,
+        OneShotTask, managed_dependency_identity,
     },
 };
 
@@ -79,10 +79,6 @@ pub(crate) struct PreparedAppTask {
 }
 
 impl PreparedAppTask {
-    pub(crate) fn bind_managed_identity(&mut self, identity: ManagedOneShotIdentity) {
-        self.task.managed_identity = Some(identity);
-    }
-
     pub(crate) fn execute(&self, compact_envelope: &str) -> anyhow::Result<String> {
         let mut task = self.task.clone();
         task.stdin = compact_envelope.as_bytes().to_vec();
@@ -408,7 +404,6 @@ impl<'a> Runtime<'a> {
             inaccessible_paths: Vec::new(),
             private_mounts: false,
             stdin: Vec::new(),
-            managed_identity: None,
         })
     }
 
@@ -542,7 +537,6 @@ impl<'a> Runtime<'a> {
             inaccessible_paths,
             private_mounts: true,
             stdin: Vec::new(),
-            managed_identity: None,
         })
     }
 
@@ -811,38 +805,6 @@ impl<'a> Runtime<'a> {
                     backend.inspect(&self.config.runtime.container_name).is_ok()
                 })
         })
-    }
-
-    /// Candidate recovery must never restore managed state while an
-    /// application container can still hold database or snapshot files open.
-    /// The only object this may remove is the exact controller-owned runtime;
-    /// one-shot operator tasks are synchronous and return only after their
-    /// container/unit has exited.
-    pub(crate) fn quiesce_local_oci_candidate(&self) -> anyhow::Result<()> {
-        if self.backend_kind()? == RuntimeBackendKind::Systemd {
-            bail!("local OCI candidate recovery requires a container runtime");
-        }
-        let backend = self.backend()?;
-        if backend
-            .inspect_optional(&self.config.runtime.container_name)?
-            .is_some()
-        {
-            self.remove_container()?;
-        }
-        if backend
-            .inspect_optional(&self.config.runtime.container_name)?
-            .is_some()
-        {
-            bail!("local OCI candidate runtime remains present after quiesce");
-        }
-        Ok(())
-    }
-
-    pub(crate) fn quiesce_managed_one_shot(
-        &self,
-        identity: &ManagedOneShotIdentity,
-    ) -> anyhow::Result<()> {
-        self.backend()?.quiesce_managed_one_shot(identity)
     }
 
     pub(crate) fn restart(&self) -> anyhow::Result<()> {
