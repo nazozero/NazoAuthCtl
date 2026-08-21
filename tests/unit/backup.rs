@@ -16,12 +16,14 @@ use crate::filesystem::PrivateTempDir;
 #[cfg(unix)]
 #[test]
 fn external_backup_selects_dedicated_credential_paths_not_runtime_paths() {
-    let mut dependencies = crate::model::Dependencies::default();
-    dependencies.mode = "external".to_owned();
-    dependencies.database_url_file = "/runtime-postgres-canary".into();
-    dependencies.valkey_url_file = "/runtime-valkey-canary".into();
-    dependencies.database_backup_url_file = "/backup-postgres-canary".into();
-    dependencies.valkey_backup_url_file = "/backup-valkey-canary".into();
+    let dependencies = crate::model::Dependencies {
+        mode: "external".to_owned(),
+        database_url_file: "/runtime-postgres-canary".into(),
+        database_backup_url_file: "/backup-postgres-canary".into(),
+        valkey_url_file: "/runtime-valkey-canary".into(),
+        valkey_backup_url_file: "/backup-valkey-canary".into(),
+        ..Default::default()
+    };
 
     let (database, valkey) = external_backup_url_files(&dependencies);
     assert_eq!(database, std::path::Path::new("/backup-postgres-canary"));

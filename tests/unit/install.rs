@@ -1391,9 +1391,11 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
         mount.target == Path::new("/run/nazoauth-secrets/database-migration-url")
     }));
     for name in ["database-backup-url", "valkey-backup-url"] {
-        assert!(!config.runtime.mounts.iter().any(|mount| {
-            mount.target == PathBuf::from(format!("/run/nazoauth-secrets/{name}"))
-        }));
+        assert!(
+            !config.runtime.mounts.iter().any(|mount| {
+                mount.target == Path::new(&format!("/run/nazoauth-secrets/{name}"))
+            })
+        );
     }
     for name in STANDARDS_PROFILE_SECRET_NAMES {
         let expected = PathBuf::from(format!("/run/nazoauth-secrets/{name}"));
