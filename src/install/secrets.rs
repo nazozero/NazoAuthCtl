@@ -945,7 +945,11 @@ pub(super) fn ensure_mfa_totp_key(path: &Path) -> anyhow::Result<()> {
                     path.display()
                 );
             }
-            let bytes = read_secure_secret_file(path, "MFA TOTP encryption key", 4 * 1024)?;
+            let bytes = crate::filesystem::read_secure_secret_file(
+                path,
+                "MFA TOTP encryption key",
+                4 * 1024,
+            )?;
             let value = std::str::from_utf8(&bytes)
                 .context("MFA TOTP encryption key is not valid UTF-8")?;
             validate_mfa_totp_key(value)?;
@@ -989,7 +993,11 @@ pub(super) fn read_existing_server_config(
             target.display()
         );
     }
-    let bytes = read_secure_secret_file(target, "existing server configuration", 1024 * 1024)?;
+    let bytes = crate::filesystem::read_secure_secret_file(
+        target,
+        "existing server configuration",
+        1024 * 1024,
+    )?;
     let value = String::from_utf8(bytes.to_vec()).with_context(|| {
         format!(
             "existing server configuration is not valid UTF-8: {}",
