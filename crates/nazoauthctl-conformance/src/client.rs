@@ -456,9 +456,7 @@ impl Drop for ModuleDefinition {
     }
 }
 
-fn deserialize_module_variant<'de, D>(
-    deserializer: D,
-) -> Result<BTreeMap<String, String>, D::Error>
+fn deserialize_module_variant<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
