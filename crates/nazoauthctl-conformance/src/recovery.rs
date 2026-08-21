@@ -939,7 +939,7 @@ impl ConformanceRecoveryGuard {
         if suite.cleanup_complete || !suite.pending_create_intents.is_empty() {
             bail!("Suite retention requires a settled allocation");
         }
-        validate_suite_retention_manifest(&manifest, &journal.binding, suite)?;
+        validate_suite_retention_manifest(&manifest, &journal.binding, Some(suite))?;
         let bytes = canonical_suite_retention_manifest(&manifest)?;
         let record = SuiteRetentionRecord {
             manifest,
