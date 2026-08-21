@@ -255,9 +255,13 @@ pub(super) fn normalize_external_dependencies(options: &mut InstallOptions) -> a
             "external dependencies require distinct runtime, migration, backup PostgreSQL/Valkey URLs and dedicated-instance Valkey backup scope"
         );
     }
-    if let Some(database) = &options.database_url {
+    if options.database_url.is_some() {
+        let database = options
+            .database_url
+            .as_deref()
+            .context("external dependency input lost PostgreSQL runtime URL")?;
         let credentials = [
-            database.as_str(),
+            database,
             options
                 .migration_database_url
                 .as_deref()
@@ -273,40 +277,7 @@ pub(super) fn normalize_external_dependencies(options: &mut InstallOptions) -> a
         {
             bail!("external dependency credential URLs must be distinct");
         }
-        validate_dependency_url(database, &["postgres", "postgresql"], "PostgreSQL")?;
-        validate_dependency_url(
-            options
-                .migration_database_url
-                .as_deref()
-                .unwrap_or_default(),
-            &["postgres", "postgresql"],
-            "PostgreSQL migration",
-        )?;
-        validate_dependency_url(
-            options.database_backup_url.as_deref().unwrap_or_default(),
-            &["postgres", "postgresql"],
-            "PostgreSQL backup",
-        )?;
-        validate_dependency_url(
-            options.valkey_url.as_deref().unwrap_or_default(),
-            &["redis", "rediss"],
-            "Valkey",
-        )?;
-        validate_dependency_url(
-            options.valkey_backup_url.as_deref().unwrap_or_default(),
-            &["redis", "rediss"],
-            "Valkey backup",
-        )?;
-        let binding = crate::secret_provider::bind_external_dependency_credentials(
-            database,
-            options
-                .migration_database_url
-                .as_deref()
-                .unwrap_or_default(),
-            options.database_backup_url.as_deref().unwrap_or_default(),
-            options.valkey_url.as_deref().unwrap_or_default(),
-            options.valkey_backup_url.as_deref().unwrap_or_default(),
-        )?;
+        let binding = external_dependency_endpoint_binding(options)?;
         options.database_backup_endpoint_sha256 = Some(binding.database_endpoint_sha256);
         options.valkey_backup_endpoint_sha256 = Some(binding.valkey_endpoint_sha256);
     }
@@ -381,7 +352,53 @@ pub(super) fn read_external_dependency_secrets(
     options.valkey_url = Some(secrets.valkey_url.clone());
     options.valkey_backup_url = Some(secrets.valkey_backup_url.clone());
     options.external_valkey_backup_scope = Some(secrets.valkey_backup_scope.clone());
+    let binding = external_dependency_endpoint_binding(options)?;
+    options.database_backup_endpoint_sha256 = Some(binding.database_endpoint_sha256);
+    options.valkey_backup_endpoint_sha256 = Some(binding.valkey_endpoint_sha256);
     Ok(())
+}
+
+fn external_dependency_endpoint_binding(
+    options: &InstallOptions,
+) -> anyhow::Result<crate::secret_provider::ExternalDependencyBackupBinding> {
+    let database = options
+        .database_url
+        .as_deref()
+        .context("external dependency input lost PostgreSQL runtime URL")?;
+    validate_dependency_url(database, &["postgres", "postgresql"], "PostgreSQL")?;
+    validate_dependency_url(
+        options
+            .migration_database_url
+            .as_deref()
+            .unwrap_or_default(),
+        &["postgres", "postgresql"],
+        "PostgreSQL migration",
+    )?;
+    validate_dependency_url(
+        options.database_backup_url.as_deref().unwrap_or_default(),
+        &["postgres", "postgresql"],
+        "PostgreSQL backup",
+    )?;
+    validate_dependency_url(
+        options.valkey_url.as_deref().unwrap_or_default(),
+        &["redis", "rediss"],
+        "Valkey",
+    )?;
+    validate_dependency_url(
+        options.valkey_backup_url.as_deref().unwrap_or_default(),
+        &["redis", "rediss"],
+        "Valkey backup",
+    )?;
+    crate::secret_provider::bind_external_dependency_credentials(
+        database,
+        options
+            .migration_database_url
+            .as_deref()
+            .unwrap_or_default(),
+        options.database_backup_url.as_deref().unwrap_or_default(),
+        options.valkey_url.as_deref().unwrap_or_default(),
+        options.valkey_backup_url.as_deref().unwrap_or_default(),
+    )
 }
 
 pub(super) fn read_profile_secrets(
