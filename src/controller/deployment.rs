@@ -607,7 +607,7 @@ pub(super) fn validate_completed_local_oci_candidate_provenance(
     {
         bail!("local OCI candidate deployment has no proven recovery conclusion");
     }
-    let package = state_from_record
+    let package = state
         .recovery_package
         .as_deref()
         .context("completed local OCI candidate install has no recovery package")?;
