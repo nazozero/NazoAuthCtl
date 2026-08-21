@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 use crate::{ConformanceReport, VerifiedOidfArtifact};
 
 #[cfg(unix)]
-const EVIDENCE_BUNDLE_SCHEMA: u32 = 4;
+const EVIDENCE_BUNDLE_SCHEMA: u32 = 5;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
@@ -45,6 +45,9 @@ pub enum EvidenceSourceIdentity {
     },
     SignedOidfArtifact {
         suite_origin: String,
+        /// Digest of the exact cached signed artifact requested for this run.
+        /// It is separate from the signed driver's internal digest.
+        artifact_digest: String,
         artifact: Box<VerifiedOidfArtifact>,
     },
 }
@@ -132,6 +135,16 @@ pub struct EvidenceBundleReceipt {
     pub directory: PathBuf,
     pub manifest_sha256: String,
     pub module_count: u32,
+}
+
+/// Fully re-opened provider evidence, returned only after every manifest edge
+/// has been checked. Recovery uses this typed view to bind retention ownership
+/// without reparsing unauthenticated JSON.
+#[derive(Clone, Debug)]
+pub struct VerifiedProviderEvidence {
+    pub receipt: EvidenceBundleReceipt,
+    pub identity: EvidenceBundleIdentity,
+    pub report: ConformanceReport,
 }
 
 /// Digest-bound local capture manifest that can be embedded in the Suite
@@ -275,19 +288,16 @@ fn write_private_evidence_bundle_in_directory(
             crate::secure_file::ensure_directory(root, true).map_err(map_secure_file_error)?;
         let directory = crate::secure_file::ensure_directory(&root.join(directory_relative), true)
             .map_err(map_secure_file_error)?;
-        match crate::secure_file::read_bounded(&directory.join("manifest.json"), 1, true) {
-            Err(crate::secure_file::SecureFileError::NotFound) => {}
-            Ok(_) | Err(crate::secure_file::SecureFileError::Oversize) => {
-                return Err(EvidenceError::Conflict);
-            }
-            Err(error) => return Err(map_secure_file_error(error)),
-        }
 
         let public_report = report
             .to_json_bytes()
             .map_err(|_| EvidenceError::Encoding)?;
-        crate::secure_file::write_atomic(&directory.join("report.json"), &public_report, true)
-            .map_err(map_secure_file_error)?;
+        crate::secure_file::write_new_or_exact(
+            &directory.join("report.json"),
+            &public_report,
+            true,
+        )
+        .map_err(map_secure_file_error)?;
 
         let mut modules = Vec::with_capacity(report.modules.len());
         let mut screenshots = Vec::new();
@@ -311,7 +321,7 @@ fn write_private_evidence_bundle_in_directory(
                 })
                 .map_err(|_| EvidenceError::Encoding)?,
             );
-            crate::secure_file::write_atomic(&directory.join(&file), bytes.as_slice(), true)
+            crate::secure_file::write_new_or_exact(&directory.join(&file), bytes.as_slice(), true)
                 .map_err(map_secure_file_error)?;
             modules.push(EvidenceModuleManifest {
                 index,
@@ -399,7 +409,7 @@ fn write_private_evidence_bundle_in_directory(
             screenshots,
         })
         .map_err(|_| EvidenceError::Encoding)?;
-        crate::secure_file::write_atomic(&directory.join("manifest.json"), &manifest, true)
+        crate::secure_file::write_new_or_exact(&directory.join("manifest.json"), &manifest, true)
             .map_err(map_secure_file_error)?;
         Ok(EvidenceBundleReceipt {
             schema: EVIDENCE_BUNDLE_SCHEMA,
@@ -416,10 +426,10 @@ fn write_private_evidence_bundle_in_directory(
 /// Paths are intentionally derived from the bundle directory; no manifest
 /// entry may escape it or introduce unlisted provider files.
 #[cfg(unix)]
-pub fn validate_private_provider_evidence_bundle(
+pub fn verify_private_provider_evidence_bundle(
     directory: &Path,
     manifest_sha256: &str,
-) -> Result<EvidenceBundleReceipt, EvidenceError> {
+) -> Result<VerifiedProviderEvidence, EvidenceError> {
     if !lower_hex(manifest_sha256, 64) {
         return Err(EvidenceError::Identity);
     }
@@ -490,6 +500,13 @@ pub fn validate_private_provider_evidence_bundle(
         {
             return Err(EvidenceError::Identity);
         }
+        let report_module = report
+            .modules
+            .get(usize::try_from(module.index).map_err(|_| EvidenceError::Identity)?)
+            .ok_or(EvidenceError::Identity)?;
+        if entry.info != report_module.raw_info || entry.log != report_module.raw_log {
+            return Err(EvidenceError::Identity);
+        }
     }
     for screenshot in &manifest.screenshots {
         if !screenshot_paths.insert(screenshot.path.clone())
@@ -537,6 +554,20 @@ pub fn validate_private_provider_evidence_bundle(
         {
             return Err(EvidenceError::Identity);
         }
+        let Some(report_module) = report.modules.iter().find(|module| {
+            module.matrix_plan_id == screenshot.matrix_plan_id
+                && module.suite_plan_id == screenshot.suite_plan_id
+                && module.module_id.as_deref() == Some(screenshot.module_id.as_str())
+        }) else {
+            return Err(EvidenceError::Identity);
+        };
+        if !report_module.review_screenshots.iter().any(|captured| {
+            captured.path == screenshot.path
+                && captured.sha256 == screenshot.sha256
+                && captured.size == screenshot.size
+        }) {
+            return Err(EvidenceError::Identity);
+        }
     }
     if manifest.modules.len() != report.modules.len()
         || manifest.screenshots.len() > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_RUN
@@ -552,16 +583,118 @@ pub fn validate_private_provider_evidence_bundle(
                     || entry.module_id != report_module.module_id
                     || entry.test_name != report_module.test_name
             })
+        || report
+            .modules
+            .iter()
+            .map(|module| module.review_screenshots.len())
+            .sum::<usize>()
+            != manifest.screenshots.len()
     {
         return Err(EvidenceError::Identity);
     }
-    Ok(EvidenceBundleReceipt {
-        schema: manifest.schema,
-        evidence_jti: manifest.evidence_jti,
-        directory,
-        manifest_sha256: manifest_sha256.to_owned(),
-        module_count: u32::try_from(manifest.modules.len()).map_err(|_| EvidenceError::Encoding)?,
+    validate_provider_evidence_directory_entries(&directory, &manifest)?;
+    Ok(VerifiedProviderEvidence {
+        receipt: EvidenceBundleReceipt {
+            schema: manifest.schema,
+            evidence_jti: manifest.evidence_jti,
+            directory,
+            manifest_sha256: manifest_sha256.to_owned(),
+            module_count: u32::try_from(manifest.modules.len())
+                .map_err(|_| EvidenceError::Encoding)?,
+        },
+        identity: manifest.identity,
+        report,
     })
+}
+
+/// A provider bundle is manifest-last and self-contained.  Verifying the
+/// referenced files alone would still leave a caller unable to distinguish a
+/// complete bundle from a crashed or tampered directory with extra payloads.
+/// Keep the accepted directory grammar deliberately exact.
+#[cfg(unix)]
+fn validate_provider_evidence_directory_entries(
+    directory: &Path,
+    manifest: &EvidenceManifest,
+) -> Result<(), EvidenceError> {
+    let mut expected_root = BTreeSet::from([
+        "manifest.json".to_owned(),
+        manifest.public_report_file.clone(),
+    ]);
+    for module in &manifest.modules {
+        expected_root.insert(module.file.clone());
+    }
+    let mut expected_screenshots = BTreeSet::new();
+    for screenshot in &manifest.screenshots {
+        let file = screenshot
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or(EvidenceError::UnsafePath)?;
+        expected_screenshots.insert(file.to_owned());
+        expected_screenshots.insert(format!("{file}.receipt.json"));
+    }
+    let mut seen_root = BTreeSet::new();
+    for entry in std::fs::read_dir(directory).map_err(|_| EvidenceError::Io)? {
+        let entry = entry.map_err(|_| EvidenceError::Io)?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or(EvidenceError::UnsafePath)?
+            .to_owned();
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(|_| EvidenceError::Io)?;
+        if name == "review-screenshots" {
+            if expected_screenshots.is_empty() || !metadata.is_dir() {
+                return Err(EvidenceError::Identity);
+            }
+            validate_provider_screenshot_directory(&entry.path(), &expected_screenshots)?;
+            seen_root.insert(name);
+        } else if metadata.is_file() && expected_root.contains(&name) {
+            seen_root.insert(name);
+        } else {
+            return Err(EvidenceError::Identity);
+        }
+    }
+    if seen_root.len() != expected_root.len() + usize::from(!expected_screenshots.is_empty())
+        || !expected_root.iter().all(|name| seen_root.contains(name))
+        || (!expected_screenshots.is_empty() && !seen_root.contains("review-screenshots"))
+    {
+        return Err(EvidenceError::Identity);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_provider_screenshot_directory(
+    directory: &Path,
+    expected: &BTreeSet<String>,
+) -> Result<(), EvidenceError> {
+    crate::secure_file::validate_directory(directory, true).map_err(map_secure_file_error)?;
+    let mut seen = BTreeSet::new();
+    for entry in std::fs::read_dir(directory).map_err(|_| EvidenceError::Io)? {
+        let entry = entry.map_err(|_| EvidenceError::Io)?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or(EvidenceError::UnsafePath)?
+            .to_owned();
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(|_| EvidenceError::Io)?;
+        if !metadata.is_file() || !expected.contains(&name) || !seen.insert(name) {
+            return Err(EvidenceError::Identity);
+        }
+    }
+    if seen != *expected {
+        return Err(EvidenceError::Identity);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn validate_private_provider_evidence_bundle(
+    directory: &Path,
+    manifest_sha256: &str,
+) -> Result<EvidenceBundleReceipt, EvidenceError> {
+    verify_private_provider_evidence_bundle(directory, manifest_sha256)
+        .map(|verified| verified.receipt)
 }
 
 #[cfg(not(unix))]
@@ -569,6 +702,14 @@ pub fn validate_private_provider_evidence_bundle(
     _directory: &Path,
     _manifest_sha256: &str,
 ) -> Result<EvidenceBundleReceipt, EvidenceError> {
+    Err(EvidenceError::UnsupportedPlatform)
+}
+
+#[cfg(not(unix))]
+pub fn verify_private_provider_evidence_bundle(
+    _directory: &Path,
+    _manifest_sha256: &str,
+) -> Result<VerifiedProviderEvidence, EvidenceError> {
     Err(EvidenceError::UnsupportedPlatform)
 }
 
@@ -618,10 +759,74 @@ pub fn discard_staged_private_provider_evidence_bundle(
         .map_err(map_secure_file_error)
 }
 
+/// Remove an interrupted manifest-last write using a deliberately tiny file
+/// grammar. Unknown entries, links, and nested directories fail closed rather
+/// than widening cleanup to an arbitrary evidence directory.
+#[cfg(unix)]
+pub fn discard_incomplete_staged_private_provider_evidence_bundle(
+    directory: &Path,
+) -> Result<(), EvidenceError> {
+    let directory =
+        crate::secure_file::validate_directory(directory, true).map_err(map_secure_file_error)?;
+    let entries = std::fs::read_dir(&directory).map_err(|_| EvidenceError::Io)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| EvidenceError::Io)?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or(EvidenceError::UnsafePath)?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|_| EvidenceError::Io)?;
+        if name == "review-screenshots" {
+            if !metadata.is_dir() {
+                return Err(EvidenceError::UnsafePath);
+            }
+            discard_incomplete_screenshot_directory(&path)?;
+        } else if metadata.is_file()
+            && (name == "manifest.json"
+                || name == "report.json"
+                || (name.starts_with("module-") && name.ends_with(".json"))
+                || name.starts_with(".new-"))
+        {
+            crate::secure_file::remove_file(&path, true).map_err(map_secure_file_error)?;
+        } else {
+            return Err(EvidenceError::UnsafePath);
+        }
+    }
+    crate::secure_file::remove_private_empty_directory(&directory).map_err(map_secure_file_error)
+}
+
+#[cfg(unix)]
+fn discard_incomplete_screenshot_directory(directory: &Path) -> Result<(), EvidenceError> {
+    let directory =
+        crate::secure_file::validate_directory(directory, true).map_err(map_secure_file_error)?;
+    for entry in std::fs::read_dir(&directory).map_err(|_| EvidenceError::Io)? {
+        let entry = entry.map_err(|_| EvidenceError::Io)?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or(EvidenceError::UnsafePath)?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|_| EvidenceError::Io)?;
+        if !metadata.is_file()
+            || !(name.ends_with(".png")
+                || name.ends_with(".png.receipt.json")
+                || name.starts_with(".new-"))
+        {
+            return Err(EvidenceError::UnsafePath);
+        }
+        crate::secure_file::remove_file(&path, true).map_err(map_secure_file_error)?;
+    }
+    crate::secure_file::remove_private_empty_directory(&directory).map_err(map_secure_file_error)
+}
+
 #[cfg(not(unix))]
 pub fn discard_staged_private_provider_evidence_bundle(
     _directory: &Path,
     _manifest_sha256: &str,
+) -> Result<(), EvidenceError> {
+    Err(EvidenceError::UnsupportedPlatform)
+}
+
+#[cfg(not(unix))]
+pub fn discard_incomplete_staged_private_provider_evidence_bundle(
+    _directory: &Path,
 ) -> Result<(), EvidenceError> {
     Err(EvidenceError::UnsupportedPlatform)
 }
@@ -903,9 +1108,11 @@ fn validate_identity(
         }
         EvidenceSourceIdentity::SignedOidfArtifact {
             suite_origin,
+            artifact_digest,
             artifact,
         } => {
-            if !lower_hex(&artifact.matrix_sha256, 64)
+            if !lower_hex(artifact_digest, 64)
+                || !lower_hex(&artifact.matrix_sha256, 64)
                 || !lower_hex(&artifact.driver_manifest_sha256, 64)
                 || !lower_hex(&artifact.driver_sha256, 64)
             {
@@ -1196,7 +1403,7 @@ impl std::fmt::Display for EvidenceError {
 impl std::error::Error for EvidenceError {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use crate::report::OrchestrationIntegrity;
     use crate::{CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport, ProgressSnapshot};
@@ -1461,6 +1668,95 @@ mod tests {
         }
     }
 
+    /// Build a complete provider-evidence graph for recovery tests.  The
+    /// caller supplies the recovery binding and retained-plan manifest so the
+    /// fixture cannot accidentally exercise a cross-run or cross-tenant
+    /// happy-path.
+    pub(crate) fn retained_provider_fixture(
+        binding: &crate::recovery::TenantResourceRecoveryBinding,
+        retained: &crate::recovery::SuiteRetentionManifest,
+    ) -> (ConformanceReport, EvidenceBundleIdentity) {
+        let plan = retained
+            .plans
+            .first()
+            .expect("retention fixture requires one plan");
+        let mut report = report();
+        report.schema = 4;
+        report.matrix_digest = retained.matrix_sha256.clone();
+        report.suite_origin = retained.suite_origin.clone();
+        report.modules[0].matrix_plan_id = plan.matrix_plan_id.clone();
+        report.modules[0].suite_plan_id = plan.suite_plan_id.clone();
+        report.modules[0].module_id = Some("suite-module-1".to_owned());
+        report.modules[0].test_name = "retained-test".to_owned();
+
+        let mut provider = provider();
+        provider.deployment_id = binding.deployment_id.clone();
+        for capability in &mut provider.capabilities {
+            capability.tenant_id = binding.tenant_id.clone();
+            for receipt in &mut capability.receipts {
+                receipt.deployment_id = binding.deployment_id.clone();
+                receipt.tenant_id = binding.tenant_id.clone();
+            }
+        }
+        let artifact = crate::VerifiedOidfArtifact {
+            artifact_id: "retained-artifact".to_owned(),
+            revision: "1".to_owned(),
+            source: "official".to_owned(),
+            signer_identity: "openid-foundation".to_owned(),
+            signer_key_id: "retained-key".to_owned(),
+            driver_manifest_sha256: "a".repeat(64),
+            driver_manifest_size: 1,
+            suite: crate::OidfSuiteIdentity {
+                origin: retained.suite_origin.clone(),
+                release: "v5.2.3".to_owned(),
+                revision: "a".repeat(40),
+                image_digest: format!("sha256:{}", "b".repeat(64)),
+            },
+            engine_protocol: crate::OIDF_DRIVER_ENGINE_PROTOCOL,
+            required_capabilities: Vec::new(),
+            driver_schema: 1,
+            driver_sha256: "c".repeat(64),
+            driver_size: 1,
+            driver_handlers: 1,
+            matrix_sha256: retained.matrix_sha256.clone(),
+            matrix_size: 1,
+            matrix_groups: 1,
+            matrix_plans: 1,
+            matrix_modules: 1,
+            matrix_clients: 1,
+            matrix_wall_clock_seconds: 1,
+            not_before: 1,
+            expires_at: i64::MAX - 1,
+            resource_bounds: crate::OidfResourceBounds {
+                max_plans: 1,
+                max_modules: 1,
+                max_clients: 1,
+                max_wall_clock_seconds: 1,
+            },
+        };
+        let identity = EvidenceBundleIdentity {
+            run_jti: binding.request_jti.clone(),
+            deployment: EvidenceDeploymentIdentity {
+                deployment_id: binding.deployment_id.clone(),
+                target_issuer: "https://issuer.example".to_owned(),
+                release: "v1.2.3".to_owned(),
+                revision: "a".repeat(40),
+                build_id: "build-a".to_owned(),
+                runtime: EvidenceRuntimeIdentity::HostBinary {
+                    sha256: "b".repeat(64),
+                },
+            },
+            source: EvidenceSourceIdentity::SignedOidfArtifact {
+                suite_origin: retained.suite_origin.clone(),
+                artifact_digest: retained.artifact_digest.clone(),
+                artifact: Box::new(artifact),
+            },
+            provider: Some(provider),
+            outer_cleanup_complete: true,
+        };
+        (report, identity)
+    }
+
     #[test]
     fn identity_must_match_report_before_any_filesystem_access() {
         let mut identity = identity();
@@ -1644,6 +1940,80 @@ mod tests {
             provider["capabilities"][0]["receipts"][0]["compact_sha256"],
             "a".repeat(64)
         );
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_bundle_verifier_rejects_unlisted_or_tampered_graph_entries() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-provider-evidence-{}", Uuid::now_v7()));
+        let mut identity = identity();
+        identity.provider = Some(provider());
+        let receipt = write_private_provider_evidence_bundle(&report(), &root, &identity)
+            .expect("ordinary provider evidence bundle");
+        verify_private_provider_evidence_bundle(&receipt.directory, &receipt.manifest_sha256)
+            .expect("complete provider graph");
+        crate::secure_file::write_atomic(
+            &receipt.directory.join("unexpected.json"),
+            br#"{}"#,
+            true,
+        )
+        .expect("write unlisted entry");
+        assert!(matches!(
+            verify_private_provider_evidence_bundle(&receipt.directory, &receipt.manifest_sha256),
+            Err(EvidenceError::Identity)
+        ));
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deterministic_staging_reuses_only_byte_exact_private_files() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-provider-evidence-{}", Uuid::now_v7()));
+        let first = write_private_evidence_bundle_in_directory(
+            &report(),
+            &root,
+            &identity(),
+            "evidence-0123456789abcdef",
+            Path::new("deterministic"),
+        )
+        .expect("first staged bundle");
+        let second = write_private_evidence_bundle_in_directory(
+            &report(),
+            &root,
+            &identity(),
+            "evidence-0123456789abcdef",
+            Path::new("deterministic"),
+        )
+        .expect("byte-exact staging retry");
+        assert_eq!(first, second);
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_evidence_root_keeps_distinct_retained_run_namespaces_isolated() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-provider-evidence-{}", Uuid::now_v7()));
+        let mut identity = identity();
+        identity.provider = Some(provider());
+        let first =
+            stage_private_provider_evidence_bundle(&report(), &root, &identity, "retained-run-a")
+                .expect("first retained provider staging");
+        let second =
+            stage_private_provider_evidence_bundle(&report(), &root, &identity, "retained-run-b")
+                .expect("second retained provider staging");
+        assert_ne!(first.directory, second.directory);
+        assert!(first.directory.is_dir());
+        assert!(second.directory.is_dir());
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 }

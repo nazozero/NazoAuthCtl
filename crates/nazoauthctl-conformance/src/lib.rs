@@ -72,9 +72,9 @@ pub use evidence::{
     EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceDeploymentIdentity, EvidenceError,
     EvidenceProviderCapability, EvidenceProviderIdentity, EvidenceProviderReceipt,
     EvidenceRuntimeIdentity, EvidenceSourceIdentity, ReviewScreenshotManifestReceipt,
-    validate_ordinary_provider_identity, validate_private_evidence_directory,
-    write_private_evidence_bundle, write_private_provider_evidence_bundle,
-    write_review_screenshot_manifest,
+    stage_private_provider_evidence_bundle, validate_ordinary_provider_identity,
+    validate_private_evidence_directory, write_private_evidence_bundle,
+    write_private_provider_evidence_bundle, write_review_screenshot_manifest,
 };
 pub use materializer::{
     ArtifactMaterializationBinding, CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DescriptorGroup,
