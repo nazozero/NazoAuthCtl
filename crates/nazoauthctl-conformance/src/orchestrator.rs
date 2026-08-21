@@ -564,10 +564,6 @@ impl ConformanceRunner {
                             .entry(module.test_name.as_str())
                             .or_default() += 1;
                     }
-                    let duplicate_module_names = module_name_counts
-                        .iter()
-                        .filter_map(|(test_name, count)| (*count > 1).then_some(*test_name))
-                        .collect::<Vec<_>>();
                     let unknown_expected_skips = plan
                         .expected_results
                         .keys()
@@ -576,16 +572,9 @@ impl ConformanceRunner {
                         })
                         .map(|test_name| format!("{}/{}", plan.id, test_name))
                         .collect::<Vec<_>>();
-                    let definition_mismatch =
-                        !duplicate_module_names.is_empty() || !unknown_expected_skips.is_empty();
-                    if definition_mismatch {
+                    let expected_skip_definition_mismatch = !unknown_expected_skips.is_empty();
+                    if expected_skip_definition_mismatch {
                         matrix_expectations_satisfied = false;
-                        for test_name in duplicate_module_names {
-                            errors.push(format!(
-                                "Suite plan defines duplicate test_name: {}/{}",
-                                plan.id, test_name
-                            ));
-                        }
                         for identity in unknown_expected_skips {
                             errors.push(format!(
                                 "signed Matrix expected SKIPPED module is not uniquely defined by Suite plan: {identity}"
@@ -612,7 +601,7 @@ impl ConformanceRunner {
                                 .to_owned(),
                         );
                     }
-                    if definition_mismatch || over_budget {
+                    if expected_skip_definition_mismatch || over_budget {
                         groups[group_index].status = GroupStatus::Failed;
                         break 'create;
                     }
@@ -1523,6 +1512,11 @@ mod tests {
         requests: Mutex<Vec<(HttpMethod, String)>>,
     }
 
+    struct DuplicateDefinitionTransport {
+        created_modules: AtomicUsize,
+        requests: Mutex<Vec<(HttpMethod, String)>>,
+    }
+
     struct RecordingPlanObserver {
         persisted_plans: AtomicUsize,
         module_intents: AtomicUsize,
@@ -1692,6 +1686,62 @@ mod tests {
                 status,
                 headers: Vec::new(),
                 body: serde_json::to_vec(&body).expect("definition json"),
+            })
+        }
+    }
+
+    impl Transport for DuplicateDefinitionTransport {
+        fn send(&self, request: HttpRequest, _max: usize) -> Result<HttpResponse, TransportError> {
+            let method = request.method();
+            let path = request.url().path().to_owned();
+            self.requests
+                .lock()
+                .expect("duplicate definition requests")
+                .push((method, path.clone()));
+            let (status, body) = match (method, path.as_str()) {
+                (HttpMethod::Get, "/api/plan") => (
+                    if request.header("Authorization").is_some() {
+                        200
+                    } else {
+                        401
+                    },
+                    serde_json::json!({}),
+                ),
+                (HttpMethod::Post, "/api/plan") => (
+                    201,
+                    serde_json::json!({
+                        "id": "suite-plan",
+                        "name": "plan",
+                        "modules": [
+                            {"testModule": "happy-flow"},
+                            {"testModule": "happy-flow"}
+                        ]
+                    }),
+                ),
+                (HttpMethod::Post, "/api/runner") => {
+                    let number = self.created_modules.fetch_add(1, Ordering::SeqCst) + 1;
+                    (201, serde_json::json!({"id": format!("module-{number}")}))
+                }
+                (HttpMethod::Post, path) if path.starts_with("/api/runner/module-") => {
+                    (200, serde_json::json!({}))
+                }
+                (HttpMethod::Get, path) if path.ends_with("/wait-state") => {
+                    (200, serde_json::json!({"state":"FINISHED"}))
+                }
+                (HttpMethod::Get, path) if path.starts_with("/api/info/module-") => (
+                    200,
+                    serde_json::json!({"status":"FINISHED","result":"PASSED"}),
+                ),
+                (HttpMethod::Get, path) if path.starts_with("/api/log/module-") => {
+                    (200, serde_json::json!([]))
+                }
+                (HttpMethod::Delete, "/api/plan/suite-plan") => (204, Value::Null),
+                _ => (500, serde_json::json!({})),
+            };
+            Ok(HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("duplicate definition json"),
             })
         }
     }
@@ -2036,7 +2086,71 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_or_unknown_signed_skip_definition_stops_before_module_creation() {
+    fn duplicate_unreferenced_module_names_run_as_distinct_suite_instances() {
+        let transport = Arc::new(DuplicateDefinitionTransport {
+            created_modules: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix: one_plan_matrix(serde_json::json!({})),
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
+            selected_resource_budget: budget(2, 1, 60),
+            jobs: 1,
+            automation: Vec::new(),
+            suite_resource_observer: None,
+        })
+        .expect("runner");
+
+        let report = runner.run(&mut ()).report;
+
+        assert!(report.errors.is_empty());
+        assert!(report.local_success);
+        assert!(report.orchestration_integrity.all_modules_terminal);
+        assert_eq!(report.modules.len(), 2);
+        assert_eq!(
+            report
+                .modules
+                .iter()
+                .map(|module| module.test_name.as_str())
+                .collect::<Vec<_>>(),
+            ["happy-flow", "happy-flow"]
+        );
+        assert_eq!(
+            report
+                .modules
+                .iter()
+                .filter_map(|module| module.module_id.as_deref())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["module-1", "module-2"])
+        );
+        assert_eq!(report.cleanup.deleted_plans, ["suite-plan"]);
+        assert_eq!(
+            transport
+                .requests
+                .lock()
+                .expect("duplicate definition requests")
+                .iter()
+                .filter(|(method, path)| *method == HttpMethod::Post && path == "/api/runner")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn duplicate_signed_skip_definition_stops_before_module_creation() {
         let transport = Arc::new(DefinitionTransport {
             modules: serde_json::json!([
                 {"testModule": "declared-skip"},
@@ -2067,8 +2181,8 @@ mod tests {
             poll_timeout: Duration::from_secs(1),
             control: RunControl::default(),
             plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
-            plan_resource_budgets: one_plan_budgets(),
-            selected_resource_budget: budget(1, 1, 60),
+            plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
+            selected_resource_budget: budget(2, 1, 60),
             jobs: 1,
             automation: Vec::new(),
             suite_resource_observer: Some(observer.clone()),
@@ -2080,17 +2194,9 @@ mod tests {
         assert!(!report.matrix_expectations_satisfied);
         assert!(!report.acceptance_pass);
         assert_eq!(report.unknown_declared_skip_modules, ["p/declared-skip"]);
-        assert!(
-            report.errors.iter().any(|error| {
-                error == "Suite plan defines duplicate test_name: p/declared-skip"
-            })
-        );
         assert!(report.errors.iter().any(|error| {
             error
                 == "signed Matrix expected SKIPPED module is not uniquely defined by Suite plan: p/declared-skip"
-        }));
-        assert!(report.errors.iter().any(|error| {
-            error == "Suite plan module allocation exceeds signed resource budget"
         }));
         assert_eq!(report.cleanup.deleted_plans, ["suite-plan"]);
         assert!(report.modules.is_empty());
