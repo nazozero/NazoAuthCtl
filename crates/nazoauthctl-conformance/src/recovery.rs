@@ -404,6 +404,22 @@ impl ConformanceRecoveryStore {
                 normalized_proxy_cleanup = true;
             }
             validate_journal(&journal, &self.deployment_id, request_jti)?;
+            // Completed Suite cleanup has no future external action to take.
+            // Older journals retained the already-cleaned opaque IDs, which
+            // wastes the bounded recovery budget and can prevent later
+            // tenant-resource cleanup records from being persisted. Validate
+            // their legacy contents above, then atomically discard them.
+            let mut normalized_suite_cleanup = false;
+            if let RecoveryJournal::TenantResource(tenant_journal) = &mut journal
+                && let Some(suite) = &mut tenant_journal.suite
+                && suite.cleanup_complete
+                && suite.pending_create_intents.is_empty()
+                && (!suite.plan_ids.is_empty() || !suite.module_ids.is_empty())
+            {
+                suite.plan_ids.clear();
+                suite.module_ids.clear();
+                normalized_suite_cleanup = true;
+            }
             let mut recovered_manifest_removal = false;
             if let RecoveryJournal::TenantResource(tenant_journal) = &mut journal
                 && tenant_journal.binding.manifest_path.is_some()
@@ -421,7 +437,7 @@ impl ConformanceRecoveryStore {
                     recovered_manifest_removal = true;
                 }
             }
-            if recovered_manifest_removal || normalized_proxy_cleanup {
+            if recovered_manifest_removal || normalized_proxy_cleanup || normalized_suite_cleanup {
                 validate_journal(&journal, &self.deployment_id, request_jti)?;
                 write_journal(&journal_path, &journal)?;
             }
@@ -708,6 +724,8 @@ impl ConformanceRecoveryGuard {
             bail!("Suite cleanup cannot complete with unresolved Suite create intent");
         }
         suite.cleanup_complete = true;
+        suite.plan_ids.clear();
+        suite.module_ids.clear();
         self.persist()
     }
 
@@ -1116,7 +1134,9 @@ fn validate_tenant_resource_journal(
         let origin = crate::Origin::parse_suite(&suite.origin)
             .map_err(|_| anyhow::anyhow!("Suite recovery origin is invalid"))?;
         if origin.as_str() != suite.origin
-            || (suite.plan_ids.is_empty() && suite.pending_create_intents.is_empty())
+            || (!suite.cleanup_complete
+                && suite.plan_ids.is_empty()
+                && suite.pending_create_intents.is_empty())
             || suite.plan_ids.len() > MAX_SUITE_RECOVERY_PLANS
             || suite.module_ids.len() > MAX_SUITE_RECOVERY_MODULES
             || suite.pending_create_intents.len()
@@ -1603,6 +1623,17 @@ mod tests {
         guard
             .begin_suite_create("https://suite.example", "intent-module-1")
             .expect("persist module create intent");
+        assert!(guard.mark_suite_cleanup_complete().is_err());
+        assert_eq!(
+            guard.suite_recovery(),
+            Some(&SuiteRecoveryState {
+                origin: "https://suite.example".to_owned(),
+                plan_ids: vec!["plan-1".to_owned()],
+                module_ids: Vec::new(),
+                pending_create_intents: vec!["intent-module-1".to_owned()],
+                cleanup_complete: false,
+            })
+        );
         guard
             .record_suite_module("intent-module-1", "module-1")
             .expect("persist module allocation");
@@ -1626,6 +1657,19 @@ mod tests {
             .record_tenant_resource_receipt(tenant_resource_receipt(&binding))
             .expect("receipt");
         guard
+            .mark_suite_cleanup_complete()
+            .expect("Suite cleanup settled");
+        assert_eq!(
+            guard.suite_recovery(),
+            Some(&SuiteRecoveryState {
+                origin: "https://suite.example".to_owned(),
+                plan_ids: Vec::new(),
+                module_ids: Vec::new(),
+                pending_create_intents: Vec::new(),
+                cleanup_complete: true,
+            })
+        );
+        guard
             .record_tenant_resource_enumeration(Vec::new())
             .expect("enumerate already absent");
         guard.mark_proxy_cleanup_complete().expect("proxy settled");
@@ -1633,11 +1677,120 @@ mod tests {
 
         let mut pending = store.claim_pending().expect("claim pending");
         let mut guard = pending.pop().expect("recovered guard");
-        guard
-            .mark_suite_cleanup_complete()
-            .expect("Suite cleanup settled");
         guard.finish().expect("finish after Suite cleanup");
         assert!(store.claim_pending().expect("journal removed").is_empty());
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_suite_cleanup_compacts_ids_before_tenant_cleanup_records() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-tenant-recovery-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let binding = tenant_resource_binding(&root);
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("persist tenant intent");
+        guard
+            .begin_suite_create("https://suite.example", "intent-plan-1")
+            .expect("persist plan intent");
+        guard
+            .record_suite_plan("https://suite.example", "intent-plan-1", "plan-1")
+            .expect("persist plan allocation");
+        match &mut guard.journal {
+            RecoveryJournal::TenantResource(journal) => {
+                let suite = journal.suite.as_mut().expect("Suite state");
+                suite.module_ids = (0..1408)
+                    .map(|index| format!("module-{index:04}"))
+                    .collect();
+            }
+            RecoveryJournal::Legacy(_) => panic!("expected tenant-resource journal"),
+        }
+        guard.persist().expect("persist populated Suite state");
+        guard
+            .record_tenant_resource_receipt(tenant_resource_receipt(&binding))
+            .expect("receipt");
+        guard
+            .mark_suite_cleanup_complete()
+            .expect("compact completed Suite state");
+        let suite = guard.suite_recovery().expect("completed Suite state");
+        assert!(suite.plan_ids.is_empty());
+        assert!(suite.module_ids.is_empty());
+        guard
+            .record_tenant_resource_enumeration(binding.resource_identities.clone())
+            .expect("enumerate after Suite compaction");
+        guard
+            .record_tenant_resource_revoke(
+                &binding.resource_identities[0],
+                TenantResourceRevokeOutcome::Revoked,
+            )
+            .expect("revoke after Suite compaction");
+        assert!(
+            std::fs::metadata(root.join(format!("run-{}.json", binding.request_jti)))
+                .expect("journal metadata")
+                .len()
+                < MAX_RECOVERY_JOURNAL_BYTES as u64
+        );
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_pending_normalizes_legacy_completed_suite_ids_after_validation() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-tenant-recovery-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let binding = tenant_resource_binding(&root);
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("persist tenant intent");
+        guard
+            .begin_suite_create("https://suite.example", "intent-plan-1")
+            .expect("persist plan intent");
+        guard
+            .record_suite_plan("https://suite.example", "intent-plan-1", "plan-1")
+            .expect("persist plan allocation");
+        match &mut guard.journal {
+            RecoveryJournal::TenantResource(journal) => {
+                journal
+                    .suite
+                    .as_mut()
+                    .expect("Suite state")
+                    .cleanup_complete = true;
+            }
+            RecoveryJournal::Legacy(_) => panic!("expected tenant-resource journal"),
+        }
+        guard
+            .persist()
+            .expect("persist legacy completed Suite state");
+        drop(guard);
+
+        let mut pending = store
+            .claim_pending()
+            .expect("claim legacy completed journal");
+        let guard = pending.pop().expect("claimed legacy completed journal");
+        assert_eq!(
+            guard.suite_recovery(),
+            Some(&SuiteRecoveryState {
+                origin: "https://suite.example".to_owned(),
+                plan_ids: Vec::new(),
+                module_ids: Vec::new(),
+                pending_create_intents: Vec::new(),
+                cleanup_complete: true,
+            })
+        );
+        drop(guard);
+        let journal_path = root.join(format!("run-{}.json", binding.request_jti));
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).expect("read normalized journal"))
+                .expect("decode normalized journal");
+        assert_eq!(document["suite"]["plan_ids"], serde_json::json!([]));
+        assert_eq!(document["suite"]["module_ids"], serde_json::json!([]));
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 
