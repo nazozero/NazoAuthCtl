@@ -766,7 +766,7 @@ mod tests {
         let mut stream = TcpStream::connect(bridge.local_addr()).expect("callback connect");
         write!(
             stream,
-            "GET /ciba/approve?approval_token={approval_token}&auth_req_id={auth_req_id}&action=allow HTTP/1.1\\r\\nHost: callback.example\\r\\n\\r\\n"
+            "GET /ciba/approve?approval_token={approval_token}&auth_req_id={auth_req_id}&action=allow HTTP/1.1\r\nHost: callback.example\r\n\r\n"
         )
         .expect("callback request");
         stream.shutdown(Shutdown::Write).expect("finish request");
@@ -774,7 +774,7 @@ mod tests {
         stream
             .read_to_string(&mut response)
             .expect("callback response");
-        assert!(response.starts_with("HTTP/1.1 404 Not Found\\r\\n"));
+        assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
 
         let error = (0..50)
             .find_map(|_| match bridge.ensure_healthy() {
