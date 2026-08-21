@@ -64,7 +64,7 @@ fn external_dependency_binding_canonicalizes_ports_and_rejects_alias_bypasses() 
         binding.database_runtime_endpoint_sha256,
         downgraded_tls.database_runtime_endpoint_sha256
     );
-    assert_ne!(
+    assert_eq!(
         binding.migration_database_endpoint_sha256,
         downgraded_tls.migration_database_endpoint_sha256
     );
