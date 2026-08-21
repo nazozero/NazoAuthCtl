@@ -583,7 +583,15 @@ pub(crate) fn verify_public_local_oci_candidate_control(
             "local OCI candidate runtime must expose exactly one descriptor-bound instance identity mount"
         );
     };
-    let identity = load_verified_runtime_identity(&identity_mount.source, None)?;
+    // This mount is populated by the application process, not by the
+    // controller.  Candidate OCI runtimes have a declaration-bound service
+    // UID, so accept only that service (plus the existing secure descriptor
+    // policy's controller/root transition allowance), never an arbitrary
+    // non-root owner.
+    let identity = load_verified_runtime_identity(
+        &identity_mount.source,
+        Some(crate::runtime::runtime_service_owner_uid(config)?),
+    )?;
     let public_origin = config
         .runtime
         .public_discovery_url
