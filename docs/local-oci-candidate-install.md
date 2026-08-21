@@ -52,7 +52,9 @@ must not be used for this path. Ctl canonicalizes the PostgreSQL and Valkey
 backup endpoints (host, effective port, database and Valkey TLS scheme),
 requires the runtime/migration/backup roles to use separate decoded usernames,
 and persists only SHA-256 endpoint identities plus the scope in the config,
-candidate intent and backup identity. Query options cannot vary this binding.
+candidate intent and backup identity. PostgreSQL permits at most one `sslmode`;
+that TLS policy is part of the persisted backup binding, while all other query
+options are rejected for this contract.
 Existing schema-2 managed deployments remain
 readable, while a legacy external configuration without these dedicated backup
 credentials fails closed and is never rewritten during candidate retry.

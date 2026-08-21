@@ -351,6 +351,7 @@ pub(super) fn install_transaction(
     let release = VerifiedRelease::fetch(&config.repository, version, config.container_backend())?;
     enforce_release_trust(config, &release.manifest)?;
     release.persist_verification_evidence(&release_cache_dir(config, &release.manifest))?;
+    install::verify_live_external_dependencies(config)?;
     let backup = Backup::create(config_path, config, &release.manifest.version)?;
 
     if config.runtime.backend == RuntimeBackendKind::Systemd {
@@ -688,6 +689,11 @@ fn install_local_oci_candidate_transaction(
     // only non-secret endpoint identities, so a changed secret file must fail
     // closed.
     install::verify_live_external_dependencies(config)?;
+    if let Some(backup) = state.recovery_backup.as_deref() {
+        // Verify recovery evidence before creating any new durable intent or
+        // audit record on a replay path.
+        Backup::open_existing(config, backup)?;
+    }
 
     let registration_recovery =
         ensure_local_oci_candidate_retry_is_unregistered(config, state.recovery_backup.is_some())?;
@@ -710,13 +716,6 @@ fn install_local_oci_candidate_transaction(
         &candidate.target.release,
         "backup",
     )?;
-    if let Some(backup) = state.recovery_backup.as_deref() {
-        // A retry may replay privileged migration work only after the durable
-        // backup has passed the same marker, checksum and config-identity
-        // checks used by recovery.  Do this before starting any dependency or
-        // operator task.
-        Backup::open_existing(config, backup)?;
-    }
     install::start_managed_dependencies(config)?;
     if state.recovery_backup.is_none() {
         let backup = Backup::create(config_path, config, &candidate.target.release)?;

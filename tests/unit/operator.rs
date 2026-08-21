@@ -759,6 +759,85 @@ fn broken_audit_preflight_blocks_runtime_preparation() {
 }
 
 #[test]
+fn direct_migrate_rejects_external_secret_drift_before_creating_an_audit_intent() {
+    let work = PrivateTempDir::new("nazoauth-direct-migrate-secret-drift").unwrap();
+    let mut config = config(&work);
+    let secrets = work.path().join("external-secrets");
+    fs::create_dir(&secrets).unwrap();
+    config.schema = 3;
+    config.dependencies.mode = "external".to_owned();
+    config.dependencies.database_url_file = secrets.join("database-url");
+    config.dependencies.migration_database_url_file = secrets.join("database-migration-url");
+    config.dependencies.database_backup_url_file = secrets.join("database-backup-url");
+    config.dependencies.valkey_url_file = secrets.join("valkey-url");
+    config.dependencies.valkey_backup_url_file = secrets.join("valkey-backup-url");
+    config.dependencies.external_valkey_backup_scope = "dedicated-instance".to_owned();
+    for (path, value) in [
+        (
+            &config.dependencies.database_url_file,
+            "postgresql://runtime:runtime-secret@db.example/oauth",
+        ),
+        (
+            &config.dependencies.migration_database_url_file,
+            "postgresql://migrator:migration-secret@db.example/oauth",
+        ),
+        (
+            &config.dependencies.database_backup_url_file,
+            "postgresql://backup:backup-secret@db.example/oauth?sslmode=require",
+        ),
+        (
+            &config.dependencies.valkey_url_file,
+            "rediss://runtime:runtime-secret@cache.example/0",
+        ),
+        (
+            &config.dependencies.valkey_backup_url_file,
+            "rediss://backup:backup-secret@cache.example/0",
+        ),
+    ] {
+        fs::write(path, value).unwrap();
+        crate::filesystem::set_mode(path, 0o600).unwrap();
+    }
+    let binding = crate::secret_provider::bind_external_dependency_credentials(
+        "postgresql://runtime:runtime-secret@db.example/oauth",
+        "postgresql://migrator:migration-secret@db.example/oauth",
+        "postgresql://backup:backup-secret@db.example/oauth?sslmode=require",
+        "rediss://runtime:runtime-secret@cache.example/0",
+        "rediss://backup:backup-secret@cache.example/0",
+    )
+    .unwrap();
+    config.dependencies.database_backup_endpoint_sha256 = binding.database_endpoint_sha256;
+    config.dependencies.valkey_backup_endpoint_sha256 = binding.valkey_endpoint_sha256;
+    fs::write(
+        &config.dependencies.database_backup_url_file,
+        "postgresql://backup:backup-secret@db.example/oauth?sslmode=disable",
+    )
+    .unwrap();
+    crate::filesystem::set_mode(&config.dependencies.database_backup_url_file, 0o600).unwrap();
+    let expected = ExpectedReleaseTarget {
+        embedded: EmbeddedIdentity {
+            release: "v0.1.6".to_owned(),
+            revision: "f".repeat(40),
+            protocol: nazo_operator_protocol::PROTOCOL_VERSION,
+            build_id: "build:direct-migrate".to_owned(),
+        },
+        image_digest: format!("sha256:{}", "d".repeat(64)),
+        binary_digest: "b".repeat(64),
+    };
+
+    assert!(
+        execute(
+            &config,
+            "/definitely/missing/nazoauth",
+            &expected,
+            TaskOperation::MigrateApply,
+            None,
+        )
+        .is_err()
+    );
+    assert!(!config.operator.audit_directory.join("intents").exists());
+}
+
+#[test]
 fn audit_heads_without_receipt_directories_do_not_auto_heal() {
     let work = PrivateTempDir::new("nazoauth-audit-head-residue-test").unwrap();
     let config = config(&work);

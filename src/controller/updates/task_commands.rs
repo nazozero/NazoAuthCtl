@@ -26,9 +26,6 @@ pub(crate) fn candidate_app_command(
     operation: TaskOperation,
     candidate: &CandidateTarget,
 ) -> anyhow::Result<()> {
-    if matches!(operation, TaskOperation::MigrateApply) {
-        install::verify_live_external_dependencies(config)?;
-    }
     let target = Runtime::new(config).active_image()?;
     let expected = candidate_expected_target(config, candidate)?;
     let result = operator::execute(config, &target, &expected, operation, None)?;
@@ -86,9 +83,6 @@ pub(crate) fn execute_manifest_task(
     operation: TaskOperation,
     public_jwk: Option<&Path>,
 ) -> anyhow::Result<operator::OperationResult> {
-    if matches!(operation, TaskOperation::MigrateApply) {
-        install::verify_live_external_dependencies(config)?;
-    }
     let expected = expected_target(config, manifest)?;
     operator::execute(config, target, &expected, operation, public_jwk)
 }

@@ -1947,7 +1947,6 @@ fn early_update_faults_leave_the_last_durable_phase_for_restart() {
     for (initial, expected) in [
         (UpdatePhase::Prepared, UpdatePhase::WriterStopping),
         (UpdatePhase::WriterStopped, UpdatePhase::BackupCreating),
-        (UpdatePhase::BackupCreated, UpdatePhase::MigrationRunning),
     ] {
         let work = PrivateTempDir::new("nazoauth-update-early-fault").unwrap();
         let config = config(&work);
@@ -1967,6 +1966,22 @@ fn early_update_faults_leave_the_last_durable_phase_for_restart() {
             "phase {initial:?} was not durable"
         );
     }
+}
+
+#[test]
+fn update_backup_replay_rejects_missing_backup_before_phase_mutation() {
+    let work = PrivateTempDir::new("nazoauth-update-missing-backup").unwrap();
+    let config = config(&work);
+    fs::create_dir_all(&config.deployment_root).unwrap();
+    let mut value = journal(&config, UpdatePhase::BackupCreated);
+    write_update_journal(&config, &value).unwrap();
+    let before = fs::read(update_journal_path(&config)).unwrap();
+
+    assert!(
+        advance_update_transaction(&work.path().join("config.json"), &config, &mut value).is_err()
+    );
+    assert_eq!(value.phase, UpdatePhase::BackupCreated);
+    assert_eq!(fs::read(update_journal_path(&config)).unwrap(), before);
 }
 
 #[test]

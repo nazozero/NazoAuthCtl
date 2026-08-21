@@ -221,6 +221,17 @@ impl Backup {
         // secrets never enter this provider process.
         validate_secret(database_backup_url)?;
         validate_secret(valkey_backup_url)?;
+        let binding = crate::secret_provider::bind_external_backup_url_files(
+            database_backup_url,
+            valkey_backup_url,
+        )?;
+        if binding.database_endpoint_sha256 != config.dependencies.database_backup_endpoint_sha256
+            || binding.valkey_endpoint_sha256 != config.dependencies.valkey_backup_endpoint_sha256
+        {
+            bail!(
+                "external backup credential endpoints or TLS policy no longer match the persisted deployment binding"
+            );
+        }
         let postgres = self.path.join("postgresql.dump");
         let postgres_provider = PostgresProvider::from_url_file(database_backup_url)?;
         Process::new("pg_dump")

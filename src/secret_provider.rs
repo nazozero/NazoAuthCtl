@@ -1,8 +1,7 @@
-use std::{fmt::Write as _, ops::Deref, path::Path};
+use std::{fmt::Write as _, path::Path};
 
 use anyhow::{Context, bail};
 use sha2::{Digest as _, Sha256};
-use url::Url;
 
 use crate::filesystem::{PrivateTempDir, atomic_write, read_secure_secret_file};
 
@@ -15,26 +14,15 @@ pub(crate) struct PostgresProvider {
 impl PostgresProvider {
     pub(crate) fn from_url_file(path: &Path) -> anyhow::Result<Self> {
         let raw = read_single_line(path)?;
-        // The source is Zeroizing and the URL wrapper scrubs its credential
-        // components before the parser allocation is released.
-        let url = SensitiveUrl(
-            Url::parse(raw.as_str()).context("PostgreSQL secret provider URL is invalid")?,
-        );
-        if !matches!(url.scheme(), "postgres" | "postgresql") {
+        let url = parse_dependency_url(raw.as_str(), "PostgreSQL secret provider")?;
+        if !matches!(url.scheme.as_str(), "postgres" | "postgresql") {
             bail!("PostgreSQL secret provider has an unsupported scheme");
         }
-        let host = url.host_str().context("PostgreSQL URL has no host")?;
-        reject_credential_controls(host, "PostgreSQL host")?;
-        let user = decode(url.username(), "PostgreSQL user")?;
-        let password = decode(
-            url.password().context("PostgreSQL URL has no password")?,
-            "PostgreSQL password",
-        )?;
-        let database = decode(url.path().trim_start_matches('/'), "PostgreSQL database")?;
-        if user.is_empty() || password.is_empty() || database.is_empty() || database.contains('/') {
-            bail!("PostgreSQL URL must contain one database, user, and password");
-        }
-        let port = url.port().unwrap_or(5432).to_string();
+        let host = &url.host;
+        let user = &url.username;
+        let password = &url.password;
+        let database = &url.database;
+        let port = url.port.unwrap_or(5432).to_string();
         let work = PrivateTempDir::new("nazoauth-pg-provider")?;
         let mut service = format!(
             "[nazoauth]\nhost={}\nport={}\ndbname={}\nuser={}\n",
@@ -43,7 +31,7 @@ impl PostgresProvider {
             service_value(database.as_str(), "PostgreSQL database")?,
             service_value(user.as_str(), "PostgreSQL user")?
         );
-        for (key, value) in url.query_pairs() {
+        for (key, value) in &url.query {
             if key == "password"
                 || key.is_empty()
                 || !key
@@ -55,7 +43,7 @@ impl PostgresProvider {
             service.push_str(&format!(
                 "{}={}\n",
                 key,
-                service_value(&value, "PostgreSQL service option")?
+                service_value(value, "PostgreSQL service option")?
             ));
         }
         let service_path = work.path().join("pg_service.conf");
@@ -100,33 +88,23 @@ pub(crate) struct ValkeyProvider {
 impl ValkeyProvider {
     pub(crate) fn from_url_file(path: &Path) -> anyhow::Result<Self> {
         let raw = read_single_line(path)?;
-        let url = SensitiveUrl(
-            Url::parse(raw.as_str()).context("Valkey secret provider URL is invalid")?,
-        );
-        if !matches!(url.scheme(), "redis" | "rediss") || url.query().is_some() {
+        let url = parse_dependency_url(raw.as_str(), "Valkey secret provider")?;
+        if !matches!(url.scheme.as_str(), "redis" | "rediss") || !url.query.is_empty() {
             bail!("Valkey secret provider has an unsupported URL");
         }
-        let username = (!url.username().is_empty())
-            .then(|| decode(url.username(), "Valkey user"))
-            .transpose()?
-            .map(|value| value);
-        let password = decode(
-            url.password().context("Valkey URL has no password")?,
-            "Valkey password",
-        )?;
+        let username = (!url.username.is_empty()).then(|| url.username);
+        let password = url.password;
         let database = url
-            .path()
-            .trim_start_matches('/')
+            .database
+            .as_str()
             .parse::<u32>()
             .context("Valkey database is invalid")?;
-        let host = url.host_str().context("Valkey URL has no host")?;
-        reject_credential_controls(host, "Valkey host")?;
         Ok(Self {
-            host: host.to_owned(),
-            port: url.port().unwrap_or(6379),
+            host: url.host,
+            port: url.port.unwrap_or(6379),
             username,
             database,
-            tls: url.scheme() == "rediss",
+            tls: url.scheme == "rediss",
             password,
         })
     }
@@ -171,9 +149,44 @@ pub(crate) fn bind_external_dependency_credentials(
         bail!("external Valkey runtime and backup usernames must be distinct");
     }
     Ok(ExternalDependencyBackupBinding {
-        database_endpoint_sha256: endpoint_sha256(&database.endpoint),
-        valkey_endpoint_sha256: endpoint_sha256(&valkey.endpoint),
+        database_endpoint_sha256: endpoint_sha256(&format!(
+            "{};tls-policy={}",
+            backup.endpoint, backup.tls_policy
+        )),
+        valkey_endpoint_sha256: endpoint_sha256(&format!(
+            "{};tls-policy={}",
+            valkey_backup.endpoint, valkey_backup.tls_policy
+        )),
     })
+}
+
+/// Verify the two credentials consumed by backup without exposing runtime or
+/// migration credentials to the backup process.
+pub(crate) fn bind_external_backup_credentials(
+    database_backup_url: &str,
+    valkey_backup_url: &str,
+) -> anyhow::Result<ExternalDependencyBackupBinding> {
+    let database = postgres_binding(database_backup_url, "PostgreSQL backup")?;
+    let valkey = valkey_binding(valkey_backup_url, "Valkey backup")?;
+    Ok(ExternalDependencyBackupBinding {
+        database_endpoint_sha256: endpoint_sha256(&format!(
+            "{};tls-policy={}",
+            database.endpoint, database.tls_policy
+        )),
+        valkey_endpoint_sha256: endpoint_sha256(&format!(
+            "{};tls-policy={}",
+            valkey.endpoint, valkey.tls_policy
+        )),
+    })
+}
+
+pub(crate) fn bind_external_backup_url_files(
+    database_backup_url: &Path,
+    valkey_backup_url: &Path,
+) -> anyhow::Result<ExternalDependencyBackupBinding> {
+    let database = read_single_line(database_backup_url)?;
+    let valkey = read_single_line(valkey_backup_url)?;
+    bind_external_backup_credentials(database.as_str(), valkey.as_str())
 }
 
 pub(crate) fn bind_external_dependency_url_files(
@@ -200,37 +213,146 @@ pub(crate) fn bind_external_dependency_url_files(
 struct ProviderBinding {
     endpoint: String,
     username: zeroize::Zeroizing<String>,
+    tls_policy: String,
 }
 
-/// `url::Url` owns user-info while parsing. Keep it inside a wrapper that
-/// removes credential-bearing components even on an error path before the URL
-/// allocation is dropped.
-struct SensitiveUrl(Url);
-
-impl Deref for SensitiveUrl {
-    type Target = Url;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+pub(crate) struct DependencyUrl {
+    pub(crate) scheme: String,
+    pub(crate) host: String,
+    pub(crate) port: Option<u16>,
+    pub(crate) username: zeroize::Zeroizing<String>,
+    pub(crate) password: zeroize::Zeroizing<String>,
+    pub(crate) database: zeroize::Zeroizing<String>,
+    pub(crate) query: Vec<(String, zeroize::Zeroizing<String>)>,
 }
 
-impl Drop for SensitiveUrl {
-    fn drop(&mut self) {
-        let _ = self.0.set_password(None);
-        let _ = self.0.set_username("");
-        self.0.set_path("");
-        self.0.set_query(None);
-        self.0.set_fragment(None);
+/// Parses only the strict dependency URL grammar.  It never hands a complete
+/// credential URL to a general URL type with ordinary Drop semantics.
+pub(crate) fn parse_dependency_url(value: &str, label: &str) -> anyhow::Result<DependencyUrl> {
+    let (scheme, remainder) = value
+        .split_once("://")
+        .with_context(|| format!("{label} URL is invalid"))?;
+    if scheme.is_empty()
+        || scheme
+            .chars()
+            .any(|character| !character.is_ascii_alphabetic())
+    {
+        bail!("{label} URL has an invalid scheme");
     }
+    let (remainder, query) = match remainder.split_once('?') {
+        Some((before, query)) => (before, Some(query)),
+        None => (remainder, None),
+    };
+    if remainder.contains('#') || query.is_some_and(|query| query.contains('#')) {
+        bail!("{label} URL must not contain a fragment");
+    }
+    let (authority, raw_database) = remainder
+        .split_once('/')
+        .with_context(|| format!("{label} URL must contain one database path component"))?;
+    if raw_database.is_empty() || raw_database.contains('/') || authority.is_empty() {
+        bail!("{label} URL must contain one database path component");
+    }
+    let (userinfo, host_port) = authority
+        .rsplit_once('@')
+        .with_context(|| format!("{label} URL must contain a username and password"))?;
+    if userinfo.contains('@') || host_port.is_empty() {
+        bail!("{label} URL userinfo is missing or has ambiguous separators");
+    }
+    let (raw_username, raw_password) = userinfo
+        .split_once(':')
+        .with_context(|| format!("{label} URL must contain a username and password"))?;
+    if raw_username.is_empty()
+        || raw_password.is_empty()
+        || raw_username.contains([':', '@'])
+        || raw_password.contains([':', '@'])
+    {
+        bail!("{label} URL userinfo is missing or has ambiguous separators");
+    }
+    let (host, port) = parse_host_port(host_port, label)?;
+    let username = decode(raw_username, &format!("{label} username"))?;
+    let password = decode(raw_password, &format!("{label} password"))?;
+    let database = decode(raw_database, &format!("{label} database"))?;
+    if database.contains(['/', '\\']) {
+        bail!("{label} URL database path must contain exactly one component");
+    }
+    let mut parsed_query = Vec::new();
+    if let Some(query) = query {
+        if query.is_empty() {
+            bail!("{label} URL query is empty");
+        }
+        for pair in query.split('&') {
+            let (raw_key, raw_value) = pair
+                .split_once('=')
+                .with_context(|| format!("{label} URL query is invalid"))?;
+            let key = decode(raw_key, &format!("{label} query key"))?;
+            if key.is_empty()
+                || !key
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+                || key.eq_ignore_ascii_case("password")
+            {
+                bail!("{label} URL query contains an unsafe option");
+            }
+            parsed_query.push((
+                key.as_str().to_owned(),
+                decode(raw_value, &format!("{label} query value"))?,
+            ));
+        }
+    }
+    Ok(DependencyUrl {
+        scheme: scheme.to_ascii_lowercase(),
+        host,
+        port,
+        username,
+        password,
+        database,
+        query: parsed_query,
+    })
+}
+
+fn parse_host_port(value: &str, label: &str) -> anyhow::Result<(String, Option<u16>)> {
+    let (host, raw_port) = if let Some(remainder) = value.strip_prefix('[') {
+        let (host, after) = remainder
+            .split_once(']')
+            .with_context(|| format!("{label} URL host is invalid"))?;
+        let port = after.strip_prefix(':').map(str::to_owned);
+        if !after.is_empty() && port.is_none() {
+            bail!("{label} URL host is invalid");
+        }
+        (format!("[{host}]"), port)
+    } else {
+        match value.split_once(':') {
+            Some((host, port)) if !port.contains(':') => (host.to_owned(), Some(port.to_owned())),
+            Some(_) => bail!("{label} URL host is invalid"),
+            None => (value.to_owned(), None),
+        }
+    };
+    if host.is_empty()
+        || host
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        bail!("{label} URL host contains unsafe characters");
+    }
+    let port = raw_port
+        .map(|port| {
+            if port.is_empty() {
+                bail!("{label} URL port is invalid");
+            }
+            port.parse::<u16>()
+                .with_context(|| format!("{label} URL port is invalid"))
+        })
+        .transpose()?;
+    Ok((host, port))
 }
 
 fn postgres_binding(value: &str, label: &str) -> anyhow::Result<ProviderBinding> {
-    let url = SensitiveUrl(Url::parse(value).with_context(|| format!("{label} URL is invalid"))?);
-    if !matches!(url.scheme(), "postgres" | "postgresql") {
+    let url = parse_dependency_url(value, label)?;
+    if !matches!(url.scheme.as_str(), "postgres" | "postgresql") {
         bail!("{label} URL must use a PostgreSQL endpoint");
     }
-    for (key, value) in url.query_pairs() {
+    let mut tls_policy = None;
+    for (key, value) in &url.query {
         // `sslmode` is transport policy, rather than endpoint or principal
         // identity.  Preserve the existing supported TLS form without making
         // equivalent TLS policy spellings change the durable endpoint hash.
@@ -239,66 +361,42 @@ fn postgres_binding(value: &str, label: &str) -> anyhow::Result<ProviderBinding>
                 value.as_ref(),
                 "disable" | "allow" | "prefer" | "require" | "verify-ca" | "verify-full"
             )
+            || tls_policy.replace(value.as_str().to_owned()).is_some()
         {
             bail!("{label} URL has an unsupported PostgreSQL query option");
         }
     }
-    let host = url.host_str().context("PostgreSQL URL has no host")?;
-    let username = decode(url.username(), "PostgreSQL user")?;
-    let password = decode(
-        url.password().context("PostgreSQL URL has no password")?,
-        "PostgreSQL password",
-    )?;
-    let database = decode(url.path().trim_start_matches('/'), "PostgreSQL database")?;
-    if username.is_empty()
-        || password.is_empty()
-        || database.is_empty()
-        || database.contains('/')
-        || host.contains(['\0', '\r', '\n'])
-    {
-        bail!("{label} URL has an invalid canonical PostgreSQL endpoint");
-    }
     Ok(ProviderBinding {
         endpoint: format!(
             "postgresql://{}:{}/{}",
-            host.to_ascii_lowercase(),
-            url.port().unwrap_or(5432),
-            database.as_str()
+            url.host.to_ascii_lowercase(),
+            url.port.unwrap_or(5432),
+            url.database.as_str()
         ),
-        username,
+        username: url.username,
+        tls_policy: tls_policy.unwrap_or_else(|| "default".to_owned()),
     })
 }
 
 fn valkey_binding(value: &str, label: &str) -> anyhow::Result<ProviderBinding> {
-    let url = SensitiveUrl(Url::parse(value).with_context(|| format!("{label} URL is invalid"))?);
-    if !matches!(url.scheme(), "redis" | "rediss") || url.query().is_some() {
+    let url = parse_dependency_url(value, label)?;
+    if !matches!(url.scheme.as_str(), "redis" | "rediss") || !url.query.is_empty() {
         bail!("{label} URL must use a canonical Valkey endpoint without query options");
     }
-    let host = url.host_str().context("Valkey URL has no host")?;
-    let username = decode(url.username(), "Valkey user")?;
-    let password = decode(
-        url.password().context("Valkey URL has no password")?,
-        "Valkey password",
-    )?;
-    let database = decode(url.path().trim_start_matches('/'), "Valkey database")?;
-    if username.is_empty()
-        || password.is_empty()
-        || database.is_empty()
-        || database.contains('/')
-        || database.parse::<u32>().is_err()
-        || host.contains(['\0', '\r', '\n'])
-    {
+    if url.database.parse::<u32>().is_err() {
         bail!("{label} URL has an invalid canonical Valkey endpoint");
     }
+    let tls_policy = url.scheme.clone();
     Ok(ProviderBinding {
         endpoint: format!(
             "{}://{}:{}/{}",
-            url.scheme(),
-            host.to_ascii_lowercase(),
-            url.port().unwrap_or(6379),
-            database.as_str()
+            tls_policy.as_str(),
+            url.host.to_ascii_lowercase(),
+            url.port.unwrap_or(6379),
+            url.database.as_str()
         ),
-        username,
+        username: url.username,
+        tls_policy,
     })
 }
 

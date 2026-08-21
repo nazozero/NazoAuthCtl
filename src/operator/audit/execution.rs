@@ -7,6 +7,12 @@ pub(crate) fn execute(
     operation: TaskOperation,
     public_jwk: Option<&Path>,
 ) -> anyhow::Result<OperationResult> {
+    // This is the unique privileged task execution boundary.  Re-read the
+    // entire external provider contract immediately before any audit intent
+    // or runtime preparation for DDL, including direct candidate commands.
+    if matches!(operation, TaskOperation::MigrateApply) {
+        crate::install::verify_live_external_dependencies(config)?;
+    }
     // A privileged operation is admissible only while the existing audit,
     // intent and trust-transition state is verifiably intact.  Checking after
     // the runtime side effect would be too late: the mutation could succeed
