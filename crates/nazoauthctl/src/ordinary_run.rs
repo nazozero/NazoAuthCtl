@@ -28,10 +28,10 @@ use nazoauthctl_conformance::{
     OidfProviderExecutionBinding, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
     OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard,
     RunControl, StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionManifest,
-    SuiteRetentionPlan, TenantResourceApplyOutput, TenantResourceReceiptIdentity,
-    TenantResourceRecoveryBinding, TtyRenderer, WebDriverClient, WebDriverEndpoint,
-    authorize_oidf_driver_execution, open_cached_oidf_driver_plan, read_artifact_driver,
-    read_artifact_matrix, read_compact_manifest, recover_suite_resources,
+    SuiteRetentionPlan, SuiteRetentionScreenshotManifest, TenantResourceApplyOutput,
+    TenantResourceReceiptIdentity, TenantResourceRecoveryBinding, TtyRenderer, WebDriverClient,
+    WebDriverEndpoint, authorize_oidf_driver_execution, open_cached_oidf_driver_plan,
+    read_artifact_driver, read_artifact_matrix, read_compact_manifest, recover_suite_resources,
     validate_private_evidence_directory, verify_oidf_artifact,
     write_private_provider_evidence_bundle, write_review_screenshot_manifest,
 };
@@ -468,6 +468,35 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         .as_ref()
         .is_ok_and(|report| report.orchestration_integrity.retention_eligible);
     let mut errors = Vec::new();
+    let review_screenshot_manifest = if invocation.capture_review_screenshots && retention_eligible
+    {
+        match (run_result.as_ref(), invocation.evidence_directory.as_ref()) {
+            (Ok(report), Some(directory)) => match write_review_screenshot_manifest(
+                report,
+                directory,
+                recovery
+                    .tenant_resource_binding()
+                    .context("missing ordinary recovery binding")?
+                    .request_jti
+                    .as_str(),
+                &invocation.artifact_digest,
+            ) {
+                Ok(manifest) => Some(manifest),
+                Err(error) => {
+                    retention_eligible = false;
+                    errors.push(format!("review-screenshot-manifest={error}"));
+                    None
+                }
+            },
+            _ => {
+                retention_eligible = false;
+                errors.push("review-screenshot-manifest=identity".to_owned());
+                None
+            }
+        }
+    } else {
+        None
+    };
     if run_result
         .as_ref()
         .is_ok_and(|report| report.orchestration_integrity.cleanup_complete)
@@ -482,6 +511,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                     .expect("retention eligibility requires report"),
                 &invocation.artifact_digest,
                 &deployment_report.matrix_sha256,
+                review_screenshot_manifest.as_ref(),
             )?;
             let evidence_directory = invocation
                 .evidence_directory
@@ -518,22 +548,6 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             None
         }
     };
-    if invocation.capture_review_screenshots
-        && retention_eligible
-        && proxy_cleanup_complete
-        && cleanup_evidence.is_some()
-    {
-        let manifest = match (report.as_ref(), invocation.evidence_directory.as_ref()) {
-            (Some(report), Some(directory)) => {
-                write_review_screenshot_manifest(report, directory, &request_jti)
-            }
-            _ => Err(nazoauthctl_conformance::EvidenceError::Identity),
-        };
-        if let Err(error) = manifest {
-            retention_eligible = false;
-            errors.push(format!("review-screenshot-manifest={error}"));
-        }
-    }
     let retention_committed = if retention_eligible
         && proxy_cleanup_complete
         && cleanup_evidence.is_some()
@@ -1016,6 +1030,7 @@ fn suite_retention_manifest(
     report: &nazoauthctl_conformance::ConformanceReport,
     artifact_digest: &str,
     matrix_sha256: &str,
+    review_screenshot_manifest: Option<&nazoauthctl_conformance::ReviewScreenshotManifestReceipt>,
 ) -> anyhow::Result<SuiteRetentionManifest> {
     let binding = recovery
         .tenant_resource_binding()
@@ -1044,6 +1059,12 @@ fn suite_retention_manifest(
         deployment_id: binding.deployment_id.clone(),
         tenant_id: binding.tenant_id.clone(),
         run_id: binding.request_jti.clone(),
+        review_screenshot_manifest: review_screenshot_manifest.map(|manifest| {
+            SuiteRetentionScreenshotManifest {
+                path: manifest.path.clone(),
+                sha256: manifest.sha256.clone(),
+            }
+        }),
         plans,
     })
 }
@@ -1547,6 +1568,7 @@ mod tests {
             deployment_id: "deployment-a".to_owned(),
             tenant_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             run_id: binding_request_jti.to_owned(),
+            review_screenshot_manifest: None,
             plans: Vec::new(),
         };
 

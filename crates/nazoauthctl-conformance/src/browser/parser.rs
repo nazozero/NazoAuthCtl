@@ -4,7 +4,9 @@ use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::BrowserError;
-use super::schema::{BrowserCommand, BrowserEntry, BrowserSelector, BrowserTask};
+use super::schema::{
+    BrowserCommand, BrowserEntry, BrowserSelector, BrowserTask, ReviewScreenshotMarker,
+};
 use super::validation::{
     MAX_MATCH_BYTES, MAX_SELECTOR_BYTES, MAX_STEP_TIMEOUT, MAX_STEPS, MAX_TEXT_BYTES,
     compile_pattern, validate_contains, validate_match_pattern,

@@ -67,6 +67,12 @@ pub struct ModuleReport {
     /// bytes, browser URLs, and page content never enter this report.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub review_screenshots: Vec<ReviewScreenshotReport>,
+    /// Exact signed required capture obligations reached while executing this
+    /// module's authoritative browser URLs.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub review_screenshots_required: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub review_screenshots_required_captured: usize,
     /// Optional signed screenshot markers that could not be captured. A
     /// required marker instead fails local orchestration before reporting.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -245,6 +251,8 @@ impl ModuleReport {
             blocking_log_results,
             advisory_log_results,
             review_screenshots: Vec::new(),
+            review_screenshots_required: 0,
+            review_screenshots_required_captured: 0,
             review_screenshots_missing: 0,
             info: public_info_summary(&raw_info),
             log: public_log_summary(&raw_log),

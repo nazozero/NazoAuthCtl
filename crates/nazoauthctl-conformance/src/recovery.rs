@@ -181,7 +181,16 @@ pub struct SuiteRetentionManifest {
     pub deployment_id: String,
     pub tenant_id: String,
     pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_screenshot_manifest: Option<SuiteRetentionScreenshotManifest>,
     pub plans: Vec<SuiteRetentionPlan>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuiteRetentionScreenshotManifest {
+    pub path: PathBuf,
+    pub sha256: String,
 }
 
 impl SuiteRetentionManifest {
@@ -972,6 +981,13 @@ impl ConformanceRecoveryGuard {
         if sha256_hex(&bytes) != record.manifest_sha256 {
             bail!("Suite retention manifest digest conflicts with the journal");
         }
+        if let Some(screenshot) = &record.manifest.review_screenshot_manifest {
+            validate_review_screenshot_manifest_binding(
+                screenshot,
+                self.tenant_resource_binding()
+                    .context("Suite retention has no ordinary binding")?,
+            )?;
+        }
         let path = self.suite_retention_pending_path()?;
         match crate::secure_file::read_bounded(&path, MAX_SUITE_RETENTION_MANIFEST_BYTES, true) {
             Ok(existing) if sha256_hex(&existing) == record.manifest_sha256 => return Ok(path),
@@ -1039,6 +1055,13 @@ impl ConformanceRecoveryGuard {
             }
         };
         let final_path = record.manifest_path.clone();
+        if let Some(screenshot) = &record.manifest.review_screenshot_manifest {
+            validate_review_screenshot_manifest_binding(
+                screenshot,
+                self.tenant_resource_binding()
+                    .context("Suite retention has no ordinary binding")?,
+            )?;
+        }
         match crate::secure_file::read_bounded(
             &final_path,
             MAX_SUITE_RETENTION_MANIFEST_BYTES,
@@ -1728,6 +1751,9 @@ fn validate_suite_retention_manifest(
     {
         bail!("Suite retention manifest is outside policy");
     }
+    if let Some(screenshot) = &manifest.review_screenshot_manifest {
+        validate_review_screenshot_manifest_binding(screenshot, binding)?;
+    }
     let mut matrix_ids = std::collections::BTreeSet::new();
     let mut suite_ids = std::collections::BTreeSet::new();
     for plan in &manifest.plans {
@@ -1761,6 +1787,32 @@ fn validate_suite_retention_manifest(
         if suite.origin != manifest.suite_origin {
             bail!("Suite retention origin conflicts with the recovery journal");
         }
+    }
+    Ok(())
+}
+
+fn validate_review_screenshot_manifest_binding(
+    screenshot: &SuiteRetentionScreenshotManifest,
+    binding: &TenantResourceRecoveryBinding,
+) -> anyhow::Result<()> {
+    let expected_name = format!("{}.json", binding.request_jti);
+    if !screenshot.path.is_absolute()
+        || screenshot.path.file_name().and_then(|name| name.to_str())
+            != Some(expected_name.as_str())
+        || screenshot
+            .path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            != Some("review-screenshot-manifests")
+        || !lower_hex(&screenshot.sha256, 64)
+    {
+        bail!("review screenshot manifest binding is outside policy");
+    }
+    let bytes = crate::secure_file::read_bounded(&screenshot.path, 1024 * 1024, true)
+        .map_err(|error| anyhow::anyhow!("review screenshot manifest is not secure: {error:?}"))?;
+    if sha256_hex(&bytes) != screenshot.sha256 {
+        bail!("review screenshot manifest digest is invalid");
     }
     Ok(())
 }
@@ -2958,6 +3010,7 @@ mod tests {
             deployment_id: binding.deployment_id.clone(),
             tenant_id: binding.tenant_id.clone(),
             run_id: binding.request_jti.clone(),
+            review_screenshot_manifest: None,
             plans: vec![SuiteRetentionPlan {
                 matrix_plan_id: "matrix-plan-1".to_owned(),
                 suite_plan_id: "suite-plan-1".to_owned(),
@@ -3056,6 +3109,7 @@ mod tests {
             deployment_id: binding.deployment_id.clone(),
             tenant_id: binding.tenant_id.clone(),
             run_id: binding.request_jti.clone(),
+            review_screenshot_manifest: None,
             plans,
         };
         let final_path = evidence.join(format!("retained-suite-{}.json", binding.request_jti));

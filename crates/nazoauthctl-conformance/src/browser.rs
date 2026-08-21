@@ -5,6 +5,7 @@
 //! execution state machine and its public orchestration traits.
 
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -239,6 +240,13 @@ pub struct BrowserRunReport {
     pub review_screenshots: Vec<BrowserReviewScreenshotReceipt>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub review_screenshot_attempts: usize,
+    /// Number of signed required capture obligations reached by this browser
+    /// program. This is kept separate from optional misses so callers can
+    /// prove that every required instruction produced exactly one image.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub review_screenshots_required: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub review_screenshots_required_captured: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub review_screenshots_missing: usize,
 }
@@ -342,24 +350,44 @@ impl BrowserReviewCaptureContext {
         validate_png_screenshot(bytes)?;
         let relative_path = self.relative_path()?;
         let path = self.evidence_directory.join(&relative_path);
-        crate::secure_file::write_atomic(&path, bytes, true)
-            .map_err(|_| BrowserError::EvidenceWrite)?;
+        write_private_new_or_exact(&path, bytes)?;
         let receipt = BrowserReviewScreenshotReceipt {
             path: relative_path,
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: sha256_hex(bytes),
             size: bytes.len(),
             suite_plan_id: self.suite_plan_id.clone(),
             module_id: self.module_id.clone(),
             trigger_origin: redacted_origin(trigger_url),
-            trigger_url_sha256: format!("{:x}", Sha256::digest(trigger_url.as_str().as_bytes())),
+            trigger_path: trigger_url.path().to_owned(),
+            trigger_url_sha256: sha256_hex(trigger_url.as_str().as_bytes()),
         };
         let audit_path = path.with_extension("png.receipt.json");
         let audit = serde_json::to_vec(&BrowserReviewScreenshotAudit::from(&receipt))
             .map_err(|_| BrowserError::EvidenceWrite)?;
-        crate::secure_file::write_atomic(&audit_path, &audit, true)
-            .map_err(|_| BrowserError::EvidenceWrite)?;
+        write_private_new_or_exact(&audit_path, &audit)?;
         Ok(receipt)
     }
+}
+
+fn write_private_new_or_exact(path: &std::path::Path, bytes: &[u8]) -> Result<(), BrowserError> {
+    match crate::secure_file::read_bounded(path, bytes.len(), true) {
+        Ok(existing) if existing == bytes => Ok(()),
+        Ok(_) | Err(crate::secure_file::SecureFileError::Oversize) => {
+            Err(BrowserError::EvidenceWrite)
+        }
+        Err(crate::secure_file::SecureFileError::NotFound) => {
+            crate::secure_file::write_atomic(path, bytes, true)
+                .map_err(|_| BrowserError::EvidenceWrite)
+        }
+        Err(_) => Err(BrowserError::EvidenceWrite),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Private orchestration receipt. Public module reports project only
@@ -372,6 +400,7 @@ pub struct BrowserReviewScreenshotReceipt {
     pub suite_plan_id: String,
     pub module_id: String,
     pub trigger_origin: String,
+    pub trigger_path: String,
     pub trigger_url_sha256: String,
 }
 
@@ -383,6 +412,7 @@ struct BrowserReviewScreenshotAudit<'a> {
     sha256: &'a str,
     size: usize,
     trigger_origin: &'a str,
+    trigger_path: &'a str,
     trigger_url_sha256: &'a str,
 }
 
@@ -395,6 +425,7 @@ impl<'a> From<&'a BrowserReviewScreenshotReceipt> for BrowserReviewScreenshotAud
             sha256: &receipt.sha256,
             size: receipt.size,
             trigger_origin: &receipt.trigger_origin,
+            trigger_path: &receipt.trigger_path,
             trigger_url_sha256: &receipt.trigger_url_sha256,
         }
     }
@@ -424,7 +455,126 @@ pub(crate) fn validate_png_screenshot(bytes: &[u8]) -> Result<(), BrowserError> 
     if bytes.len() > MAX_REVIEW_SCREENSHOT_BYTES || !bytes.starts_with(PNG_SIGNATURE) {
         return Err(BrowserError::InvalidScreenshot);
     }
+    // PNG is deliberately parsed completely here instead of accepting a
+    // magic prefix. WebDriver output is untrusted input at this boundary.
+    // Bound width/height and verify every chunk CRC before evidence reaches
+    // the root-owned directory. The browser is the only producer, so we do
+    // not accept ancillary trailing bytes or a truncated IEND.
+    let mut cursor = PNG_SIGNATURE.len();
+    let mut saw_ihdr = false;
+    let mut saw_idat = false;
+    let mut saw_iend = false;
+    while cursor < bytes.len() {
+        let header_end = cursor
+            .checked_add(8)
+            .ok_or(BrowserError::InvalidScreenshot)?;
+        if header_end > bytes.len() {
+            return Err(BrowserError::InvalidScreenshot);
+        }
+        let length = u32::from_be_bytes(
+            bytes[cursor..cursor + 4]
+                .try_into()
+                .map_err(|_| BrowserError::InvalidScreenshot)?,
+        ) as usize;
+        let kind = &bytes[cursor + 4..header_end];
+        let data_end = header_end
+            .checked_add(length)
+            .ok_or(BrowserError::InvalidScreenshot)?;
+        let crc_end = data_end
+            .checked_add(4)
+            .ok_or(BrowserError::InvalidScreenshot)?;
+        if crc_end > bytes.len() {
+            return Err(BrowserError::InvalidScreenshot);
+        }
+        let expected_crc = u32::from_be_bytes(
+            bytes[data_end..crc_end]
+                .try_into()
+                .map_err(|_| BrowserError::InvalidScreenshot)?,
+        );
+        if png_crc32(&bytes[cursor + 4..data_end]) != expected_crc {
+            return Err(BrowserError::InvalidScreenshot);
+        }
+        match kind {
+            b"IHDR" if !saw_ihdr && !saw_idat && !saw_iend && length == 13 => {
+                let width = u32::from_be_bytes(
+                    bytes[header_end..header_end + 4]
+                        .try_into()
+                        .map_err(|_| BrowserError::InvalidScreenshot)?,
+                );
+                let height = u32::from_be_bytes(
+                    bytes[header_end + 4..header_end + 8]
+                        .try_into()
+                        .map_err(|_| BrowserError::InvalidScreenshot)?,
+                );
+                let bit_depth = bytes[header_end + 8];
+                let color_type = bytes[header_end + 9];
+                if width == 0
+                    || height == 0
+                    || width > 8_192
+                    || height > 8_192
+                    || u64::from(width) * u64::from(height) > 16 * 1024 * 1024
+                    || !matches!(bit_depth, 1 | 2 | 4 | 8 | 16)
+                    || !matches!(color_type, 0 | 2 | 3 | 4 | 6)
+                    || bytes[header_end + 10] != 0
+                    || bytes[header_end + 11] != 0
+                    || bytes[header_end + 12] > 1
+                {
+                    return Err(BrowserError::InvalidScreenshot);
+                }
+                saw_ihdr = true;
+            }
+            b"IDAT" if saw_ihdr && !saw_iend && length > 0 => saw_idat = true,
+            b"IEND" if saw_ihdr && saw_idat && !saw_iend && length == 0 => {
+                saw_iend = true;
+                if crc_end != bytes.len() {
+                    return Err(BrowserError::InvalidScreenshot);
+                }
+            }
+            _ if saw_iend || !saw_ihdr => return Err(BrowserError::InvalidScreenshot),
+            _ => {}
+        }
+        cursor = crc_end;
+    }
+    if !saw_ihdr || !saw_idat || !saw_iend {
+        return Err(BrowserError::InvalidScreenshot);
+    }
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_limits(png::Limits {
+        bytes: 64 * 1024 * 1024,
+    });
+    let mut reader = decoder
+        .read_info()
+        .map_err(|_| BrowserError::InvalidScreenshot)?;
+    let info = reader.info();
+    if info.is_animated()
+        || info.width == 0
+        || info.height == 0
+        || info.width > 8_192
+        || info.height > 8_192
+        || u64::from(info.width) * u64::from(info.height) > 16 * 1024 * 1024
+    {
+        return Err(BrowserError::InvalidScreenshot);
+    }
+    let output_size = reader
+        .output_buffer_size()
+        .filter(|size| *size <= 64 * 1024 * 1024)
+        .ok_or(BrowserError::InvalidScreenshot)?;
+    let mut decoded = Zeroizing::new(vec![0_u8; output_size]);
+    reader
+        .next_frame(decoded.as_mut_slice())
+        .map_err(|_| BrowserError::InvalidScreenshot)?;
     Ok(())
+}
+
+fn png_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
 }
 
 fn safe_capture_component(value: &str) -> Result<&str, BrowserError> {
@@ -453,6 +603,12 @@ fn review_screenshot_markers(
             })
         })
     })
+}
+
+pub(crate) fn required_review_screenshot_count(entries: &[BrowserEntry]) -> usize {
+    review_screenshot_markers(entries)
+        .filter(|marker| *marker == ReviewScreenshotMarker::Required)
+        .count()
 }
 
 pub struct BrowserExecutor<D> {
@@ -495,6 +651,8 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                 final_origin: String::new(),
                 review_screenshots: Vec::new(),
                 review_screenshot_attempts: 0,
+                review_screenshots_required: 0,
+                review_screenshots_required_captured: 0,
                 review_screenshots_missing: 0,
             },
         )
@@ -511,20 +669,45 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         }
         let mut executed = 0usize;
         for command in commands {
-            self.execute_command(command)?;
+            let marker = match command {
+                BrowserCommand::WaitForElement {
+                    review_screenshot, ..
+                } => *review_screenshot,
+                _ => None,
+            };
+            if let Err(error) = self.execute_command(command) {
+                // An optional marker is a signed best-effort capture point,
+                // not permission to capture the previous page.  Skip this
+                // action only, then continue the remaining signed commands.
+                if marker == Some(ReviewScreenshotMarker::Optional)
+                    && matches!(
+                        error,
+                        BrowserError::Timeout
+                            | BrowserError::ElementNotFound
+                            | BrowserError::StaleElement
+                    )
+                {
+                    report.review_screenshot_attempts =
+                        report.review_screenshot_attempts.saturating_add(1);
+                    report.review_screenshots_missing =
+                        report.review_screenshots_missing.saturating_add(1);
+                    continue;
+                }
+                return Err(error);
+            }
             executed += 1;
             self.steps = self.steps.saturating_add(1);
             let trigger_url = self.ensure_current_url()?;
-            if let BrowserCommand::WaitForElement {
-                review_screenshot: Some(marker),
-                ..
-            } = command
-            {
+            if let Some(marker) = marker {
                 let index = report.review_screenshot_attempts;
                 if index >= MAX_REVIEW_SCREENSHOTS_PER_MODULE {
                     return Err(BrowserError::ReviewScreenshotLimit);
                 }
                 report.review_screenshot_attempts = index.saturating_add(1);
+                if marker == ReviewScreenshotMarker::Required {
+                    report.review_screenshots_required =
+                        report.review_screenshots_required.saturating_add(1);
+                }
                 match capture {
                     Some(capture) => {
                         self.capture_review_screenshot(
@@ -556,6 +739,11 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         marker: ReviewScreenshotMarker,
         report: &mut BrowserRunReport,
     ) -> Result<(), BrowserError> {
+        if !self.policy.suite_origin.same_origin_url(trigger_url)
+            || !review_screenshot_path_binds_module(trigger_url, &capture.module_id)
+        {
+            return Err(BrowserError::CrossOriginNavigation);
+        }
         let context = capture.for_index(index);
         let result = context.and_then(|context| {
             let screenshot = self.driver.screenshot_png()?;
@@ -563,6 +751,11 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         });
         match result {
             Ok(receipt) => {
+                if marker == ReviewScreenshotMarker::Required {
+                    report.review_screenshots_required_captured = report
+                        .review_screenshots_required_captured
+                        .saturating_add(1);
+                }
                 report.review_screenshots.push(receipt);
                 Ok(())
             }
@@ -762,6 +955,8 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             final_origin: String::new(),
             review_screenshots: Vec::new(),
             review_screenshot_attempts: 0,
+            review_screenshots_required: 0,
+            review_screenshots_required_captured: 0,
             review_screenshots_missing: 0,
         };
         let entry = &entries[entry_index];
@@ -790,6 +985,20 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         report.final_origin = redacted_origin(&final_url);
         Ok(report)
     }
+}
+
+/// Review evidence is an explicit Suite-module artefact. Capturing an issuer
+/// page, another Suite module, or a generic Suite landing page would create a
+/// misleading local receipt even though the browser policy permits those
+/// pages for normal protocol automation.
+pub(crate) fn review_screenshot_path_binds_module(url: &Url, module_id: &str) -> bool {
+    let Some(mut segments) = url.path_segments() else {
+        return false;
+    };
+    matches!(
+        (segments.next(), segments.next(), segments.next(), segments.next()),
+        (Some("test"), Some("a"), Some(module), Some(_)) if module == module_id
+    )
 }
 
 impl<D: BrowserDriver> BrowserAutomation for BrowserExecutor<D> {
@@ -1074,8 +1283,14 @@ mod tests {
         }
 
         fn screenshot_png(&mut self) -> Result<Zeroizing<Vec<u8>>, BrowserError> {
-            Ok(Zeroizing::new(PNG_SIGNATURE.to_vec()))
+            Ok(Zeroizing::new(test_png()))
         }
+    }
+
+    fn test_png() -> Vec<u8> {
+        STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            .expect("fixed PNG")
     }
 
     struct RedirectingMockDriver {
@@ -1176,7 +1391,8 @@ mod tests {
         let suite = Origin::parse("https://suite.example").expect("suite");
         let policy = BrowserPolicy::new(target, suite).expect("policy");
         let driver = MockDriver {
-            current: Url::parse("https://issuer.example/authorize").expect("url"),
+            current: Url::parse("https://suite.example/test/a/module-a/verification-evidence")
+                .expect("url"),
             source: "review evidence".to_owned(),
             found: true,
             displayed: true,
@@ -1189,7 +1405,7 @@ mod tests {
         };
         let mut executor = BrowserExecutor::new(driver, policy);
         let entries = vec![BrowserEntry::parse(&json!({
-            "match": "https://issuer.example/authorize*",
+            "match": "https://suite.example/test/a/module-a/verification-evidence*",
             "tasks": [{
                 "commands": [["wait", "css", ".review", 1, "review evidence", "update-image-placeholder"]]
             }]
@@ -1198,7 +1414,8 @@ mod tests {
         assert_eq!(
             executor
                 .execute(
-                    &Url::parse("https://issuer.example/authorize").expect("url"),
+                    &Url::parse("https://suite.example/test/a/module-a/verification-evidence")
+                        .expect("url"),
                     &entries,
                 )
                 .expect_err("required capture"),
@@ -1213,7 +1430,8 @@ mod tests {
         let suite = Origin::parse("https://suite.example").expect("suite");
         let policy = BrowserPolicy::new(target, suite).expect("policy");
         let driver = MockDriver {
-            current: Url::parse("https://issuer.example/authorize").expect("url"),
+            current: Url::parse("https://suite.example/test/a/module-a/verification-evidence")
+                .expect("url"),
             source: "review evidence".to_owned(),
             found: true,
             displayed: true,
@@ -1239,7 +1457,7 @@ mod tests {
         .expect("context");
         let mut executor = BrowserExecutor::new(driver, policy);
         let entries = vec![BrowserEntry::parse(&json!({
-            "match": "https://issuer.example/authorize*",
+            "match": "https://suite.example/test/a/module-a/verification-evidence*",
             "tasks": [{
                 "commands": [["wait", "xpath", "//*", 1, "review evidence", "update-image-placeholder"]]
             }]
@@ -1247,7 +1465,8 @@ mod tests {
         .expect("entry")];
         let report = executor
             .execute_with_review_capture(
-                &Url::parse("https://issuer.example/authorize").expect("url"),
+                &Url::parse("https://suite.example/test/a/module-a/verification-evidence")
+                    .expect("url"),
                 &entries,
                 Some(&capture),
             )
@@ -1262,7 +1481,7 @@ mod tests {
             std::fs::read(root.join(&receipt.path))
                 .expect("png")
                 .as_slice(),
-            PNG_SIGNATURE
+            test_png().as_slice()
         );
         assert!(
             root.join(&receipt.path)
@@ -1274,10 +1493,10 @@ mod tests {
 
     #[test]
     fn webdriver_png_decoder_rejects_noncanonical_or_non_png_values() {
-        let encoded = STANDARD.encode(PNG_SIGNATURE);
+        let encoded = STANDARD.encode(test_png());
         assert_eq!(
             decode_webdriver_png(&encoded).expect("png").as_slice(),
-            PNG_SIGNATURE
+            test_png().as_slice()
         );
         assert_eq!(
             decode_webdriver_png(&format!("{encoded}\n")).expect_err("noncanonical"),
@@ -1287,6 +1506,25 @@ mod tests {
             decode_webdriver_png(&STANDARD.encode(b"not png")).expect_err("not png"),
             BrowserError::InvalidScreenshot
         );
+        let mut corrupted = test_png();
+        let last = corrupted.len().saturating_sub(1);
+        corrupted[last] ^= 1;
+        assert_eq!(
+            validate_png_screenshot(&corrupted).expect_err("CRC mismatch"),
+            BrowserError::InvalidScreenshot
+        );
+    }
+
+    #[test]
+    fn review_capture_path_is_bound_to_the_current_suite_module() {
+        let url =
+            Url::parse("https://suite.example/test/a/module-a/verification-evidence").expect("URL");
+        assert!(review_screenshot_path_binds_module(&url, "module-a"));
+        assert!(!review_screenshot_path_binds_module(&url, "module-b"));
+        assert!(!review_screenshot_path_binds_module(
+            &Url::parse("https://suite.example/test/a/module-a").expect("URL"),
+            "module-a"
+        ));
     }
 
     #[test]

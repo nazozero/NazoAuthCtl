@@ -134,6 +134,16 @@ pub struct EvidenceBundleReceipt {
     pub module_count: u32,
 }
 
+/// Digest-bound local capture manifest that can be embedded in the Suite
+/// retention journal without carrying any image bytes, URLs, secrets, or
+/// Suite credentials.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewScreenshotManifestReceipt {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
 #[cfg(unix)]
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
@@ -170,6 +180,7 @@ struct ReviewScreenshotAudit {
     sha256: String,
     size: usize,
     trigger_origin: String,
+    trigger_path: String,
     trigger_url_sha256: String,
 }
 
@@ -237,7 +248,9 @@ pub fn write_private_evidence_bundle(
         let mut modules = Vec::with_capacity(report.modules.len());
         let mut screenshots = Vec::new();
         let mut screenshot_paths = BTreeSet::new();
+        let mut total_screenshot_bytes = 0usize;
         for (index, module) in report.modules.iter().enumerate() {
+            validate_review_screenshot_obligations(module)?;
             let index = u32::try_from(index).map_err(|_| EvidenceError::Encoding)?;
             let file = format!("module-{index:04}.json");
             let bytes = Zeroizing::new(
@@ -274,6 +287,11 @@ pub fn write_private_evidence_bundle(
                 let source = root.join(&screenshot.path);
                 let screenshot_bytes = crate::secure_file::read_bounded(&source, 500 * 1024, true)
                     .map_err(map_secure_file_error)?;
+                if screenshots.len() >= crate::browser::MAX_REVIEW_SCREENSHOTS_PER_RUN
+                    || screenshot_bytes.len() > 32 * 1024 * 1024 - total_screenshot_bytes
+                {
+                    return Err(EvidenceError::Identity);
+                }
                 crate::browser::validate_png_screenshot(&screenshot_bytes)
                     .map_err(|_| EvidenceError::Identity)?;
                 if screenshot_bytes.len() != screenshot.size
@@ -291,7 +309,15 @@ pub fn write_private_evidence_bundle(
                     || audit.path != screenshot.path
                     || audit.sha256 != screenshot.sha256
                     || audit.size != screenshot.size
-                    || !valid_origin(&audit.trigger_origin)
+                    || audit.trigger_origin != report.suite_origin
+                    || !crate::browser::review_screenshot_path_binds_module(
+                        &url::Url::parse(&format!(
+                            "{}{}",
+                            audit.trigger_origin, audit.trigger_path
+                        ))
+                        .map_err(|_| EvidenceError::Identity)?,
+                        module_id,
+                    )
                     || !lower_hex(&audit.trigger_url_sha256, 64)
                 {
                     return Err(EvidenceError::Identity);
@@ -314,6 +340,7 @@ pub fn write_private_evidence_bundle(
                     size: screenshot.size,
                     receipt_sha256: sha256(&receipt),
                 });
+                total_screenshot_bytes = total_screenshot_bytes.saturating_add(screenshot.size);
             }
         }
 
@@ -338,13 +365,6 @@ pub fn write_private_evidence_bundle(
             module_count,
         })
     }
-}
-
-#[cfg(unix)]
-fn valid_origin(value: &str) -> bool {
-    url::Url::parse(value)
-        .ok()
-        .is_some_and(|url| matches!(url.scheme(), "https" | "http") && url.host_str().is_some())
 }
 
 #[cfg(unix)]
@@ -391,10 +411,11 @@ pub fn write_review_screenshot_manifest(
     report: &ConformanceReport,
     root: &Path,
     run_jti: &str,
-) -> Result<PathBuf, EvidenceError> {
+    artifact_digest: &str,
+) -> Result<ReviewScreenshotManifestReceipt, EvidenceError> {
     #[cfg(not(unix))]
     {
-        let _ = (report, root, run_jti);
+        let _ = (report, root, run_jti, artifact_digest);
         Err(EvidenceError::UnsupportedPlatform)
     }
     #[cfg(unix)]
@@ -404,9 +425,25 @@ pub fn write_review_screenshot_manifest(
         }
         let root =
             crate::secure_file::validate_directory(root, true).map_err(map_secure_file_error)?;
+        if !lower_hex(artifact_digest, 64) {
+            return Err(EvidenceError::Identity);
+        }
+        let mut modules = Vec::with_capacity(report.modules.len());
         let mut screenshots = Vec::new();
         let mut paths = BTreeSet::new();
+        let mut total_screenshot_bytes = 0usize;
         for module in &report.modules {
+            validate_review_screenshot_obligations(module)?;
+            modules.push(ReviewScreenshotModuleManifest {
+                matrix_plan_id: module.matrix_plan_id.clone(),
+                suite_plan_id: module.suite_plan_id.clone(),
+                module_id: module.module_id.clone().ok_or(EvidenceError::Identity)?,
+                test_name: module.test_name.clone(),
+                variant: module.variant.clone(),
+                required: module.review_screenshots_required,
+                captured_required: module.review_screenshots_required_captured,
+                missing_optional: module.review_screenshots_missing,
+            });
             for screenshot in &module.review_screenshots {
                 let module_id = module.module_id.as_deref().ok_or(EvidenceError::Identity)?;
                 if !paths.insert(screenshot.path.clone()) {
@@ -416,6 +453,11 @@ pub fn write_review_screenshot_manifest(
                 let source = root.join(&screenshot.path);
                 let image = crate::secure_file::read_bounded(&source, 500 * 1024, true)
                     .map_err(map_secure_file_error)?;
+                if screenshots.len() >= crate::browser::MAX_REVIEW_SCREENSHOTS_PER_RUN
+                    || image.len() > 32 * 1024 * 1024 - total_screenshot_bytes
+                {
+                    return Err(EvidenceError::Identity);
+                }
                 crate::browser::validate_png_screenshot(&image)
                     .map_err(|_| EvidenceError::Identity)?;
                 if image.len() != screenshot.size || sha256(&image) != screenshot.sha256 {
@@ -434,7 +476,15 @@ pub fn write_review_screenshot_manifest(
                     || audit.path != screenshot.path
                     || audit.sha256 != screenshot.sha256
                     || audit.size != screenshot.size
-                    || !valid_origin(&audit.trigger_origin)
+                    || audit.trigger_origin != report.suite_origin
+                    || !crate::browser::review_screenshot_path_binds_module(
+                        &url::Url::parse(&format!(
+                            "{}{}",
+                            audit.trigger_origin, audit.trigger_path
+                        ))
+                        .map_err(|_| EvidenceError::Identity)?,
+                        module_id,
+                    )
                     || !lower_hex(&audit.trigger_url_sha256, 64)
                 {
                     return Err(EvidenceError::Identity);
@@ -448,20 +498,71 @@ pub fn write_review_screenshot_manifest(
                     size: screenshot.size,
                     receipt_sha256: sha256(&receipt),
                 });
+                total_screenshot_bytes = total_screenshot_bytes.saturating_add(image.len());
             }
         }
         let bytes = serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": 1,
+            "schema": 2,
             "run_jti": run_jti,
+            "artifact_digest": artifact_digest,
+            "matrix_sha256": report.matrix_digest,
+            "suite_origin": report.suite_origin,
+            "modules": modules,
             "screenshots": screenshots,
         }))
         .map_err(|_| EvidenceError::Encoding)?;
         let path = root
             .join("review-screenshot-manifests")
             .join(format!("{run_jti}.json"));
-        crate::secure_file::write_atomic(&path, &bytes, true).map_err(map_secure_file_error)?;
-        Ok(path)
+        write_private_new_or_exact(&path, &bytes)?;
+        Ok(ReviewScreenshotManifestReceipt {
+            path,
+            sha256: sha256(&bytes),
+        })
     }
+}
+
+#[cfg(unix)]
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewScreenshotModuleManifest {
+    matrix_plan_id: String,
+    suite_plan_id: String,
+    module_id: String,
+    test_name: String,
+    variant: std::collections::BTreeMap<String, String>,
+    required: usize,
+    captured_required: usize,
+    missing_optional: usize,
+}
+
+#[cfg(unix)]
+fn write_private_new_or_exact(path: &Path, bytes: &[u8]) -> Result<(), EvidenceError> {
+    match crate::secure_file::read_bounded(path, bytes.len(), true) {
+        Ok(existing) if existing == bytes => Ok(()),
+        Ok(_) | Err(crate::secure_file::SecureFileError::Oversize) => Err(EvidenceError::Conflict),
+        Err(crate::secure_file::SecureFileError::NotFound) => {
+            crate::secure_file::write_atomic(path, bytes, true).map_err(map_secure_file_error)
+        }
+        Err(error) => Err(map_secure_file_error(error)),
+    }
+}
+
+#[cfg(unix)]
+fn validate_review_screenshot_obligations(
+    module: &crate::report::ModuleReport,
+) -> Result<(), EvidenceError> {
+    if module.review_screenshots_required != module.review_screenshots_required_captured
+        || module.review_screenshots_required_captured > module.review_screenshots.len()
+        || module
+            .review_screenshots
+            .len()
+            .saturating_add(module.review_screenshots_missing)
+            > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_MODULE
+    {
+        return Err(EvidenceError::Identity);
+    }
+    Ok(())
 }
 
 /// Validates ordinary provider evidence without touching the filesystem.  A
@@ -897,6 +998,8 @@ mod tests {
                 blocking_log_results: Vec::new(),
                 advisory_log_results: Vec::new(),
                 review_screenshots: Vec::new(),
+                review_screenshots_required: 0,
+                review_screenshots_required_captured: 0,
                 review_screenshots_missing: 0,
                 info: serde_json::json!({"status":"FINISHED","result":"PASSED"}),
                 log: serde_json::json!({"entries":1,"present":true}),

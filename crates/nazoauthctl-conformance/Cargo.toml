@@ -35,6 +35,7 @@ thiserror = "2.0.20"
 uuid = { version = "1.24.1", features = ["v4", "v7"] }
 url = "2.5.8"
 zeroize = { version = "1.8.2", features = ["derive", "serde"] }
+png = "=0.18.1"
 
 [target.'cfg(windows)'.dependencies]
 # Windows Credential Manager (DPAPI-backed by the OS) is the only supported

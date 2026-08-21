@@ -15,7 +15,7 @@ use crate::browser::{
     BrowserAutomation, BrowserPolicy, BrowserReviewScreenshotCapture, BrowserRunnerState,
     BrowserTargetOrigin, ConformanceBinding, MAX_REVIEW_SCREENSHOTS_PER_RUN, OpenId4VciError,
     OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpStartRequest, OpenId4VpVerifier,
-    browser_config_for_module, parse_browser_entries_owned,
+    browser_config_for_module, parse_browser_entries_owned, required_review_screenshot_count,
 };
 use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
 use crate::matrix::{MatrixError, SelectedMatrix, zeroize_json_value};
@@ -53,7 +53,11 @@ pub struct ConformanceAutomation {
 #[derive(Default)]
 struct BrowserReviewEvidence {
     screenshots: Vec<ReviewScreenshotReport>,
+    required: usize,
+    required_captured: usize,
     missing: usize,
+    attempts: usize,
+    decoded_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -356,6 +360,7 @@ impl ConformanceRunner {
             .map_err(|error| error.to_string())?;
         let entries =
             parse_browser_entries_owned(browser_config).map_err(|error| error.to_string())?;
+        let required_review_screenshots = required_review_screenshot_count(&entries);
         let target_origin = self.config.target_origin.clone().ok_or_else(|| {
             "Suite runner is WAITING but the target browser origin is unavailable".to_owned()
         })?;
@@ -383,6 +388,10 @@ impl ConformanceRunner {
                     .module_info(module_id)
                     .map_err(|error| safe_error(&error))?;
                 if is_terminal_state(&observed) {
+                    verify_required_review_screenshots(
+                        &review_evidence,
+                        required_review_screenshots,
+                    )?;
                     return Ok((observed, review_evidence));
                 }
                 if !is_waiting(&observed) {
@@ -392,6 +401,10 @@ impl ConformanceRunner {
                         deadline,
                     )?;
                     if is_terminal_state(&observed) {
+                        verify_required_review_screenshots(
+                            &review_evidence,
+                            required_review_screenshots,
+                        )?;
                         return Ok((observed, review_evidence));
                     }
                 }
@@ -452,14 +465,37 @@ impl ConformanceRunner {
                 let report = driver
                     .execute_with_review_capture(pending_url, &entries, capture.as_ref())
                     .map_err(|error| error.to_string())?;
+                let next_attempts = review_evidence
+                    .attempts
+                    .checked_add(report.review_screenshot_attempts)
+                    .ok_or_else(|| "browser review screenshot limit exceeded".to_owned())?;
+                if next_attempts > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_MODULE {
+                    return Err("browser review screenshot limit exceeded".to_owned());
+                }
+                review_evidence.attempts = next_attempts;
+                review_evidence.required = review_evidence
+                    .required
+                    .checked_add(report.review_screenshots_required)
+                    .ok_or_else(|| "browser review screenshot obligation overflow".to_owned())?;
+                review_evidence.required_captured = review_evidence
+                    .required_captured
+                    .checked_add(report.review_screenshots_required_captured)
+                    .ok_or_else(|| "browser review screenshot obligation overflow".to_owned())?;
                 for receipt in report.review_screenshots {
                     if receipt.suite_plan_id != plan.suite_plan_id || receipt.module_id != module_id
                     {
                         return Err("browser review evidence context mismatch".to_owned());
                     }
-                    if review_evidence.screenshots.len() >= MAX_REVIEW_SCREENSHOTS_PER_RUN {
+                    let next_bytes = review_evidence
+                        .decoded_bytes
+                        .checked_add(receipt.size)
+                        .ok_or_else(|| "browser review screenshot size overflow".to_owned())?;
+                    if review_evidence.screenshots.len() >= MAX_REVIEW_SCREENSHOTS_PER_RUN
+                        || next_bytes > 32 * 1024 * 1024
+                    {
                         return Err("browser review screenshot limit exceeded".to_owned());
                     }
+                    review_evidence.decoded_bytes = next_bytes;
                     review_evidence.screenshots.push(ReviewScreenshotReport {
                         path: receipt.path,
                         sha256: receipt.sha256,
@@ -469,6 +505,9 @@ impl ConformanceRunner {
                 review_evidence.missing = review_evidence
                     .missing
                     .saturating_add(report.review_screenshots_missing);
+                if review_evidence.required != review_evidence.required_captured {
+                    return Err("required browser review screenshot was not captured".to_owned());
+                }
             }
             completed_url_digests.insert(Sha256::digest(pending_url.as_str().as_bytes()).into());
             self.wait_for_runner_refresh(deadline, "browser")?;
@@ -1077,6 +1116,9 @@ impl ConformanceRunner {
                         log,
                     );
                     module_report.review_screenshots = browser_review_evidence.screenshots;
+                    module_report.review_screenshots_required = browser_review_evidence.required;
+                    module_report.review_screenshots_required_captured =
+                        browser_review_evidence.required_captured;
                     module_report.review_screenshots_missing = browser_review_evidence.missing;
                     modules.push(module_report);
                     let module_outcome = modules.last().map(|module| module.outcome);
@@ -1140,6 +1182,9 @@ impl ConformanceRunner {
         let terminal_modules = modules.iter().filter(|module| module.terminal).count();
         let all_modules_instantiated = defined_modules == created_instances;
         let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
+        if let Err(error) = validate_review_screenshot_run_limit(&modules) {
+            errors.push(error);
+        }
         let retention_requested = self
             .config
             .suite_resource_observer
@@ -1211,6 +1256,39 @@ impl ConformanceRunner {
         };
         RunSummary { report }
     }
+}
+
+fn verify_required_review_screenshots(
+    evidence: &BrowserReviewEvidence,
+    expected: usize,
+) -> Result<(), String> {
+    if evidence.required != expected || evidence.required_captured != expected {
+        return Err("required browser review screenshots are incomplete".to_owned());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_review_screenshot_run_limit(modules: &[ModuleReport]) -> Result<(), String> {
+    let mut captures = 0usize;
+    let mut bytes = 0usize;
+    for module in modules {
+        captures = captures
+            .checked_add(module.review_screenshots.len())
+            .and_then(|value| value.checked_add(module.review_screenshots_missing))
+            .ok_or_else(|| "browser review screenshot limit exceeded".to_owned())?;
+        if captures > MAX_REVIEW_SCREENSHOTS_PER_RUN {
+            return Err("browser review screenshot limit exceeded".to_owned());
+        }
+        for screenshot in &module.review_screenshots {
+            bytes = bytes
+                .checked_add(screenshot.size)
+                .ok_or_else(|| "browser review screenshot size limit exceeded".to_owned())?;
+            if bytes > 32 * 1024 * 1024 {
+                return Err("browser review screenshot size limit exceeded".to_owned());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn plan_lanes_match_selected(
@@ -2993,6 +3071,8 @@ mod tests {
                 final_origin: "https://target.example".into(),
                 review_screenshots: Vec::new(),
                 review_screenshot_attempts: 0,
+                review_screenshots_required: 0,
+                review_screenshots_required_captured: 0,
                 review_screenshots_missing: 0,
             })
         }

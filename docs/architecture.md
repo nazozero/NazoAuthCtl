@@ -114,10 +114,15 @@ requirement.
 `update-image-placeholder` or `update-image-placeholder-optional`; it never
 calls a Suite image API. A required marker fails local orchestration if a
 bounded W3C PNG screenshot cannot be captured, while an optional marker is
-reported as missing. Captures are written owner-only under
-`review-screenshots/`, are bounded to 500 KiB, and are named from the current
-Matrix plan, newly-created Suite module ID, and module-local index. Module
-reports contain only the relative path, SHA-256, and size. Existing terminal
+reported as missing and execution continues with the next signed task. A
+capture is accepted only on the canonical Suite `/test/a/{module-id}/…` page
+for its newly-created module. PNG input is capped at 500 KiB and fully decoded
+with bounded dimensions, pixels, and output before it is written owner-only
+under `review-screenshots/`. The root-private capture manifest binds the run,
+artifact/Matrix digests, Suite origin, exact plan/module IDs, test/variant, and
+required/captured/missing obligations; retained plans bind its path and SHA-256
+into the recovery journal and reverify it before publication. Module reports
+contain only the relative path, SHA-256, and size. Existing terminal
 Suite modules are never targeted: a retained plan must be repeated to collect
 new local evidence, which can then be attached manually in the official UI.
 
