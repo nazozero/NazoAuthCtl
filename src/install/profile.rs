@@ -459,12 +459,12 @@ pub(super) fn validate_public_jwks(value: &serde_json::Value, label: &str) -> an
 }
 
 #[derive(Clone, Copy)]
-enum AttestationJwkPurpose {
+pub(super) enum AttestationJwkPurpose {
     Client,
     HolderKey,
 }
 
-fn validate_attestation_jwks(
+pub(super) fn validate_attestation_jwks(
     value: &serde_json::Value,
     label: &str,
     purpose: AttestationJwkPurpose,

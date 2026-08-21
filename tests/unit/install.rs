@@ -412,7 +412,10 @@ fn oidf_profile_missing_credential_signing_algorithms_fails_before_prepare_mutat
     options.trusted_proxy_cidr = Some("192.0.2.10/32".to_owned());
     let config = work.path().join("config/nazoauthctl.json");
 
-    let error = prepare(&config, options).unwrap_err();
+    let error = match prepare(&config, options) {
+        Err(error) => error,
+        Ok(_) => panic!("incomplete credential configuration must be rejected"),
+    };
     assert!(error.to_string().contains("strict JSON"));
     assert!(!config.exists());
     assert!(!work.path().join("data").exists());
