@@ -658,6 +658,19 @@ mod tests {
     use super::*;
     use base64::Engine as _;
 
+    fn valid_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("PNG header");
+        writer
+            .write_image_data(&[0x00, 0x00, 0x00, 0xff])
+            .expect("one opaque pixel");
+        drop(writer);
+        bytes
+    }
+
     #[test]
     fn webdriver_error_tokens_preserve_only_retryable_dom_states() {
         assert_eq!(
@@ -697,13 +710,13 @@ mod tests {
 
     #[test]
     fn w3c_screenshot_response_accepts_only_bounded_canonical_png() {
-        let png = b"\x89PNG\r\n\x1a\n";
-        let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+        let png = valid_png();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
         assert_eq!(
             parse_screenshot_response(&json!({"value": encoded}))
                 .expect("w3c screenshot")
                 .as_slice(),
-            png
+            png.as_slice()
         );
         assert_eq!(
             parse_screenshot_response(&json!({"value": "not-base64"}))

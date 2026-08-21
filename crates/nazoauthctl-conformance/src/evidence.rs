@@ -308,21 +308,18 @@ pub fn write_private_evidence_bundle(
                     .map_err(map_secure_file_error)?;
                 let audit: ReviewScreenshotAudit =
                     serde_json::from_slice(&receipt).map_err(|_| EvidenceError::Identity)?;
+                let trigger_url =
+                    url::Url::parse(&format!("{}{}", audit.trigger_origin, audit.trigger_path))
+                        .map_err(|_| EvidenceError::Identity)?;
                 if audit.suite_plan_id != module.suite_plan_id
                     || audit.module_id != module_id
                     || audit.path != screenshot.path
                     || audit.sha256 != screenshot.sha256
                     || audit.size != screenshot.size
                     || audit.trigger_origin != report.suite_origin
-                    || !crate::browser::review_screenshot_path_binds_module(
-                        &url::Url::parse(&format!(
-                            "{}{}",
-                            audit.trigger_origin, audit.trigger_path
-                        ))
-                        .map_err(|_| EvidenceError::Identity)?,
-                        module_id,
-                    )
+                    || !crate::browser::review_screenshot_path_binds_module(&trigger_url, module_id)
                     || !lower_hex(&audit.trigger_url_sha256, 64)
+                    || sha256(trigger_url.as_str().as_bytes()) != audit.trigger_url_sha256
                 {
                     return Err(EvidenceError::Identity);
                 }
@@ -482,21 +479,18 @@ pub fn write_review_screenshot_manifest(
                 .map_err(map_secure_file_error)?;
                 let audit: ReviewScreenshotAudit =
                     serde_json::from_slice(&receipt).map_err(|_| EvidenceError::Identity)?;
+                let trigger_url =
+                    url::Url::parse(&format!("{}{}", audit.trigger_origin, audit.trigger_path))
+                        .map_err(|_| EvidenceError::Identity)?;
                 if audit.suite_plan_id != module.suite_plan_id
                     || audit.module_id != module_id
                     || audit.path != screenshot.path
                     || audit.sha256 != screenshot.sha256
                     || audit.size != screenshot.size
                     || audit.trigger_origin != report.suite_origin
-                    || !crate::browser::review_screenshot_path_binds_module(
-                        &url::Url::parse(&format!(
-                            "{}{}",
-                            audit.trigger_origin, audit.trigger_path
-                        ))
-                        .map_err(|_| EvidenceError::Identity)?,
-                        module_id,
-                    )
+                    || !crate::browser::review_screenshot_path_binds_module(&trigger_url, module_id)
                     || !lower_hex(&audit.trigger_url_sha256, 64)
+                    || sha256(trigger_url.as_str().as_bytes()) != audit.trigger_url_sha256
                 {
                     return Err(EvidenceError::Identity);
                 }
@@ -516,7 +510,7 @@ pub fn write_review_screenshot_manifest(
             }
         }
         let bytes = serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": 2,
+            "schema": 3,
             "run_jti": run_jti,
             "artifact_digest": artifact_digest,
             "matrix_sha256": report.matrix_digest,

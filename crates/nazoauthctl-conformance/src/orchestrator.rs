@@ -53,12 +53,12 @@ pub struct ConformanceAutomation {
 #[derive(Default)]
 struct BrowserReviewEvidence {
     screenshots: Vec<ReviewScreenshotReport>,
-    required_expected: usize,
     required: usize,
     required_captured: usize,
     missing: usize,
     attempts: usize,
     decoded_bytes: usize,
+    entered_browser_program: bool,
 }
 
 #[derive(Clone)]
@@ -209,6 +209,15 @@ impl ConformanceRunner {
             config.client.origin(),
             config.target_origin.as_ref(),
         )?;
+        let mut capture_budgets = config
+            .automation
+            .iter()
+            .filter_map(|automation| automation.review_screenshot_capture.as_ref());
+        if let Some(first) = capture_budgets.next()
+            && !capture_budgets.all(|capture| capture.shares_run_budget_with(first))
+        {
+            return Err(OrchestrationError::InvalidInput);
+        }
         Ok(Self { config })
     }
 
@@ -361,7 +370,6 @@ impl ConformanceRunner {
             .map_err(|error| error.to_string())?;
         let entries =
             parse_browser_entries_owned(browser_config).map_err(|error| error.to_string())?;
-        let declared_required_review_screenshots = required_review_screenshot_count(&entries);
         let target_origin = self.config.target_origin.clone().ok_or_else(|| {
             "Suite runner is WAITING but the target browser origin is unavailable".to_owned()
         })?;
@@ -389,10 +397,6 @@ impl ConformanceRunner {
                     .module_info(module_id)
                     .map_err(|error| safe_error(&error))?;
                 if is_terminal_state(&observed) {
-                    verify_required_review_screenshots(
-                        &review_evidence,
-                        declared_required_review_screenshots,
-                    )?;
                     return Ok((observed, review_evidence));
                 }
                 if !is_waiting(&observed) {
@@ -402,22 +406,12 @@ impl ConformanceRunner {
                         deadline,
                     )?;
                     if is_terminal_state(&observed) {
-                        verify_required_review_screenshots(
-                            &review_evidence,
-                            declared_required_review_screenshots,
-                        )?;
                         return Ok((observed, review_evidence));
                     }
                 }
             }
             first_round = false;
             if !is_waiting(&observed) {
-                if is_terminal_state(&observed) {
-                    verify_required_review_screenshots(
-                        &review_evidence,
-                        declared_required_review_screenshots,
-                    )?;
-                }
                 return Ok((observed, review_evidence));
             }
 
@@ -472,11 +466,10 @@ impl ConformanceRunner {
                 let report = driver
                     .execute_with_review_capture(pending_url, &entries, capture.as_ref())
                     .map_err(|error| error.to_string())?;
-                let selected = entries
-                    .get(report.entry_index)
-                    .ok_or_else(|| "browser returned an invalid selected entry".to_owned())?;
-                let expected_required =
-                    required_review_screenshot_count(std::slice::from_ref(selected));
+                if report.entry_index >= entries.len() {
+                    return Err("browser returned an invalid selected entry".to_owned());
+                }
+                review_evidence.entered_browser_program = true;
                 let next_attempts = review_evidence
                     .attempts
                     .checked_add(report.review_screenshot_attempts)
@@ -488,10 +481,6 @@ impl ConformanceRunner {
                 review_evidence.required = review_evidence
                     .required
                     .checked_add(report.review_screenshots_required)
-                    .ok_or_else(|| "browser review screenshot obligation overflow".to_owned())?;
-                review_evidence.required_expected = review_evidence
-                    .required_expected
-                    .checked_add(expected_required)
                     .ok_or_else(|| "browser review screenshot obligation overflow".to_owned())?;
                 review_evidence.required_captured = review_evidence
                     .required_captured
@@ -1117,6 +1106,23 @@ impl ConformanceRunner {
                     if !terminal {
                         errors.push("Suite module did not reach a terminal status".to_owned());
                         groups[group_index].status = GroupStatus::Failed;
+                    } else if plan.config.get("browser").is_some() {
+                        let declared = (|| -> Result<usize, String> {
+                            let config = browser_config_for_module(&plan.config, &module.test_name)
+                                .map_err(|error| error.to_string())?;
+                            let entries = parse_browser_entries_owned(config)
+                                .map_err(|error| error.to_string())?;
+                            Ok(required_review_screenshot_count(&entries))
+                        })();
+                        match declared.and_then(|declared| {
+                            verify_required_review_screenshots(&browser_review_evidence, declared)
+                        }) {
+                            Ok(()) => {}
+                            Err(error) => {
+                                errors.push(error);
+                                groups[group_index].status = GroupStatus::Failed;
+                            }
+                        }
                     }
                     let mut module_report = ModuleReport::from_info(
                         ModuleReportContext {
@@ -1278,12 +1284,15 @@ fn verify_required_review_screenshots(
     evidence: &BrowserReviewEvidence,
     declared: usize,
 ) -> Result<(), String> {
-    let expected = if evidence.attempts == 0 {
-        declared
-    } else {
-        evidence.required_expected
-    };
-    if evidence.required != expected || evidence.required_captured != expected {
+    // A terminal result before any browser program is entered cannot prove
+    // whether a required signed entry was skipped, so fail closed. Once the
+    // program is entered, obligations arise solely from commands actually
+    // reached after task matching; mutually-exclusive or optional unmatched
+    // tasks do not create phantom capture requirements.
+    if !evidence.entered_browser_program && declared > 0 {
+        return Err("required browser review screenshot was not reached".to_owned());
+    }
+    if evidence.required != evidence.required_captured {
         return Err("required browser review screenshots are incomplete".to_owned());
     }
     Ok(())

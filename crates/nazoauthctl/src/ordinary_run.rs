@@ -563,6 +563,24 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         && !errors
             .iter()
             .any(|error| error.starts_with("resource-cleanup="));
+    let retention_commit_possible =
+        retention_eligible && proxy_cleanup_complete && cleanup_evidence.is_some();
+    // The provider bundle is staged before ownership transfer, but its report
+    // must be byte-for-byte the same successful Retained projection later
+    // emitted to stdout. A commit failure leaves this unreferenced local
+    // bundle behind and follows Prepared cleanup; it never publishes a
+    // misleading retained manifest.
+    if retention_commit_possible {
+        if let Some(report) = report.as_mut() {
+            report.orchestration_integrity.retention_eligible = true;
+            report.orchestration_integrity.suite_resources_settled = true;
+            report.orchestration_integrity.cleanup_complete = false;
+            report.local_success = report.errors.is_empty()
+                && report.orchestration_integrity.all_modules_instantiated
+                && report.orchestration_integrity.all_modules_terminal
+                && report.orchestration_integrity.suite_resources_settled;
+        }
+    }
     let mut evidence = None;
     if let (Some(report), Some(directory), Some(cleanup_evidence)) = (
         report.as_ref(),
@@ -608,11 +626,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             }
         }
     }
-    let retention_committed = if retention_eligible
-        && proxy_cleanup_complete
-        && cleanup_evidence.is_some()
-        && evidence.is_some()
-    {
+    let retention_committed = if retention_commit_possible && evidence.is_some() {
         match (|| -> anyhow::Result<()> {
             recovery.stage_suite_retention_manifest()?;
             recovery.commit_suite_plan_retention()?;

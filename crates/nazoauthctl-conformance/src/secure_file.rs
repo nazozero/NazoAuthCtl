@@ -243,39 +243,92 @@ pub(crate) fn write_new_or_exact(
     #[cfg(unix)]
     {
         let parent_file = open_directory_chain(parent, private, false)?;
-        let name = absolute
+        let target_name = absolute
             .file_name()
             .ok_or(SecureFileError::UnsafePath)?
             .to_owned();
-        let handle = rustix::fs::openat(
-            &parent_file,
-            &name,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(if private { 0o600 } else { 0o644 }),
-        );
-        match handle {
-            Ok(owned) => {
-                let mut file = File::from(owned);
-                let result = (|| {
-                    file.write_all(bytes).map_err(|_| SecureFileError::Io)?;
-                    rustix::fs::fsync(&file).map_err(|_| SecureFileError::Io)?;
-                    rustix::fs::fsync(&parent_file).map_err(|_| SecureFileError::Io)
-                })();
-                if result.is_err() {
-                    let _ = rustix::fs::unlinkat(&parent_file, &name, rustix::fs::AtFlags::empty());
-                }
-                result
+        let file_name = target_name.to_string_lossy();
+        let mut random = [0u8; 16];
+        let mut rng = SysRng;
+        for _ in 0..16 {
+            rng.try_fill_bytes(&mut random)
+                .map_err(|_| SecureFileError::Io)?;
+            let temp_name = format!(".{file_name}.new-{}", hex_suffix(&random));
+            let owned = match rustix::fs::openat(
+                &parent_file,
+                &temp_name,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(if private { 0o600 } else { 0o644 }),
+            ) {
+                Ok(owned) => owned,
+                Err(error) if error.raw_os_error() == libc::EEXIST => continue,
+                Err(_) => return Err(SecureFileError::Io),
+            };
+            let mut file = File::from(owned);
+            let write_result = (|| {
+                file.write_all(bytes).map_err(|_| SecureFileError::Io)?;
+                rustix::fs::fsync(&file).map_err(|_| SecureFileError::Io)
+            })();
+            drop(file);
+            if let Err(error) = write_result {
+                let _ =
+                    rustix::fs::unlinkat(&parent_file, &temp_name, rustix::fs::AtFlags::empty());
+                return Err(error);
             }
-            Err(error) if error.raw_os_error() == libc::EEXIST => {
-                let existing = read_bounded(&absolute, bytes.len(), private)?;
-                if existing == bytes {
-                    Ok(())
-                } else {
-                    Err(SecureFileError::Io)
+            match rustix::fs::linkat(
+                &parent_file,
+                &temp_name,
+                &parent_file,
+                &target_name,
+                rustix::fs::AtFlags::empty(),
+            ) {
+                Ok(()) => {
+                    let result = (|| {
+                        rustix::fs::unlinkat(
+                            &parent_file,
+                            &temp_name,
+                            rustix::fs::AtFlags::empty(),
+                        )
+                        .map_err(|_| SecureFileError::Io)?;
+                        // The destination is now the sole link and is
+                        // therefore safe for a concurrent exact reader. One
+                        // directory fsync commits both the publication and
+                        // temporary-name removal.
+                        rustix::fs::fsync(&parent_file).map_err(|_| SecureFileError::Io)
+                    })();
+                    if result.is_err() {
+                        let _ = rustix::fs::unlinkat(
+                            &parent_file,
+                            &temp_name,
+                            rustix::fs::AtFlags::empty(),
+                        );
+                    }
+                    return result;
+                }
+                Err(error) if error.raw_os_error() == libc::EEXIST => {
+                    let _ = rustix::fs::unlinkat(
+                        &parent_file,
+                        &temp_name,
+                        rustix::fs::AtFlags::empty(),
+                    );
+                    let existing = read_bounded(&absolute, bytes.len(), private)?;
+                    return if existing == bytes {
+                        Ok(())
+                    } else {
+                        Err(SecureFileError::Io)
+                    };
+                }
+                Err(_) => {
+                    let _ = rustix::fs::unlinkat(
+                        &parent_file,
+                        &temp_name,
+                        rustix::fs::AtFlags::empty(),
+                    );
+                    return Err(SecureFileError::Io);
                 }
             }
-            Err(_) => Err(SecureFileError::Io),
         }
+        Err(SecureFileError::Io)
     }
 }
 

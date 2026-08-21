@@ -302,6 +302,10 @@ impl BrowserReviewScreenshotCapture {
             self.budget.clone(),
         )
     }
+
+    pub(crate) fn shares_run_budget_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.budget, &other.budget)
+    }
 }
 
 /// Identifies one Suite module's bounded review screenshot sequence. It never
