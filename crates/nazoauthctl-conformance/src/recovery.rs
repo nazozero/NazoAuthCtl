@@ -1545,11 +1545,16 @@ fn validate_tenant_resource_journal(
     if journal.binding.proxy.is_none() && !journal.proxy_cleanup_complete {
         bail!("tenant-resource proxy cleanup marker is incomplete without a proxy binding");
     }
+    let suite_inventory_transferred = matches!(
+        &journal.suite_retention,
+        SuiteRetentionDisposition::Retained { .. }
+    );
     if let Some(suite) = &journal.suite {
         let origin = crate::Origin::parse_suite(&suite.origin)
             .map_err(|_| anyhow::anyhow!("Suite recovery origin is invalid"))?;
         if origin.as_str() != suite.origin
             || (!suite.cleanup_complete
+                && !suite_inventory_transferred
                 && suite.plan_ids.is_empty()
                 && suite.pending_create_intents.is_empty())
             || suite.plan_ids.len() > MAX_SUITE_RECOVERY_PLANS
