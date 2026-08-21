@@ -2,7 +2,7 @@
   "schema": 1,
   "artifact": {
     "artifact_id": "nazoauth-oidf-v5.2.2-ordinary-provider",
-    "revision": "608e85321d5297f3ecac9a11227a806e34c5c505"
+    "revision": "c4256d30f20c4c16b768215cc0937316d10925be"
   },
   "source_matrix": {
     "repository": "https://github.com/nazozero/NazoAuth.git",
@@ -75,12 +75,12 @@
       "size": 461
     },
     "matrix": {
-      "sha256": "9bd0c0b3d015f83a1168a4a2941b1b3280f53d845393935731dd991802608825",
-      "size": 481950
+      "sha256": "9765e5f58993c3ffbb6d21d2eac543aa35f8e0647c2b5ec88f8bc82157ae1ac7",
+      "size": 481994
     },
     "resource_bounds": {
       "max_plans": 44,
-      "max_modules": 1408,
+      "max_modules": 5632,
       "max_clients": 66,
       "max_wall_clock_seconds": 79200
     }

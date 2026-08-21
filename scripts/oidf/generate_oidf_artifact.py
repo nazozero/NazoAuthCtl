@@ -20,7 +20,7 @@ import urllib.parse
 
 
 ARTIFACT_ID = "nazoauth-oidf-v5.2.2-ordinary-provider"
-ARTIFACT_REVISION = "608e85321d5297f3ecac9a11227a806e34c5c505"
+ARTIFACT_REVISION = "c4256d30f20c4c16b768215cc0937316d10925be"
 SOURCE_REPOSITORY = "https://github.com/nazozero/NazoAuth.git"
 SOURCE_COMMIT = "77c362f9fc62e5114f3c61e2b4420f864d7112ab"
 SOURCE_PATH = "crates/authorization-server/resources/nazoauth-conformance-matrix-v1.json"
@@ -33,16 +33,19 @@ GENERATOR_PREDECESSOR_SHA256 = (
 )
 EXPECTED_DRIVER_SHA256 = "62b54d229e01bfb4a1b93c340a2e71839e492b83f53aff1b9792b38b71ea7a1a"
 EXPECTED_DRIVER_SIZE = 461
-EXPECTED_MATRIX_SHA256 = "9bd0c0b3d015f83a1168a4a2941b1b3280f53d845393935731dd991802608825"
-EXPECTED_MATRIX_SIZE = 481950
+EXPECTED_MATRIX_SHA256 = "9765e5f58993c3ffbb6d21d2eac543aa35f8e0647c2b5ec88f8bc82157ae1ac7"
+EXPECTED_MATRIX_SIZE = 481994
 EXPECTED_BOUNDS = {
     "max_plans": 44,
-    "max_modules": 1408,
+    "max_modules": 5632,
     "max_clients": 66,
     "max_wall_clock_seconds": 79200,
 }
 RUNNER_CAPABILITY = "nazoauth.client.create"
-PLAN_MODULE_BUDGET = 32
+# The Suite may add modules within a plan between release revisions. Keep the
+# signed per-plan allocation conservative while retaining the artifact-wide
+# verifier bound.
+PLAN_MODULE_UPPER_BOUND = 128
 PLAN_WALL_CLOCK_SECONDS = 1800
 VCI_UNSUPPORTED_ENCRYPTION_MODULE = (
     "oid4vci-1_0-issuer-fail-unsupported-encryption-algorithm"
@@ -441,7 +444,7 @@ def transform_matrix(source: dict[str, object]) -> tuple[dict[str, object], dict
             required_roles = plan.get("required_roles", [])
             plan["driver_handler"] = handler_id
             plan["resource_budget"] = {
-                "modules": PLAN_MODULE_BUDGET,
+                "modules": PLAN_MODULE_UPPER_BOUND,
                 "clients": len(required_roles),
                 "wall_clock_seconds": PLAN_WALL_CLOCK_SECONDS,
             }
@@ -469,7 +472,7 @@ def transform_matrix(source: dict[str, object]) -> tuple[dict[str, object], dict
     }
     bounds = {
         "max_plans": plan_count,
-        "max_modules": plan_count * PLAN_MODULE_BUDGET,
+        "max_modules": plan_count * PLAN_MODULE_UPPER_BOUND,
         "max_clients": client_count,
         "max_wall_clock_seconds": plan_count * PLAN_WALL_CLOCK_SECONDS,
     }
