@@ -4,7 +4,10 @@ use anyhow::{Context, bail};
 
 use super::super::types::{CandidateTarget, InstallOptions, LocalOciCandidateInstall};
 use super::common::validate_version;
-use crate::install::{normalize_public_url_for_profile, normalize_single_host_cidr};
+use crate::install::{
+    normalize_public_url_for_profile, normalize_single_host_cidr,
+    validate_standards_full_trusted_proxy_contract,
+};
 
 pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOptions> {
     let mut runtime = "auto".to_owned();
@@ -178,6 +181,11 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
         }
     }
     public_url = normalize_public_url_for_profile(&public_url, &profile)?;
+    validate_standards_full_trusted_proxy_contract(
+        &public_url,
+        &profile,
+        trusted_proxy_cidr.as_deref(),
+    )?;
     Ok(InstallOptions {
         runtime,
         public_url,

@@ -378,6 +378,7 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
     }
     assert!(rendered.contains("ENABLE_OPENID4VCI_ISSUER: true"));
     assert!(rendered.contains("ENABLE_OPENID4VP_VERIFIER: true"));
+    assert!(rendered.contains("TRANSPORT_MODE: \"trusted-proxy\""));
     assert!(rendered.contains("TRUSTED_PROXY_CIDRS: \"${TRUSTED_PROXY_CIDR}\""));
     assert!(rendered.contains("MTLS_CERTIFICATE_SOURCE: \"rfc9440\""));
     assert!(!rendered.contains("legacy-verified-headers"));
@@ -421,6 +422,35 @@ fn oidf_profile_missing_credential_signing_algorithms_fails_before_prepare_mutat
     assert!(!work.path().join("data").exists());
     assert!(!work.path().join("control").exists());
     assert!(!work.path().join("recovery").exists());
+}
+
+#[test]
+fn standards_full_trusted_proxy_preflight_requires_https_and_a_host_boundary() {
+    let work = PrivateTempDir::new("standards-full-trusted-proxy-preflight").unwrap();
+    let mut options = install_options(work.path().join("data"));
+    options.profile = "standards-full".to_owned();
+    options.public_url = "http://127.0.0.1:8000".to_owned();
+    options.trusted_proxy_cidr = Some("192.0.2.10/32".to_owned());
+    let config = work.path().join("config/nazoauthctl.json");
+
+    let error = match prepare(&config, options) {
+        Err(error) => error,
+        Ok(_) => panic!("loopback HTTP must not be accepted for standards-full proxy install"),
+    };
+    assert!(error.to_string().contains("requires an HTTPS --public-url"));
+    assert!(!config.exists());
+    assert!(!work.path().join("data").exists());
+    assert!(!work.path().join("control").exists());
+    assert!(!work.path().join("recovery").exists());
+
+    assert!(
+        validate_standards_full_trusted_proxy_contract(
+            "https://auth.example",
+            "standards-full",
+            None,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1312,6 +1342,7 @@ fn existing_standards_full_server_config_must_match_the_explicit_proxy_boundary(
     let valid = "PUBLIC_BASE_URL: \"https://auth.example\"\n\
                  ENABLE_AUTHORIZATION_DETAILS: true\n\
                  ENABLE_NATIVE_SSO: true\n\
+                 TRANSPORT_MODE: \"trusted-proxy\"\n\
                  MTLS_ENDPOINT_BASE_URL: \"https://auth.example\"\n\
                  MTLS_CERTIFICATE_SOURCE: \"rfc9440\"\n\
                  TRUSTED_PROXY_CIDRS: \"192.0.2.10/32\"\n\
@@ -1322,6 +1353,7 @@ fn existing_standards_full_server_config_must_match_the_explicit_proxy_boundary(
                             ENABLE_NATIVE_SSO: true\n\
                             ENABLE_OPENID4VCI_ISSUER: true\n\
                             ENABLE_OPENID4VP_VERIFIER: true\n\
+                            TRANSPORT_MODE: \"trusted-proxy\"\n\
                             MTLS_ENDPOINT_BASE_URL: \"https://auth.example\"\n\
                             TRUSTED_PROXY_CIDRS: \"192.0.2.10/32\"\n\
                             MTLS_CERTIFICATE_SOURCE: \"rfc9440\"\n\
@@ -1337,6 +1369,8 @@ fn existing_standards_full_server_config_must_match_the_explicit_proxy_boundary(
     for invalid in [
         valid.replace("rfc9440", "legacy-verified-headers"),
         valid.replace("192.0.2.10/32", "0.0.0.0/0"),
+        valid.replace("TRANSPORT_MODE: \"trusted-proxy\"\n", ""),
+        valid.replace("trusted-proxy", "direct-tls"),
         valid.replace("https://auth.example", "https://other.example"),
         valid.replace(
             "ENABLE_OPENID4VP_VERIFIER: true",

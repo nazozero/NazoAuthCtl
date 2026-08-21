@@ -1233,6 +1233,7 @@ pub(super) fn validate_existing_server_config(
             "ENABLE_NATIVE_SSO",
             "ENABLE_OPENID4VCI_ISSUER",
             "ENABLE_OPENID4VP_VERIFIER",
+            "TRANSPORT_MODE",
             "MTLS_ENDPOINT_BASE_URL",
             "TRUSTED_PROXY_CIDRS",
             "MTLS_CERTIFICATE_SOURCE",
@@ -1294,6 +1295,9 @@ pub(super) fn validate_existing_server_config(
                 bail!("standards-full existing server configuration must enable {key}");
             }
         }
+        if config_key_value(content, "TRANSPORT_MODE")?.as_deref() != Some("trusted-proxy") {
+            bail!("standards-full requires TRANSPORT_MODE=trusted-proxy");
+        }
     } else {
         if expected_profile_config.is_some() {
             bail!("baseline existing configuration validation received profile material");
@@ -1305,6 +1309,7 @@ pub(super) fn validate_existing_server_config(
             "MTLS_ENDPOINT_BASE_URL",
             "MTLS_CERTIFICATE_SOURCE",
             "TRUSTED_PROXY_CIDRS",
+            "TRANSPORT_MODE",
             "ENABLE_OPENID4VCI_ISSUER",
             "ENABLE_OPENID4VP_VERIFIER",
         ] {

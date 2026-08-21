@@ -311,6 +311,7 @@ fn write_profile_secrets_and_render(
         "ENABLE_NATIVE_SSO: true".to_owned(),
         "ENABLE_OPENID4VCI_ISSUER: true".to_owned(),
         "ENABLE_OPENID4VP_VERIFIER: true".to_owned(),
+        "TRANSPORT_MODE: \"trusted-proxy\"".to_owned(),
         format!(
             "MTLS_ENDPOINT_BASE_URL: {}",
             scalar(options.public_url.trim_end_matches('/'))

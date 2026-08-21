@@ -212,6 +212,11 @@ pub(crate) fn prepare(
     } else if options.trusted_proxy_cidr.is_some() {
         bail!("--trusted-proxy-cidr is accepted only with --profile standards-full");
     }
+    validate_standards_full_trusted_proxy_contract(
+        &options.public_url,
+        &options.profile,
+        options.trusted_proxy_cidr.as_deref(),
+    )?;
     if options.local_oci_candidate.is_some() && options.external_dependencies {
         bail!("a local OCI candidate install is managed-only and rejects external dependencies");
     }
@@ -342,6 +347,23 @@ pub(crate) fn prepare(
         config_path: config_path.to_owned(),
         local_oci_candidate: options.local_oci_candidate.clone(),
     })
+}
+
+pub(crate) fn validate_standards_full_trusted_proxy_contract(
+    public_url: &str,
+    profile: &str,
+    trusted_proxy_cidr: Option<&str>,
+) -> anyhow::Result<()> {
+    if profile != "standards-full" {
+        return Ok(());
+    }
+    if !public_url.starts_with("https://") {
+        bail!("standards-full trusted-proxy install requires an HTTPS --public-url");
+    }
+    let cidr = trusted_proxy_cidr
+        .context("standards-full trusted-proxy install requires --trusted-proxy-cidr")?;
+    normalize_single_host_cidr(cidr)?;
+    Ok(())
 }
 
 fn configure_runtime_permissions(config: &UpdateConfig) -> anyhow::Result<()> {

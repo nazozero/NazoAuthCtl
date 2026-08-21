@@ -29,6 +29,11 @@ The candidate path rejects `--to`, the host runtime, and
 the ordinary Ctl-managed PostgreSQL, Valkey, generated secret material, and
 managed backup flow. It therefore requires a fresh deployment root and does
 not adopt, share, or infer credentials for hand-created dependency containers.
+It is an HTTPS trusted-proxy contract: Ctl requires a paired single-host
+`--trusted-proxy-cidr` and writes `TRANSPORT_MODE: "trusted-proxy"` together
+with `TRUSTED_PROXY_CIDRS` and `MTLS_CERTIFICATE_SOURCE: "rfc9440"`.
+NazoAuth defaults `CLIENT_IP_HEADER_MODE` to `none`; Ctl does not select a
+forwarded-client-IP header policy implicitly.
 
 `--profile-material` is strict, non-secret JSON and is validated before Ctl
 creates any config, controller identity, or managed object. Its required
