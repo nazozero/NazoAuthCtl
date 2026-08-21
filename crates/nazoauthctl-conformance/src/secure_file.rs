@@ -224,6 +224,61 @@ pub(crate) fn write_atomic(
     }
 }
 
+/// Create a secure file exactly once. If a concurrent/crash-resume writer has
+/// already created the destination, the bytes must match exactly; this never
+/// falls back to a rename that could replace evidence owned by that writer.
+pub(crate) fn write_new_or_exact(
+    path: &Path,
+    bytes: &[u8],
+    private: bool,
+) -> Result<(), SecureFileError> {
+    let absolute = normalize_absolute(path)?;
+    let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
+    ensure_directory(parent, private)?;
+    #[cfg(not(unix))]
+    {
+        let _ = (bytes, private);
+        Err(SecureFileError::UnsupportedPlatform)
+    }
+    #[cfg(unix)]
+    {
+        let parent_file = open_directory_chain(parent, private, false)?;
+        let name = absolute
+            .file_name()
+            .ok_or(SecureFileError::UnsafePath)?
+            .to_owned();
+        let handle = rustix::fs::openat(
+            &parent_file,
+            &name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(if private { 0o600 } else { 0o644 }),
+        );
+        match handle {
+            Ok(owned) => {
+                let mut file = File::from(owned);
+                let result = (|| {
+                    file.write_all(bytes).map_err(|_| SecureFileError::Io)?;
+                    rustix::fs::fsync(&file).map_err(|_| SecureFileError::Io)?;
+                    rustix::fs::fsync(&parent_file).map_err(|_| SecureFileError::Io)
+                })();
+                if result.is_err() {
+                    let _ = rustix::fs::unlinkat(&parent_file, &name, rustix::fs::AtFlags::empty());
+                }
+                result
+            }
+            Err(error) if error.raw_os_error() == libc::EEXIST => {
+                let existing = read_bounded(&absolute, bytes.len(), private)?;
+                if existing == bytes {
+                    Ok(())
+                } else {
+                    Err(SecureFileError::Io)
+                }
+            }
+            Err(_) => Err(SecureFileError::Io),
+        }
+    }
+}
+
 /// Promote a previously fsynced private file in the same private directory.
 /// The caller must verify the content before calling this; this primitive
 /// refuses replacement of an existing destination and fsyncs the directory.
@@ -541,10 +596,38 @@ fn hex_suffix(bytes: &[u8; 16]) -> String {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::thread;
+
     #[test]
     fn current_effective_user_is_an_accepted_owner() {
         let current = rustix::process::geteuid().as_raw();
         assert!(super::owner_is_current_or_root(current));
         assert!(super::owner_is_current_or_root(0));
+    }
+
+    #[test]
+    fn write_new_or_exact_never_overwrites_conflicting_concurrent_evidence() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temporary directory")
+            .join(format!("nazoauthctl-secure-new-{}", uuid::Uuid::now_v7()));
+        super::ensure_directory(&root, true).expect("private evidence root");
+        let path = root.join("capture.png");
+        let first = {
+            let path = path.clone();
+            thread::spawn(move || super::write_new_or_exact(&path, b"first", true))
+        };
+        let second = {
+            let path = path.clone();
+            thread::spawn(move || super::write_new_or_exact(&path, b"second", true))
+        };
+        assert!(
+            first.join().expect("first writer").is_ok()
+                ^ second.join().expect("second writer").is_ok()
+        );
+        let bytes = std::fs::read(&path).expect("persisted evidence");
+        assert!(bytes == b"first" || bytes == b"second");
+        assert_eq!(super::write_new_or_exact(&path, &bytes, true), Ok(()));
+        std::fs::remove_dir_all(root).expect("cleanup temporary evidence");
     }
 }

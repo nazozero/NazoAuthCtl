@@ -53,6 +53,7 @@ pub struct ConformanceAutomation {
 #[derive(Default)]
 struct BrowserReviewEvidence {
     screenshots: Vec<ReviewScreenshotReport>,
+    required_expected: usize,
     required: usize,
     required_captured: usize,
     missing: usize,
@@ -360,7 +361,7 @@ impl ConformanceRunner {
             .map_err(|error| error.to_string())?;
         let entries =
             parse_browser_entries_owned(browser_config).map_err(|error| error.to_string())?;
-        let required_review_screenshots = required_review_screenshot_count(&entries);
+        let declared_required_review_screenshots = required_review_screenshot_count(&entries);
         let target_origin = self.config.target_origin.clone().ok_or_else(|| {
             "Suite runner is WAITING but the target browser origin is unavailable".to_owned()
         })?;
@@ -390,7 +391,7 @@ impl ConformanceRunner {
                 if is_terminal_state(&observed) {
                     verify_required_review_screenshots(
                         &review_evidence,
-                        required_review_screenshots,
+                        declared_required_review_screenshots,
                     )?;
                     return Ok((observed, review_evidence));
                 }
@@ -403,7 +404,7 @@ impl ConformanceRunner {
                     if is_terminal_state(&observed) {
                         verify_required_review_screenshots(
                             &review_evidence,
-                            required_review_screenshots,
+                            declared_required_review_screenshots,
                         )?;
                         return Ok((observed, review_evidence));
                     }
@@ -411,6 +412,12 @@ impl ConformanceRunner {
             }
             first_round = false;
             if !is_waiting(&observed) {
+                if is_terminal_state(&observed) {
+                    verify_required_review_screenshots(
+                        &review_evidence,
+                        declared_required_review_screenshots,
+                    )?;
+                }
                 return Ok((observed, review_evidence));
             }
 
@@ -465,6 +472,11 @@ impl ConformanceRunner {
                 let report = driver
                     .execute_with_review_capture(pending_url, &entries, capture.as_ref())
                     .map_err(|error| error.to_string())?;
+                let selected = entries
+                    .get(report.entry_index)
+                    .ok_or_else(|| "browser returned an invalid selected entry".to_owned())?;
+                let expected_required =
+                    required_review_screenshot_count(std::slice::from_ref(selected));
                 let next_attempts = review_evidence
                     .attempts
                     .checked_add(report.review_screenshot_attempts)
@@ -476,6 +488,10 @@ impl ConformanceRunner {
                 review_evidence.required = review_evidence
                     .required
                     .checked_add(report.review_screenshots_required)
+                    .ok_or_else(|| "browser review screenshot obligation overflow".to_owned())?;
+                review_evidence.required_expected = review_evidence
+                    .required_expected
+                    .checked_add(expected_required)
                     .ok_or_else(|| "browser review screenshot obligation overflow".to_owned())?;
                 review_evidence.required_captured = review_evidence
                     .required_captured
@@ -1260,8 +1276,13 @@ impl ConformanceRunner {
 
 fn verify_required_review_screenshots(
     evidence: &BrowserReviewEvidence,
-    expected: usize,
+    declared: usize,
 ) -> Result<(), String> {
+    let expected = if evidence.attempts == 0 {
+        declared
+    } else {
+        evidence.required_expected
+    };
     if evidence.required != expected || evidence.required_captured != expected {
         return Err("required browser review screenshots are incomplete".to_owned());
     }

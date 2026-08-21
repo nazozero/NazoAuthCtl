@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -200,7 +201,13 @@ pub trait BrowserAutomation: Send {
         capture: Option<&BrowserReviewCaptureContext>,
     ) -> Result<BrowserRunReport, BrowserError> {
         let mut report = self.execute(authorization_url, entries)?;
-        for marker in review_screenshot_markers(entries) {
+        let selected = entries
+            .get(report.entry_index)
+            .ok_or(BrowserError::InvalidSchema)?;
+        // A browser program may have mutually-exclusive entries. A test
+        // double cannot claim required capture for an entry it did not
+        // actually select.
+        for marker in review_screenshot_markers(std::slice::from_ref(selected)) {
             if report.review_screenshot_attempts >= MAX_REVIEW_SCREENSHOTS_PER_MODULE {
                 return Err(BrowserError::ReviewScreenshotLimit);
             }
@@ -260,13 +267,23 @@ fn is_zero(value: &usize) -> bool {
 #[derive(Clone)]
 pub struct BrowserReviewScreenshotCapture {
     evidence_directory: PathBuf,
+    budget: Arc<Mutex<ReviewCaptureBudget>>,
+}
+
+#[derive(Default)]
+struct ReviewCaptureBudget {
+    attempts: usize,
+    decoded_bytes: usize,
 }
 
 impl BrowserReviewScreenshotCapture {
     pub fn new(evidence_directory: PathBuf) -> Result<Self, BrowserError> {
         crate::evidence::validate_private_evidence_directory(&evidence_directory)
             .map_err(|_| BrowserError::UnsafeEvidencePath)?;
-        Ok(Self { evidence_directory })
+        Ok(Self {
+            evidence_directory,
+            budget: Arc::new(Mutex::new(ReviewCaptureBudget::default())),
+        })
     }
 
     pub fn context(
@@ -282,6 +299,7 @@ impl BrowserReviewScreenshotCapture {
             suite_plan_id,
             module_id,
             capture_index,
+            self.budget.clone(),
         )
     }
 }
@@ -295,6 +313,7 @@ pub struct BrowserReviewCaptureContext {
     suite_plan_id: String,
     module_id: String,
     capture_index: usize,
+    budget: Arc<Mutex<ReviewCaptureBudget>>,
 }
 
 impl BrowserReviewCaptureContext {
@@ -304,6 +323,7 @@ impl BrowserReviewCaptureContext {
         suite_plan_id: &str,
         module_id: &str,
         capture_index: usize,
+        budget: Arc<Mutex<ReviewCaptureBudget>>,
     ) -> Result<Self, BrowserError> {
         let plan = safe_capture_component(matrix_plan_id)?;
         let suite_plan = safe_capture_component(suite_plan_id)?;
@@ -314,6 +334,7 @@ impl BrowserReviewCaptureContext {
             suite_plan_id: suite_plan.to_owned(),
             module_id: module.to_owned(),
             capture_index,
+            budget,
         })
     }
 
@@ -328,7 +349,40 @@ impl BrowserReviewCaptureContext {
             suite_plan_id: self.suite_plan_id.clone(),
             module_id: self.module_id.clone(),
             capture_index,
+            budget: self.budget.clone(),
         })
+    }
+
+    fn reserve_attempt(&self) -> Result<(), BrowserError> {
+        let mut budget = self
+            .budget
+            .lock()
+            .map_err(|_| BrowserError::EvidenceWrite)?;
+        let next = budget
+            .attempts
+            .checked_add(1)
+            .ok_or(BrowserError::ReviewScreenshotLimit)?;
+        if next > MAX_REVIEW_SCREENSHOTS_PER_RUN {
+            return Err(BrowserError::ReviewScreenshotLimit);
+        }
+        budget.attempts = next;
+        Ok(())
+    }
+
+    fn reserve_bytes(&self, size: usize) -> Result<(), BrowserError> {
+        let mut budget = self
+            .budget
+            .lock()
+            .map_err(|_| BrowserError::EvidenceWrite)?;
+        let next = budget
+            .decoded_bytes
+            .checked_add(size)
+            .ok_or(BrowserError::ReviewScreenshotLimit)?;
+        if next > 32 * 1024 * 1024 {
+            return Err(BrowserError::ReviewScreenshotLimit);
+        }
+        budget.decoded_bytes = next;
+        Ok(())
     }
 
     fn relative_path(&self) -> Result<PathBuf, BrowserError> {
@@ -348,6 +402,7 @@ impl BrowserReviewCaptureContext {
         trigger_url: &Url,
     ) -> Result<BrowserReviewScreenshotReceipt, BrowserError> {
         validate_png_screenshot(bytes)?;
+        self.reserve_bytes(bytes.len())?;
         let relative_path = self.relative_path()?;
         let path = self.evidence_directory.join(&relative_path);
         write_private_new_or_exact(&path, bytes)?;
@@ -370,17 +425,8 @@ impl BrowserReviewCaptureContext {
 }
 
 fn write_private_new_or_exact(path: &std::path::Path, bytes: &[u8]) -> Result<(), BrowserError> {
-    match crate::secure_file::read_bounded(path, bytes.len(), true) {
-        Ok(existing) if existing == bytes => Ok(()),
-        Ok(_) | Err(crate::secure_file::SecureFileError::Oversize) => {
-            Err(BrowserError::EvidenceWrite)
-        }
-        Err(crate::secure_file::SecureFileError::NotFound) => {
-            crate::secure_file::write_atomic(path, bytes, true)
-                .map_err(|_| BrowserError::EvidenceWrite)
-        }
-        Err(_) => Err(BrowserError::EvidenceWrite),
-    }
+    crate::secure_file::write_new_or_exact(path, bytes, true)
+        .map_err(|_| BrowserError::EvidenceWrite)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -435,6 +481,7 @@ const MAX_REVIEW_SCREENSHOT_BYTES: usize = 500 * 1024;
 pub(crate) const MAX_REVIEW_SCREENSHOTS_PER_MODULE: usize = 2;
 pub(crate) const MAX_REVIEW_SCREENSHOTS_PER_RUN: usize = 64;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+const OFFICIAL_SUITE_ORIGIN: &str = "https://www.certification.openid.net";
 
 pub(crate) fn decode_webdriver_png(value: &str) -> Result<Zeroizing<Vec<u8>>, BrowserError> {
     const MAX_BASE64_BYTES: usize = MAX_REVIEW_SCREENSHOT_BYTES.div_ceil(3) * 4;
@@ -668,17 +715,23 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             return Err(BrowserError::StepLimit);
         }
         let mut executed = 0usize;
-        for command in commands {
+        'commands: for command in commands {
             let marker = match command {
                 BrowserCommand::WaitForElement {
                     review_screenshot, ..
                 } => *review_screenshot,
                 _ => None,
             };
+            if marker.is_some()
+                && let Some(capture) = capture
+            {
+                capture.reserve_attempt()?;
+            }
             if let Err(error) = self.execute_command(command) {
                 // An optional marker is a signed best-effort capture point,
                 // not permission to capture the previous page.  Skip this
-                // action only, then continue the remaining signed commands.
+                // action only. Do not execute later commands for this task on
+                // the previous page; the outer task loop may continue.
                 if marker == Some(ReviewScreenshotMarker::Optional)
                     && matches!(
                         error,
@@ -691,7 +744,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                         report.review_screenshot_attempts.saturating_add(1);
                     report.review_screenshots_missing =
                         report.review_screenshots_missing.saturating_add(1);
-                    continue;
+                    break 'commands;
                 }
                 return Err(error);
             }
@@ -739,7 +792,8 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         marker: ReviewScreenshotMarker,
         report: &mut BrowserRunReport,
     ) -> Result<(), BrowserError> {
-        if !self.policy.suite_origin.same_origin_url(trigger_url)
+        if self.policy.suite_origin.as_str() != OFFICIAL_SUITE_ORIGIN
+            || !self.policy.suite_origin.same_origin_url(trigger_url)
             || !review_screenshot_path_binds_module(trigger_url, &capture.module_id)
         {
             return Err(BrowserError::CrossOriginNavigation);
@@ -961,6 +1015,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         };
         let entry = &entries[entry_index];
         for task in &entry.tasks {
+            let mut task_matched = true;
             if let Some(pattern) = task.match_pattern.as_deref() {
                 validate_match_pattern(pattern, MAX_MATCH_BYTES)?;
                 let deadline = self.deadline(DEFAULT_STEP_TIMEOUT);
@@ -971,11 +1026,19 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                     }
                     if let Err(BrowserError::Timeout) = self.sleep_until(deadline) {
                         if task.optional {
+                            task_matched = false;
                             break 'wait_for_task;
                         }
                         return Err(BrowserError::Timeout);
                     }
                 }
+            }
+            // A signed optional task whose selector never became true has
+            // not authorized any of its commands (including screenshot
+            // capture). Continue with the next task rather than executing on
+            // the previous page.
+            if !task_matched {
+                continue;
             }
             self.run_commands_with_review_capture(&task.commands, capture, &mut report)?;
             report.tasks = report.tasks.saturating_add(1);
@@ -992,12 +1055,26 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
 /// misleading local receipt even though the browser policy permits those
 /// pages for normal protocol automation.
 pub(crate) fn review_screenshot_path_binds_module(url: &Url, module_id: &str) -> bool {
+    if url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return false;
+    }
     let Some(mut segments) = url.path_segments() else {
         return false;
     };
     matches!(
-        (segments.next(), segments.next(), segments.next(), segments.next()),
-        (Some("test"), Some("a"), Some(module), Some(_)) if module == module_id
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (Some("test"), Some("a"), Some(module), Some("verification-evidence"), None)
+            if module == module_id
     )
 }
 
@@ -1427,11 +1504,13 @@ mod tests {
     #[test]
     fn signed_required_review_marker_writes_only_bounded_module_evidence() {
         let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
-        let suite = Origin::parse("https://suite.example").expect("suite");
+        let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
         let policy = BrowserPolicy::new(target, suite).expect("policy");
         let driver = MockDriver {
-            current: Url::parse("https://suite.example/test/a/module-a/verification-evidence")
-                .expect("url"),
+            current: Url::parse(
+                "https://www.certification.openid.net/test/a/module-a/verification-evidence",
+            )
+            .expect("url"),
             source: "review evidence".to_owned(),
             found: true,
             displayed: true,
@@ -1447,17 +1526,13 @@ mod tests {
             .expect("temp")
             .join(format!("nazoauth-review-capture-{}", uuid::Uuid::now_v7()));
         crate::secure_file::ensure_directory(&root, true).expect("private root");
-        let capture = BrowserReviewCaptureContext::new(
-            root.clone(),
-            "matrix-plan-a",
-            "suite-plan-a",
-            "module-a",
-            0,
-        )
-        .expect("context");
+        let capture = BrowserReviewScreenshotCapture::new(root.clone())
+            .expect("capture")
+            .context("matrix-plan-a", "suite-plan-a", "module-a", 0)
+            .expect("context");
         let mut executor = BrowserExecutor::new(driver, policy);
         let entries = vec![BrowserEntry::parse(&json!({
-            "match": "https://suite.example/test/a/module-a/verification-evidence*",
+            "match": "https://www.certification.openid.net/test/a/module-a/verification-evidence",
             "tasks": [{
                 "commands": [["wait", "xpath", "//*", 1, "review evidence", "update-image-placeholder"]]
             }]
@@ -1465,8 +1540,10 @@ mod tests {
         .expect("entry")];
         let report = executor
             .execute_with_review_capture(
-                &Url::parse("https://suite.example/test/a/module-a/verification-evidence")
-                    .expect("url"),
+                &Url::parse(
+                    "https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                )
+                .expect("url"),
                 &entries,
                 Some(&capture),
             )
@@ -1488,6 +1565,74 @@ mod tests {
                 .with_extension("png.receipt.json")
                 .is_file()
         );
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn mutually_exclusive_unselected_required_marker_does_not_create_an_obligation() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let policy =
+            BrowserPolicy::new(target, Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite"))
+                .expect("policy");
+        let driver = MockDriver {
+            current: Url::parse("https://issuer.example/selected").expect("URL"),
+            source: String::new(),
+            found: true,
+            displayed: true,
+            clicked: false,
+            cookies_cleared: false,
+            cookie_clear_count: 0,
+            navigated: Vec::new(),
+            redirect_to: None,
+            session_checks: 0,
+        };
+        let entries = vec![
+            BrowserEntry::parse(&json!({
+                "match": "https://issuer.example/alternate",
+                "tasks": [{"commands": [["wait", "xpath", "//*", 1, ".*", "update-image-placeholder"]]}]
+            }))
+            .expect("alternate entry"),
+            BrowserEntry::parse(&json!({
+                "match": "https://issuer.example/selected",
+                "tasks": []
+            }))
+            .expect("selected entry"),
+        ];
+        let report = BrowserExecutor::new(driver, policy)
+            .execute(
+                &Url::parse("https://issuer.example/selected").expect("URL"),
+                &entries,
+            )
+            .expect("unselected required marker is not an obligation");
+        assert_eq!(report.entry_index, 1);
+        assert_eq!(report.review_screenshots_required, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_capture_budget_is_shared_and_rejects_the_sixty_fifth_attempt_before_write() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp")
+            .join(format!("nazoauth-review-budget-{}", uuid::Uuid::now_v7()));
+        crate::secure_file::ensure_directory(&root, true).expect("private root");
+        let capture = BrowserReviewScreenshotCapture::new(root.clone()).expect("capture");
+        for index in 0..MAX_REVIEW_SCREENSHOTS_PER_RUN {
+            capture
+                .context("matrix", "suite", "module", index)
+                .expect("context")
+                .reserve_attempt()
+                .expect("bounded attempt");
+        }
+        assert_eq!(
+            capture
+                .context("matrix", "suite", "module", 64)
+                .expect("context")
+                .reserve_attempt()
+                .expect_err("sixty fifth attempt"),
+            BrowserError::ReviewScreenshotLimit
+        );
+        assert!(!root.join("review-screenshots").exists());
         std::fs::remove_dir_all(root).expect("remove root");
     }
 
@@ -1517,14 +1662,32 @@ mod tests {
 
     #[test]
     fn review_capture_path_is_bound_to_the_current_suite_module() {
-        let url =
-            Url::parse("https://suite.example/test/a/module-a/verification-evidence").expect("URL");
+        let url = Url::parse(
+            "https://www.certification.openid.net/test/a/module-a/verification-evidence",
+        )
+        .expect("URL");
         assert!(review_screenshot_path_binds_module(&url, "module-a"));
         assert!(!review_screenshot_path_binds_module(&url, "module-b"));
         assert!(!review_screenshot_path_binds_module(
-            &Url::parse("https://suite.example/test/a/module-a").expect("URL"),
+            &Url::parse("https://www.certification.openid.net/test/a/module-a").expect("URL"),
             "module-a"
         ));
+        for invalid in [
+            "https://www.certification.openid.net/test/a/module-a/verification-evidence/extra",
+            "https://www.certification.openid.net/test/a/module-a/verification-evidence/",
+            "https://www.certification.openid.net/test/a/module-a/verification-evidence?x=1",
+            "https://www.certification.openid.net/test/a/module-a/verification-evidence#x",
+            "https://user@www.certification.openid.net/test/a/module-a/verification-evidence",
+            "https://www.certification.openid.net/test/a/module-b/verification-evidence",
+        ] {
+            assert!(
+                !review_screenshot_path_binds_module(
+                    &Url::parse(invalid).expect("URL"),
+                    "module-a"
+                ),
+                "unexpected authorized evidence URL: {invalid}"
+            );
+        }
     }
 
     #[test]

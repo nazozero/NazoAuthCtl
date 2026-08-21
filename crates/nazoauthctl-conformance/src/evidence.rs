@@ -168,6 +168,9 @@ struct EvidenceScreenshotManifest {
     sha256: String,
     size: usize,
     receipt_sha256: String,
+    trigger_origin: String,
+    trigger_path: String,
+    trigger_url_sha256: String,
 }
 
 #[cfg(unix)]
@@ -218,6 +221,7 @@ pub fn write_private_evidence_bundle(
     identity: &EvidenceBundleIdentity,
 ) -> Result<EvidenceBundleReceipt, EvidenceError> {
     validate_identity(report, identity)?;
+    validate_review_screenshot_run_limit(report)?;
     #[cfg(not(unix))]
     {
         let _ = root;
@@ -323,9 +327,9 @@ pub fn write_private_evidence_bundle(
                     return Err(EvidenceError::Identity);
                 }
                 let destination = directory.join(&screenshot.path);
-                crate::secure_file::write_atomic(&destination, &screenshot_bytes, true)
+                crate::secure_file::write_new_or_exact(&destination, &screenshot_bytes, true)
                     .map_err(map_secure_file_error)?;
-                crate::secure_file::write_atomic(
+                crate::secure_file::write_new_or_exact(
                     &destination.with_extension("png.receipt.json"),
                     &receipt,
                     true,
@@ -339,6 +343,9 @@ pub fn write_private_evidence_bundle(
                     sha256: screenshot.sha256.clone(),
                     size: screenshot.size,
                     receipt_sha256: sha256(&receipt),
+                    trigger_origin: audit.trigger_origin,
+                    trigger_path: audit.trigger_path,
+                    trigger_url_sha256: audit.trigger_url_sha256,
                 });
                 total_screenshot_bytes = total_screenshot_bytes.saturating_add(screenshot.size);
             }
@@ -420,6 +427,10 @@ pub fn write_review_screenshot_manifest(
     }
     #[cfg(unix)]
     {
+        if report.suite_origin != "https://www.certification.openid.net" {
+            return Err(EvidenceError::Identity);
+        }
+        validate_review_screenshot_run_limit(report)?;
         if crate::artifact::validate_identifier(run_jti, 128).is_err() {
             return Err(EvidenceError::Identity);
         }
@@ -497,6 +508,9 @@ pub fn write_review_screenshot_manifest(
                     sha256: screenshot.sha256.clone(),
                     size: screenshot.size,
                     receipt_sha256: sha256(&receipt),
+                    trigger_origin: audit.trigger_origin,
+                    trigger_path: audit.trigger_path,
+                    trigger_url_sha256: audit.trigger_url_sha256,
                 });
                 total_screenshot_bytes = total_screenshot_bytes.saturating_add(image.len());
             }
@@ -538,14 +552,7 @@ struct ReviewScreenshotModuleManifest {
 
 #[cfg(unix)]
 fn write_private_new_or_exact(path: &Path, bytes: &[u8]) -> Result<(), EvidenceError> {
-    match crate::secure_file::read_bounded(path, bytes.len(), true) {
-        Ok(existing) if existing == bytes => Ok(()),
-        Ok(_) | Err(crate::secure_file::SecureFileError::Oversize) => Err(EvidenceError::Conflict),
-        Err(crate::secure_file::SecureFileError::NotFound) => {
-            crate::secure_file::write_atomic(path, bytes, true).map_err(map_secure_file_error)
-        }
-        Err(error) => Err(map_secure_file_error(error)),
-    }
+    crate::secure_file::write_new_or_exact(path, bytes, true).map_err(map_secure_file_error)
 }
 
 #[cfg(unix)]
@@ -560,6 +567,19 @@ fn validate_review_screenshot_obligations(
             .saturating_add(module.review_screenshots_missing)
             > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_MODULE
     {
+        return Err(EvidenceError::Identity);
+    }
+    Ok(())
+}
+
+fn validate_review_screenshot_run_limit(report: &ConformanceReport) -> Result<(), EvidenceError> {
+    let attempts = report.modules.iter().try_fold(0usize, |total, module| {
+        total
+            .checked_add(module.review_screenshots.len())
+            .and_then(|total| total.checked_add(module.review_screenshots_missing))
+            .ok_or(EvidenceError::Identity)
+    })?;
+    if attempts > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_RUN {
         return Err(EvidenceError::Identity);
     }
     Ok(())
@@ -1049,6 +1069,16 @@ mod tests {
             serde_json::json!(true)
         );
         assert_eq!(value["acceptance_pass"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn screenshot_manifest_writer_rejects_more_than_sixty_four_optional_misses() {
+        let mut report = report();
+        report.modules[0].review_screenshots_missing = 65;
+        assert_eq!(
+            validate_review_screenshot_run_limit(&report),
+            Err(EvidenceError::Identity)
+        );
     }
 
     struct ReceiptSpec<'a> {

@@ -101,6 +101,11 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         )?;
     }
     if invocation.capture_review_screenshots {
+        if suite_origin != Origin::official() {
+            bail!(
+                "--capture-review-screenshots is restricted to the canonical official Suite origin"
+            );
+        }
         let evidence_directory = invocation
             .evidence_directory
             .as_ref()
@@ -548,62 +553,16 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             None
         }
     };
-    let retention_committed = if retention_eligible
-        && proxy_cleanup_complete
-        && cleanup_evidence.is_some()
-    {
-        match (|| -> anyhow::Result<()> {
-            recovery.stage_suite_retention_manifest()?;
-            recovery.commit_suite_plan_retention()?;
-            let manifest_path = recovery.publish_committed_suite_retention_manifest()?;
-            eprintln!(
-                "Suite plans retained for certification review: review/publish them in the official Suite UI, then use a controlled deletion procedure; manifest={}",
-                manifest_path.display()
-            );
-            Ok(())
-        })() {
-            Ok(()) => true,
-            Err(error) => {
-                errors.push(format!("suite-retention={error:#}"));
-                cleanup_unretained_suite(&mut recovery, &suite_client)?;
-                false
-            }
-        }
-    } else {
-        cleanup_unretained_suite(&mut recovery, &suite_client)?;
-        false
-    };
-    if let Some(report) = report.as_mut() {
-        report.orchestration_integrity.retention_eligible = retention_eligible;
-        report.orchestration_integrity.suite_resources_settled = recovery.suite_cleanup_complete();
-        report.orchestration_integrity.cleanup_complete = !recovery.suite_retention_committed()
-            && !retention_committed
-            && report.orchestration_integrity.suite_resources_settled;
-        if errors
-            .iter()
-            .any(|error| error.starts_with("suite-retention"))
-        {
-            report.errors.extend(
-                errors
-                    .iter()
-                    .filter(|error| error.starts_with("suite-retention"))
-                    .cloned(),
-            );
-        }
-        report.local_success = report.errors.is_empty()
-            && report.orchestration_integrity.all_modules_instantiated
-            && report.orchestration_integrity.all_modules_terminal
-            && report.orchestration_integrity.suite_resources_settled;
-    }
-    if cleanup_evidence.is_some() && proxy_cleanup_complete && recovery.suite_cleanup_complete() {
-        recovery.finish()?;
-    }
+    // Provider evidence is part of the retention commit boundary: a retained
+    // Suite allocation must never outlive the local evidence that authorizes
+    // and identifies the run.  Write it while the journal is still Prepared,
+    // so any failure retains plan ownership locally and falls back to exact
+    // Suite cleanup below.
     let cleanup_complete = cleanup_evidence.is_some()
         && proxy_cleanup_complete
         && !errors
             .iter()
             .any(|error| error.starts_with("resource-cleanup="));
-    deployment_report.cleanup_complete = cleanup_complete;
     let mut evidence = None;
     if let (Some(report), Some(directory), Some(cleanup_evidence)) = (
         report.as_ref(),
@@ -643,9 +602,72 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         };
         match write_private_provider_evidence_bundle(report, directory, &identity) {
             Ok(receipt) => evidence = Some(receipt),
-            Err(error) => errors.push(format!("evidence={error}")),
+            Err(error) => {
+                retention_eligible = false;
+                errors.push(format!("evidence={error}"));
+            }
         }
     }
+    let retention_committed = if retention_eligible
+        && proxy_cleanup_complete
+        && cleanup_evidence.is_some()
+        && evidence.is_some()
+    {
+        match (|| -> anyhow::Result<()> {
+            recovery.stage_suite_retention_manifest()?;
+            recovery.commit_suite_plan_retention()?;
+            let manifest_path = recovery.publish_committed_suite_retention_manifest()?;
+            eprintln!(
+                "Suite plans retained for certification review: review/publish them in the official Suite UI, then use a controlled deletion procedure; manifest={}",
+                manifest_path.display()
+            );
+            Ok(())
+        })() {
+            Ok(()) => true,
+            Err(error) => {
+                errors.push(format!("suite-retention={error:#}"));
+                // `commit_suite_plan_retention` transfers plan ownership and
+                // compacts the journal before final publication. A later
+                // publish failure is recoverable Retained state, not ordinary
+                // cleanup: deleting here would lose exact ownership and make
+                // a retry unsafe. Only Prepared failures retain plan IDs and
+                // may fall back to exact deletion.
+                if !recovery.suite_retention_committed() {
+                    cleanup_unretained_suite(&mut recovery, &suite_client)?;
+                }
+                false
+            }
+        }
+    } else {
+        cleanup_unretained_suite(&mut recovery, &suite_client)?;
+        false
+    };
+    if let Some(report) = report.as_mut() {
+        report.orchestration_integrity.retention_eligible = retention_eligible;
+        report.orchestration_integrity.suite_resources_settled = recovery.suite_cleanup_complete();
+        report.orchestration_integrity.cleanup_complete = !recovery.suite_retention_committed()
+            && !retention_committed
+            && report.orchestration_integrity.suite_resources_settled;
+        if errors
+            .iter()
+            .any(|error| error.starts_with("suite-retention"))
+        {
+            report.errors.extend(
+                errors
+                    .iter()
+                    .filter(|error| error.starts_with("suite-retention"))
+                    .cloned(),
+            );
+        }
+        report.local_success = report.errors.is_empty()
+            && report.orchestration_integrity.all_modules_instantiated
+            && report.orchestration_integrity.all_modules_terminal
+            && report.orchestration_integrity.suite_resources_settled;
+    }
+    if cleanup_evidence.is_some() && proxy_cleanup_complete && recovery.suite_cleanup_complete() {
+        recovery.finish()?;
+    }
+    deployment_report.cleanup_complete = cleanup_complete;
     let success = errors.is_empty()
         && report.as_ref().is_some_and(|report| {
             conformance_acceptance_succeeds(
