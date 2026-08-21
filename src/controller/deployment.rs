@@ -632,6 +632,7 @@ fn install_local_oci_candidate_transaction(
     candidate: &LocalOciCandidateInstall,
     persisted: Option<LocalOciCandidateInstallState>,
 ) -> anyhow::Result<()> {
+    require_managed_local_oci_candidate_dependencies(config)?;
     if config.runtime.backend == RuntimeBackendKind::Systemd {
         bail!("local OCI candidate installation requires a container runtime");
     }
@@ -751,18 +752,21 @@ fn install_local_oci_candidate_transaction(
     if active_local_artifact_id != local_artifact_id {
         bail!("active local OCI candidate image ID differs from the inspected local image ID");
     }
-    verify_local_oci_candidate_public_preconditions(config, candidate)?;
-
     let backup = state
         .recovery_backup
         .as_deref()
         .context("local OCI candidate installation lost its recovery backup path")?;
-    register_local_oci_candidate_deployment(
-        config_path,
-        config,
-        candidate,
-        local_artifact_id,
-        backup,
+    after_local_oci_candidate_public_proof(
+        || verify_local_oci_candidate_public_preconditions(config, candidate),
+        || {
+            register_local_oci_candidate_deployment(
+                config_path,
+                config,
+                candidate,
+                local_artifact_id,
+                backup,
+            )
+        },
     )?;
     let store = DeploymentStore::system();
     // `register_local_oci_candidate_deployment` uses `persist_exact_locked`;
@@ -892,6 +896,17 @@ fn verify_local_oci_candidate_completion_preconditions(
     verify_local_oci_candidate_public_preconditions(config, candidate)
 }
 
+pub(super) fn require_managed_local_oci_candidate_dependencies(
+    config: &UpdateConfig,
+) -> anyhow::Result<()> {
+    if config.dependencies.mode != "managed" {
+        bail!(
+            "local OCI candidate installation requires managed PostgreSQL and Valkey dependencies"
+        );
+    }
+    Ok(())
+}
+
 /// The ordinary discovery check establishes the public issuer. The candidate
 /// path additionally requires a fresh control statement signed by the
 /// descriptor-mounted instance key for this exact public candidate. Run this
@@ -903,6 +918,17 @@ fn verify_local_oci_candidate_public_preconditions(
     wait_ready(config)?;
     verify_public(config)?;
     crate::discovery::verify_public_local_oci_candidate_control(config, &candidate.target)
+}
+
+/// The registration write is deliberately sequenced behind the public proof.
+/// Keeping this tiny gate explicit makes the no-registration-on-proof-failure
+/// invariant testable without adding a parallel candidate transaction layer.
+pub(super) fn after_local_oci_candidate_public_proof<T>(
+    public_proof: impl FnOnce() -> anyhow::Result<()>,
+    registration: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    public_proof()?;
+    registration()
 }
 
 fn validate_completed_local_oci_candidate_install(

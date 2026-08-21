@@ -98,27 +98,21 @@ fn transition(
     let store = DeploymentStore::system();
     let selected = store.resolve(selector, true)?;
     crate::controller::reject_pending_local_oci_candidate_record(&selected)?;
-    if operation != "capability-relinquish" {
-        crate::controller::reject_completed_local_oci_candidate_transition(&selected)?;
-    }
+    crate::controller::reject_completed_local_oci_candidate_transition(&selected)?;
     let _registry_lock = store.registry_lock()?;
     let resolved = store.resolve(selector, true)?;
     if resolved.deployment_id != selected.deployment_id {
         bail!("deployment selection changed while capability transition was being prepared");
     }
     crate::controller::reject_pending_local_oci_candidate_record(&resolved)?;
-    if operation != "capability-relinquish" {
-        crate::controller::reject_completed_local_oci_candidate_transition(&resolved)?;
-    }
+    crate::controller::reject_completed_local_oci_candidate_transition(&resolved)?;
     // Resolve only chooses the deployment ID.  The declaration must be
     // reloaded after the registry/deployment lock is held so a caller cannot
     // replay capability changes from a stale snapshot.
     let _deployment_lock = store.deployment_lock(&resolved.deployment_id)?;
     let record = store.load(&resolved.deployment_id)?;
     crate::controller::reject_pending_local_oci_candidate_record(&record)?;
-    if operation != "capability-relinquish" {
-        crate::controller::reject_completed_local_oci_candidate_transition(&record)?;
-    }
+    crate::controller::reject_completed_local_oci_candidate_transition(&record)?;
     let mut shared_resources = changes
         .iter()
         .filter(|(capability, grant)| {

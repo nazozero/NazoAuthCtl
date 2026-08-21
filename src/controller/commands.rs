@@ -2,6 +2,13 @@ use super::*;
 
 const MAX_EXTERNAL_PUBLIC_JWK_BYTES: u64 = 1024 * 1024;
 
+pub(super) fn reject_registered_local_oci_candidate_mutation(
+    record: &DeploymentRecord,
+) -> anyhow::Result<()> {
+    super::reject_pending_local_oci_candidate_record(record)?;
+    super::reject_completed_local_oci_candidate_transition(record)
+}
+
 /// Read an external public JWK through one secure descriptor, hash those exact
 /// bytes, and stage them under the declaration-bound operator state directory.
 /// The runtime task receives only the staged path, so a caller cannot replace
@@ -406,7 +413,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             require_confirmation(options.yes, "change deployment capability grants")?;
             let store = DeploymentStore::system();
             let record = store.resolve(selector.as_deref(), true)?;
-            super::reject_pending_local_oci_candidate_record(&record)?;
+            reject_registered_local_oci_candidate_mutation(&record)?;
             crate::governance::set_permissions(cli.deployment.as_deref(), &options.changes)
         }
         Command::Relinquish(options) => {
@@ -417,7 +424,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             )?;
             let store = DeploymentStore::system();
             let record = store.resolve(selector.as_deref(), true)?;
-            super::reject_pending_local_oci_candidate_record(&record)?;
+            reject_registered_local_oci_candidate_mutation(&record)?;
             crate::governance::relinquish(cli.deployment.as_deref(), &options.capabilities)
         }
         Command::Reconcile => crate::governance::reconcile(cli.deployment.as_deref()),
@@ -505,8 +512,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), !options.plan)?;
-                super::reject_pending_local_oci_candidate_record(&record)?;
-                super::reject_completed_local_oci_candidate_transition(&record)?;
+                reject_registered_local_oci_candidate_mutation(&record)?;
                 if options.plan {
                     registered_update_plan(&record, &options)
                 } else {
@@ -653,8 +659,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
-                super::reject_pending_local_oci_candidate_record(&record)?;
-                super::reject_completed_local_oci_candidate_transition(&record)?;
+                reject_registered_local_oci_candidate_mutation(&record)?;
                 require_registered_recovery_authority(
                     "rollback",
                     crate::coordination::active_update_exists(&store, &record),
@@ -693,8 +698,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
-                super::reject_pending_local_oci_candidate_record(&record)?;
-                super::reject_completed_local_oci_candidate_transition(&record)?;
+                reject_registered_local_oci_candidate_mutation(&record)?;
                 require_registered_recovery_authority(
                     "recovery",
                     crate::coordination::active_update_exists(&store, &record),
@@ -735,8 +739,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
-                super::reject_pending_local_oci_candidate_record(&record)?;
-                super::reject_completed_local_oci_candidate_transition(&record)?;
+                reject_registered_local_oci_candidate_mutation(&record)?;
                 require_confirmation(
                     yes,
                     "resume the deployment-bound interrupted update transaction",

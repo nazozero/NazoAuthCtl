@@ -626,11 +626,7 @@ pub(crate) fn verify_public_local_oci_candidate_control(
         ])
         .stdout()
         .context("local OCI candidate public control request failed")?;
-    if response.len() > 64 * 1024 {
-        bail!("local OCI candidate public control response exceeds 64 KiB");
-    }
-    let response: DiscoveryResponse = serde_json::from_str(&response)
-        .context("local OCI candidate public control response is invalid")?;
+    let response = parse_bounded_local_oci_candidate_public_control_response(&response)?;
     let response_key = decode_instance_public_key(&response.instance_public_key)
         .context("local OCI candidate public control response has an invalid instance key")?;
     if response_key.to_bytes() != identity.public_key.to_bytes() {
@@ -638,6 +634,11 @@ pub(crate) fn verify_public_local_oci_candidate_control(
     }
     let header = protected_header(&response.statement)
         .context("local OCI candidate public control statement has an invalid protected header")?;
+    if header.kid != identity.statement.instance_key_id {
+        bail!(
+            "local OCI candidate public control statement key ID differs from descriptor-bound identity"
+        );
+    }
     let statement = verify_discovery_statement(
         &response.statement,
         &identity.statement.instance_key_id,
@@ -652,6 +653,15 @@ pub(crate) fn verify_public_local_oci_candidate_control(
         &identity.statement,
         &statement,
     )
+}
+
+pub(crate) fn parse_bounded_local_oci_candidate_public_control_response(
+    response: &str,
+) -> anyhow::Result<DiscoveryResponse> {
+    if response.len() > 64 * 1024 {
+        bail!("local OCI candidate public control response exceeds 64 KiB");
+    }
+    serde_json::from_str(response).context("local OCI candidate public control response is invalid")
 }
 
 /// Keep the semantic comparison separate from transport/signature handling so

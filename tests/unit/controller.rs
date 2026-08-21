@@ -3273,6 +3273,174 @@ fn local_oci_candidate_public_statement_must_match_the_descriptor_and_candidate(
 }
 
 #[test]
+fn local_oci_candidate_public_control_rejects_response_over_64_kib() {
+    let response = "x".repeat(64 * 1024 + 1);
+    assert!(
+        crate::discovery::parse_bounded_local_oci_candidate_public_control_response(&response)
+            .is_err()
+    );
+}
+
+#[test]
+fn fresh_local_oci_candidate_public_proof_failure_keeps_state_pending_without_registration() {
+    let work = PrivateTempDir::new("nazoauth-local-candidate-public-proof-gate").unwrap();
+    let config = config(&work);
+    fs::create_dir_all(&config.deployment_root).unwrap();
+    let revision = "a".repeat(40);
+    let state = LocalOciCandidateInstallState {
+        schema: 1,
+        candidate: LocalOciCandidateInstall {
+            image: "candidate:local".to_owned(),
+            target: CandidateTarget {
+                release: "v0.1.41-candidate.459".to_owned(),
+                revision: revision.clone(),
+                build_id: format!("source:{revision}"),
+                oci_digest: format!("sha256:{}", "b".repeat(64)),
+            },
+        },
+        local_artifact_id: format!("sha256:{}", "c".repeat(64)),
+        recovery_backup: None,
+        management_event_file: None,
+        management_event_sha256: None,
+        completed: false,
+    };
+    let state_path = deployment::local_oci_candidate_install_resource_path(&config);
+    atomic_write(
+        &state_path,
+        &serde_json::to_vec_pretty(&state).unwrap(),
+        0o600,
+    )
+    .unwrap();
+    let registry_record = work.path().join("registry-record.json");
+    let registration_called = std::cell::Cell::new(false);
+    let result = deployment::after_local_oci_candidate_public_proof(
+        || anyhow::bail!("public control statement did not verify"),
+        || {
+            registration_called.set(true);
+            fs::write(&registry_record, b"registered")?;
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert!(!registration_called.get());
+    assert!(!registry_record.exists());
+    assert!(deployment::local_oci_candidate_install_is_pending(&config).unwrap());
+    assert!(!deployment::local_oci_candidate_install_is_completed(&config).unwrap());
+}
+
+#[test]
+fn local_oci_candidate_rejects_legacy_external_config_before_retry() {
+    let work = PrivateTempDir::new("nazoauth-local-candidate-external-config").unwrap();
+    let mut config = config(&work);
+    configure_external_dependency_fixture(&mut config);
+    assert!(deployment::require_managed_local_oci_candidate_dependencies(&config).is_err());
+}
+
+#[test]
+fn completed_local_oci_candidate_command_guard_blocks_update_recovery_and_governance() {
+    let work = PrivateTempDir::new("nazoauth-local-candidate-command-guard").unwrap();
+    let mut config = config(&work);
+    config.runtime.backend = RuntimeBackendKind::Podman;
+    fs::create_dir_all(&config.deployment_root).unwrap();
+    let config_path = work.path().join("controller.json");
+    atomic_write(
+        &config_path,
+        &serde_json::to_vec_pretty(&config).unwrap(),
+        0o600,
+    )
+    .unwrap();
+    let revision = "a".repeat(40);
+    let candidate = CandidateTarget {
+        release: "v0.1.41-candidate.459".to_owned(),
+        revision: revision.clone(),
+        build_id: format!("source:{revision}"),
+        oci_digest: format!("sha256:{}", "b".repeat(64)),
+    };
+    let local_artifact_id = format!("sha256:{}", "c".repeat(64));
+    let state = LocalOciCandidateInstallState {
+        schema: 1,
+        candidate: LocalOciCandidateInstall {
+            image: "candidate:local".to_owned(),
+            target: candidate.clone(),
+        },
+        local_artifact_id: local_artifact_id.clone(),
+        recovery_backup: None,
+        management_event_file: None,
+        management_event_sha256: None,
+        completed: true,
+    };
+    let state_path = deployment::local_oci_candidate_install_resource_path(&config);
+    atomic_write(
+        &state_path,
+        &serde_json::to_vec_pretty(&state).unwrap(),
+        0o600,
+    )
+    .unwrap();
+    let record = DeploymentRecord {
+        schema: crate::deployment::DEPLOYMENT_SCHEMA,
+        deployment_id: config.operator.deployment_id.clone(),
+        control_authority: config.operator.controller_key_id.clone(),
+        alias: None,
+        issuer: config.runtime.expected_issuer.clone(),
+        active_release: nazo_operator_protocol::EmbeddedIdentity {
+            release: candidate.release,
+            revision: candidate.revision,
+            protocol: nazo_operator_protocol::PROTOCOL_VERSION,
+            build_id: candidate.build_id,
+        },
+        trust: crate::deployment::TrustState::Adopted,
+        capabilities: crate::deployment::CapabilityGrants::controller_installed(),
+        runtime_instances: vec![crate::deployment::RuntimeInstance {
+            runtime_instance_id: config.runtime.runtime_instance_id.clone(),
+            backend: RuntimeBackendKind::Podman,
+            object_reference: config.runtime.container_name.clone(),
+            artifact: crate::deployment::ArtifactReference::Oci {
+                image_reference: local_artifact_id.clone(),
+                digest: state.candidate.target.oci_digest.clone(),
+            },
+            local_artifact_id: Some(local_artifact_id),
+            ports: Vec::new(),
+            networks: Vec::new(),
+            mounts: Vec::new(),
+            instance_key_id: None,
+            deployment_statement: None,
+        }],
+        resources: BTreeMap::from([
+            (
+                "controller_config".to_owned(),
+                crate::deployment::SafeReference::File { path: config_path },
+            ),
+            (
+                deployment::LOCAL_OCI_CANDIDATE_INSTALL_RESOURCE.to_owned(),
+                crate::deployment::SafeReference::File { path: state_path },
+            ),
+        ]),
+        recovery: crate::deployment::RecoveryAssessment {
+            conclusion: RecoveryConclusion::RequiresUserEvidence,
+            evidence: Vec::new(),
+            off_host_package_required_for_machine_loss: true,
+        },
+        operator_protocol_versions: std::collections::BTreeSet::new(),
+        control_protocol_versions: std::collections::BTreeSet::new(),
+        declaration_revision: 1,
+    };
+    for command in [
+        "update --plan",
+        "update --yes",
+        "rollback",
+        "recover",
+        "recover-update",
+        "permissions set",
+        "relinquish",
+    ] {
+        assert!(
+            commands::reject_registered_local_oci_candidate_mutation(&record).is_err(),
+            "{command}"
+        );
+    }
+}
+
+#[test]
 fn signed_release_with_a_source_build_id_is_not_classified_as_a_local_candidate() {
     let record = DeploymentRecord {
         schema: crate::deployment::DEPLOYMENT_SCHEMA,
