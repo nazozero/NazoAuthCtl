@@ -567,7 +567,7 @@ pub enum OpenId4VpError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{HttpResponse, TransportError};
+    use crate::transport::{HttpResponse, TransportError, TransportFailureStage};
     use std::collections::VecDeque;
 
     struct VerifierTransport {
@@ -586,7 +586,7 @@ mod tests {
                 .lock()
                 .expect("response lock")
                 .take()
-                .ok_or(TransportError::Network)
+                .ok_or(TransportError::Network(TransportFailureStage::SendRequest))
         }
     }
 
@@ -606,7 +606,7 @@ mod tests {
                 .lock()
                 .expect("response lock")
                 .pop_front()
-                .ok_or(TransportError::Network)
+                .ok_or(TransportError::Network(TransportFailureStage::SendRequest))
         }
     }
 

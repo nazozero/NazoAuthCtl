@@ -1199,7 +1199,7 @@ fn browser_visited(browser: &serde_json::Map<String, Value>, authorization_url: 
 mod tests {
     use super::*;
     use crate::browser::BrowserTargetOrigin;
-    use crate::transport::{HttpResponse, Transport};
+    use crate::transport::{HttpResponse, Transport, TransportFailureStage};
     use std::sync::Mutex;
 
     struct FixtureTransport {
@@ -1218,7 +1218,7 @@ mod tests {
                 .lock()
                 .expect("responses")
                 .pop()
-                .ok_or(TransportError::Network)
+                .ok_or(TransportError::Network(TransportFailureStage::SendRequest))
         }
     }
 

@@ -104,4 +104,5 @@ pub use report::{
 };
 pub use transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, Transport, TransportError,
+    TransportFailureStage,
 };
