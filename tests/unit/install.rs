@@ -35,6 +35,8 @@ fn install_options(data_root: PathBuf) -> InstallOptions {
         valkey_url: None,
         valkey_backup_url: None,
         external_valkey_backup_scope: None,
+        database_backup_endpoint_sha256: None,
+        valkey_backup_endpoint_sha256: None,
         external_dependencies: false,
         secrets_stdin: false,
         secret_fd: None,
@@ -240,6 +242,10 @@ fn host_service_unit_exposes_only_runtime_state() {
             operator_directory: PathBuf::from("/etc/nazoauth/operator"),
             recovery_directory: PathBuf::from("/var/lib/nazoauth/recovery"),
             migration_url: PathBuf::from("/etc/nazoauth/secrets/database-migration-url"),
+            restricted_secret_paths: vec![
+                PathBuf::from("/etc/nazoauth/secrets/database-backup-url"),
+                PathBuf::from("/etc/nazoauth/secrets/valkey-backup-url"),
+            ],
             receipt_private_key: PathBuf::from("/etc/nazoauth/operator/receipt.key"),
             runtime_readable_secret_names: Vec::new(),
         },
@@ -255,7 +261,7 @@ fn host_service_unit_exposes_only_runtime_state() {
     ));
     assert!(!unit.contains("ReadOnlyPaths=/var/lib/nazoauth/ui-releases"));
     assert!(unit.contains(
-        "InaccessiblePaths=/var/lib/nazoauth/app/operator-state /etc/nazoauth/operator /var/lib/nazoauth/recovery /etc/nazoauth/secrets/database-migration-url"
+        "InaccessiblePaths=/var/lib/nazoauth/app/operator-state /etc/nazoauth/operator /var/lib/nazoauth/recovery /etc/nazoauth/secrets/database-migration-url /etc/nazoauth/secrets/database-backup-url /etc/nazoauth/secrets/valkey-backup-url"
     ));
     assert!(!unit.contains("ReadWritePaths=/etc/nazoauth/secrets"));
     assert!(!unit.contains("ReadWritePaths=/var/lib/nazoauth/app\n"));
@@ -300,6 +306,8 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
         valkey_url: None,
         valkey_backup_url: None,
         external_valkey_backup_scope: None,
+        database_backup_endpoint_sha256: None,
+        valkey_backup_endpoint_sha256: None,
         external_dependencies: false,
         secrets_stdin: false,
         secret_fd: None,
@@ -731,6 +739,18 @@ fn external_dependency_secret_input_is_bounded_closed_and_value_opaque() {
         options.external_valkey_backup_scope.as_deref(),
         Some("dedicated-instance")
     );
+    assert!(
+        options
+            .database_backup_endpoint_sha256
+            .as_deref()
+            .is_some_and(|value| value.len() == 64)
+    );
+    assert!(
+        options
+            .valkey_backup_endpoint_sha256
+            .as_deref()
+            .is_some_and(|value| value.len() == 64)
+    );
 
     let required = [
         "database_url",
@@ -1108,7 +1128,10 @@ fn tenant_resource_controller_identity_is_stable_and_idempotent() {
 fn tenant_resource_controller_upgrade_replaces_only_the_legacy_managed_binding() {
     let work = PrivateTempDir::new("tenant-resource-controller-upgrade").unwrap();
     let config_dir = work.path().join("config");
-    let options = install_options(work.path().join("data"));
+    let mut options = install_options(work.path().join("data"));
+    options.external_valkey_backup_scope = Some("dedicated-instance".to_owned());
+    options.database_backup_endpoint_sha256 = Some("a".repeat(64));
+    options.valkey_backup_endpoint_sha256 = Some("b".repeat(64));
     operator::initialize_identity_generation(&config_dir.join("operator"), &options.recovery_root)
         .unwrap();
     ensure_tenant_resource_controller_identity(&config_dir).unwrap();

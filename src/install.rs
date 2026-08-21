@@ -392,6 +392,10 @@ fn configure_runtime_permissions(config: &UpdateConfig) -> anyhow::Result<()> {
     let mut readable = vec![
         config_file,
         config.dependencies.database_url_file.clone(),
+        // This is mounted only into the isolated migration task.  It shares
+        // the fixed non-root operator group, while the long-lived runtime has
+        // no mount for this path.
+        config.dependencies.migration_database_url_file.clone(),
         config.dependencies.valkey_url_file.clone(),
         mfa_key,
         config.operator.receipt_private_key.clone(),
@@ -516,12 +520,21 @@ pub(crate) fn install_systemd(config: &UpdateConfig) -> anyhow::Result<()> {
                 .context("host runtime has no recovery directory")?
                 .to_owned(),
             migration_url: config.dependencies.migration_database_url_file.clone(),
+            restricted_secret_paths: vec![
+                config.dependencies.database_backup_url_file.clone(),
+                config.dependencies.valkey_backup_url_file.clone(),
+            ],
             receipt_private_key: config.operator.receipt_private_key.clone(),
-            runtime_readable_secret_names: ["database-url", "valkey-url", MFA_TOTP_KEY_FILE_NAME]
-                .into_iter()
-                .chain(STANDARDS_PROFILE_SECRET_NAMES.iter().copied())
-                .map(ToOwned::to_owned)
-                .collect(),
+            runtime_readable_secret_names: [
+                "database-url",
+                "database-migration-url",
+                "valkey-url",
+                MFA_TOTP_KEY_FILE_NAME,
+            ]
+            .into_iter()
+            .chain(STANDARDS_PROFILE_SECRET_NAMES.iter().copied())
+            .map(ToOwned::to_owned)
+            .collect(),
         },
     )?;
     Ok(())

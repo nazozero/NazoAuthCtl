@@ -81,6 +81,10 @@ pub(crate) struct Dependencies {
     pub(crate) valkey_backup_url_file: PathBuf,
     #[serde(default)]
     pub(crate) external_valkey_backup_scope: String,
+    #[serde(default)]
+    pub(crate) database_backup_endpoint_sha256: String,
+    #[serde(default)]
+    pub(crate) valkey_backup_endpoint_sha256: String,
 }
 
 fn default_dependency_mode() -> String {
@@ -97,6 +101,8 @@ impl Default for Dependencies {
             valkey_url_file: PathBuf::new(),
             valkey_backup_url_file: PathBuf::new(),
             external_valkey_backup_scope: String::new(),
+            database_backup_endpoint_sha256: String::new(),
+            valkey_backup_endpoint_sha256: String::new(),
         }
     }
 }
@@ -364,6 +370,24 @@ impl UpdateConfig {
             }
             if self.dependencies.external_valkey_backup_scope != "dedicated-instance" {
                 bail!("external Valkey backup must declare dedicated-instance scope");
+            }
+            for (label, identity) in [
+                (
+                    "external PostgreSQL backup endpoint identity",
+                    &self.dependencies.database_backup_endpoint_sha256,
+                ),
+                (
+                    "external Valkey backup endpoint identity",
+                    &self.dependencies.valkey_backup_endpoint_sha256,
+                ),
+            ] {
+                if identity.len() != 64
+                    || !identity
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    bail!("{label} must be a lowercase SHA-256 digest");
+                }
             }
             for (index, path) in paths.iter().enumerate() {
                 if paths[..index].contains(path) {

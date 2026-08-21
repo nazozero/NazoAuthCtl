@@ -357,7 +357,10 @@ pub(super) fn validate_dependency_url(
         bail!("{name} URL userinfo is missing or has ambiguous separators");
     }
     let username = decode_dependency_component(raw_username, &format!("{name} username"))?;
-    let password = decode_dependency_component(raw_password, &format!("{name} password"))?;
+    let password = zeroize::Zeroizing::new(decode_dependency_component(
+        raw_password,
+        &format!("{name} password"),
+    )?);
     if username.chars().any(char::is_whitespace) || password.chars().any(char::is_control) {
         bail!("{name} URL userinfo contains unsafe characters");
     }

@@ -178,6 +178,14 @@ pub(super) fn build_config(
                 .external_valkey_backup_scope
                 .clone()
                 .unwrap_or_default(),
+            database_backup_endpoint_sha256: options
+                .database_backup_endpoint_sha256
+                .clone()
+                .unwrap_or_default(),
+            valkey_backup_endpoint_sha256: options
+                .valkey_backup_endpoint_sha256
+                .clone()
+                .unwrap_or_default(),
         },
         runtime: Runtime {
             backend: runtime_backend,

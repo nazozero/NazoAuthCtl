@@ -61,6 +61,8 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
             valkey_url_file: secrets.join("valkey-url"),
             valkey_backup_url_file: secrets.join("valkey-backup-url"),
             external_valkey_backup_scope: "dedicated-instance".to_owned(),
+            database_backup_endpoint_sha256: "a".repeat(64),
+            valkey_backup_endpoint_sha256: "b".repeat(64),
         },
         runtime: RuntimeConfig {
             backend: RuntimeBackendKind::Podman,
@@ -427,7 +429,7 @@ fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
         .one_shot_task(artifact.clone(), &TaskOperation::MigrateApply, None)
         .unwrap();
 
-    assert_eq!(migration.service_user.as_deref(), Some("0"));
+    assert_eq!(migration.service_user.as_deref(), Some("10001:10001"));
 
     assert_eq!(
         migration.environment.get("DATABASE_URL_FILE"),

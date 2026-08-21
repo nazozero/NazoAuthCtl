@@ -297,6 +297,18 @@ pub(super) fn normalize_external_dependencies(options: &mut InstallOptions) -> a
             &["redis", "rediss"],
             "Valkey backup",
         )?;
+        let binding = crate::secret_provider::bind_external_dependency_credentials(
+            database,
+            options
+                .migration_database_url
+                .as_deref()
+                .unwrap_or_default(),
+            options.database_backup_url.as_deref().unwrap_or_default(),
+            options.valkey_url.as_deref().unwrap_or_default(),
+            options.valkey_backup_url.as_deref().unwrap_or_default(),
+        )?;
+        options.database_backup_endpoint_sha256 = Some(binding.database_endpoint_sha256);
+        options.valkey_backup_endpoint_sha256 = Some(binding.valkey_endpoint_sha256);
     }
     Ok(())
 }

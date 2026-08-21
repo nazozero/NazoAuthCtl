@@ -24,6 +24,8 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
     let valkey_url = None;
     let valkey_backup_url = None;
     let external_valkey_backup_scope = None;
+    let database_backup_endpoint_sha256 = None;
+    let valkey_backup_endpoint_sha256 = None;
     let mut external_dependencies = false;
     let mut secrets_stdin = false;
     let mut secret_fd = None;
@@ -187,6 +189,8 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
         valkey_url,
         valkey_backup_url,
         external_valkey_backup_scope,
+        database_backup_endpoint_sha256,
+        valkey_backup_endpoint_sha256,
         external_dependencies,
         secrets_stdin,
         secret_fd,

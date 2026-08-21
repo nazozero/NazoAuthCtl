@@ -33,6 +33,56 @@ fn providers_split_secrets_from_non_secret_connection_parameters() {
 }
 
 #[test]
+fn external_dependency_binding_canonicalizes_ports_and_rejects_alias_bypasses() {
+    let binding = bind_external_dependency_credentials(
+        "postgresql://runtime:runtime-secret@db.example/oauth",
+        "postgresql://migrator:migration-secret@db.example:5432/oauth",
+        "postgres://backup:backup-secret@DB.EXAMPLE/oauth",
+        "rediss://runtime:runtime-secret@cache.example/0",
+        "rediss://backup:backup-secret@CACHE.EXAMPLE:6379/0",
+    )
+    .unwrap();
+    assert_eq!(binding.database_endpoint_sha256.len(), 64);
+    assert_eq!(binding.valkey_endpoint_sha256.len(), 64);
+
+    for input in [
+        (
+            "postgresql://runtime:runtime-secret@db.example/oauth",
+            "postgresql://run%74ime:migration-secret@db.example/oauth",
+            "postgresql://backup:backup-secret@db.example/oauth",
+            "rediss://runtime:runtime-secret@cache.example/0",
+            "rediss://backup:backup-secret@cache.example/0",
+        ),
+        (
+            "postgresql://runtime:runtime-secret@db.example/oauth?sslmode=require",
+            "postgresql://migrator:migration-secret@db.example/oauth",
+            "postgresql://backup:backup-secret@db.example/oauth",
+            "rediss://runtime:runtime-secret@cache.example/0",
+            "rediss://backup:backup-secret@cache.example/0",
+        ),
+        (
+            "postgresql://runtime:runtime-secret@db.example/oauth",
+            "postgresql://migrator:migration-secret@other.example/oauth",
+            "postgresql://backup:backup-secret@db.example/oauth",
+            "rediss://runtime:runtime-secret@cache.example/0",
+            "rediss://backup:backup-secret@cache.example/0",
+        ),
+        (
+            "postgresql://runtime:runtime-secret@db.example/oauth",
+            "postgresql://migrator:migration-secret@db.example/oauth",
+            "postgresql://backup:backup-secret@db.example/oauth",
+            "rediss://runtime:runtime-secret@cache.example/0",
+            "redis://backup:backup-secret@cache.example/0",
+        ),
+    ] {
+        assert!(
+            bind_external_dependency_credentials(input.0, input.1, input.2, input.3, input.4)
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn postgres_provider_rejects_values_service_files_cannot_represent() {
     let work = PrivateTempDir::new("nazoauth-provider-invalid-service-test").unwrap();
     for (name, url) in [

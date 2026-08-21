@@ -618,6 +618,7 @@ pub struct HostServiceInstall {
     pub operator_directory: PathBuf,
     pub recovery_directory: PathBuf,
     pub migration_url: PathBuf,
+    pub restricted_secret_paths: Vec<PathBuf>,
     pub receipt_private_key: PathBuf,
     pub runtime_readable_secret_names: Vec<String>,
 }

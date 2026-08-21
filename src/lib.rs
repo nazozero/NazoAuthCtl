@@ -157,8 +157,8 @@ Options:
   --candidate-revision SHA            Full lowercase Git revision
   --candidate-build-id source:SHA     Must exactly bind the full candidate revision
   --candidate-oci-digest sha256:DIGEST Expected local OCI manifest digest
-  --external-dependencies             Use operator-owned PostgreSQL and Valkey
-  --secrets-stdin                     Read the three dependency URLs as strict JSON from stdin
+  --external-dependencies             Use operator-owned runtime, migration, and backup PostgreSQL/Valkey
+  --secrets-stdin                     Read five dependency URLs plus dedicated-instance Valkey backup scope as strict JSON from stdin
   --secret-fd FD                      Read the same JSON from an already-open FD (Linux)
   --profile-secrets-stdin             Read standards-full profile bearer secrets as strict JSON from stdin
   --profile-secret-fd FD              Read the same profile JSON from an already-open FD (Linux)

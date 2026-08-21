@@ -704,6 +704,13 @@ fn install_local_oci_candidate_transaction(
         &candidate.target.release,
         "backup",
     )?;
+    if let Some(backup) = state.recovery_backup.as_deref() {
+        // A retry may replay privileged migration work only after the durable
+        // backup has passed the same marker, checksum and config-identity
+        // checks used by recovery.  Do this before starting any dependency or
+        // operator task.
+        Backup::open_existing(config, backup)?;
+    }
     install::start_managed_dependencies(config)?;
     if state.recovery_backup.is_none() {
         let backup = Backup::create(config_path, config, &candidate.target.release)?;

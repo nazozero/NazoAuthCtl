@@ -47,7 +47,12 @@ the only dependency credentials mounted into the long-lived server; migration
 and both backup URLs remain root-only. Backups use only the two backup URLs.
 `valkey_backup_scope` is an operator assertion that the raw RDB export target
 is a deployment-dedicated Valkey instance; shared instances are rejected and
-must not be used for this path. Existing schema-2 managed deployments remain
+must not be used for this path. Ctl canonicalizes the PostgreSQL and Valkey
+backup endpoints (host, effective port, database and Valkey TLS scheme),
+requires the runtime/migration/backup roles to use separate decoded usernames,
+and persists only SHA-256 endpoint identities plus the scope in the config,
+candidate intent and backup identity. Query options cannot vary this binding.
+Existing schema-2 managed deployments remain
 readable, while a legacy external configuration without these dedicated backup
 credentials fails closed and is never rewritten during candidate retry.
 Before a migration, key task, or runtime replacement,
