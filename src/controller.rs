@@ -110,11 +110,7 @@ pub(crate) fn conformance_control_context(
     let expected = if let Some(record) = context.record.as_ref()
         && commands::is_local_oci_candidate_record(record)
     {
-        commands::validate_declared_local_artifact(record, &context.config)?;
-        let active = runtime.active_build_target()?;
-        if active.embedded != record.active_release {
-            bail!("active local OCI identity differs from the deployment declaration");
-        }
+        let active = commands::active_local_oci_candidate_build_target(record, &context.config)?;
         let expected_oci_digest = record
             .runtime_instances
             .first()
@@ -123,17 +119,6 @@ pub(crate) fn conformance_control_context(
                 _ => None,
             })
             .context("local OCI deployment declaration has no OCI artifact binding")?;
-        if active.image_digest != *expected_oci_digest {
-            bail!("active local OCI image digest differs from the deployment declaration");
-        }
-        let expected_local_artifact_id = record
-            .runtime_instances
-            .first()
-            .and_then(|runtime| runtime.local_artifact_id.as_deref())
-            .context("local OCI deployment declaration has no immutable local image ID")?;
-        if active.local_artifact_id.as_deref() != Some(expected_local_artifact_id) {
-            bail!("active local OCI image ID differs from the deployment declaration");
-        }
         operator::expected_release_target(
             &context.config,
             active.embedded,

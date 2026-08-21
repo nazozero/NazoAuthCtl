@@ -3168,6 +3168,133 @@ fn pending_local_oci_candidate_state_is_distinct_from_completed_state() {
 }
 
 #[test]
+fn candidate_completion_observation_rejects_active_id_digest_and_embedded_drift() {
+    let work = PrivateTempDir::new("nazoauth-candidate-completion-observation").unwrap();
+    let mut config = config(&work);
+    config.runtime.backend = RuntimeBackendKind::Podman;
+    let revision = "a".repeat(40);
+    let local_artifact_id = format!("sha256:{}", "b".repeat(64));
+    let candidate = CandidateTarget {
+        release: "v0.1.41-candidate.459".to_owned(),
+        revision: revision.clone(),
+        build_id: format!("source:{revision}"),
+        oci_digest: format!("sha256:{}", "c".repeat(64)),
+    };
+    let identity = nazo_operator_protocol::EmbeddedIdentity {
+        release: candidate.release.clone(),
+        revision: candidate.revision.clone(),
+        protocol: nazo_operator_protocol::PROTOCOL_VERSION,
+        build_id: candidate.build_id.clone(),
+    };
+    let record = DeploymentRecord {
+        schema: crate::deployment::DEPLOYMENT_SCHEMA,
+        deployment_id: config.operator.deployment_id.clone(),
+        control_authority: config.operator.controller_key_id.clone(),
+        alias: None,
+        issuer: config.runtime.expected_issuer.clone(),
+        active_release: identity.clone(),
+        trust: crate::deployment::TrustState::Adopted,
+        capabilities: crate::deployment::CapabilityGrants::controller_installed(),
+        runtime_instances: vec![crate::deployment::RuntimeInstance {
+            runtime_instance_id: config.runtime.runtime_instance_id.clone(),
+            backend: RuntimeBackendKind::Podman,
+            object_reference: config.runtime.container_name.clone(),
+            artifact: crate::deployment::ArtifactReference::Oci {
+                image_reference: local_artifact_id.clone(),
+                digest: candidate.oci_digest.clone(),
+            },
+            local_artifact_id: Some(local_artifact_id.clone()),
+            ports: Vec::new(),
+            networks: Vec::new(),
+            mounts: Vec::new(),
+            instance_key_id: None,
+            deployment_statement: None,
+        }],
+        resources: BTreeMap::new(),
+        recovery: crate::deployment::RecoveryAssessment {
+            conclusion: RecoveryConclusion::RequiresUserEvidence,
+            evidence: Vec::new(),
+            off_host_package_required_for_machine_loss: true,
+        },
+        operator_protocol_versions: std::collections::BTreeSet::new(),
+        control_protocol_versions: std::collections::BTreeSet::new(),
+        declaration_revision: 1,
+    };
+    let active = |embedded, image_digest, local_artifact_id| crate::runtime::ActiveBuildTarget {
+        embedded,
+        image_digest,
+        binary_digest: String::new(),
+        local_artifact_id,
+    };
+    let exact = active(
+        identity.clone(),
+        candidate.oci_digest.clone(),
+        Some(local_artifact_id.clone()),
+    );
+    assert!(
+        commands::validate_active_local_oci_candidate_observation(
+            &record,
+            &config,
+            &candidate,
+            &local_artifact_id,
+            &exact,
+        )
+        .is_ok()
+    );
+
+    let wrong_id = active(
+        identity.clone(),
+        candidate.oci_digest.clone(),
+        Some(format!("sha256:{}", "d".repeat(64))),
+    );
+    assert!(
+        commands::validate_active_local_oci_candidate_observation(
+            &record,
+            &config,
+            &candidate,
+            &local_artifact_id,
+            &wrong_id,
+        )
+        .is_err()
+    );
+
+    let wrong_digest = active(
+        identity.clone(),
+        format!("sha256:{}", "d".repeat(64)),
+        Some(local_artifact_id.clone()),
+    );
+    assert!(
+        commands::validate_active_local_oci_candidate_observation(
+            &record,
+            &config,
+            &candidate,
+            &local_artifact_id,
+            &wrong_digest,
+        )
+        .is_err()
+    );
+
+    let wrong_identity = active(
+        nazo_operator_protocol::EmbeddedIdentity {
+            revision: "d".repeat(40),
+            ..identity
+        },
+        candidate.oci_digest.clone(),
+        Some(local_artifact_id.clone()),
+    );
+    assert!(
+        commands::validate_active_local_oci_candidate_observation(
+            &record,
+            &config,
+            &candidate,
+            &local_artifact_id,
+            &wrong_identity,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn candidate_prepare_intent_binds_the_exact_existing_config_and_can_restore_it() {
     let work = PrivateTempDir::new("nazoauth-local-candidate-prepare-intent").unwrap();
     let config = config(&work);

@@ -672,11 +672,13 @@ fn install_local_oci_candidate_transaction(
     };
     if state.completed {
         validate_completed_local_oci_candidate_install(config_path, config, &state)?;
-        if !health_ready(config) {
-            bail!(
-                "local OCI candidate installation is complete but not healthy; run nazoauthctl doctor"
-            );
-        }
+        let record = DeploymentStore::system().load(&config.operator.deployment_id)?;
+        verify_local_oci_candidate_completion_preconditions(
+            config,
+            &record,
+            &state.candidate,
+            &state.local_artifact_id,
+        )?;
         println!("NazoAuth local OCI candidate is already installed and ready");
         return Ok(());
     }
@@ -748,6 +750,12 @@ fn install_local_oci_candidate_transaction(
     // loading only after it returns is the exact-record proof needed before
     // this installation writes its completion audit/state.
     let record = store.load(&config.operator.deployment_id)?;
+    verify_local_oci_candidate_completion_preconditions(
+        config,
+        &record,
+        candidate,
+        local_artifact_id,
+    )?;
     crate::lifecycle::cache_trusted_runtime(&store, &record)?;
     let management_event = crate::operator::append_management_event(
         config,
@@ -800,11 +808,12 @@ fn finish_local_oci_candidate_registration_recovery(
     )?;
     let store = DeploymentStore::system();
     let record = store.load(&config.operator.deployment_id)?;
-    if !health_ready(config) {
-        bail!(
-            "local OCI candidate registration is durable but the runtime is not healthy; do not release the pending install state"
-        );
-    }
+    verify_local_oci_candidate_completion_preconditions(
+        config,
+        &record,
+        candidate,
+        local_artifact_id,
+    )?;
     crate::lifecycle::cache_trusted_runtime(&store, &record)?;
     let management_event = crate::operator::append_management_event(
         config,
@@ -830,6 +839,26 @@ fn finish_local_oci_candidate_registration_recovery(
         candidate.target.release, candidate.target.revision
     );
     Ok(())
+}
+
+/// Completion is a second, post-registration trust boundary.  A registration
+/// crash must not release the candidate's unsettled-state guard merely because
+/// a declaration exists: the active object, immutable image identity, local
+/// readiness, and public issuer must all still be exact.
+fn verify_local_oci_candidate_completion_preconditions(
+    config: &UpdateConfig,
+    record: &DeploymentRecord,
+    candidate: &LocalOciCandidateInstall,
+    local_artifact_id: &str,
+) -> anyhow::Result<()> {
+    crate::controller::commands::validate_active_local_oci_candidate_runtime(
+        record,
+        config,
+        &candidate.target,
+        local_artifact_id,
+    )?;
+    wait_ready(config)?;
+    verify_public(config)
 }
 
 fn validate_completed_local_oci_candidate_install(
