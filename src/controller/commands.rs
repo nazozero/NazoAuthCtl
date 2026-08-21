@@ -653,6 +653,31 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
+                if is_local_oci_candidate_record(&record) {
+                    require_confirmation(
+                        yes,
+                        "restore the exact local OCI candidate from its controller-managed baseline and recovery package",
+                    )?;
+                    record.require_mutation(&[
+                        Capability::Runtime,
+                        Capability::Artifact,
+                        Capability::Database,
+                        Capability::Valkey,
+                        Capability::Backups,
+                        Capability::OperatorTasks,
+                    ])?;
+                    let path = match record.resources.get("controller_config") {
+                        Some(crate::deployment::SafeReference::File { path }) => path,
+                        _ => {
+                            bail!("registered local OCI candidate has no controller configuration")
+                        }
+                    };
+                    let config = load_config_unsettled(path)?;
+                    super::verify_control_binding(&record, &config)?;
+                    return super::deployment::recover_registered_local_oci_candidate(
+                        path, &config, &record,
+                    );
+                }
                 require_registered_recovery_authority(
                     "rollback",
                     crate::coordination::active_update_exists(&store, &record),

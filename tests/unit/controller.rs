@@ -225,7 +225,7 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
 
 fn journal(config: &UpdateConfig, phase: UpdatePhase) -> UpdateJournal {
     UpdateJournal {
-        schema: 1,
+        schema: 2,
         transaction_id: "update-test".to_owned(),
         started_at: "2026-08-01T00:00:00Z".to_owned(),
         phase,
@@ -3235,7 +3235,7 @@ fn pending_local_oci_candidate_state_is_distinct_from_completed_state() {
     fs::create_dir_all(&config.deployment_root).unwrap();
     let revision = "a".repeat(40);
     let mut state = LocalOciCandidateInstallState {
-        schema: 1,
+        schema: 2,
         candidate: LocalOciCandidateInstall {
             image: "candidate:local".to_owned(),
             target: CandidateTarget {
@@ -3246,7 +3246,17 @@ fn pending_local_oci_candidate_state_is_distinct_from_completed_state() {
             },
         },
         local_artifact_id: format!("sha256:{}", "c".repeat(64)),
-        recovery_backup: None,
+        phase: LocalOciCandidatePhase::Prepared,
+        attempt: 1,
+        migration_jti: "request-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        keys_jti: "request-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        migration_receipt_sha256: None,
+        keys_receipt_sha256: None,
+        rollback_backup: None,
+        baseline_backup: None,
+        recovery_package: None,
+        recovery_archive_sha256: None,
+        recovery_cache_sha256: None,
         management_event_file: None,
         management_event_sha256: None,
         completed: false,
@@ -3277,7 +3287,7 @@ fn external_secret_drift_does_not_mutate_pending_candidate_state() {
     fs::create_dir_all(&config.deployment_root).unwrap();
     let revision = "a".repeat(40);
     let state = LocalOciCandidateInstallState {
-        schema: 1,
+        schema: 2,
         candidate: LocalOciCandidateInstall {
             image: "candidate:local".to_owned(),
             target: CandidateTarget {
@@ -3288,7 +3298,17 @@ fn external_secret_drift_does_not_mutate_pending_candidate_state() {
             },
         },
         local_artifact_id: format!("sha256:{}", "c".repeat(64)),
-        recovery_backup: None,
+        phase: LocalOciCandidatePhase::Prepared,
+        attempt: 1,
+        migration_jti: "request-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        keys_jti: "request-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        migration_receipt_sha256: None,
+        keys_receipt_sha256: None,
+        rollback_backup: None,
+        baseline_backup: None,
+        recovery_package: None,
+        recovery_archive_sha256: None,
+        recovery_cache_sha256: None,
         management_event_file: None,
         management_event_sha256: None,
         completed: false,
@@ -3319,7 +3339,7 @@ fn external_principal_drift_rejects_each_role_without_state_mutation() {
     configure_external_dependency_fixture(&mut config);
     fs::create_dir_all(&config.deployment_root).unwrap();
     let state = LocalOciCandidateInstallState {
-        schema: 1,
+        schema: 2,
         candidate: LocalOciCandidateInstall {
             image: "candidate:local".to_owned(),
             target: CandidateTarget {
@@ -3330,7 +3350,17 @@ fn external_principal_drift_rejects_each_role_without_state_mutation() {
             },
         },
         local_artifact_id: format!("sha256:{}", "c".repeat(64)),
-        recovery_backup: None,
+        phase: LocalOciCandidatePhase::Prepared,
+        attempt: 1,
+        migration_jti: "request-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        keys_jti: "request-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        migration_receipt_sha256: None,
+        keys_receipt_sha256: None,
+        rollback_backup: None,
+        baseline_backup: None,
+        recovery_package: None,
+        recovery_archive_sha256: None,
+        recovery_cache_sha256: None,
         management_event_file: None,
         management_event_sha256: None,
         completed: false,
@@ -3435,7 +3465,7 @@ fn candidate_retry_rejects_bad_backup_evidence_before_state_mutation() {
             _ => unreachable!(),
         }
         let state = LocalOciCandidateInstallState {
-            schema: 1,
+            schema: 2,
             candidate: LocalOciCandidateInstall {
                 image: "candidate:local".to_owned(),
                 target: CandidateTarget {
@@ -3446,7 +3476,17 @@ fn candidate_retry_rejects_bad_backup_evidence_before_state_mutation() {
                 },
             },
             local_artifact_id: format!("sha256:{}", "c".repeat(64)),
-            recovery_backup: Some(backup),
+            phase: LocalOciCandidatePhase::Prepared,
+            attempt: 1,
+            migration_jti: "request-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            keys_jti: "request-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            migration_receipt_sha256: None,
+            keys_receipt_sha256: None,
+            rollback_backup: Some(backup),
+            baseline_backup: None,
+            recovery_package: None,
+            recovery_archive_sha256: None,
+            recovery_cache_sha256: None,
             management_event_file: None,
             management_event_sha256: None,
             completed: false,

@@ -171,9 +171,16 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
         if version.is_some() {
             bail!("--to cannot be combined with a local OCI candidate install");
         }
-        if !external_dependencies {
+        if profile != "standards-full" {
+            bail!("a local OCI candidate install requires --profile standards-full");
+        }
+        // A candidate is an explicitly controller-managed recovery
+        // transaction.  Taking provider URLs here would leave the controller
+        // unable to prove or restore its database and Valkey state after an
+        // interrupted candidate task.
+        if external_dependencies || secrets_stdin || secret_fd.is_some() {
             bail!(
-                "a local OCI candidate install requires --external-dependencies and secure dependency input"
+                "a local OCI candidate install uses managed dependencies and rejects --external-dependencies and dependency secret input"
             );
         }
     }

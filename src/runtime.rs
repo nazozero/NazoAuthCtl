@@ -807,6 +807,24 @@ impl<'a> Runtime<'a> {
         })
     }
 
+    /// Candidate recovery must never restore managed state while an
+    /// application container can still hold database or snapshot files open.
+    /// The only object this may remove is the exact controller-owned runtime;
+    /// one-shot operator tasks are synchronous and return only after their
+    /// container/unit has exited.
+    pub(crate) fn quiesce_local_oci_candidate(&self) -> anyhow::Result<()> {
+        if self.backend_kind()? == RuntimeBackendKind::Systemd {
+            bail!("local OCI candidate recovery requires a container runtime");
+        }
+        if self.container_exists() {
+            self.remove_container()?;
+        }
+        if self.container_exists() {
+            bail!("local OCI candidate runtime remains present after quiesce");
+        }
+        Ok(())
+    }
+
     pub(crate) fn restart(&self) -> anyhow::Result<()> {
         self.require_runtime_mutation("runtime restart")?;
         let kind = self.backend_kind()?;

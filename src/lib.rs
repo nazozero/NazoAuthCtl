@@ -151,8 +151,8 @@ Options:
   --network-subnet CIDR               Optional fixed container subnet; requires --runtime-ip
   --runtime-ip ADDRESS                Optional fixed application IP; requires --network-subnet
   --to VERSION                        Immutable vSemVer Release; default: latest
-  --candidate-image IMAGE             Explicitly use an already-present local OCI image; requires
-                                      all four --candidate-* identity bindings below
+  --candidate-image IMAGE             Explicitly use an already-present local OCI image with
+                                      controller-managed PostgreSQL/Valkey; requires all four bindings
   --candidate-release VERSION         Candidate vSemVer release identity
   --candidate-revision SHA            Full lowercase Git revision
   --candidate-build-id source:SHA     Must exactly bind the full candidate revision
@@ -173,6 +173,8 @@ Profile JSON keys: dynamic_registration_initial_access_token,
 ciba_automated_decision_token, openid4vci_management_token,
 openid4vp_management_token. Profile secret input is accepted only for standards-full.
 The two stdin modes are mutually exclusive; use separate inherited FDs when both inputs are needed.
+Local OCI candidates reject --external-dependencies and dependency secret input: their rollback
+and registered recovery packages require managed dependency ownership.
 Secret values are rejected in argv and ordinary environment variables."
         }
         cli::HelpTopic::BootstrapAdmin => {

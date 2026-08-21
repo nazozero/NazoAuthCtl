@@ -20,9 +20,97 @@ use crate::filesystem::read_secure_regular_file_for_uid;
 use crate::{
     deployment::{ArtifactReference, RecoveryConclusion, RuntimeBackendKind},
     filesystem::read_secure_regular_file,
+    model::UpdateConfig,
     process::Process,
     runtime_backend::{RuntimeObservation, installed_backends},
 };
+
+/// Verify the public control listener against the descriptor-bound local
+/// identity.  Discovery normally tolerates an unavailable network endpoint;
+/// candidate completion and recovery must not.  They require a fresh nonce,
+/// a response signed by the mounted instance key, and a statement that is
+/// byte-for-byte equivalent in all identity fields to the offline statement.
+pub(crate) fn verify_public_candidate_control_identity(
+    config: &UpdateConfig,
+    candidate: &crate::cli::CandidateTarget,
+) -> anyhow::Result<()> {
+    let object = if config.runtime.backend == RuntimeBackendKind::Systemd {
+        &config.runtime.service_name
+    } else {
+        &config.runtime.container_name
+    };
+    let runtime = crate::runtime_backend::backend(config.runtime.backend).inspect(object)?;
+    if !runtime.running {
+        bail!("candidate runtime is not running for public control identity verification");
+    }
+    let offline = offline_statement(&runtime)?
+        .context("candidate runtime has no descriptor-bound deployment statement")?;
+    if offline.deployment_id != config.operator.deployment_id
+        || offline.runtime_instance_id != config.runtime.runtime_instance_id
+        || offline.issuer != config.runtime.expected_issuer
+        || offline.release != candidate.release
+        || offline.revision != candidate.revision
+        || offline.build_id != candidate.build_id
+    {
+        bail!("descriptor-bound candidate deployment statement differs from its exact binding");
+    }
+    let identity_dir = runtime_identity_host_directory(&runtime)?
+        .context("candidate runtime has no descriptor-bound identity directory")?;
+    let verified = load_verified_runtime_identity(&identity_dir, None)?;
+    if verified.statement != offline {
+        bail!("candidate descriptor-bound identity changed during public verification");
+    }
+    let nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let request = serde_json::to_string(&DiscoveryRequest {
+        schema: CONTROL_DISCOVERY_SCHEMA,
+        nonce: nonce.clone(),
+    })?;
+    let endpoint = format!(
+        "{}/.well-known/nazoauth-control",
+        config.runtime.expected_issuer.trim_end_matches('/')
+    );
+    let output = Process::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--proto",
+            "=http,https",
+            "--max-time",
+            "10",
+            "--connect-timeout",
+            "3",
+            "--header",
+            "Content-Type: application/json",
+            "--data-binary",
+            &request,
+            &endpoint,
+        ])
+        .stdout()
+        .context("candidate public control endpoint is unavailable")?;
+    if output.len() > 64 * 1024 {
+        bail!("candidate public control response exceeds the verification limit");
+    }
+    let response: DiscoveryResponse =
+        serde_json::from_str(&output).context("candidate public control response is invalid")?;
+    let public_key = decode_instance_public_key(&response.instance_public_key)
+        .context("candidate public control response has an invalid instance key")?;
+    if public_key != verified.public_key {
+        bail!("candidate public control response uses a different instance key");
+    }
+    let header = protected_header(&response.statement)?;
+    let online = verify_discovery_statement(
+        &response.statement,
+        &header.kid,
+        &public_key,
+        &nonce,
+        Utc::now().timestamp(),
+    )?;
+    if !statements_match(&online, &offline) {
+        bail!("candidate public control statement differs from its descriptor-bound identity");
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

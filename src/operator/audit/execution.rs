@@ -7,6 +7,20 @@ pub(crate) fn execute(
     operation: TaskOperation,
     public_jwk: Option<&Path>,
 ) -> anyhow::Result<OperationResult> {
+    execute_with_requested_jti(config, target, expected, operation, public_jwk, None)
+}
+
+/// Run a task with an explicitly durable request identity.  Only recovery
+/// state machines use this: ordinary signed-release operations retain their
+/// existing random request allocation semantics.
+pub(crate) fn execute_with_requested_jti(
+    config: &UpdateConfig,
+    target: &str,
+    expected: &ExpectedReleaseTarget,
+    operation: TaskOperation,
+    public_jwk: Option<&Path>,
+    requested_jti: Option<&str>,
+) -> anyhow::Result<OperationResult> {
     // This is the unique privileged task execution boundary.  Re-read the
     // entire external provider contract immediately before any audit intent
     // or runtime preparation for DDL, including direct candidate commands.
@@ -20,7 +34,7 @@ pub(crate) fn execute(
     verify_audit(config).context("operator audit preflight failed")?;
     #[cfg(debug_assertions)]
     if std::env::var_os("NAZOAUTHCTL_TESTING").is_some() {
-        return execute_test_task(config, target, operation);
+        return execute_test_task(config, target, operation, requested_jti);
     }
     let manifest = canonical_manifest(config, &operation)?;
     let manifest_bytes = serde_json::to_vec(&manifest)?;
@@ -45,7 +59,7 @@ pub(crate) fn execute(
         expected.embedded.clone(),
         config_binding.clone(),
         operation,
-        None,
+        requested_jti,
     )?;
     let request_id = task.jti.clone();
     if let Some(result) = existing_final_result(config, &task, &compact_task)? {
@@ -305,6 +319,7 @@ pub(crate) fn execute_test_task(
     config: &UpdateConfig,
     target: &str,
     operation: TaskOperation,
+    requested_jti: Option<&str>,
 ) -> anyhow::Result<OperationResult> {
     let arguments = match &operation {
         TaskOperation::MigrateApply => vec!["migrate".to_owned()],
@@ -320,7 +335,10 @@ pub(crate) fn execute_test_task(
             arguments,
         },
     )?;
-    let request_id = format!("request-test-{}", encode_hex(&rand::random::<[u8; 8]>()));
+    let request_id = requested_jti.map(str::to_owned).unwrap_or_else(|| {
+        let suffix = encode_hex(&rand::random::<[u8; 8]>());
+        format!("request-test-{suffix}")
+    });
     let directory = config.operator.audit_directory.join("test-receipts");
     crate::filesystem::ensure_directory_chain(&directory)?;
     let receipt = directory.join(format!("{request_id}.txt"));
@@ -349,6 +367,7 @@ pub(crate) fn execute_test_task(
     _config: &UpdateConfig,
     _target: &str,
     _operation: TaskOperation,
+    _requested_jti: Option<&str>,
 ) -> anyhow::Result<OperationResult> {
     bail!("test task adapter is unavailable in release builds")
 }

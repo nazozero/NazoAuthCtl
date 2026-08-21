@@ -540,17 +540,52 @@ struct InstallCompletion {
     recovery_backup: PathBuf,
 }
 
-/// Durable state for the explicit local-OCI install path.  It exists before
-/// the first privileged operator task, so a crash can only be resumed with the
-/// same four identity bindings and immutable local image ID.
+/// Durable state for the explicit local-OCI install path.  This deliberately
+/// is not an update journal: a candidate has no signed predecessor to roll
+/// forward to.  Every mutation is therefore fenced by a managed rollback
+/// backup and an immutable, per-attempt operator request identity.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LocalOciCandidatePhase {
+    Prepared,
+    MigrationStarted,
+    MigrationApplied,
+    KeysStarted,
+    KeysApplied,
+    RuntimeStarted,
+    BaselineCreated,
+    Registered,
+    Completed,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LocalOciCandidateInstallState {
     schema: u32,
     candidate: LocalOciCandidateInstall,
     local_artifact_id: String,
+    phase: LocalOciCandidatePhase,
+    attempt: u64,
+    /// A new attempt gets new request identifiers.  The identifier remains
+    /// stable while its receipt is being persisted; an interrupted started
+    /// task is otherwise treated as unknown and rolled back rather than
+    /// forwarded under a fresh authorization.
+    migration_jti: String,
+    keys_jti: String,
     #[serde(default)]
-    recovery_backup: Option<PathBuf>,
+    migration_receipt_sha256: Option<String>,
+    #[serde(default)]
+    keys_receipt_sha256: Option<String>,
+    #[serde(default)]
+    rollback_backup: Option<PathBuf>,
+    #[serde(default)]
+    baseline_backup: Option<PathBuf>,
+    #[serde(default)]
+    recovery_package: Option<PathBuf>,
+    #[serde(default)]
+    recovery_archive_sha256: Option<String>,
+    #[serde(default)]
+    recovery_cache_sha256: Option<String>,
     #[serde(default)]
     management_event_file: Option<String>,
     #[serde(default)]
