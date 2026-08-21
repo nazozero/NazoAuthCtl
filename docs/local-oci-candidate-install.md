@@ -78,3 +78,10 @@ evidence. If registration is already visible while the candidate state remains
 incomplete, it stays fail-closed for operator recovery rather than silently
 running or replacing that deployment. Do not use `development activate`,
 `adopt`, or `update` to bypass that binding.
+
+Candidate install-state schemas 1 and 2 are intentionally not replayed or
+migrated: they predate the generation-bound dependency-image recovery evidence
+required by the current schema 3 contract. Preserve old state for incident
+evidence and create a fresh managed candidate deployment instead. Hostinger's
+candidate rollout began from zero candidate state, so no in-place migration is
+performed.

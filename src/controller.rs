@@ -558,7 +558,7 @@ enum LocalOciCandidatePhase {
     Completed,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LocalOciCandidateInstallState {
     schema: u32,
@@ -587,10 +587,44 @@ struct LocalOciCandidateInstallState {
     #[serde(default)]
     recovery_cache_sha256: Option<String>,
     #[serde(default)]
+    recovery_postgres_archive_sha256: Option<String>,
+    #[serde(default)]
+    recovery_valkey_archive_sha256: Option<String>,
+    #[serde(default)]
     management_event_file: Option<String>,
     #[serde(default)]
     management_event_sha256: Option<String>,
     completed: bool,
+}
+
+/// Independent transaction for a completed candidate's recovery.  It lives
+/// under the recovery control root, never in a generation directory that a
+/// restore may replace.  The journal is the authority for resuming the
+/// external side effects between baseline restore and declaration CAS.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum LocalOciCandidateRecoveryPhase {
+    Prepared,
+    Quiesced,
+    Restored,
+    Staged,
+    Accepted,
+    DeclarationCommitted,
+    StateCommitted,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LocalOciCandidateRecoveryJournal {
+    schema: u32,
+    deployment_id: String,
+    runtime_instance_id: String,
+    generation: u64,
+    expected_declaration_revision: u64,
+    expected_record_sha256: String,
+    phase: LocalOciCandidateRecoveryPhase,
+    #[serde(default)]
+    staged_state: Option<LocalOciCandidateInstallState>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
