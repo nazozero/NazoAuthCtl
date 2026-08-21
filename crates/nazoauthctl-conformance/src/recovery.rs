@@ -2909,9 +2909,9 @@ mod tests {
     fn retained_suite_manifest_transfers_plan_ownership_only_after_pending_write() {
         let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
         let root = temp_root.join(format!("nazoauth-retention-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
         let evidence = root.join("evidence");
         crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
-        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
         let binding = tenant_resource_binding(&root);
         let mut guard = store
             .begin_tenant_resource(binding.clone())
@@ -3001,9 +3001,9 @@ mod tests {
     fn prepared_retention_compacts_terminal_module_inventory_below_the_journal_cap() {
         let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
         let root = temp_root.join(format!("nazoauth-retention-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
         let evidence = root.join("evidence");
         crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
-        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
         let binding = tenant_resource_binding(&root);
         let mut guard = store
             .begin_tenant_resource(binding.clone())
