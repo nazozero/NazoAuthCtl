@@ -352,7 +352,7 @@ fn run_callback_loop(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(CALLBACK_IDLE_WAIT);
             }
-            Err(error) => {
+            Err(_) => {
                 *health.lock().expect("callback health lock") =
                     Some(CallbackHealth::ListenerUnhealthy);
                 return;
