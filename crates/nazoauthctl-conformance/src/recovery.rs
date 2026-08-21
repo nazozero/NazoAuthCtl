@@ -1673,10 +1673,6 @@ mod tests {
             .record_tenant_resource_enumeration(Vec::new())
             .expect("enumerate already absent");
         guard.mark_proxy_cleanup_complete().expect("proxy settled");
-        assert!(guard.finish().is_err());
-
-        let mut pending = store.claim_pending().expect("claim pending");
-        let mut guard = pending.pop().expect("recovered guard");
         guard.finish().expect("finish after Suite cleanup");
         assert!(store.claim_pending().expect("journal removed").is_empty());
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");

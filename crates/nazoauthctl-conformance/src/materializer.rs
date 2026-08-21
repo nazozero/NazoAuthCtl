@@ -351,6 +351,7 @@ impl PreparedMaterialization {
             MAX_TENANT_RESOURCE_PASSWORD_BYTES,
             "generated.applicant_password",
         )?;
+        let applicant_profile_origin = self.target_issuer.trim_end_matches('/');
 
         let mut resources = Vec::with_capacity(
             1usize
@@ -371,6 +372,28 @@ impl PreparedMaterialization {
                 "email": self.applicant_email.as_str(),
                 "password": self.applicant_password.as_str(),
                 "email_verified": true,
+                "profile": {
+                    "display_name": "OIDF Conformance User",
+                    "given_name": "OIDF",
+                    "family_name": "Conformance",
+                    "middle_name": "Test",
+                    "nickname": "oidf-user",
+                    "profile_url": format!("{applicant_profile_origin}/oidf/profile"),
+                    "avatar_url": format!("{applicant_profile_origin}/oidf/avatar.png"),
+                    "website_url": format!("{applicant_profile_origin}/"),
+                    "gender": "unspecified",
+                    "birthdate": "1980-01-01",
+                    "zoneinfo": "UTC",
+                    "locale": "en-US",
+                    "address_formatted": "123 Conformance Way, Test City, CA 94105, US",
+                    "address_street_address": "123 Conformance Way",
+                    "address_locality": "Test City",
+                    "address_region": "CA",
+                    "address_postal_code": "94105",
+                    "address_country": "US",
+                    "phone_number": "+12025550100",
+                    "phone_number_verified": true,
+                },
             }),
         )?;
 
@@ -2736,6 +2759,63 @@ mod tests {
         assert_eq!(mtls_client_ref.as_deref(), oauth_id.as_deref());
         assert_eq!(dataset_user_ref.as_deref(), user_id.as_deref());
         assert_eq!(oauth_trust_ref, trust_policy_id);
+    }
+
+    #[test]
+    fn ordinary_applicant_manifest_includes_complete_nonsecret_oidc_profile() {
+        let (prepared, _) = DescriptorMaterializer::prepare(
+            tenant_resource_descriptor(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+            test_trust_anchor(),
+        )
+        .expect("prepare");
+        let manifest = prepared
+            .tenant_resource_manifest(prepared.request_jti())
+            .expect("manifest");
+        let document: Value =
+            serde_json::from_slice(manifest.bytes().as_bytes()).expect("manifest JSON");
+        let user = document["resources"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .find(|resource| resource["kind"].as_str() == Some("user"))
+            .expect("user resource");
+        let payload = URL_SAFE_NO_PAD
+            .decode(user["payload_base64url"].as_str().expect("user payload"))
+            .expect("payload encoding");
+        let payload: Value = serde_json::from_slice(&payload).expect("payload JSON");
+
+        assert_eq!(
+            payload["profile"],
+            serde_json::json!({
+                "display_name": "OIDF Conformance User",
+                "given_name": "OIDF",
+                "family_name": "Conformance",
+                "middle_name": "Test",
+                "nickname": "oidf-user",
+                "profile_url": "https://issuer.example/oidf/profile",
+                "avatar_url": "https://issuer.example/oidf/avatar.png",
+                "website_url": "https://issuer.example/",
+                "gender": "unspecified",
+                "birthdate": "1980-01-01",
+                "zoneinfo": "UTC",
+                "locale": "en-US",
+                "address_formatted": "123 Conformance Way, Test City, CA 94105, US",
+                "address_street_address": "123 Conformance Way",
+                "address_locality": "Test City",
+                "address_region": "CA",
+                "address_postal_code": "94105",
+                "address_country": "US",
+                "phone_number": "+12025550100",
+                "phone_number_verified": true,
+            })
+        );
+        let profile = payload["profile"].as_object().expect("profile object");
+        assert!(!profile.contains_key("username"));
+        assert!(!profile.contains_key("email"));
+        assert!(!profile.contains_key("password"));
     }
 
     #[test]
