@@ -98,7 +98,7 @@ impl ValkeyProvider {
         if !matches!(url.scheme.as_str(), "redis" | "rediss") || !url.query.is_empty() {
             bail!("Valkey secret provider has an unsupported URL");
         }
-        let username = (!url.username.is_empty()).then(|| url.username);
+        let username = (!url.username.is_empty()).then_some(url.username);
         let password = url.password;
         let database = url
             .database
