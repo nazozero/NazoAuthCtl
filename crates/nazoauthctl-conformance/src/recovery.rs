@@ -183,6 +183,8 @@ pub struct SuiteRetentionManifest {
     pub run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_screenshot_manifest: Option<SuiteRetentionScreenshotManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_evidence: Option<SuiteRetentionProviderEvidence>,
     pub plans: Vec<SuiteRetentionPlan>,
 }
 
@@ -191,6 +193,16 @@ pub struct SuiteRetentionManifest {
 pub struct SuiteRetentionScreenshotManifest {
     pub path: PathBuf,
     pub sha256: String,
+}
+
+/// A provider evidence bundle is staged before plan ownership is transferred.
+/// The retention journal binds its root-private directory and immutable
+/// manifest digest so a crash cannot later report an unrelated bundle.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuiteRetentionProviderEvidence {
+    pub directory: PathBuf,
+    pub manifest_sha256: String,
 }
 
 impl SuiteRetentionManifest {
@@ -961,6 +973,37 @@ impl ConformanceRecoveryGuard {
         // inventory: plan deletion removes the terminal modules with it.
         suite.module_ids.clear();
         journal.suite_retention = SuiteRetentionDisposition::RetentionPrepared { record };
+        self.persist()
+    }
+
+    /// Bind a fully fsynced provider evidence bundle while Suite plans remain
+    /// journal-owned. The later Retained transition therefore cannot expose a
+    /// receipt whose report was not part of the exact recovery record.
+    pub fn bind_prepared_suite_provider_evidence(
+        &mut self,
+        provider_evidence: SuiteRetentionProviderEvidence,
+    ) -> anyhow::Result<()> {
+        let binding = self
+            .tenant_resource_binding()
+            .context("Suite retention has no ordinary binding")?
+            .clone();
+        let suite = self
+            .suite_recovery()
+            .context("Suite retention has no persisted allocation")?
+            .clone();
+        let journal = self
+            .tenant_resource_journal_mut()
+            .context("Suite retention is not valid for a legacy journal")?;
+        let SuiteRetentionDisposition::RetentionPrepared { record } = &mut journal.suite_retention
+        else {
+            bail!("Suite retention has not been prepared");
+        };
+        if record.manifest.provider_evidence.is_some() {
+            bail!("Suite retention provider evidence is already bound");
+        }
+        record.manifest.provider_evidence = Some(provider_evidence);
+        validate_suite_retention_manifest(&record.manifest, &binding, Some(&suite))?;
+        record.manifest_sha256 = sha256_hex(&canonical_suite_retention_manifest(&record.manifest)?);
         self.persist()
     }
 
@@ -1754,6 +1797,9 @@ fn validate_suite_retention_manifest(
     if let Some(screenshot) = &manifest.review_screenshot_manifest {
         validate_review_screenshot_manifest_binding(screenshot, binding)?;
     }
+    if let Some(provider_evidence) = &manifest.provider_evidence {
+        validate_suite_retention_provider_evidence(provider_evidence)?;
+    }
     let mut matrix_ids = std::collections::BTreeSet::new();
     let mut suite_ids = std::collections::BTreeSet::new();
     for plan in &manifest.plans {
@@ -1813,6 +1859,28 @@ fn validate_review_screenshot_manifest_binding(
         .map_err(|error| anyhow::anyhow!("review screenshot manifest is not secure: {error:?}"))?;
     if sha256_hex(&bytes) != screenshot.sha256 {
         bail!("review screenshot manifest digest is invalid");
+    }
+    Ok(())
+}
+
+fn validate_suite_retention_provider_evidence(
+    provider_evidence: &SuiteRetentionProviderEvidence,
+) -> anyhow::Result<()> {
+    if !provider_evidence.directory.is_absolute()
+        || !lower_hex(&provider_evidence.manifest_sha256, 64)
+    {
+        bail!("provider evidence binding is outside policy");
+    }
+    let directory = crate::secure_file::validate_directory(&provider_evidence.directory, true)
+        .map_err(|error| anyhow::anyhow!("provider evidence directory is not secure: {error:?}"))?;
+    let manifest = crate::secure_file::read_bounded(
+        &directory.join("manifest.json"),
+        2 * 1024 * 1024,
+        true,
+    )
+    .map_err(|error| anyhow::anyhow!("provider evidence manifest is not secure: {error:?}"))?;
+    if sha256_hex(&manifest) != provider_evidence.manifest_sha256 {
+        bail!("provider evidence manifest digest is invalid");
     }
     Ok(())
 }
@@ -3011,6 +3079,7 @@ mod tests {
             tenant_id: binding.tenant_id.clone(),
             run_id: binding.request_jti.clone(),
             review_screenshot_manifest: None,
+            provider_evidence: None,
             plans: vec![SuiteRetentionPlan {
                 matrix_plan_id: "matrix-plan-1".to_owned(),
                 suite_plan_id: "suite-plan-1".to_owned(),
@@ -3110,6 +3179,7 @@ mod tests {
             tenant_id: binding.tenant_id.clone(),
             run_id: binding.request_jti.clone(),
             review_screenshot_manifest: None,
+            provider_evidence: None,
             plans,
         };
         let final_path = evidence.join(format!("retained-suite-{}.json", binding.request_jti));

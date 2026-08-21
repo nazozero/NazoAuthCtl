@@ -102,8 +102,9 @@ pub use proxy_trust::ProxyTrustGuard;
 pub use recovery::{
     ConformanceProxyRecovery, ConformanceRecoveryBinding, ConformanceRecoveryGuard,
     ConformanceRecoveryStore, SuiteRecoveryState, SuiteRetentionManifest, SuiteRetentionPlan,
-    SuiteRetentionScreenshotManifest, TenantResourceReceiptIdentity, TenantResourceRecoveryBinding,
-    TenantResourceRevokeOutcome, TenantResourceRevokeRecord,
+    SuiteRetentionProviderEvidence, SuiteRetentionScreenshotManifest,
+    TenantResourceReceiptIdentity, TenantResourceRecoveryBinding, TenantResourceRevokeOutcome,
+    TenantResourceRevokeRecord,
 };
 pub use report::{
     CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport, PlanReport,
