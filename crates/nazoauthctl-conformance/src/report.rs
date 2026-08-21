@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::client::AuthProbe;
 use crate::progress::ProgressSnapshot;
@@ -38,6 +38,11 @@ pub struct ModuleReport {
     pub suite_plan_id: String,
     pub module_id: Option<String>,
     pub test_name: String,
+    /// Canonical Suite definition variant. Empty preserves the legacy
+    /// name-only report shape while non-empty variants distinguish otherwise
+    /// identical Suite test names.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variant: BTreeMap<String, String>,
     pub terminal: bool,
     /// The suite's status is preserved verbatim; it is not mapped to a local
     /// pass/fail result.
@@ -82,6 +87,7 @@ pub(crate) struct ModuleReportContext {
     pub suite_plan_id: String,
     pub module_id: Option<String>,
     pub test_name: String,
+    pub variant: BTreeMap<String, String>,
     pub terminal: bool,
     pub expected_result: Option<String>,
 }
@@ -122,16 +128,16 @@ pub struct ConformanceReport {
     /// emitted a WARNING condition. These modules remain listed in `modules`
     /// and require explicit human follow-up.
     pub human_review_required: bool,
-    /// Exact `matrix_plan_id/test_name` entries requiring human review.
+    /// Variant-qualified module identities requiring human review.
     pub human_review_modules: Vec<String>,
-    /// Exact entries that the Suite classified as `SKIPPED`. An expected skip
+    /// Variant-qualified identities that the Suite classified as `SKIPPED`. An expected skip
     /// remains skipped and never contributes to `suite_pass`.
     pub skipped_modules: Vec<String>,
-    /// Exact `matrix_plan_id/test_name` entries that actually finished
+    /// Variant-qualified identities that actually finished
     /// `SKIPPED` and were explicitly allowed by the signed Matrix.
     #[serde(default)]
     pub expected_skipped_modules: Vec<String>,
-    /// Exact `matrix_plan_id/test_name` entries that actually finished
+    /// Variant-qualified identities that actually finished
     /// `SKIPPED` without an exact signed Matrix allowance.
     #[serde(default)]
     pub unexpected_skipped_modules: Vec<String>,
@@ -145,9 +151,9 @@ pub struct ConformanceReport {
     /// execution from an unacceptable signed-expectation mismatch.
     #[serde(default = "matrix_expectations_satisfied_default")]
     pub matrix_expectations_satisfied: bool,
-    /// Exact entries with an explicit failed/unknown result or a blocking log.
+    /// Variant-qualified identities with an explicit failed/unknown result or a blocking log.
     pub failed_modules: Vec<String>,
-    /// Exact entries that never reached the Suite's `FINISHED` state.
+    /// Variant-qualified identities that never reached the Suite's `FINISHED` state.
     pub incomplete_modules: Vec<String>,
     pub orchestration_integrity: OrchestrationIntegrity,
     pub progress: ProgressSnapshot,
@@ -200,6 +206,7 @@ impl ModuleReport {
             suite_plan_id: context.suite_plan_id,
             module_id: context.module_id,
             test_name: context.test_name,
+            variant: context.variant,
             terminal: context.terminal,
             official_status,
             official_result,
@@ -247,7 +254,7 @@ pub(crate) fn summarize_module_outcomes(modules: &[ModuleReport]) -> ModuleOutco
         incomplete_modules: Vec::new(),
     };
     for module in modules {
-        let identity = format!("{}/{}", module.matrix_plan_id, module.test_name);
+        let identity = module_identity(module);
         if module.human_review_required {
             summary.human_review_modules.push(identity.clone());
         }
@@ -290,7 +297,7 @@ pub(crate) fn summarize_matrix_expectations(modules: &[ModuleReport]) -> MatrixE
         if module.outcome != ModuleOutcome::Skipped {
             continue;
         }
-        let identity = format!("{}/{}", module.matrix_plan_id, module.test_name);
+        let identity = module_identity(module);
         if module.expected_result.as_deref() == Some("SKIPPED") {
             summary.expected_skipped_modules.push(identity);
         } else {
@@ -298,6 +305,18 @@ pub(crate) fn summarize_matrix_expectations(modules: &[ModuleReport]) -> MatrixE
         }
     }
     summary
+}
+
+pub(crate) fn module_identity(module: &ModuleReport) -> String {
+    if module.variant.is_empty() {
+        return format!("{}/{}", module.matrix_plan_id, module.test_name);
+    }
+    let canonical_variant = serde_json::to_string(&module.variant)
+        .expect("BTreeMap<String, String> always serializes to JSON");
+    format!(
+        "{}/{}?variant={canonical_variant}",
+        module.matrix_plan_id, module.test_name
+    )
 }
 
 const fn matrix_expectations_satisfied_default() -> bool {
@@ -391,6 +410,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some(format!("m-{test_name}")),
                 test_name: test_name.into(),
+                variant: BTreeMap::new(),
                 terminal,
                 expected_result: None,
             },
@@ -409,6 +429,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some("m".into()),
                 test_name: "test".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: None,
             },
@@ -488,6 +509,37 @@ mod tests {
     }
 
     #[test]
+    fn variant_qualified_module_identity_distinguishes_same_named_definitions() {
+        let mut plain = module(
+            "happy-flow",
+            true,
+            "FINISHED",
+            "FAILED",
+            serde_json::json!([]),
+        );
+        plain.variant = BTreeMap::from([("credential_configuration".into(), "plain".into())]);
+        let mut encrypted = module(
+            "happy-flow",
+            true,
+            "FINISHED",
+            "FAILED",
+            serde_json::json!([]),
+        );
+        encrypted.variant =
+            BTreeMap::from([("credential_configuration".into(), "encrypted".into())]);
+
+        let summary = summarize_module_outcomes(&[plain, encrypted]);
+
+        assert_eq!(
+            summary.failed_modules,
+            [
+                "p/happy-flow?variant={\"credential_configuration\":\"plain\"}",
+                "p/happy-flow?variant={\"credential_configuration\":\"encrypted\"}"
+            ]
+        );
+    }
+
+    #[test]
     fn skipped_modules_require_an_exact_signed_allowance() {
         let modules = vec![
             ModuleReport::from_info(
@@ -496,6 +548,7 @@ mod tests {
                     suite_plan_id: "s".into(),
                     module_id: Some("expected".into()),
                     test_name: "expected-skip".into(),
+                    variant: BTreeMap::new(),
                     terminal: true,
                     expected_result: Some("SKIPPED".into()),
                 },

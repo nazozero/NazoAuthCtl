@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use url::Url;
+use zeroize::Zeroize;
 
 use crate::credentials::BearerToken;
 use crate::matrix::zeroize_json_value;
@@ -144,10 +145,8 @@ impl SuiteClient {
         if plan_id.is_empty() || module.test_name.is_empty() {
             return Err(SuiteClientError::InvalidInput);
         }
-        let variant_json = module
-            .variant
-            .as_ref()
-            .map(serde_json::to_string)
+        let variant_json = (!module.variant.is_empty())
+            .then(|| serde_json::to_string(&module.variant))
             .transpose()
             .map_err(|_| SuiteClientError::InvalidInput)?;
         let mut query = vec![("test", module.test_name.as_str()), ("plan", plan_id)];
@@ -434,19 +433,36 @@ pub struct AuthProbe {
 pub struct ModuleDefinition {
     #[serde(rename = "testModule")]
     pub test_name: String,
-    #[serde(default)]
-    pub variant: Option<Value>,
+    /// The Suite definition is normalized to a sorted map at the response
+    /// boundary. This gives module creation, local automation, and reports
+    /// one exact identity even when Suite JSON object key order differs.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_module_variant",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub variant: BTreeMap<String, String>,
     #[serde(skip)]
     pub raw: Value,
 }
 
 impl Drop for ModuleDefinition {
     fn drop(&mut self) {
-        if let Some(variant) = &mut self.variant {
-            zeroize_json_value(variant);
+        for (mut key, mut value) in std::mem::take(&mut self.variant) {
+            key.zeroize();
+            value.zeroize();
         }
         zeroize_json_value(&mut self.raw);
     }
+}
+
+fn deserialize_module_variant<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<BTreeMap<String, String>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -540,9 +556,22 @@ fn parse_plan_created(body: Value) -> Result<PlanCreated, SuiteClientError> {
             .get("testModule")
             .and_then(Value::as_str)
             .ok_or(SuiteClientError::MalformedResponse)?;
+        let variant = match module.get("variant") {
+            None | Some(Value::Null) => BTreeMap::new(),
+            Some(Value::Object(entries)) => entries
+                .iter()
+                .map(|(key, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (key.clone(), value.to_owned()))
+                        .ok_or(SuiteClientError::MalformedResponse)
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?,
+            Some(_) => return Err(SuiteClientError::MalformedResponse),
+        };
         parsed.push(ModuleDefinition {
             test_name: test_name.to_owned(),
-            variant: module.get("variant").cloned(),
+            variant,
             raw: raw.clone(),
         });
     }
@@ -721,5 +750,43 @@ mod tests {
             Some("Bearer secret-token")
         );
         assert!(!authenticated.url().as_str().contains("secret-token"));
+    }
+
+    #[test]
+    fn plan_definition_variant_is_a_canonical_string_map_or_rejected() {
+        let created = parse_plan_created(serde_json::json!({
+            "id": "plan",
+            "name": "plan",
+            "modules": [
+                {"testModule": "missing"},
+                {"testModule": "null", "variant": null},
+                {"testModule": "ordered", "variant": {"b": "two", "a": "one"}}
+            ]
+        }))
+        .expect("valid definition");
+        assert!(created.modules[0].variant.is_empty());
+        assert!(created.modules[1].variant.is_empty());
+        assert_eq!(
+            created.modules[2].variant,
+            BTreeMap::from([
+                ("a".to_owned(), "one".to_owned()),
+                ("b".to_owned(), "two".to_owned())
+            ])
+        );
+
+        for variant in [
+            serde_json::json!(["not", "an object"]),
+            serde_json::json!({"key": 1}),
+            serde_json::json!(true),
+        ] {
+            assert!(matches!(
+                parse_plan_created(serde_json::json!({
+                    "id": "plan",
+                    "name": "plan",
+                    "modules": [{"testModule": "invalid", "variant": variant}]
+                })),
+                Err(SuiteClientError::MalformedResponse)
+            ));
+        }
     }
 }

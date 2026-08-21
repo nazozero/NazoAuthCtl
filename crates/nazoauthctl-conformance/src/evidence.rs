@@ -668,6 +668,7 @@ mod tests {
                 suite_plan_id: "suite-plan-a".to_owned(),
                 module_id: Some("module-a".to_owned()),
                 test_name: "test-a".to_owned(),
+                variant: Default::default(),
                 terminal: true,
                 official_status: Some("FINISHED".to_owned()),
                 official_result: Some("PASSED".to_owned()),

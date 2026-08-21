@@ -308,7 +308,7 @@ impl ConformanceRunner {
             let module_context = OpenId4VciModule::new(
                 module_id.to_owned(),
                 module.test_name.clone(),
-                plan.runtime_variant.clone(),
+                runtime_variant_for_definition(plan, module),
                 plan.config.clone(),
                 runner,
             )
@@ -559,10 +559,18 @@ impl ConformanceRunner {
                     // declaration observable in the public evidence even
                     // when the Suite also exceeds a resource bound.
                     let mut module_name_counts = BTreeMap::<&str, usize>::new();
+                    let mut definition_identities = BTreeSet::new();
+                    let mut duplicate_definition_identities = Vec::new();
                     for module in &created.modules {
                         *module_name_counts
                             .entry(module.test_name.as_str())
                             .or_default() += 1;
+                        if !definition_identities
+                            .insert((module.test_name.clone(), module.variant.clone()))
+                        {
+                            duplicate_definition_identities
+                                .push(definition_identity(&plan.id, module));
+                        }
                     }
                     let unknown_expected_skips = plan
                         .expected_results
@@ -601,7 +609,16 @@ impl ConformanceRunner {
                                 .to_owned(),
                         );
                     }
-                    if expected_skip_definition_mismatch || over_budget {
+                    let has_duplicate_definition = !duplicate_definition_identities.is_empty();
+                    if has_duplicate_definition {
+                        for identity in duplicate_definition_identities {
+                            errors.push(format!(
+                                "Suite plan defines an exact duplicate module definition: {identity}"
+                            ));
+                        }
+                    }
+                    if expected_skip_definition_mismatch || over_budget || has_duplicate_definition
+                    {
                         groups[group_index].status = GroupStatus::Failed;
                         break 'create;
                     }
@@ -962,6 +979,7 @@ impl ConformanceRunner {
                             suite_plan_id: plan.suite_plan_id.clone(),
                             module_id: Some(instance.id.clone()),
                             test_name: module.test_name.clone(),
+                            variant: module.variant.clone(),
                             terminal,
                             expected_result: plan.expected_results.get(&module.test_name).cloned(),
                         },
@@ -1367,6 +1385,26 @@ fn cancel_once(client: &SuiteClient, module_id: &str, report: &mut CleanupReport
     }
 }
 
+fn runtime_variant_for_definition(
+    plan: &PlannedPlan,
+    module: &ModuleDefinition,
+) -> BTreeMap<String, String> {
+    let mut variant = plan.runtime_variant.clone();
+    // The Suite definition fixes this concrete runner's behavior. It must
+    // override the Matrix defaults used to create the containing plan.
+    variant.extend(module.variant.clone());
+    variant
+}
+
+fn definition_identity(matrix_plan_id: &str, module: &ModuleDefinition) -> String {
+    if module.variant.is_empty() {
+        return format!("{matrix_plan_id}/{}", module.test_name);
+    }
+    let variant = serde_json::to_string(&module.variant)
+        .expect("BTreeMap<String, String> always serializes to JSON");
+    format!("{matrix_plan_id}/{}?variant={variant}", module.test_name)
+}
+
 fn safe_error(error: &impl std::fmt::Display) -> String {
     error.to_string()
 }
@@ -1514,7 +1552,9 @@ mod tests {
 
     struct DuplicateDefinitionTransport {
         created_modules: AtomicUsize,
+        module_info_calls: Mutex<BTreeMap<String, usize>>,
         requests: Mutex<Vec<(HttpMethod, String)>>,
+        runner_variants: Mutex<Vec<String>>,
     }
 
     struct RecordingPlanObserver {
@@ -1694,6 +1734,18 @@ mod tests {
         fn send(&self, request: HttpRequest, _max: usize) -> Result<HttpResponse, TransportError> {
             let method = request.method();
             let path = request.url().path().to_owned();
+            if method == HttpMethod::Post && path == "/api/runner" {
+                let variant = request
+                    .url()
+                    .query_pairs()
+                    .find_map(|(key, value)| (key == "variant").then(|| value.into_owned()));
+                if let Some(variant) = variant {
+                    self.runner_variants
+                        .lock()
+                        .expect("duplicate definition variants")
+                        .push(variant);
+                }
+            }
             self.requests
                 .lock()
                 .expect("duplicate definition requests")
@@ -1713,8 +1765,14 @@ mod tests {
                         "id": "suite-plan",
                         "name": "plan",
                         "modules": [
-                            {"testModule": "happy-flow"},
-                            {"testModule": "happy-flow"}
+                            {"testModule": "happy-flow", "variant": {
+                                "credential_configuration": "plain",
+                                "vci_authorization_code_flow_variant": "issuer_initiated"
+                            }},
+                            {"testModule": "happy-flow", "variant": {
+                                "credential_configuration": "encrypted",
+                                "vci_authorization_code_flow_variant": "issuer_initiated"
+                            }}
                         ]
                     }),
                 ),
@@ -1728,10 +1786,28 @@ mod tests {
                 (HttpMethod::Get, path) if path.ends_with("/wait-state") => {
                     (200, serde_json::json!({"state":"FINISHED"}))
                 }
-                (HttpMethod::Get, path) if path.starts_with("/api/info/module-") => (
-                    200,
-                    serde_json::json!({"status":"FINISHED","result":"PASSED"}),
-                ),
+                (HttpMethod::Get, path) if path.starts_with("/api/info/module-") => {
+                    let calls = {
+                        let mut calls = self
+                            .module_info_calls
+                            .lock()
+                            .expect("duplicate definition module info");
+                        let calls = calls.entry(path.to_owned()).or_default();
+                        *calls += 1;
+                        *calls
+                    };
+                    if calls == 1 {
+                        (200, serde_json::json!({"status":"WAITING"}))
+                    } else {
+                        (
+                            200,
+                            serde_json::json!({"status":"FINISHED","result":"PASSED"}),
+                        )
+                    }
+                }
+                (HttpMethod::Get, path) if path.starts_with("/api/runner/module-") => {
+                    (200, serde_json::json!({}))
+                }
                 (HttpMethod::Get, path) if path.starts_with("/api/log/module-") => {
                     (200, serde_json::json!([]))
                 }
@@ -1800,6 +1876,7 @@ mod tests {
                 suite_plan_id: "suite-plan".into(),
                 module_id: Some("terminal".into()),
                 test_name: "terminal-test".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: None,
             },
@@ -1812,6 +1889,7 @@ mod tests {
                 suite_plan_id: "suite-plan".into(),
                 module_id: Some("incomplete".into()),
                 test_name: "incomplete-test".into(),
+                variant: BTreeMap::new(),
                 terminal: false,
                 expected_result: None,
             },
@@ -2086,10 +2164,12 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_unreferenced_module_names_run_as_distinct_suite_instances() {
+    fn same_name_distinct_variants_create_exact_suite_instances_and_runtime_overlays() {
         let transport = Arc::new(DuplicateDefinitionTransport {
             created_modules: AtomicUsize::new(0),
+            module_info_calls: Mutex::new(BTreeMap::new()),
             requests: Mutex::new(Vec::new()),
+            runner_variants: Mutex::new(Vec::new()),
         });
         let client = SuiteClient::with_transport(
             Origin::parse("https://suite.example").expect("origin"),
@@ -2098,9 +2178,25 @@ mod tests {
             ClientConfig::default(),
         )
         .expect("client");
+        let mut matrix = one_plan_matrix(serde_json::json!({}));
+        let matrix_plan = &mut matrix.document.groups[0].plans[0];
+        matrix_plan.plan = "oid4vci-issuer-test-plan".to_owned();
+        matrix_plan.variant = BTreeMap::from([
+            (
+                "vci_authorization_code_flow_variant".to_owned(),
+                "wallet_initiated".to_owned(),
+            ),
+            (
+                "credential_configuration".to_owned(),
+                "matrix-default".to_owned(),
+            ),
+            ("matrix_only".to_owned(), "kept".to_owned()),
+        ]);
+        let issuer = Arc::new(Mutex::new(RecordingIssuer::default()));
+        let issuer_driver: Arc<Mutex<dyn OpenId4VciIssuerDriver>> = issuer.clone();
         let runner = ConformanceRunner::new(ConformanceRunConfig {
             client,
-            matrix: one_plan_matrix(serde_json::json!({})),
+            matrix,
             target_origin: None,
             binding: test_binding(),
             poll_timeout: Duration::from_secs(1),
@@ -2109,7 +2205,10 @@ mod tests {
             plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
             selected_resource_budget: budget(2, 1, 60),
             jobs: 1,
-            automation: Vec::new(),
+            automation: vec![ConformanceAutomation {
+                issuer: Some(issuer_driver),
+                ..ConformanceAutomation::default()
+            }],
             suite_resource_observer: None,
         })
         .expect("runner");
@@ -2136,6 +2235,17 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>(),
             std::collections::BTreeSet::from(["module-1", "module-2"])
         );
+        assert_eq!(
+            report
+                .modules
+                .iter()
+                .map(|module| module
+                    .variant
+                    .get("credential_configuration")
+                    .map(String::as_str))
+                .collect::<Vec<_>>(),
+            [Some("plain"), Some("encrypted")]
+        );
         assert_eq!(report.cleanup.deleted_plans, ["suite-plan"]);
         assert_eq!(
             transport
@@ -2147,14 +2257,41 @@ mod tests {
                 .count(),
             2
         );
+        assert_eq!(
+            transport
+                .runner_variants
+                .lock()
+                .expect("duplicate definition variants")
+                .as_slice(),
+            [
+                "{\"credential_configuration\":\"plain\",\"vci_authorization_code_flow_variant\":\"issuer_initiated\"}",
+                "{\"credential_configuration\":\"encrypted\",\"vci_authorization_code_flow_variant\":\"issuer_initiated\"}"
+            ]
+        );
+        let observed_variants = issuer.lock().expect("recording issuer").variants.clone();
+        assert_eq!(observed_variants.len(), 2);
+        assert!(observed_variants.iter().all(|variant| {
+            variant.get("matrix_only").map(String::as_str) == Some("kept")
+                && variant
+                    .get("vci_authorization_code_flow_variant")
+                    .map(String::as_str)
+                    == Some("issuer_initiated")
+        }));
+        assert_eq!(
+            observed_variants
+                .iter()
+                .map(|variant| variant.get("credential_configuration").map(String::as_str))
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([Some("plain"), Some("encrypted")])
+        );
     }
 
     #[test]
     fn duplicate_signed_skip_definition_stops_before_module_creation() {
         let transport = Arc::new(DefinitionTransport {
             modules: serde_json::json!([
-                {"testModule": "declared-skip"},
-                {"testModule": "declared-skip"}
+                {"testModule": "declared-skip", "variant": {"credential_configuration": "plain"}},
+                {"testModule": "declared-skip", "variant": {"credential_configuration": "encrypted"}}
             ]),
             requests: Mutex::new(Vec::new()),
         });
@@ -2211,6 +2348,59 @@ mod tests {
                 .filter(|(method, path)| *method == HttpMethod::Post && path == "/api/runner")
                 .count(),
             0,
+        );
+    }
+
+    #[test]
+    fn exact_duplicate_suite_definition_with_reordered_variant_keys_stops_before_creation() {
+        let transport = Arc::new(DefinitionTransport {
+            modules: serde_json::json!([
+                {"testModule": "duplicate", "variant": {"a": "one", "b": "two"}},
+                {"testModule": "duplicate", "variant": {"b": "two", "a": "one"}}
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix: one_plan_matrix(serde_json::json!({})),
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
+            selected_resource_budget: budget(2, 1, 60),
+            jobs: 1,
+            automation: Vec::new(),
+            suite_resource_observer: None,
+        })
+        .expect("runner");
+
+        let report = runner.run(&mut ()).report;
+
+        assert!(report.errors.iter().any(|error| {
+            error
+                == "Suite plan defines an exact duplicate module definition: p/duplicate?variant={\"a\":\"one\",\"b\":\"two\"}"
+        }));
+        assert_eq!(report.plans[0].defined_modules, 2);
+        assert_eq!(report.plans[0].created_instances, 0);
+        assert!(report.modules.is_empty());
+        assert_eq!(
+            transport
+                .requests
+                .lock()
+                .expect("definition requests")
+                .iter()
+                .filter(|(method, path)| *method == HttpMethod::Post && path == "/api/runner")
+                .count(),
+            0
         );
     }
 
@@ -2355,6 +2545,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some("m".into()),
                 test_name: "test".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: None,
             },
@@ -2373,6 +2564,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some("m".into()),
                 test_name: "oidcc-review".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: None,
             },
@@ -2391,6 +2583,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some("m".into()),
                 test_name: "oidcc-skip".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: Some("SKIPPED".into()),
             },
@@ -2405,6 +2598,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some("m".into()),
                 test_name: "oidcc-other".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: None,
             },
@@ -2422,6 +2616,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some("m".into()),
                 test_name: "oidcc-review".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: None,
             },
@@ -2442,6 +2637,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some("m-warning".into()),
                 test_name: "oidcc-warning".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: None,
             },
@@ -2459,6 +2655,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some("m-failure".into()),
                 test_name: "oidcc-failure".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: None,
             },
@@ -2544,6 +2741,18 @@ mod tests {
         drives: usize,
     }
 
+    #[derive(Default)]
+    struct RecordingIssuer {
+        variants: Vec<BTreeMap<String, String>>,
+    }
+
+    impl OpenId4VciIssuerDriver for RecordingIssuer {
+        fn drive(&mut self, module: &OpenId4VciModule) -> Result<(), OpenId4VciError> {
+            self.variants.push(module.variant.clone());
+            Ok(())
+        }
+    }
+
     impl OpenId4VciIssuerDriver for PendingIssuer {
         fn drive(&mut self, _module: &OpenId4VciModule) -> Result<(), OpenId4VciError> {
             self.drives += 1;
@@ -2605,7 +2814,7 @@ mod tests {
         };
         let module = ModuleDefinition {
             test_name: "test".into(),
-            variant: None,
+            variant: BTreeMap::new(),
             raw: serde_json::json!({}),
         };
         let issuer_driver: Arc<Mutex<dyn OpenId4VciIssuerDriver>> = issuer.clone();
@@ -2741,7 +2950,7 @@ mod tests {
         }));
         let module = ModuleDefinition {
             test_name: "browser-module".to_owned(),
-            variant: None,
+            variant: BTreeMap::new(),
             raw: Value::Null,
         };
 
