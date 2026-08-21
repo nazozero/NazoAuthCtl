@@ -53,8 +53,10 @@ backup endpoints (host, effective port, database and Valkey TLS scheme),
 requires the runtime/migration/backup roles to use separate decoded usernames,
 and persists only SHA-256 endpoint identities plus the scope in the config,
 candidate intent and backup identity. PostgreSQL permits at most one `sslmode`;
-that TLS policy is part of the persisted backup binding, while all other query
-options are rejected for this contract.
+that TLS policy is part of each persisted PostgreSQL binding, while all other
+query options are rejected for this contract. Each runtime, migration, and backup
+PostgreSQL URL has its own persisted endpoint-plus-TLS identity, so changing
+any `sslmode` (including a downgrade) blocks replay.
 Existing schema-2 managed deployments remain
 readable, while a legacy external configuration without these dedicated backup
 credentials fails closed and is never rewritten during candidate retry.

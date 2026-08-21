@@ -82,6 +82,10 @@ pub(crate) struct Dependencies {
     #[serde(default)]
     pub(crate) external_valkey_backup_scope: String,
     #[serde(default)]
+    pub(crate) database_runtime_endpoint_sha256: String,
+    #[serde(default)]
+    pub(crate) migration_database_endpoint_sha256: String,
+    #[serde(default)]
     pub(crate) database_backup_endpoint_sha256: String,
     #[serde(default)]
     pub(crate) valkey_backup_endpoint_sha256: String,
@@ -101,6 +105,8 @@ impl Default for Dependencies {
             valkey_url_file: PathBuf::new(),
             valkey_backup_url_file: PathBuf::new(),
             external_valkey_backup_scope: String::new(),
+            database_runtime_endpoint_sha256: String::new(),
+            migration_database_endpoint_sha256: String::new(),
             database_backup_endpoint_sha256: String::new(),
             valkey_backup_endpoint_sha256: String::new(),
         }
@@ -372,6 +378,14 @@ impl UpdateConfig {
                 bail!("external Valkey backup must declare dedicated-instance scope");
             }
             for (label, identity) in [
+                (
+                    "external PostgreSQL runtime endpoint identity",
+                    &self.dependencies.database_runtime_endpoint_sha256,
+                ),
+                (
+                    "external PostgreSQL migration endpoint identity",
+                    &self.dependencies.migration_database_endpoint_sha256,
+                ),
                 (
                     "external PostgreSQL backup endpoint identity",
                     &self.dependencies.database_backup_endpoint_sha256,

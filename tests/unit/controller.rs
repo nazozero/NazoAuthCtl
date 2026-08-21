@@ -300,6 +300,9 @@ fn configure_external_dependency_fixture(config: &mut UpdateConfig) {
         "rediss://backup:backup-secret@CACHE.EXAMPLE:6379/0",
     )
     .unwrap();
+    config.dependencies.database_runtime_endpoint_sha256 = binding.database_runtime_endpoint_sha256;
+    config.dependencies.migration_database_endpoint_sha256 =
+        binding.migration_database_endpoint_sha256;
     config.dependencies.database_backup_endpoint_sha256 = binding.database_endpoint_sha256;
     config.dependencies.valkey_backup_endpoint_sha256 = binding.valkey_endpoint_sha256;
 }
@@ -3300,6 +3303,86 @@ fn external_secret_drift_does_not_mutate_pending_candidate_state() {
 
     assert!(install::verify_live_external_dependencies(&config).is_err());
     assert_eq!(fs::read(&state_path).unwrap(), before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn candidate_retry_rejects_bad_backup_evidence_before_state_mutation() {
+    let work = PrivateTempDir::new("nazoauth-candidate-bad-backup-retry").unwrap();
+    if fs::metadata(work.path()).unwrap().uid() != 0 {
+        return;
+    }
+    let mut config = config(&work);
+    configure_external_dependency_fixture(&mut config);
+    let revision = "a".repeat(40);
+    for kind in ["missing-marker", "bad-checksum", "wrong-config"] {
+        let backup = config.backup_root.join(kind);
+        materialize_verified_backup(&config, &backup);
+        match kind {
+            "missing-marker" => fs::remove_file(backup.join("BACKUP-COMPLETE")).unwrap(),
+            "bad-checksum" => {
+                crate::filesystem::set_mode(&backup.join("state.bin"), 0o600).unwrap();
+                fs::write(backup.join("state.bin"), b"corrupted").unwrap();
+                crate::filesystem::set_mode(&backup.join("state.bin"), 0o440).unwrap();
+            }
+            "wrong-config" => {
+                let archived = backup.join("update-config.json");
+                crate::filesystem::set_mode(&archived, 0o600).unwrap();
+                let mut other = config.clone();
+                other.postgres.validation_image = "other-validation-image".to_owned();
+                fs::write(&archived, serde_json::to_vec_pretty(&other).unwrap()).unwrap();
+                let checksums = backup.join("SHA256SUMS");
+                crate::filesystem::set_mode(&checksums, 0o600).unwrap();
+                fs::write(
+                    &checksums,
+                    format!(
+                        "{}  state.bin\n{}  update-config.json\n",
+                        crate::filesystem::sha256(&backup.join("state.bin")).unwrap(),
+                        crate::filesystem::sha256(&archived).unwrap(),
+                    ),
+                )
+                .unwrap();
+                let marker = backup.join("BACKUP-COMPLETE");
+                crate::filesystem::set_mode(&marker, 0o600).unwrap();
+                fs::write(
+                    &marker,
+                    format!(
+                        "marker=BACKUP-COMPLETE\nversion=1\nmanifest-sha256={}\n",
+                        crate::filesystem::sha256(&checksums).unwrap(),
+                    ),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let state = LocalOciCandidateInstallState {
+            schema: 1,
+            candidate: LocalOciCandidateInstall {
+                image: "candidate:local".to_owned(),
+                target: CandidateTarget {
+                    release: "v0.2.0-candidate.1".to_owned(),
+                    revision: revision.clone(),
+                    build_id: format!("source:{revision}"),
+                    oci_digest: format!("sha256:{}", "b".repeat(64)),
+                },
+            },
+            local_artifact_id: format!("sha256:{}", "c".repeat(64)),
+            recovery_backup: Some(backup),
+            management_event_file: None,
+            management_event_sha256: None,
+            completed: false,
+        };
+        let state_path = deployment::local_oci_candidate_install_resource_path(&config);
+        atomic_write(
+            &state_path,
+            &serde_json::to_vec_pretty(&state).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        let before = fs::read(&state_path).unwrap();
+        assert!(verify_local_oci_candidate_retry_preconditions(&config, &state).is_err());
+        assert_eq!(fs::read(&state_path).unwrap(), before, "{kind}");
+    }
 }
 
 #[test]

@@ -278,6 +278,9 @@ pub(super) fn normalize_external_dependencies(options: &mut InstallOptions) -> a
             bail!("external dependency credential URLs must be distinct");
         }
         let binding = external_dependency_endpoint_binding(options)?;
+        options.database_runtime_endpoint_sha256 = Some(binding.database_runtime_endpoint_sha256);
+        options.migration_database_endpoint_sha256 =
+            Some(binding.migration_database_endpoint_sha256);
         options.database_backup_endpoint_sha256 = Some(binding.database_endpoint_sha256);
         options.valkey_backup_endpoint_sha256 = Some(binding.valkey_endpoint_sha256);
     }
@@ -302,7 +305,11 @@ pub(crate) fn verify_live_external_dependencies(config: &UpdateConfig) -> anyhow
         &config.dependencies.valkey_url_file,
         &config.dependencies.valkey_backup_url_file,
     )?;
-    if binding.database_endpoint_sha256 != config.dependencies.database_backup_endpoint_sha256
+    if binding.database_runtime_endpoint_sha256
+        != config.dependencies.database_runtime_endpoint_sha256
+        || binding.migration_database_endpoint_sha256
+            != config.dependencies.migration_database_endpoint_sha256
+        || binding.database_endpoint_sha256 != config.dependencies.database_backup_endpoint_sha256
         || binding.valkey_endpoint_sha256 != config.dependencies.valkey_backup_endpoint_sha256
     {
         bail!(
@@ -381,6 +388,8 @@ pub(super) fn read_external_dependency_secrets(
     options.valkey_backup_url = Some(secrets.valkey_backup_url.clone());
     options.external_valkey_backup_scope = Some(secrets.valkey_backup_scope.clone());
     let binding = external_dependency_endpoint_binding(options)?;
+    options.database_runtime_endpoint_sha256 = Some(binding.database_runtime_endpoint_sha256);
+    options.migration_database_endpoint_sha256 = Some(binding.migration_database_endpoint_sha256);
     options.database_backup_endpoint_sha256 = Some(binding.database_endpoint_sha256);
     options.valkey_backup_endpoint_sha256 = Some(binding.valkey_endpoint_sha256);
     Ok(())

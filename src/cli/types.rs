@@ -249,6 +249,8 @@ pub(crate) struct InstallOptions {
     pub(crate) valkey_url: Option<String>,
     pub(crate) valkey_backup_url: Option<String>,
     pub(crate) external_valkey_backup_scope: Option<String>,
+    pub(crate) database_runtime_endpoint_sha256: Option<String>,
+    pub(crate) migration_database_endpoint_sha256: Option<String>,
     pub(crate) database_backup_endpoint_sha256: Option<String>,
     pub(crate) valkey_backup_endpoint_sha256: Option<String>,
     pub(crate) external_dependencies: bool,

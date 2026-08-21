@@ -60,6 +60,42 @@ fn external_dependency_binding_canonicalizes_ports_and_rejects_alias_bypasses() 
         binding.database_endpoint_sha256,
         downgraded_tls.database_endpoint_sha256
     );
+    assert_ne!(
+        binding.database_runtime_endpoint_sha256,
+        downgraded_tls.database_runtime_endpoint_sha256
+    );
+    assert_ne!(
+        binding.migration_database_endpoint_sha256,
+        downgraded_tls.migration_database_endpoint_sha256
+    );
+    let migration_downgrade = bind_external_dependency_credentials(
+        "postgresql://runtime:runtime-secret@db.example/oauth?sslmode=require",
+        "postgresql://migrator:migration-secret@db.example/oauth?sslmode=disable",
+        "postgresql://backup:backup-secret@db.example/oauth?sslmode=require",
+        "rediss://runtime:runtime-secret@cache.example/0",
+        "rediss://backup:backup-secret@cache.example/0",
+    )
+    .unwrap();
+    assert_eq!(
+        binding.database_runtime_endpoint_sha256,
+        migration_downgrade.database_runtime_endpoint_sha256
+    );
+    assert_ne!(
+        binding.migration_database_endpoint_sha256,
+        migration_downgrade.migration_database_endpoint_sha256
+    );
+    let runtime_downgrade = bind_external_dependency_credentials(
+        "postgresql://runtime:runtime-secret@db.example/oauth?sslmode=disable",
+        "postgresql://migrator:migration-secret@db.example/oauth",
+        "postgresql://backup:backup-secret@db.example/oauth?sslmode=require",
+        "rediss://runtime:runtime-secret@cache.example/0",
+        "rediss://backup:backup-secret@cache.example/0",
+    )
+    .unwrap();
+    assert_ne!(
+        binding.database_runtime_endpoint_sha256,
+        runtime_downgrade.database_runtime_endpoint_sha256
+    );
 
     for input in [
         (
@@ -106,6 +142,32 @@ fn external_dependency_binding_canonicalizes_ports_and_rejects_alias_bypasses() 
 }
 
 #[test]
+fn dependency_url_parser_is_strict_about_percent_encoding_and_hosts() {
+    let ipv6 = parse_dependency_url(
+        "postgresql://runtime:secret@[2001:0DB8:0:0:0:0:0:1]/oauth?sslmode=require",
+        "PostgreSQL runtime",
+    )
+    .unwrap();
+    assert_eq!(ipv6.host, "[2001:db8::1]");
+    let dns = parse_dependency_url(
+        "postgresql://runtime:secret@DB.EXAMPLE/oauth",
+        "PostgreSQL runtime",
+    )
+    .unwrap();
+    assert_eq!(dns.host, "db.example");
+    for input in [
+        "postgresql://runtime:bad%@db.example/oauth",
+        "postgresql://runtime:bad%0@db.example/oauth",
+        "postgresql://runtime:bad%GG@db.example/oauth",
+        "postgresql://runtime:secret@[not-ip]/oauth",
+        "postgresql://runtime:secret@db\\example/oauth",
+        "postgresql://runtime:secret@-db.example/oauth",
+    ] {
+        assert!(parse_dependency_url(input, "PostgreSQL runtime").is_err());
+    }
+}
+
+#[test]
 fn backup_binding_reads_only_the_two_dedicated_credentials() {
     let work = PrivateTempDir::new("nazoauth-backup-credential-binding").unwrap();
     let database_backup = work.path().join("database-backup-url");
@@ -123,9 +185,47 @@ fn backup_binding_reads_only_the_two_dedicated_credentials() {
     crate::filesystem::set_mode(&database_backup, 0o600).unwrap();
     crate::filesystem::set_mode(&valkey_backup, 0o600).unwrap();
 
-    let binding = bind_external_backup_url_files(&database_backup, &valkey_backup).unwrap();
-    assert_eq!(binding.database_endpoint_sha256.len(), 64);
-    assert_eq!(binding.valkey_endpoint_sha256.len(), 64);
+    let providers = read_external_backup_providers(&database_backup, &valkey_backup).unwrap();
+    assert_eq!(providers.binding.database_endpoint_sha256.len(), 64);
+    assert_eq!(providers.binding.valkey_endpoint_sha256.len(), 64);
+}
+
+#[test]
+fn backup_providers_consume_the_single_verified_read_after_source_replacement() {
+    let work = PrivateTempDir::new("nazoauth-backup-provider-single-read").unwrap();
+    let database_backup = work.path().join("database-backup-url");
+    let valkey_backup = work.path().join("valkey-backup-url");
+    fs::write(
+        &database_backup,
+        "postgresql://backup:backup-secret@db.example/oauth?sslmode=require",
+    )
+    .unwrap();
+    fs::write(
+        &valkey_backup,
+        "rediss://backup:backup-secret@cache.example/0",
+    )
+    .unwrap();
+    crate::filesystem::set_mode(&database_backup, 0o600).unwrap();
+    crate::filesystem::set_mode(&valkey_backup, 0o600).unwrap();
+
+    let providers = read_external_backup_providers(&database_backup, &valkey_backup).unwrap();
+    fs::write(
+        &database_backup,
+        "postgresql://backup:changed@other.example/oauth",
+    )
+    .unwrap();
+    fs::write(&valkey_backup, "redis://backup:changed@other.example/0").unwrap();
+    crate::filesystem::set_mode(&database_backup, 0o600).unwrap();
+    crate::filesystem::set_mode(&valkey_backup, 0o600).unwrap();
+
+    assert_eq!(providers.binding.database_endpoint_sha256.len(), 64);
+    assert!(
+        fs::read_to_string(providers.postgres.service_file())
+            .unwrap()
+            .contains("host=db.example")
+    );
+    assert_eq!(providers.valkey.host, "cache.example");
+    assert!(providers.valkey.tls);
 }
 
 #[test]

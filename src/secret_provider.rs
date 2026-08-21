@@ -1,4 +1,8 @@
-use std::{fmt::Write as _, path::Path};
+use std::{
+    fmt::Write as _,
+    net::{Ipv4Addr, Ipv6Addr},
+    path::Path,
+};
 
 use anyhow::{Context, bail};
 use sha2::{Digest as _, Sha256};
@@ -15,6 +19,10 @@ impl PostgresProvider {
     pub(crate) fn from_url_file(path: &Path) -> anyhow::Result<Self> {
         let raw = read_single_line(path)?;
         let url = parse_dependency_url(raw.as_str(), "PostgreSQL secret provider")?;
+        Self::from_dependency_url(url)
+    }
+
+    fn from_dependency_url(url: DependencyUrl) -> anyhow::Result<Self> {
         if !matches!(url.scheme.as_str(), "postgres" | "postgresql") {
             bail!("PostgreSQL secret provider has an unsupported scheme");
         }
@@ -89,6 +97,10 @@ impl ValkeyProvider {
     pub(crate) fn from_url_file(path: &Path) -> anyhow::Result<Self> {
         let raw = read_single_line(path)?;
         let url = parse_dependency_url(raw.as_str(), "Valkey secret provider")?;
+        Self::from_dependency_url(url)
+    }
+
+    fn from_dependency_url(url: DependencyUrl) -> anyhow::Result<Self> {
         if !matches!(url.scheme.as_str(), "redis" | "rediss") || !url.query.is_empty() {
             bail!("Valkey secret provider has an unsupported URL");
         }
@@ -115,8 +127,19 @@ impl ValkeyProvider {
 }
 
 pub(crate) struct ExternalDependencyBackupBinding {
+    pub(crate) database_runtime_endpoint_sha256: String,
+    pub(crate) migration_database_endpoint_sha256: String,
     pub(crate) database_endpoint_sha256: String,
     pub(crate) valkey_endpoint_sha256: String,
+}
+
+/// The two backup credentials are read and parsed exactly once.  The binding
+/// is verified before the already-parsed providers are handed to subprocesses,
+/// so replacing either source file cannot redirect a backup after validation.
+pub(crate) struct ExternalBackupProviders {
+    pub(crate) binding: ExternalDependencyBackupBinding,
+    pub(crate) postgres: PostgresProvider,
+    pub(crate) valkey: ValkeyProvider,
 }
 
 pub(crate) fn bind_external_dependency_credentials(
@@ -149,6 +172,8 @@ pub(crate) fn bind_external_dependency_credentials(
         bail!("external Valkey runtime and backup usernames must be distinct");
     }
     Ok(ExternalDependencyBackupBinding {
+        database_runtime_endpoint_sha256: postgres_binding_sha256(&database),
+        migration_database_endpoint_sha256: postgres_binding_sha256(&migration),
         database_endpoint_sha256: endpoint_sha256(&format!(
             "{};tls-policy={}",
             backup.endpoint, backup.tls_policy
@@ -160,33 +185,26 @@ pub(crate) fn bind_external_dependency_credentials(
     })
 }
 
-/// Verify the two credentials consumed by backup without exposing runtime or
-/// migration credentials to the backup process.
-pub(crate) fn bind_external_backup_credentials(
-    database_backup_url: &str,
-    valkey_backup_url: &str,
-) -> anyhow::Result<ExternalDependencyBackupBinding> {
-    let database = postgres_binding(database_backup_url, "PostgreSQL backup")?;
-    let valkey = valkey_binding(valkey_backup_url, "Valkey backup")?;
-    Ok(ExternalDependencyBackupBinding {
-        database_endpoint_sha256: endpoint_sha256(&format!(
-            "{};tls-policy={}",
-            database.endpoint, database.tls_policy
-        )),
-        valkey_endpoint_sha256: endpoint_sha256(&format!(
-            "{};tls-policy={}",
-            valkey.endpoint, valkey.tls_policy
-        )),
-    })
-}
-
-pub(crate) fn bind_external_backup_url_files(
+pub(crate) fn read_external_backup_providers(
     database_backup_url: &Path,
     valkey_backup_url: &Path,
-) -> anyhow::Result<ExternalDependencyBackupBinding> {
-    let database = read_single_line(database_backup_url)?;
-    let valkey = read_single_line(valkey_backup_url)?;
-    bind_external_backup_credentials(database.as_str(), valkey.as_str())
+) -> anyhow::Result<ExternalBackupProviders> {
+    let database_raw = read_single_line(database_backup_url)?;
+    let valkey_raw = read_single_line(valkey_backup_url)?;
+    let database = parse_dependency_url(database_raw.as_str(), "PostgreSQL backup")?;
+    let valkey = parse_dependency_url(valkey_raw.as_str(), "Valkey backup")?;
+    let database_endpoint_sha256 = postgres_endpoint_sha256(&database, "PostgreSQL backup")?;
+    let valkey_hash = valkey_endpoint_sha256(&valkey, "Valkey backup")?;
+    Ok(ExternalBackupProviders {
+        binding: ExternalDependencyBackupBinding {
+            database_runtime_endpoint_sha256: String::new(),
+            migration_database_endpoint_sha256: String::new(),
+            database_endpoint_sha256,
+            valkey_endpoint_sha256: valkey_hash,
+        },
+        postgres: PostgresProvider::from_dependency_url(database)?,
+        valkey: ValkeyProvider::from_dependency_url(valkey)?,
+    })
 }
 
 pub(crate) fn bind_external_dependency_url_files(
@@ -319,7 +337,10 @@ fn parse_host_port(value: &str, label: &str) -> anyhow::Result<(String, Option<u
         if !after.is_empty() && port.is_none() {
             bail!("{label} URL host is invalid");
         }
-        (format!("[{host}]"), port)
+        let address = host
+            .parse::<Ipv6Addr>()
+            .with_context(|| format!("{label} URL host is invalid"))?;
+        (format!("[{address}]"), port)
     } else {
         match value.split_once(':') {
             Some((host, port)) if !port.contains(':') => (host.to_owned(), Some(port.to_owned())),
@@ -327,13 +348,13 @@ fn parse_host_port(value: &str, label: &str) -> anyhow::Result<(String, Option<u
             None => (value.to_owned(), None),
         }
     };
-    if host.is_empty()
-        || host
-            .chars()
-            .any(|character| character.is_control() || character.is_whitespace())
-    {
-        bail!("{label} URL host contains unsafe characters");
-    }
+    let host = if host.starts_with('[') {
+        // Only the branch above can construct bracketed text, after parsing it
+        // as Ipv6Addr. Never accept brackets in the DNS/IPv4 path.
+        host
+    } else {
+        normalize_host(&host, label)?
+    };
     let port = raw_port
         .map(|port| {
             if port.is_empty() {
@@ -346,8 +367,41 @@ fn parse_host_port(value: &str, label: &str) -> anyhow::Result<(String, Option<u
     Ok((host, port))
 }
 
+fn normalize_host(value: &str, label: &str) -> anyhow::Result<String> {
+    if value.is_empty()
+        || value.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '[' | ']' | '\\' | '/' | '?' | '#' | '%' | '@')
+        })
+    {
+        bail!("{label} URL host contains unsafe characters");
+    }
+    if let Ok(address) = value.parse::<Ipv4Addr>() {
+        return Ok(address.to_string());
+    }
+    if value.len() > 253
+        || value.split('.').any(|part| {
+            part.is_empty()
+                || part.len() > 63
+                || part.starts_with('-')
+                || part.ends_with('-')
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        bail!("{label} URL host is not a safe DNS name");
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
 fn postgres_binding(value: &str, label: &str) -> anyhow::Result<ProviderBinding> {
     let url = parse_dependency_url(value, label)?;
+    postgres_binding_from_url(url, label)
+}
+
+fn postgres_binding_from_url(url: DependencyUrl, label: &str) -> anyhow::Result<ProviderBinding> {
     if !matches!(url.scheme.as_str(), "postgres" | "postgresql") {
         bail!("{label} URL must use a PostgreSQL endpoint");
     }
@@ -380,6 +434,10 @@ fn postgres_binding(value: &str, label: &str) -> anyhow::Result<ProviderBinding>
 
 fn valkey_binding(value: &str, label: &str) -> anyhow::Result<ProviderBinding> {
     let url = parse_dependency_url(value, label)?;
+    valkey_binding_from_url(url, label)
+}
+
+fn valkey_binding_from_url(url: DependencyUrl, label: &str) -> anyhow::Result<ProviderBinding> {
     if !matches!(url.scheme.as_str(), "redis" | "rediss") || !url.query.is_empty() {
         bail!("{label} URL must use a canonical Valkey endpoint without query options");
     }
@@ -407,6 +465,55 @@ fn endpoint_sha256(endpoint: &str) -> String {
         .collect()
 }
 
+fn postgres_binding_sha256(binding: &ProviderBinding) -> String {
+    endpoint_sha256(&format!(
+        "{};tls-policy={}",
+        binding.endpoint, binding.tls_policy
+    ))
+}
+
+fn postgres_endpoint_sha256(url: &DependencyUrl, label: &str) -> anyhow::Result<String> {
+    if !matches!(url.scheme.as_str(), "postgres" | "postgresql") {
+        bail!("{label} URL must use a PostgreSQL endpoint");
+    }
+    let mut tls_policy = None;
+    for (key, value) in &url.query {
+        if key != "sslmode"
+            || !matches!(
+                value.as_ref(),
+                "disable" | "allow" | "prefer" | "require" | "verify-ca" | "verify-full"
+            )
+            || tls_policy.replace(value.as_str()).is_some()
+        {
+            bail!("{label} URL has an unsupported PostgreSQL query option");
+        }
+    }
+    Ok(endpoint_sha256(&format!(
+        "postgresql://{}:{}/{};tls-policy={}",
+        url.host,
+        url.port.unwrap_or(5432),
+        url.database.as_str(),
+        tls_policy.unwrap_or("default")
+    )))
+}
+
+fn valkey_endpoint_sha256(url: &DependencyUrl, label: &str) -> anyhow::Result<String> {
+    if !matches!(url.scheme.as_str(), "redis" | "rediss") || !url.query.is_empty() {
+        bail!("{label} URL must use a canonical Valkey endpoint without query options");
+    }
+    if url.database.parse::<u32>().is_err() {
+        bail!("{label} URL has an invalid canonical Valkey endpoint");
+    }
+    Ok(endpoint_sha256(&format!(
+        "{}://{}:{}/{};tls-policy={}",
+        url.scheme,
+        url.host,
+        url.port.unwrap_or(6379),
+        url.database.as_str(),
+        url.scheme
+    )))
+}
+
 fn read_single_line(path: &Path) -> anyhow::Result<zeroize::Zeroizing<String>> {
     let bytes = read_secure_secret_file(path, "secret provider", MAX_SECRET_PROVIDER_BYTES)?;
     let value = std::str::from_utf8(&bytes)
@@ -419,13 +526,40 @@ fn read_single_line(path: &Path) -> anyhow::Result<zeroize::Zeroizing<String>> {
 }
 
 fn decode(value: &str, label: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
-    let decoded = zeroize::Zeroizing::new(
-        urlencoding::decode(value)
-            .with_context(|| format!("{label} has invalid percent encoding"))?
-            .into_owned(),
-    );
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(value.len()));
+    let source = value.as_bytes();
+    let mut index = 0;
+    while index < source.len() {
+        if source[index] != b'%' {
+            bytes.push(source[index]);
+            index += 1;
+            continue;
+        }
+        let high = source
+            .get(index + 1)
+            .and_then(|byte| hex_value(*byte))
+            .with_context(|| format!("{label} has invalid percent encoding"))?;
+        let low = source
+            .get(index + 2)
+            .and_then(|byte| hex_value(*byte))
+            .with_context(|| format!("{label} has invalid percent encoding"))?;
+        bytes.push((high << 4) | low);
+        index += 3;
+    }
+    let decoded = std::str::from_utf8(&bytes)
+        .with_context(|| format!("{label} has invalid percent encoding"))?;
+    let decoded = zeroize::Zeroizing::new(decoded.to_owned());
     reject_credential_controls(&decoded, label)?;
     Ok(decoded)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn reject_credential_controls(value: &str, label: &str) -> anyhow::Result<()> {

@@ -24,7 +24,7 @@ use crate::{
         MANAGED_VALKEY_BACKUP_USER, ManagedDependencyBackup, RuntimeBackendKind, backend,
         managed_dependency_identity,
     },
-    secret_provider::{PostgresProvider, ValkeyProvider},
+    secret_provider::{PostgresProvider, read_external_backup_providers},
 };
 
 const BACKUP_COMPLETION_MARKER: &str = "BACKUP-COMPLETE";
@@ -216,27 +216,23 @@ impl Backup {
         let (database_backup_url, valkey_backup_url) =
             external_backup_url_files(&config.dependencies);
         // The controller validates the complete live five-credential contract
-        // before it can replay any migration.  Backup execution deliberately
-        // reads only its two dedicated credentials; runtime and migration
-        // secrets never enter this provider process.
-        validate_secret(database_backup_url)?;
-        validate_secret(valkey_backup_url)?;
-        let binding = crate::secret_provider::bind_external_backup_url_files(
-            database_backup_url,
-            valkey_backup_url,
-        )?;
-        if binding.database_endpoint_sha256 != config.dependencies.database_backup_endpoint_sha256
-            || binding.valkey_endpoint_sha256 != config.dependencies.valkey_backup_endpoint_sha256
+        // before it can replay any migration. Backup consumes exactly its two
+        // dedicated credentials, reading and parsing each once before their
+        // binding is checked and the same parsed providers are used below.
+        let providers = read_external_backup_providers(database_backup_url, valkey_backup_url)?;
+        if providers.binding.database_endpoint_sha256
+            != config.dependencies.database_backup_endpoint_sha256
+            || providers.binding.valkey_endpoint_sha256
+                != config.dependencies.valkey_backup_endpoint_sha256
         {
             bail!(
                 "external backup credential endpoints or TLS policy no longer match the persisted deployment binding"
             );
         }
         let postgres = self.path.join("postgresql.dump");
-        let postgres_provider = PostgresProvider::from_url_file(database_backup_url)?;
         Process::new("pg_dump")
-            .env("PGSERVICEFILE", postgres_provider.service_file())
-            .env("PGPASSFILE", postgres_provider.password_file())
+            .env("PGSERVICEFILE", providers.postgres.service_file())
+            .env("PGPASSFILE", providers.postgres.password_file())
             .args([
                 "--dbname=service=nazoauth",
                 "--format=custom",
@@ -249,22 +245,21 @@ impl Backup {
             .arg(&postgres)
             .run_quiet()?;
         let valkey = self.path.join("valkey-dump.rdb");
-        let valkey_provider = ValkeyProvider::from_url_file(valkey_backup_url)?;
         let mut command = Process::new("valkey-cli")
             .args(["--no-auth-warning", "--askpass", "-h"])
-            .arg(&valkey_provider.host)
+            .arg(&providers.valkey.host)
             .arg("-p")
-            .arg(valkey_provider.port.to_string())
+            .arg(providers.valkey.port.to_string())
             .arg("-n")
-            .arg(valkey_provider.database.to_string());
-        if let Some(username) = &valkey_provider.username {
+            .arg(providers.valkey.database.to_string());
+        if let Some(username) = &providers.valkey.username {
             command = command.arg("--user").arg(username.as_str());
         }
-        if valkey_provider.tls {
+        if providers.valkey.tls {
             command = command.arg("--tls");
         }
         command = command.arg("--rdb").arg(&valkey);
-        command.stdin_stdout(&valkey_provider.password_stdin())?;
+        command.stdin_stdout(&providers.valkey.password_stdin())?;
         if fs::metadata(&valkey).map_or(true, |metadata| metadata.len() == 0) {
             bail!("external Valkey RDB export is empty");
         }
@@ -342,6 +337,10 @@ impl Backup {
         if archived.dependencies.mode == "external"
             && (archived.dependencies.external_valkey_backup_scope
                 != config.dependencies.external_valkey_backup_scope
+                || archived.dependencies.database_runtime_endpoint_sha256
+                    != config.dependencies.database_runtime_endpoint_sha256
+                || archived.dependencies.migration_database_endpoint_sha256
+                    != config.dependencies.migration_database_endpoint_sha256
                 || archived.dependencies.database_backup_endpoint_sha256
                     != config.dependencies.database_backup_endpoint_sha256
                 || archived.dependencies.valkey_backup_endpoint_sha256

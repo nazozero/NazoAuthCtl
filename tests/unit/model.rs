@@ -352,6 +352,8 @@ fn external_and_container_dependency_modes_resolve_explicitly() {
     config.dependencies.valkey_url_file = root.join("valkey-url");
     config.dependencies.valkey_backup_url_file = root.join("valkey-backup-url");
     config.dependencies.external_valkey_backup_scope = "dedicated-instance".to_owned();
+    config.dependencies.database_runtime_endpoint_sha256 = "a".repeat(64);
+    config.dependencies.migration_database_endpoint_sha256 = "b".repeat(64);
     config.dependencies.database_backup_endpoint_sha256 = "a".repeat(64);
     config.dependencies.valkey_backup_endpoint_sha256 = "b".repeat(64);
     config.validate().unwrap();

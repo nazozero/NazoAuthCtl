@@ -688,12 +688,7 @@ fn install_local_oci_candidate_transaction(
     // or touching any registration, task, or runtime state.  A config records
     // only non-secret endpoint identities, so a changed secret file must fail
     // closed.
-    install::verify_live_external_dependencies(config)?;
-    if let Some(backup) = state.recovery_backup.as_deref() {
-        // Verify recovery evidence before creating any new durable intent or
-        // audit record on a replay path.
-        Backup::open_existing(config, backup)?;
-    }
+    verify_local_oci_candidate_retry_preconditions(config, &state)?;
 
     let registration_recovery =
         ensure_local_oci_candidate_retry_is_unregistered(config, state.recovery_backup.is_some())?;
@@ -792,6 +787,19 @@ fn install_local_oci_candidate_transaction(
         "NazoAuth local OCI candidate installed at {} ({})",
         candidate.target.release, candidate.target.revision
     );
+    Ok(())
+}
+
+/// This is deliberately called before a retry can persist state, append audit
+/// evidence, start dependencies, or replay an operator task.
+fn verify_local_oci_candidate_retry_preconditions(
+    config: &UpdateConfig,
+    state: &LocalOciCandidateInstallState,
+) -> anyhow::Result<()> {
+    install::verify_live_external_dependencies(config)?;
+    if let Some(backup) = state.recovery_backup.as_deref() {
+        Backup::open_existing(config, backup)?;
+    }
     Ok(())
 }
 

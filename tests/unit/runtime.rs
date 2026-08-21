@@ -61,6 +61,8 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
             valkey_url_file: secrets.join("valkey-url"),
             valkey_backup_url_file: secrets.join("valkey-backup-url"),
             external_valkey_backup_scope: "dedicated-instance".to_owned(),
+            database_runtime_endpoint_sha256: "a".repeat(64),
+            migration_database_endpoint_sha256: "b".repeat(64),
             database_backup_endpoint_sha256: "a".repeat(64),
             valkey_backup_endpoint_sha256: "b".repeat(64),
         },
