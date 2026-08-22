@@ -600,6 +600,12 @@ impl OpenId4VpVerificationEvidence {
         receipt_sha256: &str,
         ui_url: &str,
     ) -> Self {
+        use time::format_description::well_known::Rfc3339;
+
+        let completed = time::OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .expect("whole seconds");
+        let expires = completed + time::Duration::seconds(300);
         Self {
             receipt: OpenId4VpVerificationReceiptProvenance {
                 issuer: "https://issuer.example".to_owned(),
@@ -618,8 +624,8 @@ impl OpenId4VpVerificationEvidence {
                 runtime_instance_id: "runtime-a".to_owned(),
                 instance_key_id: "test-key".to_owned(),
                 instance_public_key_base64: "test-key".to_owned(),
-                completed_at: "2026-01-01T00:00:00Z".to_owned(),
-                expires_at: "2026-01-01T00:05:00Z".to_owned(),
+                completed_at: completed.format(&Rfc3339).expect("timestamp"),
+                expires_at: expires.format(&Rfc3339).expect("timestamp"),
             },
             context,
             ui_url: Zeroizing::new(ui_url.to_owned()),

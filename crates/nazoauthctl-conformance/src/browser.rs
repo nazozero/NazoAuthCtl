@@ -715,6 +715,31 @@ fn vp_result_driver_error(
     })
 }
 
+/// The receipt capability is valid for at most ten minutes, while browser
+/// operations share the policy's bounded per-step lifetime.  The fragment
+/// bootstrap gets a fresh lifecycle budget from those two authoritative
+/// limits, rather than borrowing the generic signed-task default (30s).
+fn vp_result_fragment_scrub_budget(
+    expires_at: &str,
+    now: time::OffsetDateTime,
+    policy_max: Duration,
+) -> Result<Duration, BrowserError> {
+    use time::format_description::well_known::Rfc3339;
+
+    let expires_at = time::OffsetDateTime::parse(expires_at, &Rfc3339)
+        .map_err(|_| BrowserError::VpVerificationResultField("receipt-expires-at"))?;
+    let remaining_seconds = expires_at
+        .unix_timestamp()
+        .checked_sub(now.unix_timestamp())
+        .filter(|seconds| *seconds > 0)
+        .ok_or(BrowserError::VpVerificationResultField("receipt-expired"))?;
+    let remaining = Duration::from_secs(
+        u64::try_from(remaining_seconds)
+            .map_err(|_| BrowserError::VpVerificationResultField("receipt-expires-at"))?,
+    );
+    Ok(remaining.min(policy_max))
+}
+
 /// Private orchestration receipt. Public module reports project only
 /// `path`, `sha256`, and `size` from this value.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1205,10 +1230,15 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             return Err(self.navigation_violation(self.last_url.as_ref(), &ui_url));
         }
         vp_result_driver("bootstrap-navigate", None, self.navigate(&ui_url))?;
+        let fragment_scrub_budget = vp_result_fragment_scrub_budget(
+            &evidence.receipt.expires_at,
+            time::OffsetDateTime::now_utc(),
+            self.policy.limits.max_step_timeout,
+        )?;
         vp_result_driver(
             "fragment-scrub-current-url",
             None,
-            self.wait_for_openid4vp_fragment_scrub(&ui_url),
+            self.wait_for_openid4vp_fragment_scrub(&ui_url, fragment_scrub_budget),
         )?;
         let deadline = self.deadline(DEFAULT_STEP_TIMEOUT);
         loop {
@@ -1305,7 +1335,11 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
     /// WebDriver can observe the bootstrap URL before that script runs. Wait
     /// only for that exact fragment to disappear; a changed capability, path,
     /// origin, or query is still a navigation violation.
-    fn wait_for_openid4vp_fragment_scrub(&mut self, bootstrap: &Url) -> Result<Url, BrowserError> {
+    fn wait_for_openid4vp_fragment_scrub(
+        &mut self,
+        bootstrap: &Url,
+        budget: Duration,
+    ) -> Result<Url, BrowserError> {
         let initially_observed = self
             .last_url
             .clone()
@@ -1319,7 +1353,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         if !is_expected_observation(&initially_observed) {
             return Err(self.navigation_violation(Some(&initially_observed), &initially_observed));
         }
-        let deadline = self.deadline(DEFAULT_STEP_TIMEOUT);
+        let deadline = self.deadline(budget);
         loop {
             let current = self.ensure_current_url()?;
             let same_result_page = self.policy.target_origin.allows(&current)
@@ -2534,6 +2568,36 @@ mod tests {
             &BrowserError::ProtocolDiagnostic(response)
         );
         assert!(diagnostic.to_string().contains("endpoint=current_url"));
+    }
+
+    #[test]
+    fn vp_result_fragment_scrub_budget_is_fresh_and_bounded_by_receipt_and_policy() {
+        use time::format_description::well_known::Rfc3339;
+
+        let now = time::OffsetDateTime::from_unix_timestamp(1_800_000_000)
+            .expect("clock")
+            .replace_nanosecond(0)
+            .expect("whole seconds");
+        let expiry = |seconds| {
+            (now + time::Duration::seconds(seconds))
+                .format(&Rfc3339)
+                .expect("expiry")
+        };
+        assert_eq!(
+            vp_result_fragment_scrub_budget(&expiry(600), now, Duration::from_secs(300))
+                .expect("policy cap"),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            vp_result_fragment_scrub_budget(&expiry(20), now, Duration::from_secs(300))
+                .expect("receipt cap"),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            vp_result_fragment_scrub_budget(&expiry(0), now, Duration::from_secs(300))
+                .expect_err("expired receipt"),
+            BrowserError::VpVerificationResultField("receipt-expired")
+        );
     }
 
     #[test]
