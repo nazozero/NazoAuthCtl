@@ -1225,7 +1225,7 @@ dependencies = [
 [[package]]
 name = "nazo-operator-protocol"
 version = "0.1.41"
-source = "git+https://github.com/nazozero/NazoAuth.git?rev=31d7a1b3e51cd7c3c96ce2ef0c1f43eeb527a3bf#31d7a1b3e51cd7c3c96ce2ef0c1f43eeb527a3bf"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=bd6de6e137149f1e94685adf363ed1d4486897be#bd6de6e137149f1e94685adf363ed1d4486897be"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2477,6 +2477,7 @@ checksum = "2cefc03fd367c0c6d4305de1b312cf00248c4114f4a0418ce6a6af769e3b0bd9"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
