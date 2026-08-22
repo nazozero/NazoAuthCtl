@@ -703,14 +703,16 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     } else {
         None
     };
-    if cleanup_evidence.is_some() && proxy_cleanup_complete && recovery.suite_cleanup_complete() {
-        if let Err(error) = recovery.finish() {
-            // `finish` consumes the guard but leaves its durable journal in
-            // place on failure. The already-published retention receipt
-            // remains honest; report a structured incomplete local result
-            // rather than deleting plans or losing stdout evidence.
-            errors.push(format!("recovery-finish={error:#}"));
-        }
+    if cleanup_evidence.is_some()
+        && proxy_cleanup_complete
+        && recovery.suite_cleanup_complete()
+        && let Err(error) = recovery.finish()
+    {
+        // `finish` consumes the guard but leaves its durable journal in
+        // place on failure. The already-published retention receipt
+        // remains honest; report a structured incomplete local result
+        // rather than deleting plans or losing stdout evidence.
+        errors.push(format!("recovery-finish={error:#}"));
     }
     deployment_report.cleanup_complete = cleanup_complete;
     let success = errors.is_empty()
