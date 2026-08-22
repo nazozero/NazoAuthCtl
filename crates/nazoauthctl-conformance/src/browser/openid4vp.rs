@@ -29,7 +29,6 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_ALIAS_BYTES: usize = 256;
 const MAX_TEST_NAME_BYTES: usize = 512;
 const MAX_VARIANT_VALUE_BYTES: usize = 256;
-const MAX_EVIDENCE_TEST_NAME_BYTES: usize = 512;
 const MAX_EVIDENCE_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_CREATE_ATTEMPTS: usize = 4;
 const VP_VERIFICATION_RESULT_PATH: &str = "/ui/verification-result";
@@ -253,19 +252,11 @@ impl OpenId4VpEvidenceContext {
     }
 
     fn validate(&self) -> Result<(), OpenId4VpError> {
-        if !valid_lower_hex(&self.artifact_sha256)
-            || !valid_lower_hex(&self.matrix_sha256)
-            || !valid_lower_hex(&self.variant_sha256)
-            || !valid_identifier(&self.run_jti, 128)
-            || Uuid::parse_str(&self.suite_plan_id).is_err()
-            || Uuid::parse_str(&self.suite_module_id).is_err()
-            || self.test_name.is_empty()
-            || self.test_name.len() > MAX_EVIDENCE_TEST_NAME_BYTES
-            || self.test_name.chars().any(char::is_control)
-        {
-            return Err(OpenId4VpError::InvalidEvidenceContext);
-        }
-        Ok(())
+        nazo_operator_protocol::canonical_openid4vp_evidence_context_sha256(
+            &protocol_evidence_context(self),
+        )
+        .map(|_| ())
+        .map_err(|_| OpenId4VpError::InvalidEvidenceContext)
     }
 }
 
@@ -1961,7 +1952,7 @@ mod tests {
     }
 
     #[test]
-    fn attaches_exact_evidence_context_only_after_start_returns_the_transaction() {
+    fn attaches_exact_opaque_suite_identifier_context_after_start_returns_the_transaction() {
         let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
         let suite = Origin::parse("https://suite.example").expect("suite");
         let transaction_id =
@@ -1973,12 +1964,7 @@ mod tests {
             "b".repeat(64),
         )
         .expect("run context")
-        .for_module(
-            "550e8400-e29b-41d4-a716-446655440001",
-            "550e8400-e29b-41d4-a716-446655440002",
-            "happy",
-            &variant,
-        )
+        .for_module("suite-plan-01", "module-item-001", "happy", &variant)
         .expect("module context");
         let expected_context_sha256 =
             nazo_operator_protocol::canonical_openid4vp_evidence_context_sha256(
@@ -2086,9 +2072,10 @@ mod tests {
         let attach: Value =
             serde_json::from_slice(requests[1].body().expect("attach body")).expect("attach JSON");
         assert_eq!(attach["schema"], 1);
+        assert_eq!(attach["evidence_context"]["suite_plan_id"], "suite-plan-01");
         assert_eq!(
             attach["evidence_context"]["suite_module_id"],
-            context.suite_module_id.as_str()
+            "module-item-001"
         );
         assert!(attach.get("capability").is_none());
         assert_eq!(presentation.evidence_context, Some(context));
@@ -2097,6 +2084,48 @@ mod tests {
                 .issuance_request_jti
                 .as_deref()
                 .is_some_and(|value| Uuid::parse_str(value).is_ok())
+        );
+    }
+
+    #[test]
+    fn evidence_context_uses_the_protocol_opaque_suite_identifier_contract() {
+        let variant = BTreeMap::new();
+        let context = OpenId4VpEvidenceContext::new(
+            "request-0123456789abcdef0123456789abcdef",
+            "a".repeat(64),
+            "b".repeat(64),
+            "suite-plan-01",
+            "module-item-001",
+            "happy",
+            &variant,
+        )
+        .expect("official opaque IDs");
+        assert_eq!(context.suite_plan_id.len(), 13);
+        assert_eq!(context.suite_module_id.len(), 15);
+
+        assert_eq!(
+            OpenId4VpEvidenceContext::new(
+                "request-0123456789abcdef0123456789abcdef",
+                "a".repeat(64),
+                "b".repeat(64),
+                "suite/plan",
+                "module-item-001",
+                "happy",
+                &variant,
+            ),
+            Err(OpenId4VpError::InvalidEvidenceContext)
+        );
+        assert_eq!(
+            OpenId4VpEvidenceContext::new(
+                "request-0123456789abcdef0123456789abcdef",
+                "a".repeat(64),
+                "b".repeat(64),
+                "s".repeat(129),
+                "module-item-001",
+                "happy",
+                &variant,
+            ),
+            Err(OpenId4VpError::InvalidEvidenceContext)
         );
     }
 
