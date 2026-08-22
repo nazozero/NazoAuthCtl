@@ -1488,21 +1488,6 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         )
     }
 
-    fn validate_openid4vp_result_url(&mut self, expected: &Url) -> Result<(), BrowserError> {
-        let current = self.ensure_current_url()?;
-        if !self.policy.target_origin.allows(&current)
-            || current.path() != "/ui/verification-result"
-            || !current.username().is_empty()
-            || current.password().is_some()
-            || current.query().is_some()
-            || current.fragment().is_some()
-            || current != *expected
-        {
-            return Err(self.navigation_violation(self.last_url.as_ref(), &current));
-        }
-        Ok(())
-    }
-
     /// Navigate to the capability-free NazoAuthWeb shell without routing the
     /// first post-navigation observation through the general redirect helper.
     /// That first observation must still contain any unexpected fragment or
@@ -1517,9 +1502,9 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
     }
 
     /// Strictly validate the *first* URL observed after the canonical shell
-    /// navigation. Unlike `validate_openid4vp_result_url`, this deliberately
-    /// does not poll or use `ensure_current_url`: a redirect that injects a
-    /// receipt-looking fragment must fail before capability navigation.
+    /// navigation. This deliberately does not poll or use
+    /// `ensure_current_url`: a redirect that injects a receipt-looking
+    /// fragment must fail before capability navigation.
     fn validate_openid4vp_result_shell_url(&mut self, expected: &Url) -> Result<(), BrowserError> {
         let current = self.driver.current_url()?;
         if !self.policy.target_origin.allows(&current)
