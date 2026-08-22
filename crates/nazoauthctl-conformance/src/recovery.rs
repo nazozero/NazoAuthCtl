@@ -193,6 +193,46 @@ pub struct SuiteRetentionScreenshotManifest {
     pub sha256: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewScreenshotManifestDocument {
+    schema: u32,
+    run_jti: String,
+    artifact_digest: String,
+    matrix_sha256: String,
+    suite_origin: String,
+    modules: Vec<ReviewScreenshotManifestModule>,
+    screenshots: Vec<ReviewScreenshotManifestImage>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewScreenshotManifestModule {
+    matrix_plan_id: String,
+    suite_plan_id: String,
+    module_id: String,
+    test_name: String,
+    variant: std::collections::BTreeMap<String, String>,
+    required: usize,
+    captured_required: usize,
+    missing_optional: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewScreenshotManifestImage {
+    matrix_plan_id: String,
+    suite_plan_id: String,
+    module_id: String,
+    path: PathBuf,
+    sha256: String,
+    size: usize,
+    receipt_sha256: String,
+    trigger_origin: String,
+    trigger_path: String,
+    trigger_url_sha256: String,
+}
+
 impl SuiteRetentionManifest {
     pub fn plan_alias_sha256(matrix_plan_id: &str) -> String {
         sha256_hex(matrix_plan_id.as_bytes())
@@ -992,6 +1032,7 @@ impl ConformanceRecoveryGuard {
         if let Some(screenshot) = &record.manifest.review_screenshot_manifest {
             validate_review_screenshot_manifest_binding(
                 screenshot,
+                &record.manifest,
                 self.tenant_resource_binding()
                     .context("Suite retention has no ordinary binding")?,
             )?;
@@ -1030,6 +1071,7 @@ impl ConformanceRecoveryGuard {
         if let Some(screenshot) = &record.manifest.review_screenshot_manifest {
             validate_review_screenshot_manifest_binding(
                 screenshot,
+                &record.manifest,
                 self.tenant_resource_binding()
                     .context("Suite retention has no ordinary binding")?,
             )?;
@@ -1080,6 +1122,7 @@ impl ConformanceRecoveryGuard {
         if let Some(screenshot) = &record.manifest.review_screenshot_manifest {
             validate_review_screenshot_manifest_binding(
                 screenshot,
+                &record.manifest,
                 self.tenant_resource_binding()
                     .context("Suite retention has no ordinary binding")?,
             )?;
@@ -1810,7 +1853,7 @@ fn validate_suite_retention_manifest(
         bail!("Suite retention manifest is outside policy");
     }
     if let Some(screenshot) = &manifest.review_screenshot_manifest {
-        validate_review_screenshot_manifest_binding(screenshot, binding)?;
+        validate_review_screenshot_manifest_binding(screenshot, manifest, binding)?;
     }
     let mut matrix_ids = std::collections::BTreeSet::new();
     let mut suite_ids = std::collections::BTreeSet::new();
@@ -1851,6 +1894,7 @@ fn validate_suite_retention_manifest(
 
 fn validate_review_screenshot_manifest_binding(
     screenshot: &SuiteRetentionScreenshotManifest,
+    retention: &SuiteRetentionManifest,
     binding: &TenantResourceRecoveryBinding,
 ) -> anyhow::Result<()> {
     let expected_name = format!("{}.json", binding.request_jti);
@@ -1875,6 +1919,68 @@ fn validate_review_screenshot_manifest_binding(
     .map_err(|error| anyhow::anyhow!("review screenshot manifest is not secure: {error:?}"))?;
     if sha256_hex(&bytes) != screenshot.sha256 {
         bail!("review screenshot manifest digest is invalid");
+    }
+    let document: ReviewScreenshotManifestDocument =
+        serde_json::from_slice(&bytes).context("review screenshot manifest is not valid JSON")?;
+    if document.schema != 3
+        || document.run_jti != binding.request_jti
+        || document.artifact_digest != retention.artifact_digest
+        || document.matrix_sha256 != retention.matrix_sha256
+        || document.suite_origin != retention.suite_origin
+    {
+        bail!("review screenshot manifest identity conflicts with retention");
+    }
+    let plans = retention
+        .plans
+        .iter()
+        .map(|plan| (&plan.matrix_plan_id, &plan.suite_plan_id))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut modules = std::collections::BTreeSet::new();
+    for module in &document.modules {
+        if !plans.contains(&(&module.matrix_plan_id, &module.suite_plan_id))
+            || module.module_id.is_empty()
+            || module.test_name.is_empty()
+            || module.required != module.captured_required
+            || !modules.insert((
+                &module.matrix_plan_id,
+                &module.suite_plan_id,
+                &module.module_id,
+                &module.test_name,
+                &module.variant,
+            ))
+        {
+            bail!("review screenshot manifest module graph is invalid");
+        }
+    }
+    let mut images = std::collections::BTreeSet::new();
+    for image in &document.screenshots {
+        let valid_path =
+            image.path.components().count() == 2
+                && image.path.components().next().is_some_and(|part| {
+                    part.as_os_str() == std::ffi::OsStr::new("review-screenshots")
+                });
+        let target = format!("/test/a/{}/verification-evidence", image.module_id);
+        if !plans.contains(&(&image.matrix_plan_id, &image.suite_plan_id))
+            || !modules
+                .iter()
+                .any(|(matrix_plan_id, suite_plan_id, module_id, _, _)| {
+                    *matrix_plan_id == &image.matrix_plan_id
+                        && *suite_plan_id == &image.suite_plan_id
+                        && *module_id == &image.module_id
+                })
+            || !valid_path
+            || image.size == 0
+            || !lower_hex(&image.sha256, 64)
+            || !lower_hex(&image.receipt_sha256, 64)
+            || image.trigger_origin != "https://www.certification.openid.net"
+            || image.trigger_path != target
+            || !lower_hex(&image.trigger_url_sha256, 64)
+            || sha256_hex(format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes())
+                != image.trigger_url_sha256
+            || !images.insert(&image.path)
+        {
+            bail!("review screenshot manifest screenshot graph is invalid");
+        }
     }
     Ok(())
 }
@@ -3147,8 +3253,26 @@ mod tests {
         crate::secure_file::ensure_directory(&screenshot_directory, true)
             .expect("screenshot manifest directory");
         let screenshot_path = screenshot_directory.join(format!("{}.json", binding.request_jti));
-        let original = br#"{\"schema\":1}"#;
-        crate::secure_file::write_atomic(&screenshot_path, original, true)
+        let original = serde_json::to_vec(&serde_json::json!({
+            "schema": 3,
+            "run_jti": binding.request_jti,
+            "artifact_digest": "a".repeat(64),
+            "matrix_sha256": "b".repeat(64),
+            "suite_origin": "https://www.certification.openid.net",
+            "modules": [{
+                "matrix_plan_id": "matrix-plan-1",
+                "suite_plan_id": "suite-plan-1",
+                "module_id": "suite-module-1",
+                "test_name": "test",
+                "variant": {},
+                "required": 0,
+                "captured_required": 0,
+                "missing_optional": 0
+            }],
+            "screenshots": []
+        }))
+        .expect("serialize screenshot manifest");
+        crate::secure_file::write_atomic(&screenshot_path, &original, true)
             .expect("write screenshot manifest");
         let manifest = SuiteRetentionManifest {
             schema: SUITE_RETENTION_MANIFEST_SCHEMA,
@@ -3160,7 +3284,7 @@ mod tests {
             run_id: binding.request_jti.clone(),
             review_screenshot_manifest: Some(SuiteRetentionScreenshotManifest {
                 path: screenshot_path.clone(),
-                sha256: sha256_hex(&original[..]),
+                sha256: sha256_hex(&original),
             }),
             plans: vec![SuiteRetentionPlan {
                 matrix_plan_id: "matrix-plan-1".to_owned(),
@@ -3186,7 +3310,7 @@ mod tests {
             .expect("tamper screenshot manifest");
         assert!(guard.commit_suite_plan_retention().is_err());
 
-        crate::secure_file::write_atomic(&screenshot_path, original, true)
+        crate::secure_file::write_atomic(&screenshot_path, &original, true)
             .expect("restore screenshot manifest");
         guard
             .commit_suite_plan_retention()
