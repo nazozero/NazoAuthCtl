@@ -840,6 +840,15 @@ fn canonical_navigation_url(url: &Url) -> String {
     canonical.to_string()
 }
 
+fn is_same_vp_result_document(url: &Url, canonical: &Url) -> bool {
+    url.username().is_empty()
+        && url.password().is_none()
+        && url.scheme() == canonical.scheme()
+        && url.host_str() == canonical.host_str()
+        && url.port_or_known_default() == canonical.port_or_known_default()
+        && url.path() == canonical.path()
+}
+
 fn vp_result_url_diagnostic(
     url: &Url,
     bootstrap_fragment: Option<&str>,
@@ -1441,7 +1450,25 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             None,
             self.ensure_current_url(),
         )?;
-        if entry_url == shell_url {
+        if !entry_url.username().is_empty() || entry_url.password().is_some() {
+            return Err(self.navigation_violation(self.last_url.as_ref(), &entry_url));
+        }
+        if is_same_vp_result_document(&entry_url, &shell_url) {
+            if entry_url.as_str() != shell_url.as_str() {
+                vp_result_driver_for_url(
+                    "canonical-shell-clear-navigate",
+                    None,
+                    &shell_url,
+                    None,
+                    Some(evidence.ui_url_diagnostic.authority_has_at),
+                    self.navigate_openid4vp_result_shell(&shell_url),
+                )?;
+                vp_result_driver(
+                    "canonical-shell-clear-current-url",
+                    None,
+                    self.validate_openid4vp_result_shell_url(&shell_url),
+                )?;
+            }
             vp_result_driver_for_url(
                 "canonical-shell-refresh",
                 None,
@@ -3143,6 +3170,7 @@ mod tests {
         assert!(audit.contains("nazo-vp-verification-result/live-webdriver"));
         assert!(!audit.contains("receipt=AAAAAAAA"));
         assert_eq!(executor.driver_mut().navigated.len(), 2);
+        assert_eq!(executor.driver_mut().refreshes, 0);
         assert_eq!(
             executor.driver_mut().navigated[0].as_str(),
             "https://issuer.example/ui/verification-result"
@@ -3280,6 +3308,49 @@ mod tests {
                 .expect("recognized shell state permits capability bootstrap");
             assert_eq!(executor.driver_mut().navigated.len(), 2);
             assert!(executor.driver_mut().navigated[1].fragment().is_some());
+            std::fs::remove_dir_all(root).expect("remove root");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_canonical_document_clears_query_or_fragment_before_refresh() {
+        for previous in [
+            "https://issuer.example/ui/verification-result#old-capability",
+            "https://issuer.example/ui/verification-result?old=capability",
+        ] {
+            let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .expect("temp")
+                .join(format!(
+                    "nazoauth-vp-canonical-pre-document-{}",
+                    uuid::Uuid::now_v7()
+                ));
+            crate::secure_file::ensure_directory(&root, true).expect("private root");
+            let capture = vp_capture_context(root.clone(), &context, &variant);
+            let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+            driver.current = Url::parse(previous).expect("previous canonical document URL");
+            let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+            let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+            let mut executor =
+                BrowserExecutor::new(driver, BrowserPolicy::new(target, suite).expect("policy"));
+
+            executor
+                .capture_openid4vp_verification_result(&evidence, &capture, 0)
+                .expect("clear canonical document then refresh");
+            assert_eq!(executor.driver_mut().refreshes, 1);
+            assert_eq!(executor.driver_mut().navigated.len(), 2);
+            assert_eq!(
+                executor.driver_mut().navigated[0].as_str(),
+                "https://issuer.example/ui/verification-result"
+            );
+            assert!(executor.driver_mut().navigated[0].query().is_none());
+            assert!(executor.driver_mut().navigated[0].fragment().is_none());
+            assert_eq!(
+                executor.driver_mut().refreshed_from.as_slice(),
+                &[Url::parse("https://issuer.example/ui/verification-result").expect("shell URL")]
+            );
             std::fs::remove_dir_all(root).expect("remove root");
         }
     }
