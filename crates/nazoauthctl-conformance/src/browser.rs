@@ -255,10 +255,9 @@ pub use openid4vci::{
 };
 pub use openid4vp::{
     ConformanceBinding, OpenId4VpError, OpenId4VpEvidenceBindingDiagnostic,
-    OpenId4VpEvidenceContext, OpenId4VpEvidenceRunContext, OpenId4VpEvidenceUrlDiagnostic,
-    OpenId4VpEvidenceVerifier, OpenId4VpPresentation, OpenId4VpStartRequest,
-    OpenId4VpVerificationEvidence, OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier,
-    OpenId4VpVerifierClient,
+    OpenId4VpEvidenceContext, OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier,
+    OpenId4VpPresentation, OpenId4VpStartRequest, OpenId4VpVerificationEvidence,
+    OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier, OpenId4VpVerifierClient,
 };
 pub use parser::{parse_browser_entries, parse_browser_entries_owned};
 pub use plan::{BrowserRunnerState, OpenId4VcBrowserState};
@@ -2814,7 +2813,10 @@ mod tests {
         let BrowserError::VpVerificationResultDriverDiagnostic(diagnostic) = error else {
             panic!("bootstrap diagnostic")
         };
-        let requested = diagnostic.requested_url.expect("requested URL metadata");
+        let requested = diagnostic
+            .requested_url
+            .as_ref()
+            .expect("requested URL metadata");
         assert_eq!(requested.authority_has_at, Some(false));
         assert_eq!(requested.fragment_len, "receipt=".len() + 43);
         assert_eq!(requested.fragment_matches_capability_hash, Some(true));
