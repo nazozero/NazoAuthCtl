@@ -167,6 +167,65 @@ impl std::fmt::Display for VpVerificationResultFragmentScrubDiagnostic {
     }
 }
 
+/// Metadata-only observation of the document returned while the canonical VP
+/// evidence shell failed to mount. The document itself is never retained.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VpVerificationResultShellPageDiagnostic {
+    pub byte_len: usize,
+    pub sha256: String,
+    pub has_result_root: bool,
+    pub has_completion_title: bool,
+    pub has_nazoauth_asset_prefix: bool,
+}
+
+impl std::fmt::Display for VpVerificationResultShellPageDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "byte_len={} sha256={} has_result_root={} has_completion_title={} has_nazoauth_asset_prefix={}",
+            self.byte_len,
+            self.sha256,
+            self.has_result_root,
+            self.has_completion_title,
+            self.has_nazoauth_asset_prefix,
+        )
+    }
+}
+
+/// A canonical-shell mount failure enriched with safe page identity metadata.
+/// The original mount error remains the primary source; a failed page-source
+/// observation is recorded separately and never replaces it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VpVerificationResultShellMountDiagnostic {
+    pub stage: &'static str,
+    pub current_url: VpVerificationResultUrlDiagnostic,
+    pub page: Option<VpVerificationResultShellPageDiagnostic>,
+    pub page_source_error: Option<Box<BrowserError>>,
+    pub source: Box<BrowserError>,
+}
+
+impl std::fmt::Display for VpVerificationResultShellMountDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "stage={} current_url=[{}] page=[{}] page_source_error={} cause={}",
+            self.stage,
+            self.current_url,
+            self.page
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                .unwrap_or("unavailable"),
+            self.page_source_error
+                .as_deref()
+                .map(ToString::to_string)
+                .as_deref()
+                .unwrap_or("none"),
+            self.source,
+        )
+    }
+}
+
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum BrowserError {
     #[error("browser endpoint is invalid")]
@@ -219,6 +278,8 @@ pub enum BrowserError {
     VpVerificationResultDriverDiagnostic(Box<VpVerificationResultDriverDiagnostic>),
     #[error("OpenID4VP verification-result fragment scrub failed [{0}]")]
     VpVerificationResultFragmentScrubDiagnostic(Box<VpVerificationResultFragmentScrubDiagnostic>),
+    #[error("OpenID4VP verification-result canonical shell mount failed [{0}]")]
+    VpVerificationResultShellMountDiagnostic(Box<VpVerificationResultShellMountDiagnostic>),
     #[error("OpenID4VP verification-result projection field is invalid: {0}")]
     VpVerificationResultField(&'static str),
     #[error("browser WebDriver rejected the request")]
@@ -754,6 +815,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn vp_result_shell_page_diagnostic(source: &str) -> VpVerificationResultShellPageDiagnostic {
+    VpVerificationResultShellPageDiagnostic {
+        byte_len: source.len(),
+        sha256: sha256_hex(source.as_bytes()),
+        has_result_root: source.contains("data-testid=\"vp-verification-result\""),
+        has_completion_title: source.contains("<title>Presentation complete</title>"),
+        has_nazoauth_asset_prefix: source.contains("/ui/assets/index-"),
+    }
 }
 
 fn canonical_navigation_url(url: &Url) -> String {
@@ -1554,6 +1625,27 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         Ok(())
     }
 
+    fn canonical_shell_mount_failure(
+        &mut self,
+        stage: &'static str,
+        current: &Url,
+        source: BrowserError,
+    ) -> BrowserError {
+        let (page, page_source_error) = match self.driver.page_source() {
+            Ok(page) => (Some(vp_result_shell_page_diagnostic(&page)), None),
+            Err(error) => (None, Some(Box::new(error))),
+        };
+        BrowserError::VpVerificationResultShellMountDiagnostic(Box::new(
+            VpVerificationResultShellMountDiagnostic {
+                stage,
+                current_url: vp_result_url_diagnostic(current, None, None, None),
+                page,
+                page_source_error,
+                source: Box::new(source),
+            },
+        ))
+    }
+
     /// A capability-free navigation must expose the stable NazoAuthWeb shell.
     /// Root mount and attribute availability are allowed to settle within the
     /// ordinary browser step timeout, but every retry proves the page remains
@@ -1574,18 +1666,19 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             )) {
                 Ok(root) => root,
                 Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {
-                    vp_result_driver(
-                        "canonical-shell-root-find",
-                        Some("vp-verification-result"),
-                        self.sleep_until(deadline),
-                    )?;
+                    if let Err(source) = self.sleep_until(deadline) {
+                        return Err(self.canonical_shell_mount_failure(
+                            "canonical-shell-root-find",
+                            expected,
+                            source,
+                        ));
+                    }
                     continue;
                 }
                 Err(error) => {
-                    return Err(vp_result_driver_error(
+                    return Err(self.canonical_shell_mount_failure(
                         "canonical-shell-root-find",
-                        Some("vp-verification-result"),
-                        None,
+                        expected,
                         error,
                     ));
                 }
@@ -1595,11 +1688,13 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                 Some("vp-verification-result"),
                 self.driver.element_displayed(&root),
             )? {
-                vp_result_driver(
-                    "canonical-shell-root-visible",
-                    Some("vp-verification-result"),
-                    self.sleep_until(deadline),
-                )?;
+                if let Err(source) = self.sleep_until(deadline) {
+                    return Err(self.canonical_shell_mount_failure(
+                        "canonical-shell-root-visible",
+                        expected,
+                        source,
+                    ));
+                }
                 continue;
             }
             match vp_result_driver(
@@ -1612,11 +1707,15 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                 Some("loading" | "verified" | "expired" | "not-found" | "generic-error") => {
                     return Ok(());
                 }
-                None => vp_result_driver(
-                    "canonical-shell-root-state-attribute",
-                    Some("vp-verification-result"),
-                    self.sleep_until(deadline),
-                )?,
+                None => {
+                    if let Err(source) = self.sleep_until(deadline) {
+                        return Err(self.canonical_shell_mount_failure(
+                            "canonical-shell-root-state-attribute",
+                            expected,
+                            source,
+                        ));
+                    }
+                }
                 Some(_) => {
                     return Err(BrowserError::VpVerificationResultField(
                         "vp-verification-result:data-state",
@@ -2437,6 +2536,8 @@ mod tests {
         root_hidden_reads: usize,
         state_attribute_missing_reads: usize,
         redirect_after_root_not_found: Option<Url>,
+        page_source: String,
+        page_source_error: Option<BrowserError>,
         receipt_navigation_seen: bool,
         refreshes: usize,
         refreshed_from: Vec<Url>,
@@ -2490,7 +2591,10 @@ mod tests {
         }
 
         fn page_source(&mut self) -> Result<String, BrowserError> {
-            Ok(String::new())
+            match &self.page_source_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(self.page_source.clone()),
+            }
         }
 
         fn find_element(&mut self, selector: &BrowserSelector) -> Result<String, BrowserError> {
@@ -2626,6 +2730,8 @@ mod tests {
             root_hidden_reads: 0,
             state_attribute_missing_reads: 0,
             redirect_after_root_not_found: None,
+            page_source: String::new(),
+            page_source_error: None,
             receipt_navigation_seen: false,
             refreshes: 0,
             refreshed_from: Vec::new(),
@@ -3082,10 +3188,19 @@ mod tests {
             let error = executor
                 .capture_openid4vp_verification_result(&evidence, &capture, 0)
                 .expect_err("canonical shell failure");
-            let BrowserError::VpVerificationResultDriverDiagnostic(diagnostic) = error else {
-                panic!("staged shell failure")
-            };
-            assert_eq!(diagnostic.stage, expected_stage, "case={case}");
+            if case == "missing-shell" {
+                let BrowserError::VpVerificationResultShellMountDiagnostic(diagnostic) = error
+                else {
+                    panic!("mount timeout must retain shell metadata")
+                };
+                assert_eq!(diagnostic.stage, expected_stage, "case={case}");
+                assert_eq!(diagnostic.source.as_ref(), &BrowserError::Timeout);
+            } else {
+                let BrowserError::VpVerificationResultDriverDiagnostic(diagnostic) = error else {
+                    panic!("staged shell failure")
+                };
+                assert_eq!(diagnostic.stage, expected_stage, "case={case}");
+            }
             assert_eq!(executor.driver_mut().navigated.len(), 1, "case={case}");
             assert!(executor.driver_mut().navigated[0].fragment().is_none());
             assert!(
@@ -3347,7 +3462,8 @@ mod tests {
                 .capture_openid4vp_verification_result(&evidence, &capture, 0)
                 .expect_err("missing or unknown shell state");
             if let Some(timeout_stage) = timeout_stage {
-                let BrowserError::VpVerificationResultDriverDiagnostic(diagnostic) = error else {
+                let BrowserError::VpVerificationResultShellMountDiagnostic(diagnostic) = error
+                else {
                     panic!("temporary shell state must time out with a stage")
                 };
                 assert_eq!(diagnostic.stage, timeout_stage);
@@ -3390,6 +3506,100 @@ mod tests {
             &BrowserError::ProtocolDiagnostic(response)
         );
         assert!(diagnostic.to_string().contains("endpoint=current_url"));
+    }
+
+    #[test]
+    fn vp_result_shell_page_diagnostic_is_metadata_only_and_classifies_fixed_markers() {
+        let nazo = r#"<html><title>Presentation complete</title><script src="/ui/assets/index-a.js"></script><div data-testid="vp-verification-result">secret=do-not-retain</div></html>"#;
+        let nazo_diagnostic = vp_result_shell_page_diagnostic(nazo);
+        assert_eq!(nazo_diagnostic.byte_len, nazo.len());
+        assert_eq!(nazo_diagnostic.sha256, sha256_hex(nazo.as_bytes()));
+        assert!(nazo_diagnostic.has_result_root);
+        assert!(nazo_diagnostic.has_completion_title);
+        assert!(nazo_diagnostic.has_nazoauth_asset_prefix);
+
+        let completion = "<title>Presentation complete</title>";
+        let completion_diagnostic = vp_result_shell_page_diagnostic(completion);
+        assert!(!completion_diagnostic.has_result_root);
+        assert!(completion_diagnostic.has_completion_title);
+        assert!(!completion_diagnostic.has_nazoauth_asset_prefix);
+
+        let sensitive = "<html>token=do-not-retain&dynamic=private</html>";
+        let sensitive_diagnostic = vp_result_shell_page_diagnostic(sensitive);
+        let rendered = sensitive_diagnostic.to_string();
+        assert!(!sensitive_diagnostic.has_result_root);
+        assert!(!sensitive_diagnostic.has_completion_title);
+        assert!(!sensitive_diagnostic.has_nazoauth_asset_prefix);
+        assert!(!rendered.contains("do-not-retain"));
+        assert!(!rendered.contains("dynamic=private"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_shell_mount_failure_keeps_root_cause_and_redacts_page_source() {
+        for (page_source, page_source_error) in [
+            (
+                "<title>Presentation complete</title><div data-testid=\"vp-verification-result\">token=do-not-retain</div>",
+                None,
+            ),
+            ("", Some(BrowserError::Transport)),
+        ] {
+            let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .expect("temp")
+                .join(format!(
+                    "nazoauth-vp-shell-diagnostic-{}",
+                    uuid::Uuid::now_v7()
+                ));
+            crate::secure_file::ensure_directory(&root, true).expect("private root");
+            let capture = vp_capture_context(root.clone(), &context, &variant);
+            let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+            driver.shell_available = false;
+            driver.page_source = page_source.to_owned();
+            let source_failed = page_source_error.is_some();
+            driver.page_source_error = page_source_error;
+            let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+            let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+            let policy = BrowserPolicy::new(target, suite)
+                .expect("policy")
+                .with_limits(BrowserLimits {
+                    max_step_timeout: Duration::from_millis(1),
+                    poll_interval: Duration::from_millis(1),
+                    ..BrowserLimits::default()
+                })
+                .expect("short shell policy");
+            let mut executor = BrowserExecutor::new(driver, policy);
+
+            let error = executor
+                .capture_openid4vp_verification_result(&evidence, &capture, 0)
+                .expect_err("shell mount timeout");
+            let BrowserError::VpVerificationResultShellMountDiagnostic(diagnostic) = error else {
+                panic!("shell mount diagnostic")
+            };
+            assert_eq!(diagnostic.stage, "canonical-shell-root-find");
+            assert_eq!(diagnostic.source.as_ref(), &BrowserError::Timeout);
+            assert_eq!(
+                diagnostic.current_url.canonical_origin,
+                "https://issuer.example"
+            );
+            assert_eq!(diagnostic.current_url.path, "/ui/verification-result");
+            if source_failed {
+                assert!(diagnostic.page.is_none());
+                assert_eq!(
+                    diagnostic.page_source_error.as_deref(),
+                    Some(&BrowserError::Transport)
+                );
+            } else {
+                let page = diagnostic.page.as_ref().expect("page metadata");
+                assert!(page.has_result_root);
+                assert!(page.has_completion_title);
+                assert!(!page.has_nazoauth_asset_prefix);
+                assert!(diagnostic.page_source_error.is_none());
+                assert!(!diagnostic.to_string().contains("do-not-retain"));
+            }
+            std::fs::remove_dir_all(root).expect("remove root");
+        }
     }
 
     #[test]
