@@ -33,7 +33,7 @@ subtle = "2.6.1"
 x509-parser = { version = "0.18.1", features = ["verify-aws"] }
 time = { version = "0.3", default-features = false, features = ["std", "parsing", "formatting"] }
 thiserror = "2.0.20"
-uuid = { version = "1.24.1", features = ["v4", "v7"] }
+uuid = { version = "1.24.1", features = ["v4", "v7", "serde"] }
 url = "2.5.8"
 zeroize = { version = "1.8.2", features = ["derive", "serde"] }
 png = "=0.18.1"

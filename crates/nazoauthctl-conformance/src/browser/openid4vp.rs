@@ -1152,7 +1152,7 @@ impl OpenId4VpVerifier for OpenId4VpVerifierClient {
         &mut self,
         presentation: &OpenId4VpPresentation,
     ) -> Result<OpenId4VpVerificationEvidence, OpenId4VpError> {
-        self.verification_evidence(presentation)
+        OpenId4VpVerifierClient::verification_evidence(self, presentation)
     }
 
     fn attach_evidence_context(
@@ -1599,7 +1599,7 @@ mod tests {
     }
 
     struct RetryingCreateTransport {
-        requests: std::sync::Mutex<Vec<HttpRequest>>,
+        request_bodies: std::sync::Mutex<Vec<Vec<u8>>>,
     }
 
     impl Transport for RetryingCreateTransport {
@@ -1608,9 +1608,10 @@ mod tests {
             request: HttpRequest,
             _max_response_bytes: usize,
         ) -> Result<HttpResponse, TransportError> {
-            let mut requests = self.requests.lock().expect("request lock");
-            requests.push(request.clone());
-            if requests.len() == 1 {
+            let body = request.body().expect("create body").to_vec();
+            let mut request_bodies = self.request_bodies.lock().expect("request lock");
+            request_bodies.push(body);
+            if request_bodies.len() == 1 {
                 return Err(TransportError::Network(TransportFailureStage::SendRequest));
             }
             let mut response = HttpResponse {
@@ -1633,7 +1634,7 @@ mod tests {
         let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
         let suite = Origin::parse("https://suite.example").expect("suite");
         let transport = Arc::new(RetryingCreateTransport {
-            requests: std::sync::Mutex::new(Vec::new()),
+            request_bodies: std::sync::Mutex::new(Vec::new()),
         });
         let mut client = OpenId4VpVerifierClient::with_transport(
             target,
@@ -1647,12 +1648,10 @@ mod tests {
             .expect("request");
 
         let presentation = client.start(&request).expect("response-loss retry");
-        let requests = transport.requests.lock().expect("request lock");
-        assert_eq!(requests.len(), 2);
-        let first: Value = serde_json::from_slice(requests[0].body().expect("first body"))
-            .expect("first body JSON");
-        let second: Value = serde_json::from_slice(requests[1].body().expect("second body"))
-            .expect("second body JSON");
+        let request_bodies = transport.request_bodies.lock().expect("request lock");
+        assert_eq!(request_bodies.len(), 2);
+        let first: Value = serde_json::from_slice(&request_bodies[0]).expect("first body JSON");
+        let second: Value = serde_json::from_slice(&request_bodies[1]).expect("second body JSON");
         assert_eq!(first["create_request_jti"], second["create_request_jti"]);
         assert_eq!(
             first["create_request_jti"],
@@ -2112,8 +2111,7 @@ mod tests {
             immediate_rejection_allowed: false,
         };
         assert_eq!(
-            client
-                .verification_evidence(&presentation)
+            OpenId4VpVerifier::verification_evidence(&mut client, &presentation)
                 .expect_err("pending issuance"),
             OpenId4VpError::EvidenceUnavailable
         );
