@@ -16,13 +16,9 @@ use sha2::{Digest as _, Sha256};
 const LEGACY_RECOVERY_JOURNAL_SCHEMA: u32 = 1;
 /// The ordinary default journal remains schema 2 byte-for-byte compatible.
 const TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 2;
-/// Schema 3 is the first retention journal format. It stays readable for
-/// previously completed/Retained runs but is never emitted by new capture
-/// runs.
+/// Schema 3 is emitted only after an explicit certification-retention policy
+/// is durably bound. Older binaries reject it rather than deleting plans.
 const RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 3;
-/// Schema 4 adds a durable provider-evidence state machine. New retention
-/// runs persist an Intent before creating any provider evidence directory.
-const RETAINING_PROVIDER_EVIDENCE_RECOVERY_JOURNAL_SCHEMA: u32 = 4;
 const TENANT_RESOURCE_RECOVERY_KIND: &str = "tenant-resource";
 const MAX_RECOVERY_JOURNAL_BYTES: usize = 128 * 1024;
 const MAX_PENDING_RUNS: usize = 64;
@@ -209,34 +205,6 @@ pub struct SuiteRetentionProviderEvidence {
     pub manifest_sha256: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
-enum SuiteRetentionProviderState {
-    None,
-    Intent {
-        pending_directory: PathBuf,
-        final_directory: PathBuf,
-    },
-    Staged {
-        pending_directory: PathBuf,
-        final_directory: PathBuf,
-        manifest_sha256: String,
-    },
-    Final {
-        evidence: SuiteRetentionProviderEvidence,
-    },
-    CleanupIntent {
-        pending_directory: PathBuf,
-        manifest_sha256: Option<String>,
-    },
-}
-
-impl Default for SuiteRetentionProviderState {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
 impl SuiteRetentionManifest {
     pub fn plan_alias_sha256(matrix_plan_id: &str) -> String {
         sha256_hex(matrix_plan_id.as_bytes())
@@ -249,15 +217,6 @@ struct SuiteRetentionRecord {
     manifest: SuiteRetentionManifest,
     manifest_sha256: String,
     manifest_path: PathBuf,
-    #[serde(
-        default,
-        skip_serializing_if = "suite_retention_provider_state_is_none"
-    )]
-    provider_state: SuiteRetentionProviderState,
-}
-
-fn suite_retention_provider_state_is_none(value: &SuiteRetentionProviderState) -> bool {
-    matches!(value, SuiteRetentionProviderState::None)
 }
 
 /// Suite plan ownership remains active until all non-Suite cleanup succeeds.
@@ -361,19 +320,17 @@ impl<'de> Deserialize<'de> for RecoveryJournal {
         const TENANT_RESOURCE_SCHEMA: u64 = TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA as u64;
         const RETAINING_TENANT_RESOURCE_SCHEMA: u64 =
             RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA as u64;
-        const RETAINING_PROVIDER_EVIDENCE_SCHEMA: u64 =
-            RETAINING_PROVIDER_EVIDENCE_RECOVERY_JOURNAL_SCHEMA as u64;
         match schema {
             LEGACY_SCHEMA => serde_json::from_value(value)
                 .map(Box::new)
                 .map(Self::Legacy)
                 .map_err(serde::de::Error::custom),
-            TENANT_RESOURCE_SCHEMA
-            | RETAINING_TENANT_RESOURCE_SCHEMA
-            | RETAINING_PROVIDER_EVIDENCE_SCHEMA => serde_json::from_value(value)
-                .map(Box::new)
-                .map(Self::TenantResource)
-                .map_err(serde::de::Error::custom),
+            TENANT_RESOURCE_SCHEMA | RETAINING_TENANT_RESOURCE_SCHEMA => {
+                serde_json::from_value(value)
+                    .map(Box::new)
+                    .map(Self::TenantResource)
+                    .map_err(serde::de::Error::custom)
+            }
             _ => Err(serde::de::Error::custom(
                 "unsupported recovery journal schema",
             )),
@@ -558,14 +515,12 @@ impl ConformanceRecoveryStore {
             {
                 suite.plan_ids.clear();
                 suite.module_ids.clear();
-                if matches!(
-                    tenant_journal.schema,
-                    RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
-                        | RETAINING_PROVIDER_EVIDENCE_RECOVERY_JOURNAL_SCHEMA
-                ) && matches!(
-                    &tenant_journal.suite_retention,
-                    SuiteRetentionDisposition::Active { .. }
-                ) {
+                if tenant_journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                    && matches!(
+                        &tenant_journal.suite_retention,
+                        SuiteRetentionDisposition::Active { .. }
+                    )
+                {
                     tenant_journal.suite_retention = SuiteRetentionDisposition::Cleaned;
                 }
                 normalized_suite_cleanup = true;
@@ -801,7 +756,7 @@ impl ConformanceRecoveryGuard {
                     requested: retain_suite_plans_for_certification,
                 };
                 if retain_suite_plans_for_certification {
-                    journal.schema = RETAINING_PROVIDER_EVIDENCE_RECOVERY_JOURNAL_SCHEMA;
+                    journal.schema = RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA;
                 }
             }
             SuiteRetentionDisposition::RetentionPrepared { .. }
@@ -931,11 +886,7 @@ impl ConformanceRecoveryGuard {
             suite.plan_ids.clear();
             suite.module_ids.clear();
         }
-        if matches!(
-            journal.schema,
-            RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
-                | RETAINING_PROVIDER_EVIDENCE_RECOVERY_JOURNAL_SCHEMA
-        ) {
+        if journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA {
             journal.suite_retention = SuiteRetentionDisposition::Cleaned;
         }
         self.persist()
@@ -965,33 +916,12 @@ impl ConformanceRecoveryGuard {
         if suite.cleanup_complete || !suite.pending_create_intents.is_empty() {
             bail!("Suite retention requires a settled allocation");
         }
-        validate_suite_retention_manifest(&manifest, &journal.binding, Some(suite), false)?;
+        validate_suite_retention_manifest(&manifest, &journal.binding, Some(suite))?;
         let bytes = canonical_suite_retention_manifest(&manifest)?;
-        let provider_state =
-            if journal.schema == RETAINING_PROVIDER_EVIDENCE_RECOVERY_JOURNAL_SCHEMA {
-                let evidence_root = manifest_path
-                    .parent()
-                    .context("Suite retention manifest has no evidence parent")?;
-                let evidence_root = crate::secure_file::validate_directory(evidence_root, true)
-                    .map_err(|error| {
-                        anyhow::anyhow!("provider evidence root is not secure: {error:?}")
-                    })?;
-                SuiteRetentionProviderState::Intent {
-                    pending_directory: evidence_root
-                        .join(".pending-provider")
-                        .join(&journal.binding.request_jti),
-                    final_directory: evidence_root
-                        .join("provider-evidence")
-                        .join(&journal.binding.request_jti),
-                }
-            } else {
-                SuiteRetentionProviderState::None
-            };
         let record = SuiteRetentionRecord {
             manifest,
             manifest_sha256: sha256_hex(&bytes),
             manifest_path,
-            provider_state,
         };
         // Retention eligibility is evaluated only after every allocated
         // module has reached a terminal state. Prepared fallback cleanup
@@ -1024,28 +954,12 @@ impl ConformanceRecoveryGuard {
         else {
             bail!("Suite retention has not been prepared");
         };
-        let (pending_directory, final_directory) = match &record.provider_state {
-            SuiteRetentionProviderState::Intent {
-                pending_directory,
-                final_directory,
-            } => (pending_directory.clone(), final_directory.clone()),
-            _ => bail!("Suite retention provider evidence was not prepared"),
-        };
-        if provider_evidence.directory != pending_directory {
-            bail!("staged provider evidence path conflicts with the recovery intent");
+        if record.manifest.provider_evidence.is_some() {
+            bail!("Suite retention provider evidence is already bound");
         }
-        validate_suite_retention_provider_evidence(
-            &provider_evidence,
-            &binding,
-            &record.manifest,
-            false,
-            None,
-        )?;
-        record.provider_state = SuiteRetentionProviderState::Staged {
-            pending_directory,
-            final_directory,
-            manifest_sha256: provider_evidence.manifest_sha256,
-        };
+        record.manifest.provider_evidence = Some(provider_evidence);
+        validate_suite_retention_manifest(&record.manifest, &binding, Some(&suite))?;
+        record.manifest_sha256 = sha256_hex(&canonical_suite_retention_manifest(&record.manifest)?);
         self.persist()
     }
 
@@ -1096,82 +1010,47 @@ impl ConformanceRecoveryGuard {
     pub fn publish_retained_provider_evidence(
         &mut self,
     ) -> anyhow::Result<SuiteRetentionProviderEvidence> {
-        let (
-            pending,
-            final_directory,
-            manifest_sha256,
-            already_published,
-            schema_four,
-            binding,
-            manifest_path,
-        ) = {
+        let (pending, final_directory, manifest_sha256, already_published) = {
             let journal = self
                 .tenant_resource_journal()
                 .context("Suite retention is not valid for a legacy journal")?;
             let SuiteRetentionDisposition::Retained { record } = &journal.suite_retention else {
                 bail!("Suite retention has not been committed");
             };
-            if let SuiteRetentionProviderState::Final { evidence } = &record.provider_state {
-                validate_suite_retention_provider_evidence(
-                    evidence,
-                    &journal.binding,
-                    &record.manifest,
-                    journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA,
-                    Some(&record.manifest_path),
-                )?;
-                return Ok(evidence.clone());
-            }
-            let legacy_schema = journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA;
-            let (provider, final_directory, already_published) = match &record.provider_state {
-                SuiteRetentionProviderState::Staged {
-                    pending_directory,
-                    final_directory,
-                    manifest_sha256,
-                } => (
-                    SuiteRetentionProviderEvidence {
-                        directory: pending_directory.clone(),
-                        manifest_sha256: manifest_sha256.clone(),
-                    },
-                    final_directory.clone(),
-                    false,
-                ),
-                _ if legacy_schema => {
-                    let provider = record
-                        .manifest
-                        .provider_evidence
-                        .clone()
-                        .context("legacy retained Suite journal has no provider evidence")?;
-                    (provider.clone(), provider.directory.clone(), true)
-                }
-                _ => bail!("retained Suite journal has no staged provider evidence"),
-            };
-            if !legacy_schema {
-                let namespace = provider
-                    .directory
-                    .parent()
-                    .and_then(|path| path.file_name())
-                    .and_then(|name| name.to_str());
-                if provider
-                    .directory
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    != Some(record.manifest.run_id.as_str())
-                    || !matches!(
-                        namespace,
-                        Some(".pending-provider") | Some("provider-evidence")
-                    )
-                {
-                    bail!("provider evidence pending path is outside policy");
-                }
+            let provider = record
+                .manifest
+                .provider_evidence
+                .as_ref()
+                .context("retained Suite journal has no provider evidence")?;
+            let evidence_root = provider
+                .directory
+                .parent()
+                .and_then(Path::parent)
+                .context("provider evidence pending path is invalid")?;
+            let namespace = provider
+                .directory
+                .parent()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str());
+            if provider
+                .directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some(record.manifest.run_id.as_str())
+                || !matches!(
+                    namespace,
+                    Some(".pending-provider") | Some("provider-evidence")
+                )
+            {
+                bail!("provider evidence pending path is outside policy");
             }
             (
                 provider.directory.clone(),
-                final_directory,
+                evidence_root
+                    .join("provider-evidence")
+                    .join(&record.manifest.run_id),
                 provider.manifest_sha256.clone(),
-                already_published,
-                journal.schema == RETAINING_PROVIDER_EVIDENCE_RECOVERY_JOURNAL_SCHEMA,
-                journal.binding.clone(),
-                record.manifest_path.clone(),
+                namespace == Some("provider-evidence"),
             )
         };
         if !already_published {
@@ -1181,44 +1060,20 @@ impl ConformanceRecoveryGuard {
             crate::secure_file::ensure_directory(final_parent, true).map_err(|error| {
                 anyhow::anyhow!("provider evidence final directory is not secure: {error:?}")
             })?;
-            match crate::secure_file::validate_directory(&pending, true) {
-                Ok(_) => crate::secure_file::promote_private_directory(&pending, &final_directory)
-                    .map_err(|error| {
-                        anyhow::anyhow!("failed to publish provider evidence: {error:?}")
-                    })?,
-                Err(crate::secure_file::SecureFileError::NotFound) => {
-                    let adopted = SuiteRetentionProviderEvidence {
-                        directory: final_directory.clone(),
-                        manifest_sha256: manifest_sha256.clone(),
-                    };
-                    let manifest = self
-                        .suite_retention_manifest()
-                        .context("retained Suite journal has no manifest")?;
-                    validate_suite_retention_provider_evidence(
-                        &adopted, &binding, manifest, false, None,
-                    )
-                    .map_err(|error| {
-                        anyhow::anyhow!("provider evidence promotion cannot be adopted: {error:#}")
-                    })?;
-                }
-                Err(error) => {
-                    bail!("provider evidence pending directory is not secure: {error:?}")
-                }
-            }
+            crate::secure_file::promote_private_directory(&pending, &final_directory).map_err(
+                |error| anyhow::anyhow!("failed to publish provider evidence: {error:?}"),
+            )?;
         }
         let published = SuiteRetentionProviderEvidence {
             directory: final_directory,
             manifest_sha256,
         };
-        let manifest = self
-            .suite_retention_manifest()
-            .context("retained Suite journal has no manifest")?;
         validate_suite_retention_provider_evidence(
             &published,
-            &binding,
-            manifest,
-            !schema_four,
-            Some(&manifest_path),
+            &self
+                .tenant_resource_journal()
+                .expect("tenant-resource journal was just verified")
+                .binding,
         )?;
         let journal = self
             .tenant_resource_journal_mut()
@@ -1227,11 +1082,6 @@ impl ConformanceRecoveryGuard {
             bail!("Suite retention has not been committed");
         };
         record.manifest.provider_evidence = Some(published.clone());
-        if schema_four {
-            record.provider_state = SuiteRetentionProviderState::Final {
-                evidence: published.clone(),
-            };
-        }
         record.manifest_sha256 = sha256_hex(&canonical_suite_retention_manifest(&record.manifest)?);
         self.persist()?;
         Ok(published)
@@ -1249,13 +1099,10 @@ impl ConformanceRecoveryGuard {
         let record = match &self.journal {
             RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
                 SuiteRetentionDisposition::RetentionPrepared { record }
-                    if journal.schema == RETAINING_PROVIDER_EVIDENCE_RECOVERY_JOURNAL_SCHEMA
-                        && !matches!(
-                            &record.provider_state,
-                            SuiteRetentionProviderState::Staged { .. }
-                        ) =>
+                    if journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                        && record.manifest.provider_evidence.is_none() =>
                 {
-                    bail!("schema-4 retained Suite journals require staged provider evidence")
+                    bail!("new retained Suite journals require bound provider evidence")
                 }
                 SuiteRetentionDisposition::RetentionPrepared { record } => record.clone(),
                 _ => bail!("Suite retention has not been prepared"),
@@ -1312,14 +1159,6 @@ impl ConformanceRecoveryGuard {
                 provider,
                 self.tenant_resource_binding()
                     .context("Suite retention has no ordinary binding")?,
-                &record.manifest,
-                match &self.journal {
-                    RecoveryJournal::TenantResource(journal) => {
-                        journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
-                    }
-                    RecoveryJournal::Legacy(_) => false,
-                },
-                Some(&record.manifest_path),
             )?;
         } else {
             bail!("retained Suite journal has no provider evidence");
@@ -1366,7 +1205,7 @@ impl ConformanceRecoveryGuard {
 
     /// A prepared-but-uncommitted retention is ordinary cleanup state. Remove
     /// only its non-final staging file before deleting the journal-owned plans.
-    pub fn discard_prepared_suite_retention_staging(&mut self) -> anyhow::Result<()> {
+    pub fn discard_prepared_suite_retention_staging(&self) -> anyhow::Result<()> {
         let prepared = matches!(
             &self.journal,
             RecoveryJournal::TenantResource(journal)
@@ -1378,67 +1217,37 @@ impl ConformanceRecoveryGuard {
         if !prepared {
             return Ok(());
         }
-        let provider_cleanup = {
-            let journal = self
-                .tenant_resource_journal_mut()
-                .context("Suite retention is not valid for a legacy journal")?;
-            let SuiteRetentionDisposition::RetentionPrepared { record } =
-                &mut journal.suite_retention
-            else {
-                bail!("Suite retention is no longer prepared");
-            };
-            let provider_cleanup = match &record.provider_state {
-                SuiteRetentionProviderState::Intent {
-                    pending_directory, ..
-                } => (pending_directory.clone(), None),
-                SuiteRetentionProviderState::Staged {
-                    pending_directory,
-                    manifest_sha256,
-                    ..
-                } => (pending_directory.clone(), Some(manifest_sha256.clone())),
-                SuiteRetentionProviderState::CleanupIntent {
-                    pending_directory,
-                    manifest_sha256,
-                } => (pending_directory.clone(), manifest_sha256.clone()),
-                SuiteRetentionProviderState::None | SuiteRetentionProviderState::Final { .. } => {
-                    bail!("prepared Suite journal has invalid provider cleanup state")
-                }
-            };
-            record.provider_state = SuiteRetentionProviderState::CleanupIntent {
-                pending_directory: provider_cleanup.0.clone(),
-                manifest_sha256: provider_cleanup.1.clone(),
-            };
-            provider_cleanup
-        };
-        // Persist intent before removing either Suite or provider staging so a
-        // crash resumes the same bounded cleanup rather than retaining plans.
-        self.persist()?;
         let pending = self.suite_retention_pending_path()?;
         match crate::secure_file::remove_file(&pending, true) {
-            Ok(()) | Err(crate::secure_file::SecureFileError::NotFound) => {}
+            Ok(()) | Err(crate::secure_file::SecureFileError::NotFound) => Ok(()),
             Err(error) => bail!("failed to discard staged Suite retention manifest: {error:?}"),
         }
-        match crate::secure_file::validate_directory(&provider_cleanup.0, true) {
-            Ok(_) => {
-                if let Some(manifest_sha256) = provider_cleanup.1 {
-                    crate::evidence::discard_staged_private_provider_evidence_bundle(
-                        &provider_cleanup.0,
-                        &manifest_sha256,
-                    )
-                    .map_err(|error| {
-                        anyhow::anyhow!("failed to discard staged provider evidence: {error:?}")
-                    })?;
-                } else {
-                    crate::evidence::discard_incomplete_staged_private_provider_evidence_bundle(
-                        &provider_cleanup.0,
-                    )
-                    .map_err(|error| {
-                        anyhow::anyhow!("failed to discard incomplete provider evidence: {error:?}")
-                    })?;
+        let provider = match &self.journal {
+            RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
+                SuiteRetentionDisposition::RetentionPrepared { record } => {
+                    record.manifest.provider_evidence.as_ref()
                 }
+                _ => None,
+            },
+            RecoveryJournal::Legacy(_) => None,
+        };
+        if let Some(provider) = provider {
+            if provider
+                .directory
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                != Some(".pending-provider")
+            {
+                bail!("prepared Suite journal references published provider evidence");
             }
-            Err(crate::secure_file::SecureFileError::NotFound) => {}
-            Err(error) => bail!("provider evidence staging directory is not secure: {error:?}"),
+            crate::evidence::discard_staged_private_provider_evidence_bundle(
+                &provider.directory,
+                &provider.manifest_sha256,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!("failed to discard staged provider evidence: {error:?}")
+            })?;
         }
         Ok(())
     }
@@ -1705,12 +1514,13 @@ impl ConformanceRecoveryGuard {
 
     pub fn finish(mut self) -> anyhow::Result<()> {
         if self.suite_retention_committed() {
+            let suite_manifest_published = self.suite_retention_manifest_is_published()?;
             self.publish_retained_provider_evidence()?;
             // A crash between the provider directory promotion and final Suite
             // manifest publication leaves a Retained journal. Recreate its
             // private pending manifest from the authoritative journal before
             // the final no-replace promotion.
-            if !self.suite_retention_manifest_is_published()? {
+            if !suite_manifest_published {
                 self.stage_suite_retention_manifest()?;
                 self.publish_committed_suite_retention_manifest()?;
             }
@@ -1877,7 +1687,6 @@ fn validate_journal(
                 journal.schema,
                 TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
                     | RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
-                    | RETAINING_PROVIDER_EVIDENCE_RECOVERY_JOURNAL_SCHEMA
             ) || journal.kind != TENANT_RESOURCE_RECOVERY_KIND
             {
                 bail!("tenant-resource recovery journal discriminator is invalid");
@@ -1897,42 +1706,10 @@ fn validate_tenant_resource_journal(
     {
         bail!("schema-2 recovery journal cannot retain Suite plans");
     }
-    if matches!(
-        journal.schema,
-        RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
-            | RETAINING_PROVIDER_EVIDENCE_RECOVERY_JOURNAL_SCHEMA
-    ) && SuiteRetentionDisposition::is_default(&journal.suite_retention)
+    if journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+        && SuiteRetentionDisposition::is_default(&journal.suite_retention)
     {
-        bail!("retaining recovery journal has no explicit retention policy");
-    }
-    if journal.schema == RETAINING_PROVIDER_EVIDENCE_RECOVERY_JOURNAL_SCHEMA {
-        match &journal.suite_retention {
-            SuiteRetentionDisposition::RetentionPrepared { record }
-                if !matches!(
-                    &record.provider_state,
-                    SuiteRetentionProviderState::Intent { .. }
-                        | SuiteRetentionProviderState::Staged { .. }
-                        | SuiteRetentionProviderState::CleanupIntent { .. }
-                ) =>
-            {
-                bail!("schema-4 prepared retention has no provider staging state")
-            }
-            SuiteRetentionDisposition::Retained { record }
-                if !matches!(
-                    &record.provider_state,
-                    SuiteRetentionProviderState::Staged { .. }
-                        | SuiteRetentionProviderState::Final { .. }
-                ) =>
-            {
-                bail!("schema-4 retained Suite plans have no staged provider evidence")
-            }
-            _ => {}
-        }
-        if let SuiteRetentionDisposition::RetentionPrepared { record }
-        | SuiteRetentionDisposition::Retained { record } = &journal.suite_retention
-        {
-            validate_suite_retention_provider_state(record, &journal.binding)?;
-        }
+        bail!("schema-3 recovery journal has no explicit retention policy");
     }
     if journal.cleanup_complete && !tenant_resource_obligations_complete(journal) {
         bail!("tenant-resource cleanup marker is ahead of its obligations");
@@ -2025,12 +1802,7 @@ fn validate_tenant_resource_journal(
             if suite.cleanup_complete || !suite.pending_create_intents.is_empty() {
                 bail!("prepared Suite retention has unsettled allocation state");
             }
-            validate_suite_retention_record(
-                record,
-                &journal.binding,
-                suite,
-                journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA,
-            )?;
+            validate_suite_retention_record(record, &journal.binding, suite)?;
         }
         SuiteRetentionDisposition::Retained { record } => {
             let suite = journal
@@ -2044,11 +1816,7 @@ fn validate_tenant_resource_journal(
             {
                 bail!("retained Suite disposition must transfer all allocation IDs");
             }
-            validate_suite_retention_record_without_inventory(
-                record,
-                &journal.binding,
-                journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA,
-            )?;
+            validate_suite_retention_record_without_inventory(record, &journal.binding)?;
         }
     }
     if let Some(receipt) = &journal.receipt {
@@ -2089,55 +1857,6 @@ fn validate_tenant_resource_journal(
     Ok(())
 }
 
-fn validate_suite_retention_provider_state(
-    record: &SuiteRetentionRecord,
-    binding: &TenantResourceRecoveryBinding,
-) -> anyhow::Result<()> {
-    let evidence_root = record
-        .manifest_path
-        .parent()
-        .context("schema-4 Suite retention manifest has no evidence root")?;
-    let pending = evidence_root
-        .join(".pending-provider")
-        .join(&binding.request_jti);
-    let final_directory = evidence_root
-        .join("provider-evidence")
-        .join(&binding.request_jti);
-    match &record.provider_state {
-        SuiteRetentionProviderState::Intent {
-            pending_directory,
-            final_directory: declared_final,
-        } if pending_directory == &pending && declared_final == &final_directory => Ok(()),
-        SuiteRetentionProviderState::Staged {
-            pending_directory,
-            final_directory: declared_final,
-            manifest_sha256,
-        } if pending_directory == &pending
-            && declared_final == &final_directory
-            && lower_hex(manifest_sha256, 64) =>
-        {
-            Ok(())
-        }
-        SuiteRetentionProviderState::Final { evidence }
-            if evidence.directory == final_directory
-                && lower_hex(&evidence.manifest_sha256, 64) =>
-        {
-            Ok(())
-        }
-        SuiteRetentionProviderState::CleanupIntent {
-            pending_directory,
-            manifest_sha256,
-        } if pending_directory == &pending
-            && manifest_sha256
-                .as_deref()
-                .is_none_or(|digest| lower_hex(digest, 64)) =>
-        {
-            Ok(())
-        }
-        _ => bail!("schema-4 provider evidence state conflicts with its recovery binding"),
-    }
-}
-
 fn canonical_suite_retention_manifest(
     manifest: &SuiteRetentionManifest,
 ) -> anyhow::Result<Vec<u8>> {
@@ -2158,9 +1877,8 @@ fn validate_suite_retention_record(
     record: &SuiteRetentionRecord,
     binding: &TenantResourceRecoveryBinding,
     suite: &SuiteRecoveryState,
-    legacy_read_only: bool,
 ) -> anyhow::Result<()> {
-    validate_suite_retention_manifest(&record.manifest, binding, Some(suite), legacy_read_only)?;
+    validate_suite_retention_manifest(&record.manifest, binding, Some(suite))?;
     if sha256_hex(&canonical_suite_retention_manifest(&record.manifest)?) != record.manifest_sha256
     {
         bail!("Suite retention manifest digest is invalid");
@@ -2172,9 +1890,8 @@ fn validate_suite_retention_record(
 fn validate_suite_retention_record_without_inventory(
     record: &SuiteRetentionRecord,
     binding: &TenantResourceRecoveryBinding,
-    legacy_read_only: bool,
 ) -> anyhow::Result<()> {
-    validate_suite_retention_manifest(&record.manifest, binding, None, legacy_read_only)?;
+    validate_suite_retention_manifest(&record.manifest, binding, None)?;
     if sha256_hex(&canonical_suite_retention_manifest(&record.manifest)?) != record.manifest_sha256
     {
         bail!("Suite retention manifest digest is invalid");
@@ -2187,7 +1904,6 @@ fn validate_suite_retention_manifest(
     manifest: &SuiteRetentionManifest,
     binding: &TenantResourceRecoveryBinding,
     suite: Option<&SuiteRecoveryState>,
-    legacy_read_only: bool,
 ) -> anyhow::Result<()> {
     if manifest.schema != SUITE_RETENTION_MANIFEST_SCHEMA
         || crate::Origin::parse_suite(&manifest.suite_origin)
@@ -2207,16 +1923,8 @@ fn validate_suite_retention_manifest(
     if let Some(screenshot) = &manifest.review_screenshot_manifest {
         validate_review_screenshot_manifest_binding(screenshot, binding)?;
     }
-    if let Some(provider_evidence) = &manifest.provider_evidence
-        && !legacy_read_only
-    {
-        validate_suite_retention_provider_evidence(
-            provider_evidence,
-            binding,
-            manifest,
-            false,
-            None,
-        )?;
+    if let Some(provider_evidence) = &manifest.provider_evidence {
+        validate_suite_retention_provider_evidence(provider_evidence, binding)?;
     }
     let mut matrix_ids = std::collections::BTreeSet::new();
     let mut suite_ids = std::collections::BTreeSet::new();
@@ -2284,9 +1992,6 @@ fn validate_review_screenshot_manifest_binding(
 fn validate_suite_retention_provider_evidence(
     provider_evidence: &SuiteRetentionProviderEvidence,
     binding: &TenantResourceRecoveryBinding,
-    manifest: &SuiteRetentionManifest,
-    legacy_provider_layout: bool,
-    legacy_manifest_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     if !provider_evidence.directory.is_absolute()
         || !lower_hex(&provider_evidence.manifest_sha256, 64)
@@ -2298,88 +2003,24 @@ fn validate_suite_retention_provider_evidence(
         .parent()
         .and_then(|parent| parent.file_name())
         .and_then(|name| name.to_str());
-    let canonical_layout = matches!(
+    if !matches!(
         namespace,
         Some(".pending-provider") | Some("provider-evidence")
-    ) && provider_evidence
+    ) || provider_evidence
         .directory
         .file_name()
         .and_then(|name| name.to_str())
-        == Some(binding.request_jti.as_str());
-    let legacy_layout = legacy_manifest_path
-        .and_then(Path::parent)
-        .is_some_and(|root| provider_evidence.directory.parent() == Some(root))
-        && provider_evidence
-            .directory
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_prefix("run-"))
-            .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok());
-    if !canonical_layout && !(legacy_provider_layout && legacy_layout) {
+        != Some(binding.request_jti.as_str())
+    {
         bail!("provider evidence path is outside the retained run policy");
     }
-    let verified = crate::evidence::verify_private_provider_evidence_bundle(
+    let receipt = crate::evidence::validate_private_provider_evidence_bundle(
         &provider_evidence.directory,
         &provider_evidence.manifest_sha256,
     )
     .map_err(|error| anyhow::anyhow!("provider evidence bundle is invalid: {error:?}"))?;
-    if verified.identity.run_jti != binding.request_jti
-        || (!legacy_provider_layout && verified.receipt.evidence_jti != binding.request_jti)
-    {
+    if receipt.evidence_jti != binding.request_jti {
         bail!("provider evidence JTI conflicts with the retained run binding");
-    }
-    if verified.identity.deployment.deployment_id != manifest.deployment_id
-        || verified.report.suite_origin != manifest.suite_origin
-        || verified.report.matrix_digest != manifest.matrix_sha256
-    {
-        bail!("provider evidence deployment, Suite, or matrix identity conflicts with retention");
-    }
-    let crate::evidence::EvidenceSourceIdentity::SignedOidfArtifact {
-        suite_origin,
-        artifact_digest,
-        artifact,
-    } = &verified.identity.source
-    else {
-        bail!("retained provider evidence must be sourced from a signed OIDF artifact");
-    };
-    if artifact_digest != &manifest.artifact_digest
-        || suite_origin != &manifest.suite_origin
-        || artifact.suite.origin != manifest.suite_origin
-        || artifact.matrix_sha256 != manifest.matrix_sha256
-    {
-        bail!("provider evidence artifact conflicts with retained Suite identity");
-    }
-    let provider = verified
-        .identity
-        .provider
-        .as_ref()
-        .context("provider evidence has no provider capability identity")?;
-    if provider.deployment_id != manifest.deployment_id
-        || provider
-            .capabilities
-            .iter()
-            .any(|capability| capability.tenant_id != manifest.tenant_id)
-    {
-        bail!("provider evidence capability tenant conflicts with retention");
-    }
-    let expected_plans = manifest
-        .plans
-        .iter()
-        .map(|plan| (&plan.matrix_plan_id, &plan.suite_plan_id))
-        .collect::<std::collections::BTreeSet<_>>();
-    let observed_plans = verified
-        .report
-        .modules
-        .iter()
-        .map(|module| {
-            if !module.terminal || module.module_id.is_none() {
-                bail!("provider evidence contains a nonterminal or unowned module");
-            }
-            Ok((&module.matrix_plan_id, &module.suite_plan_id))
-        })
-        .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?;
-    if observed_plans != expected_plans {
-        bail!("provider evidence module ownership does not exactly match retained plans");
     }
     Ok(())
 }
@@ -3566,8 +3207,8 @@ mod tests {
             .expect("Suite module");
         let journal_path = root.join(format!("run-{}.json", binding.request_jti));
         let retention_journal =
-            std::fs::read_to_string(&journal_path).expect("read schema-four journal");
-        assert!(retention_journal.contains("\"schema\": 4"));
+            std::fs::read_to_string(&journal_path).expect("read schema-three journal");
+        assert!(retention_journal.contains("\"schema\": 3"));
         assert!(retention_journal.contains("suite_retention"));
         let manifest = SuiteRetentionManifest {
             schema: SUITE_RETENTION_MANIFEST_SCHEMA,
@@ -3595,135 +3236,21 @@ mod tests {
             vec!["suite-plan-1".to_owned()]
         );
         assert!(guard.suite_recovery().expect("suite").module_ids.is_empty());
-        let retained = guard
-            .suite_retention_manifest()
-            .expect("retention manifest")
-            .clone();
-        let (report, identity) =
-            crate::evidence::test_support::retained_provider_fixture(&binding, &retained);
-        let staged = crate::evidence::stage_private_provider_evidence_bundle(
-            &report,
-            &evidence,
-            &identity,
-            &binding.request_jti,
-        )
-        .expect("stage provider evidence");
-        let expected_pending = evidence
-            .join(".pending-provider")
-            .join(&binding.request_jti);
-        assert_eq!(staged.directory, expected_pending);
-        let staged_binding = SuiteRetentionProviderEvidence {
-            directory: staged.directory.clone(),
-            manifest_sha256: staged.manifest_sha256.clone(),
-        };
-        let mut wrong_tenant = retained.clone();
-        wrong_tenant.tenant_id = "00000000-0000-4000-8000-000000000002".to_owned();
-        assert!(
-            validate_suite_retention_provider_evidence(
-                &staged_binding,
-                &binding,
-                &wrong_tenant,
-                false,
-                None,
-            )
-            .is_err()
-        );
-        let mut wrong_artifact = retained.clone();
-        wrong_artifact.artifact_digest = "c".repeat(64);
-        assert!(
-            validate_suite_retention_provider_evidence(
-                &staged_binding,
-                &binding,
-                &wrong_artifact,
-                false,
-                None,
-            )
-            .is_err()
-        );
-        let mut wrong_plan = retained.clone();
-        wrong_plan.plans[0].matrix_plan_id = "matrix-plan-2".to_owned();
-        wrong_plan.plans[0].plan_alias_sha256 =
-            SuiteRetentionManifest::plan_alias_sha256("matrix-plan-2");
-        assert!(
-            validate_suite_retention_provider_evidence(
-                &staged_binding,
-                &binding,
-                &wrong_plan,
-                false,
-                None,
-            )
-            .is_err()
-        );
         guard
             .stage_suite_retention_manifest()
             .expect("stage manifest");
         assert!(!final_path.exists());
+        assert!(guard.commit_suite_plan_retention().is_err());
         guard
             .record_tenant_resource_receipt(tenant_resource_receipt(&binding))
             .expect("receipt");
         guard
             .record_tenant_resource_enumeration(Vec::new())
             .expect("enumeration");
-        let error = guard
-            .commit_suite_plan_retention()
-            .expect_err("schema-four commit requires staged provider evidence");
-        assert!(
-            error
-                .to_string()
-                .contains("require staged provider evidence")
-        );
-        guard
-            .bind_prepared_suite_provider_evidence(SuiteRetentionProviderEvidence {
-                directory: staged_binding.directory.clone(),
-                manifest_sha256: staged_binding.manifest_sha256.clone(),
-            })
-            .expect("bind provider evidence");
         guard
             .commit_suite_plan_retention()
             .expect("transfer ownership");
         assert!(guard.suite_recovery().expect("suite").plan_ids.is_empty());
-        let published_provider = guard
-            .publish_retained_provider_evidence()
-            .expect("publish provider evidence");
-        assert_eq!(
-            published_provider.directory,
-            evidence
-                .join("provider-evidence")
-                .join(&binding.request_jti)
-        );
-        assert!(!expected_pending.exists());
-        assert!(published_provider.directory.exists());
-        // Simulate a crash after the no-replace directory promotion and
-        // before the Retained journal records Final. Recovery must adopt the
-        // exact final directory; it must not attempt another rename or delete
-        // the transferred Suite plan.
-        {
-            let journal = guard.tenant_resource_journal_mut().expect("tenant journal");
-            let SuiteRetentionDisposition::Retained { record } = &mut journal.suite_retention
-            else {
-                panic!("retained record");
-            };
-            record.manifest.provider_evidence = None;
-            record.provider_state = SuiteRetentionProviderState::Staged {
-                pending_directory: expected_pending.clone(),
-                final_directory: published_provider.directory.clone(),
-                manifest_sha256: published_provider.manifest_sha256.clone(),
-            };
-            record.manifest_sha256 = sha256_hex(
-                &canonical_suite_retention_manifest(&record.manifest)
-                    .expect("canonical crash-recovery manifest"),
-            );
-        }
-        guard.persist().expect("persist pre-final crash fixture");
-        assert_eq!(
-            guard
-                .publish_retained_provider_evidence()
-                .expect("adopt promoted provider publication"),
-            published_provider
-        );
-        guard
-            .stage_suite_retention_manifest()
-            .expect("restage provider-bound manifest");
         guard
             .publish_committed_suite_retention_manifest()
             .expect("publish manifest");
@@ -3731,8 +3258,8 @@ mod tests {
             crate::secure_file::read_bounded(&final_path, MAX_SUITE_RETENTION_MANIFEST_BYTES, true)
                 .expect("read manifest");
         assert!(!String::from_utf8_lossy(&manifest_bytes).contains("capability.header.payload"));
-        guard.finish().expect("complete retained journal");
-        assert!(store.claim_pending().expect("retained recovery").is_empty());
+        drop(guard);
+        assert_eq!(store.claim_pending().expect("retained recovery").len(), 1);
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 
@@ -3799,24 +3326,6 @@ mod tests {
         guard
             .prepare_suite_plan_retention(manifest, final_path)
             .expect("prepare retention");
-        let SuiteRetentionDisposition::RetentionPrepared { record } = &guard
-            .tenant_resource_journal()
-            .expect("tenant journal")
-            .suite_retention
-        else {
-            panic!("prepared retention record");
-        };
-        assert_eq!(
-            record.provider_state,
-            SuiteRetentionProviderState::Intent {
-                pending_directory: evidence
-                    .join(".pending-provider")
-                    .join(&binding.request_jti),
-                final_directory: evidence
-                    .join("provider-evidence")
-                    .join(&binding.request_jti),
-            }
-        );
         let suite = guard.suite_recovery().expect("prepared Suite recovery");
         assert_eq!(suite.plan_ids.len(), 44);
         assert!(suite.module_ids.is_empty());
@@ -3834,200 +3343,6 @@ mod tests {
         assert_eq!(suite.plan_ids.len(), 44);
         assert!(suite.module_ids.is_empty());
         drop(claimed);
-        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn legacy_schema_three_retained_journal_without_provider_bundle_is_read_only() {
-        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
-        let root = temp_root.join(format!("nazoauth-retention-{}", uuid::Uuid::now_v7()));
-        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
-        let evidence = root.join("evidence");
-        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
-        let binding = tenant_resource_binding(&root);
-        let mut guard = store
-            .begin_tenant_resource(binding.clone())
-            .expect("tenant intent");
-        guard
-            .begin_suite_create_with_retention(
-                "https://www.certification.openid.net",
-                "suite-intent-1",
-                true,
-            )
-            .expect("Suite intent");
-        guard
-            .record_suite_plan(
-                "https://www.certification.openid.net",
-                "suite-intent-1",
-                "suite-plan-1",
-            )
-            .expect("Suite plan");
-        let manifest = SuiteRetentionManifest {
-            schema: SUITE_RETENTION_MANIFEST_SCHEMA,
-            suite_origin: "https://www.certification.openid.net".to_owned(),
-            artifact_digest: "a".repeat(64),
-            matrix_sha256: "b".repeat(64),
-            deployment_id: binding.deployment_id.clone(),
-            tenant_id: binding.tenant_id.clone(),
-            run_id: binding.request_jti.clone(),
-            review_screenshot_manifest: None,
-            provider_evidence: None,
-            plans: vec![SuiteRetentionPlan {
-                matrix_plan_id: "matrix-plan-1".to_owned(),
-                suite_plan_id: "suite-plan-1".to_owned(),
-                plan_name: "Certification plan".to_owned(),
-                plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256("matrix-plan-1"),
-            }],
-        };
-        guard
-            .prepare_suite_plan_retention(
-                manifest,
-                evidence.join(format!("retained-suite-{}.json", binding.request_jti)),
-            )
-            .expect("prepare retention");
-        let retained = guard
-            .suite_retention_manifest()
-            .expect("retention manifest")
-            .clone();
-        let (report, identity) =
-            crate::evidence::test_support::retained_provider_fixture(&binding, &retained);
-        let provider =
-            crate::evidence::write_private_provider_evidence_bundle(&report, &evidence, &identity)
-                .expect("legacy provider evidence");
-        {
-            let journal = guard.tenant_resource_journal_mut().expect("tenant journal");
-            journal.schema = RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA;
-            let SuiteRetentionDisposition::RetentionPrepared { record } =
-                &mut journal.suite_retention
-            else {
-                panic!("prepared retention record");
-            };
-            record.provider_state = SuiteRetentionProviderState::None;
-            record.manifest.provider_evidence = Some(SuiteRetentionProviderEvidence {
-                directory: provider.directory.clone(),
-                manifest_sha256: provider.manifest_sha256.clone(),
-            });
-            record.manifest_sha256 = sha256_hex(
-                &canonical_suite_retention_manifest(&record.manifest)
-                    .expect("canonical schema-three manifest"),
-            );
-        }
-        guard.persist().expect("persist schema-three fixture");
-        guard
-            .stage_suite_retention_manifest()
-            .expect("stage legacy manifest");
-        guard
-            .record_tenant_resource_receipt(tenant_resource_receipt(&binding))
-            .expect("receipt");
-        guard
-            .record_tenant_resource_enumeration(Vec::new())
-            .expect("enumeration");
-        guard
-            .commit_suite_plan_retention()
-            .expect("legacy ownership transfer");
-        guard
-            .finish()
-            .expect("finish compatible schema-three journal");
-        assert!(
-            store
-                .claim_pending()
-                .expect("finished schema-three journal")
-                .is_empty()
-        );
-        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn prepared_retention_persists_provider_cleanup_intent_before_plan_fallback() {
-        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
-        let root = temp_root.join(format!("nazoauth-retention-{}", uuid::Uuid::now_v7()));
-        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
-        let evidence = root.join("evidence");
-        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
-        let binding = tenant_resource_binding(&root);
-        let mut guard = store
-            .begin_tenant_resource(binding.clone())
-            .expect("tenant intent");
-        guard
-            .begin_suite_create_with_retention(
-                "https://www.certification.openid.net",
-                "suite-intent-1",
-                true,
-            )
-            .expect("Suite intent");
-        guard
-            .record_suite_plan(
-                "https://www.certification.openid.net",
-                "suite-intent-1",
-                "suite-plan-1",
-            )
-            .expect("Suite plan");
-        guard
-            .prepare_suite_plan_retention(
-                SuiteRetentionManifest {
-                    schema: SUITE_RETENTION_MANIFEST_SCHEMA,
-                    suite_origin: "https://www.certification.openid.net".to_owned(),
-                    artifact_digest: "a".repeat(64),
-                    matrix_sha256: "b".repeat(64),
-                    deployment_id: binding.deployment_id.clone(),
-                    tenant_id: binding.tenant_id.clone(),
-                    run_id: binding.request_jti.clone(),
-                    review_screenshot_manifest: None,
-                    provider_evidence: None,
-                    plans: vec![SuiteRetentionPlan {
-                        matrix_plan_id: "matrix-plan-1".to_owned(),
-                        suite_plan_id: "suite-plan-1".to_owned(),
-                        plan_name: "Certification plan".to_owned(),
-                        plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256(
-                            "matrix-plan-1",
-                        ),
-                    }],
-                },
-                evidence.join(format!("retained-suite-{}.json", binding.request_jti)),
-            )
-            .expect("prepare retention");
-        guard
-            .stage_suite_retention_manifest()
-            .expect("stage Suite manifest");
-        let partial_provider = evidence
-            .join(".pending-provider")
-            .join(&binding.request_jti);
-        crate::secure_file::write_new_or_exact(
-            &partial_provider.join("module-0000.json"),
-            br#"{}"#,
-            true,
-        )
-        .expect("write bounded interrupted provider file");
-        guard
-            .discard_prepared_suite_retention_staging()
-            .expect("persist cleanup intent and discard staging");
-        assert!(!partial_provider.exists());
-        let SuiteRetentionDisposition::RetentionPrepared { record } = &guard
-            .tenant_resource_journal()
-            .expect("tenant journal")
-            .suite_retention
-        else {
-            panic!("prepared retention record");
-        };
-        assert!(matches!(
-            &record.provider_state,
-            SuiteRetentionProviderState::CleanupIntent {
-                pending_directory,
-                manifest_sha256: None,
-            } if pending_directory == &evidence
-                .join(".pending-provider")
-                .join(&binding.request_jti)
-        ));
-        assert_eq!(
-            guard.suite_recovery().expect("Suite recovery").plan_ids,
-            vec!["suite-plan-1".to_owned()]
-        );
-        drop(guard);
-        let pending = store.claim_pending().expect("claim cleanup-intent journal");
-        assert_eq!(pending.len(), 1);
-        drop(pending);
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 }

@@ -605,7 +605,6 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             },
             source: EvidenceSourceIdentity::SignedOidfArtifact {
                 suite_origin: suite_origin.to_string(),
-                artifact_digest: invocation.artifact_digest.clone(),
                 artifact: Box::new(driver_plan.artifact.clone()),
             },
             provider: Some(EvidenceProviderIdentity {

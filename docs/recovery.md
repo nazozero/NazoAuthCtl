@@ -118,25 +118,17 @@ An explicitly requested certification retention is a separate disposition, not
 `cleanup_complete`. It is accepted only for the canonical official Suite and
 only after all created modules are terminal and ordinary resource, listener,
 and proxy cleanup have succeeded. The journal first records `RetentionPrepared`
-while it still owns every Suite plan and, before creating files, binds
-deterministic private provider-evidence paths. It then stages and verifies the
-complete provider bundle, records its digest, writes a root-owned owner-only
-pending Suite manifest, transfers ownership as `Retained`, promotes provider
-evidence, and finally promotes the Suite manifest. A crash before transfer
-defaults to normal plan deletion; a retained journal with a missing or
-digest-mismatched provider bundle or Suite manifest fails closed and never
-deletes the recorded plans. Operators review/publish retained plans in the
-official UI and must use a later controlled deletion procedure; ctl does not
-roll them back when unrelated cleanup subsequently fails.
+while it still owns every Suite plan, then writes a root-owned owner-only pending manifest
+in the requested evidence directory, transfers ownership as `Retained`, and
+finally promotes that manifest. A crash before transfer defaults to normal plan
+deletion; a retained journal with a missing or digest-mismatched manifest fails
+closed and never deletes the recorded plans. Operators review/publish retained
+plans in the official UI and must use a later controlled deletion procedure;
+ctl does not roll them back when unrelated cleanup subsequently fails.
 Default ordinary runs continue to write schema-2 journals without retention
-fields. New requested retentions upgrade the live journal to schema 4; schema
-3 retained journals remain readable only for recovery/inspection compatibility
-and are never silently upgraded. An older ctl binary rejects schema 4
-fail-closed, so operators must not downgrade the binary until the retained
-journal has finished and been removed.
-The provider bundle itself is schema 5 and includes the exact signed artifact
-digest in addition to its signed driver and Matrix identities; older bundle
-shapes are not accepted for a new retained ownership transfer.
+fields. A requested retention upgrades that live journal to schema 3; an older
+ctl binary rejects schema 3 fail-closed, so operators must not downgrade the
+binary until the retained journal has finished and been removed.
 
 The signed offline deployment statement identifies a stopped replica from its
 persistent mount. It is not sufficient artifact trust: ctl also verifies the
