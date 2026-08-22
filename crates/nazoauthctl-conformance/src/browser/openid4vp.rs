@@ -1498,12 +1498,12 @@ fn validate_evidence_window(
     let now = time::OffsetDateTime::now_utc();
     if !(1..=600).contains(&verification_ttl_seconds)
         || expires_at <= completed_at
+        || completed_at > issued_at
         || expires_at_jwt != expires_at
         || expires_at_jwt <= issued_at
         || expires_at_epoch - issued_at.unix_timestamp()
             != i64::try_from(verification_ttl_seconds)
                 .map_err(|_| OpenId4VpError::EvidenceBindingMismatch)?
-        || expires_at - completed_at > time::Duration::seconds(600)
         || expires_at_jwt <= now
         || issued_at > now + time::Duration::minutes(5)
         || completed_at > now + time::Duration::minutes(5)
@@ -1655,6 +1655,51 @@ mod tests {
     use super::*;
     use crate::transport::{HttpResponse, TransportError, TransportFailureStage};
     use std::collections::VecDeque;
+
+    #[test]
+    fn evidence_window_starts_when_the_receipt_is_issued() {
+        use time::format_description::well_known::Rfc3339;
+
+        let issued_at = time::OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .expect("whole-second issuance time");
+        let completed_at = issued_at - time::Duration::seconds(1);
+        let expires_at = issued_at + time::Duration::seconds(600);
+
+        assert!(
+            validate_evidence_window(
+                &completed_at.format(&Rfc3339).expect("completion time"),
+                &expires_at.format(&Rfc3339).expect("expiry time"),
+                issued_at.unix_timestamp(),
+                expires_at.unix_timestamp(),
+                600,
+            )
+            .is_ok(),
+            "a receipt issued after verification owns its own bounded lifetime"
+        );
+    }
+
+    #[test]
+    fn evidence_window_rejects_completion_after_receipt_issuance() {
+        use time::format_description::well_known::Rfc3339;
+
+        let issued_at = time::OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .expect("whole-second issuance time");
+        let completed_at = issued_at + time::Duration::seconds(1);
+        let expires_at = issued_at + time::Duration::seconds(600);
+
+        assert!(
+            validate_evidence_window(
+                &completed_at.format(&Rfc3339).expect("completion time"),
+                &expires_at.format(&Rfc3339).expect("expiry time"),
+                issued_at.unix_timestamp(),
+                expires_at.unix_timestamp(),
+                600,
+            )
+            .is_err()
+        );
+    }
 
     struct VerifierTransport {
         request: std::sync::Mutex<Option<HttpRequest>>,
