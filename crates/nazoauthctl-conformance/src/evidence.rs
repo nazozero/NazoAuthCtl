@@ -265,6 +265,7 @@ pub fn write_private_evidence_bundle(
         let mut total_screenshot_bytes = 0usize;
         for (index, module) in report.modules.iter().enumerate() {
             validate_review_screenshot_obligations(module)?;
+            let mut obligations = BTreeSet::new();
             let index = u32::try_from(index).map_err(|_| EvidenceError::Encoding)?;
             let file = format!("module-{index:04}.json");
             let bytes = Zeroizing::new(
@@ -323,6 +324,14 @@ pub fn write_private_evidence_bundle(
                         .map_err(|_| EvidenceError::Identity)?;
                 if audit.suite_plan_id != module.suite_plan_id
                     || audit.module_id != module_id
+                    || audit.test_name != module.test_name
+                    || audit.variant != module.variant
+                    || (matches!(audit.marker, crate::ReviewScreenshotMarker::Required)
+                        && audit.obligation_index >= module.review_screenshots_required)
+                    || !obligations.insert((
+                        matches!(audit.marker, crate::ReviewScreenshotMarker::Required),
+                        audit.obligation_index,
+                    ))
                     || audit.path != screenshot.path
                     || audit.sha256 != screenshot.sha256
                     || audit.size != screenshot.size
@@ -460,6 +469,7 @@ pub fn write_review_screenshot_manifest(
         let mut total_screenshot_bytes = 0usize;
         for module in &report.modules {
             validate_review_screenshot_obligations(module)?;
+            let mut obligations = BTreeSet::new();
             modules.push(ReviewScreenshotModuleManifest {
                 matrix_plan_id: module.matrix_plan_id.clone(),
                 suite_plan_id: module.suite_plan_id.clone(),
@@ -502,6 +512,14 @@ pub fn write_review_screenshot_manifest(
                         .map_err(|_| EvidenceError::Identity)?;
                 if audit.suite_plan_id != module.suite_plan_id
                     || audit.module_id != module_id
+                    || audit.test_name != module.test_name
+                    || audit.variant != module.variant
+                    || (matches!(audit.marker, crate::ReviewScreenshotMarker::Required)
+                        && audit.obligation_index >= module.review_screenshots_required)
+                    || !obligations.insert((
+                        matches!(audit.marker, crate::ReviewScreenshotMarker::Required),
+                        audit.obligation_index,
+                    ))
                     || audit.path != screenshot.path
                     || audit.sha256 != screenshot.sha256
                     || audit.size != screenshot.size

@@ -415,10 +415,43 @@ pub struct ConformanceRecoveryGuard {
     journal_path: PathBuf,
     lock_path: PathBuf,
     lock: Option<File>,
+    retention_commit_resolution: SuiteRetentionCommitResolution,
     // This is deliberately a test-only durability seam.  Production always
     // persists through the same atomic journal writer.
     #[cfg(test)]
-    fail_next_persist: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    persist_failpoint: std::sync::Arc<std::sync::Mutex<Option<PersistFailpoint>>>,
+}
+
+/// The only safe cleanup decision after attempting the durable ownership
+/// transfer. `Ambiguous` is intentionally distinct from `Prepared`: callers
+/// must leave Suite resources and the journal untouched until a later claim
+/// can validate the on-disk transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SuiteRetentionCommitResolution {
+    NotAttempted,
+    Prepared,
+    Retained,
+    Ambiguous,
+}
+
+#[derive(Debug)]
+pub struct AmbiguousSuiteRetentionCommit;
+
+impl std::fmt::Display for AmbiguousSuiteRetentionCommit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "Suite retention journal persistence is ambiguous; leave exact Suite resources for recovery",
+        )
+    }
+}
+
+impl std::error::Error for AmbiguousSuiteRetentionCommit {}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistFailpoint {
+    BeforeWrite,
+    AfterRenameBeforeDirectoryFsync,
 }
 
 impl ConformanceRecoveryStore {
@@ -508,8 +541,9 @@ impl ConformanceRecoveryStore {
             journal_path,
             lock_path,
             lock: Some(lock),
+            retention_commit_resolution: SuiteRetentionCommitResolution::NotAttempted,
             #[cfg(test)]
-            fail_next_persist: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            persist_failpoint: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -664,8 +698,19 @@ impl ConformanceRecoveryStore {
                 journal_path,
                 lock_path,
                 lock: Some(lock),
+                retention_commit_resolution: match &journal {
+                    RecoveryJournal::TenantResource(journal)
+                        if matches!(
+                            &journal.suite_retention,
+                            SuiteRetentionDisposition::Retained { .. }
+                        ) =>
+                    {
+                        SuiteRetentionCommitResolution::Retained
+                    }
+                    _ => SuiteRetentionCommitResolution::Prepared,
+                },
                 #[cfg(test)]
-                fail_next_persist: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                persist_failpoint: std::sync::Arc::new(std::sync::Mutex::new(None)),
             });
         }
         Ok(pending)
@@ -691,8 +736,24 @@ impl Clone for ConformanceRecoveryStore {
 impl ConformanceRecoveryGuard {
     #[cfg(test)]
     fn fail_next_persist_for_test(&self) {
-        self.fail_next_persist
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.set_persist_failpoint_for_test(PersistFailpoint::BeforeWrite);
+    }
+
+    #[cfg(test)]
+    fn fail_after_rename_before_directory_fsync_for_test(&self) {
+        self.set_persist_failpoint_for_test(PersistFailpoint::AfterRenameBeforeDirectoryFsync);
+    }
+
+    #[cfg(test)]
+    fn set_persist_failpoint_for_test(&self, failpoint: PersistFailpoint) {
+        *self
+            .persist_failpoint
+            .lock()
+            .expect("test persist failpoint lock") = Some(failpoint);
+    }
+
+    pub fn suite_retention_commit_resolution(&self) -> SuiteRetentionCommitResolution {
+        self.retention_commit_resolution
     }
     pub fn binding(&self) -> &ConformanceRecoveryBinding {
         match &self.journal {
@@ -1135,9 +1196,33 @@ impl ConformanceRecoveryGuard {
         // Do not expose an in-memory Retained state until its compacted
         // ownership journal is durable. A failed write must remain Prepared
         // so the caller can still perform exact fallback deletion.
-        self.persist_snapshot(&next)?;
-        self.journal = next;
-        Ok(())
+        let old = self.journal.clone();
+        match self.persist_snapshot(&next) {
+            Ok(()) => {
+                self.journal = next;
+                self.retention_commit_resolution = SuiteRetentionCommitResolution::Retained;
+                Ok(())
+            }
+            Err(write_error) => match self.reconcile_retention_commit(&old, &next) {
+                Ok(SuiteRetentionCommitResolution::Retained) => {
+                    self.journal = next;
+                    self.retention_commit_resolution = SuiteRetentionCommitResolution::Retained;
+                    Ok(())
+                }
+                Ok(SuiteRetentionCommitResolution::Prepared) => {
+                    self.retention_commit_resolution = SuiteRetentionCommitResolution::Prepared;
+                    Err(write_error.context(
+                        "Suite retention journal remained Prepared; exact fallback cleanup is permitted",
+                    ))
+                }
+                Ok(SuiteRetentionCommitResolution::NotAttempted)
+                | Ok(SuiteRetentionCommitResolution::Ambiguous)
+                | Err(_) => {
+                    self.retention_commit_resolution = SuiteRetentionCommitResolution::Ambiguous;
+                    Err(AmbiguousSuiteRetentionCommit.into())
+                }
+            },
+        }
     }
 
     /// Finalize a journal-authorized pending manifest. A missing or altered
@@ -1235,6 +1320,30 @@ impl ConformanceRecoveryGuard {
             RecoveryJournal::TenantResource(journal)
                 if matches!(&journal.suite_retention, SuiteRetentionDisposition::Retained { .. })
         )
+    }
+
+    fn reconcile_retention_commit(
+        &self,
+        old: &RecoveryJournal,
+        next: &RecoveryJournal,
+    ) -> anyhow::Result<SuiteRetentionCommitResolution> {
+        let bytes =
+            crate::secure_file::read_bounded(&self.journal_path, MAX_RECOVERY_JOURNAL_BYTES, true)
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to re-read retention journal: {error:?}")
+                })?;
+        let disk: RecoveryJournal =
+            serde_json::from_slice(&bytes).context("retention journal is not valid JSON")?;
+        validate_journal(&disk, &self.store.deployment_id, old.request_jti())?;
+        let old_bytes = canonical_journal_bytes(old)?;
+        let next_bytes = canonical_journal_bytes(next)?;
+        if bytes == next_bytes {
+            Ok(SuiteRetentionCommitResolution::Retained)
+        } else if bytes == old_bytes {
+            Ok(SuiteRetentionCommitResolution::Prepared)
+        } else {
+            Ok(SuiteRetentionCommitResolution::Ambiguous)
+        }
     }
 
     /// A prepared-but-uncommitted retention is ordinary cleanup state. Remove
@@ -1596,11 +1705,14 @@ impl ConformanceRecoveryGuard {
 
     fn persist_snapshot(&self, journal: &RecoveryJournal) -> anyhow::Result<()> {
         #[cfg(test)]
-        if self
-            .fail_next_persist
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            bail!("injected recovery journal persistence failure");
+        let failpoint = self
+            .persist_failpoint
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test persist failpoint lock poisoned"))?
+            .take();
+        #[cfg(test)]
+        if failpoint == Some(PersistFailpoint::BeforeWrite) {
+            bail!("injected recovery journal persistence failure before write");
         }
         validate_journal(journal, &self.store.deployment_id, journal.request_jti())?;
         if let RecoveryJournal::TenantResource(journal) = journal
@@ -1614,7 +1726,14 @@ impl ConformanceRecoveryGuard {
                 bail!("tenant-resource apply manifest disappeared before cleanup");
             }
         }
-        write_journal(&self.journal_path, journal)
+        write_journal(&self.journal_path, journal)?;
+        #[cfg(test)]
+        if failpoint == Some(PersistFailpoint::AfterRenameBeforeDirectoryFsync) {
+            bail!(
+                "injected recovery journal persistence failure after rename before directory fsync"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1629,12 +1748,17 @@ fn suite_resources_settled(journal: &TenantResourceRecoveryJournal) -> bool {
 }
 
 fn write_journal(path: &Path, journal: &RecoveryJournal) -> anyhow::Result<()> {
+    let bytes = canonical_journal_bytes(journal)?;
+    crate::secure_file::write_atomic(path, &bytes, true)
+        .map_err(|error| anyhow::anyhow!("failed to persist recovery journal: {error:?}"))
+}
+
+fn canonical_journal_bytes(journal: &RecoveryJournal) -> anyhow::Result<Vec<u8>> {
     let bytes = serde_json::to_vec_pretty(journal)?;
     if bytes.len() > MAX_RECOVERY_JOURNAL_BYTES {
         bail!("conformance recovery journal exceeds policy");
     }
-    crate::secure_file::write_atomic(path, &bytes, true)
-        .map_err(|error| anyhow::anyhow!("failed to persist recovery journal: {error:?}"))
+    Ok(bytes)
 }
 
 fn validate_journal(
@@ -1994,6 +2118,7 @@ fn validate_review_screenshot_manifest_binding(
         }
     }
     let mut images = std::collections::BTreeSet::new();
+    let mut obligations = std::collections::BTreeSet::new();
     let mut expected_files = std::collections::BTreeSet::new();
     let evidence_root = screenshot
         .path
@@ -2015,13 +2140,13 @@ fn validate_review_screenshot_manifest_binding(
             && path_components.next().is_none();
         let target = format!("/test/a/{}/verification-evidence", image.module_id);
         if !plans.contains(&(&image.matrix_plan_id, &image.suite_plan_id))
-            || !modules
-                .iter()
-                .any(|(matrix_plan_id, suite_plan_id, module_id, _, _)| {
-                    *matrix_plan_id == &image.matrix_plan_id
-                        && *suite_plan_id == &image.suite_plan_id
-                        && *module_id == &image.module_id
-                })
+            || !modules.contains(&(
+                &image.matrix_plan_id,
+                &image.suite_plan_id,
+                &image.module_id,
+                &image.test_name,
+                &image.variant,
+            ))
             || !valid_path
             || image.size == 0
             || !lower_hex(&image.sha256, 64)
@@ -2034,6 +2159,31 @@ fn validate_review_screenshot_manifest_binding(
             || !images.insert(&image.path)
         {
             bail!("review screenshot manifest screenshot graph is invalid");
+        }
+        let module = document
+            .modules
+            .iter()
+            .find(|module| {
+                module.matrix_plan_id == image.matrix_plan_id
+                    && module.suite_plan_id == image.suite_plan_id
+                    && module.module_id == image.module_id
+                    && module.test_name == image.test_name
+                    && module.variant == image.variant
+            })
+            .context("review screenshot has no exact module tuple")?;
+        let required = matches!(image.marker, crate::ReviewScreenshotMarker::Required);
+        if (required && image.obligation_index >= module.required)
+            || !obligations.insert((
+                &image.matrix_plan_id,
+                &image.suite_plan_id,
+                &image.module_id,
+                &image.test_name,
+                &image.variant,
+                required,
+                image.obligation_index,
+            ))
+        {
+            bail!("review screenshot manifest obligation graph is invalid");
         }
         let image_path = evidence_root.join(&image.path);
         expected_files.insert(image.path.clone());
@@ -2068,6 +2218,49 @@ fn validate_review_screenshot_manifest_binding(
             || audit.trigger_url_sha256 != image.trigger_url_sha256
         {
             bail!("review screenshot receipt conflicts with the manifest");
+        }
+    }
+    for module in &document.modules {
+        for obligation_index in 0..module.required {
+            if !obligations.contains(&(
+                &module.matrix_plan_id,
+                &module.suite_plan_id,
+                &module.module_id,
+                &module.test_name,
+                &module.variant,
+                true,
+                obligation_index,
+            )) {
+                bail!("review screenshot manifest is missing a required obligation");
+            }
+        }
+        let optional_captured = document
+            .screenshots
+            .iter()
+            .filter(|image| {
+                image.matrix_plan_id == module.matrix_plan_id
+                    && image.suite_plan_id == module.suite_plan_id
+                    && image.module_id == module.module_id
+                    && image.test_name == module.test_name
+                    && image.variant == module.variant
+                    && matches!(image.marker, crate::ReviewScreenshotMarker::Optional)
+            })
+            .count();
+        let optional_attempts = optional_captured
+            .checked_add(module.missing_optional)
+            .context("review screenshot optional attempt count overflows")?;
+        if optional_attempts > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_MODULE
+            || document.screenshots.iter().any(|image| {
+                image.matrix_plan_id == module.matrix_plan_id
+                    && image.suite_plan_id == module.suite_plan_id
+                    && image.module_id == module.module_id
+                    && image.test_name == module.test_name
+                    && image.variant == module.variant
+                    && matches!(image.marker, crate::ReviewScreenshotMarker::Optional)
+                    && image.obligation_index >= optional_attempts
+            })
+        {
+            bail!("review screenshot manifest optional obligation count is invalid");
         }
     }
     if expected_files.len() > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_RUN * 2 {
@@ -3347,9 +3540,14 @@ mod tests {
             guard.suite_recovery().expect("prepared suite").plan_ids,
             vec!["suite-plan-1".to_owned()]
         );
+        guard.fail_after_rename_before_directory_fsync_for_test();
         guard
             .commit_suite_plan_retention()
-            .expect("transfer ownership");
+            .expect("reconciles durable Retained ownership after rename");
+        assert_eq!(
+            guard.suite_retention_commit_resolution(),
+            SuiteRetentionCommitResolution::Retained
+        );
         assert!(guard.suite_recovery().expect("suite").plan_ids.is_empty());
         guard
             .publish_committed_suite_retention_manifest()
@@ -3471,6 +3669,63 @@ mod tests {
         };
         validate_review_screenshot_manifest_binding(&bound, &retention, &binding)
             .expect("complete typed chain");
+        let reject_manifest = |value: serde_json::Value| {
+            let bytes = serde_json::to_vec(&value).expect("serialize altered manifest");
+            crate::secure_file::write_atomic(&bound.path, &bytes, true)
+                .expect("write altered manifest");
+            let altered = SuiteRetentionScreenshotManifest {
+                path: bound.path.clone(),
+                sha256: sha256_hex(&bytes),
+            };
+            assert!(
+                validate_review_screenshot_manifest_binding(&altered, &retention, &binding)
+                    .is_err()
+            );
+            crate::secure_file::write_atomic(&bound.path, &document, true)
+                .expect("restore typed manifest");
+        };
+        let original_value: serde_json::Value =
+            serde_json::from_slice(&document).expect("parse typed manifest");
+        let mut wrong_marker = original_value.clone();
+        wrong_marker["screenshots"][0]["marker"] = serde_json::json!("optional");
+        reject_manifest(wrong_marker);
+        let mut wrong_test = original_value.clone();
+        wrong_test["screenshots"][0]["test_name"] = serde_json::json!("other-test");
+        reject_manifest(wrong_test);
+        let mut wrong_variant = original_value.clone();
+        wrong_variant["screenshots"][0]["variant"] = serde_json::json!({"mode":"other"});
+        reject_manifest(wrong_variant);
+        let mut out_of_range = original_value;
+        out_of_range["screenshots"][0]["obligation_index"] = serde_json::json!(1);
+        reject_manifest(out_of_range);
+        let duplicate_relative = PathBuf::from("review-screenshots")
+            .join(&binding.request_jti)
+            .join("matrix-plan-1--suite-module-1--001.png");
+        let duplicate_path = evidence.join(&duplicate_relative);
+        crate::secure_file::write_atomic(&duplicate_path, &png, true).expect("write duplicate png");
+        let mut duplicate_audit: serde_json::Value =
+            serde_json::from_slice(&audit).expect("parse audit");
+        duplicate_audit["path"] = serde_json::json!(duplicate_relative);
+        let duplicate_receipt = serde_json::to_vec(&duplicate_audit).expect("duplicate receipt");
+        crate::secure_file::write_atomic(
+            &duplicate_path.with_extension("png.receipt.json"),
+            &duplicate_receipt,
+            true,
+        )
+        .expect("write duplicate receipt");
+        let mut duplicate =
+            serde_json::from_slice::<serde_json::Value>(&document).expect("parse typed manifest");
+        let mut duplicate_image = duplicate["screenshots"][0].clone();
+        duplicate_image["path"] = serde_json::json!(duplicate_relative);
+        duplicate_image["receipt_sha256"] = serde_json::json!(sha256_hex(&duplicate_receipt));
+        duplicate["screenshots"]
+            .as_array_mut()
+            .expect("screenshots array")
+            .push(duplicate_image);
+        reject_manifest(duplicate);
+        std::fs::remove_file(duplicate_path.with_extension("png.receipt.json"))
+            .expect("remove duplicate receipt");
+        std::fs::remove_file(&duplicate_path).expect("remove duplicate png");
         let extra = image_path.parent().expect("image parent").join("extra.png");
         crate::secure_file::write_atomic(&extra, &png, true).expect("extra image");
         assert!(validate_review_screenshot_manifest_binding(&bound, &retention, &binding).is_err());
@@ -3656,12 +3911,6 @@ mod tests {
                 .expect("prepared journal metadata")
                 .len()
                 < MAX_RECOVERY_JOURNAL_BYTES as u64
-        );
-        assert!(
-            std::fs::metadata(&journal_path)
-                .expect("prepared journal metadata")
-                .len()
-                < crate::evidence::MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES as u64
         );
         drop(guard);
         let mut pending = store.claim_pending().expect("claim prepared journal");

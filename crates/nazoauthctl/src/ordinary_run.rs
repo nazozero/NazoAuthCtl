@@ -598,7 +598,10 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                 // cleanup: deleting here would lose exact ownership and make
                 // a retry unsafe. Only Prepared failures retain plan IDs and
                 // may fall back to exact deletion.
-                if !recovery.suite_retention_committed() {
+                if !recovery.suite_retention_committed()
+                    && recovery.suite_retention_commit_resolution()
+                        != nazoauthctl_conformance::SuiteRetentionCommitResolution::Ambiguous
+                {
                     cleanup_unretained_suite(&mut recovery, &suite_client)?;
                 }
                 false
