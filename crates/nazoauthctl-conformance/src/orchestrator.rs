@@ -473,6 +473,8 @@ impl ConformanceRunner {
                             &plan.matrix_plan_id,
                             &plan.suite_plan_id,
                             module_id,
+                            &module.test_name,
+                            &plan.variant,
                             review_evidence
                                 .screenshots
                                 .len()

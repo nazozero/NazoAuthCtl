@@ -224,6 +224,10 @@ struct ReviewScreenshotManifestImage {
     matrix_plan_id: String,
     suite_plan_id: String,
     module_id: String,
+    test_name: String,
+    variant: std::collections::BTreeMap<String, String>,
+    marker: crate::ReviewScreenshotMarker,
+    obligation_index: usize,
     path: PathBuf,
     sha256: String,
     size: usize,
@@ -238,6 +242,10 @@ struct ReviewScreenshotManifestImage {
 struct ReviewScreenshotAudit {
     suite_plan_id: String,
     module_id: String,
+    test_name: String,
+    variant: std::collections::BTreeMap<String, String>,
+    marker: crate::ReviewScreenshotMarker,
+    obligation_index: usize,
     path: PathBuf,
     sha256: String,
     size: usize,
@@ -2025,6 +2033,10 @@ fn validate_review_screenshot_manifest_binding(
         if sha256_hex(&receipt) != image.receipt_sha256
             || audit.suite_plan_id != image.suite_plan_id
             || audit.module_id != image.module_id
+            || audit.test_name != image.test_name
+            || audit.variant != image.variant
+            || audit.marker != image.marker
+            || audit.obligation_index != image.obligation_index
             || audit.path != image.path
             || audit.sha256 != image.sha256
             || audit.size != image.size

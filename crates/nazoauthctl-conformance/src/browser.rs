@@ -4,7 +4,7 @@
 //! validation live in private modules; this file owns the driver-facing
 //! execution state machine and its public orchestration traits.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -294,6 +294,8 @@ impl BrowserReviewScreenshotCapture {
         matrix_plan_id: &str,
         suite_plan_id: &str,
         module_id: &str,
+        test_name: &str,
+        variant: &BTreeMap<String, String>,
         capture_index: usize,
     ) -> Result<BrowserReviewCaptureContext, BrowserError> {
         BrowserReviewCaptureContext::new(
@@ -302,6 +304,8 @@ impl BrowserReviewScreenshotCapture {
             matrix_plan_id,
             suite_plan_id,
             module_id,
+            test_name,
+            variant,
             capture_index,
             self.budget.clone(),
         )
@@ -321,6 +325,8 @@ pub struct BrowserReviewCaptureContext {
     matrix_plan_id: String,
     suite_plan_id: String,
     module_id: String,
+    test_name: String,
+    variant: BTreeMap<String, String>,
     capture_index: usize,
     budget: Arc<Mutex<ReviewCaptureBudget>>,
 }
@@ -332,6 +338,8 @@ impl BrowserReviewCaptureContext {
         matrix_plan_id: &str,
         suite_plan_id: &str,
         module_id: &str,
+        test_name: &str,
+        variant: &BTreeMap<String, String>,
         capture_index: usize,
         budget: Arc<Mutex<ReviewCaptureBudget>>,
     ) -> Result<Self, BrowserError> {
@@ -344,6 +352,8 @@ impl BrowserReviewCaptureContext {
             matrix_plan_id: plan.to_owned(),
             suite_plan_id: suite_plan.to_owned(),
             module_id: module.to_owned(),
+            test_name: safe_capture_component(test_name)?.to_owned(),
+            variant: variant.clone(),
             capture_index,
             budget,
         })
@@ -360,6 +370,8 @@ impl BrowserReviewCaptureContext {
             matrix_plan_id: self.matrix_plan_id.clone(),
             suite_plan_id: self.suite_plan_id.clone(),
             module_id: self.module_id.clone(),
+            test_name: self.test_name.clone(),
+            variant: self.variant.clone(),
             capture_index,
             budget: self.budget.clone(),
         })
@@ -414,6 +426,8 @@ impl BrowserReviewCaptureContext {
         &self,
         bytes: &[u8],
         trigger_url: &Url,
+        marker: ReviewScreenshotMarker,
+        obligation_index: usize,
     ) -> Result<BrowserReviewScreenshotReceipt, BrowserError> {
         validate_png_screenshot(bytes)?;
         self.reserve_bytes(bytes.len())?;
@@ -426,6 +440,10 @@ impl BrowserReviewCaptureContext {
             size: bytes.len(),
             suite_plan_id: self.suite_plan_id.clone(),
             module_id: self.module_id.clone(),
+            test_name: self.test_name.clone(),
+            variant: self.variant.clone(),
+            marker,
+            obligation_index,
             trigger_origin: redacted_origin(trigger_url),
             trigger_path: trigger_url.path().to_owned(),
             trigger_url_sha256: sha256_hex(trigger_url.as_str().as_bytes()),
@@ -459,6 +477,10 @@ pub struct BrowserReviewScreenshotReceipt {
     pub size: usize,
     pub suite_plan_id: String,
     pub module_id: String,
+    pub test_name: String,
+    pub variant: BTreeMap<String, String>,
+    pub marker: ReviewScreenshotMarker,
+    pub obligation_index: usize,
     pub trigger_origin: String,
     pub trigger_path: String,
     pub trigger_url_sha256: String,
@@ -468,6 +490,10 @@ pub struct BrowserReviewScreenshotReceipt {
 struct BrowserReviewScreenshotAudit<'a> {
     suite_plan_id: &'a str,
     module_id: &'a str,
+    test_name: &'a str,
+    variant: &'a BTreeMap<String, String>,
+    marker: ReviewScreenshotMarker,
+    obligation_index: usize,
     path: &'a PathBuf,
     sha256: &'a str,
     size: usize,
@@ -481,6 +507,10 @@ impl<'a> From<&'a BrowserReviewScreenshotReceipt> for BrowserReviewScreenshotAud
         Self {
             suite_plan_id: &receipt.suite_plan_id,
             module_id: &receipt.module_id,
+            test_name: &receipt.test_name,
+            variant: &receipt.variant,
+            marker: receipt.marker,
+            obligation_index: receipt.obligation_index,
             path: &receipt.path,
             sha256: &receipt.sha256,
             size: receipt.size,
@@ -815,7 +845,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         let context = capture.for_index(index);
         let result = context.and_then(|context| {
             let screenshot = self.driver.screenshot_png()?;
-            context.write_png(&screenshot, trigger_url)
+            context.write_png(&screenshot, trigger_url, marker, index)
         });
         match result {
             Ok(receipt) => {
@@ -1542,7 +1572,14 @@ mod tests {
         crate::secure_file::ensure_directory(&root, true).expect("private root");
         let capture = BrowserReviewScreenshotCapture::new(root.clone(), "run-a")
             .expect("capture")
-            .context("matrix-plan-a", "suite-plan-a", "module-a", 0)
+            .context(
+                "matrix-plan-a",
+                "suite-plan-a",
+                "module-a",
+                "test-a",
+                &BTreeMap::new(),
+                0,
+            )
             .expect("context");
         let mut executor = BrowserExecutor::new(driver, policy);
         let entries = vec![BrowserEntry::parse(&json!({
@@ -1633,14 +1670,14 @@ mod tests {
         let capture = BrowserReviewScreenshotCapture::new(root.clone(), "run-a").expect("capture");
         for index in 0..MAX_REVIEW_SCREENSHOTS_PER_RUN {
             capture
-                .context("matrix", "suite", "module", index)
+                .context("matrix", "suite", "module", "test", &BTreeMap::new(), index)
                 .expect("context")
                 .reserve_attempt()
                 .expect("bounded attempt");
         }
         assert_eq!(
             capture
-                .context("matrix", "suite", "module", 64)
+                .context("matrix", "suite", "module", "test", &BTreeMap::new(), 64,)
                 .expect("context")
                 .reserve_attempt()
                 .expect_err("sixty fifth attempt"),

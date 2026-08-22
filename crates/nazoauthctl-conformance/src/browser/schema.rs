@@ -1,5 +1,6 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 /// A Suite `browser` entry. Secret values are kept only in `BrowserCommand`;
@@ -90,7 +91,8 @@ pub enum BrowserCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ReviewScreenshotMarker {
     Required,
     Optional,
