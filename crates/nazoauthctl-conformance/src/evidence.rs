@@ -145,20 +145,20 @@ pub struct ReviewScreenshotManifestReceipt {
 }
 
 #[cfg(unix)]
-#[derive(Deserialize, Serialize)]
+#[derive(Serialize)]
 #[serde(deny_unknown_fields)]
-struct EvidenceManifest {
+struct EvidenceManifest<'a> {
     schema: u32,
-    evidence_jti: String,
-    identity: EvidenceBundleIdentity,
-    public_report_file: String,
+    evidence_jti: &'a str,
+    identity: &'a EvidenceBundleIdentity,
+    public_report_file: &'static str,
     public_report_sha256: String,
     modules: Vec<EvidenceModuleManifest>,
     screenshots: Vec<EvidenceScreenshotManifest>,
 }
 
 #[cfg(unix)]
-#[derive(Deserialize, Serialize)]
+#[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 struct EvidenceScreenshotManifest {
     matrix_plan_id: String,
@@ -188,7 +188,7 @@ struct ReviewScreenshotAudit {
 }
 
 #[cfg(unix)]
-#[derive(Deserialize, Serialize)]
+#[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 struct EvidenceModuleManifest {
     index: u32,
@@ -201,66 +201,24 @@ struct EvidenceModuleManifest {
 }
 
 #[cfg(unix)]
-#[derive(Deserialize, Serialize)]
+#[derive(Serialize)]
 #[serde(deny_unknown_fields)]
-struct PrivateModuleEvidence {
+struct PrivateModuleEvidence<'a> {
     schema: u32,
-    evidence_jti: String,
+    evidence_jti: &'a str,
     index: u32,
-    matrix_plan_id: String,
-    suite_plan_id: String,
-    module_id: Option<String>,
-    test_name: String,
-    info: serde_json::Value,
-    log: serde_json::Value,
+    matrix_plan_id: &'a str,
+    suite_plan_id: &'a str,
+    module_id: &'a Option<String>,
+    test_name: &'a str,
+    info: &'a serde_json::Value,
+    log: &'a serde_json::Value,
 }
 
 pub fn write_private_evidence_bundle(
     report: &ConformanceReport,
     root: &Path,
     identity: &EvidenceBundleIdentity,
-) -> Result<EvidenceBundleReceipt, EvidenceError> {
-    let evidence_jti = uuid::Uuid::now_v7().to_string();
-    write_private_evidence_bundle_in_directory(
-        report,
-        root,
-        identity,
-        evidence_jti.as_str(),
-        &PathBuf::from(format!("run-{evidence_jti}")),
-    )
-}
-
-/// Stage an ordinary provider bundle in a deterministic, root-private
-/// namespace. The caller must bind the returned digest into its durable
-/// retention journal before promoting this directory.
-pub fn stage_private_provider_evidence_bundle(
-    report: &ConformanceReport,
-    root: &Path,
-    identity: &EvidenceBundleIdentity,
-    run_jti: &str,
-) -> Result<EvidenceBundleReceipt, EvidenceError> {
-    // Staged bundles are later transferred with the retained Suite plans.  Do
-    // not let the ordinary provider-only binding get deferred until after
-    // files have been materialized in the recovery-controlled namespace.
-    validate_ordinary_provider_identity(report, identity)?;
-    if crate::artifact::validate_identifier(run_jti, 128).is_err() {
-        return Err(EvidenceError::Identity);
-    }
-    write_private_evidence_bundle_in_directory(
-        report,
-        root,
-        identity,
-        run_jti,
-        &PathBuf::from(".pending-provider").join(run_jti),
-    )
-}
-
-fn write_private_evidence_bundle_in_directory(
-    report: &ConformanceReport,
-    root: &Path,
-    identity: &EvidenceBundleIdentity,
-    evidence_jti: &str,
-    directory_relative: &Path,
 ) -> Result<EvidenceBundleReceipt, EvidenceError> {
     validate_identity(report, identity)?;
     validate_review_screenshot_run_limit(report)?;
@@ -273,8 +231,10 @@ fn write_private_evidence_bundle_in_directory(
     {
         let root =
             crate::secure_file::ensure_directory(root, true).map_err(map_secure_file_error)?;
-        let directory = crate::secure_file::ensure_directory(&root.join(directory_relative), true)
-            .map_err(map_secure_file_error)?;
+        let evidence_jti = uuid::Uuid::now_v7().to_string();
+        let directory =
+            crate::secure_file::ensure_directory(&root.join(format!("run-{evidence_jti}")), true)
+                .map_err(map_secure_file_error)?;
         match crate::secure_file::read_bounded(&directory.join("manifest.json"), 1, true) {
             Err(crate::secure_file::SecureFileError::NotFound) => {}
             Ok(_) | Err(crate::secure_file::SecureFileError::Oversize) => {
@@ -300,14 +260,14 @@ fn write_private_evidence_bundle_in_directory(
             let bytes = Zeroizing::new(
                 serde_json::to_vec(&PrivateModuleEvidence {
                     schema: EVIDENCE_BUNDLE_SCHEMA,
-                    evidence_jti: evidence_jti.to_owned(),
+                    evidence_jti: &evidence_jti,
                     index,
-                    matrix_plan_id: module.matrix_plan_id.clone(),
-                    suite_plan_id: module.suite_plan_id.clone(),
-                    module_id: module.module_id.clone(),
-                    test_name: module.test_name.clone(),
-                    info: module.raw_info.clone(),
-                    log: module.raw_log.clone(),
+                    matrix_plan_id: &module.matrix_plan_id,
+                    suite_plan_id: &module.suite_plan_id,
+                    module_id: &module.module_id,
+                    test_name: &module.test_name,
+                    info: &module.raw_info,
+                    log: &module.raw_log,
                 })
                 .map_err(|_| EvidenceError::Encoding)?,
             );
@@ -391,9 +351,9 @@ fn write_private_evidence_bundle_in_directory(
         let module_count = u32::try_from(modules.len()).map_err(|_| EvidenceError::Encoding)?;
         let manifest = serde_json::to_vec_pretty(&EvidenceManifest {
             schema: EVIDENCE_BUNDLE_SCHEMA,
-            evidence_jti: evidence_jti.to_owned(),
-            identity: identity.clone(),
-            public_report_file: "report.json".to_owned(),
+            evidence_jti: &evidence_jti,
+            identity,
+            public_report_file: "report.json",
             public_report_sha256: sha256(&public_report),
             modules,
             screenshots,
@@ -403,227 +363,12 @@ fn write_private_evidence_bundle_in_directory(
             .map_err(map_secure_file_error)?;
         Ok(EvidenceBundleReceipt {
             schema: EVIDENCE_BUNDLE_SCHEMA,
-            evidence_jti: evidence_jti.to_owned(),
+            evidence_jti,
             directory,
             manifest_sha256: sha256(&manifest),
             module_count,
         })
     }
-}
-
-/// Re-open an already staged or published provider bundle and verify every
-/// file named by its manifest before a recovery transition may trust it.
-/// Paths are intentionally derived from the bundle directory; no manifest
-/// entry may escape it or introduce unlisted provider files.
-#[cfg(unix)]
-pub fn validate_private_provider_evidence_bundle(
-    directory: &Path,
-    manifest_sha256: &str,
-) -> Result<EvidenceBundleReceipt, EvidenceError> {
-    if !lower_hex(manifest_sha256, 64) {
-        return Err(EvidenceError::Identity);
-    }
-    let directory =
-        crate::secure_file::validate_directory(directory, true).map_err(map_secure_file_error)?;
-    let manifest_bytes =
-        crate::secure_file::read_bounded(&directory.join("manifest.json"), 2 * 1024 * 1024, true)
-            .map_err(map_secure_file_error)?;
-    if sha256(&manifest_bytes) != manifest_sha256 {
-        return Err(EvidenceError::Identity);
-    }
-    let manifest: EvidenceManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(|_| EvidenceError::Identity)?;
-    if manifest.schema != EVIDENCE_BUNDLE_SCHEMA
-        || crate::artifact::validate_identifier(&manifest.evidence_jti, 128).is_err()
-        || manifest.public_report_file != "report.json"
-    {
-        return Err(EvidenceError::Identity);
-    }
-    let report_bytes = crate::secure_file::read_bounded(
-        &directory.join(&manifest.public_report_file),
-        2 * 1024 * 1024,
-        true,
-    )
-    .map_err(map_secure_file_error)?;
-    if sha256(&report_bytes) != manifest.public_report_sha256 {
-        return Err(EvidenceError::Identity);
-    }
-    let report: ConformanceReport =
-        serde_json::from_slice(&report_bytes).map_err(|_| EvidenceError::Identity)?;
-    validate_ordinary_provider_identity(&report, &manifest.identity)?;
-    let identity_suite_origin = match &manifest.identity.source {
-        EvidenceSourceIdentity::LegacyOperatorMatrix { suite_origin, .. }
-        | EvidenceSourceIdentity::SignedOidfArtifact { suite_origin, .. } => suite_origin,
-    };
-    // `evidence_jti` is the recovery-owned provider-bundle generation while
-    // `identity.run_jti` remains the caller's artifact request JTI. They are
-    // intentionally different facts and must not be silently conflated.
-    if report.suite_origin != *identity_suite_origin {
-        return Err(EvidenceError::Identity);
-    }
-    let mut modules = BTreeSet::new();
-    let mut screenshot_paths = BTreeSet::new();
-    let mut total_screenshot_bytes = 0usize;
-    for module in &manifest.modules {
-        let expected = format!("module-{:04}.json", module.index);
-        if module.file != expected
-            || !modules.insert(module.index)
-            || !lower_hex(&module.sha256, 64)
-        {
-            return Err(EvidenceError::Identity);
-        }
-        let bytes =
-            crate::secure_file::read_bounded(&directory.join(&module.file), 2 * 1024 * 1024, true)
-                .map_err(map_secure_file_error)?;
-        if sha256(&bytes) != module.sha256 {
-            return Err(EvidenceError::Identity);
-        }
-        let entry: PrivateModuleEvidence =
-            serde_json::from_slice(&bytes).map_err(|_| EvidenceError::Identity)?;
-        if entry.schema != EVIDENCE_BUNDLE_SCHEMA
-            || entry.evidence_jti != manifest.evidence_jti
-            || entry.index != module.index
-            || entry.matrix_plan_id != module.matrix_plan_id
-            || entry.suite_plan_id != module.suite_plan_id
-            || entry.module_id != module.module_id
-            || entry.test_name != module.test_name
-        {
-            return Err(EvidenceError::Identity);
-        }
-    }
-    for screenshot in &manifest.screenshots {
-        if !screenshot_paths.insert(screenshot.path.clone())
-            || !lower_hex(&screenshot.sha256, 64)
-            || !lower_hex(&screenshot.receipt_sha256, 64)
-            || !lower_hex(&screenshot.trigger_url_sha256, 64)
-        {
-            return Err(EvidenceError::Identity);
-        }
-        validate_review_screenshot_path(&screenshot.path)?;
-        let png =
-            crate::secure_file::read_bounded(&directory.join(&screenshot.path), 500 * 1024, true)
-                .map_err(map_secure_file_error)?;
-        if png.len() != screenshot.size || sha256(&png) != screenshot.sha256 {
-            return Err(EvidenceError::Identity);
-        }
-        crate::browser::validate_png_screenshot(&png).map_err(|_| EvidenceError::Identity)?;
-        total_screenshot_bytes = total_screenshot_bytes
-            .checked_add(png.len())
-            .filter(|total| *total <= 32 * 1024 * 1024)
-            .ok_or(EvidenceError::Identity)?;
-        let receipt = crate::secure_file::read_bounded(
-            &directory
-                .join(&screenshot.path)
-                .with_extension("png.receipt.json"),
-            16 * 1024,
-            true,
-        )
-        .map_err(map_secure_file_error)?;
-        if sha256(&receipt) != screenshot.receipt_sha256 {
-            return Err(EvidenceError::Identity);
-        }
-        let audit: ReviewScreenshotAudit =
-            serde_json::from_slice(&receipt).map_err(|_| EvidenceError::Identity)?;
-        let trigger = url::Url::parse(&format!("{}{}", audit.trigger_origin, audit.trigger_path))
-            .map_err(|_| EvidenceError::Identity)?;
-        if audit.suite_plan_id != screenshot.suite_plan_id
-            || audit.module_id != screenshot.module_id
-            || audit.path != screenshot.path
-            || audit.sha256 != screenshot.sha256
-            || audit.size != screenshot.size
-            || audit.trigger_origin != report.suite_origin
-            || !crate::browser::review_screenshot_path_binds_module(&trigger, &screenshot.module_id)
-            || sha256(trigger.as_str().as_bytes()) != screenshot.trigger_url_sha256
-        {
-            return Err(EvidenceError::Identity);
-        }
-    }
-    if manifest.modules.len() != report.modules.len()
-        || manifest.screenshots.len() > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_RUN
-        || manifest
-            .modules
-            .iter()
-            .zip(&report.modules)
-            .enumerate()
-            .any(|(index, (entry, report_module))| {
-                entry.index != u32::try_from(index).unwrap_or(u32::MAX)
-                    || entry.matrix_plan_id != report_module.matrix_plan_id
-                    || entry.suite_plan_id != report_module.suite_plan_id
-                    || entry.module_id != report_module.module_id
-                    || entry.test_name != report_module.test_name
-            })
-    {
-        return Err(EvidenceError::Identity);
-    }
-    Ok(EvidenceBundleReceipt {
-        schema: manifest.schema,
-        evidence_jti: manifest.evidence_jti,
-        directory,
-        manifest_sha256: manifest_sha256.to_owned(),
-        module_count: u32::try_from(manifest.modules.len()).map_err(|_| EvidenceError::Encoding)?,
-    })
-}
-
-#[cfg(not(unix))]
-pub fn validate_private_provider_evidence_bundle(
-    _directory: &Path,
-    _manifest_sha256: &str,
-) -> Result<EvidenceBundleReceipt, EvidenceError> {
-    Err(EvidenceError::UnsupportedPlatform)
-}
-
-/// Remove only a complete, manifest-authorized staged provider bundle. This
-/// is used for `RetentionPrepared` fallback cleanup; a retained bundle is
-/// never eligible for this operation.
-#[cfg(unix)]
-pub fn discard_staged_private_provider_evidence_bundle(
-    directory: &Path,
-    manifest_sha256: &str,
-) -> Result<(), EvidenceError> {
-    let receipt = validate_private_provider_evidence_bundle(directory, manifest_sha256)?;
-    let manifest_bytes = crate::secure_file::read_bounded(
-        &receipt.directory.join("manifest.json"),
-        2 * 1024 * 1024,
-        true,
-    )
-    .map_err(map_secure_file_error)?;
-    let manifest: EvidenceManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(|_| EvidenceError::Identity)?;
-    for screenshot in &manifest.screenshots {
-        crate::secure_file::remove_file(
-            &receipt
-                .directory
-                .join(&screenshot.path)
-                .with_extension("png.receipt.json"),
-            true,
-        )
-        .map_err(map_secure_file_error)?;
-        crate::secure_file::remove_file(&receipt.directory.join(&screenshot.path), true)
-            .map_err(map_secure_file_error)?;
-    }
-    for module in &manifest.modules {
-        crate::secure_file::remove_file(&receipt.directory.join(&module.file), true)
-            .map_err(map_secure_file_error)?;
-    }
-    crate::secure_file::remove_file(&receipt.directory.join("report.json"), true)
-        .map_err(map_secure_file_error)?;
-    crate::secure_file::remove_file(&receipt.directory.join("manifest.json"), true)
-        .map_err(map_secure_file_error)?;
-    let screenshots = receipt.directory.join("review-screenshots");
-    if screenshots.exists() {
-        crate::secure_file::remove_private_empty_directory(&screenshots)
-            .map_err(map_secure_file_error)?;
-    }
-    crate::secure_file::remove_private_empty_directory(&receipt.directory)
-        .map_err(map_secure_file_error)
-}
-
-#[cfg(not(unix))]
-pub fn discard_staged_private_provider_evidence_bundle(
-    _directory: &Path,
-    _manifest_sha256: &str,
-) -> Result<(), EvidenceError> {
-    Err(EvidenceError::UnsupportedPlatform)
 }
 
 #[cfg(unix)]

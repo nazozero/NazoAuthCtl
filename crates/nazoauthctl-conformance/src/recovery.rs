@@ -525,11 +525,51 @@ impl ConformanceRecoveryStore {
                 }
                 normalized_suite_cleanup = true;
             }
-            // A Retained provider bundle may still be in its private pending
-            // namespace. Do not publish the Suite manifest from claim_pending:
-            // `finish` owns the ordered provider promotion -> manifest restage
-            // -> final publish transition and can retry it without deleting
-            // the retained plans.
+            let mut recovered_retention_manifest = false;
+            if let RecoveryJournal::TenantResource(tenant_journal) = &journal
+                && let SuiteRetentionDisposition::Retained { record } =
+                    &tenant_journal.suite_retention
+            {
+                let final_path = record.manifest_path.clone();
+                let name = final_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .context("retained Suite manifest path is invalid")?;
+                let pending_path = final_path.with_file_name(format!(".{name}.pending"));
+                match crate::secure_file::read_bounded(
+                    &final_path,
+                    MAX_SUITE_RETENTION_MANIFEST_BYTES,
+                    true,
+                ) {
+                    Ok(bytes) if sha256_hex(&bytes) == record.manifest_sha256 => {}
+                    Ok(_) => bail!("retained Suite manifest conflicts with recovery journal"),
+                    Err(crate::secure_file::SecureFileError::NotFound) => {
+                        let pending = crate::secure_file::read_bounded(
+                            &pending_path,
+                            MAX_SUITE_RETENTION_MANIFEST_BYTES,
+                            true,
+                        )
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "retained Suite pending manifest is not secure: {error:?}"
+                            )
+                        })?;
+                        if sha256_hex(&pending) != record.manifest_sha256 {
+                            bail!(
+                                "retained Suite pending manifest conflicts with recovery journal"
+                            );
+                        }
+                        crate::secure_file::promote_private_file(&pending_path, &final_path)
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "failed to recover retained Suite manifest: {error:?}"
+                                )
+                            })?;
+                        recovered_retention_manifest = true;
+                    }
+                    Err(error) => bail!("retained Suite manifest is not secure: {error:?}"),
+                }
+            }
             let mut recovered_manifest_removal = false;
             if let RecoveryJournal::TenantResource(tenant_journal) = &mut journal
                 && tenant_journal.binding.manifest_path.is_some()
@@ -547,7 +587,11 @@ impl ConformanceRecoveryStore {
                     recovered_manifest_removal = true;
                 }
             }
-            if recovered_manifest_removal || normalized_proxy_cleanup || normalized_suite_cleanup {
+            if recovered_manifest_removal
+                || normalized_proxy_cleanup
+                || normalized_suite_cleanup
+                || recovered_retention_manifest
+            {
                 validate_journal(&journal, &self.deployment_id, request_jti)?;
                 write_journal(&journal_path, &journal)?;
             }
@@ -969,8 +1013,7 @@ impl ConformanceRecoveryGuard {
     pub fn stage_suite_retention_manifest(&self) -> anyhow::Result<PathBuf> {
         let record = match &self.journal {
             RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
-                SuiteRetentionDisposition::RetentionPrepared { record }
-                | SuiteRetentionDisposition::Retained { record } => record,
+                SuiteRetentionDisposition::RetentionPrepared { record } => record,
                 _ => bail!("Suite retention has not been prepared"),
             },
             RecoveryJournal::Legacy(_) => {
@@ -991,10 +1034,7 @@ impl ConformanceRecoveryGuard {
         let path = self.suite_retention_pending_path()?;
         match crate::secure_file::read_bounded(&path, MAX_SUITE_RETENTION_MANIFEST_BYTES, true) {
             Ok(existing) if sha256_hex(&existing) == record.manifest_sha256 => return Ok(path),
-            // This pending file is journal-owned and has not been published.
-            // A Retained provider promotion updates its bound path/digest, so
-            // replace only this private staging file before final publish.
-            Ok(_) => {}
+            Ok(_) => bail!("retained Suite manifest conflicts with the recovery journal"),
             Err(crate::secure_file::SecureFileError::NotFound) => {}
             Err(error) => bail!("retained Suite manifest is not secure: {error:?}"),
         }
@@ -1002,89 +1042,6 @@ impl ConformanceRecoveryGuard {
             anyhow::anyhow!("failed to stage retained Suite manifest: {error:?}")
         })?;
         Ok(path)
-    }
-
-    /// Promote the journal-bound provider evidence only after Suite ownership
-    /// has moved to Retained. The directory name is deterministic from the
-    /// run binding; no caller-controlled path is accepted here.
-    pub fn publish_retained_provider_evidence(
-        &mut self,
-    ) -> anyhow::Result<SuiteRetentionProviderEvidence> {
-        let (pending, final_directory, manifest_sha256, already_published) = {
-            let journal = self
-                .tenant_resource_journal()
-                .context("Suite retention is not valid for a legacy journal")?;
-            let SuiteRetentionDisposition::Retained { record } = &journal.suite_retention else {
-                bail!("Suite retention has not been committed");
-            };
-            let provider = record
-                .manifest
-                .provider_evidence
-                .as_ref()
-                .context("retained Suite journal has no provider evidence")?;
-            let evidence_root = provider
-                .directory
-                .parent()
-                .and_then(Path::parent)
-                .context("provider evidence pending path is invalid")?;
-            let namespace = provider
-                .directory
-                .parent()
-                .and_then(|path| path.file_name())
-                .and_then(|name| name.to_str());
-            if provider
-                .directory
-                .file_name()
-                .and_then(|name| name.to_str())
-                != Some(record.manifest.run_id.as_str())
-                || !matches!(
-                    namespace,
-                    Some(".pending-provider") | Some("provider-evidence")
-                )
-            {
-                bail!("provider evidence pending path is outside policy");
-            }
-            (
-                provider.directory.clone(),
-                evidence_root
-                    .join("provider-evidence")
-                    .join(&record.manifest.run_id),
-                provider.manifest_sha256.clone(),
-                namespace == Some("provider-evidence"),
-            )
-        };
-        if !already_published {
-            let final_parent = final_directory
-                .parent()
-                .context("provider evidence final path is invalid")?;
-            crate::secure_file::ensure_directory(final_parent, true).map_err(|error| {
-                anyhow::anyhow!("provider evidence final directory is not secure: {error:?}")
-            })?;
-            crate::secure_file::promote_private_directory(&pending, &final_directory).map_err(
-                |error| anyhow::anyhow!("failed to publish provider evidence: {error:?}"),
-            )?;
-        }
-        let published = SuiteRetentionProviderEvidence {
-            directory: final_directory,
-            manifest_sha256,
-        };
-        validate_suite_retention_provider_evidence(
-            &published,
-            &self
-                .tenant_resource_journal()
-                .expect("tenant-resource journal was just verified")
-                .binding,
-        )?;
-        let journal = self
-            .tenant_resource_journal_mut()
-            .context("Suite retention is not valid for a legacy journal")?;
-        let SuiteRetentionDisposition::Retained { record } = &mut journal.suite_retention else {
-            bail!("Suite retention has not been committed");
-        };
-        record.manifest.provider_evidence = Some(published.clone());
-        record.manifest_sha256 = sha256_hex(&canonical_suite_retention_manifest(&record.manifest)?);
-        self.persist()?;
-        Ok(published)
     }
 
     /// Transfer ownership only after a complete pending manifest has been
@@ -1098,12 +1055,6 @@ impl ConformanceRecoveryGuard {
         let pending = self.suite_retention_pending_path()?;
         let record = match &self.journal {
             RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
-                SuiteRetentionDisposition::RetentionPrepared { record }
-                    if journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
-                        && record.manifest.provider_evidence.is_none() =>
-                {
-                    bail!("new retained Suite journals require bound provider evidence")
-                }
                 SuiteRetentionDisposition::RetentionPrepared { record } => record.clone(),
                 _ => bail!("Suite retention has not been prepared"),
             },
@@ -1153,15 +1104,6 @@ impl ConformanceRecoveryGuard {
                 self.tenant_resource_binding()
                     .context("Suite retention has no ordinary binding")?,
             )?;
-        }
-        if let Some(provider) = &record.manifest.provider_evidence {
-            validate_suite_retention_provider_evidence(
-                provider,
-                self.tenant_resource_binding()
-                    .context("Suite retention has no ordinary binding")?,
-            )?;
-        } else {
-            bail!("retained Suite journal has no provider evidence");
         }
         match crate::secure_file::read_bounded(
             &final_path,
@@ -1222,34 +1164,6 @@ impl ConformanceRecoveryGuard {
             Ok(()) | Err(crate::secure_file::SecureFileError::NotFound) => Ok(()),
             Err(error) => bail!("failed to discard staged Suite retention manifest: {error:?}"),
         }
-        let provider = match &self.journal {
-            RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
-                SuiteRetentionDisposition::RetentionPrepared { record } => {
-                    record.manifest.provider_evidence.as_ref()
-                }
-                _ => None,
-            },
-            RecoveryJournal::Legacy(_) => None,
-        };
-        if let Some(provider) = provider {
-            if provider
-                .directory
-                .parent()
-                .and_then(|parent| parent.file_name())
-                .and_then(|name| name.to_str())
-                != Some(".pending-provider")
-            {
-                bail!("prepared Suite journal references published provider evidence");
-            }
-            crate::evidence::discard_staged_private_provider_evidence_bundle(
-                &provider.directory,
-                &provider.manifest_sha256,
-            )
-            .map_err(|error| {
-                anyhow::anyhow!("failed to discard staged provider evidence: {error:?}")
-            })?;
-        }
-        Ok(())
     }
 
     fn suite_retention_pending_path(&self) -> anyhow::Result<PathBuf> {
@@ -1426,13 +1340,6 @@ impl ConformanceRecoveryGuard {
         }
     }
 
-    fn tenant_resource_journal(&self) -> Option<&TenantResourceRecoveryJournal> {
-        match &self.journal {
-            RecoveryJournal::TenantResource(journal) => Some(journal),
-            RecoveryJournal::Legacy(_) => None,
-        }
-    }
-
     pub fn ordinary_cleanup_complete(&self) -> bool {
         self.tenant_resource_cleanup_complete()
     }
@@ -1514,16 +1421,7 @@ impl ConformanceRecoveryGuard {
 
     pub fn finish(mut self) -> anyhow::Result<()> {
         if self.suite_retention_committed() {
-            let suite_manifest_published = self.suite_retention_manifest_is_published()?;
-            self.publish_retained_provider_evidence()?;
-            // A crash between the provider directory promotion and final Suite
-            // manifest publication leaves a Retained journal. Recreate its
-            // private pending manifest from the authoritative journal before
-            // the final no-replace promotion.
-            if !suite_manifest_published {
-                self.stage_suite_retention_manifest()?;
-                self.publish_committed_suite_retention_manifest()?;
-            }
+            self.publish_committed_suite_retention_manifest()?;
         }
         match &self.journal {
             RecoveryJournal::Legacy(journal) => {
@@ -1586,30 +1484,6 @@ impl ConformanceRecoveryGuard {
             }
         }
         self.remove_journal_and_lock()
-    }
-
-    fn suite_retention_manifest_is_published(&self) -> anyhow::Result<bool> {
-        let record = match &self.journal {
-            RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
-                SuiteRetentionDisposition::Retained { record } => record,
-                _ => return Ok(false),
-            },
-            RecoveryJournal::Legacy(_) => return Ok(false),
-        };
-        match crate::secure_file::read_bounded(
-            &record.manifest_path,
-            MAX_SUITE_RETENTION_MANIFEST_BYTES,
-            true,
-        ) {
-            Ok(bytes) => {
-                if sha256_hex(&bytes) != record.manifest_sha256 {
-                    bail!("retained Suite manifest conflicts with the recovery journal");
-                }
-                Ok(true)
-            }
-            Err(crate::secure_file::SecureFileError::NotFound) => Ok(false),
-            Err(error) => bail!("retained Suite manifest is not secure: {error:?}"),
-        }
     }
 
     fn remove_journal_and_lock(mut self) -> anyhow::Result<()> {
@@ -1924,7 +1798,7 @@ fn validate_suite_retention_manifest(
         validate_review_screenshot_manifest_binding(screenshot, binding)?;
     }
     if let Some(provider_evidence) = &manifest.provider_evidence {
-        validate_suite_retention_provider_evidence(provider_evidence, binding)?;
+        validate_suite_retention_provider_evidence(provider_evidence)?;
     }
     let mut matrix_ids = std::collections::BTreeSet::new();
     let mut suite_ids = std::collections::BTreeSet::new();
@@ -1991,36 +1865,22 @@ fn validate_review_screenshot_manifest_binding(
 
 fn validate_suite_retention_provider_evidence(
     provider_evidence: &SuiteRetentionProviderEvidence,
-    binding: &TenantResourceRecoveryBinding,
 ) -> anyhow::Result<()> {
     if !provider_evidence.directory.is_absolute()
         || !lower_hex(&provider_evidence.manifest_sha256, 64)
     {
         bail!("provider evidence binding is outside policy");
     }
-    let namespace = provider_evidence
-        .directory
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .and_then(|name| name.to_str());
-    if !matches!(
-        namespace,
-        Some(".pending-provider") | Some("provider-evidence")
-    ) || provider_evidence
-        .directory
-        .file_name()
-        .and_then(|name| name.to_str())
-        != Some(binding.request_jti.as_str())
-    {
-        bail!("provider evidence path is outside the retained run policy");
-    }
-    let receipt = crate::evidence::validate_private_provider_evidence_bundle(
-        &provider_evidence.directory,
-        &provider_evidence.manifest_sha256,
+    let directory = crate::secure_file::validate_directory(&provider_evidence.directory, true)
+        .map_err(|error| anyhow::anyhow!("provider evidence directory is not secure: {error:?}"))?;
+    let manifest = crate::secure_file::read_bounded(
+        &directory.join("manifest.json"),
+        2 * 1024 * 1024,
+        true,
     )
-    .map_err(|error| anyhow::anyhow!("provider evidence bundle is invalid: {error:?}"))?;
-    if receipt.evidence_jti != binding.request_jti {
-        bail!("provider evidence JTI conflicts with the retained run binding");
+    .map_err(|error| anyhow::anyhow!("provider evidence manifest is not secure: {error:?}"))?;
+    if sha256_hex(&manifest) != provider_evidence.manifest_sha256 {
+        bail!("provider evidence manifest digest is invalid");
     }
     Ok(())
 }
