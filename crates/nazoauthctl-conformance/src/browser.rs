@@ -24,7 +24,64 @@ use zeroize::Zeroizing;
 #[cfg(test)]
 use crate::origin::Origin;
 
-#[derive(Debug, Error, Clone, Copy, Eq, PartialEq)]
+/// A response-shape observation is deliberately metadata-only.  It is safe to
+/// retain in root-private run evidence: it has no response body, selector,
+/// URL, session id, or browser content.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WebDriverProtocolDiagnostic {
+    pub endpoint: &'static str,
+    pub status: u16,
+    pub content_type: &'static str,
+    pub body_len: usize,
+    pub body_sha256: String,
+    pub value_type: &'static str,
+    pub top_level_keys: Vec<String>,
+}
+
+impl std::fmt::Display for WebDriverProtocolDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "endpoint={} status={} content_type={} body_len={} body_sha256={} value_type={} top_level_keys={}",
+            self.endpoint,
+            self.status,
+            self.content_type,
+            self.body_len,
+            self.body_sha256,
+            self.value_type,
+            self.top_level_keys.join(","),
+        )
+    }
+}
+
+/// Canonical navigation observations exclude userinfo, query, and fragment.
+/// The matcher is a digest prefix rather than a raw Suite value so this can
+/// safely travel through the persisted local error report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserNavigationDiagnostic {
+    pub from: String,
+    pub to: String,
+    pub selected_entry: Option<usize>,
+    pub matcher_sha256_prefix: Option<String>,
+}
+
+impl std::fmt::Display for BrowserNavigationDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "from={} to={} selected_entry={} matcher_sha256_prefix={}",
+            self.from,
+            self.to,
+            self.selected_entry
+                .map(|value| value.to_string())
+                .as_deref()
+                .unwrap_or("none"),
+            self.matcher_sha256_prefix.as_deref().unwrap_or("none"),
+        )
+    }
+}
+
+#[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum BrowserError {
     #[error("browser endpoint is invalid")]
     InvalidEndpoint,
@@ -56,6 +113,8 @@ pub enum BrowserError {
     StepLimit,
     #[error("browser redirect or navigation crossed the allowlist")]
     CrossOriginNavigation,
+    #[error("browser redirect or navigation crossed the allowlist [{0}]")]
+    CrossOriginNavigationDiagnostic(BrowserNavigationDiagnostic),
     #[error("browser redirect limit exceeded")]
     RedirectLimit,
     #[error("browser entry did not match the current page")]
@@ -68,6 +127,8 @@ pub enum BrowserError {
     Transport,
     #[error("browser WebDriver protocol response is invalid")]
     Protocol,
+    #[error("browser WebDriver protocol response is invalid [{0}]")]
+    ProtocolDiagnostic(WebDriverProtocolDiagnostic),
     #[error("browser WebDriver rejected the request")]
     DriverRejected,
     #[error("browser response exceeds the size limit")]
@@ -101,10 +162,10 @@ pub use openid4vci::{
     OpenId4VciModule,
 };
 pub use openid4vp::{
-    ConformanceBinding, OpenId4VpError, OpenId4VpEvidenceContext, OpenId4VpEvidenceRunContext,
-    OpenId4VpEvidenceVerifier, OpenId4VpPresentation, OpenId4VpStartRequest,
-    OpenId4VpVerificationEvidence, OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier,
-    OpenId4VpVerifierClient,
+    ConformanceBinding, OpenId4VpError, OpenId4VpEvidenceBindingDiagnostic,
+    OpenId4VpEvidenceContext, OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier,
+    OpenId4VpPresentation, OpenId4VpStartRequest, OpenId4VpVerificationEvidence,
+    OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier, OpenId4VpVerifierClient,
 };
 pub use parser::{parse_browser_entries, parse_browser_entries_owned};
 pub use plan::{BrowserRunnerState, OpenId4VcBrowserState};
@@ -597,6 +658,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn canonical_navigation_url(url: &Url) -> String {
+    let mut canonical = url.clone();
+    canonical
+        .set_username("")
+        .expect("URL username can be cleared");
+    canonical
+        .set_password(None)
+        .expect("URL password can be cleared");
+    canonical.set_query(None);
+    canonical.set_fragment(None);
+    canonical.to_string()
+}
+
 /// Private orchestration receipt. Public module reports project only
 /// `path`, `sha256`, and `size` from this value.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -892,6 +966,13 @@ pub struct BrowserExecutor<D> {
     steps: usize,
     redirects: usize,
     last_url: Option<Url>,
+    active_entry: Option<BrowserNavigationEntry>,
+}
+
+#[derive(Clone)]
+struct BrowserNavigationEntry {
+    index: usize,
+    matcher_sha256_prefix: String,
 }
 
 impl<D: BrowserDriver> BrowserExecutor<D> {
@@ -903,6 +984,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             steps: 0,
             redirects: 0,
             last_url: None,
+            active_entry: None,
         }
     }
 
@@ -1023,7 +1105,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             || !self.policy.suite_origin.same_origin_url(trigger_url)
             || !review_screenshot_path_binds_module(trigger_url, &capture.module_id)
         {
-            return Err(BrowserError::CrossOriginNavigation);
+            return Err(self.navigation_violation(self.last_url.as_ref(), trigger_url));
         }
         let context = capture.for_index(index);
         let result = context.and_then(|context| {
@@ -1076,7 +1158,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
             })
         {
-            return Err(BrowserError::CrossOriginNavigation);
+            return Err(self.navigation_violation(self.last_url.as_ref(), &ui_url));
         }
         self.navigate(&ui_url)?;
         let current = self.ensure_current_url()?;
@@ -1085,7 +1167,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             || current.query().is_some()
             || current.fragment().is_some()
         {
-            return Err(BrowserError::CrossOriginNavigation);
+            return Err(self.navigation_violation(self.last_url.as_ref(), &current));
         }
         let deadline = self.deadline(DEFAULT_STEP_TIMEOUT);
         loop {
@@ -1122,7 +1204,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             || current.query().is_some()
             || current.fragment().is_some()
         {
-            return Err(BrowserError::CrossOriginNavigation);
+            return Err(self.navigation_violation(self.last_url.as_ref(), &current));
         }
         let context = capture.for_index(obligation_index)?;
         let screenshot = self.driver.screenshot_png()?;
@@ -1135,7 +1217,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             || current.query().is_some()
             || current.fragment().is_some()
         {
-            return Err(BrowserError::CrossOriginNavigation);
+            return Err(self.navigation_violation(self.last_url.as_ref(), &current));
         }
         self.verify_openid4vp_result_projection(evidence)?;
         context.write_vp_png(
@@ -1329,7 +1411,9 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
 
     fn ensure_current_url(&mut self) -> Result<Url, BrowserError> {
         let current = self.driver.current_url()?;
-        self.policy.validate_url(&current)?;
+        self.policy
+            .validate_url(&current)
+            .map_err(|_| self.navigation_violation(self.last_url.as_ref(), &current))?;
         if let Some(previous) = &self.last_url
             && previous != &current
         {
@@ -1340,6 +1424,31 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         }
         self.last_url = Some(current.clone());
         Ok(current)
+    }
+
+    fn select_navigation_entry(&mut self, index: usize, entry: &BrowserEntry) {
+        let matcher_sha256_prefix = sha256_hex(entry.match_pattern.as_bytes())
+            .chars()
+            .take(12)
+            .collect();
+        self.active_entry = Some(BrowserNavigationEntry {
+            index,
+            matcher_sha256_prefix,
+        });
+    }
+
+    fn navigation_violation(&self, from: Option<&Url>, to: &Url) -> BrowserError {
+        BrowserError::CrossOriginNavigationDiagnostic(BrowserNavigationDiagnostic {
+            from: from
+                .map(canonical_navigation_url)
+                .unwrap_or_else(|| "none".to_owned()),
+            to: canonical_navigation_url(to),
+            selected_entry: self.active_entry.as_ref().map(|entry| entry.index),
+            matcher_sha256_prefix: self
+                .active_entry
+                .as_ref()
+                .map(|entry| entry.matcher_sha256_prefix.clone()),
+        })
     }
 
     fn matching_entry(
@@ -1365,18 +1474,17 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
     }
 
     fn selected_openid4vp_result_marker(
-        &self,
+        &mut self,
         authorization_url: &Url,
         entries: &[BrowserEntry],
         suite_evidence_url: &Url,
     ) -> Result<bool, BrowserError> {
         let entry_index = self.matching_entry(authorization_url, entries)?;
-        selected_required_review_screenshot_marker(
-            entries
-                .get(entry_index)
-                .ok_or(BrowserError::InvalidSchema)?,
-            suite_evidence_url,
-        )
+        let entry = entries
+            .get(entry_index)
+            .ok_or(BrowserError::InvalidSchema)?;
+        self.select_navigation_entry(entry_index, entry);
+        selected_required_review_screenshot_marker(entry, suite_evidence_url)
     }
 
     fn execute_inner(
@@ -1392,6 +1500,10 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         self.redirects = 0;
         self.last_url = None;
         let entry_index = self.matching_entry(authorization_url, entries)?;
+        let entry = entries
+            .get(entry_index)
+            .ok_or(BrowserError::InvalidSchema)?;
+        self.select_navigation_entry(entry_index, entry);
         self.navigate(authorization_url)?;
         *self.entry_uses.entry(entry_index).or_default() += 1;
         let mut report = BrowserRunReport {
@@ -1405,7 +1517,6 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             review_screenshots_required_captured: 0,
             review_screenshots_missing: 0,
         };
-        let entry = &entries[entry_index];
         for task in &entry.tasks {
             let mut task_matched = true;
             if let Some(pattern) = task.match_pattern.as_deref() {
@@ -1494,6 +1605,7 @@ impl<D: BrowserDriver> BrowserAutomation for BrowserExecutor<D> {
         self.steps = 0;
         self.redirects = 0;
         self.last_url = None;
+        self.active_entry = None;
         Ok(())
     }
 
@@ -1515,7 +1627,9 @@ impl<D: BrowserDriver> BrowserAutomation for BrowserExecutor<D> {
     }
 
     fn navigate(&mut self, url: &Url) -> Result<(), BrowserError> {
-        self.policy.validate_url(url)?;
+        self.policy
+            .validate_url(url)
+            .map_err(|_| self.navigation_violation(self.last_url.as_ref(), url))?;
         self.redirects = 0;
         self.last_url = Some(url.clone());
         self.driver.navigate(url)?;
@@ -1523,7 +1637,9 @@ impl<D: BrowserDriver> BrowserAutomation for BrowserExecutor<D> {
     }
 
     fn wait_for_url(&mut self, expected: &Url, timeout: Duration) -> Result<(), BrowserError> {
-        self.policy.validate_url(expected)?;
+        self.policy
+            .validate_url(expected)
+            .map_err(|_| self.navigation_violation(self.last_url.as_ref(), expected))?;
         let deadline = self.deadline(timeout);
         loop {
             let current = self.ensure_current_url()?;
@@ -1968,7 +2084,9 @@ mod tests {
         assert_eq!(executor.driver_mut().navigated.len(), 2);
         assert!(matches!(
             executor.navigate(&Url::parse("https://evil.example/").expect("url")),
-            Err(BrowserError::CrossOriginNavigation)
+            Err(BrowserError::CrossOriginNavigationDiagnostic(
+                BrowserNavigationDiagnostic { ref to, .. }
+            )) if to == "https://evil.example/"
         ));
         let entries = vec![BrowserEntry::parse(&json!({
             "match": "https://issuer.example/authorize*",
@@ -1984,6 +2102,50 @@ mod tests {
             )
             .expect("flow");
         assert_eq!(report.steps, 2);
+    }
+
+    #[test]
+    fn navigation_diagnostic_redacts_query_fragment_and_matcher_value() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse("https://suite.example").expect("suite");
+        let mut executor = BrowserExecutor::new(
+            MockDriver {
+                current: Url::parse("https://issuer.example/").expect("url"),
+                source: String::new(),
+                found: true,
+                displayed: true,
+                clicked: false,
+                cookies_cleared: false,
+                cookie_clear_count: 0,
+                navigated: Vec::new(),
+                redirect_to: None,
+                session_checks: 0,
+            },
+            BrowserPolicy::new(target, suite).expect("policy"),
+        );
+        let entry = BrowserEntry::parse(&json!({
+            "match": "https://suite.example/test/a/*/authorize?nonsecret-matcher",
+            "tasks": []
+        }))
+        .expect("entry");
+        executor.select_navigation_entry(3, &entry);
+        let diagnostic = executor.navigation_violation(
+            Some(&Url::parse("https://suite.example/a?token=secret#fragment").expect("from")),
+            &Url::parse("https://elsewhere.example/b?code=secret#fragment").expect("to"),
+        );
+        let BrowserError::CrossOriginNavigationDiagnostic(diagnostic) = diagnostic else {
+            panic!("navigation diagnostic")
+        };
+        let rendered = diagnostic.to_string();
+        assert_eq!(diagnostic.from, "https://suite.example/a");
+        assert_eq!(diagnostic.to, "https://elsewhere.example/b");
+        assert_eq!(diagnostic.selected_entry, Some(3));
+        assert_eq!(
+            diagnostic.matcher_sha256_prefix.as_deref().map(str::len),
+            Some(12)
+        );
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("nonsecret-matcher"));
     }
 
     #[test]
@@ -2279,7 +2441,7 @@ mod tests {
             }))
             .expect("unselected alternative"),
         ];
-        let executor = BrowserExecutor::new(driver, policy);
+        let mut executor = BrowserExecutor::new(driver, policy);
         assert!(
             executor
                 .selected_openid4vp_result_marker(&authorization, &entries, &evidence)

@@ -10,15 +10,29 @@ use std::time::{Duration, Instant};
 use reqwest::blocking::Client;
 use reqwest::redirect::Policy;
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use super::validation::{MAX_TEXT_BYTES, is_loopback_host};
-use super::{BrowserDriver, BrowserError, BrowserSelector, decode_webdriver_png};
+use super::{
+    BrowserDriver, BrowserError, BrowserSelector, WebDriverProtocolDiagnostic, decode_webdriver_png,
+};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_SESSION_ID_BYTES: usize = 256;
 const W3C_ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
 const LEGACY_ELEMENT_KEY: &str = "ELEMENT";
+
+struct WebDriverResponse {
+    value: Value,
+    diagnostic: WebDriverProtocolDiagnostic,
+}
+
+impl WebDriverResponse {
+    fn protocol(&self) -> BrowserError {
+        BrowserError::ProtocolDiagnostic(self.diagnostic.clone())
+    }
+}
 
 fn valid_session_id(value: &str) -> bool {
     !value.is_empty()
@@ -145,8 +159,11 @@ impl WebDriverClient {
         if self.session_id.is_some() {
             return Err(BrowserError::SessionAlreadyStarted);
         }
-        let value = self.post_value("/session", &capabilities)?;
-        let object = value.as_object().ok_or(BrowserError::Protocol)?;
+        let response = self.post_value("/session", &capabilities, "new_session")?;
+        let object = response
+            .value
+            .as_object()
+            .ok_or_else(|| response.protocol())?;
         let session = object
             .get("sessionId")
             .and_then(Value::as_str)
@@ -156,9 +173,9 @@ impl WebDriverClient {
                     .and_then(|item| item.get("sessionId"))
                     .and_then(Value::as_str)
             })
-            .ok_or(BrowserError::Protocol)?;
+            .ok_or_else(|| response.protocol())?;
         if !valid_session_id(session) {
-            return Err(BrowserError::Protocol);
+            return Err(response.protocol());
         }
         self.session_id = Some(session.to_owned());
         Ok(())
@@ -172,7 +189,7 @@ impl WebDriverClient {
             return Err(BrowserError::Protocol);
         }
         let path = format!("/session/{session}");
-        let _ = self.delete_value(&path);
+        let _ = self.delete_value(&path, "delete_session");
         Ok(())
     }
 
@@ -191,7 +208,12 @@ impl WebDriverClient {
         Ok(format!("/session/{session}{suffix}"))
     }
 
-    fn post_value(&self, path: &str, body: &Value) -> Result<Value, BrowserError> {
+    fn post_value(
+        &self,
+        path: &str,
+        body: &Value,
+        endpoint: &'static str,
+    ) -> Result<WebDriverResponse, BrowserError> {
         let url = self.endpoint.endpoint_url(path)?;
         let response = self
             .client
@@ -201,10 +223,14 @@ impl WebDriverClient {
             .body(serde_json::to_vec(body).map_err(|_| BrowserError::Protocol)?)
             .send()
             .map_err(|_| BrowserError::Transport)?;
-        parse_webdriver_response(response, self.max_response_bytes)
+        parse_webdriver_response(response, self.max_response_bytes, endpoint)
     }
 
-    fn get_value(&self, path: &str) -> Result<Value, BrowserError> {
+    fn get_value(
+        &self,
+        path: &str,
+        endpoint: &'static str,
+    ) -> Result<WebDriverResponse, BrowserError> {
         let url = self.endpoint.endpoint_url(path)?;
         let response = self
             .client
@@ -212,10 +238,14 @@ impl WebDriverClient {
             .header("Accept", "application/json")
             .send()
             .map_err(|_| BrowserError::Transport)?;
-        parse_webdriver_response(response, self.max_response_bytes)
+        parse_webdriver_response(response, self.max_response_bytes, endpoint)
     }
 
-    fn delete_value(&self, path: &str) -> Result<Value, BrowserError> {
+    fn delete_value(
+        &self,
+        path: &str,
+        endpoint: &'static str,
+    ) -> Result<WebDriverResponse, BrowserError> {
         let url = self.endpoint.endpoint_url(path)?;
         let response = self
             .client
@@ -223,14 +253,14 @@ impl WebDriverClient {
             .header("Accept", "application/json")
             .send()
             .map_err(|_| BrowserError::Transport)?;
-        parse_webdriver_response(response, self.max_response_bytes)
+        parse_webdriver_response(response, self.max_response_bytes, endpoint)
     }
 }
 
 impl BrowserDriver for WebDriverClient {
     fn ensure_session(&mut self) -> Result<(), BrowserError> {
         let path = self.session_path("/url")?;
-        match self.get_value(&path) {
+        match self.get_value(&path, "session_probe") {
             Ok(_) => Ok(()),
             Err(BrowserError::InvalidSession) => {
                 self.session_id = None;
@@ -241,31 +271,33 @@ impl BrowserDriver for WebDriverClient {
     }
 
     fn clear_cookies(&mut self) -> Result<(), BrowserError> {
-        self.delete_value(&self.session_path("/cookie")?)
+        self.delete_value(&self.session_path("/cookie")?, "delete_all_cookies")
             .map(|_| ())
     }
 
     fn navigate(&mut self, url: &Url) -> Result<(), BrowserError> {
         let path = self.session_path("/url")?;
-        self.post_value(&path, &json!({ "url": url.as_str() }))
+        self.post_value(&path, &json!({ "url": url.as_str() }), "navigate")
             .map(|_| ())
     }
 
     fn current_url(&mut self) -> Result<Url, BrowserError> {
-        let value = self.get_value(&self.session_path("/url")?)?;
-        let text = value
+        let response = self.get_value(&self.session_path("/url")?, "current_url")?;
+        let text = response
+            .value
             .get("value")
             .and_then(Value::as_str)
-            .ok_or(BrowserError::Protocol)?;
-        Url::parse(text).map_err(|_| BrowserError::Protocol)
+            .ok_or_else(|| response.protocol())?;
+        Url::parse(text).map_err(|_| response.protocol())
     }
 
     fn page_source(&mut self) -> Result<String, BrowserError> {
-        let value = self.get_value(&self.session_path("/source")?)?;
-        let text = value
+        let response = self.get_value(&self.session_path("/source")?, "page_source")?;
+        let text = response
+            .value
             .get("value")
             .and_then(Value::as_str)
-            .ok_or(BrowserError::Protocol)?;
+            .ok_or_else(|| response.protocol())?;
         if text.len() > MAX_RESPONSE_BYTES {
             return Err(BrowserError::ResponseTooLarge);
         }
@@ -278,21 +310,23 @@ impl BrowserDriver for WebDriverClient {
             BrowserSelector::Css(value) => ("css selector", value.as_str()),
             BrowserSelector::XPath(value) => ("xpath", value.as_str()),
         };
-        let result = self.post_value(
+        let response = self.post_value(
             &self.session_path("/element")?,
             &json!({ "using": using, "value": value }),
+            "find_element",
         )?;
-        let object = result
+        let object = response
+            .value
             .get("value")
             .and_then(Value::as_object)
-            .ok_or(BrowserError::ElementNotFound)?;
+            .ok_or_else(|| response.protocol())?;
         let id = object
             .get(W3C_ELEMENT_KEY)
             .or_else(|| object.get(LEGACY_ELEMENT_KEY))
             .and_then(Value::as_str)
-            .ok_or(BrowserError::ElementNotFound)?;
+            .ok_or_else(|| response.protocol())?;
         if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
-            return Err(BrowserError::Protocol);
+            return Err(response.protocol());
         }
         Ok(id.to_owned())
     }
@@ -310,40 +344,49 @@ impl BrowserDriver for WebDriverClient {
             BrowserSelector::Css(value) => ("css selector", value.as_str()),
             BrowserSelector::XPath(value) => ("xpath", value.as_str()),
         };
-        let result = self.post_value(
+        let response = self.post_value(
             &self.session_path(&format!("/element/{parent}/element"))?,
             &json!({ "using": using, "value": value }),
+            "find_child_element",
         )?;
-        let object = result
+        let object = response
+            .value
             .get("value")
             .and_then(Value::as_object)
-            .ok_or(BrowserError::ElementNotFound)?;
+            .ok_or_else(|| response.protocol())?;
         let id = object
             .get(W3C_ELEMENT_KEY)
             .or_else(|| object.get(LEGACY_ELEMENT_KEY))
             .and_then(Value::as_str)
-            .ok_or(BrowserError::ElementNotFound)?;
+            .ok_or_else(|| response.protocol())?;
         if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
-            return Err(BrowserError::Protocol);
+            return Err(response.protocol());
         }
         Ok(id.to_owned())
     }
 
     fn element_displayed(&mut self, element: &str) -> Result<bool, BrowserError> {
-        let value =
-            self.get_value(&self.session_path(&format!("/element/{element}/displayed"))?)?;
-        value
+        let response = self.get_value(
+            &self.session_path(&format!("/element/{element}/displayed"))?,
+            "element_displayed",
+        )?;
+        response
+            .value
             .get("value")
             .and_then(Value::as_bool)
-            .ok_or(BrowserError::Protocol)
+            .ok_or_else(|| response.protocol())
     }
 
     fn element_text(&mut self, element: &str) -> Result<String, BrowserError> {
-        let value = self.get_value(&self.session_path(&format!("/element/{element}/text"))?)?;
-        let text = value
+        let response = self.get_value(
+            &self.session_path(&format!("/element/{element}/text"))?,
+            "element_text",
+        )?;
+        let text = response
+            .value
             .get("value")
             .and_then(Value::as_str)
-            .ok_or(BrowserError::Protocol)?;
+            .ok_or_else(|| response.protocol())?;
         if text.len() > MAX_RESPONSE_BYTES {
             return Err(BrowserError::ResponseTooLarge);
         }
@@ -363,14 +406,16 @@ impl BrowserDriver for WebDriverClient {
         {
             return Err(BrowserError::Protocol);
         }
-        let value =
-            self.get_value(&self.session_path(&format!("/element/{element}/attribute/{name}"))?)?;
-        match value.get("value") {
+        let response = self.get_value(
+            &self.session_path(&format!("/element/{element}/attribute/{name}"))?,
+            "element_attribute",
+        )?;
+        match response.value.get("value") {
             Some(Value::Null) | None => Ok(None),
             Some(Value::String(value)) if value.len() <= MAX_RESPONSE_BYTES => {
                 Ok(Some(value.clone()))
             }
-            _ => Err(BrowserError::Protocol),
+            _ => Err(response.protocol()),
         }
     }
 
@@ -384,6 +429,7 @@ impl BrowserDriver for WebDriverClient {
         self.post_value(
             &self.session_path(&format!("/element/{element}/value"))?,
             &body,
+            "element_send_keys",
         )
         .map(|_| ())
     }
@@ -392,13 +438,17 @@ impl BrowserDriver for WebDriverClient {
         self.post_value(
             &self.session_path(&format!("/element/{element}/click"))?,
             &json!({}),
+            "element_click",
         )
         .map(|_| ())
     }
 
     fn screenshot_png(&mut self) -> Result<zeroize::Zeroizing<Vec<u8>>, BrowserError> {
-        let value = self.get_value(&self.session_path("/screenshot")?)?;
-        parse_screenshot_response(&value)
+        let response = self.get_value(&self.session_path("/screenshot")?, "screenshot")?;
+        parse_screenshot_response(&response.value).map_err(|error| match error {
+            BrowserError::Protocol => response.protocol(),
+            error => error,
+        })
     }
 }
 
@@ -677,8 +727,11 @@ fn configure_driver_process(command: &mut Command) {
 fn parse_webdriver_response(
     response: reqwest::blocking::Response,
     max: usize,
-) -> Result<Value, BrowserError> {
+    endpoint: &'static str,
+) -> Result<WebDriverResponse, BrowserError> {
     let status = response.status();
+    let content_type =
+        webdriver_content_type(response.headers().get(reqwest::header::CONTENT_TYPE));
     let length = response.content_length().unwrap_or(0);
     if length > max as u64 {
         return Err(BrowserError::ResponseTooLarge);
@@ -691,7 +744,22 @@ fn parse_webdriver_response(
     if bytes.len() > max {
         return Err(BrowserError::ResponseTooLarge);
     }
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| BrowserError::Protocol)?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        BrowserError::ProtocolDiagnostic(webdriver_protocol_diagnostic(
+            endpoint,
+            status.as_u16(),
+            content_type,
+            &bytes,
+            None,
+        ))
+    })?;
+    let diagnostic = webdriver_protocol_diagnostic(
+        endpoint,
+        status.as_u16(),
+        content_type,
+        &bytes,
+        Some(&value),
+    );
     if !status.is_success() {
         // WebDriver error payloads often contain page text and selectors.  Do
         // not echo it. Preserve only the W3C error token needed by the bounded
@@ -699,7 +767,84 @@ fn parse_webdriver_response(
         // or protocol failure.
         return Err(classify_webdriver_error(&value));
     }
-    Ok(value)
+    Ok(WebDriverResponse { value, diagnostic })
+}
+
+fn webdriver_content_type(value: Option<&reqwest::header::HeaderValue>) -> &'static str {
+    let value = match value {
+        Some(value) => match value.to_str() {
+            Ok(value) => value,
+            Err(_) => return "invalid",
+        },
+        None => "",
+    };
+    let mime = value
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match mime.as_str() {
+        "application/json" => "application/json",
+        "" => "missing",
+        _ => "other",
+    }
+}
+
+fn webdriver_protocol_diagnostic(
+    endpoint: &'static str,
+    status: u16,
+    content_type: &'static str,
+    body: &[u8],
+    value: Option<&Value>,
+) -> WebDriverProtocolDiagnostic {
+    let (value_type, mut top_level_keys) = value.map_or(("invalid_json", Vec::new()), |value| {
+        let value_type = match value.get("value") {
+            Some(Value::Null) => "null",
+            Some(Value::Bool(_)) => "bool",
+            Some(Value::Number(_)) => "number",
+            Some(Value::String(_)) => "string",
+            Some(Value::Array(_)) => "array",
+            Some(Value::Object(_)) => "object",
+            None => "missing",
+        };
+        let mut keys = value
+            .as_object()
+            .map(|object| {
+                object
+                    .keys()
+                    .filter_map(|key| safe_top_level_key(key))
+                    .take(16)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        keys.sort();
+        (value_type, keys)
+    });
+    if top_level_keys.is_empty() {
+        top_level_keys.push("none".to_owned());
+    }
+    let body_sha256 = Sha256::digest(body)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    WebDriverProtocolDiagnostic {
+        endpoint,
+        status,
+        content_type,
+        body_len: body.len(),
+        body_sha256,
+        value_type,
+        top_level_keys,
+    }
+}
+
+fn safe_top_level_key(value: &str) -> Option<String> {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            .then_some(value.to_owned())
 }
 
 fn classify_webdriver_error(value: &Value) -> BrowserError {
@@ -767,6 +912,32 @@ mod tests {
             })),
             BrowserError::DriverRejected
         );
+    }
+
+    #[test]
+    fn protocol_diagnostic_is_metadata_only_and_bounded() {
+        let body = br#"{\"value\":{\"secret\":\"do-not-persist\"},\"sessionId\":\"ignored\",\"bad key\":true}"#;
+        let diagnostic = webdriver_protocol_diagnostic(
+            "find_child_element",
+            200,
+            "application/json",
+            body,
+            Some(&json!({
+                "value": {"secret": "do-not-persist"},
+                "sessionId": "ignored",
+                "bad key": true,
+            })),
+        );
+        let rendered = diagnostic.to_string();
+        assert_eq!(diagnostic.endpoint, "find_child_element");
+        assert_eq!(diagnostic.status, 200);
+        assert_eq!(diagnostic.content_type, "application/json");
+        assert_eq!(diagnostic.value_type, "object");
+        assert_eq!(diagnostic.top_level_keys, vec!["sessionId", "value"]);
+        assert!(rendered.contains("body_len="));
+        assert!(rendered.contains("body_sha256="));
+        assert!(!rendered.contains("do-not-persist"));
+        assert!(!rendered.contains("bad key"));
     }
 
     #[test]

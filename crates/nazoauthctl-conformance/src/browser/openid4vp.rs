@@ -1129,20 +1129,30 @@ impl OpenId4VpVerifierClient {
             nazo_operator_protocol::canonical_openid4vp_presentation_binding_sha256(
                 &response.presentation_binding,
             )
-            .map_err(|_| OpenId4VpError::EvidenceBindingMismatch)?;
-        if response.schema != 1
-            || response.transaction_id != transaction_id
-            || response.status
-                != nazo_operator_protocol::Openid4vpEvidenceAttachmentStatus::Attached
-            || response.evidence_context_sha256 != expected_sha256
-            || response.presentation_binding_sha256 != presentation_binding_sha256
-            || !presentation
-                .expected_trust_policy
-                .matches(&response.presentation_binding.trust_policy)
-            || nazo_operator_protocol::compact_sha256(&response.intent_jws)
-                != response.intent_sha256
+            .map_err(|_| attach_binding_mismatch("presentation_binding"))?;
+        if response.schema != 1 {
+            return Err(attach_binding_mismatch("schema"));
+        }
+        if response.transaction_id != transaction_id {
+            return Err(attach_binding_mismatch("transaction_id"));
+        }
+        if response.status != nazo_operator_protocol::Openid4vpEvidenceAttachmentStatus::Attached {
+            return Err(attach_binding_mismatch("status"));
+        }
+        if response.evidence_context_sha256 != expected_sha256 {
+            return Err(attach_binding_mismatch("context_sha256"));
+        }
+        if response.presentation_binding_sha256 != presentation_binding_sha256 {
+            return Err(attach_binding_mismatch("presentation_binding"));
+        }
+        if !presentation
+            .expected_trust_policy
+            .matches(&response.presentation_binding.trust_policy)
         {
-            return Err(OpenId4VpError::EvidenceBindingMismatch);
+            return Err(attach_binding_mismatch("trust_policy"));
+        }
+        if nazo_operator_protocol::compact_sha256(&response.intent_jws) != response.intent_sha256 {
+            return Err(attach_binding_mismatch("intent_sha256"));
         }
         let target_issuer = self.target_origin.as_url().as_str().trim_end_matches('/');
         let intent_audience = format!("{target_issuer}/openid4vp/verification-intents");
@@ -1163,11 +1173,11 @@ impl OpenId4VpVerifierClient {
             &verifier.instance_public_key,
             time::OffsetDateTime::now_utc().unix_timestamp(),
         )
-        .map_err(|_| OpenId4VpError::EvidenceBindingMismatch)?;
+        .map_err(|_| attach_binding_mismatch("intent_jws"))?;
         if intent.evidence_context != protocol_context
             || intent.presentation_binding != response.presentation_binding
         {
-            return Err(OpenId4VpError::EvidenceBindingMismatch);
+            return Err(attach_binding_mismatch("intent_jws_claims"));
         }
         presentation.evidence_context = Some(context);
         presentation.evidence_attachment = Some(OpenId4VpEvidenceAttachment {
@@ -1256,42 +1266,67 @@ fn verify_evidence_response(
         nazo_operator_protocol::canonical_openid4vp_presentation_binding_sha256(
             &response.presentation_binding,
         )
-        .map_err(|_| OpenId4VpError::EvidenceBindingMismatch)?;
-    if response.schema != 1
-        || response.status != nazo_operator_protocol::Openid4vpVerificationStatus::Verified
-        || response.transaction_id != expected_transaction_id
-        || response.tenant_id != verifier.tenant_id
-        || response.issuance_request_jti != issuance_request_jti
-        || response.evidence_context != *expected_context
-        || presentation_binding_sha256 != attachment.presentation_binding_sha256
-        || response.intent_sha256 != attachment.intent_sha256
-        || !valid_lower_hex(&response.receipt_sha256)
-        || response.receipt_sha256 != receipt_sha256
-        || !same_target_origin(&response.issuer, target_origin)
-        || response.deployment_id != verifier.deployment_id
-        || response.runtime_instance_id != verifier.runtime_instance_id
-        || response.instance_key_id != verifier.instance_key_id
-    {
-        return Err(OpenId4VpError::EvidenceBindingMismatch);
+        .map_err(|_| issuance_binding_mismatch("presentation_binding"))?;
+    if response.schema != 1 {
+        return Err(issuance_binding_mismatch("schema"));
+    }
+    if response.status != nazo_operator_protocol::Openid4vpVerificationStatus::Verified {
+        return Err(issuance_binding_mismatch("status"));
+    }
+    if response.transaction_id != expected_transaction_id {
+        return Err(issuance_binding_mismatch("transaction_id"));
+    }
+    if response.tenant_id != verifier.tenant_id {
+        return Err(issuance_binding_mismatch("tenant_id"));
+    }
+    if response.issuance_request_jti != issuance_request_jti {
+        return Err(issuance_binding_mismatch("issuance_request_jti"));
+    }
+    if response.evidence_context != *expected_context {
+        return Err(issuance_binding_mismatch("context_sha256"));
+    }
+    if presentation_binding_sha256 != attachment.presentation_binding_sha256 {
+        return Err(issuance_binding_mismatch("presentation_binding"));
+    }
+    if response.intent_sha256 != attachment.intent_sha256 {
+        return Err(issuance_binding_mismatch("intent_sha256"));
+    }
+    if !valid_lower_hex(&response.receipt_sha256) || response.receipt_sha256 != receipt_sha256 {
+        return Err(issuance_binding_mismatch("receipt_sha256"));
+    }
+    if !same_target_origin(&response.issuer, target_origin) {
+        return Err(issuance_binding_mismatch("issuer"));
+    }
+    if response.deployment_id != verifier.deployment_id {
+        return Err(issuance_binding_mismatch("deployment_id"));
+    }
+    if response.runtime_instance_id != verifier.runtime_instance_id {
+        return Err(issuance_binding_mismatch("runtime_instance_id"));
+    }
+    if response.instance_key_id != verifier.instance_key_id {
+        return Err(issuance_binding_mismatch("instance_key_id"));
     }
     let expected_receipt_api_url = target_origin
         .join(VP_VERIFICATION_RECEIPT_PATH)
-        .map_err(|_| OpenId4VpError::EvidenceBindingMismatch)?;
+        .map_err(|_| issuance_binding_mismatch("receipt_api_url"))?;
     if response.receipt_api_url != expected_receipt_api_url.as_str() {
-        return Err(OpenId4VpError::EvidenceBindingMismatch);
+        return Err(issuance_binding_mismatch("receipt_api_url"));
     }
-    let capability = Zeroizing::new(validate_evidence_urls(
-        &response.verification_ui_url,
-        &response.receipt_api_url,
-        target_origin,
-    )?);
+    let capability = Zeroizing::new(
+        validate_evidence_urls(
+            &response.verification_ui_url,
+            &response.receipt_api_url,
+            target_origin,
+        )
+        .map_err(|_| issuance_binding_mismatch("verification_ui_url"))?,
+    );
     let capability_sha256 =
         nazo_operator_protocol::openid4vp_verification_capability_sha256(&capability)
-            .map_err(|_| OpenId4VpError::EvidenceBindingMismatch)?;
+            .map_err(|_| issuance_binding_mismatch("capability_sha256"))?;
     let protocol_context = protocol_evidence_context(&response.evidence_context);
     let evidence_context_sha256 =
         nazo_operator_protocol::canonical_openid4vp_evidence_context_sha256(&protocol_context)
-            .map_err(|_| OpenId4VpError::EvidenceBindingMismatch)?;
+            .map_err(|_| issuance_binding_mismatch("context_sha256"))?;
     let receipt_id = response.receipt_id.to_string();
     let transaction_id = response.transaction_id.to_string();
     let expected = nazo_operator_protocol::Openid4vpVerificationReceiptExpectations {
@@ -1316,7 +1351,7 @@ fn verify_evidence_response(
         &verifier.instance_public_key,
         now,
     )
-    .map_err(|_| OpenId4VpError::EvidenceBindingMismatch)?;
+    .map_err(|_| issuance_binding_mismatch("receipt_jws"))?;
     if receipt.schema != response.schema
         || receipt.completed_at != response.completed_at
         || receipt.tenant_id != response.tenant_id
@@ -1324,7 +1359,7 @@ fn verify_evidence_response(
         || receipt.presentation_binding != response.presentation_binding
         || receipt.intent_sha256 != response.intent_sha256
     {
-        return Err(OpenId4VpError::EvidenceBindingMismatch);
+        return Err(issuance_binding_mismatch("receipt_jws_claims"));
     }
     validate_evidence_window(
         &response.completed_at,
@@ -1332,7 +1367,8 @@ fn verify_evidence_response(
         receipt.iat,
         receipt.exp,
         response.verification_ttl_seconds,
-    )?;
+    )
+    .map_err(|_| issuance_binding_mismatch("receipt_window"))?;
     Ok(OpenId4VpVerificationEvidence {
         receipt: OpenId4VpVerificationReceiptProvenance {
             issuer: response.issuer,
@@ -1472,6 +1508,35 @@ fn validate_evidence_window(
     Ok(())
 }
 
+/// Safe-only evidence-binding discriminator retained with a failed run.  The
+/// actual values (including compact JWSes, URLs, and management tokens) never
+/// cross this boundary.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct OpenId4VpEvidenceBindingDiagnostic {
+    pub stage: &'static str,
+    pub field: &'static str,
+}
+
+impl std::fmt::Display for OpenId4VpEvidenceBindingDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "stage={} field={}", self.stage, self.field)
+    }
+}
+
+fn attach_binding_mismatch(field: &'static str) -> OpenId4VpError {
+    OpenId4VpError::EvidenceBindingDiagnostic(OpenId4VpEvidenceBindingDiagnostic {
+        stage: "attach",
+        field,
+    })
+}
+
+fn issuance_binding_mismatch(field: &'static str) -> OpenId4VpError {
+    OpenId4VpError::EvidenceBindingDiagnostic(OpenId4VpEvidenceBindingDiagnostic {
+        stage: "issuance",
+        field,
+    })
+}
+
 #[derive(Debug, Error, Clone, Copy, Eq, PartialEq)]
 pub enum OpenId4VpError {
     #[error("OpenID4VP verifier input is invalid")]
@@ -1510,6 +1575,8 @@ pub enum OpenId4VpError {
     MalformedEvidenceReceipt,
     #[error("OpenID4VP verification evidence does not match this run")]
     EvidenceBindingMismatch,
+    #[error("OpenID4VP verification evidence does not match this run [{0}]")]
+    EvidenceBindingDiagnostic(OpenId4VpEvidenceBindingDiagnostic),
 }
 
 #[cfg(test)]
@@ -1675,6 +1742,22 @@ mod tests {
                 resource_digest: None,
             }
         ));
+    }
+
+    #[test]
+    fn evidence_binding_diagnostics_identify_only_safe_stage_and_field() {
+        let attach = attach_binding_mismatch("trust_policy");
+        assert_eq!(
+            attach,
+            OpenId4VpError::EvidenceBindingDiagnostic(OpenId4VpEvidenceBindingDiagnostic {
+                stage: "attach",
+                field: "trust_policy",
+            })
+        );
+        let issuance = issuance_binding_mismatch("receipt_jws_claims");
+        assert!(issuance.to_string().contains("stage=issuance"));
+        assert!(issuance.to_string().contains("field=receipt_jws_claims"));
+        assert!(!issuance.to_string().contains("eyJ"));
     }
 
     struct RetryingCreateTransport {
@@ -2450,7 +2533,7 @@ mod tests {
         let mut projection_mismatch = response.clone();
         projection_mismatch["tenant_id"] =
             Value::String("00000000-0000-4000-8000-000000000099".to_owned());
-        assert!(
+        assert_eq!(
             verify_evidence_response(
                 parse(projection_mismatch),
                 transaction_id,
@@ -2460,7 +2543,8 @@ mod tests {
                 &runtime_verifier,
                 target.as_url(),
             )
-            .is_err()
+            .expect_err("tenant projection mismatch"),
+            issuance_binding_mismatch("tenant_id")
         );
         let transport = Arc::new(VerifierTransport {
             request: std::sync::Mutex::new(None),
