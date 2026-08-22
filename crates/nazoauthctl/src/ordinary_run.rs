@@ -28,12 +28,12 @@ use nazoauthctl_conformance::{
     OidfProviderExecutionBinding, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
     OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard,
     RunControl, StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionManifest,
-    SuiteRetentionPlan, SuiteRetentionScreenshotManifest, TenantResourceApplyOutput,
-    TenantResourceReceiptIdentity, TenantResourceRecoveryBinding, TtyRenderer, WebDriverClient,
-    WebDriverEndpoint, authorize_oidf_driver_execution, open_cached_oidf_driver_plan,
-    read_artifact_driver, read_artifact_matrix, read_compact_manifest, recover_suite_resources,
-    validate_private_evidence_directory, verify_oidf_artifact,
-    write_private_provider_evidence_bundle, write_review_screenshot_manifest,
+    SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
+    TenantResourceApplyOutput, TenantResourceReceiptIdentity, TenantResourceRecoveryBinding,
+    TtyRenderer, WebDriverClient, WebDriverEndpoint, authorize_oidf_driver_execution,
+    open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
+    read_compact_manifest, recover_suite_resources, validate_private_evidence_directory,
+    verify_oidf_artifact, write_private_provider_evidence_bundle, write_review_screenshot_manifest,
 };
 use nazoauthctl_core::tenant_resources::{
     TenantResourceCapabilitySession, TenantResourceClient, TenantResourceClientError,
@@ -553,11 +553,6 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             None
         }
     };
-    // Provider evidence is part of the retention commit boundary: a retained
-    // Suite allocation must never outlive the local evidence that authorizes
-    // and identifies the run.  Write it while the journal is still Prepared,
-    // so any failure retains plan ownership locally and falls back to exact
-    // Suite cleanup below.
     let cleanup_complete = cleanup_evidence.is_some()
         && proxy_cleanup_complete
         && !errors
@@ -565,22 +560,69 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             .any(|error| error.starts_with("resource-cleanup="));
     let retention_commit_possible =
         retention_eligible && proxy_cleanup_complete && cleanup_evidence.is_some();
-    // The provider bundle is staged before ownership transfer, but its report
-    // must be byte-for-byte the same successful Retained projection later
-    // emitted to stdout. A commit failure leaves this unreferenced local
-    // bundle behind and follows Prepared cleanup; it never publishes a
-    // misleading retained manifest.
-    if retention_commit_possible {
-        if let Some(report) = report.as_mut() {
-            report.orchestration_integrity.retention_eligible = true;
-            report.orchestration_integrity.suite_resources_settled = true;
-            report.orchestration_integrity.cleanup_complete = false;
-            report.local_success = report.errors.is_empty()
-                && report.orchestration_integrity.all_modules_instantiated
-                && report.orchestration_integrity.all_modules_terminal
-                && report.orchestration_integrity.suite_resources_settled;
+    // Screenshot evidence, not the optional provider bundle, is the durable
+    // certification-retention boundary.  The screenshot manifest was bound
+    // to the Prepared journal above and is revalidated by stage, commit,
+    // publish, recovery claim, and finish.  Provider evidence is written only
+    // after ownership has transferred and the final report is fixed.
+    let retention_committed = if retention_commit_possible {
+        match (|| -> anyhow::Result<()> {
+            recovery.stage_suite_retention_manifest()?;
+            recovery.commit_suite_plan_retention()?;
+            let manifest_path = recovery.publish_committed_suite_retention_manifest()?;
+            eprintln!(
+                "Suite plans retained for certification review: review/publish them in the official Suite UI, then use a controlled deletion procedure; manifest={}",
+                manifest_path.display()
+            );
+            Ok(())
+        })() {
+            Ok(()) => true,
+            Err(error) => {
+                errors.push(format!("suite-retention={error:#}"));
+                // `commit_suite_plan_retention` transfers plan ownership and
+                // compacts the journal before final publication. A later
+                // publish failure is recoverable Retained state, not ordinary
+                // cleanup: deleting here would lose exact ownership and make
+                // a retry unsafe. Only Prepared failures retain plan IDs and
+                // may fall back to exact deletion.
+                if !recovery.suite_retention_committed() {
+                    cleanup_unretained_suite(&mut recovery, &suite_client)?;
+                }
+                false
+            }
         }
+    } else {
+        cleanup_unretained_suite(&mut recovery, &suite_client)?;
+        false
+    };
+    if let Some(report) = report.as_mut() {
+        report.orchestration_integrity.retention_eligible = retention_eligible;
+        report.orchestration_integrity.retention_committed = recovery.suite_retention_committed();
+        report.orchestration_integrity.suite_resources_settled = recovery.suite_cleanup_complete();
+        report.orchestration_integrity.cleanup_complete = !recovery.suite_retention_committed()
+            && !retention_committed
+            && report.orchestration_integrity.suite_resources_settled;
+        if errors
+            .iter()
+            .any(|error| error.starts_with("suite-retention"))
+        {
+            report.errors.extend(
+                errors
+                    .iter()
+                    .filter(|error| error.starts_with("suite-retention"))
+                    .cloned(),
+            );
+        }
+        report.local_success = report.errors.is_empty()
+            && report.orchestration_integrity.all_modules_instantiated
+            && report.orchestration_integrity.all_modules_terminal
+            && report.orchestration_integrity.suite_resources_settled;
     }
+    // Ordinary evidence is intentionally post-retention: a writer failure
+    // must not delete official Suite plans after their journal-owned
+    // retention transition.  The report above is the exact report supplied to
+    // a successful writer and to FinalOutput; a failed writer is represented
+    // only by outer diagnostics and an absent receipt.
     let mut evidence = None;
     if let (Some(report), Some(directory), Some(cleanup_evidence)) = (
         report.as_ref(),
@@ -620,64 +662,14 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         };
         match write_private_provider_evidence_bundle(report, directory, &identity) {
             Ok(receipt) => evidence = Some(receipt),
-            Err(error) => {
-                retention_eligible = false;
-                errors.push(format!("evidence={error}"));
-            }
+            Err(error) => errors.push(format!("evidence={error}")),
         }
     }
-    let retention_committed = if retention_commit_possible && evidence.is_some() {
-        match (|| -> anyhow::Result<()> {
-            recovery.stage_suite_retention_manifest()?;
-            recovery.commit_suite_plan_retention()?;
-            let manifest_path = recovery.publish_committed_suite_retention_manifest()?;
-            eprintln!(
-                "Suite plans retained for certification review: review/publish them in the official Suite UI, then use a controlled deletion procedure; manifest={}",
-                manifest_path.display()
-            );
-            Ok(())
-        })() {
-            Ok(()) => true,
-            Err(error) => {
-                errors.push(format!("suite-retention={error:#}"));
-                // `commit_suite_plan_retention` transfers plan ownership and
-                // compacts the journal before final publication. A later
-                // publish failure is recoverable Retained state, not ordinary
-                // cleanup: deleting here would lose exact ownership and make
-                // a retry unsafe. Only Prepared failures retain plan IDs and
-                // may fall back to exact deletion.
-                if !recovery.suite_retention_committed() {
-                    cleanup_unretained_suite(&mut recovery, &suite_client)?;
-                }
-                false
-            }
-        }
+    let retention = if retention_committed {
+        recovery.suite_retention_manifest_receipt()
     } else {
-        cleanup_unretained_suite(&mut recovery, &suite_client)?;
-        false
+        None
     };
-    if let Some(report) = report.as_mut() {
-        report.orchestration_integrity.retention_eligible = retention_eligible;
-        report.orchestration_integrity.suite_resources_settled = recovery.suite_cleanup_complete();
-        report.orchestration_integrity.cleanup_complete = !recovery.suite_retention_committed()
-            && !retention_committed
-            && report.orchestration_integrity.suite_resources_settled;
-        if errors
-            .iter()
-            .any(|error| error.starts_with("suite-retention"))
-        {
-            report.errors.extend(
-                errors
-                    .iter()
-                    .filter(|error| error.starts_with("suite-retention"))
-                    .cloned(),
-            );
-        }
-        report.local_success = report.errors.is_empty()
-            && report.orchestration_integrity.all_modules_instantiated
-            && report.orchestration_integrity.all_modules_terminal
-            && report.orchestration_integrity.suite_resources_settled;
-    }
     if cleanup_evidence.is_some() && proxy_cleanup_complete && recovery.suite_cleanup_complete() {
         recovery.finish()?;
     }
@@ -695,6 +687,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         success,
         errors,
         report,
+        retention,
         evidence,
         deployment: deployment_report,
     };
@@ -718,6 +711,8 @@ struct FinalOutput {
     success: bool,
     errors: Vec<String>,
     report: Option<nazoauthctl_conformance::ConformanceReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retention: Option<SuiteRetentionManifestReceipt>,
     evidence: Option<EvidenceBundleReceipt>,
     deployment: DeploymentReport,
 }

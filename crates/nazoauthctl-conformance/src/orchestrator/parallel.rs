@@ -444,6 +444,7 @@ fn merge_reports(
         cleanup_complete,
         retention_requested,
         retention_eligible,
+        retention_committed: false,
         suite_resources_settled: cleanup_complete,
     };
     let local_success =

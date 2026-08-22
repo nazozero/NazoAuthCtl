@@ -974,6 +974,7 @@ mod tests {
                 cleanup_complete: true,
                 retention_requested: false,
                 retention_eligible: false,
+                retention_committed: false,
                 suite_resources_settled: true,
             },
             progress: ProgressSnapshot {
@@ -1365,8 +1366,14 @@ mod tests {
         let root = temp_root.join(format!("nazoauth-provider-evidence-{}", Uuid::now_v7()));
         let mut identity = identity();
         identity.provider = Some(provider());
-        let receipt = write_private_provider_evidence_bundle(&report(), &root, &identity)
+        let report = report();
+        let expected_report = report.to_json_bytes().expect("serialize public report");
+        let receipt = write_private_provider_evidence_bundle(&report, &root, &identity)
             .expect("ordinary provider evidence bundle");
+        assert_eq!(
+            std::fs::read(receipt.directory.join("report.json")).expect("public report"),
+            expected_report
+        );
         let manifest =
             std::fs::read_to_string(receipt.directory.join("manifest.json")).expect("manifest");
         let manifest: serde_json::Value = serde_json::from_str(&manifest).expect("JSON manifest");

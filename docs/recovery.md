@@ -125,6 +125,11 @@ deletion; a retained journal with a missing or digest-mismatched manifest fails
 closed and never deletes the recorded plans. Operators review/publish retained
 plans in the official UI and must use a later controlled deletion procedure;
 ctl does not roll them back when unrelated cleanup subsequently fails.
+The screenshot manifest is part of that ownership proof and is rechecked at
+prepare, transfer, claim, and finish. Provider evidence is written only after
+the retained manifest is committed and published. Its failure is reported as
+missing local evidence, but never converts retained plans into cleanup or
+authorizes their deletion.
 Default ordinary runs continue to write schema-2 journals without retention
 fields. A requested retention upgrades that live journal to schema 3; an older
 ctl binary rejects schema 3 fail-closed, so operators must not downgrade the

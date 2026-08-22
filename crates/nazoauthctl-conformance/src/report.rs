@@ -132,6 +132,10 @@ pub struct OrchestrationIntegrity {
     /// Every created module reached a terminal state with no orchestration error.
     #[serde(default)]
     pub retention_eligible: bool,
+    /// Exact Suite plan ownership was transferred to a retained manifest.
+    /// This is deliberately distinct from ordinary cleanup completion.
+    #[serde(default)]
+    pub retention_committed: bool,
     /// Set only after ordinary cleanup transfers exact plan ownership.
     #[serde(default)]
     pub suite_resources_settled: bool,
@@ -643,6 +647,7 @@ mod tests {
                 cleanup_complete: true,
                 retention_requested: false,
                 retention_eligible: false,
+                retention_committed: false,
                 suite_resources_settled: true,
             },
             progress: ProgressSnapshot {

@@ -207,6 +207,14 @@ struct SuiteRetentionRecord {
     manifest_path: PathBuf,
 }
 
+/// The non-secret, root-owned manifest that now owns retained Suite plans.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuiteRetentionManifestReceipt {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
 /// Suite plan ownership remains active until all non-Suite cleanup succeeds.
 /// `RetentionPrepared` is intentionally recoverable as ordinary deletion;
 /// only `Retained` transfers plan ownership to the verified manifest.
@@ -1019,6 +1027,13 @@ impl ConformanceRecoveryGuard {
                 bail!("Suite retention is not valid for a legacy journal")
             }
         };
+        if let Some(screenshot) = &record.manifest.review_screenshot_manifest {
+            validate_review_screenshot_manifest_binding(
+                screenshot,
+                self.tenant_resource_binding()
+                    .context("Suite retention has no ordinary binding")?,
+            )?;
+        }
         let bytes =
             crate::secure_file::read_bounded(&pending, MAX_SUITE_RETENTION_MANIFEST_BYTES, true)
                 .map_err(|error| {
@@ -1091,6 +1106,24 @@ impl ConformanceRecoveryGuard {
                     None
                 }
             },
+        }
+    }
+
+    /// Returns a receipt only after exact Suite plan ownership has transferred.
+    pub fn suite_retention_manifest_receipt(&self) -> Option<SuiteRetentionManifestReceipt> {
+        match &self.journal {
+            RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
+                SuiteRetentionDisposition::Retained { record } => {
+                    Some(SuiteRetentionManifestReceipt {
+                        path: record.manifest_path.clone(),
+                        sha256: record.manifest_sha256.clone(),
+                    })
+                }
+                SuiteRetentionDisposition::Active { .. }
+                | SuiteRetentionDisposition::RetentionPrepared { .. }
+                | SuiteRetentionDisposition::Cleaned => None,
+            },
+            RecoveryJournal::Legacy(_) => None,
         }
     }
 
@@ -3051,6 +3084,91 @@ mod tests {
         assert!(!String::from_utf8_lossy(&manifest_bytes).contains("capability.header.payload"));
         drop(guard);
         assert_eq!(store.claim_pending().expect("retained recovery").len(), 1);
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_suite_screenshot_manifest_tamper_blocks_commit_and_finish() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!("nazoauth-retention-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let evidence = root.join("evidence");
+        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
+        let binding = tenant_resource_binding(&root);
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("intent");
+        guard
+            .begin_suite_create_with_retention(
+                "https://www.certification.openid.net",
+                "suite-intent-1",
+                true,
+            )
+            .expect("Suite intent");
+        guard
+            .record_suite_plan(
+                "https://www.certification.openid.net",
+                "suite-intent-1",
+                "suite-plan-1",
+            )
+            .expect("Suite plan");
+
+        let screenshot_directory = evidence.join("review-screenshot-manifests");
+        crate::secure_file::ensure_directory(&screenshot_directory, true)
+            .expect("screenshot manifest directory");
+        let screenshot_path = screenshot_directory.join(format!("{}.json", binding.request_jti));
+        let original = br#"{\"schema\":1}"#;
+        crate::secure_file::write_atomic(&screenshot_path, original, true)
+            .expect("write screenshot manifest");
+        let manifest = SuiteRetentionManifest {
+            schema: SUITE_RETENTION_MANIFEST_SCHEMA,
+            suite_origin: "https://www.certification.openid.net".to_owned(),
+            artifact_digest: "a".repeat(64),
+            matrix_sha256: "b".repeat(64),
+            deployment_id: binding.deployment_id.clone(),
+            tenant_id: binding.tenant_id.clone(),
+            run_id: binding.request_jti.clone(),
+            review_screenshot_manifest: Some(SuiteRetentionScreenshotManifest {
+                path: screenshot_path.clone(),
+                sha256: sha256_hex(&original[..]),
+            }),
+            plans: vec![SuiteRetentionPlan {
+                matrix_plan_id: "matrix-plan-1".to_owned(),
+                suite_plan_id: "suite-plan-1".to_owned(),
+                plan_name: "Certification plan".to_owned(),
+                plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256("matrix-plan-1"),
+            }],
+        };
+        let final_path = evidence.join(format!("retained-suite-{}.json", binding.request_jti));
+        guard
+            .prepare_suite_plan_retention(manifest, final_path)
+            .expect("prepare retention");
+        guard
+            .stage_suite_retention_manifest()
+            .expect("stage retention manifest");
+        guard
+            .record_tenant_resource_receipt(tenant_resource_receipt(&binding))
+            .expect("receipt");
+        guard
+            .record_tenant_resource_enumeration(Vec::new())
+            .expect("enumeration");
+        crate::secure_file::write_atomic(&screenshot_path, b"tampered", true)
+            .expect("tamper screenshot manifest");
+        assert!(guard.commit_suite_plan_retention().is_err());
+
+        crate::secure_file::write_atomic(&screenshot_path, original, true)
+            .expect("restore screenshot manifest");
+        guard
+            .commit_suite_plan_retention()
+            .expect("commit retention");
+        guard
+            .publish_committed_suite_retention_manifest()
+            .expect("publish retention manifest");
+        crate::secure_file::write_atomic(&screenshot_path, b"tampered", true)
+            .expect("tamper retained screenshot manifest");
+        assert!(guard.finish().is_err());
+        drop(guard);
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 
