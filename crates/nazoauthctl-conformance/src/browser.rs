@@ -1365,12 +1365,12 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             &shell_url,
             None,
             Some(evidence.ui_url_diagnostic.authority_has_at),
-            self.navigate(&shell_url),
+            self.navigate_openid4vp_result_shell(&shell_url),
         )?;
         vp_result_driver(
             "canonical-shell-current-url",
             None,
-            self.validate_openid4vp_result_url(&shell_url),
+            self.validate_openid4vp_result_shell_url(&shell_url),
         )?;
         self.wait_for_openid4vp_result_shell()?;
         vp_result_driver_for_url(
@@ -1490,6 +1490,38 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
 
     fn validate_openid4vp_result_url(&mut self, expected: &Url) -> Result<(), BrowserError> {
         let current = self.ensure_current_url()?;
+        if !self.policy.target_origin.allows(&current)
+            || current.path() != "/ui/verification-result"
+            || !current.username().is_empty()
+            || current.password().is_some()
+            || current.query().is_some()
+            || current.fragment().is_some()
+            || current != *expected
+        {
+            return Err(self.navigation_violation(self.last_url.as_ref(), &current));
+        }
+        Ok(())
+    }
+
+    /// Navigate to the capability-free NazoAuthWeb shell without routing the
+    /// first post-navigation observation through the general redirect helper.
+    /// That first observation must still contain any unexpected fragment or
+    /// query before a browser app can scrub it.
+    fn navigate_openid4vp_result_shell(&mut self, expected: &Url) -> Result<(), BrowserError> {
+        self.policy
+            .validate_url(expected)
+            .map_err(|_| self.navigation_violation(self.last_url.as_ref(), expected))?;
+        self.redirects = 0;
+        self.last_url = Some(expected.clone());
+        self.driver.navigate(expected)
+    }
+
+    /// Strictly validate the *first* URL observed after the canonical shell
+    /// navigation. Unlike `validate_openid4vp_result_url`, this deliberately
+    /// does not poll or use `ensure_current_url`: a redirect that injects a
+    /// receipt-looking fragment must fail before capability navigation.
+    fn validate_openid4vp_result_shell_url(&mut self, expected: &Url) -> Result<(), BrowserError> {
+        let current = self.driver.current_url()?;
         if !self.policy.target_origin.allows(&current)
             || current.path() != "/ui/verification-result"
             || !current.username().is_empty()
@@ -2387,8 +2419,11 @@ mod tests {
         }
 
         fn current_url(&mut self) -> Result<Url, BrowserError> {
-            if self.fragment_reads_before_scrub > 0 {
+            if self.receipt_navigation_seen && self.fragment_reads_before_scrub > 0 {
                 self.fragment_reads_before_scrub -= 1;
+                return Ok(self.current.clone());
+            }
+            if !self.receipt_navigation_seen {
                 return Ok(self.current.clone());
             }
             let mut current = self.current.clone();
@@ -2912,7 +2947,7 @@ mod tests {
                 "cross-origin-redirect",
                 true,
                 Some("https://evil.example/ui/verification-result"),
-                "canonical-shell-navigate",
+                "canonical-shell-current-url",
             ),
             (
                 "query-redirect",
@@ -2957,6 +2992,14 @@ mod tests {
             assert_eq!(diagnostic.stage, expected_stage, "case={case}");
             assert_eq!(executor.driver_mut().navigated.len(), 1, "case={case}");
             assert!(executor.driver_mut().navigated[0].fragment().is_none());
+            assert!(
+                executor
+                    .driver_mut()
+                    .navigated
+                    .iter()
+                    .all(|url| url.fragment().is_none()),
+                "case={case} must not navigate with the receipt capability"
+            );
             std::fs::remove_dir_all(root).expect("remove root");
         }
     }
