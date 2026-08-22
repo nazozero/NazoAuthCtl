@@ -2962,9 +2962,11 @@ mod tests {
             let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
             let mut policy = BrowserPolicy::new(target, suite).expect("policy");
             if !shell_available {
-                let mut limits = BrowserLimits::default();
-                limits.max_step_timeout = Duration::from_millis(1);
-                limits.poll_interval = Duration::from_millis(1);
+                let limits = BrowserLimits {
+                    max_step_timeout: Duration::from_millis(1),
+                    poll_interval: Duration::from_millis(1),
+                    ..BrowserLimits::default()
+                };
                 policy = policy.with_limits(limits).expect("short shell policy");
             }
             let mut executor = BrowserExecutor::new(driver, policy);
