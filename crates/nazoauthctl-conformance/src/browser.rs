@@ -2720,14 +2720,21 @@ mod tests {
             }))
             .expect("entry"),
         ];
+        let error = executor
+            .execute(
+                &Url::parse("https://issuer.example/authorize?x=1").expect("url"),
+                &entries,
+            )
+            .expect_err("cross-origin redirect");
+        let BrowserError::CrossOriginNavigationDiagnostic(diagnostic) = error else {
+            panic!("expected cross-origin navigation diagnostic")
+        };
+        assert_eq!(diagnostic.from, "https://issuer.example/authorize");
+        assert_eq!(diagnostic.to, "https://evil.example/ui/auth");
+        assert_eq!(diagnostic.selected_entry, Some(0));
         assert_eq!(
-            executor
-                .execute(
-                    &Url::parse("https://issuer.example/authorize?x=1").expect("url"),
-                    &entries,
-                )
-                .expect_err("cross-origin redirect"),
-            BrowserError::CrossOriginNavigation
+            diagnostic.matcher_sha256_prefix,
+            Some(sha256_hex("https://issuer.example/authorize*".as_bytes())[..12].to_owned())
         );
     }
 }
