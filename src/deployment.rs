@@ -1,12 +1,13 @@
 use std::{
-    #[cfg(test)]
-    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, File},
     io::ErrorKind,
     path::{Path, PathBuf},
 };
+
+#[cfg(test)]
+use std::cell::RefCell;
 
 #[cfg(test)]
 thread_local! {
@@ -34,9 +35,10 @@ pub(crate) fn scoped_test_system_roots(
     state_root: PathBuf,
     break_glass_root: PathBuf,
 ) -> TestSystemRootsGuard {
-    TestSystemRootsGuard(TEST_SYSTEM_ROOTS.with(|roots| {
-        roots.replace(Some((config_root, state_root, break_glass_root)))
-    }))
+    TestSystemRootsGuard(
+        TEST_SYSTEM_ROOTS
+            .with(|roots| roots.replace(Some((config_root, state_root, break_glass_root)))),
+    )
 }
 
 use anyhow::{Context as _, bail};
