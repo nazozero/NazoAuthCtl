@@ -85,6 +85,11 @@ DECLARE
         'openid4vci_pre_authorized_code_consumptions',
         'ciba_decision_bindings'
     ];
+    -- This idempotency ledger is write-once from the runtime's perspective.
+    -- It deliberately receives no read, update, or delete privilege.
+    optional_insert_tables CONSTANT text[] := ARRAY[
+        'openid4vp_verification_issuance_jtis'
+    ];
     append_tables CONSTANT text[] := ARRAY[
         'scim_audit_events', 'scim_security_events',
         'scim_security_event_receipts', 'identity_security_events',
@@ -114,7 +119,7 @@ DECLARE
     sequence_record record;
 BEGIN
     known_tables := full_dml_tables || optional_full_dml_tables
-        || append_tables || denied_tables
+        || optional_insert_tables || append_tables || denied_tables
         || ARRAY['__diesel_schema_migrations'];
 
     SELECT array_agg(candidate.relname ORDER BY candidate.relname)
@@ -154,6 +159,14 @@ BEGIN
             'GRANT SELECT, INSERT ON TABLE public.%I TO nazoauth_runtime',
             table_name
         );
+    END LOOP;
+    FOREACH table_name IN ARRAY optional_insert_tables LOOP
+        IF to_regclass(format('public.%I', table_name)) IS NOT NULL THEN
+            EXECUTE format(
+                'GRANT INSERT ON TABLE public.%I TO nazoauth_runtime',
+                table_name
+            );
+        END IF;
     END LOOP;
     FOREACH table_name IN ARRAY cleanup_tables LOOP
         EXECUTE format(

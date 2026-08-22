@@ -1647,6 +1647,7 @@ fn managed_runtime_database_grants_keep_the_audit_ledger_api_least_privileged() 
 
     assert!(sql.contains("full_dml_tables CONSTANT text[]"));
     assert!(sql.contains("optional_full_dml_tables CONSTANT text[]"));
+    assert!(sql.contains("optional_insert_tables CONSTANT text[]"));
     assert!(sql.contains("append_tables CONSTANT text[]"));
     assert!(sql.contains("runtime table privilege allowlist is incomplete"));
     for table in [
@@ -1659,6 +1660,7 @@ fn managed_runtime_database_grants_keep_the_audit_ledger_api_least_privileged() 
         "openid4vc_trust_policies",
         "openid4vc_trust_policy_clients",
         "ciba_decision_bindings",
+        "openid4vp_verification_issuance_jtis",
         "security_audit_event_outbox",
     ] {
         assert!(
@@ -1680,12 +1682,21 @@ fn managed_runtime_database_grants_keep_the_audit_ledger_api_least_privileged() 
         .nth(1)
         .and_then(|section| section.split("append_tables CONSTANT text[]").next())
         .expect("optional full DML table section");
+    let optional_insert_tables = sql
+        .split("optional_insert_tables CONSTANT text[]")
+        .nth(1)
+        .and_then(|section| section.split("append_tables CONSTANT text[]").next())
+        .expect("optional insert table section");
     assert!(!full_dml_tables.contains("ciba_decision_bindings"));
     assert!(optional_full_dml_tables.contains("ciba_decision_bindings"));
+    assert!(optional_insert_tables.contains("openid4vp_verification_issuance_jtis"));
+    assert!(!full_dml_tables.contains("openid4vp_verification_issuance_jtis"));
+    assert!(!optional_full_dml_tables.contains("openid4vp_verification_issuance_jtis"));
     assert!(
         sql.contains("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO nazoauth_runtime")
     );
     assert!(sql.contains("GRANT SELECT, INSERT ON TABLE public.%I TO nazoauth_runtime"));
+    assert!(sql.contains("GRANT INSERT ON TABLE public.%I TO nazoauth_runtime"));
     assert!(sql.contains("GRANT DELETE ON TABLE public.%I TO nazoauth_runtime"));
     assert!(!sql.contains("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES"));
     assert!(!sql.contains("GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES"));
