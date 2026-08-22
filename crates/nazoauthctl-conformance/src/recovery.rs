@@ -3382,6 +3382,7 @@ mod tests {
     fn typed_screenshot_manifest_binds_real_png_receipt_and_exact_directory() {
         let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
         let root = temp_root.join(format!("nazoauth-screenshot-{}", uuid::Uuid::now_v7()));
+        crate::secure_file::ensure_directory(&root, true).expect("test root");
         let evidence = root.join("evidence");
         crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
         let binding = tenant_resource_binding(&root);
