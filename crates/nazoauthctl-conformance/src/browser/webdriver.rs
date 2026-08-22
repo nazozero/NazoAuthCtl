@@ -281,6 +281,11 @@ impl BrowserDriver for WebDriverClient {
             .map(|_| ())
     }
 
+    fn refresh(&mut self) -> Result<(), BrowserError> {
+        let path = self.session_path("/refresh")?;
+        self.post_value(&path, &json!({}), "refresh").map(|_| ())
+    }
+
     fn current_url(&mut self) -> Result<Url, BrowserError> {
         let response = self.get_value(&self.session_path("/url")?, "current_url")?;
         let text = response
@@ -600,6 +605,9 @@ impl BrowserDriver for ManagedWebDriver {
     fn navigate(&mut self, url: &Url) -> Result<(), BrowserError> {
         self.client.navigate(url)
     }
+    fn refresh(&mut self) -> Result<(), BrowserError> {
+        self.client.refresh()
+    }
     fn current_url(&mut self) -> Result<Url, BrowserError> {
         self.client.current_url()
     }
@@ -873,6 +881,60 @@ mod tests {
     use super::*;
     use base64::Engine as _;
 
+    fn webdriver_test_server(
+        body: &'static str,
+    ) -> (WebDriverEndpoint, std::thread::JoinHandle<String>) {
+        let listener =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test connection");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("test read timeout");
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0u8; 512];
+                let read = stream.read(&mut chunk).expect("test request read");
+                assert_ne!(read, 0, "complete test request");
+                bytes.extend_from_slice(&chunk[..read]);
+                if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&bytes[..header_end]).expect("ASCII headers");
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then_some(value.trim())
+                })
+                .and_then(|value| value.parse::<usize>().ok())
+                .expect("content length");
+            while bytes.len() < header_end + content_length {
+                let mut chunk = [0u8; 512];
+                let read = stream.read(&mut chunk).expect("test request body");
+                assert_ne!(read, 0, "complete test body");
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            use std::io::Write as _;
+            stream
+                .write_all(response.as_bytes())
+                .expect("test response");
+            stream.flush().expect("flush test response");
+            String::from_utf8(bytes).expect("request UTF-8")
+        });
+        (
+            WebDriverEndpoint::parse(&format!("http://{address}")).expect("test endpoint"),
+            handle,
+        )
+    }
+
     fn valid_png() -> Vec<u8> {
         let mut bytes = Vec::new();
         let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
@@ -947,6 +1009,21 @@ mod tests {
         assert!(!valid_session_id("session?01"));
         assert!(!valid_session_id("session 01"));
         assert!(!valid_session_id(&"a".repeat(MAX_SESSION_ID_BYTES + 1)));
+    }
+
+    #[test]
+    fn w3c_refresh_posts_an_empty_object_to_the_session_refresh_endpoint() {
+        let (endpoint, server) = webdriver_test_server(r#"{"value":null}"#);
+        let mut client =
+            WebDriverClient::connect(endpoint, Duration::from_secs(1)).expect("WebDriver client");
+        client.session_id = Some("session-01".to_owned());
+
+        client.refresh().expect("W3C refresh response");
+        client.session_id = None;
+
+        let request = server.join().expect("test server");
+        assert!(request.starts_with("POST /session/session-01/refresh HTTP/1.1\r\n"));
+        assert!(request.ends_with("\r\n\r\n{}"));
     }
 
     #[test]

@@ -313,6 +313,12 @@ pub trait BrowserDriver: Send {
     }
 
     fn navigate(&mut self, url: &Url) -> Result<(), BrowserError>;
+    /// Reload the current document without accepting a new destination. This
+    /// is used only after the caller has independently established an exact,
+    /// capability-free document identity.
+    fn refresh(&mut self) -> Result<(), BrowserError> {
+        Err(BrowserError::UnsupportedCommand)
+    }
     fn current_url(&mut self) -> Result<Url, BrowserError>;
     fn page_source(&mut self) -> Result<String, BrowserError>;
     fn find_element(&mut self, selector: &BrowserSelector) -> Result<String, BrowserError>;
@@ -1359,14 +1365,30 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         let mut shell_url = ui_url.clone();
         shell_url.set_query(None);
         shell_url.set_fragment(None);
-        vp_result_driver_for_url(
-            "canonical-shell-navigate",
+        let entry_url = vp_result_driver(
+            "canonical-shell-entry-current-url",
             None,
-            &shell_url,
-            None,
-            Some(evidence.ui_url_diagnostic.authority_has_at),
-            self.navigate_openid4vp_result_shell(&shell_url),
+            self.ensure_current_url(),
         )?;
+        if entry_url == shell_url {
+            vp_result_driver_for_url(
+                "canonical-shell-refresh",
+                None,
+                &shell_url,
+                None,
+                Some(evidence.ui_url_diagnostic.authority_has_at),
+                self.refresh_openid4vp_result_shell(&shell_url),
+            )?;
+        } else {
+            vp_result_driver_for_url(
+                "canonical-shell-navigate",
+                None,
+                &shell_url,
+                None,
+                Some(evidence.ui_url_diagnostic.authority_has_at),
+                self.navigate_openid4vp_result_shell(&shell_url),
+            )?;
+        }
         vp_result_driver(
             "canonical-shell-current-url",
             None,
@@ -1499,6 +1521,18 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         self.redirects = 0;
         self.last_url = Some(expected.clone());
         self.driver.navigate(expected)
+    }
+
+    /// Reload only an already verified, canonical capability-free shell. The
+    /// strict first observation after this call remains mandatory and rejects
+    /// any redirect before a one-time receipt capability is introduced.
+    fn refresh_openid4vp_result_shell(&mut self, expected: &Url) -> Result<(), BrowserError> {
+        self.policy
+            .validate_url(expected)
+            .map_err(|_| self.navigation_violation(self.last_url.as_ref(), expected))?;
+        self.redirects = 0;
+        self.last_url = Some(expected.clone());
+        self.driver.refresh()
     }
 
     /// Strictly validate the *first* URL observed after the canonical shell
@@ -2381,9 +2415,12 @@ mod tests {
         allow_root_children: bool,
         fragment_reads_before_scrub: usize,
         canonical_redirect: Option<Url>,
+        refresh_redirect: Option<Url>,
         shell_available: bool,
         shell_state: &'static str,
+        refreshed_shell_state: Option<&'static str>,
         receipt_navigation_seen: bool,
+        refreshes: usize,
         navigated: Vec<Url>,
     }
 
@@ -2399,6 +2436,15 @@ mod tests {
                     .canonical_redirect
                     .clone()
                     .unwrap_or_else(|| url.clone());
+            }
+            Ok(())
+        }
+
+        fn refresh(&mut self) -> Result<(), BrowserError> {
+            self.refreshes = self.refreshes.saturating_add(1);
+            self.receipt_navigation_seen = false;
+            if let Some(redirect) = &self.refresh_redirect {
+                self.current = redirect.clone();
             }
             Ok(())
         }
@@ -2489,6 +2535,8 @@ mod tests {
                 Ok(Some(
                     if self.receipt_navigation_seen {
                         "verified"
+                    } else if self.refreshes > 0 {
+                        self.refreshed_shell_state.unwrap_or(self.shell_state)
                     } else {
                         self.shell_state
                     }
@@ -2522,9 +2570,12 @@ mod tests {
             allow_root_children: true,
             fragment_reads_before_scrub: 1,
             canonical_redirect: None,
+            refresh_redirect: None,
             shell_available: true,
             shell_state: "not-found",
+            refreshed_shell_state: None,
             receipt_navigation_seen: false,
+            refreshes: 0,
             navigated: Vec::new(),
         }
     }
@@ -3016,6 +3067,135 @@ mod tests {
         assert_eq!(executor.driver_mut().navigated.len(), 1);
         assert!(executor.driver_mut().navigated[0].fragment().is_none());
         std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_canonical_shell_refreshes_only_an_exact_existing_shell() {
+        let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp")
+            .join(format!(
+                "nazoauth-vp-shell-refresh-{}",
+                uuid::Uuid::now_v7()
+            ));
+        crate::secure_file::ensure_directory(&root, true).expect("private root");
+        let capture = vp_capture_context(root.clone(), &context, &variant);
+        let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+        driver.current = Url::parse("https://issuer.example/ui/verification-result")
+            .expect("canonical shell URL");
+        driver.shell_state = "generic-error";
+        driver.refreshed_shell_state = Some("not-found");
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+        let mut executor =
+            BrowserExecutor::new(driver, BrowserPolicy::new(target, suite).expect("policy"));
+
+        executor
+            .capture_openid4vp_verification_result(&evidence, &capture, 0)
+            .expect("refresh closed shell then bootstrap");
+
+        assert_eq!(executor.driver_mut().refreshes, 1);
+        assert_eq!(executor.driver_mut().navigated.len(), 1);
+        assert!(executor.driver_mut().navigated[0].fragment().is_some());
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_canonical_shell_refresh_rejects_redirects_before_capability_navigation() {
+        let cases = [
+            (
+                "cross-origin",
+                "https://evil.example/ui/verification-result",
+            ),
+            (
+                "query",
+                "https://issuer.example/ui/verification-result?unexpected=1",
+            ),
+            (
+                "fragment",
+                "https://issuer.example/ui/verification-result#unexpected",
+            ),
+        ];
+        for (case, redirect) in cases {
+            let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .expect("temp")
+                .join(format!(
+                    "nazoauth-vp-shell-refresh-redirect-{case}-{}",
+                    uuid::Uuid::now_v7()
+                ));
+            crate::secure_file::ensure_directory(&root, true).expect("private root");
+            let capture = vp_capture_context(root.clone(), &context, &variant);
+            let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+            driver.current = Url::parse("https://issuer.example/ui/verification-result")
+                .expect("canonical shell URL");
+            driver.refresh_redirect = Some(Url::parse(redirect).expect("refresh redirect"));
+            let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+            let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+            let mut executor =
+                BrowserExecutor::new(driver, BrowserPolicy::new(target, suite).expect("policy"));
+            let error = executor
+                .capture_openid4vp_verification_result(&evidence, &capture, 0)
+                .expect_err("noncanonical refresh redirect");
+            let BrowserError::VpVerificationResultDriverDiagnostic(diagnostic) = error else {
+                panic!("refresh redirect failure must retain its stage")
+            };
+            assert_eq!(
+                diagnostic.stage, "canonical-shell-current-url",
+                "case={case}"
+            );
+            assert_eq!(executor.driver_mut().refreshes, 1, "case={case}");
+            assert!(executor.driver_mut().navigated.is_empty(), "case={case}");
+            std::fs::remove_dir_all(root).expect("remove root");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_canonical_shell_refresh_requires_a_closed_visible_shell() {
+        let cases = [(false, "not-found"), (true, "generic-error")];
+        for (shell_available, shell_state) in cases {
+            let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .expect("temp")
+                .join(format!(
+                    "nazoauth-vp-shell-refresh-state-{}",
+                    uuid::Uuid::now_v7()
+                ));
+            crate::secure_file::ensure_directory(&root, true).expect("private root");
+            let capture = vp_capture_context(root.clone(), &context, &variant);
+            let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+            driver.current = Url::parse("https://issuer.example/ui/verification-result")
+                .expect("canonical shell URL");
+            driver.shell_available = shell_available;
+            driver.refreshed_shell_state = Some(shell_state);
+            let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+            let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+            let mut policy = BrowserPolicy::new(target, suite).expect("policy");
+            if !shell_available {
+                policy = policy
+                    .with_limits(BrowserLimits {
+                        max_step_timeout: Duration::from_millis(1),
+                        poll_interval: Duration::from_millis(1),
+                        ..BrowserLimits::default()
+                    })
+                    .expect("short shell policy");
+            }
+            let mut executor = BrowserExecutor::new(driver, policy);
+            assert!(
+                executor
+                    .capture_openid4vp_verification_result(&evidence, &capture, 0)
+                    .is_err()
+            );
+            assert_eq!(executor.driver_mut().refreshes, 1);
+            assert!(executor.driver_mut().navigated.is_empty());
+            std::fs::remove_dir_all(root).expect("remove root");
+        }
     }
 
     #[test]
