@@ -1809,6 +1809,11 @@ fn settled_config(work: &PrivateTempDir) -> (PathBuf, UpdateConfig) {
 #[test]
 fn public_command_dispatch_fails_closed_before_every_confirmed_mutation() {
     let work = PrivateTempDir::new("nazoauth-command-dispatch").unwrap();
+    let _system_store = crate::deployment::scoped_test_system_roots(
+        work.path().join("system-config"),
+        work.path().join("system-state"),
+        work.path().join("system-break-glass"),
+    );
     let (config_path, config) = settled_config(&work);
     let config_before = fs::read(&config_path).unwrap();
     let invoke = |command| {

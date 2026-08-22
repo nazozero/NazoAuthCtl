@@ -1,10 +1,43 @@
 use std::{
+    #[cfg(test)]
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, File},
     io::ErrorKind,
     path::{Path, PathBuf},
 };
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SYSTEM_ROOTS: RefCell<Option<(PathBuf, PathBuf, PathBuf)>> = const { RefCell::new(None) };
+}
+
+/// Thread-local system-store replacement for command-dispatch unit tests.
+/// This avoids mutating process-wide environment variables while the test
+/// runner executes unrelated tests concurrently.
+#[cfg(test)]
+pub(crate) struct TestSystemRootsGuard(Option<(PathBuf, PathBuf, PathBuf)>);
+
+#[cfg(test)]
+impl Drop for TestSystemRootsGuard {
+    fn drop(&mut self) {
+        TEST_SYSTEM_ROOTS.with(|roots| {
+            roots.replace(self.0.take());
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn scoped_test_system_roots(
+    config_root: PathBuf,
+    state_root: PathBuf,
+    break_glass_root: PathBuf,
+) -> TestSystemRootsGuard {
+    TestSystemRootsGuard(TEST_SYSTEM_ROOTS.with(|roots| {
+        roots.replace(Some((config_root, state_root, break_glass_root)))
+    }))
+}
 
 use anyhow::{Context as _, bail};
 use fs2::FileExt as _;
@@ -359,6 +392,16 @@ pub(crate) struct DeploymentStore {
 
 impl DeploymentStore {
     pub(crate) fn system() -> Self {
+        #[cfg(test)]
+        if let Some((config_root, state_root, break_glass_root)) =
+            TEST_SYSTEM_ROOTS.with(|roots| roots.borrow().clone())
+        {
+            return Self {
+                config_root,
+                state_root,
+                break_glass_root,
+            };
+        }
         let (config_default, state_default, break_glass_default) = if cfg!(windows) {
             (
                 r"C:\ProgramData\NazoAuthCtl\config",
