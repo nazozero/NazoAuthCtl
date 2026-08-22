@@ -448,9 +448,189 @@ pub fn write_private_provider_evidence_bundle(
     report: &ConformanceReport,
     root: &Path,
     identity: &EvidenceBundleIdentity,
+    recovery_binding: Option<&crate::recovery::TenantResourceRecoveryBinding>,
 ) -> Result<EvidenceBundleReceipt, EvidenceError> {
     validate_ordinary_provider_identity(report, identity)?;
+    validate_provider_vp_receipts(report, root, identity, recovery_binding)?;
     write_private_evidence_bundle(report, root, identity)
+}
+
+/// Re-check live-WebDriver VP receipts with the journal-owned discovery
+/// anchor before the final provider bundle copies any screenshot bytes.
+#[cfg(unix)]
+fn validate_provider_vp_receipts(
+    report: &ConformanceReport,
+    root: &Path,
+    identity: &EvidenceBundleIdentity,
+    recovery_binding: Option<&crate::recovery::TenantResourceRecoveryBinding>,
+) -> Result<(), EvidenceError> {
+    let artifact_digest = match &identity.source {
+        EvidenceSourceIdentity::SignedOidfArtifact { artifact, .. } => {
+            artifact.driver_manifest_sha256.as_str()
+        }
+        EvidenceSourceIdentity::LegacyOperatorMatrix { .. } => return Err(EvidenceError::Identity),
+    };
+    for module in &report.modules {
+        for screenshot in &module.review_screenshots {
+            let receipt_bytes = crate::secure_file::read_bounded(
+                &root
+                    .join(&screenshot.path)
+                    .with_extension("png.receipt.json"),
+                16 * 1024,
+                true,
+            )
+            .map_err(map_secure_file_error)?;
+            let audit: ReviewScreenshotAudit =
+                serde_json::from_slice(&receipt_bytes).map_err(|_| EvidenceError::Identity)?;
+            if audit.source
+                != crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver
+            {
+                continue;
+            }
+            let binding = recovery_binding.ok_or(EvidenceError::Identity)?;
+            let anchor = binding
+                .vp_evidence_trust_anchor
+                .as_ref()
+                .ok_or(EvidenceError::Identity)?;
+            let receipt = audit
+                .verification_receipt
+                .as_ref()
+                .ok_or(EvidenceError::Identity)?;
+            if !verify_provider_vp_receipt(
+                receipt,
+                anchor,
+                binding,
+                artifact_digest,
+                &report.matrix_digest,
+                &module.suite_plan_id,
+                module.module_id.as_deref().ok_or(EvidenceError::Identity)?,
+                &module.test_name,
+                &module.variant,
+                &audit.trigger_origin,
+            ) {
+                return Err(EvidenceError::Identity);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_provider_vp_receipts(
+    _report: &ConformanceReport,
+    _root: &Path,
+    _identity: &EvidenceBundleIdentity,
+    _recovery_binding: Option<&crate::recovery::TenantResourceRecoveryBinding>,
+) -> Result<(), EvidenceError> {
+    Err(EvidenceError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn verify_provider_vp_receipt(
+    receipt: &crate::OpenId4VpVerificationReceiptProvenance,
+    anchor: &crate::recovery::OpenId4VpEvidenceTrustAnchor,
+    binding: &crate::recovery::TenantResourceRecoveryBinding,
+    artifact_digest: &str,
+    matrix_sha256: &str,
+    suite_plan_id: &str,
+    suite_module_id: &str,
+    test_name: &str,
+    variant: &std::collections::BTreeMap<String, String>,
+    trigger_origin: &str,
+) -> bool {
+    use time::format_description::well_known::Rfc3339;
+
+    if receipt.issuer != anchor.target_issuer
+        || receipt.deployment_id != anchor.deployment_id
+        || receipt.tenant_id != binding.tenant_id
+        || receipt.runtime_instance_id != anchor.runtime_instance_id
+        || receipt.instance_key_id != anchor.instance_key_id
+        || receipt.instance_public_key_base64 != anchor.instance_public_key_base64
+        || trigger_origin != anchor.target_issuer
+        || receipt.receipt_api_url
+            != format!("{}/openid4vp/verification-receipts", anchor.target_issuer)
+        || sha256(receipt.receipt_jws.as_bytes()) != receipt.receipt_sha256
+        || !lower_hex(&receipt.receipt_sha256, 64)
+        || !lower_hex(&receipt.capability_sha256, 64)
+        || uuid::Uuid::parse_str(&receipt.issuance_request_jti).is_err()
+        || !lower_hex(&receipt.presentation_binding_sha256, 64)
+        || !lower_hex(&receipt.intent_sha256, 64)
+    {
+        return false;
+    }
+    let Ok(key) =
+        nazo_operator_protocol::decode_instance_public_key(&anchor.instance_public_key_base64)
+    else {
+        return false;
+    };
+    if nazo_operator_protocol::instance_key_id(&key) != receipt.instance_key_id {
+        return false;
+    }
+    let Ok(variant_bytes) = serde_json::to_vec(variant) else {
+        return false;
+    };
+    let context = nazo_operator_protocol::Openid4vpEvidenceContext {
+        run_jti: binding.request_jti.clone(),
+        artifact_sha256: artifact_digest.to_owned(),
+        matrix_sha256: matrix_sha256.to_owned(),
+        suite_plan_id: suite_plan_id.to_owned(),
+        suite_module_id: suite_module_id.to_owned(),
+        test_name: test_name.to_owned(),
+        variant_sha256: sha256(&variant_bytes),
+    };
+    let Ok(context_sha256) =
+        nazo_operator_protocol::canonical_openid4vp_evidence_context_sha256(&context)
+    else {
+        return false;
+    };
+    let Ok(completed_at) = time::OffsetDateTime::parse(&receipt.completed_at, &Rfc3339) else {
+        return false;
+    };
+    let Ok(expires_at) = time::OffsetDateTime::parse(&receipt.expires_at, &Rfc3339) else {
+        return false;
+    };
+    if completed_at.format(&Rfc3339).ok().as_deref() != Some(receipt.completed_at.as_str())
+        || expires_at.format(&Rfc3339).ok().as_deref() != Some(receipt.expires_at.as_str())
+        || expires_at <= completed_at
+    {
+        return false;
+    }
+    let receipt_id = receipt.receipt_id.to_string();
+    let transaction_id = receipt.transaction_id.to_string();
+    let expected = nazo_operator_protocol::Openid4vpVerificationReceiptExpectations {
+        issuer: &anchor.target_issuer,
+        audience: &receipt.receipt_api_url,
+        deployment_id: &anchor.deployment_id,
+        runtime_instance_id: &anchor.runtime_instance_id,
+        instance_key_id: &anchor.instance_key_id,
+        tenant_id: &binding.tenant_id,
+        transaction_id: &transaction_id,
+        receipt_id: &receipt_id,
+        issuance_request_jti: &receipt.issuance_request_jti,
+        evidence_context_sha256: &context_sha256,
+        presentation_binding_sha256: &receipt.presentation_binding_sha256,
+        intent_sha256: &receipt.intent_sha256,
+        capability_sha256: &receipt.capability_sha256,
+    };
+    let Ok(verified) = nazo_operator_protocol::verify_openid4vp_verification_receipt(
+        &receipt.receipt_jws,
+        &expected,
+        &key,
+        completed_at.unix_timestamp(),
+    ) else {
+        return false;
+    };
+    verified.completed_at == receipt.completed_at
+        && verified.iss == receipt.issuer
+        && verified.deployment_id == receipt.deployment_id
+        && verified.tenant_id == receipt.tenant_id
+        && verified.runtime_instance_id == receipt.runtime_instance_id
+        && verified.instance_key_id == receipt.instance_key_id
+        && verified.transaction_id == transaction_id
+        && verified.issuance_request_jti == receipt.issuance_request_jti
+        && verified.intent_sha256 == receipt.intent_sha256
+        && verified.exp == expires_at.unix_timestamp()
 }
 
 /// Commits the screenshot-to-current-module binding before Suite plan
@@ -1539,7 +1719,7 @@ mod tests {
         identity.provider = Some(provider());
         let report = report();
         let expected_report = report.to_json_bytes().expect("serialize public report");
-        let receipt = write_private_provider_evidence_bundle(&report, &root, &identity)
+        let receipt = write_private_provider_evidence_bundle(&report, &root, &identity, None)
             .expect("ordinary provider evidence bundle");
         assert_eq!(
             std::fs::read(receipt.directory.join("report.json")).expect("public report"),

@@ -718,7 +718,14 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             outer_cleanup_complete: cleanup_complete,
         };
         evidence = record_provider_evidence_result(
-            || write_private_provider_evidence_bundle(report, directory, &identity),
+            || {
+                write_private_provider_evidence_bundle(
+                    report,
+                    directory,
+                    &identity,
+                    recovery.tenant_resource_binding(),
+                )
+            },
             &mut errors,
         );
     }

@@ -119,6 +119,50 @@ impl ConformanceBinding {
     }
 }
 
+/// The trusted create request identifies the policy resource and immutable
+/// revision, while NazoAuth allocates the database binding UUID.  The latter
+/// is therefore not caller-known, but must still be present and canonical in
+/// the signed attachment projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExpectedTrustPolicyBinding {
+    None,
+    Resource { resource_id: String, digest: String },
+}
+
+impl ExpectedTrustPolicyBinding {
+    fn from_conformance_binding(binding: &ConformanceBinding) -> Self {
+        match binding {
+            ConformanceBinding::LegacyLease { .. } => Self::None,
+            ConformanceBinding::OpenId4VcTrustPolicy {
+                resource_id,
+                digest,
+            } => Self::Resource {
+                resource_id: resource_id.clone(),
+                digest: digest.clone(),
+            },
+        }
+    }
+
+    fn matches(&self, actual: &nazo_operator_protocol::Openid4vpTrustPolicyBinding) -> bool {
+        match self {
+            Self::None => {
+                actual.binding_id.is_none()
+                    && actual.resource_id.is_none()
+                    && actual.resource_digest.is_none()
+            }
+            Self::Resource {
+                resource_id,
+                digest,
+            } => {
+                actual.binding_id.as_deref().is_some_and(|binding_id| {
+                    Uuid::parse_str(binding_id).is_ok_and(|parsed| parsed.to_string() == binding_id)
+                }) && actual.resource_id.as_deref() == Some(resource_id)
+                    && actual.resource_digest.as_deref() == Some(digest)
+            }
+        }
+    }
+}
+
 /// Immutable facts NazoAuth signs into an OpenID4VP verification receipt.
 ///
 /// This is intentionally constructed only after the Suite allocated the new
@@ -325,6 +369,7 @@ pub struct OpenId4VpPresentation {
     /// create. It is generated once before the first request, then reused by
     /// the narrow response-loss retry loop.
     create_request_jti: String,
+    expected_trust_policy: ExpectedTrustPolicyBinding,
     evidence_context: Option<OpenId4VpEvidenceContext>,
     evidence_attachment: Option<OpenId4VpEvidenceAttachment>,
     /// A non-secret idempotency key generated once after the target accepted
@@ -355,6 +400,7 @@ impl fmt::Debug for OpenId4VpPresentation {
             .field("completion_origin", &redacted_origin(&self.completion_url))
             .field("transaction_id", &self.transaction_id)
             .field("create_request_jti", &self.create_request_jti)
+            .field("expected_trust_policy", &self.expected_trust_policy)
             .field("evidence_attachment", &self.evidence_attachment)
             .field("issuance_request_jti", &self.issuance_request_jti)
             .field(
@@ -872,6 +918,9 @@ impl OpenId4VpVerifierClient {
             completion_url,
             transaction_id,
             create_request_jti,
+            expected_trust_policy: ExpectedTrustPolicyBinding::from_conformance_binding(
+                &self.binding,
+            ),
             evidence_context: None,
             evidence_attachment: None,
             issuance_request_jti: None,
@@ -1096,6 +1145,9 @@ impl OpenId4VpVerifierClient {
                 != nazo_operator_protocol::Openid4vpEvidenceAttachmentStatus::Attached
             || response.evidence_context_sha256 != expected_sha256
             || response.presentation_binding_sha256 != presentation_binding_sha256
+            || !presentation
+                .expected_trust_policy
+                .matches(&response.presentation_binding.trust_policy)
             || nazo_operator_protocol::compact_sha256(&response.intent_jws)
                 != response.intent_sha256
         {
@@ -1598,6 +1650,42 @@ mod tests {
         .expect("trust policy binding")
     }
 
+    #[test]
+    fn signed_attachment_trust_projection_must_match_the_local_create_binding() {
+        let expected =
+            ExpectedTrustPolicyBinding::from_conformance_binding(&trust_policy_binding());
+        let exact = nazo_operator_protocol::Openid4vpTrustPolicyBinding {
+            binding_id: Some("550e8400-e29b-41d4-a716-446655440007".to_owned()),
+            resource_id: Some("openid4vc-trust-policy:provider:0123456789abcdef".to_owned()),
+            resource_digest: Some("a".repeat(64)),
+        };
+        assert!(expected.matches(&exact));
+
+        let none = nazo_operator_protocol::Openid4vpTrustPolicyBinding {
+            binding_id: None,
+            resource_id: None,
+            resource_digest: None,
+        };
+        assert!(!expected.matches(&none));
+        let mut wrong_resource = exact.clone();
+        wrong_resource.resource_id = Some("openid4vc-trust-policy:provider:other".to_owned());
+        assert!(!expected.matches(&wrong_resource));
+        let mut wrong_digest = exact.clone();
+        wrong_digest.resource_digest = Some("b".repeat(64));
+        assert!(!expected.matches(&wrong_digest));
+        let mut missing_binding_id = exact;
+        missing_binding_id.binding_id = None;
+        assert!(!expected.matches(&missing_binding_id));
+
+        assert!(ExpectedTrustPolicyBinding::None.matches(
+            &nazo_operator_protocol::Openid4vpTrustPolicyBinding {
+                binding_id: None,
+                resource_id: None,
+                resource_digest: None,
+            }
+        ));
+    }
+
     struct RetryingCreateTransport {
         request_bodies: std::sync::Mutex<Vec<Vec<u8>>>,
     }
@@ -1612,7 +1700,7 @@ mod tests {
             let mut request_bodies = self.request_bodies.lock().expect("request lock");
             request_bodies.push(body);
             if request_bodies.len() == 1 {
-                return Err(TransportError::Network(TransportFailureStage::SendRequest));
+                return Err(TransportError::Network(TransportFailureStage::ReadBody));
             }
             let mut response = HttpResponse {
                 status: 200,
@@ -1652,6 +1740,7 @@ mod tests {
         assert_eq!(request_bodies.len(), 2);
         let first: Value = serde_json::from_slice(&request_bodies[0]).expect("first body JSON");
         let second: Value = serde_json::from_slice(&request_bodies[1]).expect("second body JSON");
+        assert_eq!(request_bodies[0], request_bodies[1]);
         assert_eq!(first["create_request_jti"], second["create_request_jti"]);
         assert_eq!(
             first["create_request_jti"],
@@ -1910,9 +1999,9 @@ mod tests {
         let presentation_binding = nazo_operator_protocol::Openid4vpPresentationBinding {
             presentation_request_sha256: "d".repeat(64),
             trust_policy: nazo_operator_protocol::Openid4vpTrustPolicyBinding {
-                binding_id: None,
-                resource_id: None,
-                resource_digest: None,
+                binding_id: Some("550e8400-e29b-41d4-a716-446655440007".to_owned()),
+                resource_id: Some("openid4vc-trust-policy:provider:0123456789abcdef".to_owned()),
+                resource_digest: Some("a".repeat(64)),
             },
         };
         let presentation_binding_sha256 =
@@ -2102,6 +2191,7 @@ mod tests {
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
             create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
+            expected_trust_policy: ExpectedTrustPolicyBinding::None,
             evidence_context: Some(evidence_context),
             evidence_attachment: Some(OpenId4VpEvidenceAttachment {
                 presentation_binding_sha256: "d".repeat(64),
@@ -2170,7 +2260,7 @@ mod tests {
             Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("transaction ID");
         let receipt_id =
             Uuid::parse_str("550e8400-e29b-41d4-a716-446655440003").expect("receipt ID");
-        let capability = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let capability = "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ";
         let capability_sha256 =
             nazo_operator_protocol::openid4vp_verification_capability_sha256(capability)
                 .expect("capability hash");
@@ -2270,6 +2360,7 @@ mod tests {
             .expect("completion URL"),
             transaction_id,
             create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
+            expected_trust_policy: ExpectedTrustPolicyBinding::None,
             evidence_context: Some(context),
             evidence_attachment: Some(OpenId4VpEvidenceAttachment {
                 presentation_binding_sha256,
@@ -2287,7 +2378,10 @@ mod tests {
             evidence.context.suite_module_id,
             "550e8400-e29b-41d4-a716-446655440002"
         );
-        assert!(!format!("{evidence:?}").contains(capability));
+        let debug = format!("{evidence:?}");
+        assert!(debug.contains("ui_url: \"<redacted>\""));
+        assert!(debug.contains("receipt_id"));
+        assert!(!debug.contains(capability));
     }
 
     #[test]
@@ -2429,6 +2523,7 @@ mod tests {
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
             create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
+            expected_trust_policy: ExpectedTrustPolicyBinding::None,
             evidence_context: None,
             evidence_attachment: None,
             issuance_request_jti: None,
@@ -2526,6 +2621,7 @@ mod tests {
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
             create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
+            expected_trust_policy: ExpectedTrustPolicyBinding::None,
             evidence_context: None,
             evidence_attachment: None,
             issuance_request_jti: None,
@@ -2568,6 +2664,7 @@ mod tests {
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
             create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
+            expected_trust_policy: ExpectedTrustPolicyBinding::None,
             evidence_context: None,
             evidence_attachment: None,
             issuance_request_jti: None,
@@ -2614,6 +2711,7 @@ mod tests {
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
             create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
+            expected_trust_policy: ExpectedTrustPolicyBinding::None,
             evidence_context: None,
             evidence_attachment: None,
             issuance_request_jti: None,

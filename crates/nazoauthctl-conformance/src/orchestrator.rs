@@ -48,8 +48,7 @@ fn should_retry_openid4vp_evidence_issuance(
 ) -> bool {
     matches!(
         error,
-        OpenId4VpError::EvidenceUnavailable
-            | OpenId4VpError::EvidenceTemporarilyUnavailable
+        OpenId4VpError::EvidenceTemporarilyUnavailable
             | OpenId4VpError::Transport(TransportError::Network(_))
     ) && attempts < MAX_OPENID4VP_EVIDENCE_ISSUANCE_ATTEMPTS
         && Instant::now() < deadline
@@ -2025,7 +2024,6 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
         let control = RunControl::default();
         for error in [
-            OpenId4VpError::EvidenceUnavailable,
             OpenId4VpError::EvidenceTemporarilyUnavailable,
             OpenId4VpError::Transport(TransportError::Network(
                 crate::transport::TransportFailureStage::SendTimeout,
@@ -2036,6 +2034,7 @@ mod tests {
             ));
         }
         for error in [
+            OpenId4VpError::EvidenceUnavailable,
             OpenId4VpError::UnexpectedEvidenceStatus,
             OpenId4VpError::MalformedEvidenceResponse,
             OpenId4VpError::Transport(TransportError::InvalidConfiguration),
