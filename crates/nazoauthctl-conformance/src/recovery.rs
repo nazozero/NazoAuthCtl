@@ -1338,6 +1338,13 @@ impl ConformanceRecoveryGuard {
         let old_bytes = canonical_journal_bytes(old)?;
         let next_bytes = canonical_journal_bytes(next)?;
         if bytes == next_bytes {
+            crate::secure_file::fsync_parent_directory(&self.journal_path, true).map_err(
+                |error| {
+                    anyhow::anyhow!(
+                        "failed to fsync reconciled retention journal parent: {error:?}"
+                    )
+                },
+            )?;
             Ok(SuiteRetentionCommitResolution::Retained)
         } else if bytes == old_bytes {
             Ok(SuiteRetentionCommitResolution::Prepared)
@@ -2171,15 +2178,26 @@ fn validate_review_screenshot_manifest_binding(
                     && module.variant == image.variant
             })
             .context("review screenshot has no exact module tuple")?;
-        let required = matches!(image.marker, crate::ReviewScreenshotMarker::Required);
-        if (required && image.obligation_index >= module.required)
+        let total_attempts = document
+            .screenshots
+            .iter()
+            .filter(|candidate| {
+                candidate.matrix_plan_id == module.matrix_plan_id
+                    && candidate.suite_plan_id == module.suite_plan_id
+                    && candidate.module_id == module.module_id
+                    && candidate.test_name == module.test_name
+                    && candidate.variant == module.variant
+            })
+            .count()
+            .checked_add(module.missing_optional)
+            .context("review screenshot attempt count overflows")?;
+        if image.obligation_index >= total_attempts
             || !obligations.insert((
                 &image.matrix_plan_id,
                 &image.suite_plan_id,
                 &image.module_id,
                 &image.test_name,
                 &image.variant,
-                required,
                 image.obligation_index,
             ))
         {
@@ -2221,19 +2239,18 @@ fn validate_review_screenshot_manifest_binding(
         }
     }
     for module in &document.modules {
-        for obligation_index in 0..module.required {
-            if !obligations.contains(&(
-                &module.matrix_plan_id,
-                &module.suite_plan_id,
-                &module.module_id,
-                &module.test_name,
-                &module.variant,
-                true,
-                obligation_index,
-            )) {
-                bail!("review screenshot manifest is missing a required obligation");
-            }
-        }
+        let required_captured = document
+            .screenshots
+            .iter()
+            .filter(|image| {
+                image.matrix_plan_id == module.matrix_plan_id
+                    && image.suite_plan_id == module.suite_plan_id
+                    && image.module_id == module.module_id
+                    && image.test_name == module.test_name
+                    && image.variant == module.variant
+                    && matches!(image.marker, crate::ReviewScreenshotMarker::Required)
+            })
+            .count();
         let optional_captured = document
             .screenshots
             .iter()
@@ -2246,19 +2263,13 @@ fn validate_review_screenshot_manifest_binding(
                     && matches!(image.marker, crate::ReviewScreenshotMarker::Optional)
             })
             .count();
-        let optional_attempts = optional_captured
+        let total_attempts = required_captured
+            .checked_add(optional_captured)
             .checked_add(module.missing_optional)
             .context("review screenshot optional attempt count overflows")?;
-        if optional_attempts > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_MODULE
-            || document.screenshots.iter().any(|image| {
-                image.matrix_plan_id == module.matrix_plan_id
-                    && image.suite_plan_id == module.suite_plan_id
-                    && image.module_id == module.module_id
-                    && image.test_name == module.test_name
-                    && image.variant == module.variant
-                    && matches!(image.marker, crate::ReviewScreenshotMarker::Optional)
-                    && image.obligation_index >= optional_attempts
-            })
+        if required_captured != module.required
+            || module.captured_required != module.required
+            || total_attempts > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_MODULE
         {
             bail!("review screenshot manifest optional obligation count is invalid");
         }

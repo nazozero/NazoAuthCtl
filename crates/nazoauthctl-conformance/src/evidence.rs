@@ -266,6 +266,12 @@ pub fn write_private_evidence_bundle(
         for (index, module) in report.modules.iter().enumerate() {
             validate_review_screenshot_obligations(module)?;
             let mut obligations = BTreeSet::new();
+            let total_attempts = module
+                .review_screenshots
+                .len()
+                .checked_add(module.review_screenshots_missing)
+                .ok_or(EvidenceError::Identity)?;
+            let mut required_captured = 0usize;
             let index = u32::try_from(index).map_err(|_| EvidenceError::Encoding)?;
             let file = format!("module-{index:04}.json");
             let bytes = Zeroizing::new(
@@ -326,12 +332,8 @@ pub fn write_private_evidence_bundle(
                     || audit.module_id != module_id
                     || audit.test_name != module.test_name
                     || audit.variant != module.variant
-                    || (matches!(audit.marker, crate::ReviewScreenshotMarker::Required)
-                        && audit.obligation_index >= module.review_screenshots_required)
-                    || !obligations.insert((
-                        matches!(audit.marker, crate::ReviewScreenshotMarker::Required),
-                        audit.obligation_index,
-                    ))
+                    || audit.obligation_index >= total_attempts
+                    || !obligations.insert(audit.obligation_index)
                     || audit.path != screenshot.path
                     || audit.sha256 != screenshot.sha256
                     || audit.size != screenshot.size
@@ -341,6 +343,11 @@ pub fn write_private_evidence_bundle(
                     || sha256(trigger_url.as_str().as_bytes()) != audit.trigger_url_sha256
                 {
                     return Err(EvidenceError::Identity);
+                }
+                if matches!(audit.marker, crate::ReviewScreenshotMarker::Required) {
+                    required_captured = required_captured
+                        .checked_add(1)
+                        .ok_or(EvidenceError::Identity)?;
                 }
                 let destination = directory.join(&screenshot.path);
                 crate::secure_file::write_new_or_exact(&destination, &screenshot_bytes, true)
@@ -368,6 +375,9 @@ pub fn write_private_evidence_bundle(
                     trigger_url_sha256: audit.trigger_url_sha256,
                 });
                 total_screenshot_bytes = total_screenshot_bytes.saturating_add(screenshot.size);
+            }
+            if required_captured != module.review_screenshots_required {
+                return Err(EvidenceError::Identity);
             }
         }
 
@@ -470,6 +480,12 @@ pub fn write_review_screenshot_manifest(
         for module in &report.modules {
             validate_review_screenshot_obligations(module)?;
             let mut obligations = BTreeSet::new();
+            let total_attempts = module
+                .review_screenshots
+                .len()
+                .checked_add(module.review_screenshots_missing)
+                .ok_or(EvidenceError::Identity)?;
+            let mut required_captured = 0usize;
             modules.push(ReviewScreenshotModuleManifest {
                 matrix_plan_id: module.matrix_plan_id.clone(),
                 suite_plan_id: module.suite_plan_id.clone(),
@@ -514,12 +530,8 @@ pub fn write_review_screenshot_manifest(
                     || audit.module_id != module_id
                     || audit.test_name != module.test_name
                     || audit.variant != module.variant
-                    || (matches!(audit.marker, crate::ReviewScreenshotMarker::Required)
-                        && audit.obligation_index >= module.review_screenshots_required)
-                    || !obligations.insert((
-                        matches!(audit.marker, crate::ReviewScreenshotMarker::Required),
-                        audit.obligation_index,
-                    ))
+                    || audit.obligation_index >= total_attempts
+                    || !obligations.insert(audit.obligation_index)
                     || audit.path != screenshot.path
                     || audit.sha256 != screenshot.sha256
                     || audit.size != screenshot.size
@@ -529,6 +541,11 @@ pub fn write_review_screenshot_manifest(
                     || sha256(trigger_url.as_str().as_bytes()) != audit.trigger_url_sha256
                 {
                     return Err(EvidenceError::Identity);
+                }
+                if matches!(audit.marker, crate::ReviewScreenshotMarker::Required) {
+                    required_captured = required_captured
+                        .checked_add(1)
+                        .ok_or(EvidenceError::Identity)?;
                 }
                 screenshots.push(EvidenceScreenshotManifest {
                     matrix_plan_id: module.matrix_plan_id.clone(),
@@ -547,6 +564,9 @@ pub fn write_review_screenshot_manifest(
                     trigger_url_sha256: audit.trigger_url_sha256,
                 });
                 total_screenshot_bytes = total_screenshot_bytes.saturating_add(image.len());
+            }
+            if required_captured != module.review_screenshots_required {
+                return Err(EvidenceError::Identity);
             }
         }
         let bytes = serde_json::to_vec_pretty(&serde_json::json!({
