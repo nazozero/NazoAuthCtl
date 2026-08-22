@@ -1161,14 +1161,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             return Err(self.navigation_violation(self.last_url.as_ref(), &ui_url));
         }
         self.navigate(&ui_url)?;
-        let current = self.ensure_current_url()?;
-        if !self.policy.target_origin.allows(&current)
-            || current.path() != "/ui/verification-result"
-            || current.query().is_some()
-            || current.fragment().is_some()
-        {
-            return Err(self.navigation_violation(self.last_url.as_ref(), &current));
-        }
+        self.wait_for_openid4vp_fragment_scrub(&ui_url)?;
         let deadline = self.deadline(DEFAULT_STEP_TIMEOUT);
         loop {
             let root = self.driver.find_element(&BrowserSelector::Css(
@@ -1227,6 +1220,42 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             obligation_index,
             &evidence.receipt,
         )
+    }
+
+    /// NazoAuthWeb receives the one-time receipt capability in a fragment and
+    /// removes it with `history.replaceState` before displaying any evidence.
+    /// WebDriver can observe the bootstrap URL before that script runs. Wait
+    /// only for that exact fragment to disappear; a changed capability, path,
+    /// origin, or query is still a navigation violation.
+    fn wait_for_openid4vp_fragment_scrub(&mut self, bootstrap: &Url) -> Result<Url, BrowserError> {
+        let initially_observed = self
+            .last_url
+            .clone()
+            .ok_or(BrowserError::CrossOriginNavigation)?;
+        let is_expected_observation = |url: &Url| {
+            self.policy.target_origin.allows(url)
+                && url.path() == "/ui/verification-result"
+                && url.query().is_none()
+                && (url.fragment().is_none() || url.fragment() == bootstrap.fragment())
+        };
+        if !is_expected_observation(&initially_observed) {
+            return Err(self.navigation_violation(Some(&initially_observed), &initially_observed));
+        }
+        let deadline = self.deadline(DEFAULT_STEP_TIMEOUT);
+        loop {
+            let current = self.ensure_current_url()?;
+            let same_result_page = self.policy.target_origin.allows(&current)
+                && current.path() == "/ui/verification-result"
+                && current.query().is_none();
+            if same_result_page && current.fragment().is_none() {
+                return Ok(current);
+            }
+            if same_result_page && current.fragment() == bootstrap.fragment() {
+                self.sleep_until(deadline)?;
+                continue;
+            }
+            return Err(self.navigation_violation(self.last_url.as_ref(), &current));
+        }
     }
 
     fn expect_result_text(
@@ -1917,6 +1946,7 @@ mod tests {
         variant_sha256: String,
         receipt_sha256: String,
         allow_root_children: bool,
+        fragment_reads_before_scrub: usize,
         navigated: Vec<Url>,
     }
 
@@ -1924,12 +1954,17 @@ mod tests {
         fn navigate(&mut self, url: &Url) -> Result<(), BrowserError> {
             self.navigated.push(url.clone());
             self.current = url.clone();
-            self.current.set_fragment(None);
             Ok(())
         }
 
         fn current_url(&mut self) -> Result<Url, BrowserError> {
-            Ok(self.current.clone())
+            if self.fragment_reads_before_scrub > 0 {
+                self.fragment_reads_before_scrub -= 1;
+                return Ok(self.current.clone());
+            }
+            let mut current = self.current.clone();
+            current.set_fragment(None);
+            Ok(current)
         }
 
         fn page_source(&mut self) -> Result<String, BrowserError> {
@@ -2298,6 +2333,9 @@ mod tests {
             variant_sha256: context.variant_sha256.clone(),
             receipt_sha256: receipt_sha256.clone(),
             allow_root_children: true,
+            // The browser can report the fragment bootstrap once before the
+            // NazoAuthWeb bundle runs `history.replaceState`.
+            fragment_reads_before_scrub: 1,
             navigated: Vec::new(),
         };
         let root = std::env::temp_dir()
