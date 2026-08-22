@@ -225,7 +225,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                 invocation.tenant_id.clone(),
                 tenant_resource_client_config.runtime_instance_id.clone(),
                 tenant_resource_client_config.runtime_key_id.clone(),
-                tenant_resource_client_config.runtime_public_key.clone(),
+                tenant_resource_client_config.runtime_public_key,
             )
         })
         .transpose()
