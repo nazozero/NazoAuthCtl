@@ -1,5 +1,6 @@
 //! W3C WebDriver transport and managed local driver lifecycle.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -15,8 +16,9 @@ use url::Url;
 
 use super::validation::{MAX_TEXT_BYTES, is_loopback_host};
 use super::{
-    BrowserDriver, BrowserError, BrowserPageRuntimeDiagnostic, BrowserSelector,
-    WebDriverProtocolDiagnostic, decode_webdriver_png,
+    BrowserConsoleLogDiagnostic, BrowserConsoleLogMessageDiagnostic, BrowserDriver, BrowserError,
+    BrowserPageRuntimeDiagnostic, BrowserSelector, WebDriverProtocolDiagnostic,
+    decode_webdriver_png,
 };
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -28,6 +30,10 @@ const MAX_RUNTIME_MODULE_SCRIPTS: usize = 128;
 const MAX_RUNTIME_RESOURCE_SCAN: usize = 512;
 const MAX_RUNTIME_UI_ASSET_RESOURCES: usize = 128;
 const MAX_RUNTIME_RESPONSE_STATUSES: usize = 16;
+const MAX_RUNTIME_RECEIPT_RESOURCES: usize = 4;
+const MAX_RUNTIME_RECEIPT_STATUSES: usize = 4;
+const MAX_BROWSER_LOG_ENTRIES: usize = 128;
+const MAX_BROWSER_LOG_MESSAGE_BYTES: usize = 16 * 1024;
 const PAGE_RUNTIME_DIAGNOSTIC_SCRIPT: &str = r#"return (() => {
   const cap = (value, maximum) => Math.min(Math.max(0, Number(value) || 0), maximum);
   const root = document.getElementById('root');
@@ -41,18 +47,34 @@ const PAGE_RUNTIME_DIAGNOSTIC_SCRIPT: &str = r#"return (() => {
   let statusCapped = false;
   const statuses = new Set();
   let assetCapped = false;
+  let receiptCount = 0;
+  let receiptCapped = false;
+  let receiptTransferPositive = 0;
+  let receiptDecodedPositive = 0;
+  let receiptStatusCapped = false;
+  const receiptStatuses = new Set();
   try {
     for (const entry of performance.getEntriesByType('resource')) {
       if (resourceScanCount >= 512) { resourceScanCapped = true; break; }
       resourceScanCount += 1;
       let resource;
       try { resource = new URL(entry.name, location.href); } catch (_) { continue; }
-      if (resource.origin !== location.origin || !resource.pathname.startsWith('/ui/assets/')) { continue; }
-      if (assetCount >= 128) { assetCapped = true; break; }
+      if (resource.origin !== location.origin) { continue; }
+      const status = Number(entry.responseStatus);
+      if (resource.pathname === '/openid4vp/verification-receipts' && !resource.search && !resource.hash) {
+        if (receiptCount >= 4) { receiptCapped = true; continue; }
+        receiptCount += 1;
+        if (entry.transferSize > 0) { receiptTransferPositive += 1; }
+        if (entry.decodedBodySize > 0) { receiptDecodedPositive += 1; }
+        if (Number.isInteger(status) && status >= 100 && status <= 599) {
+          if (receiptStatuses.size < 4 || receiptStatuses.has(status)) { receiptStatuses.add(status); } else { receiptStatusCapped = true; }
+        }
+      }
+      if (!resource.pathname.startsWith('/ui/assets/')) { continue; }
+      if (assetCount >= 128) { assetCapped = true; continue; }
       assetCount += 1;
       if (entry.transferSize > 0) { transferPositive += 1; }
       if (entry.decodedBodySize > 0) { decodedPositive += 1; }
-      const status = Number(entry.responseStatus);
       if (Number.isInteger(status) && status >= 100 && status <= 599) {
         if (statuses.size < 16 || statuses.has(status)) { statuses.add(status); } else { statusCapped = true; }
       }
@@ -76,6 +98,12 @@ const PAGE_RUNTIME_DIAGNOSTIC_SCRIPT: &str = r#"return (() => {
     ui_asset_response_statuses_capped: statusCapped,
     ui_asset_transfer_size_positive_count: transferPositive,
     ui_asset_decoded_size_positive_count: decodedPositive,
+    verification_receipt_resource_count: receiptCount,
+    verification_receipt_resource_count_capped: receiptCapped,
+    verification_receipt_response_statuses: Array.from(receiptStatuses).sort((a, b) => a - b),
+    verification_receipt_response_statuses_capped: receiptStatusCapped,
+    verification_receipt_transfer_size_positive_count: receiptTransferPositive,
+    verification_receipt_decoded_size_positive_count: receiptDecodedPositive,
     title_kind: document.title === 'NazoAuth' ? 'nazoauth' : 'other',
     navigator_online: Boolean(navigator.onLine)
   };
@@ -199,6 +227,9 @@ impl WebDriverClient {
             "capabilities": {
                 "alwaysMatch": {
                     "browserName": "chrome",
+                    "goog:loggingPrefs": {
+                        "browser": "ALL"
+                    },
                     "goog:chromeOptions": {
                         "args": [
                             "--headless=new",
@@ -374,6 +405,17 @@ impl BrowserDriver for WebDriverClient {
             "page_runtime_diagnostic",
         )?;
         parse_page_runtime_diagnostic(&response.value).ok_or_else(|| response.protocol())
+    }
+
+    fn browser_console_log_diagnostic(
+        &mut self,
+    ) -> Result<BrowserConsoleLogDiagnostic, BrowserError> {
+        let response = self.post_value(
+            &self.session_path("/log")?,
+            &json!({ "type": "browser" }),
+            "browser_console_log",
+        )?;
+        parse_browser_console_log_diagnostic(&response.value).ok_or_else(|| response.protocol())
     }
 
     fn find_element(&mut self, selector: &BrowserSelector) -> Result<String, BrowserError> {
@@ -684,6 +726,11 @@ impl BrowserDriver for ManagedWebDriver {
     fn page_runtime_diagnostic(&mut self) -> Result<BrowserPageRuntimeDiagnostic, BrowserError> {
         self.client.page_runtime_diagnostic()
     }
+    fn browser_console_log_diagnostic(
+        &mut self,
+    ) -> Result<BrowserConsoleLogDiagnostic, BrowserError> {
+        self.client.browser_console_log_diagnostic()
+    }
     fn find_element(&mut self, selector: &BrowserSelector) -> Result<String, BrowserError> {
         self.client.find_element(selector)
     }
@@ -940,7 +987,7 @@ fn classify_webdriver_error(value: &Value) -> BrowserError {
 
 fn parse_page_runtime_diagnostic(value: &Value) -> Option<BrowserPageRuntimeDiagnostic> {
     let value = value.get("value")?.as_object()?;
-    if value.len() != 17
+    if value.len() != 23
         || value.keys().any(|key| {
             !matches!(
                 key.as_str(),
@@ -959,6 +1006,12 @@ fn parse_page_runtime_diagnostic(value: &Value) -> Option<BrowserPageRuntimeDiag
                     | "ui_asset_response_statuses_capped"
                     | "ui_asset_transfer_size_positive_count"
                     | "ui_asset_decoded_size_positive_count"
+                    | "verification_receipt_resource_count"
+                    | "verification_receipt_resource_count_capped"
+                    | "verification_receipt_response_statuses"
+                    | "verification_receipt_response_statuses_capped"
+                    | "verification_receipt_transfer_size_positive_count"
+                    | "verification_receipt_decoded_size_positive_count"
                     | "title_kind"
                     | "navigator_online"
             )
@@ -997,6 +1050,20 @@ fn parse_page_runtime_diagnostic(value: &Value) -> Option<BrowserPageRuntimeDiag
     {
         return None;
     }
+    let receipt_statuses = value
+        .get("verification_receipt_response_statuses")?
+        .as_array()?
+        .iter()
+        .map(|status| u16::try_from(status.as_u64()?).ok())
+        .collect::<Option<Vec<_>>>()?;
+    if receipt_statuses.len() > MAX_RUNTIME_RECEIPT_STATUSES
+        || receipt_statuses
+            .iter()
+            .any(|status| !(100..=599).contains(status))
+        || receipt_statuses.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return None;
+    }
     let resource_scan_count = bounded_count("resource_scan_count", MAX_RUNTIME_RESOURCE_SCAN)?;
     let same_origin_ui_asset_resource_count = bounded_count(
         "same_origin_ui_asset_resource_count",
@@ -1010,9 +1077,24 @@ fn parse_page_runtime_diagnostic(value: &Value) -> Option<BrowserPageRuntimeDiag
         "ui_asset_decoded_size_positive_count",
         MAX_RUNTIME_UI_ASSET_RESOURCES,
     )?;
+    let verification_receipt_resource_count = bounded_count(
+        "verification_receipt_resource_count",
+        MAX_RUNTIME_RECEIPT_RESOURCES,
+    )?;
+    let verification_receipt_transfer_size_positive_count = bounded_count(
+        "verification_receipt_transfer_size_positive_count",
+        MAX_RUNTIME_RECEIPT_RESOURCES,
+    )?;
+    let verification_receipt_decoded_size_positive_count = bounded_count(
+        "verification_receipt_decoded_size_positive_count",
+        MAX_RUNTIME_RECEIPT_RESOURCES,
+    )?;
     if same_origin_ui_asset_resource_count > resource_scan_count
         || ui_asset_transfer_size_positive_count > same_origin_ui_asset_resource_count
         || ui_asset_decoded_size_positive_count > same_origin_ui_asset_resource_count
+        || verification_receipt_resource_count > resource_scan_count
+        || verification_receipt_transfer_size_positive_count > verification_receipt_resource_count
+        || verification_receipt_decoded_size_positive_count > verification_receipt_resource_count
     {
         return None;
     }
@@ -1037,12 +1119,119 @@ fn parse_page_runtime_diagnostic(value: &Value) -> Option<BrowserPageRuntimeDiag
         ui_asset_response_statuses_capped: bool_value("ui_asset_response_statuses_capped")?,
         ui_asset_transfer_size_positive_count,
         ui_asset_decoded_size_positive_count,
+        verification_receipt_resource_count,
+        verification_receipt_resource_count_capped: bool_value(
+            "verification_receipt_resource_count_capped",
+        )?,
+        verification_receipt_response_statuses: receipt_statuses,
+        verification_receipt_response_statuses_capped: bool_value(
+            "verification_receipt_response_statuses_capped",
+        )?,
+        verification_receipt_transfer_size_positive_count,
+        verification_receipt_decoded_size_positive_count,
         title_kind,
         navigator_online: bool_value("navigator_online")?,
-        // Selenium exposes browser-log retrieval through a vendor-specific
-        // endpoint rather than W3C. Never guess that schema or retain raw log
-        // text just to fill a diagnostic field.
-        browser_log_collection: "not-collected-non-w3c",
+        browser_log_collection: "selenium-vendor-browser-log",
+    })
+}
+
+fn browser_log_level(value: &str) -> &'static str {
+    match value {
+        "SEVERE" => "severe",
+        "WARNING" => "warning",
+        "INFO" => "info",
+        "DEBUG" => "debug",
+        _ => "other",
+    }
+}
+
+fn browser_log_source_kind(value: &str) -> &'static str {
+    match value {
+        "javascript" => "javascript",
+        "network" => "network",
+        "console-api" => "console-api",
+        _ => "other",
+    }
+}
+
+fn browser_log_category(message: &str) -> &'static str {
+    let message = message.to_ascii_lowercase();
+    if message.contains("uncaught") {
+        "uncaught"
+    } else if message.contains("content security policy") || message.contains("csp") {
+        "csp"
+    } else if message.contains("module") {
+        "module"
+    } else if message.contains("net::")
+        || message.contains("failed to load resource")
+        || message.contains("network")
+    {
+        "network"
+    } else {
+        "other"
+    }
+}
+
+fn browser_log_message_sha256(message: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"nazoauthctl-browser-console-message-v1\0");
+    digest.update(message.as_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn parse_browser_console_log_diagnostic(value: &Value) -> Option<BrowserConsoleLogDiagnostic> {
+    let entries = value.get("value")?.as_array()?;
+    if entries.len() > MAX_BROWSER_LOG_ENTRIES {
+        return None;
+    }
+    let mut level_counts = BTreeMap::new();
+    let mut source_kind_counts = BTreeMap::new();
+    let mut category_counts = BTreeMap::new();
+    let mut messages = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let entry = entry.as_object()?;
+        if entry
+            .keys()
+            .any(|key| !matches!(key.as_str(), "level" | "message" | "source" | "timestamp"))
+            || !entry.contains_key("level")
+            || !entry.contains_key("message")
+            || !entry.contains_key("source")
+            || entry.get("timestamp").is_some_and(|value| !value.is_u64())
+        {
+            return None;
+        }
+        let raw_level = entry.get("level")?.as_str()?;
+        let raw_source = entry.get("source")?.as_str()?;
+        if raw_level.len() > 64 || raw_source.len() > 64 {
+            return None;
+        }
+        let level = browser_log_level(raw_level);
+        let source_kind = browser_log_source_kind(raw_source);
+        let message = entry.get("message")?.as_str()?;
+        let category = browser_log_category(message);
+        *level_counts.entry(level).or_insert(0) += 1;
+        *source_kind_counts.entry(source_kind).or_insert(0) += 1;
+        *category_counts.entry(category).or_insert(0) += 1;
+        messages.push(BrowserConsoleLogMessageDiagnostic {
+            level,
+            source_kind,
+            category,
+            message_sha256: browser_log_message_sha256(message),
+            message_len: message.len().min(MAX_BROWSER_LOG_MESSAGE_BYTES),
+            message_len_capped: message.len() > MAX_BROWSER_LOG_MESSAGE_BYTES,
+        });
+    }
+    Some(BrowserConsoleLogDiagnostic {
+        total: entries.len(),
+        capped: false,
+        level_counts: level_counts.into_iter().collect(),
+        source_kind_counts: source_kind_counts.into_iter().collect(),
+        category_counts: category_counts.into_iter().collect(),
+        messages,
     })
 }
 
@@ -1205,8 +1394,28 @@ mod tests {
     }
 
     #[test]
+    fn chrome_session_enables_consumed_browser_log_collection() {
+        let (endpoint, server) = webdriver_test_server(r#"{"value":{"sessionId":"session-01"}}"#);
+        let mut client =
+            WebDriverClient::connect(endpoint, Duration::from_secs(1)).expect("WebDriver client");
+
+        client.start_chrome().expect("start chrome");
+        client.session_id = None;
+
+        let request = server.join().expect("test server");
+        let body = request.split_once("\r\n\r\n").expect("request body").1;
+        let capabilities: Value = serde_json::from_str(body).expect("capabilities JSON");
+        assert_eq!(
+            capabilities
+                .pointer("/capabilities/alwaysMatch/goog:loggingPrefs/browser")
+                .and_then(Value::as_str),
+            Some("ALL")
+        );
+    }
+
+    #[test]
     fn w3c_page_runtime_diagnostic_uses_a_fixed_script_and_bounded_safe_shape() {
-        let body = r#"{"value":{"ready_state":"complete","root_present":true,"root_child_element_count":2,"root_child_element_count_capped":false,"has_vp_verification_result":true,"module_script_count":1,"module_script_count_capped":false,"resource_scan_count":2,"resource_scan_count_capped":false,"same_origin_ui_asset_resource_count":2,"same_origin_ui_asset_resource_count_capped":false,"ui_asset_response_statuses":[200,304],"ui_asset_response_statuses_capped":false,"ui_asset_transfer_size_positive_count":2,"ui_asset_decoded_size_positive_count":1,"title_kind":"nazoauth","navigator_online":true}}"#;
+        let body = r#"{"value":{"ready_state":"complete","root_present":true,"root_child_element_count":2,"root_child_element_count_capped":false,"has_vp_verification_result":true,"module_script_count":1,"module_script_count_capped":false,"resource_scan_count":2,"resource_scan_count_capped":false,"same_origin_ui_asset_resource_count":2,"same_origin_ui_asset_resource_count_capped":false,"ui_asset_response_statuses":[200,304],"ui_asset_response_statuses_capped":false,"ui_asset_transfer_size_positive_count":2,"ui_asset_decoded_size_positive_count":1,"verification_receipt_resource_count":1,"verification_receipt_resource_count_capped":false,"verification_receipt_response_statuses":[404],"verification_receipt_response_statuses_capped":false,"verification_receipt_transfer_size_positive_count":1,"verification_receipt_decoded_size_positive_count":1,"title_kind":"nazoauth","navigator_online":true}}"#;
         let (endpoint, server) = webdriver_test_server(body);
         let mut client =
             WebDriverClient::connect(endpoint, Duration::from_secs(1)).expect("WebDriver client");
@@ -1219,7 +1428,19 @@ mod tests {
 
         assert_eq!(diagnostic.ready_state, "complete");
         assert_eq!(diagnostic.ui_asset_response_statuses, vec![200, 304]);
-        assert_eq!(diagnostic.browser_log_collection, "not-collected-non-w3c");
+        assert_eq!(diagnostic.verification_receipt_response_statuses, vec![404]);
+        assert_eq!(
+            diagnostic.browser_log_collection,
+            "selenium-vendor-browser-log"
+        );
+        let mut receipt_200: Value = serde_json::from_str(body).expect("runtime fixture JSON");
+        receipt_200["value"]["verification_receipt_response_statuses"] = json!([200]);
+        assert_eq!(
+            parse_page_runtime_diagnostic(&receipt_200)
+                .expect("same-origin receipt 200 timing")
+                .verification_receipt_response_statuses,
+            vec![200]
+        );
         let request = server.join().expect("test server");
         assert!(request.starts_with("POST /session/session-01/execute/sync HTTP/1.1\r\n"));
         let body = request.split_once("\r\n\r\n").expect("request body").1;
@@ -1229,7 +1450,79 @@ mod tests {
             Some(PAGE_RUNTIME_DIAGNOSTIC_SCRIPT)
         );
         assert_eq!(command.get("args"), Some(&json!([])));
+        assert!(PAGE_RUNTIME_DIAGNOSTIC_SCRIPT.contains(
+            "resource.pathname === '/openid4vp/verification-receipts' && !resource.search && !resource.hash"
+        ));
         assert!(!request.contains("secret="));
+    }
+
+    #[test]
+    fn selenium_browser_log_adapter_posts_only_the_fixed_type_and_hashes_messages() {
+        let body = r#"{"value":[{"level":"SEVERE","source":"javascript","message":"Uncaught module error token=do-not-retain","timestamp":1},{"level":"WARNING","source":"network","message":"Failed to load resource: net::ERR_CONNECTION_REFUSED","timestamp":2}]}"#;
+        let (endpoint, server) = webdriver_test_server(body);
+        let mut client =
+            WebDriverClient::connect(endpoint, Duration::from_secs(1)).expect("WebDriver client");
+        client.session_id = Some("session-01".to_owned());
+
+        let diagnostic = client
+            .browser_console_log_diagnostic()
+            .expect("browser log summary");
+        client.session_id = None;
+
+        assert_eq!(diagnostic.total, 2);
+        assert_eq!(diagnostic.level_counts, vec![("severe", 1), ("warning", 1)]);
+        assert_eq!(
+            diagnostic.category_counts,
+            vec![("module", 1), ("network", 1)]
+        );
+        assert!(diagnostic.messages[0].message_len > 0);
+        assert!(!diagnostic.messages[0].message_len_capped);
+        let rendered = diagnostic.to_string();
+        assert!(!rendered.contains("do-not-retain"));
+        assert!(!rendered.contains("token="));
+        let request = server.join().expect("test server");
+        assert!(request.starts_with("POST /session/session-01/log HTTP/1.1\r\n"));
+        assert!(request.ends_with("\r\n\r\n{\"type\":\"browser\"}"));
+    }
+
+    #[test]
+    fn selenium_browser_log_adapter_rejects_unbounded_or_unknown_entries() {
+        let entry = json!({
+            "level": "SEVERE",
+            "source": "javascript",
+            "message": "uncaught",
+        });
+        let entries = Value::Array(
+            (0..=MAX_BROWSER_LOG_ENTRIES)
+                .map(|_| entry.clone())
+                .collect(),
+        );
+        assert!(parse_browser_console_log_diagnostic(&json!({ "value": entries })).is_none());
+        assert!(
+            parse_browser_console_log_diagnostic(&json!({
+                "value": [{
+                    "level": "SEVERE",
+                    "source": "javascript",
+                    "message": "secret=do-not-retain",
+                    "url": "https://issuer.example/?token=do-not-retain"
+                }]
+            }))
+            .is_none()
+        );
+        let long_message = "m".repeat(MAX_BROWSER_LOG_MESSAGE_BYTES + 1);
+        let summary = parse_browser_console_log_diagnostic(&json!({
+            "value": [{
+                "level": "INFO",
+                "source": "console-api",
+                "message": long_message,
+            }]
+        }))
+        .expect("bounded message summary");
+        assert_eq!(
+            summary.messages[0].message_len,
+            MAX_BROWSER_LOG_MESSAGE_BYTES
+        );
+        assert!(summary.messages[0].message_len_capped);
     }
 
     #[test]
@@ -1251,6 +1544,12 @@ mod tests {
                 "ui_asset_response_statuses_capped": false,
                 "ui_asset_transfer_size_positive_count": 0,
                 "ui_asset_decoded_size_positive_count": 0,
+                "verification_receipt_resource_count": 0,
+                "verification_receipt_resource_count_capped": false,
+                "verification_receipt_response_statuses": [],
+                "verification_receipt_response_statuses_capped": false,
+                "verification_receipt_transfer_size_positive_count": 0,
+                "verification_receipt_decoded_size_positive_count": 0,
                 "title_kind": "other",
                 "navigator_online": false,
                 "untrusted_page_text": "secret=do-not-retain"
