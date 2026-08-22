@@ -81,6 +81,26 @@ impl std::fmt::Display for BrowserNavigationDiagnostic {
     }
 }
 
+/// A bounded VP result-page driver failure.  Stages and fields are static
+/// implementation labels; the inner browser error already carries only safe
+/// WebDriver response metadata when that is available.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VpVerificationResultDriverDiagnostic {
+    pub stage: &'static str,
+    pub field: Option<&'static str>,
+    pub source: Box<BrowserError>,
+}
+
+impl std::fmt::Display for VpVerificationResultDriverDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "stage={}", self.stage)?;
+        if let Some(field) = self.field {
+            write!(formatter, " field={field}")?;
+        }
+        write!(formatter, " cause={}", self.source)
+    }
+}
+
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum BrowserError {
     #[error("browser endpoint is invalid")]
@@ -129,6 +149,10 @@ pub enum BrowserError {
     Protocol,
     #[error("browser WebDriver protocol response is invalid [{0}]")]
     ProtocolDiagnostic(WebDriverProtocolDiagnostic),
+    #[error("OpenID4VP verification-result WebDriver operation failed [{0}]")]
+    VpVerificationResultDriverDiagnostic(VpVerificationResultDriverDiagnostic),
+    #[error("OpenID4VP verification-result projection field is invalid: {0}")]
+    VpVerificationResultField(&'static str),
     #[error("browser WebDriver rejected the request")]
     DriverRejected,
     #[error("browser response exceeds the size limit")]
@@ -671,6 +695,26 @@ fn canonical_navigation_url(url: &Url) -> String {
     canonical.to_string()
 }
 
+fn vp_result_driver<T>(
+    stage: &'static str,
+    field: Option<&'static str>,
+    result: Result<T, BrowserError>,
+) -> Result<T, BrowserError> {
+    result.map_err(|source| vp_result_driver_error(stage, field, source))
+}
+
+fn vp_result_driver_error(
+    stage: &'static str,
+    field: Option<&'static str>,
+    source: BrowserError,
+) -> BrowserError {
+    BrowserError::VpVerificationResultDriverDiagnostic(VpVerificationResultDriverDiagnostic {
+        stage,
+        field,
+        source: Box::new(source),
+    })
+}
+
 /// Private orchestration receipt. Public module reports project only
 /// `path`, `sha256`, and `size` from this value.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1160,38 +1204,68 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         {
             return Err(self.navigation_violation(self.last_url.as_ref(), &ui_url));
         }
-        self.navigate(&ui_url)?;
-        self.wait_for_openid4vp_fragment_scrub(&ui_url)?;
+        vp_result_driver("bootstrap-navigate", None, self.navigate(&ui_url))?;
+        vp_result_driver(
+            "fragment-scrub-current-url",
+            None,
+            self.wait_for_openid4vp_fragment_scrub(&ui_url),
+        )?;
         let deadline = self.deadline(DEFAULT_STEP_TIMEOUT);
         loop {
             let root = self.driver.find_element(&BrowserSelector::Css(
                 "[data-testid=\"vp-verification-result\"]".to_owned(),
             ));
             match root {
-                Ok(root) => match self
-                    .driver
-                    .element_attribute(&root, "data-state")?
-                    .as_deref()
+                Ok(root) => match vp_result_driver(
+                    "result-root-state-attribute",
+                    Some("vp-verification-result"),
+                    self.driver.element_attribute(&root, "data-state"),
+                )?
+                .as_deref()
                 {
                     Some("verified") => {
-                        if !self.driver.element_displayed(&root)? {
-                            return Err(BrowserError::Protocol);
+                        if !vp_result_driver(
+                            "result-root-visible",
+                            Some("vp-verification-result"),
+                            self.driver.element_displayed(&root),
+                        )? {
+                            return Err(BrowserError::VpVerificationResultField(
+                                "vp-verification-result:data-state",
+                            ));
                         }
                         break;
                     }
-                    Some("loading") => self.sleep_until(deadline)?,
-                    _ => return Err(BrowserError::Protocol),
+                    Some("loading") => vp_result_driver(
+                        "result-root-wait",
+                        Some("vp-verification-result"),
+                        self.sleep_until(deadline),
+                    )?,
+                    _ => {
+                        return Err(BrowserError::VpVerificationResultField(
+                            "vp-verification-result:data-state",
+                        ));
+                    }
                 },
                 Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {
-                    self.sleep_until(deadline)?;
+                    vp_result_driver(
+                        "result-root-wait",
+                        Some("vp-verification-result"),
+                        self.sleep_until(deadline),
+                    )?;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    return Err(vp_result_driver_error("result-root-find", None, error));
+                }
             }
         }
         self.verify_openid4vp_result_projection(evidence)?;
         // Re-observe after the DOM checks: a page that navigates during the
         // bounded wait must not donate a screenshot from another origin.
-        let current = self.ensure_current_url()?;
+        let current = vp_result_driver(
+            "post-projection-current-url",
+            None,
+            self.ensure_current_url(),
+        )?;
         if !self.policy.target_origin.allows(&current)
             || current.path() != "/ui/verification-result"
             || current.query().is_some()
@@ -1200,11 +1274,15 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             return Err(self.navigation_violation(self.last_url.as_ref(), &current));
         }
         let context = capture.for_index(obligation_index)?;
-        let screenshot = self.driver.screenshot_png()?;
+        let screenshot = vp_result_driver("screenshot", None, self.driver.screenshot_png())?;
         // The screenshot bytes are still only in memory. Recheck both the
         // URL and all visible DOM bindings before the durable PNG/receipt
         // pair is committed, so a late navigation cannot donate another page.
-        let current = self.ensure_current_url()?;
+        let current = vp_result_driver(
+            "post-screenshot-current-url",
+            None,
+            self.ensure_current_url(),
+        )?;
         if !self.policy.target_origin.allows(&current)
             || current.path() != "/ui/verification-result"
             || current.query().is_some()
@@ -1261,17 +1339,31 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
     fn expect_result_text(
         &mut self,
         root: &str,
-        test_id: &str,
+        test_id: &'static str,
         expected: &str,
     ) -> Result<(), BrowserError> {
-        let element = self.driver.find_child_element(
-            root,
-            &BrowserSelector::Css(format!("[data-testid=\"{test_id}\"]")),
+        let element = vp_result_driver(
+            "projection-field-find",
+            Some(test_id),
+            self.driver.find_child_element(
+                root,
+                &BrowserSelector::Css(format!("[data-testid=\"{test_id}\"]")),
+            ),
         )?;
-        if !self.driver.element_displayed(&element)?
-            || self.driver.element_text(&element)? != expected
+        if !vp_result_driver(
+            "projection-field-visible",
+            Some(test_id),
+            self.driver.element_displayed(&element),
+        )? {
+            return Err(BrowserError::VpVerificationResultField(test_id));
+        }
+        if vp_result_driver(
+            "projection-field-text",
+            Some(test_id),
+            self.driver.element_text(&element),
+        )? != expected
         {
-            return Err(BrowserError::Protocol);
+            return Err(BrowserError::VpVerificationResultField(test_id));
         }
         Ok(())
     }
@@ -1280,17 +1372,33 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         &mut self,
         evidence: &OpenId4VpVerificationEvidence,
     ) -> Result<(), BrowserError> {
-        let root = self.driver.find_element(&BrowserSelector::Css(
-            "[data-testid=\"vp-verification-result\"]".to_owned(),
-        ))?;
-        if !self.driver.element_displayed(&root)?
-            || self
-                .driver
-                .element_attribute(&root, "data-state")?
-                .as_deref()
-                != Some("verified")
+        let root = vp_result_driver(
+            "projection-root-find",
+            Some("vp-verification-result"),
+            self.driver.find_element(&BrowserSelector::Css(
+                "[data-testid=\"vp-verification-result\"]".to_owned(),
+            )),
+        )?;
+        if !vp_result_driver(
+            "projection-root-visible",
+            Some("vp-verification-result"),
+            self.driver.element_displayed(&root),
+        )? {
+            return Err(BrowserError::VpVerificationResultField(
+                "vp-verification-result:visible",
+            ));
+        }
+        if vp_result_driver(
+            "projection-root-state-attribute",
+            Some("vp-verification-result"),
+            self.driver.element_attribute(&root, "data-state"),
+        )?
+        .as_deref()
+            != Some("verified")
         {
-            return Err(BrowserError::Protocol);
+            return Err(BrowserError::VpVerificationResultField(
+                "vp-verification-result:data-state",
+            ));
         }
         self.expect_result_text(&root, "vp-verification-status", "Verification successful")?;
         self.expect_result_text(&root, "vp-run-jti", &evidence.context.run_jti)?;
@@ -2387,13 +2495,45 @@ mod tests {
             Some("receipt=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         );
         executor.driver_mut().allow_root_children = false;
-        assert_eq!(
-            executor
-                .capture_openid4vp_verification_result(&evidence, &capture, 1)
-                .expect_err("global lookalike outside the verified root"),
-            BrowserError::ElementNotFound
-        );
+        let error = executor
+            .capture_openid4vp_verification_result(&evidence, &capture, 1)
+            .expect_err("global lookalike outside the verified root");
+        let BrowserError::VpVerificationResultDriverDiagnostic(diagnostic) = error else {
+            panic!("staged WebDriver failure")
+        };
+        assert_eq!(diagnostic.stage, "projection-field-find");
+        assert_eq!(diagnostic.field, Some("vp-verification-status"));
+        assert_eq!(diagnostic.source.as_ref(), &BrowserError::ElementNotFound);
         std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn vp_result_driver_diagnostic_preserves_webdriver_protocol_metadata() {
+        let response = WebDriverProtocolDiagnostic {
+            endpoint: "current_url",
+            status: 200,
+            content_type: "application/json",
+            body_len: 21,
+            body_sha256: "a".repeat(64),
+            value_type: "object",
+            top_level_keys: vec!["value".to_owned()],
+        };
+        let error = vp_result_driver::<()>(
+            "post-projection-current-url",
+            None,
+            Err(BrowserError::ProtocolDiagnostic(response.clone())),
+        )
+        .expect_err("protocol diagnostic");
+        let BrowserError::VpVerificationResultDriverDiagnostic(diagnostic) = error else {
+            panic!("staged protocol diagnostic")
+        };
+        assert_eq!(diagnostic.stage, "post-projection-current-url");
+        assert_eq!(diagnostic.field, None);
+        assert_eq!(
+            diagnostic.source.as_ref(),
+            &BrowserError::ProtocolDiagnostic(response)
+        );
+        assert!(diagnostic.to_string().contains("endpoint=current_url"));
     }
 
     #[test]
