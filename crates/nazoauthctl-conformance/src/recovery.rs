@@ -1974,6 +1974,7 @@ fn validate_review_screenshot_manifest_binding(
         }
     }
     let mut images = std::collections::BTreeSet::new();
+    let mut expected_files = std::collections::BTreeSet::new();
     let evidence_root = screenshot
         .path
         .parent()
@@ -2015,6 +2016,8 @@ fn validate_review_screenshot_manifest_binding(
             bail!("review screenshot manifest screenshot graph is invalid");
         }
         let image_path = evidence_root.join(&image.path);
+        expected_files.insert(image.path.clone());
+        expected_files.insert(image.path.with_extension("png.receipt.json"));
         let image_bytes = crate::secure_file::read_bounded(&image_path, 500 * 1024, true)
             .map_err(|error| anyhow::anyhow!("review screenshot is not secure: {error:?}"))?;
         if image_bytes.len() != image.size
@@ -2046,6 +2049,48 @@ fn validate_review_screenshot_manifest_binding(
         {
             bail!("review screenshot receipt conflicts with the manifest");
         }
+    }
+    if expected_files.len() > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_RUN * 2 {
+        bail!("review screenshot manifest exceeds the run file budget");
+    }
+    let run_directory = evidence_root
+        .join("review-screenshots")
+        .join(&binding.request_jti);
+    match crate::secure_file::validate_directory(&run_directory, true) {
+        Ok(_) => {}
+        Err(crate::secure_file::SecureFileError::NotFound) if expected_files.is_empty() => {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "review screenshot run directory is not secure: {error:?}"
+            ));
+        }
+    }
+    let mut found_files = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&run_directory)
+        .context("failed to enumerate review screenshot run directory")?
+    {
+        let entry = entry.context("failed to enumerate review screenshot entry")?;
+        let file_type = entry
+            .file_type()
+            .context("failed to inspect review screenshot entry")?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            bail!("review screenshot run directory contains a non-file entry");
+        }
+        let name = entry.file_name();
+        let relative = PathBuf::from("review-screenshots")
+            .join(&binding.request_jti)
+            .join(name);
+        if !expected_files.contains(&relative) || !found_files.insert(relative) {
+            bail!("review screenshot run directory contains an unexpected entry");
+        }
+        if found_files.len() > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_RUN * 2 {
+            bail!("review screenshot run directory exceeds the file budget");
+        }
+    }
+    if found_files != expected_files {
+        bail!("review screenshot run directory is missing a declared entry");
     }
     Ok(())
 }
