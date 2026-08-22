@@ -1394,7 +1394,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             None,
             self.validate_openid4vp_result_shell_url(&shell_url),
         )?;
-        self.wait_for_openid4vp_result_shell()?;
+        self.validate_openid4vp_result_shell_identity()?;
         vp_result_driver_for_url(
             "bootstrap-navigate",
             None,
@@ -1555,61 +1555,38 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
     }
 
     /// A capability-free navigation must expose the stable NazoAuthWeb shell.
-    /// `loading` is a bounded render transition; only `not-found` is the
-    /// closed, no-receipt state. Dynamic page text is deliberately not read.
-    fn wait_for_openid4vp_result_shell(&mut self) -> Result<(), BrowserError> {
-        let deadline = self.deadline(DEFAULT_STEP_TIMEOUT);
-        loop {
-            let root = self.driver.find_element(&BrowserSelector::Css(
+    /// The Web shell can legitimately be in any recognized closed state while
+    /// a capability is rotated or a previous one is discarded. The receipt
+    /// capability is still injected only after this identity check; final
+    /// evidence requires `verified` and every signed projection field.
+    fn validate_openid4vp_result_shell_identity(&mut self) -> Result<(), BrowserError> {
+        let root = vp_result_driver(
+            "canonical-shell-root-find",
+            Some("vp-verification-result"),
+            self.driver.find_element(&BrowserSelector::Css(
                 "[data-testid=\"vp-verification-result\"]".to_owned(),
+            )),
+        )?;
+        if !vp_result_driver(
+            "canonical-shell-root-visible",
+            Some("vp-verification-result"),
+            self.driver.element_displayed(&root),
+        )? {
+            return Err(BrowserError::VpVerificationResultField(
+                "vp-verification-result:visible",
             ));
-            match root {
-                Ok(root) => {
-                    if !vp_result_driver(
-                        "canonical-shell-root-visible",
-                        Some("vp-verification-result"),
-                        self.driver.element_displayed(&root),
-                    )? {
-                        return Err(BrowserError::VpVerificationResultField(
-                            "vp-verification-result:visible",
-                        ));
-                    }
-                    match vp_result_driver(
-                        "canonical-shell-root-state-attribute",
-                        Some("vp-verification-result"),
-                        self.driver.element_attribute(&root, "data-state"),
-                    )?
-                    .as_deref()
-                    {
-                        Some("not-found") => return Ok(()),
-                        Some("loading") => vp_result_driver(
-                            "canonical-shell-wait",
-                            Some("vp-verification-result"),
-                            self.sleep_until(deadline),
-                        )?,
-                        _ => {
-                            return Err(BrowserError::VpVerificationResultField(
-                                "vp-verification-result:data-state",
-                            ));
-                        }
-                    }
-                }
-                Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {
-                    vp_result_driver(
-                        "canonical-shell-wait",
-                        Some("vp-verification-result"),
-                        self.sleep_until(deadline),
-                    )?;
-                }
-                Err(error) => {
-                    return Err(vp_result_driver_error(
-                        "canonical-shell-root-find",
-                        Some("vp-verification-result"),
-                        None,
-                        error,
-                    ));
-                }
-            }
+        }
+        match vp_result_driver(
+            "canonical-shell-root-state-attribute",
+            Some("vp-verification-result"),
+            self.driver.element_attribute(&root, "data-state"),
+        )?
+        .as_deref()
+        {
+            Some("loading" | "verified" | "expired" | "not-found" | "generic-error") => Ok(()),
+            _ => Err(BrowserError::VpVerificationResultField(
+                "vp-verification-result:data-state",
+            )),
         }
     }
 
@@ -2419,6 +2396,7 @@ mod tests {
         shell_available: bool,
         shell_state: &'static str,
         refreshed_shell_state: Option<&'static str>,
+        shell_state_attribute_missing: bool,
         receipt_navigation_seen: bool,
         refreshes: usize,
         refreshed_from: Vec<Url>,
@@ -2541,6 +2519,9 @@ mod tests {
             name: &str,
         ) -> Result<Option<String>, BrowserError> {
             if element.contains("vp-verification-result") && name == "data-state" {
+                if self.shell_state_attribute_missing {
+                    return Ok(None);
+                }
                 Ok(Some(
                     if self.receipt_navigation_seen {
                         "verified"
@@ -2583,6 +2564,7 @@ mod tests {
             shell_available: true,
             shell_state: "not-found",
             refreshed_shell_state: None,
+            shell_state_attribute_missing: false,
             receipt_navigation_seen: false,
             refreshes: 0,
             refreshed_from: Vec::new(),
@@ -2993,7 +2975,7 @@ mod tests {
     #[test]
     fn vp_result_canonical_shell_rejects_missing_or_noncanonical_before_capability_navigation() {
         let cases = [
-            ("missing-shell", false, None, "canonical-shell-wait"),
+            ("missing-shell", false, None, "canonical-shell-root-find"),
             (
                 "cross-origin-redirect",
                 true,
@@ -3059,29 +3041,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn vp_result_canonical_shell_accepts_only_the_closed_no_receipt_state() {
-        let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
-        let root = std::env::temp_dir()
-            .canonicalize()
-            .expect("temp")
-            .join(format!("nazoauth-vp-shell-state-{}", uuid::Uuid::now_v7()));
-        crate::secure_file::ensure_directory(&root, true).expect("private root");
-        let capture = vp_capture_context(root.clone(), &context, &variant);
-        let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
-        driver.shell_state = "generic-error";
-        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
-        let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
-        let mut executor =
-            BrowserExecutor::new(driver, BrowserPolicy::new(target, suite).expect("policy"));
-        assert_eq!(
+    fn vp_result_canonical_shell_accepts_each_recognized_web_state_before_capability() {
+        for shell_state in [
+            "loading",
+            "verified",
+            "expired",
+            "not-found",
+            "generic-error",
+        ] {
+            let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .expect("temp")
+                .join(format!(
+                    "nazoauth-vp-shell-state-{shell_state}-{}",
+                    uuid::Uuid::now_v7()
+                ));
+            crate::secure_file::ensure_directory(&root, true).expect("private root");
+            let capture = vp_capture_context(root.clone(), &context, &variant);
+            let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+            driver.shell_state = shell_state;
+            let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+            let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+            let mut executor =
+                BrowserExecutor::new(driver, BrowserPolicy::new(target, suite).expect("policy"));
+
             executor
                 .capture_openid4vp_verification_result(&evidence, &capture, 0)
-                .expect_err("non-closed shell state"),
-            BrowserError::VpVerificationResultField("vp-verification-result:data-state")
-        );
-        assert_eq!(executor.driver_mut().navigated.len(), 1);
-        assert!(executor.driver_mut().navigated[0].fragment().is_none());
-        std::fs::remove_dir_all(root).expect("remove root");
+                .expect("recognized shell state permits capability bootstrap");
+            assert_eq!(executor.driver_mut().navigated.len(), 2);
+            assert!(executor.driver_mut().navigated[1].fragment().is_some());
+            std::fs::remove_dir_all(root).expect("remove root");
+        }
     }
 
     #[cfg(unix)]
@@ -3109,7 +3100,7 @@ mod tests {
 
         executor
             .capture_openid4vp_verification_result(&evidence, &capture, 0)
-            .expect("refresh closed shell then bootstrap");
+            .expect("refresh recognized shell then bootstrap");
 
         assert_eq!(executor.driver_mut().refreshes, 1);
         assert_eq!(
@@ -3175,8 +3166,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn vp_result_canonical_shell_refresh_requires_a_closed_visible_shell() {
-        let cases = [(false, "not-found"), (true, "generic-error")];
+    fn vp_result_canonical_shell_refresh_rejects_missing_or_unknown_shell_state() {
+        let cases = [
+            (false, Some("not-found")),
+            (true, None),
+            (true, Some("")),
+            (true, Some("unknown")),
+        ];
         for (shell_available, shell_state) in cases {
             let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
             let root = std::env::temp_dir()
@@ -3192,7 +3188,8 @@ mod tests {
             driver.current = Url::parse("https://issuer.example/ui/verification-result")
                 .expect("canonical shell URL");
             driver.shell_available = shell_available;
-            driver.refreshed_shell_state = Some(shell_state);
+            driver.shell_state_attribute_missing = shell_state.is_none();
+            driver.refreshed_shell_state = shell_state;
             let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
             let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
             let mut policy = BrowserPolicy::new(target, suite).expect("policy");
