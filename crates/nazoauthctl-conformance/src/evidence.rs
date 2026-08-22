@@ -1774,4 +1774,76 @@ mod tests {
         assert_eq!(vp_artifact_digest(&legacy), Err(EvidenceError::Identity));
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_provider_evidence_with_nazo_vp_receipt_fails_before_bundle_publish() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-provider-legacy-vp-{}", Uuid::now_v7()));
+        let root = crate::secure_file::ensure_directory(&root, true).expect("evidence root");
+        let run = "request-0123456789abcdef0123456789abcdef";
+        let relative = PathBuf::from("review-screenshots")
+            .join(run)
+            .join("plan-a--module-a--000.png");
+        let parent = root
+            .join(&relative)
+            .parent()
+            .expect("capture parent")
+            .to_owned();
+        crate::secure_file::ensure_directory(&parent, true).expect("capture parent");
+        let audit = serde_json::json!({
+            "suite_plan_id": "suite-plan-a",
+            "module_id": "module-a",
+            "test_name": "test-a",
+            "variant": {},
+            "marker": "required",
+            "obligation_index": 0,
+            "path": relative,
+            "sha256": "a".repeat(64),
+            "size": 1,
+            "trigger_origin": "https://issuer.example",
+            "trigger_path": "/ui/verification-result",
+            "trigger_url_sha256": "b".repeat(64),
+            "source": "nazo-vp-verification-result/live-webdriver",
+            "verification_receipt": serde_json::Value::Null,
+        });
+        let audit_path = root
+            .join("review-screenshots")
+            .join(run)
+            .join("plan-a--module-a--000.png.receipt.json");
+        crate::secure_file::write_atomic(
+            &audit_path,
+            &serde_json::to_vec(&audit).expect("audit JSON"),
+            true,
+        )
+        .expect("audit receipt");
+        let mut legacy = identity();
+        legacy.provider = Some(provider());
+        let mut report = report();
+        report.modules[0]
+            .review_screenshots
+            .push(crate::ReviewScreenshotReport {
+                path: PathBuf::from("review-screenshots")
+                    .join(run)
+                    .join("plan-a--module-a--000.png"),
+                sha256: "a".repeat(64),
+                size: 1,
+            });
+        assert_eq!(
+            write_private_provider_evidence_bundle(&report, &root, &legacy, None),
+            Err(EvidenceError::Identity)
+        );
+        assert!(
+            !std::fs::read_dir(&root)
+                .expect("evidence root listing")
+                .any(|entry| entry
+                    .expect("evidence entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("run-"))
+        );
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
 }
