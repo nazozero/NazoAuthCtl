@@ -1916,6 +1916,8 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         expected: &Url,
     ) -> Result<(), BrowserError> {
         let deadline = self.deadline(DEFAULT_STEP_TIMEOUT);
+        let mut recovery_observations = 0usize;
+        let mut recovery_used = false;
         loop {
             vp_result_driver(
                 "canonical-shell-current-url",
@@ -1927,6 +1929,13 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             )) {
                 Ok(root) => root,
                 Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {
+                    if self.maybe_recover_openid4vp_result_shell(
+                        expected,
+                        &mut recovery_observations,
+                        &mut recovery_used,
+                    )? {
+                        continue;
+                    }
                     if let Err(source) = self.sleep_until(deadline) {
                         return Err(self.canonical_shell_mount_failure(
                             "canonical-shell-root-find",
@@ -1949,6 +1958,13 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                 Some("vp-verification-result"),
                 self.driver.element_displayed(&root),
             )? {
+                if self.maybe_recover_openid4vp_result_shell(
+                    expected,
+                    &mut recovery_observations,
+                    &mut recovery_used,
+                )? {
+                    continue;
+                }
                 if let Err(source) = self.sleep_until(deadline) {
                     return Err(self.canonical_shell_mount_failure(
                         "canonical-shell-root-visible",
@@ -1969,6 +1985,13 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                     return Ok(());
                 }
                 None => {
+                    if self.maybe_recover_openid4vp_result_shell(
+                        expected,
+                        &mut recovery_observations,
+                        &mut recovery_used,
+                    )? {
+                        continue;
+                    }
                     if let Err(source) = self.sleep_until(deadline) {
                         return Err(self.canonical_shell_mount_failure(
                             "canonical-shell-root-state-attribute",
@@ -1984,6 +2007,69 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                 }
             }
         }
+    }
+
+    /// A full NazoAuthWeb document can occasionally finish loading before its
+    /// result root mounts.  After two consecutive, independently observed
+    /// mount transients, reload that *already canonical* shell once.  This is
+    /// a document recovery, not a retry budget: it shares the caller's
+    /// deadline and is never attempted for an unknown state or a URL that is
+    /// not the exact capability-free shell.
+    fn maybe_recover_openid4vp_result_shell(
+        &mut self,
+        expected: &Url,
+        recovery_observations: &mut usize,
+        recovery_used: &mut bool,
+    ) -> Result<bool, BrowserError> {
+        if *recovery_used {
+            return Ok(false);
+        }
+        vp_result_driver(
+            "canonical-shell-recovery-current-url",
+            None,
+            self.validate_openid4vp_result_shell_url(expected),
+        )?;
+        let runtime = match self.driver.page_runtime_diagnostic() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return Err(self.canonical_shell_mount_failure(
+                    "canonical-shell-recovery-runtime",
+                    expected,
+                    error,
+                ));
+            }
+        };
+        let incomplete_mount = runtime.ready_state == "complete"
+            && runtime.root_present
+            && (!runtime.has_vp_verification_result || runtime.root_child_element_count == 0);
+        if !incomplete_mount {
+            *recovery_observations = 0;
+            return Ok(false);
+        }
+        *recovery_observations = recovery_observations.saturating_add(1);
+        if *recovery_observations < 2 {
+            return Ok(false);
+        }
+        // Drain session-global historical logs before the one permitted
+        // recovery reload. A later failure summary then has a bounded
+        // recovery window rather than stale pre-shell entries.
+        let _ = self.driver.browser_console_log_diagnostic(expected);
+        vp_result_driver_for_url(
+            "canonical-shell-recovery-refresh",
+            None,
+            expected,
+            None,
+            None,
+            self.refresh_openid4vp_result_shell(expected),
+        )?;
+        vp_result_driver(
+            "canonical-shell-recovery-current-url",
+            None,
+            self.validate_openid4vp_result_shell_url(expected),
+        )?;
+        *recovery_used = true;
+        *recovery_observations = 0;
+        Ok(true)
     }
 
     /// Once the bootstrap fragment is scrubbed, wait only for the verified
@@ -2941,6 +3027,7 @@ mod tests {
         page_source: String,
         page_source_error: Option<BrowserError>,
         page_runtime: Result<BrowserPageRuntimeDiagnostic, BrowserError>,
+        refreshed_page_runtime: Option<BrowserPageRuntimeDiagnostic>,
         browser_logs: Result<BrowserConsoleLogDiagnostic, BrowserError>,
         browser_log_queue: VecDeque<Result<BrowserConsoleLogDiagnostic, BrowserError>>,
         browser_log_calls: usize,
@@ -3009,6 +3096,11 @@ mod tests {
         fn page_runtime_diagnostic(
             &mut self,
         ) -> Result<BrowserPageRuntimeDiagnostic, BrowserError> {
+            if self.refreshes > 0
+                && let Some(runtime) = &self.refreshed_page_runtime
+            {
+                return Ok(runtime.clone());
+            }
             self.page_runtime.clone()
         }
 
@@ -3209,6 +3301,7 @@ mod tests {
                 navigator_online: true,
                 browser_log_collection: "selenium-vendor-browser-log",
             }),
+            refreshed_page_runtime: None,
             browser_logs: Ok(BrowserConsoleLogDiagnostic {
                 total: 0,
                 capped: false,
@@ -3230,6 +3323,20 @@ mod tests {
             refreshed_from: Vec::new(),
             navigated: Vec::new(),
         }
+    }
+
+    fn make_incomplete_canonical_shell(driver: &mut VpResultDriver) {
+        let recovered_runtime = driver
+            .page_runtime
+            .as_ref()
+            .expect("default runtime")
+            .clone();
+        let mut incomplete_runtime = recovered_runtime.clone();
+        incomplete_runtime.root_child_element_count = 0;
+        incomplete_runtime.has_vp_verification_result = false;
+        driver.page_runtime = Ok(incomplete_runtime);
+        driver.refreshed_page_runtime = Some(recovered_runtime);
+        driver.root_not_found_reads = 2;
     }
 
     #[cfg(unix)]
@@ -4336,6 +4443,165 @@ mod tests {
             }
             assert_eq!(executor.driver_mut().refreshes, 1);
             assert!(executor.driver_mut().navigated.is_empty());
+            std::fs::remove_dir_all(root).expect("remove root");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_canonical_shell_recovers_one_complete_unmounted_document() {
+        let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp")
+            .join(format!(
+                "nazoauth-vp-shell-recover-{}",
+                uuid::Uuid::now_v7()
+            ));
+        crate::secure_file::ensure_directory(&root, true).expect("private root");
+        let capture = vp_capture_context(root.clone(), &context, &variant);
+        let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+        make_incomplete_canonical_shell(&mut driver);
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+        let policy = BrowserPolicy::new(target, suite)
+            .expect("policy")
+            .with_limits(BrowserLimits {
+                max_step_timeout: Duration::from_millis(20),
+                poll_interval: Duration::from_millis(1),
+                ..BrowserLimits::default()
+            })
+            .expect("short policy");
+        let mut executor = BrowserExecutor::new(driver, policy);
+
+        executor
+            .capture_openid4vp_verification_result(&evidence, &capture, 0)
+            .expect("single shell recovery then verified result");
+        assert_eq!(executor.driver_mut().refreshes, 1);
+        assert_eq!(executor.driver_mut().browser_log_calls, 2);
+        assert_eq!(executor.driver_mut().navigated.len(), 2);
+        assert!(executor.driver_mut().navigated[0].fragment().is_none());
+        assert!(executor.driver_mut().navigated[1].fragment().is_some());
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_canonical_shell_recovery_is_once_and_failure_logs_start_after_recovery() {
+        let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp")
+            .join(format!(
+                "nazoauth-vp-shell-recover-once-{}",
+                uuid::Uuid::now_v7()
+            ));
+        crate::secure_file::ensure_directory(&root, true).expect("private root");
+        let capture = vp_capture_context(root.clone(), &context, &variant);
+        let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+        make_incomplete_canonical_shell(&mut driver);
+        driver.shell_available = false;
+        driver.browser_log_queue = VecDeque::from([
+            Ok(test_browser_logs("other")),
+            Ok(test_browser_logs("csp")),
+            Ok(test_browser_logs("network")),
+        ]);
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+        let policy = BrowserPolicy::new(target, suite)
+            .expect("policy")
+            .with_limits(BrowserLimits {
+                max_step_timeout: Duration::from_millis(1),
+                poll_interval: Duration::from_millis(1),
+                ..BrowserLimits::default()
+            })
+            .expect("short policy");
+        let mut executor = BrowserExecutor::new(driver, policy);
+
+        let error = executor
+            .capture_openid4vp_verification_result(&evidence, &capture, 0)
+            .expect_err("shell remains unmounted after one recovery");
+        let BrowserError::VpVerificationResultShellMountDiagnostic(diagnostic) = error else {
+            panic!("shell mount diagnostic")
+        };
+        assert_eq!(diagnostic.source.as_ref(), &BrowserError::Timeout);
+        assert_eq!(
+            diagnostic
+                .browser_logs
+                .as_ref()
+                .expect("post-recovery logs")
+                .category_counts,
+            vec![("network", 1)]
+        );
+        assert_eq!(executor.driver_mut().refreshes, 1);
+        assert_eq!(executor.driver_mut().browser_log_calls, 3);
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_canonical_shell_recovery_rejects_redirects_and_unknown_state_without_refresh() {
+        for (case, refresh_redirect, unknown_state, expected_stage, expected_refreshes) in [
+            (
+                "query-redirect",
+                Some("https://issuer.example/ui/verification-result?unexpected=1"),
+                false,
+                Some("canonical-shell-recovery-current-url"),
+                1,
+            ),
+            ("unknown-state", None, true, None, 0),
+        ] {
+            let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .expect("temp")
+                .join(format!(
+                    "nazoauth-vp-shell-recover-reject-{case}-{}",
+                    uuid::Uuid::now_v7()
+                ));
+            crate::secure_file::ensure_directory(&root, true).expect("private root");
+            let capture = vp_capture_context(root.clone(), &context, &variant);
+            let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+            if unknown_state {
+                driver.shell_state = "unknown";
+            } else {
+                make_incomplete_canonical_shell(&mut driver);
+                driver.refresh_redirect = refresh_redirect
+                    .map(|value| Url::parse(value).expect("canonical recovery refresh redirect"));
+            }
+            let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+            let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+            let mut executor =
+                BrowserExecutor::new(driver, BrowserPolicy::new(target, suite).expect("policy"));
+
+            let error = executor
+                .capture_openid4vp_verification_result(&evidence, &capture, 0)
+                .expect_err("invalid shell must fail closed");
+            if let Some(expected_stage) = expected_stage {
+                let BrowserError::VpVerificationResultDriverDiagnostic(diagnostic) = error else {
+                    panic!("redirect must preserve recovery stage")
+                };
+                assert_eq!(diagnostic.stage, expected_stage, "case={case}");
+            } else {
+                assert_eq!(
+                    error,
+                    BrowserError::VpVerificationResultField("vp-verification-result:data-state"),
+                    "case={case}"
+                );
+            }
+            assert_eq!(
+                executor.driver_mut().refreshes,
+                expected_refreshes,
+                "case={case}"
+            );
+            assert!(
+                executor
+                    .driver_mut()
+                    .navigated
+                    .iter()
+                    .all(|url| url.fragment().is_none()),
+                "case={case}"
+            );
             std::fs::remove_dir_all(root).expect("remove root");
         }
     }
