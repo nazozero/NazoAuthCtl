@@ -409,13 +409,15 @@ impl BrowserDriver for WebDriverClient {
 
     fn browser_console_log_diagnostic(
         &mut self,
+        target_origin: &Url,
     ) -> Result<BrowserConsoleLogDiagnostic, BrowserError> {
         let response = self.post_value(
             &self.session_path("/log")?,
             &json!({ "type": "browser" }),
             "browser_console_log",
         )?;
-        parse_browser_console_log_diagnostic(&response.value).ok_or_else(|| response.protocol())
+        parse_browser_console_log_diagnostic(&response.value, target_origin)
+            .ok_or_else(|| response.protocol())
     }
 
     fn find_element(&mut self, selector: &BrowserSelector) -> Result<String, BrowserError> {
@@ -728,8 +730,9 @@ impl BrowserDriver for ManagedWebDriver {
     }
     fn browser_console_log_diagnostic(
         &mut self,
+        target_origin: &Url,
     ) -> Result<BrowserConsoleLogDiagnostic, BrowserError> {
-        self.client.browser_console_log_diagnostic()
+        self.client.browser_console_log_diagnostic(target_origin)
     }
     fn find_element(&mut self, selector: &BrowserSelector) -> Result<String, BrowserError> {
         self.client.find_element(selector)
@@ -1172,6 +1175,83 @@ fn browser_log_category(message: &str) -> &'static str {
     }
 }
 
+fn browser_log_http_status(message: &str) -> Option<u16> {
+    for marker in ["HTTP/1.1 ", "HTTP/2 ", "HTTP/3 ", "status of ", "status="] {
+        let Some(index) = message.find(marker) else {
+            continue;
+        };
+        let bytes = message[index + marker.len()..].as_bytes();
+        if bytes.len() < 3 || !bytes[..3].iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let status = std::str::from_utf8(&bytes[..3]).ok()?.parse().ok()?;
+        if (100..=599).contains(&status) {
+            return Some(status);
+        }
+    }
+    None
+}
+
+fn browser_log_network_error(message: &str, category: &'static str) -> Option<&'static str> {
+    if category != "network" {
+        return None;
+    }
+    for (needle, value) in [
+        ("net::ERR_CONNECTION_REFUSED", "connection-refused"),
+        ("net::ERR_NAME_NOT_RESOLVED", "name-not-resolved"),
+        ("net::ERR_CONNECTION_TIMED_OUT", "connection-timed-out"),
+        ("net::ERR_CONNECTION_RESET", "connection-reset"),
+        ("net::ERR_ABORTED", "aborted"),
+        ("net::ERR_FAILED", "failed"),
+    ] {
+        if message.contains(needle) {
+            return Some(value);
+        }
+    }
+    Some("other")
+}
+
+fn browser_log_resource_url(message: &str) -> Option<Url> {
+    for prefix in ["https://", "http://"] {
+        let mut remaining = message;
+        while let Some(index) = remaining.find(prefix) {
+            let candidate = &remaining[index..];
+            let end = candidate
+                .find(char::is_whitespace)
+                .unwrap_or(candidate.len());
+            let candidate = candidate[..end].trim_end_matches(|character: char| {
+                matches!(character, ')' | ']' | '}' | ',' | ';' | '.' | '\'' | '"')
+            });
+            if let Ok(url) = Url::parse(candidate) {
+                return Some(url);
+            }
+            remaining = &candidate[prefix.len()..];
+        }
+    }
+    None
+}
+
+fn browser_log_resource_bucket(message: &str, target_origin: &Url) -> &'static str {
+    let Some(resource) = browser_log_resource_url(message) else {
+        return "unknown";
+    };
+    if resource.origin() != target_origin.origin() {
+        return "cross-origin";
+    }
+    if resource.path() == "/openid4vp/verification-receipts"
+        && resource.query().is_none()
+        && resource.fragment().is_none()
+    {
+        "receipt-api"
+    } else if resource.path().starts_with("/ui/assets/") {
+        "ui-asset"
+    } else if resource.path().starts_with("/ui/icons/") {
+        "ui-icon"
+    } else {
+        "same-origin-other"
+    }
+}
+
 fn browser_log_message_sha256(message: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"nazoauthctl-browser-console-message-v1\0");
@@ -1183,7 +1263,10 @@ fn browser_log_message_sha256(message: &str) -> String {
         .collect()
 }
 
-fn parse_browser_console_log_diagnostic(value: &Value) -> Option<BrowserConsoleLogDiagnostic> {
+fn parse_browser_console_log_diagnostic(
+    value: &Value,
+    target_origin: &Url,
+) -> Option<BrowserConsoleLogDiagnostic> {
     let entries = value.get("value")?.as_array()?;
     if entries.len() > MAX_BROWSER_LOG_ENTRIES {
         return None;
@@ -1191,6 +1274,9 @@ fn parse_browser_console_log_diagnostic(value: &Value) -> Option<BrowserConsoleL
     let mut level_counts = BTreeMap::new();
     let mut source_kind_counts = BTreeMap::new();
     let mut category_counts = BTreeMap::new();
+    let mut http_status_counts = BTreeMap::new();
+    let mut resource_bucket_counts = BTreeMap::new();
+    let mut network_error_counts = BTreeMap::new();
     let mut messages = Vec::with_capacity(entries.len());
     for entry in entries {
         let entry = entry.as_object()?;
@@ -1213,13 +1299,26 @@ fn parse_browser_console_log_diagnostic(value: &Value) -> Option<BrowserConsoleL
         let source_kind = browser_log_source_kind(raw_source);
         let message = entry.get("message")?.as_str()?;
         let category = browser_log_category(message);
+        let http_status = browser_log_http_status(message);
+        let resource_bucket = browser_log_resource_bucket(message, target_origin);
+        let network_error = browser_log_network_error(message, category);
         *level_counts.entry(level).or_insert(0) += 1;
         *source_kind_counts.entry(source_kind).or_insert(0) += 1;
         *category_counts.entry(category).or_insert(0) += 1;
+        if let Some(status) = http_status {
+            *http_status_counts.entry(status).or_insert(0) += 1;
+        }
+        *resource_bucket_counts.entry(resource_bucket).or_insert(0) += 1;
+        if let Some(error) = network_error {
+            *network_error_counts.entry(error).or_insert(0) += 1;
+        }
         messages.push(BrowserConsoleLogMessageDiagnostic {
             level,
             source_kind,
             category,
+            http_status,
+            resource_bucket,
+            network_error,
             message_sha256: browser_log_message_sha256(message),
             message_len: message.len().min(MAX_BROWSER_LOG_MESSAGE_BYTES),
             message_len_capped: message.len() > MAX_BROWSER_LOG_MESSAGE_BYTES,
@@ -1231,6 +1330,9 @@ fn parse_browser_console_log_diagnostic(value: &Value) -> Option<BrowserConsoleL
         level_counts: level_counts.into_iter().collect(),
         source_kind_counts: source_kind_counts.into_iter().collect(),
         category_counts: category_counts.into_iter().collect(),
+        http_status_counts: http_status_counts.into_iter().collect(),
+        resource_bucket_counts: resource_bucket_counts.into_iter().collect(),
+        network_error_counts: network_error_counts.into_iter().collect(),
         messages,
     })
 }
@@ -1458,14 +1560,15 @@ mod tests {
 
     #[test]
     fn selenium_browser_log_adapter_posts_only_the_fixed_type_and_hashes_messages() {
-        let body = r#"{"value":[{"level":"SEVERE","source":"javascript","message":"Uncaught module error token=do-not-retain","timestamp":1},{"level":"WARNING","source":"network","message":"Failed to load resource: net::ERR_CONNECTION_REFUSED","timestamp":2}]}"#;
+        let body = r#"{"value":[{"level":"SEVERE","source":"javascript","message":"Uncaught module error https://issuer.example/ui/assets/app.js?token=do-not-retain","timestamp":1},{"level":"WARNING","source":"network","message":"Failed to load resource https://issuer.example/openid4vp/verification-receipts status of 503 net::ERR_CONNECTION_REFUSED","timestamp":2}]}"#;
         let (endpoint, server) = webdriver_test_server(body);
         let mut client =
             WebDriverClient::connect(endpoint, Duration::from_secs(1)).expect("WebDriver client");
         client.session_id = Some("session-01".to_owned());
 
+        let target_origin = Url::parse("https://issuer.example").expect("target origin");
         let diagnostic = client
-            .browser_console_log_diagnostic()
+            .browser_console_log_diagnostic(&target_origin)
             .expect("browser log summary");
         client.session_id = None;
 
@@ -1475,11 +1578,21 @@ mod tests {
             diagnostic.category_counts,
             vec![("network", 1), ("uncaught", 1)]
         );
+        assert_eq!(diagnostic.http_status_counts, vec![(503, 1)]);
+        assert_eq!(
+            diagnostic.resource_bucket_counts,
+            vec![("receipt-api", 1), ("ui-asset", 1)]
+        );
+        assert_eq!(
+            diagnostic.network_error_counts,
+            vec![("connection-refused", 1)]
+        );
         assert!(diagnostic.messages[0].message_len > 0);
         assert!(!diagnostic.messages[0].message_len_capped);
         let rendered = diagnostic.to_string();
         assert!(!rendered.contains("do-not-retain"));
         assert!(!rendered.contains("token="));
+        assert!(!rendered.contains("openid4vp/verification-receipts"));
         let request = server.join().expect("test server");
         assert!(request.starts_with("POST /session/session-01/log HTTP/1.1\r\n"));
         assert!(request.ends_with("\r\n\r\n{\"type\":\"browser\"}"));
@@ -1497,32 +1610,95 @@ mod tests {
                 .map(|_| entry.clone())
                 .collect(),
         );
-        assert!(parse_browser_console_log_diagnostic(&json!({ "value": entries })).is_none());
+        let target_origin = Url::parse("https://issuer.example").expect("target origin");
         assert!(
-            parse_browser_console_log_diagnostic(&json!({
-                "value": [{
-                    "level": "SEVERE",
-                    "source": "javascript",
-                    "message": "secret=do-not-retain",
-                    "url": "https://issuer.example/?token=do-not-retain"
-                }]
-            }))
+            parse_browser_console_log_diagnostic(&json!({ "value": entries }), &target_origin)
+                .is_none()
+        );
+        assert!(
+            parse_browser_console_log_diagnostic(
+                &json!({
+                    "value": [{
+                        "level": "SEVERE",
+                        "source": "javascript",
+                        "message": "secret=do-not-retain",
+                        "url": "https://issuer.example/?token=do-not-retain"
+                    }]
+                }),
+                &target_origin
+            )
             .is_none()
         );
         let long_message = "m".repeat(MAX_BROWSER_LOG_MESSAGE_BYTES + 1);
-        let summary = parse_browser_console_log_diagnostic(&json!({
-            "value": [{
-                "level": "INFO",
-                "source": "console-api",
-                "message": long_message,
-            }]
-        }))
+        let summary = parse_browser_console_log_diagnostic(
+            &json!({
+                "value": [{
+                    "level": "INFO",
+                    "source": "console-api",
+                    "message": long_message,
+                }]
+            }),
+            &target_origin,
+        )
         .expect("bounded message summary");
         assert_eq!(
             summary.messages[0].message_len,
             MAX_BROWSER_LOG_MESSAGE_BYTES
         );
         assert!(summary.messages[0].message_len_capped);
+    }
+
+    #[test]
+    fn selenium_browser_log_network_projection_is_bounded_and_never_retains_urls() {
+        let target_origin = Url::parse("https://issuer.example").expect("target origin");
+        let summary = parse_browser_console_log_diagnostic(
+            &json!({
+                "value": [
+                    {
+                        "level": "SEVERE",
+                        "source": "network",
+                        "message": "https://issuer.example/ui/icons/warning.svg HTTP/2 404 net::ERR_FAILED secret=do-not-retain"
+                    },
+                    {
+                        "level": "WARNING",
+                        "source": "network",
+                        "message": "https://outside.example/trace?token=do-not-retain status=502 net::ERR_UNRECOGNIZED"
+                    },
+                    {
+                        "level": "INFO",
+                        "source": "network",
+                        "message": "network request failed token=do-not-retain"
+                    }
+                ]
+            }),
+            &target_origin,
+        )
+        .expect("bounded browser log projection");
+
+        assert_eq!(summary.http_status_counts, vec![(404, 1), (502, 1)]);
+        assert_eq!(
+            summary.resource_bucket_counts,
+            vec![("cross-origin", 1), ("ui-icon", 1), ("unknown", 1)]
+        );
+        assert_eq!(
+            summary.network_error_counts,
+            vec![("failed", 1), ("other", 2)]
+        );
+        assert!(summary.messages.iter().all(|message| {
+            matches!(
+                message.resource_bucket,
+                "receipt-api"
+                    | "ui-asset"
+                    | "ui-icon"
+                    | "same-origin-other"
+                    | "cross-origin"
+                    | "unknown"
+            )
+        }));
+        let rendered = summary.to_string();
+        assert!(!rendered.contains("outside.example"));
+        assert!(!rendered.contains("do-not-retain"));
+        assert!(!rendered.contains("token="));
     }
 
     #[test]

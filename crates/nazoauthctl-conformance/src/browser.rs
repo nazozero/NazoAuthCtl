@@ -4,6 +4,8 @@
 //! validation live in private modules; this file owns the driver-facing
 //! execution state machine and its public orchestration traits.
 
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -261,6 +263,9 @@ pub struct BrowserConsoleLogMessageDiagnostic {
     pub level: &'static str,
     pub source_kind: &'static str,
     pub category: &'static str,
+    pub http_status: Option<u16>,
+    pub resource_bucket: &'static str,
+    pub network_error: Option<&'static str>,
     pub message_sha256: String,
     pub message_len: usize,
     pub message_len_capped: bool,
@@ -275,6 +280,9 @@ pub struct BrowserConsoleLogDiagnostic {
     pub level_counts: Vec<(&'static str, usize)>,
     pub source_kind_counts: Vec<(&'static str, usize)>,
     pub category_counts: Vec<(&'static str, usize)>,
+    pub http_status_counts: Vec<(u16, usize)>,
+    pub resource_bucket_counts: Vec<(&'static str, usize)>,
+    pub network_error_counts: Vec<(&'static str, usize)>,
     pub messages: Vec<BrowserConsoleLogMessageDiagnostic>,
 }
 
@@ -289,19 +297,29 @@ impl std::fmt::Display for BrowserConsoleLogDiagnostic {
         };
         write!(
             formatter,
-            "total={} capped={} levels={} sources={} categories={} messages={}",
+            "total={} capped={} levels={} sources={} categories={} http_statuses={} resource_buckets={} network_errors={} messages={}",
             self.total,
             self.capped,
             counts(&self.level_counts),
             counts(&self.source_kind_counts),
             counts(&self.category_counts),
+            self.http_status_counts
+                .iter()
+                .map(|(status, count)| format!("{status}:{count}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            counts(&self.resource_bucket_counts),
+            counts(&self.network_error_counts),
             self.messages
                 .iter()
                 .map(|message| format!(
-                    "{}:{}:{}:{}:{}:{}",
+                    "{}:{}:{}:{:?}:{}:{:?}:{}:{}:{}",
                     message.level,
                     message.source_kind,
                     message.category,
+                    message.http_status,
+                    message.resource_bucket,
+                    message.network_error,
                     message.message_sha256,
                     message.message_len,
                     message.message_len_capped,
@@ -598,6 +616,7 @@ pub trait BrowserDriver: Send {
     /// audited vendor endpoint. This is never a generic log transport.
     fn browser_console_log_diagnostic(
         &mut self,
+        _target_origin: &Url,
     ) -> Result<BrowserConsoleLogDiagnostic, BrowserError> {
         Err(BrowserError::UnsupportedCommand)
     }
@@ -1664,6 +1683,12 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         let mut shell_url = ui_url.clone();
         shell_url.set_query(None);
         shell_url.set_fragment(None);
+        // ChromeDriver's Selenium log endpoint drains a session-wide queue.
+        // Consume all history before entering the evidence UI so diagnostics
+        // collected on a later failure are attributable only to this bounded
+        // canonical-shell/capability window. This is intentionally best-effort:
+        // diagnostics cannot influence a successful conformance flow.
+        let _ = self.driver.browser_console_log_diagnostic(&shell_url);
         let entry_url = vp_result_driver(
             "canonical-shell-entry-current-url",
             None,
@@ -1833,10 +1858,11 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             Ok(runtime) => (Some(runtime), None),
             Err(error) => (None, Some(Box::new(error))),
         };
-        let (browser_logs, browser_log_error) = match self.driver.browser_console_log_diagnostic() {
-            Ok(logs) => (Some(logs), None),
-            Err(error) => (None, Some(Box::new(error))),
-        };
+        let (browser_logs, browser_log_error) =
+            match self.driver.browser_console_log_diagnostic(current) {
+                Ok(logs) => (Some(logs), None),
+                Err(error) => (None, Some(Box::new(error))),
+            };
         BrowserError::VpVerificationResultShellMountDiagnostic(Box::new(
             VpVerificationResultShellMountDiagnostic {
                 stage,
@@ -1856,16 +1882,18 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         &mut self,
         stage: &'static str,
         actual_state: &'static str,
+        current: &Url,
         source: BrowserError,
     ) -> BrowserError {
         let (runtime, runtime_error) = match self.driver.page_runtime_diagnostic() {
             Ok(runtime) => (Some(runtime), None),
             Err(error) => (None, Some(Box::new(error))),
         };
-        let (browser_logs, browser_log_error) = match self.driver.browser_console_log_diagnostic() {
-            Ok(logs) => (Some(logs), None),
-            Err(error) => (None, Some(Box::new(error))),
-        };
+        let (browser_logs, browser_log_error) =
+            match self.driver.browser_console_log_diagnostic(current) {
+                Ok(logs) => (Some(logs), None),
+                Err(error) => (None, Some(Box::new(error))),
+            };
         BrowserError::VpVerificationResultProjectionStateDiagnostic(Box::new(
             VpVerificationResultProjectionStateDiagnostic {
                 stage,
@@ -1981,6 +2009,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                         return Err(self.projection_state_failure(
                             "projection-state-root-find",
                             "empty",
+                            expected,
                             source,
                         ));
                     }
@@ -2004,6 +2033,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                     return Err(self.projection_state_failure(
                         "projection-state-root-visible",
                         "empty",
+                        expected,
                         source,
                     ));
                 }
@@ -2021,6 +2051,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                         return Err(self.projection_state_failure(
                             "projection-state-attribute",
                             "empty",
+                            expected,
                             source,
                         ));
                     }
@@ -2030,6 +2061,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                         return Err(self.projection_state_failure(
                             "projection-state-wait",
                             "loading",
+                            expected,
                             source,
                         ));
                     }
@@ -2038,6 +2070,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                     return Err(self.projection_state_failure(
                         "projection-state-terminal",
                         "expired",
+                        expected,
                         BrowserError::VpVerificationResultField(
                             "vp-verification-result:data-state",
                         ),
@@ -2047,6 +2080,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                     return Err(self.projection_state_failure(
                         "projection-state-terminal",
                         "not-found",
+                        expected,
                         BrowserError::VpVerificationResultField(
                             "vp-verification-result:data-state",
                         ),
@@ -2056,6 +2090,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                     return Err(self.projection_state_failure(
                         "projection-state-terminal",
                         "generic-error",
+                        expected,
                         BrowserError::VpVerificationResultField(
                             "vp-verification-result:data-state",
                         ),
@@ -2065,6 +2100,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                     return Err(self.projection_state_failure(
                         "projection-state-terminal",
                         "unknown",
+                        expected,
                         BrowserError::VpVerificationResultField(
                             "vp-verification-result:data-state",
                         ),
@@ -2863,6 +2899,20 @@ mod tests {
             .expect("fixed PNG")
     }
 
+    fn test_browser_logs(category: &'static str) -> BrowserConsoleLogDiagnostic {
+        BrowserConsoleLogDiagnostic {
+            total: 1,
+            capped: false,
+            level_counts: vec![("severe", 1)],
+            source_kind_counts: vec![("network", 1)],
+            category_counts: vec![(category, 1)],
+            http_status_counts: vec![(503, 1)],
+            resource_bucket_counts: vec![("receipt-api", 1)],
+            network_error_counts: vec![("connection-refused", 1)],
+            messages: Vec::new(),
+        }
+    }
+
     struct VpResultDriver {
         current: Url,
         run_jti: String,
@@ -2892,6 +2942,7 @@ mod tests {
         page_source_error: Option<BrowserError>,
         page_runtime: Result<BrowserPageRuntimeDiagnostic, BrowserError>,
         browser_logs: Result<BrowserConsoleLogDiagnostic, BrowserError>,
+        browser_log_queue: VecDeque<Result<BrowserConsoleLogDiagnostic, BrowserError>>,
         browser_log_calls: usize,
         post_scrub_loading_reads: usize,
         post_scrub_state: Option<&'static str>,
@@ -2963,9 +3014,12 @@ mod tests {
 
         fn browser_console_log_diagnostic(
             &mut self,
+            _target_origin: &Url,
         ) -> Result<BrowserConsoleLogDiagnostic, BrowserError> {
             self.browser_log_calls = self.browser_log_calls.saturating_add(1);
-            self.browser_logs.clone()
+            self.browser_log_queue
+                .pop_front()
+                .unwrap_or_else(|| self.browser_logs.clone())
         }
 
         fn find_element(&mut self, selector: &BrowserSelector) -> Result<String, BrowserError> {
@@ -3161,8 +3215,12 @@ mod tests {
                 level_counts: Vec::new(),
                 source_kind_counts: Vec::new(),
                 category_counts: Vec::new(),
+                http_status_counts: Vec::new(),
+                resource_bucket_counts: Vec::new(),
+                network_error_counts: Vec::new(),
                 messages: Vec::new(),
             }),
+            browser_log_queue: VecDeque::new(),
             browser_log_calls: 0,
             post_scrub_loading_reads: 0,
             post_scrub_state: None,
@@ -3838,7 +3896,9 @@ mod tests {
             .capture_openid4vp_verification_result(&evidence, &capture, 0)
             .expect("loading result becomes verified");
         assert_eq!(executor.driver_mut().post_scrub_loading_reads, 0);
-        assert_eq!(executor.driver_mut().browser_log_calls, 0);
+        // Success drains the historical Selenium queue once before entering
+        // the canonical shell; it does not persist a second log summary.
+        assert_eq!(executor.driver_mut().browser_log_calls, 1);
         std::fs::remove_dir_all(root).expect("remove root");
     }
 
@@ -4019,6 +4079,72 @@ mod tests {
             diagnostic.browser_log_error.as_deref(),
             Some(&BrowserError::Transport)
         );
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_log_drain_discards_precanonical_history_before_failure_capture() {
+        let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp")
+            .join(format!("nazoauth-vp-log-window-{}", uuid::Uuid::now_v7()));
+        crate::secure_file::ensure_directory(&root, true).expect("private root");
+        let capture = vp_capture_context(root.clone(), &context, &variant);
+        let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+        driver.post_scrub_state = Some("expired");
+        driver.browser_log_queue = VecDeque::from([
+            Ok(test_browser_logs("other")),
+            Ok(test_browser_logs("network")),
+        ]);
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+        let mut executor =
+            BrowserExecutor::new(driver, BrowserPolicy::new(target, suite).expect("policy"));
+
+        let error = executor
+            .capture_openid4vp_verification_result(&evidence, &capture, 0)
+            .expect_err("terminal state");
+        let BrowserError::VpVerificationResultProjectionStateDiagnostic(diagnostic) = error else {
+            panic!("projection diagnostic")
+        };
+        assert_eq!(
+            diagnostic
+                .browser_logs
+                .as_ref()
+                .expect("post-window logs")
+                .category_counts,
+            vec![("network", 1)]
+        );
+        assert_eq!(executor.driver_mut().browser_log_calls, 2);
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_log_drain_error_does_not_block_a_successful_capture() {
+        let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp")
+            .join(format!(
+                "nazoauth-vp-log-drain-error-{}",
+                uuid::Uuid::now_v7()
+            ));
+        crate::secure_file::ensure_directory(&root, true).expect("private root");
+        let capture = vp_capture_context(root.clone(), &context, &variant);
+        let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+        driver.browser_log_queue = VecDeque::from([Err(BrowserError::Transport)]);
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+        let mut executor =
+            BrowserExecutor::new(driver, BrowserPolicy::new(target, suite).expect("policy"));
+
+        executor
+            .capture_openid4vp_verification_result(&evidence, &capture, 0)
+            .expect("drain error cannot affect success");
+        assert_eq!(executor.driver_mut().browser_log_calls, 1);
         std::fs::remove_dir_all(root).expect("remove root");
     }
 
