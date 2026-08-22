@@ -23,6 +23,7 @@ use zeroize::Zeroizing;
 
 #[cfg(test)]
 use crate::origin::Origin;
+use crate::origin::has_userinfo;
 
 /// A response-shape observation is deliberately metadata-only.  It is safe to
 /// retain in root-private run evidence: it has no response body, selector,
@@ -61,6 +62,7 @@ impl std::fmt::Display for WebDriverProtocolDiagnostic {
 pub struct BrowserNavigationDiagnostic {
     pub from: String,
     pub to: String,
+    pub userinfo_present: bool,
     pub selected_entry: Option<usize>,
     pub matcher_sha256_prefix: Option<String>,
 }
@@ -69,9 +71,10 @@ impl std::fmt::Display for BrowserNavigationDiagnostic {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "from={} to={} selected_entry={} matcher_sha256_prefix={}",
+            "from={} to={} userinfo_present={} selected_entry={} matcher_sha256_prefix={}",
             self.from,
             self.to,
+            self.userinfo_present,
             self.selected_entry
                 .map(|value| value.to_string())
                 .as_deref()
@@ -1443,6 +1446,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                 .map(canonical_navigation_url)
                 .unwrap_or_else(|| "none".to_owned()),
             to: canonical_navigation_url(to),
+            userinfo_present: has_userinfo(to),
             selected_entry: self.active_entry.as_ref().map(|entry| entry.index),
             matcher_sha256_prefix: self
                 .active_entry
@@ -2139,6 +2143,7 @@ mod tests {
         let rendered = diagnostic.to_string();
         assert_eq!(diagnostic.from, "https://suite.example/a");
         assert_eq!(diagnostic.to, "https://elsewhere.example/b");
+        assert!(!diagnostic.userinfo_present);
         assert_eq!(diagnostic.selected_entry, Some(3));
         assert_eq!(
             diagnostic.matcher_sha256_prefix.as_deref().map(str::len),
@@ -2146,6 +2151,40 @@ mod tests {
         );
         assert!(!rendered.contains("secret"));
         assert!(!rendered.contains("nonsecret-matcher"));
+    }
+
+    #[test]
+    fn browser_policy_rejects_explicit_empty_userinfo_and_diagnoses_it_safely() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse("https://suite.example").expect("suite");
+        let policy = BrowserPolicy::new(target, suite).expect("policy");
+        let current = Url::parse("https://@issuer.example/ui/verification-result").expect("url");
+
+        assert!(current.username().is_empty());
+        assert!(current.password().is_none());
+        assert!(has_userinfo(&current));
+        assert!(!policy.allows_url(&current));
+        assert!(BrowserTargetOrigin::parse("https://@issuer.example").is_err());
+
+        let mut executor = BrowserExecutor::new(
+            RedirectingMockDriver {
+                current: Url::parse("https://issuer.example/").expect("url"),
+                cross_origin: false,
+            },
+            policy,
+        );
+        let error = executor
+            .navigate(&current)
+            .expect_err("empty userinfo must be rejected");
+        let BrowserError::CrossOriginNavigationDiagnostic(diagnostic) = error else {
+            panic!("navigation diagnostic")
+        };
+        assert!(diagnostic.userinfo_present);
+        assert_eq!(
+            diagnostic.to,
+            "https://issuer.example/ui/verification-result"
+        );
+        assert!(!diagnostic.to.contains('@'));
     }
 
     #[test]
