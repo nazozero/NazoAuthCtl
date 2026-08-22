@@ -1322,7 +1322,7 @@ fn verify_evidence_response(
             &response.receipt_api_url,
             target_origin,
         )
-        .map_err(|_| OpenId4VpError::EvidenceUrlDiagnostic(ui_url_diagnostic.clone()))?,
+        .map_err(|_| OpenId4VpError::EvidenceUrlDiagnostic(Box::new(ui_url_diagnostic.clone())))?,
     );
     let capability_sha256 =
         nazo_operator_protocol::openid4vp_verification_capability_sha256(&capability)
@@ -1647,7 +1647,7 @@ pub enum OpenId4VpError {
     #[error("OpenID4VP verification evidence does not match this run [{0}]")]
     EvidenceBindingDiagnostic(OpenId4VpEvidenceBindingDiagnostic),
     #[error("OpenID4VP verification evidence URL is invalid [{0}]")]
-    EvidenceUrlDiagnostic(OpenId4VpEvidenceUrlDiagnostic),
+    EvidenceUrlDiagnostic(Box<OpenId4VpEvidenceUrlDiagnostic>),
 }
 
 #[cfg(test)]

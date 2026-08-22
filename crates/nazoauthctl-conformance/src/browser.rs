@@ -216,9 +216,9 @@ pub enum BrowserError {
     #[error("browser WebDriver protocol response is invalid [{0}]")]
     ProtocolDiagnostic(WebDriverProtocolDiagnostic),
     #[error("OpenID4VP verification-result WebDriver operation failed [{0}]")]
-    VpVerificationResultDriverDiagnostic(VpVerificationResultDriverDiagnostic),
+    VpVerificationResultDriverDiagnostic(Box<VpVerificationResultDriverDiagnostic>),
     #[error("OpenID4VP verification-result fragment scrub failed [{0}]")]
-    VpVerificationResultFragmentScrubDiagnostic(VpVerificationResultFragmentScrubDiagnostic),
+    VpVerificationResultFragmentScrubDiagnostic(Box<VpVerificationResultFragmentScrubDiagnostic>),
     #[error("OpenID4VP verification-result projection field is invalid: {0}")]
     VpVerificationResultField(&'static str),
     #[error("browser WebDriver rejected the request")]
@@ -827,12 +827,14 @@ fn vp_result_driver_error(
     requested_url: Option<VpVerificationResultUrlDiagnostic>,
     source: BrowserError,
 ) -> BrowserError {
-    BrowserError::VpVerificationResultDriverDiagnostic(VpVerificationResultDriverDiagnostic {
-        stage,
-        field,
-        requested_url,
-        source: Box::new(source),
-    })
+    BrowserError::VpVerificationResultDriverDiagnostic(Box::new(
+        VpVerificationResultDriverDiagnostic {
+            stage,
+            field,
+            requested_url,
+            source: Box::new(source),
+        },
+    ))
 }
 
 fn vp_result_fragment_scrub_error(
@@ -844,7 +846,7 @@ fn vp_result_fragment_scrub_error(
     authority_has_at: Option<bool>,
     source: BrowserError,
 ) -> BrowserError {
-    BrowserError::VpVerificationResultFragmentScrubDiagnostic(
+    BrowserError::VpVerificationResultFragmentScrubDiagnostic(Box::new(
         VpVerificationResultFragmentScrubDiagnostic {
             poll_count,
             elapsed_millis: elapsed.as_millis(),
@@ -856,7 +858,7 @@ fn vp_result_fragment_scrub_error(
             ),
             source: Box::new(source),
         },
-    )
+    ))
 }
 
 /// Private orchestration receipt. Public module reports project only
