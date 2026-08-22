@@ -117,8 +117,11 @@ bounded W3C PNG screenshot cannot be captured, while an optional marker is
 reported as missing and execution continues with the next signed task. A
 normal capture is accepted only on the canonical Suite
 `/test/a/{module-id}/…` page for its newly-created module. OpenID4VP required
-captures first use the same browser lane's actual signed-entry selection to
-attach exact new plan/module context, then complete the protocol before issuing a
+captures first create with a caller-owned stable create JTI; a lost network
+response retries the exact canonical request and validates the echoed JTI and
+normalized-request digest before the same browser lane's actual signed-entry
+selection attaches exact new plan/module context. They then complete the
+protocol before issuing a
 same-module, runtime-signed verification receipt and one-time NazoAuthWeb
 result view at
 `/ui/verification-result#receipt=…`; ctl verifies its non-secret DOM binding

@@ -31,6 +31,7 @@ const MAX_TEST_NAME_BYTES: usize = 512;
 const MAX_VARIANT_VALUE_BYTES: usize = 256;
 const MAX_EVIDENCE_TEST_NAME_BYTES: usize = 512;
 const MAX_EVIDENCE_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_CREATE_ATTEMPTS: usize = 4;
 const VP_VERIFICATION_RESULT_PATH: &str = "/ui/verification-result";
 const VP_VERIFICATION_RECEIPT_PATH: &str = "/openid4vp/verification-receipts";
 const SPECIAL_POST_TEST: &str = "oid4vp-1final-verifier-request-uri-method-post";
@@ -320,6 +321,10 @@ pub struct OpenId4VpPresentation {
     pub authorization_url: Url,
     pub completion_url: Url,
     pub transaction_id: Uuid,
+    /// Non-secret caller idempotency key for the target-side presentation
+    /// create. It is generated once before the first request, then reused by
+    /// the narrow response-loss retry loop.
+    create_request_jti: String,
     evidence_context: Option<OpenId4VpEvidenceContext>,
     evidence_attachment: Option<OpenId4VpEvidenceAttachment>,
     /// A non-secret idempotency key generated once after the target accepted
@@ -349,6 +354,7 @@ impl fmt::Debug for OpenId4VpPresentation {
             )
             .field("completion_origin", &redacted_origin(&self.completion_url))
             .field("transaction_id", &self.transaction_id)
+            .field("create_request_jti", &self.create_request_jti)
             .field("evidence_attachment", &self.evidence_attachment)
             .field("issuance_request_jti", &self.issuance_request_jti)
             .field(
@@ -737,22 +743,56 @@ impl OpenId4VpVerifierClient {
         endpoint.set_path("/openid4vp/presentations");
         endpoint.set_query(None);
         endpoint.set_fragment(None);
+        let create_request_jti = Uuid::new_v4().to_string();
+        nazo_operator_protocol::validate_openid4vp_create_request_jti(&create_request_jti)
+            .map_err(|_| OpenId4VpError::InvalidInput)?;
+        let dcql_query = serde_json::json!({
+            "credentials": [{
+                "id": "credential",
+                "format": dcql_format,
+                "meta": credential_meta,
+                "require_cryptographic_holder_binding": true,
+            }]
+        });
+        let (trust_policy_resource_id, trust_policy_digest) = match &self.binding {
+            ConformanceBinding::LegacyLease { .. } => (None, None),
+            ConformanceBinding::OpenId4VcTrustPolicy {
+                resource_id,
+                digest,
+            } => (Some(resource_id.clone()), Some(digest.clone())),
+        };
+        let normalized = nazo_operator_protocol::Openid4vpNormalizedCreateRequest {
+            wallet_authorization_endpoint: wallet_authorization_endpoint.as_str().to_owned(),
+            dcql_query: dcql_query.clone(),
+            haip: request.haip,
+            client_id_prefix: client_id_prefix.clone(),
+            request_method: request_method.to_owned(),
+            response_mode: response_mode.clone(),
+            transaction_data: None,
+            openid4vc_trust_policy_resource_id: trust_policy_resource_id.clone(),
+            openid4vc_trust_policy_digest: trust_policy_digest.clone(),
+        };
+        let (_, create_request_sha256) =
+            nazo_operator_protocol::canonical_openid4vp_normalized_create_request(&normalized)
+                .map_err(|_| OpenId4VpError::InvalidInput)?;
         let mut body = serde_json::json!({
             "wallet_authorization_endpoint": wallet_authorization_endpoint.as_str(),
-            "dcql_query": {
-                "credentials": [{
-                    "id": "credential",
-                    "format": dcql_format,
-                    "meta": credential_meta,
-                    "require_cryptographic_holder_binding": true,
-                }]
-            },
+            "dcql_query": dcql_query,
             "haip": request.haip,
             "client_id_prefix": client_id_prefix,
             "request_method": request_method,
             "response_mode": response_mode,
         });
         let body_object = body.as_object_mut().ok_or(OpenId4VpError::InvalidInput)?;
+        let idempotency =
+            serde_json::to_value(nazo_operator_protocol::Openid4vpCreateIdempotencyRequest {
+                create_request_jti: create_request_jti.clone(),
+            })
+            .map_err(|_| OpenId4VpError::InvalidInput)?;
+        let idempotency = idempotency
+            .as_object()
+            .ok_or(OpenId4VpError::InvalidInput)?;
+        body_object.extend(idempotency.clone());
         match &self.binding {
             ConformanceBinding::LegacyLease { lease_id, task_jti } => {
                 body_object.insert(
@@ -779,31 +819,38 @@ impl OpenId4VpVerifierClient {
             }
         }
         let body = serde_json::to_vec(&body).map_err(|_| OpenId4VpError::InvalidInput)?;
-        let response = self
-            .transport
-            .send(
-                HttpRequest {
-                    method: HttpMethod::Post,
-                    url: endpoint,
-                    headers: vec![
-                        ("Accept".to_owned(), "application/json".to_owned()),
-                        ("Content-Type".to_owned(), "application/json".to_owned()),
-                        (
-                            "Authorization".to_owned(),
-                            format!("Bearer {}", self.management_token.as_str()),
-                        ),
-                    ],
-                    body: Some(body),
-                },
-                self.max_response_bytes,
-            )
-            .map_err(OpenId4VpError::Transport)?;
+        let mut attempts = 0usize;
+        let response = loop {
+            attempts = attempts.saturating_add(1);
+            let request = HttpRequest {
+                method: HttpMethod::Post,
+                url: endpoint.clone(),
+                headers: vec![
+                    ("Accept".to_owned(), "application/json".to_owned()),
+                    ("Content-Type".to_owned(), "application/json".to_owned()),
+                    (
+                        "Authorization".to_owned(),
+                        format!("Bearer {}", self.management_token.as_str()),
+                    ),
+                ],
+                body: Some(body.clone()),
+            };
+            match self.transport.send(request, self.max_response_bytes) {
+                Ok(response) => break response,
+                Err(TransportError::Network(_)) if attempts < MAX_CREATE_ATTEMPTS => continue,
+                Err(error) => return Err(OpenId4VpError::Transport(error)),
+            }
+        };
         if !(200..300).contains(&response.status) {
             return Err(OpenId4VpError::UnexpectedStatus);
         }
         let response: CreatePresentationResponse = serde_json::from_slice(&response.body)
             .map_err(|_| OpenId4VpError::MalformedResponse)?;
-        if response.expires_in == 0 {
+        if response.expires_in == 0
+            || response.idempotency.create_request_jti != create_request_jti
+            || !valid_lower_hex(&response.idempotency.create_request_sha256)
+            || response.idempotency.create_request_sha256 != create_request_sha256
+        {
             return Err(OpenId4VpError::MalformedResponse);
         }
         let authorization_url = Url::parse(&response.authorization_url)
@@ -824,6 +871,7 @@ impl OpenId4VpVerifierClient {
             authorization_url,
             completion_url,
             transaction_id,
+            create_request_jti,
             evidence_context: None,
             evidence_attachment: None,
             issuance_request_jti: None,
@@ -1119,6 +1167,8 @@ impl OpenId4VpVerifier for OpenId4VpVerifierClient {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreatePresentationResponse {
+    #[serde(flatten)]
+    idempotency: nazo_operator_protocol::Openid4vpCreateIdempotencyBinding,
     authorization_url: String,
     transaction_id: Uuid,
     expires_in: u64,
@@ -1436,12 +1486,15 @@ mod tests {
             request: HttpRequest,
             _max_response_bytes: usize,
         ) -> Result<HttpResponse, TransportError> {
-            *self.request.lock().expect("request lock") = Some(request);
-            self.response
+            let mut response = self
+                .response
                 .lock()
                 .expect("response lock")
                 .take()
-                .ok_or(TransportError::Network(TransportFailureStage::SendRequest))
+                .ok_or(TransportError::Network(TransportFailureStage::SendRequest))?;
+            bind_test_create_response(&request, &mut response);
+            *self.request.lock().expect("request lock") = Some(request);
+            Ok(response)
         }
     }
 
@@ -1456,13 +1509,77 @@ mod tests {
             request: HttpRequest,
             _max_response_bytes: usize,
         ) -> Result<HttpResponse, TransportError> {
-            self.requests.lock().expect("request lock").push(request);
-            self.responses
+            let mut response = self
+                .responses
                 .lock()
                 .expect("response lock")
                 .pop_front()
-                .ok_or(TransportError::Network(TransportFailureStage::SendRequest))
+                .ok_or(TransportError::Network(TransportFailureStage::SendRequest))?;
+            bind_test_create_response(&request, &mut response);
+            self.requests.lock().expect("request lock").push(request);
+            Ok(response)
         }
+    }
+
+    fn bind_test_create_response(request: &HttpRequest, response: &mut HttpResponse) {
+        if request.url().path() != "/openid4vp/presentations"
+            || !(200..300).contains(&response.status)
+        {
+            return;
+        }
+        let request_body: Value =
+            serde_json::from_slice(request.body().expect("create body")).expect("create body JSON");
+        let response_body: Value = serde_json::from_slice(&response.body).expect("create JSON");
+        let mut response_body = response_body.as_object().expect("create object").clone();
+        if response_body.contains_key("create_request_jti")
+            || response_body.contains_key("create_request_sha256")
+        {
+            return;
+        }
+        let normalized = nazo_operator_protocol::Openid4vpNormalizedCreateRequest {
+            wallet_authorization_endpoint: request_body["wallet_authorization_endpoint"]
+                .as_str()
+                .expect("wallet endpoint")
+                .to_owned(),
+            dcql_query: request_body["dcql_query"].clone(),
+            haip: request_body["haip"].as_bool().expect("haip"),
+            client_id_prefix: request_body["client_id_prefix"]
+                .as_str()
+                .expect("client id prefix")
+                .to_owned(),
+            request_method: request_body["request_method"]
+                .as_str()
+                .expect("request method")
+                .to_owned(),
+            response_mode: request_body["response_mode"]
+                .as_str()
+                .expect("response mode")
+                .to_owned(),
+            transaction_data: request_body
+                .get("transaction_data")
+                .filter(|value| !value.is_null())
+                .map(|value| serde_json::from_value(value.clone()).expect("transaction data")),
+            openid4vc_trust_policy_resource_id: request_body
+                .get("openid4vc_trust_policy_resource_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            openid4vc_trust_policy_digest: request_body
+                .get("openid4vc_trust_policy_digest")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        };
+        let (_, create_request_sha256) =
+            nazo_operator_protocol::canonical_openid4vp_normalized_create_request(&normalized)
+                .expect("canonical create request");
+        response_body.insert(
+            "create_request_jti".to_owned(),
+            request_body["create_request_jti"].clone(),
+        );
+        response_body.insert(
+            "create_request_sha256".to_owned(),
+            Value::String(create_request_sha256),
+        );
+        response.body = serde_json::to_vec(&response_body).expect("bound create JSON");
     }
 
     fn binding() -> ConformanceBinding {
@@ -1479,6 +1596,109 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )
         .expect("trust policy binding")
+    }
+
+    struct RetryingCreateTransport {
+        requests: std::sync::Mutex<Vec<HttpRequest>>,
+    }
+
+    impl Transport for RetryingCreateTransport {
+        fn send(
+            &self,
+            request: HttpRequest,
+            _max_response_bytes: usize,
+        ) -> Result<HttpResponse, TransportError> {
+            let mut requests = self.requests.lock().expect("request lock");
+            requests.push(request.clone());
+            if requests.len() == 1 {
+                return Err(TransportError::Network(TransportFailureStage::SendRequest));
+            }
+            let mut response = HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&serde_json::json!({
+                    "authorization_url": "https://suite.example/test/a/vp/authorize?x=1",
+                    "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "expires_in": 300,
+                }))
+                .expect("response"),
+            };
+            bind_test_create_response(&request, &mut response);
+            Ok(response)
+        }
+    }
+
+    #[test]
+    fn create_response_loss_retries_once_with_the_same_typed_idempotency_binding() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse("https://suite.example").expect("suite");
+        let transport = Arc::new(RetryingCreateTransport {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut client = OpenId4VpVerifierClient::with_transport(
+            target,
+            suite,
+            Zeroizing::new("management-secret".to_owned()),
+            transport.clone(),
+            binding(),
+        )
+        .expect("client");
+        let request = OpenId4VpStartRequest::new("vp", "happy", BTreeMap::new(), false, binding())
+            .expect("request");
+
+        let presentation = client.start(&request).expect("response-loss retry");
+        let requests = transport.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
+        let first: Value = serde_json::from_slice(requests[0].body().expect("first body"))
+            .expect("first body JSON");
+        let second: Value = serde_json::from_slice(requests[1].body().expect("second body"))
+            .expect("second body JSON");
+        assert_eq!(first["create_request_jti"], second["create_request_jti"]);
+        assert_eq!(
+            first["create_request_jti"],
+            Value::String(presentation.create_request_jti)
+        );
+        assert!(
+            nazo_operator_protocol::validate_openid4vp_create_request_jti(
+                first["create_request_jti"].as_str().expect("create JTI")
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn create_rejects_response_with_a_nonmatching_idempotency_binding() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse("https://suite.example").expect("suite");
+        let transport = Arc::new(VerifierTransport {
+            request: std::sync::Mutex::new(None),
+            response: std::sync::Mutex::new(Some(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&serde_json::json!({
+                    "create_request_jti": "550e8400-e29b-41d4-a716-446655440000",
+                    "create_request_sha256": "a".repeat(64),
+                    "authorization_url": "https://suite.example/test/a/vp/authorize?x=1",
+                    "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "expires_in": 300,
+                }))
+                .expect("response"),
+            })),
+        });
+        let mut client = OpenId4VpVerifierClient::with_transport(
+            target,
+            suite,
+            Zeroizing::new("management-secret".to_owned()),
+            transport,
+            binding(),
+        )
+        .expect("client");
+        let request = OpenId4VpStartRequest::new("vp", "happy", BTreeMap::new(), false, binding())
+            .expect("request");
+        assert_eq!(
+            client.start(&request).expect_err("mismatched echo"),
+            OpenId4VpError::MalformedResponse
+        );
     }
 
     #[test]
@@ -1882,6 +2102,7 @@ mod tests {
             .expect("completion URL"),
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
+            create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
             evidence_context: Some(evidence_context),
             evidence_attachment: Some(OpenId4VpEvidenceAttachment {
                 presentation_binding_sha256: "d".repeat(64),
@@ -2050,6 +2271,7 @@ mod tests {
             )
             .expect("completion URL"),
             transaction_id,
+            create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
             evidence_context: Some(context),
             evidence_attachment: Some(OpenId4VpEvidenceAttachment {
                 presentation_binding_sha256,
@@ -2208,6 +2430,7 @@ mod tests {
             completion_url: completion_url.clone(),
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
+            create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
             evidence_context: None,
             evidence_attachment: None,
             issuance_request_jti: None,
@@ -2304,6 +2527,7 @@ mod tests {
             .expect("completion URL"),
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
+            create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
             evidence_context: None,
             evidence_attachment: None,
             issuance_request_jti: None,
@@ -2345,6 +2569,7 @@ mod tests {
             .expect("completion URL"),
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
+            create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
             evidence_context: None,
             evidence_attachment: None,
             issuance_request_jti: None,
@@ -2390,6 +2615,7 @@ mod tests {
             .expect("completion URL"),
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
+            create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
             evidence_context: None,
             evidence_attachment: None,
             issuance_request_jti: None,
