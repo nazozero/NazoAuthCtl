@@ -1482,59 +1482,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             Some(evidence.ui_url_diagnostic.authority_has_at),
             self.wait_for_openid4vp_fragment_scrub(&ui_url, &evidence.receipt.capability_sha256),
         )?;
-        let deadline = self.deadline(DEFAULT_STEP_TIMEOUT);
-        loop {
-            let root = self.driver.find_element(&BrowserSelector::Css(
-                "[data-testid=\"vp-verification-result\"]".to_owned(),
-            ));
-            match root {
-                Ok(root) => match vp_result_driver(
-                    "result-root-state-attribute",
-                    Some("vp-verification-result"),
-                    self.driver.element_attribute(&root, "data-state"),
-                )?
-                .as_deref()
-                {
-                    Some("verified") => {
-                        if !vp_result_driver(
-                            "result-root-visible",
-                            Some("vp-verification-result"),
-                            self.driver.element_displayed(&root),
-                        )? {
-                            return Err(BrowserError::VpVerificationResultField(
-                                "vp-verification-result:data-state",
-                            ));
-                        }
-                        break;
-                    }
-                    Some("loading") => vp_result_driver(
-                        "result-root-wait",
-                        Some("vp-verification-result"),
-                        self.sleep_until(deadline),
-                    )?,
-                    _ => {
-                        return Err(BrowserError::VpVerificationResultField(
-                            "vp-verification-result:data-state",
-                        ));
-                    }
-                },
-                Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {
-                    vp_result_driver(
-                        "result-root-wait",
-                        Some("vp-verification-result"),
-                        self.sleep_until(deadline),
-                    )?;
-                }
-                Err(error) => {
-                    return Err(vp_result_driver_error(
-                        "result-root-find",
-                        None,
-                        None,
-                        error,
-                    ));
-                }
-            }
-        }
+        self.wait_for_openid4vp_verified_projection_state(&shell_url)?;
         self.verify_openid4vp_result_projection(evidence)?;
         // Re-observe after the DOM checks: a page that navigates during the
         // bounded wait must not donate a screenshot from another origin.
@@ -1716,6 +1664,75 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                         ));
                     }
                 }
+                Some(_) => {
+                    return Err(BrowserError::VpVerificationResultField(
+                        "vp-verification-result:data-state",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Once the bootstrap fragment is scrubbed, wait only for the verified
+    /// result state. Every transient observation must remain the exact
+    /// capability-free shell; terminal or unrecognized states never retry.
+    fn wait_for_openid4vp_verified_projection_state(
+        &mut self,
+        expected: &Url,
+    ) -> Result<(), BrowserError> {
+        let deadline = self.deadline(DEFAULT_STEP_TIMEOUT);
+        loop {
+            vp_result_driver(
+                "projection-state-current-url",
+                None,
+                self.validate_openid4vp_result_shell_url(expected),
+            )?;
+            let root = match self.driver.find_element(&BrowserSelector::Css(
+                "[data-testid=\"vp-verification-result\"]".to_owned(),
+            )) {
+                Ok(root) => root,
+                Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {
+                    vp_result_driver(
+                        "projection-state-wait",
+                        Some("vp-verification-result"),
+                        self.sleep_until(deadline),
+                    )?;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(vp_result_driver_error(
+                        "projection-state-root-find",
+                        Some("vp-verification-result"),
+                        None,
+                        error,
+                    ));
+                }
+            };
+            if !vp_result_driver(
+                "projection-state-root-visible",
+                Some("vp-verification-result"),
+                self.driver.element_displayed(&root),
+            )? {
+                vp_result_driver(
+                    "projection-state-wait",
+                    Some("vp-verification-result"),
+                    self.sleep_until(deadline),
+                )?;
+                continue;
+            }
+            match vp_result_driver(
+                "projection-state-attribute",
+                Some("vp-verification-result"),
+                self.driver.element_attribute(&root, "data-state"),
+            )?
+            .as_deref()
+            {
+                Some("verified") => return Ok(()),
+                None | Some("loading") => vp_result_driver(
+                    "projection-state-wait",
+                    Some("vp-verification-result"),
+                    self.sleep_until(deadline),
+                )?,
                 Some(_) => {
                     return Err(BrowserError::VpVerificationResultField(
                         "vp-verification-result:data-state",
@@ -2538,6 +2555,9 @@ mod tests {
         redirect_after_root_not_found: Option<Url>,
         page_source: String,
         page_source_error: Option<BrowserError>,
+        post_scrub_loading_reads: usize,
+        post_scrub_state: Option<&'static str>,
+        redirect_after_post_scrub_loading: Option<Url>,
         receipt_navigation_seen: bool,
         refreshes: usize,
         refreshed_from: Vec<Url>,
@@ -2685,7 +2705,17 @@ mod tests {
                 }
                 Ok(Some(
                     if self.receipt_navigation_seen {
-                        "verified"
+                        if self.post_scrub_loading_reads > 0 {
+                            self.post_scrub_loading_reads -= 1;
+                            if self.post_scrub_loading_reads == 0
+                                && let Some(redirect) = &self.redirect_after_post_scrub_loading
+                            {
+                                self.current = redirect.clone();
+                            }
+                            "loading"
+                        } else {
+                            self.post_scrub_state.unwrap_or("verified")
+                        }
                     } else if self.refreshes > 0 {
                         self.refreshed_shell_state.unwrap_or(self.shell_state)
                     } else {
@@ -2732,6 +2762,9 @@ mod tests {
             redirect_after_root_not_found: None,
             page_source: String::new(),
             page_source_error: None,
+            post_scrub_loading_reads: 0,
+            post_scrub_state: None,
+            redirect_after_post_scrub_loading: None,
             receipt_navigation_seen: false,
             refreshes: 0,
             refreshed_from: Vec::new(),
@@ -3325,6 +3358,136 @@ mod tests {
         assert_eq!(diagnostic.stage, "canonical-shell-current-url");
         assert_eq!(executor.driver_mut().navigated.len(), 1);
         assert!(executor.driver_mut().navigated[0].fragment().is_none());
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_projection_waits_for_loading_then_verifies_once() {
+        let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp")
+            .join(format!(
+                "nazoauth-vp-projection-loading-{}",
+                uuid::Uuid::now_v7()
+            ));
+        crate::secure_file::ensure_directory(&root, true).expect("private root");
+        let capture = vp_capture_context(root.clone(), &context, &variant);
+        let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+        driver.post_scrub_loading_reads = 2;
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+        let policy = BrowserPolicy::new(target, suite)
+            .expect("policy")
+            .with_limits(BrowserLimits {
+                max_step_timeout: Duration::from_millis(20),
+                poll_interval: Duration::from_millis(1),
+                ..BrowserLimits::default()
+            })
+            .expect("short policy");
+        let mut executor = BrowserExecutor::new(driver, policy);
+
+        executor
+            .capture_openid4vp_verification_result(&evidence, &capture, 0)
+            .expect("loading result becomes verified");
+        assert_eq!(executor.driver_mut().post_scrub_loading_reads, 0);
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_projection_loading_timeout_or_terminal_state_fails_closed() {
+        for (loading_reads, terminal_state, timeout) in [
+            (usize::MAX, None, true),
+            (0, Some("expired"), false),
+            (0, Some("not-found"), false),
+            (0, Some("generic-error"), false),
+            (0, Some("unknown"), false),
+            (0, Some(""), false),
+        ] {
+            let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .expect("temp")
+                .join(format!(
+                    "nazoauth-vp-projection-terminal-{}",
+                    uuid::Uuid::now_v7()
+                ));
+            crate::secure_file::ensure_directory(&root, true).expect("private root");
+            let capture = vp_capture_context(root.clone(), &context, &variant);
+            let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+            driver.post_scrub_loading_reads = loading_reads;
+            driver.post_scrub_state = terminal_state;
+            let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+            let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+            let policy = BrowserPolicy::new(target, suite)
+                .expect("policy")
+                .with_limits(BrowserLimits {
+                    max_step_timeout: Duration::from_millis(1),
+                    poll_interval: Duration::from_millis(1),
+                    ..BrowserLimits::default()
+                })
+                .expect("short policy");
+            let mut executor = BrowserExecutor::new(driver, policy);
+
+            let error = executor
+                .capture_openid4vp_verification_result(&evidence, &capture, 0)
+                .expect_err("loading or terminal state");
+            if timeout {
+                let BrowserError::VpVerificationResultDriverDiagnostic(diagnostic) = error else {
+                    panic!("loading timeout retains projection stage")
+                };
+                assert_eq!(diagnostic.stage, "projection-state-wait");
+                assert_eq!(diagnostic.source.as_ref(), &BrowserError::Timeout);
+            } else {
+                assert_eq!(
+                    error,
+                    BrowserError::VpVerificationResultField("vp-verification-result:data-state")
+                );
+            }
+            std::fs::remove_dir_all(root).expect("remove root");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_projection_wait_rejects_midwait_redirect() {
+        let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp")
+            .join(format!(
+                "nazoauth-vp-projection-redirect-{}",
+                uuid::Uuid::now_v7()
+            ));
+        crate::secure_file::ensure_directory(&root, true).expect("private root");
+        let capture = vp_capture_context(root.clone(), &context, &variant);
+        let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+        driver.post_scrub_loading_reads = 1;
+        driver.redirect_after_post_scrub_loading = Some(
+            Url::parse("https://issuer.example/ui/verification-result?unexpected=1")
+                .expect("redirect URL"),
+        );
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+        let policy = BrowserPolicy::new(target, suite)
+            .expect("policy")
+            .with_limits(BrowserLimits {
+                max_step_timeout: Duration::from_millis(20),
+                poll_interval: Duration::from_millis(1),
+                ..BrowserLimits::default()
+            })
+            .expect("short policy");
+        let mut executor = BrowserExecutor::new(driver, policy);
+
+        let error = executor
+            .capture_openid4vp_verification_result(&evidence, &capture, 0)
+            .expect_err("redirect during projection wait");
+        let BrowserError::VpVerificationResultDriverDiagnostic(diagnostic) = error else {
+            panic!("projection redirect retains its stage")
+        };
+        assert_eq!(diagnostic.stage, "projection-state-current-url");
         std::fs::remove_dir_all(root).expect("remove root");
     }
 
