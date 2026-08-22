@@ -464,12 +464,6 @@ fn validate_provider_vp_receipts(
     identity: &EvidenceBundleIdentity,
     recovery_binding: Option<&crate::recovery::TenantResourceRecoveryBinding>,
 ) -> Result<(), EvidenceError> {
-    let artifact_digest = match &identity.source {
-        EvidenceSourceIdentity::SignedOidfArtifact { artifact, .. } => {
-            artifact.driver_manifest_sha256.as_str()
-        }
-        EvidenceSourceIdentity::LegacyOperatorMatrix { .. } => return Err(EvidenceError::Identity),
-    };
     for module in &report.modules {
         for screenshot in &module.review_screenshots {
             let receipt_bytes = crate::secure_file::read_bounded(
@@ -487,6 +481,7 @@ fn validate_provider_vp_receipts(
             {
                 continue;
             }
+            let artifact_digest = vp_artifact_digest(identity)?;
             let binding = recovery_binding.ok_or(EvidenceError::Identity)?;
             let anchor = binding
                 .vp_evidence_trust_anchor
@@ -511,6 +506,19 @@ fn validate_provider_vp_receipts(
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn vp_artifact_digest(identity: &EvidenceBundleIdentity) -> Result<&str, EvidenceError> {
+    match &identity.source {
+        EvidenceSourceIdentity::SignedOidfArtifact { artifact, .. } => {
+            Ok(artifact.driver_manifest_sha256.as_str())
+        }
+        // Legacy evidence remains compatible only while it contains no
+        // NazoAuth-sourced VP image. Such an image needs the signed artifact
+        // digest to reconstruct the receipt context.
+        EvidenceSourceIdentity::LegacyOperatorMatrix { .. } => Err(EvidenceError::Identity),
+    }
 }
 
 #[cfg(not(unix))]
@@ -1749,6 +1757,21 @@ mod tests {
             provider["capabilities"][0]["receipts"][0]["compact_sha256"],
             "a".repeat(64)
         );
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_provider_evidence_without_nazo_vp_screenshots_remains_compatible() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-provider-legacy-{}", Uuid::now_v7()));
+        let mut legacy = identity();
+        legacy.provider = Some(provider());
+        write_private_provider_evidence_bundle(&report(), &root, &legacy, None)
+            .expect("legacy evidence without a Nazo VP receipt remains supported");
+        assert_eq!(vp_artifact_digest(&legacy), Err(EvidenceError::Identity));
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 }
