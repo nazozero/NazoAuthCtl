@@ -52,13 +52,14 @@ pub use artifact_plan::{
 };
 pub use browser::{
     BrowserAutomation, BrowserCommand, BrowserDriver, BrowserEntry, BrowserError, BrowserExecutor,
-    BrowserLimits, BrowserPolicy, BrowserReviewCaptureContext, BrowserReviewScreenshotCapture,
-    BrowserReviewScreenshotReceipt, BrowserRunReport, BrowserRunnerState, BrowserSelector,
-    BrowserTargetOrigin, BrowserTask, ConformanceBinding, ManagedWebDriver, OpenId4VcBrowserState,
-    OpenId4VciError, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
-    OpenId4VciModule, OpenId4VpError, OpenId4VpPresentation, OpenId4VpStartRequest,
-    OpenId4VpVerifier, OpenId4VpVerifierClient, ReviewScreenshotMarker, WebDriverClient,
-    WebDriverEndpoint, parse_browser_entries, parse_browser_entries_owned,
+    BrowserLimits, BrowserPolicy, BrowserReviewCaptureContext, BrowserReviewModuleIdentity,
+    BrowserReviewScreenshotCapture, BrowserReviewScreenshotReceipt, BrowserRunReport,
+    BrowserRunnerState, BrowserSelector, BrowserTargetOrigin, BrowserTask, ConformanceBinding,
+    ManagedWebDriver, OpenId4VcBrowserState, OpenId4VciError, OpenId4VciIssuerClient,
+    OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpError,
+    OpenId4VpPresentation, OpenId4VpStartRequest, OpenId4VpVerifier, OpenId4VpVerifierClient,
+    ReviewScreenshotMarker, WebDriverClient, WebDriverEndpoint, parse_browser_entries,
+    parse_browser_entries_owned,
 };
 pub use ciba_approval::{
     CibaApprovalFailureStage, CibaUserApprovalBridge, CibaUserApprovalClient, CibaUserApprovalError,

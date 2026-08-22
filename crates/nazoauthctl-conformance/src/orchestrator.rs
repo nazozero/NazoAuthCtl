@@ -12,10 +12,11 @@ use thiserror::Error;
 use url::Url;
 
 use crate::browser::{
-    BrowserAutomation, BrowserPolicy, BrowserReviewScreenshotCapture, BrowserRunnerState,
-    BrowserTargetOrigin, ConformanceBinding, MAX_REVIEW_SCREENSHOTS_PER_RUN, OpenId4VciError,
-    OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpStartRequest, OpenId4VpVerifier,
-    browser_config_for_module, parse_browser_entries_owned, required_review_screenshot_count,
+    BrowserAutomation, BrowserPolicy, BrowserReviewModuleIdentity, BrowserReviewScreenshotCapture,
+    BrowserRunnerState, BrowserTargetOrigin, ConformanceBinding, MAX_REVIEW_SCREENSHOTS_PER_RUN,
+    OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpStartRequest,
+    OpenId4VpVerifier, browser_config_for_module, parse_browser_entries_owned,
+    required_review_screenshot_count,
 };
 use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
 use crate::matrix::{MatrixError, SelectedMatrix, zeroize_json_value};
@@ -469,17 +470,22 @@ impl ConformanceRunner {
                     .first()
                     .and_then(|automation| automation.review_screenshot_capture.as_ref())
                     .map(|capture| {
-                        capture.context(
+                        BrowserReviewModuleIdentity::new(
                             &plan.matrix_plan_id,
                             &plan.suite_plan_id,
                             module_id,
                             &module.test_name,
                             &plan.variant,
-                            review_evidence
-                                .screenshots
-                                .len()
-                                .saturating_add(review_evidence.missing),
                         )
+                        .and_then(|identity| {
+                            capture.context(
+                                identity,
+                                review_evidence
+                                    .screenshots
+                                    .len()
+                                    .saturating_add(review_evidence.missing),
+                            )
+                        })
                     })
                     .transpose()
                     .map_err(|error| error.to_string())?;

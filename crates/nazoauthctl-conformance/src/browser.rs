@@ -291,21 +291,13 @@ impl BrowserReviewScreenshotCapture {
 
     pub fn context(
         &self,
-        matrix_plan_id: &str,
-        suite_plan_id: &str,
-        module_id: &str,
-        test_name: &str,
-        variant: &BTreeMap<String, String>,
+        identity: BrowserReviewModuleIdentity,
         capture_index: usize,
     ) -> Result<BrowserReviewCaptureContext, BrowserError> {
         BrowserReviewCaptureContext::new(
             self.evidence_directory.clone(),
             self.run_jti.clone(),
-            matrix_plan_id,
-            suite_plan_id,
-            module_id,
-            test_name,
-            variant,
+            identity,
             capture_index,
             self.budget.clone(),
         )
@@ -313,6 +305,36 @@ impl BrowserReviewScreenshotCapture {
 
     pub(crate) fn shares_run_budget_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.budget, &other.budget)
+    }
+}
+
+/// The signed/module allocation facts that bind a review capture. Keeping
+/// them together prevents serial, parallel, and test callers from deriving
+/// overlapping identities through separate argument lists.
+#[derive(Clone)]
+pub struct BrowserReviewModuleIdentity {
+    matrix_plan_id: String,
+    suite_plan_id: String,
+    module_id: String,
+    test_name: String,
+    variant: BTreeMap<String, String>,
+}
+
+impl BrowserReviewModuleIdentity {
+    pub fn new(
+        matrix_plan_id: &str,
+        suite_plan_id: &str,
+        module_id: &str,
+        test_name: &str,
+        variant: &BTreeMap<String, String>,
+    ) -> Result<Self, BrowserError> {
+        Ok(Self {
+            matrix_plan_id: safe_capture_component(matrix_plan_id)?.to_owned(),
+            suite_plan_id: safe_capture_component(suite_plan_id)?.to_owned(),
+            module_id: safe_capture_component(module_id)?.to_owned(),
+            test_name: safe_capture_component(test_name)?.to_owned(),
+            variant: variant.clone(),
+        })
     }
 }
 
@@ -335,25 +357,18 @@ impl BrowserReviewCaptureContext {
     fn new(
         evidence_directory: PathBuf,
         run_jti: String,
-        matrix_plan_id: &str,
-        suite_plan_id: &str,
-        module_id: &str,
-        test_name: &str,
-        variant: &BTreeMap<String, String>,
+        identity: BrowserReviewModuleIdentity,
         capture_index: usize,
         budget: Arc<Mutex<ReviewCaptureBudget>>,
     ) -> Result<Self, BrowserError> {
-        let plan = safe_capture_component(matrix_plan_id)?;
-        let suite_plan = safe_capture_component(suite_plan_id)?;
-        let module = safe_capture_component(module_id)?;
         Ok(Self {
             evidence_directory,
             run_jti,
-            matrix_plan_id: plan.to_owned(),
-            suite_plan_id: suite_plan.to_owned(),
-            module_id: module.to_owned(),
-            test_name: safe_capture_component(test_name)?.to_owned(),
-            variant: variant.clone(),
+            matrix_plan_id: identity.matrix_plan_id,
+            suite_plan_id: identity.suite_plan_id,
+            module_id: identity.module_id,
+            test_name: identity.test_name,
+            variant: identity.variant,
             capture_index,
             budget,
         })
@@ -1573,11 +1588,14 @@ mod tests {
         let capture = BrowserReviewScreenshotCapture::new(root.clone(), "run-a")
             .expect("capture")
             .context(
-                "matrix-plan-a",
-                "suite-plan-a",
-                "module-a",
-                "test-a",
-                &BTreeMap::new(),
+                BrowserReviewModuleIdentity::new(
+                    "matrix-plan-a",
+                    "suite-plan-a",
+                    "module-a",
+                    "test-a",
+                    &BTreeMap::new(),
+                )
+                .expect("identity"),
                 0,
             )
             .expect("context");
@@ -1670,14 +1688,34 @@ mod tests {
         let capture = BrowserReviewScreenshotCapture::new(root.clone(), "run-a").expect("capture");
         for index in 0..MAX_REVIEW_SCREENSHOTS_PER_RUN {
             capture
-                .context("matrix", "suite", "module", "test", &BTreeMap::new(), index)
+                .context(
+                    BrowserReviewModuleIdentity::new(
+                        "matrix",
+                        "suite",
+                        "module",
+                        "test",
+                        &BTreeMap::new(),
+                    )
+                    .expect("identity"),
+                    index,
+                )
                 .expect("context")
                 .reserve_attempt()
                 .expect("bounded attempt");
         }
         assert_eq!(
             capture
-                .context("matrix", "suite", "module", "test", &BTreeMap::new(), 64,)
+                .context(
+                    BrowserReviewModuleIdentity::new(
+                        "matrix",
+                        "suite",
+                        "module",
+                        "test",
+                        &BTreeMap::new(),
+                    )
+                    .expect("identity"),
+                    64,
+                )
                 .expect("context")
                 .reserve_attempt()
                 .expect_err("sixty fifth attempt"),
