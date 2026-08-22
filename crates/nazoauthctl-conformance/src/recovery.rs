@@ -1042,9 +1042,11 @@ impl ConformanceRecoveryGuard {
         if sha256_hex(&bytes) != record.manifest_sha256 {
             bail!("retained Suite pending manifest conflicts with the journal");
         }
-        let journal = self
-            .tenant_resource_journal_mut()
-            .expect("tenant-resource journal was just verified");
+        let mut next = self.journal.clone();
+        let journal = match &mut next {
+            RecoveryJournal::TenantResource(journal) => journal,
+            RecoveryJournal::Legacy(_) => unreachable!("tenant-resource journal was just verified"),
+        };
         {
             let suite = journal
                 .suite
@@ -1054,7 +1056,12 @@ impl ConformanceRecoveryGuard {
             suite.module_ids.clear();
         }
         journal.suite_retention = SuiteRetentionDisposition::Retained { record };
-        self.persist()
+        // Do not expose an in-memory Retained state until its compacted
+        // ownership journal is durable. A failed write must remain Prepared
+        // so the caller can still perform exact fallback deletion.
+        self.persist_snapshot(&next)?;
+        self.journal = next;
+        Ok(())
     }
 
     /// Finalize a journal-authorized pending manifest. A missing or altered
@@ -1110,20 +1117,38 @@ impl ConformanceRecoveryGuard {
     }
 
     /// Returns a receipt only after exact Suite plan ownership has transferred.
-    pub fn suite_retention_manifest_receipt(&self) -> Option<SuiteRetentionManifestReceipt> {
+    pub fn suite_retention_manifest_receipt(
+        &self,
+    ) -> anyhow::Result<Option<SuiteRetentionManifestReceipt>> {
         match &self.journal {
             RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
                 SuiteRetentionDisposition::Retained { record } => {
-                    Some(SuiteRetentionManifestReceipt {
+                    validate_suite_retention_manifest_path(
+                        record,
+                        self.tenant_resource_binding()
+                            .context("Suite retention has no ordinary binding")?,
+                    )?;
+                    let bytes = crate::secure_file::read_bounded(
+                        &record.manifest_path,
+                        MAX_SUITE_RETENTION_MANIFEST_BYTES,
+                        true,
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!("retained Suite manifest is not secure: {error:?}")
+                    })?;
+                    if sha256_hex(&bytes) != record.manifest_sha256 {
+                        bail!("retained Suite manifest conflicts with the recovery journal");
+                    }
+                    Ok(Some(SuiteRetentionManifestReceipt {
                         path: record.manifest_path.clone(),
                         sha256: record.manifest_sha256.clone(),
-                    })
+                    }))
                 }
                 SuiteRetentionDisposition::Active { .. }
                 | SuiteRetentionDisposition::RetentionPrepared { .. }
-                | SuiteRetentionDisposition::Cleaned => None,
+                | SuiteRetentionDisposition::Cleaned => Ok(None),
             },
-            RecoveryJournal::Legacy(_) => None,
+            RecoveryJournal::Legacy(_) => Ok(None),
         }
     }
 
@@ -1489,12 +1514,12 @@ impl ConformanceRecoveryGuard {
     }
 
     fn persist(&self) -> anyhow::Result<()> {
-        validate_journal(
-            &self.journal,
-            &self.store.deployment_id,
-            self.journal.request_jti(),
-        )?;
-        if let RecoveryJournal::TenantResource(journal) = &self.journal
+        self.persist_snapshot(&self.journal)
+    }
+
+    fn persist_snapshot(&self, journal: &RecoveryJournal) -> anyhow::Result<()> {
+        validate_journal(journal, &self.store.deployment_id, journal.request_jti())?;
+        if let RecoveryJournal::TenantResource(journal) = journal
             && journal.binding.manifest_path.is_some()
         {
             let present = validate_tenant_resource_manifest_file(&journal.binding)?;
@@ -1505,7 +1530,7 @@ impl ConformanceRecoveryGuard {
                 bail!("tenant-resource apply manifest disappeared before cleanup");
             }
         }
-        write_journal(&self.journal_path, &self.journal)
+        write_journal(&self.journal_path, journal)
     }
 }
 
@@ -1842,8 +1867,12 @@ fn validate_review_screenshot_manifest_binding(
     {
         bail!("review screenshot manifest binding is outside policy");
     }
-    let bytes = crate::secure_file::read_bounded(&screenshot.path, 1024 * 1024, true)
-        .map_err(|error| anyhow::anyhow!("review screenshot manifest is not secure: {error:?}"))?;
+    let bytes = crate::secure_file::read_bounded(
+        &screenshot.path,
+        crate::evidence::MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES,
+        true,
+    )
+    .map_err(|error| anyhow::anyhow!("review screenshot manifest is not secure: {error:?}"))?;
     if sha256_hex(&bytes) != screenshot.sha256 {
         bail!("review screenshot manifest digest is invalid");
     }
@@ -3168,7 +3197,6 @@ mod tests {
         crate::secure_file::write_atomic(&screenshot_path, b"tampered", true)
             .expect("tamper retained screenshot manifest");
         assert!(guard.finish().is_err());
-        drop(guard);
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 

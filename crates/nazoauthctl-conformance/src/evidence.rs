@@ -16,6 +16,8 @@ use crate::{ConformanceReport, VerifiedOidfArtifact};
 
 #[cfg(unix)]
 const EVIDENCE_BUNDLE_SCHEMA: u32 = 3;
+/// Shared writer/retention-reader ceiling for the public screenshot manifest.
+pub(crate) const MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
@@ -519,6 +521,9 @@ pub fn write_review_screenshot_manifest(
             "screenshots": screenshots,
         }))
         .map_err(|_| EvidenceError::Encoding)?;
+        if bytes.len() > MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES {
+            return Err(EvidenceError::Encoding);
+        }
         let path = root
             .join("review-screenshot-manifests")
             .join(format!("{run_jti}.json"));

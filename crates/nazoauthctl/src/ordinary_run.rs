@@ -121,7 +121,20 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     suite_client
         .probe_auth()
         .context("Suite API token authentication failed")?;
-    recover_pending_runs(&session, &recovery_store, &suite_client)?;
+    let recovered_retention = recover_pending_runs(&session, &recovery_store, &suite_client)?;
+    if !recovered_retention.is_empty() {
+        serde_json::to_writer_pretty(
+            io::stdout().lock(),
+            &RecoveredRetentionOutput {
+                schema: 1,
+                recovered: true,
+                retention: recovered_retention,
+            },
+        )
+        .context("failed to write recovered retention report")?;
+        writeln!(io::stdout()).context("failed to finish recovered retention report")?;
+        return Ok(0);
+    }
     if prompted {
         offer_credential_persistence(&suite_origin, &token)?;
     }
@@ -565,7 +578,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     // to the Prepared journal above and is revalidated by stage, commit,
     // publish, recovery claim, and finish.  Provider evidence is written only
     // after ownership has transferred and the final report is fixed.
-    let retention_committed = if retention_commit_possible {
+    let mut retention_committed = if retention_commit_possible {
         match (|| -> anyhow::Result<()> {
             recovery.stage_suite_retention_manifest()?;
             recovery.commit_suite_plan_retention()?;
@@ -595,6 +608,23 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         cleanup_unretained_suite(&mut recovery, &suite_client)?;
         false
     };
+    // A crash or I/O failure may occur after the durable Retained transition
+    // but before the pending manifest promotion reports success. Retry the
+    // idempotent promotion before deriving the final report; a successful
+    // retry is not a failed run.
+    if !retention_committed && recovery.suite_retention_committed() {
+        match recovery.publish_committed_suite_retention_manifest() {
+            Ok(manifest_path) => {
+                retention_committed = true;
+                errors.retain(|error| !error.starts_with("suite-retention="));
+                eprintln!(
+                    "Suite plans retained for certification review: review/publish them in the official Suite UI, then use a controlled deletion procedure; manifest={}",
+                    manifest_path.display()
+                );
+            }
+            Err(error) => errors.push(format!("suite-retention-retry={error:#}")),
+        }
+    }
     if let Some(report) = report.as_mut() {
         report.orchestration_integrity.retention_eligible = retention_eligible;
         report.orchestration_integrity.retention_committed = recovery.suite_retention_committed();
@@ -666,12 +696,18 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         }
     }
     let retention = if retention_committed {
-        recovery.suite_retention_manifest_receipt()
+        recovery.suite_retention_manifest_receipt()?
     } else {
         None
     };
     if cleanup_evidence.is_some() && proxy_cleanup_complete && recovery.suite_cleanup_complete() {
-        recovery.finish()?;
+        if let Err(error) = recovery.finish() {
+            // `finish` consumes the guard but leaves its durable journal in
+            // place on failure. The already-published retention receipt
+            // remains honest; report a structured incomplete local result
+            // rather than deleting plans or losing stdout evidence.
+            errors.push(format!("recovery-finish={error:#}"));
+        }
     }
     deployment_report.cleanup_complete = cleanup_complete;
     let success = errors.is_empty()
@@ -715,6 +751,13 @@ struct FinalOutput {
     retention: Option<SuiteRetentionManifestReceipt>,
     evidence: Option<EvidenceBundleReceipt>,
     deployment: DeploymentReport,
+}
+
+#[derive(Serialize)]
+struct RecoveredRetentionOutput {
+    schema: u32,
+    recovered: bool,
+    retention: Vec<SuiteRetentionManifestReceipt>,
 }
 
 #[derive(Serialize)]
@@ -1229,12 +1272,13 @@ fn recover_pending_runs(
     session: &nazoauthctl_core::ConformanceSession,
     store: &ConformanceRecoveryStore,
     suite_client: &SuiteClient,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<SuiteRetentionManifestReceipt>> {
     let pending = store.claim_pending()?;
     if pending.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut failures = Vec::new();
+    let mut retained = Vec::new();
     for mut recovery in pending {
         let Some(binding) = recovery.tenant_resource_binding().cloned() else {
             // Legacy journals remain readable, but this ordinary command must
@@ -1242,10 +1286,10 @@ fn recover_pending_runs(
             failures.push("legacy-read-only: use the release that created this journal".to_owned());
             continue;
         };
-        let result = (|| -> anyhow::Result<()> {
+        let result = (|| -> anyhow::Result<Option<SuiteRetentionManifestReceipt>> {
             if recovery.tenant_resource_abort_uncommitted_intent() {
                 recovery.abort_uncommitted_tenant_resource()?;
-                return Ok(());
+                return Ok(None);
             }
             let client = TenantResourceClient::with_curl(
                 session.tenant_resource_client_config(&binding.tenant_id)?,
@@ -1279,7 +1323,7 @@ fn recover_pending_runs(
                             recovery.mark_proxy_cleanup_complete()?;
                         }
                         recovery.abort_uncommitted_tenant_resource()?;
-                        return Ok(());
+                        return Ok(None);
                     }
                     Err(error) => return Err(error.into()),
                 };
@@ -1308,17 +1352,20 @@ fn recover_pending_runs(
                 recovery.mark_proxy_cleanup_complete()?;
             }
             cleanup_run_resources(&client, &mut recovery)?;
+            let receipt = recovery.suite_retention_manifest_receipt()?;
             if recovery.suite_cleanup_complete() && recovery.proxy_cleanup_complete() {
                 recovery.finish()?;
             }
-            Ok(())
+            Ok(receipt)
         })();
-        if let Err(error) = result {
-            failures.push(format!("{}: {error:#}", binding.request_jti));
+        match result {
+            Ok(Some(receipt)) => retained.push(receipt),
+            Ok(None) => {}
+            Err(error) => failures.push(format!("{}: {error:#}", binding.request_jti)),
         }
     }
     if failures.is_empty() {
-        Ok(())
+        Ok(retained)
     } else {
         bail!(
             "pending conformance cleanup could not be recovered: {}",
