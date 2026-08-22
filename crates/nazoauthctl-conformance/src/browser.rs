@@ -3966,7 +3966,8 @@ mod tests {
         let BrowserError::VpVerificationResultDriverDiagnostic(diagnostic) = error else {
             panic!("shell redirect must retain its stage")
         };
-        assert_eq!(diagnostic.stage, "canonical-shell-current-url");
+        assert_eq!(diagnostic.stage, "canonical-shell-recovery-current-url");
+        assert_eq!(executor.driver_mut().refreshes, 0);
         assert_eq!(executor.driver_mut().navigated.len(), 1);
         assert!(executor.driver_mut().navigated[0].fragment().is_none());
         std::fs::remove_dir_all(root).expect("remove root");
