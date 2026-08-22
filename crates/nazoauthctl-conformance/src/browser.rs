@@ -619,18 +619,13 @@ pub struct BrowserReviewScreenshotReceipt {
 
 /// The only two review image origins. The NazoAuthWeb source is admitted only
 /// after a same-module, runtime-signed OpenID4VP receipt was verified.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum BrowserReviewScreenshotSource {
     #[serde(rename = "suite-verification-evidence")]
+    #[default]
     SuiteVerificationEvidence,
     #[serde(rename = "nazo-vp-verification-result/live-webdriver")]
     NazoVpVerificationResultLiveWebdriver,
-}
-
-impl Default for BrowserReviewScreenshotSource {
-    fn default() -> Self {
-        Self::SuiteVerificationEvidence
-    }
 }
 
 #[derive(Serialize)]
