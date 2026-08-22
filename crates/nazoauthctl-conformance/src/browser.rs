@@ -4774,8 +4774,8 @@ mod tests {
         let BrowserError::VpVerificationResultShellMountDiagnostic(diagnostic) = error else {
             panic!("shell mount diagnostic")
         };
-        assert_eq!(diagnostic.stage, "canonical-shell-root-find");
-        assert_eq!(diagnostic.source.as_ref(), &BrowserError::Timeout);
+        assert_eq!(diagnostic.stage, "canonical-shell-recovery-runtime");
+        assert_eq!(diagnostic.source.as_ref(), &BrowserError::Protocol);
         assert!(diagnostic.runtime.is_none());
         assert_eq!(
             diagnostic.runtime_error.as_deref(),
@@ -4786,6 +4786,11 @@ mod tests {
             diagnostic.browser_log_error.as_deref(),
             Some(&BrowserError::Transport)
         );
+        assert_eq!(executor.driver_mut().refreshes, 0);
+        // The initial best-effort window drain is discarded; only the final
+        // mount diagnostic retains the independent log-observation failure.
+        assert_eq!(executor.driver_mut().browser_log_calls, 2);
+        assert!(!diagnostic.to_string().contains("secret="));
         std::fs::remove_dir_all(root).expect("remove root");
     }
 
