@@ -690,10 +690,10 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             }),
             outer_cleanup_complete: cleanup_complete,
         };
-        match write_private_provider_evidence_bundle(report, directory, &identity) {
-            Ok(receipt) => evidence = Some(receipt),
-            Err(error) => errors.push(format!("evidence={error}")),
-        }
+        evidence = record_provider_evidence_result(
+            || write_private_provider_evidence_bundle(report, directory, &identity),
+            &mut errors,
+        );
     }
     let retention = if retention_committed {
         recovery.suite_retention_manifest_receipt()?
@@ -1295,6 +1295,20 @@ fn recover_pending_runs(
             continue;
         };
         let result = (|| -> anyhow::Result<Option<SuiteRetentionManifestReceipt>> {
+            // Retained is a durable transfer of exact Suite-plan ownership.
+            // Its commit precondition already proves provider, proxy, and
+            // ordinary cleanup.  A recovery must therefore publish/read the
+            // retained receipt and stop before constructing any live Apply
+            // client; retrying an Apply here could create a second resource
+            // set after certification plans have been preserved.
+            if retained_recovery_stops_before_live_apply(recovery.suite_retention_committed()) {
+                recovery.publish_committed_suite_retention_manifest()?;
+                let receipt = recovery.suite_retention_manifest_receipt()?;
+                if recovery.suite_cleanup_complete() && recovery.proxy_cleanup_complete() {
+                    recovery.finish()?;
+                }
+                return Ok(receipt);
+            }
             if recovery.tenant_resource_abort_uncommitted_intent() {
                 recovery.abort_uncommitted_tenant_resource()?;
                 return Ok(None);
@@ -1406,6 +1420,31 @@ fn evidence_runtime(
             }
         }
     }
+}
+
+// Keep the provider-bundle failure boundary explicit and independently
+// testable.  Retention ownership is committed before this callback and is
+// intentionally not an input here, so a writer failure cannot select Suite
+// cleanup or change a retained-plan decision.
+fn record_provider_evidence_result<F, E>(
+    writer: F,
+    errors: &mut Vec<String>,
+) -> Option<EvidenceBundleReceipt>
+where
+    F: FnOnce() -> Result<EvidenceBundleReceipt, E>,
+    E: std::fmt::Display,
+{
+    match writer() {
+        Ok(receipt) => Some(receipt),
+        Err(error) => {
+            errors.push(format!("evidence={error}"));
+            None
+        }
+    }
+}
+
+fn retained_recovery_stops_before_live_apply(retention_committed: bool) -> bool {
+    retention_committed
 }
 
 fn evidence_capability(
@@ -1639,6 +1678,25 @@ mod tests {
         assert!(!conformance_acceptance_succeeds(false, true, true));
         assert!(!conformance_acceptance_succeeds(true, false, true));
         assert!(!conformance_acceptance_succeeds(true, true, false));
+    }
+
+    #[test]
+    fn provider_evidence_failure_is_diagnostic_only_after_retention_commit() {
+        let mut errors = Vec::new();
+        let retention_committed = true;
+        let evidence = record_provider_evidence_result(
+            || -> Result<EvidenceBundleReceipt, &'static str> { Err("injected writer failure") },
+            &mut errors,
+        );
+        assert!(retention_committed);
+        assert!(evidence.is_none());
+        assert_eq!(errors, vec!["evidence=injected writer failure"]);
+    }
+
+    #[test]
+    fn retained_recovery_never_reenters_live_apply() {
+        assert!(retained_recovery_stops_before_live_apply(true));
+        assert!(!retained_recovery_stops_before_live_apply(false));
     }
 
     #[test]

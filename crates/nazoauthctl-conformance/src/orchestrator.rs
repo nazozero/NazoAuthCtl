@@ -2339,6 +2339,100 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn screenshot_capture_lanes_require_one_shared_browser_budget() {
+        let temp = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let evidence = temp.join(format!("nazoauth-lanes-{}", uuid::Uuid::now_v7()));
+        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            Arc::new(FixtureTransport {
+                requests: Mutex::new(Vec::new()),
+            }),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let browser = || {
+            Arc::new(Mutex::new(CompletingBrowser {
+                completed: Arc::new(AtomicBool::new(false)),
+            })) as Arc<Mutex<dyn BrowserAutomation>>
+        };
+        let config = |automation| ConformanceRunConfig {
+            client: client.clone(),
+            matrix: one_plan_matrix(serde_json::json!({})),
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: one_plan_budgets(),
+            selected_resource_budget: budget(1, 1, 60),
+            jobs: 2,
+            automation,
+            suite_resource_observer: None,
+        };
+        assert!(ConformanceRunner::new(config(Vec::new())).is_ok());
+        let shared =
+            BrowserReviewScreenshotCapture::new(evidence.clone(), "run-a").expect("shared capture");
+        assert!(
+            ConformanceRunner::new(config(vec![
+                ConformanceAutomation {
+                    browser: Some(browser()),
+                    review_screenshot_capture: Some(shared.clone()),
+                    ..ConformanceAutomation::default()
+                },
+                ConformanceAutomation {
+                    browser: Some(browser()),
+                    review_screenshot_capture: Some(shared),
+                    ..ConformanceAutomation::default()
+                },
+            ]))
+            .is_ok()
+        );
+        let first =
+            BrowserReviewScreenshotCapture::new(evidence.clone(), "run-b").expect("first capture");
+        let second =
+            BrowserReviewScreenshotCapture::new(evidence.clone(), "run-b").expect("second capture");
+        assert!(
+            ConformanceRunner::new(config(vec![
+                ConformanceAutomation {
+                    browser: Some(browser()),
+                    review_screenshot_capture: Some(first),
+                    ..ConformanceAutomation::default()
+                },
+                ConformanceAutomation {
+                    browser: Some(browser()),
+                    review_screenshot_capture: Some(second),
+                    ..ConformanceAutomation::default()
+                },
+            ]))
+            .is_err()
+        );
+        let capture =
+            BrowserReviewScreenshotCapture::new(evidence.clone(), "run-c").expect("capture");
+        assert!(
+            ConformanceRunner::new(config(vec![
+                ConformanceAutomation::default(),
+                ConformanceAutomation {
+                    browser: Some(browser()),
+                    review_screenshot_capture: Some(capture.clone()),
+                    ..ConformanceAutomation::default()
+                },
+            ]))
+            .is_err()
+        );
+        assert!(
+            ConformanceRunner::new(config(vec![ConformanceAutomation {
+                review_screenshot_capture: Some(capture),
+                ..ConformanceAutomation::default()
+            }]))
+            .is_err()
+        );
+        std::fs::remove_dir_all(&evidence).expect("remove evidence");
+    }
+
     #[test]
     fn suite_module_count_over_budget_fails_before_runner_creation_and_cleans_plan() {
         let transport = Arc::new(BudgetDriftTransport {

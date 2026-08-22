@@ -415,6 +415,10 @@ pub struct ConformanceRecoveryGuard {
     journal_path: PathBuf,
     lock_path: PathBuf,
     lock: Option<File>,
+    // This is deliberately a test-only durability seam.  Production always
+    // persists through the same atomic journal writer.
+    #[cfg(test)]
+    fail_next_persist: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ConformanceRecoveryStore {
@@ -504,6 +508,8 @@ impl ConformanceRecoveryStore {
             journal_path,
             lock_path,
             lock: Some(lock),
+            #[cfg(test)]
+            fail_next_persist: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -658,6 +664,8 @@ impl ConformanceRecoveryStore {
                 journal_path,
                 lock_path,
                 lock: Some(lock),
+                #[cfg(test)]
+                fail_next_persist: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             });
         }
         Ok(pending)
@@ -681,6 +689,11 @@ impl Clone for ConformanceRecoveryStore {
 }
 
 impl ConformanceRecoveryGuard {
+    #[cfg(test)]
+    fn fail_next_persist_for_test(&self) {
+        self.fail_next_persist
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     pub fn binding(&self) -> &ConformanceRecoveryBinding {
         match &self.journal {
             RecoveryJournal::Legacy(journal) => &journal.binding,
@@ -1582,6 +1595,13 @@ impl ConformanceRecoveryGuard {
     }
 
     fn persist_snapshot(&self, journal: &RecoveryJournal) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_persist
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            bail!("injected recovery journal persistence failure");
+        }
         validate_journal(journal, &self.store.deployment_id, journal.request_jti())?;
         if let RecoveryJournal::TenantResource(journal) = journal
             && journal.binding.manifest_path.is_some()
@@ -2366,6 +2386,8 @@ fn lower_hex(value: &str, length: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     fn binding() -> ConformanceRecoveryBinding {
         ConformanceRecoveryBinding {
@@ -3316,6 +3338,15 @@ mod tests {
         guard
             .record_tenant_resource_enumeration(Vec::new())
             .expect("enumeration");
+        // A disk failure must not expose a compacted in-memory Retained
+        // state: exact plan ownership remains available for recovery.
+        guard.fail_next_persist_for_test();
+        assert!(guard.commit_suite_plan_retention().is_err());
+        assert!(!guard.suite_retention_committed());
+        assert_eq!(
+            guard.suite_recovery().expect("prepared suite").plan_ids,
+            vec!["suite-plan-1".to_owned()]
+        );
         guard
             .commit_suite_plan_retention()
             .expect("transfer ownership");
@@ -3323,12 +3354,131 @@ mod tests {
         guard
             .publish_committed_suite_retention_manifest()
             .expect("publish manifest");
+        let receipt = guard
+            .suite_retention_manifest_receipt()
+            .expect("retention receipt")
+            .expect("committed receipt");
+        assert_eq!(receipt.path, final_path);
         let manifest_bytes =
             crate::secure_file::read_bounded(&final_path, MAX_SUITE_RETENTION_MANIFEST_BYTES, true)
                 .expect("read manifest");
         assert!(!String::from_utf8_lossy(&manifest_bytes).contains("capability.header.payload"));
         drop(guard);
-        assert_eq!(store.claim_pending().expect("retained recovery").len(), 1);
+        let mut recovered = store.claim_pending().expect("retained recovery");
+        assert_eq!(recovered.len(), 1);
+        assert!(
+            recovered
+                .pop()
+                .expect("retained guard")
+                .suite_retention_manifest_receipt()
+                .expect("recovered receipt")
+                .is_some()
+        );
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_screenshot_manifest_binds_real_png_receipt_and_exact_directory() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!("nazoauth-screenshot-{}", uuid::Uuid::now_v7()));
+        let evidence = root.join("evidence");
+        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
+        let binding = tenant_resource_binding(&root);
+        let relative = PathBuf::from("review-screenshots")
+            .join(&binding.request_jti)
+            .join("matrix-plan-1--suite-module-1--000.png");
+        let image_path = evidence.join(&relative);
+        crate::secure_file::ensure_directory(image_path.parent().expect("image parent"), true)
+            .expect("image directory");
+        let png = STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            .expect("one pixel png");
+        crate::secure_file::write_atomic(&image_path, &png, true).expect("write png");
+        let trigger_origin = "https://www.certification.openid.net";
+        let trigger_path = "/test/a/suite-module-1/verification-evidence";
+        let image_sha = sha256_hex(&png);
+        let trigger_sha = sha256_hex(format!("{trigger_origin}{trigger_path}").as_bytes());
+        let audit = serde_json::to_vec(&serde_json::json!({
+            "suite_plan_id": "suite-plan-1",
+            "module_id": "suite-module-1",
+            "test_name": "browser-test",
+            "variant": {"mode":"review"},
+            "marker": "required",
+            "obligation_index": 0,
+            "path": relative.clone(),
+            "sha256": image_sha.clone(),
+            "size": png.len(),
+            "trigger_origin": trigger_origin,
+            "trigger_path": trigger_path,
+            "trigger_url_sha256": trigger_sha.clone(),
+        }))
+        .expect("audit");
+        let receipt_path = image_path.with_extension("png.receipt.json");
+        crate::secure_file::write_atomic(&receipt_path, &audit, true).expect("write receipt");
+        let screenshot_path = evidence
+            .join("review-screenshot-manifests")
+            .join(format!("{}.json", binding.request_jti));
+        crate::secure_file::ensure_directory(
+            screenshot_path.parent().expect("manifest parent"),
+            true,
+        )
+        .expect("manifest directory");
+        let document = serde_json::to_vec(&serde_json::json!({
+            "schema": 3,
+            "run_jti": binding.request_jti.clone(),
+            "artifact_digest": "a".repeat(64),
+            "matrix_sha256": "b".repeat(64),
+            "suite_origin": trigger_origin,
+            "modules": [{
+                "matrix_plan_id": "matrix-plan-1", "suite_plan_id": "suite-plan-1",
+                "module_id": "suite-module-1", "test_name": "browser-test",
+                "variant": {"mode":"review"}, "required": 1,
+                "captured_required": 1, "missing_optional": 0
+            }],
+            "screenshots": [{
+                "matrix_plan_id": "matrix-plan-1", "suite_plan_id": "suite-plan-1",
+                "module_id": "suite-module-1", "test_name": "browser-test",
+                "variant": {"mode":"review"}, "marker": "required", "obligation_index": 0,
+                "path": relative.clone(), "sha256": image_sha.clone(), "size": png.len(),
+                "receipt_sha256": sha256_hex(&audit), "trigger_origin": trigger_origin,
+                "trigger_path": trigger_path, "trigger_url_sha256": trigger_sha.clone()
+            }]
+        }))
+        .expect("typed manifest");
+        crate::secure_file::write_atomic(&screenshot_path, &document, true)
+            .expect("write manifest");
+        let retention = SuiteRetentionManifest {
+            schema: SUITE_RETENTION_MANIFEST_SCHEMA,
+            suite_origin: trigger_origin.to_owned(),
+            artifact_digest: "a".repeat(64),
+            matrix_sha256: "b".repeat(64),
+            deployment_id: binding.deployment_id.clone(),
+            tenant_id: binding.tenant_id.clone(),
+            run_id: binding.request_jti.clone(),
+            review_screenshot_manifest: None,
+            plans: vec![SuiteRetentionPlan {
+                matrix_plan_id: "matrix-plan-1".to_owned(),
+                suite_plan_id: "suite-plan-1".to_owned(),
+                plan_name: "Certification plan".to_owned(),
+                plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256("matrix-plan-1"),
+            }],
+        };
+        let bound = SuiteRetentionScreenshotManifest {
+            path: screenshot_path,
+            sha256: sha256_hex(&document),
+        };
+        validate_review_screenshot_manifest_binding(&bound, &retention, &binding)
+            .expect("complete typed chain");
+        let extra = image_path.parent().expect("image parent").join("extra.png");
+        crate::secure_file::write_atomic(&extra, &png, true).expect("extra image");
+        assert!(validate_review_screenshot_manifest_binding(&bound, &retention, &binding).is_err());
+        std::fs::remove_file(&extra).expect("remove extra");
+        std::fs::remove_file(&receipt_path).expect("remove receipt");
+        assert!(validate_review_screenshot_manifest_binding(&bound, &retention, &binding).is_err());
+        crate::secure_file::write_atomic(&receipt_path, &audit, true).expect("restore receipt");
+        crate::secure_file::write_atomic(&image_path, b"not-a-png", true).expect("tamper png");
+        assert!(validate_review_screenshot_manifest_binding(&bound, &retention, &binding).is_err());
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 
@@ -3436,7 +3586,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn prepared_retention_compacts_terminal_module_inventory_below_the_journal_cap() {
+    fn prepared_retention_compacts_1198_terminal_modules_below_shared_manifest_cap() {
         let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
         let root = temp_root.join(format!("nazoauth-retention-{}", uuid::Uuid::now_v7()));
         let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
@@ -3467,7 +3617,7 @@ mod tests {
             .as_mut()
             .expect("Suite recovery");
         suite.plan_ids = (0..44).map(|index| format!("suite-plan-{index}")).collect();
-        suite.module_ids = (0..1408)
+        suite.module_ids = (0..1198)
             .map(|index| format!("suite-module-{index}"))
             .collect();
         let plans = (0..44)
@@ -3505,6 +3655,12 @@ mod tests {
                 .expect("prepared journal metadata")
                 .len()
                 < MAX_RECOVERY_JOURNAL_BYTES as u64
+        );
+        assert!(
+            std::fs::metadata(&journal_path)
+                .expect("prepared journal metadata")
+                .len()
+                < crate::evidence::MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES as u64
         );
         drop(guard);
         let mut pending = store.claim_pending().expect("claim prepared journal");
