@@ -453,9 +453,13 @@ fn materialize_vp_verification_evidence_browser(
         "{}/test/a/*/verification-evidence",
         suite_base_url.trim_end_matches('/')
     );
+    let authorization_url = format!(
+        "{}/test/a/*/authorize*",
+        suite_base_url.trim_end_matches('/')
+    );
     let expected = serde_json::json!([{
-        "comment": "capture the suite-served evidence page to fill the verification-result screenshot placeholder without human interaction",
-        "match": evidence_url,
+        "comment": "drive the signed VP authorization entry; its required evidence task authorizes a NazoAuth verification-result capture",
+        "match": authorization_url,
         "tasks": [{
             "task": "Capture verification evidence",
             "match": evidence_url,

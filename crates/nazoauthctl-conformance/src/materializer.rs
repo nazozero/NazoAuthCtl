@@ -4493,6 +4493,10 @@ mod tests {
         assert_vp_credential_signer(config, "suite.example");
         assert_eq!(
             config["browser"][0]["match"],
+            "https://suite.example/test/a/*/authorize*"
+        );
+        assert_eq!(
+            config["browser"][0]["tasks"][0]["match"],
             "https://suite.example/test/a/*/verification-evidence"
         );
         assert_eq!(

@@ -2243,7 +2243,8 @@ mod tests {
             BrowserPolicy::new(target, Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite"))
                 .expect("policy");
         let authorization =
-            Url::parse("https://issuer.example/authorize?request=one").expect("authorization URL");
+            Url::parse("https://www.certification.openid.net/test/a/vp/authorize?request=one")
+                .expect("authorization URL");
         let evidence = Url::parse(
             "https://www.certification.openid.net/test/a/module-a/verification-evidence",
         )
@@ -2262,7 +2263,7 @@ mod tests {
         };
         let entries = vec![
             BrowserEntry::parse(&json!({
-                "match": "https://issuer.example/authorize*",
+                "match": "https://www.certification.openid.net/test/a/*/authorize*",
                 "tasks": [{
                     "match": "https://www.certification.openid.net/test/a/module-a/verification-evidence",
                     "commands": [["wait", "xpath", "//*", 1, "review", "update-image-placeholder"]]
@@ -2270,7 +2271,7 @@ mod tests {
             }))
             .expect("first selected entry"),
             BrowserEntry::parse(&json!({
-                "match": "https://issuer.example/authorize*",
+                "match": "https://www.certification.openid.net/test/a/*/authorize*",
                 "tasks": [{
                     "match": "https://www.certification.openid.net/test/a/module-a/verification-evidence",
                     "commands": [["wait", "xpath", "//*", 1, "review", "update-image-placeholder"]]
@@ -2287,12 +2288,12 @@ mod tests {
 
         let no_marker_in_selected = vec![
             BrowserEntry::parse(&json!({
-                "match": "https://issuer.example/authorize*",
+                "match": "https://www.certification.openid.net/test/a/*/authorize*",
                 "tasks": [{"commands": []}]
             }))
             .expect("selected entry"),
             BrowserEntry::parse(&json!({
-                "match": "https://issuer.example/authorize*",
+                "match": "https://www.certification.openid.net/test/a/*/authorize*",
                 "tasks": [{
                     "match": "https://www.certification.openid.net/test/a/module-a/verification-evidence",
                     "commands": [["wait", "xpath", "//*", 1, "review", "update-image-placeholder"]]
@@ -2322,7 +2323,7 @@ mod tests {
         exhausted_executor.entry_uses.insert(0, 1);
         let limited_entries = vec![
             BrowserEntry::parse(&json!({
-                "match": "https://issuer.example/authorize*",
+                "match": "https://www.certification.openid.net/test/a/*/authorize*",
                 "match-limit": 1,
                 "tasks": [{
                     "match": "https://www.certification.openid.net/test/a/module-a/verification-evidence",
@@ -2331,7 +2332,7 @@ mod tests {
             }))
             .expect("exhausted entry"),
             BrowserEntry::parse(&json!({
-                "match": "https://issuer.example/authorize*",
+                "match": "https://www.certification.openid.net/test/a/*/authorize*",
                 "tasks": [{"commands": []}]
             }))
             .expect("next eligible entry"),
