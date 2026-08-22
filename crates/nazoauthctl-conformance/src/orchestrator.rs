@@ -209,32 +209,14 @@ impl ConformanceRunner {
             config.client.origin(),
             config.target_origin.as_ref(),
         )?;
-        if let Some(first_lane) = config.automation.first() {
-            match first_lane.review_screenshot_capture.as_ref() {
-                Some(first_capture) => {
-                    if first_lane.browser.is_none()
-                        || config.automation.iter().any(|lane| {
-                            lane.browser.is_none()
-                                || lane
-                                    .review_screenshot_capture
-                                    .as_ref()
-                                    .is_none_or(|capture| {
-                                        !capture.shares_run_budget_with(first_capture)
-                                    })
-                        })
-                    {
-                        return Err(OrchestrationError::InvalidInput);
-                    }
-                }
-                None if config
-                    .automation
-                    .iter()
-                    .any(|lane| lane.review_screenshot_capture.is_some()) =>
-                {
-                    return Err(OrchestrationError::InvalidInput);
-                }
-                None => {}
-            }
+        let mut capture_budgets = config
+            .automation
+            .iter()
+            .filter_map(|automation| automation.review_screenshot_capture.as_ref());
+        if let Some(first) = capture_budgets.next()
+            && !capture_budgets.all(|capture| capture.shares_run_budget_with(first))
+        {
+            return Err(OrchestrationError::InvalidInput);
         }
         Ok(Self { config })
     }

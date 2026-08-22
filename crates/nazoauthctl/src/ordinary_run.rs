@@ -28,12 +28,12 @@ use nazoauthctl_conformance::{
     OidfProviderExecutionBinding, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
     OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard,
     RunControl, StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionManifest,
-    SuiteRetentionPlan, SuiteRetentionProviderEvidence, SuiteRetentionScreenshotManifest,
-    TenantResourceApplyOutput, TenantResourceReceiptIdentity, TenantResourceRecoveryBinding,
-    TtyRenderer, WebDriverClient, WebDriverEndpoint, authorize_oidf_driver_execution,
-    open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
-    read_compact_manifest, recover_suite_resources, validate_private_evidence_directory,
-    verify_oidf_artifact, write_private_provider_evidence_bundle, write_review_screenshot_manifest,
+    SuiteRetentionPlan, SuiteRetentionScreenshotManifest, TenantResourceApplyOutput,
+    TenantResourceReceiptIdentity, TenantResourceRecoveryBinding, TtyRenderer, WebDriverClient,
+    WebDriverEndpoint, authorize_oidf_driver_execution, open_cached_oidf_driver_plan,
+    read_artifact_driver, read_artifact_matrix, read_compact_manifest, recover_suite_resources,
+    validate_private_evidence_directory, verify_oidf_artifact,
+    write_private_provider_evidence_bundle, write_review_screenshot_manifest,
 };
 use nazoauthctl_core::tenant_resources::{
     TenantResourceCapabilitySession, TenantResourceClient, TenantResourceClientError,
@@ -563,7 +563,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         && !errors
             .iter()
             .any(|error| error.starts_with("resource-cleanup="));
-    let mut retention_commit_possible =
+    let retention_commit_possible =
         retention_eligible && proxy_cleanup_complete && cleanup_evidence.is_some();
     // The provider bundle is staged before ownership transfer, but its report
     // must be byte-for-byte the same successful Retained projection later
@@ -581,7 +581,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                 && report.orchestration_integrity.suite_resources_settled;
         }
     }
-    let mut staged_evidence = None;
+    let mut evidence = None;
     if let (Some(report), Some(directory), Some(cleanup_evidence)) = (
         report.as_ref(),
         invocation.evidence_directory.as_ref(),
@@ -619,34 +619,14 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             outer_cleanup_complete: cleanup_complete,
         };
         match write_private_provider_evidence_bundle(report, directory, &identity) {
-            Ok(receipt) => staged_evidence = Some(receipt),
+            Ok(receipt) => evidence = Some(receipt),
             Err(error) => {
                 retention_eligible = false;
                 errors.push(format!("evidence={error}"));
             }
         }
     }
-    if retention_commit_possible {
-        match staged_evidence.as_ref() {
-            Some(receipt) => {
-                if let Err(error) =
-                    recovery.bind_prepared_suite_provider_evidence(SuiteRetentionProviderEvidence {
-                        directory: receipt.directory.clone(),
-                        manifest_sha256: receipt.manifest_sha256.clone(),
-                    })
-                {
-                    retention_eligible = false;
-                    retention_commit_possible = false;
-                    errors.push(format!("suite-retention-provider-evidence={error:#}"));
-                }
-            }
-            None => {
-                retention_eligible = false;
-                retention_commit_possible = false;
-            }
-        }
-    }
-    let retention_committed = if retention_commit_possible && staged_evidence.is_some() {
+    let retention_committed = if retention_commit_possible && evidence.is_some() {
         match (|| -> anyhow::Result<()> {
             recovery.stage_suite_retention_manifest()?;
             recovery.commit_suite_plan_retention()?;
@@ -675,15 +655,6 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     } else {
         cleanup_unretained_suite(&mut recovery, &suite_client)?;
         false
-    };
-    // A prepared/provider bundle is not a successful receipt. Expose it only
-    // after Suite ownership has been durably transferred and its manifest has
-    // been published. Retained publication failures keep the journal for
-    // recovery but return no stale success evidence to this invocation.
-    let evidence = if retention_commit_possible {
-        retention_committed.then_some(staged_evidence).flatten()
-    } else {
-        staged_evidence
     };
     if let Some(report) = report.as_mut() {
         report.orchestration_integrity.retention_eligible = retention_eligible;
@@ -1130,7 +1101,6 @@ fn suite_retention_manifest(
                 sha256: manifest.sha256.clone(),
             }
         }),
-        provider_evidence: None,
         plans,
     })
 }
@@ -1635,7 +1605,6 @@ mod tests {
             tenant_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             run_id: binding_request_jti.to_owned(),
             review_screenshot_manifest: None,
-            provider_evidence: None,
             plans: Vec::new(),
         };
 

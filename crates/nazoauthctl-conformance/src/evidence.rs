@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 use crate::{ConformanceReport, VerifiedOidfArtifact};
 
 #[cfg(unix)]
-const EVIDENCE_BUNDLE_SCHEMA: u32 = 4;
+const EVIDENCE_BUNDLE_SCHEMA: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
