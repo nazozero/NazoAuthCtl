@@ -178,6 +178,65 @@ pub struct VpVerificationResultShellPageDiagnostic {
     pub has_nazoauth_asset_prefix: bool,
 }
 
+/// Fixed, metadata-only runtime observations from the current browser
+/// document.  The WebDriver client executes one literal script; callers
+/// cannot supply JavaScript, selectors, URLs, or other page-derived input.
+/// Chrome's browser-log endpoint is not a W3C WebDriver command, so browser
+/// logs are deliberately marked not-collected rather than queried through a
+/// vendor route with an unreviewed response schema.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserPageRuntimeDiagnostic {
+    pub ready_state: &'static str,
+    pub root_present: bool,
+    pub root_child_element_count: usize,
+    pub root_child_element_count_capped: bool,
+    pub has_vp_verification_result: bool,
+    pub module_script_count: usize,
+    pub module_script_count_capped: bool,
+    pub resource_scan_count: usize,
+    pub resource_scan_count_capped: bool,
+    pub same_origin_ui_asset_resource_count: usize,
+    pub same_origin_ui_asset_resource_count_capped: bool,
+    pub ui_asset_response_statuses: Vec<u16>,
+    pub ui_asset_response_statuses_capped: bool,
+    pub ui_asset_transfer_size_positive_count: usize,
+    pub ui_asset_decoded_size_positive_count: usize,
+    pub title_kind: &'static str,
+    pub navigator_online: bool,
+    pub browser_log_collection: &'static str,
+}
+
+impl std::fmt::Display for BrowserPageRuntimeDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "ready_state={} root_present={} root_child_element_count={} root_child_element_count_capped={} has_vp_verification_result={} module_script_count={} module_script_count_capped={} resource_scan_count={} resource_scan_count_capped={} same_origin_ui_asset_resource_count={} same_origin_ui_asset_resource_count_capped={} ui_asset_response_statuses={} ui_asset_response_statuses_capped={} ui_asset_transfer_size_positive_count={} ui_asset_decoded_size_positive_count={} title_kind={} navigator_online={} browser_log_collection={}",
+            self.ready_state,
+            self.root_present,
+            self.root_child_element_count,
+            self.root_child_element_count_capped,
+            self.has_vp_verification_result,
+            self.module_script_count,
+            self.module_script_count_capped,
+            self.resource_scan_count,
+            self.resource_scan_count_capped,
+            self.same_origin_ui_asset_resource_count,
+            self.same_origin_ui_asset_resource_count_capped,
+            self.ui_asset_response_statuses
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            self.ui_asset_response_statuses_capped,
+            self.ui_asset_transfer_size_positive_count,
+            self.ui_asset_decoded_size_positive_count,
+            self.title_kind,
+            self.navigator_online,
+            self.browser_log_collection,
+        )
+    }
+}
+
 impl std::fmt::Display for VpVerificationResultShellPageDiagnostic {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -201,6 +260,8 @@ pub struct VpVerificationResultShellMountDiagnostic {
     pub current_url: VpVerificationResultUrlDiagnostic,
     pub page: Option<VpVerificationResultShellPageDiagnostic>,
     pub page_source_error: Option<Box<BrowserError>>,
+    pub runtime: Option<BrowserPageRuntimeDiagnostic>,
+    pub runtime_error: Option<Box<BrowserError>>,
     pub source: Box<BrowserError>,
 }
 
@@ -208,7 +269,7 @@ impl std::fmt::Display for VpVerificationResultShellMountDiagnostic {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "stage={} current_url=[{}] page=[{}] page_source_error={} cause={}",
+            "stage={} current_url=[{}] page=[{}] page_source_error={} runtime=[{}] runtime_error={} cause={}",
             self.stage,
             self.current_url,
             self.page
@@ -217,6 +278,16 @@ impl std::fmt::Display for VpVerificationResultShellMountDiagnostic {
                 .as_deref()
                 .unwrap_or("unavailable"),
             self.page_source_error
+                .as_deref()
+                .map(ToString::to_string)
+                .as_deref()
+                .unwrap_or("none"),
+            self.runtime
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                .unwrap_or("unavailable"),
+            self.runtime_error
                 .as_deref()
                 .map(ToString::to_string)
                 .as_deref()
@@ -382,6 +453,11 @@ pub trait BrowserDriver: Send {
     }
     fn current_url(&mut self) -> Result<Url, BrowserError>;
     fn page_source(&mut self) -> Result<String, BrowserError>;
+    /// Fixed page metadata for diagnostics. Implementations must not expose a
+    /// generic script execution surface through this trait.
+    fn page_runtime_diagnostic(&mut self) -> Result<BrowserPageRuntimeDiagnostic, BrowserError> {
+        Err(BrowserError::UnsupportedCommand)
+    }
     fn find_element(&mut self, selector: &BrowserSelector) -> Result<String, BrowserError>;
     /// Find an element relative to a previously verified root.  VP evidence
     /// projections must not be satisfied by lookalike elements elsewhere in
@@ -1610,12 +1686,18 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             Ok(page) => (Some(vp_result_shell_page_diagnostic(&page)), None),
             Err(error) => (None, Some(Box::new(error))),
         };
+        let (runtime, runtime_error) = match self.driver.page_runtime_diagnostic() {
+            Ok(runtime) => (Some(runtime), None),
+            Err(error) => (None, Some(Box::new(error))),
+        };
         BrowserError::VpVerificationResultShellMountDiagnostic(Box::new(
             VpVerificationResultShellMountDiagnostic {
                 stage,
                 current_url: vp_result_url_diagnostic(current, None, None, None),
                 page,
                 page_source_error,
+                runtime,
+                runtime_error,
                 source: Box::new(source),
             },
         ))
@@ -2582,6 +2664,7 @@ mod tests {
         redirect_after_root_not_found: Option<Url>,
         page_source: String,
         page_source_error: Option<BrowserError>,
+        page_runtime: Result<BrowserPageRuntimeDiagnostic, BrowserError>,
         post_scrub_loading_reads: usize,
         post_scrub_state: Option<&'static str>,
         redirect_after_post_scrub_loading: Option<Url>,
@@ -2642,6 +2725,12 @@ mod tests {
                 Some(error) => Err(error.clone()),
                 None => Ok(self.page_source.clone()),
             }
+        }
+
+        fn page_runtime_diagnostic(
+            &mut self,
+        ) -> Result<BrowserPageRuntimeDiagnostic, BrowserError> {
+            self.page_runtime.clone()
         }
 
         fn find_element(&mut self, selector: &BrowserSelector) -> Result<String, BrowserError> {
@@ -2789,6 +2878,26 @@ mod tests {
             redirect_after_root_not_found: None,
             page_source: String::new(),
             page_source_error: None,
+            page_runtime: Ok(BrowserPageRuntimeDiagnostic {
+                ready_state: "complete",
+                root_present: true,
+                root_child_element_count: 1,
+                root_child_element_count_capped: false,
+                has_vp_verification_result: true,
+                module_script_count: 1,
+                module_script_count_capped: false,
+                resource_scan_count: 1,
+                resource_scan_count_capped: false,
+                same_origin_ui_asset_resource_count: 1,
+                same_origin_ui_asset_resource_count_capped: false,
+                ui_asset_response_statuses: vec![200],
+                ui_asset_response_statuses_capped: false,
+                ui_asset_transfer_size_positive_count: 1,
+                ui_asset_decoded_size_positive_count: 1,
+                title_kind: "nazoauth",
+                navigator_online: true,
+                browser_log_collection: "not-collected-non-w3c",
+            }),
             post_scrub_loading_reads: 0,
             post_scrub_state: None,
             redirect_after_post_scrub_loading: None,
@@ -3818,6 +3927,11 @@ mod tests {
                 "https://issuer.example"
             );
             assert_eq!(diagnostic.current_url.path, "/ui/verification-result");
+            let runtime = diagnostic.runtime.as_ref().expect("runtime metadata");
+            assert_eq!(runtime.ready_state, "complete");
+            assert!(runtime.has_vp_verification_result);
+            assert_eq!(runtime.ui_asset_response_statuses, vec![200]);
+            assert!(diagnostic.runtime_error.is_none());
             if source_failed {
                 assert!(diagnostic.page.is_none());
                 assert_eq!(
@@ -3834,6 +3948,50 @@ mod tests {
             }
             std::fs::remove_dir_all(root).expect("remove root");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_shell_mount_failure_keeps_runtime_observation_failure_separate() {
+        let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp")
+            .join(format!(
+                "nazoauth-vp-shell-runtime-diagnostic-{}",
+                uuid::Uuid::now_v7()
+            ));
+        crate::secure_file::ensure_directory(&root, true).expect("private root");
+        let capture = vp_capture_context(root.clone(), &context, &variant);
+        let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+        driver.shell_available = false;
+        driver.page_runtime = Err(BrowserError::Protocol);
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+        let policy = BrowserPolicy::new(target, suite)
+            .expect("policy")
+            .with_limits(BrowserLimits {
+                max_step_timeout: Duration::from_millis(1),
+                poll_interval: Duration::from_millis(1),
+                ..BrowserLimits::default()
+            })
+            .expect("short shell policy");
+        let mut executor = BrowserExecutor::new(driver, policy);
+
+        let error = executor
+            .capture_openid4vp_verification_result(&evidence, &capture, 0)
+            .expect_err("shell mount timeout");
+        let BrowserError::VpVerificationResultShellMountDiagnostic(diagnostic) = error else {
+            panic!("shell mount diagnostic")
+        };
+        assert_eq!(diagnostic.stage, "canonical-shell-root-find");
+        assert_eq!(diagnostic.source.as_ref(), &BrowserError::Timeout);
+        assert!(diagnostic.runtime.is_none());
+        assert_eq!(
+            diagnostic.runtime_error.as_deref(),
+            Some(&BrowserError::Protocol)
+        );
+        std::fs::remove_dir_all(root).expect("remove root");
     }
 
     #[test]

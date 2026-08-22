@@ -15,13 +15,71 @@ use url::Url;
 
 use super::validation::{MAX_TEXT_BYTES, is_loopback_host};
 use super::{
-    BrowserDriver, BrowserError, BrowserSelector, WebDriverProtocolDiagnostic, decode_webdriver_png,
+    BrowserDriver, BrowserError, BrowserPageRuntimeDiagnostic, BrowserSelector,
+    WebDriverProtocolDiagnostic, decode_webdriver_png,
 };
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_SESSION_ID_BYTES: usize = 256;
 const W3C_ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
 const LEGACY_ELEMENT_KEY: &str = "ELEMENT";
+const MAX_RUNTIME_ROOT_CHILDREN: usize = 4096;
+const MAX_RUNTIME_MODULE_SCRIPTS: usize = 128;
+const MAX_RUNTIME_RESOURCE_SCAN: usize = 512;
+const MAX_RUNTIME_UI_ASSET_RESOURCES: usize = 128;
+const MAX_RUNTIME_RESPONSE_STATUSES: usize = 16;
+const PAGE_RUNTIME_DIAGNOSTIC_SCRIPT: &str = r#"return (() => {
+  const cap = (value, maximum) => Math.min(Math.max(0, Number(value) || 0), maximum);
+  const root = document.getElementById('root');
+  const rawChildCount = root ? root.childElementCount : 0;
+  const rawModuleScriptCount = document.querySelectorAll('script[type="module"]').length;
+  let resourceScanCount = 0;
+  let resourceScanCapped = false;
+  let assetCount = 0;
+  let transferPositive = 0;
+  let decodedPositive = 0;
+  let statusCapped = false;
+  const statuses = new Set();
+  let assetCapped = false;
+  try {
+    for (const entry of performance.getEntriesByType('resource')) {
+      if (resourceScanCount >= 512) { resourceScanCapped = true; break; }
+      resourceScanCount += 1;
+      let resource;
+      try { resource = new URL(entry.name, location.href); } catch (_) { continue; }
+      if (resource.origin !== location.origin || !resource.pathname.startsWith('/ui/assets/')) { continue; }
+      if (assetCount >= 128) { assetCapped = true; break; }
+      assetCount += 1;
+      if (entry.transferSize > 0) { transferPositive += 1; }
+      if (entry.decodedBodySize > 0) { decodedPositive += 1; }
+      const status = Number(entry.responseStatus);
+      if (Number.isInteger(status) && status >= 100 && status <= 599) {
+        if (statuses.size < 16 || statuses.has(status)) { statuses.add(status); } else { statusCapped = true; }
+      }
+    }
+  } catch (_) {}
+  const readyState = ['loading', 'interactive', 'complete'].includes(document.readyState)
+    ? document.readyState : 'other';
+  return {
+    ready_state: readyState,
+    root_present: Boolean(root),
+    root_child_element_count: cap(rawChildCount, 4096),
+    root_child_element_count_capped: rawChildCount > 4096,
+    has_vp_verification_result: Boolean(document.querySelector('[data-testid="vp-verification-result"]')),
+    module_script_count: cap(rawModuleScriptCount, 128),
+    module_script_count_capped: rawModuleScriptCount > 128,
+    resource_scan_count: resourceScanCount,
+    resource_scan_count_capped: resourceScanCapped,
+    same_origin_ui_asset_resource_count: assetCount,
+    same_origin_ui_asset_resource_count_capped: assetCapped,
+    ui_asset_response_statuses: Array.from(statuses).sort((a, b) => a - b),
+    ui_asset_response_statuses_capped: statusCapped,
+    ui_asset_transfer_size_positive_count: transferPositive,
+    ui_asset_decoded_size_positive_count: decodedPositive,
+    title_kind: document.title === 'NazoAuth' ? 'nazoauth' : 'other',
+    navigator_online: Boolean(navigator.onLine)
+  };
+})();"#;
 
 struct WebDriverResponse {
     value: Value,
@@ -307,6 +365,15 @@ impl BrowserDriver for WebDriverClient {
             return Err(BrowserError::ResponseTooLarge);
         }
         Ok(text.to_owned())
+    }
+
+    fn page_runtime_diagnostic(&mut self) -> Result<BrowserPageRuntimeDiagnostic, BrowserError> {
+        let response = self.post_value(
+            &self.session_path("/execute/sync")?,
+            &json!({ "script": PAGE_RUNTIME_DIAGNOSTIC_SCRIPT, "args": [] }),
+            "page_runtime_diagnostic",
+        )?;
+        parse_page_runtime_diagnostic(&response.value).ok_or_else(|| response.protocol())
     }
 
     fn find_element(&mut self, selector: &BrowserSelector) -> Result<String, BrowserError> {
@@ -614,6 +681,9 @@ impl BrowserDriver for ManagedWebDriver {
     fn page_source(&mut self) -> Result<String, BrowserError> {
         self.client.page_source()
     }
+    fn page_runtime_diagnostic(&mut self) -> Result<BrowserPageRuntimeDiagnostic, BrowserError> {
+        self.client.page_runtime_diagnostic()
+    }
     fn find_element(&mut self, selector: &BrowserSelector) -> Result<String, BrowserError> {
         self.client.find_element(selector)
     }
@@ -868,6 +938,114 @@ fn classify_webdriver_error(value: &Value) -> BrowserError {
     }
 }
 
+fn parse_page_runtime_diagnostic(value: &Value) -> Option<BrowserPageRuntimeDiagnostic> {
+    let value = value.get("value")?.as_object()?;
+    if value.len() != 17
+        || value.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "ready_state"
+                    | "root_present"
+                    | "root_child_element_count"
+                    | "root_child_element_count_capped"
+                    | "has_vp_verification_result"
+                    | "module_script_count"
+                    | "module_script_count_capped"
+                    | "resource_scan_count"
+                    | "resource_scan_count_capped"
+                    | "same_origin_ui_asset_resource_count"
+                    | "same_origin_ui_asset_resource_count_capped"
+                    | "ui_asset_response_statuses"
+                    | "ui_asset_response_statuses_capped"
+                    | "ui_asset_transfer_size_positive_count"
+                    | "ui_asset_decoded_size_positive_count"
+                    | "title_kind"
+                    | "navigator_online"
+            )
+        })
+    {
+        return None;
+    }
+    let ready_state = match value.get("ready_state")?.as_str()? {
+        "loading" => "loading",
+        "interactive" => "interactive",
+        "complete" => "complete",
+        "other" => "other",
+        _ => return None,
+    };
+    let title_kind = match value.get("title_kind")?.as_str()? {
+        "nazoauth" => "nazoauth",
+        "other" => "other",
+        _ => return None,
+    };
+    let bounded_count = |key: &str, maximum: usize| {
+        let value = value.get(key)?.as_u64()?;
+        usize::try_from(value)
+            .ok()
+            .filter(|value| *value <= maximum)
+    };
+    let bool_value = |key: &str| value.get(key)?.as_bool();
+    let statuses = value
+        .get("ui_asset_response_statuses")?
+        .as_array()?
+        .iter()
+        .map(|status| u16::try_from(status.as_u64()?).ok())
+        .collect::<Option<Vec<_>>>()?;
+    if statuses.len() > MAX_RUNTIME_RESPONSE_STATUSES
+        || statuses.iter().any(|status| !(100..=599).contains(status))
+        || statuses.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return None;
+    }
+    let resource_scan_count = bounded_count("resource_scan_count", MAX_RUNTIME_RESOURCE_SCAN)?;
+    let same_origin_ui_asset_resource_count = bounded_count(
+        "same_origin_ui_asset_resource_count",
+        MAX_RUNTIME_UI_ASSET_RESOURCES,
+    )?;
+    let ui_asset_transfer_size_positive_count = bounded_count(
+        "ui_asset_transfer_size_positive_count",
+        MAX_RUNTIME_UI_ASSET_RESOURCES,
+    )?;
+    let ui_asset_decoded_size_positive_count = bounded_count(
+        "ui_asset_decoded_size_positive_count",
+        MAX_RUNTIME_UI_ASSET_RESOURCES,
+    )?;
+    if same_origin_ui_asset_resource_count > resource_scan_count
+        || ui_asset_transfer_size_positive_count > same_origin_ui_asset_resource_count
+        || ui_asset_decoded_size_positive_count > same_origin_ui_asset_resource_count
+    {
+        return None;
+    }
+    Some(BrowserPageRuntimeDiagnostic {
+        ready_state,
+        root_present: bool_value("root_present")?,
+        root_child_element_count: bounded_count(
+            "root_child_element_count",
+            MAX_RUNTIME_ROOT_CHILDREN,
+        )?,
+        root_child_element_count_capped: bool_value("root_child_element_count_capped")?,
+        has_vp_verification_result: bool_value("has_vp_verification_result")?,
+        module_script_count: bounded_count("module_script_count", MAX_RUNTIME_MODULE_SCRIPTS)?,
+        module_script_count_capped: bool_value("module_script_count_capped")?,
+        resource_scan_count,
+        resource_scan_count_capped: bool_value("resource_scan_count_capped")?,
+        same_origin_ui_asset_resource_count,
+        same_origin_ui_asset_resource_count_capped: bool_value(
+            "same_origin_ui_asset_resource_count_capped",
+        )?,
+        ui_asset_response_statuses: statuses,
+        ui_asset_response_statuses_capped: bool_value("ui_asset_response_statuses_capped")?,
+        ui_asset_transfer_size_positive_count,
+        ui_asset_decoded_size_positive_count,
+        title_kind,
+        navigator_online: bool_value("navigator_online")?,
+        // Selenium exposes browser-log retrieval through a vendor-specific
+        // endpoint rather than W3C. Never guess that schema or retain raw log
+        // text just to fill a diagnostic field.
+        browser_log_collection: "not-collected-non-w3c",
+    })
+}
+
 fn parse_screenshot_response(value: &Value) -> Result<zeroize::Zeroizing<Vec<u8>>, BrowserError> {
     let encoded = value
         .get("value")
@@ -1024,6 +1202,79 @@ mod tests {
         let request = server.join().expect("test server");
         assert!(request.starts_with("POST /session/session-01/refresh HTTP/1.1\r\n"));
         assert!(request.ends_with("\r\n\r\n{}"));
+    }
+
+    #[test]
+    fn w3c_page_runtime_diagnostic_uses_a_fixed_script_and_bounded_safe_shape() {
+        let body = r#"{"value":{"ready_state":"complete","root_present":true,"root_child_element_count":2,"root_child_element_count_capped":false,"has_vp_verification_result":true,"module_script_count":1,"module_script_count_capped":false,"resource_scan_count":2,"resource_scan_count_capped":false,"same_origin_ui_asset_resource_count":2,"same_origin_ui_asset_resource_count_capped":false,"ui_asset_response_statuses":[200,304],"ui_asset_response_statuses_capped":false,"ui_asset_transfer_size_positive_count":2,"ui_asset_decoded_size_positive_count":1,"title_kind":"nazoauth","navigator_online":true}}"#;
+        let (endpoint, server) = webdriver_test_server(body);
+        let mut client =
+            WebDriverClient::connect(endpoint, Duration::from_secs(1)).expect("WebDriver client");
+        client.session_id = Some("session-01".to_owned());
+
+        let diagnostic = client
+            .page_runtime_diagnostic()
+            .expect("fixed runtime diagnostic");
+        client.session_id = None;
+
+        assert_eq!(diagnostic.ready_state, "complete");
+        assert_eq!(diagnostic.ui_asset_response_statuses, vec![200, 304]);
+        assert_eq!(diagnostic.browser_log_collection, "not-collected-non-w3c");
+        let request = server.join().expect("test server");
+        assert!(request.starts_with("POST /session/session-01/execute/sync HTTP/1.1\r\n"));
+        let body = request.split_once("\r\n\r\n").expect("request body").1;
+        let command: Value = serde_json::from_str(body).expect("execute JSON");
+        assert_eq!(
+            command.get("script").and_then(Value::as_str),
+            Some(PAGE_RUNTIME_DIAGNOSTIC_SCRIPT)
+        );
+        assert_eq!(command.get("args"), Some(&json!([])));
+        assert!(!request.contains("secret="));
+    }
+
+    #[test]
+    fn page_runtime_diagnostic_rejects_unbounded_or_sensitive_response_shape() {
+        let mut valid = json!({
+            "value": {
+                "ready_state": "complete",
+                "root_present": true,
+                "root_child_element_count": 0,
+                "root_child_element_count_capped": false,
+                "has_vp_verification_result": false,
+                "module_script_count": 0,
+                "module_script_count_capped": false,
+                "resource_scan_count": 0,
+                "resource_scan_count_capped": false,
+                "same_origin_ui_asset_resource_count": 0,
+                "same_origin_ui_asset_resource_count_capped": false,
+                "ui_asset_response_statuses": [],
+                "ui_asset_response_statuses_capped": false,
+                "ui_asset_transfer_size_positive_count": 0,
+                "ui_asset_decoded_size_positive_count": 0,
+                "title_kind": "other",
+                "navigator_online": false,
+                "untrusted_page_text": "secret=do-not-retain"
+            }
+        });
+        assert!(parse_page_runtime_diagnostic(&valid).is_none());
+        valid["value"]
+            .as_object_mut()
+            .expect("object")
+            .remove("untrusted_page_text");
+        let diagnostic = parse_page_runtime_diagnostic(&valid).expect("safe fields only");
+        assert_eq!(diagnostic.title_kind, "other");
+        assert!(!diagnostic.to_string().contains("do-not-retain"));
+
+        let mut oversized = valid;
+        oversized["value"]["module_script_count"] = json!(MAX_RUNTIME_MODULE_SCRIPTS + 1);
+        assert!(parse_page_runtime_diagnostic(&oversized).is_none());
+        oversized["value"]["module_script_count"] = json!(0);
+        oversized["value"]["ui_asset_response_statuses"] = Value::Array(
+            (0..=MAX_RUNTIME_RESPONSE_STATUSES)
+                .map(|_| json!(200))
+                .collect(),
+        );
+        assert!(parse_page_runtime_diagnostic(&oversized).is_none());
     }
 
     #[test]
