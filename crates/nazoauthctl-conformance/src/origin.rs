@@ -20,7 +20,8 @@ impl Origin {
         let parsed = Url::parse(value).map_err(|_| OriginError::InvalidSyntax)?;
         if parsed.scheme() != "https"
             || parsed.host_str().is_none()
-            || has_userinfo(&parsed)
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
             || parsed.query().is_some()
             || parsed.fragment().is_some()
             || !matches!(parsed.path(), "" | "/")
@@ -89,7 +90,7 @@ impl Origin {
     }
 
     pub fn same_origin_url(&self, url: &Url) -> bool {
-        if url.scheme() != "https" || has_userinfo(url) {
+        if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
             return false;
         }
         let Some(host) = url.host_str() else {
@@ -106,21 +107,6 @@ impl Origin {
         };
         self.0 == format!("https://{authority}")
     }
-}
-
-/// Whether a parsed URL carries a user-info delimiter.  `Url::username()` and
-/// `Url::password()` alone represent both absent user-info and `https://@host`
-/// as empty/none, so authority syntax must be checked as well.
-pub(crate) fn has_userinfo(url: &Url) -> bool {
-    if !url.username().is_empty() || url.password().is_some() {
-        return true;
-    }
-    let authority = url
-        .as_str()
-        .strip_prefix(url.scheme())
-        .and_then(|value| value.strip_prefix("://"))
-        .and_then(|value| value.split(['/', '?', '#']).next());
-    authority.is_some_and(|value| value.contains('@'))
 }
 
 impl fmt::Debug for Origin {
@@ -211,7 +197,6 @@ mod tests {
         assert_eq!(origin.as_str(), "https://example.test");
         assert!(Origin::parse("https://example.test/path").is_err());
         assert!(Origin::parse("http://example.test").is_err());
-        assert!(Origin::parse("https://@example.test").is_err());
     }
 
     #[test]

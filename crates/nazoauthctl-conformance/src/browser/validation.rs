@@ -5,7 +5,7 @@ use std::time::Duration;
 use regex::Regex;
 use url::Url;
 
-use crate::origin::{Origin, has_userinfo};
+use crate::origin::Origin;
 
 use super::BrowserError;
 
@@ -40,7 +40,8 @@ impl BrowserTargetOrigin {
         let url = Url::parse(value.trim()).map_err(|_| BrowserError::InvalidOrigin)?;
         if !matches!(url.scheme(), "http" | "https")
             || url.host_str().is_none()
-            || has_userinfo(&url)
+            || !url.username().is_empty()
+            || url.password().is_some()
             || url.query().is_some()
             || url.fragment().is_some()
             || !matches!(url.path(), "" | "/")
@@ -109,8 +110,7 @@ impl BrowserPolicy {
     }
 
     pub fn allows_url(&self, url: &Url) -> bool {
-        !has_userinfo(url)
-            && (self.target_origin.allows(url) || self.suite_origin.same_origin_url(url))
+        (self.target_origin.allows(url) || self.suite_origin.same_origin_url(url))
             && matches!(url.scheme(), "https" | "http")
     }
 
@@ -228,12 +228,10 @@ pub(super) fn redacted_origin(url: &Url) -> String {
     url.origin().ascii_serialization()
 }
 
-/// `Url::username()` and `Url::password()` cannot distinguish an absent
-/// user-info component from an explicitly empty one (`https://@host`).  The
-/// latter is still user-info and must never participate in origin checks.
 pub(super) fn same_origin(expected: &Url, actual: &Url) -> bool {
     expected.scheme() == actual.scheme()
         && expected.host_str() == actual.host_str()
         && expected.port_or_known_default() == actual.port_or_known_default()
-        && !has_userinfo(actual)
+        && actual.username().is_empty()
+        && actual.password().is_none()
 }
