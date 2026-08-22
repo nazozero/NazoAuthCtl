@@ -2373,8 +2373,10 @@ mod tests {
 
         let other_signing = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
         let other_key_id = nazo_operator_protocol::instance_key_id(&other_signing.verifying_key());
+        let mut wrong_kid_receipt = receipt.clone();
+        wrong_kid_receipt.instance_key_id = other_key_id.clone();
         let wrong_kid_jws = nazo_operator_protocol::sign_openid4vp_verification_receipt(
-            &receipt,
+            &wrong_kid_receipt,
             &other_key_id,
             &other_signing,
         )
@@ -2439,7 +2441,7 @@ mod tests {
                 body: serde_json::to_vec(&response).expect("response"),
             })),
         });
-        let mut client = OpenId4VpVerifierClient::with_transport(
+        let client = OpenId4VpVerifierClient::with_transport(
             target,
             suite,
             Zeroizing::new("management-secret".to_owned()),
