@@ -110,7 +110,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             .evidence_directory
             .as_ref()
             .expect("CLI requires --evidence-dir for review screenshots");
-        BrowserReviewScreenshotCapture::new(evidence_directory.clone())
+        validate_private_evidence_directory(evidence_directory)
             .context("review screenshot evidence directory must be root-owned and private")?;
     }
 
@@ -819,6 +819,13 @@ fn run_signed_suite(
     let openid4vp_management_token = session
         .openid4vp_management_token()
         .context("failed to load the deployment OpenID4VP management token")?;
+    let review_screenshot_run_jti = recovery
+        .lock()
+        .map_err(|_| anyhow::anyhow!("ordinary recovery lock is poisoned"))?
+        .tenant_resource_binding()
+        .context("ordinary screenshot capture has no recovery binding")?
+        .request_jti
+        .clone();
     let review_screenshot_capture = invocation
         .capture_review_screenshots
         .then(|| {
@@ -828,6 +835,7 @@ fn run_signed_suite(
                     .as_ref()
                     .expect("CLI requires --evidence-dir for review screenshots")
                     .clone(),
+                &review_screenshot_run_jti,
             )
         })
         .transpose()

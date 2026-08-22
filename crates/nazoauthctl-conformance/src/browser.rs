@@ -267,6 +267,7 @@ fn is_zero(value: &usize) -> bool {
 #[derive(Clone)]
 pub struct BrowserReviewScreenshotCapture {
     evidence_directory: PathBuf,
+    run_jti: String,
     budget: Arc<Mutex<ReviewCaptureBudget>>,
 }
 
@@ -277,11 +278,13 @@ struct ReviewCaptureBudget {
 }
 
 impl BrowserReviewScreenshotCapture {
-    pub fn new(evidence_directory: PathBuf) -> Result<Self, BrowserError> {
+    pub fn new(evidence_directory: PathBuf, run_jti: &str) -> Result<Self, BrowserError> {
         crate::evidence::validate_private_evidence_directory(&evidence_directory)
             .map_err(|_| BrowserError::UnsafeEvidencePath)?;
+        safe_capture_component(run_jti)?;
         Ok(Self {
             evidence_directory,
+            run_jti: run_jti.to_owned(),
             budget: Arc::new(Mutex::new(ReviewCaptureBudget::default())),
         })
     }
@@ -295,6 +298,7 @@ impl BrowserReviewScreenshotCapture {
     ) -> Result<BrowserReviewCaptureContext, BrowserError> {
         BrowserReviewCaptureContext::new(
             self.evidence_directory.clone(),
+            self.run_jti.clone(),
             matrix_plan_id,
             suite_plan_id,
             module_id,
@@ -313,6 +317,7 @@ impl BrowserReviewScreenshotCapture {
 #[derive(Clone)]
 pub struct BrowserReviewCaptureContext {
     evidence_directory: PathBuf,
+    run_jti: String,
     matrix_plan_id: String,
     suite_plan_id: String,
     module_id: String,
@@ -323,6 +328,7 @@ pub struct BrowserReviewCaptureContext {
 impl BrowserReviewCaptureContext {
     fn new(
         evidence_directory: PathBuf,
+        run_jti: String,
         matrix_plan_id: &str,
         suite_plan_id: &str,
         module_id: &str,
@@ -334,6 +340,7 @@ impl BrowserReviewCaptureContext {
         let module = safe_capture_component(module_id)?;
         Ok(Self {
             evidence_directory,
+            run_jti,
             matrix_plan_id: plan.to_owned(),
             suite_plan_id: suite_plan.to_owned(),
             module_id: module.to_owned(),
@@ -349,6 +356,7 @@ impl BrowserReviewCaptureContext {
             .ok_or(BrowserError::UnsafeEvidencePath)?;
         Ok(Self {
             evidence_directory: self.evidence_directory.clone(),
+            run_jti: self.run_jti.clone(),
             matrix_plan_id: self.matrix_plan_id.clone(),
             suite_plan_id: self.suite_plan_id.clone(),
             module_id: self.module_id.clone(),
@@ -397,7 +405,9 @@ impl BrowserReviewCaptureContext {
         if name.len() > 240 {
             return Err(BrowserError::UnsafeEvidencePath);
         }
-        Ok(PathBuf::from("review-screenshots").join(name))
+        Ok(PathBuf::from("review-screenshots")
+            .join(&self.run_jti)
+            .join(name))
     }
 
     fn write_png(
@@ -1530,7 +1540,7 @@ mod tests {
             .expect("temp")
             .join(format!("nazoauth-review-capture-{}", uuid::Uuid::now_v7()));
         crate::secure_file::ensure_directory(&root, true).expect("private root");
-        let capture = BrowserReviewScreenshotCapture::new(root.clone())
+        let capture = BrowserReviewScreenshotCapture::new(root.clone(), "run-a")
             .expect("capture")
             .context("matrix-plan-a", "suite-plan-a", "module-a", 0)
             .expect("context");
@@ -1556,7 +1566,7 @@ mod tests {
         let receipt = &report.review_screenshots[0];
         assert_eq!(
             receipt.path,
-            PathBuf::from("review-screenshots/matrix-plan-a--module-a--000.png")
+            PathBuf::from("review-screenshots/run-a/matrix-plan-a--module-a--000.png")
         );
         assert_eq!(
             std::fs::read(root.join(&receipt.path))
@@ -1620,7 +1630,7 @@ mod tests {
             .expect("temp")
             .join(format!("nazoauth-review-budget-{}", uuid::Uuid::now_v7()));
         crate::secure_file::ensure_directory(&root, true).expect("private root");
-        let capture = BrowserReviewScreenshotCapture::new(root.clone()).expect("capture");
+        let capture = BrowserReviewScreenshotCapture::new(root.clone(), "run-a").expect("capture");
         for index in 0..MAX_REVIEW_SCREENSHOTS_PER_RUN {
             capture
                 .context("matrix", "suite", "module", index)

@@ -1972,11 +1972,18 @@ fn validate_review_screenshot_manifest_binding(
         .and_then(Path::parent)
         .context("review screenshot manifest has no evidence root")?;
     for image in &document.screenshots {
-        let valid_path =
-            image.path.components().count() == 2
-                && image.path.components().next().is_some_and(|part| {
-                    part.as_os_str() == std::ffi::OsStr::new("review-screenshots")
-                });
+        let mut path_components = image.path.components();
+        let valid_path = path_components
+            .next()
+            .is_some_and(|part| part.as_os_str() == std::ffi::OsStr::new("review-screenshots"))
+            && path_components
+                .next()
+                .is_some_and(|part| part.as_os_str() == std::ffi::OsStr::new(&binding.request_jti))
+            && matches!(
+                path_components.next(),
+                Some(std::path::Component::Normal(_))
+            )
+            && path_components.next().is_none();
         let target = format!("/test/a/{}/verification-evidence", image.module_id);
         if !plans.contains(&(&image.matrix_plan_id, &image.suite_plan_id))
             || !modules

@@ -379,11 +379,15 @@ fn validate_review_screenshot_path(path: &Path) -> Result<(), EvidenceError> {
     let Some(Component::Normal(directory)) = components.next() else {
         return Err(EvidenceError::UnsafePath);
     };
+    let Some(Component::Normal(run_jti)) = components.next() else {
+        return Err(EvidenceError::UnsafePath);
+    };
     let Some(Component::Normal(file)) = components.next() else {
         return Err(EvidenceError::UnsafePath);
     };
     if components.next().is_some()
         || directory != "review-screenshots"
+        || run_jti.is_empty()
         || !file.to_string_lossy().ends_with(".png")
         || file.len() > 240
         || !file
