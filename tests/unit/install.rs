@@ -1680,7 +1680,11 @@ fn managed_runtime_database_grants_keep_the_audit_ledger_api_least_privileged() 
     let optional_full_dml_tables = sql
         .split("optional_full_dml_tables CONSTANT text[]")
         .nth(1)
-        .and_then(|section| section.split("append_tables CONSTANT text[]").next())
+        .and_then(|section| {
+            section
+                .split("optional_insert_tables CONSTANT text[]")
+                .next()
+        })
         .expect("optional full DML table section");
     let optional_insert_tables = sql
         .split("optional_insert_tables CONSTANT text[]")
