@@ -692,23 +692,24 @@ impl ConformanceRecoveryStore {
                 validate_journal(&journal, &self.deployment_id, request_jti)?;
                 write_journal(&journal_path, &journal)?;
             }
+            let retention_commit_resolution = match &journal {
+                RecoveryJournal::TenantResource(journal)
+                    if matches!(
+                        &journal.suite_retention,
+                        SuiteRetentionDisposition::Retained { .. }
+                    ) =>
+                {
+                    SuiteRetentionCommitResolution::Retained
+                }
+                _ => SuiteRetentionCommitResolution::Prepared,
+            };
             pending.push(ConformanceRecoveryGuard {
                 store: self.clone(),
                 journal,
                 journal_path,
                 lock_path,
                 lock: Some(lock),
-                retention_commit_resolution: match &journal {
-                    RecoveryJournal::TenantResource(journal)
-                        if matches!(
-                            &journal.suite_retention,
-                            SuiteRetentionDisposition::Retained { .. }
-                        ) =>
-                    {
-                        SuiteRetentionCommitResolution::Retained
-                    }
-                    _ => SuiteRetentionCommitResolution::Prepared,
-                },
+                retention_commit_resolution,
                 #[cfg(test)]
                 persist_failpoint: std::sync::Arc::new(std::sync::Mutex::new(None)),
             });
@@ -2265,7 +2266,7 @@ fn validate_review_screenshot_manifest_binding(
             .count();
         let total_attempts = required_captured
             .checked_add(optional_captured)
-            .checked_add(module.missing_optional)
+            .and_then(|attempts| attempts.checked_add(module.missing_optional))
             .context("review screenshot optional attempt count overflows")?;
         if required_captured != module.required
             || module.captured_required != module.required
