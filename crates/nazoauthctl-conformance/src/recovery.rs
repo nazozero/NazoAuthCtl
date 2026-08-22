@@ -233,6 +233,19 @@ struct ReviewScreenshotManifestImage {
     trigger_url_sha256: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewScreenshotAudit {
+    suite_plan_id: String,
+    module_id: String,
+    path: PathBuf,
+    sha256: String,
+    size: usize,
+    trigger_origin: String,
+    trigger_path: String,
+    trigger_url_sha256: String,
+}
+
 impl SuiteRetentionManifest {
     pub fn plan_alias_sha256(matrix_plan_id: &str) -> String {
         sha256_hex(matrix_plan_id.as_bytes())
@@ -1953,6 +1966,11 @@ fn validate_review_screenshot_manifest_binding(
         }
     }
     let mut images = std::collections::BTreeSet::new();
+    let evidence_root = screenshot
+        .path
+        .parent()
+        .and_then(Path::parent)
+        .context("review screenshot manifest has no evidence root")?;
     for image in &document.screenshots {
         let valid_path =
             image.path.components().count() == 2
@@ -1980,6 +1998,34 @@ fn validate_review_screenshot_manifest_binding(
             || !images.insert(&image.path)
         {
             bail!("review screenshot manifest screenshot graph is invalid");
+        }
+        let image_path = evidence_root.join(&image.path);
+        let image_bytes = crate::secure_file::read_bounded(&image_path, 500 * 1024, true)
+            .map_err(|error| anyhow::anyhow!("review screenshot is not secure: {error:?}"))?;
+        if image_bytes.len() != image.size
+            || sha256_hex(&image_bytes) != image.sha256
+            || crate::browser::validate_png_screenshot(&image_bytes).is_err()
+        {
+            bail!("review screenshot bytes conflict with the manifest");
+        }
+        let receipt_path = image_path.with_extension("png.receipt.json");
+        let receipt =
+            crate::secure_file::read_bounded(&receipt_path, 16 * 1024, true).map_err(|error| {
+                anyhow::anyhow!("review screenshot receipt is not secure: {error:?}")
+            })?;
+        let audit: ReviewScreenshotAudit = serde_json::from_slice(&receipt)
+            .context("review screenshot receipt is invalid JSON")?;
+        if sha256_hex(&receipt) != image.receipt_sha256
+            || audit.suite_plan_id != image.suite_plan_id
+            || audit.module_id != image.module_id
+            || audit.path != image.path
+            || audit.sha256 != image.sha256
+            || audit.size != image.size
+            || audit.trigger_origin != image.trigger_origin
+            || audit.trigger_path != image.trigger_path
+            || audit.trigger_url_sha256 != image.trigger_url_sha256
+        {
+            bail!("review screenshot receipt conflicts with the manifest");
         }
     }
     Ok(())
