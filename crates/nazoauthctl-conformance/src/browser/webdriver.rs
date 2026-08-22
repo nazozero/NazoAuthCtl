@@ -1473,7 +1473,7 @@ mod tests {
         assert_eq!(diagnostic.level_counts, vec![("severe", 1), ("warning", 1)]);
         assert_eq!(
             diagnostic.category_counts,
-            vec![("module", 1), ("network", 1)]
+            vec![("network", 1), ("uncaught", 1)]
         );
         assert!(diagnostic.messages[0].message_len > 0);
         assert!(!diagnostic.messages[0].message_len_capped);
