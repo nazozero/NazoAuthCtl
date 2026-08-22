@@ -1177,7 +1177,8 @@ mod tests {
             "00000000-0000-0000-0000-000000000000",
             "--capture-review-screenshots",
         ]))
-        .expect_err("capture needs evidence root");
+        .err()
+        .expect("capture needs evidence root");
         assert!(error.to_string().contains("requires --evidence-dir"));
     }
 
