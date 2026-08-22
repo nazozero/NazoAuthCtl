@@ -1339,6 +1339,8 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             .map_err(|_| BrowserError::CrossOriginNavigation)?;
         if !self.policy.target_origin.allows(&ui_url)
             || ui_url.path() != "/ui/verification-result"
+            || !ui_url.username().is_empty()
+            || ui_url.password().is_some()
             || ui_url.query().is_some()
             || !ui_url.fragment().is_some_and(|fragment| {
                 fragment.len() == "receipt=".len() + 43
@@ -1350,6 +1352,27 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         {
             return Err(self.navigation_violation(self.last_url.as_ref(), &ui_url));
         }
+        // The verification-result view is a private NazoAuthWeb evidence
+        // consumer, not a Suite browser task. Establish its no-capability
+        // shell first so the one-time receipt fragment is only ever offered
+        // to the verified target-side UI route.
+        let mut shell_url = ui_url.clone();
+        shell_url.set_query(None);
+        shell_url.set_fragment(None);
+        vp_result_driver_for_url(
+            "canonical-shell-navigate",
+            None,
+            &shell_url,
+            None,
+            Some(evidence.ui_url_diagnostic.authority_has_at),
+            self.navigate(&shell_url),
+        )?;
+        vp_result_driver(
+            "canonical-shell-current-url",
+            None,
+            self.validate_openid4vp_result_url(&shell_url),
+        )?;
+        self.wait_for_openid4vp_result_shell()?;
         vp_result_driver_for_url(
             "bootstrap-navigate",
             None,
@@ -1429,6 +1452,8 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         )?;
         if !self.policy.target_origin.allows(&current)
             || current.path() != "/ui/verification-result"
+            || !current.username().is_empty()
+            || current.password().is_some()
             || current.query().is_some()
             || current.fragment().is_some()
         {
@@ -1446,6 +1471,8 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         )?;
         if !self.policy.target_origin.allows(&current)
             || current.path() != "/ui/verification-result"
+            || !current.username().is_empty()
+            || current.password().is_some()
             || current.query().is_some()
             || current.fragment().is_some()
         {
@@ -1459,6 +1486,80 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             obligation_index,
             &evidence.receipt,
         )
+    }
+
+    fn validate_openid4vp_result_url(&mut self, expected: &Url) -> Result<(), BrowserError> {
+        let current = self.ensure_current_url()?;
+        if !self.policy.target_origin.allows(&current)
+            || current.path() != "/ui/verification-result"
+            || !current.username().is_empty()
+            || current.password().is_some()
+            || current.query().is_some()
+            || current.fragment().is_some()
+            || current != *expected
+        {
+            return Err(self.navigation_violation(self.last_url.as_ref(), &current));
+        }
+        Ok(())
+    }
+
+    /// A capability-free navigation must expose the stable NazoAuthWeb shell.
+    /// `loading` is a bounded render transition; only `not-found` is the
+    /// closed, no-receipt state. Dynamic page text is deliberately not read.
+    fn wait_for_openid4vp_result_shell(&mut self) -> Result<(), BrowserError> {
+        let deadline = self.deadline(DEFAULT_STEP_TIMEOUT);
+        loop {
+            let root = self.driver.find_element(&BrowserSelector::Css(
+                "[data-testid=\"vp-verification-result\"]".to_owned(),
+            ));
+            match root {
+                Ok(root) => {
+                    if !vp_result_driver(
+                        "canonical-shell-root-visible",
+                        Some("vp-verification-result"),
+                        self.driver.element_displayed(&root),
+                    )? {
+                        return Err(BrowserError::VpVerificationResultField(
+                            "vp-verification-result:visible",
+                        ));
+                    }
+                    match vp_result_driver(
+                        "canonical-shell-root-state-attribute",
+                        Some("vp-verification-result"),
+                        self.driver.element_attribute(&root, "data-state"),
+                    )?
+                    .as_deref()
+                    {
+                        Some("not-found") => return Ok(()),
+                        Some("loading") => vp_result_driver(
+                            "canonical-shell-wait",
+                            Some("vp-verification-result"),
+                            self.sleep_until(deadline),
+                        )?,
+                        _ => {
+                            return Err(BrowserError::VpVerificationResultField(
+                                "vp-verification-result:data-state",
+                            ));
+                        }
+                    }
+                }
+                Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {
+                    vp_result_driver(
+                        "canonical-shell-wait",
+                        Some("vp-verification-result"),
+                        self.sleep_until(deadline),
+                    )?;
+                }
+                Err(error) => {
+                    return Err(vp_result_driver_error(
+                        "canonical-shell-root-find",
+                        Some("vp-verification-result"),
+                        None,
+                        error,
+                    ));
+                }
+            }
+        }
     }
 
     /// NazoAuthWeb receives the one-time receipt capability in a fragment and
@@ -2262,13 +2363,26 @@ mod tests {
         receipt_sha256: String,
         allow_root_children: bool,
         fragment_reads_before_scrub: usize,
+        canonical_redirect: Option<Url>,
+        shell_available: bool,
+        shell_state: &'static str,
+        receipt_navigation_seen: bool,
         navigated: Vec<Url>,
     }
 
     impl BrowserDriver for VpResultDriver {
         fn navigate(&mut self, url: &Url) -> Result<(), BrowserError> {
             self.navigated.push(url.clone());
-            self.current = url.clone();
+            if url.fragment().is_some() {
+                self.receipt_navigation_seen = true;
+                self.current = url.clone();
+            } else {
+                self.receipt_navigation_seen = false;
+                self.current = self
+                    .canonical_redirect
+                    .clone()
+                    .unwrap_or_else(|| url.clone());
+            }
             Ok(())
         }
 
@@ -2287,6 +2401,9 @@ mod tests {
         }
 
         fn find_element(&mut self, selector: &BrowserSelector) -> Result<String, BrowserError> {
+            if !self.shell_available {
+                return Err(BrowserError::ElementNotFound);
+            }
             match selector {
                 BrowserSelector::Css(value) if value.contains("data-testid") => Ok(value.clone()),
                 _ => Err(BrowserError::ElementNotFound),
@@ -2349,7 +2466,14 @@ mod tests {
             name: &str,
         ) -> Result<Option<String>, BrowserError> {
             if element.contains("vp-verification-result") && name == "data-state" {
-                Ok(Some("verified".to_owned()))
+                Ok(Some(
+                    if self.receipt_navigation_seen {
+                        "verified"
+                    } else {
+                        self.shell_state
+                    }
+                    .to_owned(),
+                ))
             } else {
                 Ok(None)
             }
@@ -2358,6 +2482,80 @@ mod tests {
         fn screenshot_png(&mut self) -> Result<Zeroizing<Vec<u8>>, BrowserError> {
             Ok(Zeroizing::new(test_png()))
         }
+    }
+
+    fn verified_vp_result_driver(
+        context: &OpenId4VpEvidenceContext,
+        receipt_sha256: &str,
+    ) -> VpResultDriver {
+        VpResultDriver {
+            current: Url::parse("https://issuer.example/openid4vp/complete/transaction-a")
+                .expect("completion URL"),
+            run_jti: context.run_jti.clone(),
+            artifact_sha256: context.artifact_sha256.clone(),
+            matrix_sha256: context.matrix_sha256.clone(),
+            test_name: context.test_name.clone(),
+            suite_plan_id: context.suite_plan_id.clone(),
+            module_id: context.suite_module_id.clone(),
+            variant_sha256: context.variant_sha256.clone(),
+            receipt_sha256: receipt_sha256.to_owned(),
+            allow_root_children: true,
+            fragment_reads_before_scrub: 1,
+            canonical_redirect: None,
+            shell_available: true,
+            shell_state: "not-found",
+            receipt_navigation_seen: false,
+            navigated: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn vp_capture_context(
+        root: PathBuf,
+        context: &OpenId4VpEvidenceContext,
+        variant: &BTreeMap<String, String>,
+    ) -> BrowserReviewCaptureContext {
+        BrowserReviewScreenshotCapture::new(root, &context.run_jti)
+            .expect("capture")
+            .context(
+                BrowserReviewModuleIdentity::new(
+                    "matrix-plan-a",
+                    &context.suite_plan_id,
+                    &context.suite_module_id,
+                    &context.test_name,
+                    variant,
+                )
+                .expect("identity"),
+                0,
+            )
+            .expect("context")
+    }
+
+    #[cfg(unix)]
+    fn test_vp_evidence() -> (
+        BTreeMap<String, String>,
+        OpenId4VpEvidenceContext,
+        OpenId4VpVerificationEvidence,
+        String,
+    ) {
+        let variant = BTreeMap::from([("transport".to_owned(), "direct_post".to_owned())]);
+        let context = OpenId4VpEvidenceContext::new(
+            "request-0123456789abcdef0123456789abcdef",
+            "a".repeat(64),
+            "b".repeat(64),
+            "550e8400-e29b-41d4-a716-446655440001",
+            "550e8400-e29b-41d4-a716-446655440002",
+            "vp-happy",
+            &variant,
+        )
+        .expect("context");
+        let receipt_sha256 = "c".repeat(64);
+        let evidence = OpenId4VpVerificationEvidence::test_verified(
+            context.clone(),
+            &receipt_sha256,
+            "https://issuer.example/ui/verification-result#receipt=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        );
+        (variant, context, evidence, receipt_sha256)
     }
 
     struct RedirectingMockDriver {
@@ -2637,22 +2835,7 @@ mod tests {
             &receipt_sha256,
             "https://issuer.example/ui/verification-result#receipt=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         );
-        let driver = VpResultDriver {
-            current: Url::parse("https://issuer.example/").expect("url"),
-            run_jti: context.run_jti.clone(),
-            artifact_sha256: context.artifact_sha256.clone(),
-            matrix_sha256: context.matrix_sha256.clone(),
-            test_name: context.test_name.clone(),
-            suite_plan_id: context.suite_plan_id.clone(),
-            module_id: context.suite_module_id.clone(),
-            variant_sha256: context.variant_sha256.clone(),
-            receipt_sha256: receipt_sha256.clone(),
-            allow_root_children: true,
-            // The browser can report the fragment bootstrap once before the
-            // NazoAuthWeb bundle runs `history.replaceState`.
-            fragment_reads_before_scrub: 1,
-            navigated: Vec::new(),
-        };
+        let driver = verified_vp_result_driver(&context, &receipt_sha256);
         let root = std::env::temp_dir()
             .canonicalize()
             .expect("temp")
@@ -2696,9 +2879,15 @@ mod tests {
                 .expect("audit");
         assert!(audit.contains("nazo-vp-verification-result/live-webdriver"));
         assert!(!audit.contains("receipt=AAAAAAAA"));
-        assert_eq!(executor.driver_mut().navigated.len(), 1);
+        assert_eq!(executor.driver_mut().navigated.len(), 2);
         assert_eq!(
-            executor.driver_mut().navigated[0].fragment(),
+            executor.driver_mut().navigated[0].as_str(),
+            "https://issuer.example/ui/verification-result"
+        );
+        assert!(executor.driver_mut().navigated[0].query().is_none());
+        assert!(executor.driver_mut().navigated[0].fragment().is_none());
+        assert_eq!(
+            executor.driver_mut().navigated[1].fragment(),
             Some("receipt=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         );
         executor.driver_mut().allow_root_children = false;
@@ -2711,6 +2900,91 @@ mod tests {
         assert_eq!(diagnostic.stage, "projection-field-find");
         assert_eq!(diagnostic.field, Some("vp-verification-status"));
         assert_eq!(diagnostic.source.as_ref(), &BrowserError::ElementNotFound);
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_canonical_shell_rejects_missing_or_noncanonical_before_capability_navigation() {
+        let cases = [
+            ("missing-shell", false, None, "canonical-shell-wait"),
+            (
+                "cross-origin-redirect",
+                true,
+                Some("https://evil.example/ui/verification-result"),
+                "canonical-shell-navigate",
+            ),
+            (
+                "query-redirect",
+                true,
+                Some("https://issuer.example/ui/verification-result?unexpected=1"),
+                "canonical-shell-current-url",
+            ),
+            (
+                "fragment-redirect",
+                true,
+                Some("https://issuer.example/ui/verification-result#unexpected"),
+                "canonical-shell-current-url",
+            ),
+        ];
+        for (case, shell_available, redirect, expected_stage) in cases {
+            let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .expect("temp")
+                .join(format!("nazoauth-vp-shell-{case}-{}", uuid::Uuid::now_v7()));
+            crate::secure_file::ensure_directory(&root, true).expect("private root");
+            let capture = vp_capture_context(root.clone(), &context, &variant);
+            let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+            driver.shell_available = shell_available;
+            driver.canonical_redirect = redirect.map(|value| Url::parse(value).expect("redirect"));
+            let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+            let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+            let mut policy = BrowserPolicy::new(target, suite).expect("policy");
+            if !shell_available {
+                let mut limits = BrowserLimits::default();
+                limits.max_step_timeout = Duration::from_millis(1);
+                limits.poll_interval = Duration::from_millis(1);
+                policy = policy.with_limits(limits).expect("short shell policy");
+            }
+            let mut executor = BrowserExecutor::new(driver, policy);
+            let error = executor
+                .capture_openid4vp_verification_result(&evidence, &capture, 0)
+                .expect_err("canonical shell failure");
+            let BrowserError::VpVerificationResultDriverDiagnostic(diagnostic) = error else {
+                panic!("staged shell failure")
+            };
+            assert_eq!(diagnostic.stage, expected_stage, "case={case}");
+            assert_eq!(executor.driver_mut().navigated.len(), 1, "case={case}");
+            assert!(executor.driver_mut().navigated[0].fragment().is_none());
+            std::fs::remove_dir_all(root).expect("remove root");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_canonical_shell_accepts_only_the_closed_no_receipt_state() {
+        let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp")
+            .join(format!("nazoauth-vp-shell-state-{}", uuid::Uuid::now_v7()));
+        crate::secure_file::ensure_directory(&root, true).expect("private root");
+        let capture = vp_capture_context(root.clone(), &context, &variant);
+        let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+        driver.shell_state = "generic-error";
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+        let mut executor =
+            BrowserExecutor::new(driver, BrowserPolicy::new(target, suite).expect("policy"));
+        assert_eq!(
+            executor
+                .capture_openid4vp_verification_result(&evidence, &capture, 0)
+                .expect_err("non-closed shell state"),
+            BrowserError::VpVerificationResultField("vp-verification-result:data-state")
+        );
+        assert_eq!(executor.driver_mut().navigated.len(), 1);
+        assert!(executor.driver_mut().navigated[0].fragment().is_none());
         std::fs::remove_dir_all(root).expect("remove root");
     }
 
