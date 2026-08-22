@@ -2421,6 +2421,7 @@ mod tests {
         refreshed_shell_state: Option<&'static str>,
         receipt_navigation_seen: bool,
         refreshes: usize,
+        refreshed_from: Vec<Url>,
         navigated: Vec<Url>,
     }
 
@@ -2441,6 +2442,12 @@ mod tests {
         }
 
         fn refresh(&mut self) -> Result<(), BrowserError> {
+            let canonical = Url::parse("https://issuer.example/ui/verification-result")
+                .expect("test canonical shell URL");
+            if self.current != canonical {
+                return Err(BrowserError::CrossOriginNavigation);
+            }
+            self.refreshed_from.push(self.current.clone());
             self.refreshes = self.refreshes.saturating_add(1);
             self.receipt_navigation_seen = false;
             if let Some(redirect) = &self.refresh_redirect {
@@ -2578,6 +2585,7 @@ mod tests {
             refreshed_shell_state: None,
             receipt_navigation_seen: false,
             refreshes: 0,
+            refreshed_from: Vec::new(),
             navigated: Vec::new(),
         }
     }
@@ -2973,6 +2981,11 @@ mod tests {
         assert_eq!(diagnostic.stage, "projection-field-find");
         assert_eq!(diagnostic.field, Some("vp-verification-status"));
         assert_eq!(diagnostic.source.as_ref(), &BrowserError::ElementNotFound);
+        assert_eq!(executor.driver_mut().refreshes, 1);
+        assert_eq!(
+            executor.driver_mut().refreshed_from.as_slice(),
+            &[Url::parse("https://issuer.example/ui/verification-result").expect("shell URL")]
+        );
         std::fs::remove_dir_all(root).expect("remove root");
     }
 
@@ -3099,6 +3112,10 @@ mod tests {
             .expect("refresh closed shell then bootstrap");
 
         assert_eq!(executor.driver_mut().refreshes, 1);
+        assert_eq!(
+            executor.driver_mut().refreshed_from.as_slice(),
+            &[Url::parse("https://issuer.example/ui/verification-result").expect("shell URL")]
+        );
         assert_eq!(executor.driver_mut().navigated.len(), 1);
         assert!(executor.driver_mut().navigated[0].fragment().is_some());
         std::fs::remove_dir_all(root).expect("remove root");
