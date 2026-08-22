@@ -2334,6 +2334,103 @@ mod tests {
             ),
             "verification_ttl_seconds": 300,
         });
+        let attachment = OpenId4VpEvidenceAttachment {
+            presentation_binding_sha256: presentation_binding_sha256.clone(),
+            intent_sha256: intent_sha256.clone(),
+        };
+        let parse = |value: Value| {
+            serde_json::from_value::<VerificationEvidenceResponse>(value)
+                .expect("typed evidence response")
+        };
+        assert!(
+            verify_evidence_response(
+                parse(response.clone()),
+                transaction_id,
+                &context,
+                issuance_request_jti,
+                &attachment,
+                &runtime_verifier,
+                target.as_url(),
+            )
+            .is_ok()
+        );
+
+        let mut bad_signature = response.clone();
+        bad_signature["receipt_jws"] = Value::String("bad.compact.jws".to_owned());
+        bad_signature["receipt_sha256"] = Value::String(sha256_hex(b"bad.compact.jws"));
+        assert!(
+            verify_evidence_response(
+                parse(bad_signature),
+                transaction_id,
+                &context,
+                issuance_request_jti,
+                &attachment,
+                &runtime_verifier,
+                target.as_url(),
+            )
+            .is_err()
+        );
+
+        let other_signing = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+        let other_key_id = nazo_operator_protocol::instance_key_id(&other_signing.verifying_key());
+        let wrong_kid_jws = nazo_operator_protocol::sign_openid4vp_verification_receipt(
+            &receipt,
+            &other_key_id,
+            &other_signing,
+        )
+        .expect("wrong-kid signed receipt");
+        let mut wrong_kid = response.clone();
+        wrong_kid["receipt_jws"] = Value::String(wrong_kid_jws.clone());
+        wrong_kid["receipt_sha256"] = Value::String(sha256_hex(wrong_kid_jws.as_bytes()));
+        assert!(
+            verify_evidence_response(
+                parse(wrong_kid),
+                transaction_id,
+                &context,
+                issuance_request_jti,
+                &attachment,
+                &runtime_verifier,
+                target.as_url(),
+            )
+            .is_err()
+        );
+
+        let wrong_key_verifier = OpenId4VpEvidenceVerifier::new(
+            "deployment-a",
+            "00000000-0000-4000-8000-000000000001",
+            "runtime-a",
+            other_key_id,
+            other_signing.verifying_key(),
+        )
+        .expect("wrong runtime key verifier");
+        assert!(
+            verify_evidence_response(
+                parse(response.clone()),
+                transaction_id,
+                &context,
+                issuance_request_jti,
+                &attachment,
+                &wrong_key_verifier,
+                target.as_url(),
+            )
+            .is_err()
+        );
+
+        let mut projection_mismatch = response.clone();
+        projection_mismatch["tenant_id"] =
+            Value::String("00000000-0000-4000-8000-000000000099".to_owned());
+        assert!(
+            verify_evidence_response(
+                parse(projection_mismatch),
+                transaction_id,
+                &context,
+                issuance_request_jti,
+                &attachment,
+                &runtime_verifier,
+                target.as_url(),
+            )
+            .is_err()
+        );
         let transport = Arc::new(VerifierTransport {
             request: std::sync::Mutex::new(None),
             response: std::sync::Mutex::new(Some(HttpResponse {
@@ -2362,10 +2459,7 @@ mod tests {
             create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
             expected_trust_policy: ExpectedTrustPolicyBinding::None,
             evidence_context: Some(context),
-            evidence_attachment: Some(OpenId4VpEvidenceAttachment {
-                presentation_binding_sha256,
-                intent_sha256,
-            }),
+            evidence_attachment: Some(attachment),
             issuance_request_jti: Some(issuance_request_jti.to_owned()),
             immediate_rejection_allowed: false,
         };

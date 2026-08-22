@@ -496,18 +496,16 @@ fn validate_provider_vp_receipts(
                 .verification_receipt
                 .as_ref()
                 .ok_or(EvidenceError::Identity)?;
-            if !verify_provider_vp_receipt(
-                receipt,
-                anchor,
-                binding,
+            let context = ProviderVpReceiptContext {
                 artifact_digest,
-                &report.matrix_digest,
-                &module.suite_plan_id,
-                module.module_id.as_deref().ok_or(EvidenceError::Identity)?,
-                &module.test_name,
-                &module.variant,
-                &audit.trigger_origin,
-            ) {
+                matrix_sha256: &report.matrix_digest,
+                suite_plan_id: &module.suite_plan_id,
+                suite_module_id: module.module_id.as_deref().ok_or(EvidenceError::Identity)?,
+                test_name: &module.test_name,
+                variant: &module.variant,
+                trigger_origin: &audit.trigger_origin,
+            };
+            if !verify_provider_vp_receipt(receipt, anchor, binding, &context) {
                 return Err(EvidenceError::Identity);
             }
         }
@@ -526,18 +524,22 @@ fn validate_provider_vp_receipts(
 }
 
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
+struct ProviderVpReceiptContext<'a> {
+    artifact_digest: &'a str,
+    matrix_sha256: &'a str,
+    suite_plan_id: &'a str,
+    suite_module_id: &'a str,
+    test_name: &'a str,
+    variant: &'a std::collections::BTreeMap<String, String>,
+    trigger_origin: &'a str,
+}
+
+#[cfg(unix)]
 fn verify_provider_vp_receipt(
     receipt: &crate::OpenId4VpVerificationReceiptProvenance,
     anchor: &crate::recovery::OpenId4VpEvidenceTrustAnchor,
     binding: &crate::recovery::TenantResourceRecoveryBinding,
-    artifact_digest: &str,
-    matrix_sha256: &str,
-    suite_plan_id: &str,
-    suite_module_id: &str,
-    test_name: &str,
-    variant: &std::collections::BTreeMap<String, String>,
-    trigger_origin: &str,
+    context: &ProviderVpReceiptContext<'_>,
 ) -> bool {
     use time::format_description::well_known::Rfc3339;
 
@@ -547,7 +549,7 @@ fn verify_provider_vp_receipt(
         || receipt.runtime_instance_id != anchor.runtime_instance_id
         || receipt.instance_key_id != anchor.instance_key_id
         || receipt.instance_public_key_base64 != anchor.instance_public_key_base64
-        || trigger_origin != anchor.target_issuer
+        || context.trigger_origin != anchor.target_issuer
         || receipt.receipt_api_url
             != format!("{}/openid4vp/verification-receipts", anchor.target_issuer)
         || sha256(receipt.receipt_jws.as_bytes()) != receipt.receipt_sha256
@@ -567,16 +569,16 @@ fn verify_provider_vp_receipt(
     if nazo_operator_protocol::instance_key_id(&key) != receipt.instance_key_id {
         return false;
     }
-    let Ok(variant_bytes) = serde_json::to_vec(variant) else {
+    let Ok(variant_bytes) = serde_json::to_vec(context.variant) else {
         return false;
     };
     let context = nazo_operator_protocol::Openid4vpEvidenceContext {
         run_jti: binding.request_jti.clone(),
-        artifact_sha256: artifact_digest.to_owned(),
-        matrix_sha256: matrix_sha256.to_owned(),
-        suite_plan_id: suite_plan_id.to_owned(),
-        suite_module_id: suite_module_id.to_owned(),
-        test_name: test_name.to_owned(),
+        artifact_sha256: context.artifact_digest.to_owned(),
+        matrix_sha256: context.matrix_sha256.to_owned(),
+        suite_plan_id: context.suite_plan_id.to_owned(),
+        suite_module_id: context.suite_module_id.to_owned(),
+        test_name: context.test_name.to_owned(),
         variant_sha256: sha256(&variant_bytes),
     };
     let Ok(context_sha256) =
