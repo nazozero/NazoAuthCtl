@@ -641,6 +641,10 @@ fn verify_provider_vp_receipt(
         && verified.issuance_request_jti == receipt.issuance_request_jti
         && verified.intent_sha256 == receipt.intent_sha256
         && verified.exp == expires_at.unix_timestamp()
+        && crate::recovery::exact_vp_trust_policy_binding(
+            binding,
+            &verified.presentation_binding.trust_policy,
+        )
 }
 
 /// Commits the screenshot-to-current-module binding before Suite plan

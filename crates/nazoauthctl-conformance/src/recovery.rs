@@ -8,7 +8,8 @@ use anyhow::{Context as _, bail};
 use fs2::FileExt as _;
 use nazo_operator_protocol::{
     MAX_COMPACT_JWS_BYTES, MAX_TENANT_RESOURCE_IDENTITIES, TenantResourceIdentity,
-    TenantResourceOperation, TenantResourceReceipt, compact_sha256, validate_file_identifier_value,
+    TenantResourceKind, TenantResourceOperation, TenantResourceReceipt, compact_sha256,
+    validate_file_identifier_value,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -2526,6 +2527,37 @@ fn verify_vp_receipt_provenance(
         && verified.issuance_request_jti == receipt.issuance_request_jti
         && verified.intent_sha256 == receipt.intent_sha256
         && verified.exp == expires_at.unix_timestamp()
+        && exact_vp_trust_policy_binding(binding, &verified.presentation_binding.trust_policy)
+}
+
+/// Bind the signed VP trust-policy projection to the one policy resource this
+/// ordinary run was authorized to create. A hash alone cannot distinguish a
+/// different valid policy resource, so both the kind and the exact identity
+/// must agree with the durable tenant-resource journal.
+pub(crate) fn exact_vp_trust_policy_binding(
+    binding: &TenantResourceRecoveryBinding,
+    policy: &nazo_operator_protocol::Openid4vpTrustPolicyBinding,
+) -> bool {
+    let (Some(binding_id), Some(resource_id), Some(resource_digest)) = (
+        policy.binding_id.as_deref(),
+        policy.resource_id.as_deref(),
+        policy.resource_digest.as_deref(),
+    ) else {
+        return false;
+    };
+    if !uuid::Uuid::parse_str(binding_id).is_ok_and(|parsed| parsed.to_string() == binding_id) {
+        return false;
+    }
+    let mut matching = binding
+        .resource_identities
+        .iter()
+        .filter(|identity| identity.kind == TenantResourceKind::Openid4vcTrustPolicy);
+    let Some(identity) = matching.next() else {
+        return false;
+    };
+    matching.next().is_none()
+        && identity.resource_id == resource_id
+        && identity.digest == resource_digest
 }
 
 fn validate_suite_retention_manifest_path(
@@ -2924,11 +2956,72 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn vp_receipt_requires_one_exact_journal_trust_policy_identity() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!("nazoauth-vp-policy-{}", uuid::Uuid::now_v7()));
+        crate::secure_file::ensure_directory(&root, true).expect("test root");
+        let mut binding = tenant_resource_binding(&root);
+        let policy = nazo_operator_protocol::Openid4vpTrustPolicyBinding {
+            binding_id: Some("550e8400-e29b-41d4-a716-446655440006".to_owned()),
+            resource_id: Some("openid4vc-trust-policy:provider:0123456789abcdef".to_owned()),
+            resource_digest: Some("f".repeat(64)),
+        };
+
+        assert!(!exact_vp_trust_policy_binding(&binding, &policy));
+
+        binding.resource_identities = vec![TenantResourceIdentity {
+            kind: TenantResourceKind::Openid4vcTrustPolicy,
+            resource_id: policy.resource_id.clone().expect("resource ID"),
+            digest: policy.resource_digest.clone().expect("resource digest"),
+        }];
+        assert!(exact_vp_trust_policy_binding(&binding, &policy));
+        assert!(!exact_vp_trust_policy_binding(
+            &binding,
+            &nazo_operator_protocol::Openid4vpTrustPolicyBinding {
+                binding_id: None,
+                resource_id: policy.resource_id.clone(),
+                resource_digest: policy.resource_digest.clone(),
+            },
+        ));
+
+        binding.resource_identities[0].digest = "0".repeat(64);
+        assert!(!exact_vp_trust_policy_binding(&binding, &policy));
+        binding.resource_identities[0].digest = "f".repeat(64);
+        binding.resource_identities.push(TenantResourceIdentity {
+            kind: TenantResourceKind::Openid4vcTrustPolicy,
+            resource_id: "openid4vc-trust-policy:other:0123456789abcdef".to_owned(),
+            digest: "e".repeat(64),
+        });
+        assert!(!exact_vp_trust_policy_binding(&binding, &policy));
+
+        std::fs::remove_dir_all(&root).expect("remove test root");
+    }
+
+    #[cfg(unix)]
     fn vp_receipt_fixture(
         binding: &mut TenantResourceRecoveryBinding,
     ) -> (SuiteRetentionManifest, ReviewScreenshotManifestImage) {
+        vp_receipt_fixture_with_trust_policy(
+            binding,
+            "openid4vc-trust-policy:provider:0123456789abcdef",
+            "f".repeat(64),
+        )
+    }
+
+    #[cfg(unix)]
+    fn vp_receipt_fixture_with_trust_policy(
+        binding: &mut TenantResourceRecoveryBinding,
+        trust_policy_resource_id: &str,
+        trust_policy_digest: String,
+    ) -> (SuiteRetentionManifest, ReviewScreenshotManifestImage) {
         use time::format_description::well_known::Rfc3339;
 
+        binding.resource_identities = vec![TenantResourceIdentity {
+            kind: TenantResourceKind::Openid4vcTrustPolicy,
+            resource_id: trust_policy_resource_id.to_owned(),
+            digest: trust_policy_digest.clone(),
+        }];
         let signing = ed25519_dalek::SigningKey::from_bytes(&[13; 32]);
         let verifying = signing.verifying_key();
         let key_id = nazo_operator_protocol::instance_key_id(&verifying);
@@ -2970,9 +3063,9 @@ mod tests {
         let presentation_binding = nazo_operator_protocol::Openid4vpPresentationBinding {
             presentation_request_sha256: "c".repeat(64),
             trust_policy: nazo_operator_protocol::Openid4vpTrustPolicyBinding {
-                binding_id: None,
-                resource_id: None,
-                resource_digest: None,
+                binding_id: Some("550e8400-e29b-41d4-a716-446655440006".to_owned()),
+                resource_id: Some(trust_policy_resource_id.to_owned()),
+                resource_digest: Some(trust_policy_digest),
             },
         };
         let presentation_binding_sha256 =
@@ -3076,6 +3169,33 @@ mod tests {
             .expect("receipt provenance");
         assert!(verify_vp_receipt_provenance(
             receipt, anchor, &binding, &retention, &image
+        ));
+
+        let mut other_policy_binding = binding.clone();
+        let (other_policy_retention, other_policy_image) = vp_receipt_fixture_with_trust_policy(
+            &mut other_policy_binding,
+            "openid4vc-trust-policy:other:0123456789abcdef",
+            "e".repeat(64),
+        );
+        assert!(!verify_vp_receipt_provenance(
+            other_policy_image
+                .verification_receipt
+                .as_ref()
+                .expect("other-policy receipt"),
+            anchor,
+            &binding,
+            &other_policy_retention,
+            &other_policy_image,
+        ));
+
+        let mut other_policy = binding.clone();
+        other_policy.resource_identities[0].digest = "0".repeat(64);
+        assert!(!verify_vp_receipt_provenance(
+            receipt,
+            anchor,
+            &other_policy,
+            &retention,
+            &image
         ));
 
         let mut wrong_tenant = receipt.clone();
