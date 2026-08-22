@@ -1180,7 +1180,7 @@ fn browser_log_http_status(message: &str) -> Option<u16> {
         let Some(index) = message.find(marker) else {
             continue;
         };
-        let bytes = message[index + marker.len()..].as_bytes();
+        let bytes = &message.as_bytes()[index + marker.len()..];
         if bytes.len() < 3 || !bytes[..3].iter().all(u8::is_ascii_digit) {
             continue;
         }
