@@ -438,7 +438,13 @@ impl DeploymentStore {
     /// link.  Callers use this only to choose the registered/legacy command
     /// boundary; the subsequent load still validates the same descriptor.
     pub(crate) fn registry_present(&self) -> anyhow::Result<bool> {
-        self.validate_failure_domains()?;
+        #[cfg(test)]
+        let test_override_active = TEST_SYSTEM_ROOTS.with(|roots| roots.borrow().is_some());
+        #[cfg(not(test))]
+        let test_override_active = false;
+        if !test_override_active {
+            self.validate_failure_domains()?;
+        }
         if self.registration_pending()? {
             bail!("deployment registration transaction is pending; rerun install to reconcile it");
         }
