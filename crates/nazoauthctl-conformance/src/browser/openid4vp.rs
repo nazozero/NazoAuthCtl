@@ -575,6 +575,7 @@ impl fmt::Debug for OpenId4VpVerificationReceiptProvenance {
 pub struct OpenId4VpVerificationEvidence {
     pub receipt: OpenId4VpVerificationReceiptProvenance,
     pub context: OpenId4VpEvidenceContext,
+    pub(crate) ui_url_diagnostic: OpenId4VpEvidenceUrlDiagnostic,
     ui_url: Zeroizing<String>,
 }
 
@@ -622,6 +623,7 @@ impl OpenId4VpVerificationEvidence {
                 expires_at: "2026-01-01T00:05:00Z".to_owned(),
             },
             context,
+            ui_url_diagnostic: issuance_url_diagnostic("verification_ui_url", ui_url),
             ui_url: Zeroizing::new(ui_url.to_owned()),
         }
     }
@@ -1312,13 +1314,15 @@ fn verify_evidence_response(
     if response.receipt_api_url != expected_receipt_api_url.as_str() {
         return Err(issuance_binding_mismatch("receipt_api_url"));
     }
+    let ui_url_diagnostic =
+        issuance_url_diagnostic("verification_ui_url", &response.verification_ui_url);
     let capability = Zeroizing::new(
         validate_evidence_urls(
             &response.verification_ui_url,
             &response.receipt_api_url,
             target_origin,
         )
-        .map_err(|_| issuance_binding_mismatch("verification_ui_url"))?,
+        .map_err(|_| OpenId4VpError::EvidenceUrlDiagnostic(ui_url_diagnostic.clone()))?,
     );
     let capability_sha256 =
         nazo_operator_protocol::openid4vp_verification_capability_sha256(&capability)
@@ -1390,6 +1394,7 @@ fn verify_evidence_response(
             expires_at: response.expires_at,
         },
         context: response.evidence_context,
+        ui_url_diagnostic,
         ui_url: Zeroizing::new(response.verification_ui_url),
     })
 }
@@ -1523,6 +1528,70 @@ impl std::fmt::Display for OpenId4VpEvidenceBindingDiagnostic {
     }
 }
 
+/// Safe parse-boundary metadata for a capability-bearing verification UI URL.
+/// The raw URL and its fragment never cross this diagnostic boundary.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct OpenId4VpEvidenceUrlDiagnostic {
+    pub stage: &'static str,
+    pub field: &'static str,
+    pub authority_has_at: bool,
+    pub canonical_origin: Option<String>,
+    pub canonical_path: Option<String>,
+    pub fragment_len: Option<usize>,
+    pub fragment_sha256: Option<String>,
+    pub capability_sha256: Option<String>,
+}
+
+impl std::fmt::Display for OpenId4VpEvidenceUrlDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "stage={} field={} authority_has_at={} canonical_origin={} canonical_path={} fragment_len={} fragment_sha256={} capability_sha256={}",
+            self.stage,
+            self.field,
+            self.authority_has_at,
+            self.canonical_origin.as_deref().unwrap_or("none"),
+            self.canonical_path.as_deref().unwrap_or("none"),
+            self.fragment_len
+                .map(|value| value.to_string())
+                .as_deref()
+                .unwrap_or("none"),
+            self.fragment_sha256.as_deref().unwrap_or("none"),
+            self.capability_sha256.as_deref().unwrap_or("none"),
+        )
+    }
+}
+
+fn raw_url_authority_has_at(value: &str) -> bool {
+    let Some((_, remainder)) = value.split_once("://") else {
+        return false;
+    };
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    authority.contains('@')
+}
+
+fn issuance_url_diagnostic(field: &'static str, value: &str) -> OpenId4VpEvidenceUrlDiagnostic {
+    let parsed = Url::parse(value).ok();
+    let fragment = parsed.as_ref().and_then(|url| url.fragment());
+    let capability_sha256 = fragment
+        .and_then(|fragment| fragment.strip_prefix("receipt="))
+        .and_then(|capability| {
+            nazo_operator_protocol::openid4vp_verification_capability_sha256(capability).ok()
+        });
+    OpenId4VpEvidenceUrlDiagnostic {
+        stage: "issuance",
+        field,
+        authority_has_at: raw_url_authority_has_at(value),
+        canonical_origin: parsed
+            .as_ref()
+            .map(|url| url.origin().ascii_serialization()),
+        canonical_path: parsed.as_ref().map(|url| url.path().to_owned()),
+        fragment_len: fragment.map(str::len),
+        fragment_sha256: fragment.map(|fragment| sha256_hex(fragment.as_bytes())),
+        capability_sha256,
+    }
+}
+
 fn attach_binding_mismatch(field: &'static str) -> OpenId4VpError {
     OpenId4VpError::EvidenceBindingDiagnostic(OpenId4VpEvidenceBindingDiagnostic {
         stage: "attach",
@@ -1537,7 +1606,7 @@ fn issuance_binding_mismatch(field: &'static str) -> OpenId4VpError {
     })
 }
 
-#[derive(Debug, Error, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum OpenId4VpError {
     #[error("OpenID4VP verifier input is invalid")]
     InvalidInput,
@@ -1577,6 +1646,8 @@ pub enum OpenId4VpError {
     EvidenceBindingMismatch,
     #[error("OpenID4VP verification evidence does not match this run [{0}]")]
     EvidenceBindingDiagnostic(OpenId4VpEvidenceBindingDiagnostic),
+    #[error("OpenID4VP verification evidence URL is invalid [{0}]")]
+    EvidenceUrlDiagnostic(OpenId4VpEvidenceUrlDiagnostic),
 }
 
 #[cfg(test)]
@@ -1758,6 +1829,43 @@ mod tests {
         assert!(issuance.to_string().contains("stage=issuance"));
         assert!(issuance.to_string().contains("field=receipt_jws_claims"));
         assert!(!issuance.to_string().contains("eyJ"));
+    }
+
+    #[test]
+    fn issuance_url_diagnostic_redacts_fragment_but_retains_parse_boundary_metadata() {
+        let capability = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+        assert_eq!(capability.len(), 43);
+        let diagnostic = issuance_url_diagnostic(
+            "verification_ui_url",
+            &format!(
+                "https://unexpected@issuer.example/ui/verification-result#receipt={capability}"
+            ),
+        );
+        assert_eq!(diagnostic.stage, "issuance");
+        assert_eq!(diagnostic.field, "verification_ui_url");
+        assert!(diagnostic.authority_has_at);
+        assert_eq!(
+            diagnostic.canonical_origin.as_deref(),
+            Some("https://issuer.example")
+        );
+        assert_eq!(
+            diagnostic.canonical_path.as_deref(),
+            Some(VP_VERIFICATION_RESULT_PATH)
+        );
+        assert_eq!(
+            diagnostic.fragment_len,
+            Some("receipt=".len() + capability.len())
+        );
+        let expected_capability_sha256 =
+            nazo_operator_protocol::openid4vp_verification_capability_sha256(capability)
+                .expect("capability hash");
+        assert_eq!(
+            diagnostic.capability_sha256.as_deref(),
+            Some(expected_capability_sha256.as_str())
+        );
+        let rendered = diagnostic.to_string();
+        assert!(!rendered.contains(capability));
+        assert!(!rendered.contains("unexpected@"));
     }
 
     struct RetryingCreateTransport {

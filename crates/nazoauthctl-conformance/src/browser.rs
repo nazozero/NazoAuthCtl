@@ -88,6 +88,7 @@ impl std::fmt::Display for BrowserNavigationDiagnostic {
 pub struct VpVerificationResultDriverDiagnostic {
     pub stage: &'static str,
     pub field: Option<&'static str>,
+    pub requested_url: Option<VpVerificationResultUrlDiagnostic>,
     pub source: Box<BrowserError>,
 }
 
@@ -97,7 +98,72 @@ impl std::fmt::Display for VpVerificationResultDriverDiagnostic {
         if let Some(field) = self.field {
             write!(formatter, " field={field}")?;
         }
+        if let Some(url) = &self.requested_url {
+            write!(formatter, " requested_url=[{url}]")?;
+        }
         write!(formatter, " cause={}", self.source)
+    }
+}
+
+/// A VP result URL projected without its query, fragment, or userinfo. The
+/// fragment capability is never retained verbatim; only its bounded length and
+/// SHA-256 are available to root-private failure evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VpVerificationResultUrlDiagnostic {
+    pub authority_has_at: Option<bool>,
+    pub canonical_origin: String,
+    pub path: String,
+    pub fragment_present: bool,
+    pub fragment_len: usize,
+    pub fragment_sha256: Option<String>,
+    pub fragment_matches_bootstrap: Option<bool>,
+    pub fragment_matches_capability_hash: Option<bool>,
+}
+
+impl std::fmt::Display for VpVerificationResultUrlDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "authority_has_at={} origin={} path={} fragment_present={} fragment_len={} fragment_sha256={} fragment_matches_bootstrap={} fragment_matches_capability_hash={}",
+            self.authority_has_at
+                .map(|value| value.to_string())
+                .as_deref()
+                .unwrap_or("unknown"),
+            self.canonical_origin,
+            self.path,
+            self.fragment_present,
+            self.fragment_len,
+            self.fragment_sha256.as_deref().unwrap_or("none"),
+            self.fragment_matches_bootstrap
+                .map(|value| value.to_string())
+                .as_deref()
+                .unwrap_or("none"),
+            self.fragment_matches_capability_hash
+                .map(|value| value.to_string())
+                .as_deref()
+                .unwrap_or("none"),
+        )
+    }
+}
+
+/// The fragment-scrub loop can only accept the exact bootstrap capability
+/// disappearing. This error retains the final safe URL projection and poll
+/// timing when that lifecycle condition cannot be met.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VpVerificationResultFragmentScrubDiagnostic {
+    pub poll_count: usize,
+    pub elapsed_millis: u128,
+    pub current_url: VpVerificationResultUrlDiagnostic,
+    pub source: Box<BrowserError>,
+}
+
+impl std::fmt::Display for VpVerificationResultFragmentScrubDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "poll_count={} elapsed_millis={} current_url=[{}] cause={}",
+            self.poll_count, self.elapsed_millis, self.current_url, self.source
+        )
     }
 }
 
@@ -151,6 +217,8 @@ pub enum BrowserError {
     ProtocolDiagnostic(WebDriverProtocolDiagnostic),
     #[error("OpenID4VP verification-result WebDriver operation failed [{0}]")]
     VpVerificationResultDriverDiagnostic(VpVerificationResultDriverDiagnostic),
+    #[error("OpenID4VP verification-result fragment scrub failed [{0}]")]
+    VpVerificationResultFragmentScrubDiagnostic(VpVerificationResultFragmentScrubDiagnostic),
     #[error("OpenID4VP verification-result projection field is invalid: {0}")]
     VpVerificationResultField(&'static str),
     #[error("browser WebDriver rejected the request")]
@@ -187,9 +255,10 @@ pub use openid4vci::{
 };
 pub use openid4vp::{
     ConformanceBinding, OpenId4VpError, OpenId4VpEvidenceBindingDiagnostic,
-    OpenId4VpEvidenceContext, OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier,
-    OpenId4VpPresentation, OpenId4VpStartRequest, OpenId4VpVerificationEvidence,
-    OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier, OpenId4VpVerifierClient,
+    OpenId4VpEvidenceContext, OpenId4VpEvidenceRunContext, OpenId4VpEvidenceUrlDiagnostic,
+    OpenId4VpEvidenceVerifier, OpenId4VpPresentation, OpenId4VpStartRequest,
+    OpenId4VpVerificationEvidence, OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier,
+    OpenId4VpVerifierClient,
 };
 pub use parser::{parse_browser_entries, parse_browser_entries_owned};
 pub use plan::{BrowserRunnerState, OpenId4VcBrowserState};
@@ -695,24 +764,100 @@ fn canonical_navigation_url(url: &Url) -> String {
     canonical.to_string()
 }
 
+fn vp_result_url_diagnostic(
+    url: &Url,
+    bootstrap_fragment: Option<&str>,
+    expected_capability_sha256: Option<&str>,
+    authority_has_at: Option<bool>,
+) -> VpVerificationResultUrlDiagnostic {
+    let fragment = url.fragment();
+    let fragment_matches_capability_hash = expected_capability_sha256.map(|expected| {
+        fragment
+            .and_then(|value| value.strip_prefix("receipt="))
+            .and_then(|capability| {
+                nazo_operator_protocol::openid4vp_verification_capability_sha256(capability).ok()
+            })
+            .is_some_and(|actual| actual == expected)
+    });
+    VpVerificationResultUrlDiagnostic {
+        authority_has_at,
+        canonical_origin: url.origin().ascii_serialization(),
+        path: url.path().to_owned(),
+        fragment_present: fragment.is_some(),
+        fragment_len: fragment.map_or(0, str::len),
+        fragment_sha256: fragment.map(|value| sha256_hex(value.as_bytes())),
+        fragment_matches_bootstrap: bootstrap_fragment.map(|expected| fragment == Some(expected)),
+        fragment_matches_capability_hash,
+    }
+}
+
 fn vp_result_driver<T>(
     stage: &'static str,
     field: Option<&'static str>,
     result: Result<T, BrowserError>,
 ) -> Result<T, BrowserError> {
-    result.map_err(|source| vp_result_driver_error(stage, field, source))
+    result.map_err(|source| vp_result_driver_error(stage, field, None, source))
+}
+
+fn vp_result_driver_for_url<T>(
+    stage: &'static str,
+    field: Option<&'static str>,
+    requested_url: &Url,
+    expected_capability_sha256: Option<&str>,
+    authority_has_at: Option<bool>,
+    result: Result<T, BrowserError>,
+) -> Result<T, BrowserError> {
+    result.map_err(|source| {
+        vp_result_driver_error(
+            stage,
+            field,
+            Some(vp_result_url_diagnostic(
+                requested_url,
+                None,
+                expected_capability_sha256,
+                authority_has_at,
+            )),
+            source,
+        )
+    })
 }
 
 fn vp_result_driver_error(
     stage: &'static str,
     field: Option<&'static str>,
+    requested_url: Option<VpVerificationResultUrlDiagnostic>,
     source: BrowserError,
 ) -> BrowserError {
     BrowserError::VpVerificationResultDriverDiagnostic(VpVerificationResultDriverDiagnostic {
         stage,
         field,
+        requested_url,
         source: Box::new(source),
     })
+}
+
+fn vp_result_fragment_scrub_error(
+    poll_count: usize,
+    elapsed: Duration,
+    current: &Url,
+    bootstrap_fragment: Option<&str>,
+    expected_capability_sha256: Option<&str>,
+    authority_has_at: Option<bool>,
+    source: BrowserError,
+) -> BrowserError {
+    BrowserError::VpVerificationResultFragmentScrubDiagnostic(
+        VpVerificationResultFragmentScrubDiagnostic {
+            poll_count,
+            elapsed_millis: elapsed.as_millis(),
+            current_url: vp_result_url_diagnostic(
+                current,
+                bootstrap_fragment,
+                expected_capability_sha256,
+                authority_has_at,
+            ),
+            source: Box::new(source),
+        },
+    )
 }
 
 /// Private orchestration receipt. Public module reports project only
@@ -1204,11 +1349,21 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         {
             return Err(self.navigation_violation(self.last_url.as_ref(), &ui_url));
         }
-        vp_result_driver("bootstrap-navigate", None, self.navigate(&ui_url))?;
-        vp_result_driver(
+        vp_result_driver_for_url(
+            "bootstrap-navigate",
+            None,
+            &ui_url,
+            Some(&evidence.receipt.capability_sha256),
+            Some(evidence.ui_url_diagnostic.authority_has_at),
+            self.navigate(&ui_url),
+        )?;
+        vp_result_driver_for_url(
             "fragment-scrub-current-url",
             None,
-            self.wait_for_openid4vp_fragment_scrub(&ui_url),
+            &ui_url,
+            Some(&evidence.receipt.capability_sha256),
+            Some(evidence.ui_url_diagnostic.authority_has_at),
+            self.wait_for_openid4vp_fragment_scrub(&ui_url, &evidence.receipt.capability_sha256),
         )?;
         let deadline = self.deadline(DEFAULT_STEP_TIMEOUT);
         loop {
@@ -1254,7 +1409,12 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                     )?;
                 }
                 Err(error) => {
-                    return Err(vp_result_driver_error("result-root-find", None, error));
+                    return Err(vp_result_driver_error(
+                        "result-root-find",
+                        None,
+                        None,
+                        error,
+                    ));
                 }
             }
         }
@@ -1305,7 +1465,11 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
     /// WebDriver can observe the bootstrap URL before that script runs. Wait
     /// only for that exact fragment to disappear; a changed capability, path,
     /// origin, or query is still a navigation violation.
-    fn wait_for_openid4vp_fragment_scrub(&mut self, bootstrap: &Url) -> Result<Url, BrowserError> {
+    fn wait_for_openid4vp_fragment_scrub(
+        &mut self,
+        bootstrap: &Url,
+        expected_capability_sha256: &str,
+    ) -> Result<Url, BrowserError> {
         let initially_observed = self
             .last_url
             .clone()
@@ -1317,11 +1481,35 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                 && (url.fragment().is_none() || url.fragment() == bootstrap.fragment())
         };
         if !is_expected_observation(&initially_observed) {
-            return Err(self.navigation_violation(Some(&initially_observed), &initially_observed));
+            return Err(vp_result_fragment_scrub_error(
+                0,
+                Duration::ZERO,
+                &initially_observed,
+                bootstrap.fragment(),
+                Some(expected_capability_sha256),
+                None,
+                self.navigation_violation(Some(&initially_observed), &initially_observed),
+            ));
         }
         let deadline = self.deadline(DEFAULT_STEP_TIMEOUT);
+        let started = Instant::now();
+        let mut poll_count = 0usize;
         loop {
-            let current = self.ensure_current_url()?;
+            let current = match self.ensure_current_url() {
+                Ok(current) => current,
+                Err(source) => {
+                    return Err(vp_result_fragment_scrub_error(
+                        poll_count,
+                        started.elapsed(),
+                        &initially_observed,
+                        bootstrap.fragment(),
+                        Some(expected_capability_sha256),
+                        None,
+                        source,
+                    ));
+                }
+            };
+            poll_count = poll_count.saturating_add(1);
             let same_result_page = self.policy.target_origin.allows(&current)
                 && current.path() == "/ui/verification-result"
                 && current.query().is_none();
@@ -1329,10 +1517,28 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                 return Ok(current);
             }
             if same_result_page && current.fragment() == bootstrap.fragment() {
-                self.sleep_until(deadline)?;
+                if let Err(source) = self.sleep_until(deadline) {
+                    return Err(vp_result_fragment_scrub_error(
+                        poll_count,
+                        started.elapsed(),
+                        &current,
+                        bootstrap.fragment(),
+                        Some(expected_capability_sha256),
+                        None,
+                        source,
+                    ));
+                }
                 continue;
             }
-            return Err(self.navigation_violation(self.last_url.as_ref(), &current));
+            return Err(vp_result_fragment_scrub_error(
+                poll_count,
+                started.elapsed(),
+                &current,
+                bootstrap.fragment(),
+                Some(expected_capability_sha256),
+                None,
+                self.navigation_violation(self.last_url.as_ref(), &current),
+            ));
         }
     }
 
@@ -2534,6 +2740,85 @@ mod tests {
             &BrowserError::ProtocolDiagnostic(response)
         );
         assert!(diagnostic.to_string().contains("endpoint=current_url"));
+    }
+
+    #[test]
+    fn vp_result_fragment_scrub_timeout_retains_only_safe_poll_observation() {
+        let bootstrap = Url::parse(
+            "https://issuer.example/ui/verification-result#receipt=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        .expect("bootstrap");
+        let expected_capability_sha256 =
+            nazo_operator_protocol::openid4vp_verification_capability_sha256(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            )
+            .expect("capability hash");
+        let error = vp_result_fragment_scrub_error(
+            321,
+            Duration::from_secs(80),
+            &bootstrap,
+            bootstrap.fragment(),
+            Some(&expected_capability_sha256),
+            None,
+            BrowserError::Timeout,
+        );
+        let BrowserError::VpVerificationResultFragmentScrubDiagnostic(diagnostic) = error else {
+            panic!("fragment scrub diagnostic")
+        };
+        assert_eq!(diagnostic.poll_count, 321);
+        assert_eq!(diagnostic.elapsed_millis, 80_000);
+        assert_eq!(
+            diagnostic.current_url.canonical_origin,
+            "https://issuer.example"
+        );
+        assert_eq!(
+            diagnostic.current_url.path,
+            "/ui/verification-result".to_owned()
+        );
+        assert!(diagnostic.current_url.fragment_present);
+        assert_eq!(diagnostic.current_url.fragment_len, "receipt=".len() + 43);
+        assert_eq!(
+            diagnostic.current_url.fragment_matches_bootstrap,
+            Some(true)
+        );
+        assert_eq!(
+            diagnostic.current_url.fragment_matches_capability_hash,
+            Some(true)
+        );
+        assert_eq!(diagnostic.source.as_ref(), &BrowserError::Timeout);
+        let rendered = diagnostic.to_string();
+        assert!(!rendered.contains("receipt=AAAAAAAA"));
+        assert!(rendered.contains("poll_count=321"));
+    }
+
+    #[test]
+    fn vp_result_bootstrap_navigation_diagnostic_binds_the_signed_capability_hash() {
+        let bootstrap = Url::parse(
+            "https://issuer.example/ui/verification-result#receipt=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        .expect("bootstrap");
+        let expected_capability_sha256 =
+            nazo_operator_protocol::openid4vp_verification_capability_sha256(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            )
+            .expect("capability hash");
+        let error = vp_result_driver_for_url::<()>(
+            "bootstrap-navigate",
+            None,
+            &bootstrap,
+            Some(&expected_capability_sha256),
+            Some(false),
+            Err(BrowserError::Transport),
+        )
+        .expect_err("driver failure");
+        let BrowserError::VpVerificationResultDriverDiagnostic(diagnostic) = error else {
+            panic!("bootstrap diagnostic")
+        };
+        let requested = diagnostic.requested_url.expect("requested URL metadata");
+        assert_eq!(requested.authority_has_at, Some(false));
+        assert_eq!(requested.fragment_len, "receipt=".len() + 43);
+        assert_eq!(requested.fragment_matches_capability_hash, Some(true));
+        assert!(!diagnostic.to_string().contains("receipt=AAAAAAAA"));
     }
 
     #[test]
