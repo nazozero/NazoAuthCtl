@@ -247,11 +247,28 @@ pub(crate) fn fsync_parent_directory(path: &Path, private: bool) -> Result<(), S
 /// Create a secure file exactly once. If a concurrent/crash-resume writer has
 /// already created the destination, the bytes must match exactly; this never
 /// falls back to a rename that could replace evidence owned by that writer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NewOrExactOutcome {
+    Created,
+    Existing,
+}
+
 pub(crate) fn write_new_or_exact(
     path: &Path,
     bytes: &[u8],
     private: bool,
 ) -> Result<(), SecureFileError> {
+    write_new_or_exact_with_outcome(path, bytes, private).map(|_| ())
+}
+
+/// Same as [`write_new_or_exact`], but tells a paired-file caller whether it
+/// owns the newly published file and may therefore safely remove it if the
+/// companion write fails. An exact pre-existing file is never removed.
+pub(crate) fn write_new_or_exact_with_outcome(
+    path: &Path,
+    bytes: &[u8],
+    private: bool,
+) -> Result<NewOrExactOutcome, SecureFileError> {
     let absolute = normalize_absolute(path)?;
     let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
     ensure_directory(parent, private)?;
@@ -323,7 +340,7 @@ pub(crate) fn write_new_or_exact(
                             rustix::fs::AtFlags::empty(),
                         );
                     }
-                    return result;
+                    return result.map(|()| NewOrExactOutcome::Created);
                 }
                 Err(error) if error.raw_os_error() == libc::EEXIST => {
                     let _ = rustix::fs::unlinkat(
@@ -333,7 +350,7 @@ pub(crate) fn write_new_or_exact(
                     );
                     let existing = read_bounded(&absolute, bytes.len(), private)?;
                     return if existing == bytes {
-                        Ok(())
+                        Ok(NewOrExactOutcome::Existing)
                     } else {
                         Err(SecureFileError::Io)
                     };
@@ -349,6 +366,33 @@ pub(crate) fn write_new_or_exact(
             }
         }
         Err(SecureFileError::Io)
+    }
+}
+
+/// Removes a root-private file only after confirming its exact bytes. This is
+/// intentionally narrow: it is used to roll back a just-created PNG/audit
+/// companion, never to replace or clean up evidence of an unknown writer.
+pub(crate) fn remove_private_file_if_exact(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), SecureFileError> {
+    let absolute = normalize_absolute(path)?;
+    let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
+    #[cfg(not(unix))]
+    {
+        let _ = (bytes, parent);
+        Err(SecureFileError::UnsupportedPlatform)
+    }
+    #[cfg(unix)]
+    {
+        let parent_file = open_directory_chain(parent, true, false)?;
+        if read_bounded(&absolute, bytes.len(), true)? != bytes {
+            return Err(SecureFileError::Io);
+        }
+        let name = absolute.file_name().ok_or(SecureFileError::UnsafePath)?;
+        rustix::fs::unlinkat(&parent_file, name, rustix::fs::AtFlags::empty())
+            .map_err(|_| SecureFileError::Io)?;
+        rustix::fs::fsync(&parent_file).map_err(|_| SecureFileError::Io)
     }
 }
 

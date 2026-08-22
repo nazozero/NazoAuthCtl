@@ -297,6 +297,38 @@ impl BrowserDriver for WebDriverClient {
         Ok(id.to_owned())
     }
 
+    fn find_child_element(
+        &mut self,
+        parent: &str,
+        selector: &BrowserSelector,
+    ) -> Result<String, BrowserError> {
+        if parent.is_empty() || parent.len() > 256 || parent.chars().any(char::is_control) {
+            return Err(BrowserError::Protocol);
+        }
+        let (using, value) = match selector {
+            BrowserSelector::Id(value) => ("id", value.as_str()),
+            BrowserSelector::Css(value) => ("css selector", value.as_str()),
+            BrowserSelector::XPath(value) => ("xpath", value.as_str()),
+        };
+        let result = self.post_value(
+            &self.session_path(&format!("/element/{parent}/element"))?,
+            &json!({ "using": using, "value": value }),
+        )?;
+        let object = result
+            .get("value")
+            .and_then(Value::as_object)
+            .ok_or(BrowserError::ElementNotFound)?;
+        let id = object
+            .get(W3C_ELEMENT_KEY)
+            .or_else(|| object.get(LEGACY_ELEMENT_KEY))
+            .and_then(Value::as_str)
+            .ok_or(BrowserError::ElementNotFound)?;
+        if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+            return Err(BrowserError::Protocol);
+        }
+        Ok(id.to_owned())
+    }
+
     fn element_displayed(&mut self, element: &str) -> Result<bool, BrowserError> {
         let value =
             self.get_value(&self.session_path(&format!("/element/{element}/displayed"))?)?;
@@ -316,6 +348,30 @@ impl BrowserDriver for WebDriverClient {
             return Err(BrowserError::ResponseTooLarge);
         }
         Ok(text.to_owned())
+    }
+
+    fn element_attribute(
+        &mut self,
+        element: &str,
+        name: &str,
+    ) -> Result<Option<String>, BrowserError> {
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(BrowserError::Protocol);
+        }
+        let value =
+            self.get_value(&self.session_path(&format!("/element/{element}/attribute/{name}"))?)?;
+        match value.get("value") {
+            Some(Value::Null) | None => Ok(None),
+            Some(Value::String(value)) if value.len() <= MAX_RESPONSE_BYTES => {
+                Ok(Some(value.clone()))
+            }
+            _ => Err(BrowserError::Protocol),
+        }
     }
 
     fn element_send_keys(&mut self, element: &str, value: &str) -> Result<(), BrowserError> {
@@ -503,11 +559,25 @@ impl BrowserDriver for ManagedWebDriver {
     fn find_element(&mut self, selector: &BrowserSelector) -> Result<String, BrowserError> {
         self.client.find_element(selector)
     }
+    fn find_child_element(
+        &mut self,
+        parent: &str,
+        selector: &BrowserSelector,
+    ) -> Result<String, BrowserError> {
+        self.client.find_child_element(parent, selector)
+    }
     fn element_displayed(&mut self, element: &str) -> Result<bool, BrowserError> {
         self.client.element_displayed(element)
     }
     fn element_text(&mut self, element: &str) -> Result<String, BrowserError> {
         self.client.element_text(element)
+    }
+    fn element_attribute(
+        &mut self,
+        element: &str,
+        name: &str,
+    ) -> Result<Option<String>, BrowserError> {
+        self.client.element_attribute(element, name)
     }
     fn element_send_keys(&mut self, element: &str, value: &str) -> Result<(), BrowserError> {
         self.client.element_send_keys(element, value)

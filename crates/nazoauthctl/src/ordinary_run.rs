@@ -26,8 +26,9 @@ use nazoauthctl_conformance::{
     EvidenceRuntimeIdentity, EvidenceSourceIdentity, HttpTransport, ManagedWebDriver,
     MatrixSelection, OidfArtifactMatrix, OidfDriverLane, OidfPlanResourceBudget, OidfPlanSelection,
     OidfProviderExecutionBinding, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
-    OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard,
-    RunControl, StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionManifest,
+    OpenId4VciIssuerDriver, OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier,
+    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl,
+    StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionManifest,
     SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
     TenantResourceApplyOutput, TenantResourceReceiptIdentity, TenantResourceRecoveryBinding,
     TtyRenderer, WebDriverClient, WebDriverEndpoint, authorize_oidf_driver_execution,
@@ -213,11 +214,28 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         mtls_trust_anchor_pem: prepared.mtls_trust_anchor_pem(),
     };
 
-    let client = TenantResourceClient::with_curl(
-        session
-            .tenant_resource_client_config(&invocation.tenant_id)
-            .context("failed to bind the tenant-resource client to the selected runtime")?,
-    )?;
+    let tenant_resource_client_config = session
+        .tenant_resource_client_config(&invocation.tenant_id)
+        .context("failed to bind the tenant-resource client to the selected runtime")?;
+    let vp_evidence_verifier = invocation
+        .capture_review_screenshots
+        .then(|| {
+            OpenId4VpEvidenceVerifier::new(
+                tenant_resource_client_config.deployment_id.clone(),
+                invocation.tenant_id.clone(),
+                tenant_resource_client_config.runtime_instance_id.clone(),
+                tenant_resource_client_config.runtime_key_id.clone(),
+                tenant_resource_client_config.runtime_public_key.clone(),
+            )
+        })
+        .transpose()
+        .context("failed to bind OpenID4VP evidence receipts to the selected runtime")?;
+    let vp_evidence_trust_anchor = vp_evidence_verifier
+        .as_ref()
+        .map(|verifier| verifier.recovery_trust_anchor(session.target_issuer()))
+        .transpose()
+        .context("failed to persist the OpenID4VP evidence runtime trust anchor")?;
+    let client = TenantResourceClient::with_curl(tenant_resource_client_config)?;
     let capability = client
         .discover_capability()
         .context("failed to discover the signed tenant-resource capability")?;
@@ -351,6 +369,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         expected_revision: prepared_apply.task().expected_revision,
         manifest_path: Some(private_manifest_path.clone()),
         proxy: proxy_recovery,
+        vp_evidence_trust_anchor,
         resource_identities: manifest.resource_identities().to_vec(),
     };
     let recovery = match recovery_store.begin_tenant_resource(recovery_binding) {
@@ -479,6 +498,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         selected_resource_budget,
         recovery.clone(),
         ciba_bridge,
+        vp_evidence_verifier,
     );
 
     let mut recovery = take_recovery(recovery)?;
@@ -486,8 +506,11 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         .as_ref()
         .is_ok_and(|report| report.orchestration_integrity.retention_eligible);
     let mut errors = Vec::new();
-    let review_screenshot_manifest = if invocation.capture_review_screenshots && retention_eligible
-    {
+    // This root-private, module-bound manifest is the manual upload list for
+    // NazoAuthWeb VP result captures. It performs no Suite upload and is
+    // produced even when retention was not requested; only a later retention
+    // transition binds its digest into the Suite journal.
+    let review_screenshot_manifest = if invocation.capture_review_screenshots {
         match (run_result.as_ref(), invocation.evidence_directory.as_ref()) {
             (Ok(report), Some(directory)) => match write_review_screenshot_manifest(
                 report,
@@ -498,6 +521,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                     .request_jti
                     .as_str(),
                 &invocation.artifact_digest,
+                session.target_issuer(),
             ) {
                 Ok(manifest) => Some(manifest),
                 Err(error) => {
@@ -806,6 +830,7 @@ fn run_signed_suite(
     selected_resource_budget: OidfPlanResourceBudget,
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
     ciba_bridge: Option<CibaUserApprovalBridge>,
+    vp_evidence_verifier: Option<OpenId4VpEvidenceVerifier>,
 ) -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
     if let Some(bridge) = &ciba_bridge {
         bridge
@@ -846,6 +871,25 @@ fn run_signed_suite(
         .transpose()
         .context("review screenshot evidence directory must be root-owned and private")?;
 
+    let selected = materialized
+        .take_matrix()
+        .select(&MatrixSelection {
+            groups: invocation.groups.clone(),
+            profiles: Vec::new(),
+            plans: invocation.plans.clone(),
+        })
+        .context("requested selection is outside the signed artifact Matrix")?;
+    let vp_evidence = invocation
+        .capture_review_screenshots
+        .then(|| {
+            OpenId4VpEvidenceRunContext::new(
+                &review_screenshot_run_jti,
+                invocation.artifact_digest.as_str(),
+                selected.digest.as_str(),
+            )
+        })
+        .transpose()
+        .context("OpenID4VP review evidence binding is invalid")?;
     let mut automation = Vec::with_capacity(invocation.jobs);
     for worker_index in 0..invocation.jobs {
         let browser = build_browser(
@@ -867,30 +911,28 @@ fn run_signed_suite(
                 openid4vci_management_token.clone(),
                 token.clone(),
             )?));
-        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
-            Arc::new(Mutex::new(OpenId4VpVerifierClient::new(
-                target_origin.clone(),
-                suite_origin.clone(),
-                openid4vp_management_token.clone(),
-                Duration::from_secs(30),
-                binding.clone(),
-            )?));
+        let verifier_client = OpenId4VpVerifierClient::new(
+            target_origin.clone(),
+            suite_origin.clone(),
+            openid4vp_management_token.clone(),
+            Duration::from_secs(30),
+            binding.clone(),
+        )?;
+        let verifier_client = match &vp_evidence_verifier {
+            Some(evidence_verifier) => {
+                verifier_client.with_evidence_verifier(evidence_verifier.clone())
+            }
+            None => verifier_client,
+        };
+        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = Arc::new(Mutex::new(verifier_client));
         automation.push(ConformanceAutomation {
             browser: Some(browser),
             review_screenshot_capture: review_screenshot_capture.clone(),
+            vp_evidence: vp_evidence.clone(),
             verifier: Some(verifier),
             issuer: Some(issuer),
         });
     }
-
-    let selected = materialized
-        .take_matrix()
-        .select(&MatrixSelection {
-            groups: invocation.groups.clone(),
-            profiles: Vec::new(),
-            plans: invocation.plans.clone(),
-        })
-        .context("requested selection is outside the signed artifact Matrix")?;
     let control = RunControl::default();
     let interrupt = control.clone();
     ctrlc::set_handler(move || interrupt.interrupt())

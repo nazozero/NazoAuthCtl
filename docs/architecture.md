@@ -115,16 +115,35 @@ requirement.
 calls a Suite image API. A required marker fails local orchestration if a
 bounded W3C PNG screenshot cannot be captured, while an optional marker is
 reported as missing and execution continues with the next signed task. A
-capture is accepted only on the canonical Suite `/test/a/{module-id}/…` page
-for its newly-created module. PNG input is capped at 500 KiB and fully decoded
-with bounded dimensions, pixels, and output before it is written owner-only
-under `review-screenshots/`. The root-private capture manifest binds the run,
-artifact/Matrix digests, Suite origin, exact plan/module IDs, test/variant, and
-required/captured/missing obligations; retained plans bind its path and SHA-256
-into the recovery journal and reverify it before publication. Module reports
-contain only the relative path, SHA-256, and size. Existing terminal
-Suite modules are never targeted: a retained plan must be repeated to collect
-new local evidence, which can then be attached manually in the official UI.
+normal capture is accepted only on the canonical Suite
+`/test/a/{module-id}/…` page for its newly-created module. OpenID4VP required
+captures first use the same browser lane's actual signed-entry selection to
+attach exact new plan/module context, then complete the protocol before issuing a
+same-module, runtime-signed verification receipt and one-time NazoAuthWeb
+result view at
+`/ui/verification-result#receipt=…`; ctl verifies its non-secret DOM binding
+before capture and never records the fragment capability. The capability is
+issued only after protocol completion. Attachment is authenticated by the
+runtime-discovery key: ctl checks the signed intent's issuer, audience, tenant,
+transaction, exact evidence context, presentation request digest, and trust
+policy binding before generating one stable issuance JTI. Retried issuance
+requests reuse that JTI, so a lost response cannot silently rotate the browser
+capability. The durable screenshot receipt retains only the signed JWS and its
+non-secret tenant/runtime/key/context/binding/intent/capability hashes; recovery
+reverifies it under the journal-owned runtime key. The capability is deliberately
+not recoverable: a
+process crash before the new module becomes terminal fails that module and
+uses the ordinary exact cleanup path. PNG input is capped
+at 500 KiB and fully decoded with bounded dimensions, pixels, and output before
+it is written owner-only under `review-screenshots/`. The root-private capture
+manifest is also the local, module-bound manual-upload list: it binds the run,
+artifact/Matrix digests, Suite origin, exact plan/module IDs, test/variant,
+capture source, and required/captured/missing obligations. It never POSTs an
+image to the Suite. Retained plans bind its path and SHA-256 into the recovery
+journal and reverify it before publication. Module reports contain only the
+relative path, SHA-256, and size. Existing terminal Suite modules are never
+targeted: a retained plan must be repeated to collect new local evidence, which
+can then be attached manually in the official UI.
 
 Final output schema 2 preserves a completed `RunOutput` even when resource,
 proxy, or evidence cleanup fails. Such failures are listed in `errors`, keep

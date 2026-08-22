@@ -53,13 +53,15 @@ pub use artifact_plan::{
 pub use browser::{
     BrowserAutomation, BrowserCommand, BrowserDriver, BrowserEntry, BrowserError, BrowserExecutor,
     BrowserLimits, BrowserPolicy, BrowserReviewCaptureContext, BrowserReviewModuleIdentity,
-    BrowserReviewScreenshotCapture, BrowserReviewScreenshotReceipt, BrowserRunReport,
-    BrowserRunnerState, BrowserSelector, BrowserTargetOrigin, BrowserTask, ConformanceBinding,
-    ManagedWebDriver, OpenId4VcBrowserState, OpenId4VciError, OpenId4VciIssuerClient,
-    OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpError,
-    OpenId4VpPresentation, OpenId4VpStartRequest, OpenId4VpVerifier, OpenId4VpVerifierClient,
-    ReviewScreenshotMarker, WebDriverClient, WebDriverEndpoint, parse_browser_entries,
-    parse_browser_entries_owned,
+    BrowserReviewScreenshotCapture, BrowserReviewScreenshotReceipt, BrowserReviewScreenshotSource,
+    BrowserRunReport, BrowserRunnerState, BrowserSelector, BrowserTargetOrigin, BrowserTask,
+    ConformanceBinding, ManagedWebDriver, OpenId4VcBrowserState, OpenId4VciError,
+    OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VciModule,
+    OpenId4VpError, OpenId4VpEvidenceContext, OpenId4VpEvidenceRunContext,
+    OpenId4VpEvidenceVerifier, OpenId4VpPresentation, OpenId4VpStartRequest,
+    OpenId4VpVerificationEvidence, OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier,
+    OpenId4VpVerifierClient, ReviewScreenshotMarker, WebDriverClient, WebDriverEndpoint,
+    parse_browser_entries, parse_browser_entries_owned,
 };
 pub use ciba_approval::{
     CibaApprovalFailureStage, CibaUserApprovalBridge, CibaUserApprovalClient, CibaUserApprovalError,
@@ -102,10 +104,10 @@ pub use progress::{
 pub use proxy_trust::ProxyTrustGuard;
 pub use recovery::{
     ConformanceProxyRecovery, ConformanceRecoveryBinding, ConformanceRecoveryGuard,
-    ConformanceRecoveryStore, SuiteRecoveryState, SuiteRetentionCommitResolution,
-    SuiteRetentionManifest, SuiteRetentionManifestReceipt, SuiteRetentionPlan,
-    SuiteRetentionScreenshotManifest, TenantResourceReceiptIdentity, TenantResourceRecoveryBinding,
-    TenantResourceRevokeOutcome, TenantResourceRevokeRecord,
+    ConformanceRecoveryStore, OpenId4VpEvidenceTrustAnchor, SuiteRecoveryState,
+    SuiteRetentionCommitResolution, SuiteRetentionManifest, SuiteRetentionManifestReceipt,
+    SuiteRetentionPlan, SuiteRetentionScreenshotManifest, TenantResourceReceiptIdentity,
+    TenantResourceRecoveryBinding, TenantResourceRevokeOutcome, TenantResourceRevokeRecord,
 };
 pub use report::{
     CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport, PlanReport,

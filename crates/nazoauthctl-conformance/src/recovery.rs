@@ -19,6 +19,10 @@ const TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 2;
 /// Schema 3 is emitted only after an explicit certification-retention policy
 /// is durably bound. Older binaries reject it rather than deleting plans.
 const RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 3;
+/// Schema 4 is emitted only for a run that may retain a NazoAuthWeb VP result
+/// capture. It binds the recovery journal to the runtime discovery key rather
+/// than trusting a key copied from a screenshot receipt.
+const VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 4;
 const TENANT_RESOURCE_RECOVERY_KIND: &str = "tenant-resource";
 const MAX_RECOVERY_JOURNAL_BYTES: usize = 128 * 1024;
 const MAX_PENDING_RUNS: usize = 64;
@@ -77,7 +81,22 @@ pub struct TenantResourceRecoveryBinding {
     /// executes the legacy proxy command itself.
     #[serde(default)]
     pub proxy: Option<ConformanceProxyRecovery>,
+    /// Runtime-discovery trust anchor for a possible NazoAuthWeb VP evidence
+    /// receipt. Existing ordinary journals omit it; those journals are never
+    /// permitted to validate the newer VP screenshot source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vp_evidence_trust_anchor: Option<OpenId4VpEvidenceTrustAnchor>,
     pub resource_identities: Vec<TenantResourceIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenId4VpEvidenceTrustAnchor {
+    pub target_issuer: String,
+    pub deployment_id: String,
+    pub runtime_instance_id: String,
+    pub instance_key_id: String,
+    pub instance_public_key_base64: String,
 }
 
 /// A compact, verified identity of the signed apply receipt.  The signed JWS
@@ -201,6 +220,8 @@ struct ReviewScreenshotManifestDocument {
     artifact_digest: String,
     matrix_sha256: String,
     suite_origin: String,
+    #[serde(default)]
+    target_issuer: Option<String>,
     modules: Vec<ReviewScreenshotManifestModule>,
     screenshots: Vec<ReviewScreenshotManifestImage>,
 }
@@ -235,6 +256,10 @@ struct ReviewScreenshotManifestImage {
     trigger_origin: String,
     trigger_path: String,
     trigger_url_sha256: String,
+    #[serde(default)]
+    source: crate::BrowserReviewScreenshotSource,
+    #[serde(default)]
+    verification_receipt: Option<crate::OpenId4VpVerificationReceiptProvenance>,
 }
 
 #[derive(Deserialize)]
@@ -252,6 +277,10 @@ struct ReviewScreenshotAudit {
     trigger_origin: String,
     trigger_path: String,
     trigger_url_sha256: String,
+    #[serde(default)]
+    source: crate::BrowserReviewScreenshotSource,
+    #[serde(default)]
+    verification_receipt: Option<crate::OpenId4VpVerificationReceiptProvenance>,
 }
 
 impl SuiteRetentionManifest {
@@ -377,17 +406,19 @@ impl<'de> Deserialize<'de> for RecoveryJournal {
         const TENANT_RESOURCE_SCHEMA: u64 = TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA as u64;
         const RETAINING_TENANT_RESOURCE_SCHEMA: u64 =
             RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA as u64;
+        const VP_EVIDENCE_TENANT_RESOURCE_SCHEMA: u64 =
+            VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA as u64;
         match schema {
             LEGACY_SCHEMA => serde_json::from_value(value)
                 .map(Box::new)
                 .map(Self::Legacy)
                 .map_err(serde::de::Error::custom),
-            TENANT_RESOURCE_SCHEMA | RETAINING_TENANT_RESOURCE_SCHEMA => {
-                serde_json::from_value(value)
-                    .map(Box::new)
-                    .map(Self::TenantResource)
-                    .map_err(serde::de::Error::custom)
-            }
+            TENANT_RESOURCE_SCHEMA
+            | RETAINING_TENANT_RESOURCE_SCHEMA
+            | VP_EVIDENCE_TENANT_RESOURCE_SCHEMA => serde_json::from_value(value)
+                .map(Box::new)
+                .map(Self::TenantResource)
+                .map_err(serde::de::Error::custom),
             _ => Err(serde::de::Error::custom(
                 "unsupported recovery journal schema",
             )),
@@ -500,7 +531,11 @@ impl ConformanceRecoveryStore {
         self.begin_journal(
             &request_jti,
             RecoveryJournal::TenantResource(Box::new(TenantResourceRecoveryJournal {
-                schema: TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA,
+                schema: if binding.vp_evidence_trust_anchor.is_some() {
+                    VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                } else {
+                    TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                },
                 kind: TENANT_RESOURCE_RECOVERY_KIND.to_owned(),
                 binding,
                 receipt: None,
@@ -612,12 +647,14 @@ impl ConformanceRecoveryStore {
             {
                 suite.plan_ids.clear();
                 suite.module_ids.clear();
-                if tenant_journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
-                    && matches!(
-                        &tenant_journal.suite_retention,
-                        SuiteRetentionDisposition::Active { .. }
-                    )
-                {
+                if matches!(
+                    tenant_journal.schema,
+                    RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                        | VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                ) && matches!(
+                    &tenant_journal.suite_retention,
+                    SuiteRetentionDisposition::Active { .. }
+                ) {
                     tenant_journal.suite_retention = SuiteRetentionDisposition::Cleaned;
                 }
                 normalized_suite_cleanup = true;
@@ -932,7 +969,11 @@ impl ConformanceRecoveryGuard {
                     requested: retain_suite_plans_for_certification,
                 };
                 if retain_suite_plans_for_certification {
-                    journal.schema = RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA;
+                    journal.schema = if journal.binding.vp_evidence_trust_anchor.is_some() {
+                        VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                    } else {
+                        RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                    };
                 }
             }
             SuiteRetentionDisposition::RetentionPrepared { .. }
@@ -1062,7 +1103,11 @@ impl ConformanceRecoveryGuard {
             suite.plan_ids.clear();
             suite.module_ids.clear();
         }
-        if journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA {
+        if matches!(
+            journal.schema,
+            RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                | VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+        ) {
             journal.suite_retention = SuiteRetentionDisposition::Cleaned;
         }
         self.persist()
@@ -1792,6 +1837,7 @@ fn validate_journal(
                 journal.schema,
                 TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
                     | RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                    | VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
             ) || journal.kind != TENANT_RESOURCE_RECOVERY_KIND
             {
                 bail!("tenant-resource recovery journal discriminator is invalid");
@@ -1810,6 +1856,16 @@ fn validate_tenant_resource_journal(
         && !SuiteRetentionDisposition::is_default(&journal.suite_retention)
     {
         bail!("schema-2 recovery journal cannot retain Suite plans");
+    }
+    if journal.schema == VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+        && journal.binding.vp_evidence_trust_anchor.is_none()
+    {
+        bail!("schema-4 recovery journal has no VP evidence trust anchor");
+    }
+    if journal.schema != VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+        && journal.binding.vp_evidence_trust_anchor.is_some()
+    {
+        bail!("legacy recovery journal cannot carry a VP evidence trust anchor");
     }
     if journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
         && SuiteRetentionDisposition::is_default(&journal.suite_retention)
@@ -2095,13 +2151,22 @@ fn validate_review_screenshot_manifest_binding(
     }
     let document: ReviewScreenshotManifestDocument =
         serde_json::from_slice(&bytes).context("review screenshot manifest is not valid JSON")?;
-    if document.schema != 3
-        || document.run_jti != binding.request_jti
+    if !matches!(
+        document.schema,
+        3 | 4 | 5 | crate::evidence::REVIEW_SCREENSHOT_MANIFEST_SCHEMA
+    ) || document.run_jti != binding.request_jti
         || document.artifact_digest != retention.artifact_digest
         || document.matrix_sha256 != retention.matrix_sha256
         || document.suite_origin != retention.suite_origin
     {
         bail!("review screenshot manifest identity conflicts with retention");
+    }
+    let target_issuer = document.target_issuer.as_deref();
+    let vp_trust_anchor = binding.vp_evidence_trust_anchor.as_ref();
+    if document.schema == crate::evidence::REVIEW_SCREENSHOT_MANIFEST_SCHEMA
+        && target_issuer.is_none()
+    {
+        bail!("review screenshot manifest has no target issuer");
     }
     let plans = retention
         .plans
@@ -2134,6 +2199,12 @@ fn validate_review_screenshot_manifest_binding(
         .and_then(Path::parent)
         .context("review screenshot manifest has no evidence root")?;
     for image in &document.screenshots {
+        if document.schema != crate::evidence::REVIEW_SCREENSHOT_MANIFEST_SCHEMA
+            && (image.source != crate::BrowserReviewScreenshotSource::SuiteVerificationEvidence
+                || image.verification_receipt.is_some())
+        {
+            bail!("legacy review screenshot manifest has a non-Suite source");
+        }
         let mut path_components = image.path.components();
         let valid_path = path_components
             .next()
@@ -2146,7 +2217,42 @@ fn validate_review_screenshot_manifest_binding(
                 Some(std::path::Component::Normal(_))
             )
             && path_components.next().is_none();
-        let target = format!("/test/a/{}/verification-evidence", image.module_id);
+        let source_valid = match image.source {
+            crate::BrowserReviewScreenshotSource::SuiteVerificationEvidence => {
+                image.verification_receipt.is_none()
+                    && image.trigger_origin == "https://www.certification.openid.net"
+                    && image.trigger_path
+                        == format!("/test/a/{}/verification-evidence", image.module_id)
+                    && sha256_hex(
+                        format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes(),
+                    ) == image.trigger_url_sha256
+            }
+            crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver => {
+                url::Url::parse(&format!("{}{}", image.trigger_origin, image.trigger_path))
+                    .is_ok_and(|url| {
+                        url.scheme() == "https"
+                            && url.host_str().is_some()
+                            && url.username().is_empty()
+                            && url.password().is_none()
+                            && url.query().is_none()
+                            && url.fragment().is_none()
+                    })
+                    && target_issuer
+                        .zip(vp_trust_anchor)
+                        .is_some_and(|(target_issuer, anchor)| {
+                            target_issuer == anchor.target_issuer
+                                && image.verification_receipt.as_ref().is_some_and(|receipt| {
+                                    verify_vp_receipt_provenance(
+                                        receipt, anchor, binding, retention, image,
+                                    )
+                                })
+                        })
+                    && image.trigger_path == "/ui/verification-result"
+                    && sha256_hex(
+                        format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes(),
+                    ) == image.trigger_url_sha256
+            }
+        };
         if !plans.contains(&(&image.matrix_plan_id, &image.suite_plan_id))
             || !modules.contains(&(
                 &image.matrix_plan_id,
@@ -2159,11 +2265,8 @@ fn validate_review_screenshot_manifest_binding(
             || image.size == 0
             || !lower_hex(&image.sha256, 64)
             || !lower_hex(&image.receipt_sha256, 64)
-            || image.trigger_origin != "https://www.certification.openid.net"
-            || image.trigger_path != target
             || !lower_hex(&image.trigger_url_sha256, 64)
-            || sha256_hex(format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes())
-                != image.trigger_url_sha256
+            || !source_valid
             || !images.insert(&image.path)
         {
             bail!("review screenshot manifest screenshot graph is invalid");
@@ -2235,6 +2338,8 @@ fn validate_review_screenshot_manifest_binding(
             || audit.trigger_origin != image.trigger_origin
             || audit.trigger_path != image.trigger_path
             || audit.trigger_url_sha256 != image.trigger_url_sha256
+            || audit.source != image.source
+            || audit.verification_receipt != image.verification_receipt
         {
             bail!("review screenshot receipt conflicts with the manifest");
         }
@@ -2318,6 +2423,109 @@ fn validate_review_screenshot_manifest_binding(
         bail!("review screenshot run directory is missing a declared entry");
     }
     Ok(())
+}
+
+fn verify_vp_receipt_provenance(
+    receipt: &crate::OpenId4VpVerificationReceiptProvenance,
+    anchor: &OpenId4VpEvidenceTrustAnchor,
+    binding: &TenantResourceRecoveryBinding,
+    retention: &SuiteRetentionManifest,
+    image: &ReviewScreenshotManifestImage,
+) -> bool {
+    use time::format_description::well_known::Rfc3339;
+
+    if receipt.issuer != anchor.target_issuer
+        || receipt.deployment_id != anchor.deployment_id
+        || receipt.tenant_id != binding.tenant_id
+        || receipt.runtime_instance_id != anchor.runtime_instance_id
+        || receipt.instance_key_id != anchor.instance_key_id
+        || receipt.instance_public_key_base64 != anchor.instance_public_key_base64
+        || image.trigger_origin != anchor.target_issuer
+        || receipt.receipt_api_url
+            != format!("{}/openid4vp/verification-receipts", anchor.target_issuer)
+        || sha256_hex(receipt.receipt_jws.as_bytes()) != receipt.receipt_sha256
+        || !lower_hex(&receipt.receipt_sha256, 64)
+        || !lower_hex(&receipt.capability_sha256, 64)
+        || uuid::Uuid::parse_str(&receipt.issuance_request_jti).is_err()
+        || !lower_hex(&receipt.presentation_binding_sha256, 64)
+        || !lower_hex(&receipt.intent_sha256, 64)
+    {
+        return false;
+    }
+    let Ok(key) =
+        nazo_operator_protocol::decode_instance_public_key(&anchor.instance_public_key_base64)
+    else {
+        return false;
+    };
+    if nazo_operator_protocol::instance_key_id(&key) != receipt.instance_key_id {
+        return false;
+    }
+    let Ok(variant_bytes) = serde_json::to_vec(&image.variant) else {
+        return false;
+    };
+    let context = nazo_operator_protocol::Openid4vpEvidenceContext {
+        run_jti: binding.request_jti.clone(),
+        artifact_sha256: retention.artifact_digest.clone(),
+        matrix_sha256: retention.matrix_sha256.clone(),
+        suite_plan_id: image.suite_plan_id.clone(),
+        suite_module_id: image.module_id.clone(),
+        test_name: image.test_name.clone(),
+        variant_sha256: sha256_hex(&variant_bytes),
+    };
+    let Ok(context_sha256) =
+        nazo_operator_protocol::canonical_openid4vp_evidence_context_sha256(&context)
+    else {
+        return false;
+    };
+    let Ok(completed_at) = time::OffsetDateTime::parse(&receipt.completed_at, &Rfc3339) else {
+        return false;
+    };
+    if completed_at.format(&Rfc3339).ok().as_deref() != Some(receipt.completed_at.as_str()) {
+        return false;
+    }
+    let Ok(expires_at) = time::OffsetDateTime::parse(&receipt.expires_at, &Rfc3339) else {
+        return false;
+    };
+    if expires_at.format(&Rfc3339).ok().as_deref() != Some(receipt.expires_at.as_str())
+        || expires_at <= completed_at
+    {
+        return false;
+    }
+    let receipt_id = receipt.receipt_id.to_string();
+    let transaction_id = receipt.transaction_id.to_string();
+    let expected = nazo_operator_protocol::Openid4vpVerificationReceiptExpectations {
+        issuer: &anchor.target_issuer,
+        audience: &receipt.receipt_api_url,
+        deployment_id: &receipt.deployment_id,
+        runtime_instance_id: &receipt.runtime_instance_id,
+        instance_key_id: &receipt.instance_key_id,
+        tenant_id: &receipt.tenant_id,
+        transaction_id: &transaction_id,
+        receipt_id: &receipt_id,
+        issuance_request_jti: &receipt.issuance_request_jti,
+        evidence_context_sha256: &context_sha256,
+        presentation_binding_sha256: &receipt.presentation_binding_sha256,
+        intent_sha256: &receipt.intent_sha256,
+        capability_sha256: &receipt.capability_sha256,
+    };
+    let Ok(verified) = nazo_operator_protocol::verify_openid4vp_verification_receipt(
+        &receipt.receipt_jws,
+        &expected,
+        &key,
+        completed_at.unix_timestamp(),
+    ) else {
+        return false;
+    };
+    verified.completed_at == receipt.completed_at
+        && verified.iss == receipt.issuer
+        && verified.deployment_id == receipt.deployment_id
+        && verified.tenant_id == receipt.tenant_id
+        && verified.runtime_instance_id == receipt.runtime_instance_id
+        && verified.instance_key_id == receipt.instance_key_id
+        && verified.transaction_id == transaction_id
+        && verified.issuance_request_jti == receipt.issuance_request_jti
+        && verified.intent_sha256 == receipt.intent_sha256
+        && verified.exp == expires_at.unix_timestamp()
 }
 
 fn validate_suite_retention_manifest_path(
@@ -2437,7 +2645,44 @@ fn validate_tenant_resource_binding(
     validate_tenant_resource_identities(
         &binding.resource_identities,
         !matches!(binding.operation, TenantResourceOperation::Enumerate),
-    )
+    )?;
+    if let Some(anchor) = &binding.vp_evidence_trust_anchor {
+        validate_vp_evidence_trust_anchor(anchor, binding)?;
+    }
+    Ok(())
+}
+
+fn validate_vp_evidence_trust_anchor(
+    anchor: &OpenId4VpEvidenceTrustAnchor,
+    binding: &TenantResourceRecoveryBinding,
+) -> anyhow::Result<()> {
+    validate_component(&anchor.deployment_id, "VP evidence deployment ID")?;
+    validate_component(
+        &anchor.runtime_instance_id,
+        "VP evidence runtime instance ID",
+    )?;
+    validate_component(&anchor.instance_key_id, "VP evidence instance key ID")?;
+    let issuer =
+        url::Url::parse(&anchor.target_issuer).context("VP evidence target issuer is invalid")?;
+    if anchor.deployment_id != binding.deployment_id
+        || issuer.scheme() != "https"
+        || issuer.host_str().is_none()
+        || !issuer.username().is_empty()
+        || issuer.password().is_some()
+        || issuer.query().is_some()
+        || issuer.fragment().is_some()
+        || !matches!(issuer.path(), "" | "/")
+        || anchor.target_issuer != issuer.as_str().trim_end_matches('/')
+    {
+        bail!("VP evidence trust anchor conflicts with the recovery binding");
+    }
+    let key =
+        nazo_operator_protocol::decode_instance_public_key(&anchor.instance_public_key_base64)
+            .context("VP evidence instance public key is invalid")?;
+    if nazo_operator_protocol::instance_key_id(&key) != anchor.instance_key_id {
+        bail!("VP evidence instance key ID conflicts with its public key");
+    }
+    Ok(())
 }
 
 fn validate_compact_jws(value: &str, label: &str) -> anyhow::Result<()> {
@@ -2644,6 +2889,7 @@ mod tests {
             expected_revision: 7,
             manifest_path: Some(manifest_path),
             proxy: None,
+            vp_evidence_trust_anchor: None,
             resource_identities: vec![tenant_resource_identity('c')],
         }
     }
@@ -2675,6 +2921,209 @@ mod tests {
             revision: binding.expected_revision + 1,
             resources: binding.resource_identities.clone(),
         }
+    }
+
+    #[cfg(unix)]
+    fn vp_receipt_fixture(
+        binding: &mut TenantResourceRecoveryBinding,
+    ) -> (SuiteRetentionManifest, ReviewScreenshotManifestImage) {
+        use time::format_description::well_known::Rfc3339;
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[13; 32]);
+        let verifying = signing.verifying_key();
+        let key_id = nazo_operator_protocol::instance_key_id(&verifying);
+        binding.vp_evidence_trust_anchor = Some(OpenId4VpEvidenceTrustAnchor {
+            target_issuer: "https://issuer.example".to_owned(),
+            deployment_id: binding.deployment_id.clone(),
+            runtime_instance_id: "runtime-a".to_owned(),
+            instance_key_id: key_id.clone(),
+            instance_public_key_base64: nazo_operator_protocol::encode_instance_public_key(
+                &verifying,
+            ),
+        });
+        let retention = SuiteRetentionManifest {
+            schema: SUITE_RETENTION_MANIFEST_SCHEMA,
+            suite_origin: "https://www.certification.openid.net".to_owned(),
+            artifact_digest: "a".repeat(64),
+            matrix_sha256: "b".repeat(64),
+            deployment_id: binding.deployment_id.clone(),
+            tenant_id: binding.tenant_id.clone(),
+            run_id: binding.request_jti.clone(),
+            review_screenshot_manifest: None,
+            plans: vec![SuiteRetentionPlan {
+                matrix_plan_id: "matrix-plan-1".to_owned(),
+                suite_plan_id: "550e8400-e29b-41d4-a716-446655440001".to_owned(),
+                plan_name: "Certification plan".to_owned(),
+                plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256("matrix-plan-1"),
+            }],
+        };
+        let variant = std::collections::BTreeMap::new();
+        let context = nazo_operator_protocol::Openid4vpEvidenceContext {
+            run_jti: binding.request_jti.clone(),
+            artifact_sha256: retention.artifact_digest.clone(),
+            matrix_sha256: retention.matrix_sha256.clone(),
+            suite_plan_id: "550e8400-e29b-41d4-a716-446655440001".to_owned(),
+            suite_module_id: "550e8400-e29b-41d4-a716-446655440002".to_owned(),
+            test_name: "vp-happy".to_owned(),
+            variant_sha256: sha256_hex(&serde_json::to_vec(&variant).expect("variant")),
+        };
+        let presentation_binding = nazo_operator_protocol::Openid4vpPresentationBinding {
+            presentation_request_sha256: "c".repeat(64),
+            trust_policy: nazo_operator_protocol::Openid4vpTrustPolicyBinding {
+                binding_id: None,
+                resource_id: None,
+                resource_digest: None,
+            },
+        };
+        let presentation_binding_sha256 =
+            nazo_operator_protocol::canonical_openid4vp_presentation_binding_sha256(
+                &presentation_binding,
+            )
+            .expect("presentation binding digest");
+        let now = time::OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .expect("whole seconds");
+        let completed_at = now.format(&Rfc3339).expect("completed time");
+        let expires_at = (now + time::Duration::seconds(300))
+            .format(&Rfc3339)
+            .expect("expiry time");
+        let transaction_id = "550e8400-e29b-41d4-a716-446655440003".to_owned();
+        let receipt_id = "550e8400-e29b-41d4-a716-446655440004".to_owned();
+        let issuance_request_jti = "550e8400-e29b-41d4-a716-446655440005".to_owned();
+        let intent_sha256 = "d".repeat(64);
+        let capability_sha256 = "e".repeat(64);
+        let receipt = nazo_operator_protocol::Openid4vpVerificationReceipt {
+            schema: 1,
+            iss: "https://issuer.example".to_owned(),
+            aud: "https://issuer.example/openid4vp/verification-receipts".to_owned(),
+            jti: receipt_id.clone(),
+            iat: now.unix_timestamp(),
+            exp: now.unix_timestamp() + 300,
+            deployment_id: binding.deployment_id.clone(),
+            runtime_instance_id: "runtime-a".to_owned(),
+            instance_key_id: key_id.clone(),
+            tenant_id: binding.tenant_id.clone(),
+            transaction_id: transaction_id.clone(),
+            issuance_request_jti: issuance_request_jti.clone(),
+            status: nazo_operator_protocol::Openid4vpVerificationStatus::Verified,
+            evidence_context: context,
+            presentation_binding,
+            intent_sha256: intent_sha256.clone(),
+            completed_at: completed_at.clone(),
+            capability_sha256: capability_sha256.clone(),
+        };
+        let receipt_jws = nazo_operator_protocol::sign_openid4vp_verification_receipt(
+            &receipt, &key_id, &signing,
+        )
+        .expect("sign receipt");
+        let receipt = crate::OpenId4VpVerificationReceiptProvenance {
+            issuer: "https://issuer.example".to_owned(),
+            receipt_api_url: "https://issuer.example/openid4vp/verification-receipts".to_owned(),
+            receipt_id: uuid::Uuid::parse_str(&receipt_id).expect("receipt id"),
+            transaction_id: uuid::Uuid::parse_str(&transaction_id).expect("transaction id"),
+            tenant_id: binding.tenant_id.clone(),
+            issuance_request_jti,
+            presentation_binding_sha256,
+            intent_sha256,
+            receipt_sha256: sha256_hex(receipt_jws.as_bytes()),
+            receipt_jws,
+            capability_sha256,
+            deployment_id: binding.deployment_id.clone(),
+            runtime_instance_id: "runtime-a".to_owned(),
+            instance_key_id: key_id,
+            instance_public_key_base64: binding
+                .vp_evidence_trust_anchor
+                .as_ref()
+                .expect("anchor")
+                .instance_public_key_base64
+                .clone(),
+            completed_at,
+            expires_at,
+        };
+        let image = ReviewScreenshotManifestImage {
+            matrix_plan_id: "matrix-plan-1".to_owned(),
+            suite_plan_id: "550e8400-e29b-41d4-a716-446655440001".to_owned(),
+            module_id: "550e8400-e29b-41d4-a716-446655440002".to_owned(),
+            test_name: "vp-happy".to_owned(),
+            variant,
+            marker: crate::ReviewScreenshotMarker::Required,
+            obligation_index: 0,
+            path: PathBuf::from("review-screenshots/run/screenshot.png"),
+            sha256: "f".repeat(64),
+            size: 1,
+            receipt_sha256: "a".repeat(64),
+            trigger_origin: "https://issuer.example".to_owned(),
+            trigger_path: "/ui/verification-result".to_owned(),
+            trigger_url_sha256: sha256_hex(b"https://issuer.example/ui/verification-result"),
+            source: crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver,
+            verification_receipt: Some(receipt),
+        };
+        (retention, image)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_screenshot_receipt_recovery_rechecks_runtime_tenant_and_signed_bindings() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!("nazoauth-vp-recovery-{}", uuid::Uuid::now_v7()));
+        crate::secure_file::ensure_directory(&root, true).expect("test root");
+        let mut binding = tenant_resource_binding(&root);
+        let (retention, image) = vp_receipt_fixture(&mut binding);
+        let anchor = binding.vp_evidence_trust_anchor.as_ref().expect("anchor");
+        let receipt = image
+            .verification_receipt
+            .as_ref()
+            .expect("receipt provenance");
+        assert!(verify_vp_receipt_provenance(
+            receipt, anchor, &binding, &retention, &image
+        ));
+
+        let mut wrong_tenant = receipt.clone();
+        wrong_tenant.tenant_id = "00000000-0000-4000-8000-000000000009".to_owned();
+        assert!(!verify_vp_receipt_provenance(
+            &wrong_tenant,
+            anchor,
+            &binding,
+            &retention,
+            &image
+        ));
+        let mut wrong_issuer = receipt.clone();
+        wrong_issuer.issuer = "https://other-issuer.example".to_owned();
+        assert!(!verify_vp_receipt_provenance(
+            &wrong_issuer,
+            anchor,
+            &binding,
+            &retention,
+            &image
+        ));
+        let mut wrong_intent = receipt.clone();
+        wrong_intent.intent_sha256 = "0".repeat(64);
+        assert!(!verify_vp_receipt_provenance(
+            &wrong_intent,
+            anchor,
+            &binding,
+            &retention,
+            &image
+        ));
+        let mut tampered_jws = receipt.clone();
+        tampered_jws.receipt_jws.push('x');
+        assert!(!verify_vp_receipt_provenance(
+            &tampered_jws,
+            anchor,
+            &binding,
+            &retention,
+            &image
+        ));
+        let mut wrong_expiry = receipt.clone();
+        wrong_expiry.expires_at = "2030-01-01T00:00:00Z".to_owned();
+        assert!(!verify_vp_receipt_provenance(
+            &wrong_expiry,
+            anchor,
+            &binding,
+            &retention,
+            &image
+        ));
+        std::fs::remove_dir_all(&root).expect("remove test root");
     }
 
     #[test]
@@ -2717,6 +3166,44 @@ mod tests {
         assert_eq!(guard.tenant_resource_binding(), Some(&binding));
         assert!(!guard.tenant_resource_cleanup_complete());
         drop(guard);
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_evidence_anchor_upgrades_only_new_tenant_journals_to_schema_four() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-tenant-recovery-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let mut binding = tenant_resource_binding(&root);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[17; 32]);
+        let key = signing.verifying_key();
+        binding.vp_evidence_trust_anchor = Some(OpenId4VpEvidenceTrustAnchor {
+            target_issuer: "https://issuer.example".to_owned(),
+            deployment_id: binding.deployment_id.clone(),
+            runtime_instance_id: "runtime-a".to_owned(),
+            instance_key_id: nazo_operator_protocol::instance_key_id(&key),
+            instance_public_key_base64: nazo_operator_protocol::encode_instance_public_key(&key),
+        });
+        let guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("persist schema-four tenant intent");
+        let journal_path = root.join(format!("run-{}.json", binding.request_jti));
+        let journal = std::fs::read_to_string(&journal_path).expect("read journal");
+        assert!(journal.contains("\"schema\": 4"));
+        assert!(journal.contains("vp_evidence_trust_anchor"));
+        drop(guard);
+        let mut pending = store.claim_pending().expect("claim schema-four journal");
+        let claimed = pending.pop().expect("claimed journal");
+        assert_eq!(
+            claimed
+                .tenant_resource_binding()
+                .and_then(|item| item.vp_evidence_trust_anchor.as_ref()),
+            binding.vp_evidence_trust_anchor.as_ref()
+        );
+        drop(claimed);
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 

@@ -15,9 +15,13 @@ use zeroize::Zeroizing;
 use crate::{ConformanceReport, VerifiedOidfArtifact};
 
 #[cfg(unix)]
-const EVIDENCE_BUNDLE_SCHEMA: u32 = 3;
+const EVIDENCE_BUNDLE_SCHEMA: u32 = 4;
 /// Shared writer/retention-reader ceiling for the public screenshot manifest.
 pub(crate) const MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES: usize = 1024 * 1024;
+/// Schema 6 retains the runtime-signed OpenID4VP receipt provenance needed to
+/// re-verify a NazoAuthWeb result after process restart. Earlier schemas are
+/// accepted only for their Suite-origin screenshot source.
+pub(crate) const REVIEW_SCREENSHOT_MANIFEST_SCHEMA: u32 = 6;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
@@ -177,6 +181,9 @@ struct EvidenceScreenshotManifest {
     trigger_origin: String,
     trigger_path: String,
     trigger_url_sha256: String,
+    source: crate::BrowserReviewScreenshotSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_receipt: Option<crate::OpenId4VpVerificationReceiptProvenance>,
 }
 
 #[cfg(unix)]
@@ -195,6 +202,10 @@ struct ReviewScreenshotAudit {
     trigger_origin: String,
     trigger_path: String,
     trigger_url_sha256: String,
+    #[serde(default)]
+    source: crate::BrowserReviewScreenshotSource,
+    #[serde(default)]
+    verification_receipt: Option<crate::OpenId4VpVerificationReceiptProvenance>,
 }
 
 #[cfg(unix)]
@@ -337,10 +348,13 @@ pub fn write_private_evidence_bundle(
                     || audit.path != screenshot.path
                     || audit.sha256 != screenshot.sha256
                     || audit.size != screenshot.size
-                    || audit.trigger_origin != report.suite_origin
-                    || !crate::browser::review_screenshot_path_binds_module(&trigger_url, module_id)
-                    || !lower_hex(&audit.trigger_url_sha256, 64)
-                    || sha256(trigger_url.as_str().as_bytes()) != audit.trigger_url_sha256
+                    || !valid_review_screenshot_trigger(
+                        &audit,
+                        &trigger_url,
+                        &report.suite_origin,
+                        &identity.deployment.target_issuer,
+                        module_id,
+                    )
                 {
                     return Err(EvidenceError::Identity);
                 }
@@ -350,14 +364,7 @@ pub fn write_private_evidence_bundle(
                         .ok_or(EvidenceError::Identity)?;
                 }
                 let destination = directory.join(&screenshot.path);
-                crate::secure_file::write_new_or_exact(&destination, &screenshot_bytes, true)
-                    .map_err(map_secure_file_error)?;
-                crate::secure_file::write_new_or_exact(
-                    &destination.with_extension("png.receipt.json"),
-                    &receipt,
-                    true,
-                )
-                .map_err(map_secure_file_error)?;
+                write_private_screenshot_pair(&destination, &screenshot_bytes, &receipt)?;
                 screenshots.push(EvidenceScreenshotManifest {
                     matrix_plan_id: module.matrix_plan_id.clone(),
                     suite_plan_id: module.suite_plan_id.clone(),
@@ -373,6 +380,8 @@ pub fn write_private_evidence_bundle(
                     trigger_origin: audit.trigger_origin,
                     trigger_path: audit.trigger_path,
                     trigger_url_sha256: audit.trigger_url_sha256,
+                    source: audit.source,
+                    verification_receipt: audit.verification_receipt,
                 });
                 total_screenshot_bytes = total_screenshot_bytes.saturating_add(screenshot.size);
             }
@@ -453,10 +462,11 @@ pub fn write_review_screenshot_manifest(
     root: &Path,
     run_jti: &str,
     artifact_digest: &str,
+    target_issuer: &str,
 ) -> Result<ReviewScreenshotManifestReceipt, EvidenceError> {
     #[cfg(not(unix))]
     {
-        let _ = (report, root, run_jti, artifact_digest);
+        let _ = (report, root, run_jti, artifact_digest, target_issuer);
         Err(EvidenceError::UnsupportedPlatform)
     }
     #[cfg(unix)]
@@ -473,6 +483,18 @@ pub fn write_review_screenshot_manifest(
         if !lower_hex(artifact_digest, 64) {
             return Err(EvidenceError::Identity);
         }
+        let target_issuer = url::Url::parse(target_issuer).map_err(|_| EvidenceError::Identity)?;
+        if target_issuer.scheme() != "https"
+            || target_issuer.host_str().is_none()
+            || !target_issuer.username().is_empty()
+            || target_issuer.password().is_some()
+            || target_issuer.query().is_some()
+            || target_issuer.fragment().is_some()
+            || !matches!(target_issuer.path(), "" | "/")
+        {
+            return Err(EvidenceError::Identity);
+        }
+        let target_issuer = target_issuer.as_str().trim_end_matches('/').to_owned();
         let mut modules = Vec::with_capacity(report.modules.len());
         let mut screenshots = Vec::new();
         let mut paths = BTreeSet::new();
@@ -535,10 +557,13 @@ pub fn write_review_screenshot_manifest(
                     || audit.path != screenshot.path
                     || audit.sha256 != screenshot.sha256
                     || audit.size != screenshot.size
-                    || audit.trigger_origin != report.suite_origin
-                    || !crate::browser::review_screenshot_path_binds_module(&trigger_url, module_id)
-                    || !lower_hex(&audit.trigger_url_sha256, 64)
-                    || sha256(trigger_url.as_str().as_bytes()) != audit.trigger_url_sha256
+                    || !valid_review_screenshot_trigger(
+                        &audit,
+                        &trigger_url,
+                        &report.suite_origin,
+                        &target_issuer,
+                        module_id,
+                    )
                 {
                     return Err(EvidenceError::Identity);
                 }
@@ -562,6 +587,8 @@ pub fn write_review_screenshot_manifest(
                     trigger_origin: audit.trigger_origin,
                     trigger_path: audit.trigger_path,
                     trigger_url_sha256: audit.trigger_url_sha256,
+                    source: audit.source,
+                    verification_receipt: audit.verification_receipt,
                 });
                 total_screenshot_bytes = total_screenshot_bytes.saturating_add(image.len());
             }
@@ -570,11 +597,12 @@ pub fn write_review_screenshot_manifest(
             }
         }
         let bytes = serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": 3,
+            "schema": REVIEW_SCREENSHOT_MANIFEST_SCHEMA,
             "run_jti": run_jti,
             "artifact_digest": artifact_digest,
             "matrix_sha256": report.matrix_digest,
             "suite_origin": report.suite_origin,
+            "target_issuer": target_issuer,
             "modules": modules,
             "screenshots": screenshots,
         }))
@@ -613,6 +641,24 @@ fn write_private_new_or_exact(path: &Path, bytes: &[u8]) -> Result<(), EvidenceE
 }
 
 #[cfg(unix)]
+fn write_private_screenshot_pair(
+    image_path: &Path,
+    image: &[u8],
+    audit: &[u8],
+) -> Result<(), EvidenceError> {
+    let outcome = crate::secure_file::write_new_or_exact_with_outcome(image_path, image, true)
+        .map_err(map_secure_file_error)?;
+    let audit_path = image_path.with_extension("png.receipt.json");
+    if let Err(error) = crate::secure_file::write_new_or_exact(&audit_path, audit, true) {
+        if matches!(outcome, crate::secure_file::NewOrExactOutcome::Created) {
+            let _ = crate::secure_file::remove_private_file_if_exact(image_path, image);
+        }
+        return Err(map_secure_file_error(error));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn validate_review_screenshot_obligations(
     module: &crate::report::ModuleReport,
 ) -> Result<(), EvidenceError> {
@@ -627,6 +673,68 @@ fn validate_review_screenshot_obligations(
         return Err(EvidenceError::Identity);
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn valid_review_screenshot_trigger(
+    audit: &ReviewScreenshotAudit,
+    trigger_url: &url::Url,
+    suite_origin: &str,
+    target_issuer: &str,
+    module_id: &str,
+) -> bool {
+    if !lower_hex(&audit.trigger_url_sha256, 64) {
+        return false;
+    }
+    match audit.source {
+        crate::BrowserReviewScreenshotSource::SuiteVerificationEvidence => {
+            audit.verification_receipt.is_none()
+                && audit.trigger_origin == suite_origin
+                && crate::browser::review_screenshot_path_binds_module(trigger_url, module_id)
+                && sha256(trigger_url.as_str().as_bytes()) == audit.trigger_url_sha256
+        }
+        crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver => {
+            audit.verification_receipt.as_ref().is_some_and(|receipt| {
+                valid_vp_verification_receipt_provenance(receipt, target_issuer)
+            }) && audit.trigger_origin == target_issuer
+                && trigger_url.scheme() == "https"
+                && trigger_url.host_str().is_some()
+                && trigger_url.path() == "/ui/verification-result"
+                && trigger_url.query().is_none()
+                && trigger_url.fragment().is_none()
+                && trigger_url.username().is_empty()
+                && trigger_url.password().is_none()
+                && sha256(format!("{}{}", audit.trigger_origin, audit.trigger_path).as_bytes())
+                    == audit.trigger_url_sha256
+        }
+    }
+}
+
+#[cfg(unix)]
+fn valid_vp_verification_receipt_provenance(
+    receipt: &crate::OpenId4VpVerificationReceiptProvenance,
+    target_issuer: &str,
+) -> bool {
+    receipt.issuer == target_issuer
+        && receipt.receipt_api_url == format!("{target_issuer}/openid4vp/verification-receipts")
+        && !receipt.receipt_jws.is_empty()
+        && receipt.receipt_jws.len() <= 16 * 1024
+        && lower_hex(&receipt.receipt_sha256, 64)
+        && lower_hex(&receipt.capability_sha256, 64)
+        && !receipt.deployment_id.is_empty()
+        && uuid::Uuid::parse_str(&receipt.tenant_id)
+            .is_ok_and(|tenant_id| tenant_id.to_string() == receipt.tenant_id)
+        && !receipt.runtime_instance_id.is_empty()
+        && !receipt.instance_key_id.is_empty()
+        && uuid::Uuid::parse_str(&receipt.issuance_request_jti).is_ok()
+        && lower_hex(&receipt.presentation_binding_sha256, 64)
+        && lower_hex(&receipt.intent_sha256, 64)
+        && nazo_operator_protocol::decode_instance_public_key(&receipt.instance_public_key_base64)
+            .is_ok_and(|key| {
+                nazo_operator_protocol::instance_key_id(&key) == receipt.instance_key_id
+            })
+        && !receipt.completed_at.is_empty()
+        && !receipt.expires_at.is_empty()
 }
 
 fn validate_review_screenshot_run_limit(report: &ConformanceReport) -> Result<(), EvidenceError> {

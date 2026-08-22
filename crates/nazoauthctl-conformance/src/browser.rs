@@ -101,8 +101,10 @@ pub use openid4vci::{
     OpenId4VciModule,
 };
 pub use openid4vp::{
-    ConformanceBinding, OpenId4VpError, OpenId4VpPresentation, OpenId4VpStartRequest,
-    OpenId4VpVerifier, OpenId4VpVerifierClient,
+    ConformanceBinding, OpenId4VpError, OpenId4VpEvidenceContext, OpenId4VpEvidenceRunContext,
+    OpenId4VpEvidenceVerifier, OpenId4VpPresentation, OpenId4VpStartRequest,
+    OpenId4VpVerificationEvidence, OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier,
+    OpenId4VpVerifierClient,
 };
 pub use parser::{parse_browser_entries, parse_browser_entries_owned};
 pub use plan::{BrowserRunnerState, OpenId4VcBrowserState};
@@ -161,8 +163,25 @@ pub trait BrowserDriver: Send {
     fn current_url(&mut self) -> Result<Url, BrowserError>;
     fn page_source(&mut self) -> Result<String, BrowserError>;
     fn find_element(&mut self, selector: &BrowserSelector) -> Result<String, BrowserError>;
+    /// Find an element relative to a previously verified root.  VP evidence
+    /// projections must not be satisfied by lookalike elements elsewhere in
+    /// the document.
+    fn find_child_element(
+        &mut self,
+        _parent: &str,
+        _selector: &BrowserSelector,
+    ) -> Result<String, BrowserError> {
+        Err(BrowserError::UnsupportedCommand)
+    }
     fn element_displayed(&mut self, element: &str) -> Result<bool, BrowserError>;
     fn element_text(&mut self, element: &str) -> Result<String, BrowserError>;
+    fn element_attribute(
+        &mut self,
+        _element: &str,
+        _name: &str,
+    ) -> Result<Option<String>, BrowserError> {
+        Err(BrowserError::UnsupportedCommand)
+    }
     fn element_send_keys(&mut self, element: &str, value: &str) -> Result<(), BrowserError>;
     fn element_click(&mut self, element: &str) -> Result<(), BrowserError>;
 
@@ -234,6 +253,31 @@ pub trait BrowserAutomation: Send {
     fn wait_for_url(&mut self, expected: &Url, timeout: Duration) -> Result<(), BrowserError> {
         let _ = (expected, timeout);
         Err(BrowserError::UnsupportedCommand)
+    }
+
+    /// Ask the lane which entry it would select *now* for the target's
+    /// authorization URL, before the verifier is completed. This preserves
+    /// `match_limit` and prior-entry accounting; callers must not infer the
+    /// result from a different Suite URL or an unselected alternative.
+    fn selected_openid4vp_result_marker(
+        &mut self,
+        _authorization_url: &Url,
+        _entries: &[BrowserEntry],
+        _suite_evidence_url: &Url,
+    ) -> Result<bool, BrowserError> {
+        Err(BrowserError::ReviewScreenshotRequired)
+    }
+
+    /// Navigate only to a verified NazoAuthWeb VP receipt view, prove its
+    /// non-secret DOM projection matches the runtime-signed receipt, then
+    /// capture the current page. This never executes Suite stand-in commands.
+    fn capture_openid4vp_verification_result(
+        &mut self,
+        _evidence: &crate::browser::OpenId4VpVerificationEvidence,
+        _capture: &BrowserReviewCaptureContext,
+        _obligation_index: usize,
+    ) -> Result<BrowserReviewScreenshotReceipt, BrowserError> {
+        Err(BrowserError::ReviewScreenshotRequired)
     }
 }
 
@@ -444,11 +488,64 @@ impl BrowserReviewCaptureContext {
         marker: ReviewScreenshotMarker,
         obligation_index: usize,
     ) -> Result<BrowserReviewScreenshotReceipt, BrowserError> {
+        self.write_png_with_audit(
+            bytes,
+            trigger_url,
+            marker,
+            obligation_index,
+            BrowserReviewScreenshotSource::SuiteVerificationEvidence,
+            None,
+        )
+    }
+
+    fn write_vp_png(
+        &self,
+        bytes: &[u8],
+        trigger_url: &Url,
+        marker: ReviewScreenshotMarker,
+        obligation_index: usize,
+        verification_receipt: &OpenId4VpVerificationReceiptProvenance,
+    ) -> Result<BrowserReviewScreenshotReceipt, BrowserError> {
+        self.write_png_with_audit(
+            bytes,
+            trigger_url,
+            marker,
+            obligation_index,
+            BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver,
+            Some(verification_receipt),
+        )
+    }
+
+    fn write_png_with_audit(
+        &self,
+        bytes: &[u8],
+        trigger_url: &Url,
+        marker: ReviewScreenshotMarker,
+        obligation_index: usize,
+        source: BrowserReviewScreenshotSource,
+        verification_receipt: Option<&OpenId4VpVerificationReceiptProvenance>,
+    ) -> Result<BrowserReviewScreenshotReceipt, BrowserError> {
         validate_png_screenshot(bytes)?;
+        if verification_receipt.is_some_and(|receipt| {
+            receipt.receipt_sha256.len() != 64
+                || !receipt
+                    .receipt_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        }) {
+            return Err(BrowserError::InvalidScreenshot);
+        }
         self.reserve_bytes(bytes.len())?;
         let relative_path = self.relative_path()?;
         let path = self.evidence_directory.join(&relative_path);
-        write_private_new_or_exact(&path, bytes)?;
+        let trigger_url_sha256 = match source {
+            BrowserReviewScreenshotSource::SuiteVerificationEvidence => {
+                sha256_hex(trigger_url.as_str().as_bytes())
+            }
+            BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver => sha256_hex(
+                format!("{}{}", redacted_origin(trigger_url), trigger_url.path()).as_bytes(),
+            ),
+        };
         let receipt = BrowserReviewScreenshotReceipt {
             path: relative_path,
             sha256: sha256_hex(bytes),
@@ -461,18 +558,35 @@ impl BrowserReviewCaptureContext {
             obligation_index,
             trigger_origin: redacted_origin(trigger_url),
             trigger_path: trigger_url.path().to_owned(),
-            trigger_url_sha256: sha256_hex(trigger_url.as_str().as_bytes()),
+            // The one-time VP capability sits only in the fragment. It is
+            // deliberately excluded from durable evidence; its signed hash
+            // was checked before this write.
+            trigger_url_sha256,
+            source,
+            verification_receipt: verification_receipt.cloned(),
         };
-        let audit_path = path.with_extension("png.receipt.json");
         let audit = serde_json::to_vec(&BrowserReviewScreenshotAudit::from(&receipt))
             .map_err(|_| BrowserError::EvidenceWrite)?;
-        write_private_new_or_exact(&audit_path, &audit)?;
+        let audit_path = path.with_extension("png.receipt.json");
+        let image_outcome = write_private_new_or_exact(&path, bytes)?;
+        if let Err(error) = write_private_new_or_exact(&audit_path, &audit) {
+            if matches!(
+                image_outcome,
+                crate::secure_file::NewOrExactOutcome::Created
+            ) {
+                let _ = crate::secure_file::remove_private_file_if_exact(&path, bytes);
+            }
+            return Err(error);
+        }
         Ok(receipt)
     }
 }
 
-fn write_private_new_or_exact(path: &std::path::Path, bytes: &[u8]) -> Result<(), BrowserError> {
-    crate::secure_file::write_new_or_exact(path, bytes, true)
+fn write_private_new_or_exact(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<crate::secure_file::NewOrExactOutcome, BrowserError> {
+    crate::secure_file::write_new_or_exact_with_outcome(path, bytes, true)
         .map_err(|_| BrowserError::EvidenceWrite)
 }
 
@@ -499,6 +613,24 @@ pub struct BrowserReviewScreenshotReceipt {
     pub trigger_origin: String,
     pub trigger_path: String,
     pub trigger_url_sha256: String,
+    pub source: BrowserReviewScreenshotSource,
+    pub verification_receipt: Option<OpenId4VpVerificationReceiptProvenance>,
+}
+
+/// The only two review image origins. The NazoAuthWeb source is admitted only
+/// after a same-module, runtime-signed OpenID4VP receipt was verified.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum BrowserReviewScreenshotSource {
+    #[serde(rename = "suite-verification-evidence")]
+    SuiteVerificationEvidence,
+    #[serde(rename = "nazo-vp-verification-result/live-webdriver")]
+    NazoVpVerificationResultLiveWebdriver,
+}
+
+impl Default for BrowserReviewScreenshotSource {
+    fn default() -> Self {
+        Self::SuiteVerificationEvidence
+    }
 }
 
 #[derive(Serialize)]
@@ -515,6 +647,9 @@ struct BrowserReviewScreenshotAudit<'a> {
     trigger_origin: &'a str,
     trigger_path: &'a str,
     trigger_url_sha256: &'a str,
+    source: BrowserReviewScreenshotSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_receipt: Option<&'a OpenId4VpVerificationReceiptProvenance>,
 }
 
 impl<'a> From<&'a BrowserReviewScreenshotReceipt> for BrowserReviewScreenshotAudit<'a> {
@@ -532,6 +667,8 @@ impl<'a> From<&'a BrowserReviewScreenshotReceipt> for BrowserReviewScreenshotAud
             trigger_origin: &receipt.trigger_origin,
             trigger_path: &receipt.trigger_path,
             trigger_url_sha256: &receipt.trigger_url_sha256,
+            source: receipt.source,
+            verification_receipt: receipt.verification_receipt.as_ref(),
         }
     }
 }
@@ -717,6 +854,42 @@ pub(crate) fn required_review_screenshot_count(entries: &[BrowserEntry]) -> usiz
         .count()
 }
 
+/// Returns true only when the browser program's already-*selected* entry
+/// reaches exactly one current-module verification-evidence task with one
+/// non-optional required screenshot command. Other entries (including
+/// mutually exclusive alternatives) deliberately have no authority to ask
+/// NazoAuth for a one-time VP result capability.
+pub(crate) fn selected_required_review_screenshot_marker(
+    entry: &BrowserEntry,
+    suite_evidence_url: &Url,
+) -> Result<bool, BrowserError> {
+    let mut markers = 0usize;
+    for task in &entry.tasks {
+        // A marker with no URL gate would execute on whichever page the
+        // browser happened to retain.  It has no authority to request a VP
+        // result capability.  The selected entry must explicitly wait for
+        // this module's signed Suite evidence URL.
+        let Some(pattern) = task.match_pattern.as_deref() else {
+            continue;
+        };
+        if task.optional || !glob_matches(pattern, suite_evidence_url.as_str()) {
+            continue;
+        }
+        for command in &task.commands {
+            if matches!(
+                command,
+                BrowserCommand::WaitForElement {
+                    review_screenshot: Some(ReviewScreenshotMarker::Required),
+                    ..
+                }
+            ) {
+                markers = markers.saturating_add(1);
+            }
+        }
+    }
+    Ok(markers == 1)
+}
+
 pub struct BrowserExecutor<D> {
     driver: D,
     policy: BrowserPolicy,
@@ -880,6 +1053,156 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn capture_openid4vp_verification_result(
+        &mut self,
+        evidence: &OpenId4VpVerificationEvidence,
+        capture: &BrowserReviewCaptureContext,
+        obligation_index: usize,
+    ) -> Result<BrowserReviewScreenshotReceipt, BrowserError> {
+        if obligation_index >= MAX_REVIEW_SCREENSHOTS_PER_MODULE {
+            return Err(BrowserError::ReviewScreenshotLimit);
+        }
+        // Reserve before navigating or asking WebDriver for bytes, so the
+        // shared cross-lane budget cannot be exceeded by concurrent workers.
+        capture.reserve_attempt()?;
+        let ui_url = evidence
+            .ui_url()
+            .map_err(|_| BrowserError::CrossOriginNavigation)?;
+        if !self.policy.target_origin.allows(&ui_url)
+            || ui_url.path() != "/ui/verification-result"
+            || ui_url.query().is_some()
+            || !ui_url.fragment().is_some_and(|fragment| {
+                fragment.len() == "receipt=".len() + 43
+                    && fragment.starts_with("receipt=")
+                    && fragment["receipt=".len()..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
+        {
+            return Err(BrowserError::CrossOriginNavigation);
+        }
+        self.navigate(&ui_url)?;
+        let current = self.ensure_current_url()?;
+        if !self.policy.target_origin.allows(&current)
+            || current.path() != "/ui/verification-result"
+            || current.query().is_some()
+            || current.fragment().is_some()
+        {
+            return Err(BrowserError::CrossOriginNavigation);
+        }
+        let deadline = self.deadline(DEFAULT_STEP_TIMEOUT);
+        loop {
+            let root = self.driver.find_element(&BrowserSelector::Css(
+                "[data-testid=\"vp-verification-result\"]".to_owned(),
+            ));
+            match root {
+                Ok(root) => match self
+                    .driver
+                    .element_attribute(&root, "data-state")?
+                    .as_deref()
+                {
+                    Some("verified") => {
+                        if !self.driver.element_displayed(&root)? {
+                            return Err(BrowserError::Protocol);
+                        }
+                        break;
+                    }
+                    Some("loading") => self.sleep_until(deadline)?,
+                    _ => return Err(BrowserError::Protocol),
+                },
+                Err(BrowserError::ElementNotFound | BrowserError::StaleElement) => {
+                    self.sleep_until(deadline)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.verify_openid4vp_result_projection(evidence)?;
+        // Re-observe after the DOM checks: a page that navigates during the
+        // bounded wait must not donate a screenshot from another origin.
+        let current = self.ensure_current_url()?;
+        if !self.policy.target_origin.allows(&current)
+            || current.path() != "/ui/verification-result"
+            || current.query().is_some()
+            || current.fragment().is_some()
+        {
+            return Err(BrowserError::CrossOriginNavigation);
+        }
+        let context = capture.for_index(obligation_index)?;
+        let screenshot = self.driver.screenshot_png()?;
+        // The screenshot bytes are still only in memory. Recheck both the
+        // URL and all visible DOM bindings before the durable PNG/receipt
+        // pair is committed, so a late navigation cannot donate another page.
+        let current = self.ensure_current_url()?;
+        if !self.policy.target_origin.allows(&current)
+            || current.path() != "/ui/verification-result"
+            || current.query().is_some()
+            || current.fragment().is_some()
+        {
+            return Err(BrowserError::CrossOriginNavigation);
+        }
+        self.verify_openid4vp_result_projection(evidence)?;
+        context.write_vp_png(
+            &screenshot,
+            &current,
+            ReviewScreenshotMarker::Required,
+            obligation_index,
+            &evidence.receipt,
+        )
+    }
+
+    fn expect_result_text(
+        &mut self,
+        root: &str,
+        test_id: &str,
+        expected: &str,
+    ) -> Result<(), BrowserError> {
+        let element = self.driver.find_child_element(
+            root,
+            &BrowserSelector::Css(format!("[data-testid=\"{test_id}\"]")),
+        )?;
+        if !self.driver.element_displayed(&element)?
+            || self.driver.element_text(&element)? != expected
+        {
+            return Err(BrowserError::Protocol);
+        }
+        Ok(())
+    }
+
+    fn verify_openid4vp_result_projection(
+        &mut self,
+        evidence: &OpenId4VpVerificationEvidence,
+    ) -> Result<(), BrowserError> {
+        let root = self.driver.find_element(&BrowserSelector::Css(
+            "[data-testid=\"vp-verification-result\"]".to_owned(),
+        ))?;
+        if !self.driver.element_displayed(&root)?
+            || self
+                .driver
+                .element_attribute(&root, "data-state")?
+                .as_deref()
+                != Some("verified")
+        {
+            return Err(BrowserError::Protocol);
+        }
+        self.expect_result_text(&root, "vp-verification-status", "Verification successful")?;
+        self.expect_result_text(&root, "vp-run-jti", &evidence.context.run_jti)?;
+        self.expect_result_text(
+            &root,
+            "vp-artifact-sha256",
+            &evidence.context.artifact_sha256,
+        )?;
+        self.expect_result_text(&root, "vp-matrix-sha256", &evidence.context.matrix_sha256)?;
+        self.expect_result_text(&root, "vp-test-name", &evidence.context.test_name)?;
+        self.expect_result_text(&root, "vp-suite-plan-id", &evidence.context.suite_plan_id)?;
+        self.expect_result_text(
+            &root,
+            "vp-suite-module-id",
+            &evidence.context.suite_module_id,
+        )?;
+        self.expect_result_text(&root, "vp-variant-sha256", &evidence.context.variant_sha256)?;
+        self.expect_result_text(&root, "vp-receipt-sha256", &evidence.receipt.receipt_sha256)
     }
 
     pub fn run_command_values(&mut self, commands: &[Value]) -> Result<usize, BrowserError> {
@@ -1046,6 +1369,21 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         Err(BrowserError::NoMatchingEntry)
     }
 
+    fn selected_openid4vp_result_marker(
+        &self,
+        authorization_url: &Url,
+        entries: &[BrowserEntry],
+        suite_evidence_url: &Url,
+    ) -> Result<bool, BrowserError> {
+        let entry_index = self.matching_entry(authorization_url, entries)?;
+        selected_required_review_screenshot_marker(
+            entries
+                .get(entry_index)
+                .ok_or(BrowserError::InvalidSchema)?,
+            suite_evidence_url,
+        )
+    }
+
     fn execute_inner(
         &mut self,
         authorization_url: &Url,
@@ -1199,6 +1537,34 @@ impl<D: BrowserDriver> BrowserAutomation for BrowserExecutor<D> {
             }
             self.sleep_until(deadline)?;
         }
+    }
+
+    fn selected_openid4vp_result_marker(
+        &mut self,
+        authorization_url: &Url,
+        entries: &[BrowserEntry],
+        suite_evidence_url: &Url,
+    ) -> Result<bool, BrowserError> {
+        BrowserExecutor::selected_openid4vp_result_marker(
+            self,
+            authorization_url,
+            entries,
+            suite_evidence_url,
+        )
+    }
+
+    fn capture_openid4vp_verification_result(
+        &mut self,
+        evidence: &OpenId4VpVerificationEvidence,
+        capture: &BrowserReviewCaptureContext,
+        obligation_index: usize,
+    ) -> Result<BrowserReviewScreenshotReceipt, BrowserError> {
+        BrowserExecutor::capture_openid4vp_verification_result(
+            self,
+            evidence,
+            capture,
+            obligation_index,
+        )
     }
 }
 
@@ -1429,6 +1795,110 @@ mod tests {
             .expect("fixed PNG")
     }
 
+    struct VpResultDriver {
+        current: Url,
+        run_jti: String,
+        artifact_sha256: String,
+        matrix_sha256: String,
+        test_name: String,
+        suite_plan_id: String,
+        module_id: String,
+        variant_sha256: String,
+        receipt_sha256: String,
+        allow_root_children: bool,
+        navigated: Vec<Url>,
+    }
+
+    impl BrowserDriver for VpResultDriver {
+        fn navigate(&mut self, url: &Url) -> Result<(), BrowserError> {
+            self.navigated.push(url.clone());
+            self.current = url.clone();
+            self.current.set_fragment(None);
+            Ok(())
+        }
+
+        fn current_url(&mut self) -> Result<Url, BrowserError> {
+            Ok(self.current.clone())
+        }
+
+        fn page_source(&mut self) -> Result<String, BrowserError> {
+            Ok(String::new())
+        }
+
+        fn find_element(&mut self, selector: &BrowserSelector) -> Result<String, BrowserError> {
+            match selector {
+                BrowserSelector::Css(value) if value.contains("data-testid") => Ok(value.clone()),
+                _ => Err(BrowserError::ElementNotFound),
+            }
+        }
+
+        fn find_child_element(
+            &mut self,
+            parent: &str,
+            selector: &BrowserSelector,
+        ) -> Result<String, BrowserError> {
+            if !parent.contains("vp-verification-result") {
+                return Err(BrowserError::ElementNotFound);
+            }
+            if !self.allow_root_children {
+                return Err(BrowserError::ElementNotFound);
+            }
+            self.find_element(selector)
+        }
+
+        fn element_displayed(&mut self, _element: &str) -> Result<bool, BrowserError> {
+            Ok(true)
+        }
+
+        fn element_text(&mut self, element: &str) -> Result<String, BrowserError> {
+            if element.contains("vp-verification-status") {
+                Ok("Verification successful".to_owned())
+            } else if element.contains("vp-run-jti") {
+                Ok(self.run_jti.clone())
+            } else if element.contains("vp-artifact-sha256") {
+                Ok(self.artifact_sha256.clone())
+            } else if element.contains("vp-matrix-sha256") {
+                Ok(self.matrix_sha256.clone())
+            } else if element.contains("vp-test-name") {
+                Ok(self.test_name.clone())
+            } else if element.contains("vp-suite-plan-id") {
+                Ok(self.suite_plan_id.clone())
+            } else if element.contains("vp-suite-module-id") {
+                Ok(self.module_id.clone())
+            } else if element.contains("vp-variant-sha256") {
+                Ok(self.variant_sha256.clone())
+            } else if element.contains("vp-receipt-sha256") {
+                Ok(self.receipt_sha256.clone())
+            } else {
+                Err(BrowserError::ElementNotFound)
+            }
+        }
+
+        fn element_send_keys(&mut self, _element: &str, _value: &str) -> Result<(), BrowserError> {
+            Ok(())
+        }
+
+        fn element_click(&mut self, _element: &str) -> Result<(), BrowserError> {
+            Ok(())
+        }
+
+        fn element_attribute(
+            &mut self,
+            element: &str,
+            name: &str,
+        ) -> Result<Option<String>, BrowserError> {
+            if element.contains("vp-verification-result") && name == "data-state" {
+                Ok(Some("verified".to_owned()))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn screenshot_png(&mut self) -> Result<Zeroizing<Vec<u8>>, BrowserError> {
+            Ok(Zeroizing::new(test_png()))
+        }
+    }
+
     struct RedirectingMockDriver {
         current: Url,
         cross_origin: bool,
@@ -1637,6 +2107,100 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove root");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_capture_uses_only_the_same_module_nazoauthweb_projection() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+        let policy = BrowserPolicy::new(target, suite).expect("policy");
+        let variant = BTreeMap::from([("transport".to_owned(), "direct_post".to_owned())]);
+        let context = OpenId4VpEvidenceContext::new(
+            "request-0123456789abcdef0123456789abcdef",
+            "a".repeat(64),
+            "b".repeat(64),
+            "550e8400-e29b-41d4-a716-446655440001",
+            "550e8400-e29b-41d4-a716-446655440002",
+            "vp-happy",
+            &variant,
+        )
+        .expect("context");
+        let receipt_sha256 = "c".repeat(64);
+        let evidence = OpenId4VpVerificationEvidence::test_verified(
+            context.clone(),
+            &receipt_sha256,
+            "https://issuer.example/ui/verification-result#receipt=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        );
+        let driver = VpResultDriver {
+            current: Url::parse("https://issuer.example/").expect("url"),
+            run_jti: context.run_jti.clone(),
+            artifact_sha256: context.artifact_sha256.clone(),
+            matrix_sha256: context.matrix_sha256.clone(),
+            test_name: context.test_name.clone(),
+            suite_plan_id: context.suite_plan_id.clone(),
+            module_id: context.suite_module_id.clone(),
+            variant_sha256: context.variant_sha256.clone(),
+            receipt_sha256: receipt_sha256.clone(),
+            allow_root_children: true,
+            navigated: Vec::new(),
+        };
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp")
+            .join(format!("nazoauth-vp-result-{}", uuid::Uuid::now_v7()));
+        crate::secure_file::ensure_directory(&root, true).expect("private root");
+        let capture = BrowserReviewScreenshotCapture::new(
+            root.clone(),
+            "request-0123456789abcdef0123456789abcdef",
+        )
+        .expect("capture")
+        .context(
+            BrowserReviewModuleIdentity::new(
+                "matrix-plan-a",
+                &context.suite_plan_id,
+                &context.suite_module_id,
+                &context.test_name,
+                &variant,
+            )
+            .expect("identity"),
+            0,
+        )
+        .expect("context");
+        let mut executor = BrowserExecutor::new(driver, policy);
+        let receipt = executor
+            .capture_openid4vp_verification_result(&evidence, &capture, 0)
+            .expect("same-module result capture");
+        assert_eq!(
+            receipt.source,
+            BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver
+        );
+        assert_eq!(
+            receipt
+                .verification_receipt
+                .as_ref()
+                .map(|provenance| provenance.receipt_sha256.as_str()),
+            Some(receipt_sha256.as_str())
+        );
+        assert_eq!(receipt.module_id, context.suite_module_id);
+        let audit =
+            std::fs::read_to_string(root.join(&receipt.path).with_extension("png.receipt.json"))
+                .expect("audit");
+        assert!(audit.contains("nazo-vp-verification-result/live-webdriver"));
+        assert!(!audit.contains("receipt=AAAAAAAA"));
+        assert_eq!(executor.driver_mut().navigated.len(), 1);
+        assert_eq!(
+            executor.driver_mut().navigated[0].fragment(),
+            Some("receipt=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        );
+        executor.driver_mut().allow_root_children = false;
+        assert_eq!(
+            executor
+                .capture_openid4vp_verification_result(&evidence, &capture, 1)
+                .expect_err("global lookalike outside the verified root"),
+            BrowserError::ElementNotFound
+        );
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
     #[test]
     fn mutually_exclusive_unselected_required_marker_does_not_create_an_obligation() {
         let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
@@ -1675,6 +2239,113 @@ mod tests {
             .expect("unselected required marker is not an obligation");
         assert_eq!(report.entry_index, 1);
         assert_eq!(report.review_screenshots_required, 0);
+    }
+
+    #[test]
+    fn vp_evidence_context_requires_the_actual_selected_required_marker() {
+        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+        let policy =
+            BrowserPolicy::new(target, Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite"))
+                .expect("policy");
+        let authorization =
+            Url::parse("https://issuer.example/authorize?request=one").expect("authorization URL");
+        let evidence = Url::parse(
+            "https://www.certification.openid.net/test/a/module-a/verification-evidence",
+        )
+        .expect("evidence URL");
+        let driver = MockDriver {
+            current: authorization.clone(),
+            source: String::new(),
+            found: true,
+            displayed: true,
+            clicked: false,
+            cookies_cleared: false,
+            cookie_clear_count: 0,
+            navigated: Vec::new(),
+            redirect_to: None,
+            session_checks: 0,
+        };
+        let entries = vec![
+            BrowserEntry::parse(&json!({
+                "match": "https://issuer.example/authorize*",
+                "tasks": [{
+                    "match": "https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                    "commands": [["wait", "xpath", "//*", 1, "review", "update-image-placeholder"]]
+                }]
+            }))
+            .expect("first selected entry"),
+            BrowserEntry::parse(&json!({
+                "match": "https://issuer.example/authorize*",
+                "tasks": [{
+                    "match": "https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                    "commands": [["wait", "xpath", "//*", 1, "review", "update-image-placeholder"]]
+                }]
+            }))
+            .expect("unselected alternative"),
+        ];
+        let executor = BrowserExecutor::new(driver, policy);
+        assert!(
+            executor
+                .selected_openid4vp_result_marker(&authorization, &entries, &evidence)
+                .expect("actual selected marker")
+        );
+
+        let no_marker_in_selected = vec![
+            BrowserEntry::parse(&json!({
+                "match": "https://issuer.example/authorize*",
+                "tasks": [{"commands": []}]
+            }))
+            .expect("selected entry"),
+            BrowserEntry::parse(&json!({
+                "match": "https://issuer.example/authorize*",
+                "tasks": [{
+                    "match": "https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                    "commands": [["wait", "xpath", "//*", 1, "review", "update-image-placeholder"]]
+                }]
+            }))
+            .expect("unselected alternative"),
+        ];
+        assert!(
+            !executor
+                .selected_openid4vp_result_marker(&authorization, &no_marker_in_selected, &evidence)
+                .expect("unselected marker has no authority")
+        );
+
+        let ungated_marker = BrowserEntry::parse(&json!({
+            "match": "https://issuer.example/authorize*",
+            "tasks": [{
+                "commands": [["wait", "xpath", "//*", 1, "review", "update-image-placeholder"]]
+            }]
+        }))
+        .expect("ungated marker entry");
+        assert!(
+            !selected_required_review_screenshot_marker(&ungated_marker, &evidence)
+                .expect("ungated marker cannot authorize issuance")
+        );
+
+        let mut exhausted_executor = executor;
+        exhausted_executor.entry_uses.insert(0, 1);
+        let limited_entries = vec![
+            BrowserEntry::parse(&json!({
+                "match": "https://issuer.example/authorize*",
+                "match-limit": 1,
+                "tasks": [{
+                    "match": "https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                    "commands": [["wait", "xpath", "//*", 1, "review", "update-image-placeholder"]]
+                }]
+            }))
+            .expect("exhausted entry"),
+            BrowserEntry::parse(&json!({
+                "match": "https://issuer.example/authorize*",
+                "tasks": [{"commands": []}]
+            }))
+            .expect("next eligible entry"),
+        ];
+        assert!(
+            !exhausted_executor
+                .selected_openid4vp_result_marker(&authorization, &limited_entries, &evidence)
+                .expect("match limit selects the next entry")
+        );
     }
 
     #[cfg(unix)]
