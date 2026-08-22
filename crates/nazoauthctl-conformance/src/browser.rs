@@ -2034,10 +2034,28 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                         ));
                     }
                 }
-                Some(state @ ("expired" | "not-found" | "generic-error")) => {
+                Some("expired") => {
                     return Err(self.projection_state_failure(
                         "projection-state-terminal",
-                        state,
+                        "expired",
+                        BrowserError::VpVerificationResultField(
+                            "vp-verification-result:data-state",
+                        ),
+                    ));
+                }
+                Some("not-found") => {
+                    return Err(self.projection_state_failure(
+                        "projection-state-terminal",
+                        "not-found",
+                        BrowserError::VpVerificationResultField(
+                            "vp-verification-result:data-state",
+                        ),
+                    ));
+                }
+                Some("generic-error") => {
+                    return Err(self.projection_state_failure(
+                        "projection-state-terminal",
+                        "generic-error",
                         BrowserError::VpVerificationResultField(
                             "vp-verification-result:data-state",
                         ),
