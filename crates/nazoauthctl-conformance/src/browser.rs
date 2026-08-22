@@ -2457,9 +2457,11 @@ mod tests {
             if !self.receipt_navigation_seen {
                 return Ok(self.current.clone());
             }
-            let mut current = self.current.clone();
-            current.set_fragment(None);
-            Ok(current)
+            // Model NazoAuthWeb's `replaceState` scrub as durable browser
+            // state, not a one-shot read transformation. A later capture
+            // therefore observes the capability-free canonical shell.
+            self.current.set_fragment(None);
+            Ok(self.current.clone())
         }
 
         fn page_source(&mut self) -> Result<String, BrowserError> {
