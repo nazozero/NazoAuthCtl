@@ -408,6 +408,9 @@ impl std::fmt::Display for VpVerificationResultShellMountDiagnostic {
 pub struct VpVerificationResultProjectionStateDiagnostic {
     pub stage: &'static str,
     pub actual_state: &'static str,
+    /// Present only for the root-scoped `generic-error` terminal state. This
+    /// is a fixed NazoAuthWeb code, `missing`, or `unknown`—never raw DOM.
+    pub generic_error_reason: Option<&'static str>,
     pub runtime: Option<BrowserPageRuntimeDiagnostic>,
     pub runtime_error: Option<Box<BrowserError>>,
     pub browser_logs: Option<BrowserConsoleLogDiagnostic>,
@@ -417,11 +420,16 @@ pub struct VpVerificationResultProjectionStateDiagnostic {
 
 impl std::fmt::Display for VpVerificationResultProjectionStateDiagnostic {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let generic_error_reason = self
+            .generic_error_reason
+            .map(|reason| format!(" generic_error_reason={reason}"))
+            .unwrap_or_default();
         write!(
             formatter,
-            "stage={} actual_state={} runtime=[{}] runtime_error={} browser_logs=[{}] browser_log_error={} cause={}",
+            "stage={} actual_state={}{} runtime=[{}] runtime_error={} browser_logs=[{}] browser_log_error={} cause={}",
             self.stage,
             self.actual_state,
+            generic_error_reason,
             self.runtime
                 .as_ref()
                 .map(ToString::to_string)
@@ -1882,6 +1890,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         &mut self,
         stage: &'static str,
         actual_state: &'static str,
+        generic_error_reason: Option<&'static str>,
         current: &Url,
         source: BrowserError,
     ) -> BrowserError {
@@ -1898,6 +1907,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             VpVerificationResultProjectionStateDiagnostic {
                 stage,
                 actual_state,
+                generic_error_reason,
                 runtime,
                 runtime_error,
                 browser_logs,
@@ -1905,6 +1915,65 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                 source: Box::new(source),
             },
         ))
+    }
+
+    /// Read the NazoAuthWeb generic-error code only after the caller has
+    /// found the visible, root-scoped verification-result element.  The raw
+    /// attribute never escapes this method.
+    fn openid4vp_generic_error_reason(&mut self, root: &str) -> Result<&'static str, BrowserError> {
+        let value = vp_result_driver(
+            "projection-state-generic-error-reason",
+            Some("vp-verification-result"),
+            self.driver.element_attribute(root, "data-error-reason"),
+        )?;
+        Ok(Self::normalize_openid4vp_generic_error_reason(
+            value.as_deref(),
+        ))
+    }
+
+    /// This is intentionally a closed projection: callers can never retain a
+    /// page-provided reason outside this fixed NazoAuthWeb vocabulary.
+    fn normalize_openid4vp_generic_error_reason(value: Option<&str>) -> &'static str {
+        match value {
+            None => "missing",
+            Some("http-status") => "http-status",
+            Some("content-type") => "content-type",
+            Some("invalid-json") => "invalid-json",
+            Some("network") => "network",
+            Some("receipt-shape") => "receipt-shape",
+            Some("receipt-fields") => "receipt-fields",
+            Some("evidence-shape") => "evidence-shape",
+            Some("evidence-fields") => "evidence-fields",
+            Some("binding-shape") => "binding-shape",
+            Some("binding-fields") => "binding-fields",
+            Some("trust-policy-shape") => "trust-policy-shape",
+            Some("trust-policy-fields") => "trust-policy-fields",
+            Some("schema") => "schema",
+            Some("status") => "status",
+            Some("issuer") => "issuer",
+            Some("deployment-id") => "deployment-id",
+            Some("runtime-instance-id") => "runtime-instance-id",
+            Some("instance-key-id") => "instance-key-id",
+            Some("tenant-id") => "tenant-id",
+            Some("transaction-id") => "transaction-id",
+            Some("receipt-id") => "receipt-id",
+            Some("issuance-request-jti") => "issuance-request-jti",
+            Some("intent-sha256") => "intent-sha256",
+            Some("receipt-sha256") => "receipt-sha256",
+            Some("presentation-request-sha256") => "presentation-request-sha256",
+            Some("trust-policy-values") => "trust-policy-values",
+            Some("completed-at") => "completed-at",
+            Some("expires-at") => "expires-at",
+            Some("timestamp-order") => "timestamp-order",
+            Some("run-jti") => "run-jti",
+            Some("artifact-sha256") => "artifact-sha256",
+            Some("matrix-sha256") => "matrix-sha256",
+            Some("suite-plan-id") => "suite-plan-id",
+            Some("suite-module-id") => "suite-module-id",
+            Some("test-name") => "test-name",
+            Some("variant-sha256") => "variant-sha256",
+            Some(_) => "unknown",
+        }
     }
 
     /// A capability-free navigation must expose the stable NazoAuthWeb shell.
@@ -2095,6 +2164,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                         return Err(self.projection_state_failure(
                             "projection-state-root-find",
                             "empty",
+                            None,
                             expected,
                             source,
                         ));
@@ -2119,6 +2189,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                     return Err(self.projection_state_failure(
                         "projection-state-root-visible",
                         "empty",
+                        None,
                         expected,
                         source,
                     ));
@@ -2137,6 +2208,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                         return Err(self.projection_state_failure(
                             "projection-state-attribute",
                             "empty",
+                            None,
                             expected,
                             source,
                         ));
@@ -2147,6 +2219,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                         return Err(self.projection_state_failure(
                             "projection-state-wait",
                             "loading",
+                            None,
                             expected,
                             source,
                         ));
@@ -2156,6 +2229,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                     return Err(self.projection_state_failure(
                         "projection-state-terminal",
                         "expired",
+                        None,
                         expected,
                         BrowserError::VpVerificationResultField(
                             "vp-verification-result:data-state",
@@ -2166,6 +2240,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                     return Err(self.projection_state_failure(
                         "projection-state-terminal",
                         "not-found",
+                        None,
                         expected,
                         BrowserError::VpVerificationResultField(
                             "vp-verification-result:data-state",
@@ -2173,9 +2248,11 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                     ));
                 }
                 Some("generic-error") => {
+                    let reason = self.openid4vp_generic_error_reason(&root)?;
                     return Err(self.projection_state_failure(
                         "projection-state-terminal",
                         "generic-error",
+                        Some(reason),
                         expected,
                         BrowserError::VpVerificationResultField(
                             "vp-verification-result:data-state",
@@ -2186,6 +2263,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                     return Err(self.projection_state_failure(
                         "projection-state-terminal",
                         "unknown",
+                        None,
                         expected,
                         BrowserError::VpVerificationResultField(
                             "vp-verification-result:data-state",
@@ -3015,6 +3093,8 @@ mod tests {
         refresh_redirect: Option<Url>,
         shell_available: bool,
         shell_state: &'static str,
+        generic_error_reason: Option<String>,
+        generic_error_reason_reads: usize,
         refreshed_shell_state: Option<&'static str>,
         shell_state_attribute_missing: bool,
         root_not_found_reads: usize,
@@ -3200,7 +3280,10 @@ mod tests {
             element: &str,
             name: &str,
         ) -> Result<Option<String>, BrowserError> {
-            if element.contains("vp-verification-result") && name == "data-state" {
+            if element.contains("vp-verification-result") && name == "data-error-reason" {
+                self.generic_error_reason_reads = self.generic_error_reason_reads.saturating_add(1);
+                Ok(self.generic_error_reason.clone())
+            } else if element.contains("vp-verification-result") && name == "data-state" {
                 if self.receipt_navigation_seen && self.post_scrub_state_attribute_missing_reads > 0
                 {
                     self.post_scrub_state_attribute_missing_reads -= 1;
@@ -3264,6 +3347,8 @@ mod tests {
             refresh_redirect: None,
             shell_available: true,
             shell_state: "not-found",
+            generic_error_reason: None,
+            generic_error_reason_reads: 0,
             refreshed_shell_state: None,
             shell_state_attribute_missing: false,
             root_not_found_reads: 0,
@@ -4007,6 +4092,7 @@ mod tests {
         // Success drains the historical Selenium queue once before entering
         // the canonical shell; it does not persist a second log summary.
         assert_eq!(executor.driver_mut().browser_log_calls, 1);
+        assert_eq!(executor.driver_mut().generic_error_reason_reads, 0);
         std::fs::remove_dir_all(root).expect("remove root");
     }
 
@@ -4083,6 +4169,17 @@ mod tests {
             };
             assert_eq!(diagnostic.stage, expected_stage);
             assert_eq!(diagnostic.actual_state, expected_state);
+            assert_eq!(
+                diagnostic.generic_error_reason,
+                (expected_state == "generic-error").then_some("missing")
+            );
+            assert_eq!(
+                executor.driver_mut().generic_error_reason_reads,
+                usize::from(expected_state == "generic-error")
+            );
+            if expected_state != "generic-error" {
+                assert!(!diagnostic.to_string().contains("generic_error_reason"));
+            }
             assert!(diagnostic.runtime.is_some());
             assert!(diagnostic.browser_logs.is_some());
             if expected_state == "loading" || expected_state == "empty" {
@@ -4094,6 +4191,108 @@ mod tests {
                 );
             }
             assert!(!diagnostic.to_string().contains("raw-state-with-secret"));
+            std::fs::remove_dir_all(root).expect("remove root");
+        }
+    }
+
+    #[test]
+    fn vp_result_generic_error_reason_accepts_only_the_web_contract_codes() {
+        let allowed = [
+            "http-status",
+            "content-type",
+            "invalid-json",
+            "network",
+            "receipt-shape",
+            "receipt-fields",
+            "evidence-shape",
+            "evidence-fields",
+            "binding-shape",
+            "binding-fields",
+            "trust-policy-shape",
+            "trust-policy-fields",
+            "schema",
+            "status",
+            "issuer",
+            "deployment-id",
+            "runtime-instance-id",
+            "instance-key-id",
+            "tenant-id",
+            "transaction-id",
+            "receipt-id",
+            "issuance-request-jti",
+            "intent-sha256",
+            "receipt-sha256",
+            "presentation-request-sha256",
+            "trust-policy-values",
+            "completed-at",
+            "expires-at",
+            "timestamp-order",
+            "run-jti",
+            "artifact-sha256",
+            "matrix-sha256",
+            "suite-plan-id",
+            "suite-module-id",
+            "test-name",
+            "variant-sha256",
+        ];
+        for reason in allowed {
+            assert_eq!(
+                BrowserExecutor::<VpResultDriver>::normalize_openid4vp_generic_error_reason(Some(
+                    reason,
+                )),
+                reason,
+                "reason={reason}"
+            );
+        }
+        assert_eq!(
+            BrowserExecutor::<VpResultDriver>::normalize_openid4vp_generic_error_reason(None),
+            "missing"
+        );
+        assert_eq!(
+            BrowserExecutor::<VpResultDriver>::normalize_openid4vp_generic_error_reason(Some(
+                "secret=do-not-retain",
+            )),
+            "unknown"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_result_generic_error_reason_is_root_scoped_and_redacted() {
+        for (raw_reason, expected_reason) in [
+            (Some("issuer"), "issuer"),
+            (None, "missing"),
+            (Some("secret=do-not-retain"), "unknown"),
+        ] {
+            let (variant, context, evidence, receipt_sha256) = test_vp_evidence();
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .expect("temp")
+                .join(format!(
+                    "nazoauth-vp-generic-reason-{}",
+                    uuid::Uuid::now_v7()
+                ));
+            crate::secure_file::ensure_directory(&root, true).expect("private root");
+            let capture = vp_capture_context(root.clone(), &context, &variant);
+            let mut driver = verified_vp_result_driver(&context, &receipt_sha256);
+            driver.post_scrub_state = Some("generic-error");
+            driver.generic_error_reason = raw_reason.map(str::to_owned);
+            let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+            let suite = Origin::parse(OFFICIAL_SUITE_ORIGIN).expect("suite");
+            let mut executor =
+                BrowserExecutor::new(driver, BrowserPolicy::new(target, suite).expect("policy"));
+
+            let error = executor
+                .capture_openid4vp_verification_result(&evidence, &capture, 0)
+                .expect_err("generic-error must fail closed");
+            let BrowserError::VpVerificationResultProjectionStateDiagnostic(diagnostic) = error
+            else {
+                panic!("generic-error diagnostic")
+            };
+            assert_eq!(diagnostic.actual_state, "generic-error");
+            assert_eq!(diagnostic.generic_error_reason, Some(expected_reason));
+            assert_eq!(executor.driver_mut().generic_error_reason_reads, 1);
+            assert!(!diagnostic.to_string().contains("do-not-retain"));
             std::fs::remove_dir_all(root).expect("remove root");
         }
     }
