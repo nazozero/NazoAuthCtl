@@ -840,11 +840,11 @@ fn webdriver_protocol_diagnostic(
 }
 
 fn safe_top_level_key(value: &str) -> Option<String> {
-    (1..=64).contains(&value.len())
+    ((1..=64).contains(&value.len())
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-            .then_some(value.to_owned())
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
+    .then_some(value.to_owned())
 }
 
 fn classify_webdriver_error(value: &Value) -> BrowserError {
