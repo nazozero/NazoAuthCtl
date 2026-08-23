@@ -1142,7 +1142,7 @@ impl ConformanceRunner {
                                         &plan.suite_plan_id,
                                         &instance.id,
                                         &module.test_name,
-                                        &plan.variant,
+                                        &effective_module_identity_variant(plan, module),
                                     )
                                     .map_err(|error| error.to_string())?;
                                 verifier
@@ -2223,6 +2223,7 @@ mod tests {
     struct DeferredReviewTransport {
         requests: Mutex<Vec<(HttpMethod, String)>>,
         test_name: &'static str,
+        module_variant: BTreeMap<String, String>,
         info_after_capture: Value,
         wait_state_after_capture: Value,
         info_calls: AtomicUsize,
@@ -2241,6 +2242,7 @@ mod tests {
     struct DeferredReviewBrowser {
         captures: usize,
         capture_fails: bool,
+        variant: BTreeMap<String, String>,
     }
 
     #[cfg(unix)]
@@ -2411,7 +2413,10 @@ mod tests {
                     serde_json::json!({
                         "id":"suite-plan",
                         "name":"oid4vp-1final-verifier-test-plan",
-                        "modules":[{"testModule":self.test_name}]
+                        "modules":[{
+                            "testModule":self.test_name,
+                            "variant":self.module_variant
+                        }]
                     }),
                 ),
                 (HttpMethod::Post, "/api/runner") => {
@@ -2535,7 +2540,7 @@ mod tests {
                 suite_plan_id: evidence.context.suite_plan_id.clone(),
                 module_id: evidence.context.suite_module_id.clone(),
                 test_name: evidence.context.test_name.clone(),
-                variant: BTreeMap::new(),
+                variant: self.variant.clone(),
                 marker: crate::browser::ReviewScreenshotMarker::Required,
                 obligation_index,
                 trigger_origin: "https://issuer.example".to_owned(),
@@ -4041,6 +4046,10 @@ mod tests {
         let transport = Arc::new(DeferredReviewTransport {
             requests: Mutex::new(Vec::new()),
             test_name: "happy-flow",
+            module_variant: BTreeMap::from([(
+                "response_mode".to_owned(),
+                "direct_post.jwt".to_owned(),
+            )]),
             info_after_capture: serde_json::json!({"status":"WAITING"}),
             wait_state_after_capture: serde_json::json!({"state":"WAITING"}),
             info_calls: AtomicUsize::new(0),
@@ -4064,9 +4073,17 @@ mod tests {
         }));
         matrix.digest = "b".repeat(64);
         matrix.document.groups[0].plans[0].plan = "oid4vp-1final-verifier-test-plan".to_owned();
+        matrix.document.groups[0].plans[0]
+            .variant
+            .insert("credential_format".to_owned(), "dc+sd-jwt".to_owned());
+        let effective_variant = BTreeMap::from([
+            ("credential_format".to_owned(), "dc+sd-jwt".to_owned()),
+            ("response_mode".to_owned(), "direct_post.jwt".to_owned()),
+        ]);
         let browser_state = Arc::new(Mutex::new(DeferredReviewBrowser {
             captures: 0,
             capture_fails: false,
+            variant: effective_variant.clone(),
         }));
         let browser: Arc<Mutex<dyn BrowserAutomation>> = browser_state.clone();
         let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
@@ -4179,6 +4196,7 @@ mod tests {
         assert_eq!(module.outcome, ModuleOutcome::DeferredReviewPending);
         assert!(!module.terminal);
         assert_eq!(module.review_screenshots.len(), 1);
+        assert_eq!(module.variant, effective_variant);
         assert_eq!(module.review_screenshots_required, 1);
         assert_eq!(module.review_screenshots_required_captured, 1);
         assert_eq!(
@@ -4196,7 +4214,19 @@ mod tests {
             (verifier.starts, verifier.completes, verifier.issuances),
             (1, 1, 1)
         );
-        assert!(verifier.attached.is_some());
+        let attached = verifier
+            .attached
+            .as_ref()
+            .expect("VP evidence context is attached");
+        let expected_context = OpenId4VpEvidenceRunContext::new(
+            "request-0123456789abcdef0123456789abcdef",
+            "a".repeat(64),
+            "b".repeat(64),
+        )
+        .expect("VP evidence run context")
+        .for_module("suite-plan", "module-a", "happy-flow", &effective_variant)
+        .expect("effective module evidence context");
+        assert_eq!(attached, &expected_context);
         let requests = transport.requests.lock().expect("requests");
         assert!(
             requests
@@ -4238,6 +4268,7 @@ mod tests {
         let transport = Arc::new(DeferredReviewTransport {
             requests: Mutex::new(Vec::new()),
             test_name: "oid4vp-1final-verifier-invalid-kb-jwt-signature",
+            module_variant: BTreeMap::new(),
             info_after_capture: serde_json::json!({"status":"FINISHED","result":"PASSED"}),
             wait_state_after_capture: serde_json::json!({"state":"FINISHED"}),
             info_calls: AtomicUsize::new(0),
@@ -4261,6 +4292,7 @@ mod tests {
         let browser_state = Arc::new(Mutex::new(DeferredReviewBrowser {
             captures: 0,
             capture_fails: false,
+            variant: BTreeMap::new(),
         }));
         let browser: Arc<Mutex<dyn BrowserAutomation>> = browser_state.clone();
         let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
@@ -4434,6 +4466,7 @@ mod tests {
             let transport = Arc::new(DeferredReviewTransport {
                 requests: Mutex::new(Vec::new()),
                 test_name: "happy-flow",
+                module_variant: BTreeMap::new(),
                 info_after_capture: if matches!(case, Case::PostCaptureInfoNotWaiting) {
                     serde_json::json!({"status":"FINISHED"})
                 } else {
@@ -4463,6 +4496,7 @@ mod tests {
                 Arc::new(Mutex::new(DeferredReviewBrowser {
                     captures: 0,
                     capture_fails: matches!(case, Case::CaptureFailure),
+                    variant: BTreeMap::new(),
                 }));
             let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
                 Arc::new(Mutex::new(DeferredReviewVerifier {
