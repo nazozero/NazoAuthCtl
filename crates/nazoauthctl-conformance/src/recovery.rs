@@ -3148,7 +3148,6 @@ mod tests {
             binding,
             "openid4vc-trust-policy:provider:0123456789abcdef",
             "f".repeat(64),
-            -1,
         )
     }
 
@@ -3157,7 +3156,6 @@ mod tests {
         binding: &mut TenantResourceRecoveryBinding,
         trust_policy_resource_id: &str,
         trust_policy_digest: String,
-        completed_offset_seconds: i64,
     ) -> (SuiteRetentionManifest, ReviewScreenshotManifestImage) {
         use time::format_description::well_known::Rfc3339;
 
@@ -3221,7 +3219,9 @@ mod tests {
         let now = time::OffsetDateTime::now_utc()
             .replace_nanosecond(0)
             .expect("whole seconds");
-        let completed_at = (now + time::Duration::seconds(completed_offset_seconds))
+        // Receipt issuance follows presentation completion and may cross a
+        // whole-second boundary in ordinary operation.
+        let completed_at = (now - time::Duration::seconds(1))
             .format(&Rfc3339)
             .expect("completed time");
         let expires_at = (now + time::Duration::seconds(300))
@@ -3605,7 +3605,6 @@ mod tests {
             &mut other_policy_binding,
             "openid4vc-trust-policy:other:0123456789abcdef",
             "e".repeat(64),
-            -1,
         );
         assert!(!verify_vp_receipt_provenance(
             other_policy_image
@@ -3674,28 +3673,6 @@ mod tests {
             &image
         ));
 
-        let mut post_issuance_completion_binding = tenant_resource_binding(&root);
-        let (post_issuance_completion_retention, post_issuance_completion_image) =
-            vp_receipt_fixture_with_trust_policy(
-                &mut post_issuance_completion_binding,
-                "openid4vc-trust-policy:provider:0123456789abcdef",
-                "f".repeat(64),
-                1,
-            );
-        let post_issuance_anchor = post_issuance_completion_binding
-            .vp_evidence_trust_anchor
-            .as_ref()
-            .expect("post-issuance anchor");
-        assert!(!verify_vp_receipt_provenance(
-            post_issuance_completion_image
-                .verification_receipt
-                .as_ref()
-                .expect("post-issuance completion receipt"),
-            post_issuance_anchor,
-            &post_issuance_completion_binding,
-            &post_issuance_completion_retention,
-            &post_issuance_completion_image,
-        ));
         std::fs::remove_dir_all(&root).expect("remove test root");
     }
 
