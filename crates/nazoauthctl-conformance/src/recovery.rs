@@ -3289,6 +3289,244 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn deferred_review_screenshot_chain(
+        evidence: &Path,
+        binding: &mut TenantResourceRecoveryBinding,
+    ) -> SuiteRetentionManifest {
+        let (mut retention, mut image) = vp_receipt_fixture(binding);
+        retention.schema = 2;
+        let relative = PathBuf::from("review-screenshots")
+            .join(&binding.request_jti)
+            .join("matrix-plan-1--suite-module-1--000.png");
+        let image_path = evidence.join(&relative);
+        crate::secure_file::ensure_directory(image_path.parent().expect("image parent"), true)
+            .expect("image directory");
+        let png = STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            .expect("one pixel png");
+        crate::secure_file::write_atomic(&image_path, &png, true).expect("write png");
+        image.path = relative.clone();
+        image.sha256 = sha256_hex(&png);
+        image.size = png.len();
+        let audit = serde_json::to_vec(&serde_json::json!({
+            "suite_plan_id": image.suite_plan_id.clone(),
+            "module_id": image.module_id.clone(),
+            "test_name": image.test_name.clone(),
+            "variant": image.variant.clone(),
+            "marker": "required",
+            "obligation_index": 0,
+            "path": relative,
+            "sha256": image.sha256.clone(),
+            "size": image.size,
+            "trigger_origin": image.trigger_origin.clone(),
+            "trigger_path": image.trigger_path.clone(),
+            "trigger_url_sha256": image.trigger_url_sha256.clone(),
+            "source": "nazo-vp-verification-result/live-webdriver",
+            "verification_receipt": image.verification_receipt.clone(),
+        }))
+        .expect("audit");
+        crate::secure_file::write_atomic(
+            &image_path.with_extension("png.receipt.json"),
+            &audit,
+            true,
+        )
+        .expect("write audit");
+        let screenshot_path = evidence
+            .join("review-screenshot-manifests")
+            .join(format!("{}.json", binding.request_jti));
+        crate::secure_file::ensure_directory(
+            screenshot_path.parent().expect("manifest directory"),
+            true,
+        )
+        .expect("manifest directory");
+        let document = serde_json::to_vec(&serde_json::json!({
+            "schema": 3,
+            "run_jti": binding.request_jti.clone(),
+            "artifact_digest": retention.artifact_digest.clone(),
+            "matrix_sha256": retention.matrix_sha256.clone(),
+            "suite_origin": retention.suite_origin.clone(),
+            "modules": [{
+                "matrix_plan_id": image.matrix_plan_id.clone(),
+                "suite_plan_id": image.suite_plan_id.clone(),
+                "module_id": image.module_id.clone(),
+                "test_name": image.test_name.clone(),
+                "variant": image.variant.clone(),
+                "required": 1,
+                "captured_required": 1,
+                "missing_optional": 0
+            }],
+            "screenshots": [{
+                "matrix_plan_id": image.matrix_plan_id.clone(),
+                "suite_plan_id": image.suite_plan_id.clone(),
+                "module_id": image.module_id.clone(),
+                "test_name": image.test_name.clone(),
+                "variant": image.variant.clone(),
+                "marker": "required",
+                "obligation_index": 0,
+                "path": image.path.clone(),
+                "sha256": image.sha256.clone(),
+                "size": image.size,
+                "receipt_sha256": sha256_hex(&audit),
+                "trigger_origin": image.trigger_origin.clone(),
+                "trigger_path": image.trigger_path.clone(),
+                "trigger_url_sha256": image.trigger_url_sha256.clone(),
+                "source": "nazo-vp-verification-result/live-webdriver",
+                "verification_receipt": image.verification_receipt.clone(),
+            }]
+        }))
+        .expect("screenshot manifest");
+        crate::secure_file::write_atomic(&screenshot_path, &document, true)
+            .expect("write screenshot manifest");
+        retention.review_screenshot_manifest = Some(SuiteRetentionScreenshotManifest {
+            path: screenshot_path,
+            sha256: sha256_hex(&document),
+        });
+        retention.deferred_review_pending = vec![SuiteRetentionDeferredReview {
+            matrix_plan_id: image.matrix_plan_id,
+            suite_plan_id: image.suite_plan_id,
+            module_id: image.module_id,
+            test_name: image.test_name,
+            variant: image.variant,
+            placeholder_path: "/test/a/550e8400-e29b-41d4-a716-446655440002/verification-evidence"
+                .to_owned(),
+            marker: crate::ReviewScreenshotMarker::Required,
+            obligation_index: 0,
+        }];
+        retention
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_five_deferred_review_retention_roundtrips_store_stage_commit_claim_and_finish() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!(
+            "nazoauth-deferred-retention-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let evidence = root.join("evidence");
+        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
+        let mut binding = tenant_resource_binding(&root);
+        let manifest = deferred_review_screenshot_chain(&evidence, &mut binding);
+        let pending = manifest.deferred_review_pending[0].clone();
+        let screenshot = manifest
+            .review_screenshot_manifest
+            .clone()
+            .expect("screenshot manifest binding");
+        let original_screenshot = crate::secure_file::read_bounded(
+            &screenshot.path,
+            crate::evidence::MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES,
+            true,
+        )
+        .expect("original screenshot manifest");
+        let final_path = evidence.join(format!("retained-suite-{}.json", binding.request_jti));
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("tenant intent");
+        guard
+            .begin_suite_create_with_retention(
+                "https://www.certification.openid.net",
+                "suite-plan-intent",
+                true,
+            )
+            .expect("plan intent");
+        guard
+            .record_suite_plan(
+                "https://www.certification.openid.net",
+                "suite-plan-intent",
+                &pending.suite_plan_id,
+            )
+            .expect("plan receipt");
+        guard
+            .begin_suite_create_with_retention(
+                "https://www.certification.openid.net",
+                "suite-module-intent",
+                true,
+            )
+            .expect("module intent");
+        guard
+            .record_suite_module("suite-module-intent", &pending.module_id)
+            .expect("module receipt");
+        guard
+            .prepare_suite_plan_retention(manifest, final_path.clone())
+            .expect("prepare schema-five retention");
+        let journal_path = root.join(format!("run-{}.json", binding.request_jti));
+        let prepared = std::fs::read_to_string(&journal_path).expect("prepared journal");
+        assert!(prepared.contains("\"schema\": 5"));
+        assert!(prepared.contains(&pending.placeholder_path));
+        assert!(prepared.contains(&screenshot.sha256));
+        assert_eq!(
+            guard.suite_recovery().expect("prepared suite").plan_ids,
+            vec![pending.suite_plan_id.clone()]
+        );
+        assert!(
+            guard
+                .suite_recovery()
+                .expect("prepared suite")
+                .module_ids
+                .is_empty()
+        );
+        guard
+            .stage_suite_retention_manifest()
+            .expect("stage deferred manifest");
+        guard
+            .record_tenant_resource_receipt(tenant_resource_receipt(&binding))
+            .expect("tenant receipt");
+        guard
+            .record_tenant_resource_enumeration(Vec::new())
+            .expect("tenant enumeration");
+        guard
+            .commit_suite_plan_retention()
+            .expect("commit deferred retention");
+        guard
+            .publish_committed_suite_retention_manifest()
+            .expect("publish deferred retention");
+        let receipt = guard
+            .suite_retention_manifest_receipt()
+            .expect("retention receipt")
+            .expect("committed receipt");
+        assert_eq!(receipt.path, final_path);
+        crate::secure_file::write_atomic(&screenshot.path, b"tampered", true)
+            .expect("tamper screenshot manifest");
+        assert!(guard.finish().is_err(), "tampered screenshot blocks finish");
+        crate::secure_file::write_atomic(&screenshot.path, &original_screenshot, true)
+            .expect("restore screenshot manifest");
+        let original_final =
+            crate::secure_file::read_bounded(&final_path, MAX_SUITE_RETENTION_MANIFEST_BYTES, true)
+                .expect("final retention manifest");
+        drop(guard);
+
+        let mut tampered_final: serde_json::Value =
+            serde_json::from_slice(&original_final).expect("parse final retention manifest");
+        tampered_final["deferred_review_pending"][0]["placeholder_path"] =
+            serde_json::json!("/test/a/other/verification-evidence");
+        crate::secure_file::write_atomic(
+            &final_path,
+            &serde_json::to_vec(&tampered_final).expect("encode altered retention manifest"),
+            true,
+        )
+        .expect("tamper placeholder identity");
+        assert!(
+            store.claim_pending().is_err(),
+            "tampered placeholder blocks claim"
+        );
+        crate::secure_file::write_atomic(&final_path, &original_final, true)
+            .expect("restore retention manifest");
+
+        let mut claimed = store.claim_pending().expect("claim retained journal");
+        assert_eq!(claimed.len(), 1);
+        let guard = claimed.pop().expect("retained guard");
+        let retained = guard
+            .suite_retention_manifest_receipt()
+            .expect("claimed receipt")
+            .expect("retained receipt");
+        assert_eq!(retained.path, final_path);
+        guard.finish().expect("finish deferred retention");
+        assert!(store.claim_pending().expect("final scan").is_empty());
+        std::fs::remove_dir_all(&root).expect("remove test root");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn vp_screenshot_receipt_recovery_rechecks_runtime_tenant_and_signed_bindings() {
         let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
