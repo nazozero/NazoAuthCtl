@@ -2373,9 +2373,16 @@ mod tests {
                 .expect("deferred review requests")
                 .push((method, path.clone()));
             let (status, body) = match (method, path.as_str()) {
-                (HttpMethod::Get, "/api/plan") => (200, serde_json::json!({})),
+                (HttpMethod::Get, "/api/plan") => (
+                    if request.header("Authorization").is_some() {
+                        200
+                    } else {
+                        401
+                    },
+                    serde_json::json!({}),
+                ),
                 (HttpMethod::Post, "/api/plan") => (
-                    200,
+                    201,
                     serde_json::json!({
                         "id":"suite-plan",
                         "name":"oid4vp-1final-verifier-test-plan",
@@ -2383,7 +2390,7 @@ mod tests {
                     }),
                 ),
                 (HttpMethod::Post, "/api/runner") => {
-                    (200, serde_json::json!({"id":"module-a","alias":"vp-alias"}))
+                    (201, serde_json::json!({"id":"module-a","alias":"vp-alias"}))
                 }
                 (HttpMethod::Get, "/api/info/module-a") => {
                     let calls = self.info_calls.fetch_add(1, Ordering::SeqCst);
@@ -4071,6 +4078,14 @@ mod tests {
         );
 
         assert!(report.errors.is_empty(), "{fixture_diagnostic}");
+        assert_eq!(
+            report
+                .auth_probe
+                .as_ref()
+                .map(|probe| (probe.unauthenticated_status, probe.authenticated_status)),
+            Some((401, 200)),
+            "{fixture_diagnostic}"
+        );
         assert_eq!(integrity.defined_modules, 1, "{fixture_diagnostic}");
         assert_eq!(integrity.created_instances, 1, "{fixture_diagnostic}");
         assert_eq!(integrity.terminal_modules, 0, "{fixture_diagnostic}");
@@ -4117,6 +4132,24 @@ mod tests {
         );
         assert!(verifier.attached.is_some());
         let requests = transport.requests.lock().expect("requests");
+        assert!(
+            requests
+                .iter()
+                .any(|(method, path)| *method == HttpMethod::Post && path == "/api/plan"),
+            "the authenticated probe must complete before production plan creation: {fixture_diagnostic}"
+        );
+        let plan_create = requests
+            .iter()
+            .position(|(method, path)| *method == HttpMethod::Post && path == "/api/plan")
+            .expect("plan creation asserted above");
+        assert_eq!(
+            requests[..plan_create]
+                .iter()
+                .filter(|(method, path)| *method == HttpMethod::Get && path == "/api/plan")
+                .count(),
+            2,
+            "both authentication probe calls must precede production plan creation: {fixture_diagnostic}"
+        );
         assert!(requests.iter().all(|(method, path)| {
             *method != HttpMethod::Delete && !path.contains("image") && !path.contains("visited")
         }));
