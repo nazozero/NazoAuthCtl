@@ -2308,6 +2308,7 @@ mod tests {
         captures: usize,
         capture_fails: bool,
         variant: BTreeMap<String, String>,
+        capture_root: Option<std::path::PathBuf>,
     }
 
     #[cfg(unix)]
@@ -2617,10 +2618,30 @@ mod tests {
             if self.capture_fails {
                 return Err(BrowserError::ReviewScreenshotRequired);
             }
+            let (path, sha256, size) = if let Some(root) = &self.capture_root {
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
+                let png = STANDARD
+                    .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+                    .expect("fixed PNG");
+                let path = std::path::PathBuf::from("review-screenshots")
+                    .join("request-0123456789abcdef0123456789abcdef")
+                    .join("p--module-a--000.png");
+                crate::secure_file::write_atomic(&root.join(&path), &png, true)
+                    .expect("module-bound review PNG");
+                let size = png.len();
+                let sha256 = format!("{:x}", Sha256::digest(&png));
+                (path, sha256, size)
+            } else {
+                (
+                    std::path::PathBuf::from("review-screenshots/test/module-a-0.png"),
+                    "d".repeat(64),
+                    67,
+                )
+            };
             Ok(crate::browser::BrowserReviewScreenshotReceipt {
-                path: std::path::PathBuf::from("review-screenshots/test/module-a-0.png"),
-                sha256: "d".repeat(64),
-                size: 67,
+                path,
+                sha256,
+                size,
                 suite_plan_id: evidence.context.suite_plan_id.clone(),
                 module_id: evidence.context.suite_module_id.clone(),
                 test_name: evidence.context.test_name.clone(),
@@ -4190,6 +4211,7 @@ mod tests {
             captures: 0,
             capture_fails: false,
             variant: effective_variant.clone(),
+            capture_root: Some(root.clone()),
         }));
         let browser: Arc<Mutex<dyn BrowserAutomation>> = browser_state.clone();
         let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
@@ -4404,6 +4426,7 @@ mod tests {
             captures: 0,
             capture_fails: false,
             variant: BTreeMap::new(),
+            capture_root: None,
         }));
         let browser: Arc<Mutex<dyn BrowserAutomation>> = browser_state.clone();
         let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
@@ -4611,6 +4634,7 @@ mod tests {
                     captures: 0,
                     capture_fails: matches!(case, Case::CaptureFailure),
                     variant: BTreeMap::new(),
+                    capture_root: None,
                 }));
             let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
                 Arc::new(Mutex::new(DeferredReviewVerifier {
