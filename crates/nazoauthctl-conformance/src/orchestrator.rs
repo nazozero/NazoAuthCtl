@@ -3977,18 +3977,18 @@ mod tests {
         }));
         matrix.digest = "b".repeat(64);
         matrix.document.groups[0].plans[0].plan = "oid4vp-1final-verifier-test-plan".to_owned();
-        let browser: Arc<Mutex<dyn BrowserAutomation>> =
-            Arc::new(Mutex::new(DeferredReviewBrowser {
-                captures: 0,
-                capture_fails: false,
-            }));
-        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
-            Arc::new(Mutex::new(DeferredReviewVerifier {
-                attached: None,
-                starts: 0,
-                completes: 0,
-                issuances: 0,
-            }));
+        let browser_state = Arc::new(Mutex::new(DeferredReviewBrowser {
+            captures: 0,
+            capture_fails: false,
+        }));
+        let browser: Arc<Mutex<dyn BrowserAutomation>> = browser_state.clone();
+        let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
+            attached: None,
+            starts: 0,
+            completes: 0,
+            issuances: 0,
+        }));
+        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = verifier_state.clone();
         let capture = BrowserReviewScreenshotCapture::new(
             root.clone(),
             "request-0123456789abcdef0123456789abcdef",
@@ -4054,8 +4054,8 @@ mod tests {
         assert!(report.orchestration_integrity.retention_eligible);
         assert!(report.orchestration_integrity.all_modules_settled);
         assert!(!report.orchestration_integrity.all_modules_terminal);
-        assert_eq!(browser.lock().expect("browser").captures, 1);
-        let verifier = verifier.lock().expect("verifier");
+        assert_eq!(browser_state.lock().expect("browser").captures, 1);
+        let verifier = verifier_state.lock().expect("verifier");
         assert_eq!(
             (verifier.starts, verifier.completes, verifier.issuances),
             (1, 1, 1)

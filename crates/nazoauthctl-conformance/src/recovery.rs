@@ -3494,7 +3494,6 @@ mod tests {
         let original_final =
             crate::secure_file::read_bounded(&final_path, MAX_SUITE_RETENTION_MANIFEST_BYTES, true)
                 .expect("final retention manifest");
-        drop(guard);
 
         let mut tampered_final: serde_json::Value =
             serde_json::from_slice(&original_final).expect("parse final retention manifest");
