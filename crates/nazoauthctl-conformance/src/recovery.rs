@@ -24,6 +24,10 @@ const RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 3;
 /// capture. It binds the recovery journal to the runtime discovery key rather
 /// than trusting a key copied from a screenshot receipt.
 const VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 4;
+/// Schema 5 is emitted only when a retained Suite plan contains an explicit
+/// OIDF deferred-review module. Older binaries reject it rather than treating
+/// a non-terminal Suite runner as ordinary cleanup.
+const DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 5;
 const TENANT_RESOURCE_RECOVERY_KIND: &str = "tenant-resource";
 const MAX_RECOVERY_JOURNAL_BYTES: usize = 128 * 1024;
 const MAX_PENDING_RUNS: usize = 64;
@@ -31,7 +35,7 @@ const MAX_PERSISTED_REVISION: u64 = i64::MAX as u64;
 const MAX_TENANT_RESOURCE_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SUITE_RECOVERY_PLANS: usize = 128;
 const MAX_SUITE_RECOVERY_MODULES: usize = 16 * 1024;
-const SUITE_RETENTION_MANIFEST_SCHEMA: u32 = 1;
+const SUITE_RETENTION_MANIFEST_SCHEMA: u32 = 2;
 const MAX_SUITE_RETENTION_MANIFEST_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -203,7 +207,24 @@ pub struct SuiteRetentionManifest {
     pub run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_screenshot_manifest: Option<SuiteRetentionScreenshotManifest>,
+    /// Explicit non-terminal Suite modules retained at the OIDF deferred
+    /// verification-evidence boundary. They are not terminal/pass results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_review_pending: Vec<SuiteRetentionDeferredReview>,
     pub plans: Vec<SuiteRetentionPlan>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuiteRetentionDeferredReview {
+    pub matrix_plan_id: String,
+    pub suite_plan_id: String,
+    pub module_id: String,
+    pub test_name: String,
+    pub variant: std::collections::BTreeMap<String, String>,
+    pub placeholder_path: String,
+    pub marker: crate::ReviewScreenshotMarker,
+    pub obligation_index: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -409,6 +430,8 @@ impl<'de> Deserialize<'de> for RecoveryJournal {
             RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA as u64;
         const VP_EVIDENCE_TENANT_RESOURCE_SCHEMA: u64 =
             VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA as u64;
+        const DEFERRED_REVIEW_TENANT_RESOURCE_SCHEMA: u64 =
+            DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA as u64;
         match schema {
             LEGACY_SCHEMA => serde_json::from_value(value)
                 .map(Box::new)
@@ -416,7 +439,8 @@ impl<'de> Deserialize<'de> for RecoveryJournal {
                 .map_err(serde::de::Error::custom),
             TENANT_RESOURCE_SCHEMA
             | RETAINING_TENANT_RESOURCE_SCHEMA
-            | VP_EVIDENCE_TENANT_RESOURCE_SCHEMA => serde_json::from_value(value)
+            | VP_EVIDENCE_TENANT_RESOURCE_SCHEMA
+            | DEFERRED_REVIEW_TENANT_RESOURCE_SCHEMA => serde_json::from_value(value)
                 .map(Box::new)
                 .map(Self::TenantResource)
                 .map_err(serde::de::Error::custom),
@@ -652,6 +676,7 @@ impl ConformanceRecoveryStore {
                     tenant_journal.schema,
                     RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
                         | VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                        | DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
                 ) && matches!(
                     &tenant_journal.suite_retention,
                     SuiteRetentionDisposition::Active { .. }
@@ -1108,6 +1133,7 @@ impl ConformanceRecoveryGuard {
             journal.schema,
             RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
                 | VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                | DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
         ) {
             journal.suite_retention = SuiteRetentionDisposition::Cleaned;
         }
@@ -1139,6 +1165,12 @@ impl ConformanceRecoveryGuard {
             bail!("Suite retention requires a settled allocation");
         }
         validate_suite_retention_manifest(&manifest, &journal.binding, Some(suite))?;
+        if !manifest.deferred_review_pending.is_empty() {
+            if journal.binding.vp_evidence_trust_anchor.is_none() {
+                bail!("deferred review retention has no runtime trust anchor");
+            }
+            journal.schema = DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA;
+        }
         let bytes = canonical_suite_retention_manifest(&manifest)?;
         let record = SuiteRetentionRecord {
             manifest,
@@ -1839,6 +1871,7 @@ fn validate_journal(
                 TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
                     | RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
                     | VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                    | DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
             ) || journal.kind != TENANT_RESOURCE_RECOVERY_KIND
             {
                 bail!("tenant-resource recovery journal discriminator is invalid");
@@ -1858,13 +1891,19 @@ fn validate_tenant_resource_journal(
     {
         bail!("schema-2 recovery journal cannot retain Suite plans");
     }
-    if journal.schema == VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
-        && journal.binding.vp_evidence_trust_anchor.is_none()
+    if matches!(
+        journal.schema,
+        VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+            | DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+    ) && journal.binding.vp_evidence_trust_anchor.is_none()
     {
         bail!("schema-4 recovery journal has no VP evidence trust anchor");
     }
-    if journal.schema != VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
-        && journal.binding.vp_evidence_trust_anchor.is_some()
+    if !matches!(
+        journal.schema,
+        VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+            | DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+    ) && journal.binding.vp_evidence_trust_anchor.is_some()
     {
         bail!("legacy recovery journal cannot carry a VP evidence trust anchor");
     }
@@ -1872,6 +1911,16 @@ fn validate_tenant_resource_journal(
         && SuiteRetentionDisposition::is_default(&journal.suite_retention)
     {
         bail!("schema-3 recovery journal has no explicit retention policy");
+    }
+    if journal.schema == DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+        && !matches!(
+            &journal.suite_retention,
+            SuiteRetentionDisposition::RetentionPrepared { record }
+                | SuiteRetentionDisposition::Retained { record }
+                if !record.manifest.deferred_review_pending.is_empty()
+        )
+    {
+        bail!("schema-5 recovery journal has no deferred review retention record");
     }
     if journal.cleanup_complete && !tenant_resource_obligations_complete(journal) {
         bail!("tenant-resource cleanup marker is ahead of its obligations");
@@ -2067,7 +2116,8 @@ fn validate_suite_retention_manifest(
     binding: &TenantResourceRecoveryBinding,
     suite: Option<&SuiteRecoveryState>,
 ) -> anyhow::Result<()> {
-    if manifest.schema != SUITE_RETENTION_MANIFEST_SCHEMA
+    if !matches!(manifest.schema, 1 | SUITE_RETENTION_MANIFEST_SCHEMA)
+        || (manifest.schema == 1 && !manifest.deferred_review_pending.is_empty())
         || crate::Origin::parse_suite(&manifest.suite_origin)
             .map_err(|_| anyhow::anyhow!("retained Suite origin is invalid"))?
             .as_str()
@@ -2084,6 +2134,13 @@ fn validate_suite_retention_manifest(
     }
     if let Some(screenshot) = &manifest.review_screenshot_manifest {
         validate_review_screenshot_manifest_binding(screenshot, manifest, binding)?;
+    }
+    if !manifest.deferred_review_pending.is_empty() {
+        let screenshot = manifest
+            .review_screenshot_manifest
+            .as_ref()
+            .context("deferred review retention has no screenshot manifest")?;
+        validate_deferred_review_screenshot_binding(screenshot, manifest, binding)?;
     }
     let mut matrix_ids = std::collections::BTreeSet::new();
     let mut suite_ids = std::collections::BTreeSet::new();
@@ -2102,6 +2159,36 @@ fn validate_suite_retention_manifest(
             bail!("Suite retention plan ownership is invalid");
         }
     }
+    let mut deferred_modules = std::collections::BTreeSet::new();
+    for pending in &manifest.deferred_review_pending {
+        let canonical_variant = serde_json::to_string(&pending.variant)
+            .expect("BTreeMap<String, String> always serializes to JSON");
+        validate_component(&pending.matrix_plan_id, "deferred review Matrix plan ID")?;
+        validate_component(&pending.suite_plan_id, "deferred review Suite plan ID")?;
+        validate_component(&pending.module_id, "deferred review Suite module ID")?;
+        if pending.test_name.is_empty()
+            || pending.test_name.len() > 256
+            || pending
+                .test_name
+                .bytes()
+                .any(|byte| byte.is_ascii_control())
+            || pending.marker != crate::ReviewScreenshotMarker::Required
+            || pending.obligation_index != 0
+            || pending.placeholder_path
+                != format!("/test/a/{}/verification-evidence", pending.module_id)
+            || !matrix_ids.contains(&pending.matrix_plan_id)
+            || !suite_ids.contains(&pending.suite_plan_id)
+            || !deferred_modules.insert((
+                pending.matrix_plan_id.clone(),
+                pending.suite_plan_id.clone(),
+                pending.module_id.clone(),
+                pending.test_name.clone(),
+                canonical_variant,
+            ))
+        {
+            bail!("deferred review retention identity is invalid");
+        }
+    }
     if let Some(suite) = suite {
         let suite_ids = suite
             .plan_ids
@@ -2118,6 +2205,52 @@ fn validate_suite_retention_manifest(
         if suite.origin != manifest.suite_origin {
             bail!("Suite retention origin conflicts with the recovery journal");
         }
+    }
+    Ok(())
+}
+
+fn validate_deferred_review_screenshot_binding(
+    screenshot: &SuiteRetentionScreenshotManifest,
+    retention: &SuiteRetentionManifest,
+    binding: &TenantResourceRecoveryBinding,
+) -> anyhow::Result<()> {
+    let bytes = crate::secure_file::read_bounded(
+        &screenshot.path,
+        crate::evidence::MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES,
+        true,
+    )
+    .map_err(|error| anyhow::anyhow!("review screenshot manifest is not secure: {error:?}"))?;
+    let document: ReviewScreenshotManifestDocument =
+        serde_json::from_slice(&bytes).context("review screenshot manifest is not valid JSON")?;
+    for pending in &retention.deferred_review_pending {
+        let module_matches = document.modules.iter().any(|module| {
+            module.matrix_plan_id == pending.matrix_plan_id
+                && module.suite_plan_id == pending.suite_plan_id
+                && module.module_id == pending.module_id
+                && module.test_name == pending.test_name
+                && module.variant == pending.variant
+                && module.required == 1
+                && module.captured_required == 1
+                && module.missing_optional == 0
+        });
+        let screenshot_matches = document.screenshots.iter().any(|image| {
+            image.matrix_plan_id == pending.matrix_plan_id
+                && image.suite_plan_id == pending.suite_plan_id
+                && image.module_id == pending.module_id
+                && image.test_name == pending.test_name
+                && image.variant == pending.variant
+                && image.marker == pending.marker
+                && image.obligation_index == pending.obligation_index
+                && image.source
+                    == crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver
+                && image.trigger_path == "/ui/verification-result"
+        });
+        if !module_matches || !screenshot_matches {
+            bail!("deferred review screenshot manifest does not bind the retained module");
+        }
+    }
+    if document.run_jti != binding.request_jti {
+        bail!("deferred review screenshot manifest has the wrong run identity");
     }
     Ok(())
 }
@@ -3043,6 +3176,7 @@ mod tests {
             tenant_id: binding.tenant_id.clone(),
             run_id: binding.request_jti.clone(),
             review_screenshot_manifest: None,
+            deferred_review_pending: Vec::new(),
             plans: vec![SuiteRetentionPlan {
                 matrix_plan_id: "matrix-plan-1".to_owned(),
                 suite_plan_id: "550e8400-e29b-41d4-a716-446655440001".to_owned(),
@@ -3244,6 +3378,85 @@ mod tests {
             &image
         ));
         std::fs::remove_dir_all(&root).expect("remove test root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_review_manifest_requires_the_same_required_nazo_capture_identity() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!("nazoauth-deferred-review-{}", uuid::Uuid::now_v7()));
+        crate::secure_file::ensure_directory(&root, true).expect("test root");
+        let mut binding = tenant_resource_binding(&root);
+        let (mut retention, image) = vp_receipt_fixture(&mut binding);
+        let manifest_path = root
+            .join("review-screenshot-manifests")
+            .join(format!("{}.json", binding.request_jti));
+        crate::secure_file::ensure_directory(
+            manifest_path.parent().expect("manifest parent"),
+            true,
+        )
+        .expect("manifest directory");
+        let document = serde_json::to_vec(&serde_json::json!({
+            "schema": crate::evidence::REVIEW_SCREENSHOT_MANIFEST_SCHEMA,
+            "run_jti": binding.request_jti.clone(),
+            "artifact_digest": retention.artifact_digest.clone(),
+            "matrix_sha256": retention.matrix_sha256.clone(),
+            "suite_origin": retention.suite_origin.clone(),
+            "target_issuer": "https://issuer.example",
+            "modules": [{
+                "matrix_plan_id": image.matrix_plan_id.clone(),
+                "suite_plan_id": image.suite_plan_id.clone(),
+                "module_id": image.module_id.clone(),
+                "test_name": image.test_name.clone(),
+                "variant": image.variant.clone(),
+                "required": 1,
+                "captured_required": 1,
+                "missing_optional": 0
+            }],
+            "screenshots": [{
+                "matrix_plan_id": image.matrix_plan_id.clone(),
+                "suite_plan_id": image.suite_plan_id.clone(),
+                "module_id": image.module_id.clone(),
+                "test_name": image.test_name.clone(),
+                "variant": image.variant.clone(),
+                "marker": "required",
+                "obligation_index": 0,
+                "path": image.path.clone(),
+                "sha256": image.sha256.clone(),
+                "size": image.size,
+                "receipt_sha256": image.receipt_sha256.clone(),
+                "trigger_origin": image.trigger_origin.clone(),
+                "trigger_path": image.trigger_path.clone(),
+                "trigger_url_sha256": image.trigger_url_sha256.clone(),
+                "source": "nazo-vp-verification-result/live-webdriver",
+                "verification_receipt": image.verification_receipt.clone()
+            }]
+        }))
+        .expect("manifest JSON");
+        crate::secure_file::write_atomic(&manifest_path, &document, true).expect("write manifest");
+        let screenshot = SuiteRetentionScreenshotManifest {
+            path: manifest_path,
+            sha256: sha256_hex(&document),
+        };
+        retention.review_screenshot_manifest = Some(screenshot.clone());
+        retention.deferred_review_pending = vec![SuiteRetentionDeferredReview {
+            matrix_plan_id: image.matrix_plan_id.clone(),
+            suite_plan_id: image.suite_plan_id.clone(),
+            module_id: image.module_id.clone(),
+            test_name: image.test_name.clone(),
+            variant: image.variant.clone(),
+            placeholder_path: format!("/test/a/{}/verification-evidence", image.module_id),
+            marker: crate::ReviewScreenshotMarker::Required,
+            obligation_index: 0,
+        }];
+
+        validate_deferred_review_screenshot_binding(&screenshot, &retention, &binding)
+            .expect("exact deferred review binding");
+        retention.deferred_review_pending[0].obligation_index = 1;
+        assert!(
+            validate_deferred_review_screenshot_binding(&screenshot, &retention, &binding).is_err()
+        );
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 
     #[test]
@@ -4123,6 +4336,7 @@ mod tests {
             tenant_id: binding.tenant_id.clone(),
             run_id: binding.request_jti.clone(),
             review_screenshot_manifest: None,
+            deferred_review_pending: Vec::new(),
             plans: vec![SuiteRetentionPlan {
                 matrix_plan_id: "matrix-plan-1".to_owned(),
                 suite_plan_id: "suite-plan-1".to_owned(),
@@ -4275,6 +4489,7 @@ mod tests {
             tenant_id: binding.tenant_id.clone(),
             run_id: binding.request_jti.clone(),
             review_screenshot_manifest: None,
+            deferred_review_pending: Vec::new(),
             plans: vec![SuiteRetentionPlan {
                 matrix_plan_id: "matrix-plan-1".to_owned(),
                 suite_plan_id: "suite-plan-1".to_owned(),
@@ -4421,6 +4636,7 @@ mod tests {
                 path: screenshot_path.clone(),
                 sha256: sha256_hex(&original),
             }),
+            deferred_review_pending: Vec::new(),
             plans: vec![SuiteRetentionPlan {
                 matrix_plan_id: "matrix-plan-1".to_owned(),
                 suite_plan_id: "suite-plan-1".to_owned(),
@@ -4515,6 +4731,7 @@ mod tests {
             tenant_id: binding.tenant_id.clone(),
             run_id: binding.request_jti.clone(),
             review_screenshot_manifest: None,
+            deferred_review_pending: Vec::new(),
             plans,
         };
         let final_path = evidence.join(format!("retained-suite-{}.json", binding.request_jti));

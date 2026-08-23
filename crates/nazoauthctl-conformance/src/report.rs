@@ -44,6 +44,12 @@ pub struct ModuleReport {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub variant: BTreeMap<String, String>,
     pub terminal: bool,
+    /// A signed OpenID4VP verifier module which remains at the Suite's
+    /// deferred-review boundary. This is deliberately not a Suite terminal
+    /// result and can only be retained with a locally verified required
+    /// verification-result capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_review_pending: Option<DeferredReviewPending>,
     /// The suite's status is preserved verbatim; it is not mapped to a local
     /// pass/fail result.
     pub official_status: Option<String>,
@@ -94,8 +100,22 @@ pub struct ReviewScreenshotReport {
     pub size: usize,
 }
 
+/// Identity of the sole signed Suite placeholder that remains pending after a
+/// locally verified NazoAuthWeb OpenID4VP result capture. The controller never
+/// calls the Suite image API or marks this placeholder visited.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeferredReviewPending {
+    pub placeholder_path: String,
+    pub marker: crate::ReviewScreenshotMarker,
+    pub obligation_index: usize,
+}
+
 fn is_zero(value: &usize) -> bool {
     *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -103,6 +123,7 @@ fn is_zero(value: &usize) -> bool {
 pub enum ModuleOutcome {
     Passed,
     Review,
+    DeferredReviewPending,
     Skipped,
     Failed,
     Incomplete,
@@ -125,6 +146,14 @@ pub struct OrchestrationIntegrity {
     pub terminal_modules: usize,
     pub all_modules_instantiated: bool,
     pub all_modules_terminal: bool,
+    /// Every module either reached an exact Suite terminal state or the
+    /// constrained deferred-review state recorded below.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub all_modules_settled: bool,
+    /// Count of explicit deferred-review modules. These are never Suite pass
+    /// or acceptance pass results.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub deferred_review_modules: usize,
     pub cleanup_complete: bool,
     /// A requested certification retention path is deliberately not cleanup.
     #[serde(default)]
@@ -163,12 +192,20 @@ pub struct ConformanceReport {
     /// remains stricter and only represents all-PASSED Suite execution.
     #[serde(default)]
     pub acceptance_pass: bool,
+    /// At least one module is retained at the Suite's deferred-review
+    /// boundary. This is auditable local settlement, not certification.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub review_pending: bool,
     /// True when one or more modules returned REVIEW/WARNING or
     /// emitted a WARNING condition. These modules remain listed in `modules`
     /// and require explicit human follow-up.
     pub human_review_required: bool,
     /// Variant-qualified module identities requiring human review.
     pub human_review_modules: Vec<String>,
+    /// Variant-qualified modules at the deferred Suite review boundary. These
+    /// are settled locally but never terminal/passed Suite outcomes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_review_modules: Vec<String>,
     /// Variant-qualified identities that the Suite classified as `SKIPPED`. An expected skip
     /// remains skipped and never contributes to `suite_pass`.
     pub skipped_modules: Vec<String>,
@@ -238,8 +275,11 @@ impl ModuleReport {
                 _ => ModuleOutcome::Failed,
             }
         };
-        let human_review_required = outcome == ModuleOutcome::Review
-            || (outcome == ModuleOutcome::Skipped && !advisory_log_results.is_empty());
+        let human_review_required = matches!(
+            outcome,
+            ModuleOutcome::Review | ModuleOutcome::DeferredReviewPending
+        ) || (outcome == ModuleOutcome::Skipped
+            && !advisory_log_results.is_empty());
         Self {
             matrix_plan_id: context.matrix_plan_id,
             suite_plan_id: context.suite_plan_id,
@@ -247,6 +287,7 @@ impl ModuleReport {
             test_name: context.test_name,
             variant: context.variant,
             terminal: context.terminal,
+            deferred_review_pending: None,
             official_status,
             official_result,
             expected_result: context.expected_result,
@@ -264,6 +305,13 @@ impl ModuleReport {
             raw_log,
         }
     }
+
+    pub(crate) fn mark_deferred_review_pending(&mut self, pending: DeferredReviewPending) {
+        debug_assert!(!self.terminal);
+        self.deferred_review_pending = Some(pending);
+        self.outcome = ModuleOutcome::DeferredReviewPending;
+        self.human_review_required = true;
+    }
 }
 
 impl Drop for ModuleReport {
@@ -277,6 +325,7 @@ pub(crate) struct ModuleOutcomeSummary {
     pub all_passed: bool,
     pub acceptance_pass: bool,
     pub human_review_modules: Vec<String>,
+    pub deferred_review_modules: Vec<String>,
     pub skipped_modules: Vec<String>,
     pub failed_modules: Vec<String>,
     pub incomplete_modules: Vec<String>,
@@ -292,6 +341,7 @@ pub(crate) fn summarize_module_outcomes(modules: &[ModuleReport]) -> ModuleOutco
         all_passed: !modules.is_empty(),
         acceptance_pass: !modules.is_empty(),
         human_review_modules: Vec::new(),
+        deferred_review_modules: Vec::new(),
         skipped_modules: Vec::new(),
         failed_modules: Vec::new(),
         incomplete_modules: Vec::new(),
@@ -306,6 +356,11 @@ pub(crate) fn summarize_module_outcomes(modules: &[ModuleReport]) -> ModuleOutco
             ModuleOutcome::Review => {
                 summary.all_passed = false;
                 summary.acceptance_pass = false;
+            }
+            ModuleOutcome::DeferredReviewPending => {
+                summary.all_passed = false;
+                summary.acceptance_pass = false;
+                summary.deferred_review_modules.push(identity);
             }
             ModuleOutcome::Skipped => {
                 summary.all_passed = false;
@@ -629,8 +684,10 @@ mod tests {
             local_success: true,
             suite_pass: true,
             acceptance_pass: true,
+            review_pending: false,
             human_review_required: false,
             human_review_modules: Vec::new(),
+            deferred_review_modules: Vec::new(),
             skipped_modules: Vec::new(),
             expected_skipped_modules: Vec::new(),
             unexpected_skipped_modules: Vec::new(),
@@ -644,6 +701,8 @@ mod tests {
                 terminal_modules: 0,
                 all_modules_instantiated: true,
                 all_modules_terminal: true,
+                all_modules_settled: true,
+                deferred_review_modules: 0,
                 cleanup_complete: true,
                 retention_requested: false,
                 retention_eligible: false,
@@ -692,5 +751,25 @@ mod tests {
         assert!(restored.expected_skipped_modules.is_empty());
         assert!(restored.unexpected_skipped_modules.is_empty());
         assert!(restored.unknown_declared_skip_modules.is_empty());
+    }
+
+    #[test]
+    fn deferred_review_is_settled_evidence_but_never_a_suite_acceptance() {
+        let mut pending = module("vp-result", false, "WAITING", "", serde_json::json!([]));
+        pending.mark_deferred_review_pending(DeferredReviewPending {
+            placeholder_path: "/test/a/module-vp-result/verification-evidence".to_owned(),
+            marker: crate::ReviewScreenshotMarker::Required,
+            obligation_index: 0,
+        });
+
+        let summary = summarize_module_outcomes(&[pending]);
+
+        assert!(!summary.all_passed);
+        assert!(!summary.acceptance_pass);
+        assert!(summary.incomplete_modules.is_empty());
+        assert_eq!(
+            summary.deferred_review_modules,
+            vec!["p/vp-result".to_owned()]
+        );
     }
 }

@@ -106,13 +106,14 @@ pub use proxy_trust::ProxyTrustGuard;
 pub use recovery::{
     ConformanceProxyRecovery, ConformanceRecoveryBinding, ConformanceRecoveryGuard,
     ConformanceRecoveryStore, OpenId4VpEvidenceTrustAnchor, SuiteRecoveryState,
-    SuiteRetentionCommitResolution, SuiteRetentionManifest, SuiteRetentionManifestReceipt,
-    SuiteRetentionPlan, SuiteRetentionScreenshotManifest, TenantResourceReceiptIdentity,
-    TenantResourceRecoveryBinding, TenantResourceRevokeOutcome, TenantResourceRevokeRecord,
+    SuiteRetentionCommitResolution, SuiteRetentionDeferredReview, SuiteRetentionManifest,
+    SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
+    TenantResourceReceiptIdentity, TenantResourceRecoveryBinding, TenantResourceRevokeOutcome,
+    TenantResourceRevokeRecord,
 };
 pub use report::{
-    CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport, PlanReport,
-    ReviewScreenshotReport,
+    CleanupFailure, CleanupReport, ConformanceReport, DeferredReviewPending, ModuleOutcome,
+    ModuleReport, PlanReport, ReviewScreenshotReport,
 };
 pub use transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, Transport, TransportError,

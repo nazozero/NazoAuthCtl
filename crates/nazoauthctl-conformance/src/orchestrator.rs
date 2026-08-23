@@ -25,8 +25,8 @@ use crate::progress::{
     GroupProgress, GroupStatus, ProgressEvent, ProgressSink, ProgressSnapshot, redacted_variant,
 };
 use crate::report::{
-    CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport,
-    ModuleReportContext, OrchestrationIntegrity, PlanReport, ReviewScreenshotReport,
+    CleanupFailure, CleanupReport, ConformanceReport, DeferredReviewPending, ModuleOutcome,
+    ModuleReport, ModuleReportContext, OrchestrationIntegrity, PlanReport, ReviewScreenshotReport,
     summarize_matrix_expectations, summarize_module_outcomes,
 };
 use crate::transport::TransportError;
@@ -832,6 +832,15 @@ impl ConformanceRunner {
         let mut cleanup = CleanupReport::default();
         let mut module_ids = Vec::<String>::new();
         let mut current_test = None;
+        let retention_requested = self
+            .config
+            .suite_resource_observer
+            .as_ref()
+            .is_some_and(|observer| observer.retain_suite_plans_for_certification());
+        let review_capture_requested = self.config.automation.first().is_some_and(|automation| {
+            automation.review_screenshot_capture.is_some() && automation.vp_evidence.is_some()
+        });
+        let deferred_review_enabled = retention_requested && review_capture_requested;
 
         // The denominator is now frozen. A plan-creation failure leaves the
         // successfully created subset visible, but no execution is attempted.
@@ -941,6 +950,7 @@ impl ConformanceRunner {
                     };
                     let mut observed = initial;
                     let mut browser_review_evidence = BrowserReviewEvidence::default();
+                    let mut deferred_review_pending = None;
                     let has_browser_config =
                         match module_has_browser_config(&plan.config, &module.test_name) {
                             Ok(value) => value,
@@ -1012,7 +1022,15 @@ impl ConformanceRunner {
                                     break 'execute;
                                 }
                             }
-                        } else if plan.plan_name.starts_with("oid4vp-1final-verifier") {
+                        } else if is_openid4vp_verifier_plan(plan) {
+                            if review_capture_requested && !retention_requested {
+                                errors.push(
+                                    "OpenID4VP deferred review requires explicit Suite plan retention"
+                                        .to_owned(),
+                                );
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            }
                             let Some(verifier) = self
                                 .config
                                 .automation
@@ -1140,6 +1158,14 @@ impl ConformanceRunner {
                                     break 'execute;
                                 }
                             };
+                            if deferred_review_enabled && !evidence_requested {
+                                errors.push(
+                                    "deferred review requires one selected required verification-evidence marker"
+                                        .to_owned(),
+                                );
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            }
                             if let Err(error) = verifier.complete(&presentation) {
                                 errors.push(error.to_string());
                                 groups[group_index].status = GroupStatus::Failed;
@@ -1252,6 +1278,59 @@ impl ConformanceRunner {
                                         browser_review_evidence.attempts = 1;
                                         browser_review_evidence.decoded_bytes = screenshot.size;
                                         browser_review_evidence.screenshots.push(screenshot);
+                                        // OIDF v5.2.2 MR !2100 deliberately leaves the
+                                        // verifier runner WAITING while the operator later
+                                        // supplies review evidence. See
+                                        // https://gitlab.com/openid/conformance-suite/-/merge_requests/2100.
+                                        // We never upload or mark
+                                        // that Suite placeholder visited. A fresh exact state
+                                        // read is the only admissible local settlement proof.
+                                        let pending_info =
+                                            match self.config.client.module_info(&instance.id) {
+                                                Ok(info) => info,
+                                                Err(error) => {
+                                                    errors.push(safe_error(&error));
+                                                    groups[group_index].status =
+                                                        GroupStatus::Failed;
+                                                    break 'execute;
+                                                }
+                                            };
+                                        if !is_deferred_review_waiting(&pending_info) {
+                                            errors.push(
+                                                "deferred review requires the Suite module to remain WAITING"
+                                                    .to_owned(),
+                                            );
+                                            groups[group_index].status = GroupStatus::Failed;
+                                            break 'execute;
+                                        }
+                                        let pending_wait = match self.wait_for_state_interruptible(
+                                            &instance.id,
+                                            &["WAITING", "FINISHED", "INTERRUPTED"],
+                                        ) {
+                                            Ok(state) => state,
+                                            Err(error) => {
+                                                errors.push(error);
+                                                groups[group_index].status = GroupStatus::Failed;
+                                                break 'execute;
+                                            }
+                                        };
+                                        if !is_deferred_review_waiting(&pending_wait) {
+                                            errors.push(
+                                                "deferred review wait-state is not exact WAITING"
+                                                    .to_owned(),
+                                            );
+                                            groups[group_index].status = GroupStatus::Failed;
+                                            break 'execute;
+                                        }
+                                        deferred_review_pending = Some(DeferredReviewPending {
+                                            placeholder_path: format!(
+                                                "/test/a/{}/verification-evidence",
+                                                instance.id
+                                            ),
+                                            marker: crate::ReviewScreenshotMarker::Required,
+                                            obligation_index: 0,
+                                        });
+                                        observed = Some(pending_wait);
                                     }
                                     Err(error) => {
                                         errors.push(error);
@@ -1325,7 +1404,8 @@ impl ConformanceRunner {
                         }
                     }
 
-                    if !observed.as_ref().is_some_and(is_terminal_state)
+                    if deferred_review_pending.is_none()
+                        && !observed.as_ref().is_some_and(is_terminal_state)
                         && let Err(error) = self.wait_for_state_interruptible(
                             &instance.id,
                             &["FINISHED", "INTERRUPTED"],
@@ -1352,12 +1432,18 @@ impl ConformanceRunner {
                         }
                     };
                     let terminal = is_terminal(&info);
-                    if !terminal {
+                    if deferred_review_pending.is_some() && !is_deferred_review_waiting(&info) {
+                        errors.push(
+                            "deferred review module changed state before report collection"
+                                .to_owned(),
+                        );
+                        groups[group_index].status = GroupStatus::Failed;
+                    } else if !terminal && deferred_review_pending.is_none() {
                         errors.push("Suite module did not reach a terminal status".to_owned());
                         groups[group_index].status = GroupStatus::Failed;
                     } else if has_browser_config {
                         let declared = (|| -> Result<usize, String> {
-                            if plan.plan_name.starts_with("oid4vp-1final-verifier") {
+                            if is_openid4vp_verifier_plan(plan) {
                                 return Ok(browser_review_evidence.required);
                             }
                             let config = browser_config_for_module(&plan.config, &module.test_name)
@@ -1394,14 +1480,23 @@ impl ConformanceRunner {
                     module_report.review_screenshots_required_captured =
                         browser_review_evidence.required_captured;
                     module_report.review_screenshots_missing = browser_review_evidence.missing;
+                    if let Some(pending) = deferred_review_pending {
+                        module_report.mark_deferred_review_pending(pending);
+                    }
                     modules.push(module_report);
                     let module_outcome = modules.last().map(|module| module.outcome);
-                    if terminal {
+                    if terminal
+                        || modules
+                            .last()
+                            .is_some_and(|module| module.deferred_review_pending.is_some())
+                    {
                         groups[group_index].running = groups[group_index].running.saturating_sub(1);
                         groups[group_index].completed += 1;
                         match module_outcome {
                             Some(ModuleOutcome::Passed) => groups[group_index].passed += 1,
-                            Some(ModuleOutcome::Review) => groups[group_index].reviewed += 1,
+                            Some(ModuleOutcome::Review | ModuleOutcome::DeferredReviewPending) => {
+                                groups[group_index].reviewed += 1
+                            }
                             Some(ModuleOutcome::Skipped) => groups[group_index].skipped += 1,
                             Some(ModuleOutcome::Failed | ModuleOutcome::Incomplete) | None => {
                                 groups[group_index].failed += 1;
@@ -1456,19 +1551,22 @@ impl ConformanceRunner {
         let terminal_modules = modules.iter().filter(|module| module.terminal).count();
         let all_modules_instantiated = defined_modules == created_instances;
         let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
+        let deferred_review_modules = modules
+            .iter()
+            .filter(|module| module.deferred_review_pending.is_some())
+            .count();
+        let all_modules_settled = all_modules_instantiated
+            && terminal_modules
+                .checked_add(deferred_review_modules)
+                .is_some_and(|settled| settled == defined_modules);
         if let Err(error) = validate_review_screenshot_run_limit(&modules) {
             errors.push(error);
         }
-        let retention_requested = self
-            .config
-            .suite_resource_observer
-            .as_ref()
-            .is_some_and(|observer| observer.retain_suite_plans_for_certification());
         let retain_suite_plans = retention_requested
             && errors.is_empty()
             && all_selected_plan_definitions_enumerated
             && defined_modules > 0
-            && all_modules_terminal;
+            && all_modules_settled;
         if !retain_suite_plans {
             let cancellable_module_ids = cancellable_module_ids(&module_ids, &modules);
             cleanup_all(
@@ -1492,6 +1590,8 @@ impl ConformanceRunner {
             terminal_modules,
             all_modules_instantiated,
             all_modules_terminal,
+            all_modules_settled,
+            deferred_review_modules,
             cleanup_complete,
             retention_requested,
             retention_eligible: retain_suite_plans,
@@ -1500,13 +1600,14 @@ impl ConformanceRunner {
         };
         let local_success = errors.is_empty()
             && orchestration_integrity.all_modules_instantiated
-            && orchestration_integrity.all_modules_terminal
+            && orchestration_integrity.all_modules_settled
             && orchestration_integrity.suite_resources_settled;
         let human_review_required = !outcomes.human_review_modules.is_empty();
         let snapshot = snapshot(&groups, current_profile, current_variant, current_test);
         let report = ConformanceReport {
-            // Schema 3 separates local execution from exact Suite outcomes.
-            schema: 3,
+            // Schema 4 is emitted only when a deferred Suite review boundary
+            // exists; terminal-only execution keeps the existing schema.
+            schema: if deferred_review_modules > 0 { 4 } else { 3 },
             matrix_digest: self.config.matrix.digest.clone(),
             suite_origin: self.config.client.origin().to_string(),
             auth_probe,
@@ -1514,8 +1615,10 @@ impl ConformanceRunner {
             local_success,
             suite_pass,
             acceptance_pass: outcomes.acceptance_pass && matrix_expectations_satisfied,
+            review_pending: deferred_review_modules > 0,
             human_review_required,
             human_review_modules: outcomes.human_review_modules,
+            deferred_review_modules: outcomes.deferred_review_modules,
             skipped_modules: outcomes.skipped_modules,
             expected_skipped_modules: matrix_expectations.expected_skipped_modules,
             unexpected_skipped_modules: matrix_expectations.unexpected_skipped_modules,
@@ -1544,6 +1647,14 @@ fn module_has_browser_config(plan_config: &Value, test_name: &str) -> Result<boo
         Some(_) => return Err("browser override map is malformed".to_owned()),
     };
     Ok(override_browser || plan_config.get("browser").is_some())
+}
+
+/// `PlannedPlan` exists only after the signed Matrix was materialized and its
+/// selected plan definitions were enumerated. The official OpenID4VP verifier
+/// family is therefore a signed capability classification here, not a
+/// suite/test-case exception (and never a p038-specific branch).
+fn is_openid4vp_verifier_plan(plan: &PlannedPlan) -> bool {
+    plan.plan_name.starts_with("oid4vp-1final-verifier")
 }
 
 fn verify_required_review_screenshots(
@@ -1911,6 +2022,13 @@ fn is_waiting(value: &Value) -> bool {
         status(value),
         Some("WAITING" | "WAITING_FOR_USER" | "WAITING_FOR_BROWSER")
     )
+}
+
+/// OIDF deferred evidence has a narrower contract than generic interactive
+/// browser waiting: the Suite must still report its exact `WAITING` review
+/// boundary after NazoAuthWeb capture, not another user/browser state.
+fn is_deferred_review_waiting(value: &Value) -> bool {
+    status(value) == Some("WAITING")
 }
 
 fn is_terminal_state(value: &Value) -> bool {
@@ -3605,5 +3723,18 @@ mod tests {
         assert!(is_terminal(&serde_json::json!({"state":"FINISHED"})));
         assert!(is_terminal(&serde_json::json!({"state":"INTERRUPTED"})));
         assert!(!is_terminal(&serde_json::json!({"state":"RUNNING"})));
+    }
+
+    #[test]
+    fn deferred_review_requires_the_exact_suite_waiting_boundary() {
+        assert!(is_deferred_review_waiting(
+            &serde_json::json!({"status":"WAITING"})
+        ));
+        assert!(!is_deferred_review_waiting(
+            &serde_json::json!({"status":"WAITING_FOR_BROWSER"})
+        ));
+        assert!(!is_deferred_review_waiting(
+            &serde_json::json!({"state":"FINISHED"})
+        ));
     }
 }

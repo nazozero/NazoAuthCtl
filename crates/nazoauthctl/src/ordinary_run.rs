@@ -28,13 +28,14 @@ use nazoauthctl_conformance::{
     OidfProviderExecutionBinding, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
     OpenId4VciIssuerDriver, OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier,
     OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl,
-    StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionManifest,
-    SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
-    TenantResourceApplyOutput, TenantResourceReceiptIdentity, TenantResourceRecoveryBinding,
-    TtyRenderer, WebDriverClient, WebDriverEndpoint, authorize_oidf_driver_execution,
-    open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
-    read_compact_manifest, recover_suite_resources, validate_private_evidence_directory,
-    verify_oidf_artifact, write_private_provider_evidence_bundle, write_review_screenshot_manifest,
+    StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionDeferredReview,
+    SuiteRetentionManifest, SuiteRetentionManifestReceipt, SuiteRetentionPlan,
+    SuiteRetentionScreenshotManifest, TenantResourceApplyOutput, TenantResourceReceiptIdentity,
+    TenantResourceRecoveryBinding, TtyRenderer, WebDriverClient, WebDriverEndpoint,
+    authorize_oidf_driver_execution, open_cached_oidf_driver_plan, read_artifact_driver,
+    read_artifact_matrix, read_compact_manifest, recover_suite_resources,
+    validate_private_evidence_directory, verify_oidf_artifact,
+    write_private_provider_evidence_bundle, write_review_screenshot_manifest,
 };
 use nazoauthctl_core::tenant_resources::{
     TenantResourceCapabilitySession, TenantResourceClient, TenantResourceClientError,
@@ -672,7 +673,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         }
         report.local_success = report.errors.is_empty()
             && report.orchestration_integrity.all_modules_instantiated
-            && report.orchestration_integrity.all_modules_terminal
+            && report.orchestration_integrity.all_modules_settled
             && report.orchestration_integrity.suite_resources_settled;
     }
     // Ordinary evidence is intentionally post-retention: a writer failure
@@ -1178,7 +1179,7 @@ fn suite_retention_manifest(
             let suite_plan_id = plan
                 .suite_plan_id
                 .clone()
-                .context("terminal retained report has no Suite plan ID")?;
+                .context("settled retained report has no Suite plan ID")?;
             Ok(SuiteRetentionPlan {
                 matrix_plan_id: plan.matrix_plan_id.clone(),
                 suite_plan_id,
@@ -1188,7 +1189,7 @@ fn suite_retention_manifest(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(SuiteRetentionManifest {
-        schema: 1,
+        schema: if report.review_pending { 2 } else { 1 },
         suite_origin: report.suite_origin.clone(),
         artifact_digest: artifact_digest.to_owned(),
         matrix_sha256: matrix_sha256.to_owned(),
@@ -1201,6 +1202,23 @@ fn suite_retention_manifest(
                 sha256: manifest.sha256.clone(),
             }
         }),
+        deferred_review_pending: report
+            .modules
+            .iter()
+            .filter_map(|module| {
+                let pending = module.deferred_review_pending.as_ref()?;
+                Some(SuiteRetentionDeferredReview {
+                    matrix_plan_id: module.matrix_plan_id.clone(),
+                    suite_plan_id: module.suite_plan_id.clone(),
+                    module_id: module.module_id.clone()?,
+                    test_name: module.test_name.clone(),
+                    variant: module.variant.clone(),
+                    placeholder_path: pending.placeholder_path.clone(),
+                    marker: pending.marker,
+                    obligation_index: pending.obligation_index,
+                })
+            })
+            .collect(),
         plans,
     })
 }
@@ -1767,6 +1785,7 @@ mod tests {
             tenant_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             run_id: binding_request_jti.to_owned(),
             review_screenshot_manifest: None,
+            deferred_review_pending: Vec::new(),
             plans: Vec::new(),
         };
 

@@ -148,6 +148,18 @@ relative path, SHA-256, and size. Existing terminal Suite modules are never
 targeted: a retained plan must be repeated to collect new local evidence, which
 can then be attached manually in the official UI.
 
+For the OpenID4VP deferred verification-evidence boundary documented by
+[OIDF Suite MR !2100](https://gitlab.com/openid/conformance-suite/-/merge_requests/2100), a
+capture-and-retain run may instead record a typed `deferred_review_pending`
+module. This requires one actually selected signed required
+`verification-evidence` marker, a verified NazoAuthWeb result capture, and a
+fresh exact Suite `WAITING` state for that same module. It is neither a Suite
+terminal result nor a pass/certification claim: reports keep
+`acceptance_pass=false` and `review_pending=true`. The retention manifest
+persists the exact plan/module/placeholder identity and capture-manifest hash
+for controlled operator action later; ctl does not upload an image, mark a
+browser URL visited, or modify an existing retained plan.
+
 Final output schema 2 preserves a completed `RunOutput` even when resource,
 proxy, or evidence cleanup fails. Such failures are listed in `errors`, keep
 `success: false`, and leave `deployment.cleanup_complete: false`; they are no

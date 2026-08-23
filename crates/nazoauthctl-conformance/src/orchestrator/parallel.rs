@@ -404,6 +404,14 @@ fn merge_reports(
     let terminal_modules = modules.iter().filter(|module| module.terminal).count();
     let all_modules_instantiated = all_plans_finished && defined_modules == created_instances;
     let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
+    let deferred_review_modules = modules
+        .iter()
+        .filter(|module| module.deferred_review_pending.is_some())
+        .count();
+    let all_modules_settled = all_modules_instantiated
+        && terminal_modules
+            .checked_add(deferred_review_modules)
+            .is_some_and(|settled| settled == defined_modules);
     if let Err(error) = super::validate_review_screenshot_run_limit(&modules) {
         errors.push(error);
     }
@@ -417,7 +425,7 @@ fn merge_reports(
         && errors.is_empty()
         && prepared.all_selected_plan_definitions_enumerated
         && defined_modules > 0
-        && all_modules_terminal;
+        && all_modules_settled;
     if !retention_eligible {
         let cancellable_module_ids = cancellable_module_ids(&observed_module_ids, &modules);
         cleanup_all(
@@ -441,6 +449,8 @@ fn merge_reports(
         terminal_modules,
         all_modules_instantiated,
         all_modules_terminal,
+        all_modules_settled,
+        deferred_review_modules,
         cleanup_complete,
         retention_requested,
         retention_eligible,
@@ -448,10 +458,10 @@ fn merge_reports(
         suite_resources_settled: cleanup_complete,
     };
     let local_success =
-        errors.is_empty() && all_modules_instantiated && all_modules_terminal && cleanup_complete;
+        errors.is_empty() && all_modules_instantiated && all_modules_settled && cleanup_complete;
     RunSummary {
         report: ConformanceReport {
-            schema: 3,
+            schema: if deferred_review_modules > 0 { 4 } else { 3 },
             matrix_digest: runner.config.matrix.digest.clone(),
             suite_origin: runner.config.client.origin().to_string(),
             auth_probe: prepared.auth_probe,
@@ -459,8 +469,10 @@ fn merge_reports(
             local_success,
             suite_pass,
             acceptance_pass: outcomes.acceptance_pass && matrix_expectations_satisfied,
+            review_pending: deferred_review_modules > 0,
             human_review_required: !outcomes.human_review_modules.is_empty(),
             human_review_modules: outcomes.human_review_modules,
+            deferred_review_modules: outcomes.deferred_review_modules,
             skipped_modules: outcomes.skipped_modules,
             expected_skipped_modules: matrix_expectations.expected_skipped_modules,
             unexpected_skipped_modules: matrix_expectations.unexpected_skipped_modules,
