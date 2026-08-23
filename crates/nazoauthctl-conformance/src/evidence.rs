@@ -1265,7 +1265,6 @@ fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
-#[cfg(unix)]
 fn map_secure_file_error(error: crate::secure_file::SecureFileError) -> EvidenceError {
     match error {
         crate::secure_file::SecureFileError::UnsupportedPlatform => {

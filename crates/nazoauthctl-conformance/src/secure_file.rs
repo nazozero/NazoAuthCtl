@@ -126,7 +126,7 @@ pub(crate) fn open_lock_file(path: &Path, private: bool) -> Result<fs::File, Sec
     validate_directory(parent, private)?;
     #[cfg(not(unix))]
     {
-        let _ = private;
+        let _ = (private, parent);
         Err(SecureFileError::UnsupportedPlatform)
     }
     #[cfg(unix)]
@@ -408,7 +408,7 @@ pub(crate) fn promote_private_file(from: &Path, to: &Path) -> Result<(), SecureF
     }
     #[cfg(not(unix))]
     {
-        let _ = (from, to, parent);
+        let _ = (&from, &to, parent);
         Err(SecureFileError::UnsupportedPlatform)
     }
     #[cfg(unix)]

@@ -460,6 +460,11 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                     lock_recovery(&recovery)?.mark_proxy_cleanup_complete()?;
                 }
                 let mut recovery = take_recovery(recovery)?;
+                // The external Suite runner has not been constructed, so this
+                // failure cannot own a Suite plan or module.
+                if !recovery.suite_cleanup_complete() {
+                    recovery.mark_suite_cleanup_complete()?;
+                }
                 let resource_cleanup = cleanup_run_resources(&client, &mut recovery);
                 if resource_cleanup.is_ok()
                     && proxy_cleanup.is_ok()
@@ -1434,11 +1439,13 @@ fn recover_pending_runs(
             }
             if !recovery.suite_cleanup_complete() {
                 recovery.discard_prepared_suite_retention_staging()?;
-                let suite = recovery
-                    .suite_recovery()
-                    .context("ordinary recovery Suite state is incomplete")?;
-                recover_suite_resources(suite_client, suite)
-                    .map_err(|error| anyhow::anyhow!(error))?;
+                // The observer records a plan before any child module can be
+                // allocated. An absent Suite state therefore means the crash
+                // happened before the runner owned an external resource.
+                if let Some(suite) = recovery.suite_recovery() {
+                    recover_suite_resources(suite_client, suite)
+                        .map_err(|error| anyhow::anyhow!(error))?;
+                }
                 recovery.mark_suite_cleanup_complete()?;
             }
             if !recovery.proxy_cleanup_complete() {
