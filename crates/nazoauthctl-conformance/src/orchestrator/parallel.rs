@@ -436,6 +436,7 @@ fn merge_reports(
         );
     }
     let cleanup_complete = !retention_eligible && !worker_panicked && cleanup.failures.is_empty();
+    let retention_candidate_settled = retention_eligible;
     let outcomes = summarize_module_outcomes(&modules);
     let matrix_expectations = summarize_matrix_expectations(&modules);
     let matrix_expectations_satisfied = prepared.matrix_expectations_satisfied
@@ -454,11 +455,17 @@ fn merge_reports(
         cleanup_complete,
         retention_requested,
         retention_eligible,
+        retention_candidate_settled,
         retention_committed: false,
-        suite_resources_settled: cleanup_complete,
+        suite_resources_settled: super::suite_resources_settled(
+            cleanup_complete,
+            retention_candidate_settled,
+        ),
     };
-    let local_success =
-        errors.is_empty() && all_modules_instantiated && all_modules_settled && cleanup_complete;
+    let local_success = errors.is_empty()
+        && all_modules_instantiated
+        && all_modules_settled
+        && orchestration_integrity.suite_resources_settled;
     RunSummary {
         report: ConformanceReport {
             schema: if deferred_review_modules > 0 { 4 } else { 3 },

@@ -398,6 +398,21 @@ fn retained_parallel_run_launches_work_after_the_first_worker_finishes() {
 
     assert!(summary.report.errors.is_empty());
     assert!(summary.report.orchestration_integrity.retention_eligible);
+    assert!(
+        summary
+            .report
+            .orchestration_integrity
+            .retention_candidate_settled
+    );
+    assert!(!summary.report.orchestration_integrity.retention_committed);
+    assert!(!summary.report.orchestration_integrity.cleanup_complete);
+    assert!(
+        summary
+            .report
+            .orchestration_integrity
+            .suite_resources_settled
+    );
+    assert!(summary.report.local_success);
     assert!(!summary.report.orchestration_integrity.cleanup_complete);
     assert_eq!(summary.report.orchestration_integrity.terminal_modules, 5);
     assert_eq!(
@@ -485,7 +500,11 @@ fn parallel_aggregation_retains_terminal_and_deferred_review_workers_without_cla
     assert_eq!(report.orchestration_integrity.terminal_modules, 1);
     assert_eq!(report.orchestration_integrity.deferred_review_modules, 1);
     assert!(report.orchestration_integrity.retention_eligible);
+    assert!(report.orchestration_integrity.retention_candidate_settled);
+    assert!(!report.orchestration_integrity.retention_committed);
+    assert!(report.orchestration_integrity.suite_resources_settled);
     assert!(!report.orchestration_integrity.cleanup_complete);
+    assert!(report.local_success);
     assert!(report.review_pending);
     assert!(!report.suite_pass);
     assert!(!report.acceptance_pass);

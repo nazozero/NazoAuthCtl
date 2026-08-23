@@ -158,14 +158,22 @@ pub struct OrchestrationIntegrity {
     /// A requested certification retention path is deliberately not cleanup.
     #[serde(default)]
     pub retention_requested: bool,
-    /// Every created module reached a terminal state with no orchestration error.
+    /// Every created module reached an exact terminal or deferred-review
+    /// settlement state with no orchestration error.
     #[serde(default)]
     pub retention_eligible: bool,
+    /// All exact Suite allocations are covered by a locally verified
+    /// retention candidate, but ownership has not yet moved to its durable
+    /// manifest. This lets the ordinary runner stage that handoff without
+    /// falsely reporting retention as committed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub retention_candidate_settled: bool,
     /// Exact Suite plan ownership was transferred to a retained manifest.
     /// This is deliberately distinct from ordinary cleanup completion.
     #[serde(default)]
     pub retention_committed: bool,
-    /// Set only after ordinary cleanup transfers exact plan ownership.
+    /// Set after ordinary cleanup or a durable retained-manifest transition
+    /// transfers exact plan ownership.
     #[serde(default)]
     pub suite_resources_settled: bool,
 }
@@ -706,6 +714,7 @@ mod tests {
                 cleanup_complete: true,
                 retention_requested: false,
                 retention_eligible: false,
+                retention_candidate_settled: false,
                 retention_committed: false,
                 suite_resources_settled: true,
             },

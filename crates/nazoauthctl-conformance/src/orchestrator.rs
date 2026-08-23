@@ -1577,6 +1577,7 @@ impl ConformanceRunner {
             );
         }
         let cleanup_complete = !retain_suite_plans && cleanup.failures.is_empty();
+        let retention_candidate_settled = retain_suite_plans;
         let outcomes = summarize_module_outcomes(&modules);
         let matrix_expectations = summarize_matrix_expectations(&modules);
         let matrix_expectations_satisfied = matrix_expectations_satisfied
@@ -1595,8 +1596,12 @@ impl ConformanceRunner {
             cleanup_complete,
             retention_requested,
             retention_eligible: retain_suite_plans,
+            retention_candidate_settled,
             retention_committed: false,
-            suite_resources_settled: cleanup_complete,
+            suite_resources_settled: suite_resources_settled(
+                cleanup_complete,
+                retention_candidate_settled,
+            ),
         };
         let local_success = errors.is_empty()
             && orchestration_integrity.all_modules_instantiated
@@ -2029,6 +2034,16 @@ fn is_waiting(value: &Value) -> bool {
 /// boundary after NazoAuthWeb capture, not another user/browser state.
 fn is_deferred_review_waiting(value: &Value) -> bool {
     status(value) == Some("WAITING")
+}
+
+/// A run may proceed to the ordinary retention handoff once it has either
+/// deleted every observed Suite allocation or fully accounted for them in an
+/// exact candidate. The latter is deliberately not a retention commit.
+pub(super) const fn suite_resources_settled(
+    cleanup_complete: bool,
+    retention_candidate_settled: bool,
+) -> bool {
+    cleanup_complete || retention_candidate_settled
 }
 
 fn is_terminal_state(value: &Value) -> bool {
@@ -4052,6 +4067,10 @@ mod tests {
             "/test/a/module-a/verification-evidence"
         );
         assert!(report.orchestration_integrity.retention_eligible);
+        assert!(report.orchestration_integrity.retention_candidate_settled);
+        assert!(!report.orchestration_integrity.retention_committed);
+        assert!(!report.orchestration_integrity.cleanup_complete);
+        assert!(report.orchestration_integrity.suite_resources_settled);
         assert!(report.orchestration_integrity.all_modules_settled);
         assert!(!report.orchestration_integrity.all_modules_terminal);
         assert_eq!(browser_state.lock().expect("browser").captures, 1);
@@ -4265,6 +4284,12 @@ mod tests {
             assert!(
                 !report.orchestration_integrity.retention_eligible,
                 "{} must not retain Suite resources",
+                case.name()
+            );
+            assert!(
+                !report.orchestration_integrity.retention_candidate_settled
+                    && !report.local_success,
+                "{} must not turn an incomplete retention candidate into local success",
                 case.name()
             );
             assert!(

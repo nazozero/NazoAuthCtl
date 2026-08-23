@@ -1343,6 +1343,7 @@ mod tests {
                 cleanup_complete: true,
                 retention_requested: false,
                 retention_eligible: false,
+                retention_candidate_settled: false,
                 retention_committed: false,
                 suite_resources_settled: true,
             },

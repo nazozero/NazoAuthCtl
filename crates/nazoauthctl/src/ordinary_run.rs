@@ -655,6 +655,9 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     }
     if let Some(report) = report.as_mut() {
         report.orchestration_integrity.retention_eligible = retention_eligible;
+        report.orchestration_integrity.retention_candidate_settled = retention_eligible
+            && (recovery.suite_retention_committed()
+                || recovery.suite_retention_manifest().is_some());
         report.orchestration_integrity.retention_committed = recovery.suite_retention_committed();
         report.orchestration_integrity.suite_resources_settled = recovery.suite_cleanup_complete();
         report.orchestration_integrity.cleanup_complete = !recovery.suite_retention_committed()
