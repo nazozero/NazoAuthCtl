@@ -14,8 +14,8 @@ use url::Url;
 use crate::browser::{
     BrowserAutomation, BrowserPolicy, BrowserReviewModuleIdentity, BrowserReviewScreenshotCapture,
     BrowserRunnerState, BrowserTargetOrigin, ConformanceBinding, MAX_REVIEW_SCREENSHOTS_PER_RUN,
-    OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpError,
-    OpenId4VpEvidenceRunContext, OpenId4VpStartRequest, OpenId4VpVerifier,
+    OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpCompletionOutcome,
+    OpenId4VpError, OpenId4VpEvidenceRunContext, OpenId4VpStartRequest, OpenId4VpVerifier,
     browser_config_for_module, parse_browser_entries_owned, required_review_screenshot_count,
 };
 use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
@@ -1158,7 +1158,18 @@ impl ConformanceRunner {
                                     break 'execute;
                                 }
                             };
-                            if deferred_review_enabled && !evidence_requested {
+                            let completion_outcome = match verifier.complete(&presentation) {
+                                Ok(outcome) => outcome,
+                                Err(error) => {
+                                    errors.push(error.to_string());
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                }
+                            };
+                            if completion_outcome == OpenId4VpCompletionOutcome::Completed
+                                && deferred_review_enabled
+                                && !evidence_requested
+                            {
                                 errors.push(
                                     "deferred review requires one selected required verification-evidence marker"
                                         .to_owned(),
@@ -1166,12 +1177,9 @@ impl ConformanceRunner {
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
                             }
-                            if let Err(error) = verifier.complete(&presentation) {
-                                errors.push(error.to_string());
-                                groups[group_index].status = GroupStatus::Failed;
-                                break 'execute;
-                            }
-                            let verification_evidence = if evidence_requested {
+                            let verification_evidence = if evidence_requested
+                                && completion_outcome == OpenId4VpCompletionOutcome::Completed
+                            {
                                 // `complete` already proved the verifier result. The
                                 // capability endpoint may need a retry only when its
                                 // response was lost; it must not turn that narrow step
@@ -1338,7 +1346,9 @@ impl ConformanceRunner {
                                         break 'execute;
                                     }
                                 }
-                            } else if has_browser_config {
+                            } else if has_browser_config
+                                && completion_outcome == OpenId4VpCompletionOutcome::Completed
+                            {
                                 let Some(browser) = self
                                     .config
                                     .automation
@@ -2199,6 +2209,7 @@ mod tests {
     #[cfg(unix)]
     struct DeferredReviewTransport {
         requests: Mutex<Vec<(HttpMethod, String)>>,
+        test_name: &'static str,
         info_after_capture: Value,
         wait_state_after_capture: Value,
         info_calls: AtomicUsize,
@@ -2210,6 +2221,7 @@ mod tests {
         starts: usize,
         completes: usize,
         issuances: usize,
+        completion_outcome: OpenId4VpCompletionOutcome,
     }
 
     #[cfg(unix)]
@@ -2386,7 +2398,7 @@ mod tests {
                     serde_json::json!({
                         "id":"suite-plan",
                         "name":"oid4vp-1final-verifier-test-plan",
-                        "modules":[{"testModule":"happy-flow"}]
+                        "modules":[{"testModule":self.test_name}]
                     }),
                 ),
                 (HttpMethod::Post, "/api/runner") => {
@@ -2432,9 +2444,9 @@ mod tests {
         fn complete(
             &mut self,
             _presentation: &crate::browser::OpenId4VpPresentation,
-        ) -> Result<(), OpenId4VpError> {
+        ) -> Result<OpenId4VpCompletionOutcome, OpenId4VpError> {
             self.completes += 1;
-            Ok(())
+            Ok(self.completion_outcome)
         }
 
         fn attach_evidence_context(
@@ -3978,6 +3990,7 @@ mod tests {
         crate::secure_file::ensure_directory(&root, true).expect("private evidence root");
         let transport = Arc::new(DeferredReviewTransport {
             requests: Mutex::new(Vec::new()),
+            test_name: "happy-flow",
             info_after_capture: serde_json::json!({"status":"WAITING"}),
             wait_state_after_capture: serde_json::json!({"state":"WAITING"}),
             info_calls: AtomicUsize::new(0),
@@ -4011,6 +4024,7 @@ mod tests {
             starts: 0,
             completes: 0,
             issuances: 0,
+            completion_outcome: OpenId4VpCompletionOutcome::Completed,
         }));
         let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = verifier_state.clone();
         let capture = BrowserReviewScreenshotCapture::new(
@@ -4162,6 +4176,117 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn serial_vp_expected_immediate_rejection_skips_receipt_and_deferred_review() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temporary root")
+            .join(format!(
+                "nazoauth-vp-expected-rejection-{}",
+                uuid::Uuid::now_v7()
+            ));
+        crate::secure_file::ensure_directory(&root, true).expect("private evidence root");
+        let transport = Arc::new(DeferredReviewTransport {
+            requests: Mutex::new(Vec::new()),
+            test_name: "oid4vp-1final-verifier-invalid-kb-jwt-signature",
+            info_after_capture: serde_json::json!({"status":"FINISHED","result":"PASSED"}),
+            wait_state_after_capture: serde_json::json!({"state":"FINISHED"}),
+            info_calls: AtomicUsize::new(0),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://www.certification.openid.net").expect("official Suite"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let mut matrix = one_plan_matrix(serde_json::json!({
+            "alias":"vp-alias",
+            "browser":[{
+                "match":"https://issuer.example/authorize*",
+                "tasks":[{"commands":[]}]
+            }]
+        }));
+        matrix.digest = "b".repeat(64);
+        matrix.document.groups[0].plans[0].plan = "oid4vp-1final-verifier-test-plan".to_owned();
+        let browser_state = Arc::new(Mutex::new(DeferredReviewBrowser {
+            captures: 0,
+            capture_fails: false,
+        }));
+        let browser: Arc<Mutex<dyn BrowserAutomation>> = browser_state.clone();
+        let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
+            attached: None,
+            starts: 0,
+            completes: 0,
+            issuances: 0,
+            completion_outcome: OpenId4VpCompletionOutcome::ExpectedImmediateRejection,
+        }));
+        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = verifier_state.clone();
+        let capture = BrowserReviewScreenshotCapture::new(
+            root.clone(),
+            "request-0123456789abcdef0123456789abcdef",
+        )
+        .expect("capture");
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix,
+            target_origin: Some(
+                BrowserTargetOrigin::parse("https://issuer.example").expect("target"),
+            ),
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: one_plan_budgets(),
+            selected_resource_budget: budget(1, 1, 60),
+            jobs: 1,
+            automation: vec![ConformanceAutomation {
+                browser: Some(browser),
+                review_screenshot_capture: Some(capture),
+                vp_evidence: Some(
+                    OpenId4VpEvidenceRunContext::new(
+                        "request-0123456789abcdef0123456789abcdef",
+                        "a".repeat(64),
+                        "b".repeat(64),
+                    )
+                    .expect("VP evidence run context"),
+                ),
+                verifier: Some(verifier),
+                issuer: None,
+            }],
+            suite_resource_observer: Some(Arc::new(RetainingObserver)),
+        })
+        .expect("runner");
+
+        let report = runner.run(&mut ()).report;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.local_success);
+        assert!(report.suite_pass);
+        assert!(report.acceptance_pass);
+        assert!(!report.review_pending);
+        assert_eq!(report.modules.len(), 1);
+        assert_eq!(report.modules[0].outcome, ModuleOutcome::Passed);
+        assert!(report.modules[0].terminal);
+        assert!(report.modules[0].deferred_review_pending.is_none());
+        assert!(report.modules[0].review_screenshots.is_empty());
+        assert_eq!(browser_state.lock().expect("browser").captures, 0);
+        let verifier = verifier_state.lock().expect("verifier");
+        assert_eq!(
+            (verifier.starts, verifier.completes, verifier.issuances),
+            (1, 1, 0)
+        );
+        assert!(verifier.attached.is_none());
+        drop(verifier);
+        let requests = transport.requests.lock().expect("requests");
+        assert!(requests.iter().all(|(method, path)| {
+            *method != HttpMethod::Delete && !path.contains("image") && !path.contains("visited")
+        }));
+        drop(requests);
+        std::fs::remove_dir_all(root).expect("remove temporary evidence root");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn serial_vp_deferred_review_failures_close_and_clean_without_suite_placeholder_mutation() {
         #[derive(Clone, Copy)]
         enum Case {
@@ -4258,6 +4383,7 @@ mod tests {
             crate::secure_file::ensure_directory(&root, true).expect("private evidence root");
             let transport = Arc::new(DeferredReviewTransport {
                 requests: Mutex::new(Vec::new()),
+                test_name: "happy-flow",
                 info_after_capture: if matches!(case, Case::PostCaptureInfoNotWaiting) {
                     serde_json::json!({"status":"FINISHED"})
                 } else {
@@ -4294,6 +4420,7 @@ mod tests {
                     starts: 0,
                     completes: 0,
                     issuances: 0,
+                    completion_outcome: OpenId4VpCompletionOutcome::Completed,
                 }));
             let capture = (!matches!(case, Case::CaptureDisabled)).then(|| {
                 BrowserReviewScreenshotCapture::new(

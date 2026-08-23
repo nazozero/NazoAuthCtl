@@ -548,10 +548,11 @@ pub use openid4vci::{
     OpenId4VciModule,
 };
 pub use openid4vp::{
-    ConformanceBinding, OpenId4VpError, OpenId4VpEvidenceBindingDiagnostic,
-    OpenId4VpEvidenceContext, OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier,
-    OpenId4VpPresentation, OpenId4VpStartRequest, OpenId4VpVerificationEvidence,
-    OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier, OpenId4VpVerifierClient,
+    ConformanceBinding, OpenId4VpCompletionOutcome, OpenId4VpError,
+    OpenId4VpEvidenceBindingDiagnostic, OpenId4VpEvidenceContext, OpenId4VpEvidenceRunContext,
+    OpenId4VpEvidenceVerifier, OpenId4VpPresentation, OpenId4VpStartRequest,
+    OpenId4VpVerificationEvidence, OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier,
+    OpenId4VpVerifierClient,
 };
 pub use parser::{parse_browser_entries, parse_browser_entries_owned};
 pub use plan::{BrowserRunnerState, OpenId4VcBrowserState};

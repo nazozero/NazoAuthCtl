@@ -370,6 +370,16 @@ pub struct OpenId4VpPresentation {
     immediate_rejection_allowed: bool,
 }
 
+/// The protocol-level result of delivering the wallet response. A named
+/// negative test may be rejected by the verifier before a completed
+/// presentation exists; that expected outcome must never be treated as a
+/// completed transaction with verification evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenId4VpCompletionOutcome {
+    Completed,
+    ExpectedImmediateRejection,
+}
+
 /// Non-secret attachment facts verified under the live runtime key before the
 /// presentation can be completed. The signed compact intent is persisted only
 /// through its digest in the later receipt provenance; the receipt itself
@@ -441,7 +451,10 @@ pub trait OpenId4VpVerifier: Send {
     /// Deliver the presentation request to the Suite wallet and require the
     /// one redirect that proves the target transaction completed. This is an
     /// HTTP protocol step, not an interactive browser session.
-    fn complete(&mut self, presentation: &OpenId4VpPresentation) -> Result<(), OpenId4VpError>;
+    fn complete(
+        &mut self,
+        presentation: &OpenId4VpPresentation,
+    ) -> Result<OpenId4VpCompletionOutcome, OpenId4VpError>;
 
     /// Fetch a completed, runtime-signed evidence receipt for a presentation
     /// that explicitly requested one. Existing verifier test doubles remain
@@ -958,7 +971,7 @@ impl OpenId4VpVerifierClient {
     fn complete_presentation(
         &self,
         presentation: &OpenId4VpPresentation,
-    ) -> Result<(), OpenId4VpError> {
+    ) -> Result<OpenId4VpCompletionOutcome, OpenId4VpError> {
         let response = self
             .transport
             .send(
@@ -981,7 +994,7 @@ impl OpenId4VpVerifierClient {
         // on that Suite 2xx; positive and deferred-verification flows remain
         // bound to the exact completion redirect.
         if (200..300).contains(&response.status) && presentation.immediate_rejection_allowed {
-            return Ok(());
+            return Ok(OpenId4VpCompletionOutcome::ExpectedImmediateRejection);
         }
         if !matches!(response.status, 302 | 303) {
             return Err(OpenId4VpError::UnexpectedAuthorizationRedirect);
@@ -1015,7 +1028,7 @@ impl OpenId4VpVerifierClient {
         if !(200..300).contains(&completed.status) {
             return Err(OpenId4VpError::CompletionFailed);
         }
-        Ok(())
+        Ok(OpenId4VpCompletionOutcome::Completed)
     }
 
     fn verification_evidence(
@@ -1227,7 +1240,10 @@ impl OpenId4VpVerifier for OpenId4VpVerifierClient {
         self.start_presentation(request)
     }
 
-    fn complete(&mut self, presentation: &OpenId4VpPresentation) -> Result<(), OpenId4VpError> {
+    fn complete(
+        &mut self,
+        presentation: &OpenId4VpPresentation,
+    ) -> Result<OpenId4VpCompletionOutcome, OpenId4VpError> {
         self.complete_presentation(presentation)
     }
 
@@ -2920,7 +2936,10 @@ mod tests {
             immediate_rejection_allowed: false,
         };
 
-        client.complete(&presentation).expect("completion");
+        assert_eq!(
+            client.complete(&presentation).expect("completion"),
+            OpenId4VpCompletionOutcome::Completed
+        );
 
         let requests = transport.requests.lock().expect("request lock");
         assert_eq!(requests.len(), 2);
@@ -2975,9 +2994,12 @@ mod tests {
         .expect("request");
         let presentation = client.start(&request).expect("presentation");
 
-        client
-            .complete(&presentation)
-            .expect("immediate rejection is an expected negative outcome");
+        assert_eq!(
+            client
+                .complete(&presentation)
+                .expect("immediate rejection is an expected negative outcome"),
+            OpenId4VpCompletionOutcome::ExpectedImmediateRejection
+        );
         assert_eq!(transport.requests.lock().expect("request lock").len(), 2);
     }
 
