@@ -2184,6 +2184,9 @@ mod tests {
     #[cfg(unix)]
     struct DeferredReviewTransport {
         requests: Mutex<Vec<(HttpMethod, String)>>,
+        info_after_capture: Value,
+        wait_state_after_capture: Value,
+        info_calls: AtomicUsize,
     }
 
     #[cfg(unix)]
@@ -2196,8 +2199,8 @@ mod tests {
 
     #[cfg(unix)]
     struct DeferredReviewBrowser {
-        selected: bool,
         captures: usize,
+        capture_fails: bool,
     }
 
     #[cfg(unix)]
@@ -2368,10 +2371,15 @@ mod tests {
                     (200, serde_json::json!({"id":"module-a","alias":"vp-alias"}))
                 }
                 (HttpMethod::Get, "/api/info/module-a") => {
-                    (200, serde_json::json!({"status":"WAITING"}))
+                    let calls = self.info_calls.fetch_add(1, Ordering::SeqCst);
+                    if calls == 0 {
+                        (200, serde_json::json!({"status":"WAITING"}))
+                    } else {
+                        (200, self.info_after_capture.clone())
+                    }
                 }
                 (HttpMethod::Get, "/api/runner/module-a/wait-state") => {
-                    (200, serde_json::json!({"state":"WAITING"}))
+                    (200, self.wait_state_after_capture.clone())
                 }
                 (HttpMethod::Get, "/api/log/module-a") => (200, serde_json::json!([])),
                 (HttpMethod::Delete, "/api/runner/module-a" | "/api/plan/suite-plan") => {
@@ -2452,12 +2460,13 @@ mod tests {
             suite_evidence_url: &Url,
         ) -> Result<bool, BrowserError> {
             assert_eq!(authorization_url.host_str(), Some("issuer.example"));
-            assert_eq!(entries.len(), 1);
             assert_eq!(
                 suite_evidence_url.path(),
                 "/test/a/module-a/verification-evidence"
             );
-            Ok(self.selected)
+            let selected = entries.first().ok_or(BrowserError::InvalidSchema)?;
+            assert_eq!(selected.match_pattern, "https://issuer.example/authorize*");
+            crate::browser::selected_required_review_screenshot_marker(selected, suite_evidence_url)
         }
 
         fn capture_openid4vp_verification_result(
@@ -2467,6 +2476,9 @@ mod tests {
             obligation_index: usize,
         ) -> Result<crate::browser::BrowserReviewScreenshotReceipt, BrowserError> {
             self.captures += 1;
+            if self.capture_fails {
+                return Err(BrowserError::ReviewScreenshotRequired);
+            }
             Ok(crate::browser::BrowserReviewScreenshotReceipt {
                 path: std::path::PathBuf::from("review-screenshots/test/module-a-0.png"),
                 sha256: "d".repeat(64),
@@ -3942,6 +3954,9 @@ mod tests {
         crate::secure_file::ensure_directory(&root, true).expect("private evidence root");
         let transport = Arc::new(DeferredReviewTransport {
             requests: Mutex::new(Vec::new()),
+            info_after_capture: serde_json::json!({"status":"WAITING"}),
+            wait_state_after_capture: serde_json::json!({"state":"WAITING"}),
+            info_calls: AtomicUsize::new(0),
         });
         let client = SuiteClient::with_transport(
             Origin::parse("https://www.certification.openid.net").expect("official Suite"),
@@ -3964,8 +3979,8 @@ mod tests {
         matrix.document.groups[0].plans[0].plan = "oid4vp-1final-verifier-test-plan".to_owned();
         let browser: Arc<Mutex<dyn BrowserAutomation>> =
             Arc::new(Mutex::new(DeferredReviewBrowser {
-                selected: true,
                 captures: 0,
+                capture_fails: false,
             }));
         let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
             Arc::new(Mutex::new(DeferredReviewVerifier {
@@ -4052,5 +4067,240 @@ mod tests {
         }));
         drop(requests);
         std::fs::remove_dir_all(root).expect("remove temporary evidence root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serial_vp_deferred_review_failures_close_and_clean_without_suite_placeholder_mutation() {
+        #[derive(Clone, Copy)]
+        enum Case {
+            RetentionDisabled,
+            CaptureDisabled,
+            ZeroRequiredMarker,
+            TwoRequiredMarkers,
+            RequiredMarkerInUnselectedEntry,
+            CaptureFailure,
+            PostCaptureInfoNotWaiting,
+            PostCaptureWaitStateNotWaiting,
+        }
+
+        impl Case {
+            fn name(self) -> &'static str {
+                match self {
+                    Self::RetentionDisabled => "retention-disabled",
+                    Self::CaptureDisabled => "capture-disabled",
+                    Self::ZeroRequiredMarker => "zero-required-marker",
+                    Self::TwoRequiredMarkers => "two-required-markers",
+                    Self::RequiredMarkerInUnselectedEntry => "marker-in-unselected-entry",
+                    Self::CaptureFailure => "capture-failure",
+                    Self::PostCaptureInfoNotWaiting => "post-capture-info-not-waiting",
+                    Self::PostCaptureWaitStateNotWaiting => "post-capture-wait-not-waiting",
+                }
+            }
+
+            fn browser_config(self) -> Value {
+                let required = serde_json::json!([
+                    "wait",
+                    "xpath",
+                    "//*",
+                    1,
+                    "review",
+                    "update-image-placeholder"
+                ]);
+                match self {
+                    Self::ZeroRequiredMarker => serde_json::json!([{
+                        "match":"https://issuer.example/authorize*",
+                        "tasks":[{
+                            "match":"https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                            "commands":[]
+                        }]
+                    }]),
+                    Self::TwoRequiredMarkers => serde_json::json!([{
+                        "match":"https://issuer.example/authorize*",
+                        "tasks":[{
+                            "match":"https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                            "commands":[required.clone(), required]
+                        }]
+                    }]),
+                    Self::RequiredMarkerInUnselectedEntry => serde_json::json!([
+                        {
+                            "match":"https://issuer.example/authorize*",
+                            "tasks":[{"commands":[]}]
+                        },
+                        {
+                            "match":"https://issuer.example/alternate*",
+                            "tasks":[{
+                                "match":"https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                                "commands":[required]
+                            }]
+                        }
+                    ]),
+                    _ => serde_json::json!([{
+                        "match":"https://issuer.example/authorize*",
+                        "tasks":[{
+                            "match":"https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                            "commands":[required]
+                        }]
+                    }]),
+                }
+            }
+        }
+
+        for case in [
+            Case::RetentionDisabled,
+            Case::CaptureDisabled,
+            Case::ZeroRequiredMarker,
+            Case::TwoRequiredMarkers,
+            Case::RequiredMarkerInUnselectedEntry,
+            Case::CaptureFailure,
+            Case::PostCaptureInfoNotWaiting,
+            Case::PostCaptureWaitStateNotWaiting,
+        ] {
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .expect("temporary root")
+                .join(format!(
+                    "nazoauth-deferred-review-failclosed-{}-{}",
+                    case.name(),
+                    uuid::Uuid::now_v7()
+                ));
+            crate::secure_file::ensure_directory(&root, true).expect("private evidence root");
+            let transport = Arc::new(DeferredReviewTransport {
+                requests: Mutex::new(Vec::new()),
+                info_after_capture: if matches!(case, Case::PostCaptureInfoNotWaiting) {
+                    serde_json::json!({"status":"FINISHED"})
+                } else {
+                    serde_json::json!({"status":"WAITING"})
+                },
+                wait_state_after_capture: if matches!(case, Case::PostCaptureWaitStateNotWaiting) {
+                    serde_json::json!({"state":"FINISHED"})
+                } else {
+                    serde_json::json!({"state":"WAITING"})
+                },
+                info_calls: AtomicUsize::new(0),
+            });
+            let client = SuiteClient::with_transport(
+                Origin::parse("https://www.certification.openid.net").expect("official Suite"),
+                Some(BearerToken::new("suite-token").expect("token")),
+                transport.clone(),
+                ClientConfig::default(),
+            )
+            .expect("client");
+            let mut matrix = one_plan_matrix(serde_json::json!({
+                "alias":"vp-alias",
+                "browser":case.browser_config()
+            }));
+            matrix.digest = "b".repeat(64);
+            matrix.document.groups[0].plans[0].plan = "oid4vp-1final-verifier-test-plan".to_owned();
+            let browser: Arc<Mutex<dyn BrowserAutomation>> =
+                Arc::new(Mutex::new(DeferredReviewBrowser {
+                    captures: 0,
+                    capture_fails: matches!(case, Case::CaptureFailure),
+                }));
+            let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
+                Arc::new(Mutex::new(DeferredReviewVerifier {
+                    attached: None,
+                    starts: 0,
+                    completes: 0,
+                    issuances: 0,
+                }));
+            let capture = (!matches!(case, Case::CaptureDisabled)).then(|| {
+                BrowserReviewScreenshotCapture::new(
+                    root.clone(),
+                    "request-0123456789abcdef0123456789abcdef",
+                )
+                .expect("capture")
+            });
+            let runner = ConformanceRunner::new(ConformanceRunConfig {
+                client,
+                matrix,
+                target_origin: Some(
+                    BrowserTargetOrigin::parse("https://issuer.example").expect("target"),
+                ),
+                binding: test_binding(),
+                poll_timeout: Duration::from_secs(1),
+                control: RunControl::default(),
+                plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+                plan_resource_budgets: one_plan_budgets(),
+                selected_resource_budget: budget(1, 1, 60),
+                jobs: 1,
+                automation: vec![ConformanceAutomation {
+                    browser: Some(browser.clone()),
+                    review_screenshot_capture: capture,
+                    vp_evidence: Some(
+                        OpenId4VpEvidenceRunContext::new(
+                            "request-0123456789abcdef0123456789abcdef",
+                            "a".repeat(64),
+                            "b".repeat(64),
+                        )
+                        .expect("VP evidence run context"),
+                    ),
+                    verifier: Some(verifier),
+                    issuer: None,
+                }],
+                suite_resource_observer: (!matches!(case, Case::RetentionDisabled))
+                    .then(|| Arc::new(RetainingObserver) as Arc<dyn SuiteResourceObserver>),
+            })
+            .expect("runner");
+
+            let report = runner.run(&mut ()).report;
+
+            assert!(
+                report
+                    .modules
+                    .iter()
+                    .all(|module| module.outcome != ModuleOutcome::DeferredReviewPending),
+                "{} must not create a deferred review outcome: errors={:?}",
+                case.name(),
+                report.errors
+            );
+            assert!(
+                report
+                    .modules
+                    .iter()
+                    .all(|module| module.deferred_review_pending.is_none()),
+                "{} must not retain a deferred placeholder identity",
+                case.name()
+            );
+            assert!(
+                !report.orchestration_integrity.retention_eligible,
+                "{} must not retain Suite resources",
+                case.name()
+            );
+            assert!(
+                report.orchestration_integrity.cleanup_complete,
+                "{} must complete ordinary cleanup: {:?}",
+                case.name(),
+                report.cleanup
+            );
+            assert!(
+                report
+                    .cleanup
+                    .deleted_plans
+                    .iter()
+                    .any(|plan| plan == "suite-plan"),
+                "{} must delete the unretained Suite plan",
+                case.name()
+            );
+            let requests = transport.requests.lock().expect("deferred review requests");
+            assert!(
+                requests.iter().any(|(method, path)| {
+                    *method == HttpMethod::Delete && path == "/api/plan/suite-plan"
+                }),
+                "{} must use production plan cleanup",
+                case.name()
+            );
+            assert!(
+                requests.iter().all(|(_, path)| {
+                    !path.contains("image")
+                        && !path.contains("update-placeholder")
+                        && !path.contains("visited")
+                }),
+                "{} must never mutate a Suite review placeholder: {requests:?}",
+                case.name()
+            );
+            drop(requests);
+            std::fs::remove_dir_all(root).expect("remove temporary evidence root");
+        }
     }
 }
