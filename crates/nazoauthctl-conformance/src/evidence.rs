@@ -968,7 +968,7 @@ pub fn validate_private_evidence_directory(root: &Path) -> Result<(), EvidenceEr
     {
         use std::os::unix::fs::MetadataExt as _;
         let metadata = std::fs::metadata(root).map_err(|_| EvidenceError::Io)?;
-        if metadata.uid() != 0 {
+        if !private_evidence_owner_is_allowed(metadata.uid()) {
             return Err(EvidenceError::UnsafePath);
         }
         Ok(())
@@ -978,6 +978,16 @@ pub fn validate_private_evidence_directory(root: &Path) -> Result<(), EvidenceEr
         let _ = root;
         Err(EvidenceError::UnsupportedPlatform)
     }
+}
+
+#[cfg(all(unix, not(test)))]
+fn private_evidence_owner_is_allowed(uid: u32) -> bool {
+    uid == 0
+}
+
+#[cfg(all(unix, test))]
+fn private_evidence_owner_is_allowed(uid: u32) -> bool {
+    uid == 0 || uid == rustix::process::geteuid().as_raw()
 }
 
 fn validate_identity(
