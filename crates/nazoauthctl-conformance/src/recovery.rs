@@ -2625,6 +2625,13 @@ fn verify_vp_receipt_provenance(
     {
         return false;
     }
+    // This is historical verification: the presentation completes before the
+    // runtime can issue its receipt, so `completed_at` may precede the signed
+    // `iat`. Verify at the last whole second inside the signed validity window,
+    // then separately bind the verified issuance time to presentation order.
+    let Some(verification_time) = expires_at.unix_timestamp().checked_sub(1) else {
+        return false;
+    };
     let receipt_id = receipt.receipt_id.to_string();
     let transaction_id = receipt.transaction_id.to_string();
     let expected = nazo_operator_protocol::Openid4vpVerificationReceiptExpectations {
@@ -2646,11 +2653,13 @@ fn verify_vp_receipt_provenance(
         &receipt.receipt_jws,
         &expected,
         &key,
-        completed_at.unix_timestamp(),
+        verification_time,
     ) else {
         return false;
     };
     verified.completed_at == receipt.completed_at
+        && verified.iat >= completed_at.unix_timestamp()
+        && verified.iat < verified.exp
         && verified.iss == receipt.issuer
         && verified.deployment_id == receipt.deployment_id
         && verified.tenant_id == receipt.tenant_id
@@ -3139,6 +3148,7 @@ mod tests {
             binding,
             "openid4vc-trust-policy:provider:0123456789abcdef",
             "f".repeat(64),
+            -1,
         )
     }
 
@@ -3147,6 +3157,7 @@ mod tests {
         binding: &mut TenantResourceRecoveryBinding,
         trust_policy_resource_id: &str,
         trust_policy_digest: String,
+        completed_offset_seconds: i64,
     ) -> (SuiteRetentionManifest, ReviewScreenshotManifestImage) {
         use time::format_description::well_known::Rfc3339;
 
@@ -3210,7 +3221,9 @@ mod tests {
         let now = time::OffsetDateTime::now_utc()
             .replace_nanosecond(0)
             .expect("whole seconds");
-        let completed_at = now.format(&Rfc3339).expect("completed time");
+        let completed_at = (now + time::Duration::seconds(completed_offset_seconds))
+            .format(&Rfc3339)
+            .expect("completed time");
         let expires_at = (now + time::Duration::seconds(300))
             .format(&Rfc3339)
             .expect("expiry time");
@@ -3592,6 +3605,7 @@ mod tests {
             &mut other_policy_binding,
             "openid4vc-trust-policy:other:0123456789abcdef",
             "e".repeat(64),
+            -1,
         );
         assert!(!verify_vp_receipt_provenance(
             other_policy_image
@@ -3658,6 +3672,29 @@ mod tests {
             &binding,
             &retention,
             &image
+        ));
+
+        let mut post_issuance_completion_binding = tenant_resource_binding(&root);
+        let (post_issuance_completion_retention, post_issuance_completion_image) =
+            vp_receipt_fixture_with_trust_policy(
+                &mut post_issuance_completion_binding,
+                "openid4vc-trust-policy:provider:0123456789abcdef",
+                "f".repeat(64),
+                1,
+            );
+        let post_issuance_anchor = post_issuance_completion_binding
+            .vp_evidence_trust_anchor
+            .as_ref()
+            .expect("post-issuance anchor");
+        assert!(!verify_vp_receipt_provenance(
+            post_issuance_completion_image
+                .verification_receipt
+                .as_ref()
+                .expect("post-issuance completion receipt"),
+            post_issuance_anchor,
+            &post_issuance_completion_binding,
+            &post_issuance_completion_retention,
+            &post_issuance_completion_image,
         ));
         std::fs::remove_dir_all(&root).expect("remove test root");
     }
