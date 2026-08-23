@@ -3340,11 +3340,17 @@ mod tests {
         )
         .expect("manifest directory");
         let document = serde_json::to_vec(&serde_json::json!({
-            "schema": 3,
+            "schema": crate::evidence::REVIEW_SCREENSHOT_MANIFEST_SCHEMA,
             "run_jti": binding.request_jti.clone(),
             "artifact_digest": retention.artifact_digest.clone(),
             "matrix_sha256": retention.matrix_sha256.clone(),
             "suite_origin": retention.suite_origin.clone(),
+            "target_issuer": binding
+                .vp_evidence_trust_anchor
+                .as_ref()
+                .expect("VP trust anchor")
+                .target_issuer
+                .clone(),
             "modules": [{
                 "matrix_plan_id": image.matrix_plan_id.clone(),
                 "suite_plan_id": image.suite_plan_id.clone(),
@@ -3393,6 +3399,45 @@ mod tests {
             obligation_index: 0,
         }];
         retention
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_screenshot_manifest_rejects_nazo_vp_result_source() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!(
+            "nazoauth-deferred-legacy-source-{}",
+            uuid::Uuid::now_v7()
+        ));
+        crate::secure_file::ensure_directory(&root, true).expect("test root");
+        let evidence = root.join("evidence");
+        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
+        let mut binding = tenant_resource_binding(&root);
+        let mut retention = deferred_review_screenshot_chain(&evidence, &mut binding);
+        let screenshot = retention
+            .review_screenshot_manifest
+            .as_mut()
+            .expect("screenshot manifest binding");
+        let mut document: serde_json::Value = serde_json::from_slice(
+            &crate::secure_file::read_bounded(
+                &screenshot.path,
+                crate::evidence::MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES,
+                true,
+            )
+            .expect("read current screenshot manifest"),
+        )
+        .expect("parse current screenshot manifest");
+        document["schema"] = serde_json::json!(3);
+        let legacy = serde_json::to_vec(&document).expect("serialize legacy screenshot manifest");
+        crate::secure_file::write_atomic(&screenshot.path, &legacy, true)
+            .expect("write legacy screenshot manifest");
+        screenshot.sha256 = sha256_hex(&legacy);
+
+        assert!(
+            validate_suite_retention_manifest(&retention, &binding, None).is_err(),
+            "a legacy screenshot manifest must not admit the NazoAuthWeb source"
+        );
+        std::fs::remove_dir_all(&root).expect("remove test root");
     }
 
     #[cfg(unix)]
