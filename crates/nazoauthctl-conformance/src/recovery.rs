@@ -798,17 +798,17 @@ impl Clone for ConformanceRecoveryStore {
 }
 
 impl ConformanceRecoveryGuard {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn fail_next_persist_for_test(&self) {
         self.set_persist_failpoint_for_test(PersistFailpoint::BeforeWrite);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn fail_after_rename_before_directory_fsync_for_test(&self) {
         self.set_persist_failpoint_for_test(PersistFailpoint::AfterRenameBeforeDirectoryFsync);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn set_persist_failpoint_for_test(&self, failpoint: PersistFailpoint) {
         *self
             .persist_failpoint

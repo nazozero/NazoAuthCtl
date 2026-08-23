@@ -75,6 +75,7 @@ fn standards_full_profile_material() -> serde_json::Value {
     })
 }
 
+#[cfg(unix)]
 fn bind_external_dependency_fixture(options: &mut InstallOptions) {
     let binding = crate::secret_provider::bind_external_dependency_credentials(
         "postgresql://runtime:runtime-secret@db.example/oauth?sslmode=require",

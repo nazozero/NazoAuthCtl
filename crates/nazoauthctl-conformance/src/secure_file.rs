@@ -231,14 +231,14 @@ pub(crate) fn write_atomic(
 /// barrier succeeds.
 pub(crate) fn fsync_parent_directory(path: &Path, private: bool) -> Result<(), SecureFileError> {
     let absolute = normalize_absolute(path)?;
-    let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
     #[cfg(not(unix))]
     {
-        let _ = private;
+        let _ = (absolute, private);
         Err(SecureFileError::UnsupportedPlatform)
     }
     #[cfg(unix)]
     {
+        let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
         let parent_file = open_directory_chain(parent, private, false)?;
         rustix::fs::fsync(&parent_file).map_err(|_| SecureFileError::Io)
     }
@@ -248,11 +248,16 @@ pub(crate) fn fsync_parent_directory(path: &Path, private: bool) -> Result<(), S
 /// already created the destination, the bytes must match exactly; this never
 /// falls back to a rename that could replace evidence owned by that writer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(unix),
+    expect(dead_code, reason = "secure evidence publication is Unix-only")
+)]
 pub(crate) enum NewOrExactOutcome {
     Created,
     Existing,
 }
 
+#[cfg(unix)]
 pub(crate) fn write_new_or_exact(
     path: &Path,
     bytes: &[u8],

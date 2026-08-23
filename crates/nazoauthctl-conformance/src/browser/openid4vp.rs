@@ -412,7 +412,7 @@ impl fmt::Debug for OpenId4VpPresentation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl OpenId4VpPresentation {
     /// Test-only presentation fixture for orchestration tests. Production
     /// construction remains exclusively in the verified management client.
@@ -636,7 +636,7 @@ impl OpenId4VpVerificationEvidence {
         Url::parse(self.ui_url.as_str()).map_err(|_| OpenId4VpError::MalformedEvidenceResponse)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn test_verified(
         context: OpenId4VpEvidenceContext,
         receipt_sha256: &str,

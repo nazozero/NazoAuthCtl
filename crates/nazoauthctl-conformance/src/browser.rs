@@ -3097,6 +3097,7 @@ mod tests {
             .expect("fixed PNG")
     }
 
+    #[cfg(unix)]
     fn test_browser_logs(category: &'static str) -> BrowserConsoleLogDiagnostic {
         BrowserConsoleLogDiagnostic {
             total: 1,
@@ -3360,6 +3361,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn verified_vp_result_driver(
         context: &OpenId4VpEvidenceContext,
         receipt_sha256: &str,
@@ -3444,6 +3446,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn make_incomplete_canonical_shell(driver: &mut VpResultDriver) {
         let recovered_runtime = driver
             .page_runtime
