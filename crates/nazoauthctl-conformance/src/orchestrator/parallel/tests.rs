@@ -7,11 +7,13 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::*;
+use crate::ReviewScreenshotMarker;
 use crate::browser::ConformanceBinding;
 use crate::client::{ClientConfig, SuiteClient};
 use crate::credentials::BearerToken;
 use crate::matrix::{MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix};
 use crate::origin::Origin;
+use crate::report::{DeferredReviewPending, ModuleOutcome, ReviewScreenshotReport};
 use crate::transport::{HttpMethod, HttpRequest, HttpResponse, Transport, TransportError};
 
 struct ParallelFixtureTransport {
@@ -413,6 +415,142 @@ fn retained_parallel_run_launches_work_after_the_first_worker_finishes() {
                 !(*method == HttpMethod::Delete && path.starts_with("/api/plan/"))
             }),
         "eligible retained plans remain for the caller's durable retention handoff"
+    );
+}
+
+fn merge_terminal_and_deferred_review_workers(
+    include_worker_error: bool,
+) -> (RunSummary, Arc<ParallelFixtureTransport>) {
+    let (mut runner, transport) =
+        parallel_fixture(serde_json::json!({}), &["plan-a", "plan-b"], None);
+    runner.config.suite_resource_observer = Some(Arc::new(RetainSuiteObserver));
+
+    let mut prepared = runner.prepare_run();
+    let work = plan_work(&mut prepared);
+    let terminal = runner.run_prepared(&mut (), worker_prepared(&work[0]));
+    let mut deferred = runner.run_prepared(&mut (), worker_prepared(&work[1]));
+    let module = deferred
+        .report
+        .modules
+        .first_mut()
+        .expect("deferred worker module");
+    module.terminal = false;
+    module.official_status = Some("WAITING".to_owned());
+    module.official_result = None;
+    module.review_screenshots = vec![ReviewScreenshotReport {
+        path: "review-screenshots/run-1/m-plan-b-0.png".into(),
+        sha256: "a".repeat(64),
+        size: 1,
+    }];
+    module.review_screenshots_required = 1;
+    module.review_screenshots_required_captured = 1;
+    module.mark_deferred_review_pending(DeferredReviewPending {
+        placeholder_path: "/test/a/m-plan-b/verification-evidence".to_owned(),
+        marker: ReviewScreenshotMarker::Required,
+        obligation_index: 0,
+    });
+    if include_worker_error {
+        deferred
+            .report
+            .errors
+            .push("simulated deferred capture integrity failure".to_owned());
+    }
+    let snapshots = vec![
+        Some(terminal.report.progress.clone()),
+        Some(deferred.report.progress.clone()),
+    ];
+
+    (
+        merge_reports(
+            &runner,
+            prepared,
+            &work,
+            snapshots,
+            vec![true, true],
+            vec![Some(terminal), Some(deferred)],
+            false,
+        ),
+        transport,
+    )
+}
+
+#[test]
+fn parallel_aggregation_retains_terminal_and_deferred_review_workers_without_claiming_pass() {
+    let (summary, transport) = merge_terminal_and_deferred_review_workers(false);
+    let report = summary.report;
+
+    assert!(report.errors.is_empty());
+    assert!(report.orchestration_integrity.all_modules_settled);
+    assert!(!report.orchestration_integrity.all_modules_terminal);
+    assert_eq!(report.orchestration_integrity.terminal_modules, 1);
+    assert_eq!(report.orchestration_integrity.deferred_review_modules, 1);
+    assert!(report.orchestration_integrity.retention_eligible);
+    assert!(!report.orchestration_integrity.cleanup_complete);
+    assert!(report.review_pending);
+    assert!(!report.suite_pass);
+    assert!(!report.acceptance_pass);
+    assert!(
+        report
+            .modules
+            .iter()
+            .any(|module| module.outcome == ModuleOutcome::DeferredReviewPending)
+    );
+    assert!(
+        transport
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .all(|(method, path)| {
+                !(*method == HttpMethod::Delete
+                    && (path.starts_with("/api/runner/") || path.starts_with("/api/plan/")))
+            }),
+        "the settled deferred review worker retains its module and plan for the durable handoff"
+    );
+}
+
+#[test]
+fn parallel_aggregation_cleans_deferred_review_workers_when_any_worker_reports_an_error() {
+    let (summary, transport) = merge_terminal_and_deferred_review_workers(true);
+    let report = summary.report;
+
+    assert!(!report.orchestration_integrity.retention_eligible);
+    assert!(report.orchestration_integrity.cleanup_complete);
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains("simulated deferred capture integrity failure"))
+    );
+    assert!(
+        report
+            .cleanup
+            .deleted_plans
+            .iter()
+            .any(|plan| plan == "plan-a")
+    );
+    assert!(
+        report
+            .cleanup
+            .deleted_plans
+            .iter()
+            .any(|plan| plan == "plan-b")
+    );
+    assert!(
+        transport
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .any(|(method, path)| *method == HttpMethod::Delete && path == "/api/plan/plan-a")
+    );
+    assert!(
+        transport
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .any(|(method, path)| *method == HttpMethod::Delete && path == "/api/plan/plan-b")
     );
 }
 
