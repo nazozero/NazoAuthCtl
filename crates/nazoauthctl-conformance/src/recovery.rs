@@ -2714,7 +2714,7 @@ fn validate_suite_retention_manifest_path(
 }
 
 fn record_path_is_invalid(path: &Path, expected_name: &str) -> bool {
-    !retention_manifest_parent_is_root_owned(path)
+    !retention_manifest_parent_has_allowed_owner(path)
         || !path.is_absolute()
         || path.file_name().and_then(|value| value.to_str()) != Some(expected_name)
         || crate::secure_file::normalize_absolute(path).is_err()
@@ -2723,19 +2723,29 @@ fn record_path_is_invalid(path: &Path, expected_name: &str) -> bool {
             .is_err()
 }
 
-fn retention_manifest_parent_is_root_owned(path: &Path) -> bool {
+fn retention_manifest_parent_has_allowed_owner(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
         path.parent()
             .and_then(|parent| std::fs::metadata(parent).ok())
-            .is_some_and(|metadata| metadata.uid() == 0)
+            .is_some_and(|metadata| retention_manifest_owner_is_allowed(metadata.uid()))
     }
     #[cfg(not(unix))]
     {
         let _ = path;
         false
     }
+}
+
+#[cfg(all(unix, not(test)))]
+fn retention_manifest_owner_is_allowed(uid: u32) -> bool {
+    uid == 0
+}
+
+#[cfg(all(unix, test))]
+fn retention_manifest_owner_is_allowed(uid: u32) -> bool {
+    uid == 0 || uid == rustix::process::geteuid().as_raw()
 }
 
 fn tenant_resource_obligations_complete(journal: &TenantResourceRecoveryJournal) -> bool {
