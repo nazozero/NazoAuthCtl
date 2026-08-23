@@ -363,8 +363,10 @@ impl SuiteClient {
             HttpMethod::Post,
             &format!("/api/log/{module_id}/images/{placeholder_id}"),
             &[],
-            Some(encoded.into_bytes()),
-            Some("text/plain"),
+            Some(RequestBody {
+                bytes: encoded.into_bytes(),
+                content_type: "text/plain",
+            }),
             true,
             self.config.max_response_bytes,
         )?;
@@ -426,13 +428,14 @@ impl SuiteClient {
         let body_bytes = body
             .map(|value| serde_json::to_vec(value).map_err(|_| SuiteClientError::InvalidInput))
             .transpose()?;
-        let content_type = body_bytes.as_ref().map(|_| "application/json");
         self.request_bytes(
             method,
             path,
             query,
-            body_bytes,
-            content_type,
+            body_bytes.map(|bytes| RequestBody {
+                bytes,
+                content_type: "application/json",
+            }),
             authenticated,
             max_response_bytes,
         )
@@ -443,14 +446,10 @@ impl SuiteClient {
         method: HttpMethod,
         path: &str,
         query: &[(&str, &str)],
-        body_bytes: Option<Vec<u8>>,
-        content_type: Option<&str>,
+        body: Option<RequestBody>,
         authenticated: bool,
         max_response_bytes: usize,
     ) -> Result<RawResponse, SuiteClientError> {
-        if body_bytes.is_some() != content_type.is_some() {
-            return Err(SuiteClientError::InvalidInput);
-        }
         let mut url = self.origin.url(path)?;
         {
             let mut pairs = url.query_pairs_mut();
@@ -462,8 +461,8 @@ impl SuiteClient {
             return Err(SuiteClientError::CrossOriginRedirect);
         }
         let mut headers = vec![("Accept".to_owned(), "application/json".to_owned())];
-        if let Some(content_type) = content_type {
-            headers.push(("Content-Type".to_owned(), content_type.to_owned()));
+        if let Some(body) = &body {
+            headers.push(("Content-Type".to_owned(), body.content_type.to_owned()));
         }
         if authenticated {
             let token = self.token.as_ref().ok_or(SuiteClientError::MissingToken)?;
@@ -478,7 +477,7 @@ impl SuiteClient {
                 method,
                 url: url.clone(),
                 headers: headers.clone(),
-                body: body_bytes.clone(),
+                body: body.as_ref().map(|body| body.bytes.clone()),
             };
             let response = self.transport.send(request, max_response_bytes)?;
             if response.body.len() > max_response_bytes {
@@ -597,6 +596,11 @@ pub enum DeleteOutcome {
 struct RawResponse {
     status: u16,
     body: Value,
+}
+
+struct RequestBody {
+    bytes: Vec<u8>,
+    content_type: &'static str,
 }
 
 #[derive(Debug, Error)]
