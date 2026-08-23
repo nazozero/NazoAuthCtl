@@ -4041,8 +4041,51 @@ mod tests {
         .expect("runner");
 
         let report = runner.run(&mut ()).report;
+        let integrity = &report.orchestration_integrity;
+        let module_outcomes = report
+            .modules
+            .iter()
+            .map(|module| {
+                (
+                    module.outcome,
+                    module.terminal,
+                    module.deferred_review_pending.is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let fixture_diagnostic = format!(
+            "errors={:?}; defined={}; created={}; terminal={}; deferred={}; instantiated={}; settled={}; retention_requested={}; retention_eligible={}; retention_candidate_settled={}; retention_committed={}; cleanup_complete={}; suite_resources_settled={}; module_outcomes={module_outcomes:?}",
+            report.errors,
+            integrity.defined_modules,
+            integrity.created_instances,
+            integrity.terminal_modules,
+            integrity.deferred_review_modules,
+            integrity.all_modules_instantiated,
+            integrity.all_modules_settled,
+            integrity.retention_requested,
+            integrity.retention_eligible,
+            integrity.retention_candidate_settled,
+            integrity.retention_committed,
+            integrity.cleanup_complete,
+            integrity.suite_resources_settled,
+        );
 
-        assert!(report.local_success);
+        assert!(report.errors.is_empty(), "{fixture_diagnostic}");
+        assert_eq!(integrity.defined_modules, 1, "{fixture_diagnostic}");
+        assert_eq!(integrity.created_instances, 1, "{fixture_diagnostic}");
+        assert_eq!(integrity.terminal_modules, 0, "{fixture_diagnostic}");
+        assert_eq!(integrity.deferred_review_modules, 1, "{fixture_diagnostic}");
+        assert!(integrity.all_modules_instantiated, "{fixture_diagnostic}");
+        assert!(integrity.all_modules_settled, "{fixture_diagnostic}");
+        assert!(integrity.retention_requested, "{fixture_diagnostic}");
+        assert!(integrity.retention_eligible, "{fixture_diagnostic}");
+        assert!(
+            integrity.retention_candidate_settled,
+            "{fixture_diagnostic}"
+        );
+        assert!(!integrity.retention_committed, "{fixture_diagnostic}");
+        assert!(!integrity.cleanup_complete, "{fixture_diagnostic}");
+        assert!(integrity.suite_resources_settled, "{fixture_diagnostic}");
         assert!(!report.suite_pass);
         assert!(!report.acceptance_pass);
         assert!(report.review_pending);
@@ -4050,7 +4093,6 @@ mod tests {
             report.deferred_review_modules,
             vec!["p/happy-flow".to_owned()]
         );
-        assert!(report.errors.is_empty());
         assert_eq!(report.modules.len(), 1);
         let module = &report.modules[0];
         assert_eq!(module.outcome, ModuleOutcome::DeferredReviewPending);
@@ -4066,13 +4108,7 @@ mod tests {
                 .placeholder_path,
             "/test/a/module-a/verification-evidence"
         );
-        assert!(report.orchestration_integrity.retention_eligible);
-        assert!(report.orchestration_integrity.retention_candidate_settled);
-        assert!(!report.orchestration_integrity.retention_committed);
-        assert!(!report.orchestration_integrity.cleanup_complete);
-        assert!(report.orchestration_integrity.suite_resources_settled);
-        assert!(report.orchestration_integrity.all_modules_settled);
-        assert!(!report.orchestration_integrity.all_modules_terminal);
+        assert!(!integrity.all_modules_terminal, "{fixture_diagnostic}");
         assert_eq!(browser_state.lock().expect("browser").captures, 1);
         let verifier = verifier_state.lock().expect("verifier");
         assert_eq!(
@@ -4084,6 +4120,7 @@ mod tests {
         assert!(requests.iter().all(|(method, path)| {
             *method != HttpMethod::Delete && !path.contains("image") && !path.contains("visited")
         }));
+        assert!(report.local_success, "{fixture_diagnostic}");
         drop(requests);
         std::fs::remove_dir_all(root).expect("remove temporary evidence root");
     }
