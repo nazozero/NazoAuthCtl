@@ -4189,7 +4189,10 @@ mod tests {
         assert!(report.review_pending);
         assert_eq!(
             report.deferred_review_modules,
-            vec!["p/happy-flow".to_owned()]
+            vec![format!(
+                "p/happy-flow?variant={}",
+                serde_json::to_string(&effective_variant).expect("canonical effective variant")
+            )]
         );
         assert_eq!(report.modules.len(), 1);
         let module = &report.modules[0];
