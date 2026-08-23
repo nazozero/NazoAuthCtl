@@ -2,6 +2,13 @@ use super::*;
 
 const MAX_EXTERNAL_PUBLIC_JWK_BYTES: u64 = 1024 * 1024;
 
+pub(super) fn reject_registered_local_oci_candidate_mutation(
+    record: &DeploymentRecord,
+) -> anyhow::Result<()> {
+    super::reject_pending_local_oci_candidate_record(record)?;
+    super::reject_completed_local_oci_candidate_transition(record)
+}
+
 /// Read an external public JWK through one secure descriptor, hash those exact
 /// bytes, and stage them under the declaration-bound operator state directory.
 /// The runtime task receives only the staged path, so a caller cannot replace
@@ -75,6 +82,227 @@ pub(super) fn validate_local_development_identity(
     Ok(())
 }
 
+pub(super) fn validate_local_oci_candidate_identity(
+    candidate: &CandidateTarget,
+    identity: &EmbeddedIdentity,
+) -> anyhow::Result<()> {
+    let expected = EmbeddedIdentity {
+        release: candidate.release.clone(),
+        revision: candidate.revision.clone(),
+        protocol: nazo_operator_protocol::PROTOCOL_VERSION,
+        build_id: candidate.build_id.clone(),
+    };
+    if identity.protocol != nazo_operator_protocol::PROTOCOL_VERSION || identity != &expected {
+        bail!("local OCI candidate embedded identity does not match the exact candidate binding");
+    }
+    if candidate.build_id != format!("source:{}", candidate.revision) {
+        bail!("local OCI candidate build ID must be source:<full-revision>");
+    }
+    Ok(())
+}
+
+pub(super) fn validate_local_oci_candidate_observation(
+    candidate: &CandidateTarget,
+    identity: &EmbeddedIdentity,
+    local_artifact_id: &str,
+    actual_oci_digest: &str,
+) -> anyhow::Result<()> {
+    validate_local_oci_candidate_identity(candidate, identity)?;
+    if !local_artifact_id
+        .strip_prefix("sha256:")
+        .is_some_and(|value| {
+            value.len() == 64
+                && value.chars().all(|character| {
+                    character.is_ascii_hexdigit() && !character.is_ascii_uppercase()
+                })
+        })
+    {
+        bail!("local OCI candidate did not resolve to an immutable local image ID");
+    }
+    if actual_oci_digest != candidate.oci_digest {
+        bail!("local OCI candidate image digest does not match --candidate-oci-digest");
+    }
+    Ok(())
+}
+
+pub(super) fn is_local_oci_candidate_record(record: &DeploymentRecord) -> bool {
+    record
+        .resources
+        .contains_key(crate::controller::deployment::LOCAL_OCI_CANDIDATE_INSTALL_RESOURCE)
+}
+
+pub(super) fn validate_declared_local_artifact(
+    record: &DeploymentRecord,
+    config: &UpdateConfig,
+) -> anyhow::Result<()> {
+    let marker = record
+        .resources
+        .get(crate::controller::deployment::LOCAL_OCI_CANDIDATE_INSTALL_RESOURCE);
+    if marker.is_none() && record.active_release.build_id.starts_with("local:") {
+        return validate_local_development_identity(&record.active_release);
+    }
+    let marker = marker
+        .context("deployment does not declare an explicit local OCI candidate provenance marker")?;
+    match marker {
+        crate::deployment::SafeReference::File { path }
+            if path
+                == &crate::controller::deployment::local_oci_candidate_install_resource_path(
+                    config,
+                ) => {}
+        _ => bail!("local OCI candidate provenance marker is not bound to the controller state"),
+    }
+    crate::controller::deployment::validate_completed_local_oci_candidate_provenance(
+        config, record,
+    )?;
+    if !record.active_release.build_id.starts_with("source:") {
+        bail!("local OCI candidate build ID is not source-bound");
+    }
+    if record.runtime_instances.len() != 1 || config.runtime.backend == RuntimeBackendKind::Systemd
+    {
+        bail!("local OCI candidate declaration must bind exactly one container runtime");
+    }
+    let runtime = record
+        .runtime_instances
+        .first()
+        .context("local OCI candidate declaration has no runtime")?;
+    let crate::deployment::ArtifactReference::Oci {
+        image_reference,
+        digest,
+    } = &runtime.artifact
+    else {
+        bail!("local OCI candidate declaration has no OCI artifact");
+    };
+    if runtime.local_artifact_id.is_none()
+        || !digest.strip_prefix("sha256:").is_some_and(|value| {
+            value.len() == 64
+                && value.chars().all(|character| {
+                    character.is_ascii_hexdigit() && !character.is_ascii_uppercase()
+                })
+        })
+    {
+        bail!("local OCI candidate declaration is missing its immutable local artifact binding");
+    }
+    if runtime.local_artifact_id.as_deref() != Some(image_reference.as_str()) {
+        bail!("local OCI candidate declaration does not bind its exact local image ID");
+    }
+    if record.active_release.revision.len() != 40
+        || !record
+            .active_release
+            .revision
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+        || !crate::model::semantic_tag(&record.active_release.release)
+    {
+        bail!("local OCI candidate declaration has an invalid release or full revision");
+    }
+    let candidate = CandidateTarget {
+        release: record.active_release.release.clone(),
+        revision: record.active_release.revision.clone(),
+        build_id: record.active_release.build_id.clone(),
+        oci_digest: digest.clone(),
+    };
+    validate_local_oci_candidate_identity(&candidate, &record.active_release)
+}
+
+/// Re-observe the running local OCI candidate immediately before an operation
+/// treats its registered binding as complete.  The declaration check belongs
+/// to the caller because registration recovery deliberately runs before the
+/// durable state is marked complete.
+pub(crate) fn validate_active_local_oci_candidate_runtime(
+    record: &DeploymentRecord,
+    config: &UpdateConfig,
+    candidate: &CandidateTarget,
+    expected_local_artifact_id: &str,
+) -> anyhow::Result<crate::runtime::ActiveBuildTarget> {
+    let active = Runtime::new(config).active_build_target()?;
+    validate_active_local_oci_candidate_observation(
+        record,
+        config,
+        candidate,
+        expected_local_artifact_id,
+        &active,
+    )?;
+    Ok(active)
+}
+
+pub(crate) fn validate_active_local_oci_candidate_observation(
+    record: &DeploymentRecord,
+    config: &UpdateConfig,
+    candidate: &CandidateTarget,
+    expected_local_artifact_id: &str,
+    active: &crate::runtime::ActiveBuildTarget,
+) -> anyhow::Result<()> {
+    let declared_runtime = record
+        .runtime_instances
+        .first()
+        .filter(|_| record.runtime_instances.len() == 1)
+        .context("local OCI candidate deployment must bind exactly one runtime")?;
+    if config.runtime.backend == RuntimeBackendKind::Systemd
+        || declared_runtime.backend != config.runtime.backend
+        || declared_runtime.object_reference != config.runtime.container_name
+    {
+        bail!("local OCI candidate runtime declaration does not match the active container");
+    }
+    let crate::deployment::ArtifactReference::Oci {
+        image_reference,
+        digest,
+    } = &declared_runtime.artifact
+    else {
+        bail!("local OCI candidate deployment artifact is not OCI");
+    };
+    if record.active_release.release != candidate.release
+        || record.active_release.revision != candidate.revision
+        || record.active_release.build_id != candidate.build_id
+        || declared_runtime.local_artifact_id.as_deref() != Some(expected_local_artifact_id)
+        || image_reference != expected_local_artifact_id
+        || digest != &candidate.oci_digest
+    {
+        bail!("local OCI candidate deployment differs from its exact persisted binding");
+    }
+
+    let active_local_artifact_id = active
+        .local_artifact_id
+        .as_deref()
+        .context("active local OCI runtime exposes no immutable local image ID")?;
+    if active_local_artifact_id != expected_local_artifact_id {
+        bail!("active local OCI image ID differs from the deployment declaration");
+    }
+    validate_local_oci_candidate_observation(
+        candidate,
+        &active.embedded,
+        active_local_artifact_id,
+        &active.image_digest,
+    )?;
+    Ok(())
+}
+
+/// The completed-state caller first validates durable candidate provenance;
+/// registration recovery instead supplies the exact pending state explicitly.
+pub(crate) fn active_local_oci_candidate_build_target(
+    record: &DeploymentRecord,
+    config: &UpdateConfig,
+) -> anyhow::Result<crate::runtime::ActiveBuildTarget> {
+    validate_declared_local_artifact(record, config)?;
+    let runtime = record
+        .runtime_instances
+        .first()
+        .context("local OCI candidate deployment has no runtime binding")?;
+    let crate::deployment::ArtifactReference::Oci { digest, .. } = &runtime.artifact else {
+        bail!("local OCI candidate deployment artifact is not OCI");
+    };
+    let local_artifact_id = runtime
+        .local_artifact_id
+        .as_deref()
+        .context("local OCI candidate deployment has no immutable local image ID")?;
+    let candidate = CandidateTarget {
+        release: record.active_release.release.clone(),
+        revision: record.active_release.revision.clone(),
+        build_id: record.active_release.build_id.clone(),
+        oci_digest: digest.clone(),
+    };
+    validate_active_local_oci_candidate_runtime(record, config, &candidate, local_artifact_id)
+}
+
 pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
     let configured_path = cli.config.clone();
     let selector = cli.deployment.clone();
@@ -101,6 +329,8 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             require_confirmation(yes, "accept deployment-bound external step evidence")?;
             let store = DeploymentStore::system();
             let record = store.resolve(selector.as_deref(), true)?;
+            super::reject_pending_local_oci_candidate_record(&record)?;
+            super::reject_completed_local_oci_candidate_transition(&record)?;
             let transaction = crate::coordination::submit_evidence(&store, &record, &file)?;
             println!("{}", serde_json::to_string_pretty(&transaction)?);
             Ok(())
@@ -113,6 +343,8 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             require_confirmation(yes, "resume the deployment-bound update transaction")?;
             let store = DeploymentStore::system();
             let record = store.resolve(selector.as_deref(), true)?;
+            super::reject_pending_local_oci_candidate_record(&record)?;
+            super::reject_completed_local_oci_candidate_transition(&record)?;
             let transaction = crate::coordination::resume(&store, &record)?;
             let current_record = store.load(&record.deployment_id)?;
             if matches!(
@@ -179,6 +411,9 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         Command::PermissionsSet(options) => {
             require_root()?;
             require_confirmation(options.yes, "change deployment capability grants")?;
+            let store = DeploymentStore::system();
+            let record = store.resolve(selector.as_deref(), true)?;
+            reject_registered_local_oci_candidate_mutation(&record)?;
             crate::governance::set_permissions(cli.deployment.as_deref(), &options.changes)
         }
         Command::Relinquish(options) => {
@@ -187,27 +422,46 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 options.yes,
                 "relinquish deployment capabilities without deleting resources",
             )?;
+            let store = DeploymentStore::system();
+            let record = store.resolve(selector.as_deref(), true)?;
+            reject_registered_local_oci_candidate_mutation(&record)?;
             crate::governance::relinquish(cli.deployment.as_deref(), &options.capabilities)
         }
         Command::Reconcile => crate::governance::reconcile(cli.deployment.as_deref()),
         Command::Install(options) => install(cli.config, *options),
         Command::Status => {
-            if crate::deployment::DeploymentStore::system().registry_present()? {
-                let record = crate::deployment::DeploymentStore::system()
-                    .resolve(cli.deployment.as_deref(), false)?;
-                return registered_status(&record, false);
+            let store = crate::deployment::DeploymentStore::system();
+            match store.registry_present() {
+                Ok(true) => {
+                    let record = store.resolve(cli.deployment.as_deref(), false)?;
+                    registered_status(&record, false)
+                }
+                Ok(false) => status(&load_config(&cli.config)?),
+                Err(error) => {
+                    let config = load_config_unsettled(&cli.config)?;
+                    if deployment::local_oci_candidate_install_is_pending(&config)? {
+                        return status(&config);
+                    }
+                    Err(error)
+                }
             }
-            let config = load_config(&cli.config)?;
-            status(&config)
         }
         Command::Doctor => {
-            if crate::deployment::DeploymentStore::system().registry_present()? {
-                let record = crate::deployment::DeploymentStore::system()
-                    .resolve(cli.deployment.as_deref(), false)?;
-                return registered_status(&record, true);
+            let store = crate::deployment::DeploymentStore::system();
+            match store.registry_present() {
+                Ok(true) => {
+                    let record = store.resolve(cli.deployment.as_deref(), false)?;
+                    registered_status(&record, true)
+                }
+                Ok(false) => doctor(&load_config(&cli.config)?),
+                Err(error) => {
+                    let config = load_config_unsettled(&cli.config)?;
+                    if deployment::local_oci_candidate_install_is_pending(&config)? {
+                        return doctor(&config);
+                    }
+                    Err(error)
+                }
             }
-            let config = load_config(&cli.config)?;
-            doctor(&config)
         }
         Command::BootstrapAdmin(options) => {
             require_root()?;
@@ -258,6 +512,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), !options.plan)?;
+                reject_registered_local_oci_candidate_mutation(&record)?;
                 if options.plan {
                     registered_update_plan(&record, &options)
                 } else {
@@ -404,6 +659,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
+                reject_registered_local_oci_candidate_mutation(&record)?;
                 require_registered_recovery_authority(
                     "rollback",
                     crate::coordination::active_update_exists(&store, &record),
@@ -442,6 +698,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
+                reject_registered_local_oci_candidate_mutation(&record)?;
                 require_registered_recovery_authority(
                     "recovery",
                     crate::coordination::active_update_exists(&store, &record),
@@ -482,6 +739,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), true)?;
+                reject_registered_local_oci_candidate_mutation(&record)?;
                 require_confirmation(
                     yes,
                     "resume the deployment-bound interrupted update transaction",

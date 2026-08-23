@@ -1102,5 +1102,14 @@ fn parse_tmpfs_options(
             );
         }
     }
+    // Podman injects these two propagation/copy-up annotations when it
+    // serializes tmpfs mounts through inspect. They do not relax the tmpfs
+    // security policy and are not part of the user-declared mount contract.
+    // Keep the exception engine-specific: Docker and every other caller must
+    // still match the declared option set exactly.
+    if backend_name == "Podman" {
+        options.remove("rprivate");
+        options.remove("tmpcopyup");
+    }
     Ok(options)
 }

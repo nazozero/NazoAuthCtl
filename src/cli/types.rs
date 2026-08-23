@@ -182,12 +182,24 @@ pub(crate) struct RelinquishOptions {
     pub(crate) yes: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct CandidateTarget {
     pub(crate) release: String,
     pub(crate) revision: String,
     pub(crate) build_id: String,
     pub(crate) oci_digest: String,
+}
+
+/// A deliberately local-only OCI target for a fresh standards installation.
+///
+/// This is not an unsigned replacement for `update` or `development activate`:
+/// the caller supplies the release identity and the expected OCI manifest digest,
+/// and install proves them against an image that is already present in the
+/// selected container runtime.  No registry resolution or pull is performed.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct LocalOciCandidateInstall {
+    pub(crate) image: String,
+    pub(crate) target: CandidateTarget,
 }
 
 #[derive(Debug)]
@@ -233,7 +245,19 @@ pub(crate) struct InstallOptions {
     pub(crate) runtime_ip: Option<String>,
     pub(crate) database_url: Option<String>,
     pub(crate) migration_database_url: Option<String>,
+    pub(crate) database_backup_url: Option<String>,
     pub(crate) valkey_url: Option<String>,
+    pub(crate) valkey_backup_url: Option<String>,
+    pub(crate) external_valkey_backup_scope: Option<String>,
+    pub(crate) database_runtime_endpoint_sha256: Option<String>,
+    pub(crate) database_runtime_principal_sha256: Option<String>,
+    pub(crate) migration_database_endpoint_sha256: Option<String>,
+    pub(crate) migration_database_principal_sha256: Option<String>,
+    pub(crate) database_backup_endpoint_sha256: Option<String>,
+    pub(crate) database_backup_principal_sha256: Option<String>,
+    pub(crate) valkey_runtime_principal_sha256: Option<String>,
+    pub(crate) valkey_backup_endpoint_sha256: Option<String>,
+    pub(crate) valkey_backup_principal_sha256: Option<String>,
     pub(crate) external_dependencies: bool,
     pub(crate) secrets_stdin: bool,
     pub(crate) secret_fd: Option<u32>,
@@ -241,6 +265,7 @@ pub(crate) struct InstallOptions {
     pub(crate) profile_secret_fd: Option<u32>,
     pub(crate) profile_secrets: Option<StandardsProfileSecrets>,
     pub(crate) version: Option<String>,
+    pub(crate) local_oci_candidate: Option<LocalOciCandidateInstall>,
 }
 
 impl Drop for InstallOptions {
@@ -248,7 +273,9 @@ impl Drop for InstallOptions {
         for value in [
             &mut self.database_url,
             &mut self.migration_database_url,
+            &mut self.database_backup_url,
             &mut self.valkey_url,
+            &mut self.valkey_backup_url,
         ] {
             if let Some(value) = value.as_mut() {
                 zeroize::Zeroize::zeroize(value);

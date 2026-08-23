@@ -2,9 +2,12 @@ use std::{collections::BTreeSet, path::PathBuf};
 
 use anyhow::{Context, bail};
 
-use super::super::types::InstallOptions;
+use super::super::types::{CandidateTarget, InstallOptions, LocalOciCandidateInstall};
 use super::common::validate_version;
-use crate::install::{normalize_public_url_for_profile, normalize_single_host_cidr};
+use crate::install::{
+    normalize_public_url_for_profile, normalize_single_host_cidr,
+    validate_standards_full_trusted_proxy_contract,
+};
 
 pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOptions> {
     let mut runtime = "auto".to_owned();
@@ -20,13 +23,30 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
     let mut runtime_ip = None;
     let database_url = None;
     let migration_database_url = None;
+    let database_backup_url = None;
     let valkey_url = None;
+    let valkey_backup_url = None;
+    let external_valkey_backup_scope = None;
+    let database_runtime_endpoint_sha256 = None;
+    let database_runtime_principal_sha256 = None;
+    let migration_database_endpoint_sha256 = None;
+    let migration_database_principal_sha256 = None;
+    let database_backup_endpoint_sha256 = None;
+    let database_backup_principal_sha256 = None;
+    let valkey_runtime_principal_sha256 = None;
+    let valkey_backup_endpoint_sha256 = None;
+    let valkey_backup_principal_sha256 = None;
     let mut external_dependencies = false;
     let mut secrets_stdin = false;
     let mut secret_fd = None;
     let mut profile_secrets_stdin = false;
     let mut profile_secret_fd = None;
     let mut version = None;
+    let mut candidate_image = None;
+    let mut candidate_release = None;
+    let mut candidate_revision = None;
+    let mut candidate_build_id = None;
+    let mut candidate_oci_digest = None;
     let mut seen_options = BTreeSet::new();
     let mut index = 0;
     while index < values.len() {
@@ -101,6 +121,11 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
                 validate_version(&value)?;
                 version = Some(value);
             }
+            "--candidate-image" => candidate_image = Some(validate_local_oci_image(&value)?),
+            "--candidate-release" => candidate_release = Some(value),
+            "--candidate-revision" => candidate_revision = Some(value),
+            "--candidate-build-id" => candidate_build_id = Some(value),
+            "--candidate-oci-digest" => candidate_oci_digest = Some(value),
             other => bail!("unknown install option {other}"),
         }
         index += 2;
@@ -135,7 +160,32 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
     if runtime == "host" && network_subnet.is_some() {
         bail!("container network options are unavailable with --runtime host");
     }
+    let local_oci_candidate = parse_local_oci_candidate(
+        candidate_image,
+        candidate_release,
+        candidate_revision,
+        candidate_build_id,
+        candidate_oci_digest,
+    )?;
+    if local_oci_candidate.is_some() {
+        if runtime == "host" {
+            bail!("a local OCI candidate install requires --runtime auto, podman, or docker");
+        }
+        if version.is_some() {
+            bail!("--to cannot be combined with a local OCI candidate install");
+        }
+        if external_dependencies {
+            bail!(
+                "a local OCI candidate install is managed-only and rejects --external-dependencies"
+            );
+        }
+    }
     public_url = normalize_public_url_for_profile(&public_url, &profile)?;
+    validate_standards_full_trusted_proxy_contract(
+        &public_url,
+        &profile,
+        trusted_proxy_cidr.as_deref(),
+    )?;
     Ok(InstallOptions {
         runtime,
         public_url,
@@ -150,7 +200,19 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
         runtime_ip,
         database_url,
         migration_database_url,
+        database_backup_url,
         valkey_url,
+        valkey_backup_url,
+        external_valkey_backup_scope,
+        database_runtime_endpoint_sha256,
+        database_runtime_principal_sha256,
+        migration_database_endpoint_sha256,
+        migration_database_principal_sha256,
+        database_backup_endpoint_sha256,
+        database_backup_principal_sha256,
+        valkey_runtime_principal_sha256,
+        valkey_backup_endpoint_sha256,
+        valkey_backup_principal_sha256,
         external_dependencies,
         secrets_stdin,
         secret_fd,
@@ -158,7 +220,86 @@ pub(super) fn parse_install(values: Vec<String>) -> anyhow::Result<InstallOption
         profile_secret_fd,
         profile_secrets: None,
         version,
+        local_oci_candidate,
     })
+}
+
+fn parse_local_oci_candidate(
+    image: Option<String>,
+    release: Option<String>,
+    revision: Option<String>,
+    build_id: Option<String>,
+    oci_digest: Option<String>,
+) -> anyhow::Result<Option<LocalOciCandidateInstall>> {
+    let values_present = [
+        image.as_ref(),
+        release.as_ref(),
+        revision.as_ref(),
+        build_id.as_ref(),
+        oci_digest.as_ref(),
+    ]
+    .into_iter()
+    .filter(Option::is_some)
+    .count();
+    if values_present == 0 {
+        return Ok(None);
+    }
+    if values_present != 5 {
+        bail!(
+            "local OCI candidate install requires --candidate-image plus --candidate-release, --candidate-revision, --candidate-build-id, and --candidate-oci-digest"
+        );
+    }
+    let release = release.expect("checked candidate release");
+    if !crate::model::semantic_tag(&release) {
+        bail!("--candidate-release must be a canonical v-prefixed semantic version");
+    }
+    let candidate_version = semver::Version::parse(release.trim_start_matches('v'))
+        .context("--candidate-release must be a prerelease semantic version")?;
+    if candidate_version.pre.is_empty() {
+        bail!("--candidate-release must be a prerelease semantic version");
+    }
+    let revision = revision.expect("checked candidate revision");
+    if revision.len() != 40
+        || !revision
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+    {
+        bail!("--candidate-revision must be a full lowercase Git commit SHA");
+    }
+    let build_id = build_id.expect("checked candidate build ID");
+    if build_id != format!("source:{revision}") {
+        bail!("local OCI candidate --candidate-build-id must be source:<full-revision>");
+    }
+    let oci_digest = oci_digest.expect("checked candidate OCI digest");
+    if !oci_digest.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+    }) {
+        bail!("--candidate-oci-digest must be a lowercase sha256 digest");
+    }
+    Ok(Some(LocalOciCandidateInstall {
+        image: image.expect("checked candidate image"),
+        target: CandidateTarget {
+            release,
+            revision,
+            build_id,
+            oci_digest,
+        },
+    }))
+}
+
+fn validate_local_oci_image(value: &str) -> anyhow::Result<String> {
+    if value.is_empty()
+        || value.len() > 512
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._:/@+-".contains(character))
+    {
+        bail!("--candidate-image must be a safe local OCI image reference");
+    }
+    Ok(value.to_owned())
 }
 
 fn validate_network_subnet(value: &str) -> anyhow::Result<()> {

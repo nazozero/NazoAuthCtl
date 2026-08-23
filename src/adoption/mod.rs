@@ -195,6 +195,19 @@ pub(crate) fn run(options: AdoptionOptions) -> anyhow::Result<()> {
         .deployment_id
         .as_deref()
         .context("target has no verified NazoAuth deployment identity")?;
+    if options.yes {
+        let store = DeploymentStore::system();
+        if store.registry_present()?
+            && store
+                .load_registry()?
+                .deployments
+                .contains_key(deployment_id)
+        {
+            let record = store.load(deployment_id)?;
+            crate::controller::reject_pending_local_oci_candidate_record(&record)?;
+            crate::controller::reject_completed_local_oci_candidate_transition(&record)?;
+        }
+    }
     let replicas = report
         .candidates
         .iter()

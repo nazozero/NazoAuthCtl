@@ -7,11 +7,13 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::*;
+use crate::ReviewScreenshotMarker;
 use crate::browser::ConformanceBinding;
 use crate::client::{ClientConfig, SuiteClient};
 use crate::credentials::BearerToken;
 use crate::matrix::{MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix};
 use crate::origin::Origin;
+use crate::report::{DeferredReviewPending, ModuleOutcome, ReviewScreenshotReport};
 use crate::transport::{HttpMethod, HttpRequest, HttpResponse, Transport, TransportError};
 
 struct ParallelFixtureTransport {
@@ -22,6 +24,60 @@ struct ParallelFixtureTransport {
     created_plans: Mutex<Vec<String>>,
     fail_module_for_plan: Option<String>,
     module_result: String,
+}
+
+struct RejectCreatedPlanObserver;
+
+struct RetainSuiteObserver;
+
+impl SuiteResourceObserver for RetainSuiteObserver {
+    fn retain_suite_plans_for_certification(&self) -> bool {
+        true
+    }
+
+    fn plan_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn plan_created(
+        &self,
+        _origin: &Origin,
+        _intent_id: &str,
+        _plan_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn module_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn module_created(&self, _intent_id: &str, _module_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl SuiteResourceObserver for RejectCreatedPlanObserver {
+    fn plan_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn plan_created(
+        &self,
+        _origin: &Origin,
+        _intent_id: &str,
+        _plan_id: &str,
+    ) -> Result<(), String> {
+        Err("simulated durable plan persistence failure".to_owned())
+    }
+
+    fn module_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn module_created(&self, _intent_id: &str, _module_id: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 impl ParallelFixtureTransport {
@@ -209,6 +265,20 @@ fn parallel_fixture_with_lanes(
             )
         })
         .collect();
+    let plan_resource_budgets = plan_ids
+        .iter()
+        .map(|id| {
+            (
+                (*id).to_owned(),
+                OidfPlanResourceBudget {
+                    modules: 1,
+                    clients: 1,
+                    wall_clock_seconds: 60,
+                },
+            )
+        })
+        .collect();
+    let selected_plan_count = u32::try_from(plan_ids.len()).expect("fixture plan count");
     let runner = ConformanceRunner::new(ConformanceRunConfig {
         client,
         matrix: SelectedMatrix {
@@ -232,7 +302,14 @@ fn parallel_fixture_with_lanes(
         poll_timeout: Duration::from_secs(2),
         control: RunControl::default(),
         plan_lanes,
+        plan_resource_budgets,
+        selected_resource_budget: OidfPlanResourceBudget {
+            modules: selected_plan_count,
+            clients: selected_plan_count,
+            wall_clock_seconds: u64::from(selected_plan_count) * 60,
+        },
         jobs: 2,
+        upload_review_screenshots: false,
         automation: Vec::new(),
         suite_resource_observer: None,
     })
@@ -277,6 +354,17 @@ fn independent_plans_overlap_but_reports_remain_in_matrix_order() {
     assert_eq!(summary.report.orchestration_integrity.defined_modules, 2);
     assert_eq!(summary.report.orchestration_integrity.terminal_modules, 2);
     assert!(summary.report.cleanup.failures.is_empty());
+    assert!(
+        transport
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .all(|(method, path)| {
+                !(*method == HttpMethod::Delete && path.starts_with("/api/runner/"))
+            }),
+        "parallel cleanup must use observed terminal reports instead of re-cancelling them"
+    );
     assert!(!progress.0.is_empty());
     assert!(
         progress.0.iter().all(|snapshot| snapshot.total == 2),
@@ -294,6 +382,195 @@ fn independent_plans_overlap_but_reports_remain_in_matrix_order() {
             .count(),
         2,
         "every selected plan must be created before module execution begins"
+    );
+}
+
+#[test]
+fn retained_parallel_run_launches_work_after_the_first_worker_finishes() {
+    let (mut runner, transport) = parallel_fixture(
+        serde_json::json!({}),
+        &["plan-a", "plan-b", "plan-c", "plan-d", "plan-e"],
+        None,
+    );
+    runner.config.jobs = 4;
+    runner.config.suite_resource_observer = Some(Arc::new(RetainSuiteObserver));
+
+    let summary = runner.run(&mut ());
+
+    assert!(summary.report.errors.is_empty());
+    assert!(summary.report.orchestration_integrity.retention_eligible);
+    assert!(
+        summary
+            .report
+            .orchestration_integrity
+            .retention_candidate_settled
+    );
+    assert!(!summary.report.orchestration_integrity.retention_committed);
+    assert!(!summary.report.orchestration_integrity.cleanup_complete);
+    assert!(
+        summary
+            .report
+            .orchestration_integrity
+            .suite_resources_settled
+    );
+    assert!(summary.report.local_success);
+    assert!(!summary.report.orchestration_integrity.cleanup_complete);
+    assert_eq!(summary.report.orchestration_integrity.terminal_modules, 5);
+    assert_eq!(
+        transport.created_plans.lock().expect("plans").len(),
+        5,
+        "retention must not make the first finished worker stop the remaining queue"
+    );
+    assert!(
+        transport
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .all(|(method, path)| {
+                !(*method == HttpMethod::Delete && path.starts_with("/api/plan/"))
+            }),
+        "eligible retained plans remain for the caller's durable retention handoff"
+    );
+}
+
+fn merge_terminal_and_deferred_review_workers(
+    include_worker_error: bool,
+) -> (RunSummary, Arc<ParallelFixtureTransport>) {
+    let (mut runner, transport) =
+        parallel_fixture(serde_json::json!({}), &["plan-a", "plan-b"], None);
+    runner.config.suite_resource_observer = Some(Arc::new(RetainSuiteObserver));
+
+    let mut prepared = runner.prepare_run();
+    let work = plan_work(&mut prepared);
+    let terminal = runner.run_prepared(&mut (), worker_prepared(&work[0]));
+    let mut deferred = runner.run_prepared(&mut (), worker_prepared(&work[1]));
+    let module = deferred
+        .report
+        .modules
+        .first_mut()
+        .expect("deferred worker module");
+    module.terminal = false;
+    module.official_status = Some("WAITING".to_owned());
+    module.official_result = None;
+    module.review_screenshots = vec![ReviewScreenshotReport {
+        path: "review-screenshots/run-1/m-plan-b-0.png".into(),
+        sha256: "a".repeat(64),
+        size: 1,
+    }];
+    module.review_screenshots_required = 1;
+    module.review_screenshots_required_captured = 1;
+    module.mark_deferred_review_pending(DeferredReviewPending {
+        placeholder_path: "/test/a/m-plan-b/verification-evidence".to_owned(),
+        marker: ReviewScreenshotMarker::Required,
+        obligation_index: 0,
+    });
+    if include_worker_error {
+        deferred
+            .report
+            .errors
+            .push("simulated deferred capture integrity failure".to_owned());
+    }
+    let snapshots = vec![
+        Some(terminal.report.progress.clone()),
+        Some(deferred.report.progress.clone()),
+    ];
+
+    (
+        merge_reports(
+            &runner,
+            prepared,
+            &work,
+            snapshots,
+            vec![true, true],
+            vec![Some(terminal), Some(deferred)],
+            false,
+        ),
+        transport,
+    )
+}
+
+#[test]
+fn parallel_aggregation_retains_terminal_and_deferred_review_workers_without_claiming_pass() {
+    let (summary, transport) = merge_terminal_and_deferred_review_workers(false);
+    let report = summary.report;
+
+    assert!(report.errors.is_empty());
+    assert!(report.orchestration_integrity.all_modules_settled);
+    assert!(!report.orchestration_integrity.all_modules_terminal);
+    assert_eq!(report.orchestration_integrity.terminal_modules, 1);
+    assert_eq!(report.orchestration_integrity.deferred_review_modules, 1);
+    assert!(report.orchestration_integrity.retention_eligible);
+    assert!(report.orchestration_integrity.retention_candidate_settled);
+    assert!(!report.orchestration_integrity.retention_committed);
+    assert!(report.orchestration_integrity.suite_resources_settled);
+    assert!(!report.orchestration_integrity.cleanup_complete);
+    assert!(report.local_success);
+    assert!(report.review_pending);
+    assert!(!report.suite_pass);
+    assert!(!report.acceptance_pass);
+    assert!(
+        report
+            .modules
+            .iter()
+            .any(|module| module.outcome == ModuleOutcome::DeferredReviewPending)
+    );
+    assert!(
+        transport
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .all(|(method, path)| {
+                !(*method == HttpMethod::Delete
+                    && (path.starts_with("/api/runner/") || path.starts_with("/api/plan/")))
+            }),
+        "the settled deferred review worker retains its module and plan for the durable handoff"
+    );
+}
+
+#[test]
+fn parallel_aggregation_cleans_deferred_review_workers_when_any_worker_reports_an_error() {
+    let (summary, transport) = merge_terminal_and_deferred_review_workers(true);
+    let report = summary.report;
+
+    assert!(!report.orchestration_integrity.retention_eligible);
+    assert!(report.orchestration_integrity.cleanup_complete);
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains("simulated deferred capture integrity failure"))
+    );
+    assert!(
+        report
+            .cleanup
+            .deleted_plans
+            .iter()
+            .any(|plan| plan == "plan-a")
+    );
+    assert!(
+        report
+            .cleanup
+            .deleted_plans
+            .iter()
+            .any(|plan| plan == "plan-b")
+    );
+    assert!(
+        transport
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .any(|(method, path)| *method == HttpMethod::Delete && path == "/api/plan/plan-a")
+    );
+    assert!(
+        transport
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .any(|(method, path)| *method == HttpMethod::Delete && path == "/api/plan/plan-b")
     );
 }
 
@@ -338,6 +615,33 @@ fn parallel_non_pass_outcomes_complete_locally_without_claiming_suite_pass() {
     assert_eq!(failed.progress.failed, 2);
     assert_eq!(failed.progress.failed_groups, 1);
     assert_eq!(failed.progress.groups[0].status, GroupStatus::Failed);
+}
+
+#[test]
+fn parallel_expected_skips_are_preserved_and_acceptance_is_exact() {
+    let (mut runner, _) = parallel_fixture_with_result(
+        serde_json::json!({}),
+        &["plan-a", "plan-b"],
+        None,
+        "SKIPPED",
+    );
+    for plan in &mut runner.config.matrix.document.groups[0].plans {
+        plan.expected_results
+            .insert(format!("test-{}", plan.plan), "SKIPPED".to_owned());
+    }
+
+    let report = runner.run(&mut ()).report;
+
+    assert!(report.local_success);
+    assert!(!report.suite_pass, "SKIPPED must not be relabeled PASSED");
+    assert!(report.acceptance_pass);
+    assert!(report.matrix_expectations_satisfied);
+    assert_eq!(
+        report.expected_skipped_modules,
+        ["plan-a/test-plan-a", "plan-b/test-plan-b"]
+    );
+    assert!(report.unexpected_skipped_modules.is_empty());
+    assert!(report.unknown_declared_skip_modules.is_empty());
 }
 
 #[test]
@@ -419,4 +723,30 @@ fn orchestration_error_stops_queued_plans_and_drains_in_flight_cleanup() {
             .iter()
             .any(|deleted| deleted == plan)
     }));
+}
+
+#[test]
+fn observer_failure_still_cleans_up_the_in_memory_plan_id() {
+    let (mut runner, transport) = parallel_fixture(serde_json::json!({}), &["plan-a"], None);
+    runner.config.suite_resource_observer = Some(Arc::new(RejectCreatedPlanObserver));
+
+    let summary = runner.run(&mut ());
+
+    assert!(!summary.report.local_success);
+    assert!(
+        summary
+            .report
+            .errors
+            .iter()
+            .any(|error| error == "simulated durable plan persistence failure")
+    );
+    assert_eq!(summary.report.cleanup.deleted_plans, vec!["plan-a"]);
+    assert!(
+        transport
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .any(|(method, path)| *method == HttpMethod::Delete && path == "/api/plan/plan-a")
+    );
 }

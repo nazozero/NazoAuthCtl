@@ -106,7 +106,23 @@ fn operator_protocol_dependency_pins_source_without_coupling_server_version() {
         .expect("workspace must declare the operator protocol dependency");
 
     assert!(dependency.contains("git = \"https://github.com/nazozero/NazoAuth.git\""));
-    assert!(dependency.contains("rev = \""));
+    let revision = dependency
+        .split("rev = \"")
+        .nth(1)
+        .and_then(|tail| tail.split('"').next())
+        .expect("operator protocol dependency must pin a Git revision");
+    assert_eq!(
+        revision.len(),
+        40,
+        "protocol revision must be a full commit"
+    );
+    assert!(
+        revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit()
+                || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())),
+        "protocol revision must be lowercase hexadecimal"
+    );
     assert!(
         !dependency.contains("version = "),
         "the controller must not couple its release to a NazoAuth product version"

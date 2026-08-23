@@ -74,7 +74,31 @@ pub(crate) struct Dependencies {
     #[serde(default)]
     pub(crate) migration_database_url_file: PathBuf,
     #[serde(default)]
+    pub(crate) database_backup_url_file: PathBuf,
+    #[serde(default)]
     pub(crate) valkey_url_file: PathBuf,
+    #[serde(default)]
+    pub(crate) valkey_backup_url_file: PathBuf,
+    #[serde(default)]
+    pub(crate) external_valkey_backup_scope: String,
+    #[serde(default)]
+    pub(crate) database_runtime_endpoint_sha256: String,
+    #[serde(default)]
+    pub(crate) database_runtime_principal_sha256: String,
+    #[serde(default)]
+    pub(crate) migration_database_endpoint_sha256: String,
+    #[serde(default)]
+    pub(crate) migration_database_principal_sha256: String,
+    #[serde(default)]
+    pub(crate) database_backup_endpoint_sha256: String,
+    #[serde(default)]
+    pub(crate) database_backup_principal_sha256: String,
+    #[serde(default)]
+    pub(crate) valkey_runtime_principal_sha256: String,
+    #[serde(default)]
+    pub(crate) valkey_backup_endpoint_sha256: String,
+    #[serde(default)]
+    pub(crate) valkey_backup_principal_sha256: String,
 }
 
 fn default_dependency_mode() -> String {
@@ -87,7 +111,19 @@ impl Default for Dependencies {
             mode: default_dependency_mode(),
             database_url_file: PathBuf::new(),
             migration_database_url_file: PathBuf::new(),
+            database_backup_url_file: PathBuf::new(),
             valkey_url_file: PathBuf::new(),
+            valkey_backup_url_file: PathBuf::new(),
+            external_valkey_backup_scope: String::new(),
+            database_runtime_endpoint_sha256: String::new(),
+            database_runtime_principal_sha256: String::new(),
+            migration_database_endpoint_sha256: String::new(),
+            migration_database_principal_sha256: String::new(),
+            database_backup_endpoint_sha256: String::new(),
+            database_backup_principal_sha256: String::new(),
+            valkey_runtime_principal_sha256: String::new(),
+            valkey_backup_endpoint_sha256: String::new(),
+            valkey_backup_principal_sha256: String::new(),
         }
     }
 }
@@ -233,7 +269,7 @@ impl UpdateConfig {
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        if self.schema != 2 {
+        if !matches!(self.schema, 2 | 3) {
             bail!("unsupported update config schema");
         }
         self.capabilities.validate()?;
@@ -333,9 +369,80 @@ impl UpdateConfig {
             }
         }
         if self.dependencies.mode == "external" {
-            safe_absolute(&self.dependencies.database_url_file)?;
-            safe_absolute(&self.dependencies.migration_database_url_file)?;
-            safe_absolute(&self.dependencies.valkey_url_file)?;
+            if self.schema != 3 {
+                bail!(
+                    "external dependencies require update config schema 3 with dedicated backup credentials"
+                );
+            }
+            let paths = [
+                &self.dependencies.database_url_file,
+                &self.dependencies.migration_database_url_file,
+                &self.dependencies.database_backup_url_file,
+                &self.dependencies.valkey_url_file,
+                &self.dependencies.valkey_backup_url_file,
+            ];
+            for path in paths {
+                if path.as_os_str().is_empty() {
+                    bail!(
+                        "external dependencies require distinct runtime, migration, and backup credential paths"
+                    );
+                }
+                safe_absolute(path)?;
+            }
+            if self.dependencies.external_valkey_backup_scope != "dedicated-instance" {
+                bail!("external Valkey backup must declare dedicated-instance scope");
+            }
+            for (label, identity) in [
+                (
+                    "external PostgreSQL runtime endpoint identity",
+                    &self.dependencies.database_runtime_endpoint_sha256,
+                ),
+                (
+                    "external PostgreSQL runtime principal identity",
+                    &self.dependencies.database_runtime_principal_sha256,
+                ),
+                (
+                    "external PostgreSQL migration endpoint identity",
+                    &self.dependencies.migration_database_endpoint_sha256,
+                ),
+                (
+                    "external PostgreSQL migration principal identity",
+                    &self.dependencies.migration_database_principal_sha256,
+                ),
+                (
+                    "external PostgreSQL backup endpoint identity",
+                    &self.dependencies.database_backup_endpoint_sha256,
+                ),
+                (
+                    "external PostgreSQL backup principal identity",
+                    &self.dependencies.database_backup_principal_sha256,
+                ),
+                (
+                    "external Valkey runtime principal identity",
+                    &self.dependencies.valkey_runtime_principal_sha256,
+                ),
+                (
+                    "external Valkey backup endpoint identity",
+                    &self.dependencies.valkey_backup_endpoint_sha256,
+                ),
+                (
+                    "external Valkey backup principal identity",
+                    &self.dependencies.valkey_backup_principal_sha256,
+                ),
+            ] {
+                if identity.len() != 64
+                    || !identity
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    bail!("{label} must be a lowercase SHA-256 digest");
+                }
+            }
+            for (index, path) in paths.iter().enumerate() {
+                if paths[..index].contains(path) {
+                    bail!("external dependency credential paths must be distinct");
+                }
+            }
         }
         if self.runtime.readiness_attempts == 0 {
             bail!("readiness_attempts must be positive");

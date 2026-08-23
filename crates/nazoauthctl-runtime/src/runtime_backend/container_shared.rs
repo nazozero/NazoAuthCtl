@@ -426,6 +426,72 @@ mod tests {
     }
 
     #[test]
+    fn podman_tmpfs_inspect_normalizes_only_its_non_security_metadata() {
+        fn assert_tmpfs_policy(tmpfs: serde_json::Value, backend: &str) -> anyhow::Result<()> {
+            let work = PrivateTempDir::new("managed-container-tmpfs-inspect").unwrap();
+            let engine = work.path().join("fake-engine");
+            let document = serde_json::json!({
+                "HostConfig": {
+                    "RestartPolicy": {"Name": "unless-stopped"},
+                    "ReadonlyRootfs": true,
+                    "SecurityOpt": ["no-new-privileges"],
+                    "CapDrop": ["ALL"],
+                    "PidsLimit": 512,
+                    "Memory": 1073741824_i64,
+                    "NanoCpus": 2000000000_i64,
+                    "Tmpfs": tmpfs,
+                },
+                "NetworkSettings": {"Networks": {"managed-network": {}}},
+                "Mounts": [{
+                    "Destination": "/data",
+                    "RW": true,
+                    "Source": "managed-data"
+                }],
+                "Config": {"Env": ["POSTGRES_DB=oauth", "PATH=/usr/local/bin"]},
+            });
+            write_shell_executable(&engine, &format!("printf '%s\\n' '{}'", document));
+            super::assert_managed_container_policy(
+                engine.as_os_str(),
+                &["container", "inspect", "managed"],
+                backend,
+                &super::ContainerRuntimePolicy::managed_default(),
+                "managed-network",
+                &[("/data", false, Some("managed-data"))],
+                &[("POSTGRES_DB", "oauth")],
+                &std::collections::BTreeMap::from([(
+                    "PATH".to_owned(),
+                    "/usr/local/bin".to_owned(),
+                )]),
+            )
+        }
+
+        let podman_tmpfs = serde_json::json!({
+            "/tmp": "rw,noexec,nosuid,nodev,size=67108864,rprivate,tmpcopyup",
+            "/run/postgresql": "rw,noexec,nosuid,nodev,size=16777216,rprivate,tmpcopyup",
+        });
+        assert_tmpfs_policy(podman_tmpfs.clone(), "Podman").unwrap();
+        assert!(assert_tmpfs_policy(podman_tmpfs, "Docker").is_err());
+
+        let unknown_token = serde_json::json!({
+            "/tmp": "rw,noexec,nosuid,nodev,size=67108864,rprivate,tmpcopyup,unknown",
+            "/run/postgresql": "rw,noexec,nosuid,nodev,size=16777216,rprivate,tmpcopyup",
+        });
+        assert!(assert_tmpfs_policy(unknown_token, "Podman").is_err());
+
+        let relaxed_permissions = serde_json::json!({
+            "/tmp": "rw,noexec,nosuid,size=67108864,rprivate,tmpcopyup",
+            "/run/postgresql": "rw,noexec,nosuid,nodev,size=16777216,rprivate,tmpcopyup",
+        });
+        assert!(assert_tmpfs_policy(relaxed_permissions, "Podman").is_err());
+
+        let duplicate_option = serde_json::json!({
+            "/tmp": "rw,rw,noexec,nosuid,nodev,size=67108864,rprivate,tmpcopyup",
+            "/run/postgresql": "rw,noexec,nosuid,nodev,size=16777216,rprivate,tmpcopyup",
+        });
+        assert!(assert_tmpfs_policy(duplicate_option, "Podman").is_err());
+    }
+
+    #[test]
     fn oci_backup_completion_and_artifact_digests_are_bound() {
         use sha2::{Digest as _, Sha256};
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, chown};

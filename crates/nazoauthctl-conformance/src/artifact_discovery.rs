@@ -592,7 +592,7 @@ mod tests {
 
     fn trust() -> ArtifactTrustPolicy {
         let key = signing_key();
-        let point = key.verifying_key().to_encoded_point(true);
+        let point = key.verifying_key().to_sec1_point(true);
         ArtifactTrustPolicy {
             schema: OIDF_TRUST_POLICY_SCHEMA_VERSION,
             source: "https://artifacts.example/oidf/".to_owned(),

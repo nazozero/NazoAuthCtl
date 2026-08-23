@@ -233,38 +233,102 @@ pub(super) fn normalize_external_dependencies(options: &mut InstallOptions) -> a
             #[cfg(not(unix))]
             bail!("--secret-fd requires Linux");
         } else {
-            options.database_url = Some(rpassword::prompt_password("PostgreSQL runtime URL: ")?);
-            options.migration_database_url =
-                Some(rpassword::prompt_password("PostgreSQL migration URL: ")?);
-            options.valkey_url = Some(rpassword::prompt_password("Valkey URL: ")?);
+            bail!(
+                "external dependencies require strict JSON through --secrets-stdin or --secret-fd"
+            );
         }
     }
-    if (options.database_url.is_some()
+    let has_any_external_credential = options.database_url.is_some()
         || options.migration_database_url.is_some()
-        || options.valkey_url.is_some())
-        && (options.database_url.is_none()
-            || options.migration_database_url.is_none()
-            || options.valkey_url.is_none())
-    {
+        || options.database_backup_url.is_some()
+        || options.valkey_url.is_some()
+        || options.valkey_backup_url.is_some()
+        || options.external_valkey_backup_scope.is_some();
+    let has_complete_external_contract = options.database_url.is_some()
+        && options.migration_database_url.is_some()
+        && options.database_backup_url.is_some()
+        && options.valkey_url.is_some()
+        && options.valkey_backup_url.is_some()
+        && options.external_valkey_backup_scope.as_deref() == Some("dedicated-instance");
+    if has_any_external_credential && !has_complete_external_contract {
         bail!(
-            "external dependencies require runtime PostgreSQL, migration PostgreSQL, and Valkey URLs"
+            "external dependencies require distinct runtime, migration, backup PostgreSQL/Valkey URLs and dedicated-instance Valkey backup scope"
         );
     }
-    if let Some(database) = &options.database_url {
-        validate_dependency_url(database, &["postgres", "postgresql"], "PostgreSQL")?;
-        validate_dependency_url(
+    if options.database_url.is_some() {
+        let database = options
+            .database_url
+            .as_deref()
+            .context("external dependency input lost PostgreSQL runtime URL")?;
+        let credentials = [
+            database,
             options
                 .migration_database_url
                 .as_deref()
                 .unwrap_or_default(),
-            &["postgres", "postgresql"],
-            "PostgreSQL migration",
-        )?;
-        validate_dependency_url(
+            options.database_backup_url.as_deref().unwrap_or_default(),
             options.valkey_url.as_deref().unwrap_or_default(),
-            &["redis", "rediss"],
-            "Valkey",
-        )?;
+            options.valkey_backup_url.as_deref().unwrap_or_default(),
+        ];
+        if credentials
+            .iter()
+            .enumerate()
+            .any(|(index, credential)| credentials[..index].contains(credential))
+        {
+            bail!("external dependency credential URLs must be distinct");
+        }
+        let binding = external_dependency_endpoint_binding(options)?;
+        options.database_runtime_endpoint_sha256 = Some(binding.database_runtime_endpoint_sha256);
+        options.database_runtime_principal_sha256 = Some(binding.database_runtime_principal_sha256);
+        options.migration_database_endpoint_sha256 =
+            Some(binding.migration_database_endpoint_sha256);
+        options.migration_database_principal_sha256 =
+            Some(binding.migration_database_principal_sha256);
+        options.database_backup_endpoint_sha256 = Some(binding.database_endpoint_sha256);
+        options.database_backup_principal_sha256 = Some(binding.database_principal_sha256);
+        options.valkey_runtime_principal_sha256 = Some(binding.valkey_runtime_principal_sha256);
+        options.valkey_backup_endpoint_sha256 = Some(binding.valkey_endpoint_sha256);
+        options.valkey_backup_principal_sha256 = Some(binding.valkey_principal_sha256);
+    }
+    Ok(())
+}
+
+/// Re-read the live external dependency contract before a controller can
+/// replay a privileged task.  The config only records non-secret endpoint
+/// identities, so changing a credential file after prepare must never redirect
+/// a retry to a different provider endpoint or principal.
+pub(crate) fn verify_live_external_dependencies(config: &UpdateConfig) -> anyhow::Result<()> {
+    if config.dependencies.mode != "external" {
+        return Ok(());
+    }
+    if config.dependencies.external_valkey_backup_scope != "dedicated-instance" {
+        bail!("external Valkey backup must declare dedicated-instance scope");
+    }
+    let binding = crate::secret_provider::bind_external_dependency_url_files(
+        &config.dependencies.database_url_file,
+        &config.dependencies.migration_database_url_file,
+        &config.dependencies.database_backup_url_file,
+        &config.dependencies.valkey_url_file,
+        &config.dependencies.valkey_backup_url_file,
+    )?;
+    if binding.database_runtime_endpoint_sha256
+        != config.dependencies.database_runtime_endpoint_sha256
+        || binding.database_runtime_principal_sha256
+            != config.dependencies.database_runtime_principal_sha256
+        || binding.migration_database_endpoint_sha256
+            != config.dependencies.migration_database_endpoint_sha256
+        || binding.migration_database_principal_sha256
+            != config.dependencies.migration_database_principal_sha256
+        || binding.database_endpoint_sha256 != config.dependencies.database_backup_endpoint_sha256
+        || binding.database_principal_sha256 != config.dependencies.database_backup_principal_sha256
+        || binding.valkey_runtime_principal_sha256
+            != config.dependencies.valkey_runtime_principal_sha256
+        || binding.valkey_endpoint_sha256 != config.dependencies.valkey_backup_endpoint_sha256
+        || binding.valkey_principal_sha256 != config.dependencies.valkey_backup_principal_sha256
+    {
+        bail!(
+            "live external dependency endpoints or principals no longer match the persisted deployment binding"
+        );
     }
     Ok(())
 }
@@ -308,7 +372,10 @@ pub(super) fn normalize_profile_secrets(options: &mut InstallOptions) -> anyhow:
 struct ExternalDependencySecrets {
     database_url: String,
     migration_database_url: String,
+    database_backup_url: String,
     valkey_url: String,
+    valkey_backup_url: String,
+    valkey_backup_scope: String,
 }
 
 pub(super) fn read_external_dependency_secrets(
@@ -330,8 +397,64 @@ pub(super) fn read_external_dependency_secrets(
     // independently wiped on drop.
     options.database_url = Some(secrets.database_url.clone());
     options.migration_database_url = Some(secrets.migration_database_url.clone());
+    options.database_backup_url = Some(secrets.database_backup_url.clone());
     options.valkey_url = Some(secrets.valkey_url.clone());
+    options.valkey_backup_url = Some(secrets.valkey_backup_url.clone());
+    options.external_valkey_backup_scope = Some(secrets.valkey_backup_scope.clone());
+    let binding = external_dependency_endpoint_binding(options)?;
+    options.database_runtime_endpoint_sha256 = Some(binding.database_runtime_endpoint_sha256);
+    options.database_runtime_principal_sha256 = Some(binding.database_runtime_principal_sha256);
+    options.migration_database_endpoint_sha256 = Some(binding.migration_database_endpoint_sha256);
+    options.migration_database_principal_sha256 = Some(binding.migration_database_principal_sha256);
+    options.database_backup_endpoint_sha256 = Some(binding.database_endpoint_sha256);
+    options.database_backup_principal_sha256 = Some(binding.database_principal_sha256);
+    options.valkey_runtime_principal_sha256 = Some(binding.valkey_runtime_principal_sha256);
+    options.valkey_backup_endpoint_sha256 = Some(binding.valkey_endpoint_sha256);
+    options.valkey_backup_principal_sha256 = Some(binding.valkey_principal_sha256);
     Ok(())
+}
+
+fn external_dependency_endpoint_binding(
+    options: &InstallOptions,
+) -> anyhow::Result<crate::secret_provider::ExternalDependencyBackupBinding> {
+    let database = options
+        .database_url
+        .as_deref()
+        .context("external dependency input lost PostgreSQL runtime URL")?;
+    validate_dependency_url(database, &["postgres", "postgresql"], "PostgreSQL")?;
+    validate_dependency_url(
+        options
+            .migration_database_url
+            .as_deref()
+            .unwrap_or_default(),
+        &["postgres", "postgresql"],
+        "PostgreSQL migration",
+    )?;
+    validate_dependency_url(
+        options.database_backup_url.as_deref().unwrap_or_default(),
+        &["postgres", "postgresql"],
+        "PostgreSQL backup",
+    )?;
+    validate_dependency_url(
+        options.valkey_url.as_deref().unwrap_or_default(),
+        &["redis", "rediss"],
+        "Valkey",
+    )?;
+    validate_dependency_url(
+        options.valkey_backup_url.as_deref().unwrap_or_default(),
+        &["redis", "rediss"],
+        "Valkey backup",
+    )?;
+    crate::secret_provider::bind_external_dependency_credentials(
+        database,
+        options
+            .migration_database_url
+            .as_deref()
+            .unwrap_or_default(),
+        options.database_backup_url.as_deref().unwrap_or_default(),
+        options.valkey_url.as_deref().unwrap_or_default(),
+        options.valkey_backup_url.as_deref().unwrap_or_default(),
+    )
 }
 
 pub(super) fn read_profile_secrets(
@@ -348,6 +471,14 @@ pub(super) fn read_profile_secrets(
     }
     let input: StandardsProfileSecrets =
         serde_json::from_slice(&bytes).context("profile secret input must be strict JSON")?;
+    validate_explicit_profile_secrets(&input)?;
+    options.profile_secrets = Some(input);
+    Ok(())
+}
+
+pub(super) fn validate_explicit_profile_secrets(
+    input: &StandardsProfileSecrets,
+) -> anyhow::Result<()> {
     for (name, value) in [
         (
             "dynamic_registration_initial_access_token",
@@ -368,7 +499,9 @@ pub(super) fn read_profile_secrets(
     ] {
         validate_profile_secret_value(name, value)?;
     }
-    options.profile_secrets = Some(input);
+    if input.openid4vci_management_token == input.openid4vp_management_token {
+        bail!("openid4vci_management_token and openid4vp_management_token must differ");
+    }
     Ok(())
 }
 
@@ -428,7 +561,16 @@ pub(super) fn write_external_urls(
             .as_deref()
             .context("missing PostgreSQL migration URL")?
             .as_bytes(),
-        0o440,
+        0o400,
+    )?;
+    atomic_write(
+        &secrets.join("database-backup-url"),
+        options
+            .database_backup_url
+            .as_deref()
+            .context("missing PostgreSQL backup URL")?
+            .as_bytes(),
+        0o400,
     )?;
     atomic_write(
         &secrets.join("database-url"),
@@ -447,6 +589,15 @@ pub(super) fn write_external_urls(
             .context("missing Valkey URL")?
             .as_bytes(),
         0o440,
+    )?;
+    atomic_write(
+        &secrets.join("valkey-backup-url"),
+        options
+            .valkey_backup_url
+            .as_deref()
+            .context("missing Valkey backup URL")?
+            .as_bytes(),
+        0o400,
     )?;
     Ok("external".to_owned())
 }
@@ -569,7 +720,7 @@ fn ensure_managed_secrets(
                 "user {} on >{} ~* ",
                 "+get +mget +getdel +set +setnx +del +exists ",
                 "+expire +expireat +expiretime +pexpireat +pexpiretime +ttl ",
-                "+incr +zadd +zrangebyscore +zrem +time +eval ",
+                "+incr +zadd +zrangebyscore +zrem +time +dbsize +eval ",
                 "+ping +hello +select +client|setname +client|setinfo\n",
                 "user {} on >{} ~* +ping +lastsave +bgsave\n"
             ),
@@ -823,7 +974,11 @@ pub(super) fn ensure_mfa_totp_key(path: &Path) -> anyhow::Result<()> {
                     path.display()
                 );
             }
-            let bytes = read_secure_secret_file(path, "MFA TOTP encryption key", 4 * 1024)?;
+            let bytes = crate::filesystem::read_secure_secret_file(
+                path,
+                "MFA TOTP encryption key",
+                4 * 1024,
+            )?;
             let value = std::str::from_utf8(&bytes)
                 .context("MFA TOTP encryption key is not valid UTF-8")?;
             validate_mfa_totp_key(value)?;
@@ -867,7 +1022,11 @@ pub(super) fn read_existing_server_config(
             target.display()
         );
     }
-    let bytes = read_secure_secret_file(target, "existing server configuration", 1024 * 1024)?;
+    let bytes = crate::filesystem::read_secure_secret_file(
+        target,
+        "existing server configuration",
+        1024 * 1024,
+    )?;
     let value = String::from_utf8(bytes.to_vec()).with_context(|| {
         format!(
             "existing server configuration is not valid UTF-8: {}",
@@ -1074,6 +1233,7 @@ pub(super) fn validate_existing_server_config(
             "ENABLE_NATIVE_SSO",
             "ENABLE_OPENID4VCI_ISSUER",
             "ENABLE_OPENID4VP_VERIFIER",
+            "TRANSPORT_MODE",
             "MTLS_ENDPOINT_BASE_URL",
             "TRUSTED_PROXY_CIDRS",
             "MTLS_CERTIFICATE_SOURCE",
@@ -1135,6 +1295,9 @@ pub(super) fn validate_existing_server_config(
                 bail!("standards-full existing server configuration must enable {key}");
             }
         }
+        if config_key_value(content, "TRANSPORT_MODE")?.as_deref() != Some("trusted-proxy") {
+            bail!("standards-full requires TRANSPORT_MODE=trusted-proxy");
+        }
     } else {
         if expected_profile_config.is_some() {
             bail!("baseline existing configuration validation received profile material");
@@ -1146,6 +1309,7 @@ pub(super) fn validate_existing_server_config(
             "MTLS_ENDPOINT_BASE_URL",
             "MTLS_CERTIFICATE_SOURCE",
             "TRUSTED_PROXY_CIDRS",
+            "TRANSPORT_MODE",
             "ENABLE_OPENID4VCI_ISSUER",
             "ENABLE_OPENID4VP_VERIFIER",
         ] {

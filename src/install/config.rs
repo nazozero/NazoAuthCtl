@@ -156,7 +156,10 @@ pub(super) fn build_config(
         PathBuf::new()
     };
     let config = UpdateConfig {
-        schema: 2,
+        // Schema 3 adds the external backup-credential contract.  Parsing
+        // schema 2 remains supported for managed deployments and historical
+        // backup identity checks; it is never rewritten during retry.
+        schema: 3,
         trust: crate::deployment::TrustState::Adopted,
         capabilities: crate::deployment::CapabilityGrants::controller_installed(),
         install_profile: options.profile.clone(),
@@ -168,7 +171,49 @@ pub(super) fn build_config(
             mode: dependency_mode.to_owned(),
             database_url_file: secrets.join("database-url"),
             migration_database_url_file: secrets.join("database-migration-url"),
+            database_backup_url_file: secrets.join("database-backup-url"),
             valkey_url_file: secrets.join("valkey-url"),
+            valkey_backup_url_file: secrets.join("valkey-backup-url"),
+            external_valkey_backup_scope: options
+                .external_valkey_backup_scope
+                .clone()
+                .unwrap_or_default(),
+            database_runtime_endpoint_sha256: options
+                .database_runtime_endpoint_sha256
+                .clone()
+                .unwrap_or_default(),
+            database_runtime_principal_sha256: options
+                .database_runtime_principal_sha256
+                .clone()
+                .unwrap_or_default(),
+            migration_database_endpoint_sha256: options
+                .migration_database_endpoint_sha256
+                .clone()
+                .unwrap_or_default(),
+            migration_database_principal_sha256: options
+                .migration_database_principal_sha256
+                .clone()
+                .unwrap_or_default(),
+            database_backup_endpoint_sha256: options
+                .database_backup_endpoint_sha256
+                .clone()
+                .unwrap_or_default(),
+            database_backup_principal_sha256: options
+                .database_backup_principal_sha256
+                .clone()
+                .unwrap_or_default(),
+            valkey_runtime_principal_sha256: options
+                .valkey_runtime_principal_sha256
+                .clone()
+                .unwrap_or_default(),
+            valkey_backup_endpoint_sha256: options
+                .valkey_backup_endpoint_sha256
+                .clone()
+                .unwrap_or_default(),
+            valkey_backup_principal_sha256: options
+                .valkey_backup_principal_sha256
+                .clone()
+                .unwrap_or_default(),
         },
         runtime: Runtime {
             backend: runtime_backend,

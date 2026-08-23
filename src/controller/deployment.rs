@@ -192,7 +192,7 @@ pub(super) fn install(
     options: crate::cli::InstallOptions,
 ) -> anyhow::Result<()> {
     require_root()?;
-    let config_present = match fs::symlink_metadata(&config_path) {
+    let mut config_present = match fs::symlink_metadata(&config_path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => true,
         Ok(_) => bail!(
             "update config must be a regular non-symlink file: {}",
@@ -204,9 +204,51 @@ pub(super) fn install(
                 .with_context(|| format!("failed to inspect {}", config_path.display()));
         }
     };
+    if !config_present
+        && let Some(_intent) = install::load_local_oci_candidate_prepare_intent(&config_path)?
+    {
+        let candidate = options.local_oci_candidate.as_ref().context(
+            "a durable local OCI candidate prepare intent exists; repeat its exact candidate install command",
+        )?;
+        // This verifies the candidate tuple and the serialized config digest
+        // before restoring the config file that was lost in the intent→config
+        // publication window.
+        install::restore_local_oci_candidate_prepare_intent(&config_path, candidate)?;
+        config_present = true;
+    }
     if config_present {
         let config = load_config(&config_path)?;
         config.require_managed_lifecycle()?;
+        if let Some(candidate) = options.local_oci_candidate.as_ref() {
+            if let Some(state) = load_local_oci_candidate_install_state(&config)? {
+                return install_local_oci_candidate_transaction(
+                    &config_path,
+                    &config,
+                    candidate,
+                    Some(state),
+                );
+            }
+            // A state-less existing config is permitted only when the
+            // candidate prepare intent binds these exact config bytes and
+            // caller tuple.  Arbitrary legacy/signed configs cannot enter the
+            // candidate transaction.
+            install::validate_existing_local_oci_candidate_prepare_intent(
+                &config_path,
+                &config,
+                candidate,
+            )?;
+            return install_local_oci_candidate_transaction(&config_path, &config, candidate, None);
+        }
+        if load_local_oci_candidate_install_state(&config)?.is_some() {
+            bail!(
+                "local OCI candidate installation is pending or complete; do not switch this controller config to a signed Release install"
+            );
+        }
+        if install::load_local_oci_candidate_prepare_intent(&config_path)?.is_some() {
+            bail!(
+                "local OCI candidate prepare intent is present; repeat its exact candidate install command instead of switching this config to a signed Release"
+            );
+        }
         let store = DeploymentStore::system();
         if store.registry_present()?
             && store
@@ -283,8 +325,13 @@ pub(super) fn install(
     let PreparedInstall {
         config,
         config_path,
+        local_oci_candidate,
     } = install::prepare(&config_path, options)?;
-    let result = install_transaction(&config_path, &config, requested_version.as_deref());
+    let result = if let Some(candidate) = local_oci_candidate.as_ref() {
+        install_local_oci_candidate_transaction(&config_path, &config, candidate, None)
+    } else {
+        install_transaction(&config_path, &config, requested_version.as_deref())
+    };
     if let Err(error) = result {
         eprintln!(
             "nazoauthctl: install stopped; persisted data was retained for a safe retry: {error:#}"
@@ -304,6 +351,7 @@ pub(super) fn install_transaction(
     let release = VerifiedRelease::fetch(&config.repository, version, config.container_backend())?;
     enforce_release_trust(config, &release.manifest)?;
     release.persist_verification_evidence(&release_cache_dir(config, &release.manifest))?;
+    install::verify_live_external_dependencies(config)?;
     let backup = Backup::create(config_path, config, &release.manifest.version)?;
 
     if config.runtime.backend == RuntimeBackendKind::Systemd {
@@ -388,6 +436,553 @@ pub(super) fn install_transaction(
     Ok(())
 }
 
+fn local_oci_candidate_install_state_path(config: &UpdateConfig) -> PathBuf {
+    config
+        .deployment_root
+        .join("local-oci-candidate-install.json")
+}
+
+fn load_local_oci_candidate_install_state(
+    config: &UpdateConfig,
+) -> anyhow::Result<Option<LocalOciCandidateInstallState>> {
+    let path = local_oci_candidate_install_state_path(config);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => bail!("local OCI candidate installation state is not a regular non-symlink file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).context("failed to inspect local OCI candidate installation state");
+        }
+    }
+    let bytes = crate::filesystem::read_secure_regular_file(
+        &path,
+        "local OCI candidate installation state",
+        true,
+        256 * 1024,
+    )?;
+    let state: LocalOciCandidateInstallState = serde_json::from_slice(&bytes)
+        .context("local OCI candidate installation state is invalid")?;
+    if state.schema != 1 || state.local_artifact_id.is_empty() {
+        bail!("local OCI candidate installation state has an unsupported schema or identity");
+    }
+    Ok(Some(state))
+}
+
+pub(super) fn local_oci_candidate_install_is_pending(
+    config: &UpdateConfig,
+) -> anyhow::Result<bool> {
+    Ok(load_local_oci_candidate_install_state(config)?.is_some_and(|state| !state.completed))
+}
+
+pub(super) fn local_oci_candidate_install_is_completed(
+    config: &UpdateConfig,
+) -> anyhow::Result<bool> {
+    Ok(load_local_oci_candidate_install_state(config)?.is_some_and(|state| state.completed))
+}
+
+pub(super) fn validate_completed_local_oci_candidate_provenance(
+    config: &UpdateConfig,
+    record: &DeploymentRecord,
+) -> anyhow::Result<()> {
+    let state = load_local_oci_candidate_install_state(config)?
+        .context("local OCI candidate deployment has no durable candidate state")?;
+    if !state.completed {
+        bail!("local OCI candidate deployment is not complete");
+    }
+    let runtime = record
+        .runtime_instances
+        .first()
+        .context("local OCI candidate deployment has no runtime binding")?;
+    let crate::deployment::ArtifactReference::Oci { digest, .. } = &runtime.artifact else {
+        bail!("local OCI candidate deployment artifact is not OCI");
+    };
+    if record.active_release.release != state.candidate.target.release
+        || record.active_release.revision != state.candidate.target.revision
+        || record.active_release.build_id != state.candidate.target.build_id
+        || runtime.local_artifact_id.as_deref() != Some(&state.local_artifact_id)
+        || digest != &state.candidate.target.oci_digest
+    {
+        bail!("local OCI candidate deployment does not match its completed durable state");
+    }
+    let event_file = state
+        .management_event_file
+        .as_deref()
+        .context("completed local OCI candidate install has no management audit event")?;
+    let event_sha256 = state
+        .management_event_sha256
+        .as_deref()
+        .context("completed local OCI candidate install has no management audit digest")?;
+    let event_path = config
+        .operator
+        .audit_directory
+        .join("management")
+        .join(event_file);
+    if crate::filesystem::sha256(&event_path)? != event_sha256 {
+        bail!("completed local OCI candidate install management audit digest mismatch");
+    }
+    let event = operator::load_management_event(config, event_file)?;
+    if event.operation != "local-oci-candidate-install"
+        || event.release != state.candidate.target.release
+    {
+        bail!("completed local OCI candidate install management audit event is inconsistent");
+    }
+    Ok(())
+}
+
+pub(super) fn local_oci_candidate_install_resource_path(config: &UpdateConfig) -> PathBuf {
+    local_oci_candidate_install_state_path(config)
+}
+
+pub(super) const LOCAL_OCI_CANDIDATE_INSTALL_RESOURCE: &str = "local_oci_candidate_install";
+
+fn candidate_registration_journal_present(
+    store: &DeploymentStore,
+    deployment_id: &str,
+) -> anyhow::Result<bool> {
+    let path = store.registration_journal_path(deployment_id);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => bail!(
+            "local OCI candidate registration journal is not a regular non-symlink file: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect local OCI candidate registration journal {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+/// Admit either an entirely unregistered candidate retry or the narrow crash
+/// window after this exact candidate's registration started.  The latter is
+/// reconciled before any application task; every other existing declaration
+/// remains a fresh-only failure.
+fn ensure_local_oci_candidate_retry_is_unregistered(
+    config: &UpdateConfig,
+    allow_registration_recovery: bool,
+) -> anyhow::Result<bool> {
+    let store = DeploymentStore::system();
+    // Keep the same global-to-specific order used by registration.  A retry
+    // therefore cannot observe a registry between phases while a declaration
+    // is being committed for this deployment.
+    let _registry_lock = store.registry_lock()?;
+    let _deployment_lock = store.deployment_lock(&config.operator.deployment_id)?;
+    if store.registration_pending_except(Some(&config.operator.deployment_id))? {
+        bail!(
+            "deployment registration transaction is pending; recover it before a local OCI candidate retry"
+        );
+    }
+    let candidate_journal =
+        candidate_registration_journal_present(&store, &config.operator.deployment_id)?;
+    let registry = store.load_registry()?;
+    let registry_binding = registry
+        .deployments
+        .contains_key(&config.operator.deployment_id);
+    let declaration = store.declaration_path(&config.operator.deployment_id);
+    let declaration_present = declaration.exists();
+    if crate::coordination::active_update_exists_for_deployment(
+        &store,
+        &config.operator.deployment_id,
+    ) {
+        bail!("local OCI candidate retry is blocked by an active deployment update");
+    }
+    let registration_recovery = candidate_journal || registry_binding || declaration_present;
+    if registration_recovery && !allow_registration_recovery {
+        bail!(
+            "local OCI candidate retry refuses an existing deployment binding; only the exact post-registration crash recovery is permitted"
+        );
+    }
+    Ok(registration_recovery)
+}
+
+fn persist_local_oci_candidate_install_state(
+    config: &UpdateConfig,
+    state: &LocalOciCandidateInstallState,
+) -> anyhow::Result<()> {
+    atomic_write(
+        &local_oci_candidate_install_state_path(config),
+        &serde_json::to_vec_pretty(state)?,
+        0o600,
+    )
+}
+
+fn local_oci_candidate_expected_target(
+    config: &UpdateConfig,
+    candidate: &LocalOciCandidateInstall,
+) -> anyhow::Result<ExpectedReleaseTarget> {
+    operator::expected_release_target(
+        config,
+        nazo_operator_protocol::EmbeddedIdentity {
+            release: candidate.target.release.clone(),
+            revision: candidate.target.revision.clone(),
+            protocol: nazo_operator_protocol::PROTOCOL_VERSION,
+            build_id: candidate.target.build_id.clone(),
+        },
+        candidate.target.oci_digest.clone(),
+        String::new(),
+    )
+}
+
+fn install_local_oci_candidate_transaction(
+    config_path: &Path,
+    config: &UpdateConfig,
+    candidate: &LocalOciCandidateInstall,
+    persisted: Option<LocalOciCandidateInstallState>,
+) -> anyhow::Result<()> {
+    require_managed_local_oci_candidate_dependencies(config)?;
+    if config.runtime.backend == RuntimeBackendKind::Systemd {
+        bail!("local OCI candidate installation requires a container runtime");
+    }
+    if config.install_profile != "standards-full" {
+        bail!("local OCI candidate installation requires the standards-full profile");
+    }
+    let runtime = Runtime::new(config);
+    let local = runtime.inspect_local_development_artifact(&candidate.image)?;
+    let local_artifact_id = local
+        .local_artifact_id
+        .as_deref()
+        .context("local OCI candidate did not resolve to an immutable local image ID")?;
+    let actual_digest = runtime.image_digest(local_artifact_id)?;
+    crate::controller::commands::validate_local_oci_candidate_observation(
+        &candidate.target,
+        &local.embedded,
+        local_artifact_id,
+        &actual_digest,
+    )?;
+
+    let mut state = match persisted {
+        Some(state) => {
+            if state.candidate != *candidate || state.local_artifact_id != local_artifact_id {
+                bail!(
+                    "local OCI candidate retry does not match the persisted candidate identity and local image ID"
+                );
+            }
+            state
+        }
+        None => LocalOciCandidateInstallState {
+            schema: 1,
+            candidate: candidate.clone(),
+            local_artifact_id: local_artifact_id.to_owned(),
+            recovery_backup: None,
+            management_event_file: None,
+            management_event_sha256: None,
+            completed: false,
+        },
+    };
+    if state.completed {
+        validate_completed_local_oci_candidate_install(config_path, config, &state)?;
+        let record = DeploymentStore::system().load(&config.operator.deployment_id)?;
+        verify_local_oci_candidate_completion_preconditions(
+            config,
+            &record,
+            &state.candidate,
+            &state.local_artifact_id,
+        )?;
+        println!("NazoAuth local OCI candidate is already installed and ready");
+        return Ok(());
+    }
+
+    // Re-open any existing managed backup before recording a retry intent or
+    // touching runtime state. Candidate installation is deliberately
+    // managed-only, so there is no external provider contract to replay.
+    verify_local_oci_candidate_retry_preconditions(config, &state)?;
+
+    let registration_recovery =
+        ensure_local_oci_candidate_retry_is_unregistered(config, state.recovery_backup.is_some())?;
+    if registration_recovery {
+        return finish_local_oci_candidate_registration_recovery(
+            config_path,
+            config,
+            candidate,
+            local_artifact_id,
+            &mut state,
+        );
+    }
+
+    // Persist the exact image ID before any task, database mutation, or
+    // container replacement. A retry must prove the same local object again.
+    persist_local_oci_candidate_install_state(config, &state)?;
+    crate::operator::append_management_event(
+        config,
+        "local-oci-candidate-install-intent",
+        &candidate.target.release,
+        "backup",
+    )?;
+    install::start_managed_dependencies(config)?;
+    if state.recovery_backup.is_none() {
+        let backup = Backup::create(config_path, config, &candidate.target.release)?;
+        state.recovery_backup = Some(backup.path().to_owned());
+        persist_local_oci_candidate_install_state(config, &state)?;
+    }
+    let expected = local_oci_candidate_expected_target(config, candidate)?;
+    operator::execute(
+        config,
+        local_artifact_id,
+        &expected,
+        TaskOperation::MigrateApply,
+        None,
+    )?;
+    install::grant_runtime_database(config)?;
+    operator::execute(
+        config,
+        local_artifact_id,
+        &expected,
+        TaskOperation::KeysGenerateLocal {
+            alg: "ES256".to_owned(),
+            purposes: vec!["credential".to_owned(), "presentation_request".to_owned()],
+        },
+        None,
+    )?;
+    bootstrap_openid4vc_revocation_snapshot(config)?;
+    runtime.activate_local_development_artifact(&local)?;
+    let active = runtime.active_build_target()?;
+    let active_local_artifact_id = active
+        .local_artifact_id
+        .as_deref()
+        .context("active local OCI candidate exposes no immutable local image ID")?;
+    crate::controller::commands::validate_local_oci_candidate_observation(
+        &candidate.target,
+        &active.embedded,
+        active_local_artifact_id,
+        &active.image_digest,
+    )?;
+    if active_local_artifact_id != local_artifact_id {
+        bail!("active local OCI candidate image ID differs from the inspected local image ID");
+    }
+    let backup = state
+        .recovery_backup
+        .as_deref()
+        .context("local OCI candidate installation lost its recovery backup path")?;
+    after_local_oci_candidate_public_proof(
+        || verify_local_oci_candidate_public_preconditions(config, candidate),
+        || {
+            register_local_oci_candidate_deployment(
+                config_path,
+                config,
+                candidate,
+                local_artifact_id,
+                backup,
+            )
+        },
+    )?;
+    let store = DeploymentStore::system();
+    // `register_local_oci_candidate_deployment` uses `persist_exact_locked`;
+    // loading only after it returns is the exact-record proof needed before
+    // this installation writes its completion audit/state.
+    let record = store.load(&config.operator.deployment_id)?;
+    verify_local_oci_candidate_completion_preconditions(
+        config,
+        &record,
+        candidate,
+        local_artifact_id,
+    )?;
+    crate::lifecycle::cache_trusted_runtime(&store, &record)?;
+    let management_event = crate::operator::append_management_event(
+        config,
+        "local-oci-candidate-install",
+        &candidate.target.release,
+        "backup",
+    )?;
+    state.management_event_file = management_event
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned);
+    state.management_event_sha256 = Some(crate::filesystem::sha256(&management_event)?);
+    state.completed = true;
+    persist_local_oci_candidate_install_state(config, &state)?;
+    validate_registered_local_oci_candidate_deployment(
+        config_path,
+        config,
+        candidate,
+        local_artifact_id,
+    )?;
+    println!(
+        "NazoAuth local OCI candidate installed at {} ({})",
+        candidate.target.release, candidate.target.revision
+    );
+    Ok(())
+}
+
+/// This is deliberately called before a retry can persist state, append audit
+/// evidence, start dependencies, or replay an operator task.
+pub(super) fn verify_local_oci_candidate_retry_preconditions(
+    config: &UpdateConfig,
+    state: &LocalOciCandidateInstallState,
+) -> anyhow::Result<()> {
+    if let Some(backup) = state.recovery_backup.as_deref() {
+        Backup::open_existing(config, backup)?;
+    }
+    Ok(())
+}
+
+/// A crash after declaration/registry persistence but before the completed
+/// candidate state must not replay migrations, key generation, or container
+/// replacement.  `persist_exact_locked` below first proves the declaration is
+/// byte-for-byte the candidate binding; only then may this finish the audit
+/// and release the global unsettled-state guard.
+fn finish_local_oci_candidate_registration_recovery(
+    config_path: &Path,
+    config: &UpdateConfig,
+    candidate: &LocalOciCandidateInstall,
+    local_artifact_id: &str,
+    state: &mut LocalOciCandidateInstallState,
+) -> anyhow::Result<()> {
+    let backup = state
+        .recovery_backup
+        .as_deref()
+        .context("local OCI candidate registration recovery has no durable backup")?;
+    Backup::open_existing(config, backup)?;
+    register_local_oci_candidate_deployment(
+        config_path,
+        config,
+        candidate,
+        local_artifact_id,
+        backup,
+    )?;
+    let store = DeploymentStore::system();
+    let record = store.load(&config.operator.deployment_id)?;
+    verify_local_oci_candidate_completion_preconditions(
+        config,
+        &record,
+        candidate,
+        local_artifact_id,
+    )?;
+    crate::lifecycle::cache_trusted_runtime(&store, &record)?;
+    let management_event = crate::operator::append_management_event(
+        config,
+        "local-oci-candidate-install",
+        &candidate.target.release,
+        "backup",
+    )?;
+    state.management_event_file = management_event
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned);
+    state.management_event_sha256 = Some(crate::filesystem::sha256(&management_event)?);
+    state.completed = true;
+    persist_local_oci_candidate_install_state(config, state)?;
+    validate_registered_local_oci_candidate_deployment(
+        config_path,
+        config,
+        candidate,
+        local_artifact_id,
+    )?;
+    println!(
+        "NazoAuth local OCI candidate registration recovery completed at {} ({})",
+        candidate.target.release, candidate.target.revision
+    );
+    Ok(())
+}
+
+/// Completion is a second, post-registration trust boundary.  A registration
+/// crash must not release the candidate's unsettled-state guard merely because
+/// a declaration exists: the active object, immutable image identity, local
+/// readiness, and public issuer must all still be exact.
+fn verify_local_oci_candidate_completion_preconditions(
+    config: &UpdateConfig,
+    record: &DeploymentRecord,
+    candidate: &LocalOciCandidateInstall,
+    local_artifact_id: &str,
+) -> anyhow::Result<()> {
+    crate::controller::commands::validate_active_local_oci_candidate_runtime(
+        record,
+        config,
+        &candidate.target,
+        local_artifact_id,
+    )?;
+    verify_local_oci_candidate_public_preconditions(config, candidate)
+}
+
+pub(super) fn require_managed_local_oci_candidate_dependencies(
+    config: &UpdateConfig,
+) -> anyhow::Result<()> {
+    if config.dependencies.mode != "managed" {
+        bail!(
+            "local OCI candidate installation requires managed PostgreSQL and Valkey dependencies"
+        );
+    }
+    Ok(())
+}
+
+/// The ordinary discovery check establishes the public issuer. The candidate
+/// path additionally requires a fresh control statement signed by the
+/// descriptor-mounted instance key for this exact public candidate. Run this
+/// before registration so a bad proof remains a retryable pending install.
+fn verify_local_oci_candidate_public_preconditions(
+    config: &UpdateConfig,
+    candidate: &LocalOciCandidateInstall,
+) -> anyhow::Result<()> {
+    wait_ready(config)?;
+    verify_public(config)?;
+    crate::discovery::verify_public_local_oci_candidate_control(config, &candidate.target)
+}
+
+/// The registration write is deliberately sequenced behind the public proof.
+/// Keeping this tiny gate explicit makes the no-registration-on-proof-failure
+/// invariant testable without adding a parallel candidate transaction layer.
+pub(super) fn after_local_oci_candidate_public_proof<T>(
+    public_proof: impl FnOnce() -> anyhow::Result<()>,
+    registration: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    public_proof()?;
+    registration()
+}
+
+fn validate_completed_local_oci_candidate_install(
+    config_path: &Path,
+    config: &UpdateConfig,
+    state: &LocalOciCandidateInstallState,
+) -> anyhow::Result<()> {
+    validate_registered_local_oci_candidate_deployment(
+        config_path,
+        config,
+        &state.candidate,
+        &state.local_artifact_id,
+    )?;
+    Ok(())
+}
+
+fn validate_registered_local_oci_candidate_deployment(
+    config_path: &Path,
+    config: &UpdateConfig,
+    candidate: &LocalOciCandidateInstall,
+    local_artifact_id: &str,
+) -> anyhow::Result<DeploymentRecord> {
+    let store = DeploymentStore::system();
+    let record = store.load(&config.operator.deployment_id)?;
+    match record.resources.get("controller_config") {
+        Some(SafeReference::File { path }) if path == config_path => {}
+        _ => bail!(
+            "local OCI candidate deployment is not declaration-bound to its controller config"
+        ),
+    }
+    crate::controller::commands::validate_declared_local_artifact(&record, config)?;
+    if record.active_release.release != candidate.target.release
+        || record.active_release.revision != candidate.target.revision
+        || record.active_release.build_id != candidate.target.build_id
+        || record.runtime_instances.len() != 1
+        || record.runtime_instances[0].local_artifact_id.as_deref() != Some(local_artifact_id)
+    {
+        bail!("local OCI candidate deployment differs from its exact persisted binding");
+    }
+    let crate::deployment::ArtifactReference::Oci {
+        image_reference,
+        digest,
+    } = &record.runtime_instances[0].artifact
+    else {
+        bail!("local OCI candidate deployment artifact is not OCI");
+    };
+    if image_reference != local_artifact_id || digest != &candidate.target.oci_digest {
+        bail!(
+            "local OCI candidate deployment artifact differs from its local ID or expected digest"
+        );
+    }
+    Ok(record)
+}
+
 pub(super) fn bootstrap_profile_keys(
     config: &UpdateConfig,
     release: &VerifiedRelease,
@@ -466,9 +1061,9 @@ pub(super) fn register_installed_deployment(
     use crate::deployment::{
         ArtifactReference, DEPLOYMENT_SCHEMA, DeploymentRecord, DeploymentStore, MountReference,
         RecoveryAssessment, RecoveryConclusion, ResourceScope, Responsibility, RuntimeBackendKind,
-        RuntimeInstance, SafeReference, TrustState,
+        RuntimeInstance, TrustState,
     };
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     let backend = config.runtime.backend;
     let artifact = if backend == RuntimeBackendKind::Systemd {
@@ -492,63 +1087,7 @@ pub(super) fn register_installed_deployment(
     } else {
         config.runtime.container_name.clone()
     };
-    let resources = BTreeMap::from([
-        (
-            "controller_config".to_owned(),
-            SafeReference::File {
-                path: config_path.to_owned(),
-            },
-        ),
-        (
-            "audit_private_key".to_owned(),
-            SafeReference::File {
-                path: config.operator.audit_private_key.clone(),
-            },
-        ),
-        (
-            "audit_public_key".to_owned(),
-            SafeReference::File {
-                path: config.operator.audit_public_key.clone(),
-            },
-        ),
-        (
-            "break_glass_private_key".to_owned(),
-            SafeReference::File {
-                path: config.operator.break_glass_private_key.clone(),
-            },
-        ),
-        (
-            "database".to_owned(),
-            if config.dependencies.mode == "managed" {
-                SafeReference::RuntimeObject {
-                    backend: config
-                        .container_backend()
-                        .context("managed database has no typed container backend")?,
-                    object_reference: config.postgres.container_name.clone(),
-                }
-            } else {
-                SafeReference::File {
-                    path: config.dependencies.database_url_file.clone(),
-                }
-            },
-        ),
-        (
-            "valkey".to_owned(),
-            if config.dependencies.mode == "managed" {
-                SafeReference::RuntimeObject {
-                    backend: config
-                        .container_backend()
-                        .context("managed Valkey has no typed container backend")?,
-                    object_reference: config.valkey.container_name.clone(),
-                }
-            } else {
-                SafeReference::File {
-                    path: config.dependencies.valkey_url_file.clone(),
-                }
-            },
-        ),
-        ("proxy_tls".to_owned(), SafeReference::NotObserved),
-    ]);
+    let resources = installed_deployment_resources(config_path, config)?;
     let record = DeploymentRecord {
         schema: DEPLOYMENT_SCHEMA,
         deployment_id: config.operator.deployment_id.clone(),
@@ -609,4 +1148,167 @@ pub(super) fn register_installed_deployment(
     };
     let store = DeploymentStore::system();
     store.persist(&record)
+}
+
+fn register_local_oci_candidate_deployment(
+    config_path: &Path,
+    config: &UpdateConfig,
+    candidate: &LocalOciCandidateInstall,
+    local_artifact_id: &str,
+    backup: &Path,
+) -> anyhow::Result<()> {
+    use crate::deployment::{
+        ArtifactReference, DEPLOYMENT_SCHEMA, DeploymentRecord, DeploymentStore, MountReference,
+        RecoveryAssessment, RecoveryConclusion, ResourceScope, Responsibility, RuntimeInstance,
+        TrustState,
+    };
+    use std::collections::BTreeSet;
+
+    let backend = config.runtime.backend;
+    if backend == RuntimeBackendKind::Systemd {
+        bail!("local OCI candidate deployment cannot use the host runtime");
+    }
+    let mut resources = installed_deployment_resources(config_path, config)?;
+    resources.insert(
+        LOCAL_OCI_CANDIDATE_INSTALL_RESOURCE.to_owned(),
+        SafeReference::File {
+            path: local_oci_candidate_install_resource_path(config),
+        },
+    );
+    let record = DeploymentRecord {
+        schema: DEPLOYMENT_SCHEMA,
+        deployment_id: config.operator.deployment_id.clone(),
+        control_authority: config.operator.controller_key_id.clone(),
+        alias: None,
+        issuer: config.runtime.expected_issuer.clone(),
+        active_release: nazo_operator_protocol::EmbeddedIdentity {
+            release: candidate.target.release.clone(),
+            revision: candidate.target.revision.clone(),
+            protocol: nazo_operator_protocol::PROTOCOL_VERSION,
+            build_id: candidate.target.build_id.clone(),
+        },
+        trust: TrustState::Adopted,
+        capabilities: config.capabilities.clone(),
+        runtime_instances: vec![RuntimeInstance {
+            runtime_instance_id: config.runtime.runtime_instance_id.clone(),
+            backend,
+            object_reference: config.runtime.container_name.clone(),
+            artifact: ArtifactReference::Oci {
+                image_reference: local_artifact_id.to_owned(),
+                digest: candidate.target.oci_digest.clone(),
+            },
+            local_artifact_id: Some(local_artifact_id.to_owned()),
+            ports: (!config.runtime.publish_address.is_empty())
+                .then(|| config.runtime.publish_address.clone())
+                .into_iter()
+                .collect(),
+            networks: (!config.runtime.network.is_empty())
+                .then(|| config.runtime.network.clone())
+                .into_iter()
+                .collect(),
+            mounts: config
+                .runtime
+                .mounts
+                .iter()
+                .map(|mount| MountReference {
+                    source: mount.source.clone(),
+                    destination: mount.target.clone(),
+                    read_only: mount.read_only,
+                    selinux_relabel: mount.selinux_relabel,
+                    scope: ResourceScope::Deployment,
+                    ownership: Responsibility::Managed,
+                })
+                .collect(),
+            instance_key_id: None,
+            deployment_statement: config.runtime.mounts.iter().find_map(|mount| {
+                (mount.target == Path::new("/var/lib/nazo_oauth/instance"))
+                    .then(|| mount.source.join("deployment-statement.jws"))
+            }),
+        }],
+        resources,
+        recovery: RecoveryAssessment {
+            conclusion: RecoveryConclusion::RequiresUserEvidence,
+            evidence: vec![
+                format!("backup:{}", backup.display()),
+                format!("local-oci-image-id:{local_artifact_id}"),
+                format!("local-oci-digest:{}", candidate.target.oci_digest),
+            ],
+            off_host_package_required_for_machine_loss: true,
+        },
+        operator_protocol_versions: BTreeSet::from([nazo_operator_protocol::PROTOCOL_VERSION]),
+        control_protocol_versions: BTreeSet::from([1]),
+        declaration_revision: 1,
+    };
+    let store = DeploymentStore::system();
+    // Match DeploymentStore::persist lock ordering explicitly: registry first,
+    // then this deployment.  Candidate registration cannot race an ordinary
+    // declaration write into a retained older record.
+    let _registry_lock = store.registry_lock()?;
+    let _deployment_lock = store.deployment_lock(&record.deployment_id)?;
+    store.persist_exact_locked(&record)
+}
+
+fn installed_deployment_resources(
+    config_path: &Path,
+    config: &UpdateConfig,
+) -> anyhow::Result<std::collections::BTreeMap<String, SafeReference>> {
+    use std::collections::BTreeMap;
+
+    Ok(BTreeMap::from([
+        (
+            "controller_config".to_owned(),
+            SafeReference::File {
+                path: config_path.to_owned(),
+            },
+        ),
+        (
+            "audit_private_key".to_owned(),
+            SafeReference::File {
+                path: config.operator.audit_private_key.clone(),
+            },
+        ),
+        (
+            "audit_public_key".to_owned(),
+            SafeReference::File {
+                path: config.operator.audit_public_key.clone(),
+            },
+        ),
+        (
+            "break_glass_private_key".to_owned(),
+            SafeReference::File {
+                path: config.operator.break_glass_private_key.clone(),
+            },
+        ),
+        (
+            "database".to_owned(),
+            if config.dependencies.mode == "managed" {
+                SafeReference::RuntimeObject {
+                    backend: config
+                        .container_backend()
+                        .context("managed database has no typed container backend")?,
+                    object_reference: config.postgres.container_name.clone(),
+                }
+            } else {
+                SafeReference::File {
+                    path: config.dependencies.database_url_file.clone(),
+                }
+            },
+        ),
+        (
+            "valkey".to_owned(),
+            if config.dependencies.mode == "managed" {
+                SafeReference::RuntimeObject {
+                    backend: config
+                        .container_backend()
+                        .context("managed Valkey has no typed container backend")?,
+                    object_reference: config.valkey.container_name.clone(),
+                }
+            } else {
+                SafeReference::File {
+                    path: config.dependencies.valkey_url_file.clone(),
+                }
+            },
+        ),
+        ("proxy_tls".to_owned(), SafeReference::NotObserved),
+    ]))
 }

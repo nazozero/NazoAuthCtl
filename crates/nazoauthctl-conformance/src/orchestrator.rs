@@ -11,11 +11,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
-use crate::OidfDriverLane;
 use crate::browser::{
-    BrowserAutomation, BrowserPolicy, BrowserRunnerState, BrowserTargetOrigin, ConformanceBinding,
-    OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpStartRequest,
-    OpenId4VpVerifier, browser_config_for_module, parse_browser_entries_owned,
+    BrowserAutomation, BrowserPolicy, BrowserReviewModuleIdentity, BrowserReviewScreenshotCapture,
+    BrowserRunnerState, BrowserTargetOrigin, ConformanceBinding, MAX_REVIEW_SCREENSHOTS_PER_RUN,
+    OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpCompletionOutcome,
+    OpenId4VpError, OpenId4VpEvidenceRunContext, OpenId4VpStartRequest, OpenId4VpVerifier,
+    browser_config_for_module, parse_browser_entries_owned, required_review_screenshot_count,
 };
 use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
 use crate::matrix::{MatrixError, SelectedMatrix, zeroize_json_value};
@@ -24,9 +25,12 @@ use crate::progress::{
     GroupProgress, GroupStatus, ProgressEvent, ProgressSink, ProgressSnapshot, redacted_variant,
 };
 use crate::report::{
-    CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport,
-    ModuleReportContext, OrchestrationIntegrity, PlanReport, summarize_module_outcomes,
+    CleanupFailure, CleanupReport, ConformanceReport, DeferredReviewPending, ModuleOutcome,
+    ModuleReport, ModuleReportContext, OrchestrationIntegrity, PlanReport, ReviewScreenshotReport,
+    summarize_matrix_expectations, summarize_module_outcomes,
 };
+use crate::transport::TransportError;
+use crate::{OidfDriverLane, OidfPlanResourceBudget};
 
 mod parallel;
 
@@ -34,6 +38,22 @@ pub const MAX_PARALLEL_JOBS: usize = 4;
 pub const BOUNDED_PLAN_RUNNER_PROTOCOL: &str = "nazoauthctl-bounded-plan-runner-v1";
 pub const MAX_POLL_TIMEOUT_SECONDS: u64 = 86_400;
 pub const MAX_POLL_TIMEOUT: Duration = Duration::from_secs(MAX_POLL_TIMEOUT_SECONDS);
+const MAX_OPENID4VP_EVIDENCE_ISSUANCE_ATTEMPTS: usize = 4;
+
+fn should_retry_openid4vp_evidence_issuance(
+    error: &OpenId4VpError,
+    attempts: usize,
+    deadline: Instant,
+    control: &RunControl,
+) -> bool {
+    matches!(
+        error,
+        OpenId4VpError::EvidenceTemporarilyUnavailable
+            | OpenId4VpError::Transport(TransportError::Network(_))
+    ) && attempts < MAX_OPENID4VP_EVIDENCE_ISSUANCE_ATTEMPTS
+        && Instant::now() < deadline
+        && !control.is_interrupted()
+}
 
 /// One worker-owned interactive automation lane. A lane is never shared by
 /// concurrent plan workers, so WebDriver cookies/navigation and OpenID4VC
@@ -41,8 +61,25 @@ pub const MAX_POLL_TIMEOUT: Duration = Duration::from_secs(MAX_POLL_TIMEOUT_SECO
 #[derive(Clone, Default)]
 pub struct ConformanceAutomation {
     pub browser: Option<Arc<Mutex<dyn BrowserAutomation>>>,
+    /// Explicit local-only capture capability. It is cloned into worker-owned
+    /// lanes but every resulting filename remains bound to the current module.
+    pub review_screenshot_capture: Option<BrowserReviewScreenshotCapture>,
+    /// Run-scoped facts that are signed into NazoAuth's OpenID4VP verification
+    /// evidence only after this lane owns a newly allocated Suite module.
+    pub vp_evidence: Option<OpenId4VpEvidenceRunContext>,
     pub verifier: Option<Arc<Mutex<dyn OpenId4VpVerifier>>>,
     pub issuer: Option<Arc<Mutex<dyn OpenId4VciIssuerDriver>>>,
+}
+
+#[derive(Default)]
+struct BrowserReviewEvidence {
+    screenshots: Vec<ReviewScreenshotReport>,
+    required: usize,
+    required_captured: usize,
+    missing: usize,
+    attempts: usize,
+    decoded_bytes: usize,
+    entered_browser_program: bool,
 }
 
 #[derive(Clone)]
@@ -83,26 +120,48 @@ pub struct ConformanceRunConfig {
     /// required to match the selected plan ids one-for-one; the runner never
     /// derives CIBA semantics from mutable Suite plan names.
     pub plan_lanes: BTreeMap<String, OidfDriverLane>,
+    /// Exact signed resource budget for every selected Matrix plan. The map
+    /// must cover the selected plan ids one-for-one.
+    pub plan_resource_budgets: BTreeMap<String, OidfPlanResourceBudget>,
+    /// Signed aggregate budget for exactly the selected Matrix plans.
+    pub selected_resource_budget: OidfPlanResourceBudget,
     /// Maximum number of independent Suite plans executed at once. Modules
     /// inside one plan remain strictly ordered. Browser, verifier, and issuer
     /// automation retain their existing mutex-owned sessions, so parallel
     /// HTTP runners cannot interleave interactive state.
     pub jobs: usize,
+    /// Explicit authorization to transmit each verified, module-bound local
+    /// review PNG to the exact outstanding Suite image placeholder. Without
+    /// this, a nonterminal review module can be retained only when it is the
+    /// final module in its plan.
+    pub upload_review_screenshots: bool,
     /// Worker-owned automation lanes. HTTP-only test fixtures may leave this
     /// empty; production creates one independent lane per configured job.
     pub automation: Vec<ConformanceAutomation>,
-    /// Durable observer for externally allocated Suite resources.  The
+    /// Durable observer for externally allocated Suite resources. The
     /// controller installs this before creating plans so a process crash can
-    /// recover only the opaque Suite IDs it actually allocated.
+    /// recover recorded opaque IDs and fail closed for an unresolved create
+    /// request.
     pub suite_resource_observer: Option<Arc<dyn SuiteResourceObserver>>,
 }
 
-/// Receives Suite allocation events synchronously.  A persistence failure is
-/// treated as a run failure: returning an unjournaled plan or module would
-/// make crash cleanup impossible.
+/// Receives Suite allocation intents and outcomes synchronously.  An intent
+/// is durably persisted before the remote create request; its opaque resource
+/// ID atomically replaces the intent after a successful response. A surviving
+/// intent deliberately blocks recovery completion because the current Suite
+/// API cannot enumerate or deduplicate an unknown create outcome.
 pub trait SuiteResourceObserver: Send + Sync {
-    fn plan_created(&self, origin: &Origin, plan_id: &str) -> Result<(), String>;
-    fn module_created(&self, module_id: &str) -> Result<(), String>;
+    /// An explicitly authenticated operator request may retain fully terminal
+    /// Suite plans for certification review.  The default preserves normal
+    /// cleanup for every existing observer.
+    fn retain_suite_plans_for_certification(&self) -> bool {
+        false
+    }
+
+    fn plan_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String>;
+    fn plan_created(&self, origin: &Origin, intent_id: &str, plan_id: &str) -> Result<(), String>;
+    fn module_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String>;
+    fn module_created(&self, intent_id: &str, module_id: &str) -> Result<(), String>;
 }
 
 pub struct ConformanceRunner {
@@ -145,6 +204,9 @@ struct PreparedRun {
     planned: Vec<PlannedPlan>,
     suite_plan_ids: Vec<String>,
     errors: Vec<String>,
+    unknown_declared_skip_modules: Vec<String>,
+    matrix_expectations_satisfied: bool,
+    all_selected_plan_definitions_enumerated: bool,
     auth_probe: Option<crate::client::AuthProbe>,
     current_profile: Option<String>,
     current_variant: Option<BTreeMap<String, String>>,
@@ -159,7 +221,13 @@ impl ConformanceRunner {
         {
             return Err(OrchestrationError::InvalidInput);
         }
-        if !plan_lanes_match_selected(&config.matrix, &config.plan_lanes) {
+        if !plan_lanes_match_selected(&config.matrix, &config.plan_lanes)
+            || !resource_budgets_match_selected(
+                &config.matrix,
+                &config.plan_resource_budgets,
+                &config.selected_resource_budget,
+            )
+        {
             return Err(OrchestrationError::InvalidInput);
         }
         validate_matrix_origins(
@@ -167,6 +235,40 @@ impl ConformanceRunner {
             config.client.origin(),
             config.target_origin.as_ref(),
         )?;
+        if let Some(first_lane) = config.automation.first() {
+            match first_lane.review_screenshot_capture.as_ref() {
+                Some(first_capture) => {
+                    if first_lane.browser.is_none()
+                        || config.automation.iter().any(|lane| {
+                            lane.browser.is_none()
+                                || lane
+                                    .review_screenshot_capture
+                                    .as_ref()
+                                    .is_none_or(|capture| {
+                                        !capture.shares_run_budget_with(first_capture)
+                                    })
+                        })
+                    {
+                        return Err(OrchestrationError::InvalidInput);
+                    }
+                }
+                None if config
+                    .automation
+                    .iter()
+                    .any(|lane| lane.review_screenshot_capture.is_some()) =>
+                {
+                    return Err(OrchestrationError::InvalidInput);
+                }
+                None => {}
+            }
+            if config
+                .automation
+                .iter()
+                .any(|lane| lane.vp_evidence != first_lane.vp_evidence)
+            {
+                return Err(OrchestrationError::InvalidInput);
+            }
+        }
         Ok(Self { config })
     }
 
@@ -288,7 +390,7 @@ impl ConformanceRunner {
             let module_context = OpenId4VciModule::new(
                 module_id.to_owned(),
                 module.test_name.clone(),
-                plan.runtime_variant.clone(),
+                runtime_variant_for_definition(plan, module),
                 plan.config.clone(),
                 runner,
             )
@@ -314,7 +416,7 @@ impl ConformanceRunner {
         module: &ModuleDefinition,
         module_id: &str,
         initial: Value,
-    ) -> Result<Value, String> {
+    ) -> Result<(Value, BrowserReviewEvidence), String> {
         let browser_config = browser_config_for_module(&plan.config, &module.test_name)
             .map_err(|error| error.to_string())?;
         let entries =
@@ -330,6 +432,7 @@ impl ConformanceRunner {
         let mut observed = initial;
         let mut first_round = true;
         let mut completed_url_digests = BTreeSet::<[u8; 32]>::new();
+        let mut review_evidence = BrowserReviewEvidence::default();
 
         loop {
             if self.config.control.is_interrupted() {
@@ -345,7 +448,7 @@ impl ConformanceRunner {
                     .module_info(module_id)
                     .map_err(|error| safe_error(&error))?;
                 if is_terminal_state(&observed) {
-                    return Ok(observed);
+                    return Ok((observed, review_evidence));
                 }
                 if !is_waiting(&observed) {
                     observed = self.wait_for_state_until(
@@ -354,13 +457,13 @@ impl ConformanceRunner {
                         deadline,
                     )?;
                     if is_terminal_state(&observed) {
-                        return Ok(observed);
+                        return Ok((observed, review_evidence));
                     }
                 }
             }
             first_round = false;
             if !is_waiting(&observed) {
-                return Ok(observed);
+                return Ok((observed, review_evidence));
             }
 
             let runner = match self.config.client.runner_info(module_id) {
@@ -393,9 +496,81 @@ impl ConformanceRunner {
                 let mut driver = browser
                     .lock()
                     .map_err(|_| "browser automation lock failed".to_owned())?;
-                driver
-                    .execute(pending_url, &entries)
+                let capture = self
+                    .config
+                    .automation
+                    .first()
+                    .and_then(|automation| automation.review_screenshot_capture.as_ref())
+                    .map(|capture| {
+                        BrowserReviewModuleIdentity::new(
+                            &plan.matrix_plan_id,
+                            &plan.suite_plan_id,
+                            module_id,
+                            &module.test_name,
+                            &effective_module_identity_variant(plan, module),
+                        )
+                        .and_then(|identity| {
+                            capture.context(
+                                identity,
+                                review_evidence
+                                    .screenshots
+                                    .len()
+                                    .saturating_add(review_evidence.missing),
+                            )
+                        })
+                    })
+                    .transpose()
                     .map_err(|error| error.to_string())?;
+                let report = driver
+                    .execute_with_review_capture(pending_url, &entries, capture.as_ref())
+                    .map_err(|error| error.to_string())?;
+                if report.entry_index >= entries.len() {
+                    return Err("browser returned an invalid selected entry".to_owned());
+                }
+                review_evidence.entered_browser_program = true;
+                let next_attempts = review_evidence
+                    .attempts
+                    .checked_add(report.review_screenshot_attempts)
+                    .ok_or_else(|| "browser review screenshot limit exceeded".to_owned())?;
+                if next_attempts > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_MODULE {
+                    return Err("browser review screenshot limit exceeded".to_owned());
+                }
+                review_evidence.attempts = next_attempts;
+                review_evidence.required = review_evidence
+                    .required
+                    .checked_add(report.review_screenshots_required)
+                    .ok_or_else(|| "browser review screenshot obligation overflow".to_owned())?;
+                review_evidence.required_captured = review_evidence
+                    .required_captured
+                    .checked_add(report.review_screenshots_required_captured)
+                    .ok_or_else(|| "browser review screenshot obligation overflow".to_owned())?;
+                for receipt in report.review_screenshots {
+                    if receipt.suite_plan_id != plan.suite_plan_id || receipt.module_id != module_id
+                    {
+                        return Err("browser review evidence context mismatch".to_owned());
+                    }
+                    let next_bytes = review_evidence
+                        .decoded_bytes
+                        .checked_add(receipt.size)
+                        .ok_or_else(|| "browser review screenshot size overflow".to_owned())?;
+                    if review_evidence.screenshots.len() >= MAX_REVIEW_SCREENSHOTS_PER_RUN
+                        || next_bytes > 32 * 1024 * 1024
+                    {
+                        return Err("browser review screenshot limit exceeded".to_owned());
+                    }
+                    review_evidence.decoded_bytes = next_bytes;
+                    review_evidence.screenshots.push(ReviewScreenshotReport {
+                        path: receipt.path,
+                        sha256: receipt.sha256,
+                        size: receipt.size,
+                    });
+                }
+                review_evidence.missing = review_evidence
+                    .missing
+                    .saturating_add(report.review_screenshots_missing);
+                if review_evidence.required != review_evidence.required_captured {
+                    return Err("required browser review screenshot was not captured".to_owned());
+                }
             }
             completed_url_digests.insert(Sha256::digest(pending_url.as_str().as_bytes()).into());
             self.wait_for_runner_refresh(deadline, "browser")?;
@@ -434,9 +609,21 @@ impl ConformanceRunner {
         let mut planned = Vec::<PlannedPlan>::new();
         let mut suite_plan_ids = Vec::<String>::new();
         let mut errors = Vec::<String>::new();
+        let mut unknown_declared_skip_modules = Vec::<String>::new();
+        let mut matrix_expectations_satisfied = true;
+        let selected_plan_count = self
+            .config
+            .matrix
+            .document
+            .groups
+            .iter()
+            .map(|group| group.plans.len())
+            .sum::<usize>();
+        let mut enumerated_plan_count = 0usize;
         let mut auth_probe = None;
         let mut current_profile = None;
         let mut current_variant = None;
+        let mut observed_modules = 0u32;
 
         match self.config.client.probe_auth() {
             Ok(probe) => auth_probe = Some(probe),
@@ -463,6 +650,20 @@ impl ConformanceRunner {
                     let variant = group.effective_variant(plan);
                     let runtime_variant = group.effective_runtime_variant(plan);
                     current_variant = Some(redacted_variant(&variant));
+                    let plan_create_intent =
+                        if let Some(observer) = &self.config.suite_resource_observer {
+                            let intent_id = uuid::Uuid::now_v7().to_string();
+                            if let Err(error) =
+                                observer.plan_create_intent(self.config.client.origin(), &intent_id)
+                            {
+                                errors.push(error);
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'create;
+                            }
+                            Some(intent_id)
+                        } else {
+                            None
+                        };
                     let mut created =
                         match self
                             .config
@@ -481,9 +682,17 @@ impl ConformanceRunner {
                     // response wrapper is partially moved below.
                     zeroize_json_value(&mut created.raw);
                     suite_plan_ids.push(created.id.clone());
-                    if let Some(observer) = &self.config.suite_resource_observer
-                        && let Err(error) =
-                            observer.plan_created(self.config.client.origin(), &created.id)
+                    // Persist the opaque ID before evaluating any returned
+                    // definition or budget. A local rejection must never
+                    // strand a durable create intent after the remote plan
+                    // already exists.
+                    if let (Some(observer), Some(intent_id)) =
+                        (&self.config.suite_resource_observer, &plan_create_intent)
+                        && let Err(error) = observer.plan_created(
+                            self.config.client.origin(),
+                            intent_id,
+                            &created.id,
+                        )
                     {
                         errors.push(error);
                         groups[group_index].status = GroupStatus::Failed;
@@ -500,6 +709,76 @@ impl ConformanceRunner {
                         created_instances: 0,
                     });
                     let report_index = plans.len() - 1;
+                    // Validate the full Suite definition before any budget
+                    // failure can stop phase 1. This keeps every signed skip
+                    // declaration observable in the public evidence even
+                    // when the Suite also exceeds a resource bound.
+                    let mut module_name_counts = BTreeMap::<&str, usize>::new();
+                    let mut definition_identities = BTreeSet::new();
+                    let mut duplicate_definition_identities = Vec::new();
+                    for module in &created.modules {
+                        *module_name_counts
+                            .entry(module.test_name.as_str())
+                            .or_default() += 1;
+                        if !definition_identities
+                            .insert((module.test_name.clone(), module.variant.clone()))
+                        {
+                            duplicate_definition_identities
+                                .push(definition_identity(&plan.id, module));
+                        }
+                    }
+                    let unknown_expected_skips = plan
+                        .expected_results
+                        .keys()
+                        .filter(|test_name| {
+                            module_name_counts.get(test_name.as_str()).copied() != Some(1)
+                        })
+                        .map(|test_name| format!("{}/{}", plan.id, test_name))
+                        .collect::<Vec<_>>();
+                    let expected_skip_definition_mismatch = !unknown_expected_skips.is_empty();
+                    if expected_skip_definition_mismatch {
+                        matrix_expectations_satisfied = false;
+                        for identity in unknown_expected_skips {
+                            errors.push(format!(
+                                "signed Matrix expected SKIPPED module is not uniquely defined by Suite plan: {identity}"
+                            ));
+                            unknown_declared_skip_modules.push(identity);
+                        }
+                    }
+                    enumerated_plan_count += 1;
+                    let actual_modules = u32::try_from(defined_modules).ok();
+                    let plan_budget =
+                        self.config.plan_resource_budgets.get(&plan.id).expect(
+                            "selected plan resource budgets were validated at construction",
+                        );
+                    let next_observed_modules =
+                        actual_modules.and_then(|count| observed_modules.checked_add(count));
+                    let over_budget = actual_modules
+                        .is_none_or(|count| count > plan_budget.modules)
+                        || next_observed_modules.is_none_or(|count| {
+                            count > self.config.selected_resource_budget.modules
+                        });
+                    if over_budget {
+                        errors.push(
+                            "Suite plan module allocation exceeds signed resource budget"
+                                .to_owned(),
+                        );
+                    }
+                    let has_duplicate_definition = !duplicate_definition_identities.is_empty();
+                    if has_duplicate_definition {
+                        for identity in duplicate_definition_identities {
+                            errors.push(format!(
+                                "Suite plan defines an exact duplicate module definition: {identity}"
+                            ));
+                        }
+                    }
+                    if expected_skip_definition_mismatch || over_budget || has_duplicate_definition
+                    {
+                        groups[group_index].status = GroupStatus::Failed;
+                        break 'create;
+                    }
+                    observed_modules = next_observed_modules
+                        .expect("validated Suite module count must remain in range");
                     planned.push(PlannedPlan {
                         group_index,
                         matrix_plan_id: plan.id.clone(),
@@ -527,6 +806,9 @@ impl ConformanceRunner {
             planned,
             suite_plan_ids,
             errors,
+            unknown_declared_skip_modules,
+            matrix_expectations_satisfied,
+            all_selected_plan_definitions_enumerated: enumerated_plan_count == selected_plan_count,
             auth_probe,
             current_profile,
             current_variant,
@@ -544,6 +826,9 @@ impl ConformanceRunner {
             mut planned,
             suite_plan_ids,
             mut errors,
+            unknown_declared_skip_modules,
+            matrix_expectations_satisfied,
+            all_selected_plan_definitions_enumerated,
             auth_probe,
             mut current_profile,
             mut current_variant,
@@ -552,6 +837,15 @@ impl ConformanceRunner {
         let mut cleanup = CleanupReport::default();
         let mut module_ids = Vec::<String>::new();
         let mut current_test = None;
+        let retention_requested = self
+            .config
+            .suite_resource_observer
+            .as_ref()
+            .is_some_and(|observer| observer.retain_suite_plans_for_certification());
+        let review_capture_requested = self.config.automation.first().is_some_and(|automation| {
+            automation.review_screenshot_capture.is_some() && automation.vp_evidence.is_some()
+        });
+        let deferred_review_enabled = retention_requested && review_capture_requested;
 
         // The denominator is now frozen. A plan-creation failure leaves the
         // successfully created subset visible, but no execution is attempted.
@@ -578,7 +872,7 @@ impl ConformanceRunner {
                     current_variant.clone(),
                     None,
                 );
-                for module in &plan.modules {
+                for (module_index, module) in plan.modules.iter().enumerate() {
                     if self.config.control.is_interrupted() {
                         errors.push("run interrupted".to_owned());
                         groups[group_index].status = GroupStatus::Failed;
@@ -597,6 +891,20 @@ impl ConformanceRunner {
                         current_variant.clone(),
                         current_test.clone(),
                     );
+                    let module_create_intent =
+                        if let Some(observer) = &self.config.suite_resource_observer {
+                            let intent_id = uuid::Uuid::now_v7().to_string();
+                            if let Err(error) = observer
+                                .module_create_intent(self.config.client.origin(), &intent_id)
+                            {
+                                errors.push(error);
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            }
+                            Some(intent_id)
+                        } else {
+                            None
+                        };
                     let instance = match self
                         .config
                         .client
@@ -610,8 +918,9 @@ impl ConformanceRunner {
                         }
                     };
                     module_ids.push(instance.id.clone());
-                    if let Some(observer) = &self.config.suite_resource_observer
-                        && let Err(error) = observer.module_created(&instance.id)
+                    if let (Some(observer), Some(intent_id)) =
+                        (&self.config.suite_resource_observer, &module_create_intent)
+                        && let Err(error) = observer.module_created(intent_id, &instance.id)
                     {
                         errors.push(error);
                         groups[group_index].status = GroupStatus::Failed;
@@ -645,6 +954,17 @@ impl ConformanceRunner {
                         },
                     };
                     let mut observed = initial;
+                    let mut browser_review_evidence = BrowserReviewEvidence::default();
+                    let mut deferred_review_pending = None;
+                    let has_browser_config =
+                        match module_has_browser_config(&plan.config, &module.test_name) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                errors.push(error);
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            }
+                        };
                     if observed.as_ref().is_some_and(is_configured) {
                         emit_progress(
                             sink,
@@ -707,7 +1027,15 @@ impl ConformanceRunner {
                                     break 'execute;
                                 }
                             }
-                        } else if plan.plan_name.starts_with("oid4vp-1final-verifier") {
+                        } else if is_openid4vp_verifier_plan(plan) {
+                            if review_capture_requested && !retention_requested {
+                                errors.push(
+                                    "OpenID4VP deferred review requires explicit Suite plan retention"
+                                        .to_owned(),
+                                );
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            }
                             let Some(verifier) = self
                                 .config
                                 .automation
@@ -753,7 +1081,7 @@ impl ConformanceRunner {
                                     break 'execute;
                                 }
                             };
-                            let presentation = match verifier.start(&request) {
+                            let mut presentation = match verifier.start(&request) {
                                 Ok(presentation) => presentation,
                                 Err(error) => {
                                     errors.push(error.to_string());
@@ -761,12 +1089,339 @@ impl ConformanceRunner {
                                     break 'execute;
                                 }
                             };
-                            if let Err(error) = verifier.complete(&presentation) {
-                                errors.push(error.to_string());
+                            // NazoAuth now accepts evidence context only after it created
+                            // the presentation. Query the same lane's actual matching-entry
+                            // state before attaching, so a different browser alternative can
+                            // never obtain a capability.
+                            let evidence_requested = (|| -> Result<bool, String> {
+                                let Some(context) = self
+                                    .config
+                                    .automation
+                                    .first()
+                                    .and_then(|automation| automation.vp_evidence.as_ref())
+                                else {
+                                    return Ok(false);
+                                };
+                                if !has_browser_config {
+                                    return Ok(false);
+                                }
+                                if self.config.client.origin().as_str()
+                                    != "https://www.certification.openid.net"
+                                {
+                                    return Ok(false);
+                                }
+                                let config =
+                                    browser_config_for_module(&plan.config, &module.test_name)
+                                        .map_err(|error| error.to_string())?;
+                                let entries = parse_browser_entries_owned(config)
+                                    .map_err(|error| error.to_string())?;
+                                let marker_url = self
+                                    .config
+                                    .client
+                                    .origin()
+                                    .url(&format!("/test/a/{}/verification-evidence", instance.id))
+                                    .map_err(|error| error.to_string())?;
+                                let browser = self
+                                    .config
+                                    .automation
+                                    .first()
+                                    .and_then(|automation| automation.browser.as_ref())
+                                    .ok_or_else(|| {
+                                        "OpenID4VP review browser automation is unavailable"
+                                            .to_owned()
+                                    })?;
+                                let selected = browser
+                                    .lock()
+                                    .map_err(|_| "browser automation lock failed".to_owned())?
+                                    .selected_openid4vp_result_marker(
+                                        &presentation.authorization_url,
+                                        &entries,
+                                        &marker_url,
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                if !selected {
+                                    return Ok(false);
+                                }
+                                let evidence_context = context
+                                    .for_module(
+                                        &plan.suite_plan_id,
+                                        &instance.id,
+                                        &module.test_name,
+                                        &effective_module_identity_variant(plan, module),
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                verifier
+                                    .attach_evidence_context(&mut presentation, evidence_context)
+                                    .map_err(|error| error.to_string())?;
+                                Ok(true)
+                            })();
+                            let evidence_requested = match evidence_requested {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    errors.push(error);
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                }
+                            };
+                            let completion_outcome = match verifier.complete(&presentation) {
+                                Ok(outcome) => outcome,
+                                Err(error) => {
+                                    errors.push(error.to_string());
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                }
+                            };
+                            if completion_outcome == OpenId4VpCompletionOutcome::Completed
+                                && deferred_review_enabled
+                                && !evidence_requested
+                            {
+                                errors.push(
+                                    "deferred review requires one selected required verification-evidence marker"
+                                        .to_owned(),
+                                );
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
                             }
-                        } else if plan.config.get("browser").is_some() {
+                            let verification_evidence = if evidence_requested
+                                && completion_outcome == OpenId4VpCompletionOutcome::Completed
+                            {
+                                // `complete` already proved the verifier result. The
+                                // capability endpoint may need a retry only when its
+                                // response was lost; it must not turn that narrow step
+                                // into an hours-long polling state.
+                                let issuance_timeout =
+                                    self.config.poll_timeout.min(Duration::from_secs(600));
+                                let deadline = Instant::now()
+                                    .checked_add(issuance_timeout)
+                                    .expect("validated poll timeout");
+                                let mut attempts = 0usize;
+                                loop {
+                                    attempts = attempts.saturating_add(1);
+                                    match verifier.verification_evidence(&presentation) {
+                                        Ok(evidence) => break Some(evidence),
+                                        Err(error)
+                                            if should_retry_openid4vp_evidence_issuance(
+                                                &error,
+                                                attempts,
+                                                deadline,
+                                                &self.config.control,
+                                            ) =>
+                                        {
+                                            let backoff = Duration::from_millis(
+                                                250_u64.saturating_mul(1_u64 << (attempts - 1)),
+                                            );
+                                            thread::sleep(backoff.min(
+                                                deadline.saturating_duration_since(Instant::now()),
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            errors.push(error.to_string());
+                                            groups[group_index].status = GroupStatus::Failed;
+                                            break 'execute;
+                                        }
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            drop(verifier);
+                            if let Some(verification_evidence) = verification_evidence {
+                                let Some(browser) = self
+                                    .config
+                                    .automation
+                                    .first()
+                                    .and_then(|automation| automation.browser.as_ref())
+                                else {
+                                    errors.push(
+                                        "OpenID4VP review browser automation is unavailable"
+                                            .to_owned(),
+                                    );
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                };
+                                let captured = (|| -> Result<
+                                    (ReviewScreenshotReport, Option<Vec<u8>>),
+                                    String,
+                                > {
+                                    let capture_owner = self
+                                        .config
+                                        .automation
+                                        .first()
+                                        .and_then(|automation| {
+                                            automation.review_screenshot_capture.as_ref()
+                                        })
+                                        .ok_or_else(|| {
+                                            "OpenID4VP verification-result capture is unavailable"
+                                                .to_owned()
+                                        })?;
+                                    let identity = BrowserReviewModuleIdentity::new(
+                                        &plan.matrix_plan_id,
+                                        &plan.suite_plan_id,
+                                        &instance.id,
+                                        &module.test_name,
+                                        &effective_module_identity_variant(plan, module),
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                    let capture = capture_owner
+                                        .context(identity, 0)
+                                        .map_err(|error| error.to_string())?;
+                                    let mut browser = browser
+                                        .lock()
+                                        .map_err(|_| "browser automation lock failed".to_owned())?;
+                                    let receipt = browser
+                                        .capture_openid4vp_verification_result(
+                                            &verification_evidence,
+                                            &capture,
+                                            0,
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                    if receipt.suite_plan_id != plan.suite_plan_id
+                                        || receipt.module_id != instance.id
+                                    {
+                                        return Err("OpenID4VP verification-result evidence context mismatch".to_owned());
+                                    }
+                                    let upload_png = self
+                                        .config
+                                        .upload_review_screenshots
+                                        .then(|| capture_owner.read_captured_png(&receipt))
+                                        .transpose()
+                                        .map_err(|error| error.to_string())?;
+                                    Ok((
+                                        ReviewScreenshotReport {
+                                            path: receipt.path,
+                                            sha256: receipt.sha256,
+                                            size: receipt.size,
+                                        },
+                                        upload_png,
+                                    ))
+                                })();
+                                match captured {
+                                    Ok((screenshot, upload_png)) => {
+                                        browser_review_evidence.entered_browser_program = true;
+                                        browser_review_evidence.required = 1;
+                                        browser_review_evidence.required_captured = 1;
+                                        browser_review_evidence.attempts = 1;
+                                        browser_review_evidence.decoded_bytes = screenshot.size;
+                                        browser_review_evidence.screenshots.push(screenshot);
+                                        // OIDF v5.2.2 MR !2100 deliberately leaves the
+                                        // verifier runner WAITING while the operator later
+                                        // supplies review evidence. See
+                                        // https://gitlab.com/openid/conformance-suite/-/merge_requests/2100.
+                                        // We never upload or mark
+                                        // that Suite placeholder visited. A fresh exact state
+                                        // read is the only admissible local settlement proof.
+                                        let pending_info =
+                                            match self.config.client.module_info(&instance.id) {
+                                                Ok(info) => info,
+                                                Err(error) => {
+                                                    errors.push(safe_error(&error));
+                                                    groups[group_index].status =
+                                                        GroupStatus::Failed;
+                                                    break 'execute;
+                                                }
+                                            };
+                                        if !is_deferred_review_waiting(&pending_info) {
+                                            errors.push(
+                                                "deferred review requires the Suite module to remain WAITING"
+                                                    .to_owned(),
+                                            );
+                                            groups[group_index].status = GroupStatus::Failed;
+                                            break 'execute;
+                                        }
+                                        let pending_wait = match self.wait_for_state_interruptible(
+                                            &instance.id,
+                                            &["WAITING", "FINISHED", "INTERRUPTED"],
+                                        ) {
+                                            Ok(state) => state,
+                                            Err(error) => {
+                                                errors.push(error);
+                                                groups[group_index].status = GroupStatus::Failed;
+                                                break 'execute;
+                                            }
+                                        };
+                                        if !is_deferred_review_waiting(&pending_wait) {
+                                            errors.push(
+                                                "deferred review wait-state is not exact WAITING"
+                                                    .to_owned(),
+                                            );
+                                            groups[group_index].status = GroupStatus::Failed;
+                                            break 'execute;
+                                        }
+                                        if let Some(png) = upload_png {
+                                            if let Err(error) = self
+                                                .config
+                                                .client
+                                                .upload_single_review_screenshot(&instance.id, &png)
+                                            {
+                                                errors.push(safe_error(&error));
+                                                groups[group_index].status = GroupStatus::Failed;
+                                                break 'execute;
+                                            }
+                                            observed = match self.wait_for_state_interruptible(
+                                                &instance.id,
+                                                &["FINISHED", "INTERRUPTED"],
+                                            ) {
+                                                Ok(state) => Some(state),
+                                                Err(error) => {
+                                                    errors.push(error);
+                                                    groups[group_index].status =
+                                                        GroupStatus::Failed;
+                                                    break 'execute;
+                                                }
+                                            };
+                                        } else {
+                                            deferred_review_pending = Some(DeferredReviewPending {
+                                                placeholder_path: format!(
+                                                    "/test/a/{}/verification-evidence",
+                                                    instance.id
+                                                ),
+                                                marker: crate::ReviewScreenshotMarker::Required,
+                                                obligation_index: 0,
+                                            });
+                                            observed = Some(pending_wait);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        errors.push(error);
+                                        groups[group_index].status = GroupStatus::Failed;
+                                        break 'execute;
+                                    }
+                                }
+                            } else if has_browser_config
+                                && completion_outcome == OpenId4VpCompletionOutcome::Completed
+                            {
+                                let Some(browser) = self
+                                    .config
+                                    .automation
+                                    .first()
+                                    .and_then(|automation| automation.browser.as_ref())
+                                else {
+                                    errors.push(
+                                        "OpenID4VP review browser automation is unavailable"
+                                            .to_owned(),
+                                    );
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                };
+                                match self.drive_browser_waiting_interruptible(
+                                    browser,
+                                    plan,
+                                    module,
+                                    &instance.id,
+                                    observed.clone().expect("waiting runner state"),
+                                ) {
+                                    Ok((state, evidence)) => {
+                                        observed = Some(state);
+                                        browser_review_evidence = evidence;
+                                    }
+                                    Err(error) => {
+                                        errors.push(error);
+                                        groups[group_index].status = GroupStatus::Failed;
+                                        break 'execute;
+                                    }
+                                }
+                            }
+                        } else if has_browser_config {
                             let Some(browser) = self
                                 .config
                                 .automation
@@ -787,7 +1442,10 @@ impl ConformanceRunner {
                                 &instance.id,
                                 observed.clone().expect("waiting runner state"),
                             ) {
-                                Ok(state) => observed = Some(state),
+                                Ok((state, evidence)) => {
+                                    observed = Some(state);
+                                    browser_review_evidence = evidence;
+                                }
                                 Err(error) => {
                                     errors.push(error);
                                     groups[group_index].status = GroupStatus::Failed;
@@ -797,7 +1455,8 @@ impl ConformanceRunner {
                         }
                     }
 
-                    if !observed.as_ref().is_some_and(is_terminal_state)
+                    if deferred_review_pending.is_none()
+                        && !observed.as_ref().is_some_and(is_terminal_state)
                         && let Err(error) = self.wait_for_state_interruptible(
                             &instance.id,
                             &["FINISHED", "INTERRUPTED"],
@@ -824,29 +1483,77 @@ impl ConformanceRunner {
                         }
                     };
                     let terminal = is_terminal(&info);
-                    if !terminal {
+                    if deferred_review_pending.is_some() && !is_deferred_review_waiting(&info) {
+                        errors.push(
+                            "deferred review module changed state before report collection"
+                                .to_owned(),
+                        );
+                        groups[group_index].status = GroupStatus::Failed;
+                    } else if !terminal && deferred_review_pending.is_none() {
                         errors.push("Suite module did not reach a terminal status".to_owned());
                         groups[group_index].status = GroupStatus::Failed;
+                    } else if has_browser_config {
+                        let declared = (|| -> Result<usize, String> {
+                            if is_openid4vp_verifier_plan(plan) {
+                                return Ok(browser_review_evidence.required);
+                            }
+                            let config = browser_config_for_module(&plan.config, &module.test_name)
+                                .map_err(|error| error.to_string())?;
+                            let entries = parse_browser_entries_owned(config)
+                                .map_err(|error| error.to_string())?;
+                            Ok(required_review_screenshot_count(&entries))
+                        })();
+                        match declared.and_then(|declared| {
+                            verify_required_review_screenshots(&browser_review_evidence, declared)
+                        }) {
+                            Ok(()) => {}
+                            Err(error) => {
+                                errors.push(error);
+                                groups[group_index].status = GroupStatus::Failed;
+                            }
+                        }
                     }
-                    modules.push(ModuleReport::from_info(
+                    let mut module_report = ModuleReport::from_info(
                         ModuleReportContext {
                             matrix_plan_id: plan.matrix_plan_id.clone(),
                             suite_plan_id: plan.suite_plan_id.clone(),
                             module_id: Some(instance.id.clone()),
                             test_name: module.test_name.clone(),
+                            variant: effective_module_identity_variant(plan, module),
                             terminal,
                             expected_result: plan.expected_results.get(&module.test_name).cloned(),
                         },
                         info,
                         log,
-                    ));
+                    );
+                    module_report.review_screenshots = browser_review_evidence.screenshots;
+                    module_report.review_screenshots_required = browser_review_evidence.required;
+                    module_report.review_screenshots_required_captured =
+                        browser_review_evidence.required_captured;
+                    module_report.review_screenshots_missing = browser_review_evidence.missing;
+                    let deferred_blocks_remaining_modules =
+                        deferred_review_blocks_remaining_modules(
+                            deferred_review_pending.is_some(),
+                            module_index,
+                            plan.modules.len(),
+                        );
+                    if let Some(pending) = deferred_review_pending {
+                        module_report.mark_deferred_review_pending(pending);
+                    }
+                    modules.push(module_report);
                     let module_outcome = modules.last().map(|module| module.outcome);
-                    if terminal {
+                    if terminal
+                        || modules
+                            .last()
+                            .is_some_and(|module| module.deferred_review_pending.is_some())
+                    {
                         groups[group_index].running = groups[group_index].running.saturating_sub(1);
                         groups[group_index].completed += 1;
                         match module_outcome {
                             Some(ModuleOutcome::Passed) => groups[group_index].passed += 1,
-                            Some(ModuleOutcome::Review) => groups[group_index].reviewed += 1,
+                            Some(ModuleOutcome::Review | ModuleOutcome::DeferredReviewPending) => {
+                                groups[group_index].reviewed += 1
+                            }
                             Some(ModuleOutcome::Skipped) => groups[group_index].skipped += 1,
                             Some(ModuleOutcome::Failed | ModuleOutcome::Incomplete) | None => {
                                 groups[group_index].failed += 1;
@@ -866,6 +1573,14 @@ impl ConformanceRunner {
                         current_variant.clone(),
                         current_test.clone(),
                     );
+                    if deferred_blocks_remaining_modules {
+                        errors.push(
+                            "nonterminal deferred review blocks later modules that share the Suite plan alias; upload the captured review screenshot explicitly or stop at this incomplete plan boundary"
+                                .to_owned(),
+                        );
+                        groups[group_index].status = GroupStatus::Failed;
+                        break 'execute;
+                    }
                     if !errors.is_empty() {
                         break 'execute;
                     }
@@ -889,12 +1604,10 @@ impl ConformanceRunner {
             }
         }
 
-        cleanup_all(
-            &self.config.client,
-            &module_ids,
-            &suite_plan_ids,
-            &mut cleanup,
-        );
+        // A terminal Suite module is already owned by its plan deletion.  A
+        // cancellation after a terminal result can race the Suite's final
+        // callback, while an unreported allocation still needs cancellation
+        // before its plan is deleted.
         let defined_modules = plans.iter().map(|plan| plan.defined_modules).sum::<usize>();
         let created_instances = plans
             .iter()
@@ -903,8 +1616,39 @@ impl ConformanceRunner {
         let terminal_modules = modules.iter().filter(|module| module.terminal).count();
         let all_modules_instantiated = defined_modules == created_instances;
         let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
-        let cleanup_complete = cleanup.failures.is_empty();
+        let deferred_review_modules = modules
+            .iter()
+            .filter(|module| module.deferred_review_pending.is_some())
+            .count();
+        let all_modules_settled = all_modules_instantiated
+            && terminal_modules
+                .checked_add(deferred_review_modules)
+                .is_some_and(|settled| settled == defined_modules);
+        if let Err(error) = validate_review_screenshot_run_limit(&modules) {
+            errors.push(error);
+        }
+        let retain_suite_plans = retention_requested
+            && errors.is_empty()
+            && all_selected_plan_definitions_enumerated
+            && defined_modules > 0
+            && all_modules_settled;
+        if !retain_suite_plans {
+            let cancellable_module_ids = cancellable_module_ids(&module_ids, &modules);
+            cleanup_all(
+                &self.config.client,
+                &cancellable_module_ids,
+                &suite_plan_ids,
+                &mut cleanup,
+            );
+        }
+        let cleanup_complete = !retain_suite_plans && cleanup.failures.is_empty();
+        let retention_candidate_settled = retain_suite_plans;
         let outcomes = summarize_module_outcomes(&modules);
+        let matrix_expectations = summarize_matrix_expectations(&modules);
+        let matrix_expectations_satisfied = matrix_expectations_satisfied
+            && all_selected_plan_definitions_enumerated
+            && matrix_expectations.unexpected_skipped_modules.is_empty()
+            && unknown_declared_skip_modules.is_empty();
         let suite_pass = defined_modules > 0 && all_modules_terminal && outcomes.all_passed;
         let orchestration_integrity = OrchestrationIntegrity {
             defined_modules,
@@ -912,26 +1656,44 @@ impl ConformanceRunner {
             terminal_modules,
             all_modules_instantiated,
             all_modules_terminal,
+            all_modules_settled,
+            deferred_review_modules,
             cleanup_complete,
+            retention_requested,
+            retention_eligible: retain_suite_plans,
+            retention_candidate_settled,
+            retention_committed: false,
+            suite_resources_settled: suite_resources_settled(
+                cleanup_complete,
+                retention_candidate_settled,
+            ),
         };
         let local_success = errors.is_empty()
             && orchestration_integrity.all_modules_instantiated
-            && orchestration_integrity.all_modules_terminal
-            && orchestration_integrity.cleanup_complete;
+            && orchestration_integrity.all_modules_settled
+            && orchestration_integrity.suite_resources_settled;
         let human_review_required = !outcomes.human_review_modules.is_empty();
         let snapshot = snapshot(&groups, current_profile, current_variant, current_test);
         let report = ConformanceReport {
-            // Schema 3 separates local execution from exact Suite outcomes.
-            schema: 3,
+            // Schema 4 is emitted only when a deferred Suite review boundary
+            // exists; terminal-only execution keeps the existing schema.
+            schema: if deferred_review_modules > 0 { 4 } else { 3 },
             matrix_digest: self.config.matrix.digest.clone(),
             suite_origin: self.config.client.origin().to_string(),
             auth_probe,
             errors,
             local_success,
             suite_pass,
+            acceptance_pass: outcomes.acceptance_pass && matrix_expectations_satisfied,
+            review_pending: deferred_review_modules > 0,
             human_review_required,
             human_review_modules: outcomes.human_review_modules,
+            deferred_review_modules: outcomes.deferred_review_modules,
             skipped_modules: outcomes.skipped_modules,
+            expected_skipped_modules: matrix_expectations.expected_skipped_modules,
+            unexpected_skipped_modules: matrix_expectations.unexpected_skipped_modules,
+            unknown_declared_skip_modules,
+            matrix_expectations_satisfied,
             failed_modules: outcomes.failed_modules,
             incomplete_modules: outcomes.incomplete_modules,
             orchestration_integrity,
@@ -942,6 +1704,68 @@ impl ConformanceRunner {
         };
         RunSummary { report }
     }
+}
+
+fn module_has_browser_config(plan_config: &Value, test_name: &str) -> Result<bool, String> {
+    let override_browser = match plan_config.get("override") {
+        None => false,
+        Some(Value::Object(overrides)) => match overrides.get(test_name) {
+            None => false,
+            Some(Value::Object(module)) => module.get("browser").is_some(),
+            Some(_) => return Err("module browser override is malformed".to_owned()),
+        },
+        Some(_) => return Err("browser override map is malformed".to_owned()),
+    };
+    Ok(override_browser || plan_config.get("browser").is_some())
+}
+
+/// `PlannedPlan` exists only after the signed Matrix was materialized and its
+/// selected plan definitions were enumerated. The official OpenID4VP verifier
+/// family is therefore a signed capability classification here, not a
+/// suite/test-case exception (and never a p038-specific branch).
+fn is_openid4vp_verifier_plan(plan: &PlannedPlan) -> bool {
+    plan.plan_name.starts_with("oid4vp-1final-verifier")
+}
+
+fn verify_required_review_screenshots(
+    evidence: &BrowserReviewEvidence,
+    declared: usize,
+) -> Result<(), String> {
+    // A terminal result before any browser program is entered cannot prove
+    // whether a required signed entry was skipped, so fail closed. Once the
+    // program is entered, obligations arise solely from commands actually
+    // reached after task matching; mutually-exclusive or optional unmatched
+    // tasks do not create phantom capture requirements.
+    if !evidence.entered_browser_program && declared > 0 {
+        return Err("required browser review screenshot was not reached".to_owned());
+    }
+    if evidence.required != evidence.required_captured {
+        return Err("required browser review screenshots are incomplete".to_owned());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_review_screenshot_run_limit(modules: &[ModuleReport]) -> Result<(), String> {
+    let mut captures = 0usize;
+    let mut bytes = 0usize;
+    for module in modules {
+        captures = captures
+            .checked_add(module.review_screenshots.len())
+            .and_then(|value| value.checked_add(module.review_screenshots_missing))
+            .ok_or_else(|| "browser review screenshot limit exceeded".to_owned())?;
+        if captures > MAX_REVIEW_SCREENSHOTS_PER_RUN {
+            return Err("browser review screenshot limit exceeded".to_owned());
+        }
+        for screenshot in &module.review_screenshots {
+            bytes = bytes
+                .checked_add(screenshot.size)
+                .ok_or_else(|| "browser review screenshot size limit exceeded".to_owned())?;
+            if bytes > 32 * 1024 * 1024 {
+                return Err("browser review screenshot size limit exceeded".to_owned());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn plan_lanes_match_selected(
@@ -965,6 +1789,51 @@ fn plan_lanes_match_selected(
         && plan_lanes
             .keys()
             .all(|plan_id| selected_plan_ids.contains(plan_id.as_str()))
+}
+
+fn resource_budgets_match_selected(
+    matrix: &SelectedMatrix,
+    plan_resource_budgets: &BTreeMap<String, OidfPlanResourceBudget>,
+    selected_resource_budget: &OidfPlanResourceBudget,
+) -> bool {
+    let selected_plan_ids = matrix
+        .document
+        .groups
+        .iter()
+        .flat_map(|group| group.plans.iter().map(|plan| plan.id.as_str()))
+        .collect::<BTreeSet<_>>();
+    let selected_plan_count = matrix
+        .document
+        .groups
+        .iter()
+        .map(|group| group.plans.len())
+        .sum::<usize>();
+    if selected_plan_ids.len() != selected_plan_count
+        || selected_plan_ids.len() != plan_resource_budgets.len()
+        || !plan_resource_budgets
+            .keys()
+            .all(|plan_id| selected_plan_ids.contains(plan_id.as_str()))
+    {
+        return false;
+    }
+
+    let summed = plan_resource_budgets.values().try_fold(
+        OidfPlanResourceBudget {
+            modules: 0,
+            clients: 0,
+            wall_clock_seconds: 0,
+        },
+        |sum, budget| {
+            Some(OidfPlanResourceBudget {
+                modules: sum.modules.checked_add(budget.modules)?,
+                clients: sum.clients.checked_add(budget.clients)?,
+                wall_clock_seconds: sum
+                    .wall_clock_seconds
+                    .checked_add(budget.wall_clock_seconds)?,
+            })
+        },
+    );
+    summed.as_ref() == Some(selected_resource_budget)
 }
 
 #[derive(Clone)]
@@ -1056,7 +1925,16 @@ fn cleanup_all(
             ) => {
                 report.deleted_plans.push(plan_id.clone());
             }
-            Ok(DeleteOutcome::Immutable) => report.immutable_plans.push(plan_id.clone()),
+            Ok(DeleteOutcome::Immutable) => {
+                report.immutable_plans.push(plan_id.clone());
+                report.failures.push(CleanupFailure {
+                    operation: "delete-plan".to_owned(),
+                    target: plan_id.clone(),
+                    error:
+                        "Suite retained an immutable plan without an authoritative cleanup receipt"
+                            .to_owned(),
+                });
+            }
             Err(first_error) => {
                 // The official Suite can race plan finalisation with DELETE;
                 // retry once after cancellation before reporting a failure.
@@ -1070,7 +1948,15 @@ fn cleanup_all(
                     ) => {
                         report.deleted_plans.push(plan_id.clone());
                     }
-                    Ok(DeleteOutcome::Immutable) => report.immutable_plans.push(plan_id.clone()),
+                    Ok(DeleteOutcome::Immutable) => {
+                        report.immutable_plans.push(plan_id.clone());
+                        report.failures.push(CleanupFailure {
+                            operation: "delete-plan".to_owned(),
+                            target: plan_id.clone(),
+                            error: "Suite retained an immutable plan without an authoritative cleanup receipt"
+                                .to_owned(),
+                        });
+                    }
                     Err(retry_error) => report.failures.push(CleanupFailure {
                         operation: "delete-plan".to_owned(),
                         target: plan_id.clone(),
@@ -1086,6 +1972,19 @@ fn cleanup_all(
     }
 }
 
+fn cancellable_module_ids(module_ids: &[String], reports: &[ModuleReport]) -> Vec<String> {
+    let terminal_module_ids = reports
+        .iter()
+        .filter(|module| module.terminal)
+        .filter_map(|module| module.module_id.as_deref())
+        .collect::<BTreeSet<_>>();
+    module_ids
+        .iter()
+        .filter(|module_id| !terminal_module_ids.contains(module_id.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Idempotently clean only Suite resources durably recorded by the controller
 /// before a crash.  The caller must bind the current authenticated Suite
 /// client to the exact journal origin before invoking this function.
@@ -1096,8 +1995,38 @@ pub fn recover_suite_resources(
     if client.origin().as_str() != state.origin {
         return Err("Suite recovery origin does not match the authenticated client".to_owned());
     }
+    if !state.pending_create_intents.is_empty() {
+        return Err(format!(
+            "Suite recovery has {} unknown create allocation(s); the Suite API cannot safely reconcile them",
+            state.pending_create_intents.len()
+        ));
+    }
+    let mut cancellable_module_ids = Vec::with_capacity(state.module_ids.len());
+    for module_id in &state.module_ids {
+        match client.module_info(module_id) {
+            Ok(info) if is_terminal(&info) => {}
+            Ok(info) if status(&info).is_some() => cancellable_module_ids.push(module_id.clone()),
+            Ok(_) => {
+                return Err(format!(
+                    "Suite recovery refused to cancel module {module_id}: current Suite state is missing"
+                ));
+            }
+            Err(SuiteClientError::HttpStatus(404)) => {}
+            Err(error) => {
+                return Err(format!(
+                    "Suite recovery refused to cancel module {module_id}: cannot read current Suite state: {}",
+                    safe_error(&error)
+                ));
+            }
+        }
+    }
     let mut report = CleanupReport::default();
-    cleanup_all(client, &state.module_ids, &state.plan_ids, &mut report);
+    cleanup_all(
+        client,
+        &cancellable_module_ids,
+        &state.plan_ids,
+        &mut report,
+    );
     if report.failures.is_empty() {
         Ok(())
     } else {
@@ -1117,6 +2046,39 @@ fn cancel_once(client: &SuiteClient, module_id: &str, report: &mut CleanupReport
             error: safe_error(&error),
         }),
     }
+}
+
+fn runtime_variant_for_definition(
+    plan: &PlannedPlan,
+    module: &ModuleDefinition,
+) -> BTreeMap<String, String> {
+    let mut variant = plan.runtime_variant.clone();
+    // The Suite definition fixes this concrete runner's behavior. It must
+    // override the Matrix defaults used to create the containing plan.
+    variant.extend(module.variant.clone());
+    variant
+}
+
+fn effective_module_identity_variant(
+    plan: &PlannedPlan,
+    module: &ModuleDefinition,
+) -> BTreeMap<String, String> {
+    let mut variant = plan.variant.clone();
+    // The containing plan supplies the baseline identity while a concrete
+    // Suite definition may further specialize the otherwise identical test
+    // name. Reports and review-capture receipts must bind the same effective
+    // identity, with the Suite definition taking precedence.
+    variant.extend(module.variant.clone());
+    variant
+}
+
+fn definition_identity(matrix_plan_id: &str, module: &ModuleDefinition) -> String {
+    if module.variant.is_empty() {
+        return format!("{matrix_plan_id}/{}", module.test_name);
+    }
+    let variant = serde_json::to_string(&module.variant)
+        .expect("BTreeMap<String, String> always serializes to JSON");
+    format!("{matrix_plan_id}/{}?variant={variant}", module.test_name)
 }
 
 fn safe_error(error: &impl std::fmt::Display) -> String {
@@ -1145,6 +2107,31 @@ fn is_waiting(value: &Value) -> bool {
     )
 }
 
+/// OIDF deferred evidence has a narrower contract than generic interactive
+/// browser waiting: the Suite must still report its exact `WAITING` review
+/// boundary after NazoAuthWeb capture, not another user/browser state.
+fn is_deferred_review_waiting(value: &Value) -> bool {
+    status(value) == Some("WAITING")
+}
+
+fn deferred_review_blocks_remaining_modules(
+    review_is_nonterminal: bool,
+    module_index: usize,
+    module_count: usize,
+) -> bool {
+    review_is_nonterminal && module_index.saturating_add(1) < module_count
+}
+
+/// A run may proceed to the ordinary retention handoff once it has either
+/// deleted every observed Suite allocation or fully accounted for them in an
+/// exact candidate. The latter is deliberately not a retention commit.
+pub(super) const fn suite_resources_settled(
+    cleanup_complete: bool,
+    retention_candidate_settled: bool,
+) -> bool {
+    cleanup_complete || retention_candidate_settled
+}
+
 fn is_terminal_state(value: &Value) -> bool {
     matches!(status(value), Some("FINISHED" | "INTERRUPTED"))
 }
@@ -1154,10 +2141,7 @@ fn needs_interactive_or_terminal_wait(value: Option<&Value>) -> bool {
 }
 
 fn is_terminal(value: &Value) -> bool {
-    matches!(
-        value.get("status").and_then(Value::as_str),
-        Some("FINISHED" | "INTERRUPTED")
-    )
+    is_terminal_state(value)
 }
 
 fn validate_matrix_origins(
@@ -1249,12 +2233,189 @@ mod tests {
     use crate::client::ClientConfig;
     use crate::credentials::BearerToken;
     use crate::matrix::{MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix};
-    use crate::transport::{HttpRequest, HttpResponse, Transport, TransportError};
+    use crate::transport::{HttpMethod, HttpRequest, HttpResponse, Transport, TransportError};
     use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn vp_receipt_issuance_retries_only_bounded_transient_failures() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let control = RunControl::default();
+        for error in [
+            OpenId4VpError::EvidenceTemporarilyUnavailable,
+            OpenId4VpError::Transport(TransportError::Network(
+                crate::transport::TransportFailureStage::SendTimeout,
+            )),
+        ] {
+            assert!(should_retry_openid4vp_evidence_issuance(
+                &error, 1, deadline, &control
+            ));
+        }
+        for error in [
+            OpenId4VpError::EvidenceUnavailable,
+            OpenId4VpError::UnexpectedEvidenceStatus,
+            OpenId4VpError::MalformedEvidenceResponse,
+            OpenId4VpError::Transport(TransportError::InvalidConfiguration),
+            OpenId4VpError::Transport(TransportError::Oversize),
+        ] {
+            assert!(!should_retry_openid4vp_evidence_issuance(
+                &error, 1, deadline, &control
+            ));
+        }
+        assert!(!should_retry_openid4vp_evidence_issuance(
+            &OpenId4VpError::EvidenceUnavailable,
+            MAX_OPENID4VP_EVIDENCE_ISSUANCE_ATTEMPTS,
+            deadline,
+            &control,
+        ));
+        control.interrupt();
+        assert!(!should_retry_openid4vp_evidence_issuance(
+            &OpenId4VpError::EvidenceTemporarilyUnavailable,
+            1,
+            deadline,
+            &control,
+        ));
+    }
 
     struct FixtureTransport {
         requests: Mutex<Vec<HttpRequest>>,
+    }
+
+    #[cfg(unix)]
+    struct DeferredReviewTransport {
+        requests: Mutex<Vec<(HttpMethod, String)>>,
+        test_name: &'static str,
+        module_variant: BTreeMap<String, String>,
+        info_after_capture: Value,
+        wait_state_after_capture: Value,
+        info_calls: AtomicUsize,
+        upload_review: bool,
+        uploaded: AtomicBool,
+    }
+
+    #[cfg(unix)]
+    struct DeferredReviewVerifier {
+        attached: Option<crate::browser::OpenId4VpEvidenceContext>,
+        starts: usize,
+        completes: usize,
+        issuances: usize,
+        completion_outcome: OpenId4VpCompletionOutcome,
+    }
+
+    #[cfg(unix)]
+    struct DeferredReviewBrowser {
+        captures: usize,
+        capture_fails: bool,
+        variant: BTreeMap<String, String>,
+        capture_root: Option<std::path::PathBuf>,
+    }
+
+    #[cfg(unix)]
+    struct RetainingObserver;
+
+    struct BudgetDriftTransport {
+        requests: Mutex<Vec<(HttpMethod, String)>>,
+    }
+
+    struct DefinitionTransport {
+        modules: Value,
+        requests: Mutex<Vec<(HttpMethod, String)>>,
+    }
+
+    struct DuplicateDefinitionTransport {
+        created_modules: AtomicUsize,
+        module_info_calls: Mutex<BTreeMap<String, usize>>,
+        requests: Mutex<Vec<(HttpMethod, String)>>,
+        runner_variants: Mutex<Vec<String>>,
+    }
+
+    struct RecordingPlanObserver {
+        persisted_plans: AtomicUsize,
+        module_intents: AtomicUsize,
+    }
+
+    impl SuiteResourceObserver for RecordingPlanObserver {
+        fn plan_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn plan_created(
+            &self,
+            _origin: &Origin,
+            _intent_id: &str,
+            _plan_id: &str,
+        ) -> Result<(), String> {
+            self.persisted_plans.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn module_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+            self.module_intents.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn module_created(&self, _intent_id: &str, _module_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    impl SuiteResourceObserver for RetainingObserver {
+        fn retain_suite_plans_for_certification(&self) -> bool {
+            true
+        }
+
+        fn plan_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn plan_created(
+            &self,
+            _origin: &Origin,
+            _intent_id: &str,
+            _plan_id: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn module_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn module_created(&self, _intent_id: &str, _module_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct RecoveryTransport {
+        module_state: Value,
+        module_status: u16,
+        plan_status: u16,
+        requests: Mutex<Vec<(HttpMethod, String)>>,
+    }
+
+    impl Transport for RecoveryTransport {
+        fn send(&self, request: HttpRequest, _max: usize) -> Result<HttpResponse, TransportError> {
+            let path = request.url().path().to_owned();
+            self.requests
+                .lock()
+                .expect("recovery requests")
+                .push((request.method(), path.clone()));
+            let (status, body) = match (request.method(), path.as_str()) {
+                (HttpMethod::Get, "/api/info/module-1") => {
+                    (self.module_status, self.module_state.clone())
+                }
+                (HttpMethod::Delete, "/api/runner/module-1") => (200, serde_json::json!({})),
+                (HttpMethod::Delete, "/api/plan/plan-1") => (self.plan_status, Value::Null),
+                _ => (404, serde_json::json!({})),
+            };
+            Ok(HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("recovery json"),
+            })
+        }
     }
 
     impl Transport for FixtureTransport {
@@ -1295,6 +2456,378 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    impl Transport for DeferredReviewTransport {
+        fn send(&self, request: HttpRequest, _max: usize) -> Result<HttpResponse, TransportError> {
+            let method = request.method();
+            let path = request.url().path().to_owned();
+            self.requests
+                .lock()
+                .expect("deferred review requests")
+                .push((method, path.clone()));
+            let (status, body) = match (method, path.as_str()) {
+                (HttpMethod::Get, "/api/plan") => (
+                    if request.header("Authorization").is_some() {
+                        200
+                    } else {
+                        401
+                    },
+                    serde_json::json!({}),
+                ),
+                (HttpMethod::Post, "/api/plan") => (
+                    201,
+                    serde_json::json!({
+                        "id":"suite-plan",
+                        "name":"oid4vp-1final-verifier-test-plan",
+                        "modules":[{
+                            "testModule":self.test_name,
+                            "variant":self.module_variant
+                        }]
+                    }),
+                ),
+                (HttpMethod::Post, "/api/runner") => {
+                    (201, serde_json::json!({"id":"module-a","alias":"vp-alias"}))
+                }
+                (HttpMethod::Get, "/api/info/module-a") => {
+                    let calls = self.info_calls.fetch_add(1, Ordering::SeqCst);
+                    if self.uploaded.load(Ordering::SeqCst) {
+                        (
+                            200,
+                            serde_json::json!({"status":"FINISHED","result":"REVIEW"}),
+                        )
+                    } else if calls == 0 {
+                        (200, serde_json::json!({"status":"WAITING"}))
+                    } else {
+                        (200, self.info_after_capture.clone())
+                    }
+                }
+                (HttpMethod::Get, "/api/runner/module-a/wait-state") => {
+                    if self.uploaded.load(Ordering::SeqCst) {
+                        (200, serde_json::json!({"state":"FINISHED"}))
+                    } else {
+                        (200, self.wait_state_after_capture.clone())
+                    }
+                }
+                (HttpMethod::Get, "/api/log/module-a/images") if self.upload_review => (
+                    200,
+                    serde_json::json!([{"_id":"log-a","upload":"placeholder-a"}]),
+                ),
+                (HttpMethod::Post, "/api/log/module-a/images/placeholder-a")
+                    if self.upload_review =>
+                {
+                    self.uploaded.store(true, Ordering::SeqCst);
+                    (200, serde_json::json!({"_id":"log-a","img":"stored"}))
+                }
+                (HttpMethod::Get, "/api/log/module-a") => (200, serde_json::json!([])),
+                // Suite cancellation accepts only 200, while plan deletion also
+                // accepts 204. Keep this transport aligned with those distinct
+                // production contracts so the negative cases exercise cleanup.
+                (HttpMethod::Delete, "/api/runner/module-a") => (200, Value::Null),
+                (HttpMethod::Delete, "/api/plan/suite-plan") => (204, Value::Null),
+                _ => (404, serde_json::json!({})),
+            };
+            Ok(HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("deferred review JSON"),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    impl OpenId4VpVerifier for DeferredReviewVerifier {
+        fn start(
+            &mut self,
+            _request: &OpenId4VpStartRequest,
+        ) -> Result<crate::browser::OpenId4VpPresentation, OpenId4VpError> {
+            self.starts += 1;
+            Ok(crate::browser::OpenId4VpPresentation::test_presentation())
+        }
+
+        fn complete(
+            &mut self,
+            _presentation: &crate::browser::OpenId4VpPresentation,
+        ) -> Result<OpenId4VpCompletionOutcome, OpenId4VpError> {
+            self.completes += 1;
+            Ok(self.completion_outcome)
+        }
+
+        fn attach_evidence_context(
+            &mut self,
+            _presentation: &mut crate::browser::OpenId4VpPresentation,
+            context: crate::browser::OpenId4VpEvidenceContext,
+        ) -> Result<(), OpenId4VpError> {
+            self.attached = Some(context);
+            Ok(())
+        }
+
+        fn verification_evidence(
+            &mut self,
+            _presentation: &crate::browser::OpenId4VpPresentation,
+        ) -> Result<crate::browser::OpenId4VpVerificationEvidence, OpenId4VpError> {
+            self.issuances += 1;
+            Ok(
+                crate::browser::OpenId4VpVerificationEvidence::test_verified(
+                    self.attached
+                        .clone()
+                        .expect("evidence is attached before issuance"),
+                    &"c".repeat(64),
+                    "https://issuer.example/ui/verification-result#receipt=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO12",
+                ),
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    impl BrowserAutomation for DeferredReviewBrowser {
+        fn execute(
+            &mut self,
+            _authorization_url: &Url,
+            _entries: &[crate::browser::BrowserEntry],
+        ) -> Result<crate::browser::BrowserRunReport, BrowserError> {
+            Err(BrowserError::ReviewScreenshotRequired)
+        }
+
+        fn navigate(&mut self, _url: &Url) -> Result<(), BrowserError> {
+            Ok(())
+        }
+
+        fn selected_openid4vp_result_marker(
+            &mut self,
+            authorization_url: &Url,
+            entries: &[crate::browser::BrowserEntry],
+            suite_evidence_url: &Url,
+        ) -> Result<bool, BrowserError> {
+            assert_eq!(authorization_url.host_str(), Some("issuer.example"));
+            assert_eq!(
+                suite_evidence_url.path(),
+                "/test/a/module-a/verification-evidence"
+            );
+            let selected = entries.first().ok_or(BrowserError::InvalidSchema)?;
+            assert_eq!(selected.match_pattern, "https://issuer.example/authorize*");
+            crate::browser::selected_required_review_screenshot_marker(selected, suite_evidence_url)
+        }
+
+        fn capture_openid4vp_verification_result(
+            &mut self,
+            evidence: &crate::browser::OpenId4VpVerificationEvidence,
+            _capture: &crate::browser::BrowserReviewCaptureContext,
+            obligation_index: usize,
+        ) -> Result<crate::browser::BrowserReviewScreenshotReceipt, BrowserError> {
+            self.captures += 1;
+            if self.capture_fails {
+                return Err(BrowserError::ReviewScreenshotRequired);
+            }
+            let (path, sha256, size) = if let Some(root) = &self.capture_root {
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
+                let png = STANDARD
+                    .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+                    .expect("fixed PNG");
+                let path = std::path::PathBuf::from("review-screenshots")
+                    .join("request-0123456789abcdef0123456789abcdef")
+                    .join("p--module-a--000.png");
+                crate::secure_file::write_atomic(&root.join(&path), &png, true)
+                    .expect("module-bound review PNG");
+                let size = png.len();
+                let digest: [u8; 32] = Sha256::digest(&png).into();
+                let sha256 = digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                (path, sha256, size)
+            } else {
+                (
+                    std::path::PathBuf::from("review-screenshots/test/module-a-0.png"),
+                    "d".repeat(64),
+                    67,
+                )
+            };
+            Ok(crate::browser::BrowserReviewScreenshotReceipt {
+                path,
+                sha256,
+                size,
+                suite_plan_id: evidence.context.suite_plan_id.clone(),
+                module_id: evidence.context.suite_module_id.clone(),
+                test_name: evidence.context.test_name.clone(),
+                variant: self.variant.clone(),
+                marker: crate::browser::ReviewScreenshotMarker::Required,
+                obligation_index,
+                trigger_origin: "https://issuer.example".to_owned(),
+                trigger_path: "/ui/verification-result".to_owned(),
+                trigger_url_sha256: "e".repeat(64),
+                source: crate::browser::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver,
+                verification_receipt: Some(evidence.receipt.clone()),
+            })
+        }
+    }
+
+    impl Transport for BudgetDriftTransport {
+        fn send(&self, request: HttpRequest, _max: usize) -> Result<HttpResponse, TransportError> {
+            let method = request.method();
+            let path = request.url().path().to_owned();
+            self.requests
+                .lock()
+                .expect("budget drift requests")
+                .push((method, path.clone()));
+            let (status, body) = match (method, path.as_str()) {
+                (HttpMethod::Get, "/api/plan") => (
+                    if request.header("Authorization").is_some() {
+                        200
+                    } else {
+                        401
+                    },
+                    serde_json::json!({}),
+                ),
+                (HttpMethod::Post, "/api/plan") => (
+                    201,
+                    serde_json::json!({
+                        "id": "suite-plan",
+                        "name": "plan",
+                        "modules": [
+                            {"testModule": "test-1"},
+                            {"testModule": "test-2"}
+                        ]
+                    }),
+                ),
+                (HttpMethod::Delete, "/api/plan/suite-plan") => (204, Value::Null),
+                _ => (500, serde_json::json!({})),
+            };
+            Ok(HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("budget drift json"),
+            })
+        }
+    }
+
+    impl Transport for DefinitionTransport {
+        fn send(&self, request: HttpRequest, _max: usize) -> Result<HttpResponse, TransportError> {
+            let method = request.method();
+            let path = request.url().path().to_owned();
+            self.requests
+                .lock()
+                .expect("definition requests")
+                .push((method, path.clone()));
+            let (status, body) = match (method, path.as_str()) {
+                (HttpMethod::Get, "/api/plan") => (
+                    if request.header("Authorization").is_some() {
+                        200
+                    } else {
+                        401
+                    },
+                    serde_json::json!({}),
+                ),
+                (HttpMethod::Post, "/api/plan") => (
+                    201,
+                    serde_json::json!({
+                        "id": "suite-plan",
+                        "name": "plan",
+                        "modules": self.modules.clone(),
+                    }),
+                ),
+                (HttpMethod::Delete, "/api/plan/suite-plan") => (204, Value::Null),
+                _ => (500, serde_json::json!({})),
+            };
+            Ok(HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("definition json"),
+            })
+        }
+    }
+
+    impl Transport for DuplicateDefinitionTransport {
+        fn send(&self, request: HttpRequest, _max: usize) -> Result<HttpResponse, TransportError> {
+            let method = request.method();
+            let path = request.url().path().to_owned();
+            if method == HttpMethod::Post && path == "/api/runner" {
+                let variant = request
+                    .url()
+                    .query_pairs()
+                    .find_map(|(key, value)| (key == "variant").then(|| value.into_owned()));
+                if let Some(variant) = variant {
+                    self.runner_variants
+                        .lock()
+                        .expect("duplicate definition variants")
+                        .push(variant);
+                }
+            }
+            self.requests
+                .lock()
+                .expect("duplicate definition requests")
+                .push((method, path.clone()));
+            let (status, body) = match (method, path.as_str()) {
+                (HttpMethod::Get, "/api/plan") => (
+                    if request.header("Authorization").is_some() {
+                        200
+                    } else {
+                        401
+                    },
+                    serde_json::json!({}),
+                ),
+                (HttpMethod::Post, "/api/plan") => (
+                    201,
+                    serde_json::json!({
+                        "id": "suite-plan",
+                        "name": "oid4vci-issuer-test-plan",
+                        "modules": [
+                            {"testModule": "happy-flow", "variant": {
+                                "credential_configuration": "plain",
+                                "vci_authorization_code_flow_variant": "issuer_initiated"
+                            }},
+                            {"testModule": "happy-flow", "variant": {
+                                "credential_configuration": "encrypted",
+                                "vci_authorization_code_flow_variant": "issuer_initiated"
+                            }}
+                        ]
+                    }),
+                ),
+                (HttpMethod::Post, "/api/runner") => {
+                    let number = self.created_modules.fetch_add(1, Ordering::SeqCst) + 1;
+                    (201, serde_json::json!({"id": format!("module-{number}")}))
+                }
+                (HttpMethod::Post, path) if path.starts_with("/api/runner/module-") => {
+                    (200, serde_json::json!({}))
+                }
+                (HttpMethod::Get, path) if path.ends_with("/wait-state") => {
+                    (200, serde_json::json!({"state":"FINISHED"}))
+                }
+                (HttpMethod::Get, path) if path.starts_with("/api/info/module-") => {
+                    let calls = {
+                        let mut calls = self
+                            .module_info_calls
+                            .lock()
+                            .expect("duplicate definition module info");
+                        let calls = calls.entry(path.to_owned()).or_default();
+                        *calls += 1;
+                        *calls
+                    };
+                    if calls == 1 {
+                        (200, serde_json::json!({"status":"WAITING"}))
+                    } else {
+                        (
+                            200,
+                            serde_json::json!({"status":"FINISHED","result":"PASSED"}),
+                        )
+                    }
+                }
+                (HttpMethod::Get, path) if path.starts_with("/api/runner/module-") => {
+                    (200, serde_json::json!({}))
+                }
+                (HttpMethod::Get, path) if path.starts_with("/api/log/module-") => {
+                    (200, serde_json::json!([]))
+                }
+                (HttpMethod::Delete, "/api/plan/suite-plan") => (204, Value::Null),
+                _ => (500, serde_json::json!({})),
+            };
+            Ok(HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("duplicate definition json"),
+            })
+        }
+    }
+
     fn test_binding() -> ConformanceBinding {
         ConformanceBinding::new(
             "019ff000-8190-7393-8c33-ab4339c3d85e",
@@ -1329,6 +2862,175 @@ mod tests {
         }
     }
 
+    fn budget(modules: u32, clients: u32, wall_clock_seconds: u64) -> OidfPlanResourceBudget {
+        OidfPlanResourceBudget {
+            modules,
+            clients,
+            wall_clock_seconds,
+        }
+    }
+
+    fn one_plan_budgets() -> BTreeMap<String, OidfPlanResourceBudget> {
+        BTreeMap::from([("p".to_owned(), budget(1, 1, 60))])
+    }
+
+    #[test]
+    fn cleanup_cancels_only_modules_without_terminal_reports() {
+        let terminal = ModuleReport::from_info(
+            ModuleReportContext {
+                matrix_plan_id: "plan".into(),
+                suite_plan_id: "suite-plan".into(),
+                module_id: Some("terminal".into()),
+                test_name: "terminal-test".into(),
+                variant: BTreeMap::new(),
+                terminal: true,
+                expected_result: None,
+            },
+            serde_json::json!({"status":"FINISHED","result":"PASSED"}),
+            serde_json::json!([]),
+        );
+        let incomplete = ModuleReport::from_info(
+            ModuleReportContext {
+                matrix_plan_id: "plan".into(),
+                suite_plan_id: "suite-plan".into(),
+                module_id: Some("incomplete".into()),
+                test_name: "incomplete-test".into(),
+                variant: BTreeMap::new(),
+                terminal: false,
+                expected_result: None,
+            },
+            serde_json::json!({"status":"RUNNING"}),
+            serde_json::json!([]),
+        );
+
+        assert_eq!(
+            cancellable_module_ids(
+                &["terminal".into(), "incomplete".into(), "unobserved".into()],
+                &[terminal, incomplete],
+            ),
+            vec!["incomplete", "unobserved"],
+        );
+    }
+
+    fn recovery_client(transport: Arc<RecoveryTransport>) -> SuiteClient {
+        SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport,
+            ClientConfig::default(),
+        )
+        .expect("client")
+    }
+
+    #[test]
+    fn recovery_queries_state_and_skips_terminal_modules() {
+        let transport = Arc::new(RecoveryTransport {
+            module_state: serde_json::json!({"state":"FINISHED"}),
+            module_status: 200,
+            plan_status: 204,
+            requests: Mutex::new(Vec::new()),
+        });
+        let state = crate::recovery::SuiteRecoveryState {
+            origin: "https://suite.example".to_owned(),
+            plan_ids: vec!["plan-1".to_owned()],
+            module_ids: vec!["module-1".to_owned()],
+            pending_create_intents: Vec::new(),
+            cleanup_complete: false,
+        };
+
+        recover_suite_resources(&recovery_client(transport.clone()), &state)
+            .expect("terminal recovery cleanup");
+
+        assert_eq!(
+            *transport.requests.lock().expect("recovery requests"),
+            vec![
+                (HttpMethod::Get, "/api/info/module-1".to_owned()),
+                (HttpMethod::Delete, "/api/plan/plan-1".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_fails_closed_when_module_state_cannot_be_observed() {
+        let transport = Arc::new(RecoveryTransport {
+            module_state: serde_json::json!({}),
+            module_status: 200,
+            plan_status: 204,
+            requests: Mutex::new(Vec::new()),
+        });
+        let state = crate::recovery::SuiteRecoveryState {
+            origin: "https://suite.example".to_owned(),
+            plan_ids: vec!["plan-1".to_owned()],
+            module_ids: vec!["module-1".to_owned()],
+            pending_create_intents: Vec::new(),
+            cleanup_complete: false,
+        };
+
+        let error = recover_suite_resources(&recovery_client(transport.clone()), &state)
+            .expect_err("unobservable module state must retain the recovery journal");
+
+        assert!(error.contains("current Suite state is missing"));
+        assert_eq!(
+            *transport.requests.lock().expect("recovery requests"),
+            vec![(HttpMethod::Get, "/api/info/module-1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn recovery_fails_closed_for_unknown_create_intent() {
+        let transport = Arc::new(RecoveryTransport {
+            module_state: serde_json::json!({"state":"RUNNING"}),
+            module_status: 200,
+            plan_status: 204,
+            requests: Mutex::new(Vec::new()),
+        });
+        let state = crate::recovery::SuiteRecoveryState {
+            origin: "https://suite.example".to_owned(),
+            plan_ids: vec!["plan-1".to_owned()],
+            module_ids: vec!["module-1".to_owned()],
+            pending_create_intents: vec!["019ff000-8190-7393-8c33-ab4339c3d85e".to_owned()],
+            cleanup_complete: false,
+        };
+
+        let error = recover_suite_resources(&recovery_client(transport.clone()), &state)
+            .expect_err("unknown remote allocation must block recovery completion");
+
+        assert!(error.contains("unknown create allocation"));
+        assert!(
+            transport
+                .requests
+                .lock()
+                .expect("recovery requests")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_treat_immutable_plan_as_cleanup_complete() {
+        let transport = Arc::new(RecoveryTransport {
+            module_state: serde_json::json!({}),
+            module_status: 200,
+            plan_status: 405,
+            requests: Mutex::new(Vec::new()),
+        });
+        let state = crate::recovery::SuiteRecoveryState {
+            origin: "https://suite.example".to_owned(),
+            plan_ids: vec!["plan-1".to_owned()],
+            module_ids: Vec::new(),
+            pending_create_intents: Vec::new(),
+            cleanup_complete: false,
+        };
+
+        let error = recover_suite_resources(&recovery_client(transport.clone()), &state)
+            .expect_err("an immutable plan has no authoritative cleanup receipt");
+
+        assert!(error.contains("cleanup failed"));
+        assert_eq!(
+            *transport.requests.lock().expect("recovery requests"),
+            vec![(HttpMethod::Delete, "/api/plan/plan-1".to_owned())]
+        );
+    }
+
     #[test]
     fn selected_plans_require_exact_signed_lane_coverage() {
         let selected = one_plan_matrix(serde_json::json!({}));
@@ -1341,6 +3043,553 @@ mod tests {
             &selected,
             &BTreeMap::from([("other".to_owned(), OidfDriverLane::Parallel)])
         ));
+    }
+
+    #[test]
+    fn runner_construction_rejects_inexact_signed_resource_budgets() {
+        let selected = one_plan_matrix(serde_json::json!({}));
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            Arc::new(FixtureTransport {
+                requests: Mutex::new(Vec::new()),
+            }),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let make_config = |plan_resource_budgets, selected_resource_budget| ConformanceRunConfig {
+            client: client.clone(),
+            matrix: selected.clone(),
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets,
+            selected_resource_budget,
+            jobs: 1,
+            upload_review_screenshots: false,
+            automation: Vec::new(),
+            suite_resource_observer: None,
+        };
+
+        assert!(ConformanceRunner::new(make_config(BTreeMap::new(), budget(0, 0, 0))).is_err());
+        for inexact_total in [budget(2, 1, 60), budget(1, 2, 60), budget(1, 1, 61)] {
+            assert!(
+                ConformanceRunner::new(make_config(one_plan_budgets(), inexact_total)).is_err()
+            );
+        }
+
+        let mut overflow_matrix = selected.clone();
+        let mut second_plan = overflow_matrix.document.groups[0].plans[0].clone();
+        second_plan.id = "q".to_owned();
+        overflow_matrix.document.groups[0].plans.push(second_plan);
+        assert!(
+            ConformanceRunner::new(ConformanceRunConfig {
+                client,
+                matrix: overflow_matrix,
+                target_origin: None,
+                binding: test_binding(),
+                poll_timeout: Duration::from_secs(1),
+                control: RunControl::default(),
+                plan_lanes: BTreeMap::from([
+                    ("p".to_owned(), OidfDriverLane::Parallel),
+                    ("q".to_owned(), OidfDriverLane::Parallel),
+                ]),
+                plan_resource_budgets: BTreeMap::from([
+                    ("p".to_owned(), budget(u32::MAX, 1, 60)),
+                    ("q".to_owned(), budget(1, 1, 60)),
+                ]),
+                selected_resource_budget: budget(u32::MAX, 2, 120),
+                jobs: 1,
+                upload_review_screenshots: false,
+                automation: Vec::new(),
+                suite_resource_observer: None,
+            })
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn screenshot_capture_lanes_require_one_shared_browser_budget() {
+        let temp = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let evidence = temp.join(format!("nazoauth-lanes-{}", uuid::Uuid::now_v7()));
+        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            Arc::new(FixtureTransport {
+                requests: Mutex::new(Vec::new()),
+            }),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let browser = || {
+            Arc::new(Mutex::new(CompletingBrowser {
+                completed: Arc::new(AtomicBool::new(false)),
+            })) as Arc<Mutex<dyn BrowserAutomation>>
+        };
+        let config = |automation| ConformanceRunConfig {
+            client: client.clone(),
+            matrix: one_plan_matrix(serde_json::json!({})),
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: one_plan_budgets(),
+            selected_resource_budget: budget(1, 1, 60),
+            jobs: 2,
+            upload_review_screenshots: false,
+            automation,
+            suite_resource_observer: None,
+        };
+        assert!(ConformanceRunner::new(config(Vec::new())).is_ok());
+        let shared =
+            BrowserReviewScreenshotCapture::new(evidence.clone(), "run-a").expect("shared capture");
+        assert!(
+            ConformanceRunner::new(config(vec![
+                ConformanceAutomation {
+                    browser: Some(browser()),
+                    review_screenshot_capture: Some(shared.clone()),
+                    ..ConformanceAutomation::default()
+                },
+                ConformanceAutomation {
+                    browser: Some(browser()),
+                    review_screenshot_capture: Some(shared),
+                    ..ConformanceAutomation::default()
+                },
+            ]))
+            .is_ok()
+        );
+        let first =
+            BrowserReviewScreenshotCapture::new(evidence.clone(), "run-b").expect("first capture");
+        let second =
+            BrowserReviewScreenshotCapture::new(evidence.clone(), "run-b").expect("second capture");
+        assert!(
+            ConformanceRunner::new(config(vec![
+                ConformanceAutomation {
+                    browser: Some(browser()),
+                    review_screenshot_capture: Some(first),
+                    ..ConformanceAutomation::default()
+                },
+                ConformanceAutomation {
+                    browser: Some(browser()),
+                    review_screenshot_capture: Some(second),
+                    ..ConformanceAutomation::default()
+                },
+            ]))
+            .is_err()
+        );
+        let capture =
+            BrowserReviewScreenshotCapture::new(evidence.clone(), "run-c").expect("capture");
+        assert!(
+            ConformanceRunner::new(config(vec![
+                ConformanceAutomation::default(),
+                ConformanceAutomation {
+                    browser: Some(browser()),
+                    review_screenshot_capture: Some(capture.clone()),
+                    ..ConformanceAutomation::default()
+                },
+            ]))
+            .is_err()
+        );
+        assert!(
+            ConformanceRunner::new(config(vec![ConformanceAutomation {
+                review_screenshot_capture: Some(capture),
+                ..ConformanceAutomation::default()
+            }]))
+            .is_err()
+        );
+        std::fs::remove_dir_all(&evidence).expect("remove evidence");
+    }
+
+    #[test]
+    fn suite_module_count_over_budget_fails_before_runner_creation_and_cleans_plan() {
+        let transport = Arc::new(BudgetDriftTransport {
+            requests: Mutex::new(Vec::new()),
+        });
+        let observer = Arc::new(RecordingPlanObserver {
+            persisted_plans: AtomicUsize::new(0),
+            module_intents: AtomicUsize::new(0),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix: one_plan_matrix(serde_json::json!({})),
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: one_plan_budgets(),
+            selected_resource_budget: budget(1, 1, 60),
+            jobs: 1,
+            upload_review_screenshots: false,
+            automation: Vec::new(),
+            suite_resource_observer: Some(observer.clone()),
+        })
+        .expect("runner");
+
+        let report = runner.run(&mut ()).report;
+
+        assert_eq!(
+            report.errors,
+            vec!["Suite plan module allocation exceeds signed resource budget".to_owned()]
+        );
+        assert_eq!(report.progress.groups[0].status, GroupStatus::Failed);
+        assert_eq!(report.plans.len(), 1);
+        assert_eq!(report.plans[0].defined_modules, 2);
+        assert_eq!(report.plans[0].created_instances, 0);
+        assert_eq!(report.orchestration_integrity.created_instances, 0);
+        assert!(report.modules.is_empty());
+        assert_eq!(report.cleanup.deleted_plans, vec!["suite-plan".to_owned()]);
+        assert!(report.cleanup.failures.is_empty());
+        assert_eq!(observer.persisted_plans.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.module_intents.load(Ordering::SeqCst), 0);
+        let requests = transport.requests.lock().expect("budget drift requests");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(method, path)| *method == HttpMethod::Post && path == "/api/runner")
+                .count(),
+            0
+        );
+        assert!(requests.iter().any(|(method, path)| {
+            *method == HttpMethod::Delete && path == "/api/plan/suite-plan"
+        }));
+    }
+
+    #[test]
+    fn same_name_distinct_variants_create_exact_suite_instances_and_runtime_overlays() {
+        let transport = Arc::new(DuplicateDefinitionTransport {
+            created_modules: AtomicUsize::new(0),
+            module_info_calls: Mutex::new(BTreeMap::new()),
+            requests: Mutex::new(Vec::new()),
+            runner_variants: Mutex::new(Vec::new()),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let mut matrix = one_plan_matrix(serde_json::json!({}));
+        let matrix_plan = &mut matrix.document.groups[0].plans[0];
+        matrix_plan.plan = "oid4vci-issuer-test-plan".to_owned();
+        matrix_plan.variant = BTreeMap::from([
+            (
+                "vci_authorization_code_flow_variant".to_owned(),
+                "wallet_initiated".to_owned(),
+            ),
+            (
+                "credential_configuration".to_owned(),
+                "matrix-default".to_owned(),
+            ),
+            ("matrix_only".to_owned(), "kept".to_owned()),
+        ]);
+        let issuer = Arc::new(Mutex::new(RecordingIssuer::default()));
+        let issuer_driver: Arc<Mutex<dyn OpenId4VciIssuerDriver>> = issuer.clone();
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix,
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
+            selected_resource_budget: budget(2, 1, 60),
+            jobs: 1,
+            upload_review_screenshots: false,
+            automation: vec![ConformanceAutomation {
+                issuer: Some(issuer_driver),
+                ..ConformanceAutomation::default()
+            }],
+            suite_resource_observer: None,
+        })
+        .expect("runner");
+
+        let report = runner.run(&mut ()).report;
+
+        assert!(report.errors.is_empty());
+        assert!(report.local_success);
+        assert!(report.orchestration_integrity.all_modules_terminal);
+        assert_eq!(report.modules.len(), 2);
+        assert_eq!(
+            report
+                .modules
+                .iter()
+                .map(|module| module.test_name.as_str())
+                .collect::<Vec<_>>(),
+            ["happy-flow", "happy-flow"]
+        );
+        assert_eq!(
+            report
+                .modules
+                .iter()
+                .filter_map(|module| module.module_id.as_deref())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["module-1", "module-2"])
+        );
+        assert_eq!(
+            report
+                .modules
+                .iter()
+                .map(|module| module
+                    .variant
+                    .get("credential_configuration")
+                    .map(String::as_str))
+                .collect::<Vec<_>>(),
+            [Some("plain"), Some("encrypted")]
+        );
+        assert_eq!(report.cleanup.deleted_plans, ["suite-plan"]);
+        assert_eq!(
+            transport
+                .requests
+                .lock()
+                .expect("duplicate definition requests")
+                .iter()
+                .filter(|(method, path)| *method == HttpMethod::Post && path == "/api/runner")
+                .count(),
+            2
+        );
+        assert_eq!(
+            transport
+                .runner_variants
+                .lock()
+                .expect("duplicate definition variants")
+                .as_slice(),
+            [
+                "{\"credential_configuration\":\"plain\",\"vci_authorization_code_flow_variant\":\"issuer_initiated\"}",
+                "{\"credential_configuration\":\"encrypted\",\"vci_authorization_code_flow_variant\":\"issuer_initiated\"}"
+            ]
+        );
+        let observed_variants = issuer.lock().expect("recording issuer").variants.clone();
+        assert_eq!(observed_variants.len(), 2);
+        assert!(observed_variants.iter().all(|variant| {
+            variant.get("matrix_only").map(String::as_str) == Some("kept")
+                && variant
+                    .get("vci_authorization_code_flow_variant")
+                    .map(String::as_str)
+                    == Some("issuer_initiated")
+        }));
+        assert_eq!(
+            observed_variants
+                .iter()
+                .map(|variant| variant.get("credential_configuration").map(String::as_str))
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([Some("plain"), Some("encrypted")])
+        );
+    }
+
+    #[test]
+    fn duplicate_signed_skip_definition_stops_before_module_creation() {
+        let transport = Arc::new(DefinitionTransport {
+            modules: serde_json::json!([
+                {"testModule": "declared-skip", "variant": {"credential_configuration": "plain"}},
+                {"testModule": "declared-skip", "variant": {"credential_configuration": "encrypted"}}
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let mut matrix = one_plan_matrix(serde_json::json!({}));
+        matrix.document.groups[0].plans[0]
+            .expected_results
+            .insert("declared-skip".to_owned(), "SKIPPED".to_owned());
+        let observer = Arc::new(RecordingPlanObserver {
+            persisted_plans: AtomicUsize::new(0),
+            module_intents: AtomicUsize::new(0),
+        });
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix,
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
+            selected_resource_budget: budget(2, 1, 60),
+            jobs: 1,
+            upload_review_screenshots: false,
+            automation: Vec::new(),
+            suite_resource_observer: Some(observer.clone()),
+        })
+        .expect("runner");
+
+        let report = runner.run(&mut ()).report;
+
+        assert!(!report.matrix_expectations_satisfied);
+        assert!(!report.acceptance_pass);
+        assert_eq!(report.unknown_declared_skip_modules, ["p/declared-skip"]);
+        assert!(report.errors.iter().any(|error| {
+            error
+                == "signed Matrix expected SKIPPED module is not uniquely defined by Suite plan: p/declared-skip"
+        }));
+        assert_eq!(report.cleanup.deleted_plans, ["suite-plan"]);
+        assert!(report.modules.is_empty());
+        assert_eq!(observer.persisted_plans.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.module_intents.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            transport
+                .requests
+                .lock()
+                .expect("definition requests")
+                .iter()
+                .filter(|(method, path)| *method == HttpMethod::Post && path == "/api/runner")
+                .count(),
+            0,
+        );
+    }
+
+    #[test]
+    fn exact_duplicate_suite_definition_with_reordered_variant_keys_stops_before_creation() {
+        let transport = Arc::new(DefinitionTransport {
+            modules: serde_json::json!([
+                {"testModule": "duplicate", "variant": {"a": "one", "b": "two"}},
+                {"testModule": "duplicate", "variant": {"b": "two", "a": "one"}}
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix: one_plan_matrix(serde_json::json!({})),
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
+            selected_resource_budget: budget(2, 1, 60),
+            jobs: 1,
+            upload_review_screenshots: false,
+            automation: Vec::new(),
+            suite_resource_observer: None,
+        })
+        .expect("runner");
+
+        let report = runner.run(&mut ()).report;
+
+        assert!(report.errors.iter().any(|error| {
+            error
+                == "Suite plan defines an exact duplicate module definition: p/duplicate?variant={\"a\":\"one\",\"b\":\"two\"}"
+        }));
+        assert_eq!(report.plans[0].defined_modules, 2);
+        assert_eq!(report.plans[0].created_instances, 0);
+        assert!(report.modules.is_empty());
+        assert_eq!(
+            transport
+                .requests
+                .lock()
+                .expect("definition requests")
+                .iter()
+                .filter(|(method, path)| *method == HttpMethod::Post && path == "/api/runner")
+                .count(),
+            0
+        );
+    }
+
+    struct PlanCreateFailureTransport {
+        requests: Mutex<Vec<(HttpMethod, String)>>,
+    }
+
+    impl Transport for PlanCreateFailureTransport {
+        fn send(&self, request: HttpRequest, _max: usize) -> Result<HttpResponse, TransportError> {
+            let method = request.method();
+            let path = request.url().path().to_owned();
+            self.requests
+                .lock()
+                .expect("plan-create failure requests")
+                .push((method, path.clone()));
+            let (status, body) = match (method, path.as_str()) {
+                (HttpMethod::Get, "/api/plan") => (
+                    if request.header("Authorization").is_some() {
+                        200
+                    } else {
+                        401
+                    },
+                    serde_json::json!({}),
+                ),
+                (HttpMethod::Post, "/api/plan") => (500, serde_json::json!({})),
+                _ => (500, serde_json::json!({})),
+            };
+            Ok(HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("plan-create failure json"),
+            })
+        }
+    }
+
+    #[test]
+    fn plan_creation_failure_marks_matrix_expectations_unverifiable() {
+        let transport = Arc::new(PlanCreateFailureTransport {
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix: one_plan_matrix(serde_json::json!({})),
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: one_plan_budgets(),
+            selected_resource_budget: budget(1, 1, 60),
+            jobs: 1,
+            upload_review_screenshots: false,
+            automation: Vec::new(),
+            suite_resource_observer: None,
+        })
+        .expect("runner");
+
+        let report = runner.run(&mut ()).report;
+
+        assert!(!report.matrix_expectations_satisfied);
+        assert!(!report.acceptance_pass);
+        assert!(report.unknown_declared_skip_modules.is_empty());
+        assert!(report.errors.iter().any(|error| error.contains("500")));
+        let requests = transport
+            .requests
+            .lock()
+            .expect("plan-create failure requests");
+        assert!(
+            requests
+                .iter()
+                .any(|(method, path)| { *method == HttpMethod::Post && path == "/api/plan" })
+        );
+        assert!(!requests.iter().any(|(method, path)| {
+            *method == HttpMethod::Delete && path.starts_with("/api/plan/")
+        }));
     }
 
     #[test]
@@ -1364,7 +3613,10 @@ mod tests {
                 poll_timeout: Duration::from_secs(1),
                 control: RunControl::default(),
                 plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+                plan_resource_budgets: one_plan_budgets(),
+                selected_resource_budget: budget(1, 1, 60),
                 jobs: 1,
+                upload_review_screenshots: false,
                 automation: Vec::new(),
                 suite_resource_observer: None,
             })
@@ -1402,6 +3654,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some("m".into()),
                 test_name: "test".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: None,
             },
@@ -1420,6 +3673,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some("m".into()),
                 test_name: "oidcc-review".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: None,
             },
@@ -1438,6 +3692,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some("m".into()),
                 test_name: "oidcc-skip".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: Some("SKIPPED".into()),
             },
@@ -1452,6 +3707,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some("m".into()),
                 test_name: "oidcc-other".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: None,
             },
@@ -1469,6 +3725,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some("m".into()),
                 test_name: "oidcc-review".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: None,
             },
@@ -1489,6 +3746,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some("m-warning".into()),
                 test_name: "oidcc-warning".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: None,
             },
@@ -1506,6 +3764,7 @@ mod tests {
                 suite_plan_id: "s".into(),
                 module_id: Some("m-failure".into()),
                 test_name: "oidcc-failure".into(),
+                variant: BTreeMap::new(),
                 terminal: true,
                 expected_result: None,
             },
@@ -1547,7 +3806,10 @@ mod tests {
             poll_timeout: Duration::from_secs(30),
             control,
             plan_lanes: BTreeMap::new(),
+            plan_resource_budgets: BTreeMap::new(),
+            selected_resource_budget: budget(0, 0, 0),
             jobs: 1,
+            upload_review_screenshots: false,
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -1589,6 +3851,18 @@ mod tests {
         drives: usize,
     }
 
+    #[derive(Default)]
+    struct RecordingIssuer {
+        variants: Vec<BTreeMap<String, String>>,
+    }
+
+    impl OpenId4VciIssuerDriver for RecordingIssuer {
+        fn drive(&mut self, module: &OpenId4VciModule) -> Result<(), OpenId4VciError> {
+            self.variants.push(module.variant.clone());
+            Ok(())
+        }
+    }
+
     impl OpenId4VciIssuerDriver for PendingIssuer {
         fn drive(&mut self, _module: &OpenId4VciModule) -> Result<(), OpenId4VciError> {
             self.drives += 1;
@@ -1621,7 +3895,10 @@ mod tests {
             poll_timeout: Duration::from_millis(250),
             control,
             plan_lanes: BTreeMap::new(),
+            plan_resource_budgets: BTreeMap::new(),
+            selected_resource_budget: budget(0, 0, 0),
             jobs: 1,
+            upload_review_screenshots: false,
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -1648,7 +3925,7 @@ mod tests {
         };
         let module = ModuleDefinition {
             test_name: "test".into(),
-            variant: None,
+            variant: BTreeMap::new(),
             raw: serde_json::json!({}),
         };
         let issuer_driver: Arc<Mutex<dyn OpenId4VciIssuerDriver>> = issuer.clone();
@@ -1717,6 +3994,11 @@ mod tests {
                 tasks: 0,
                 entry_index: 0,
                 final_origin: "https://target.example".into(),
+                review_screenshots: Vec::new(),
+                review_screenshot_attempts: 0,
+                review_screenshots_required: 0,
+                review_screenshots_required_captured: 0,
+                review_screenshots_missing: 0,
             })
         }
 
@@ -1754,7 +4036,10 @@ mod tests {
             poll_timeout: Duration::from_secs(2),
             control: RunControl::default(),
             plan_lanes: BTreeMap::new(),
+            plan_resource_budgets: BTreeMap::new(),
+            selected_resource_budget: budget(0, 0, 0),
             jobs: 1,
+            upload_review_screenshots: false,
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -1782,11 +4067,11 @@ mod tests {
         }));
         let module = ModuleDefinition {
             test_name: "browser-module".to_owned(),
-            variant: None,
+            variant: BTreeMap::new(),
             raw: Value::Null,
         };
 
-        let observed = runner
+        let (observed, review_evidence) = runner
             .drive_browser_waiting_interruptible(
                 &browser,
                 &plan,
@@ -1796,6 +4081,7 @@ mod tests {
             )
             .expect("browser drive");
         assert_eq!(status(&observed), Some("FINISHED"));
+        assert!(review_evidence.screenshots.is_empty());
         assert!(completed.load(Ordering::SeqCst));
     }
 
@@ -1808,5 +4094,664 @@ mod tests {
         assert!(needs_interactive_or_terminal_wait(Some(&running)));
         assert!(!needs_interactive_or_terminal_wait(Some(&waiting)));
         assert!(!needs_interactive_or_terminal_wait(Some(&finished)));
+    }
+
+    #[test]
+    fn effective_module_identity_variant_merges_plan_and_suite_definition() {
+        let plan = PlannedPlan {
+            group_index: 0,
+            matrix_plan_id: "matrix-plan".into(),
+            suite_plan_id: "suite-plan".into(),
+            plan_name: "plan".into(),
+            variant: BTreeMap::from([
+                ("credential_format".into(), "sd_jwt_vc".into()),
+                ("response_mode".into(), "direct_post".into()),
+            ]),
+            runtime_variant: BTreeMap::new(),
+            expected_results: BTreeMap::new(),
+            modules: Vec::new(),
+            config: Value::Null,
+            report_index: 0,
+            lane: OidfDriverLane::Parallel,
+        };
+        let module = ModuleDefinition {
+            test_name: "happy-flow".into(),
+            variant: BTreeMap::from([
+                ("response_mode".into(), "direct_post.jwt".into()),
+                ("request_method".into(), "url_query".into()),
+            ]),
+            raw: Value::Null,
+        };
+
+        assert_eq!(
+            effective_module_identity_variant(&plan, &module),
+            BTreeMap::from([
+                ("credential_format".into(), "sd_jwt_vc".into()),
+                ("request_method".into(), "url_query".into()),
+                ("response_mode".into(), "direct_post.jwt".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn terminal_detection_accepts_state_only_suite_responses() {
+        assert!(is_terminal(&serde_json::json!({"state":"FINISHED"})));
+        assert!(is_terminal(&serde_json::json!({"state":"INTERRUPTED"})));
+        assert!(!is_terminal(&serde_json::json!({"state":"RUNNING"})));
+    }
+
+    #[test]
+    fn deferred_review_requires_the_exact_suite_waiting_boundary() {
+        assert!(is_deferred_review_waiting(
+            &serde_json::json!({"status":"WAITING"})
+        ));
+        assert!(!is_deferred_review_waiting(
+            &serde_json::json!({"status":"WAITING_FOR_BROWSER"})
+        ));
+        assert!(!is_deferred_review_waiting(
+            &serde_json::json!({"state":"FINISHED"})
+        ));
+    }
+
+    #[test]
+    fn nonterminal_review_never_settles_a_plan_with_later_alias_sharing_modules() {
+        assert!(deferred_review_blocks_remaining_modules(true, 0, 2));
+        assert!(deferred_review_blocks_remaining_modules(true, 3, 5));
+        assert!(!deferred_review_blocks_remaining_modules(true, 0, 1));
+        assert!(!deferred_review_blocks_remaining_modules(false, 0, 2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serial_vp_review_upload_reaches_the_terminal_suite_review_boundary() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temporary root")
+            .join(format!(
+                "nazoauth-deferred-review-run-{}",
+                uuid::Uuid::now_v7()
+            ));
+        crate::secure_file::ensure_directory(&root, true).expect("private evidence root");
+        let transport = Arc::new(DeferredReviewTransport {
+            requests: Mutex::new(Vec::new()),
+            test_name: "happy-flow",
+            module_variant: BTreeMap::from([(
+                "response_mode".to_owned(),
+                "direct_post.jwt".to_owned(),
+            )]),
+            info_after_capture: serde_json::json!({"status":"WAITING"}),
+            wait_state_after_capture: serde_json::json!({"state":"WAITING"}),
+            info_calls: AtomicUsize::new(0),
+            upload_review: true,
+            uploaded: AtomicBool::new(false),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://www.certification.openid.net").expect("official Suite"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let mut matrix = one_plan_matrix(serde_json::json!({
+            "alias":"vp-alias",
+            "browser":[{
+                "match":"https://issuer.example/authorize*",
+                "tasks":[{
+                    "match":"https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                    "commands":[["wait","xpath","//*",1,"review","update-image-placeholder"]]
+                }]
+            }]
+        }));
+        matrix.digest = "b".repeat(64);
+        matrix.document.groups[0].plans[0].plan = "oid4vp-1final-verifier-test-plan".to_owned();
+        matrix.document.groups[0].plans[0]
+            .variant
+            .insert("credential_format".to_owned(), "dc+sd-jwt".to_owned());
+        let effective_variant = BTreeMap::from([
+            ("credential_format".to_owned(), "dc+sd-jwt".to_owned()),
+            ("response_mode".to_owned(), "direct_post.jwt".to_owned()),
+        ]);
+        let browser_state = Arc::new(Mutex::new(DeferredReviewBrowser {
+            captures: 0,
+            capture_fails: false,
+            variant: effective_variant.clone(),
+            capture_root: Some(root.clone()),
+        }));
+        let browser: Arc<Mutex<dyn BrowserAutomation>> = browser_state.clone();
+        let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
+            attached: None,
+            starts: 0,
+            completes: 0,
+            issuances: 0,
+            completion_outcome: OpenId4VpCompletionOutcome::Completed,
+        }));
+        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = verifier_state.clone();
+        let capture = BrowserReviewScreenshotCapture::new(
+            root.clone(),
+            "request-0123456789abcdef0123456789abcdef",
+        )
+        .expect("capture");
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix,
+            target_origin: Some(
+                BrowserTargetOrigin::parse("https://issuer.example").expect("target"),
+            ),
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: one_plan_budgets(),
+            selected_resource_budget: budget(1, 1, 60),
+            jobs: 1,
+            upload_review_screenshots: true,
+            automation: vec![ConformanceAutomation {
+                browser: Some(browser.clone()),
+                review_screenshot_capture: Some(capture),
+                vp_evidence: Some(
+                    OpenId4VpEvidenceRunContext::new(
+                        "request-0123456789abcdef0123456789abcdef",
+                        "a".repeat(64),
+                        "b".repeat(64),
+                    )
+                    .expect("VP evidence run context"),
+                ),
+                verifier: Some(verifier.clone()),
+                issuer: None,
+            }],
+            suite_resource_observer: Some(Arc::new(RetainingObserver)),
+        })
+        .expect("runner");
+
+        let report = runner.run(&mut ()).report;
+        let integrity = &report.orchestration_integrity;
+        let module_outcomes = report
+            .modules
+            .iter()
+            .map(|module| {
+                (
+                    module.outcome,
+                    module.terminal,
+                    module.deferred_review_pending.is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let fixture_diagnostic = format!(
+            "errors={:?}; defined={}; created={}; terminal={}; deferred={}; instantiated={}; settled={}; retention_requested={}; retention_eligible={}; retention_candidate_settled={}; retention_committed={}; cleanup_complete={}; suite_resources_settled={}; module_outcomes={module_outcomes:?}",
+            report.errors,
+            integrity.defined_modules,
+            integrity.created_instances,
+            integrity.terminal_modules,
+            integrity.deferred_review_modules,
+            integrity.all_modules_instantiated,
+            integrity.all_modules_settled,
+            integrity.retention_requested,
+            integrity.retention_eligible,
+            integrity.retention_candidate_settled,
+            integrity.retention_committed,
+            integrity.cleanup_complete,
+            integrity.suite_resources_settled,
+        );
+
+        assert!(report.errors.is_empty(), "{fixture_diagnostic}");
+        assert_eq!(
+            report
+                .auth_probe
+                .as_ref()
+                .map(|probe| (probe.unauthenticated_status, probe.authenticated_status)),
+            Some((401, 200)),
+            "{fixture_diagnostic}"
+        );
+        assert_eq!(integrity.defined_modules, 1, "{fixture_diagnostic}");
+        assert_eq!(integrity.created_instances, 1, "{fixture_diagnostic}");
+        assert_eq!(integrity.terminal_modules, 1, "{fixture_diagnostic}");
+        assert_eq!(integrity.deferred_review_modules, 0, "{fixture_diagnostic}");
+        assert!(integrity.all_modules_instantiated, "{fixture_diagnostic}");
+        assert!(integrity.all_modules_settled, "{fixture_diagnostic}");
+        assert!(integrity.retention_requested, "{fixture_diagnostic}");
+        assert!(integrity.retention_eligible, "{fixture_diagnostic}");
+        assert!(
+            integrity.retention_candidate_settled,
+            "{fixture_diagnostic}"
+        );
+        assert!(!integrity.retention_committed, "{fixture_diagnostic}");
+        assert!(!integrity.cleanup_complete, "{fixture_diagnostic}");
+        assert!(integrity.suite_resources_settled, "{fixture_diagnostic}");
+        assert!(!report.suite_pass);
+        assert!(!report.acceptance_pass);
+        assert!(!report.review_pending);
+        assert!(report.human_review_required);
+        assert!(report.deferred_review_modules.is_empty());
+        assert_eq!(report.modules.len(), 1);
+        let module = &report.modules[0];
+        assert_eq!(module.outcome, ModuleOutcome::Review);
+        assert!(module.terminal);
+        assert_eq!(module.review_screenshots.len(), 1);
+        assert_eq!(module.variant, effective_variant);
+        assert_eq!(module.review_screenshots_required, 1);
+        assert_eq!(module.review_screenshots_required_captured, 1);
+        assert!(module.deferred_review_pending.is_none());
+        assert!(integrity.all_modules_terminal, "{fixture_diagnostic}");
+        assert_eq!(browser_state.lock().expect("browser").captures, 1);
+        let verifier = verifier_state.lock().expect("verifier");
+        assert_eq!(
+            (verifier.starts, verifier.completes, verifier.issuances),
+            (1, 1, 1)
+        );
+        let attached = verifier
+            .attached
+            .as_ref()
+            .expect("VP evidence context is attached");
+        let expected_context = OpenId4VpEvidenceRunContext::new(
+            "request-0123456789abcdef0123456789abcdef",
+            "a".repeat(64),
+            "b".repeat(64),
+        )
+        .expect("VP evidence run context")
+        .for_module("suite-plan", "module-a", "happy-flow", &effective_variant)
+        .expect("effective module evidence context");
+        assert_eq!(attached, &expected_context);
+        let requests = transport.requests.lock().expect("requests");
+        assert!(
+            requests
+                .iter()
+                .any(|(method, path)| *method == HttpMethod::Post && path == "/api/plan"),
+            "the authenticated probe must complete before production plan creation: {fixture_diagnostic}"
+        );
+        let plan_create = requests
+            .iter()
+            .position(|(method, path)| *method == HttpMethod::Post && path == "/api/plan")
+            .expect("plan creation asserted above");
+        assert_eq!(
+            requests[..plan_create]
+                .iter()
+                .filter(|(method, path)| *method == HttpMethod::Get && path == "/api/plan")
+                .count(),
+            2,
+            "both authentication probe calls must precede production plan creation: {fixture_diagnostic}"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|(method, _)| *method != HttpMethod::Delete)
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(method, path)| {
+                    *method == HttpMethod::Post && path == "/api/log/module-a/images/placeholder-a"
+                })
+                .count(),
+            1
+        );
+        assert!(report.local_success, "{fixture_diagnostic}");
+        drop(requests);
+        std::fs::remove_dir_all(root).expect("remove temporary evidence root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serial_vp_expected_immediate_rejection_skips_receipt_and_deferred_review() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temporary root")
+            .join(format!(
+                "nazoauth-vp-expected-rejection-{}",
+                uuid::Uuid::now_v7()
+            ));
+        crate::secure_file::ensure_directory(&root, true).expect("private evidence root");
+        let transport = Arc::new(DeferredReviewTransport {
+            requests: Mutex::new(Vec::new()),
+            test_name: "oid4vp-1final-verifier-invalid-kb-jwt-signature",
+            module_variant: BTreeMap::new(),
+            info_after_capture: serde_json::json!({"status":"FINISHED","result":"PASSED"}),
+            wait_state_after_capture: serde_json::json!({"state":"FINISHED"}),
+            info_calls: AtomicUsize::new(0),
+            upload_review: false,
+            uploaded: AtomicBool::new(false),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://www.certification.openid.net").expect("official Suite"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let mut matrix = one_plan_matrix(serde_json::json!({
+            "alias":"vp-alias",
+            "browser":[{
+                "match":"https://issuer.example/authorize*",
+                "tasks":[{"commands":[]}]
+            }]
+        }));
+        matrix.digest = "b".repeat(64);
+        matrix.document.groups[0].plans[0].plan = "oid4vp-1final-verifier-test-plan".to_owned();
+        let browser_state = Arc::new(Mutex::new(DeferredReviewBrowser {
+            captures: 0,
+            capture_fails: false,
+            variant: BTreeMap::new(),
+            capture_root: None,
+        }));
+        let browser: Arc<Mutex<dyn BrowserAutomation>> = browser_state.clone();
+        let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
+            attached: None,
+            starts: 0,
+            completes: 0,
+            issuances: 0,
+            completion_outcome: OpenId4VpCompletionOutcome::ExpectedImmediateRejection,
+        }));
+        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = verifier_state.clone();
+        let capture = BrowserReviewScreenshotCapture::new(
+            root.clone(),
+            "request-0123456789abcdef0123456789abcdef",
+        )
+        .expect("capture");
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix,
+            target_origin: Some(
+                BrowserTargetOrigin::parse("https://issuer.example").expect("target"),
+            ),
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: one_plan_budgets(),
+            selected_resource_budget: budget(1, 1, 60),
+            jobs: 1,
+            upload_review_screenshots: false,
+            automation: vec![ConformanceAutomation {
+                browser: Some(browser),
+                review_screenshot_capture: Some(capture),
+                vp_evidence: Some(
+                    OpenId4VpEvidenceRunContext::new(
+                        "request-0123456789abcdef0123456789abcdef",
+                        "a".repeat(64),
+                        "b".repeat(64),
+                    )
+                    .expect("VP evidence run context"),
+                ),
+                verifier: Some(verifier),
+                issuer: None,
+            }],
+            suite_resource_observer: Some(Arc::new(RetainingObserver)),
+        })
+        .expect("runner");
+
+        let report = runner.run(&mut ()).report;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.local_success);
+        assert!(report.suite_pass);
+        assert!(report.acceptance_pass);
+        assert!(!report.review_pending);
+        assert_eq!(report.modules.len(), 1);
+        assert_eq!(report.modules[0].outcome, ModuleOutcome::Passed);
+        assert!(report.modules[0].terminal);
+        assert!(report.modules[0].deferred_review_pending.is_none());
+        assert!(report.modules[0].review_screenshots.is_empty());
+        assert_eq!(browser_state.lock().expect("browser").captures, 0);
+        let verifier = verifier_state.lock().expect("verifier");
+        assert_eq!(
+            (verifier.starts, verifier.completes, verifier.issuances),
+            (1, 1, 0)
+        );
+        assert!(verifier.attached.is_none());
+        drop(verifier);
+        let requests = transport.requests.lock().expect("requests");
+        assert!(requests.iter().all(|(method, path)| {
+            *method != HttpMethod::Delete && !path.contains("image") && !path.contains("visited")
+        }));
+        drop(requests);
+        std::fs::remove_dir_all(root).expect("remove temporary evidence root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serial_vp_deferred_review_failures_close_and_clean_without_suite_placeholder_mutation() {
+        #[derive(Clone, Copy)]
+        enum Case {
+            RetentionDisabled,
+            CaptureDisabled,
+            ZeroRequiredMarker,
+            TwoRequiredMarkers,
+            RequiredMarkerInUnselectedEntry,
+            CaptureFailure,
+            PostCaptureInfoNotWaiting,
+            PostCaptureWaitStateNotWaiting,
+        }
+
+        impl Case {
+            fn name(self) -> &'static str {
+                match self {
+                    Self::RetentionDisabled => "retention-disabled",
+                    Self::CaptureDisabled => "capture-disabled",
+                    Self::ZeroRequiredMarker => "zero-required-marker",
+                    Self::TwoRequiredMarkers => "two-required-markers",
+                    Self::RequiredMarkerInUnselectedEntry => "marker-in-unselected-entry",
+                    Self::CaptureFailure => "capture-failure",
+                    Self::PostCaptureInfoNotWaiting => "post-capture-info-not-waiting",
+                    Self::PostCaptureWaitStateNotWaiting => "post-capture-wait-not-waiting",
+                }
+            }
+
+            fn browser_config(self) -> Value {
+                let required = serde_json::json!([
+                    "wait",
+                    "xpath",
+                    "//*",
+                    1,
+                    "review",
+                    "update-image-placeholder"
+                ]);
+                match self {
+                    Self::ZeroRequiredMarker => serde_json::json!([{
+                        "match":"https://issuer.example/authorize*",
+                        "tasks":[{
+                            "match":"https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                            "commands":[]
+                        }]
+                    }]),
+                    Self::TwoRequiredMarkers => serde_json::json!([{
+                        "match":"https://issuer.example/authorize*",
+                        "tasks":[{
+                            "match":"https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                            "commands":[required.clone(), required]
+                        }]
+                    }]),
+                    Self::RequiredMarkerInUnselectedEntry => serde_json::json!([
+                        {
+                            "match":"https://issuer.example/authorize*",
+                            "tasks":[{"commands":[]}]
+                        },
+                        {
+                            "match":"https://issuer.example/alternate*",
+                            "tasks":[{
+                                "match":"https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                                "commands":[required]
+                            }]
+                        }
+                    ]),
+                    _ => serde_json::json!([{
+                        "match":"https://issuer.example/authorize*",
+                        "tasks":[{
+                            "match":"https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                            "commands":[required]
+                        }]
+                    }]),
+                }
+            }
+        }
+
+        for case in [
+            Case::RetentionDisabled,
+            Case::CaptureDisabled,
+            Case::ZeroRequiredMarker,
+            Case::TwoRequiredMarkers,
+            Case::RequiredMarkerInUnselectedEntry,
+            Case::CaptureFailure,
+            Case::PostCaptureInfoNotWaiting,
+            Case::PostCaptureWaitStateNotWaiting,
+        ] {
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .expect("temporary root")
+                .join(format!(
+                    "nazoauth-deferred-review-failclosed-{}-{}",
+                    case.name(),
+                    uuid::Uuid::now_v7()
+                ));
+            crate::secure_file::ensure_directory(&root, true).expect("private evidence root");
+            let transport = Arc::new(DeferredReviewTransport {
+                requests: Mutex::new(Vec::new()),
+                test_name: "happy-flow",
+                module_variant: BTreeMap::new(),
+                info_after_capture: if matches!(case, Case::PostCaptureInfoNotWaiting) {
+                    serde_json::json!({"status":"FINISHED"})
+                } else {
+                    serde_json::json!({"status":"WAITING"})
+                },
+                wait_state_after_capture: if matches!(case, Case::PostCaptureWaitStateNotWaiting) {
+                    serde_json::json!({"state":"FINISHED"})
+                } else {
+                    serde_json::json!({"state":"WAITING"})
+                },
+                info_calls: AtomicUsize::new(0),
+                upload_review: false,
+                uploaded: AtomicBool::new(false),
+            });
+            let client = SuiteClient::with_transport(
+                Origin::parse("https://www.certification.openid.net").expect("official Suite"),
+                Some(BearerToken::new("suite-token").expect("token")),
+                transport.clone(),
+                ClientConfig::default(),
+            )
+            .expect("client");
+            let mut matrix = one_plan_matrix(serde_json::json!({
+                "alias":"vp-alias",
+                "browser":case.browser_config()
+            }));
+            matrix.digest = "b".repeat(64);
+            matrix.document.groups[0].plans[0].plan = "oid4vp-1final-verifier-test-plan".to_owned();
+            let browser: Arc<Mutex<dyn BrowserAutomation>> =
+                Arc::new(Mutex::new(DeferredReviewBrowser {
+                    captures: 0,
+                    capture_fails: matches!(case, Case::CaptureFailure),
+                    variant: BTreeMap::new(),
+                    capture_root: None,
+                }));
+            let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
+                Arc::new(Mutex::new(DeferredReviewVerifier {
+                    attached: None,
+                    starts: 0,
+                    completes: 0,
+                    issuances: 0,
+                    completion_outcome: OpenId4VpCompletionOutcome::Completed,
+                }));
+            let capture = (!matches!(case, Case::CaptureDisabled)).then(|| {
+                BrowserReviewScreenshotCapture::new(
+                    root.clone(),
+                    "request-0123456789abcdef0123456789abcdef",
+                )
+                .expect("capture")
+            });
+            let runner = ConformanceRunner::new(ConformanceRunConfig {
+                client,
+                matrix,
+                target_origin: Some(
+                    BrowserTargetOrigin::parse("https://issuer.example").expect("target"),
+                ),
+                binding: test_binding(),
+                poll_timeout: Duration::from_secs(1),
+                control: RunControl::default(),
+                plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+                plan_resource_budgets: one_plan_budgets(),
+                selected_resource_budget: budget(1, 1, 60),
+                jobs: 1,
+                upload_review_screenshots: false,
+                automation: vec![ConformanceAutomation {
+                    browser: Some(browser.clone()),
+                    review_screenshot_capture: capture,
+                    vp_evidence: Some(
+                        OpenId4VpEvidenceRunContext::new(
+                            "request-0123456789abcdef0123456789abcdef",
+                            "a".repeat(64),
+                            "b".repeat(64),
+                        )
+                        .expect("VP evidence run context"),
+                    ),
+                    verifier: Some(verifier),
+                    issuer: None,
+                }],
+                suite_resource_observer: (!matches!(case, Case::RetentionDisabled))
+                    .then(|| Arc::new(RetainingObserver) as Arc<dyn SuiteResourceObserver>),
+            })
+            .expect("runner");
+
+            let report = runner.run(&mut ()).report;
+
+            assert!(
+                report
+                    .modules
+                    .iter()
+                    .all(|module| module.outcome != ModuleOutcome::DeferredReviewPending),
+                "{} must not create a deferred review outcome: errors={:?}",
+                case.name(),
+                report.errors
+            );
+            assert!(
+                report
+                    .modules
+                    .iter()
+                    .all(|module| module.deferred_review_pending.is_none()),
+                "{} must not retain a deferred placeholder identity",
+                case.name()
+            );
+            assert!(
+                !report.orchestration_integrity.retention_eligible,
+                "{} must not retain Suite resources",
+                case.name()
+            );
+            assert!(
+                !report.orchestration_integrity.retention_candidate_settled
+                    && !report.local_success,
+                "{} must not turn an incomplete retention candidate into local success",
+                case.name()
+            );
+            assert!(
+                report.orchestration_integrity.cleanup_complete,
+                "{} must complete ordinary cleanup: {:?}",
+                case.name(),
+                report.cleanup
+            );
+            assert!(
+                report
+                    .cleanup
+                    .deleted_plans
+                    .iter()
+                    .any(|plan| plan == "suite-plan"),
+                "{} must delete the unretained Suite plan",
+                case.name()
+            );
+            let requests = transport.requests.lock().expect("deferred review requests");
+            assert!(
+                requests.iter().any(|(method, path)| {
+                    *method == HttpMethod::Delete && path == "/api/plan/suite-plan"
+                }),
+                "{} must use production plan cleanup",
+                case.name()
+            );
+            assert!(
+                requests.iter().all(|(_, path)| {
+                    !path.contains("image")
+                        && !path.contains("update-placeholder")
+                        && !path.contains("visited")
+                }),
+                "{} must never mutate a Suite review placeholder: {requests:?}",
+                case.name()
+            );
+            drop(requests);
+            std::fs::remove_dir_all(root).expect("remove temporary evidence root");
+        }
     }
 }

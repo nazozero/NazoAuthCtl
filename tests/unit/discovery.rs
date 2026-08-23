@@ -5,6 +5,16 @@ use crate::{
 };
 use std::collections::BTreeMap;
 
+#[cfg(target_os = "linux")]
+use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, chown, symlink};
+
+#[cfg(target_os = "linux")]
+use crate::filesystem::PrivateTempDir;
+#[cfg(target_os = "linux")]
+use ed25519_dalek::SigningKey;
+
 fn candidate(target: &str, deployment_id: &str, runtime_instance_id: &str) -> DiscoveredDeployment {
     DiscoveredDeployment {
         target: target.to_owned(),
@@ -47,6 +57,91 @@ fn candidate(target: &str, deployment_id: &str, runtime_instance_id: &str) -> Di
         missing: Vec::new(),
         sensitive_mount_sources: std::collections::BTreeMap::new(),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_owned_identity_descriptor(work: &PrivateTempDir) -> (PathBuf, SigningKey) {
+    let directory = work.path().join("app/instance");
+    fs::create_dir_all(&directory).unwrap();
+    let signing_key = SigningKey::from_bytes(&[71; 32]);
+    let public_key = signing_key.verifying_key();
+    let key_id = nazo_operator_protocol::instance_key_id(&public_key);
+    let statement = nazo_operator_protocol::DeploymentStatement {
+        schema: CONTROL_DISCOVERY_SCHEMA,
+        product: nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT.to_owned(),
+        deployment_id: "deployment-runtime-owner".to_owned(),
+        runtime_instance_id: "runtime-runtime-owner".to_owned(),
+        issuer: "https://issuer.example".to_owned(),
+        release: "v0.1.41-candidate.459".to_owned(),
+        revision: "a".repeat(40),
+        build_id: format!("source:{}", "a".repeat(40)),
+        control_protocol_versions: vec![CONTROL_DISCOVERY_SCHEMA],
+        operator_protocol_versions: vec![nazo_operator_protocol::PROTOCOL_VERSION],
+        instance_key_id: key_id.clone(),
+        issued_at: 1,
+    };
+    let statement =
+        nazo_operator_protocol::sign_deployment_statement(&statement, &key_id, &signing_key)
+            .unwrap();
+    let public_key_path = directory.join("identity.pub");
+    let statement_path = directory.join("deployment-statement.jws");
+    fs::write(
+        &public_key_path,
+        nazo_operator_protocol::encode_instance_public_key(&public_key),
+    )
+    .unwrap();
+    fs::write(&statement_path, statement).unwrap();
+    chown(&directory, Some(10_001), Some(10_001)).unwrap();
+    for path in [&public_key_path, &statement_path] {
+        chown(path, Some(10_001), Some(10_001)).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    (directory, signing_key)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn runtime_owned_descriptor_requires_the_declared_service_uid_and_secure_filesystem_shape() {
+    let work = PrivateTempDir::new("nazoauth-runtime-owned-descriptor").unwrap();
+    // Chown is an essential part of this production-shaped fixture. A
+    // non-root developer cannot manufacture it, so leave that environment to
+    // the existing non-privileged filesystem coverage.
+    if fs::metadata(work.path()).unwrap().uid() != 0 {
+        return;
+    }
+    let (directory, signing_key) = runtime_owned_identity_descriptor(&work);
+
+    let identity = load_verified_runtime_identity(&directory, Some(10_001)).unwrap();
+    assert_eq!(identity.public_key, signing_key.verifying_key());
+    assert_eq!(
+        identity.statement.runtime_instance_id,
+        "runtime-runtime-owner"
+    );
+    assert!(load_verified_runtime_identity(&directory, Some(10_002)).is_err());
+
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(load_verified_runtime_identity(&directory, Some(10_001)).is_err());
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let public_key_path = directory.join("identity.pub");
+    fs::set_permissions(&public_key_path, fs::Permissions::from_mode(0o664)).unwrap();
+    assert!(load_verified_runtime_identity(&directory, Some(10_001)).is_err());
+    fs::set_permissions(&public_key_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let public_key_link = work.path().join("identity-public-key-link");
+    fs::hard_link(&public_key_path, &public_key_link).unwrap();
+    assert!(load_verified_runtime_identity(&directory, Some(10_001)).is_err());
+    fs::remove_file(&public_key_link).unwrap();
+
+    let statement_path = directory.join("deployment-statement.jws");
+    let decoy = work.path().join("decoy-statement");
+    fs::write(&decoy, b"not the descriptor").unwrap();
+    chown(&decoy, Some(10_001), Some(10_001)).unwrap();
+    fs::set_permissions(&decoy, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_file(&statement_path).unwrap();
+    symlink(&decoy, &statement_path).unwrap();
+    assert!(load_verified_runtime_identity(&directory, Some(10_001)).is_err());
 }
 
 #[test]

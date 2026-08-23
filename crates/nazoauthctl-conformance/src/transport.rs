@@ -89,7 +89,7 @@ impl HttpTransport {
             .timeout(timeout)
             .redirect(Policy::none())
             .build()
-            .map_err(|_| TransportError::InvalidConfiguration)?;
+            .map_err(|_| TransportError::Network(TransportFailureStage::BuildClient))?;
         Ok(Self { client })
     }
 }
@@ -109,7 +109,9 @@ impl Transport for HttpTransport {
         if let Some(body) = request.body {
             builder = builder.body(body);
         }
-        let response = builder.send().map_err(|_| TransportError::Network)?;
+        let response = builder
+            .send()
+            .map_err(|error| TransportError::Network(classify_send_failure(&error)))?;
         if response
             .content_length()
             .is_some_and(|length| length > max_response_bytes as u64)
@@ -135,7 +137,7 @@ impl Transport for HttpTransport {
         response
             .take(max_response_bytes.saturating_add(1) as u64)
             .read_to_end(&mut body)
-            .map_err(|_| TransportError::Network)?;
+            .map_err(|_| TransportError::Network(TransportFailureStage::ReadBody))?;
         if body.len() > max_response_bytes {
             return Err(TransportError::Oversize);
         }
@@ -150,18 +152,96 @@ impl Transport for HttpTransport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportError {
     InvalidConfiguration,
-    Network,
+    Network(TransportFailureStage),
     Oversize,
 }
 
-impl std::fmt::Display for TransportError {
+/// A non-sensitive stage at which an outbound HTTP operation failed.
+///
+/// This deliberately omits the request URL, headers, body, and lower-level
+/// error text because callers may surface it in private conformance evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportFailureStage {
+    BuildClient,
+    SendConnectOrTls,
+    SendTimeout,
+    SendRequest,
+    ReadBody,
+}
+
+impl std::fmt::Display for TransportFailureStage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::InvalidConfiguration => "HTTP transport configuration is invalid",
-            Self::Network => "HTTP transport failed",
-            Self::Oversize => "HTTP response exceeds the size limit",
+            Self::BuildClient => "build-client",
+            Self::SendConnectOrTls => "send-connect-or-tls",
+            Self::SendTimeout => "send-timeout",
+            Self::SendRequest => "send-request",
+            Self::ReadBody => "read-body",
         })
     }
 }
 
+fn classify_send_failure(error: &reqwest::Error) -> TransportFailureStage {
+    classify_send_failure_flags(error.is_timeout(), error.is_connect())
+}
+
+fn classify_send_failure_flags(timeout: bool, connect: bool) -> TransportFailureStage {
+    if timeout {
+        TransportFailureStage::SendTimeout
+    } else if connect {
+        TransportFailureStage::SendConnectOrTls
+    } else {
+        TransportFailureStage::SendRequest
+    }
+}
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidConfiguration => {
+                formatter.write_str("HTTP transport configuration is invalid")
+            }
+            Self::Network(stage) => write!(formatter, "HTTP transport failed during {stage}"),
+            Self::Oversize => formatter.write_str("HTTP response exceeds the size limit"),
+        }
+    }
+}
+
 impl std::error::Error for TransportError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_failure_stages_are_static_and_specific() {
+        assert_eq!(
+            classify_send_failure_flags(false, true),
+            TransportFailureStage::SendConnectOrTls
+        );
+        assert_eq!(
+            classify_send_failure_flags(true, true),
+            TransportFailureStage::SendTimeout
+        );
+        assert_eq!(
+            classify_send_failure_flags(false, false),
+            TransportFailureStage::SendRequest
+        );
+        assert_eq!(
+            TransportError::Network(TransportFailureStage::ReadBody).to_string(),
+            "HTTP transport failed during read-body"
+        );
+        for (stage, label) in [
+            (TransportFailureStage::BuildClient, "build-client"),
+            (
+                TransportFailureStage::SendConnectOrTls,
+                "send-connect-or-tls",
+            ),
+            (TransportFailureStage::SendTimeout, "send-timeout"),
+            (TransportFailureStage::SendRequest, "send-request"),
+            (TransportFailureStage::ReadBody, "read-body"),
+        ] {
+            assert_eq!(stage.to_string(), label);
+        }
+    }
+}

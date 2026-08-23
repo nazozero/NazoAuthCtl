@@ -5,7 +5,8 @@ use rcgen::{
     KeyUsagePurpose,
 };
 use rustls::RootCertStore;
-use std::io::{Cursor, Read as _, Write as _};
+use rustls_pki_types::{PrivateKeyDer, pem::PemObject};
+use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 
 #[test]
@@ -413,7 +414,7 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
         tenant: "tenant-a".to_owned(),
         hostname: "auth.example".to_owned(),
         source: TlsCertificateSource::ExternalFiles {
-            certificate: certificate_path,
+            certificate: certificate_path.clone(),
             private_key: private_key_path.clone(),
         },
     };
@@ -464,6 +465,49 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
         load_and_validate_material(certificate, private_key, &input.hostname, &provider).is_err()
     );
     assert!(validate_rollback_material(&receipt, &provider).is_err());
+
+    fs::write(&certificate_path, b"").unwrap();
+    let error = load_and_validate_material(certificate, private_key, &input.hostname, &provider)
+        .err()
+        .expect("empty certificate chain must fail");
+    assert!(format!("{error:#}").contains("TLS certificate chain contains no certificate"));
+
+    fs::write(
+        &certificate_path,
+        b"-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    let error = load_and_validate_material(certificate, private_key, &input.hostname, &provider)
+        .err()
+        .expect("malformed certificate PEM must fail");
+    assert!(format!("{error:#}").contains("TLS certificate PEM is invalid"));
+
+    fs::write(&certificate_path, leaf.pem()).unwrap();
+    fs::write(&private_key_path, ca.pem()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&private_key_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let error = load_and_validate_material(certificate, private_key, &input.hostname, &provider)
+        .err()
+        .expect("certificate PEM is not a supported private key");
+    assert!(format!("{error:#}").contains("TLS private key PEM contains no supported private key"));
+
+    fs::write(
+        &private_key_path,
+        b"-----BEGIN PRIVATE KEY-----\nnot-base64\n-----END PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&private_key_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let error = load_and_validate_material(certificate, private_key, &input.hostname, &provider)
+        .err()
+        .expect("malformed private key PEM must fail");
+    assert!(format!("{error:#}").contains("TLS private key PEM is invalid"));
 }
 
 #[test]
@@ -744,7 +788,10 @@ fn test_server_identity() -> (
     leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let leaf_key = KeyPair::generate().unwrap();
     let leaf = leaf_params.signed_by(&leaf_key, &ca).unwrap();
-    let key_der = rustls_pemfile::private_key(&mut Cursor::new(leaf_key.serialize_pem()))
+    let leaf_key_pem = leaf_key.serialize_pem();
+    let key_der = PrivateKeyDer::pem_slice_iter(leaf_key_pem.as_bytes())
+        .next()
+        .transpose()
         .unwrap()
         .unwrap();
     (ca.pem(), leaf.der().clone(), key_der)

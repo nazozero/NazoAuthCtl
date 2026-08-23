@@ -101,7 +101,7 @@ GitHub or on a particular host. For example, from a NazoAuth checkout:
 revision="$(git rev-parse HEAD)"
 short_revision="$(printf '%s' "$revision" | cut -c1-8)"
 podman build \
-  --build-arg "NAZOAUTH_BUILD_RELEASE=v0.1.34-dev.$short_revision" \
+  --build-arg "NAZOAUTH_BUILD_RELEASE=v0.1.41-dev.$short_revision" \
   --build-arg "NAZOAUTH_BUILD_REVISION=$revision" \
   --build-arg "NAZOAUTH_BUILD_ID=local:$revision" \
   --tag "localhost/nazoauth:dev-$short_revision" \

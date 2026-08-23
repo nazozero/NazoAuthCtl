@@ -14,8 +14,7 @@ use tar::{Archive, Builder};
 
 use crate::{
     filesystem::{
-        atomic_write, open_secure_regular_file, read_secure_regular_file, read_secure_secret_file,
-        set_mode, sha256_file,
+        atomic_write, open_secure_regular_file, read_secure_regular_file, set_mode, sha256_file,
     },
     model::UpdateConfig,
     process::{Process, command_exists},
@@ -24,7 +23,7 @@ use crate::{
         MANAGED_VALKEY_BACKUP_USER, ManagedDependencyBackup, RuntimeBackendKind, backend,
         managed_dependency_identity,
     },
-    secret_provider::{PostgresProvider, ValkeyProvider},
+    secret_provider::{PostgresProvider, read_external_backup_providers},
 };
 
 const BACKUP_COMPLETION_MARKER: &str = "BACKUP-COMPLETE";
@@ -213,14 +212,30 @@ impl Backup {
                 bail!("required command is missing: {command}");
             }
         }
-        validate_secret(&config.dependencies.database_url_file)?;
-        validate_secret(&config.dependencies.valkey_url_file)?;
+        let (database_backup_url, valkey_backup_url) =
+            external_backup_url_files(&config.dependencies);
+        // The controller validates the complete live five-credential contract
+        // before it can replay any migration. Backup consumes exactly its two
+        // dedicated credentials, reading and parsing each once before their
+        // binding is checked and the same parsed providers are used below.
+        let providers = read_external_backup_providers(database_backup_url, valkey_backup_url)?;
+        if providers.binding.database_endpoint_sha256
+            != config.dependencies.database_backup_endpoint_sha256
+            || providers.binding.database_principal_sha256
+                != config.dependencies.database_backup_principal_sha256
+            || providers.binding.valkey_endpoint_sha256
+                != config.dependencies.valkey_backup_endpoint_sha256
+            || providers.binding.valkey_principal_sha256
+                != config.dependencies.valkey_backup_principal_sha256
+        {
+            bail!(
+                "external backup credential endpoints, TLS policy, or principals no longer match the persisted deployment binding"
+            );
+        }
         let postgres = self.path.join("postgresql.dump");
-        let postgres_provider =
-            PostgresProvider::from_url_file(&config.dependencies.database_url_file)?;
         Process::new("pg_dump")
-            .env("PGSERVICEFILE", postgres_provider.service_file())
-            .env("PGPASSFILE", postgres_provider.password_file())
+            .env("PGSERVICEFILE", providers.postgres.service_file())
+            .env("PGPASSFILE", providers.postgres.password_file())
             .args([
                 "--dbname=service=nazoauth",
                 "--format=custom",
@@ -233,22 +248,21 @@ impl Backup {
             .arg(&postgres)
             .run_quiet()?;
         let valkey = self.path.join("valkey-dump.rdb");
-        let valkey_provider = ValkeyProvider::from_url_file(&config.dependencies.valkey_url_file)?;
         let mut command = Process::new("valkey-cli")
             .args(["--no-auth-warning", "--askpass", "-h"])
-            .arg(&valkey_provider.host)
+            .arg(&providers.valkey.host)
             .arg("-p")
-            .arg(valkey_provider.port.to_string())
+            .arg(providers.valkey.port.to_string())
             .arg("-n")
-            .arg(valkey_provider.database.to_string());
-        if let Some(username) = &valkey_provider.username {
-            command = command.arg("--user").arg(username);
+            .arg(providers.valkey.database.to_string());
+        if let Some(username) = &providers.valkey.username {
+            command = command.arg("--user").arg(username.as_str());
         }
-        if valkey_provider.tls {
+        if providers.valkey.tls {
             command = command.arg("--tls");
         }
         command = command.arg("--rdb").arg(&valkey);
-        command.stdin_stdout(&valkey_provider.password_stdin())?;
+        command.stdin_stdout(&providers.valkey.password_stdin())?;
         if fs::metadata(&valkey).map_or(true, |metadata| metadata.len() == 0) {
             bail!("external Valkey RDB export is empty");
         }
@@ -322,6 +336,30 @@ impl Backup {
             .context("archived update configuration is invalid")?;
         if archived.dependencies.mode != config.dependencies.mode {
             bail!("backup dependency mode does not match the selected deployment");
+        }
+        if archived.dependencies.mode == "external"
+            && (archived.dependencies.external_valkey_backup_scope
+                != config.dependencies.external_valkey_backup_scope
+                || archived.dependencies.database_runtime_endpoint_sha256
+                    != config.dependencies.database_runtime_endpoint_sha256
+                || archived.dependencies.database_runtime_principal_sha256
+                    != config.dependencies.database_runtime_principal_sha256
+                || archived.dependencies.migration_database_endpoint_sha256
+                    != config.dependencies.migration_database_endpoint_sha256
+                || archived.dependencies.migration_database_principal_sha256
+                    != config.dependencies.migration_database_principal_sha256
+                || archived.dependencies.database_backup_endpoint_sha256
+                    != config.dependencies.database_backup_endpoint_sha256
+                || archived.dependencies.database_backup_principal_sha256
+                    != config.dependencies.database_backup_principal_sha256
+                || archived.dependencies.valkey_runtime_principal_sha256
+                    != config.dependencies.valkey_runtime_principal_sha256
+                || archived.dependencies.valkey_backup_endpoint_sha256
+                    != config.dependencies.valkey_backup_endpoint_sha256
+                || archived.dependencies.valkey_backup_principal_sha256
+                    != config.dependencies.valkey_backup_principal_sha256)
+        {
+            bail!("backup external dependency binding does not match the selected deployment");
         }
         if archived.container_backend() != config.container_backend()
             || archived.postgres.validation_image != config.postgres.validation_image
@@ -474,6 +512,13 @@ impl Backup {
         }
         Ok(())
     }
+}
+
+fn external_backup_url_files(dependencies: &crate::model::Dependencies) -> (&Path, &Path) {
+    (
+        &dependencies.database_backup_url_file,
+        &dependencies.valkey_backup_url_file,
+    )
 }
 
 fn require_real_directory(path: &Path, label: &str) -> anyhow::Result<()> {
@@ -956,16 +1001,6 @@ fn dependency_identity_for_config(
         &config.valkey.data_volume,
         &config.valkey.image,
     )
-}
-
-fn validate_secret(path: &Path) -> anyhow::Result<()> {
-    let bytes = read_secure_secret_file(path, "backup dependency secret", 16 * 1024)?;
-    let value = std::str::from_utf8(&bytes)
-        .with_context(|| format!("failed to read secret {}", path.display()))?;
-    if value.is_empty() || value.contains(['\n', '\r']) {
-        bail!("secret file is empty or multiline: {}", path.display());
-    }
-    Ok(())
 }
 
 fn secure_file_digest(path: &Path, label: &str) -> anyhow::Result<String> {

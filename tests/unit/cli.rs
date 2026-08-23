@@ -554,6 +554,18 @@ fn parses_complete_install_contract_and_rejects_invalid_boundaries() {
             "--profile-secret-fd",
             "2",
         ][..],
+        &[
+            "nazoauthctl",
+            "install",
+            "--public-url",
+            "http://127.0.0.1:8000",
+            "--profile",
+            "standards-full",
+            "--profile-material",
+            "/tmp/material.json",
+            "--trusted-proxy-cidr",
+            "192.0.2.10/32",
+        ][..],
         &["nazoauthctl", "install", "--profile", "standards-full"][..],
         &[
             "nazoauthctl",
@@ -570,6 +582,149 @@ fn parses_complete_install_contract_and_rejects_invalid_boundaries() {
         ][..],
         &["nazoauthctl", "install", "--unknown", "value"][..],
         &["nazoauthctl", "--config"][..],
+    ] {
+        assert!(parse(arguments).is_err(), "accepted {arguments:?}");
+    }
+}
+
+#[test]
+fn local_oci_candidate_install_requires_an_exact_complete_source_binding() {
+    let revision = "a".repeat(40);
+    let digest = format!("sha256:{}", "b".repeat(64));
+    let source = format!("source:{revision}");
+    let command = parse(&[
+        "nazoauthctl",
+        "install",
+        "--runtime",
+        "podman",
+        "--public-url",
+        "https://auth.example",
+        "--profile",
+        "standards-full",
+        "--profile-material",
+        "/srv/profile.json",
+        "--trusted-proxy-cidr",
+        "192.0.2.10/32",
+        "--candidate-image",
+        "nazoauth-candidate:459",
+        "--candidate-release",
+        "v0.1.41-candidate.459",
+        "--candidate-revision",
+        &revision,
+        "--candidate-build-id",
+        &source,
+        "--candidate-oci-digest",
+        &digest,
+    ])
+    .unwrap()
+    .unwrap()
+    .command;
+    let Command::Install(options) = command else {
+        panic!("expected install");
+    };
+    assert!(!options.external_dependencies);
+    let candidate = options
+        .local_oci_candidate
+        .as_ref()
+        .expect("candidate input")
+        .clone();
+    assert_eq!(candidate.image, "nazoauth-candidate:459");
+    assert_eq!(candidate.target.revision, revision);
+    assert_eq!(candidate.target.oci_digest, digest);
+
+    for arguments in [
+        &[
+            "nazoauthctl",
+            "install",
+            "--external-dependencies",
+            "--candidate-image",
+            "candidate",
+            "--candidate-release",
+            "v0.1.41-candidate.459",
+            "--candidate-revision",
+            &revision,
+            "--candidate-build-id",
+            &source,
+            "--candidate-oci-digest",
+            &digest,
+        ][..],
+        &[
+            "nazoauthctl",
+            "install",
+            "--external-dependencies",
+            "--candidate-image",
+            "candidate",
+            "--candidate-release",
+            "v0.1.41-candidate.459",
+            "--candidate-revision",
+            &revision,
+            "--candidate-build-id",
+            &source,
+        ][..],
+        &[
+            "nazoauthctl",
+            "install",
+            "--runtime",
+            "host",
+            "--external-dependencies",
+            "--candidate-image",
+            "candidate",
+            "--candidate-release",
+            "v0.1.41-candidate.459",
+            "--candidate-revision",
+            &revision,
+            "--candidate-build-id",
+            &source,
+            "--candidate-oci-digest",
+            &digest,
+        ][..],
+        &[
+            "nazoauthctl",
+            "install",
+            "--external-dependencies",
+            "--candidate-image",
+            "candidate",
+            "--candidate-release",
+            "v0.1.41-candidate.459",
+            "--candidate-revision",
+            &revision,
+            "--candidate-build-id",
+            "local:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--candidate-oci-digest",
+            &digest,
+        ][..],
+        &[
+            "nazoauthctl",
+            "install",
+            "--external-dependencies",
+            "--candidate-image",
+            "candidate",
+            "--candidate-release",
+            "v0.1.41-candidate.459",
+            "--candidate-revision",
+            &revision,
+            "--candidate-build-id",
+            &source,
+            "--candidate-oci-digest",
+            &digest,
+            "--to",
+            "v0.1.41",
+        ][..],
+        &[
+            "nazoauthctl",
+            "install",
+            "--external-dependencies",
+            "--candidate-image",
+            "candidate",
+            "--candidate-release",
+            "v0.1.41",
+            "--candidate-revision",
+            &revision,
+            "--candidate-build-id",
+            &source,
+            "--candidate-oci-digest",
+            &digest,
+        ][..],
     ] {
         assert!(parse(arguments).is_err(), "accepted {arguments:?}");
     }
