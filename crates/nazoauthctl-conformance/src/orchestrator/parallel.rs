@@ -114,6 +114,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                                     .selected_resource_budget
                                     .clone(),
                                 jobs: 1,
+                                upload_review_screenshots: runner.config.upload_review_screenshots,
                                 automation: runner
                                     .config
                                     .automation

@@ -141,8 +141,8 @@ at 500 KiB and fully decoded with bounded dimensions, pixels, and output before
 it is written owner-only under `review-screenshots/`. The root-private capture
 manifest is also the local, module-bound manual-upload list: it binds the run,
 artifact/Matrix digests, Suite origin, exact plan/module IDs, test/variant,
-capture source, and required/captured/missing obligations. It never POSTs an
-image to the Suite. Retained plans bind its path and SHA-256 into the recovery
+capture source, and required/captured/missing obligations. By default it never
+POSTs an image to the Suite. Retained plans bind its path and SHA-256 into the recovery
 journal and reverify it before publication. Module reports contain only the
 relative path, SHA-256, and size. Existing terminal Suite modules are never
 targeted: a retained plan must be repeated to collect new local evidence, which
@@ -150,8 +150,10 @@ can then be attached manually in the official UI.
 
 For the OpenID4VP deferred verification-evidence boundary documented by
 [OIDF Suite MR !2100](https://gitlab.com/openid/conformance-suite/-/merge_requests/2100), a
-capture-and-retain run may instead record a typed `deferred_review_pending`
-module. This requires one actually selected signed required
+capture-and-retain run may record a typed `deferred_review_pending` module only
+when that nonterminal module is the final module in its Suite plan. A waiting
+module never licenses ctl to create another module with the same plan alias;
+doing so would interrupt the earlier test. This boundary requires one actually selected signed required
 `verification-evidence` marker, a verified NazoAuthWeb result capture, and a
 fresh exact Suite `WAITING` state for that same module. It is neither a Suite
 terminal result nor a pass/certification claim: reports keep
@@ -159,6 +161,15 @@ terminal result nor a pass/certification claim: reports keep
 persists the exact plan/module/placeholder identity and capture-manifest hash
 for controlled operator action later; ctl does not upload an image, mark a
 browser URL visited, or modify an existing retained plan.
+
+`--upload-review-screenshots` is a separate explicit transmission authority.
+It requires local capture and certification retention, reopens only the
+module-bound private PNG whose size and SHA-256 still match its in-memory
+receipt, requires exactly one outstanding image placeholder for that same
+Suite module, fills that placeholder, and then waits for real
+`FINISHED`/`REVIEW`. Only this terminal boundary permits later modules sharing
+the plan alias to start. The final plan publication remains a separate operator
+action.
 
 Final output schema 2 preserves a completed `RunOutput` even when resource,
 proxy, or evidence cleanup fails. Such failures are listed in `errors`, keep

@@ -130,6 +130,11 @@ pub struct ConformanceRunConfig {
     /// automation retain their existing mutex-owned sessions, so parallel
     /// HTTP runners cannot interleave interactive state.
     pub jobs: usize,
+    /// Explicit authorization to transmit each verified, module-bound local
+    /// review PNG to the exact outstanding Suite image placeholder. Without
+    /// this, a nonterminal review module can be retained only when it is the
+    /// final module in its plan.
+    pub upload_review_screenshots: bool,
     /// Worker-owned automation lanes. HTTP-only test fixtures may leave this
     /// empty; production creates one independent lane per configured job.
     pub automation: Vec<ConformanceAutomation>,
@@ -867,7 +872,7 @@ impl ConformanceRunner {
                     current_variant.clone(),
                     None,
                 );
-                for module in &plan.modules {
+                for (module_index, module) in plan.modules.iter().enumerate() {
                     if self.config.control.is_interrupted() {
                         errors.push("run interrupted".to_owned());
                         groups[group_index].status = GroupStatus::Failed;
@@ -1234,8 +1239,11 @@ impl ConformanceRunner {
                                     groups[group_index].status = GroupStatus::Failed;
                                     break 'execute;
                                 };
-                                let captured = (|| -> Result<ReviewScreenshotReport, String> {
-                                    let capture = self
+                                let captured = (|| -> Result<
+                                    (ReviewScreenshotReport, Option<Vec<u8>>),
+                                    String,
+                                > {
+                                    let capture_owner = self
                                         .config
                                         .automation
                                         .first()
@@ -1254,7 +1262,7 @@ impl ConformanceRunner {
                                         &effective_module_identity_variant(plan, module),
                                     )
                                     .map_err(|error| error.to_string())?;
-                                    let capture = capture
+                                    let capture = capture_owner
                                         .context(identity, 0)
                                         .map_err(|error| error.to_string())?;
                                     let mut browser = browser
@@ -1272,14 +1280,23 @@ impl ConformanceRunner {
                                     {
                                         return Err("OpenID4VP verification-result evidence context mismatch".to_owned());
                                     }
-                                    Ok(ReviewScreenshotReport {
-                                        path: receipt.path,
-                                        sha256: receipt.sha256,
-                                        size: receipt.size,
-                                    })
+                                    let upload_png = self
+                                        .config
+                                        .upload_review_screenshots
+                                        .then(|| capture_owner.read_captured_png(&receipt))
+                                        .transpose()
+                                        .map_err(|error| error.to_string())?;
+                                    Ok((
+                                        ReviewScreenshotReport {
+                                            path: receipt.path,
+                                            sha256: receipt.sha256,
+                                            size: receipt.size,
+                                        },
+                                        upload_png,
+                                    ))
                                 })();
                                 match captured {
-                                    Ok(screenshot) => {
+                                    Ok((screenshot, upload_png)) => {
                                         browser_review_evidence.entered_browser_program = true;
                                         browser_review_evidence.required = 1;
                                         browser_review_evidence.required_captured = 1;
@@ -1330,15 +1347,39 @@ impl ConformanceRunner {
                                             groups[group_index].status = GroupStatus::Failed;
                                             break 'execute;
                                         }
-                                        deferred_review_pending = Some(DeferredReviewPending {
-                                            placeholder_path: format!(
-                                                "/test/a/{}/verification-evidence",
-                                                instance.id
-                                            ),
-                                            marker: crate::ReviewScreenshotMarker::Required,
-                                            obligation_index: 0,
-                                        });
-                                        observed = Some(pending_wait);
+                                        if let Some(png) = upload_png {
+                                            if let Err(error) = self
+                                                .config
+                                                .client
+                                                .upload_single_review_screenshot(&instance.id, &png)
+                                            {
+                                                errors.push(safe_error(&error));
+                                                groups[group_index].status = GroupStatus::Failed;
+                                                break 'execute;
+                                            }
+                                            observed = match self.wait_for_state_interruptible(
+                                                &instance.id,
+                                                &["FINISHED", "INTERRUPTED"],
+                                            ) {
+                                                Ok(state) => Some(state),
+                                                Err(error) => {
+                                                    errors.push(error);
+                                                    groups[group_index].status =
+                                                        GroupStatus::Failed;
+                                                    break 'execute;
+                                                }
+                                            };
+                                        } else {
+                                            deferred_review_pending = Some(DeferredReviewPending {
+                                                placeholder_path: format!(
+                                                    "/test/a/{}/verification-evidence",
+                                                    instance.id
+                                                ),
+                                                marker: crate::ReviewScreenshotMarker::Required,
+                                                obligation_index: 0,
+                                            });
+                                            observed = Some(pending_wait);
+                                        }
                                     }
                                     Err(error) => {
                                         errors.push(error);
@@ -1490,6 +1531,12 @@ impl ConformanceRunner {
                     module_report.review_screenshots_required_captured =
                         browser_review_evidence.required_captured;
                     module_report.review_screenshots_missing = browser_review_evidence.missing;
+                    let deferred_blocks_remaining_modules =
+                        deferred_review_blocks_remaining_modules(
+                            deferred_review_pending.is_some(),
+                            module_index,
+                            plan.modules.len(),
+                        );
                     if let Some(pending) = deferred_review_pending {
                         module_report.mark_deferred_review_pending(pending);
                     }
@@ -1526,6 +1573,14 @@ impl ConformanceRunner {
                         current_variant.clone(),
                         current_test.clone(),
                     );
+                    if deferred_blocks_remaining_modules {
+                        errors.push(
+                            "nonterminal deferred review blocks later modules that share the Suite plan alias; upload the captured review screenshot explicitly or stop at this incomplete plan boundary"
+                                .to_owned(),
+                        );
+                        groups[group_index].status = GroupStatus::Failed;
+                        break 'execute;
+                    }
                     if !errors.is_empty() {
                         break 'execute;
                     }
@@ -2059,6 +2114,14 @@ fn is_deferred_review_waiting(value: &Value) -> bool {
     status(value) == Some("WAITING")
 }
 
+fn deferred_review_blocks_remaining_modules(
+    review_is_nonterminal: bool,
+    module_index: usize,
+    module_count: usize,
+) -> bool {
+    review_is_nonterminal && module_index.saturating_add(1) < module_count
+}
+
 /// A run may proceed to the ordinary retention handoff once it has either
 /// deleted every observed Suite allocation or fully accounted for them in an
 /// exact candidate. The latter is deliberately not a retention commit.
@@ -2227,6 +2290,8 @@ mod tests {
         info_after_capture: Value,
         wait_state_after_capture: Value,
         info_calls: AtomicUsize,
+        upload_review: bool,
+        uploaded: AtomicBool,
     }
 
     #[cfg(unix)]
@@ -2424,14 +2489,33 @@ mod tests {
                 }
                 (HttpMethod::Get, "/api/info/module-a") => {
                     let calls = self.info_calls.fetch_add(1, Ordering::SeqCst);
-                    if calls == 0 {
+                    if self.uploaded.load(Ordering::SeqCst) {
+                        (
+                            200,
+                            serde_json::json!({"status":"FINISHED","result":"REVIEW"}),
+                        )
+                    } else if calls == 0 {
                         (200, serde_json::json!({"status":"WAITING"}))
                     } else {
                         (200, self.info_after_capture.clone())
                     }
                 }
                 (HttpMethod::Get, "/api/runner/module-a/wait-state") => {
-                    (200, self.wait_state_after_capture.clone())
+                    if self.uploaded.load(Ordering::SeqCst) {
+                        (200, serde_json::json!({"state":"FINISHED"}))
+                    } else {
+                        (200, self.wait_state_after_capture.clone())
+                    }
+                }
+                (HttpMethod::Get, "/api/log/module-a/images") if self.upload_review => (
+                    200,
+                    serde_json::json!([{"_id":"log-a","upload":"placeholder-a"}]),
+                ),
+                (HttpMethod::Post, "/api/log/module-a/images/placeholder-a")
+                    if self.upload_review =>
+                {
+                    self.uploaded.store(true, Ordering::SeqCst);
+                    (200, serde_json::json!({"_id":"log-a","img":"stored"}))
                 }
                 (HttpMethod::Get, "/api/log/module-a") => (200, serde_json::json!([])),
                 // Suite cancellation accepts only 200, while plan deletion also
@@ -2959,6 +3043,7 @@ mod tests {
             plan_resource_budgets,
             selected_resource_budget,
             jobs: 1,
+            upload_review_screenshots: false,
             automation: Vec::new(),
             suite_resource_observer: None,
         };
@@ -2992,6 +3077,7 @@ mod tests {
                 ]),
                 selected_resource_budget: budget(u32::MAX, 2, 120),
                 jobs: 1,
+                upload_review_screenshots: false,
                 automation: Vec::new(),
                 suite_resource_observer: None,
             })
@@ -3030,6 +3116,7 @@ mod tests {
             plan_resource_budgets: one_plan_budgets(),
             selected_resource_budget: budget(1, 1, 60),
             jobs: 2,
+            upload_review_screenshots: false,
             automation,
             suite_resource_observer: None,
         };
@@ -3120,6 +3207,7 @@ mod tests {
             plan_resource_budgets: one_plan_budgets(),
             selected_resource_budget: budget(1, 1, 60),
             jobs: 1,
+            upload_review_screenshots: false,
             automation: Vec::new(),
             suite_resource_observer: Some(observer.clone()),
         })
@@ -3196,6 +3284,7 @@ mod tests {
             plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
             selected_resource_budget: budget(2, 1, 60),
             jobs: 1,
+            upload_review_screenshots: false,
             automation: vec![ConformanceAutomation {
                 issuer: Some(issuer_driver),
                 ..ConformanceAutomation::default()
@@ -3312,6 +3401,7 @@ mod tests {
             plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
             selected_resource_budget: budget(2, 1, 60),
             jobs: 1,
+            upload_review_screenshots: false,
             automation: Vec::new(),
             suite_resource_observer: Some(observer.clone()),
         })
@@ -3369,6 +3459,7 @@ mod tests {
             plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
             selected_resource_budget: budget(2, 1, 60),
             jobs: 1,
+            upload_review_screenshots: false,
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -3450,6 +3541,7 @@ mod tests {
             plan_resource_budgets: one_plan_budgets(),
             selected_resource_budget: budget(1, 1, 60),
             jobs: 1,
+            upload_review_screenshots: false,
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -3499,6 +3591,7 @@ mod tests {
                 plan_resource_budgets: one_plan_budgets(),
                 selected_resource_budget: budget(1, 1, 60),
                 jobs: 1,
+                upload_review_screenshots: false,
                 automation: Vec::new(),
                 suite_resource_observer: None,
             })
@@ -3691,6 +3784,7 @@ mod tests {
             plan_resource_budgets: BTreeMap::new(),
             selected_resource_budget: budget(0, 0, 0),
             jobs: 1,
+            upload_review_screenshots: false,
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -3779,6 +3873,7 @@ mod tests {
             plan_resource_budgets: BTreeMap::new(),
             selected_resource_budget: budget(0, 0, 0),
             jobs: 1,
+            upload_review_screenshots: false,
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -3919,6 +4014,7 @@ mod tests {
             plan_resource_budgets: BTreeMap::new(),
             selected_resource_budget: budget(0, 0, 0),
             jobs: 1,
+            upload_review_screenshots: false,
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -4032,9 +4128,17 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn nonterminal_review_never_settles_a_plan_with_later_alias_sharing_modules() {
+        assert!(deferred_review_blocks_remaining_modules(true, 0, 2));
+        assert!(deferred_review_blocks_remaining_modules(true, 3, 5));
+        assert!(!deferred_review_blocks_remaining_modules(true, 0, 1));
+        assert!(!deferred_review_blocks_remaining_modules(false, 0, 2));
+    }
+
     #[cfg(unix)]
     #[test]
-    fn serial_vp_deferred_review_retains_only_the_same_waiting_module_without_suite_uploads() {
+    fn serial_vp_review_upload_reaches_the_terminal_suite_review_boundary() {
         let root = std::env::temp_dir()
             .canonicalize()
             .expect("temporary root")
@@ -4053,6 +4157,8 @@ mod tests {
             info_after_capture: serde_json::json!({"status":"WAITING"}),
             wait_state_after_capture: serde_json::json!({"state":"WAITING"}),
             info_calls: AtomicUsize::new(0),
+            upload_review: true,
+            uploaded: AtomicBool::new(false),
         });
         let client = SuiteClient::with_transport(
             Origin::parse("https://www.certification.openid.net").expect("official Suite"),
@@ -4112,6 +4218,7 @@ mod tests {
             plan_resource_budgets: one_plan_budgets(),
             selected_resource_budget: budget(1, 1, 60),
             jobs: 1,
+            upload_review_screenshots: true,
             automation: vec![ConformanceAutomation {
                 browser: Some(browser.clone()),
                 review_screenshot_capture: Some(capture),
@@ -4171,8 +4278,8 @@ mod tests {
         );
         assert_eq!(integrity.defined_modules, 1, "{fixture_diagnostic}");
         assert_eq!(integrity.created_instances, 1, "{fixture_diagnostic}");
-        assert_eq!(integrity.terminal_modules, 0, "{fixture_diagnostic}");
-        assert_eq!(integrity.deferred_review_modules, 1, "{fixture_diagnostic}");
+        assert_eq!(integrity.terminal_modules, 1, "{fixture_diagnostic}");
+        assert_eq!(integrity.deferred_review_modules, 0, "{fixture_diagnostic}");
         assert!(integrity.all_modules_instantiated, "{fixture_diagnostic}");
         assert!(integrity.all_modules_settled, "{fixture_diagnostic}");
         assert!(integrity.retention_requested, "{fixture_diagnostic}");
@@ -4186,31 +4293,19 @@ mod tests {
         assert!(integrity.suite_resources_settled, "{fixture_diagnostic}");
         assert!(!report.suite_pass);
         assert!(!report.acceptance_pass);
-        assert!(report.review_pending);
-        assert_eq!(
-            report.deferred_review_modules,
-            vec![format!(
-                "p/happy-flow?variant={}",
-                serde_json::to_string(&effective_variant).expect("canonical effective variant")
-            )]
-        );
+        assert!(!report.review_pending);
+        assert!(report.human_review_required);
+        assert!(report.deferred_review_modules.is_empty());
         assert_eq!(report.modules.len(), 1);
         let module = &report.modules[0];
-        assert_eq!(module.outcome, ModuleOutcome::DeferredReviewPending);
-        assert!(!module.terminal);
+        assert_eq!(module.outcome, ModuleOutcome::Review);
+        assert!(module.terminal);
         assert_eq!(module.review_screenshots.len(), 1);
         assert_eq!(module.variant, effective_variant);
         assert_eq!(module.review_screenshots_required, 1);
         assert_eq!(module.review_screenshots_required_captured, 1);
-        assert_eq!(
-            module
-                .deferred_review_pending
-                .as_ref()
-                .expect("deferred review identity")
-                .placeholder_path,
-            "/test/a/module-a/verification-evidence"
-        );
-        assert!(!integrity.all_modules_terminal, "{fixture_diagnostic}");
+        assert!(module.deferred_review_pending.is_none());
+        assert!(integrity.all_modules_terminal, "{fixture_diagnostic}");
         assert_eq!(browser_state.lock().expect("browser").captures, 1);
         let verifier = verifier_state.lock().expect("verifier");
         assert_eq!(
@@ -4249,9 +4344,20 @@ mod tests {
             2,
             "both authentication probe calls must precede production plan creation: {fixture_diagnostic}"
         );
-        assert!(requests.iter().all(|(method, path)| {
-            *method != HttpMethod::Delete && !path.contains("image") && !path.contains("visited")
-        }));
+        assert!(
+            requests
+                .iter()
+                .all(|(method, _)| *method != HttpMethod::Delete)
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(method, path)| {
+                    *method == HttpMethod::Post && path == "/api/log/module-a/images/placeholder-a"
+                })
+                .count(),
+            1
+        );
         assert!(report.local_success, "{fixture_diagnostic}");
         drop(requests);
         std::fs::remove_dir_all(root).expect("remove temporary evidence root");
@@ -4275,6 +4381,8 @@ mod tests {
             info_after_capture: serde_json::json!({"status":"FINISHED","result":"PASSED"}),
             wait_state_after_capture: serde_json::json!({"state":"FINISHED"}),
             info_calls: AtomicUsize::new(0),
+            upload_review: false,
+            uploaded: AtomicBool::new(false),
         });
         let client = SuiteClient::with_transport(
             Origin::parse("https://www.certification.openid.net").expect("official Suite"),
@@ -4324,6 +4432,7 @@ mod tests {
             plan_resource_budgets: one_plan_budgets(),
             selected_resource_budget: budget(1, 1, 60),
             jobs: 1,
+            upload_review_screenshots: false,
             automation: vec![ConformanceAutomation {
                 browser: Some(browser),
                 review_screenshot_capture: Some(capture),
@@ -4481,6 +4590,8 @@ mod tests {
                     serde_json::json!({"state":"WAITING"})
                 },
                 info_calls: AtomicUsize::new(0),
+                upload_review: false,
+                uploaded: AtomicBool::new(false),
             });
             let client = SuiteClient::with_transport(
                 Origin::parse("https://www.certification.openid.net").expect("official Suite"),
@@ -4529,6 +4640,7 @@ mod tests {
                 plan_resource_budgets: one_plan_budgets(),
                 selected_resource_budget: budget(1, 1, 60),
                 jobs: 1,
+                upload_review_screenshots: false,
                 automation: vec![ConformanceAutomation {
                     browser: Some(browser.clone()),
                     review_screenshot_capture: capture,

@@ -309,6 +309,7 @@ fn parallel_fixture_with_lanes(
             wall_clock_seconds: u64::from(selected_plan_count) * 60,
         },
         jobs: 2,
+        upload_review_screenshots: false,
         automation: Vec::new(),
         suite_resource_observer: None,
     })

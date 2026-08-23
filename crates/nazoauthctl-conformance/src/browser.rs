@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -479,6 +479,8 @@ pub enum BrowserError {
     UnsafeEvidencePath,
     #[error("browser review evidence write failed")]
     EvidenceWrite,
+    #[error("browser review evidence read failed")]
+    EvidenceRead,
     #[error("browser review screenshot limit exceeded")]
     ReviewScreenshotLimit,
     #[error("browser timeout expired")]
@@ -812,6 +814,37 @@ impl BrowserReviewScreenshotCapture {
             capture_index,
             self.budget.clone(),
         )
+    }
+
+    /// Reopen one capture produced by this run for exact Suite placeholder
+    /// delivery. The in-memory receipt and the private file must still agree
+    /// on path, size, digest, and PNG structure.
+    pub(crate) fn read_captured_png(
+        &self,
+        receipt: &BrowserReviewScreenshotReceipt,
+    ) -> Result<Vec<u8>, BrowserError> {
+        let prefix = PathBuf::from("review-screenshots").join(&self.run_jti);
+        if receipt.path.is_absolute()
+            || !receipt.path.starts_with(&prefix)
+            || receipt.path.extension().and_then(|value| value.to_str()) != Some("png")
+            || receipt
+                .path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(BrowserError::UnsafeEvidencePath);
+        }
+        let bytes = crate::secure_file::read_bounded(
+            &self.evidence_directory.join(&receipt.path),
+            MAX_REVIEW_SCREENSHOT_BYTES,
+            true,
+        )
+        .map_err(|_| BrowserError::EvidenceRead)?;
+        validate_png_screenshot(&bytes)?;
+        if bytes.len() != receipt.size || sha256_hex(&bytes) != receipt.sha256 {
+            return Err(BrowserError::InvalidScreenshot);
+        }
+        Ok(bytes)
     }
 
     pub(crate) fn shares_run_budget_with(&self, other: &Self) -> bool {
@@ -3676,8 +3709,9 @@ mod tests {
             .expect("temp")
             .join(format!("nazoauth-review-capture-{}", uuid::Uuid::now_v7()));
         crate::secure_file::ensure_directory(&root, true).expect("private root");
-        let capture = BrowserReviewScreenshotCapture::new(root.clone(), "run-a")
-            .expect("capture")
+        let capture_owner =
+            BrowserReviewScreenshotCapture::new(root.clone(), "run-a").expect("capture");
+        let capture = capture_owner
             .context(
                 BrowserReviewModuleIdentity::new(
                     "matrix-plan-a",
@@ -3717,6 +3751,13 @@ mod tests {
         assert_eq!(
             std::fs::read(root.join(&receipt.path))
                 .expect("png")
+                .as_slice(),
+            test_png().as_slice()
+        );
+        assert_eq!(
+            capture_owner
+                .read_captured_png(receipt)
+                .expect("reopen capture")
                 .as_slice(),
             test_png().as_slice()
         );

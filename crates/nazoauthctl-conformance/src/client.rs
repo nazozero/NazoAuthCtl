@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -20,6 +21,7 @@ const DEFAULT_MAX_LOG_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_REDIRECTS: usize = 3;
 const MAX_SUITE_LONG_POLL_MS: u128 = 30_000;
 const MAX_SUITE_LONG_POLL_HEADROOM_MS: u128 = 5_000;
+const MAX_REVIEW_SCREENSHOT_BYTES: usize = 500 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -311,6 +313,73 @@ impl SuiteClient {
         Ok(response.body)
     }
 
+    /// Fill the one outstanding review-image placeholder for a running Suite
+    /// module. The caller must provide a module-bound PNG captured from the
+    /// implementation's verification-result UI; this method never chooses an
+    /// arbitrary placeholder or creates an additional log image.
+    pub fn upload_single_review_screenshot(
+        &self,
+        module_id: &str,
+        png: &[u8],
+    ) -> Result<String, SuiteClientError> {
+        if !valid_path_component(module_id)
+            || png.is_empty()
+            || png.len() > MAX_REVIEW_SCREENSHOT_BYTES
+            || !png.starts_with(b"\x89PNG\r\n\x1a\n")
+        {
+            return Err(SuiteClientError::InvalidInput);
+        }
+        let response = self.request_json(
+            HttpMethod::Get,
+            &format!("/api/log/{module_id}/images"),
+            &[],
+            None,
+            true,
+            self.config.max_response_bytes,
+        )?;
+        if response.status != 200 {
+            return Err(SuiteClientError::HttpStatus(response.status));
+        }
+        let images = response
+            .body
+            .as_array()
+            .ok_or(SuiteClientError::MalformedResponse)?;
+        let pending = images
+            .iter()
+            .filter_map(|image| image.get("upload"))
+            .map(|placeholder| {
+                placeholder
+                    .as_str()
+                    .filter(|id| valid_path_component(id))
+                    .map(ToOwned::to_owned)
+                    .ok_or(SuiteClientError::MalformedResponse)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let [placeholder_id] = pending.as_slice() else {
+            return Err(SuiteClientError::ReviewPlaceholderBoundary);
+        };
+        let encoded = format!("data:image/png;base64,{}", STANDARD.encode(png));
+        let response = self.request_bytes(
+            HttpMethod::Post,
+            &format!("/api/log/{module_id}/images/{placeholder_id}"),
+            &[],
+            Some(encoded.into_bytes()),
+            Some("text/plain"),
+            true,
+            self.config.max_response_bytes,
+        )?;
+        if response.status != 200 {
+            return Err(SuiteClientError::HttpStatus(response.status));
+        }
+        if !response.body.is_object()
+            || response.body.get("upload").is_some()
+            || response.body.get("img").and_then(Value::as_str).is_none()
+        {
+            return Err(SuiteClientError::MalformedResponse);
+        }
+        Ok(placeholder_id.clone())
+    }
+
     pub fn cancel_module(&self, module_id: &str) -> Result<CancelOutcome, SuiteClientError> {
         let response = self.request_json(
             HttpMethod::Delete,
@@ -354,6 +423,34 @@ impl SuiteClient {
         authenticated: bool,
         max_response_bytes: usize,
     ) -> Result<RawResponse, SuiteClientError> {
+        let body_bytes = body
+            .map(|value| serde_json::to_vec(value).map_err(|_| SuiteClientError::InvalidInput))
+            .transpose()?;
+        let content_type = body_bytes.as_ref().map(|_| "application/json");
+        self.request_bytes(
+            method,
+            path,
+            query,
+            body_bytes,
+            content_type,
+            authenticated,
+            max_response_bytes,
+        )
+    }
+
+    fn request_bytes(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        query: &[(&str, &str)],
+        body_bytes: Option<Vec<u8>>,
+        content_type: Option<&str>,
+        authenticated: bool,
+        max_response_bytes: usize,
+    ) -> Result<RawResponse, SuiteClientError> {
+        if body_bytes.is_some() != content_type.is_some() {
+            return Err(SuiteClientError::InvalidInput);
+        }
         let mut url = self.origin.url(path)?;
         {
             let mut pairs = url.query_pairs_mut();
@@ -364,12 +461,9 @@ impl SuiteClient {
         if !same_origin(&self.origin, &url) {
             return Err(SuiteClientError::CrossOriginRedirect);
         }
-        let body_bytes = body
-            .map(|value| serde_json::to_vec(value).map_err(|_| SuiteClientError::InvalidInput))
-            .transpose()?;
         let mut headers = vec![("Accept".to_owned(), "application/json".to_owned())];
-        if body_bytes.is_some() {
-            headers.push(("Content-Type".to_owned(), "application/json".to_owned()));
+        if let Some(content_type) = content_type {
+            headers.push(("Content-Type".to_owned(), content_type.to_owned()));
         }
         if authenticated {
             let token = self.token.as_ref().ok_or(SuiteClientError::MissingToken)?;
@@ -527,8 +621,21 @@ pub enum SuiteClientError {
     Timeout,
     #[error("invalid Suite request input")]
     InvalidInput,
+    #[error("Suite review-image placeholder boundary failed")]
+    ReviewPlaceholderBoundary,
     #[error("invalid Suite client configuration")]
     InvalidConfiguration,
+}
+
+fn valid_path_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value != "."
+        && value != ".."
+        && value.chars().all(|character| {
+            !character.is_control()
+                && matches!(character, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.')
+        })
 }
 
 fn parse_plan_created(body: Value) -> Result<PlanCreated, SuiteClientError> {
@@ -748,6 +855,116 @@ mod tests {
             Some("Bearer secret-token")
         );
         assert!(!authenticated.url().as_str().contains("secret-token"));
+    }
+
+    struct ReviewUploadCapture {
+        requests: Mutex<Vec<HttpRequest>>,
+    }
+
+    impl Transport for ReviewUploadCapture {
+        fn send(&self, request: HttpRequest, _max: usize) -> Result<HttpResponse, TransportError> {
+            let mut requests = self.requests.lock().expect("lock");
+            let response = match requests.len() {
+                0 => HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: serde_json::to_vec(&serde_json::json!([{
+                        "_id": "module-a-log-entry",
+                        "upload": "placeholder-a"
+                    }]))
+                    .expect("images"),
+                },
+                1 => HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "_id": "module-a-log-entry",
+                        "img": "stored"
+                    }))
+                    .expect("upload"),
+                },
+                _ => panic!("unexpected request"),
+            };
+            requests.push(request);
+            Ok(response)
+        }
+    }
+
+    #[test]
+    fn review_upload_fills_only_the_single_pending_placeholder() {
+        let capture = Arc::new(ReviewUploadCapture {
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("secret-token").expect("token")),
+            capture.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let png = b"\x89PNG\r\n\x1a\nmodule-bound";
+
+        assert_eq!(
+            client
+                .upload_single_review_screenshot("module-a", png)
+                .expect("upload"),
+            "placeholder-a"
+        );
+        let requests = capture.requests.lock().expect("lock");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, HttpMethod::Get);
+        assert_eq!(requests[0].url().path(), "/api/log/module-a/images");
+        assert_eq!(requests[1].method, HttpMethod::Post);
+        assert_eq!(
+            requests[1].url().path(),
+            "/api/log/module-a/images/placeholder-a"
+        );
+        assert_eq!(requests[1].header("content-type"), Some("text/plain"));
+        let body = requests[1].body.as_deref().expect("encoded PNG");
+        assert!(body.starts_with(b"data:image/png;base64,"));
+        assert!(
+            !body
+                .windows("secret-token".len())
+                .any(|window| window == b"secret-token")
+        );
+    }
+
+    #[test]
+    fn review_upload_rejects_ambiguous_or_missing_placeholder_sets() {
+        struct PlaceholderSet(Value);
+        impl Transport for PlaceholderSet {
+            fn send(
+                &self,
+                _request: HttpRequest,
+                _max: usize,
+            ) -> Result<HttpResponse, TransportError> {
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: serde_json::to_vec(&self.0).expect("placeholder response"),
+                })
+            }
+        }
+        for images in [
+            serde_json::json!([]),
+            serde_json::json!([
+                {"_id":"log-a","upload":"placeholder-a"},
+                {"_id":"log-b","upload":"placeholder-b"}
+            ]),
+        ] {
+            let client = SuiteClient::with_transport(
+                Origin::parse("https://suite.example").expect("origin"),
+                Some(BearerToken::new("secret-token").expect("token")),
+                Arc::new(PlaceholderSet(images)),
+                ClientConfig::default(),
+            )
+            .expect("client");
+            assert!(matches!(
+                client
+                    .upload_single_review_screenshot("module-a", b"\x89PNG\r\n\x1a\nmodule-bound"),
+                Err(SuiteClientError::ReviewPlaceholderBoundary)
+            ));
+        }
     }
 
     #[test]

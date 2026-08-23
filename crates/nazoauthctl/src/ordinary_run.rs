@@ -959,6 +959,7 @@ fn run_signed_suite(
         plan_resource_budgets,
         selected_resource_budget,
         jobs: invocation.jobs,
+        upload_review_screenshots: invocation.upload_review_screenshots,
         automation,
         suite_resource_observer: Some(Arc::new(DurableSuiteObserver {
             recovery,
