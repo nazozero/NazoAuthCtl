@@ -2629,7 +2629,11 @@ mod tests {
                 crate::secure_file::write_atomic(&root.join(&path), &png, true)
                     .expect("module-bound review PNG");
                 let size = png.len();
-                let sha256 = format!("{:x}", Sha256::digest(&png));
+                let digest: [u8; 32] = Sha256::digest(&png).into();
+                let sha256 = digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
                 (path, sha256, size)
             } else {
                 (
