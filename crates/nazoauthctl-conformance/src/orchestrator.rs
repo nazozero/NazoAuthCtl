@@ -502,7 +502,7 @@ impl ConformanceRunner {
                             &plan.suite_plan_id,
                             module_id,
                             &module.test_name,
-                            &plan.variant,
+                            &effective_module_identity_variant(plan, module),
                         )
                         .and_then(|identity| {
                             capture.context(
@@ -1251,7 +1251,7 @@ impl ConformanceRunner {
                                         &plan.suite_plan_id,
                                         &instance.id,
                                         &module.test_name,
-                                        &plan.variant,
+                                        &effective_module_identity_variant(plan, module),
                                     )
                                     .map_err(|error| error.to_string())?;
                                     let capture = capture
@@ -1478,7 +1478,7 @@ impl ConformanceRunner {
                             suite_plan_id: plan.suite_plan_id.clone(),
                             module_id: Some(instance.id.clone()),
                             test_name: module.test_name.clone(),
-                            variant: module.variant.clone(),
+                            variant: effective_module_identity_variant(plan, module),
                             terminal,
                             expected_result: plan.expected_results.get(&module.test_name).cloned(),
                         },
@@ -2000,6 +2000,19 @@ fn runtime_variant_for_definition(
     let mut variant = plan.runtime_variant.clone();
     // The Suite definition fixes this concrete runner's behavior. It must
     // override the Matrix defaults used to create the containing plan.
+    variant.extend(module.variant.clone());
+    variant
+}
+
+fn effective_module_identity_variant(
+    plan: &PlannedPlan,
+    module: &ModuleDefinition,
+) -> BTreeMap<String, String> {
+    let mut variant = plan.variant.clone();
+    // The containing plan supplies the baseline identity while a concrete
+    // Suite definition may further specialize the otherwise identical test
+    // name. Reports and review-capture receipts must bind the same effective
+    // identity, with the Suite definition taking precedence.
     variant.extend(module.variant.clone());
     variant
 }
@@ -3955,6 +3968,43 @@ mod tests {
         assert!(needs_interactive_or_terminal_wait(Some(&running)));
         assert!(!needs_interactive_or_terminal_wait(Some(&waiting)));
         assert!(!needs_interactive_or_terminal_wait(Some(&finished)));
+    }
+
+    #[test]
+    fn effective_module_identity_variant_merges_plan_and_suite_definition() {
+        let plan = PlannedPlan {
+            group_index: 0,
+            matrix_plan_id: "matrix-plan".into(),
+            suite_plan_id: "suite-plan".into(),
+            plan_name: "plan".into(),
+            variant: BTreeMap::from([
+                ("credential_format".into(), "sd_jwt_vc".into()),
+                ("response_mode".into(), "direct_post".into()),
+            ]),
+            runtime_variant: BTreeMap::new(),
+            expected_results: BTreeMap::new(),
+            modules: Vec::new(),
+            config: Value::Null,
+            report_index: 0,
+            lane: OidfDriverLane::Parallel,
+        };
+        let module = ModuleDefinition {
+            test_name: "happy-flow".into(),
+            variant: BTreeMap::from([
+                ("response_mode".into(), "direct_post.jwt".into()),
+                ("request_method".into(), "url_query".into()),
+            ]),
+            raw: Value::Null,
+        };
+
+        assert_eq!(
+            effective_module_identity_variant(&plan, &module),
+            BTreeMap::from([
+                ("credential_format".into(), "sd_jwt_vc".into()),
+                ("request_method".into(), "url_query".into()),
+                ("response_mode".into(), "direct_post.jwt".into()),
+            ])
+        );
     }
 
     #[test]
