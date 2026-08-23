@@ -8,13 +8,26 @@ use anyhow::{Context as _, bail};
 use fs2::FileExt as _;
 use nazo_operator_protocol::{
     MAX_COMPACT_JWS_BYTES, MAX_TENANT_RESOURCE_IDENTITIES, TenantResourceIdentity,
-    TenantResourceOperation, TenantResourceReceipt, compact_sha256, validate_file_identifier_value,
+    TenantResourceKind, TenantResourceOperation, TenantResourceReceipt, compact_sha256,
+    validate_file_identifier_value,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 const LEGACY_RECOVERY_JOURNAL_SCHEMA: u32 = 1;
+/// The ordinary default journal remains schema 2 byte-for-byte compatible.
 const TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 2;
+/// Schema 3 is emitted only after an explicit certification-retention policy
+/// is durably bound. Older binaries reject it rather than deleting plans.
+const RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 3;
+/// Schema 4 is emitted only for a run that may retain a NazoAuthWeb VP result
+/// capture. It binds the recovery journal to the runtime discovery key rather
+/// than trusting a key copied from a screenshot receipt.
+const VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 4;
+/// Schema 5 is emitted only when a retained Suite plan contains an explicit
+/// OIDF deferred-review module. Older binaries reject it rather than treating
+/// a non-terminal Suite runner as ordinary cleanup.
+const DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 5;
 const TENANT_RESOURCE_RECOVERY_KIND: &str = "tenant-resource";
 const MAX_RECOVERY_JOURNAL_BYTES: usize = 128 * 1024;
 const MAX_PENDING_RUNS: usize = 64;
@@ -22,6 +35,8 @@ const MAX_PERSISTED_REVISION: u64 = i64::MAX as u64;
 const MAX_TENANT_RESOURCE_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SUITE_RECOVERY_PLANS: usize = 128;
 const MAX_SUITE_RECOVERY_MODULES: usize = 16 * 1024;
+const SUITE_RETENTION_MANIFEST_SCHEMA: u32 = 2;
+const MAX_SUITE_RETENTION_MANIFEST_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -71,7 +86,22 @@ pub struct TenantResourceRecoveryBinding {
     /// executes the legacy proxy command itself.
     #[serde(default)]
     pub proxy: Option<ConformanceProxyRecovery>,
+    /// Runtime-discovery trust anchor for a possible NazoAuthWeb VP evidence
+    /// receipt. Existing ordinary journals omit it; those journals are never
+    /// permitted to validate the newer VP screenshot source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vp_evidence_trust_anchor: Option<OpenId4VpEvidenceTrustAnchor>,
     pub resource_identities: Vec<TenantResourceIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenId4VpEvidenceTrustAnchor {
+    pub target_issuer: String,
+    pub deployment_id: String,
+    pub runtime_instance_id: String,
+    pub instance_key_id: String,
+    pub instance_public_key_base64: String,
 }
 
 /// A compact, verified identity of the signed apply receipt.  The signed JWS
@@ -144,7 +174,181 @@ pub struct SuiteRecoveryState {
     pub origin: String,
     pub plan_ids: Vec<String>,
     pub module_ids: Vec<String>,
+    /// Intent IDs are written before a Suite create request is sent and are
+    /// atomically replaced by the returned opaque resource ID.  A surviving
+    /// intent means the request outcome is unknown and must block cleanup
+    /// completion until an operator can reconcile it with the Suite.
+    #[serde(default)]
+    pub pending_create_intents: Vec<String>,
     pub cleanup_complete: bool,
+}
+
+/// Non-secret ownership evidence for an explicitly retained Suite plan.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuiteRetentionPlan {
+    pub matrix_plan_id: String,
+    pub suite_plan_id: String,
+    pub plan_name: String,
+    pub plan_alias_sha256: String,
+}
+
+/// Root-owned certification-review evidence. It deliberately contains no
+/// module logs, Suite credentials, client config, or tenant secrets.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuiteRetentionManifest {
+    pub schema: u32,
+    pub suite_origin: String,
+    pub artifact_digest: String,
+    pub matrix_sha256: String,
+    pub deployment_id: String,
+    pub tenant_id: String,
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_screenshot_manifest: Option<SuiteRetentionScreenshotManifest>,
+    /// Explicit non-terminal Suite modules retained at the OIDF deferred
+    /// verification-evidence boundary. They are not terminal/pass results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_review_pending: Vec<SuiteRetentionDeferredReview>,
+    pub plans: Vec<SuiteRetentionPlan>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuiteRetentionDeferredReview {
+    pub matrix_plan_id: String,
+    pub suite_plan_id: String,
+    pub module_id: String,
+    pub test_name: String,
+    pub variant: std::collections::BTreeMap<String, String>,
+    pub placeholder_path: String,
+    pub marker: crate::ReviewScreenshotMarker,
+    pub obligation_index: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuiteRetentionScreenshotManifest {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewScreenshotManifestDocument {
+    schema: u32,
+    run_jti: String,
+    artifact_digest: String,
+    matrix_sha256: String,
+    suite_origin: String,
+    #[serde(default)]
+    target_issuer: Option<String>,
+    modules: Vec<ReviewScreenshotManifestModule>,
+    screenshots: Vec<ReviewScreenshotManifestImage>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewScreenshotManifestModule {
+    matrix_plan_id: String,
+    suite_plan_id: String,
+    module_id: String,
+    test_name: String,
+    variant: std::collections::BTreeMap<String, String>,
+    required: usize,
+    captured_required: usize,
+    missing_optional: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewScreenshotManifestImage {
+    matrix_plan_id: String,
+    suite_plan_id: String,
+    module_id: String,
+    test_name: String,
+    variant: std::collections::BTreeMap<String, String>,
+    marker: crate::ReviewScreenshotMarker,
+    obligation_index: usize,
+    path: PathBuf,
+    sha256: String,
+    size: usize,
+    receipt_sha256: String,
+    trigger_origin: String,
+    trigger_path: String,
+    trigger_url_sha256: String,
+    #[serde(default)]
+    source: crate::BrowserReviewScreenshotSource,
+    #[serde(default)]
+    verification_receipt: Option<crate::OpenId4VpVerificationReceiptProvenance>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewScreenshotAudit {
+    suite_plan_id: String,
+    module_id: String,
+    test_name: String,
+    variant: std::collections::BTreeMap<String, String>,
+    marker: crate::ReviewScreenshotMarker,
+    obligation_index: usize,
+    path: PathBuf,
+    sha256: String,
+    size: usize,
+    trigger_origin: String,
+    trigger_path: String,
+    trigger_url_sha256: String,
+    #[serde(default)]
+    source: crate::BrowserReviewScreenshotSource,
+    #[serde(default)]
+    verification_receipt: Option<crate::OpenId4VpVerificationReceiptProvenance>,
+}
+
+impl SuiteRetentionManifest {
+    pub fn plan_alias_sha256(matrix_plan_id: &str) -> String {
+        sha256_hex(matrix_plan_id.as_bytes())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SuiteRetentionRecord {
+    manifest: SuiteRetentionManifest,
+    manifest_sha256: String,
+    manifest_path: PathBuf,
+}
+
+/// The non-secret, root-owned manifest that now owns retained Suite plans.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuiteRetentionManifestReceipt {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
+/// Suite plan ownership remains active until all non-Suite cleanup succeeds.
+/// `RetentionPrepared` is intentionally recoverable as ordinary deletion;
+/// only `Retained` transfers plan ownership to the verified manifest.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "disposition", rename_all = "kebab-case", deny_unknown_fields)]
+enum SuiteRetentionDisposition {
+    Active { requested: bool },
+    RetentionPrepared { record: SuiteRetentionRecord },
+    Retained { record: SuiteRetentionRecord },
+    Cleaned,
+}
+
+impl Default for SuiteRetentionDisposition {
+    fn default() -> Self {
+        Self::Active { requested: false }
+    }
+}
+
+impl SuiteRetentionDisposition {
+    fn is_default(value: &Self) -> bool {
+        matches!(value, Self::Active { requested: false })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -188,6 +392,8 @@ struct TenantResourceRecoveryJournal {
     /// Suite allocation and are therefore already settled at this boundary.
     #[serde(default)]
     suite: Option<SuiteRecoveryState>,
+    #[serde(default, skip_serializing_if = "SuiteRetentionDisposition::is_default")]
+    suite_retention: SuiteRetentionDisposition,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -220,12 +426,21 @@ impl<'de> Deserialize<'de> for RecoveryJournal {
             .ok_or_else(|| serde::de::Error::custom("recovery journal has no schema"))?;
         const LEGACY_SCHEMA: u64 = LEGACY_RECOVERY_JOURNAL_SCHEMA as u64;
         const TENANT_RESOURCE_SCHEMA: u64 = TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA as u64;
+        const RETAINING_TENANT_RESOURCE_SCHEMA: u64 =
+            RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA as u64;
+        const VP_EVIDENCE_TENANT_RESOURCE_SCHEMA: u64 =
+            VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA as u64;
+        const DEFERRED_REVIEW_TENANT_RESOURCE_SCHEMA: u64 =
+            DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA as u64;
         match schema {
             LEGACY_SCHEMA => serde_json::from_value(value)
                 .map(Box::new)
                 .map(Self::Legacy)
                 .map_err(serde::de::Error::custom),
-            TENANT_RESOURCE_SCHEMA => serde_json::from_value(value)
+            TENANT_RESOURCE_SCHEMA
+            | RETAINING_TENANT_RESOURCE_SCHEMA
+            | VP_EVIDENCE_TENANT_RESOURCE_SCHEMA
+            | DEFERRED_REVIEW_TENANT_RESOURCE_SCHEMA => serde_json::from_value(value)
                 .map(Box::new)
                 .map(Self::TenantResource)
                 .map_err(serde::de::Error::custom),
@@ -256,6 +471,43 @@ pub struct ConformanceRecoveryGuard {
     journal_path: PathBuf,
     lock_path: PathBuf,
     lock: Option<File>,
+    retention_commit_resolution: SuiteRetentionCommitResolution,
+    // This is deliberately a test-only durability seam.  Production always
+    // persists through the same atomic journal writer.
+    #[cfg(test)]
+    persist_failpoint: std::sync::Arc<std::sync::Mutex<Option<PersistFailpoint>>>,
+}
+
+/// The only safe cleanup decision after attempting the durable ownership
+/// transfer. `Ambiguous` is intentionally distinct from `Prepared`: callers
+/// must leave Suite resources and the journal untouched until a later claim
+/// can validate the on-disk transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SuiteRetentionCommitResolution {
+    NotAttempted,
+    Prepared,
+    Retained,
+    Ambiguous,
+}
+
+#[derive(Debug)]
+pub struct AmbiguousSuiteRetentionCommit;
+
+impl std::fmt::Display for AmbiguousSuiteRetentionCommit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "Suite retention journal persistence is ambiguous; leave exact Suite resources for recovery",
+        )
+    }
+}
+
+impl std::error::Error for AmbiguousSuiteRetentionCommit {}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistFailpoint {
+    BeforeWrite,
+    AfterRenameBeforeDirectoryFsync,
 }
 
 impl ConformanceRecoveryStore {
@@ -304,7 +556,11 @@ impl ConformanceRecoveryStore {
         self.begin_journal(
             &request_jti,
             RecoveryJournal::TenantResource(Box::new(TenantResourceRecoveryJournal {
-                schema: TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA,
+                schema: if binding.vp_evidence_trust_anchor.is_some() {
+                    VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                } else {
+                    TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                },
                 kind: TENANT_RESOURCE_RECOVERY_KIND.to_owned(),
                 binding,
                 receipt: None,
@@ -316,6 +572,7 @@ impl ConformanceRecoveryStore {
                 abort_uncommitted_intent: false,
                 proxy_cleanup_complete,
                 suite: None,
+                suite_retention: SuiteRetentionDisposition::default(),
             })),
         )
     }
@@ -344,6 +601,9 @@ impl ConformanceRecoveryStore {
             journal_path,
             lock_path,
             lock: Some(lock),
+            retention_commit_resolution: SuiteRetentionCommitResolution::NotAttempted,
+            #[cfg(test)]
+            persist_failpoint: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -398,6 +658,78 @@ impl ConformanceRecoveryStore {
                 normalized_proxy_cleanup = true;
             }
             validate_journal(&journal, &self.deployment_id, request_jti)?;
+            // Completed Suite cleanup has no future external action to take.
+            // Older journals retained the already-cleaned opaque IDs, which
+            // wastes the bounded recovery budget and can prevent later
+            // tenant-resource cleanup records from being persisted. Validate
+            // their legacy contents above, then atomically discard them.
+            let mut normalized_suite_cleanup = false;
+            if let RecoveryJournal::TenantResource(tenant_journal) = &mut journal
+                && let Some(suite) = &mut tenant_journal.suite
+                && suite.cleanup_complete
+                && suite.pending_create_intents.is_empty()
+                && (!suite.plan_ids.is_empty() || !suite.module_ids.is_empty())
+            {
+                suite.plan_ids.clear();
+                suite.module_ids.clear();
+                if matches!(
+                    tenant_journal.schema,
+                    RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                        | VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                        | DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                ) && matches!(
+                    &tenant_journal.suite_retention,
+                    SuiteRetentionDisposition::Active { .. }
+                ) {
+                    tenant_journal.suite_retention = SuiteRetentionDisposition::Cleaned;
+                }
+                normalized_suite_cleanup = true;
+            }
+            let mut recovered_retention_manifest = false;
+            if let RecoveryJournal::TenantResource(tenant_journal) = &journal
+                && let SuiteRetentionDisposition::Retained { record } =
+                    &tenant_journal.suite_retention
+            {
+                let final_path = record.manifest_path.clone();
+                let name = final_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .context("retained Suite manifest path is invalid")?;
+                let pending_path = final_path.with_file_name(format!(".{name}.pending"));
+                match crate::secure_file::read_bounded(
+                    &final_path,
+                    MAX_SUITE_RETENTION_MANIFEST_BYTES,
+                    true,
+                ) {
+                    Ok(bytes) if sha256_hex(&bytes) == record.manifest_sha256 => {}
+                    Ok(_) => bail!("retained Suite manifest conflicts with recovery journal"),
+                    Err(crate::secure_file::SecureFileError::NotFound) => {
+                        let pending = crate::secure_file::read_bounded(
+                            &pending_path,
+                            MAX_SUITE_RETENTION_MANIFEST_BYTES,
+                            true,
+                        )
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "retained Suite pending manifest is not secure: {error:?}"
+                            )
+                        })?;
+                        if sha256_hex(&pending) != record.manifest_sha256 {
+                            bail!(
+                                "retained Suite pending manifest conflicts with recovery journal"
+                            );
+                        }
+                        crate::secure_file::promote_private_file(&pending_path, &final_path)
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "failed to recover retained Suite manifest: {error:?}"
+                                )
+                            })?;
+                        recovered_retention_manifest = true;
+                    }
+                    Err(error) => bail!("retained Suite manifest is not secure: {error:?}"),
+                }
+            }
             let mut recovered_manifest_removal = false;
             if let RecoveryJournal::TenantResource(tenant_journal) = &mut journal
                 && tenant_journal.binding.manifest_path.is_some()
@@ -415,16 +747,34 @@ impl ConformanceRecoveryStore {
                     recovered_manifest_removal = true;
                 }
             }
-            if recovered_manifest_removal || normalized_proxy_cleanup {
+            if recovered_manifest_removal
+                || normalized_proxy_cleanup
+                || normalized_suite_cleanup
+                || recovered_retention_manifest
+            {
                 validate_journal(&journal, &self.deployment_id, request_jti)?;
                 write_journal(&journal_path, &journal)?;
             }
+            let retention_commit_resolution = match &journal {
+                RecoveryJournal::TenantResource(journal)
+                    if matches!(
+                        &journal.suite_retention,
+                        SuiteRetentionDisposition::Retained { .. }
+                    ) =>
+                {
+                    SuiteRetentionCommitResolution::Retained
+                }
+                _ => SuiteRetentionCommitResolution::Prepared,
+            };
             pending.push(ConformanceRecoveryGuard {
                 store: self.clone(),
                 journal,
                 journal_path,
                 lock_path,
                 lock: Some(lock),
+                retention_commit_resolution,
+                #[cfg(test)]
+                persist_failpoint: std::sync::Arc::new(std::sync::Mutex::new(None)),
             });
         }
         Ok(pending)
@@ -448,6 +798,27 @@ impl Clone for ConformanceRecoveryStore {
 }
 
 impl ConformanceRecoveryGuard {
+    #[cfg(test)]
+    fn fail_next_persist_for_test(&self) {
+        self.set_persist_failpoint_for_test(PersistFailpoint::BeforeWrite);
+    }
+
+    #[cfg(test)]
+    fn fail_after_rename_before_directory_fsync_for_test(&self) {
+        self.set_persist_failpoint_for_test(PersistFailpoint::AfterRenameBeforeDirectoryFsync);
+    }
+
+    #[cfg(test)]
+    fn set_persist_failpoint_for_test(&self, failpoint: PersistFailpoint) {
+        *self
+            .persist_failpoint
+            .lock()
+            .expect("test persist failpoint lock") = Some(failpoint);
+    }
+
+    pub fn suite_retention_commit_resolution(&self) -> SuiteRetentionCommitResolution {
+        self.retention_commit_resolution
+    }
     pub fn binding(&self) -> &ConformanceRecoveryBinding {
         match &self.journal {
             RecoveryJournal::Legacy(journal) => &journal.binding,
@@ -554,7 +925,12 @@ impl ConformanceRecoveryGuard {
     /// Persist a remote Suite plan immediately after it is allocated.  This
     /// is intentionally outside NazoAuth: it records only the canonical
     /// external origin and opaque Suite identifier needed for cancellation.
-    pub fn record_suite_plan(&mut self, origin: &str, plan_id: &str) -> anyhow::Result<()> {
+    pub fn record_suite_plan(
+        &mut self,
+        origin: &str,
+        intent_id: &str,
+        plan_id: &str,
+    ) -> anyhow::Result<()> {
         let origin = crate::Origin::parse_suite(origin)
             .map_err(|_| anyhow::anyhow!("Suite recovery origin is invalid"))?;
         validate_component(plan_id, "Suite plan ID")?;
@@ -565,6 +941,7 @@ impl ConformanceRecoveryGuard {
             origin: origin.as_str().to_owned(),
             plan_ids: Vec::new(),
             module_ids: Vec::new(),
+            pending_create_intents: Vec::new(),
             cleanup_complete: false,
         });
         if suite.origin != origin.as_str() {
@@ -573,6 +950,7 @@ impl ConformanceRecoveryGuard {
         if suite.cleanup_complete {
             bail!("Suite recovery is already marked complete");
         }
+        Self::resolve_suite_create_intent(suite, intent_id)?;
         if !suite.plan_ids.iter().any(|existing| existing == plan_id) {
             if suite.plan_ids.len() >= MAX_SUITE_RECOVERY_PLANS {
                 bail!("Suite recovery plan count exceeds policy");
@@ -582,10 +960,103 @@ impl ConformanceRecoveryGuard {
         self.persist()
     }
 
+    /// Persist an unknown-outcome marker before sending a Suite create
+    /// request. The Suite API does not yet expose a caller supplied
+    /// idempotency key or an authenticated run-scoped enumeration endpoint,
+    /// so recovery must retain this marker if the process dies before the
+    /// returned opaque resource ID is journaled.
+    pub fn begin_suite_create(&mut self, origin: &str, intent_id: &str) -> anyhow::Result<()> {
+        self.begin_suite_create_with_retention(origin, intent_id, false)
+    }
+
+    /// Bind the requested retention policy before any remote Suite create
+    /// request. Once persisted, retries cannot silently change it.
+    pub fn begin_suite_create_with_retention(
+        &mut self,
+        origin: &str,
+        intent_id: &str,
+        retain_suite_plans_for_certification: bool,
+    ) -> anyhow::Result<()> {
+        let origin = crate::Origin::parse_suite(origin)
+            .map_err(|_| anyhow::anyhow!("Suite recovery origin is invalid"))?;
+        validate_component(intent_id, "Suite create intent ID")?;
+        let journal = self
+            .tenant_resource_journal_mut()
+            .context("Suite recovery is not valid for a legacy journal")?;
+        match &journal.suite_retention {
+            SuiteRetentionDisposition::Active { requested }
+                if *requested != retain_suite_plans_for_certification
+                    && journal.suite.is_some() =>
+            {
+                bail!("Suite retention policy conflicts with the recovery journal");
+            }
+            SuiteRetentionDisposition::Active { .. } => {
+                journal.suite_retention = SuiteRetentionDisposition::Active {
+                    requested: retain_suite_plans_for_certification,
+                };
+                if retain_suite_plans_for_certification {
+                    journal.schema = if journal.binding.vp_evidence_trust_anchor.is_some() {
+                        VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                    } else {
+                        RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                    };
+                }
+            }
+            SuiteRetentionDisposition::RetentionPrepared { .. }
+            | SuiteRetentionDisposition::Retained { .. }
+            | SuiteRetentionDisposition::Cleaned => {
+                bail!("Suite resources are already settled for this recovery journal");
+            }
+        }
+        let suite = journal.suite.get_or_insert_with(|| SuiteRecoveryState {
+            origin: origin.as_str().to_owned(),
+            plan_ids: Vec::new(),
+            module_ids: Vec::new(),
+            pending_create_intents: Vec::new(),
+            cleanup_complete: false,
+        });
+        if suite.origin != origin.as_str() {
+            bail!("Suite recovery origin conflicts with the journal");
+        }
+        if suite.cleanup_complete {
+            bail!("Suite recovery is already marked complete");
+        }
+        if suite
+            .pending_create_intents
+            .iter()
+            .any(|existing| existing == intent_id)
+        {
+            bail!("Suite create intent is already pending");
+        }
+        if suite.pending_create_intents.len()
+            >= MAX_SUITE_RECOVERY_PLANS + MAX_SUITE_RECOVERY_MODULES
+        {
+            bail!("Suite create intent count exceeds policy");
+        }
+        suite.pending_create_intents.push(intent_id.to_owned());
+        self.persist()
+    }
+
+    fn resolve_suite_create_intent(
+        suite: &mut SuiteRecoveryState,
+        intent_id: &str,
+    ) -> anyhow::Result<()> {
+        validate_component(intent_id, "Suite create intent ID")?;
+        let Some(index) = suite
+            .pending_create_intents
+            .iter()
+            .position(|existing| existing == intent_id)
+        else {
+            bail!("Suite create intent is not pending");
+        };
+        suite.pending_create_intents.remove(index);
+        Ok(())
+    }
+
     /// Persist a Suite module immediately after it is allocated.  A module
     /// cannot be recorded before its containing plan, preventing a recovery
     /// journal with unactionable external state.
-    pub fn record_suite_module(&mut self, module_id: &str) -> anyhow::Result<()> {
+    pub fn record_suite_module(&mut self, intent_id: &str, module_id: &str) -> anyhow::Result<()> {
         validate_component(module_id, "Suite module ID")?;
         let journal = self
             .tenant_resource_journal_mut()
@@ -597,6 +1068,7 @@ impl ConformanceRecoveryGuard {
         if suite.cleanup_complete {
             bail!("Suite recovery is already marked complete");
         }
+        Self::resolve_suite_create_intent(suite, intent_id)?;
         if !suite
             .module_ids
             .iter()
@@ -618,8 +1090,17 @@ impl ConformanceRecoveryGuard {
     }
 
     pub fn suite_cleanup_complete(&self) -> bool {
-        self.suite_recovery()
-            .is_none_or(|suite| suite.cleanup_complete)
+        match &self.journal {
+            RecoveryJournal::Legacy(_) => true,
+            RecoveryJournal::TenantResource(journal) => {
+                matches!(
+                    &journal.suite_retention,
+                    SuiteRetentionDisposition::Retained { .. } | SuiteRetentionDisposition::Cleaned
+                ) || journal.suite.as_ref().is_none_or(|suite| {
+                    suite.cleanup_complete && suite.pending_create_intents.is_empty()
+                })
+            }
+        }
     }
 
     /// Mark external cleanup complete only after every persisted module has
@@ -629,12 +1110,368 @@ impl ConformanceRecoveryGuard {
         let journal = self
             .tenant_resource_journal_mut()
             .context("Suite recovery is not valid for a legacy journal")?;
+        if !matches!(
+            &journal.suite_retention,
+            SuiteRetentionDisposition::Active { .. }
+                | SuiteRetentionDisposition::RetentionPrepared { .. }
+        ) {
+            bail!("retained Suite resources cannot be marked as cleanup complete");
+        }
+        {
+            let suite = journal
+                .suite
+                .as_mut()
+                .context("Suite cleanup has no persisted allocation")?;
+            if !suite.pending_create_intents.is_empty() {
+                bail!("Suite cleanup cannot complete with unresolved Suite create intent");
+            }
+            suite.cleanup_complete = true;
+            suite.plan_ids.clear();
+            suite.module_ids.clear();
+        }
+        if matches!(
+            journal.schema,
+            RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                | VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                | DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+        ) {
+            journal.suite_retention = SuiteRetentionDisposition::Cleaned;
+        }
+        self.persist()
+    }
+
+    /// Durably record exact retained plan ownership before publishing its
+    /// root-owned manifest. A later crash can recreate the manifest without
+    /// deleting the plans.
+    pub fn prepare_suite_plan_retention(
+        &mut self,
+        manifest: SuiteRetentionManifest,
+        manifest_path: PathBuf,
+    ) -> anyhow::Result<()> {
+        let journal = self
+            .tenant_resource_journal_mut()
+            .context("Suite retention is not valid for a legacy journal")?;
+        if !matches!(
+            &journal.suite_retention,
+            SuiteRetentionDisposition::Active { requested: true }
+        ) {
+            bail!("Suite retention was not requested before allocation");
+        }
         let suite = journal
             .suite
             .as_mut()
-            .context("Suite cleanup has no persisted allocation")?;
-        suite.cleanup_complete = true;
+            .context("Suite retention has no persisted allocation")?;
+        if suite.cleanup_complete || !suite.pending_create_intents.is_empty() {
+            bail!("Suite retention requires a settled allocation");
+        }
+        validate_suite_retention_manifest(&manifest, &journal.binding, Some(suite))?;
+        if !manifest.deferred_review_pending.is_empty() {
+            if journal.binding.vp_evidence_trust_anchor.is_none() {
+                bail!("deferred review retention has no runtime trust anchor");
+            }
+            journal.schema = DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA;
+        }
+        let bytes = canonical_suite_retention_manifest(&manifest)?;
+        let record = SuiteRetentionRecord {
+            manifest,
+            manifest_sha256: sha256_hex(&bytes),
+            manifest_path,
+        };
+        // Retention eligibility is evaluated only after every allocated
+        // module has reached a terminal state. Prepared fallback cleanup
+        // therefore needs exact plan IDs, not the potentially 16k module ID
+        // inventory: plan deletion removes the terminal modules with it.
+        suite.module_ids.clear();
+        journal.suite_retention = SuiteRetentionDisposition::RetentionPrepared { record };
         self.persist()
+    }
+
+    /// Write a non-final pending manifest only after all non-Suite cleanup
+    /// obligations have completed. The journal remains `Prepared`, so a
+    /// crash here still defaults to deletion of the Suite allocation.
+    pub fn stage_suite_retention_manifest(&self) -> anyhow::Result<PathBuf> {
+        let record = match &self.journal {
+            RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
+                SuiteRetentionDisposition::RetentionPrepared { record } => record,
+                _ => bail!("Suite retention has not been prepared"),
+            },
+            RecoveryJournal::Legacy(_) => {
+                bail!("Suite retention is not valid for a legacy journal")
+            }
+        };
+        let bytes = canonical_suite_retention_manifest(&record.manifest)?;
+        if sha256_hex(&bytes) != record.manifest_sha256 {
+            bail!("Suite retention manifest digest conflicts with the journal");
+        }
+        if let Some(screenshot) = &record.manifest.review_screenshot_manifest {
+            validate_review_screenshot_manifest_binding(
+                screenshot,
+                &record.manifest,
+                self.tenant_resource_binding()
+                    .context("Suite retention has no ordinary binding")?,
+            )?;
+        }
+        let path = self.suite_retention_pending_path()?;
+        match crate::secure_file::read_bounded(&path, MAX_SUITE_RETENTION_MANIFEST_BYTES, true) {
+            Ok(existing) if sha256_hex(&existing) == record.manifest_sha256 => return Ok(path),
+            Ok(_) => bail!("retained Suite manifest conflicts with the recovery journal"),
+            Err(crate::secure_file::SecureFileError::NotFound) => {}
+            Err(error) => bail!("retained Suite manifest is not secure: {error:?}"),
+        }
+        crate::secure_file::write_atomic(&path, &bytes, true).map_err(|error| {
+            anyhow::anyhow!("failed to stage retained Suite manifest: {error:?}")
+        })?;
+        Ok(path)
+    }
+
+    /// Transfer ownership only after a complete pending manifest has been
+    /// fsynced. This is the sole transition that compacts module IDs.
+    pub fn commit_suite_plan_retention(&mut self) -> anyhow::Result<()> {
+        if let RecoveryJournal::TenantResource(journal) = &self.journal
+            && (!tenant_resource_obligations_complete(journal) || !journal.proxy_cleanup_complete)
+        {
+            bail!("Suite retention cannot commit before ordinary and proxy cleanup complete");
+        }
+        let pending = self.suite_retention_pending_path()?;
+        let record = match &self.journal {
+            RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
+                SuiteRetentionDisposition::RetentionPrepared { record } => record.clone(),
+                _ => bail!("Suite retention has not been prepared"),
+            },
+            RecoveryJournal::Legacy(_) => {
+                bail!("Suite retention is not valid for a legacy journal")
+            }
+        };
+        if let Some(screenshot) = &record.manifest.review_screenshot_manifest {
+            validate_review_screenshot_manifest_binding(
+                screenshot,
+                &record.manifest,
+                self.tenant_resource_binding()
+                    .context("Suite retention has no ordinary binding")?,
+            )?;
+        }
+        let bytes =
+            crate::secure_file::read_bounded(&pending, MAX_SUITE_RETENTION_MANIFEST_BYTES, true)
+                .map_err(|error| {
+                    anyhow::anyhow!("retained Suite pending manifest is not secure: {error:?}")
+                })?;
+        if sha256_hex(&bytes) != record.manifest_sha256 {
+            bail!("retained Suite pending manifest conflicts with the journal");
+        }
+        let mut next = self.journal.clone();
+        let journal = match &mut next {
+            RecoveryJournal::TenantResource(journal) => journal,
+            RecoveryJournal::Legacy(_) => unreachable!("tenant-resource journal was just verified"),
+        };
+        {
+            let suite = journal
+                .suite
+                .as_mut()
+                .context("Suite retention has no persisted allocation")?;
+            suite.plan_ids.clear();
+            suite.module_ids.clear();
+        }
+        journal.suite_retention = SuiteRetentionDisposition::Retained { record };
+        // Do not expose an in-memory Retained state until its compacted
+        // ownership journal is durable. A failed write must remain Prepared
+        // so the caller can still perform exact fallback deletion.
+        let old = self.journal.clone();
+        match self.persist_snapshot(&next) {
+            Ok(()) => {
+                self.journal = next;
+                self.retention_commit_resolution = SuiteRetentionCommitResolution::Retained;
+                Ok(())
+            }
+            Err(write_error) => match self.reconcile_retention_commit(&old, &next) {
+                Ok(SuiteRetentionCommitResolution::Retained) => {
+                    self.journal = next;
+                    self.retention_commit_resolution = SuiteRetentionCommitResolution::Retained;
+                    Ok(())
+                }
+                Ok(SuiteRetentionCommitResolution::Prepared) => {
+                    self.retention_commit_resolution = SuiteRetentionCommitResolution::Prepared;
+                    Err(write_error.context(
+                        "Suite retention journal remained Prepared; exact fallback cleanup is permitted",
+                    ))
+                }
+                Ok(SuiteRetentionCommitResolution::NotAttempted)
+                | Ok(SuiteRetentionCommitResolution::Ambiguous)
+                | Err(_) => {
+                    self.retention_commit_resolution = SuiteRetentionCommitResolution::Ambiguous;
+                    Err(AmbiguousSuiteRetentionCommit.into())
+                }
+            },
+        }
+    }
+
+    /// Finalize a journal-authorized pending manifest. A missing or altered
+    /// final/pending file fails closed and never triggers Suite deletion.
+    pub fn publish_committed_suite_retention_manifest(&self) -> anyhow::Result<PathBuf> {
+        let record = match &self.journal {
+            RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
+                SuiteRetentionDisposition::Retained { record } => record,
+                _ => bail!("Suite retention has not been committed"),
+            },
+            RecoveryJournal::Legacy(_) => {
+                bail!("Suite retention is not valid for a legacy journal")
+            }
+        };
+        let final_path = record.manifest_path.clone();
+        if let Some(screenshot) = &record.manifest.review_screenshot_manifest {
+            validate_review_screenshot_manifest_binding(
+                screenshot,
+                &record.manifest,
+                self.tenant_resource_binding()
+                    .context("Suite retention has no ordinary binding")?,
+            )?;
+        }
+        match crate::secure_file::read_bounded(
+            &final_path,
+            MAX_SUITE_RETENTION_MANIFEST_BYTES,
+            true,
+        ) {
+            Ok(existing) if sha256_hex(&existing) == record.manifest_sha256 => {
+                return Ok(final_path);
+            }
+            Ok(_) => bail!("retained Suite manifest conflicts with the recovery journal"),
+            Err(crate::secure_file::SecureFileError::NotFound) => {}
+            Err(error) => bail!("retained Suite manifest is not secure: {error:?}"),
+        }
+        let pending = self.suite_retention_pending_path()?;
+        crate::secure_file::promote_private_file(&pending, &final_path).map_err(|error| {
+            anyhow::anyhow!("failed to publish retained Suite manifest: {error:?}")
+        })?;
+        Ok(final_path)
+    }
+
+    pub fn suite_retention_manifest(&self) -> Option<&SuiteRetentionManifest> {
+        match &self.journal {
+            RecoveryJournal::Legacy(_) => None,
+            RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
+                SuiteRetentionDisposition::RetentionPrepared { record }
+                | SuiteRetentionDisposition::Retained { record } => Some(&record.manifest),
+                SuiteRetentionDisposition::Active { .. } | SuiteRetentionDisposition::Cleaned => {
+                    None
+                }
+            },
+        }
+    }
+
+    /// Returns a receipt only after exact Suite plan ownership has transferred.
+    pub fn suite_retention_manifest_receipt(
+        &self,
+    ) -> anyhow::Result<Option<SuiteRetentionManifestReceipt>> {
+        match &self.journal {
+            RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
+                SuiteRetentionDisposition::Retained { record } => {
+                    validate_suite_retention_manifest_path(
+                        record,
+                        self.tenant_resource_binding()
+                            .context("Suite retention has no ordinary binding")?,
+                    )?;
+                    let bytes = crate::secure_file::read_bounded(
+                        &record.manifest_path,
+                        MAX_SUITE_RETENTION_MANIFEST_BYTES,
+                        true,
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!("retained Suite manifest is not secure: {error:?}")
+                    })?;
+                    if sha256_hex(&bytes) != record.manifest_sha256 {
+                        bail!("retained Suite manifest conflicts with the recovery journal");
+                    }
+                    Ok(Some(SuiteRetentionManifestReceipt {
+                        path: record.manifest_path.clone(),
+                        sha256: record.manifest_sha256.clone(),
+                    }))
+                }
+                SuiteRetentionDisposition::Active { .. }
+                | SuiteRetentionDisposition::RetentionPrepared { .. }
+                | SuiteRetentionDisposition::Cleaned => Ok(None),
+            },
+            RecoveryJournal::Legacy(_) => Ok(None),
+        }
+    }
+
+    pub fn suite_retention_committed(&self) -> bool {
+        matches!(
+            &self.journal,
+            RecoveryJournal::TenantResource(journal)
+                if matches!(&journal.suite_retention, SuiteRetentionDisposition::Retained { .. })
+        )
+    }
+
+    fn reconcile_retention_commit(
+        &self,
+        old: &RecoveryJournal,
+        next: &RecoveryJournal,
+    ) -> anyhow::Result<SuiteRetentionCommitResolution> {
+        let bytes =
+            crate::secure_file::read_bounded(&self.journal_path, MAX_RECOVERY_JOURNAL_BYTES, true)
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to re-read retention journal: {error:?}")
+                })?;
+        let disk: RecoveryJournal =
+            serde_json::from_slice(&bytes).context("retention journal is not valid JSON")?;
+        validate_journal(&disk, &self.store.deployment_id, old.request_jti())?;
+        let old_bytes = canonical_journal_bytes(old)?;
+        let next_bytes = canonical_journal_bytes(next)?;
+        if bytes == next_bytes {
+            crate::secure_file::fsync_parent_directory(&self.journal_path, true).map_err(
+                |error| {
+                    anyhow::anyhow!(
+                        "failed to fsync reconciled retention journal parent: {error:?}"
+                    )
+                },
+            )?;
+            Ok(SuiteRetentionCommitResolution::Retained)
+        } else if bytes == old_bytes {
+            Ok(SuiteRetentionCommitResolution::Prepared)
+        } else {
+            Ok(SuiteRetentionCommitResolution::Ambiguous)
+        }
+    }
+
+    /// A prepared-but-uncommitted retention is ordinary cleanup state. Remove
+    /// only its non-final staging file before deleting the journal-owned plans.
+    pub fn discard_prepared_suite_retention_staging(&self) -> anyhow::Result<()> {
+        let prepared = matches!(
+            &self.journal,
+            RecoveryJournal::TenantResource(journal)
+                if matches!(
+                    &journal.suite_retention,
+                    SuiteRetentionDisposition::RetentionPrepared { .. }
+                )
+        );
+        if !prepared {
+            return Ok(());
+        }
+        let pending = self.suite_retention_pending_path()?;
+        match crate::secure_file::remove_file(&pending, true) {
+            Ok(()) | Err(crate::secure_file::SecureFileError::NotFound) => Ok(()),
+            Err(error) => bail!("failed to discard staged Suite retention manifest: {error:?}"),
+        }
+    }
+
+    fn suite_retention_pending_path(&self) -> anyhow::Result<PathBuf> {
+        let record = match &self.journal {
+            RecoveryJournal::TenantResource(journal) => match &journal.suite_retention {
+                SuiteRetentionDisposition::RetentionPrepared { record }
+                | SuiteRetentionDisposition::Retained { record } => record,
+                _ => bail!("Suite retention has no manifest path"),
+            },
+            RecoveryJournal::Legacy(_) => {
+                bail!("Suite retention is not valid for a legacy journal")
+            }
+        };
+        let name = record
+            .manifest_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("Suite retention manifest path is invalid")?;
+        Ok(record
+            .manifest_path
+            .with_file_name(format!(".{name}.pending")))
     }
 
     /// Persist the verified signed apply receipt identity.  This is the only
@@ -870,6 +1707,9 @@ impl ConformanceRecoveryGuard {
     }
 
     pub fn finish(mut self) -> anyhow::Result<()> {
+        if self.suite_retention_committed() {
+            self.publish_committed_suite_retention_manifest()?;
+        }
         match &self.journal {
             RecoveryJournal::Legacy(journal) => {
                 if !journal.lease_cleanup_complete || !journal.proxy_cleanup_complete {
@@ -879,10 +1719,7 @@ impl ConformanceRecoveryGuard {
             RecoveryJournal::TenantResource(journal) => {
                 if !tenant_resource_obligations_complete(journal)
                     || !journal.proxy_cleanup_complete
-                    || journal
-                        .suite
-                        .as_ref()
-                        .is_some_and(|suite| !suite.cleanup_complete)
+                    || !suite_resources_settled(journal)
                 {
                     bail!("conformance recovery obligations are incomplete");
                 }
@@ -949,12 +1786,22 @@ impl ConformanceRecoveryGuard {
     }
 
     fn persist(&self) -> anyhow::Result<()> {
-        validate_journal(
-            &self.journal,
-            &self.store.deployment_id,
-            self.journal.request_jti(),
-        )?;
-        if let RecoveryJournal::TenantResource(journal) = &self.journal
+        self.persist_snapshot(&self.journal)
+    }
+
+    fn persist_snapshot(&self, journal: &RecoveryJournal) -> anyhow::Result<()> {
+        #[cfg(test)]
+        let failpoint = self
+            .persist_failpoint
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test persist failpoint lock poisoned"))?
+            .take();
+        #[cfg(test)]
+        if failpoint == Some(PersistFailpoint::BeforeWrite) {
+            bail!("injected recovery journal persistence failure before write");
+        }
+        validate_journal(journal, &self.store.deployment_id, journal.request_jti())?;
+        if let RecoveryJournal::TenantResource(journal) = journal
             && journal.binding.manifest_path.is_some()
         {
             let present = validate_tenant_resource_manifest_file(&journal.binding)?;
@@ -965,17 +1812,39 @@ impl ConformanceRecoveryGuard {
                 bail!("tenant-resource apply manifest disappeared before cleanup");
             }
         }
-        write_journal(&self.journal_path, &self.journal)
+        write_journal(&self.journal_path, journal)?;
+        #[cfg(test)]
+        if failpoint == Some(PersistFailpoint::AfterRenameBeforeDirectoryFsync) {
+            bail!(
+                "injected recovery journal persistence failure after rename before directory fsync"
+            );
+        }
+        Ok(())
     }
 }
 
+fn suite_resources_settled(journal: &TenantResourceRecoveryJournal) -> bool {
+    matches!(
+        &journal.suite_retention,
+        SuiteRetentionDisposition::Retained { .. } | SuiteRetentionDisposition::Cleaned
+    ) || journal
+        .suite
+        .as_ref()
+        .is_none_or(|suite| suite.cleanup_complete)
+}
+
 fn write_journal(path: &Path, journal: &RecoveryJournal) -> anyhow::Result<()> {
+    let bytes = canonical_journal_bytes(journal)?;
+    crate::secure_file::write_atomic(path, &bytes, true)
+        .map_err(|error| anyhow::anyhow!("failed to persist recovery journal: {error:?}"))
+}
+
+fn canonical_journal_bytes(journal: &RecoveryJournal) -> anyhow::Result<Vec<u8>> {
     let bytes = serde_json::to_vec_pretty(journal)?;
     if bytes.len() > MAX_RECOVERY_JOURNAL_BYTES {
         bail!("conformance recovery journal exceeds policy");
     }
-    crate::secure_file::write_atomic(path, &bytes, true)
-        .map_err(|error| anyhow::anyhow!("failed to persist recovery journal: {error:?}"))
+    Ok(bytes)
 }
 
 fn validate_journal(
@@ -997,8 +1866,13 @@ fn validate_journal(
             validate_binding(&journal.binding, deployment_id)
         }
         RecoveryJournal::TenantResource(journal) => {
-            if journal.schema != TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
-                || journal.kind != TENANT_RESOURCE_RECOVERY_KIND
+            if !matches!(
+                journal.schema,
+                TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                    | RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                    | VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+                    | DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+            ) || journal.kind != TENANT_RESOURCE_RECOVERY_KIND
             {
                 bail!("tenant-resource recovery journal discriminator is invalid");
             }
@@ -1012,6 +1886,42 @@ fn validate_tenant_resource_journal(
     deployment_id: &str,
 ) -> anyhow::Result<()> {
     validate_tenant_resource_binding(&journal.binding, deployment_id)?;
+    if journal.schema == TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+        && !SuiteRetentionDisposition::is_default(&journal.suite_retention)
+    {
+        bail!("schema-2 recovery journal cannot retain Suite plans");
+    }
+    if matches!(
+        journal.schema,
+        VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+            | DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+    ) && journal.binding.vp_evidence_trust_anchor.is_none()
+    {
+        bail!("schema-4 recovery journal has no VP evidence trust anchor");
+    }
+    if !matches!(
+        journal.schema,
+        VP_EVIDENCE_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+            | DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+    ) && journal.binding.vp_evidence_trust_anchor.is_some()
+    {
+        bail!("legacy recovery journal cannot carry a VP evidence trust anchor");
+    }
+    if journal.schema == RETAINING_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+        && SuiteRetentionDisposition::is_default(&journal.suite_retention)
+    {
+        bail!("schema-3 recovery journal has no explicit retention policy");
+    }
+    if journal.schema == DEFERRED_REVIEW_TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA
+        && !matches!(
+            &journal.suite_retention,
+            SuiteRetentionDisposition::RetentionPrepared { record }
+                | SuiteRetentionDisposition::Retained { record }
+                if !record.manifest.deferred_review_pending.is_empty()
+        )
+    {
+        bail!("schema-5 recovery journal has no deferred review retention record");
+    }
     if journal.cleanup_complete && !tenant_resource_obligations_complete(journal) {
         bail!("tenant-resource cleanup marker is ahead of its obligations");
     }
@@ -1038,13 +1948,23 @@ fn validate_tenant_resource_journal(
     if journal.binding.proxy.is_none() && !journal.proxy_cleanup_complete {
         bail!("tenant-resource proxy cleanup marker is incomplete without a proxy binding");
     }
+    let suite_inventory_transferred = matches!(
+        &journal.suite_retention,
+        SuiteRetentionDisposition::Retained { .. }
+    );
     if let Some(suite) = &journal.suite {
         let origin = crate::Origin::parse_suite(&suite.origin)
             .map_err(|_| anyhow::anyhow!("Suite recovery origin is invalid"))?;
         if origin.as_str() != suite.origin
-            || suite.plan_ids.is_empty()
+            || (!suite.cleanup_complete
+                && !suite_inventory_transferred
+                && suite.plan_ids.is_empty()
+                && suite.pending_create_intents.is_empty())
             || suite.plan_ids.len() > MAX_SUITE_RECOVERY_PLANS
             || suite.module_ids.len() > MAX_SUITE_RECOVERY_MODULES
+            || suite.pending_create_intents.len()
+                > MAX_SUITE_RECOVERY_PLANS + MAX_SUITE_RECOVERY_MODULES
+            || (suite.cleanup_complete && !suite.pending_create_intents.is_empty())
         {
             bail!("Suite recovery state is outside policy");
         }
@@ -1061,6 +1981,53 @@ fn validate_tenant_resource_journal(
             if !module_ids.insert(module_id) {
                 bail!("Suite recovery module identifiers must be unique");
             }
+        }
+        let mut intent_ids = std::collections::BTreeSet::new();
+        for intent_id in &suite.pending_create_intents {
+            validate_component(intent_id, "Suite create intent ID")?;
+            if !intent_ids.insert(intent_id) {
+                bail!("Suite create intent identifiers must be unique");
+            }
+        }
+    }
+    match &journal.suite_retention {
+        SuiteRetentionDisposition::Active { .. } => {}
+        SuiteRetentionDisposition::Cleaned => {
+            let suite = journal
+                .suite
+                .as_ref()
+                .context("Suite cleanup disposition has no Suite state")?;
+            if !suite.cleanup_complete
+                || !suite.pending_create_intents.is_empty()
+                || !suite.plan_ids.is_empty()
+                || !suite.module_ids.is_empty()
+            {
+                bail!("Suite cleaned disposition is outside policy");
+            }
+        }
+        SuiteRetentionDisposition::RetentionPrepared { record } => {
+            let suite = journal
+                .suite
+                .as_ref()
+                .context("prepared Suite retention has no Suite state")?;
+            if suite.cleanup_complete || !suite.pending_create_intents.is_empty() {
+                bail!("prepared Suite retention has unsettled allocation state");
+            }
+            validate_suite_retention_record(record, &journal.binding, suite)?;
+        }
+        SuiteRetentionDisposition::Retained { record } => {
+            let suite = journal
+                .suite
+                .as_ref()
+                .context("retained Suite disposition has no Suite state")?;
+            if suite.cleanup_complete
+                || !suite.pending_create_intents.is_empty()
+                || !suite.plan_ids.is_empty()
+                || !suite.module_ids.is_empty()
+            {
+                bail!("retained Suite disposition must transfer all allocation IDs");
+            }
+            validate_suite_retention_record_without_inventory(record, &journal.binding)?;
         }
     }
     if let Some(receipt) = &journal.receipt {
@@ -1099,6 +2066,676 @@ fn validate_tenant_resource_journal(
         }
     }
     Ok(())
+}
+
+fn canonical_suite_retention_manifest(
+    manifest: &SuiteRetentionManifest,
+) -> anyhow::Result<Vec<u8>> {
+    serde_json::to_vec(manifest).context("failed to serialize Suite retention manifest")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        output.push(HEX[usize::from(byte >> 4)] as char);
+        output.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    output
+}
+
+fn validate_suite_retention_record(
+    record: &SuiteRetentionRecord,
+    binding: &TenantResourceRecoveryBinding,
+    suite: &SuiteRecoveryState,
+) -> anyhow::Result<()> {
+    validate_suite_retention_manifest(&record.manifest, binding, Some(suite))?;
+    if sha256_hex(&canonical_suite_retention_manifest(&record.manifest)?) != record.manifest_sha256
+    {
+        bail!("Suite retention manifest digest is invalid");
+    }
+    validate_suite_retention_manifest_path(record, binding)?;
+    Ok(())
+}
+
+fn validate_suite_retention_record_without_inventory(
+    record: &SuiteRetentionRecord,
+    binding: &TenantResourceRecoveryBinding,
+) -> anyhow::Result<()> {
+    validate_suite_retention_manifest(&record.manifest, binding, None)?;
+    if sha256_hex(&canonical_suite_retention_manifest(&record.manifest)?) != record.manifest_sha256
+    {
+        bail!("Suite retention manifest digest is invalid");
+    }
+    validate_suite_retention_manifest_path(record, binding)?;
+    Ok(())
+}
+
+fn validate_suite_retention_manifest(
+    manifest: &SuiteRetentionManifest,
+    binding: &TenantResourceRecoveryBinding,
+    suite: Option<&SuiteRecoveryState>,
+) -> anyhow::Result<()> {
+    if !matches!(manifest.schema, 1 | SUITE_RETENTION_MANIFEST_SCHEMA)
+        || (manifest.schema == 1 && !manifest.deferred_review_pending.is_empty())
+        || crate::Origin::parse_suite(&manifest.suite_origin)
+            .map_err(|_| anyhow::anyhow!("retained Suite origin is invalid"))?
+            .as_str()
+            != "https://www.certification.openid.net"
+        || manifest.deployment_id != binding.deployment_id
+        || manifest.tenant_id != binding.tenant_id
+        || manifest.run_id != binding.request_jti
+        || !lower_hex(&manifest.artifact_digest, 64)
+        || !lower_hex(&manifest.matrix_sha256, 64)
+        || manifest.plans.is_empty()
+        || manifest.plans.len() > MAX_SUITE_RECOVERY_PLANS
+    {
+        bail!("Suite retention manifest is outside policy");
+    }
+    if let Some(screenshot) = &manifest.review_screenshot_manifest {
+        validate_review_screenshot_manifest_binding(screenshot, manifest, binding)?;
+    }
+    if !manifest.deferred_review_pending.is_empty() {
+        let screenshot = manifest
+            .review_screenshot_manifest
+            .as_ref()
+            .context("deferred review retention has no screenshot manifest")?;
+        validate_deferred_review_screenshot_binding(screenshot, manifest, binding)?;
+    }
+    let mut matrix_ids = std::collections::BTreeSet::new();
+    let mut suite_ids = std::collections::BTreeSet::new();
+    for plan in &manifest.plans {
+        validate_component(&plan.matrix_plan_id, "retained Matrix plan ID")?;
+        validate_component(&plan.suite_plan_id, "retained Suite plan ID")?;
+        if plan.plan_name.is_empty()
+            || plan.plan_name.len() > 256
+            || plan.plan_name.bytes().any(|byte| byte.is_ascii_control())
+            || !lower_hex(&plan.plan_alias_sha256, 64)
+            || SuiteRetentionManifest::plan_alias_sha256(&plan.matrix_plan_id)
+                != plan.plan_alias_sha256
+            || !matrix_ids.insert(&plan.matrix_plan_id)
+            || !suite_ids.insert(&plan.suite_plan_id)
+        {
+            bail!("Suite retention plan ownership is invalid");
+        }
+    }
+    let mut deferred_modules = std::collections::BTreeSet::new();
+    for pending in &manifest.deferred_review_pending {
+        let canonical_variant = serde_json::to_string(&pending.variant)
+            .expect("BTreeMap<String, String> always serializes to JSON");
+        validate_component(&pending.matrix_plan_id, "deferred review Matrix plan ID")?;
+        validate_component(&pending.suite_plan_id, "deferred review Suite plan ID")?;
+        validate_component(&pending.module_id, "deferred review Suite module ID")?;
+        if pending.test_name.is_empty()
+            || pending.test_name.len() > 256
+            || pending
+                .test_name
+                .bytes()
+                .any(|byte| byte.is_ascii_control())
+            || pending.marker != crate::ReviewScreenshotMarker::Required
+            || pending.obligation_index != 0
+            || pending.placeholder_path
+                != format!("/test/a/{}/verification-evidence", pending.module_id)
+            || !matrix_ids.contains(&pending.matrix_plan_id)
+            || !suite_ids.contains(&pending.suite_plan_id)
+            || !deferred_modules.insert((
+                pending.matrix_plan_id.clone(),
+                pending.suite_plan_id.clone(),
+                pending.module_id.clone(),
+                pending.test_name.clone(),
+                canonical_variant,
+            ))
+        {
+            bail!("deferred review retention identity is invalid");
+        }
+    }
+    if let Some(suite) = suite {
+        let suite_ids = suite
+            .plan_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let manifest_ids = manifest
+            .plans
+            .iter()
+            .map(|plan| &plan.suite_plan_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        if suite_ids != manifest_ids {
+            bail!("Suite retention manifest does not cover the journal plan IDs");
+        }
+        if suite.origin != manifest.suite_origin {
+            bail!("Suite retention origin conflicts with the recovery journal");
+        }
+    }
+    Ok(())
+}
+
+fn validate_deferred_review_screenshot_binding(
+    screenshot: &SuiteRetentionScreenshotManifest,
+    retention: &SuiteRetentionManifest,
+    binding: &TenantResourceRecoveryBinding,
+) -> anyhow::Result<()> {
+    let bytes = crate::secure_file::read_bounded(
+        &screenshot.path,
+        crate::evidence::MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES,
+        true,
+    )
+    .map_err(|error| anyhow::anyhow!("review screenshot manifest is not secure: {error:?}"))?;
+    let document: ReviewScreenshotManifestDocument =
+        serde_json::from_slice(&bytes).context("review screenshot manifest is not valid JSON")?;
+    for pending in &retention.deferred_review_pending {
+        let module_matches = document.modules.iter().any(|module| {
+            module.matrix_plan_id == pending.matrix_plan_id
+                && module.suite_plan_id == pending.suite_plan_id
+                && module.module_id == pending.module_id
+                && module.test_name == pending.test_name
+                && module.variant == pending.variant
+                && module.required == 1
+                && module.captured_required == 1
+                && module.missing_optional == 0
+        });
+        let screenshot_matches = document.screenshots.iter().any(|image| {
+            image.matrix_plan_id == pending.matrix_plan_id
+                && image.suite_plan_id == pending.suite_plan_id
+                && image.module_id == pending.module_id
+                && image.test_name == pending.test_name
+                && image.variant == pending.variant
+                && image.marker == pending.marker
+                && image.obligation_index == pending.obligation_index
+                && image.source
+                    == crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver
+                && image.trigger_path == "/ui/verification-result"
+        });
+        if !module_matches || !screenshot_matches {
+            bail!("deferred review screenshot manifest does not bind the retained module");
+        }
+    }
+    if document.run_jti != binding.request_jti {
+        bail!("deferred review screenshot manifest has the wrong run identity");
+    }
+    Ok(())
+}
+
+fn validate_review_screenshot_manifest_binding(
+    screenshot: &SuiteRetentionScreenshotManifest,
+    retention: &SuiteRetentionManifest,
+    binding: &TenantResourceRecoveryBinding,
+) -> anyhow::Result<()> {
+    let expected_name = format!("{}.json", binding.request_jti);
+    if !screenshot.path.is_absolute()
+        || screenshot.path.file_name().and_then(|name| name.to_str())
+            != Some(expected_name.as_str())
+        || screenshot
+            .path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            != Some("review-screenshot-manifests")
+        || !lower_hex(&screenshot.sha256, 64)
+    {
+        bail!("review screenshot manifest binding is outside policy");
+    }
+    let bytes = crate::secure_file::read_bounded(
+        &screenshot.path,
+        crate::evidence::MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES,
+        true,
+    )
+    .map_err(|error| anyhow::anyhow!("review screenshot manifest is not secure: {error:?}"))?;
+    if sha256_hex(&bytes) != screenshot.sha256 {
+        bail!("review screenshot manifest digest is invalid");
+    }
+    let document: ReviewScreenshotManifestDocument =
+        serde_json::from_slice(&bytes).context("review screenshot manifest is not valid JSON")?;
+    if !matches!(
+        document.schema,
+        3 | 4 | 5 | crate::evidence::REVIEW_SCREENSHOT_MANIFEST_SCHEMA
+    ) || document.run_jti != binding.request_jti
+        || document.artifact_digest != retention.artifact_digest
+        || document.matrix_sha256 != retention.matrix_sha256
+        || document.suite_origin != retention.suite_origin
+    {
+        bail!("review screenshot manifest identity conflicts with retention");
+    }
+    let target_issuer = document.target_issuer.as_deref();
+    let vp_trust_anchor = binding.vp_evidence_trust_anchor.as_ref();
+    if document.schema == crate::evidence::REVIEW_SCREENSHOT_MANIFEST_SCHEMA
+        && target_issuer.is_none()
+    {
+        bail!("review screenshot manifest has no target issuer");
+    }
+    let plans = retention
+        .plans
+        .iter()
+        .map(|plan| (&plan.matrix_plan_id, &plan.suite_plan_id))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut modules = std::collections::BTreeSet::new();
+    for module in &document.modules {
+        if !plans.contains(&(&module.matrix_plan_id, &module.suite_plan_id))
+            || module.module_id.is_empty()
+            || module.test_name.is_empty()
+            || module.required != module.captured_required
+            || !modules.insert((
+                &module.matrix_plan_id,
+                &module.suite_plan_id,
+                &module.module_id,
+                &module.test_name,
+                &module.variant,
+            ))
+        {
+            bail!("review screenshot manifest module graph is invalid");
+        }
+    }
+    let mut images = std::collections::BTreeSet::new();
+    let mut obligations = std::collections::BTreeSet::new();
+    let mut expected_files = std::collections::BTreeSet::new();
+    let evidence_root = screenshot
+        .path
+        .parent()
+        .and_then(Path::parent)
+        .context("review screenshot manifest has no evidence root")?;
+    for image in &document.screenshots {
+        if document.schema != crate::evidence::REVIEW_SCREENSHOT_MANIFEST_SCHEMA
+            && (image.source != crate::BrowserReviewScreenshotSource::SuiteVerificationEvidence
+                || image.verification_receipt.is_some())
+        {
+            bail!("legacy review screenshot manifest has a non-Suite source");
+        }
+        let mut path_components = image.path.components();
+        let valid_path = path_components
+            .next()
+            .is_some_and(|part| part.as_os_str() == std::ffi::OsStr::new("review-screenshots"))
+            && path_components
+                .next()
+                .is_some_and(|part| part.as_os_str() == std::ffi::OsStr::new(&binding.request_jti))
+            && matches!(
+                path_components.next(),
+                Some(std::path::Component::Normal(_))
+            )
+            && path_components.next().is_none();
+        let source_valid = match image.source {
+            crate::BrowserReviewScreenshotSource::SuiteVerificationEvidence => {
+                image.verification_receipt.is_none()
+                    && image.trigger_origin == "https://www.certification.openid.net"
+                    && image.trigger_path
+                        == format!("/test/a/{}/verification-evidence", image.module_id)
+                    && sha256_hex(
+                        format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes(),
+                    ) == image.trigger_url_sha256
+            }
+            crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver => {
+                url::Url::parse(&format!("{}{}", image.trigger_origin, image.trigger_path))
+                    .is_ok_and(|url| {
+                        url.scheme() == "https"
+                            && url.host_str().is_some()
+                            && url.username().is_empty()
+                            && url.password().is_none()
+                            && url.query().is_none()
+                            && url.fragment().is_none()
+                    })
+                    && target_issuer
+                        .zip(vp_trust_anchor)
+                        .is_some_and(|(target_issuer, anchor)| {
+                            target_issuer == anchor.target_issuer
+                                && image.verification_receipt.as_ref().is_some_and(|receipt| {
+                                    verify_vp_receipt_provenance(
+                                        receipt, anchor, binding, retention, image,
+                                    )
+                                })
+                        })
+                    && image.trigger_path == "/ui/verification-result"
+                    && sha256_hex(
+                        format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes(),
+                    ) == image.trigger_url_sha256
+            }
+        };
+        if !plans.contains(&(&image.matrix_plan_id, &image.suite_plan_id))
+            || !modules.contains(&(
+                &image.matrix_plan_id,
+                &image.suite_plan_id,
+                &image.module_id,
+                &image.test_name,
+                &image.variant,
+            ))
+            || !valid_path
+            || image.size == 0
+            || !lower_hex(&image.sha256, 64)
+            || !lower_hex(&image.receipt_sha256, 64)
+            || !lower_hex(&image.trigger_url_sha256, 64)
+            || !source_valid
+            || !images.insert(&image.path)
+        {
+            bail!("review screenshot manifest screenshot graph is invalid");
+        }
+        let module = document
+            .modules
+            .iter()
+            .find(|module| {
+                module.matrix_plan_id == image.matrix_plan_id
+                    && module.suite_plan_id == image.suite_plan_id
+                    && module.module_id == image.module_id
+                    && module.test_name == image.test_name
+                    && module.variant == image.variant
+            })
+            .context("review screenshot has no exact module tuple")?;
+        let total_attempts = document
+            .screenshots
+            .iter()
+            .filter(|candidate| {
+                candidate.matrix_plan_id == module.matrix_plan_id
+                    && candidate.suite_plan_id == module.suite_plan_id
+                    && candidate.module_id == module.module_id
+                    && candidate.test_name == module.test_name
+                    && candidate.variant == module.variant
+            })
+            .count()
+            .checked_add(module.missing_optional)
+            .context("review screenshot attempt count overflows")?;
+        if image.obligation_index >= total_attempts
+            || !obligations.insert((
+                &image.matrix_plan_id,
+                &image.suite_plan_id,
+                &image.module_id,
+                &image.test_name,
+                &image.variant,
+                image.obligation_index,
+            ))
+        {
+            bail!("review screenshot manifest obligation graph is invalid");
+        }
+        let image_path = evidence_root.join(&image.path);
+        expected_files.insert(image.path.clone());
+        expected_files.insert(image.path.with_extension("png.receipt.json"));
+        let image_bytes = crate::secure_file::read_bounded(&image_path, 500 * 1024, true)
+            .map_err(|error| anyhow::anyhow!("review screenshot is not secure: {error:?}"))?;
+        if image_bytes.len() != image.size
+            || sha256_hex(&image_bytes) != image.sha256
+            || crate::browser::validate_png_screenshot(&image_bytes).is_err()
+        {
+            bail!("review screenshot bytes conflict with the manifest");
+        }
+        let receipt_path = image_path.with_extension("png.receipt.json");
+        let receipt =
+            crate::secure_file::read_bounded(&receipt_path, 16 * 1024, true).map_err(|error| {
+                anyhow::anyhow!("review screenshot receipt is not secure: {error:?}")
+            })?;
+        let audit: ReviewScreenshotAudit = serde_json::from_slice(&receipt)
+            .context("review screenshot receipt is invalid JSON")?;
+        if sha256_hex(&receipt) != image.receipt_sha256
+            || audit.suite_plan_id != image.suite_plan_id
+            || audit.module_id != image.module_id
+            || audit.test_name != image.test_name
+            || audit.variant != image.variant
+            || audit.marker != image.marker
+            || audit.obligation_index != image.obligation_index
+            || audit.path != image.path
+            || audit.sha256 != image.sha256
+            || audit.size != image.size
+            || audit.trigger_origin != image.trigger_origin
+            || audit.trigger_path != image.trigger_path
+            || audit.trigger_url_sha256 != image.trigger_url_sha256
+            || audit.source != image.source
+            || audit.verification_receipt != image.verification_receipt
+        {
+            bail!("review screenshot receipt conflicts with the manifest");
+        }
+    }
+    for module in &document.modules {
+        let required_captured = document
+            .screenshots
+            .iter()
+            .filter(|image| {
+                image.matrix_plan_id == module.matrix_plan_id
+                    && image.suite_plan_id == module.suite_plan_id
+                    && image.module_id == module.module_id
+                    && image.test_name == module.test_name
+                    && image.variant == module.variant
+                    && matches!(image.marker, crate::ReviewScreenshotMarker::Required)
+            })
+            .count();
+        let optional_captured = document
+            .screenshots
+            .iter()
+            .filter(|image| {
+                image.matrix_plan_id == module.matrix_plan_id
+                    && image.suite_plan_id == module.suite_plan_id
+                    && image.module_id == module.module_id
+                    && image.test_name == module.test_name
+                    && image.variant == module.variant
+                    && matches!(image.marker, crate::ReviewScreenshotMarker::Optional)
+            })
+            .count();
+        let total_attempts = required_captured
+            .checked_add(optional_captured)
+            .and_then(|attempts| attempts.checked_add(module.missing_optional))
+            .context("review screenshot optional attempt count overflows")?;
+        if required_captured != module.required
+            || module.captured_required != module.required
+            || total_attempts > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_MODULE
+        {
+            bail!("review screenshot manifest optional obligation count is invalid");
+        }
+    }
+    if expected_files.len() > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_RUN * 2 {
+        bail!("review screenshot manifest exceeds the run file budget");
+    }
+    let run_directory = evidence_root
+        .join("review-screenshots")
+        .join(&binding.request_jti);
+    match crate::secure_file::validate_directory(&run_directory, true) {
+        Ok(_) => {}
+        Err(crate::secure_file::SecureFileError::NotFound) if expected_files.is_empty() => {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "review screenshot run directory is not secure: {error:?}"
+            ));
+        }
+    }
+    let mut found_files = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&run_directory)
+        .context("failed to enumerate review screenshot run directory")?
+    {
+        let entry = entry.context("failed to enumerate review screenshot entry")?;
+        let file_type = entry
+            .file_type()
+            .context("failed to inspect review screenshot entry")?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            bail!("review screenshot run directory contains a non-file entry");
+        }
+        let name = entry.file_name();
+        let relative = PathBuf::from("review-screenshots")
+            .join(&binding.request_jti)
+            .join(name);
+        if !expected_files.contains(&relative) || !found_files.insert(relative) {
+            bail!("review screenshot run directory contains an unexpected entry");
+        }
+        if found_files.len() > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_RUN * 2 {
+            bail!("review screenshot run directory exceeds the file budget");
+        }
+    }
+    if found_files != expected_files {
+        bail!("review screenshot run directory is missing a declared entry");
+    }
+    Ok(())
+}
+
+fn verify_vp_receipt_provenance(
+    receipt: &crate::OpenId4VpVerificationReceiptProvenance,
+    anchor: &OpenId4VpEvidenceTrustAnchor,
+    binding: &TenantResourceRecoveryBinding,
+    retention: &SuiteRetentionManifest,
+    image: &ReviewScreenshotManifestImage,
+) -> bool {
+    use time::format_description::well_known::Rfc3339;
+
+    if receipt.issuer != anchor.target_issuer
+        || receipt.deployment_id != anchor.deployment_id
+        || receipt.tenant_id != binding.tenant_id
+        || receipt.runtime_instance_id != anchor.runtime_instance_id
+        || receipt.instance_key_id != anchor.instance_key_id
+        || receipt.instance_public_key_base64 != anchor.instance_public_key_base64
+        || image.trigger_origin != anchor.target_issuer
+        || receipt.receipt_api_url
+            != format!("{}/openid4vp/verification-receipts", anchor.target_issuer)
+        || sha256_hex(receipt.receipt_jws.as_bytes()) != receipt.receipt_sha256
+        || !lower_hex(&receipt.receipt_sha256, 64)
+        || !lower_hex(&receipt.capability_sha256, 64)
+        || uuid::Uuid::parse_str(&receipt.issuance_request_jti).is_err()
+        || !lower_hex(&receipt.presentation_binding_sha256, 64)
+        || !lower_hex(&receipt.intent_sha256, 64)
+    {
+        return false;
+    }
+    let Ok(key) =
+        nazo_operator_protocol::decode_instance_public_key(&anchor.instance_public_key_base64)
+    else {
+        return false;
+    };
+    if nazo_operator_protocol::instance_key_id(&key) != receipt.instance_key_id {
+        return false;
+    }
+    let Ok(variant_bytes) = serde_json::to_vec(&image.variant) else {
+        return false;
+    };
+    let context = nazo_operator_protocol::Openid4vpEvidenceContext {
+        run_jti: binding.request_jti.clone(),
+        artifact_sha256: retention.artifact_digest.clone(),
+        matrix_sha256: retention.matrix_sha256.clone(),
+        suite_plan_id: image.suite_plan_id.clone(),
+        suite_module_id: image.module_id.clone(),
+        test_name: image.test_name.clone(),
+        variant_sha256: sha256_hex(&variant_bytes),
+    };
+    let Ok(context_sha256) =
+        nazo_operator_protocol::canonical_openid4vp_evidence_context_sha256(&context)
+    else {
+        return false;
+    };
+    let Ok(completed_at) = time::OffsetDateTime::parse(&receipt.completed_at, &Rfc3339) else {
+        return false;
+    };
+    if completed_at.format(&Rfc3339).ok().as_deref() != Some(receipt.completed_at.as_str()) {
+        return false;
+    }
+    let Ok(expires_at) = time::OffsetDateTime::parse(&receipt.expires_at, &Rfc3339) else {
+        return false;
+    };
+    if expires_at.format(&Rfc3339).ok().as_deref() != Some(receipt.expires_at.as_str())
+        || expires_at <= completed_at
+    {
+        return false;
+    }
+    // This is historical verification: the presentation completes before the
+    // runtime can issue its receipt, so `completed_at` may precede the signed
+    // `iat`. Verify at the last whole second inside the signed validity window,
+    // then separately bind the verified issuance time to presentation order.
+    let Some(verification_time) = expires_at.unix_timestamp().checked_sub(1) else {
+        return false;
+    };
+    let receipt_id = receipt.receipt_id.to_string();
+    let transaction_id = receipt.transaction_id.to_string();
+    let expected = nazo_operator_protocol::Openid4vpVerificationReceiptExpectations {
+        issuer: &anchor.target_issuer,
+        audience: &receipt.receipt_api_url,
+        deployment_id: &receipt.deployment_id,
+        runtime_instance_id: &receipt.runtime_instance_id,
+        instance_key_id: &receipt.instance_key_id,
+        tenant_id: &receipt.tenant_id,
+        transaction_id: &transaction_id,
+        receipt_id: &receipt_id,
+        issuance_request_jti: &receipt.issuance_request_jti,
+        evidence_context_sha256: &context_sha256,
+        presentation_binding_sha256: &receipt.presentation_binding_sha256,
+        intent_sha256: &receipt.intent_sha256,
+        capability_sha256: &receipt.capability_sha256,
+    };
+    let Ok(verified) = nazo_operator_protocol::verify_openid4vp_verification_receipt(
+        &receipt.receipt_jws,
+        &expected,
+        &key,
+        verification_time,
+    ) else {
+        return false;
+    };
+    verified.completed_at == receipt.completed_at
+        && verified.iat >= completed_at.unix_timestamp()
+        && verified.iat < verified.exp
+        && verified.iss == receipt.issuer
+        && verified.deployment_id == receipt.deployment_id
+        && verified.tenant_id == receipt.tenant_id
+        && verified.runtime_instance_id == receipt.runtime_instance_id
+        && verified.instance_key_id == receipt.instance_key_id
+        && verified.transaction_id == transaction_id
+        && verified.issuance_request_jti == receipt.issuance_request_jti
+        && verified.intent_sha256 == receipt.intent_sha256
+        && verified.exp == expires_at.unix_timestamp()
+        && exact_vp_trust_policy_binding(binding, &verified.presentation_binding.trust_policy)
+}
+
+/// Bind the signed VP trust-policy projection to the one policy resource this
+/// ordinary run was authorized to create. A hash alone cannot distinguish a
+/// different valid policy resource, so both the kind and the exact identity
+/// must agree with the durable tenant-resource journal.
+pub(crate) fn exact_vp_trust_policy_binding(
+    binding: &TenantResourceRecoveryBinding,
+    policy: &nazo_operator_protocol::Openid4vpTrustPolicyBinding,
+) -> bool {
+    let (Some(binding_id), Some(resource_id), Some(resource_digest)) = (
+        policy.binding_id.as_deref(),
+        policy.resource_id.as_deref(),
+        policy.resource_digest.as_deref(),
+    ) else {
+        return false;
+    };
+    if !uuid::Uuid::parse_str(binding_id).is_ok_and(|parsed| parsed.to_string() == binding_id) {
+        return false;
+    }
+    let mut matching = binding
+        .resource_identities
+        .iter()
+        .filter(|identity| identity.kind == TenantResourceKind::Openid4vcTrustPolicy);
+    let Some(identity) = matching.next() else {
+        return false;
+    };
+    matching.next().is_none()
+        && identity.resource_id == resource_id
+        && identity.digest == resource_digest
+}
+
+fn validate_suite_retention_manifest_path(
+    record: &SuiteRetentionRecord,
+    binding: &TenantResourceRecoveryBinding,
+) -> anyhow::Result<()> {
+    let expected_name = format!("retained-suite-{}.json", binding.request_jti);
+    if record_path_is_invalid(&record.manifest_path, &expected_name) {
+        bail!("Suite retention manifest path is outside policy");
+    }
+    Ok(())
+}
+
+fn record_path_is_invalid(path: &Path, expected_name: &str) -> bool {
+    !retention_manifest_parent_is_root_owned(path)
+        || !path.is_absolute()
+        || path.file_name().and_then(|value| value.to_str()) != Some(expected_name)
+        || crate::secure_file::normalize_absolute(path).is_err()
+        || path.parent().is_none()
+        || crate::secure_file::validate_directory(path.parent().unwrap_or(Path::new(".")), true)
+            .is_err()
+}
+
+fn retention_manifest_parent_is_root_owned(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        path.parent()
+            .and_then(|parent| std::fs::metadata(parent).ok())
+            .is_some_and(|metadata| metadata.uid() == 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 fn tenant_resource_obligations_complete(journal: &TenantResourceRecoveryJournal) -> bool {
@@ -1182,7 +2819,44 @@ fn validate_tenant_resource_binding(
     validate_tenant_resource_identities(
         &binding.resource_identities,
         !matches!(binding.operation, TenantResourceOperation::Enumerate),
-    )
+    )?;
+    if let Some(anchor) = &binding.vp_evidence_trust_anchor {
+        validate_vp_evidence_trust_anchor(anchor, binding)?;
+    }
+    Ok(())
+}
+
+fn validate_vp_evidence_trust_anchor(
+    anchor: &OpenId4VpEvidenceTrustAnchor,
+    binding: &TenantResourceRecoveryBinding,
+) -> anyhow::Result<()> {
+    validate_component(&anchor.deployment_id, "VP evidence deployment ID")?;
+    validate_component(
+        &anchor.runtime_instance_id,
+        "VP evidence runtime instance ID",
+    )?;
+    validate_component(&anchor.instance_key_id, "VP evidence instance key ID")?;
+    let issuer =
+        url::Url::parse(&anchor.target_issuer).context("VP evidence target issuer is invalid")?;
+    if anchor.deployment_id != binding.deployment_id
+        || issuer.scheme() != "https"
+        || issuer.host_str().is_none()
+        || !issuer.username().is_empty()
+        || issuer.password().is_some()
+        || issuer.query().is_some()
+        || issuer.fragment().is_some()
+        || !matches!(issuer.path(), "" | "/")
+        || anchor.target_issuer != issuer.as_str().trim_end_matches('/')
+    {
+        bail!("VP evidence trust anchor conflicts with the recovery binding");
+    }
+    let key =
+        nazo_operator_protocol::decode_instance_public_key(&anchor.instance_public_key_base64)
+            .context("VP evidence instance public key is invalid")?;
+    if nazo_operator_protocol::instance_key_id(&key) != anchor.instance_key_id {
+        bail!("VP evidence instance key ID conflicts with its public key");
+    }
+    Ok(())
 }
 
 fn validate_compact_jws(value: &str, label: &str) -> anyhow::Result<()> {
@@ -1336,6 +3010,8 @@ fn lower_hex(value: &str, length: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     fn binding() -> ConformanceRecoveryBinding {
         ConformanceRecoveryBinding {
@@ -1387,6 +3063,7 @@ mod tests {
             expected_revision: 7,
             manifest_path: Some(manifest_path),
             proxy: None,
+            vp_evidence_trust_anchor: None,
             resource_identities: vec![tenant_resource_identity('c')],
         }
     }
@@ -1418,6 +3095,664 @@ mod tests {
             revision: binding.expected_revision + 1,
             resources: binding.resource_identities.clone(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_receipt_requires_one_exact_journal_trust_policy_identity() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!("nazoauth-vp-policy-{}", uuid::Uuid::now_v7()));
+        crate::secure_file::ensure_directory(&root, true).expect("test root");
+        let mut binding = tenant_resource_binding(&root);
+        let policy = nazo_operator_protocol::Openid4vpTrustPolicyBinding {
+            binding_id: Some("550e8400-e29b-41d4-a716-446655440006".to_owned()),
+            resource_id: Some("openid4vc-trust-policy:provider:0123456789abcdef".to_owned()),
+            resource_digest: Some("f".repeat(64)),
+        };
+
+        assert!(!exact_vp_trust_policy_binding(&binding, &policy));
+
+        binding.resource_identities = vec![TenantResourceIdentity {
+            kind: TenantResourceKind::Openid4vcTrustPolicy,
+            resource_id: policy.resource_id.clone().expect("resource ID"),
+            digest: policy.resource_digest.clone().expect("resource digest"),
+        }];
+        assert!(exact_vp_trust_policy_binding(&binding, &policy));
+        assert!(!exact_vp_trust_policy_binding(
+            &binding,
+            &nazo_operator_protocol::Openid4vpTrustPolicyBinding {
+                binding_id: None,
+                resource_id: policy.resource_id.clone(),
+                resource_digest: policy.resource_digest.clone(),
+            },
+        ));
+
+        binding.resource_identities[0].digest = "0".repeat(64);
+        assert!(!exact_vp_trust_policy_binding(&binding, &policy));
+        binding.resource_identities[0].digest = "f".repeat(64);
+        binding.resource_identities.push(TenantResourceIdentity {
+            kind: TenantResourceKind::Openid4vcTrustPolicy,
+            resource_id: "openid4vc-trust-policy:other:0123456789abcdef".to_owned(),
+            digest: "e".repeat(64),
+        });
+        assert!(!exact_vp_trust_policy_binding(&binding, &policy));
+
+        std::fs::remove_dir_all(&root).expect("remove test root");
+    }
+
+    #[cfg(unix)]
+    fn vp_receipt_fixture(
+        binding: &mut TenantResourceRecoveryBinding,
+    ) -> (SuiteRetentionManifest, ReviewScreenshotManifestImage) {
+        vp_receipt_fixture_with_trust_policy(
+            binding,
+            "openid4vc-trust-policy:provider:0123456789abcdef",
+            "f".repeat(64),
+        )
+    }
+
+    #[cfg(unix)]
+    fn vp_receipt_fixture_with_trust_policy(
+        binding: &mut TenantResourceRecoveryBinding,
+        trust_policy_resource_id: &str,
+        trust_policy_digest: String,
+    ) -> (SuiteRetentionManifest, ReviewScreenshotManifestImage) {
+        use time::format_description::well_known::Rfc3339;
+
+        binding.resource_identities = vec![TenantResourceIdentity {
+            kind: TenantResourceKind::Openid4vcTrustPolicy,
+            resource_id: trust_policy_resource_id.to_owned(),
+            digest: trust_policy_digest.clone(),
+        }];
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[13; 32]);
+        let verifying = signing.verifying_key();
+        let key_id = nazo_operator_protocol::instance_key_id(&verifying);
+        binding.vp_evidence_trust_anchor = Some(OpenId4VpEvidenceTrustAnchor {
+            target_issuer: "https://issuer.example".to_owned(),
+            deployment_id: binding.deployment_id.clone(),
+            runtime_instance_id: "runtime-a".to_owned(),
+            instance_key_id: key_id.clone(),
+            instance_public_key_base64: nazo_operator_protocol::encode_instance_public_key(
+                &verifying,
+            ),
+        });
+        let retention = SuiteRetentionManifest {
+            schema: SUITE_RETENTION_MANIFEST_SCHEMA,
+            suite_origin: "https://www.certification.openid.net".to_owned(),
+            artifact_digest: "a".repeat(64),
+            matrix_sha256: "b".repeat(64),
+            deployment_id: binding.deployment_id.clone(),
+            tenant_id: binding.tenant_id.clone(),
+            run_id: binding.request_jti.clone(),
+            review_screenshot_manifest: None,
+            deferred_review_pending: Vec::new(),
+            plans: vec![SuiteRetentionPlan {
+                matrix_plan_id: "matrix-plan-1".to_owned(),
+                suite_plan_id: "550e8400-e29b-41d4-a716-446655440001".to_owned(),
+                plan_name: "Certification plan".to_owned(),
+                plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256("matrix-plan-1"),
+            }],
+        };
+        let variant = std::collections::BTreeMap::new();
+        let context = nazo_operator_protocol::Openid4vpEvidenceContext {
+            run_jti: binding.request_jti.clone(),
+            artifact_sha256: retention.artifact_digest.clone(),
+            matrix_sha256: retention.matrix_sha256.clone(),
+            suite_plan_id: "550e8400-e29b-41d4-a716-446655440001".to_owned(),
+            suite_module_id: "550e8400-e29b-41d4-a716-446655440002".to_owned(),
+            test_name: "vp-happy".to_owned(),
+            variant_sha256: sha256_hex(&serde_json::to_vec(&variant).expect("variant")),
+        };
+        let presentation_binding = nazo_operator_protocol::Openid4vpPresentationBinding {
+            presentation_request_sha256: "c".repeat(64),
+            trust_policy: nazo_operator_protocol::Openid4vpTrustPolicyBinding {
+                binding_id: Some("550e8400-e29b-41d4-a716-446655440006".to_owned()),
+                resource_id: Some(trust_policy_resource_id.to_owned()),
+                resource_digest: Some(trust_policy_digest),
+            },
+        };
+        let presentation_binding_sha256 =
+            nazo_operator_protocol::canonical_openid4vp_presentation_binding_sha256(
+                &presentation_binding,
+            )
+            .expect("presentation binding digest");
+        let now = time::OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .expect("whole seconds");
+        // Receipt issuance follows presentation completion and may cross a
+        // whole-second boundary in ordinary operation.
+        let completed_at = (now - time::Duration::seconds(1))
+            .format(&Rfc3339)
+            .expect("completed time");
+        let expires_at = (now + time::Duration::seconds(300))
+            .format(&Rfc3339)
+            .expect("expiry time");
+        let transaction_id = "550e8400-e29b-41d4-a716-446655440003".to_owned();
+        let receipt_id = "550e8400-e29b-41d4-a716-446655440004".to_owned();
+        let issuance_request_jti = "550e8400-e29b-41d4-a716-446655440005".to_owned();
+        let intent_sha256 = "d".repeat(64);
+        let capability_sha256 = "e".repeat(64);
+        let receipt = nazo_operator_protocol::Openid4vpVerificationReceipt {
+            schema: 1,
+            iss: "https://issuer.example".to_owned(),
+            aud: "https://issuer.example/openid4vp/verification-receipts".to_owned(),
+            jti: receipt_id.clone(),
+            iat: now.unix_timestamp(),
+            exp: now.unix_timestamp() + 300,
+            deployment_id: binding.deployment_id.clone(),
+            runtime_instance_id: "runtime-a".to_owned(),
+            instance_key_id: key_id.clone(),
+            tenant_id: binding.tenant_id.clone(),
+            transaction_id: transaction_id.clone(),
+            issuance_request_jti: issuance_request_jti.clone(),
+            status: nazo_operator_protocol::Openid4vpVerificationStatus::Verified,
+            evidence_context: context,
+            presentation_binding,
+            intent_sha256: intent_sha256.clone(),
+            completed_at: completed_at.clone(),
+            capability_sha256: capability_sha256.clone(),
+        };
+        let receipt_jws = nazo_operator_protocol::sign_openid4vp_verification_receipt(
+            &receipt, &key_id, &signing,
+        )
+        .expect("sign receipt");
+        let receipt = crate::OpenId4VpVerificationReceiptProvenance {
+            issuer: "https://issuer.example".to_owned(),
+            receipt_api_url: "https://issuer.example/openid4vp/verification-receipts".to_owned(),
+            receipt_id: uuid::Uuid::parse_str(&receipt_id).expect("receipt id"),
+            transaction_id: uuid::Uuid::parse_str(&transaction_id).expect("transaction id"),
+            tenant_id: binding.tenant_id.clone(),
+            issuance_request_jti,
+            presentation_binding_sha256,
+            intent_sha256,
+            receipt_sha256: sha256_hex(receipt_jws.as_bytes()),
+            receipt_jws,
+            capability_sha256,
+            deployment_id: binding.deployment_id.clone(),
+            runtime_instance_id: "runtime-a".to_owned(),
+            instance_key_id: key_id,
+            instance_public_key_base64: binding
+                .vp_evidence_trust_anchor
+                .as_ref()
+                .expect("anchor")
+                .instance_public_key_base64
+                .clone(),
+            completed_at,
+            expires_at,
+        };
+        let image = ReviewScreenshotManifestImage {
+            matrix_plan_id: "matrix-plan-1".to_owned(),
+            suite_plan_id: "550e8400-e29b-41d4-a716-446655440001".to_owned(),
+            module_id: "550e8400-e29b-41d4-a716-446655440002".to_owned(),
+            test_name: "vp-happy".to_owned(),
+            variant,
+            marker: crate::ReviewScreenshotMarker::Required,
+            obligation_index: 0,
+            path: PathBuf::from("review-screenshots/run/screenshot.png"),
+            sha256: "f".repeat(64),
+            size: 1,
+            receipt_sha256: "a".repeat(64),
+            trigger_origin: "https://issuer.example".to_owned(),
+            trigger_path: "/ui/verification-result".to_owned(),
+            trigger_url_sha256: sha256_hex(b"https://issuer.example/ui/verification-result"),
+            source: crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver,
+            verification_receipt: Some(receipt),
+        };
+        (retention, image)
+    }
+
+    #[cfg(unix)]
+    fn deferred_review_screenshot_chain(
+        evidence: &Path,
+        binding: &mut TenantResourceRecoveryBinding,
+    ) -> SuiteRetentionManifest {
+        let (mut retention, mut image) = vp_receipt_fixture(binding);
+        retention.schema = 2;
+        let relative = PathBuf::from("review-screenshots")
+            .join(&binding.request_jti)
+            .join("matrix-plan-1--suite-module-1--000.png");
+        let image_path = evidence.join(&relative);
+        crate::secure_file::ensure_directory(image_path.parent().expect("image parent"), true)
+            .expect("image directory");
+        let png = STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            .expect("one pixel png");
+        crate::secure_file::write_atomic(&image_path, &png, true).expect("write png");
+        image.path = relative.clone();
+        image.sha256 = sha256_hex(&png);
+        image.size = png.len();
+        let audit = serde_json::to_vec(&serde_json::json!({
+            "suite_plan_id": image.suite_plan_id.clone(),
+            "module_id": image.module_id.clone(),
+            "test_name": image.test_name.clone(),
+            "variant": image.variant.clone(),
+            "marker": "required",
+            "obligation_index": 0,
+            "path": relative,
+            "sha256": image.sha256.clone(),
+            "size": image.size,
+            "trigger_origin": image.trigger_origin.clone(),
+            "trigger_path": image.trigger_path.clone(),
+            "trigger_url_sha256": image.trigger_url_sha256.clone(),
+            "source": "nazo-vp-verification-result/live-webdriver",
+            "verification_receipt": image.verification_receipt.clone(),
+        }))
+        .expect("audit");
+        crate::secure_file::write_atomic(
+            &image_path.with_extension("png.receipt.json"),
+            &audit,
+            true,
+        )
+        .expect("write audit");
+        let screenshot_path = evidence
+            .join("review-screenshot-manifests")
+            .join(format!("{}.json", binding.request_jti));
+        crate::secure_file::ensure_directory(
+            screenshot_path.parent().expect("manifest directory"),
+            true,
+        )
+        .expect("manifest directory");
+        let document = serde_json::to_vec(&serde_json::json!({
+            "schema": crate::evidence::REVIEW_SCREENSHOT_MANIFEST_SCHEMA,
+            "run_jti": binding.request_jti.clone(),
+            "artifact_digest": retention.artifact_digest.clone(),
+            "matrix_sha256": retention.matrix_sha256.clone(),
+            "suite_origin": retention.suite_origin.clone(),
+            "target_issuer": binding
+                .vp_evidence_trust_anchor
+                .as_ref()
+                .expect("VP trust anchor")
+                .target_issuer
+                .clone(),
+            "modules": [{
+                "matrix_plan_id": image.matrix_plan_id.clone(),
+                "suite_plan_id": image.suite_plan_id.clone(),
+                "module_id": image.module_id.clone(),
+                "test_name": image.test_name.clone(),
+                "variant": image.variant.clone(),
+                "required": 1,
+                "captured_required": 1,
+                "missing_optional": 0
+            }],
+            "screenshots": [{
+                "matrix_plan_id": image.matrix_plan_id.clone(),
+                "suite_plan_id": image.suite_plan_id.clone(),
+                "module_id": image.module_id.clone(),
+                "test_name": image.test_name.clone(),
+                "variant": image.variant.clone(),
+                "marker": "required",
+                "obligation_index": 0,
+                "path": image.path.clone(),
+                "sha256": image.sha256.clone(),
+                "size": image.size,
+                "receipt_sha256": sha256_hex(&audit),
+                "trigger_origin": image.trigger_origin.clone(),
+                "trigger_path": image.trigger_path.clone(),
+                "trigger_url_sha256": image.trigger_url_sha256.clone(),
+                "source": "nazo-vp-verification-result/live-webdriver",
+                "verification_receipt": image.verification_receipt.clone(),
+            }]
+        }))
+        .expect("screenshot manifest");
+        crate::secure_file::write_atomic(&screenshot_path, &document, true)
+            .expect("write screenshot manifest");
+        retention.review_screenshot_manifest = Some(SuiteRetentionScreenshotManifest {
+            path: screenshot_path,
+            sha256: sha256_hex(&document),
+        });
+        retention.deferred_review_pending = vec![SuiteRetentionDeferredReview {
+            matrix_plan_id: image.matrix_plan_id,
+            suite_plan_id: image.suite_plan_id,
+            module_id: image.module_id,
+            test_name: image.test_name,
+            variant: image.variant,
+            placeholder_path: "/test/a/550e8400-e29b-41d4-a716-446655440002/verification-evidence"
+                .to_owned(),
+            marker: crate::ReviewScreenshotMarker::Required,
+            obligation_index: 0,
+        }];
+        retention
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_screenshot_manifest_rejects_nazo_vp_result_source() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!(
+            "nazoauth-deferred-legacy-source-{}",
+            uuid::Uuid::now_v7()
+        ));
+        crate::secure_file::ensure_directory(&root, true).expect("test root");
+        let evidence = root.join("evidence");
+        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
+        let mut binding = tenant_resource_binding(&root);
+        let mut retention = deferred_review_screenshot_chain(&evidence, &mut binding);
+        let screenshot = retention
+            .review_screenshot_manifest
+            .as_mut()
+            .expect("screenshot manifest binding");
+        let mut document: serde_json::Value = serde_json::from_slice(
+            &crate::secure_file::read_bounded(
+                &screenshot.path,
+                crate::evidence::MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES,
+                true,
+            )
+            .expect("read current screenshot manifest"),
+        )
+        .expect("parse current screenshot manifest");
+        document["schema"] = serde_json::json!(3);
+        let legacy = serde_json::to_vec(&document).expect("serialize legacy screenshot manifest");
+        crate::secure_file::write_atomic(&screenshot.path, &legacy, true)
+            .expect("write legacy screenshot manifest");
+        screenshot.sha256 = sha256_hex(&legacy);
+
+        assert!(
+            validate_suite_retention_manifest(&retention, &binding, None).is_err(),
+            "a legacy screenshot manifest must not admit the NazoAuthWeb source"
+        );
+        std::fs::remove_dir_all(&root).expect("remove test root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_five_deferred_review_retention_roundtrips_store_stage_commit_claim_and_finish() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!(
+            "nazoauth-deferred-retention-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let evidence = root.join("evidence");
+        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
+        let mut binding = tenant_resource_binding(&root);
+        let manifest = deferred_review_screenshot_chain(&evidence, &mut binding);
+        let pending = manifest.deferred_review_pending[0].clone();
+        let screenshot = manifest
+            .review_screenshot_manifest
+            .clone()
+            .expect("screenshot manifest binding");
+        let original_screenshot = crate::secure_file::read_bounded(
+            &screenshot.path,
+            crate::evidence::MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES,
+            true,
+        )
+        .expect("original screenshot manifest");
+        let final_path = evidence.join(format!("retained-suite-{}.json", binding.request_jti));
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("tenant intent");
+        guard
+            .begin_suite_create_with_retention(
+                "https://www.certification.openid.net",
+                "suite-plan-intent",
+                true,
+            )
+            .expect("plan intent");
+        guard
+            .record_suite_plan(
+                "https://www.certification.openid.net",
+                "suite-plan-intent",
+                &pending.suite_plan_id,
+            )
+            .expect("plan receipt");
+        guard
+            .begin_suite_create_with_retention(
+                "https://www.certification.openid.net",
+                "suite-module-intent",
+                true,
+            )
+            .expect("module intent");
+        guard
+            .record_suite_module("suite-module-intent", &pending.module_id)
+            .expect("module receipt");
+        guard
+            .prepare_suite_plan_retention(manifest, final_path.clone())
+            .expect("prepare schema-five retention");
+        let journal_path = root.join(format!("run-{}.json", binding.request_jti));
+        let prepared = std::fs::read_to_string(&journal_path).expect("prepared journal");
+        assert!(prepared.contains("\"schema\": 5"));
+        assert!(prepared.contains(&pending.placeholder_path));
+        assert!(prepared.contains(&screenshot.sha256));
+        assert_eq!(
+            guard.suite_recovery().expect("prepared suite").plan_ids,
+            vec![pending.suite_plan_id.clone()]
+        );
+        assert!(
+            guard
+                .suite_recovery()
+                .expect("prepared suite")
+                .module_ids
+                .is_empty()
+        );
+        guard
+            .stage_suite_retention_manifest()
+            .expect("stage deferred manifest");
+        guard
+            .record_tenant_resource_receipt(tenant_resource_receipt(&binding))
+            .expect("tenant receipt");
+        guard
+            .record_tenant_resource_enumeration(Vec::new())
+            .expect("tenant enumeration");
+        guard
+            .commit_suite_plan_retention()
+            .expect("commit deferred retention");
+        guard
+            .publish_committed_suite_retention_manifest()
+            .expect("publish deferred retention");
+        let receipt = guard
+            .suite_retention_manifest_receipt()
+            .expect("retention receipt")
+            .expect("committed receipt");
+        assert_eq!(receipt.path, final_path);
+        crate::secure_file::write_atomic(&screenshot.path, b"tampered", true)
+            .expect("tamper screenshot manifest");
+        assert!(guard.finish().is_err(), "tampered screenshot blocks finish");
+        crate::secure_file::write_atomic(&screenshot.path, &original_screenshot, true)
+            .expect("restore screenshot manifest");
+        let original_final =
+            crate::secure_file::read_bounded(&final_path, MAX_SUITE_RETENTION_MANIFEST_BYTES, true)
+                .expect("final retention manifest");
+
+        let mut tampered_final: serde_json::Value =
+            serde_json::from_slice(&original_final).expect("parse final retention manifest");
+        tampered_final["deferred_review_pending"][0]["placeholder_path"] =
+            serde_json::json!("/test/a/other/verification-evidence");
+        crate::secure_file::write_atomic(
+            &final_path,
+            &serde_json::to_vec(&tampered_final).expect("encode altered retention manifest"),
+            true,
+        )
+        .expect("tamper placeholder identity");
+        assert!(
+            store.claim_pending().is_err(),
+            "tampered placeholder blocks claim"
+        );
+        crate::secure_file::write_atomic(&final_path, &original_final, true)
+            .expect("restore retention manifest");
+
+        let mut claimed = store.claim_pending().expect("claim retained journal");
+        assert_eq!(claimed.len(), 1);
+        let guard = claimed.pop().expect("retained guard");
+        let retained = guard
+            .suite_retention_manifest_receipt()
+            .expect("claimed receipt")
+            .expect("retained receipt");
+        assert_eq!(retained.path, final_path);
+        guard.finish().expect("finish deferred retention");
+        assert!(store.claim_pending().expect("final scan").is_empty());
+        std::fs::remove_dir_all(&root).expect("remove test root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_screenshot_receipt_recovery_rechecks_runtime_tenant_and_signed_bindings() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!("nazoauth-vp-recovery-{}", uuid::Uuid::now_v7()));
+        crate::secure_file::ensure_directory(&root, true).expect("test root");
+        let mut binding = tenant_resource_binding(&root);
+        let (retention, image) = vp_receipt_fixture(&mut binding);
+        let anchor = binding.vp_evidence_trust_anchor.as_ref().expect("anchor");
+        let receipt = image
+            .verification_receipt
+            .as_ref()
+            .expect("receipt provenance");
+        assert!(verify_vp_receipt_provenance(
+            receipt, anchor, &binding, &retention, &image
+        ));
+
+        let mut other_policy_binding = binding.clone();
+        let (other_policy_retention, other_policy_image) = vp_receipt_fixture_with_trust_policy(
+            &mut other_policy_binding,
+            "openid4vc-trust-policy:other:0123456789abcdef",
+            "e".repeat(64),
+        );
+        assert!(!verify_vp_receipt_provenance(
+            other_policy_image
+                .verification_receipt
+                .as_ref()
+                .expect("other-policy receipt"),
+            anchor,
+            &binding,
+            &other_policy_retention,
+            &other_policy_image,
+        ));
+
+        let mut other_policy = binding.clone();
+        other_policy.resource_identities[0].digest = "0".repeat(64);
+        assert!(!verify_vp_receipt_provenance(
+            receipt,
+            anchor,
+            &other_policy,
+            &retention,
+            &image
+        ));
+
+        let mut wrong_tenant = receipt.clone();
+        wrong_tenant.tenant_id = "00000000-0000-4000-8000-000000000009".to_owned();
+        assert!(!verify_vp_receipt_provenance(
+            &wrong_tenant,
+            anchor,
+            &binding,
+            &retention,
+            &image
+        ));
+        let mut wrong_issuer = receipt.clone();
+        wrong_issuer.issuer = "https://other-issuer.example".to_owned();
+        assert!(!verify_vp_receipt_provenance(
+            &wrong_issuer,
+            anchor,
+            &binding,
+            &retention,
+            &image
+        ));
+        let mut wrong_intent = receipt.clone();
+        wrong_intent.intent_sha256 = "0".repeat(64);
+        assert!(!verify_vp_receipt_provenance(
+            &wrong_intent,
+            anchor,
+            &binding,
+            &retention,
+            &image
+        ));
+        let mut tampered_jws = receipt.clone();
+        tampered_jws.receipt_jws.push('x');
+        assert!(!verify_vp_receipt_provenance(
+            &tampered_jws,
+            anchor,
+            &binding,
+            &retention,
+            &image
+        ));
+        let mut wrong_expiry = receipt.clone();
+        wrong_expiry.expires_at = "2030-01-01T00:00:00Z".to_owned();
+        assert!(!verify_vp_receipt_provenance(
+            &wrong_expiry,
+            anchor,
+            &binding,
+            &retention,
+            &image
+        ));
+
+        std::fs::remove_dir_all(&root).expect("remove test root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_review_manifest_requires_the_same_required_nazo_capture_identity() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!("nazoauth-deferred-review-{}", uuid::Uuid::now_v7()));
+        crate::secure_file::ensure_directory(&root, true).expect("test root");
+        let mut binding = tenant_resource_binding(&root);
+        let (mut retention, image) = vp_receipt_fixture(&mut binding);
+        let manifest_path = root
+            .join("review-screenshot-manifests")
+            .join(format!("{}.json", binding.request_jti));
+        crate::secure_file::ensure_directory(
+            manifest_path.parent().expect("manifest parent"),
+            true,
+        )
+        .expect("manifest directory");
+        let document = serde_json::to_vec(&serde_json::json!({
+            "schema": crate::evidence::REVIEW_SCREENSHOT_MANIFEST_SCHEMA,
+            "run_jti": binding.request_jti.clone(),
+            "artifact_digest": retention.artifact_digest.clone(),
+            "matrix_sha256": retention.matrix_sha256.clone(),
+            "suite_origin": retention.suite_origin.clone(),
+            "target_issuer": "https://issuer.example",
+            "modules": [{
+                "matrix_plan_id": image.matrix_plan_id.clone(),
+                "suite_plan_id": image.suite_plan_id.clone(),
+                "module_id": image.module_id.clone(),
+                "test_name": image.test_name.clone(),
+                "variant": image.variant.clone(),
+                "required": 1,
+                "captured_required": 1,
+                "missing_optional": 0
+            }],
+            "screenshots": [{
+                "matrix_plan_id": image.matrix_plan_id.clone(),
+                "suite_plan_id": image.suite_plan_id.clone(),
+                "module_id": image.module_id.clone(),
+                "test_name": image.test_name.clone(),
+                "variant": image.variant.clone(),
+                "marker": "required",
+                "obligation_index": 0,
+                "path": image.path.clone(),
+                "sha256": image.sha256.clone(),
+                "size": image.size,
+                "receipt_sha256": image.receipt_sha256.clone(),
+                "trigger_origin": image.trigger_origin.clone(),
+                "trigger_path": image.trigger_path.clone(),
+                "trigger_url_sha256": image.trigger_url_sha256.clone(),
+                "source": "nazo-vp-verification-result/live-webdriver",
+                "verification_receipt": image.verification_receipt.clone()
+            }]
+        }))
+        .expect("manifest JSON");
+        crate::secure_file::write_atomic(&manifest_path, &document, true).expect("write manifest");
+        let screenshot = SuiteRetentionScreenshotManifest {
+            path: manifest_path,
+            sha256: sha256_hex(&document),
+        };
+        retention.review_screenshot_manifest = Some(screenshot.clone());
+        retention.deferred_review_pending = vec![SuiteRetentionDeferredReview {
+            matrix_plan_id: image.matrix_plan_id.clone(),
+            suite_plan_id: image.suite_plan_id.clone(),
+            module_id: image.module_id.clone(),
+            test_name: image.test_name.clone(),
+            variant: image.variant.clone(),
+            placeholder_path: format!("/test/a/{}/verification-evidence", image.module_id),
+            marker: crate::ReviewScreenshotMarker::Required,
+            obligation_index: 0,
+        }];
+
+        validate_deferred_review_screenshot_binding(&screenshot, &retention, &binding)
+            .expect("exact deferred review binding");
+        retention.deferred_review_pending[0].obligation_index = 1;
+        assert!(
+            validate_deferred_review_screenshot_binding(&screenshot, &retention, &binding).is_err()
+        );
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 
     #[test]
@@ -1465,6 +3800,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn vp_evidence_anchor_upgrades_only_new_tenant_journals_to_schema_four() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-tenant-recovery-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let mut binding = tenant_resource_binding(&root);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[17; 32]);
+        let key = signing.verifying_key();
+        binding.vp_evidence_trust_anchor = Some(OpenId4VpEvidenceTrustAnchor {
+            target_issuer: "https://issuer.example".to_owned(),
+            deployment_id: binding.deployment_id.clone(),
+            runtime_instance_id: "runtime-a".to_owned(),
+            instance_key_id: nazo_operator_protocol::instance_key_id(&key),
+            instance_public_key_base64: nazo_operator_protocol::encode_instance_public_key(&key),
+        });
+        let guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("persist schema-four tenant intent");
+        let journal_path = root.join(format!("run-{}.json", binding.request_jti));
+        let journal = std::fs::read_to_string(&journal_path).expect("read journal");
+        assert!(journal.contains("\"schema\": 4"));
+        assert!(journal.contains("vp_evidence_trust_anchor"));
+        drop(guard);
+        let mut pending = store.claim_pending().expect("claim schema-four journal");
+        let claimed = pending.pop().expect("claimed journal");
+        assert_eq!(
+            claimed
+                .tenant_resource_binding()
+                .and_then(|item| item.vp_evidence_trust_anchor.as_ref()),
+            binding.vp_evidence_trust_anchor.as_ref()
+        );
+        drop(claimed);
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn tenant_resource_journal_rejects_legacy_fields_in_schema_two() {
         let temp_root = std::env::temp_dir()
             .canonicalize()
@@ -1503,10 +3876,35 @@ mod tests {
             .begin_tenant_resource(binding.clone())
             .expect("persist tenant intent");
         guard
-            .record_suite_plan("https://suite.example", "plan-1")
+            .begin_suite_create("https://suite.example", "intent-plan-1")
+            .expect("persist plan create intent");
+        assert_eq!(
+            guard
+                .suite_recovery()
+                .expect("pending Suite recovery")
+                .pending_create_intents,
+            vec!["intent-plan-1"]
+        );
+        assert!(guard.mark_suite_cleanup_complete().is_err());
+        guard
+            .record_suite_plan("https://suite.example", "intent-plan-1", "plan-1")
             .expect("persist plan allocation");
         guard
-            .record_suite_module("module-1")
+            .begin_suite_create("https://suite.example", "intent-module-1")
+            .expect("persist module create intent");
+        assert!(guard.mark_suite_cleanup_complete().is_err());
+        assert_eq!(
+            guard.suite_recovery(),
+            Some(&SuiteRecoveryState {
+                origin: "https://suite.example".to_owned(),
+                plan_ids: vec!["plan-1".to_owned()],
+                module_ids: Vec::new(),
+                pending_create_intents: vec!["intent-module-1".to_owned()],
+                cleanup_complete: false,
+            })
+        );
+        guard
+            .record_suite_module("intent-module-1", "module-1")
             .expect("persist module allocation");
         assert_eq!(
             guard.suite_recovery(),
@@ -1514,12 +3912,13 @@ mod tests {
                 origin: "https://suite.example".to_owned(),
                 plan_ids: vec!["plan-1".to_owned()],
                 module_ids: vec!["module-1".to_owned()],
+                pending_create_intents: Vec::new(),
                 cleanup_complete: false,
             })
         );
         assert!(
             guard
-                .record_suite_plan("https://other.example", "plan-2")
+                .record_suite_plan("https://other.example", "intent-other", "plan-2")
                 .is_err()
         );
 
@@ -1527,18 +3926,218 @@ mod tests {
             .record_tenant_resource_receipt(tenant_resource_receipt(&binding))
             .expect("receipt");
         guard
+            .mark_suite_cleanup_complete()
+            .expect("Suite cleanup settled");
+        assert_eq!(
+            guard.suite_recovery(),
+            Some(&SuiteRecoveryState {
+                origin: "https://suite.example".to_owned(),
+                plan_ids: Vec::new(),
+                module_ids: Vec::new(),
+                pending_create_intents: Vec::new(),
+                cleanup_complete: true,
+            })
+        );
+        guard
             .record_tenant_resource_enumeration(Vec::new())
             .expect("enumerate already absent");
         guard.mark_proxy_cleanup_complete().expect("proxy settled");
-        assert!(guard.finish().is_err());
-
-        let mut pending = store.claim_pending().expect("claim pending");
-        let mut guard = pending.pop().expect("recovered guard");
-        guard
-            .mark_suite_cleanup_complete()
-            .expect("Suite cleanup settled");
         guard.finish().expect("finish after Suite cleanup");
         assert!(store.claim_pending().expect("journal removed").is_empty());
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_suite_cleanup_compacts_ids_before_tenant_cleanup_records() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-tenant-recovery-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let binding = tenant_resource_binding(&root);
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("persist tenant intent");
+        guard
+            .begin_suite_create("https://suite.example", "intent-plan-1")
+            .expect("persist plan intent");
+        guard
+            .record_suite_plan("https://suite.example", "intent-plan-1", "plan-1")
+            .expect("persist plan allocation");
+        match &mut guard.journal {
+            RecoveryJournal::TenantResource(journal) => {
+                let suite = journal.suite.as_mut().expect("Suite state");
+                suite.module_ids = (0..1408)
+                    .map(|index| format!("module-{index:04}"))
+                    .collect();
+            }
+            RecoveryJournal::Legacy(_) => panic!("expected tenant-resource journal"),
+        }
+        guard.persist().expect("persist populated Suite state");
+        guard
+            .record_tenant_resource_receipt(tenant_resource_receipt(&binding))
+            .expect("receipt");
+        guard
+            .mark_suite_cleanup_complete()
+            .expect("compact completed Suite state");
+        let suite = guard.suite_recovery().expect("completed Suite state");
+        assert!(suite.plan_ids.is_empty());
+        assert!(suite.module_ids.is_empty());
+        guard
+            .record_tenant_resource_enumeration(binding.resource_identities.clone())
+            .expect("enumerate after Suite compaction");
+        guard
+            .record_tenant_resource_revoke(
+                &binding.resource_identities[0],
+                TenantResourceRevokeOutcome::Revoked,
+            )
+            .expect("revoke after Suite compaction");
+        assert!(
+            std::fs::metadata(root.join(format!("run-{}.json", binding.request_jti)))
+                .expect("journal metadata")
+                .len()
+                < MAX_RECOVERY_JOURNAL_BYTES as u64
+        );
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_pending_normalizes_legacy_completed_suite_ids_after_validation() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-tenant-recovery-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let binding = tenant_resource_binding(&root);
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("persist tenant intent");
+        guard
+            .begin_suite_create("https://suite.example", "intent-plan-1")
+            .expect("persist plan intent");
+        guard
+            .record_suite_plan("https://suite.example", "intent-plan-1", "plan-1")
+            .expect("persist plan allocation");
+        match &mut guard.journal {
+            RecoveryJournal::TenantResource(journal) => {
+                journal
+                    .suite
+                    .as_mut()
+                    .expect("Suite state")
+                    .cleanup_complete = true;
+            }
+            RecoveryJournal::Legacy(_) => panic!("expected tenant-resource journal"),
+        }
+        guard
+            .persist()
+            .expect("persist legacy completed Suite state");
+        drop(guard);
+
+        let mut pending = store
+            .claim_pending()
+            .expect("claim legacy completed journal");
+        let guard = pending.pop().expect("claimed legacy completed journal");
+        assert_eq!(
+            guard.suite_recovery(),
+            Some(&SuiteRecoveryState {
+                origin: "https://suite.example".to_owned(),
+                plan_ids: Vec::new(),
+                module_ids: Vec::new(),
+                pending_create_intents: Vec::new(),
+                cleanup_complete: true,
+            })
+        );
+        drop(guard);
+        let journal_path = root.join(format!("run-{}.json", binding.request_jti));
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).expect("read normalized journal"))
+                .expect("decode normalized journal");
+        assert_eq!(document["suite"]["plan_ids"], serde_json::json!([]));
+        assert_eq!(document["suite"]["module_ids"], serde_json::json!([]));
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_two_suite_journal_without_create_intents_remains_readable() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-tenant-recovery-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let binding = tenant_resource_binding(&root);
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("persist tenant intent");
+        guard
+            .begin_suite_create("https://suite.example", "intent-plan-1")
+            .expect("persist plan intent");
+        guard
+            .record_suite_plan("https://suite.example", "intent-plan-1", "plan-1")
+            .expect("persist plan allocation");
+        drop(guard);
+
+        let journal_path = root.join(format!("run-{}.json", binding.request_jti));
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).expect("read journal"))
+                .expect("decode journal");
+        journal["suite"]
+            .as_object_mut()
+            .expect("suite recovery object")
+            .remove("pending_create_intents");
+        std::fs::write(
+            &journal_path,
+            serde_json::to_vec_pretty(&journal).expect("encode schema-two journal"),
+        )
+        .expect("write schema-two journal");
+
+        let mut pending = store.claim_pending().expect("read compatible journal");
+        let guard = pending.pop().expect("recovered guard");
+        assert!(
+            guard
+                .suite_recovery()
+                .expect("suite recovery")
+                .pending_create_intents
+                .is_empty()
+        );
+        drop(guard);
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_suite_cleanup_remains_a_schema_two_journal_without_retention_fields() {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve system temporary directory");
+        let root = temp_root.join(format!("nazoauth-tenant-recovery-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let binding = tenant_resource_binding(&root);
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("persist tenant intent");
+        guard
+            .begin_suite_create("https://suite.example", "intent-plan-1")
+            .expect("persist plan intent");
+        guard
+            .record_suite_plan("https://suite.example", "intent-plan-1", "plan-1")
+            .expect("persist plan allocation");
+        let journal_path = root.join(format!("run-{}.json", binding.request_jti));
+        let before_cleanup =
+            std::fs::read_to_string(&journal_path).expect("read schema-two journal");
+        assert!(before_cleanup.contains("\"schema\": 2"));
+        assert!(!before_cleanup.contains("suite_retention"));
+
+        guard
+            .mark_suite_cleanup_complete()
+            .expect("settle default Suite cleanup");
+        let after_cleanup =
+            std::fs::read_to_string(&journal_path).expect("read normalized journal");
+        assert!(after_cleanup.contains("\"schema\": 2"));
+        assert!(!after_cleanup.contains("suite_retention"));
+        drop(guard);
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 
@@ -1980,6 +4579,478 @@ mod tests {
         assert!(guard.proxy_cleanup_complete());
         guard.finish().expect("complete journal");
         assert!(store.claim_pending().expect("final scan").is_empty());
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_suite_manifest_transfers_plan_ownership_only_after_pending_write() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!("nazoauth-retention-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let evidence = root.join("evidence");
+        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
+        let binding = tenant_resource_binding(&root);
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("intent");
+        guard
+            .begin_suite_create_with_retention(
+                "https://www.certification.openid.net",
+                "suite-intent-1",
+                true,
+            )
+            .expect("Suite intent");
+        guard
+            .record_suite_plan(
+                "https://www.certification.openid.net",
+                "suite-intent-1",
+                "suite-plan-1",
+            )
+            .expect("Suite plan");
+        guard
+            .begin_suite_create_with_retention(
+                "https://www.certification.openid.net",
+                "suite-intent-module-1",
+                true,
+            )
+            .expect("Suite module intent");
+        guard
+            .record_suite_module("suite-intent-module-1", "suite-module-1")
+            .expect("Suite module");
+        let journal_path = root.join(format!("run-{}.json", binding.request_jti));
+        let retention_journal =
+            std::fs::read_to_string(&journal_path).expect("read schema-three journal");
+        assert!(retention_journal.contains("\"schema\": 3"));
+        assert!(retention_journal.contains("suite_retention"));
+        let manifest = SuiteRetentionManifest {
+            schema: SUITE_RETENTION_MANIFEST_SCHEMA,
+            suite_origin: "https://www.certification.openid.net".to_owned(),
+            artifact_digest: "a".repeat(64),
+            matrix_sha256: "b".repeat(64),
+            deployment_id: binding.deployment_id.clone(),
+            tenant_id: binding.tenant_id.clone(),
+            run_id: binding.request_jti.clone(),
+            review_screenshot_manifest: None,
+            deferred_review_pending: Vec::new(),
+            plans: vec![SuiteRetentionPlan {
+                matrix_plan_id: "matrix-plan-1".to_owned(),
+                suite_plan_id: "suite-plan-1".to_owned(),
+                plan_name: "Certification plan".to_owned(),
+                plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256("matrix-plan-1"),
+            }],
+        };
+        let final_path = evidence.join(format!("retained-suite-{}.json", binding.request_jti));
+        guard
+            .prepare_suite_plan_retention(manifest, final_path.clone())
+            .expect("prepare retention");
+        assert_eq!(
+            guard.suite_recovery().expect("suite").plan_ids,
+            vec!["suite-plan-1".to_owned()]
+        );
+        assert!(guard.suite_recovery().expect("suite").module_ids.is_empty());
+        guard
+            .stage_suite_retention_manifest()
+            .expect("stage manifest");
+        assert!(!final_path.exists());
+        assert!(guard.commit_suite_plan_retention().is_err());
+        guard
+            .record_tenant_resource_receipt(tenant_resource_receipt(&binding))
+            .expect("receipt");
+        guard
+            .record_tenant_resource_enumeration(Vec::new())
+            .expect("enumeration");
+        // A disk failure must not expose a compacted in-memory Retained
+        // state: exact plan ownership remains available for recovery.
+        guard.fail_next_persist_for_test();
+        assert!(guard.commit_suite_plan_retention().is_err());
+        assert!(!guard.suite_retention_committed());
+        assert_eq!(
+            guard.suite_recovery().expect("prepared suite").plan_ids,
+            vec!["suite-plan-1".to_owned()]
+        );
+        guard.fail_after_rename_before_directory_fsync_for_test();
+        guard
+            .commit_suite_plan_retention()
+            .expect("reconciles durable Retained ownership after rename");
+        assert_eq!(
+            guard.suite_retention_commit_resolution(),
+            SuiteRetentionCommitResolution::Retained
+        );
+        assert!(guard.suite_recovery().expect("suite").plan_ids.is_empty());
+        guard
+            .publish_committed_suite_retention_manifest()
+            .expect("publish manifest");
+        let receipt = guard
+            .suite_retention_manifest_receipt()
+            .expect("retention receipt")
+            .expect("committed receipt");
+        assert_eq!(receipt.path, final_path);
+        let manifest_bytes =
+            crate::secure_file::read_bounded(&final_path, MAX_SUITE_RETENTION_MANIFEST_BYTES, true)
+                .expect("read manifest");
+        assert!(!String::from_utf8_lossy(&manifest_bytes).contains("capability.header.payload"));
+        drop(guard);
+        let mut recovered = store.claim_pending().expect("retained recovery");
+        assert_eq!(recovered.len(), 1);
+        assert!(
+            recovered
+                .pop()
+                .expect("retained guard")
+                .suite_retention_manifest_receipt()
+                .expect("recovered receipt")
+                .is_some()
+        );
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_screenshot_manifest_binds_real_png_receipt_and_exact_directory() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!("nazoauth-screenshot-{}", uuid::Uuid::now_v7()));
+        crate::secure_file::ensure_directory(&root, true).expect("test root");
+        let evidence = root.join("evidence");
+        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
+        let binding = tenant_resource_binding(&root);
+        let relative = PathBuf::from("review-screenshots")
+            .join(&binding.request_jti)
+            .join("matrix-plan-1--suite-module-1--000.png");
+        let image_path = evidence.join(&relative);
+        crate::secure_file::ensure_directory(image_path.parent().expect("image parent"), true)
+            .expect("image directory");
+        let png = STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            .expect("one pixel png");
+        crate::secure_file::write_atomic(&image_path, &png, true).expect("write png");
+        let trigger_origin = "https://www.certification.openid.net";
+        let trigger_path = "/test/a/suite-module-1/verification-evidence";
+        let image_sha = sha256_hex(&png);
+        let trigger_sha = sha256_hex(format!("{trigger_origin}{trigger_path}").as_bytes());
+        let audit = serde_json::to_vec(&serde_json::json!({
+            "suite_plan_id": "suite-plan-1",
+            "module_id": "suite-module-1",
+            "test_name": "browser-test",
+            "variant": {"mode":"review"},
+            "marker": "required",
+            "obligation_index": 0,
+            "path": relative.clone(),
+            "sha256": image_sha.clone(),
+            "size": png.len(),
+            "trigger_origin": trigger_origin,
+            "trigger_path": trigger_path,
+            "trigger_url_sha256": trigger_sha.clone(),
+        }))
+        .expect("audit");
+        let receipt_path = image_path.with_extension("png.receipt.json");
+        crate::secure_file::write_atomic(&receipt_path, &audit, true).expect("write receipt");
+        let screenshot_path = evidence
+            .join("review-screenshot-manifests")
+            .join(format!("{}.json", binding.request_jti));
+        crate::secure_file::ensure_directory(
+            screenshot_path.parent().expect("manifest parent"),
+            true,
+        )
+        .expect("manifest directory");
+        let document = serde_json::to_vec(&serde_json::json!({
+            "schema": 3,
+            "run_jti": binding.request_jti.clone(),
+            "artifact_digest": "a".repeat(64),
+            "matrix_sha256": "b".repeat(64),
+            "suite_origin": trigger_origin,
+            "modules": [{
+                "matrix_plan_id": "matrix-plan-1", "suite_plan_id": "suite-plan-1",
+                "module_id": "suite-module-1", "test_name": "browser-test",
+                "variant": {"mode":"review"}, "required": 1,
+                "captured_required": 1, "missing_optional": 0
+            }],
+            "screenshots": [{
+                "matrix_plan_id": "matrix-plan-1", "suite_plan_id": "suite-plan-1",
+                "module_id": "suite-module-1", "test_name": "browser-test",
+                "variant": {"mode":"review"}, "marker": "required", "obligation_index": 0,
+                "path": relative.clone(), "sha256": image_sha.clone(), "size": png.len(),
+                "receipt_sha256": sha256_hex(&audit), "trigger_origin": trigger_origin,
+                "trigger_path": trigger_path, "trigger_url_sha256": trigger_sha.clone()
+            }]
+        }))
+        .expect("typed manifest");
+        crate::secure_file::write_atomic(&screenshot_path, &document, true)
+            .expect("write manifest");
+        let retention = SuiteRetentionManifest {
+            schema: SUITE_RETENTION_MANIFEST_SCHEMA,
+            suite_origin: trigger_origin.to_owned(),
+            artifact_digest: "a".repeat(64),
+            matrix_sha256: "b".repeat(64),
+            deployment_id: binding.deployment_id.clone(),
+            tenant_id: binding.tenant_id.clone(),
+            run_id: binding.request_jti.clone(),
+            review_screenshot_manifest: None,
+            deferred_review_pending: Vec::new(),
+            plans: vec![SuiteRetentionPlan {
+                matrix_plan_id: "matrix-plan-1".to_owned(),
+                suite_plan_id: "suite-plan-1".to_owned(),
+                plan_name: "Certification plan".to_owned(),
+                plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256("matrix-plan-1"),
+            }],
+        };
+        let bound = SuiteRetentionScreenshotManifest {
+            path: screenshot_path,
+            sha256: sha256_hex(&document),
+        };
+        validate_review_screenshot_manifest_binding(&bound, &retention, &binding)
+            .expect("complete typed chain");
+        let reject_manifest = |value: serde_json::Value| {
+            let bytes = serde_json::to_vec(&value).expect("serialize altered manifest");
+            crate::secure_file::write_atomic(&bound.path, &bytes, true)
+                .expect("write altered manifest");
+            let altered = SuiteRetentionScreenshotManifest {
+                path: bound.path.clone(),
+                sha256: sha256_hex(&bytes),
+            };
+            assert!(
+                validate_review_screenshot_manifest_binding(&altered, &retention, &binding)
+                    .is_err()
+            );
+            crate::secure_file::write_atomic(&bound.path, &document, true)
+                .expect("restore typed manifest");
+        };
+        let original_value: serde_json::Value =
+            serde_json::from_slice(&document).expect("parse typed manifest");
+        let mut wrong_marker = original_value.clone();
+        wrong_marker["screenshots"][0]["marker"] = serde_json::json!("optional");
+        reject_manifest(wrong_marker);
+        let mut wrong_test = original_value.clone();
+        wrong_test["screenshots"][0]["test_name"] = serde_json::json!("other-test");
+        reject_manifest(wrong_test);
+        let mut wrong_variant = original_value.clone();
+        wrong_variant["screenshots"][0]["variant"] = serde_json::json!({"mode":"other"});
+        reject_manifest(wrong_variant);
+        let mut out_of_range = original_value;
+        out_of_range["screenshots"][0]["obligation_index"] = serde_json::json!(1);
+        reject_manifest(out_of_range);
+        let duplicate_relative = PathBuf::from("review-screenshots")
+            .join(&binding.request_jti)
+            .join("matrix-plan-1--suite-module-1--001.png");
+        let duplicate_path = evidence.join(&duplicate_relative);
+        crate::secure_file::write_atomic(&duplicate_path, &png, true).expect("write duplicate png");
+        let mut duplicate_audit: serde_json::Value =
+            serde_json::from_slice(&audit).expect("parse audit");
+        duplicate_audit["path"] = serde_json::json!(duplicate_relative);
+        let duplicate_receipt = serde_json::to_vec(&duplicate_audit).expect("duplicate receipt");
+        crate::secure_file::write_atomic(
+            &duplicate_path.with_extension("png.receipt.json"),
+            &duplicate_receipt,
+            true,
+        )
+        .expect("write duplicate receipt");
+        let mut duplicate =
+            serde_json::from_slice::<serde_json::Value>(&document).expect("parse typed manifest");
+        let mut duplicate_image = duplicate["screenshots"][0].clone();
+        duplicate_image["path"] = serde_json::json!(duplicate_relative);
+        duplicate_image["receipt_sha256"] = serde_json::json!(sha256_hex(&duplicate_receipt));
+        duplicate["screenshots"]
+            .as_array_mut()
+            .expect("screenshots array")
+            .push(duplicate_image);
+        reject_manifest(duplicate);
+        std::fs::remove_file(duplicate_path.with_extension("png.receipt.json"))
+            .expect("remove duplicate receipt");
+        std::fs::remove_file(&duplicate_path).expect("remove duplicate png");
+        let extra = image_path.parent().expect("image parent").join("extra.png");
+        crate::secure_file::write_atomic(&extra, &png, true).expect("extra image");
+        assert!(validate_review_screenshot_manifest_binding(&bound, &retention, &binding).is_err());
+        std::fs::remove_file(&extra).expect("remove extra");
+        std::fs::remove_file(&receipt_path).expect("remove receipt");
+        assert!(validate_review_screenshot_manifest_binding(&bound, &retention, &binding).is_err());
+        crate::secure_file::write_atomic(&receipt_path, &audit, true).expect("restore receipt");
+        crate::secure_file::write_atomic(&image_path, b"not-a-png", true).expect("tamper png");
+        assert!(validate_review_screenshot_manifest_binding(&bound, &retention, &binding).is_err());
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_suite_screenshot_manifest_tamper_blocks_commit_and_finish() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!("nazoauth-retention-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let evidence = root.join("evidence");
+        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
+        let binding = tenant_resource_binding(&root);
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("intent");
+        guard
+            .begin_suite_create_with_retention(
+                "https://www.certification.openid.net",
+                "suite-intent-1",
+                true,
+            )
+            .expect("Suite intent");
+        guard
+            .record_suite_plan(
+                "https://www.certification.openid.net",
+                "suite-intent-1",
+                "suite-plan-1",
+            )
+            .expect("Suite plan");
+
+        let screenshot_directory = evidence.join("review-screenshot-manifests");
+        crate::secure_file::ensure_directory(&screenshot_directory, true)
+            .expect("screenshot manifest directory");
+        let screenshot_path = screenshot_directory.join(format!("{}.json", binding.request_jti));
+        let original = serde_json::to_vec(&serde_json::json!({
+            "schema": 3,
+            "run_jti": binding.request_jti,
+            "artifact_digest": "a".repeat(64),
+            "matrix_sha256": "b".repeat(64),
+            "suite_origin": "https://www.certification.openid.net",
+            "modules": [{
+                "matrix_plan_id": "matrix-plan-1",
+                "suite_plan_id": "suite-plan-1",
+                "module_id": "suite-module-1",
+                "test_name": "test",
+                "variant": {},
+                "required": 0,
+                "captured_required": 0,
+                "missing_optional": 0
+            }],
+            "screenshots": []
+        }))
+        .expect("serialize screenshot manifest");
+        crate::secure_file::write_atomic(&screenshot_path, &original, true)
+            .expect("write screenshot manifest");
+        let manifest = SuiteRetentionManifest {
+            schema: SUITE_RETENTION_MANIFEST_SCHEMA,
+            suite_origin: "https://www.certification.openid.net".to_owned(),
+            artifact_digest: "a".repeat(64),
+            matrix_sha256: "b".repeat(64),
+            deployment_id: binding.deployment_id.clone(),
+            tenant_id: binding.tenant_id.clone(),
+            run_id: binding.request_jti.clone(),
+            review_screenshot_manifest: Some(SuiteRetentionScreenshotManifest {
+                path: screenshot_path.clone(),
+                sha256: sha256_hex(&original),
+            }),
+            deferred_review_pending: Vec::new(),
+            plans: vec![SuiteRetentionPlan {
+                matrix_plan_id: "matrix-plan-1".to_owned(),
+                suite_plan_id: "suite-plan-1".to_owned(),
+                plan_name: "Certification plan".to_owned(),
+                plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256("matrix-plan-1"),
+            }],
+        };
+        let final_path = evidence.join(format!("retained-suite-{}.json", binding.request_jti));
+        guard
+            .prepare_suite_plan_retention(manifest, final_path)
+            .expect("prepare retention");
+        guard
+            .stage_suite_retention_manifest()
+            .expect("stage retention manifest");
+        guard
+            .record_tenant_resource_receipt(tenant_resource_receipt(&binding))
+            .expect("receipt");
+        guard
+            .record_tenant_resource_enumeration(Vec::new())
+            .expect("enumeration");
+        crate::secure_file::write_atomic(&screenshot_path, b"tampered", true)
+            .expect("tamper screenshot manifest");
+        assert!(guard.commit_suite_plan_retention().is_err());
+
+        crate::secure_file::write_atomic(&screenshot_path, &original, true)
+            .expect("restore screenshot manifest");
+        guard
+            .commit_suite_plan_retention()
+            .expect("commit retention");
+        guard
+            .publish_committed_suite_retention_manifest()
+            .expect("publish retention manifest");
+        crate::secure_file::write_atomic(&screenshot_path, b"tampered", true)
+            .expect("tamper retained screenshot manifest");
+        assert!(guard.finish().is_err());
+        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_retention_compacts_1198_terminal_modules_below_shared_manifest_cap() {
+        let temp_root = std::env::temp_dir().canonicalize().expect("resolve temp");
+        let root = temp_root.join(format!("nazoauth-retention-{}", uuid::Uuid::now_v7()));
+        let store = ConformanceRecoveryStore::open(&root, "deployment-a").expect("store");
+        let evidence = root.join("evidence");
+        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
+        let binding = tenant_resource_binding(&root);
+        let mut guard = store
+            .begin_tenant_resource(binding.clone())
+            .expect("intent");
+        guard
+            .begin_suite_create_with_retention(
+                "https://www.certification.openid.net",
+                "suite-intent-1",
+                true,
+            )
+            .expect("Suite intent");
+        guard
+            .record_suite_plan(
+                "https://www.certification.openid.net",
+                "suite-intent-1",
+                "suite-plan-0",
+            )
+            .expect("Suite plan");
+        let suite = guard
+            .tenant_resource_journal_mut()
+            .expect("tenant journal")
+            .suite
+            .as_mut()
+            .expect("Suite recovery");
+        suite.plan_ids = (0..44).map(|index| format!("suite-plan-{index}")).collect();
+        suite.module_ids = (0..1198)
+            .map(|index| format!("suite-module-{index}"))
+            .collect();
+        let plans = (0..44)
+            .map(|index| {
+                let matrix_plan_id = format!("matrix-plan-{index}");
+                SuiteRetentionPlan {
+                    plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256(&matrix_plan_id),
+                    matrix_plan_id,
+                    suite_plan_id: format!("suite-plan-{index}"),
+                    plan_name: format!("Certification plan {index}"),
+                }
+            })
+            .collect();
+        let manifest = SuiteRetentionManifest {
+            schema: SUITE_RETENTION_MANIFEST_SCHEMA,
+            suite_origin: "https://www.certification.openid.net".to_owned(),
+            artifact_digest: "a".repeat(64),
+            matrix_sha256: "b".repeat(64),
+            deployment_id: binding.deployment_id.clone(),
+            tenant_id: binding.tenant_id.clone(),
+            run_id: binding.request_jti.clone(),
+            review_screenshot_manifest: None,
+            deferred_review_pending: Vec::new(),
+            plans,
+        };
+        let final_path = evidence.join(format!("retained-suite-{}.json", binding.request_jti));
+        guard
+            .prepare_suite_plan_retention(manifest, final_path)
+            .expect("prepare retention");
+        let suite = guard.suite_recovery().expect("prepared Suite recovery");
+        assert_eq!(suite.plan_ids.len(), 44);
+        assert!(suite.module_ids.is_empty());
+        let journal_path = root.join(format!("run-{}.json", binding.request_jti));
+        assert!(
+            std::fs::metadata(&journal_path)
+                .expect("prepared journal metadata")
+                .len()
+                < MAX_RECOVERY_JOURNAL_BYTES as u64
+        );
+        drop(guard);
+        let mut pending = store.claim_pending().expect("claim prepared journal");
+        let claimed = pending.pop().expect("prepared guard");
+        let suite = claimed.suite_recovery().expect("prepared Suite recovery");
+        assert_eq!(suite.plan_ids.len(), 44);
+        assert!(suite.module_ids.is_empty());
+        drop(claimed);
         std::fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 }

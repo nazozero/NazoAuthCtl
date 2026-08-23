@@ -1,19 +1,23 @@
 use super::MaterializerError;
+use aws_lc_rs::{
+    encoding::AsDer,
+    rsa::{KeyPair as RsaKeyPair, KeySize as RsaKeySize},
+};
 use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
-use p256::ecdsa::SigningKey;
-use rand_core::{OsRng, RngCore};
+use p256::{ecdsa::SigningKey, elliptic_curve::Generate as _};
+use pkcs1::RsaPrivateKey as Pkcs1RsaPrivateKey;
+use pkcs8::PrivateKeyInfoRef;
+use rand::{TryRng as _, rngs::SysRng};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
 };
-use rsa::RsaPrivateKey;
-use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::net::IpAddr;
+use std::{fmt::Write as _, net::IpAddr};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -60,11 +64,16 @@ pub(super) fn generate_client_crypto(
     policy: &super::CryptoPolicy,
 ) -> Result<GeneratedClientCrypto, MaterializerError> {
     let client_secret = Zeroizing::new(random_secret(32));
-    let mut rng = OsRng;
-    let rsa = RsaPrivateKey::new(&mut rng, policy.rsa_bits as usize)
+    let rsa = RsaKeyPair::generate(rsa_key_size(policy.rsa_bits)?)
         .map_err(|_| MaterializerError::Crypto)?;
-    let (rsa_private_jwks, rsa_public_jwks) = rsa_jwks(&rsa)?;
-    let ec = SigningKey::random(&mut rng);
+    let rsa_pkcs8 = Zeroizing::new(
+        rsa.as_der()
+            .map_err(|_| MaterializerError::Crypto)?
+            .as_ref()
+            .to_vec(),
+    );
+    let (rsa_private_jwks, rsa_public_jwks) = rsa_jwks(rsa_pkcs8.as_slice())?;
+    let ec = SigningKey::generate();
     let (ec_private_jwks, ec_public_jwks) = ec_jwks(&ec)?;
     let (
         mtls_ca_certificate,
@@ -74,7 +83,7 @@ pub(super) fn generate_client_crypto(
     ) = generate_mtls()?;
     Ok(GeneratedClientCrypto {
         client_secret,
-        rsa_private_jwks: Zeroizing::new(rsa_private_jwks),
+        rsa_private_jwks,
         rsa_public_jwks: Zeroizing::new(rsa_public_jwks),
         ec_private_jwks: Zeroizing::new(ec_private_jwks),
         ec_public_jwks: Zeroizing::new(ec_public_jwks),
@@ -87,24 +96,28 @@ pub(super) fn generate_client_crypto(
 
 pub(super) fn random_secret(bytes: usize) -> String {
     let mut random = vec![0_u8; bytes];
-    let mut rng = OsRng;
-    rng.fill_bytes(&mut random);
+    SysRng
+        .try_fill_bytes(&mut random)
+        .expect("operating-system CSPRNG unavailable");
     URL_SAFE_NO_PAD.encode(random)
 }
 
 pub(super) fn random_hex(bytes: usize) -> String {
     let mut random = vec![0_u8; bytes];
-    let mut rng = OsRng;
-    rng.fill_bytes(&mut random);
+    SysRng
+        .try_fill_bytes(&mut random)
+        .expect("operating-system CSPRNG unavailable");
     random.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 pub(super) fn random_tx_code() -> String {
     const RANGE: u32 = 1_000_000;
     let limit = u32::MAX - (u32::MAX % RANGE);
-    let mut rng = OsRng;
+    let mut rng = SysRng;
     loop {
-        let value = rng.next_u32();
+        let value = rng
+            .try_next_u32()
+            .expect("operating-system CSPRNG unavailable");
         if value < limit {
             return format!("{:06}", value % RANGE);
         }
@@ -112,7 +125,7 @@ pub(super) fn random_tx_code() -> String {
 }
 
 /// Generate independent P-256 proof/attester identities for VCI and VCI-HAIP.
-/// The key material comes from `OsRng`, then is wrapped in a run-local CA so
+/// The key material comes from the operating-system CSPRNG, then is wrapped in a run-local CA so
 /// the Suite can validate x5c chains without deployment secrets.  No generated
 /// private value is returned in the onboarding bundle.
 pub(super) fn generate_attestation_material(
@@ -125,8 +138,7 @@ pub(super) fn generate_attestation_material(
     ca_params.not_after = now + TimeDuration::days(2);
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let mut rng = OsRng;
-    let ca_key = p256::ecdsa::SigningKey::random(&mut rng);
+    let ca_key = p256::ecdsa::SigningKey::generate();
     let ca_key_der = Zeroizing::new(ec_pkcs8_der(&ca_key));
     let ca_key_pair =
         KeyPair::try_from(ca_key_der.as_slice()).map_err(|_| MaterializerError::Crypto)?;
@@ -153,8 +165,7 @@ fn generate_attestation_leaf<'a>(
     ca: &CertifiedIssuer<'a, KeyPair>,
     common_name: &str,
 ) -> Result<(Zeroizing<String>, Zeroizing<String>), MaterializerError> {
-    let mut rng = OsRng;
-    let signing_key = p256::ecdsa::SigningKey::random(&mut rng);
+    let signing_key = p256::ecdsa::SigningKey::generate();
     let key_der = Zeroizing::new(ec_pkcs8_der(&signing_key));
     let key_pair = KeyPair::try_from(key_der.as_slice()).map_err(|_| MaterializerError::Crypto)?;
     let now = OffsetDateTime::now_utc();
@@ -171,7 +182,7 @@ fn generate_attestation_leaf<'a>(
         .signed_by(&key_pair, ca)
         .map_err(|_| MaterializerError::Crypto)?;
     let encoded_certificate = STANDARD.encode(certificate.der().as_ref());
-    let point = signing_key.verifying_key().to_encoded_point(false);
+    let point = signing_key.verifying_key().to_sec1_point(false);
     let x = URL_SAFE_NO_PAD.encode(point.x().ok_or(MaterializerError::Crypto)?);
     let y = URL_SAFE_NO_PAD.encode(point.y().ok_or(MaterializerError::Crypto)?);
     let d = URL_SAFE_NO_PAD.encode(signing_key.to_bytes());
@@ -212,8 +223,7 @@ fn generate_credential_signing_leaf<'a>(
     ca: &CertifiedIssuer<'a, KeyPair>,
     suite_host: &str,
 ) -> Result<Zeroizing<String>, MaterializerError> {
-    let mut rng = OsRng;
-    let signing_key = p256::ecdsa::SigningKey::random(&mut rng);
+    let signing_key = p256::ecdsa::SigningKey::generate();
     let key_der = Zeroizing::new(ec_pkcs8_der(&signing_key));
     let key_pair = KeyPair::try_from(key_der.as_slice()).map_err(|_| MaterializerError::Crypto)?;
     let now = OffsetDateTime::now_utc();
@@ -241,7 +251,7 @@ fn generate_credential_signing_leaf<'a>(
         .signed_by(&key_pair, ca)
         .map_err(|_| MaterializerError::Crypto)?;
     let encoded_certificate = STANDARD.encode(certificate.der().as_ref());
-    let point = signing_key.verifying_key().to_encoded_point(false);
+    let point = signing_key.verifying_key().to_sec1_point(false);
     let x = URL_SAFE_NO_PAD.encode(point.x().ok_or(MaterializerError::Crypto)?);
     let y = URL_SAFE_NO_PAD.encode(point.y().ok_or(MaterializerError::Crypto)?);
     let d = URL_SAFE_NO_PAD.encode(signing_key.to_bytes());
@@ -262,7 +272,7 @@ fn generate_credential_signing_leaf<'a>(
 }
 
 fn ec_pkcs8_der(signing_key: &p256::ecdsa::SigningKey) -> Vec<u8> {
-    let point = signing_key.verifying_key().to_encoded_point(false);
+    let point = signing_key.verifying_key().to_sec1_point(false);
     let scalar = signing_key.to_bytes();
     let ec_private = der_sequence(&[
         der_tlv(0x02, &[0x01]),
@@ -303,33 +313,79 @@ fn der_tlv(tag: u8, payload: &[u8]) -> Vec<u8> {
     output
 }
 
-pub(super) fn rsa_jwks(key: &RsaPrivateKey) -> Result<(String, String), MaterializerError> {
-    let n = b64(key.n().to_bytes_be());
-    let e = b64(key.e().to_bytes_be());
+fn rsa_key_size(bits: u16) -> Result<RsaKeySize, MaterializerError> {
+    match bits {
+        2048 => Ok(RsaKeySize::Rsa2048),
+        3072 => Ok(RsaKeySize::Rsa3072),
+        4096 => Ok(RsaKeySize::Rsa4096),
+        _ => Err(MaterializerError::Crypto),
+    }
+}
+
+pub(super) fn rsa_jwks(pkcs8_der: &[u8]) -> Result<(Zeroizing<String>, String), MaterializerError> {
+    const RSA_ENCRYPTION_OID: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+
+    let private_key_info =
+        PrivateKeyInfoRef::try_from(pkcs8_der).map_err(|_| MaterializerError::Crypto)?;
+    if private_key_info.algorithm.oid.as_bytes() != RSA_ENCRYPTION_OID
+        || !private_key_info
+            .algorithm
+            .parameters
+            .is_some_and(|parameter| parameter.is_null())
+    {
+        return Err(MaterializerError::Crypto);
+    }
+    let key = Pkcs1RsaPrivateKey::try_from(private_key_info.private_key.as_bytes())
+        .map_err(|_| MaterializerError::Crypto)?;
+    if key.other_prime_infos.is_some()
+        || [
+            key.modulus,
+            key.public_exponent,
+            key.private_exponent,
+            key.prime1,
+            key.prime2,
+            key.exponent1,
+            key.exponent2,
+            key.coefficient,
+        ]
+        .iter()
+        .any(|component| component.is_empty())
+    {
+        return Err(MaterializerError::Crypto);
+    }
+
+    let n = b64(key.modulus.as_bytes());
+    let e = b64(key.public_exponent.as_bytes());
     let kid = jwk_thumbprint(&format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#));
     let public = serde_json::json!({
         "kty": "RSA", "n": n, "e": e, "kid": kid,
         "alg": "PS256", "use": "sig", "key_ops": ["verify"]
     });
-    let private = serde_json::json!({
-        "kty": "RSA", "n": n, "e": e, "kid": kid,
-        "d": b64(key.d().to_bytes_be()),
-        "p": b64(key.primes().first().ok_or(MaterializerError::Crypto)?.to_bytes_be()),
-        "q": b64(key.primes().get(1).ok_or(MaterializerError::Crypto)?.to_bytes_be()),
-        "dp": b64(key.dp().ok_or(MaterializerError::Crypto)?.to_bytes_be()),
-        "dq": b64(key.dq().ok_or(MaterializerError::Crypto)?.to_bytes_be()),
-        "qi": b64(key.qinv().and_then(|value| value.to_biguint()).ok_or(MaterializerError::Crypto)?.to_bytes_be()),
-        "alg": "PS256", "use": "sig", "key_ops": ["sign"]
-    });
-    let private_string = serde_json::to_string(&serde_json::json!({"keys": [private]}))
-        .map_err(|_| MaterializerError::Encoding)?;
+    let d = Zeroizing::new(b64(key.private_exponent.as_bytes()));
+    let p = Zeroizing::new(b64(key.prime1.as_bytes()));
+    let q = Zeroizing::new(b64(key.prime2.as_bytes()));
+    let dp = Zeroizing::new(b64(key.exponent1.as_bytes()));
+    let dq = Zeroizing::new(b64(key.exponent2.as_bytes()));
+    let qi = Zeroizing::new(b64(key.coefficient.as_bytes()));
+    let mut private_jwks = Zeroizing::new(String::new());
+    write!(
+        private_jwks,
+        r#"{{"keys":[{{"kty":"RSA","n":"{n}","e":"{e}","kid":"{kid}","d":"{}","p":"{}","q":"{}","dp":"{}","dq":"{}","qi":"{}","alg":"PS256","use":"sig","key_ops":["sign"]}}]}}"#,
+        d.as_str(),
+        p.as_str(),
+        q.as_str(),
+        dp.as_str(),
+        dq.as_str(),
+        qi.as_str(),
+    )
+    .map_err(|_| MaterializerError::Encoding)?;
     let public_jwks = serde_json::to_string(&serde_json::json!({"keys": [public]}))
         .map_err(|_| MaterializerError::Encoding)?;
-    Ok((private_string, public_jwks))
+    Ok((private_jwks, public_jwks))
 }
 
 pub(super) fn ec_jwks(key: &SigningKey) -> Result<(String, String), MaterializerError> {
-    let encoded = key.verifying_key().to_encoded_point(false);
+    let encoded = key.verifying_key().to_sec1_point(false);
     let x = encoded.x().ok_or(MaterializerError::Crypto)?;
     let y = encoded.y().ok_or(MaterializerError::Crypto)?;
     let x = b64(x);
@@ -486,4 +542,170 @@ pub(super) fn registration_requires_mtls(request: &Value) -> bool {
                 .and_then(Value::as_array)
                 .is_some_and(|values| !values.is_empty())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::materializer::CryptoPolicy;
+    use p256::{
+        ecdsa::{
+            Signature,
+            signature::{Signer as _, Verifier as _},
+        },
+        pkcs8::DecodePrivateKey as _,
+    };
+
+    #[test]
+    fn rsa_key_size_accepts_only_policy_supported_sizes() {
+        for bits in [2048, 3072, 4096] {
+            assert!(
+                rsa_key_size(bits).is_ok(),
+                "{bits}-bit RSA must be supported"
+            );
+        }
+        for bits in [0, 1024, 1536, 8192] {
+            assert!(matches!(rsa_key_size(bits), Err(MaterializerError::Crypto)));
+        }
+    }
+
+    #[test]
+    fn generated_rsa_jwk_has_complete_ps256_two_prime_components() {
+        let material = generate_client_crypto(&CryptoPolicy::default()).expect("client crypto");
+        let private: Value = serde_json::from_str(material.rsa_private_jwks.as_str())
+            .expect("private RSA JWKS JSON");
+        let public: Value =
+            serde_json::from_str(material.rsa_public_jwks.as_str()).expect("public RSA JWKS JSON");
+        let private = private["keys"]
+            .as_array()
+            .and_then(|keys| keys.first())
+            .expect("one private RSA JWK");
+        let public = public["keys"]
+            .as_array()
+            .and_then(|keys| keys.first())
+            .expect("one public RSA JWK");
+
+        for field in ["n", "e", "d", "p", "q", "dp", "dq", "qi"] {
+            let value = private
+                .get(field)
+                .and_then(Value::as_str)
+                .expect("private JWK component must be present");
+            assert!(!value.is_empty(), "private JWK is missing {field}");
+            assert!(!value.contains('='), "private JWK {field} must be unpadded");
+            assert!(
+                URL_SAFE_NO_PAD
+                    .decode(value)
+                    .is_ok_and(|component| !component.is_empty()),
+                "private JWK {field} must be base64url"
+            );
+        }
+        assert_eq!(private["kty"], "RSA");
+        assert_eq!(private["alg"], "PS256");
+        assert_eq!(private["use"], "sig");
+        assert_eq!(private["key_ops"], serde_json::json!(["sign"]));
+        assert_eq!(public["kty"], "RSA");
+        assert_eq!(public["alg"], "PS256");
+        assert_eq!(public["use"], "sig");
+        assert_eq!(public["key_ops"], serde_json::json!(["verify"]));
+        for field in ["n", "e", "kid"] {
+            assert_eq!(private[field], public[field], "RSA {field} must match");
+        }
+    }
+
+    #[test]
+    fn ec_jwk_pkcs8_and_es256_raw_signature_keep_the_wire_contract() {
+        let key = SigningKey::from_slice(&[7; 32]).expect("fixed P-256 signing key");
+        let (private_jwks, public_jwks) = ec_jwks(&key).expect("EC JWKS");
+        let private: Value = serde_json::from_str(&private_jwks).expect("private EC JWKS JSON");
+        let public: Value = serde_json::from_str(&public_jwks).expect("public EC JWKS JSON");
+        let private = private["keys"]
+            .as_array()
+            .and_then(|keys| keys.first())
+            .expect("one private EC JWK");
+        let public = public["keys"]
+            .as_array()
+            .and_then(|keys| keys.first())
+            .expect("one public EC JWK");
+
+        for field in ["x", "y", "d"] {
+            let value = private
+                .get(field)
+                .and_then(Value::as_str)
+                .expect("private EC JWK component must be present");
+            assert!(!value.contains('='), "private EC {field} must be unpadded");
+            assert_eq!(
+                URL_SAFE_NO_PAD
+                    .decode(value)
+                    .expect("private EC JWK component must be base64url")
+                    .len(),
+                32,
+                "private EC {field} must be a P-256 field element"
+            );
+        }
+        assert_eq!(private["kty"], "EC");
+        assert_eq!(private["crv"], "P-256");
+        assert_eq!(private["alg"], "ES256");
+        assert_eq!(private["use"], "sig");
+        assert_eq!(private["key_ops"], serde_json::json!(["sign"]));
+        assert_eq!(public["kty"], "EC");
+        assert_eq!(public["crv"], "P-256");
+        assert_eq!(public["alg"], "ES256");
+        assert_eq!(public["use"], "sig");
+        assert_eq!(public["key_ops"], serde_json::json!(["verify"]));
+        for field in ["x", "y", "kid"] {
+            assert_eq!(private[field], public[field], "EC {field} must match");
+        }
+        assert!(public.get("d").is_none(), "public EC JWK must not expose d");
+
+        let message = b"OIDF ES256 raw signature contract";
+        let signature: Signature = key.sign(message);
+        assert_eq!(signature.to_bytes().len(), 64, "ES256 must remain raw R||S");
+        key.verifying_key()
+            .verify(message, &signature)
+            .expect("ES256 raw signature verifies");
+
+        let der = Zeroizing::new(ec_pkcs8_der(&key));
+        let parsed = p256::SecretKey::from_pkcs8_der(der.as_slice())
+            .expect("generated P-256 PKCS#8 parses as P-256");
+        assert_eq!(parsed.to_bytes(), key.to_bytes(), "PKCS#8 preserves d");
+        KeyPair::try_from(der.as_slice()).expect("rcgen accepts generated P-256 PKCS#8");
+    }
+
+    #[test]
+    fn rsa_jwks_rejects_a_non_rsa_pkcs8_algorithm_identifier() {
+        let key = RsaKeyPair::generate(RsaKeySize::Rsa2048).expect("RSA key");
+        let mut pkcs8_der = Zeroizing::new(key.as_der().expect("RSA PKCS#8").as_ref().to_vec());
+        const RSA_ENCRYPTION_OID: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+        let oid_start = pkcs8_der
+            .windows(RSA_ENCRYPTION_OID.len())
+            .position(|window| window == RSA_ENCRYPTION_OID)
+            .expect("RSA algorithm identifier");
+        pkcs8_der[oid_start + RSA_ENCRYPTION_OID.len() - 1] = 0x02;
+
+        assert!(matches!(
+            rsa_jwks(pkcs8_der.as_slice()),
+            Err(MaterializerError::Crypto)
+        ));
+    }
+
+    #[test]
+    fn rsa_jwks_rejects_rsa_encryption_with_non_null_parameters() {
+        let key = RsaKeyPair::generate(RsaKeySize::Rsa2048).expect("RSA key");
+        let mut pkcs8_der = Zeroizing::new(key.as_der().expect("RSA PKCS#8").as_ref().to_vec());
+        const RSA_ALGORITHM_IDENTIFIER: &[u8] = &[
+            0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+        ];
+        let parameter_tag = pkcs8_der
+            .windows(RSA_ALGORITHM_IDENTIFIER.len())
+            .position(|window| window == RSA_ALGORITHM_IDENTIFIER)
+            .expect("RSA algorithm identifier")
+            + RSA_ALGORITHM_IDENTIFIER.len()
+            - 2;
+        pkcs8_der[parameter_tag] = 0x04;
+
+        assert!(matches!(
+            rsa_jwks(pkcs8_der.as_slice()),
+            Err(MaterializerError::Crypto)
+        ));
+    }
 }

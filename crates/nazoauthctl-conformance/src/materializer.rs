@@ -351,6 +351,7 @@ impl PreparedMaterialization {
             MAX_TENANT_RESOURCE_PASSWORD_BYTES,
             "generated.applicant_password",
         )?;
+        let applicant_profile_origin = self.target_issuer.trim_end_matches('/');
 
         let mut resources = Vec::with_capacity(
             1usize
@@ -371,6 +372,28 @@ impl PreparedMaterialization {
                 "email": self.applicant_email.as_str(),
                 "password": self.applicant_password.as_str(),
                 "email_verified": true,
+                "profile": {
+                    "display_name": "OIDF Conformance User",
+                    "given_name": "OIDF",
+                    "family_name": "Conformance",
+                    "middle_name": "Test",
+                    "nickname": "oidf-user",
+                    "profile_url": format!("{applicant_profile_origin}/oidf/profile"),
+                    "avatar_url": format!("{applicant_profile_origin}/oidf/avatar.png"),
+                    "website_url": format!("{applicant_profile_origin}/"),
+                    "gender": "unspecified",
+                    "birthdate": "1980-01-01",
+                    "zoneinfo": "UTC",
+                    "locale": "en-US",
+                    "address_formatted": "123 Conformance Way, Test City, CA 94105, US",
+                    "address_street_address": "123 Conformance Way",
+                    "address_locality": "Test City",
+                    "address_region": "CA",
+                    "address_postal_code": "94105",
+                    "address_country": "US",
+                    "phone_number": "+12025550100",
+                    "phone_number_verified": true,
+                },
             }),
         )?;
 
@@ -1505,11 +1528,19 @@ impl DescriptorMaterializer {
             &descriptor,
             "generated.dynamic_registration_initial_access_token",
         );
-        let needs_ciba_token =
-            descriptor_requires_reference(&descriptor, "generated.ciba_automated_decision_token")
-                || descriptor_requires_reference(&descriptor, "target.ciba_automated_decision_url");
+        let needs_generated_ciba_token =
+            descriptor_requires_reference(&descriptor, "generated.ciba_automated_decision_token");
+        let needs_ciba_automated_decision_url =
+            descriptor_requires_reference(&descriptor, "target.ciba_automated_decision_url");
+        let needs_legacy_ciba_token =
+            needs_generated_ciba_token || needs_ciba_automated_decision_url;
+        // An ordinary run has no provider-side automated-decision binding.
+        // Its signed legacy URL placeholder therefore resolves to the existing
+        // run-scoped user-approval bridge; raw generated tokens remain legacy
+        // onboarding-only material.
         let needs_ciba_user_approval_callback =
-            descriptor_requires_reference(&descriptor, "target.ciba_user_approval_callback_url");
+            descriptor_requires_reference(&descriptor, "target.ciba_user_approval_callback_url")
+                || (!include_legacy_profile_tokens && needs_ciba_automated_decision_url);
         if !include_legacy_profile_tokens
             && needs_dynamic_token
             && ordinary_dynamic_registration_initial_access_token.is_none()
@@ -1527,13 +1558,13 @@ impl DescriptorMaterializer {
             None
         };
         let legacy_ciba_automated_decision_token = (include_legacy_profile_tokens
-            && needs_ciba_token)
+            && needs_legacy_ciba_token)
             .then(|| Zeroizing::new(random_secret(32)));
         let ciba_decision_tokens = BTreeMap::new();
         let ciba_automated_decision_token = legacy_ciba_automated_decision_token;
-        if !include_legacy_profile_tokens && needs_ciba_token {
+        if !include_legacy_profile_tokens && needs_generated_ciba_token {
             return Err(MaterializerError::InvalidField(
-                "target.ciba_automated_decision_url",
+                "generated.ciba_automated_decision_token",
             ));
         }
         let ciba_user_approval_callback_url = if needs_ciba_user_approval_callback {
@@ -2728,6 +2759,63 @@ mod tests {
         assert_eq!(mtls_client_ref.as_deref(), oauth_id.as_deref());
         assert_eq!(dataset_user_ref.as_deref(), user_id.as_deref());
         assert_eq!(oauth_trust_ref, trust_policy_id);
+    }
+
+    #[test]
+    fn ordinary_applicant_manifest_includes_complete_nonsecret_oidc_profile() {
+        let (prepared, _) = DescriptorMaterializer::prepare(
+            tenant_resource_descriptor(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+            test_trust_anchor(),
+        )
+        .expect("prepare");
+        let manifest = prepared
+            .tenant_resource_manifest(prepared.request_jti())
+            .expect("manifest");
+        let document: Value =
+            serde_json::from_slice(manifest.bytes().as_bytes()).expect("manifest JSON");
+        let user = document["resources"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .find(|resource| resource["kind"].as_str() == Some("user"))
+            .expect("user resource");
+        let payload = URL_SAFE_NO_PAD
+            .decode(user["payload_base64url"].as_str().expect("user payload"))
+            .expect("payload encoding");
+        let payload: Value = serde_json::from_slice(&payload).expect("payload JSON");
+
+        assert_eq!(
+            payload["profile"],
+            serde_json::json!({
+                "display_name": "OIDF Conformance User",
+                "given_name": "OIDF",
+                "family_name": "Conformance",
+                "middle_name": "Test",
+                "nickname": "oidf-user",
+                "profile_url": "https://issuer.example/oidf/profile",
+                "avatar_url": "https://issuer.example/oidf/avatar.png",
+                "website_url": "https://issuer.example/",
+                "gender": "unspecified",
+                "birthdate": "1980-01-01",
+                "zoneinfo": "UTC",
+                "locale": "en-US",
+                "address_formatted": "123 Conformance Way, Test City, CA 94105, US",
+                "address_street_address": "123 Conformance Way",
+                "address_locality": "Test City",
+                "address_region": "CA",
+                "address_postal_code": "94105",
+                "address_country": "US",
+                "phone_number": "+12025550100",
+                "phone_number_verified": true,
+            })
+        );
+        let profile = payload["profile"].as_object().expect("profile object");
+        assert!(!profile.contains_key("username"));
+        assert!(!profile.contains_key("email"));
+        assert!(!profile.contains_key("password"));
     }
 
     #[test]
@@ -4405,6 +4493,10 @@ mod tests {
         assert_vp_credential_signer(config, "suite.example");
         assert_eq!(
             config["browser"][0]["match"],
+            "https://suite.example/test/a/*/authorize*"
+        );
+        assert_eq!(
+            config["browser"][0]["tasks"][0]["match"],
             "https://suite.example/test/a/*/verification-evidence"
         );
         assert_eq!(
@@ -4687,6 +4779,15 @@ mod tests {
         descriptor
     }
 
+    fn ciba_automated_decision_url_descriptor() -> MatrixDescriptor {
+        let mut descriptor = ciba_descriptor();
+        descriptor.groups[0].plans[0].config_template = serde_json::json!({
+            "client_id": "{{client.web.id}}",
+            "automated_ciba_approval_url": "{{target.ciba_automated_decision_url}}"
+        });
+        descriptor
+    }
+
     fn ordinary_ciba_prepared(descriptor: MatrixDescriptor) -> PreparedMaterialization {
         DescriptorMaterializer::prepare_materialization(
             descriptor,
@@ -4734,6 +4835,105 @@ mod tests {
             url,
             "https://callback.example/ciba/approve?approval_token=0123456789abcdef0123456789abcdef"
         );
+    }
+
+    #[test]
+    fn ordinary_legacy_ciba_url_aliases_the_existing_approval_callback() {
+        let prepared = ordinary_ciba_prepared(ciba_automated_decision_url_descriptor());
+        let manifest = prepared
+            .tenant_resource_manifest(prepared.request_jti())
+            .expect("manifest");
+        let receipt = tenant_resource_apply_receipt(&manifest);
+        let output = tenant_resource_apply_output(receipt, &manifest).expect("apply output");
+        let finalized = DescriptorMaterializer::finalize_tenant_resources(
+            prepared,
+            output,
+            test_trust_anchor(),
+        )
+        .expect("finalize");
+        assert_eq!(
+            finalized.matrix().document.groups[0].plans[0].config["automated_ciba_approval_url"],
+            "https://callback.example/ciba/approve?approval_token=0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn ordinary_legacy_ciba_url_requires_a_valid_approval_callback() {
+        let descriptor = ciba_automated_decision_url_descriptor();
+        for callback in [
+            None,
+            Some(
+                "http://callback.example/ciba/approve?approval_token=0123456789abcdef0123456789abcdef",
+            ),
+        ] {
+            let result = DescriptorMaterializer::prepare_materialization(
+                descriptor.clone(),
+                "https://issuer.example",
+                &suite(),
+                request_jti(),
+                test_trust_anchor(),
+                ProfileMaterialization::Ordinary {
+                    dynamic_registration_initial_access_token: None,
+                    ciba_user_approval_callback_url: callback,
+                },
+            );
+            assert_eq!(
+                result.err().expect("callback must be rejected"),
+                MaterializerError::InvalidField("ciba_user_approval_callback_url")
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_raw_ciba_decision_token_stays_fail_closed() {
+        let mut descriptor = ciba_descriptor();
+        descriptor.groups[0].plans[0].config_template = serde_json::json!({
+            "client_id": "{{client.web.id}}",
+            "automated_ciba_token": "{{generated.ciba_automated_decision_token}}"
+        });
+        let result = DescriptorMaterializer::prepare_materialization(
+            descriptor,
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+            test_trust_anchor(),
+            ProfileMaterialization::Ordinary {
+                dynamic_registration_initial_access_token: None,
+                ciba_user_approval_callback_url: None,
+            },
+        );
+        assert_eq!(
+            result.err().expect("raw CIBA token must be rejected"),
+            MaterializerError::InvalidField("generated.ciba_automated_decision_token")
+        );
+    }
+
+    #[test]
+    fn legacy_ciba_automated_decision_url_remains_tokenized() {
+        let (prepared, bundle) = DescriptorMaterializer::prepare(
+            ciba_automated_decision_url_descriptor(),
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+            test_trust_anchor(),
+        )
+        .expect("legacy prepare");
+        let output = onboarding_output(
+            "01890f8e-7c18-7b70-9d1e-9bb8c44a2f40",
+            prepared.request_jti(),
+            prepared.matrix_sha256(),
+            bundle.digest(),
+            BTreeMap::from([("web".to_owned(), "legacy-client".to_owned())]),
+        )
+        .expect("output");
+        let finalized = DescriptorMaterializer::finalize(prepared, output).expect("finalize");
+        let url =
+            finalized.matrix().document.groups[0].plans[0].config["automated_ciba_approval_url"]
+                .as_str()
+                .expect("CIBA URL");
+        assert!(url.starts_with(
+            "https://issuer.example/auth/ciba-automated-decision?token={auth_req_id}&type={action}&decision_token="
+        ));
     }
 
     #[test]

@@ -643,7 +643,7 @@ pub fn render_host_service_unit(install: &HostServiceInstall) -> anyhow::Result<
          CapabilityBoundingSet=\n\
          AmbientCapabilities=\n\
          ReadWritePaths={keys} {avatars} {secrets} {bootstrap} {instance} {ui_releases}\n\
-         InaccessiblePaths={operator_state} {operator_dir} {recovery_dir} {migration_url}\n\n\
+         InaccessiblePaths={operator_state} {operator_dir} {recovery_dir} {migration_url} {restricted_secrets}\n\n\
          [Install]\n\
          WantedBy=multi-user.target\n",
         user = install.service_user,
@@ -669,6 +669,12 @@ pub fn render_host_service_unit(install: &HostServiceInstall) -> anyhow::Result<
         operator_dir = install.operator_directory.display(),
         recovery_dir = install.recovery_directory.display(),
         migration_url = install.migration_url.display(),
+        restricted_secrets = install
+            .restricted_secret_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
     ))
 }
 
@@ -697,6 +703,10 @@ fn validate_host_service_install(install: &HostServiceInstall) -> anyhow::Result
         ("receipt private key path", &install.receipt_private_key),
     ] {
         safe_systemd_path(path).with_context(|| format!("{name} is unsafe for a systemd unit"))?;
+    }
+    for path in &install.restricted_secret_paths {
+        safe_systemd_path(path)
+            .context("restricted dependency secret path is unsafe for a systemd unit")?;
     }
     for name in &install.runtime_readable_secret_names {
         validate_systemd_scalar("runtime secret name", name)?;

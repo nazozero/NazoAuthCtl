@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::io::{self, IsTerminal as _, Read as _, Write as _};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,21 +17,25 @@ use anyhow::{Context as _, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nazoauthctl_conformance::{
     ArtifactMaterializationBinding, ArtifactTrustPolicy, AuthenticatedProviderAuthorization,
-    BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy, BrowserTargetOrigin,
-    CibaUserApprovalBridge, CibaUserApprovalClient, ClientConfig, ConformanceAutomation,
-    ConformanceBinding, ConformanceProxyRecovery, ConformanceRecoveryStore, ConformanceRunConfig,
-    ConformanceRunner, CredentialStore, DescriptorMaterializer, EvidenceBundleIdentity,
-    EvidenceBundleReceipt, EvidenceDeploymentIdentity, EvidenceProviderCapability,
-    EvidenceProviderIdentity, EvidenceProviderReceipt, EvidenceRuntimeIdentity,
-    EvidenceSourceIdentity, HttpTransport, ManagedWebDriver, MatrixSelection, OidfArtifactMatrix,
-    OidfDriverLane, OidfPlanSelection, OidfProviderExecutionBinding, OpenId4VciIssuerClient,
-    OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient,
-    Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient, SuiteResourceObserver,
-    TenantResourceApplyOutput, TenantResourceReceiptIdentity, TenantResourceRecoveryBinding,
-    TtyRenderer, WebDriverClient, WebDriverEndpoint, authorize_oidf_driver_execution,
-    open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
-    read_compact_manifest, recover_suite_resources, verify_oidf_artifact,
-    write_private_provider_evidence_bundle,
+    BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy, BrowserReviewScreenshotCapture,
+    BrowserTargetOrigin, CibaUserApprovalBridge, CibaUserApprovalClient, ClientConfig,
+    ConformanceAutomation, ConformanceBinding, ConformanceProxyRecovery, ConformanceRecoveryStore,
+    ConformanceRunConfig, ConformanceRunner, CredentialStore, DescriptorMaterializer,
+    EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceDeploymentIdentity,
+    EvidenceProviderCapability, EvidenceProviderIdentity, EvidenceProviderReceipt,
+    EvidenceRuntimeIdentity, EvidenceSourceIdentity, HttpTransport, ManagedWebDriver,
+    MatrixSelection, OidfArtifactMatrix, OidfDriverLane, OidfPlanResourceBudget, OidfPlanSelection,
+    OidfProviderExecutionBinding, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
+    OpenId4VciIssuerDriver, OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier,
+    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl,
+    StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionDeferredReview,
+    SuiteRetentionManifest, SuiteRetentionManifestReceipt, SuiteRetentionPlan,
+    SuiteRetentionScreenshotManifest, TenantResourceApplyOutput, TenantResourceReceiptIdentity,
+    TenantResourceRecoveryBinding, TtyRenderer, WebDriverClient, WebDriverEndpoint,
+    authorize_oidf_driver_execution, open_cached_oidf_driver_plan, read_artifact_driver,
+    read_artifact_matrix, read_compact_manifest, recover_suite_resources,
+    validate_private_evidence_directory, verify_oidf_artifact,
+    write_private_provider_evidence_bundle, write_review_screenshot_manifest,
 };
 use nazoauthctl_core::tenant_resources::{
     TenantResourceCapabilitySession, TenantResourceClient, TenantResourceClientError,
@@ -84,6 +88,33 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     if driver_plan.artifact.suite.origin != suite_origin.as_str() {
         bail!("--suite does not match the origin signed by the OIDF artifact");
     }
+    if invocation.retain_suite_plans_for_certification {
+        if suite_origin != Origin::official() {
+            bail!(
+                "--retain-suite-plans-for-certification is restricted to the canonical official Suite origin"
+            );
+        }
+        let evidence_directory = invocation
+            .evidence_directory
+            .as_deref()
+            .context("--retain-suite-plans-for-certification requires --evidence-dir")?;
+        validate_private_evidence_directory(evidence_directory).context(
+            "retention evidence directory must be an existing root-owned private directory",
+        )?;
+    }
+    if invocation.capture_review_screenshots {
+        if suite_origin != Origin::official() {
+            bail!(
+                "--capture-review-screenshots is restricted to the canonical official Suite origin"
+            );
+        }
+        let evidence_directory = invocation
+            .evidence_directory
+            .as_ref()
+            .expect("CLI requires --evidence-dir for review screenshots");
+        validate_private_evidence_directory(evidence_directory)
+            .context("review screenshot evidence directory must be root-owned and private")?;
+    }
 
     let (token, prompted) = resolve_token(&mut invocation, &suite_origin)?;
     let suite_client =
@@ -92,7 +123,20 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     suite_client
         .probe_auth()
         .context("Suite API token authentication failed")?;
-    recover_pending_runs(&session, &recovery_store, &suite_client)?;
+    let recovered_retention = recover_pending_runs(&session, &recovery_store, &suite_client)?;
+    if !recovered_retention.is_empty() {
+        serde_json::to_writer_pretty(
+            io::stdout().lock(),
+            &RecoveredRetentionOutput {
+                schema: 1,
+                recovered: true,
+                retention: recovered_retention,
+            },
+        )
+        .context("failed to write recovered retention report")?;
+        writeln!(io::stdout()).context("failed to finish recovered retention report")?;
+        return Ok(0);
+    }
     if prompted {
         offer_credential_persistence(&suite_origin, &token)?;
     }
@@ -171,11 +215,28 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         mtls_trust_anchor_pem: prepared.mtls_trust_anchor_pem(),
     };
 
-    let client = TenantResourceClient::with_curl(
-        session
-            .tenant_resource_client_config(&invocation.tenant_id)
-            .context("failed to bind the tenant-resource client to the selected runtime")?,
-    )?;
+    let tenant_resource_client_config = session
+        .tenant_resource_client_config(&invocation.tenant_id)
+        .context("failed to bind the tenant-resource client to the selected runtime")?;
+    let vp_evidence_verifier = invocation
+        .capture_review_screenshots
+        .then(|| {
+            OpenId4VpEvidenceVerifier::new(
+                tenant_resource_client_config.deployment_id.clone(),
+                invocation.tenant_id.clone(),
+                tenant_resource_client_config.runtime_instance_id.clone(),
+                tenant_resource_client_config.runtime_key_id.clone(),
+                tenant_resource_client_config.runtime_public_key,
+            )
+        })
+        .transpose()
+        .context("failed to bind OpenID4VP evidence receipts to the selected runtime")?;
+    let vp_evidence_trust_anchor = vp_evidence_verifier
+        .as_ref()
+        .map(|verifier| verifier.recovery_trust_anchor(session.target_issuer()))
+        .transpose()
+        .context("failed to persist the OpenID4VP evidence runtime trust anchor")?;
+    let client = TenantResourceClient::with_curl(tenant_resource_client_config)?;
     let capability = client
         .discover_capability()
         .context("failed to discover the signed tenant-resource capability")?;
@@ -234,6 +295,15 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     if plan_lanes.len() != driver_plan.plans.len() {
         bail!("signed driver plan contains duplicate Matrix plan ids");
     }
+    let plan_resource_budgets = driver_plan
+        .plans
+        .iter()
+        .map(|plan| (plan.plan_id.clone(), plan.resource_budget.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if plan_resource_budgets.len() != driver_plan.plans.len() {
+        bail!("signed driver plan contains duplicate Matrix plan ids");
+    }
+    let selected_resource_budget = driver_plan.selected_resource_budget.clone();
 
     let baseline = client
         .enumerate(
@@ -300,6 +370,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         expected_revision: prepared_apply.task().expected_revision,
         manifest_path: Some(private_manifest_path.clone()),
         proxy: proxy_recovery,
+        vp_evidence_trust_anchor,
         resource_identities: manifest.resource_identities().to_vec(),
     };
     let recovery = match recovery_store.begin_tenant_resource(recovery_binding) {
@@ -388,7 +459,14 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                 if proxy_cleanup.is_ok() {
                     lock_recovery(&recovery)?.mark_proxy_cleanup_complete()?;
                 }
-                let resource_cleanup = cleanup_run_resources(&client, take_recovery(recovery)?);
+                let mut recovery = take_recovery(recovery)?;
+                let resource_cleanup = cleanup_run_resources(&client, &mut recovery);
+                if resource_cleanup.is_ok()
+                    && proxy_cleanup.is_ok()
+                    && recovery.suite_cleanup_complete()
+                {
+                    recovery.finish()?;
+                }
                 bail!(
                     "proxy-install={install:#}; proxy-recovery={}; resource-cleanup={}",
                     proxy_cleanup
@@ -410,32 +488,92 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let ciba_bridge = start_ciba_user_approval_bridge(ciba_callback, &session, &run_secrets)?;
     let run_result = run_signed_suite(
         ordinary,
-        suite_client,
+        suite_client.clone(),
         token,
         run_secrets,
         &session,
         &invocation,
         &suite_origin,
         plan_lanes,
+        plan_resource_budgets,
+        selected_resource_budget,
         recovery.clone(),
         ciba_bridge,
+        vp_evidence_verifier,
     );
 
     let mut recovery = take_recovery(recovery)?;
+    let mut retention_eligible = run_result
+        .as_ref()
+        .is_ok_and(|report| report.orchestration_integrity.retention_eligible);
+    let mut errors = Vec::new();
+    // This root-private, module-bound manifest is the manual upload list for
+    // NazoAuthWeb VP result captures. It performs no Suite upload and is
+    // produced even when retention was not requested; only a later retention
+    // transition binds its digest into the Suite journal.
+    let review_screenshot_manifest = if invocation.capture_review_screenshots {
+        match (run_result.as_ref(), invocation.evidence_directory.as_ref()) {
+            (Ok(report), Some(directory)) => match write_review_screenshot_manifest(
+                report,
+                directory,
+                recovery
+                    .tenant_resource_binding()
+                    .context("missing ordinary recovery binding")?
+                    .request_jti
+                    .as_str(),
+                &invocation.artifact_digest,
+                session.target_issuer(),
+            ) {
+                Ok(manifest) => Some(manifest),
+                Err(error) => {
+                    retention_eligible = false;
+                    errors.push(format!("review-screenshot-manifest={error}"));
+                    None
+                }
+            },
+            _ => {
+                retention_eligible = false;
+                errors.push("review-screenshot-manifest=identity".to_owned());
+                None
+            }
+        }
+    } else {
+        None
+    };
     if run_result
         .as_ref()
         .is_ok_and(|report| report.orchestration_integrity.cleanup_complete)
     {
         recovery.mark_suite_cleanup_complete()?;
+    } else if retention_eligible {
+        let prepared = (|| -> anyhow::Result<()> {
+            let manifest = suite_retention_manifest(
+                &recovery,
+                run_result
+                    .as_ref()
+                    .expect("retention eligibility requires report"),
+                &invocation.artifact_digest,
+                &deployment_report.matrix_sha256,
+                review_screenshot_manifest.as_ref(),
+            )?;
+            let evidence_directory = invocation
+                .evidence_directory
+                .as_ref()
+                .expect("retention preflight requires evidence directory");
+            let manifest_path = suite_retention_manifest_path(evidence_directory, &manifest);
+            recovery.prepare_suite_plan_retention(manifest, manifest_path)
+        })();
+        if let Err(error) = prepared {
+            retention_eligible = false;
+            errors.push(format!("suite-retention-prepare={error:#}"));
+        }
     }
-
     let proxy_cleanup = proxy.as_mut().map(ProxyTrustGuard::restore).transpose();
     if proxy_cleanup.is_ok() && !recovery.proxy_cleanup_complete() {
         recovery.mark_proxy_cleanup_complete()?;
     }
-    let cleanup = cleanup_run_resources(&client, recovery);
-    let mut errors = Vec::new();
-    let report = match run_result {
+    let cleanup = cleanup_run_resources(&client, &mut recovery);
+    let mut report = match run_result {
         Ok(report) => Some(report),
         Err(error) => {
             errors.push(format!("run={error:#}"));
@@ -458,7 +596,94 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         && !errors
             .iter()
             .any(|error| error.starts_with("resource-cleanup="));
-    deployment_report.cleanup_complete = cleanup_complete;
+    let retention_commit_possible =
+        retention_eligible && proxy_cleanup_complete && cleanup_evidence.is_some();
+    // Screenshot evidence, not the optional provider bundle, is the durable
+    // certification-retention boundary.  The screenshot manifest was bound
+    // to the Prepared journal above and is revalidated by stage, commit,
+    // publish, recovery claim, and finish.  Provider evidence is written only
+    // after ownership has transferred and the final report is fixed.
+    let mut retention_committed = if retention_commit_possible {
+        match (|| -> anyhow::Result<()> {
+            recovery.stage_suite_retention_manifest()?;
+            recovery.commit_suite_plan_retention()?;
+            let manifest_path = recovery.publish_committed_suite_retention_manifest()?;
+            eprintln!(
+                "Suite plans retained for certification review: review/publish them in the official Suite UI, then use a controlled deletion procedure; manifest={}",
+                manifest_path.display()
+            );
+            Ok(())
+        })() {
+            Ok(()) => true,
+            Err(error) => {
+                errors.push(format!("suite-retention={error:#}"));
+                // `commit_suite_plan_retention` transfers plan ownership and
+                // compacts the journal before final publication. A later
+                // publish failure is recoverable Retained state, not ordinary
+                // cleanup: deleting here would lose exact ownership and make
+                // a retry unsafe. Only Prepared failures retain plan IDs and
+                // may fall back to exact deletion.
+                if !recovery.suite_retention_committed()
+                    && recovery.suite_retention_commit_resolution()
+                        != nazoauthctl_conformance::SuiteRetentionCommitResolution::Ambiguous
+                {
+                    cleanup_unretained_suite(&mut recovery, &suite_client)?;
+                }
+                false
+            }
+        }
+    } else {
+        cleanup_unretained_suite(&mut recovery, &suite_client)?;
+        false
+    };
+    // A crash or I/O failure may occur after the durable Retained transition
+    // but before the pending manifest promotion reports success. Retry the
+    // idempotent promotion before deriving the final report; a successful
+    // retry is not a failed run.
+    if !retention_committed && recovery.suite_retention_committed() {
+        match recovery.publish_committed_suite_retention_manifest() {
+            Ok(manifest_path) => {
+                retention_committed = true;
+                errors.retain(|error| !error.starts_with("suite-retention="));
+                eprintln!(
+                    "Suite plans retained for certification review: review/publish them in the official Suite UI, then use a controlled deletion procedure; manifest={}",
+                    manifest_path.display()
+                );
+            }
+            Err(error) => errors.push(format!("suite-retention-retry={error:#}")),
+        }
+    }
+    if let Some(report) = report.as_mut() {
+        report.orchestration_integrity.retention_eligible = retention_eligible;
+        report.orchestration_integrity.retention_candidate_settled = retention_eligible
+            && (recovery.suite_retention_committed()
+                || recovery.suite_retention_manifest().is_some());
+        report.orchestration_integrity.retention_committed = recovery.suite_retention_committed();
+        report.orchestration_integrity.suite_resources_settled = recovery.suite_cleanup_complete();
+        report.orchestration_integrity.cleanup_complete = !recovery.suite_retention_committed()
+            && !retention_committed
+            && report.orchestration_integrity.suite_resources_settled;
+        if errors
+            .iter()
+            .any(|error| error.starts_with("suite-retention"))
+        {
+            report.errors.extend(
+                errors
+                    .iter()
+                    .filter(|error| error.starts_with("suite-retention"))
+                    .cloned(),
+            );
+        }
+        report.local_success = report.errors.is_empty()
+            && report.orchestration_integrity.all_modules_instantiated
+            && report.orchestration_integrity.all_modules_settled
+            && report.orchestration_integrity.suite_resources_settled;
+    }
+    // Ordinary evidence is intentionally post-retention: a writer failure
+    // must not delete official Suite plans after their journal-owned
+    // retention transition.  The report above is the exact report supplied to
+    // a successful writer and to FinalOutput; a failed writer is represented
+    // only by outer diagnostics and an absent receipt.
     let mut evidence = None;
     if let (Some(report), Some(directory), Some(cleanup_evidence)) = (
         report.as_ref(),
@@ -496,20 +721,49 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             }),
             outer_cleanup_complete: cleanup_complete,
         };
-        match write_private_provider_evidence_bundle(report, directory, &identity) {
-            Ok(receipt) => evidence = Some(receipt),
-            Err(error) => errors.push(format!("evidence={error}")),
-        }
+        evidence = record_provider_evidence_result(
+            || {
+                write_private_provider_evidence_bundle(
+                    report,
+                    directory,
+                    &identity,
+                    recovery.tenant_resource_binding(),
+                )
+            },
+            &mut errors,
+        );
     }
+    let retention = if retention_committed {
+        recovery.suite_retention_manifest_receipt()?
+    } else {
+        None
+    };
+    if cleanup_evidence.is_some()
+        && proxy_cleanup_complete
+        && recovery.suite_cleanup_complete()
+        && let Err(error) = recovery.finish()
+    {
+        // `finish` consumes the guard but leaves its durable journal in
+        // place on failure. The already-published retention receipt
+        // remains honest; report a structured incomplete local result
+        // rather than deleting plans or losing stdout evidence.
+        errors.push(format!("recovery-finish={error:#}"));
+    }
+    deployment_report.cleanup_complete = cleanup_complete;
     let success = errors.is_empty()
-        && report
-            .as_ref()
-            .is_some_and(|report| report.local_success && report.suite_pass);
+        && report.as_ref().is_some_and(|report| {
+            conformance_acceptance_succeeds(
+                report.local_success,
+                report.acceptance_pass,
+                report.matrix_expectations_satisfied,
+            )
+        });
     let output = FinalOutput {
         schema: 3,
         success,
         errors,
         report,
+        retention,
         evidence,
         deployment: deployment_report,
     };
@@ -519,14 +773,31 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     Ok(if success { 0 } else { 1 })
 }
 
+fn conformance_acceptance_succeeds(
+    local_success: bool,
+    acceptance_pass: bool,
+    matrix_expectations_satisfied: bool,
+) -> bool {
+    local_success && acceptance_pass && matrix_expectations_satisfied
+}
+
 #[derive(Serialize)]
 struct FinalOutput {
     schema: u32,
     success: bool,
     errors: Vec<String>,
     report: Option<nazoauthctl_conformance::ConformanceReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retention: Option<SuiteRetentionManifestReceipt>,
     evidence: Option<EvidenceBundleReceipt>,
     deployment: DeploymentReport,
+}
+
+#[derive(Serialize)]
+struct RecoveredRetentionOutput {
+    schema: u32,
+    recovered: bool,
+    retention: Vec<SuiteRetentionManifestReceipt>,
 }
 
 #[derive(Serialize)]
@@ -566,8 +837,11 @@ fn run_signed_suite(
     invocation: &RunInvocation,
     suite_origin: &Origin,
     plan_lanes: BTreeMap<String, OidfDriverLane>,
+    plan_resource_budgets: BTreeMap<String, OidfPlanResourceBudget>,
+    selected_resource_budget: OidfPlanResourceBudget,
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
     ciba_bridge: Option<CibaUserApprovalBridge>,
+    vp_evidence_verifier: Option<OpenId4VpEvidenceVerifier>,
 ) -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
     if let Some(bridge) = &ciba_bridge {
         bridge
@@ -586,7 +860,47 @@ fn run_signed_suite(
     let openid4vp_management_token = session
         .openid4vp_management_token()
         .context("failed to load the deployment OpenID4VP management token")?;
+    let review_screenshot_run_jti = recovery
+        .lock()
+        .map_err(|_| anyhow::anyhow!("ordinary recovery lock is poisoned"))?
+        .tenant_resource_binding()
+        .context("ordinary screenshot capture has no recovery binding")?
+        .request_jti
+        .clone();
+    let review_screenshot_capture = invocation
+        .capture_review_screenshots
+        .then(|| {
+            BrowserReviewScreenshotCapture::new(
+                invocation
+                    .evidence_directory
+                    .as_ref()
+                    .expect("CLI requires --evidence-dir for review screenshots")
+                    .clone(),
+                &review_screenshot_run_jti,
+            )
+        })
+        .transpose()
+        .context("review screenshot evidence directory must be root-owned and private")?;
 
+    let selected = materialized
+        .take_matrix()
+        .select(&MatrixSelection {
+            groups: invocation.groups.clone(),
+            profiles: Vec::new(),
+            plans: invocation.plans.clone(),
+        })
+        .context("requested selection is outside the signed artifact Matrix")?;
+    let vp_evidence = invocation
+        .capture_review_screenshots
+        .then(|| {
+            OpenId4VpEvidenceRunContext::new(
+                &review_screenshot_run_jti,
+                invocation.artifact_digest.as_str(),
+                selected.digest.as_str(),
+            )
+        })
+        .transpose()
+        .context("OpenID4VP review evidence binding is invalid")?;
     let mut automation = Vec::with_capacity(invocation.jobs);
     for worker_index in 0..invocation.jobs {
         let browser = build_browser(
@@ -608,29 +922,28 @@ fn run_signed_suite(
                 openid4vci_management_token.clone(),
                 token.clone(),
             )?));
-        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
-            Arc::new(Mutex::new(OpenId4VpVerifierClient::new(
-                target_origin.clone(),
-                suite_origin.clone(),
-                openid4vp_management_token.clone(),
-                Duration::from_secs(30),
-                binding.clone(),
-            )?));
+        let verifier_client = OpenId4VpVerifierClient::new(
+            target_origin.clone(),
+            suite_origin.clone(),
+            openid4vp_management_token.clone(),
+            Duration::from_secs(30),
+            binding.clone(),
+        )?;
+        let verifier_client = match &vp_evidence_verifier {
+            Some(evidence_verifier) => {
+                verifier_client.with_evidence_verifier(evidence_verifier.clone())
+            }
+            None => verifier_client,
+        };
+        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = Arc::new(Mutex::new(verifier_client));
         automation.push(ConformanceAutomation {
             browser: Some(browser),
+            review_screenshot_capture: review_screenshot_capture.clone(),
+            vp_evidence: vp_evidence.clone(),
             verifier: Some(verifier),
             issuer: Some(issuer),
         });
     }
-
-    let selected = materialized
-        .take_matrix()
-        .select(&MatrixSelection {
-            groups: invocation.groups.clone(),
-            profiles: Vec::new(),
-            plans: invocation.plans.clone(),
-        })
-        .context("requested selection is outside the signed artifact Matrix")?;
     let control = RunControl::default();
     let interrupt = control.clone();
     ctrlc::set_handler(move || interrupt.interrupt())
@@ -643,9 +956,15 @@ fn run_signed_suite(
         poll_timeout: invocation.poll_timeout,
         control,
         plan_lanes,
+        plan_resource_budgets,
+        selected_resource_budget,
         jobs: invocation.jobs,
+        upload_review_screenshots: invocation.upload_review_screenshots,
         automation,
-        suite_resource_observer: Some(Arc::new(DurableSuiteObserver { recovery })),
+        suite_resource_observer: Some(Arc::new(DurableSuiteObserver {
+            recovery,
+            retain_suite_plans_for_certification: invocation.retain_suite_plans_for_certification,
+        })),
     })?;
     let summary = if io::stderr().is_terminal() {
         let mut renderer = TtyRenderer::new(io::stderr().lock());
@@ -754,18 +1073,49 @@ fn random_urlsafe_token(bytes: usize) -> String {
 
 struct DurableSuiteObserver {
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
+    retain_suite_plans_for_certification: bool,
 }
 
 impl SuiteResourceObserver for DurableSuiteObserver {
-    fn plan_created(&self, origin: &Origin, plan_id: &str) -> Result<(), String> {
+    fn retain_suite_plans_for_certification(&self) -> bool {
+        self.retain_suite_plans_for_certification
+    }
+
+    fn plan_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String> {
         lock_recovery(&self.recovery)
-            .and_then(|mut recovery| recovery.record_suite_plan(origin.as_str(), plan_id))
+            .and_then(|mut recovery| {
+                recovery.begin_suite_create_with_retention(
+                    origin.as_str(),
+                    intent_id,
+                    self.retain_suite_plans_for_certification,
+                )
+            })
+            .map_err(|error| format!("failed to persist Suite plan create intent: {error:#}"))
+    }
+
+    fn plan_created(&self, origin: &Origin, intent_id: &str, plan_id: &str) -> Result<(), String> {
+        lock_recovery(&self.recovery)
+            .and_then(|mut recovery| {
+                recovery.record_suite_plan(origin.as_str(), intent_id, plan_id)
+            })
             .map_err(|error| format!("failed to persist Suite plan allocation: {error:#}"))
     }
 
-    fn module_created(&self, module_id: &str) -> Result<(), String> {
+    fn module_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String> {
         lock_recovery(&self.recovery)
-            .and_then(|mut recovery| recovery.record_suite_module(module_id))
+            .and_then(|mut recovery| {
+                recovery.begin_suite_create_with_retention(
+                    origin.as_str(),
+                    intent_id,
+                    self.retain_suite_plans_for_certification,
+                )
+            })
+            .map_err(|error| format!("failed to persist Suite module create intent: {error:#}"))
+    }
+
+    fn module_created(&self, intent_id: &str, module_id: &str) -> Result<(), String> {
+        lock_recovery(&self.recovery)
+            .and_then(|mut recovery| recovery.record_suite_module(intent_id, module_id))
             .map_err(|error| format!("failed to persist Suite module allocation: {error:#}"))
     }
 }
@@ -816,9 +1166,92 @@ fn cleanup_change_set_id(request_jti: &str, phase: &str, capability_sha256: &str
     format!("{request_jti}-cleanup-{phase}-{generation}")
 }
 
+fn suite_retention_manifest(
+    recovery: &nazoauthctl_conformance::ConformanceRecoveryGuard,
+    report: &nazoauthctl_conformance::ConformanceReport,
+    artifact_digest: &str,
+    matrix_sha256: &str,
+    review_screenshot_manifest: Option<&nazoauthctl_conformance::ReviewScreenshotManifestReceipt>,
+) -> anyhow::Result<SuiteRetentionManifest> {
+    let binding = recovery
+        .tenant_resource_binding()
+        .context("missing ordinary recovery binding")?;
+    let plans = report
+        .plans
+        .iter()
+        .map(|plan| {
+            let suite_plan_id = plan
+                .suite_plan_id
+                .clone()
+                .context("settled retained report has no Suite plan ID")?;
+            Ok(SuiteRetentionPlan {
+                matrix_plan_id: plan.matrix_plan_id.clone(),
+                suite_plan_id,
+                plan_name: plan.plan_name.clone(),
+                plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256(&plan.matrix_plan_id),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(SuiteRetentionManifest {
+        schema: if report.review_pending { 2 } else { 1 },
+        suite_origin: report.suite_origin.clone(),
+        artifact_digest: artifact_digest.to_owned(),
+        matrix_sha256: matrix_sha256.to_owned(),
+        deployment_id: binding.deployment_id.clone(),
+        tenant_id: binding.tenant_id.clone(),
+        run_id: binding.request_jti.clone(),
+        review_screenshot_manifest: review_screenshot_manifest.map(|manifest| {
+            SuiteRetentionScreenshotManifest {
+                path: manifest.path.clone(),
+                sha256: manifest.sha256.clone(),
+            }
+        }),
+        deferred_review_pending: report
+            .modules
+            .iter()
+            .filter_map(|module| {
+                let pending = module.deferred_review_pending.as_ref()?;
+                Some(SuiteRetentionDeferredReview {
+                    matrix_plan_id: module.matrix_plan_id.clone(),
+                    suite_plan_id: module.suite_plan_id.clone(),
+                    module_id: module.module_id.clone()?,
+                    test_name: module.test_name.clone(),
+                    variant: module.variant.clone(),
+                    placeholder_path: pending.placeholder_path.clone(),
+                    marker: pending.marker,
+                    obligation_index: pending.obligation_index,
+                })
+            })
+            .collect(),
+        plans,
+    })
+}
+
+fn suite_retention_manifest_path(
+    evidence_directory: &Path,
+    manifest: &SuiteRetentionManifest,
+) -> PathBuf {
+    evidence_directory.join(format!("retained-suite-{}.json", manifest.run_id))
+}
+
+fn cleanup_unretained_suite(
+    recovery: &mut nazoauthctl_conformance::ConformanceRecoveryGuard,
+    suite_client: &SuiteClient,
+) -> anyhow::Result<()> {
+    if recovery.suite_cleanup_complete() {
+        return Ok(());
+    }
+    recovery.discard_prepared_suite_retention_staging()?;
+    let suite = recovery
+        .suite_recovery()
+        .context("ordinary Suite recovery state is incomplete")?;
+    recover_suite_resources(suite_client, suite).map_err(|error| anyhow::anyhow!(error))?;
+    recovery.mark_suite_cleanup_complete()
+}
+
 fn cleanup_run_resources<T>(
     client: &TenantResourceClient<T>,
-    mut recovery: nazoauthctl_conformance::ConformanceRecoveryGuard,
+    recovery: &mut nazoauthctl_conformance::ConformanceRecoveryGuard,
 ) -> anyhow::Result<CleanupEvidence>
 where
     T: nazoauthctl_core::tenant_resources::TenantResourceHttpTransport,
@@ -910,13 +1343,7 @@ where
         }
         receipts.push(revoke);
     }
-    if recovery.tenant_resource_cleanup_complete() {
-        // Recovery owns deletion of the bound private manifest before it
-        // removes the journal, preventing an orphaned secret-bearing file.
-        // `finish` durably marks removal intent, removes the bound private
-        // manifest, then removes the journal/lock.
-        recovery.finish()?;
-    } else {
+    if !recovery.tenant_resource_cleanup_complete() {
         bail!("ordinary cleanup obligations remain pending");
     }
     Ok(CleanupEvidence {
@@ -929,12 +1356,13 @@ fn recover_pending_runs(
     session: &nazoauthctl_core::ConformanceSession,
     store: &ConformanceRecoveryStore,
     suite_client: &SuiteClient,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<SuiteRetentionManifestReceipt>> {
     let pending = store.claim_pending()?;
     if pending.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut failures = Vec::new();
+    let mut retained = Vec::new();
     for mut recovery in pending {
         let Some(binding) = recovery.tenant_resource_binding().cloned() else {
             // Legacy journals remain readable, but this ordinary command must
@@ -942,10 +1370,24 @@ fn recover_pending_runs(
             failures.push("legacy-read-only: use the release that created this journal".to_owned());
             continue;
         };
-        let result = (|| -> anyhow::Result<()> {
+        let result = (|| -> anyhow::Result<Option<SuiteRetentionManifestReceipt>> {
+            // Retained is a durable transfer of exact Suite-plan ownership.
+            // Its commit precondition already proves provider, proxy, and
+            // ordinary cleanup.  A recovery must therefore publish/read the
+            // retained receipt and stop before constructing any live Apply
+            // client; retrying an Apply here could create a second resource
+            // set after certification plans have been preserved.
+            if retained_recovery_stops_before_live_apply(recovery.suite_retention_committed()) {
+                recovery.publish_committed_suite_retention_manifest()?;
+                let receipt = recovery.suite_retention_manifest_receipt()?;
+                if recovery.suite_cleanup_complete() && recovery.proxy_cleanup_complete() {
+                    recovery.finish()?;
+                }
+                return Ok(receipt);
+            }
             if recovery.tenant_resource_abort_uncommitted_intent() {
                 recovery.abort_uncommitted_tenant_resource()?;
-                return Ok(());
+                return Ok(None);
             }
             let client = TenantResourceClient::with_curl(
                 session.tenant_resource_client_config(&binding.tenant_id)?,
@@ -979,7 +1421,7 @@ fn recover_pending_runs(
                             recovery.mark_proxy_cleanup_complete()?;
                         }
                         recovery.abort_uncommitted_tenant_resource()?;
-                        return Ok(());
+                        return Ok(None);
                     }
                     Err(error) => return Err(error.into()),
                 };
@@ -991,6 +1433,7 @@ fn recover_pending_runs(
                 )?;
             }
             if !recovery.suite_cleanup_complete() {
+                recovery.discard_prepared_suite_retention_staging()?;
                 let suite = recovery
                     .suite_recovery()
                     .context("ordinary recovery Suite state is incomplete")?;
@@ -1006,14 +1449,21 @@ fn recover_pending_runs(
                 ProxyTrustGuard::recover(&proxy.bundle_path, &proxy.reload_executable)?;
                 recovery.mark_proxy_cleanup_complete()?;
             }
-            cleanup_run_resources(&client, recovery).map(|_| ())
+            cleanup_run_resources(&client, &mut recovery)?;
+            let receipt = recovery.suite_retention_manifest_receipt()?;
+            if recovery.suite_cleanup_complete() && recovery.proxy_cleanup_complete() {
+                recovery.finish()?;
+            }
+            Ok(receipt)
         })();
-        if let Err(error) = result {
-            failures.push(format!("{}: {error:#}", binding.request_jti));
+        match result {
+            Ok(Some(receipt)) => retained.push(receipt),
+            Ok(None) => {}
+            Err(error) => failures.push(format!("{}: {error:#}", binding.request_jti)),
         }
     }
     if failures.is_empty() {
-        Ok(())
+        Ok(retained)
     } else {
         bail!(
             "pending conformance cleanup could not be recovered: {}",
@@ -1046,6 +1496,31 @@ fn evidence_runtime(
             }
         }
     }
+}
+
+// Keep the provider-bundle failure boundary explicit and independently
+// testable.  Retention ownership is committed before this callback and is
+// intentionally not an input here, so a writer failure cannot select Suite
+// cleanup or change a retained-plan decision.
+fn record_provider_evidence_result<F, E>(
+    writer: F,
+    errors: &mut Vec<String>,
+) -> Option<EvidenceBundleReceipt>
+where
+    F: FnOnce() -> Result<EvidenceBundleReceipt, E>,
+    E: std::fmt::Display,
+{
+    match writer() {
+        Ok(receipt) => Some(receipt),
+        Err(error) => {
+            errors.push(format!("evidence={error}"));
+            None
+        }
+    }
+}
+
+fn retained_recovery_stops_before_live_apply(retention_committed: bool) -> bool {
+    retention_committed
 }
 
 fn evidence_capability(
@@ -1271,5 +1746,59 @@ mod tests {
 
         assert_ne!(first, second);
         assert!(first.len() <= 128);
+    }
+
+    #[test]
+    fn ordinary_success_requires_accepted_suite_outcomes_and_matrix_expectations() {
+        assert!(conformance_acceptance_succeeds(true, true, true));
+        assert!(!conformance_acceptance_succeeds(false, true, true));
+        assert!(!conformance_acceptance_succeeds(true, false, true));
+        assert!(!conformance_acceptance_succeeds(true, true, false));
+    }
+
+    #[test]
+    fn provider_evidence_failure_is_diagnostic_only_after_retention_commit() {
+        let mut errors = Vec::new();
+        let retention_committed = true;
+        let evidence = record_provider_evidence_result(
+            || -> Result<EvidenceBundleReceipt, &'static str> { Err("injected writer failure") },
+            &mut errors,
+        );
+        assert!(retention_committed);
+        assert!(evidence.is_none());
+        assert_eq!(errors, vec!["evidence=injected writer failure"]);
+    }
+
+    #[test]
+    fn retained_recovery_never_reenters_live_apply() {
+        assert!(retained_recovery_stops_before_live_apply(true));
+        assert!(!retained_recovery_stops_before_live_apply(false));
+    }
+
+    #[test]
+    fn retained_suite_manifest_path_uses_the_recovery_binding_jti() {
+        let local_request_jti = "request-local-0123456789abcdef";
+        let binding_request_jti = "tenant-request-0123456789abcdef";
+        assert_ne!(local_request_jti, binding_request_jti);
+        let manifest = SuiteRetentionManifest {
+            schema: 1,
+            suite_origin: "https://www.certification.openid.net".to_owned(),
+            artifact_digest: "a".repeat(64),
+            matrix_sha256: "b".repeat(64),
+            deployment_id: "deployment-a".to_owned(),
+            tenant_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            run_id: binding_request_jti.to_owned(),
+            review_screenshot_manifest: None,
+            deferred_review_pending: Vec::new(),
+            plans: Vec::new(),
+        };
+
+        let path = suite_retention_manifest_path(Path::new("/evidence"), &manifest);
+
+        assert_eq!(
+            path,
+            Path::new("/evidence").join(format!("retained-suite-{binding_request_jti}.json"))
+        );
+        assert!(!path.to_string_lossy().contains(local_request_jti));
     }
 }

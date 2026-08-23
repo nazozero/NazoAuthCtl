@@ -341,13 +341,26 @@ fn public_runtime_urls_are_same_origin_and_never_remote_plaintext() {
 fn external_and_container_dependency_modes_resolve_explicitly() {
     let mut config = valid_config();
     config.runtime.backend = crate::deployment::RuntimeBackendKind::Docker;
+    config.schema = 3;
     config.runtime.service_name.clear();
     config.runtime.service_user.clear();
     config.dependencies.mode = "external".to_owned();
     let root = std::env::temp_dir().join("nazoauthctl-external-model-test");
     config.dependencies.database_url_file = root.join("database-url");
     config.dependencies.migration_database_url_file = root.join("migration-database-url");
+    config.dependencies.database_backup_url_file = root.join("database-backup-url");
     config.dependencies.valkey_url_file = root.join("valkey-url");
+    config.dependencies.valkey_backup_url_file = root.join("valkey-backup-url");
+    config.dependencies.external_valkey_backup_scope = "dedicated-instance".to_owned();
+    config.dependencies.database_runtime_endpoint_sha256 = "a".repeat(64);
+    config.dependencies.database_runtime_principal_sha256 = "b".repeat(64);
+    config.dependencies.migration_database_endpoint_sha256 = "b".repeat(64);
+    config.dependencies.migration_database_principal_sha256 = "c".repeat(64);
+    config.dependencies.database_backup_endpoint_sha256 = "a".repeat(64);
+    config.dependencies.database_backup_principal_sha256 = "d".repeat(64);
+    config.dependencies.valkey_runtime_principal_sha256 = "e".repeat(64);
+    config.dependencies.valkey_backup_endpoint_sha256 = "b".repeat(64);
+    config.dependencies.valkey_backup_principal_sha256 = "f".repeat(64);
     config.validate().unwrap();
     assert_eq!(
         config.container_backend(),
@@ -359,6 +372,81 @@ fn external_and_container_dependency_modes_resolve_explicitly() {
     assert!(safe_absolute(std::path::Path::new("relative")).is_err());
     assert!(safe_absolute(std::path::Path::new(&std::path::MAIN_SEPARATOR.to_string())).is_err());
     assert!(safe_absolute(std::path::Path::new("/var/lib/../nazoauthctl")).is_err());
+}
+
+#[test]
+fn schema_two_keeps_managed_configs_readable_but_rejects_legacy_external_credentials() {
+    let managed = valid_config();
+    let mut managed_json = serde_json::to_value(&managed).unwrap();
+    let dependencies = managed_json
+        .get_mut("dependencies")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap();
+    dependencies.remove("database_backup_url_file");
+    dependencies.remove("valkey_backup_url_file");
+    dependencies.remove("external_valkey_backup_scope");
+    dependencies.remove("database_runtime_endpoint_sha256");
+    dependencies.remove("database_runtime_principal_sha256");
+    dependencies.remove("migration_database_endpoint_sha256");
+    dependencies.remove("migration_database_principal_sha256");
+    dependencies.remove("database_backup_endpoint_sha256");
+    dependencies.remove("database_backup_principal_sha256");
+    dependencies.remove("valkey_runtime_principal_sha256");
+    dependencies.remove("valkey_backup_endpoint_sha256");
+    dependencies.remove("valkey_backup_principal_sha256");
+    let managed_legacy: UpdateConfig = serde_json::from_value(managed_json.clone()).unwrap();
+    managed_legacy.validate().unwrap();
+
+    managed_json["dependencies"]["mode"] = serde_json::Value::String("external".to_owned());
+    let external_legacy: UpdateConfig = serde_json::from_value(managed_json).unwrap();
+    let error = external_legacy.validate().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("external dependencies require update config schema 3")
+    );
+
+    let mut external = valid_config();
+    external.schema = 3;
+    external.runtime.backend = crate::deployment::RuntimeBackendKind::Docker;
+    external.runtime.service_name.clear();
+    external.runtime.service_user.clear();
+    external.dependencies.mode = "external".to_owned();
+    let root = std::env::temp_dir().join("nazoauthctl-legacy-external-schema-three");
+    external.dependencies.database_url_file = root.join("database-url");
+    external.dependencies.migration_database_url_file = root.join("migration-database-url");
+    external.dependencies.database_backup_url_file = root.join("database-backup-url");
+    external.dependencies.valkey_url_file = root.join("valkey-url");
+    external.dependencies.valkey_backup_url_file = root.join("valkey-backup-url");
+    external.dependencies.external_valkey_backup_scope = "dedicated-instance".to_owned();
+    external.dependencies.database_runtime_endpoint_sha256 = "a".repeat(64);
+    external.dependencies.database_runtime_principal_sha256 = "b".repeat(64);
+    external.dependencies.migration_database_endpoint_sha256 = "b".repeat(64);
+    external.dependencies.migration_database_principal_sha256 = "c".repeat(64);
+    external.dependencies.database_backup_endpoint_sha256 = "c".repeat(64);
+    external.dependencies.database_backup_principal_sha256 = "d".repeat(64);
+    external.dependencies.valkey_runtime_principal_sha256 = "e".repeat(64);
+    external.dependencies.valkey_backup_endpoint_sha256 = "d".repeat(64);
+    external.dependencies.valkey_backup_principal_sha256 = "f".repeat(64);
+    let mut legacy_external = serde_json::to_value(&external).unwrap();
+    let dependencies = legacy_external["dependencies"].as_object_mut().unwrap();
+    dependencies.remove("database_runtime_endpoint_sha256");
+    dependencies.remove("database_runtime_principal_sha256");
+    dependencies.remove("migration_database_endpoint_sha256");
+    dependencies.remove("migration_database_principal_sha256");
+    dependencies.remove("database_backup_endpoint_sha256");
+    dependencies.remove("database_backup_principal_sha256");
+    dependencies.remove("valkey_runtime_principal_sha256");
+    dependencies.remove("valkey_backup_endpoint_sha256");
+    dependencies.remove("valkey_backup_principal_sha256");
+    let legacy_external: UpdateConfig = serde_json::from_value(legacy_external).unwrap();
+    assert!(
+        legacy_external
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("external PostgreSQL runtime endpoint identity")
+    );
 }
 
 #[test]

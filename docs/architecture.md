@@ -109,6 +109,68 @@ resource/proxy cleanup result. This is ctl-generated integrity evidence, not a
 Suite signature; signed Suite evidence remains an external release-stage
 requirement.
 
+`--capture-review-screenshots` is an explicit, local-only companion to
+`--evidence-dir`. It recognizes only signed browser commands marked
+`update-image-placeholder` or `update-image-placeholder-optional`; it never
+calls a Suite image API. A required marker fails local orchestration if a
+bounded W3C PNG screenshot cannot be captured, while an optional marker is
+reported as missing and execution continues with the next signed task. A
+normal capture is accepted only on the canonical Suite
+`/test/a/{module-id}/…` page for its newly-created module. OpenID4VP required
+captures first create with a caller-owned stable create JTI; a lost network
+response retries the exact canonical request and validates the echoed JTI and
+normalized-request digest before the same browser lane's actual signed-entry
+selection attaches exact new plan/module context. They then complete the
+protocol before issuing a
+same-module, runtime-signed verification receipt and one-time NazoAuthWeb
+result view at
+`/ui/verification-result#receipt=…`; ctl verifies its non-secret DOM binding
+before capture and never records the fragment capability. The capability is
+issued only after protocol completion. Attachment is authenticated by the
+runtime-discovery key: ctl checks the signed intent's issuer, audience, tenant,
+transaction, exact evidence context, presentation request digest, and trust
+policy binding before generating one stable issuance JTI. Retried issuance
+requests reuse that JTI, so a lost response cannot silently rotate the browser
+capability. The durable screenshot receipt retains only the signed JWS and its
+non-secret tenant/runtime/key/context/binding/intent/capability hashes; recovery
+reverifies it under the journal-owned runtime key. The capability is deliberately
+not recoverable: a
+process crash before the new module becomes terminal fails that module and
+uses the ordinary exact cleanup path. PNG input is capped
+at 500 KiB and fully decoded with bounded dimensions, pixels, and output before
+it is written owner-only under `review-screenshots/`. The root-private capture
+manifest is also the local, module-bound manual-upload list: it binds the run,
+artifact/Matrix digests, Suite origin, exact plan/module IDs, test/variant,
+capture source, and required/captured/missing obligations. By default it never
+POSTs an image to the Suite. Retained plans bind its path and SHA-256 into the recovery
+journal and reverify it before publication. Module reports contain only the
+relative path, SHA-256, and size. Existing terminal Suite modules are never
+targeted: a retained plan must be repeated to collect new local evidence, which
+can then be attached manually in the official UI.
+
+For the OpenID4VP deferred verification-evidence boundary documented by
+[OIDF Suite MR !2100](https://gitlab.com/openid/conformance-suite/-/merge_requests/2100), a
+capture-and-retain run may record a typed `deferred_review_pending` module only
+when that nonterminal module is the final module in its Suite plan. A waiting
+module never licenses ctl to create another module with the same plan alias;
+doing so would interrupt the earlier test. This boundary requires one actually selected signed required
+`verification-evidence` marker, a verified NazoAuthWeb result capture, and a
+fresh exact Suite `WAITING` state for that same module. It is neither a Suite
+terminal result nor a pass/certification claim: reports keep
+`acceptance_pass=false` and `review_pending=true`. The retention manifest
+persists the exact plan/module/placeholder identity and capture-manifest hash
+for controlled operator action later; ctl does not upload an image, mark a
+browser URL visited, or modify an existing retained plan.
+
+`--upload-review-screenshots` is a separate explicit transmission authority.
+It requires local capture and certification retention, reopens only the
+module-bound private PNG whose size and SHA-256 still match its in-memory
+receipt, requires exactly one outstanding image placeholder for that same
+Suite module, fills that placeholder, and then waits for real
+`FINISHED`/`REVIEW`. Only this terminal boundary permits later modules sharing
+the plan alias to start. The final plan publication remains a separate operator
+action.
+
 Final output schema 2 preserves a completed `RunOutput` even when resource,
 proxy, or evidence cleanup fails. Such failures are listed in `errors`, keep
 `success: false`, and leave `deployment.cleanup_complete: false`; they are no

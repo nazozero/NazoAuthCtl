@@ -446,6 +446,16 @@ impl DeploymentStore {
     }
 
     fn registration_pending(&self) -> anyhow::Result<bool> {
+        self.registration_pending_except(None)
+    }
+
+    /// Check registration journals while permitting one caller-owned
+    /// deployment journal to be reconciled under the registry/deployment
+    /// locks.  All other journals remain a global unsettled-state guard.
+    pub(crate) fn registration_pending_except(
+        &self,
+        permitted_deployment_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
         let directory = self.state_root.join("transactions");
         let metadata = match fs::symlink_metadata(&directory) {
             Ok(metadata) => metadata,
@@ -465,6 +475,11 @@ impl DeploymentStore {
                 let metadata = fs::symlink_metadata(entry.path())?;
                 if metadata.file_type().is_symlink() || !metadata.is_file() {
                     bail!("registration journal must be a regular non-symlink file");
+                }
+                if permitted_deployment_id.is_some_and(|deployment_id| {
+                    name == format!("registration-{deployment_id}.json")
+                }) {
+                    continue;
                 }
                 return Ok(true);
             }
@@ -679,6 +694,22 @@ impl DeploymentStore {
     }
 
     pub(crate) fn persist_locked(&self, record: &DeploymentRecord) -> anyhow::Result<()> {
+        self.persist_locked_with_existing_policy(record, false)
+    }
+
+    /// Register only the exact declaration supplied by the caller. This is
+    /// used by fresh local-candidate installation: accepting an older record
+    /// that merely shares a deployment identity would turn a crash retry into
+    /// a false success against a different runtime binding.
+    pub(crate) fn persist_exact_locked(&self, record: &DeploymentRecord) -> anyhow::Result<()> {
+        self.persist_locked_with_existing_policy(record, true)
+    }
+
+    fn persist_locked_with_existing_policy(
+        &self,
+        record: &DeploymentRecord,
+        require_exact: bool,
+    ) -> anyhow::Result<()> {
         self.ensure_storage_roots()?;
         record.validate()?;
         let journal_path = self.registration_journal_path(&record.deployment_id);
@@ -712,7 +743,8 @@ impl DeploymentStore {
             {
                 bail!("registration journal does not bind to the requested deployment");
             }
-            if journal.record != *record && !registration_identity_matches(&journal.record, record)
+            if journal.record != *record
+                && (require_exact || !registration_identity_matches(&journal.record, record))
             {
                 bail!("a different registration is already pending for this deployment");
             }
@@ -725,7 +757,7 @@ impl DeploymentStore {
         if path_present(&declaration)? {
             let existing = self.load(&record.deployment_id)?;
             if existing != *record {
-                if !registration_identity_matches(&existing, record) {
+                if require_exact || !registration_identity_matches(&existing, record) {
                     bail!("deployment declaration already exists with different identity");
                 }
                 // A completed install may be retried after later declaration

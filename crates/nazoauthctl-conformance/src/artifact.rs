@@ -906,7 +906,7 @@ fn decode_base64url<T>(value: &str, error: T) -> Result<Vec<u8>, T> {
 }
 
 fn key_id(key: &VerifyingKey) -> String {
-    let encoded = key.to_encoded_point(true);
+    let encoded = key.to_sec1_point(true);
     format!("oidf-es256-{}", &digest(encoded.as_bytes())[..32])
 }
 
@@ -943,7 +943,7 @@ mod tests {
 
     fn trust() -> ArtifactTrustPolicy {
         let key = signing_key();
-        let public = key.verifying_key().to_encoded_point(true);
+        let public = key.verifying_key().to_sec1_point(true);
         ArtifactTrustPolicy {
             schema: OIDF_TRUST_POLICY_SCHEMA_VERSION,
             source: "https://artifacts.example/oidf/".to_owned(),
@@ -953,6 +953,22 @@ mod tests {
             key_id: key_id(key.verifying_key()),
             public_key_sec1: URL_SAFE_NO_PAD.encode(public.as_bytes()),
         }
+    }
+
+    #[test]
+    fn artifact_base64url_fields_reject_padding_and_standard_alphabet() {
+        assert_eq!(
+            decode_base64url("_w", ArtifactError::TrustPolicy),
+            Ok(vec![0xff])
+        );
+        assert_eq!(
+            decode_base64url("_w=", ArtifactError::TrustPolicy),
+            Err(ArtifactError::TrustPolicy)
+        );
+        assert_eq!(
+            decode_base64url("/w", ArtifactError::TrustPolicy),
+            Err(ArtifactError::TrustPolicy)
+        );
     }
 
     fn matrix() -> Vec<u8> {

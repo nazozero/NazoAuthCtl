@@ -453,9 +453,13 @@ fn materialize_vp_verification_evidence_browser(
         "{}/test/a/*/verification-evidence",
         suite_base_url.trim_end_matches('/')
     );
+    let authorization_url = format!(
+        "{}/test/a/*/authorize*",
+        suite_base_url.trim_end_matches('/')
+    );
     let expected = serde_json::json!([{
-        "comment": "capture the suite-served evidence page to fill the verification-result screenshot placeholder without human interaction",
-        "match": evidence_url,
+        "comment": "drive the signed VP authorization entry; its required evidence task authorizes a NazoAuth verification-result capture",
+        "match": authorization_url,
         "tasks": [{
             "task": "Capture verification evidence",
             "match": evidence_url,
@@ -599,6 +603,13 @@ fn resolve_reference(
         )));
     }
     if name == "target.ciba_automated_decision_url" {
+        if prepared.bundle_digest.is_none() {
+            return prepared
+                .ciba_user_approval_callback_url
+                .as_ref()
+                .map(|value| Value::String(value.to_string()))
+                .ok_or_else(|| MaterializerError::UnknownSecretReference(name.to_owned()));
+        }
         let token = ciba_client_logical
             .and_then(|logical| prepared.ciba_decision_tokens.get(logical))
             .or(prepared.ciba_automated_decision_token.as_ref())

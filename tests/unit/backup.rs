@@ -6,12 +6,31 @@ use std::{
 };
 
 #[cfg(unix)]
-use super::{Backup, Builder, validate_secret};
+use super::{Backup, Builder, external_backup_url_files};
 #[cfg(unix)]
 use tar::{EntryType, Header};
 
 #[cfg(unix)]
 use crate::filesystem::PrivateTempDir;
+
+#[cfg(unix)]
+#[test]
+fn external_backup_selects_dedicated_credential_paths_not_runtime_paths() {
+    let dependencies = crate::model::Dependencies {
+        mode: "external".to_owned(),
+        database_url_file: "/runtime-postgres-canary".into(),
+        database_backup_url_file: "/backup-postgres-canary".into(),
+        valkey_url_file: "/runtime-valkey-canary".into(),
+        valkey_backup_url_file: "/backup-valkey-canary".into(),
+        ..Default::default()
+    };
+
+    let (database, valkey) = external_backup_url_files(&dependencies);
+    assert_eq!(database, std::path::Path::new("/backup-postgres-canary"));
+    assert_eq!(valkey, std::path::Path::new("/backup-valkey-canary"));
+    assert_ne!(database, dependencies.database_url_file.as_path());
+    assert_ne!(valkey, dependencies.valkey_url_file.as_path());
+}
 
 #[cfg(unix)]
 fn complete_backup(path: &std::path::Path) {
@@ -20,32 +39,6 @@ fn complete_backup(path: &std::path::Path) {
     };
     backup.write_checksums().unwrap();
     backup.write_completion_marker().unwrap();
-}
-
-#[cfg(unix)]
-#[test]
-fn backup_secret_validation_rejects_symlink_unsafe_mode_and_oversize_inputs() {
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
-
-    let work = PrivateTempDir::new("backup-secret-boundaries").unwrap();
-    let path = work.path().join("provider-secret");
-    fs::write(&path, b"one-line-secret").unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
-    validate_secret(&path).unwrap();
-
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
-    assert!(validate_secret(&path).is_err());
-
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    fs::write(&path, vec![b'x'; 16 * 1024 + 1]).unwrap();
-    assert!(validate_secret(&path).is_err());
-
-    let decoy = work.path().join("provider-secret-decoy");
-    fs::write(&decoy, b"one-line-secret").unwrap();
-    fs::set_permissions(&decoy, fs::Permissions::from_mode(0o400)).unwrap();
-    fs::remove_file(&path).unwrap();
-    symlink(&decoy, &path).unwrap();
-    assert!(validate_secret(&path).is_err());
 }
 
 #[cfg(unix)]

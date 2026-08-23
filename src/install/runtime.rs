@@ -85,6 +85,11 @@ DECLARE
         'openid4vci_pre_authorized_code_consumptions',
         'ciba_decision_bindings'
     ];
+    -- This idempotency ledger is write-once from the runtime's perspective.
+    -- It deliberately receives no read, update, or delete privilege.
+    optional_insert_tables CONSTANT text[] := ARRAY[
+        'openid4vp_verification_issuance_jtis'
+    ];
     append_tables CONSTANT text[] := ARRAY[
         'scim_audit_events', 'scim_security_events',
         'scim_security_event_receipts', 'identity_security_events',
@@ -114,7 +119,7 @@ DECLARE
     sequence_record record;
 BEGIN
     known_tables := full_dml_tables || optional_full_dml_tables
-        || append_tables || denied_tables
+        || optional_insert_tables || append_tables || denied_tables
         || ARRAY['__diesel_schema_migrations'];
 
     SELECT array_agg(candidate.relname ORDER BY candidate.relname)
@@ -154,6 +159,14 @@ BEGIN
             'GRANT SELECT, INSERT ON TABLE public.%I TO nazoauth_runtime',
             table_name
         );
+    END LOOP;
+    FOREACH table_name IN ARRAY optional_insert_tables LOOP
+        IF to_regclass(format('public.%I', table_name)) IS NOT NULL THEN
+            EXECUTE format(
+                'GRANT INSERT ON TABLE public.%I TO nazoauth_runtime',
+                table_name
+            );
+        END IF;
     END LOOP;
     FOREACH table_name IN ARRAY cleanup_tables LOOP
         EXECUTE format(
@@ -340,98 +353,43 @@ pub(super) fn validate_dependency_url(
     schemes: &[&str],
     name: &str,
 ) -> anyhow::Result<()> {
-    let parsed = Url::parse(value).with_context(|| format!("{name} URL is invalid"))?;
-    if !schemes.contains(&parsed.scheme()) || parsed.host_str().is_none() {
+    let parsed = crate::secret_provider::parse_dependency_url(value, name)?;
+    if !schemes.contains(&parsed.scheme.as_str()) {
         bail!("{name} URL has an unsupported scheme or no host");
     }
-
-    let raw_username = parsed.username();
-    let raw_password = parsed
-        .password()
-        .with_context(|| format!("{name} URL must contain a username and password"))?;
-    if raw_username.is_empty()
-        || raw_password.is_empty()
-        || raw_username.contains([':', '@'])
-        || raw_password.contains([':', '@'])
+    if parsed.username.chars().any(char::is_whitespace)
+        || parsed.password.chars().any(char::is_control)
     {
-        bail!("{name} URL userinfo is missing or has ambiguous separators");
-    }
-    let username = decode_dependency_component(raw_username, &format!("{name} username"))?;
-    let password = decode_dependency_component(raw_password, &format!("{name} password"))?;
-    if username.chars().any(char::is_whitespace) || password.chars().any(char::is_control) {
         bail!("{name} URL userinfo contains unsafe characters");
     }
-    let host = parsed
-        .host_str()
-        .context("dependency URL host is unavailable")?;
-    if host
-        .chars()
-        .any(|character| character.is_control() || character.is_whitespace())
-    {
-        bail!("{name} URL host contains unsafe characters");
-    }
-
-    if parsed.fragment().is_some() {
-        bail!("{name} URL must not contain a fragment");
-    }
-    let raw_database = parsed
-        .path()
-        .strip_prefix('/')
-        .filter(|path| !path.is_empty())
-        .with_context(|| format!("{name} URL must contain one database path component"))?;
-    let database = decode_dependency_component(raw_database, &format!("{name} database"))?;
-    if database.is_empty() || database.contains('/') || database.contains('\\') {
-        bail!("{name} URL database path must contain exactly one component");
-    }
-    if parsed.scheme() == "postgres" || parsed.scheme() == "postgresql" {
+    if parsed.scheme == "postgres" || parsed.scheme == "postgresql" {
         let mut query_keys = std::collections::BTreeSet::new();
-        if let Some(query) = parsed.query() {
-            if query.is_empty() {
-                bail!("{name} URL query is empty");
-            }
-            for (key, value) in parsed.query_pairs() {
-                if key.is_empty()
-                    || !key
-                        .chars()
-                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
-                    || key.eq_ignore_ascii_case("password")
-                    || !query_keys.insert(key.to_string())
-                {
-                    bail!("{name} URL query contains an unsafe or duplicate option");
-                }
-                let _ = decode_dependency_component(&value, &format!("{name} query value"))?;
+        for (key, _) in &parsed.query {
+            if !query_keys.insert(key.as_str().to_owned()) {
+                bail!("{name} URL query contains an unsafe or duplicate option");
             }
         }
-        if database.len() > 63
-            || !database
+        if parsed.database.len() > 63
+            || !parsed
+                .database
                 .chars()
                 .next()
                 .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
-            || !database.chars().all(|character| {
+            || !parsed.database.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
             })
         {
             bail!("{name} URL database path is not one valid PostgreSQL name");
         }
-    } else if (parsed.scheme() == "redis" || parsed.scheme() == "rediss")
-        && (parsed.query().is_some()
-            || !database.bytes().all(|byte| byte.is_ascii_digit())
-            || (database.len() > 1 && database.starts_with('0'))
-            || database.parse::<u32>().is_err())
+    } else if (parsed.scheme == "redis" || parsed.scheme == "rediss")
+        && (!parsed.query.is_empty()
+            || !parsed.database.bytes().all(|byte| byte.is_ascii_digit())
+            || (parsed.database.len() > 1 && parsed.database.starts_with('0'))
+            || parsed.database.parse::<u32>().is_err())
     {
         bail!("{name} URL database path must be an unambiguous numeric index");
     }
     Ok(())
-}
-
-fn decode_dependency_component(value: &str, label: &str) -> anyhow::Result<String> {
-    let decoded = urlencoding::decode(value)
-        .with_context(|| format!("{label} has invalid percent encoding"))?
-        .into_owned();
-    if decoded.is_empty() || decoded.chars().any(char::is_control) {
-        bail!("{label} contains unsafe control characters");
-    }
-    Ok(decoded)
 }
 
 pub(super) fn create_directory(path: &Path, mode: u32) -> anyhow::Result<()> {

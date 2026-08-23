@@ -31,7 +31,19 @@ fn install_options(data_root: PathBuf) -> InstallOptions {
         runtime_ip: None,
         database_url: None,
         migration_database_url: None,
+        database_backup_url: None,
         valkey_url: None,
+        valkey_backup_url: None,
+        external_valkey_backup_scope: None,
+        database_runtime_endpoint_sha256: None,
+        database_runtime_principal_sha256: None,
+        migration_database_endpoint_sha256: None,
+        migration_database_principal_sha256: None,
+        database_backup_endpoint_sha256: None,
+        database_backup_principal_sha256: None,
+        valkey_runtime_principal_sha256: None,
+        valkey_backup_endpoint_sha256: None,
+        valkey_backup_principal_sha256: None,
         external_dependencies: false,
         secrets_stdin: false,
         secret_fd: None,
@@ -39,7 +51,49 @@ fn install_options(data_root: PathBuf) -> InstallOptions {
         profile_secret_fd: None,
         profile_secrets: None,
         version: Some("v0.2.0".to_owned()),
+        local_oci_candidate: None,
     }
+}
+
+fn standards_full_profile_material() -> serde_json::Value {
+    serde_json::json!({
+        "credential_configurations": {
+            "example": {
+                "format": "dc+sd-jwt",
+                "scope": "example",
+                "cryptographic_binding_methods_supported": ["jwk"],
+                "credential_signing_alg_values_supported": ["ES256"],
+                "proof_types_supported": {
+                    "jwt": {"proof_signing_alg_values_supported": ["ES256"]}
+                },
+                "vct": "https://issuer.example/credentials/example"
+            }
+        },
+        "wallet_authorization_origins": ["https://suite.example"],
+        "ciba_notification_private_origins": ["https://suite.example"],
+        "backchannel_logout_private_origins": ["https://suite.example"]
+    })
+}
+
+fn bind_external_dependency_fixture(options: &mut InstallOptions) {
+    let binding = crate::secret_provider::bind_external_dependency_credentials(
+        "postgresql://runtime:runtime-secret@db.example/oauth?sslmode=require",
+        "postgresql://migrator:migration-secret@db.example/oauth",
+        "postgresql://backup:backup-secret@db.example/oauth?sslmode=require",
+        "rediss://runtime:runtime-secret@cache.example/0",
+        "rediss://backup:backup-secret@cache.example/0",
+    )
+    .unwrap();
+    options.external_valkey_backup_scope = Some("dedicated-instance".to_owned());
+    options.database_runtime_endpoint_sha256 = Some(binding.database_runtime_endpoint_sha256);
+    options.database_runtime_principal_sha256 = Some(binding.database_runtime_principal_sha256);
+    options.migration_database_endpoint_sha256 = Some(binding.migration_database_endpoint_sha256);
+    options.migration_database_principal_sha256 = Some(binding.migration_database_principal_sha256);
+    options.database_backup_endpoint_sha256 = Some(binding.database_endpoint_sha256);
+    options.database_backup_principal_sha256 = Some(binding.database_principal_sha256);
+    options.valkey_runtime_principal_sha256 = Some(binding.valkey_runtime_principal_sha256);
+    options.valkey_backup_endpoint_sha256 = Some(binding.valkey_endpoint_sha256);
+    options.valkey_backup_principal_sha256 = Some(binding.valkey_principal_sha256);
 }
 
 #[cfg(unix)]
@@ -136,9 +190,42 @@ fn managed_dependency_credentials_are_outside_runtime_secret_directory() {
     );
     assert_ne!(runtime_url, migration_url);
     let valkey_acl = fs::read_to_string(dependencies.join("valkey.acl")).unwrap();
-    assert!(valkey_acl.contains("user nazoauth_runtime on"));
-    assert!(valkey_acl.contains("user nazoauth_backup on"));
-    assert!(valkey_acl.contains("+lastsave +bgsave"));
+    let mut valkey_acl_lines = valkey_acl.lines();
+    assert_eq!(valkey_acl_lines.next(), Some("user default off"));
+    let runtime_acl = valkey_acl_lines.next().unwrap();
+    assert!(runtime_acl.starts_with("user nazoauth_runtime on"));
+    assert!(
+        runtime_acl
+            .split_whitespace()
+            .any(|token| token == "+dbsize")
+    );
+    for forbidden in [
+        "+flushall",
+        "+flushdb",
+        "+config",
+        "+acl",
+        "@all",
+        "allcommands",
+    ] {
+        assert!(
+            !runtime_acl
+                .split_whitespace()
+                .any(|token| token == forbidden)
+        );
+    }
+    let backup_acl = valkey_acl_lines.next().unwrap();
+    assert!(backup_acl.starts_with("user nazoauth_backup on"));
+    assert!(backup_acl.ends_with("~* +ping +lastsave +bgsave"));
+    assert_eq!(valkey_acl_lines.next(), None);
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(dependencies.join("valkey.acl"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o444
+    );
 
     fs::remove_file(dependencies.join("valkey-backup-password")).unwrap();
     crate::filesystem::atomic_write(
@@ -203,6 +290,10 @@ fn host_service_unit_exposes_only_runtime_state() {
             operator_directory: PathBuf::from("/etc/nazoauth/operator"),
             recovery_directory: PathBuf::from("/var/lib/nazoauth/recovery"),
             migration_url: PathBuf::from("/etc/nazoauth/secrets/database-migration-url"),
+            restricted_secret_paths: vec![
+                PathBuf::from("/etc/nazoauth/secrets/database-backup-url"),
+                PathBuf::from("/etc/nazoauth/secrets/valkey-backup-url"),
+            ],
             receipt_private_key: PathBuf::from("/etc/nazoauth/operator/receipt.key"),
             runtime_readable_secret_names: Vec::new(),
         },
@@ -218,7 +309,7 @@ fn host_service_unit_exposes_only_runtime_state() {
     ));
     assert!(!unit.contains("ReadOnlyPaths=/var/lib/nazoauth/ui-releases"));
     assert!(unit.contains(
-        "InaccessiblePaths=/var/lib/nazoauth/app/operator-state /etc/nazoauth/operator /var/lib/nazoauth/recovery /etc/nazoauth/secrets/database-migration-url"
+        "InaccessiblePaths=/var/lib/nazoauth/app/operator-state /etc/nazoauth/operator /var/lib/nazoauth/recovery /etc/nazoauth/secrets/database-migration-url /etc/nazoauth/secrets/database-backup-url /etc/nazoauth/secrets/valkey-backup-url"
     ));
     assert!(!unit.contains("ReadWritePaths=/etc/nazoauth/secrets"));
     assert!(!unit.contains("ReadWritePaths=/var/lib/nazoauth/app\n"));
@@ -233,16 +324,7 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
     let material = work.path().join("profile.json");
     fs::write(
         &material,
-        serde_json::to_vec(&serde_json::json!({
-            "client_attestation_issuer": "https://attester.example/",
-            "client_attestation_jwks": {"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y"}]},
-            "key_attestation_jwks": {"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y"}]},
-            "credential_configurations": {"example":{"format":"dc+sd-jwt","scope":"example"}},
-            "wallet_authorization_origins": ["https://suite.example"],
-            "ciba_notification_private_origins": ["https://suite.example"],
-            "backchannel_logout_private_origins": ["https://suite.example"]
-        }))
-        .unwrap(),
+        serde_json::to_vec(&standards_full_profile_material()).unwrap(),
     )
     .unwrap();
     let options = InstallOptions {
@@ -259,7 +341,19 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
         runtime_ip: None,
         database_url: None,
         migration_database_url: None,
+        database_backup_url: None,
         valkey_url: None,
+        valkey_backup_url: None,
+        external_valkey_backup_scope: None,
+        database_runtime_endpoint_sha256: None,
+        database_runtime_principal_sha256: None,
+        migration_database_endpoint_sha256: None,
+        migration_database_principal_sha256: None,
+        database_backup_endpoint_sha256: None,
+        database_backup_principal_sha256: None,
+        valkey_runtime_principal_sha256: None,
+        valkey_backup_endpoint_sha256: None,
+        valkey_backup_principal_sha256: None,
         external_dependencies: false,
         secrets_stdin: false,
         secret_fd: None,
@@ -267,6 +361,7 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
         profile_secret_fd: None,
         profile_secrets: None,
         version: Some("v1.2.3".to_owned()),
+        local_oci_candidate: None,
     };
 
     let rendered = write_install_profile(&config, &options).unwrap().unwrap();
@@ -283,6 +378,7 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
     }
     assert!(rendered.contains("ENABLE_OPENID4VCI_ISSUER: true"));
     assert!(rendered.contains("ENABLE_OPENID4VP_VERIFIER: true"));
+    assert!(rendered.contains("TRANSPORT_MODE: \"trusted-proxy\""));
     assert!(rendered.contains("TRUSTED_PROXY_CIDRS: \"${TRUSTED_PROXY_CIDR}\""));
     assert!(rendered.contains("MTLS_CERTIFICATE_SOURCE: \"rfc9440\""));
     assert!(!rendered.contains("legacy-verified-headers"));
@@ -294,7 +390,67 @@ fn oidf_profile_material_generates_only_file_references_for_secrets() {
         rendered.matches("openid4vc-certificate-bundle.pem").count(),
         2
     );
+    assert!(rendered.contains(
+        "OPENID4VCI_CREDENTIAL_CONFIGURATIONS_JSON: \"{\\\"example\\\":{\\\"format\\\":\\\"dc+sd-jwt\\\",\\\"scope\\\":\\\"example\\\",\\\"cryptographic_binding_methods_supported\\\":[\\\"jwk\\\"],\\\"credential_signing_alg_values_supported\\\":[\\\"ES256\\\"],\\\"proof_types_supported\\\":{\\\"jwt\\\":{\\\"proof_signing_alg_values_supported\\\":[\\\"ES256\\\"]}},\\\"vct\\\":\\\"https://issuer.example/credentials/example\\\"}}\""
+    ));
     assert!(!rendered.contains("PRIVATE KEY"));
+}
+
+#[test]
+fn oidf_profile_missing_credential_signing_algorithms_fails_before_prepare_mutation() {
+    let work = PrivateTempDir::new("oidf-profile-preflight").unwrap();
+    let material = work.path().join("profile.json");
+    let mut material_value = standards_full_profile_material();
+    material_value["credential_configurations"]["example"]
+        .as_object_mut()
+        .unwrap()
+        .remove("credential_signing_alg_values_supported");
+    fs::write(&material, serde_json::to_vec(&material_value).unwrap()).unwrap();
+
+    let mut options = install_options(work.path().join("data"));
+    options.profile = "standards-full".to_owned();
+    options.profile_material = Some(material);
+    options.trusted_proxy_cidr = Some("192.0.2.10/32".to_owned());
+    let config = work.path().join("config/nazoauthctl.json");
+
+    let error = match prepare(&config, options) {
+        Err(error) => error,
+        Ok(_) => panic!("incomplete credential configuration must be rejected"),
+    };
+    assert!(error.to_string().contains("strict JSON"));
+    assert!(!config.exists());
+    assert!(!work.path().join("data").exists());
+    assert!(!work.path().join("control").exists());
+    assert!(!work.path().join("recovery").exists());
+}
+
+#[test]
+fn standards_full_trusted_proxy_preflight_requires_https_and_a_host_boundary() {
+    let work = PrivateTempDir::new("standards-full-trusted-proxy-preflight").unwrap();
+    let mut options = install_options(work.path().join("data"));
+    options.profile = "standards-full".to_owned();
+    options.public_url = "http://127.0.0.1:8000".to_owned();
+    options.trusted_proxy_cidr = Some("192.0.2.10/32".to_owned());
+    let config = work.path().join("config/nazoauthctl.json");
+
+    let error = match prepare(&config, options) {
+        Err(error) => error,
+        Ok(_) => panic!("loopback HTTP must not be accepted for standards-full proxy install"),
+    };
+    assert!(error.to_string().contains("requires an HTTPS --public-url"));
+    assert!(!config.exists());
+    assert!(!work.path().join("data").exists());
+    assert!(!work.path().join("control").exists());
+    assert!(!work.path().join("recovery").exists());
+
+    assert!(
+        validate_standards_full_trusted_proxy_contract(
+            "https://auth.example",
+            "standards-full",
+            None,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -306,16 +462,7 @@ fn oidf_profile_secret_override_is_strict_private_and_resumable() {
     let material = work.path().join("profile.json");
     fs::write(
         &material,
-        serde_json::to_vec(&serde_json::json!({
-            "client_attestation_issuer": "https://attester.example/",
-            "client_attestation_jwks": {"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y"}]},
-            "key_attestation_jwks": {"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y"}]},
-            "credential_configurations": {"example":{"format":"dc+sd-jwt","scope":"example"}},
-            "wallet_authorization_origins": ["https://suite.example"],
-            "ciba_notification_private_origins": ["https://suite.example"],
-            "backchannel_logout_private_origins": ["https://suite.example"]
-        }))
-        .unwrap(),
+        serde_json::to_vec(&standards_full_profile_material()).unwrap(),
     )
     .unwrap();
     let canary = "x".repeat(32);
@@ -472,8 +619,8 @@ fn profile_secret_input_is_closed_bounded_and_never_echoed() {
     let valid = serde_json::json!({
         "dynamic_registration_initial_access_token": canary,
         "ciba_automated_decision_token": canary,
-        "openid4vci_management_token": canary,
-        "openid4vp_management_token": canary,
+        "openid4vci_management_token": format!("{canary}-issuer"),
+        "openid4vp_management_token": format!("{canary}-verifier"),
     });
     let mut options = install_options(work.path().join("data"));
     options.profile = "standards-full".to_owned();
@@ -488,8 +635,23 @@ fn profile_secret_input_is_closed_bounded_and_never_echoed() {
             .as_ref()
             .unwrap()
             .openid4vci_management_token,
-        canary
+        format!("{canary}-issuer")
     );
+
+    let duplicate_management_tokens = serde_json::json!({
+        "dynamic_registration_initial_access_token": format!("{canary}-dynamic"),
+        "ciba_automated_decision_token": format!("{canary}-ciba"),
+        "openid4vci_management_token": format!("{canary}-shared"),
+        "openid4vp_management_token": format!("{canary}-shared"),
+    });
+    let mut duplicate_options = install_options(work.path().join("duplicate-data"));
+    let error = read_profile_secrets(
+        &mut duplicate_options,
+        std::io::Cursor::new(serde_json::to_vec(&duplicate_management_tokens).unwrap()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("must differ"));
+    assert!(duplicate_options.profile_secrets.is_none());
 
     for invalid in [
         br#"{"dynamic_registration_initial_access_token":"profile-secret-canary-that-is-long-enough","ciba_automated_decision_token":"profile-secret-canary-that-is-long-enough","openid4vci_management_token":"profile-secret-canary-that-is-long-enough","openid4vp_management_token":"profile-secret-canary-that-is-long-enough","unexpected":"profile-secret-canary-that-is-long-enough"}"#.as_slice(),
@@ -564,21 +726,10 @@ fn oidf_profile_rejects_legacy_external_openid4vc_trust_anchors() {
     fs::create_dir(&config).unwrap();
     fs::create_dir(config.join("secrets")).unwrap();
     let material = work.path().join("profile.json");
-    fs::write(
-        &material,
-        serde_json::to_vec(&serde_json::json!({
-            "client_attestation_issuer": "https://attester.example/",
-            "client_attestation_jwks": {"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y"}]},
-            "key_attestation_jwks": {"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y"}]},
-            "credential_configurations": {"example":{"format":"dc+sd-jwt","scope":"example"}},
-            "wallet_authorization_origins": ["https://suite.example"],
-            "ciba_notification_private_origins": ["https://suite.example"],
-            "backchannel_logout_private_origins": ["https://suite.example"],
-            "trust_anchors_pem": "-----BEGIN CERTIFICATE-----\\nlegacy\\n-----END CERTIFICATE-----\\n"
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    let mut material_value = standards_full_profile_material();
+    material_value["trust_anchors_pem"] =
+        serde_json::json!("-----BEGIN CERTIFICATE-----\\nlegacy\\n-----END CERTIFICATE-----\\n");
+    fs::write(&material, serde_json::to_vec(&material_value).unwrap()).unwrap();
     let mut options = install_options(work.path().join("data"));
     options.profile = "standards-full".to_owned();
     options.profile_material = Some(material);
@@ -596,6 +747,42 @@ fn oidf_profile_rejects_private_jwk_material() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn oidf_profile_attestation_jwks_match_nazoauth_runtime_contract() {
+    let valid_client = serde_json::json!({
+        "keys": [{"kid":"client-1","kty":"EC","crv":"P-256","x":"x","y":"y"}]
+    });
+    validate_attestation_jwks(
+        &valid_client,
+        "client attestation JWKS",
+        AttestationJwkPurpose::Client,
+    )
+    .unwrap();
+    let valid_holder = serde_json::json!({
+        "keys": [{"kid":"holder-1","kty":"OKP","crv":"Ed25519","x":"x"}]
+    });
+    validate_attestation_jwks(
+        &valid_holder,
+        "key attestation JWKS",
+        AttestationJwkPurpose::HolderKey,
+    )
+    .unwrap();
+    for invalid in [
+        serde_json::json!({"keys":[{"kid":"","kty":"EC","crv":"P-256","x":"x","y":"y"}]}),
+        serde_json::json!({"keys":[{"kid":"same","kty":"EC","crv":"P-256","x":"x","y":"y"},{"kid":"same","kty":"EC","crv":"P-256","x":"x","y":"y"}]}),
+        serde_json::json!({"keys":[{"kid":"wrong","kty":"OKP","crv":"Ed25519","x":"x"}]}),
+    ] {
+        assert!(
+            validate_attestation_jwks(
+                &invalid,
+                "client attestation JWKS",
+                AttestationJwkPurpose::Client,
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
@@ -659,7 +846,10 @@ fn external_dependency_secret_input_is_bounded_closed_and_value_opaque() {
     let valid = br#"{
         "database_url":"postgresql://runtime:runtime-secret@db.example/oauth",
         "migration_database_url":"postgresql://migrator:migration-secret@db.example/oauth",
-        "valkey_url":"rediss://default:valkey-secret@cache.example/0"
+        "database_backup_url":"postgresql://backup:backup-secret@db.example/oauth",
+        "valkey_url":"rediss://default:valkey-secret@cache.example/0",
+        "valkey_backup_url":"rediss://backup:backup-secret@cache.example/0",
+        "valkey_backup_scope":"dedicated-instance"
     }"#;
     let mut options = install_options(work.path().join("data"));
     read_external_dependency_secrets(&mut options, std::io::Cursor::new(valid)).unwrap();
@@ -672,14 +862,74 @@ fn external_dependency_secret_input_is_bounded_closed_and_value_opaque() {
         Some("postgresql://migrator:migration-secret@db.example/oauth")
     );
     assert_eq!(
+        options.database_backup_url.as_deref(),
+        Some("postgresql://backup:backup-secret@db.example/oauth")
+    );
+    assert_eq!(
         options.valkey_url.as_deref(),
         Some("rediss://default:valkey-secret@cache.example/0")
     );
+    assert_eq!(
+        options.valkey_backup_url.as_deref(),
+        Some("rediss://backup:backup-secret@cache.example/0")
+    );
+    assert_eq!(
+        options.external_valkey_backup_scope.as_deref(),
+        Some("dedicated-instance")
+    );
+    assert!(
+        options
+            .database_backup_endpoint_sha256
+            .as_deref()
+            .is_some_and(|value| value.len() == 64)
+    );
+    assert!(
+        options
+            .valkey_backup_endpoint_sha256
+            .as_deref()
+            .is_some_and(|value| value.len() == 64)
+    );
+    for principal in [
+        options.database_runtime_principal_sha256.as_deref(),
+        options.migration_database_principal_sha256.as_deref(),
+        options.database_backup_principal_sha256.as_deref(),
+        options.valkey_runtime_principal_sha256.as_deref(),
+        options.valkey_backup_principal_sha256.as_deref(),
+    ] {
+        assert!(principal.is_some_and(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }));
+    }
 
+    let required = [
+        "database_url",
+        "migration_database_url",
+        "database_backup_url",
+        "valkey_url",
+        "valkey_backup_url",
+        "valkey_backup_scope",
+    ];
+    for omitted in required {
+        let mut input: serde_json::Value = serde_json::from_slice(valid).unwrap();
+        input.as_object_mut().unwrap().remove(omitted);
+        let mut options = install_options(work.path().join("invalid-data"));
+        let error = read_external_dependency_secrets(
+            &mut options,
+            std::io::Cursor::new(serde_json::to_vec(&input).unwrap()),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("dependency secret input must be strict JSON"));
+        assert!(options.database_url.is_none());
+        assert!(options.migration_database_url.is_none());
+        assert!(options.valkey_url.is_none());
+    }
     for invalid in [
-        br#"{"database_url":"postgresql://db.example/oauth","migration_database_url":"postgresql://db.example/oauth"}"#.as_slice(),
-        br#"{"database_url":"postgresql://db.example/oauth","migration_database_url":"postgresql://db.example/oauth","valkey_url":"redis://cache.example/0","unexpected":"secret-canary"}"#.as_slice(),
-        br#"{"database_url":"postgresql://db.example/oauth","migration_database_url":"postgresql://db.example/oauth","valkey_url":"redis://cache.example/0"} trailing"#.as_slice(),
+        br#"{"database_url":"postgresql://db.example/oauth","migration_database_url":"postgresql://db.example/oauth","database_backup_url":"postgresql://db.example/oauth","valkey_url":"redis://cache.example/0","valkey_backup_url":"redis://cache.example/0","valkey_backup_scope":"dedicated-instance","unexpected":"secret-canary"}"#.as_slice(),
+        br#"{"database_url":"postgresql://db.example/oauth","migration_database_url":"postgresql://db.example/oauth","database_backup_url":"postgresql://db.example/oauth","valkey_url":"redis://cache.example/0","valkey_backup_url":"redis://cache.example/0","valkey_backup_scope":"dedicated-instance"} trailing"#.as_slice(),
     ] {
         let mut options = install_options(work.path().join("invalid-data"));
         let error = read_external_dependency_secrets(&mut options, std::io::Cursor::new(invalid))
@@ -687,9 +937,6 @@ fn external_dependency_secret_input_is_bounded_closed_and_value_opaque() {
         let message = format!("{error:#}");
         assert!(message.contains("dependency secret input must be strict JSON"));
         assert!(!message.contains("secret-canary"));
-        assert!(options.database_url.is_none());
-        assert!(options.migration_database_url.is_none());
-        assert!(options.valkey_url.is_none());
     }
 
     let mut options = install_options(work.path().join("oversized-data"));
@@ -731,19 +978,35 @@ fn dependency_secret_channels_and_url_set_fail_closed() {
         normalize_external_dependencies(&mut partial)
             .unwrap_err()
             .to_string()
-            .contains("require runtime PostgreSQL, migration PostgreSQL, and Valkey URLs")
+            .contains("require distinct runtime, migration, backup PostgreSQL/Valkey URLs")
     );
 
     let mut invalid_scheme = install_options(work.path().join("invalid-scheme"));
     invalid_scheme.database_url = Some("https://db.example/oauth".to_owned());
     invalid_scheme.migration_database_url =
         Some("postgresql://migrator@db.example/oauth".to_owned());
+    invalid_scheme.database_backup_url = Some("postgresql://backup@db.example/oauth".to_owned());
     invalid_scheme.valkey_url = Some("redis://cache.example/0".to_owned());
-    assert!(
-        normalize_external_dependencies(&mut invalid_scheme)
+    invalid_scheme.valkey_backup_url = Some("redis://backup@cache.example/0".to_owned());
+    invalid_scheme.external_valkey_backup_scope = Some("dedicated-instance".to_owned());
+    let error = normalize_external_dependencies(&mut invalid_scheme).unwrap_err();
+    assert!(!error.to_string().is_empty());
+    assert!(!format!("{error:#}").contains("https://db.example/oauth"));
+
+    let mut copied_runtime = install_options(work.path().join("copied-runtime"));
+    copied_runtime.database_url = Some("postgresql://runtime:one@db.example/oauth".to_owned());
+    copied_runtime.migration_database_url =
+        Some("postgresql://migrator:two@db.example/oauth".to_owned());
+    copied_runtime.database_backup_url =
+        Some("postgresql://runtime:one@db.example/oauth".to_owned());
+    copied_runtime.valkey_url = Some("rediss://runtime:three@cache.example/0".to_owned());
+    copied_runtime.valkey_backup_url = Some("rediss://backup:four@cache.example/0".to_owned());
+    copied_runtime.external_valkey_backup_scope = Some("dedicated-instance".to_owned());
+    assert_eq!(
+        normalize_external_dependencies(&mut copied_runtime)
             .unwrap_err()
-            .to_string()
-            .contains("PostgreSQL URL has an unsupported scheme or no host")
+            .to_string(),
+        "external dependency credential URLs must be distinct"
     );
 }
 
@@ -823,7 +1086,10 @@ fn external_urls_are_persisted_only_as_private_secret_files() {
     let mut options = install_options(work.path().join("data"));
     options.database_url = Some("postgresql://runtime:one@db.example/oauth".to_owned());
     options.migration_database_url = Some("postgresql://migrator:two@db.example/oauth".to_owned());
+    options.database_backup_url = Some("postgresql://backup:three@db.example/oauth".to_owned());
     options.valkey_url = Some("rediss://default:three@cache.example/0".to_owned());
+    options.valkey_backup_url = Some("rediss://backup:four@cache.example/0".to_owned());
+    options.external_valkey_backup_scope = Some("dedicated-instance".to_owned());
 
     assert_eq!(write_external_urls(&secrets, &options).unwrap(), "external");
     assert_eq!(
@@ -835,11 +1101,19 @@ fn external_urls_are_persisted_only_as_private_secret_files() {
         options.migration_database_url.as_deref().unwrap()
     );
     assert_eq!(
+        fs::read_to_string(secrets.join("database-backup-url")).unwrap(),
+        options.database_backup_url.as_deref().unwrap()
+    );
+    assert_eq!(
         fs::read_to_string(secrets.join("valkey-url")).unwrap(),
         options.valkey_url.as_deref().unwrap()
     );
+    assert_eq!(
+        fs::read_to_string(secrets.join("valkey-backup-url")).unwrap(),
+        options.valkey_backup_url.as_deref().unwrap()
+    );
     #[cfg(unix)]
-    for name in ["database-url", "database-migration-url", "valkey-url"] {
+    for name in ["database-url", "valkey-url"] {
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(
             fs::metadata(secrets.join(name))
@@ -848,6 +1122,22 @@ fn external_urls_are_persisted_only_as_private_secret_files() {
                 .mode()
                 & 0o777,
             0o440
+        );
+    }
+    #[cfg(unix)]
+    for name in [
+        "database-migration-url",
+        "database-backup-url",
+        "valkey-backup-url",
+    ] {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(secrets.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400
         );
     }
 }
@@ -987,7 +1277,8 @@ fn tenant_resource_controller_identity_is_stable_and_idempotent() {
 fn tenant_resource_controller_upgrade_replaces_only_the_legacy_managed_binding() {
     let work = PrivateTempDir::new("tenant-resource-controller-upgrade").unwrap();
     let config_dir = work.path().join("config");
-    let options = install_options(work.path().join("data"));
+    let mut options = install_options(work.path().join("data"));
+    bind_external_dependency_fixture(&mut options);
     operator::initialize_identity_generation(&config_dir.join("operator"), &options.recovery_root)
         .unwrap();
     ensure_tenant_resource_controller_identity(&config_dir).unwrap();
@@ -1051,6 +1342,7 @@ fn existing_standards_full_server_config_must_match_the_explicit_proxy_boundary(
     let valid = "PUBLIC_BASE_URL: \"https://auth.example\"\n\
                  ENABLE_AUTHORIZATION_DETAILS: true\n\
                  ENABLE_NATIVE_SSO: true\n\
+                 TRANSPORT_MODE: \"trusted-proxy\"\n\
                  MTLS_ENDPOINT_BASE_URL: \"https://auth.example\"\n\
                  MTLS_CERTIFICATE_SOURCE: \"rfc9440\"\n\
                  TRUSTED_PROXY_CIDRS: \"192.0.2.10/32\"\n\
@@ -1061,6 +1353,7 @@ fn existing_standards_full_server_config_must_match_the_explicit_proxy_boundary(
                             ENABLE_NATIVE_SSO: true\n\
                             ENABLE_OPENID4VCI_ISSUER: true\n\
                             ENABLE_OPENID4VP_VERIFIER: true\n\
+                            TRANSPORT_MODE: \"trusted-proxy\"\n\
                             MTLS_ENDPOINT_BASE_URL: \"https://auth.example\"\n\
                             TRUSTED_PROXY_CIDRS: \"192.0.2.10/32\"\n\
                             MTLS_CERTIFICATE_SOURCE: \"rfc9440\"\n\
@@ -1076,6 +1369,8 @@ fn existing_standards_full_server_config_must_match_the_explicit_proxy_boundary(
     for invalid in [
         valid.replace("rfc9440", "legacy-verified-headers"),
         valid.replace("192.0.2.10/32", "0.0.0.0/0"),
+        valid.replace("TRANSPORT_MODE: \"trusted-proxy\"\n", ""),
+        valid.replace("trusted-proxy", "direct-tls"),
         valid.replace("https://auth.example", "https://other.example"),
         valid.replace(
             "ENABLE_OPENID4VP_VERIFIER: true",
@@ -1202,6 +1497,7 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
     .unwrap();
     set_server_config_fixture_permissions(&config_dir.join(".env.yaml"));
     options.profile = "standards-full".to_owned();
+    bind_external_dependency_fixture(&mut options);
     let config_path = config_dir.join("update.json");
     let config = build_config(
         &config_path,
@@ -1230,6 +1526,13 @@ fn generated_container_config_exposes_secret_files_but_not_secret_values() {
     assert!(!config.runtime.mounts.iter().any(|mount| {
         mount.target == Path::new("/run/nazoauth-secrets/database-migration-url")
     }));
+    for name in ["database-backup-url", "valkey-backup-url"] {
+        assert!(
+            !config.runtime.mounts.iter().any(|mount| {
+                mount.target == Path::new(&format!("/run/nazoauth-secrets/{name}"))
+            })
+        );
+    }
     for name in STANDARDS_PROFILE_SECRET_NAMES {
         let expected = PathBuf::from(format!("/run/nazoauth-secrets/{name}"));
         assert!(
@@ -1344,6 +1647,7 @@ fn managed_runtime_database_grants_keep_the_audit_ledger_api_least_privileged() 
 
     assert!(sql.contains("full_dml_tables CONSTANT text[]"));
     assert!(sql.contains("optional_full_dml_tables CONSTANT text[]"));
+    assert!(sql.contains("optional_insert_tables CONSTANT text[]"));
     assert!(sql.contains("append_tables CONSTANT text[]"));
     assert!(sql.contains("runtime table privilege allowlist is incomplete"));
     for table in [
@@ -1356,6 +1660,7 @@ fn managed_runtime_database_grants_keep_the_audit_ledger_api_least_privileged() 
         "openid4vc_trust_policies",
         "openid4vc_trust_policy_clients",
         "ciba_decision_bindings",
+        "openid4vp_verification_issuance_jtis",
         "security_audit_event_outbox",
     ] {
         assert!(
@@ -1375,14 +1680,27 @@ fn managed_runtime_database_grants_keep_the_audit_ledger_api_least_privileged() 
     let optional_full_dml_tables = sql
         .split("optional_full_dml_tables CONSTANT text[]")
         .nth(1)
-        .and_then(|section| section.split("append_tables CONSTANT text[]").next())
+        .and_then(|section| {
+            section
+                .split("optional_insert_tables CONSTANT text[]")
+                .next()
+        })
         .expect("optional full DML table section");
+    let optional_insert_tables = sql
+        .split("optional_insert_tables CONSTANT text[]")
+        .nth(1)
+        .and_then(|section| section.split("append_tables CONSTANT text[]").next())
+        .expect("optional insert table section");
     assert!(!full_dml_tables.contains("ciba_decision_bindings"));
     assert!(optional_full_dml_tables.contains("ciba_decision_bindings"));
+    assert!(optional_insert_tables.contains("openid4vp_verification_issuance_jtis"));
+    assert!(!full_dml_tables.contains("openid4vp_verification_issuance_jtis"));
+    assert!(!optional_full_dml_tables.contains("openid4vp_verification_issuance_jtis"));
     assert!(
         sql.contains("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO nazoauth_runtime")
     );
     assert!(sql.contains("GRANT SELECT, INSERT ON TABLE public.%I TO nazoauth_runtime"));
+    assert!(sql.contains("GRANT INSERT ON TABLE public.%I TO nazoauth_runtime"));
     assert!(sql.contains("GRANT DELETE ON TABLE public.%I TO nazoauth_runtime"));
     assert!(!sql.contains("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES"));
     assert!(!sql.contains("GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES"));

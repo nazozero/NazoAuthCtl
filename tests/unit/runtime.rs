@@ -57,7 +57,19 @@ fn config(work: &PrivateTempDir) -> UpdateConfig {
             mode: "external".to_owned(),
             database_url_file: secrets.join("database-url"),
             migration_database_url_file: secrets.join("database-migration-url"),
+            database_backup_url_file: secrets.join("database-backup-url"),
             valkey_url_file: secrets.join("valkey-url"),
+            valkey_backup_url_file: secrets.join("valkey-backup-url"),
+            external_valkey_backup_scope: "dedicated-instance".to_owned(),
+            database_runtime_endpoint_sha256: "a".repeat(64),
+            database_runtime_principal_sha256: "b".repeat(64),
+            migration_database_endpoint_sha256: "b".repeat(64),
+            migration_database_principal_sha256: "c".repeat(64),
+            database_backup_endpoint_sha256: "a".repeat(64),
+            database_backup_principal_sha256: "d".repeat(64),
+            valkey_runtime_principal_sha256: "e".repeat(64),
+            valkey_backup_endpoint_sha256: "b".repeat(64),
+            valkey_backup_principal_sha256: "f".repeat(64),
         },
         runtime: RuntimeConfig {
             backend: RuntimeBackendKind::Podman,
@@ -424,6 +436,8 @@ fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
         .one_shot_task(artifact.clone(), &TaskOperation::MigrateApply, None)
         .unwrap();
 
+    assert_eq!(migration.service_user.as_deref(), Some("10001:10001"));
+
     assert_eq!(
         migration.environment.get("DATABASE_URL_FILE"),
         Some(&"/run/nazoauth-secrets/database-url".to_owned())
@@ -443,6 +457,12 @@ fn privileged_container_task_mounts_are_operation_scoped_and_file_only() {
         mount.source == config.dependencies.migration_database_url_file
             && mount.destination == Path::new("/run/nazoauth-secrets/database-url")
     }));
+    for backup in [
+        &config.dependencies.database_backup_url_file,
+        &config.dependencies.valkey_backup_url_file,
+    ] {
+        assert!(!migration.mounts.iter().any(|mount| &mount.source == backup));
+    }
     assert!(
         !migration
             .mounts

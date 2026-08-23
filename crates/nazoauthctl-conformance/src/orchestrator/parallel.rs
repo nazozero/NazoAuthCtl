@@ -108,7 +108,13 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                                 poll_timeout: runner.config.poll_timeout,
                                 control: runner.config.control.clone(),
                                 plan_lanes: runner.config.plan_lanes.clone(),
+                                plan_resource_budgets: runner.config.plan_resource_budgets.clone(),
+                                selected_resource_budget: runner
+                                    .config
+                                    .selected_resource_budget
+                                    .clone(),
                                 jobs: 1,
+                                upload_review_screenshots: runner.config.upload_review_screenshots,
                                 automation: runner
                                     .config
                                     .automation
@@ -247,6 +253,9 @@ fn worker_prepared(work: &PlanWork) -> PreparedRun {
         // deletes every plan after all workers have drained.
         suite_plan_ids: Vec::new(),
         errors: Vec::new(),
+        unknown_declared_skip_modules: Vec::new(),
+        matrix_expectations_satisfied: true,
+        all_selected_plan_definitions_enumerated: true,
         auth_probe: None,
         current_profile: Some(group.profile),
         current_variant: Some(redacted_variant(&work.plan.variant)),
@@ -384,23 +393,57 @@ fn merge_reports(
     // Phase 1 owns every Suite plan. Deletion is deliberately centralized
     // after all workers stop so one worker can never delete a plan another
     // worker still needs, and queued plans are cleaned even if never run.
-    cleanup_all(
-        &runner.config.client,
-        &[],
-        &prepared.suite_plan_ids,
-        &mut cleanup,
-    );
-
+    let observed_module_ids = modules
+        .iter()
+        .filter_map(|module| module.module_id.clone())
+        .collect::<Vec<_>>();
     if !all_plans_finished && !errors.iter().any(|error| error == "run interrupted") {
         errors.push(SCHEDULER_INCOMPLETE.to_owned());
     }
     let defined_modules = plans.iter().map(|plan| plan.defined_modules).sum();
     let created_instances = plans.iter().map(|plan| plan.created_instances).sum();
     let terminal_modules = modules.iter().filter(|module| module.terminal).count();
-    let cleanup_complete = cleanup.failures.is_empty();
     let all_modules_instantiated = all_plans_finished && defined_modules == created_instances;
     let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
+    let deferred_review_modules = modules
+        .iter()
+        .filter(|module| module.deferred_review_pending.is_some())
+        .count();
+    let all_modules_settled = all_modules_instantiated
+        && terminal_modules
+            .checked_add(deferred_review_modules)
+            .is_some_and(|settled| settled == defined_modules);
+    if let Err(error) = super::validate_review_screenshot_run_limit(&modules) {
+        errors.push(error);
+    }
+    let retention_requested = runner
+        .config
+        .suite_resource_observer
+        .as_ref()
+        .is_some_and(|observer| observer.retain_suite_plans_for_certification());
+    let retention_eligible = retention_requested
+        && !worker_panicked
+        && errors.is_empty()
+        && prepared.all_selected_plan_definitions_enumerated
+        && defined_modules > 0
+        && all_modules_settled;
+    if !retention_eligible {
+        let cancellable_module_ids = cancellable_module_ids(&observed_module_ids, &modules);
+        cleanup_all(
+            &runner.config.client,
+            &cancellable_module_ids,
+            &prepared.suite_plan_ids,
+            &mut cleanup,
+        );
+    }
+    let cleanup_complete = !retention_eligible && !worker_panicked && cleanup.failures.is_empty();
+    let retention_candidate_settled = retention_eligible;
     let outcomes = summarize_module_outcomes(&modules);
+    let matrix_expectations = summarize_matrix_expectations(&modules);
+    let matrix_expectations_satisfied = prepared.matrix_expectations_satisfied
+        && prepared.all_selected_plan_definitions_enumerated
+        && matrix_expectations.unexpected_skipped_modules.is_empty()
+        && prepared.unknown_declared_skip_modules.is_empty();
     let suite_pass = defined_modules > 0 && all_modules_terminal && outcomes.all_passed;
     let orchestration_integrity = OrchestrationIntegrity {
         defined_modules,
@@ -408,22 +451,41 @@ fn merge_reports(
         terminal_modules,
         all_modules_instantiated,
         all_modules_terminal,
+        all_modules_settled,
+        deferred_review_modules,
         cleanup_complete,
+        retention_requested,
+        retention_eligible,
+        retention_candidate_settled,
+        retention_committed: false,
+        suite_resources_settled: super::suite_resources_settled(
+            cleanup_complete,
+            retention_candidate_settled,
+        ),
     };
-    let local_success =
-        errors.is_empty() && all_modules_instantiated && all_modules_terminal && cleanup_complete;
+    let local_success = errors.is_empty()
+        && all_modules_instantiated
+        && all_modules_settled
+        && orchestration_integrity.suite_resources_settled;
     RunSummary {
         report: ConformanceReport {
-            schema: 3,
+            schema: if deferred_review_modules > 0 { 4 } else { 3 },
             matrix_digest: runner.config.matrix.digest.clone(),
             suite_origin: runner.config.client.origin().to_string(),
             auth_probe: prepared.auth_probe,
             errors,
             local_success,
             suite_pass,
+            acceptance_pass: outcomes.acceptance_pass && matrix_expectations_satisfied,
+            review_pending: deferred_review_modules > 0,
             human_review_required: !outcomes.human_review_modules.is_empty(),
             human_review_modules: outcomes.human_review_modules,
+            deferred_review_modules: outcomes.deferred_review_modules,
             skipped_modules: outcomes.skipped_modules,
+            expected_skipped_modules: matrix_expectations.expected_skipped_modules,
+            unexpected_skipped_modules: matrix_expectations.unexpected_skipped_modules,
+            unknown_declared_skip_modules: prepared.unknown_declared_skip_modules,
+            matrix_expectations_satisfied,
             failed_modules: outcomes.failed_modules,
             incomplete_modules: outcomes.incomplete_modules,
             orchestration_integrity,
@@ -436,7 +498,9 @@ fn merge_reports(
 }
 
 fn has_fatal_orchestration_failure(report: &ConformanceReport) -> bool {
-    !report.orchestration_integrity.cleanup_complete || !report.errors.is_empty()
+    (!report.orchestration_integrity.cleanup_complete
+        && !report.orchestration_integrity.retention_eligible)
+        || !report.errors.is_empty()
 }
 
 #[cfg(test)]

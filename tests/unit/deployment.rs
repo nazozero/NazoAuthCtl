@@ -95,6 +95,51 @@ fn registration_reconciles_an_existing_declaration_without_treating_it_as_comple
 }
 
 #[test]
+fn exact_registration_refuses_an_older_record_that_only_shares_identity() {
+    let work = PrivateTempDir::new("nazoauthctl-exact-registration").unwrap();
+    let store = store(&work);
+    let existing = record("deployment-a", "alpha");
+    store.persist(&existing).unwrap();
+
+    let mut candidate = existing.clone();
+    candidate.runtime_instances[0].artifact = ArtifactReference::Oci {
+        image_reference: format!("sha256:{}", "b".repeat(64)),
+        digest: format!("sha256:{}", "c".repeat(64)),
+    };
+    candidate.runtime_instances[0].local_artifact_id = Some(format!("sha256:{}", "b".repeat(64)));
+    candidate.active_release.release = "v0.1.41-candidate.459".to_owned();
+    candidate.active_release.build_id = format!("source:{}", candidate.active_release.revision);
+
+    let _registry_lock = store.registry_lock().unwrap();
+    let _deployment_lock = store.deployment_lock("deployment-a").unwrap();
+    assert!(store.persist_exact_locked(&candidate).is_err());
+    assert_eq!(store.load("deployment-a").unwrap(), existing);
+}
+
+#[test]
+fn candidate_registration_may_reconcile_only_its_own_pending_journal() {
+    let work = PrivateTempDir::new("nazoauthctl-registration-pending-scope").unwrap();
+    let store = store(&work);
+    store.persist(&record("deployment-a", "alpha")).unwrap();
+    let own = store.registration_journal_path("deployment-a");
+    std::fs::write(&own, b"{}").unwrap();
+    assert!(
+        !store
+            .registration_pending_except(Some("deployment-a"))
+            .unwrap()
+    );
+    assert!(store.registration_pending_except(None).unwrap());
+
+    let other = store.registration_journal_path("deployment-b");
+    std::fs::write(&other, b"{}").unwrap();
+    assert!(
+        store
+            .registration_pending_except(Some("deployment-a"))
+            .unwrap()
+    );
+}
+
+#[test]
 fn missing_registry_with_registered_artifacts_never_falls_back_to_legacy_mode() {
     let work = PrivateTempDir::new("nazoauthctl-registry-missing-fail-closed").unwrap();
     let store = store(&work);

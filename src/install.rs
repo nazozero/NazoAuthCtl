@@ -15,7 +15,7 @@ use url::Url;
 use crate::{
     cli::{InstallOptions, StandardsProfileSecrets},
     deployment::RuntimeBackendKind,
-    filesystem::{atomic_write, generate_secret, read_secure_secret_file, set_mode},
+    filesystem::{atomic_write, generate_secret, set_mode},
     model::{
         Dependencies, Mount, Operator, Postgres, Runtime, Ui, UpdateConfig, Valkey, safe_absolute,
     },
@@ -45,7 +45,7 @@ pub(crate) use secrets::{
     ensure_tenant_resource_controller_identity, ensure_tenant_resource_controller_runtime,
     read_tenant_resource_controller_signing_key, reconcile_managed_secrets,
     tenant_resource_controller_key_id_path, tenant_resource_controller_private_key_path,
-    tenant_resource_controller_public_key_path,
+    tenant_resource_controller_public_key_path, verify_live_external_dependencies,
 };
 
 pub(crate) const POSTGRES_IMAGE: &str = "docker.io/library/postgres:18@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a";
@@ -68,6 +68,103 @@ const TENANT_RESOURCE_CONTROLLER_CONTAINER_KEY_PATH: &str = "/run/nazoauth-contr
 pub(crate) struct PreparedInstall {
     pub(crate) config: UpdateConfig,
     pub(crate) config_path: PathBuf,
+    pub(crate) local_oci_candidate: Option<crate::cli::LocalOciCandidateInstall>,
+}
+
+/// Durable sibling intent for the otherwise unjournaled interval between
+/// preparing a fresh configuration and the first candidate runtime check.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalOciCandidatePrepareIntent {
+    schema: u32,
+    candidate: crate::cli::LocalOciCandidateInstall,
+    config: UpdateConfig,
+    config_sha256: String,
+}
+
+pub(crate) fn local_oci_candidate_prepare_intent_path(config_path: &Path) -> PathBuf {
+    let name = config_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("nazoauthctl.json");
+    config_path.with_file_name(format!(".{name}.local-oci-candidate-intent.json"))
+}
+
+fn candidate_intent_config_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(crate) fn load_local_oci_candidate_prepare_intent(
+    config_path: &Path,
+) -> anyhow::Result<Option<LocalOciCandidatePrepareIntent>> {
+    let path = local_oci_candidate_prepare_intent_path(config_path);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => bail!(
+            "local OCI candidate prepare intent must be a regular non-symlink file: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect local OCI candidate prepare intent {}",
+                    path.display()
+                )
+            });
+        }
+    }
+    let bytes = crate::filesystem::read_secure_regular_file(
+        &path,
+        "local OCI candidate prepare intent",
+        true,
+        1024 * 1024,
+    )?;
+    Ok(Some(serde_json::from_slice(&bytes).context(
+        "local OCI candidate prepare intent is invalid",
+    )?))
+}
+
+pub(crate) fn restore_local_oci_candidate_prepare_intent(
+    config_path: &Path,
+    candidate: &crate::cli::LocalOciCandidateInstall,
+) -> anyhow::Result<()> {
+    let intent = load_local_oci_candidate_prepare_intent(config_path)?
+        .context("local OCI candidate config is absent and no durable prepare intent exists")?;
+    validate_local_oci_candidate_prepare_intent(&intent, candidate)?;
+    let bytes = serde_json::to_vec_pretty(&intent.config)?;
+    if candidate_intent_config_digest(&bytes) != intent.config_sha256 {
+        bail!("local OCI candidate prepare intent config digest is inconsistent");
+    }
+    atomic_write(config_path, &bytes, 0o600)
+}
+
+pub(crate) fn validate_existing_local_oci_candidate_prepare_intent(
+    config_path: &Path,
+    config: &UpdateConfig,
+    candidate: &crate::cli::LocalOciCandidateInstall,
+) -> anyhow::Result<()> {
+    let intent = load_local_oci_candidate_prepare_intent(config_path)?
+        .context("local OCI candidate install has no durable fresh-prepare intent")?;
+    validate_local_oci_candidate_prepare_intent(&intent, candidate)?;
+    let bytes = serde_json::to_vec_pretty(config)?;
+    if candidate_intent_config_digest(&bytes) != intent.config_sha256 {
+        bail!("existing controller config differs from its local OCI candidate prepare intent");
+    }
+    Ok(())
+}
+
+fn validate_local_oci_candidate_prepare_intent(
+    intent: &LocalOciCandidatePrepareIntent,
+    candidate: &crate::cli::LocalOciCandidateInstall,
+) -> anyhow::Result<()> {
+    if intent.schema != 1 || intent.candidate != *candidate {
+        bail!("local OCI candidate prepare intent does not match the exact requested candidate");
+    }
+    Ok(())
 }
 
 pub(crate) fn prepare(
@@ -115,9 +212,28 @@ pub(crate) fn prepare(
     } else if options.trusted_proxy_cidr.is_some() {
         bail!("--trusted-proxy-cidr is accepted only with --profile standards-full");
     }
+    validate_standards_full_trusted_proxy_contract(
+        &options.public_url,
+        &options.profile,
+        options.trusted_proxy_cidr.as_deref(),
+    )?;
+    if options.local_oci_candidate.is_some() && options.external_dependencies {
+        bail!("a local OCI candidate install is managed-only and rejects external dependencies");
+    }
     normalize_external_dependencies(&mut options)?;
     normalize_profile_secrets(&mut options)?;
+    // Validate the exact NazoAuth standards-full schema before this fresh
+    // install creates controller state, config, or managed dependencies.
+    let profile_material = load_and_validate_install_profile(&options)?;
     let (runtime_backend, dependency_backend) = select_runtime(&options)?;
+    if options.local_oci_candidate.is_some() {
+        if runtime_backend == RuntimeBackendKind::Systemd {
+            bail!("a local OCI candidate install requires a Podman or Docker runtime");
+        }
+        if options.profile != "standards-full" {
+            bail!("a local OCI candidate install requires --profile standards-full");
+        }
+    }
     let config_dir = config_path
         .parent()
         .context("update config path has no parent")?;
@@ -177,7 +293,8 @@ pub(crate) fn prepare(
         create_directory(&path, 0o700)?;
     }
     ensure_mfa_totp_configuration(config_dir, runtime_backend)?;
-    let profile = write_install_profile(config_dir, &options)?;
+    let profile =
+        write_prevalidated_install_profile(config_dir, &options, profile_material.as_ref())?;
 
     let dependency_mode = if options.database_url.is_some() {
         write_external_urls(&secrets_dir, &options)?
@@ -206,11 +323,47 @@ pub(crate) fn prepare(
         &dependency_mode,
     )?;
     configure_runtime_permissions(&config)?;
-    atomic_write(config_path, &(serde_json::to_vec_pretty(&config)?), 0o600)?;
+    let config_bytes = serde_json::to_vec_pretty(&config)?;
+    if let Some(candidate) = options.local_oci_candidate.as_ref() {
+        let intent = LocalOciCandidatePrepareIntent {
+            schema: 1,
+            candidate: candidate.clone(),
+            config: config.clone(),
+            config_sha256: candidate_intent_config_digest(&config_bytes),
+        };
+        // Write and fsync the candidate provenance before publishing the
+        // config.  If the next rename or first image inspection fails, retry
+        // can restore exactly this prepared deployment rather than creating a
+        // second controller identity.
+        atomic_write(
+            &local_oci_candidate_prepare_intent_path(config_path),
+            &serde_json::to_vec_pretty(&intent)?,
+            0o600,
+        )?;
+    }
+    atomic_write(config_path, &config_bytes, 0o600)?;
     Ok(PreparedInstall {
         config,
         config_path: config_path.to_owned(),
+        local_oci_candidate: options.local_oci_candidate.clone(),
     })
+}
+
+pub(crate) fn validate_standards_full_trusted_proxy_contract(
+    public_url: &str,
+    profile: &str,
+    trusted_proxy_cidr: Option<&str>,
+) -> anyhow::Result<()> {
+    if profile != "standards-full" {
+        return Ok(());
+    }
+    if !public_url.starts_with("https://") {
+        bail!("standards-full trusted-proxy install requires an HTTPS --public-url");
+    }
+    let cidr = trusted_proxy_cidr
+        .context("standards-full trusted-proxy install requires --trusted-proxy-cidr")?;
+    normalize_single_host_cidr(cidr)?;
+    Ok(())
 }
 
 fn configure_runtime_permissions(config: &UpdateConfig) -> anyhow::Result<()> {
@@ -268,6 +421,9 @@ fn configure_runtime_permissions(config: &UpdateConfig) -> anyhow::Result<()> {
     let mut readable = vec![
         config_file,
         config.dependencies.database_url_file.clone(),
+        // This is mounted only into the isolated migration task.  It shares
+        // the fixed non-root operator group, while the long-lived runtime has
+        // no mount for this path.
         config.dependencies.migration_database_url_file.clone(),
         config.dependencies.valkey_url_file.clone(),
         mfa_key,
@@ -393,6 +549,17 @@ pub(crate) fn install_systemd(config: &UpdateConfig) -> anyhow::Result<()> {
                 .context("host runtime has no recovery directory")?
                 .to_owned(),
             migration_url: config.dependencies.migration_database_url_file.clone(),
+            restricted_secret_paths: if config.dependencies.mode == "external" {
+                [
+                    config.dependencies.database_backup_url_file.clone(),
+                    config.dependencies.valkey_backup_url_file.clone(),
+                ]
+                .into_iter()
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect()
+            } else {
+                Vec::new()
+            },
             receipt_private_key: config.operator.receipt_private_key.clone(),
             runtime_readable_secret_names: ["database-url", "valkey-url", MFA_TOTP_KEY_FILE_NAME]
                 .into_iter()

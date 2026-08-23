@@ -151,8 +151,16 @@ Options:
   --network-subnet CIDR               Optional fixed container subnet; requires --runtime-ip
   --runtime-ip ADDRESS                Optional fixed application IP; requires --network-subnet
   --to VERSION                        Immutable vSemVer Release; default: latest
-  --external-dependencies             Use operator-owned PostgreSQL and Valkey
-  --secrets-stdin                     Read the three dependency URLs as strict JSON from stdin
+  --candidate-image IMAGE             Explicitly use an already-present local OCI image; requires
+                                      all four --candidate-* identity bindings below
+  --candidate-release VERSION         Candidate vSemVer release identity
+  --candidate-revision SHA            Full lowercase Git revision
+  --candidate-build-id source:SHA     Must exactly bind the full candidate revision
+  --candidate-oci-digest sha256:DIGEST Expected local OCI manifest digest
+                                      Local OCI candidates are managed-only and reject
+                                      --external-dependencies
+  --external-dependencies             Use operator-owned runtime, migration, and backup PostgreSQL/Valkey
+  --secrets-stdin                     Read five dependency URLs plus dedicated-instance Valkey backup scope as strict JSON from stdin; binds canonical endpoints and usernames, never passwords
   --secret-fd FD                      Read the same JSON from an already-open FD (Linux)
   --profile-secrets-stdin             Read standards-full profile bearer secrets as strict JSON from stdin
   --profile-secret-fd FD              Read the same profile JSON from an already-open FD (Linux)
@@ -161,7 +169,8 @@ With managed dependencies and standards-full profile, identities and service-own
 secrets are generated automatically and persisted in the installation secret store.
 Profile secret input is optional and is intended only for importing an existing
 secret during a controlled recovery or migration.
-External JSON keys: database_url, migration_database_url, valkey_url.
+External JSON keys: database_url, migration_database_url, database_backup_url,
+valkey_url, valkey_backup_url, valkey_backup_scope (must be dedicated-instance).
 Profile JSON keys: dynamic_registration_initial_access_token,
 ciba_automated_decision_token, openid4vci_management_token,
 openid4vp_management_token. Profile secret input is accepted only for standards-full.
@@ -195,10 +204,12 @@ rollback, backup/PITR recovery, and any irreversible migration barrier separatel
 `recover` restores a declared database backup; it is not update-journal recovery.
 Interrupted update and identity transitions are changed only by their explicit
 recovery commands. Other commands fail closed while either transition is pending.
-An unreleased OCI candidate migration requires all four candidate target bindings
-shown by `nazoauthctl conformance --help`; the active digest and embedded identity
-must match exactly. `--yes` skips only the prompt; it never skips verification, backup, health, replay,
-audit, or rollback protection."
+An unreleased OCI candidate install requires all five candidate target bindings
+shown above, uses only fresh Ctl-managed dependencies, and rejects external
+dependencies. Its active digest and embedded identity must match exactly, and
+public completion additionally requires a nonce-bound control JWS verified
+against the descriptor-mounted instance identity. `--yes` skips only the prompt;
+it never skips verification, backup, health, replay, audit, or rollback protection."
         }
         cli::HelpTopic::Keys => {
             "Usage:
@@ -333,7 +344,7 @@ server Release cannot replace the controller."
     }
 }
 
-mod controller;
+pub(crate) mod controller;
 
 #[cfg(test)]
 #[path = "../tests/unit/entrypoint.rs"]
