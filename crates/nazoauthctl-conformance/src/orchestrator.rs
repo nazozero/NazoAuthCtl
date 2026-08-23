@@ -2404,9 +2404,11 @@ mod tests {
                     (200, self.wait_state_after_capture.clone())
                 }
                 (HttpMethod::Get, "/api/log/module-a") => (200, serde_json::json!([])),
-                (HttpMethod::Delete, "/api/runner/module-a" | "/api/plan/suite-plan") => {
-                    (204, Value::Null)
-                }
+                // Suite cancellation accepts only 200, while plan deletion also
+                // accepts 204. Keep this transport aligned with those distinct
+                // production contracts so the negative cases exercise cleanup.
+                (HttpMethod::Delete, "/api/runner/module-a") => (200, Value::Null),
+                (HttpMethod::Delete, "/api/plan/suite-plan") => (204, Value::Null),
                 _ => (404, serde_json::json!({})),
             };
             Ok(HttpResponse {
