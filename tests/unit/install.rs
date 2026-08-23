@@ -413,12 +413,30 @@ fn oidf_profile_missing_credential_signing_algorithms_fails_before_prepare_mutat
     options.trusted_proxy_cidr = Some("192.0.2.10/32".to_owned());
     let config = work.path().join("config/nazoauthctl.json");
 
+    let validation_error = match load_and_validate_install_profile(&options) {
+        Err(error) => error,
+        Ok(_) => panic!("incomplete credential configuration must fail validation"),
+    };
+    assert!(
+        validation_error.to_string().contains("strict JSON"),
+        "{validation_error:#}"
+    );
+
     let error = match prepare(&config, options) {
         Err(error) => error,
         Ok(_) => panic!("incomplete credential configuration must be rejected"),
     };
     #[cfg(target_os = "linux")]
-    assert!(error.to_string().contains("strict JSON"), "{error:#}");
+    if require_root().is_ok() {
+        assert!(error.to_string().contains("strict JSON"), "{error:#}");
+    } else {
+        assert!(
+            error
+                .to_string()
+                .contains("install and update require root"),
+            "{error:#}"
+        );
+    }
     #[cfg(not(target_os = "linux"))]
     assert!(
         error
@@ -441,15 +459,37 @@ fn standards_full_trusted_proxy_preflight_requires_https_and_a_host_boundary() {
     options.trusted_proxy_cidr = Some("192.0.2.10/32".to_owned());
     let config = work.path().join("config/nazoauthctl.json");
 
+    let validation_error = validate_standards_full_trusted_proxy_contract(
+        &options.public_url,
+        &options.profile,
+        options.trusted_proxy_cidr.as_deref(),
+    )
+    .unwrap_err();
+    assert!(
+        validation_error
+            .to_string()
+            .contains("requires an HTTPS --public-url"),
+        "{validation_error:#}"
+    );
+
     let error = match prepare(&config, options) {
         Err(error) => error,
         Ok(_) => panic!("loopback HTTP must not be accepted for standards-full proxy install"),
     };
     #[cfg(target_os = "linux")]
-    assert!(
-        error.to_string().contains("requires an HTTPS --public-url"),
-        "{error:#}"
-    );
+    if require_root().is_ok() {
+        assert!(
+            error.to_string().contains("requires an HTTPS --public-url"),
+            "{error:#}"
+        );
+    } else {
+        assert!(
+            error
+                .to_string()
+                .contains("install and update require root"),
+            "{error:#}"
+        );
+    }
     #[cfg(not(target_os = "linux"))]
     assert!(
         error
