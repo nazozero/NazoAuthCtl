@@ -402,6 +402,34 @@ impl fmt::Debug for OpenId4VpPresentation {
     }
 }
 
+#[cfg(test)]
+impl OpenId4VpPresentation {
+    /// Test-only presentation fixture for orchestration tests. Production
+    /// construction remains exclusively in the verified management client.
+    pub(crate) fn test_presentation() -> Self {
+        let binding = ConformanceBinding::new(
+            "019ff000-8190-7393-8c33-ab4339c3d85e",
+            "request-0123456789abcdef0123456789abcdef",
+        )
+        .expect("test binding");
+        Self {
+            authorization_url: Url::parse("https://issuer.example/authorize?request=opaque")
+                .expect("test authorization URL"),
+            completion_url: Url::parse(
+                "https://issuer.example/openid4vp/complete/00000000-0000-0000-0000-000000000000",
+            )
+            .expect("test completion URL"),
+            transaction_id: Uuid::nil(),
+            create_request_jti: Uuid::nil().to_string(),
+            expected_trust_policy: ExpectedTrustPolicyBinding::from_conformance_binding(&binding),
+            evidence_context: None,
+            evidence_attachment: None,
+            issuance_request_jti: None,
+            immediate_rejection_allowed: false,
+        }
+    }
+}
+
 /// Narrow orchestration hook for an OpenID4VP verifier. Browser protocol
 /// remains in `BrowserAutomation`; this trait only starts a presentation.
 pub trait OpenId4VpVerifier: Send {

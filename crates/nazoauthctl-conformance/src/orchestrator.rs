@@ -2181,6 +2181,28 @@ mod tests {
         requests: Mutex<Vec<HttpRequest>>,
     }
 
+    #[cfg(unix)]
+    struct DeferredReviewTransport {
+        requests: Mutex<Vec<(HttpMethod, String)>>,
+    }
+
+    #[cfg(unix)]
+    struct DeferredReviewVerifier {
+        attached: Option<crate::browser::OpenId4VpEvidenceContext>,
+        starts: usize,
+        completes: usize,
+        issuances: usize,
+    }
+
+    #[cfg(unix)]
+    struct DeferredReviewBrowser {
+        selected: bool,
+        captures: usize,
+    }
+
+    #[cfg(unix)]
+    struct RetainingObserver;
+
     struct BudgetDriftTransport {
         requests: Mutex<Vec<(HttpMethod, String)>>,
     }
@@ -2219,6 +2241,34 @@ mod tests {
 
         fn module_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
             self.module_intents.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn module_created(&self, _intent_id: &str, _module_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    impl SuiteResourceObserver for RetainingObserver {
+        fn retain_suite_plans_for_certification(&self) -> bool {
+            true
+        }
+
+        fn plan_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn plan_created(
+            &self,
+            _origin: &Origin,
+            _intent_id: &str,
+            _plan_id: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn module_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
             Ok(())
         }
 
@@ -2291,6 +2341,147 @@ mod tests {
                 status,
                 headers: vec![],
                 body,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    impl Transport for DeferredReviewTransport {
+        fn send(&self, request: HttpRequest, _max: usize) -> Result<HttpResponse, TransportError> {
+            let method = request.method();
+            let path = request.url().path().to_owned();
+            self.requests
+                .lock()
+                .expect("deferred review requests")
+                .push((method, path.clone()));
+            let (status, body) = match (method, path.as_str()) {
+                (HttpMethod::Get, "/api/plan") => (200, serde_json::json!({})),
+                (HttpMethod::Post, "/api/plan") => (
+                    200,
+                    serde_json::json!({
+                        "id":"suite-plan",
+                        "name":"oid4vp-1final-verifier-test-plan",
+                        "modules":[{"testModule":"happy-flow"}]
+                    }),
+                ),
+                (HttpMethod::Post, "/api/runner") => {
+                    (200, serde_json::json!({"id":"module-a","alias":"vp-alias"}))
+                }
+                (HttpMethod::Get, "/api/info/module-a") => {
+                    (200, serde_json::json!({"status":"WAITING"}))
+                }
+                (HttpMethod::Get, "/api/runner/module-a/wait-state") => {
+                    (200, serde_json::json!({"state":"WAITING"}))
+                }
+                (HttpMethod::Get, "/api/log/module-a") => (200, serde_json::json!([])),
+                (HttpMethod::Delete, "/api/runner/module-a" | "/api/plan/suite-plan") => {
+                    (204, Value::Null)
+                }
+                _ => (404, serde_json::json!({})),
+            };
+            Ok(HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("deferred review JSON"),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    impl OpenId4VpVerifier for DeferredReviewVerifier {
+        fn start(
+            &mut self,
+            _request: &OpenId4VpStartRequest,
+        ) -> Result<crate::browser::OpenId4VpPresentation, OpenId4VpError> {
+            self.starts += 1;
+            Ok(crate::browser::OpenId4VpPresentation::test_presentation())
+        }
+
+        fn complete(
+            &mut self,
+            _presentation: &crate::browser::OpenId4VpPresentation,
+        ) -> Result<(), OpenId4VpError> {
+            self.completes += 1;
+            Ok(())
+        }
+
+        fn attach_evidence_context(
+            &mut self,
+            _presentation: &mut crate::browser::OpenId4VpPresentation,
+            context: crate::browser::OpenId4VpEvidenceContext,
+        ) -> Result<(), OpenId4VpError> {
+            self.attached = Some(context);
+            Ok(())
+        }
+
+        fn verification_evidence(
+            &mut self,
+            _presentation: &crate::browser::OpenId4VpPresentation,
+        ) -> Result<crate::browser::OpenId4VpVerificationEvidence, OpenId4VpError> {
+            self.issuances += 1;
+            Ok(
+                crate::browser::OpenId4VpVerificationEvidence::test_verified(
+                    self.attached
+                        .clone()
+                        .expect("evidence is attached before issuance"),
+                    &"c".repeat(64),
+                    "https://issuer.example/ui/verification-result#receipt=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO12",
+                ),
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    impl BrowserAutomation for DeferredReviewBrowser {
+        fn execute(
+            &mut self,
+            _authorization_url: &Url,
+            _entries: &[crate::browser::BrowserEntry],
+        ) -> Result<crate::browser::BrowserRunReport, BrowserError> {
+            Err(BrowserError::ReviewScreenshotRequired)
+        }
+
+        fn navigate(&mut self, _url: &Url) -> Result<(), BrowserError> {
+            Ok(())
+        }
+
+        fn selected_openid4vp_result_marker(
+            &mut self,
+            authorization_url: &Url,
+            entries: &[crate::browser::BrowserEntry],
+            suite_evidence_url: &Url,
+        ) -> Result<bool, BrowserError> {
+            assert_eq!(authorization_url.host_str(), Some("issuer.example"));
+            assert_eq!(entries.len(), 1);
+            assert_eq!(
+                suite_evidence_url.path(),
+                "/test/a/module-a/verification-evidence"
+            );
+            Ok(self.selected)
+        }
+
+        fn capture_openid4vp_verification_result(
+            &mut self,
+            evidence: &crate::browser::OpenId4VpVerificationEvidence,
+            _capture: &crate::browser::BrowserReviewCaptureContext,
+            obligation_index: usize,
+        ) -> Result<crate::browser::BrowserReviewScreenshotReceipt, BrowserError> {
+            self.captures += 1;
+            Ok(crate::browser::BrowserReviewScreenshotReceipt {
+                path: std::path::PathBuf::from("review-screenshots/test/module-a-0.png"),
+                sha256: "d".repeat(64),
+                size: 67,
+                suite_plan_id: evidence.context.suite_plan_id.clone(),
+                module_id: evidence.context.suite_module_id.clone(),
+                test_name: evidence.context.test_name.clone(),
+                variant: BTreeMap::new(),
+                marker: crate::browser::ReviewScreenshotMarker::Required,
+                obligation_index,
+                trigger_origin: "https://issuer.example".to_owned(),
+                trigger_path: "/ui/verification-result".to_owned(),
+                trigger_url_sha256: "e".repeat(64),
+                source: crate::browser::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver,
+                verification_receipt: Some(evidence.receipt.clone()),
             })
         }
     }
@@ -3736,5 +3927,130 @@ mod tests {
         assert!(!is_deferred_review_waiting(
             &serde_json::json!({"state":"FINISHED"})
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serial_vp_deferred_review_retains_only_the_same_waiting_module_without_suite_uploads() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temporary root")
+            .join(format!(
+                "nazoauth-deferred-review-run-{}",
+                uuid::Uuid::now_v7()
+            ));
+        crate::secure_file::ensure_directory(&root, true).expect("private evidence root");
+        let transport = Arc::new(DeferredReviewTransport {
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://www.certification.openid.net").expect("official Suite"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let mut matrix = one_plan_matrix(serde_json::json!({
+            "alias":"vp-alias",
+            "browser":[{
+                "match":"https://issuer.example/authorize*",
+                "tasks":[{
+                    "match":"https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                    "commands":[["wait","xpath","//*",1,"review","update-image-placeholder"]]
+                }]
+            }]
+        }));
+        matrix.digest = "b".repeat(64);
+        matrix.document.groups[0].plans[0].plan = "oid4vp-1final-verifier-test-plan".to_owned();
+        let browser: Arc<Mutex<dyn BrowserAutomation>> =
+            Arc::new(Mutex::new(DeferredReviewBrowser {
+                selected: true,
+                captures: 0,
+            }));
+        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
+            Arc::new(Mutex::new(DeferredReviewVerifier {
+                attached: None,
+                starts: 0,
+                completes: 0,
+                issuances: 0,
+            }));
+        let capture = BrowserReviewScreenshotCapture::new(
+            root.clone(),
+            "request-0123456789abcdef0123456789abcdef",
+        )
+        .expect("capture");
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix,
+            target_origin: Some(
+                BrowserTargetOrigin::parse("https://issuer.example").expect("target"),
+            ),
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(1),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+            plan_resource_budgets: one_plan_budgets(),
+            selected_resource_budget: budget(1, 1, 60),
+            jobs: 1,
+            automation: vec![ConformanceAutomation {
+                browser: Some(browser.clone()),
+                review_screenshot_capture: Some(capture),
+                vp_evidence: Some(
+                    OpenId4VpEvidenceRunContext::new(
+                        "request-0123456789abcdef0123456789abcdef",
+                        "a".repeat(64),
+                        "b".repeat(64),
+                    )
+                    .expect("VP evidence run context"),
+                ),
+                verifier: Some(verifier.clone()),
+                issuer: None,
+            }],
+            suite_resource_observer: Some(Arc::new(RetainingObserver)),
+        })
+        .expect("runner");
+
+        let report = runner.run(&mut ()).report;
+
+        assert!(report.local_success);
+        assert!(!report.suite_pass);
+        assert!(!report.acceptance_pass);
+        assert!(report.review_pending);
+        assert_eq!(
+            report.deferred_review_modules,
+            vec!["p/happy-flow".to_owned()]
+        );
+        assert!(report.errors.is_empty());
+        assert_eq!(report.modules.len(), 1);
+        let module = &report.modules[0];
+        assert_eq!(module.outcome, ModuleOutcome::DeferredReviewPending);
+        assert!(!module.terminal);
+        assert_eq!(module.review_screenshots.len(), 1);
+        assert_eq!(module.review_screenshots_required, 1);
+        assert_eq!(module.review_screenshots_required_captured, 1);
+        assert_eq!(
+            module
+                .deferred_review_pending
+                .as_ref()
+                .expect("deferred review identity")
+                .placeholder_path,
+            "/test/a/module-a/verification-evidence"
+        );
+        assert!(report.orchestration_integrity.retention_eligible);
+        assert!(report.orchestration_integrity.all_modules_settled);
+        assert!(!report.orchestration_integrity.all_modules_terminal);
+        assert_eq!(browser.lock().expect("browser").captures, 1);
+        let verifier = verifier.lock().expect("verifier");
+        assert_eq!(
+            (verifier.starts, verifier.completes, verifier.issuances),
+            (1, 1, 1)
+        );
+        assert!(verifier.attached.is_some());
+        let requests = transport.requests.lock().expect("requests");
+        assert!(requests.iter().all(|(method, path)| {
+            *method != HttpMethod::Delete && !path.contains("image") && !path.contains("visited")
+        }));
+        drop(requests);
+        std::fs::remove_dir_all(root).expect("remove temporary evidence root");
     }
 }
