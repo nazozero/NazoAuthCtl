@@ -417,7 +417,15 @@ fn oidf_profile_missing_credential_signing_algorithms_fails_before_prepare_mutat
         Err(error) => error,
         Ok(_) => panic!("incomplete credential configuration must be rejected"),
     };
-    assert!(error.to_string().contains("strict JSON"));
+    #[cfg(target_os = "linux")]
+    assert!(error.to_string().contains("strict JSON"), "{error:#}");
+    #[cfg(not(target_os = "linux"))]
+    assert!(
+        error
+            .to_string()
+            .contains("install lifecycle supports only Linux"),
+        "{error:#}"
+    );
     assert!(!config.exists());
     assert!(!work.path().join("data").exists());
     assert!(!work.path().join("control").exists());
@@ -437,7 +445,18 @@ fn standards_full_trusted_proxy_preflight_requires_https_and_a_host_boundary() {
         Err(error) => error,
         Ok(_) => panic!("loopback HTTP must not be accepted for standards-full proxy install"),
     };
-    assert!(error.to_string().contains("requires an HTTPS --public-url"));
+    #[cfg(target_os = "linux")]
+    assert!(
+        error.to_string().contains("requires an HTTPS --public-url"),
+        "{error:#}"
+    );
+    #[cfg(not(target_os = "linux"))]
+    assert!(
+        error
+            .to_string()
+            .contains("install lifecycle supports only Linux"),
+        "{error:#}"
+    );
     assert!(!config.exists());
     assert!(!work.path().join("data").exists());
     assert!(!work.path().join("control").exists());
