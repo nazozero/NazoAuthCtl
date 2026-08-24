@@ -518,7 +518,12 @@ fn write_callback_response(
             .as_bytes(),
         )
         .map_err(CibaUserApprovalError::CallbackWrite)?;
-    stream.flush().map_err(CibaUserApprovalError::CallbackWrite)
+    stream
+        .flush()
+        .map_err(CibaUserApprovalError::CallbackWrite)?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(CibaUserApprovalError::CallbackWrite)
 }
 
 #[derive(Debug, Error)]
@@ -640,7 +645,6 @@ mod tests {
     use super::*;
     use crate::TransportFailureStage;
     use std::collections::VecDeque;
-    use std::io::{Read, Write};
     use std::sync::Mutex;
 
     struct FakeTransport {
@@ -827,18 +831,19 @@ mod tests {
             ),
         )
         .expect("callback bridge");
-        let mut stream = TcpStream::connect(bridge.local_addr()).expect("callback connect");
-        let request = format!(
-            "GET /ciba/approve?approval_token={approval_token}&auth_req_id={auth_req_id}&action=allow HTTP/1.1\r\nHost: callback.example\r\n\r\n"
+        let callback_url = format!(
+            "http://{}/ciba/approve?approval_token={approval_token}&auth_req_id={auth_req_id}&action=allow",
+            bridge.local_addr()
         );
-        stream
-            .write_all(request.as_bytes())
-            .expect("callback request");
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
+        let response = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("callback client")
+            .get(callback_url)
+            .send()
             .expect("callback response");
-        assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 
         let error = (0..50)
             .find_map(|_| match bridge.ensure_healthy() {
