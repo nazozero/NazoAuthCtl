@@ -2,6 +2,7 @@ mod adoption;
 mod backup;
 mod cli;
 mod conformance;
+pub mod controller_identity;
 mod coordination;
 mod deployment;
 mod discovery;

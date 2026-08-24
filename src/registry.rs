@@ -942,26 +942,29 @@ fn read_record<T: ConformingRecord>(path: &Path) -> anyhow::Result<T> {
     Ok(record)
 }
 
-#[cfg(windows)]
-fn config_root() -> anyhow::Result<PathBuf> {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .with_context(|| "APPDATA is not set; cannot locate the user registry directory")
-}
-
-#[cfg(not(windows))]
-fn config_root() -> anyhow::Result<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        let path = PathBuf::from(xdg);
-        if path.is_absolute() {
-            return Ok(path);
-        }
-        bail!("XDG_CONFIG_HOME must be an absolute path");
+/// Platform user configuration directory that scopes all ctl local state:
+/// `%APPDATA%` on Windows, `$XDG_CONFIG_HOME` or `$HOME/.config` elsewhere.
+pub(crate) fn config_root() -> anyhow::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .with_context(|| "APPDATA is not set; cannot locate the user registry directory")
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .with_context(|| "neither XDG_CONFIG_HOME nor HOME is set")?;
-    Ok(home.join(".config"))
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            let path = PathBuf::from(xdg);
+            if path.is_absolute() {
+                return Ok(path);
+            }
+            bail!("XDG_CONFIG_HOME must be an absolute path");
+        }
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .with_context(|| "neither XDG_CONFIG_HOME nor HOME is set")?;
+        Ok(home.join(".config"))
+    }
 }
 
 #[cfg(test)]
