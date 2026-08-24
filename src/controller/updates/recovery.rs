@@ -40,6 +40,10 @@ pub(crate) fn uses_legacy_lock(command: &Command) -> bool {
             | Command::SelfRollback { .. }
             // The target-side stdio executor never touches controller state.
             | Command::RemoteExec
+            // Fleet registry commands own their user-scoped store lock and
+            // never touch the deployment lifecycle state machine.
+            | Command::Host(_)
+            | Command::Instance(_)
     )
 }
 

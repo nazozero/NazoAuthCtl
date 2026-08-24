@@ -315,6 +315,10 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         // Internal fixed stdio executor (goal plan 03 §3.2). Runs on the
         // target machine — no legacy lock, no controller state access.
         Command::RemoteExec => crate::target::remote_exec::run_stdio(),
+        // Fleet registry commands (goal plan 02): user-scoped store, their own
+        // registry lock, no lifecycle lock and no root requirement.
+        Command::Host(command) => crate::fleet::run_host(command),
+        Command::Instance(command) => crate::fleet::run_instance(command),
         Command::Adopt(options) => {
             require_root()?;
             crate::adoption::run(options)

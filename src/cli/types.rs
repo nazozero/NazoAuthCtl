@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
+use anyhow::bail;
+
 use crate::adoption::AdoptionOptions;
 use crate::deployment::{Capability, CapabilityGrant};
+use crate::registry::HostPrivilege;
 
 pub(crate) const DEFAULT_CONFIG: &str = "/etc/nazoauth/update.json";
 
@@ -94,6 +97,89 @@ pub(crate) enum Command {
     /// §3.2). Not user-facing automation surface: one bounded HostOperation
     /// JSON on stdin, one HostResult JSON on stdout, no daemon, no socket.
     RemoteExec,
+    /// Fleet host registry commands (goal plan 02, tasks B03/B06/B07).
+    Host(HostCommand),
+    /// Fleet instance registry commands (goal plan 02, tasks B04–B07).
+    Instance(InstanceCommand),
+}
+
+/// `host` command family (task B03). All of it operates on the user-scoped
+/// Registry; only `add` and `check` contact the target, and `forget` never
+/// reaches a remote host.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HostCommand {
+    Add {
+        alias: String,
+        ssh_profile: String,
+        privilege: HostPrivilege,
+    },
+    List {
+        refresh: bool,
+    },
+    Show {
+        alias: String,
+    },
+    Check {
+        alias: String,
+    },
+    Forget {
+        alias: String,
+        cascade: bool,
+    },
+}
+
+/// The two selector channels shared by the instance subcommands (task B05):
+/// the positional argument and the explicit `--instance` flag. The command
+/// layer merges them; supplying both is rejected so the effective selector is
+/// never ambiguous.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct InstanceSelector {
+    pub(crate) positional: Option<String>,
+    pub(crate) named: Option<String>,
+}
+
+impl InstanceSelector {
+    pub(crate) fn explicit(&self) -> anyhow::Result<Option<String>> {
+        match (&self.positional, &self.named) {
+            (Some(_), Some(_)) => {
+                bail!(
+                    "select the instance with either --instance or the positional selector, not both"
+                )
+            }
+            (Some(value), None) | (None, Some(value)) => Ok(Some(value.clone())),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+/// `instance` command family (tasks B04–B07).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InstanceCommand {
+    List {
+        refresh: bool,
+    },
+    Show(InstanceSelector),
+    /// Interim discovery helper: observe one host live and emit the typed
+    /// evidence artifact consumed by `instance register`.
+    Observe {
+        host: String,
+        deployment_id: String,
+        issuer: String,
+        output: PathBuf,
+    },
+    Register {
+        from_discovery: PathBuf,
+        alias: Option<String>,
+    },
+    Rename {
+        source: InstanceSelector,
+        new_alias: String,
+    },
+    Forget(InstanceSelector),
+    Relocate {
+        selector: InstanceSelector,
+        to_host: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

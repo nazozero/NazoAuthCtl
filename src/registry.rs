@@ -36,6 +36,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::filesystem;
+use crate::target::wire::{RemoteHello, verify_remote_hello};
 
 /// Schema discriminator carried by every persisted registry record.
 pub const REGISTRY_RECORD_SCHEMA: u32 = 1;
@@ -264,6 +265,96 @@ impl InstanceRecord {
         self.alias = new_alias.into();
         self.validate()?;
         Ok(self)
+    }
+}
+
+/// Schema discriminator for [`DiscoveryEvidence`] artifacts.
+pub const DISCOVERY_EVIDENCE_SCHEMA: u32 = 1;
+
+/// Exact `evidence` kind tag carried by every discovery evidence artifact.
+pub const DISCOVERY_EVIDENCE_KIND: &str = "instance-discovery-v1";
+
+/// Live-observed deployment binding produced by a real hello/inspect run
+/// against one managed host (goal plan 02, task B04).
+///
+/// `instance register` accepts deployment identities only through this
+/// artifact; hand-typed `deployment_id` + `issuer` pairs have no input path.
+/// INTERIM boundary (revisited by G05/I01): until target-side DeploymentState
+/// discovery exists, the `deployment` fields are captured from operator input
+/// at observation time while everything around them — host identity, verified
+/// [`RemoteHello`], timestamp — is genuinely live-observed. Registration
+/// re-verifies the live helper identity against the artifact before trusting
+/// it, so a stale or fabricated envelope fails closed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryEvidence {
+    pub schema: u32,
+    pub evidence: String,
+    pub observed_at: DateTime<Utc>,
+    pub host_id: Uuid,
+    pub host_alias: String,
+    pub transport: HostTransport,
+    pub hello: RemoteHello,
+    pub deployment: DiscoveredDeployment,
+}
+
+/// The deployment binding carried inside a [`DiscoveryEvidence`] artifact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveredDeployment {
+    pub deployment_id: String,
+    pub issuer: String,
+}
+
+impl DiscoveryEvidence {
+    /// Build an evidence artifact the way the observe helper does: the hello
+    /// must come from a just-completed live probe of `host`.
+    pub fn new(
+        host: &HostRecord,
+        hello: RemoteHello,
+        deployment_id: impl Into<String>,
+        issuer: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        let evidence = Self {
+            schema: DISCOVERY_EVIDENCE_SCHEMA,
+            evidence: DISCOVERY_EVIDENCE_KIND.to_owned(),
+            observed_at: Utc::now(),
+            host_id: host.host_id,
+            host_alias: host.alias.clone(),
+            transport: host.transport,
+            hello,
+            deployment: DiscoveredDeployment {
+                deployment_id: deployment_id.into(),
+                issuer: issuer.into(),
+            },
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    /// Enforce every invariant registration relies on. Unknown fields, wrong
+    /// schema/kind tags, unverifiable helper identities, and malformed
+    /// deployment bindings all fail closed here.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.schema != DISCOVERY_EVIDENCE_SCHEMA {
+            bail!(
+                "unsupported discovery evidence schema {} (expected {DISCOVERY_EVIDENCE_SCHEMA})",
+                self.schema
+            );
+        }
+        if self.evidence != DISCOVERY_EVIDENCE_KIND {
+            bail!(
+                "unsupported evidence kind '{}' (expected '{DISCOVERY_EVIDENCE_KIND}')",
+                self.evidence
+            );
+        }
+        validate_key(&self.host_alias, "evidence host alias")?;
+        verify_remote_hello(&self.hello).map_err(|reason| {
+            anyhow::anyhow!("evidence helper identity is not verifiable: {reason}")
+        })?;
+        validate_key(&self.deployment.deployment_id, "evidence deployment id")?;
+        validate_issuer(&self.deployment.issuer)?;
+        Ok(())
     }
 }
 
@@ -500,6 +591,14 @@ impl RegistryStore {
         self.find_instance_by_alias_locked(alias)
     }
 
+    pub fn instance_by_deployment(
+        &self,
+        deployment_id: &str,
+    ) -> anyhow::Result<Option<InstanceRecord>> {
+        let _lock = self.lock()?;
+        self.find_instance_by_deployment_locked(deployment_id)
+    }
+
     pub fn list_instances(&self) -> anyhow::Result<Vec<InstanceRecord>> {
         let _lock = self.lock()?;
         let mut instances = Vec::new();
@@ -508,6 +607,199 @@ impl RegistryStore {
         }
         instances.sort_by(|left, right| left.alias.cmp(&right.alias));
         Ok(instances)
+    }
+
+    pub fn host_by_id(&self, host_id: Uuid) -> anyhow::Result<Option<HostRecord>> {
+        let _lock = self.lock()?;
+        self.find_host_by_id_locked(host_id)
+    }
+
+    /// Controlled registration path (task B04): the only way an
+    /// [`InstanceRecord`] enters the store from a deployment binding. The
+    /// evidence must carry a verifiable live-observed helper identity and must
+    /// match the stored host record; duplicate `deployment_id` (reported as a
+    /// relocation candidate, never silently updated) and duplicate aliases are
+    /// rejected. `observation` is the caller's fresh live observation and
+    /// becomes the record's first cache entry.
+    pub fn register_instance(
+        &self,
+        evidence: &DiscoveryEvidence,
+        alias: Option<&str>,
+        observation: ObservationCache,
+    ) -> anyhow::Result<InstanceRecord> {
+        evidence.validate()?;
+        let _lock = self.lock()?;
+        let host = self
+            .find_host_by_id_locked(evidence.host_id)?
+            .with_context(|| format!("evidence names unknown host {}", evidence.host_id))?;
+        if host.alias != evidence.host_alias || host.transport != evidence.transport {
+            bail!(
+                "registry host '{}' drifted from the evidence artifact (alias or transport changed); \
+                 re-run the discovery step against the current registry",
+                host.alias
+            );
+        }
+        if self
+            .find_instance_by_deployment_locked(&evidence.deployment.deployment_id)?
+            .is_some()
+        {
+            bail!(
+                "duplicate deployment id '{}' (one registry entry per real instance). If this \
+                 instance relocated to another host, verify it there and use \
+                 `instance relocate --to-host <alias>` instead of registering it a second time",
+                evidence.deployment.deployment_id
+            );
+        }
+        let alias = alias.unwrap_or(&evidence.deployment.deployment_id);
+        if self.find_instance_by_alias_locked(alias)?.is_some() {
+            bail!("duplicate instance alias '{alias}'");
+        }
+        let mut record = InstanceRecord::new(
+            &evidence.deployment.deployment_id,
+            alias,
+            evidence.host_id,
+            &evidence.deployment.issuer,
+            format!(
+                "target-state/{}/{}",
+                evidence.host_id, evidence.deployment.deployment_id
+            ),
+        )?;
+        record.last_observation = Some(observation);
+        record.validate()?;
+        let path = self.instance_path(&record.deployment_id);
+        write_record(&path, "instance record", &record)?;
+        Ok(record)
+    }
+
+    /// Forget one host. Registry-only by construction: no target operation
+    /// exists on this path. Hosts still referenced by instance records are
+    /// rejected unless `cascade` is set, in which case those local instance
+    /// records are forgotten too — the remote deployments themselves keep
+    /// running untouched.
+    pub fn forget_host(
+        &self,
+        alias: &str,
+        cascade: bool,
+    ) -> anyhow::Result<(HostRecord, Vec<InstanceRecord>)> {
+        let _lock = self.lock()?;
+        let host = self
+            .find_host_by_alias_locked(alias)?
+            .with_context(|| format!("unknown host alias '{alias}'"))?;
+        if host.transport == HostTransport::Local {
+            bail!(
+                "the built-in '{}' host cannot be forgotten",
+                LOCAL_HOST_ALIAS
+            );
+        }
+        let mut referencing = Vec::new();
+        for (_, record) in self.load_all_locked::<InstanceRecord>(Directory::Instances)? {
+            if record.host_id == host.host_id {
+                referencing.push(record);
+            }
+        }
+        if !referencing.is_empty() && !cascade {
+            let names = referencing
+                .iter()
+                .map(|record| record.alias.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "host '{alias}' still has {} registered instance(s) ({names}); re-run with \
+                 --cascade to forget those local records as well — remote instances are never \
+                 uninstalled or unbound by this command",
+                referencing.len()
+            );
+        }
+        for record in &referencing {
+            filesystem::remove_file_durable(&self.instance_path(&record.deployment_id))
+                .with_context(|| format!("failed to forget instance '{}'", record.alias))?;
+        }
+        filesystem::remove_file_durable(&self.host_path(host.host_id))
+            .with_context(|| format!("failed to forget host '{alias}'"))?;
+        Ok((host, referencing))
+    }
+
+    /// Forget one instance record by its canonical identity. Registry-only:
+    /// controller slots at the server are not revoked and remote deployments
+    /// are not touched.
+    pub fn forget_instance_by_deployment(
+        &self,
+        deployment_id: &str,
+    ) -> anyhow::Result<InstanceRecord> {
+        let _lock = self.lock()?;
+        let record = self
+            .find_instance_by_deployment_locked(deployment_id)?
+            .with_context(|| format!("unknown instance deployment id '{deployment_id}'"))?;
+        filesystem::remove_file_durable(&self.instance_path(deployment_id))
+            .with_context(|| format!("failed to forget instance '{deployment_id}'"))?;
+        Ok(record)
+    }
+
+    /// Write a fresh observation cache entry for a host, preserving every
+    /// other field. Cache writes never authorize anything; they only record
+    /// what the last live contact saw.
+    pub fn set_host_observation(
+        &self,
+        host_id: Uuid,
+        observation: ObservationCache,
+    ) -> anyhow::Result<()> {
+        let _lock = self.lock()?;
+        let mut host = self
+            .find_host_by_id_locked(host_id)?
+            .with_context(|| format!("unknown host {host_id}"))?;
+        host.last_observation = Some(observation);
+        host.validate()?;
+        self.write_host_locked(&host)
+    }
+
+    /// Write a fresh observation cache entry for an instance, preserving every
+    /// other field.
+    pub fn set_instance_observation(
+        &self,
+        deployment_id: &str,
+        observation: ObservationCache,
+    ) -> anyhow::Result<()> {
+        let _lock = self.lock()?;
+        let mut record = self
+            .find_instance_by_deployment_locked(deployment_id)?
+            .with_context(|| format!("unknown instance '{deployment_id}'"))?;
+        record.last_observation = Some(observation);
+        record.validate()?;
+        write_record(
+            &self.instance_path(deployment_id),
+            "instance record",
+            &record,
+        )
+    }
+
+    /// Move an instance to another host. Callers must have verified the target
+    /// DeploymentState identity through the new host first (task B07); this
+    /// method only performs the local rebinding and clears the stale cache
+    /// entry that described the old host.
+    pub fn relocate_instance(
+        &self,
+        deployment_id: &str,
+        new_host_id: Uuid,
+    ) -> anyhow::Result<InstanceRecord> {
+        let _lock = self.lock()?;
+        let mut record = self
+            .find_instance_by_deployment_locked(deployment_id)?
+            .with_context(|| format!("unknown instance '{deployment_id}'"))?;
+        if record.host_id == new_host_id {
+            bail!("instance '{deployment_id}' is already bound to host {new_host_id}");
+        }
+        if self.find_host_by_id_locked(new_host_id)?.is_none() {
+            bail!("cannot relocate to unknown host {new_host_id}");
+        }
+        record.host_id = new_host_id;
+        record.last_observation = None;
+        record.validate()?;
+        write_record(
+            &self.instance_path(deployment_id),
+            "instance record",
+            &record,
+        )?;
+        Ok(record)
     }
 
     fn host_path(&self, host_id: Uuid) -> PathBuf {
@@ -986,5 +1278,236 @@ mod tests {
             "{error}"
         );
         Ok(())
+    }
+
+    // ---------- B04 controlled registration / evidence ----------
+
+    fn evidence_for(host: &HostRecord) -> DiscoveryEvidence {
+        let hello = crate::target::wire::local_hello(vec!["podman".to_owned()]);
+        DiscoveryEvidence::new(host, hello, "deploy-alpha", "https://auth.example.com")
+            .expect("valid evidence")
+    }
+
+    #[test]
+    fn register_instance_persists_the_controlled_binding_with_first_observation() {
+        let (_temp, store) = test_store().unwrap();
+        let host = store.ensure_local_host().unwrap();
+        let evidence = evidence_for(&host);
+
+        let record = store
+            .register_instance(&evidence, None, ObservationCache::now(true, "observed"))
+            .expect("controlled registration");
+        assert_eq!(record.alias, "deploy-alpha", "alias defaults to the id");
+        assert_eq!(record.deployment_id, "deploy-alpha");
+        assert_eq!(record.host_id, host.host_id);
+        assert_eq!(record.issuer, "https://auth.example.com");
+        assert!(record.last_observation.is_some(), "first cache entry");
+        assert_eq!(store.list_instances().unwrap().len(), 1);
+
+        let explicit = store
+            .register_instance(
+                &evidence,
+                Some("prod"),
+                ObservationCache::now(true, "again"),
+            )
+            .expect_err("duplicate deployment");
+        assert!(explicit.to_string().contains("relocate"), "{explicit}");
+    }
+
+    #[test]
+    fn register_instance_rejects_unknown_and_drifted_hosts() {
+        let (_temp, store) = test_store().unwrap();
+        let host = store.ensure_local_host().unwrap();
+        let mut evidence = evidence_for(&host);
+
+        evidence.host_id = uuid::Uuid::now_v7();
+        let error = store
+            .register_instance(&evidence, None, ObservationCache::now(true, "x"))
+            .expect_err("unknown host");
+        assert!(error.to_string().contains("unknown host"), "{error}");
+
+        evidence = evidence_for(&host);
+        evidence.host_alias = "renamed".to_owned();
+        let error = store
+            .register_instance(&evidence, None, ObservationCache::now(true, "x"))
+            .expect_err("drifted alias");
+        assert!(error.to_string().contains("drifted"), "{error}");
+    }
+
+    #[test]
+    fn discovery_evidence_validation_fails_closed() {
+        let (_temp, store) = test_store().unwrap();
+        let host = store.ensure_local_host().unwrap();
+        let good = evidence_for(&host);
+
+        for mutate in [
+            |e: &mut DiscoveryEvidence| e.schema += 1,
+            |e: &mut DiscoveryEvidence| {
+                e.evidence = "hand-typed".to_owned();
+            },
+            |e: &mut DiscoveryEvidence| {
+                e.hello.version = "0.0.1-old".to_owned();
+            },
+            |e: &mut DiscoveryEvidence| {
+                e.deployment.deployment_id = String::new();
+            },
+            |e: &mut DiscoveryEvidence| {
+                e.deployment.issuer = "ftp://auth.example.com".to_owned();
+            },
+        ] {
+            let mut broken = good.clone();
+            mutate(&mut broken);
+            assert!(
+                store
+                    .register_instance(&broken, None, ObservationCache::now(true, "x"))
+                    .is_err(),
+                "evidence must fail closed"
+            );
+        }
+
+        let raw = serde_json::to_vec_pretty(&good).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("hand_written".to_owned(), serde_json::Value::from(true));
+        assert!(
+            serde_json::from_value::<DiscoveryEvidence>(value).is_err(),
+            "unknown fields are denied"
+        );
+    }
+
+    // ---------- B03/B07 forget constraints ----------
+
+    #[test]
+    fn forget_host_defaults_to_rejecting_referenced_instances() {
+        let (_temp, store) = test_store().unwrap();
+        store.ensure_local_host().unwrap();
+        let host = store
+            .add_host(HostRecord::new_ssh("server-a", "prod-a", HostPrivilege::Sudo).unwrap())
+            .unwrap();
+        store
+            .add_instance(
+                InstanceRecord::new(
+                    "deploy-alpha",
+                    "production",
+                    host.host_id,
+                    "https://auth.example.com",
+                    "ref",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let error = store.forget_host("server-a", false).expect_err("blocked");
+        let rendered = error.to_string();
+        assert!(rendered.contains("--cascade"), "{rendered}");
+        assert!(rendered.contains("never"), "{rendered}");
+        assert!(store.host_by_alias("server-a").unwrap().is_some());
+        assert_eq!(store.list_instances().unwrap().len(), 1);
+
+        let (forgotten, removed) = store.forget_host("server-a", true).unwrap();
+        assert_eq!(forgotten.host_id, host.host_id);
+        assert_eq!(removed.len(), 1);
+        assert!(store.host_by_alias("server-a").unwrap().is_none());
+        assert!(store.list_instances().unwrap().is_empty());
+
+        assert!(store.forget_host("server-a", false).is_err(), "unknown");
+        assert!(
+            store.forget_host(LOCAL_HOST_ALIAS, true).is_err(),
+            "built-in local host cannot be forgotten"
+        );
+        assert!(store.host_by_alias(LOCAL_HOST_ALIAS).unwrap().is_some());
+    }
+
+    #[test]
+    fn observation_writers_preserve_every_other_field() {
+        let (_temp, store) = test_store().unwrap();
+        let host = store.ensure_local_host().unwrap();
+        let mut instance = InstanceRecord::new(
+            "deploy-alpha",
+            "production",
+            host.host_id,
+            "https://auth.example.com",
+            "target-state/x",
+        )
+        .unwrap();
+        instance.controller_key_ref = Some("keys/alpha".to_owned());
+        store.add_instance(instance).unwrap();
+
+        store
+            .set_host_observation(host.host_id, ObservationCache::now(false, "unreachable"))
+            .unwrap();
+        store
+            .set_instance_observation(
+                "deploy-alpha",
+                ObservationCache::now(true, "helper verified"),
+            )
+            .unwrap();
+
+        let host = store.host_by_alias(LOCAL_HOST_ALIAS).unwrap().unwrap();
+        let observation = host.last_observation.expect("host cache written");
+        assert!(!observation.reachable);
+
+        let instance = store.instance_by_alias("production").unwrap().unwrap();
+        assert_eq!(
+            instance.controller_key_ref.as_deref(),
+            Some("keys/alpha"),
+            "cache writes must not disturb bindings"
+        );
+        assert!(
+            instance
+                .last_observation
+                .expect("instance cache written")
+                .reachable
+        );
+
+        assert!(
+            store
+                .set_instance_observation("missing", ObservationCache::now(true, "x"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn relocate_instance_rebinds_host_and_clears_stale_cache() {
+        let (_temp, store) = test_store().unwrap();
+        let old = store.ensure_local_host().unwrap();
+        let new_host = store
+            .add_host(HostRecord::new_ssh("server-b", "prod-b", HostPrivilege::Direct).unwrap())
+            .unwrap();
+        let mut record = InstanceRecord::new(
+            "deploy-alpha",
+            "production",
+            old.host_id,
+            "https://auth.example.com",
+            "target-state/x",
+        )
+        .unwrap();
+        record.last_observation = Some(ObservationCache::now(true, "old host view"));
+        store.add_instance(record).unwrap();
+
+        let moved = store
+            .relocate_instance("deploy-alpha", new_host.host_id)
+            .unwrap();
+        assert_eq!(moved.host_id, new_host.host_id);
+        assert!(moved.last_observation.is_none(), "old-host cache dropped");
+
+        assert!(
+            store
+                .relocate_instance("deploy-alpha", new_host.host_id)
+                .is_err(),
+            "same host relocation rejected"
+        );
+        assert!(
+            store
+                .relocate_instance("deploy-alpha", uuid::Uuid::now_v7())
+                .is_err(),
+            "unknown target host rejected"
+        );
+        assert!(
+            store.relocate_instance("missing", old.host_id).is_err(),
+            "unknown instance rejected"
+        );
     }
 }

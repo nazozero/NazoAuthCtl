@@ -5,6 +5,7 @@ mod conformance;
 mod coordination;
 mod deployment;
 mod discovery;
+mod fleet;
 mod governance;
 mod install;
 mod lifecycle;
@@ -104,6 +105,13 @@ Start here:
   nazoauthctl conformance artifact resolve --trust-policy PATH --manifest-url URL --cache-dir PATH
   nazoauthctl conformance artifact verify --trust-policy PATH --manifest PATH --matrix PATH
   nazoauthctl [--deployment ID] development activate --artifact IMAGE_OR_BINARY --yes
+  nazoauthctl host add server-a --ssh prod-a --privilege sudo
+  nazoauthctl host list|show|check|forget <alias>
+  nazoauthctl instance list
+  nazoauthctl instance show|rename|forget [--instance SELECTOR]
+  nazoauthctl instance observe --host HOST --deployment-id ID --issuer URL --output PATH
+  nazoauthctl instance register --from-discovery PATH
+  nazoauthctl instance relocate [--instance SELECTOR] --to-host HOST
 
 Commands:
   discover      Read-only local Podman, Docker, systemd and process discovery
@@ -126,6 +134,8 @@ Commands:
   recover-identity  Explicitly finish an interrupted identity transition
   migrate       Run the signed migration operation
   keys          List, validate, export OpenID4VC trust, generate, or register signing keys
+  host          Register and inspect managed hosts (add/list/show/check/forget)
+  instance      Register and select NazoAuth instances (list/show/observe/register/rename/forget/relocate)
   conformance   Verify signed OIDF artifacts and run official tests through ordinary resources
   audit         Show or verify the management audit chain
   identity      Rotate controller and audit identities

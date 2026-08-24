@@ -1293,3 +1293,306 @@ fn internal_remote_exec_is_a_fixed_no_argument_command() {
         assert!(parse(arguments).is_err(), "accepted {arguments:?}");
     }
 }
+
+#[test]
+fn parses_the_host_command_family() {
+    let command = parse(&[
+        "nazoauthctl",
+        "host",
+        "add",
+        "server-a",
+        "--ssh",
+        "prod-a",
+        "--privilege",
+        "sudo",
+    ])
+    .unwrap()
+    .unwrap()
+    .command;
+    let Command::Host(HostCommand::Add {
+        alias,
+        ssh_profile,
+        privilege,
+    }) = command
+    else {
+        panic!("expected host add");
+    };
+    assert_eq!(alias, "server-a");
+    assert_eq!(ssh_profile, "prod-a");
+    assert_eq!(privilege, crate::registry::HostPrivilege::Sudo);
+
+    // --privilege defaults to direct.
+    let command = parse(&["nazoauthctl", "host", "add", "server-a", "--ssh", "prod-a"])
+        .unwrap()
+        .unwrap()
+        .command;
+    let Command::Host(HostCommand::Add { privilege, .. }) = command else {
+        panic!("expected host add");
+    };
+    assert_eq!(privilege, crate::registry::HostPrivilege::Direct);
+
+    let command = parse(&["nazoauthctl", "host", "list", "--refresh"])
+        .unwrap()
+        .unwrap()
+        .command;
+    assert!(matches!(
+        command,
+        Command::Host(HostCommand::List { refresh: true })
+    ));
+
+    let command = parse(&["nazoauthctl", "host", "show", "server-a"])
+        .unwrap()
+        .unwrap()
+        .command;
+    let Command::Host(HostCommand::Show { alias }) = command else {
+        panic!("expected host show");
+    };
+    assert_eq!(alias, "server-a");
+
+    let command = parse(&["nazoauthctl", "host", "check", "server-a"])
+        .unwrap()
+        .unwrap()
+        .command;
+    let Command::Host(HostCommand::Check { alias }) = command else {
+        panic!("expected host check");
+    };
+    assert_eq!(alias, "server-a");
+
+    let command = parse(&["nazoauthctl", "host", "forget", "server-a", "--cascade"])
+        .unwrap()
+        .unwrap()
+        .command;
+    let Command::Host(HostCommand::Forget { alias, cascade }) = command else {
+        panic!("expected host forget");
+    };
+    assert_eq!(alias, "server-a");
+    assert!(cascade);
+}
+
+#[test]
+fn rejects_invalid_host_commands() {
+    for arguments in [
+        &["nazoauthctl", "host"][..],
+        &["nazoauthctl", "host", "rename", "a", "b"][..],
+        &["nazoauthctl", "host", "add"][..],
+        &["nazoauthctl", "host", "add", "server-a"][..],
+        &[
+            "nazoauthctl",
+            "host",
+            "add",
+            "server-a",
+            "extra",
+            "--ssh",
+            "prod-a",
+        ][..],
+        &[
+            "nazoauthctl",
+            "host",
+            "add",
+            "server-a",
+            "--privilege",
+            "root",
+        ][..],
+        &["nazoauthctl", "host", "list", "extra"][..],
+        &["nazoauthctl", "host", "show"][..],
+        &["nazoauthctl", "host", "check", "a", "b"][..],
+        &["nazoauthctl", "host", "forget"][..],
+        &["nazoauthctl", "host", "list", "--unknown"][..],
+    ] {
+        assert!(parse(arguments).is_err(), "accepted {arguments:?}");
+    }
+}
+
+#[test]
+fn parses_the_instance_command_family() {
+    let command = parse(&["nazoauthctl", "instance", "list"])
+        .unwrap()
+        .unwrap()
+        .command;
+    assert!(matches!(
+        command,
+        Command::Instance(InstanceCommand::List { refresh: false })
+    ));
+
+    let command = parse(&["nazoauthctl", "instance", "show"])
+        .unwrap()
+        .unwrap()
+        .command;
+    let Command::Instance(InstanceCommand::Show(selector)) = command else {
+        panic!("expected instance show");
+    };
+    assert!(selector.explicit().unwrap().is_none());
+
+    let command = parse(&["nazoauthctl", "instance", "forget", "--instance", "prod"])
+        .unwrap()
+        .unwrap()
+        .command;
+    let Command::Instance(InstanceCommand::Forget(selector)) = command else {
+        panic!("expected instance forget");
+    };
+    assert_eq!(selector.explicit().unwrap().as_deref(), Some("prod"));
+
+    let command = parse(&[
+        "nazoauthctl",
+        "instance",
+        "observe",
+        "--host",
+        "server-a",
+        "--deployment-id",
+        "deploy-alpha",
+        "--issuer",
+        "https://auth.example.com",
+        "--output",
+        "evidence.json",
+    ])
+    .unwrap()
+    .unwrap()
+    .command;
+    let Command::Instance(InstanceCommand::Observe {
+        host,
+        deployment_id,
+        issuer,
+        output,
+    }) = command
+    else {
+        panic!("expected instance observe");
+    };
+    assert_eq!(host, "server-a");
+    assert_eq!(deployment_id, "deploy-alpha");
+    assert_eq!(issuer, "https://auth.example.com");
+    assert_eq!(output, PathBuf::from("evidence.json"));
+
+    let command = parse(&[
+        "nazoauthctl",
+        "instance",
+        "register",
+        "--from-discovery",
+        "evidence.json",
+        "--alias",
+        "prod",
+    ])
+    .unwrap()
+    .unwrap()
+    .command;
+    let Command::Instance(InstanceCommand::Register {
+        from_discovery,
+        alias,
+    }) = command
+    else {
+        panic!("expected instance register");
+    };
+    assert_eq!(from_discovery, PathBuf::from("evidence.json"));
+    assert_eq!(alias.as_deref(), Some("prod"));
+
+    // rename [OLD] NEW and --instance OLD NEW forms.
+    let command = parse(&["nazoauthctl", "instance", "rename", "auth-prod"])
+        .unwrap()
+        .unwrap()
+        .command;
+    let Command::Instance(InstanceCommand::Rename { source, new_alias }) = command else {
+        panic!("expected single-instance rename");
+    };
+    assert!(source.explicit().unwrap().is_none());
+    assert_eq!(new_alias, "auth-prod");
+
+    let command = parse(&[
+        "nazoauthctl",
+        "instance",
+        "rename",
+        "production",
+        "auth-prod",
+    ])
+    .unwrap()
+    .unwrap()
+    .command;
+    let Command::Instance(InstanceCommand::Rename { source, new_alias }) = command else {
+        panic!("expected positional rename");
+    };
+    assert_eq!(source.explicit().unwrap().as_deref(), Some("production"));
+    assert_eq!(new_alias, "auth-prod");
+
+    let command = parse(&[
+        "nazoauthctl",
+        "instance",
+        "rename",
+        "--instance",
+        "production",
+        "auth-prod",
+    ])
+    .unwrap()
+    .unwrap()
+    .command;
+    let Command::Instance(InstanceCommand::Rename { source, new_alias }) = command else {
+        panic!("expected named rename");
+    };
+    assert_eq!(source.explicit().unwrap().as_deref(), Some("production"));
+    assert_eq!(new_alias, "auth-prod");
+
+    let command = parse(&[
+        "nazoauthctl",
+        "instance",
+        "relocate",
+        "production",
+        "--to-host",
+        "server-b",
+    ])
+    .unwrap()
+    .unwrap()
+    .command;
+    let Command::Instance(InstanceCommand::Relocate { selector, to_host }) = command else {
+        panic!("expected instance relocate");
+    };
+    assert_eq!(selector.explicit().unwrap().as_deref(), Some("production"));
+    assert_eq!(to_host, "server-b");
+}
+
+#[test]
+fn rejects_invalid_instance_commands_and_hand_typed_registration() {
+    for arguments in [
+        &["nazoauthctl", "instance"][..],
+        &["nazoauthctl", "instance", "adopt"][..],
+        // Hand-typed deployment identities have no input path at all.
+        &["nazoauthctl", "instance", "register"][..],
+        &[
+            "nazoauthctl",
+            "instance",
+            "register",
+            "--deployment-id",
+            "deploy-alpha",
+            "--issuer",
+            "https://auth.example.com",
+        ][..],
+        &[
+            "nazoauthctl",
+            "instance",
+            "observe",
+            "--host",
+            "server-a",
+            "--deployment-id",
+            "deploy-alpha",
+        ][..],
+        &["nazoauthctl", "instance", "rename"][..],
+        &["nazoauthctl", "instance", "rename", "a", "b", "c"][..],
+        &[
+            "nazoauthctl",
+            "instance",
+            "rename",
+            "--instance",
+            "old",
+            "old",
+            "new",
+        ][..],
+        &["nazoauthctl", "instance", "show", "a", "b"][..],
+        &["nazoauthctl", "instance", "relocate", "production"][..],
+        &["nazoauthctl", "instance", "list", "--unknown"][..],
+        &["nazoauthctl", "instance", "forget", "--instance"][..],
+    ] {
+        assert!(parse(arguments).is_err(), "accepted {arguments:?}");
+    }
+
+    // The register error explains the evidence constraint.
+    let error = parse(&["nazoauthctl", "instance", "register"])
+        .err()
+        .expect("register without evidence must fail");
+    assert!(error.to_string().contains("--from-discovery"), "{error}");
+}
