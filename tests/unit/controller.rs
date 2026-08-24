@@ -1689,7 +1689,9 @@ fn oidf_run_locks_overlap_and_exclude_lifecycle_mutation() {
     let run_b = acquire_oidf_run_shared_lock_at(&path).unwrap();
     assert!(acquire_lock_at(&path, &Command::Rollback { yes: true }).is_err());
 
-    drop((run_a, run_b));
+    run_a.unlock().unwrap();
+    assert!(acquire_lock_at(&path, &Command::Rollback { yes: true }).is_err());
+    run_b.unlock().unwrap();
     assert!(acquire_lock_at(&path, &Command::Rollback { yes: true }).is_ok());
 }
 
