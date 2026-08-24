@@ -834,10 +834,14 @@ mod tests {
         stream
             .write_all(request.as_bytes())
             .expect("callback request");
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .expect("callback response");
+        let mut response = Vec::new();
+        while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut chunk = [0_u8; 512];
+            let read = stream.read(&mut chunk).expect("callback response");
+            assert_ne!(read, 0, "callback response ended before its headers");
+            response.extend_from_slice(&chunk[..read]);
+        }
+        let response = String::from_utf8(response).expect("UTF-8 callback response");
         assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
 
         let error = (0..50)
