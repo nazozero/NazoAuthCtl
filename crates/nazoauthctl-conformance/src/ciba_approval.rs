@@ -829,11 +829,12 @@ mod tests {
         )
         .expect("callback bridge");
         let mut stream = TcpStream::connect(bridge.local_addr()).expect("callback connect");
-        write!(
-            stream,
+        let request = format!(
             "GET /ciba/approve?approval_token={approval_token}&auth_req_id={auth_req_id}&action=allow HTTP/1.1\r\nHost: callback.example\r\n\r\n"
-        )
-        .expect("callback request");
+        );
+        stream
+            .write_all(request.as_bytes())
+            .expect("callback request");
         stream.shutdown(Shutdown::Write).expect("finish request");
         let mut response = String::new();
         stream
