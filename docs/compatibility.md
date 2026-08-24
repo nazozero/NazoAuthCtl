@@ -7,7 +7,7 @@ Current NazoAuth Release manifests use a closed compatibility object:
   "operator_protocol": {
     "version": 1,
     "minimum_ctl_version": "0.1.19",
-    "maximum_ctl_version_exclusive": "0.2.0"
+    "maximum_ctl_version_exclusive": "0.3.0"
   }
 }
 ```
@@ -24,17 +24,18 @@ server Releases below without rebuilding them:
 
 | Controller artifact | Server Release | Protocol | Status |
 | --- | --- | --- | --- |
-| current NazoAuthCtl v0.1.55 source, built once | v0.1.41 signed host + OCI | 1 | matrix and real-backend tested |
-| current NazoAuthCtl v0.1.55 source, built once | v0.1.34 signed host + OCI | 1 | artifact/identity matrix sentinel |
-| current NazoAuthCtl v0.1.55 source, built once | v0.1.24 signed host + OCI | 1 | artifact/identity matrix-tested |
-| current NazoAuthCtl v0.1.55 source, built once | v0.1.20 signed host + OCI | 1 | artifact/identity matrix-tested |
-| current NazoAuthCtl v0.1.55 source, built once | v0.1.19 signed host + OCI | 1 | artifact/identity matrix-tested |
+| current NazoAuthCtl v0.2.0 source, built once | v0.2.0 signed host + OCI | 1 | matrix and real-backend tested |
+| current NazoAuthCtl v0.2.0 source, built once | v0.1.41 signed host + OCI | 1 | artifact/identity matrix sentinel |
+| current NazoAuthCtl v0.2.0 source, built once | v0.1.34 signed host + OCI | 1 | artifact/identity matrix sentinel |
+| current NazoAuthCtl v0.2.0 source, built once | v0.1.24 signed host + OCI | 1 | artifact/identity matrix-tested |
+| current NazoAuthCtl v0.2.0 source, built once | v0.1.20 signed host + OCI | 1 | artifact/identity matrix-tested |
+| current NazoAuthCtl v0.2.0 source, built once | v0.1.19 signed host + OCI | 1 | artifact/identity matrix-tested |
 | signed independent NazoAuthCtl v0.1.23 | v0.1.24 signed host + OCI | 1 | artifact/identity matrix-tested |
 | signed independent NazoAuthCtl v0.1.23 | v0.1.20 signed host + OCI | 1 | artifact/identity matrix-tested |
 | signed independent NazoAuthCtl v0.1.23 | v0.1.19 signed host + OCI | 1 | artifact/identity matrix-tested |
 
-The current NazoAuth v0.1.41 Release carries the explicit controller range and
-the latest migration policy. Its migration floor is `20260816000200`; that
+The current NazoAuth v0.2.0 Release carries the explicit controller range and
+the latest migration policy. Its migration floor is `20260822000200`; that
 policy is schema-incompatible and irreversible, so database recovery requires
 the controller's verified backup path rather than a server-artifact rollback.
 v0.1.34 remains a signed compatibility sentinel. The v0.1.19 server predates
@@ -48,7 +49,7 @@ already-built signed server binaries, verifies signed OCI images, and executes
 build identity from both server forms. OCI tags are resolved to a manifest
 digest before Sigstore verification and every subsequent pull, run, cache, and
 recovery use that same digest reference. Destructive recovery scenarios run
-with the current controller against NazoAuth v0.1.41 and verify Docker, Podman,
+with the current controller against NazoAuth v0.2.0 and verify Docker, Podman,
 and systemd independently. No matrix job rebuilds the server.
 
 The release workflow invokes this compatibility workflow as a reusable job and
