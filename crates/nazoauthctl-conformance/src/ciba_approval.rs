@@ -518,12 +518,7 @@ fn write_callback_response(
             .as_bytes(),
         )
         .map_err(CibaUserApprovalError::CallbackWrite)?;
-    stream
-        .flush()
-        .map_err(CibaUserApprovalError::CallbackWrite)?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .map_err(CibaUserApprovalError::CallbackWrite)
+    stream.flush().map_err(CibaUserApprovalError::CallbackWrite)
 }
 
 #[derive(Debug, Error)]
