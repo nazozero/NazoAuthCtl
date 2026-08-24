@@ -44,6 +44,9 @@ pub(crate) fn uses_legacy_lock(command: &Command) -> bool {
             // never touch the deployment lifecycle state machine.
             | Command::Host(_)
             | Command::Instance(_)
+            // Controller identity lifecycle owns the user-scoped Registry and
+            // key stores; it never touches the legacy deployment state either.
+            | Command::Controller(_)
     )
 }
 

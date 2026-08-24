@@ -411,6 +411,61 @@ impl ControllerKeyStore {
         Ok(summaries)
     }
 
+    /// Atomically remove the active pointer, returning the instance to the
+    /// unbound state while keeping every key record on disk. Used after a
+    /// confirmed self-revocation (task D08): deleting key files while a
+    /// pointer still names them would brick loads with fail-closed errors, so
+    /// the pointer goes first.
+    pub fn clear_active(&self, deployment_id: &str) -> anyhow::Result<()> {
+        validate_instance_identifier(deployment_id)?;
+        let dir = self.instance_dir_unchecked(deployment_id);
+        let _lock = InstanceKeyLock::acquire(&Self::lock_path(&dir))?;
+        let path = Self::active_path(&dir);
+        if fs::symlink_metadata(&path).is_err() {
+            return Ok(());
+        }
+        filesystem::remove_file_durable(&path)
+            .with_context(|| format!("failed to clear {}", path.display()))
+    }
+
+    /// Newest non-active candidate kid, or `None` when every stored key is
+    /// active (or none exist). Bind resume reuses this candidate instead of
+    /// minting another keypair for a repeated proposal (task D04).
+    pub fn newest_candidate_kid(&self, deployment_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .list_keys(deployment_id)?
+            .into_iter()
+            .filter(|summary| !summary.active)
+            .max_by_key(|summary| summary.created_at)
+            .map(|summary| summary.kid))
+    }
+
+    /// Durable local retirement of one non-active key record (tasks D07/D08):
+    /// the old private key is unlinked only after callers have confirmed the
+    /// server-side change. The active pointer can never be retired through
+    /// this method; switching first and retiring second keeps a crash window
+    /// where both records still exist but never one where none does.
+    pub fn retire_kid(&self, deployment_id: &str, kid: &str) -> anyhow::Result<()> {
+        validate_instance_identifier(deployment_id)?;
+        validate_kid_shape(kid)?;
+        let dir = self.instance_dir_unchecked(deployment_id);
+        let _lock = InstanceKeyLock::acquire(&Self::lock_path(&dir))?;
+        if let Some(pointer) = self.read_active_pointer(&dir)?
+            && pointer.active_kid == kid
+        {
+            bail!(
+                "refusing to retire controller key '{kid}' while it is still the active \
+                 identity; switch the active pointer first"
+            );
+        }
+        // Validate the full record before unlinking so retirement never
+        // destroys material whose identity was not proven.
+        self.read_key_record(&dir, kid)?;
+        let path = Self::key_path(&dir, kid);
+        filesystem::remove_file_durable(&path)
+            .with_context(|| format!("failed to retire controller key {}", path.display()))
+    }
+
     fn read_active_pointer(&self, dir: &std::path::Path) -> anyhow::Result<Option<ActivePointer>> {
         let path = Self::active_path(dir);
         match fs::symlink_metadata(&path) {
@@ -810,6 +865,79 @@ mod tests {
         assert_eq!(reference, "controller-keys/deploy-alpha");
         assert!(controller_key_ref_for("../evil").is_err());
         assert!(controller_key_ref_for("").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn retirement_refuses_active_kids_and_durable_unlinks_candidates() -> anyhow::Result<()> {
+        let (_temp, store) = test_store()?;
+        let active = store.get_or_create_active("deploy-alpha")?;
+        let candidate = store.generate_candidate("deploy-alpha")?;
+
+        // Active material can never be retired through this path.
+        let error = store
+            .retire_kid("deploy-alpha", active.kid())
+            .expect_err("active kid");
+        assert!(error.to_string().contains("refusing to retire"), "{error}");
+        assert!(
+            store.load_active("deploy-alpha")?.is_some(),
+            "active key untouched"
+        );
+
+        store.retire_kid("deploy-alpha", &candidate.kid)?;
+        assert_eq!(
+            store.list_keys("deploy-alpha")?.len(),
+            1,
+            "candidate durably removed"
+        );
+        // Retiring an unknown kid fails instead of silently succeeding.
+        assert!(store.retire_kid("deploy-alpha", &candidate.kid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn clear_active_returns_to_unbound_while_keeping_material() -> anyhow::Result<()> {
+        let (_temp, store) = test_store()?;
+        let active = store.get_or_create_active("deploy-alpha")?;
+        store.clear_active("deploy-alpha")?;
+        assert!(store.load_active("deploy-alpha")?.is_none());
+        // Material survives so diagnostics can still enumerate it; a later
+        // bind may adopt it back if the server still lists the kid.
+        assert_eq!(store.list_keys("deploy-alpha")?.len(), 1);
+        assert!(!store.list_keys("deploy-alpha")?[0].active);
+        assert_eq!(
+            store.newest_candidate_kid("deploy-alpha")?,
+            Some(active.kid().to_owned())
+        );
+        store.clear_active("deploy-alpha")?; // idempotent
+        Ok(())
+    }
+
+    #[test]
+    fn newest_candidate_prefers_the_freshest_non_active_record() -> anyhow::Result<()> {
+        let (_temp, store) = test_store()?;
+        assert!(store.newest_candidate_kid("deploy-alpha")?.is_none());
+
+        let first = store.get_or_create_active("deploy-alpha")?;
+        assert!(
+            store.newest_candidate_kid("deploy-alpha")?.is_none(),
+            "an all-active instance has no candidate"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = store.generate_candidate("deploy-alpha")?;
+        assert_eq!(
+            store.newest_candidate_kid("deploy-alpha")?,
+            Some(second.kid.clone())
+        );
+
+        // After activating the newest candidate it stops being a candidate;
+        // the previously active key is superseded into one, so the freshest
+        // candidate is the third key.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let third = store.generate_candidate("deploy-alpha")?;
+        store.set_active_kid("deploy-alpha", &second.kid)?;
+        assert_eq!(store.newest_candidate_kid("deploy-alpha")?, Some(third.kid));
+        assert_ne!(first.kid(), second.kid);
         Ok(())
     }
 }

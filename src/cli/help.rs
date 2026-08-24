@@ -23,6 +23,7 @@ pub(crate) fn help_topic(args: &[String]) -> Option<HelpTopic> {
         Some("audit") => HelpTopic::Audit,
         Some("identity") => HelpTopic::Identity,
         Some("break-glass") => HelpTopic::BreakGlass,
+        Some("controller") => HelpTopic::ControllerIdentity,
         Some("self") => HelpTopic::Controller,
         _ => HelpTopic::TopLevel,
     })

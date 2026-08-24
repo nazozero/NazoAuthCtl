@@ -319,6 +319,10 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         // registry lock, no lifecycle lock and no root requirement.
         Command::Host(command) => crate::fleet::run_host(command),
         Command::Instance(command) => crate::fleet::run_instance(command),
+        // Controller identity lifecycle (goal plan 04 D04–D09): user-scoped
+        // Registry + key store; the only network peer is the instance issuer's
+        // admin surface. No root and no legacy lock for the same reasons.
+        Command::Controller(command) => crate::controller_identity::lifecycle::run_command(command),
         Command::Adopt(options) => {
             require_root()?;
             crate::adoption::run(options)

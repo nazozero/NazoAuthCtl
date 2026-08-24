@@ -783,6 +783,32 @@ impl RegistryStore {
         )
     }
 
+    /// Update the controller identity binding of one instance (tasks
+    /// D04/D06/D07/D08): `controller_id` is the server-assigned slot identity
+    /// and `key_ref` the caller-resolved locator into the Controller Key
+    /// store. Clearing both marks the instance locally unbound without
+    /// touching key material. Both values pass full record validation.
+    pub fn update_controller_binding(
+        &self,
+        deployment_id: &str,
+        controller_id: Option<&str>,
+        key_ref: Option<&str>,
+    ) -> anyhow::Result<InstanceRecord> {
+        let _lock = self.lock()?;
+        let mut record = self
+            .find_instance_by_deployment_locked(deployment_id)?
+            .with_context(|| format!("unknown instance '{deployment_id}'"))?;
+        record.controller_id = controller_id.map(str::to_owned);
+        record.controller_key_ref = key_ref.map(str::to_owned);
+        record.validate()?;
+        write_record(
+            &self.instance_path(deployment_id),
+            "instance record",
+            &record,
+        )?;
+        Ok(record)
+    }
+
     /// Move an instance to another host. Callers must have verified the target
     /// DeploymentState identity through the new host first (task B07); this
     /// method only performs the local rebinding and clears the stale cache
@@ -1262,6 +1288,52 @@ mod tests {
             .expect_err("reserved");
         assert!(error.to_string().contains("reserved"), "{error}");
         assert!(store.host_by_alias(LOCAL_HOST_ALIAS)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn update_controller_binding_round_trips_and_clears() -> anyhow::Result<()> {
+        let (_temp, store) = test_store()?;
+        let host = store.ensure_local_host()?;
+        store.add_instance(InstanceRecord::new(
+            "deploy-alpha",
+            "production",
+            host.host_id,
+            "https://auth.example.com",
+            "ref",
+        )?)?;
+
+        let bound = store.update_controller_binding(
+            "deploy-alpha",
+            Some("01900000-0000-7000-8000-00000000000a"),
+            Some("controller-keys/deploy-alpha"),
+        )?;
+        assert_eq!(
+            bound.controller_id.as_deref(),
+            Some("01900000-0000-7000-8000-00000000000a")
+        );
+        assert_eq!(
+            bound.controller_key_ref.as_deref(),
+            Some("controller-keys/deploy-alpha")
+        );
+
+        // Clearing keeps every other fact intact.
+        let cleared = store.update_controller_binding("deploy-alpha", None, None)?;
+        assert!(cleared.controller_id.is_none());
+        assert!(cleared.controller_key_ref.is_none());
+        assert_eq!(cleared.deployment_id, "deploy-alpha");
+        assert_eq!(cleared.alias, "production");
+
+        // Embedded key material stays rejected through this path too.
+        assert!(
+            store
+                .update_controller_binding(
+                    "deploy-alpha",
+                    Some("c"),
+                    Some("-----BEGIN PRIVATE KEY-----")
+                )
+                .is_err()
+        );
         Ok(())
     }
 

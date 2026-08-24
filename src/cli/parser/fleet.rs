@@ -252,13 +252,13 @@ fn split_subcommand<'a>(
     Ok((subcommand.as_str(), rest))
 }
 
-struct ParsedOptions {
-    positionals: Vec<String>,
-    values: BTreeMap<String, String>,
-    flags: BTreeSet<String>,
+pub(super) struct ParsedOptions {
+    pub(super) positionals: Vec<String>,
+    pub(super) values: BTreeMap<String, String>,
+    pub(super) flags: BTreeSet<String>,
 }
 
-fn parse_options(
+pub(super) fn parse_options(
     values: Vec<String>,
     value_flags: &[&str],
     bool_flags: &[&str],
@@ -309,7 +309,7 @@ fn require_no_positionals(positionals: &[String], command: &str) -> anyhow::Resu
     Ok(())
 }
 
-fn checked_name(flag: &str, value: &str) -> anyhow::Result<()> {
+pub(super) fn checked_name(flag: &str, value: &str) -> anyhow::Result<()> {
     if value.is_empty()
         || value.len() > 128
         || value.chars().any(|character| character.is_control())

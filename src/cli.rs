@@ -17,8 +17,8 @@ pub(crate) use help::help_topic;
 pub(crate) use types::RelinquishOptions;
 pub(crate) use types::{
     AcmeCertificateInput, AcmeCommand, BootstrapAdminOptions, CandidateTarget, Cli, Command,
-    HelpTopic, HostCommand, InstallOptions, InstanceCommand, InstanceSelector, KeysCommand,
-    LocalOciCandidateInstall, StandardsProfileSecrets, TlsCertificateCheckInput,
+    ControllerCommand, HelpTopic, HostCommand, InstallOptions, InstanceCommand, InstanceSelector,
+    KeysCommand, LocalOciCandidateInstall, StandardsProfileSecrets, TlsCertificateCheckInput,
     TlsCertificateInput, TlsCertificateSource, TlsCommand, UpdateOptions,
 };
 

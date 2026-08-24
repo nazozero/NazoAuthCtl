@@ -47,6 +47,9 @@ hmac = "0.13.0"
 http = "1.5.0"
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "native-tokio", "tls12", "rustls-platform-verifier"] }
 hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+# Already compiled transitively (hyper-util depends on it); declared only so
+# the controller-identity admin client can name request/response body types.
+http-body-util = "0.1.3"
 instant-acme = { version = "0.8.5", default-features = false, features = ["aws-lc-rs", "hyper-rustls"] }
 libc = "0.2.189"
 nazo-operator-protocol.workspace = true

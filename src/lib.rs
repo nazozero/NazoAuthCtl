@@ -113,6 +113,7 @@ Start here:
   nazoauthctl instance observe --host HOST --deployment-id ID --issuer URL --output PATH
   nazoauthctl instance register --from-discovery PATH
   nazoauthctl instance relocate [--instance SELECTOR] --to-host HOST
+  nazoauthctl controller bind|add|rotate|revoke|slots [--instance SELECTOR]
 
 Commands:
   discover      Read-only local Podman, Docker, systemd and process discovery
@@ -137,6 +138,7 @@ Commands:
   keys          List, validate, export OpenID4VC trust, generate, or register signing keys
   host          Register and inspect managed hosts (add/list/show/check/forget)
   instance      Register and select NazoAuth instances (list/show/observe/register/rename/forget/relocate)
+  controller    Per-instance Controller Key lifecycle: bind/add/rotate/revoke/slots
   conformance   Verify signed OIDF artifacts and run official tests through ordinary resources
   audit         Show or verify the management audit chain
   identity      Rotate controller and audit identities
@@ -354,6 +356,32 @@ Controller updates consume only signed NazoAuthCtl Release binaries and provenan
 They use a global controller lock, transaction, signed audit chain, and rollback slot;
 they do not select or borrow keys or state from a NazoAuth deployment. A NazoAuth
 server Release cannot replace the controller."
+        }
+        cli::HelpTopic::ControllerIdentity => {
+            "Usage:
+  nazoauthctl controller bind [--instance SELECTOR] --label NAME [--approval-token TOKEN]
+      [--admin-access-file PATH]
+  nazoauthctl controller add [--instance SELECTOR] --label NAME [same options as bind]
+  nazoauthctl controller rotate [--instance SELECTOR] [--label NAME] [same options as bind]
+  nazoauthctl controller revoke --controller-id ID --yes [same options as bind]
+  nazoauthctl controller slots [--instance SELECTOR] [--admin-access-file PATH]
+
+Every identity change (bind/add/rotate/revoke) requires a single-use approval token
+issued by an administrator with fresh 2FA at the instance admin console; the token is
+bound to the exact payload ctl displays and expires in 10 minutes. Interactive runs
+read the token with echo disabled or from one piped stdin line. `--approval-token`
+exists for automation; tokens never enter logs, audit records, or command output.
+`--admin-access-file` points at a root-private JSON document {\"session_cookie\",
+\"csrf_token\"} when the instance requires an authenticated session for the registry
+API; the file is read once and never logged.
+
+Bind mints exactly one Ed25519 keypair per deployment on this control machine and
+registers the public key only. Rotate atomically replaces one slot's key after
+approval and retires the old local key afterwards. Add enrolls a second/third
+controller slot; revoke removes one exact controller id. Keys expire 30 days after
+enrollment (server clock): expiry warnings appear in status output, expired
+identities refuse new operations locally with rotate guidance, and already-accepted
+operations keep resuming from their authorization snapshot."
         }
     }
 }

@@ -7,6 +7,7 @@
 mod admin;
 mod adoption;
 mod common;
+mod controller;
 mod fleet;
 mod install;
 mod keys;
@@ -22,6 +23,7 @@ use super::types::*;
 use admin::parse_bootstrap_admin;
 use adoption::{parse_adoption, parse_permission_options, parse_relinquish_options};
 use common::{no_arguments, parse_candidate_target, parse_version_option, parse_yes, take_yes};
+use controller::parse_controller;
 use fleet::{parse_host, parse_instance};
 use install::parse_install;
 use keys::parse_keys;
@@ -153,6 +155,7 @@ impl Cli {
             "keys" => Command::Keys(parse_keys(values)?),
             "host" => Command::Host(parse_host(values)?),
             "instance" => Command::Instance(parse_instance(values)?),
+            "controller" => Command::Controller(parse_controller(values)?),
             "tls" => Command::Tls(parse_tls(values)?),
             "audit" if values == ["verify"] => Command::AuditVerify,
             "audit" if values.first().is_some_and(|value| value == "show") => {

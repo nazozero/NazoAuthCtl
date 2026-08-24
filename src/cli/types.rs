@@ -21,6 +21,7 @@ pub(crate) enum HelpTopic {
     Identity,
     BreakGlass,
     Controller,
+    ControllerIdentity,
 }
 
 pub(crate) struct Cli {
@@ -101,6 +102,46 @@ pub(crate) enum Command {
     Host(HostCommand),
     /// Fleet instance registry commands (goal plan 02, tasks B04–B07).
     Instance(InstanceCommand),
+    /// Controller identity lifecycle commands (goal plan 04, tasks D04–D09):
+    /// bind/add/rotate/revoke against the instance Controller Registry plus
+    /// the authoritative slots view.
+    Controller(ControllerCommand),
+}
+
+/// `controller` command family (tasks D04–D09). Everything runs against the
+/// user-scoped Registry and per-instance key store; the only network peer is
+/// the instance issuer's admin surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ControllerCommand {
+    Bind {
+        selector: InstanceSelector,
+        label: String,
+        approval_token: Option<String>,
+        admin_access_file: Option<PathBuf>,
+    },
+    Add {
+        selector: InstanceSelector,
+        label: String,
+        approval_token: Option<String>,
+        admin_access_file: Option<PathBuf>,
+    },
+    Rotate {
+        selector: InstanceSelector,
+        label: Option<String>,
+        approval_token: Option<String>,
+        admin_access_file: Option<PathBuf>,
+    },
+    Revoke {
+        selector: InstanceSelector,
+        controller_id: String,
+        yes: bool,
+        approval_token: Option<String>,
+        admin_access_file: Option<PathBuf>,
+    },
+    Slots {
+        selector: InstanceSelector,
+        admin_access_file: Option<PathBuf>,
+    },
 }
 
 /// `host` command family (task B03). All of it operates on the user-scoped

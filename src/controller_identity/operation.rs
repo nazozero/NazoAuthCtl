@@ -92,6 +92,22 @@ pub fn build_signed_control_operation(
     instance_selector: &str,
     input: ControlOperationInput,
 ) -> anyhow::Result<SignedControlOperation> {
+    build_signed_control_operation_with_id(registry, keys, instance_selector, input, None)
+}
+
+/// Same as [`build_signed_control_operation`] with an explicit operation id.
+/// `None` mints a fresh UUIDv7; `Some(id)` rebuilds the exact envelope for a
+/// journaled resume (E06): combined with deterministic Ed25519 this yields a
+/// byte-identical compact JWS, so the server sees one operation, never a new
+/// identity. The caller owns resume-safety checks (hash equality); this
+/// function performs no gating of its own.
+pub fn build_signed_control_operation_with_id(
+    registry: &RegistryStore,
+    keys: &ControllerKeyStore,
+    instance_selector: &str,
+    input: ControlOperationInput,
+    operation_id: Option<&str>,
+) -> anyhow::Result<SignedControlOperation> {
     let record = resolve_instance(registry, instance_selector)?;
     let key_ref = record.controller_key_ref.as_deref().with_context(|| {
         format!(
@@ -118,7 +134,10 @@ pub fn build_signed_control_operation(
 
     let operation = ControlOperation {
         schema: CONTROL_OPERATION_SCHEMA,
-        operation_id: Uuid::now_v7().to_string(),
+        operation_id: match operation_id {
+            Some(id) => id.to_owned(),
+            None => Uuid::now_v7().to_string(),
+        },
         kid: loaded.kid().to_owned(),
         deployment_id: record.deployment_id.clone(),
         target: input.artifact_target,
