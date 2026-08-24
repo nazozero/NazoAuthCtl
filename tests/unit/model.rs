@@ -114,7 +114,7 @@ fn valid_manifest() -> ReleaseManifest {
         operator_protocol: Some(OperatorProtocolCompatibility {
             version: nazo_operator_protocol::PROTOCOL_VERSION,
             minimum_ctl_version: "0.1.19".to_owned(),
-            maximum_ctl_version_exclusive: "0.2.0".to_owned(),
+            maximum_ctl_version_exclusive: "0.3.0".to_owned(),
         }),
         artifacts: BTreeMap::from([(
             "binary".to_owned(),
