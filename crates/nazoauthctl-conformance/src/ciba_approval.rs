@@ -641,7 +641,6 @@ mod tests {
     use crate::TransportFailureStage;
     use std::collections::VecDeque;
     use std::io::{Read, Write};
-    use std::net::Shutdown;
     use std::sync::Mutex;
 
     struct FakeTransport {
@@ -835,7 +834,6 @@ mod tests {
         stream
             .write_all(request.as_bytes())
             .expect("callback request");
-        stream.shutdown(Shutdown::Write).expect("finish request");
         let mut response = String::new();
         stream
             .read_to_string(&mut response)
