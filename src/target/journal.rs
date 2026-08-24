@@ -231,23 +231,29 @@ impl Drop for JournalLock {
 /// Deployment ids become path components here, so they are re-validated at
 /// the boundary that consumes them: registry-legal identifiers pass, anything
 /// with separators or traversal segments fails closed.
+///
+/// This is the single rule source for deployment-scope directory names; the
+/// DeploymentState store (F01) reuses it so a state document and its journal
+/// always share one scope directory.
+pub(crate) fn deployment_scope(deployment_id: &str) -> anyhow::Result<String> {
+    let legal = !deployment_id.is_empty()
+        && deployment_id.len() <= 128
+        && deployment_id != "."
+        && deployment_id != ".."
+        && deployment_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ".:_+-".contains(character));
+    if legal {
+        Ok(deployment_id.to_owned())
+    } else {
+        bail!("{TARGET_JOURNAL_INVALID}: deployment_id is not usable as a journal scope")
+    }
+}
+
 fn scope_slug(deployment_id: Option<&str>) -> anyhow::Result<String> {
     match deployment_id {
         None => Ok(HOST_SCOPE.to_owned()),
-        Some(id) => {
-            let legal = !id.is_empty()
-                && id.len() <= 128
-                && id != "."
-                && id != ".."
-                && id.chars().all(|character| {
-                    character.is_ascii_alphanumeric() || ".:_+-".contains(character)
-                });
-            if legal {
-                Ok(id.to_owned())
-            } else {
-                bail!("{TARGET_JOURNAL_INVALID}: deployment_id is not usable as a journal scope")
-            }
-        }
+        Some(id) => deployment_scope(id),
     }
 }
 

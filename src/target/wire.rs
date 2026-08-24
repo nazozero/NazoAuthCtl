@@ -19,9 +19,12 @@
 //! - diagnostics quote only bounded, sanitized tokens — raw payload bytes
 //!   are never echoed back.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+use super::deployment_state::{ArtifactRefs, RuntimeSurface, StateMutationPayload};
 
 /// Wire schema discriminator for HostOperation and HostResult messages.
 pub const HOST_PROTOCOL_SCHEMA: u32 = 1;
@@ -36,7 +39,12 @@ pub const MAX_HOST_RESULT_BYTES: usize = 1024 * 1024;
 /// [`HostOperationBody`] variants on purpose; the wire-level parse classifies
 /// unknown kinds here before typed deserialization, and the
 /// `every_registered_kind_round_trips` test pins this list to the enum.
-pub const HOST_OPERATION_KINDS: &[&str] = &["hello", "ping"];
+///
+/// The F01 wave adds exactly two DeploymentState kinds: one read
+/// (`state-inspect`) and one write (`state-mutate`, itself discriminated by
+/// the closed [`StateMutationPayload`] set). The set stays this small until a
+/// real consumer demands more.
+pub const HOST_OPERATION_KINDS: &[&str] = &["hello", "ping", "state-inspect", "state-mutate"];
 
 /// Product identity reported by a remote helper and required by the C08
 /// handshake. Anything else is a different program and must never be mutated.
@@ -57,10 +65,6 @@ pub const HOST_ERR_OPERATION_INVALID: &str = "OPERATION_INVALID";
 
 /// Stable failure code: the target does not implement the requested kind.
 pub const HOST_ERR_UNSUPPORTED_OPERATION: &str = "UNSUPPORTED_OPERATION";
-
-/// Stable failure code: expected-revision CAS mismatch against the target
-/// DeploymentState. Consumed by the deployment waves (F04).
-pub const HOST_ERR_REVISION_MISMATCH: &str = "REVISION_MISMATCH";
 
 /// Stable failure code: the same `operation_id` was already accepted with a
 /// different canonical request hash (goal plan 01 rule 13). The retry must
@@ -160,6 +164,14 @@ pub enum HostOperationBody {
     /// Helper identity announcement (task C08). Answered with
     /// [`HostCompletionBody::Hello`]; carries no state and no binding.
     Hello {},
+    /// Read one deployment's target-side DeploymentState (task F01).
+    /// Requires the instance binding; read-only, so `expected_revision`
+    /// never applies.
+    StateInspect {},
+    /// Apply one closed-set mutation to the target DeploymentState (tasks
+    /// F01/F04). Bootstrap creates fresh state; every other mutation is
+    /// CAS-guarded by the mandatory `expected_revision`.
+    StateMutate { mutation: StateMutationPayload },
 }
 
 impl HostOperationBody {
@@ -167,6 +179,8 @@ impl HostOperationBody {
         match self {
             Self::Ping { .. } => "ping",
             Self::Hello {} => "hello",
+            Self::StateInspect {} => "state-inspect",
+            Self::StateMutate { .. } => "state-mutate",
         }
     }
 }
@@ -195,6 +209,38 @@ impl HostOperation {
         }
     }
 
+    /// Read one deployment's target-side DeploymentState (task F01).
+    pub fn state_inspect(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::StateInspect {},
+        }
+    }
+
+    /// Apply one state mutation (task F01/F04). `expected_revision` is
+    /// mandatory for every mutation except bootstrap, where it must be
+    /// absent; [`HostOperation::validate`] enforces the pairing.
+    pub fn state_mutate(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        expected_revision: Option<u64>,
+        mutation: StateMutationPayload,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision,
+            operation: HostOperationBody::StateMutate { mutation },
+        }
+    }
+
     pub fn validate(&self) -> Result<(), MessageRejection> {
         if self.schema != HOST_PROTOCOL_SCHEMA {
             return Err(MessageRejection::new(
@@ -208,9 +254,13 @@ impl HostOperation {
                 "operation_id must be a UUIDv7",
             ));
         }
-        if let Some(deployment) = self.deployment_id.as_deref()
-            && !valid_token(deployment, 128)
-        {
+        let bound = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(|deployment| valid_token(deployment, 128))
+                .unwrap_or(false)
+        };
+        if self.deployment_id.is_some() && !bound(&self.deployment_id) {
             return Err(MessageRejection::new(
                 RejectionCode::OperationMalformed,
                 "deployment_id is not a valid identifier",
@@ -240,6 +290,47 @@ impl HostOperation {
                         RejectionCode::OperationMalformed,
                         "hello must not carry deployment_id or expected_revision",
                     ));
+                }
+            }
+            HostOperationBody::StateInspect {} => {
+                // Inspection addresses exactly one registered deployment and
+                // never mutates, so a revision expectation is meaningless.
+                if self.deployment_id.is_none() || self.expected_revision.is_some() {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "state-inspect requires deployment_id and must not carry \
+                         expected_revision",
+                    ));
+                }
+            }
+            HostOperationBody::StateMutate { mutation } => {
+                if self.deployment_id.is_none() {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "state-mutate requires deployment_id",
+                    ));
+                }
+                match mutation {
+                    StateMutationPayload::Bootstrap { .. } => {
+                        // There is no prior revision to expect on creation.
+                        if self.expected_revision.is_some() {
+                            return Err(MessageRejection::new(
+                                RejectionCode::OperationMalformed,
+                                "bootstrap must not carry expected_revision",
+                            ));
+                        }
+                    }
+                    StateMutationPayload::ApplyConfig { .. } => {
+                        // CAS is the whole point of config application (F04):
+                        // without an expectation the mutation is rejected
+                        // instead of silently last-write-winning.
+                        if self.expected_revision.is_none() {
+                            return Err(MessageRejection::new(
+                                RejectionCode::OperationMalformed,
+                                "apply-config requires expected_revision",
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -298,6 +389,12 @@ impl HostResult {
 }
 
 /// Outcome half of a [`HostResult`], discriminated by the closed `status`.
+//
+// `large_enum_variant` is intentional: the completed body carries the typed
+// inspection payload (F01), and HostResult is a short-lived per-operation
+// value where an extra indirection would buy nothing but churn at every
+// match site.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HostOutcome {
@@ -309,8 +406,45 @@ pub enum HostOutcome {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HostCompletionBody {
-    Ping { nonce: String },
-    Hello { hello: RemoteHello },
+    Ping {
+        nonce: String,
+    },
+    Hello {
+        hello: RemoteHello,
+    },
+    /// Full live view of one deployment's target-side state (F01).
+    StateInspect {
+        inspection: InstanceInspection,
+    },
+    /// The revision a successful mutation produced (F04).
+    StateMutateApplied {
+        revision: u64,
+    },
+}
+
+/// Live inspection of one registered instance read from the target-side
+/// DeploymentState (task F01). This is the payload both transports answer
+/// with and the exact type [`crate::target::ExecutionTarget::inspect_instance`]
+/// returns, so local and remote reads cannot drift apart.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstanceInspection {
+    pub deployment_id: String,
+    pub issuer: String,
+    pub observed_at: DateTime<Utc>,
+    /// Current config revision (the single CAS fact, F04).
+    pub revision: u64,
+    pub runtime: RuntimeSurface,
+    pub artifact: ArtifactRefs,
+    pub config_reference: String,
+    pub config_schema: String,
+    /// Concrete resources with ownership + scope facts (F02).
+    pub resources: Vec<super::deployment_state::Resource>,
+    pub healthy: bool,
+    pub health_summary: String,
+    /// Operation id that produced the current revision, if any (journal index).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_host_operation: Option<String>,
 }
 
 /// Identity a target helper announces about itself (goal plan 03 §6).
@@ -560,7 +694,10 @@ mod tests {
 
     #[test]
     fn every_registered_kind_round_trips() -> anyhow::Result<()> {
-        assert_eq!(HOST_OPERATION_KINDS, &["hello", "ping"]);
+        assert_eq!(
+            HOST_OPERATION_KINDS,
+            &["hello", "ping", "state-inspect", "state-mutate"]
+        );
         let operation = ping_operation("probe");
         let encoded = encode_host_operation(&operation)?;
         let parsed = parse_host_operation(&encoded)?;
@@ -574,6 +711,136 @@ mod tests {
             "canonical encoding carries the tagged empty payload"
         );
         assert_eq!(parse_host_operation(&encoded)?, hello);
+
+        // F01 kinds round-trip with their typed payloads intact.
+        let inspect = HostOperation::state_inspect(Uuid::now_v7().to_string(), "deploy-alpha");
+        let parsed = parse_host_operation(&encode_host_operation(&inspect)?)?;
+        assert_eq!(parsed, inspect);
+        assert_eq!(parsed.operation.kind(), "state-inspect");
+
+        let bootstrap = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            None,
+            StateMutationPayload::Bootstrap {
+                issuer: "https://auth.example.com".to_owned(),
+                runtime: super::super::deployment_state::RuntimeSurface::new(
+                    "podman",
+                    "nazoauth-main",
+                )?,
+                artifact: Default::default(),
+                config_reference: "/etc/nazauth/config.toml".to_owned(),
+                config_schema: "nazauth-config-v1".to_owned(),
+                resources: vec![super::super::deployment_state::Resource::new(
+                    "db",
+                    "postgres",
+                    "pg-main.example.internal:5432",
+                    super::super::deployment_state::ResourceOwnership::External,
+                    super::super::deployment_state::ResourceScope::Shared,
+                )?],
+            },
+        );
+        let parsed = parse_host_operation(&encode_host_operation(&bootstrap)?)?;
+        assert_eq!(parsed, bootstrap);
+        assert_eq!(parsed.operation.kind(), "state-mutate");
+
+        let apply = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            Some(3),
+            StateMutationPayload::ApplyConfig {
+                reference: "/etc/nazauth/config.toml".to_owned(),
+                schema: "nazauth-config-v1".to_owned(),
+            },
+        );
+        assert_eq!(
+            parse_host_operation(&encode_host_operation(&apply)?)?,
+            apply
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn state_kinds_enforce_binding_and_revision_pairing() -> anyhow::Result<()> {
+        // Inspect demands its instance binding and never a revision.
+        let mut missing = HostOperation::ping(Uuid::now_v7().to_string(), "x");
+        missing.operation = HostOperationBody::StateInspect {};
+        missing.deployment_id = None;
+        let rejection = missing.validate().expect_err("inspect without binding");
+        assert!(
+            rejection.detail.contains("requires deployment_id"),
+            "{rejection}"
+        );
+
+        let mut revisioned = HostOperation::state_inspect(Uuid::now_v7().to_string(), "deploy-a");
+        revisioned.expected_revision = Some(2);
+        let rejection = revisioned.validate().expect_err("inspect with revision");
+        assert!(
+            rejection
+                .detail
+                .contains("must not carry expected_revision"),
+            "{rejection}"
+        );
+
+        // Apply-config without an expectation would be last-write-wins.
+        let mut cas_free = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-a",
+            None,
+            StateMutationPayload::ApplyConfig {
+                reference: "/cfg".to_owned(),
+                schema: "v1".to_owned(),
+            },
+        );
+        let rejection = cas_free.validate().expect_err("apply without CAS");
+        assert!(
+            rejection.detail.contains("expected_revision"),
+            "{rejection}"
+        );
+
+        // Bootstrap over a claimed prior revision is rejected too.
+        cas_free.expected_revision = Some(9);
+        cas_free.operation = HostOperationBody::StateMutate {
+            mutation: StateMutationPayload::Bootstrap {
+                issuer: "https://auth.example.com".to_owned(),
+                runtime: super::super::deployment_state::RuntimeSurface::new("host", "unit")?,
+                artifact: Default::default(),
+                config_reference: "/cfg".to_owned(),
+                config_schema: "v1".to_owned(),
+                resources: Vec::new(),
+            },
+        };
+        let rejection = cas_free.validate().expect_err("bootstrap with revision");
+        assert!(rejection.detail.contains("bootstrap"), "{rejection}");
+
+        // Mutations always demand their binding.
+        let mut unbound = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "",
+            Some(1),
+            StateMutationPayload::ApplyConfig {
+                reference: "/cfg".to_owned(),
+                schema: "v1".to_owned(),
+            },
+        );
+        unbound.deployment_id = None;
+        let rejection = unbound.validate().expect_err("mutate without binding");
+        assert!(
+            rejection.detail.contains("requires deployment_id"),
+            "{rejection}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_mutation_tag_is_rejected_without_echoing_payloads() -> anyhow::Result<()> {
+        let raw = format!(
+            r#"{{"schema":{HOST_PROTOCOL_SCHEMA},"operation_id":"{}","deployment_id":"deploy-a","operation":{{"kind":"state-mutate","mutation":{{"mutation":"teleport","poison":"secret-value"}}}}}}"#,
+            Uuid::now_v7()
+        );
+        let rejection = parse_host_operation(raw.as_bytes()).expect_err("unknown mutation tag");
+        assert_eq!(rejection.code, RejectionCode::OperationMalformed);
+        assert!(!rejection.detail.contains("secret-value"), "{rejection}");
         Ok(())
     }
 

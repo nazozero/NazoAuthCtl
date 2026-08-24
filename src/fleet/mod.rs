@@ -22,7 +22,8 @@ use crate::registry::{
 };
 use crate::target::{
     ExecutionTarget, HOST_ERR_REMOTE_HELPER_MISMATCH, HostCompletionBody, HostOperation,
-    HostOutcome, LocalTarget, RemoteHello, SshTarget, verify_remote_hello,
+    HostOutcome, InstanceInspection, LocalTarget, RemoteHello, ResourceOwnership, SshTarget,
+    verify_remote_hello,
 };
 
 /// Stable rejection: a multi-instance Registry demands an explicit selector.
@@ -69,7 +70,7 @@ impl FleetContext {
 
 fn production_target(record: &HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget>> {
     match record.transport {
-        HostTransport::Local => Ok(Box::new(LocalTarget::new())),
+        HostTransport::Local => Ok(Box::new(LocalTarget::new()?)),
         HostTransport::Ssh => Ok(Box::new(SshTarget::from_record(record)?)),
     }
 }
@@ -182,6 +183,37 @@ fn summarize_hello(hello: &RemoteHello) -> String {
     format!(
         "helper={} commit={commit} os={} arch={} runtimes={runtimes}",
         hello.version, hello.os, hello.arch
+    )
+}
+
+/// Compact single-line summary of one live DeploymentState inspection
+/// (task F01). This is what `--refresh` writes into the instance observation
+/// cache — real inspection data, never a placeholder sentence. The cache is
+/// still display-only: it never authorizes or overwrites target state.
+fn summarize_inspection(inspection: &InstanceInspection) -> String {
+    let artifacts = match (&inspection.artifact.current, &inspection.artifact.previous) {
+        (None, None) => "-".to_owned(),
+        (current, previous) => {
+            let current = current.clone().unwrap_or_else(|| "-".to_owned());
+            let previous = previous.clone().unwrap_or_else(|| "-".to_owned());
+            format!("{current}<-{previous}")
+        }
+    };
+    let managed = inspection
+        .resources
+        .iter()
+        .filter(|resource| resource.ownership == ResourceOwnership::Managed)
+        .count();
+    let health = if inspection.healthy { "ok" } else { "down" };
+    format!(
+        "rev={} runtime={}/{} config={} artifacts={} resources={} managed={} health={health}",
+        inspection.revision,
+        inspection.runtime.kind,
+        inspection.runtime.object,
+        inspection.config_reference,
+        artifacts,
+        inspection.resources.len(),
+        managed,
     )
 }
 
@@ -507,15 +539,25 @@ fn instance_list(context: &FleetContext, refresh: bool) -> anyhow::Result<String
                         .iter()
                         .filter(|other| other.host_id == host.host_id)
                     {
-                        context.store.set_instance_observation(
-                            &bound.deployment_id,
-                            ObservationCache::now(
-                                true,
-                                format!(
-                                    "host helper verified ({summary}); instance inspection lands with DeploymentState (F01)"
-                                ),
+                        // Real DeploymentState inspection per instance (F01):
+                        // the cache now holds live facts, not a placeholder.
+                        let observation = match target.inspect_instance(&bound.deployment_id) {
+                            Ok(inspection) if inspection.deployment_id == bound.deployment_id => {
+                                ObservationCache::now(true, summarize_inspection(&inspection))
+                            }
+                            Ok(inspection) => ObservationCache::now(
+                                false,
+                                bounded_error_text(&anyhow::anyhow!(
+                                    "target reports deployment '{}' where '{}' is registered",
+                                    inspection.deployment_id,
+                                    bound.deployment_id
+                                )),
                             ),
-                        )?;
+                            Err(error) => ObservationCache::now(false, bounded_error_text(&error)),
+                        };
+                        context
+                            .store
+                            .set_instance_observation(&bound.deployment_id, observation)?;
                     }
                 }
                 Err(error) => {
@@ -761,10 +803,10 @@ fn instance_relocate(
         .host_by_alias(to_host)?
         .with_context(|| format!("unknown target host alias '{to_host}'"))?;
 
-    // Task B07: relocation updates the binding ONLY after live verification
-    // through the NEW host — verified helper identity first, then a
-    // DeploymentState identity inspection proving the same deployment really
-    // runs there.
+    // Task B07 + F01: relocation updates the binding ONLY after live
+    // verification through the NEW host — verified helper identity first,
+    // then a real DeploymentState inspection proving the same deployment
+    // really runs there.
     let target = context.target_for(&destination)?;
     let hello = live_probe(target.as_ref()).with_context(|| {
         format!(
@@ -774,9 +816,8 @@ fn instance_relocate(
     })?;
     let inspection = target.inspect_instance(&record.deployment_id).with_context(|| {
         format!(
-            "relocation verification requires target DeploymentState inspection through '{to_host}', \
-             which lands with the F01 wave; the binding of '{}' was not changed",
-            record.alias
+            "the deployment '{}' could not be verified on '{to_host}'; the binding was not changed",
+            record.deployment_id
         )
     })?;
     if inspection.deployment_id != record.deployment_id {
@@ -796,9 +837,10 @@ fn instance_relocate(
         ObservationCache::now(
             true,
             format!(
-                "relocated onto '{}'; {}",
+                "relocated onto '{}'; {}; {}",
                 destination.alias,
-                summarize_hello(&hello)
+                summarize_hello(&hello),
+                summarize_inspection(&inspection)
             ),
         ),
     )?;
@@ -813,7 +855,7 @@ mod tests {
     use super::*;
     use crate::target::{
         ControlOperationReceipt, ControlOperationRequest, HealthSnapshot, HostOverview, HostResult,
-        InstanceInspection, TARGET_CAPABILITY_UNAVAILABLE,
+        TARGET_CAPABILITY_UNAVAILABLE,
     };
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
@@ -824,6 +866,9 @@ mod tests {
     enum Scenario {
         /// Verified helper answering hello and ping correctly.
         Online,
+        /// Verified helper whose target reports a different deployment id
+        /// than the one asked about (relocation must refuse).
+        ForeignDeployment,
         /// Answers hello with a drifted version (handshake must reject).
         HelperDrift,
         /// Transport-level failure with this diagnostic.
@@ -843,6 +888,55 @@ mod tests {
             }
             hello
         }
+
+        fn inspection(&self, deployment_id: &str) -> anyhow::Result<InstanceInspection> {
+            match self.scenario {
+                Scenario::Offline(text) => bail!("{text}"),
+                Scenario::ForeignDeployment => Ok(InstanceInspection {
+                    deployment_id: format!("elsewhere-{deployment_id}"),
+                    issuer: "https://auth.example.com".to_owned(),
+                    observed_at: chrono::Utc::now(),
+                    revision: 1,
+                    runtime: crate::target::RuntimeSurface::new("podman", "other")?,
+                    artifact: Default::default(),
+                    config_reference: "/cfg".to_owned(),
+                    config_schema: "v1".to_owned(),
+                    resources: vec![],
+                    healthy: true,
+                    health_summary: "ok".to_owned(),
+                    active_host_operation: None,
+                }),
+                _ => Ok(InstanceInspection {
+                    deployment_id: deployment_id.to_owned(),
+                    issuer: "https://auth.example.com".to_owned(),
+                    observed_at: chrono::Utc::now(),
+                    revision: 7,
+                    runtime: crate::target::RuntimeSurface::new("podman", "nazoauth-main")?,
+                    artifact: Default::default(),
+                    config_reference: "/etc/nazauth/config.toml".to_owned(),
+                    config_schema: "nazauth-config-v1".to_owned(),
+                    resources: vec![
+                        crate::target::Resource::new(
+                            "app-container",
+                            "container",
+                            "nazoauth-main",
+                            crate::target::ResourceOwnership::Managed,
+                            crate::target::ResourceScope::Deployment,
+                        )?,
+                        crate::target::Resource::new(
+                            "shared-db",
+                            "postgres",
+                            "pg-main:5432",
+                            crate::target::ResourceOwnership::External,
+                            crate::target::ResourceScope::Shared,
+                        )?,
+                    ],
+                    healthy: true,
+                    health_summary: "runtime healthy".to_owned(),
+                    active_host_operation: None,
+                }),
+            }
+        }
     }
 
     impl ExecutionTarget for FakeTarget {
@@ -850,8 +944,9 @@ mod tests {
             bail!("{TARGET_CAPABILITY_UNAVAILABLE}: unused in fleet tests")
         }
 
-        fn inspect_instance(&self, _deployment_id: &str) -> anyhow::Result<InstanceInspection> {
-            bail!("{TARGET_CAPABILITY_UNAVAILABLE}: instance inspection lands with F01")
+        fn inspect_instance(&self, deployment_id: &str) -> anyhow::Result<InstanceInspection> {
+            self.calls.set(self.calls.get() + 1);
+            self.inspection(deployment_id)
         }
 
         fn execute_host_operation(&self, operation: &HostOperation) -> anyhow::Result<HostResult> {
@@ -872,6 +967,7 @@ mod tests {
                         nonce: nonce.clone(),
                     },
                 )),
+                _ => bail!("fleet doubles only answer hello and ping"),
             }
         }
 
@@ -882,8 +978,14 @@ mod tests {
             bail!("{TARGET_CAPABILITY_UNAVAILABLE}: unused in fleet tests")
         }
 
-        fn read_health(&self, _deployment_id: &str) -> anyhow::Result<HealthSnapshot> {
-            bail!("{TARGET_CAPABILITY_UNAVAILABLE}: unused in fleet tests")
+        fn read_health(&self, deployment_id: &str) -> anyhow::Result<HealthSnapshot> {
+            let inspection = self.inspection(deployment_id)?;
+            Ok(HealthSnapshot {
+                deployment_id: inspection.deployment_id,
+                healthy: inspection.healthy,
+                summary: inspection.health_summary,
+                observed_at: inspection.observed_at,
+            })
         }
     }
 
@@ -1100,7 +1202,7 @@ mod tests {
                     "only the local host exists here"
                 );
                 *saw.borrow_mut() = true;
-                Ok(Box::new(LocalTarget::new()))
+                Ok(Box::new(LocalTarget::new()?))
             }),
         );
         let report = host_check(&context, "local")?;
@@ -1344,7 +1446,7 @@ mod tests {
     // ---------- B07 relocation constraints ----------
 
     #[test]
-    fn relocate_updates_nothing_until_target_inspection_exists() -> anyhow::Result<()> {
+    fn relocate_requires_matching_live_inspection_on_the_new_host() -> anyhow::Result<()> {
         let fixture = Fixture::with_scenario(Scenario::Online)?;
         let original = fixture.seed_ssh_host("server-a", "prod-a")?;
         let destination = fixture.seed_ssh_host("server-b", "prod-b")?;
@@ -1357,33 +1459,6 @@ mod tests {
         )?;
         record.last_observation = Some(ObservationCache::now(true, "old host view"));
         fixture.store().add_instance(record)?;
-
-        let error = instance_relocate(
-            &fixture.context,
-            &InstanceSelector {
-                positional: Some("production".to_owned()),
-                named: None,
-            },
-            "server-b",
-        )
-        .expect_err("inspection unavailable until F01");
-        let rendered = format!("{error:#}");
-        assert!(
-            rendered.contains(TARGET_CAPABILITY_UNAVAILABLE),
-            "{rendered}"
-        );
-        assert!(rendered.contains("was not changed"), "{rendered}");
-
-        let unchanged = fixture
-            .store()
-            .instance_by_deployment("deploy-alpha")?
-            .expect("still present");
-        assert_eq!(unchanged.host_id, original.host_id);
-        assert!(
-            unchanged.last_observation.is_some(),
-            "old-host cache preserved"
-        );
-        assert_ne!(unchanged.host_id, destination.host_id);
 
         // Cheap guards fire before any live contact.
         let calls_after_guards = fixture.calls.get();
@@ -1412,6 +1487,89 @@ mod tests {
             calls_after_guards,
             "guards precede the network"
         );
+
+        // The live inspection through the new host proves the deployment
+        // identity, and the binding moves with a real inspection summary.
+        let report = instance_relocate(
+            &fixture.context,
+            &InstanceSelector {
+                positional: Some("production".to_owned()),
+                named: None,
+            },
+            "server-b",
+        )?;
+        assert!(report.contains("'server-b'"), "{report}");
+
+        let moved = fixture
+            .store()
+            .instance_by_deployment("deploy-alpha")?
+            .expect("still present");
+        assert_eq!(moved.host_id, destination.host_id);
+        let observation = moved.last_observation.expect("fresh observation");
+        assert!(
+            observation.summary.contains("rev=7"),
+            "real inspection data recorded: {observation:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn relocate_refuses_when_the_target_reports_a_foreign_deployment() -> anyhow::Result<()> {
+        let fixture = Fixture::with_scenario(Scenario::ForeignDeployment)?;
+        let original = fixture.seed_ssh_host("server-a", "prod-a")?;
+        let destination = fixture.seed_ssh_host("server-b", "prod-b")?;
+        fixture.seed_instance(original.host_id, "deploy-alpha", "production")?;
+
+        let error = instance_relocate(
+            &fixture.context,
+            &InstanceSelector {
+                positional: Some("production".to_owned()),
+                named: None,
+            },
+            "server-b",
+        )
+        .expect_err("foreign identity");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("elsewhere-deploy-alpha"), "{rendered}");
+        assert!(rendered.contains("was not changed"), "{rendered}");
+
+        let unchanged = fixture
+            .store()
+            .instance_by_deployment("deploy-alpha")?
+            .expect("still present");
+        assert_eq!(unchanged.host_id, original.host_id);
+        assert_ne!(unchanged.host_id, destination.host_id);
+        Ok(())
+    }
+
+    #[test]
+    fn relocate_fails_closed_when_the_new_host_is_unreachable() -> anyhow::Result<()> {
+        let fixture = Fixture::with_host_scenarios(Box::new(|record| {
+            if record.alias == "server-b" {
+                Scenario::Offline("ssh to 'server-b' timed out")
+            } else {
+                Scenario::Online
+            }
+        }))?;
+        let original = fixture.seed_ssh_host("server-a", "prod-a")?;
+        fixture.seed_ssh_host("server-b", "prod-b")?;
+        fixture.seed_instance(original.host_id, "deploy-alpha", "production")?;
+
+        let error = instance_relocate(
+            &fixture.context,
+            &InstanceSelector {
+                positional: Some("production".to_owned()),
+                named: None,
+            },
+            "server-b",
+        )
+        .expect_err("offline destination");
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        let unchanged = fixture
+            .store()
+            .instance_by_deployment("deploy-alpha")?
+            .expect("still present");
+        assert_eq!(unchanged.host_id, original.host_id);
         Ok(())
     }
 }

@@ -18,39 +18,16 @@ use std::io::Read as _;
 use anyhow::{Context, bail};
 
 use super::{
-    LocalTarget, TargetJournal,
+    LocalTarget, TargetJournal, target_state_root,
     wire::{RejectionCode, encode_host_result, parse_host_operation},
 };
 
-/// Interim target state root for the operation journal until F01 formalizes
-/// DeploymentState storage. Target administrators may relocate it with
-/// `NAZOAUTHCTL_TARGET_STATE_ROOT`; the journal path layout beneath the root
-/// is owned by [`TargetJournal`] alone.
-fn interim_target_state_root() -> anyhow::Result<std::path::PathBuf> {
-    if let Some(root) = std::env::var_os("NAZOAUTHCTL_TARGET_STATE_ROOT") {
-        return Ok(std::path::PathBuf::from(root));
-    }
-    #[cfg(windows)]
-    {
-        let program_data = std::env::var_os("ProgramData")
-            .context("ProgramData is not set; cannot locate the target state root")?;
-        Ok(std::path::PathBuf::from(program_data)
-            .join("nazoauthctl")
-            .join("target-state"))
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(std::path::PathBuf::from(
-            "/var/lib/nazoauthctl/target-state",
-        ))
-    }
-}
-
-/// CLI entry point: wire real stdin/stdout into [`serve`].
+/// CLI entry point: wire real stdin/stdout into [`serve`]. The state root is
+/// the formalized [`super::target_state_root`] (task F01).
 pub(crate) fn run_stdio() -> anyhow::Result<()> {
     let raw = read_bounded_stdin()?;
     let mut stdout = std::io::stdout().lock();
-    serve(&raw, &mut stdout, &interim_target_state_root()?)
+    serve(&raw, &mut stdout, &target_state_root()?)
 }
 
 /// Answer exactly one HostOperation from `input` with one HostResult on
@@ -74,7 +51,8 @@ pub(crate) fn serve(
         parse_host_operation(input).map_err(|rejection| anyhow::anyhow!("{rejection}"))?;
 
     let journal = TargetJournal::open(state_root)?;
-    let result = LocalTarget::new().execute_journaled(&operation, &journal)?;
+    let target = LocalTarget::with_state_root(state_root);
+    let result = target.execute_journaled(&operation, &journal)?;
 
     output.write_all(&encode_host_result(&result)?)?;
     output.write_all(b"\n")?;
@@ -207,6 +185,202 @@ mod tests {
             panic!("expected a hello completion");
         };
         crate::target::verify_remote_hello(&hello).map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    // ---------- F01/F04 end-to-end over the remote exec protocol ----------
+
+    use crate::target::deployment_state::{
+        ArtifactRefs, CONFIG_REVISION_MISMATCH, DEPLOYMENT_UNKNOWN, Resource, ResourceOwnership,
+        ResourceScope, RuntimeSurface, StateMutationPayload,
+    };
+    use crate::target::{HostCompletionBody as Body, HostOperation};
+
+    fn bootstrap_input() -> anyhow::Result<Vec<u8>> {
+        let operation = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            None,
+            StateMutationPayload::Bootstrap {
+                issuer: "https://auth.example.com".to_owned(),
+                runtime: RuntimeSurface::new("podman", "nazoauth-main")?,
+                artifact: ArtifactRefs {
+                    current: Some("sha256:abcdef0123456789".to_owned()),
+                    previous: None,
+                },
+                config_reference: "/etc/nazauth/config.toml".to_owned(),
+                config_schema: "nazauth-config-v1".to_owned(),
+                resources: vec![
+                    Resource::new(
+                        "app-container",
+                        "container",
+                        "nazoauth-main",
+                        ResourceOwnership::Managed,
+                        ResourceScope::Deployment,
+                    )?,
+                    Resource::new(
+                        "shared-db",
+                        "postgres",
+                        "pg-main.example.internal:5432",
+                        ResourceOwnership::External,
+                        ResourceScope::Shared,
+                    )?,
+                ],
+            },
+        );
+        Ok(serde_json::to_vec(&operation)?)
+    }
+
+    fn apply_config_input(expected_revision: u64) -> anyhow::Result<Vec<u8>> {
+        let operation = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            Some(expected_revision),
+            StateMutationPayload::ApplyConfig {
+                reference: "/etc/nazauth/config-v2.toml".to_owned(),
+                schema: "nazauth-config-v2".to_owned(),
+            },
+        );
+        Ok(serde_json::to_vec(&operation)?)
+    }
+
+    fn inspect_input() -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&HostOperation::state_inspect(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+        ))?)
+    }
+
+    fn answered(input: &[u8], root: &std::path::Path) -> anyhow::Result<crate::target::HostResult> {
+        let mut output = Vec::new();
+        serve(input, &mut output, root)?;
+        parse_host_result(&output).map_err(|rejection| anyhow::anyhow!("{rejection}"))
+    }
+
+    #[test]
+    fn state_kinds_flow_end_to_end_through_the_remote_exec_contract() -> anyhow::Result<()> {
+        let (_temp, root) = temp_state()?;
+
+        // Bootstrap creates the target-side authority document.
+        let bootstrapped = answered(&bootstrap_input()?, &root)?;
+        let crate::target::HostOutcome::Completed {
+            body: Body::StateMutateApplied { revision },
+        } = bootstrapped.outcome
+        else {
+            panic!("expected a bootstrap completion: {bootstrapped:?}");
+        };
+        assert_eq!(revision, 1);
+
+        // A stale CAS expectation is refused without last-write-wins.
+        let stale = answered(&apply_config_input(99)?, &root)?;
+        let crate::target::HostOutcome::Failed { code, .. } = stale.outcome else {
+            panic!("expected the CAS failure: {stale:?}");
+        };
+        assert_eq!(code, CONFIG_REVISION_MISMATCH);
+
+        // The matching expectation applies and bumps exactly one revision.
+        let applied = answered(&apply_config_input(1)?, &root)?;
+        let crate::target::HostOutcome::Completed {
+            body: Body::StateMutateApplied { revision },
+        } = applied.outcome
+        else {
+            panic!("expected an applied completion: {applied:?}");
+        };
+        assert_eq!(revision, 2);
+
+        // Inspection reports the live document through the same contract.
+        let inspected = answered(&inspect_input()?, &root)?;
+        let crate::target::HostOutcome::Completed {
+            body: Body::StateInspect { inspection },
+        } = inspected.outcome
+        else {
+            panic!("expected an inspection: {inspected:?}");
+        };
+        assert_eq!(inspection.deployment_id, "deploy-alpha");
+        assert_eq!(inspection.revision, 2);
+        assert_eq!(inspection.config_reference, "/etc/nazauth/config-v2.toml");
+        assert_eq!(inspection.resources.len(), 2);
+        let external = inspection
+            .resources
+            .iter()
+            .find(|resource| resource.resource_id == "shared-db")
+            .expect("declared resource");
+        assert_eq!(external.ownership, ResourceOwnership::External);
+
+        // Unknown deployments answer with the stable code.
+        let missing = serde_json::to_vec(&HostOperation::state_inspect(
+            Uuid::now_v7().to_string(),
+            "deploy-ghost",
+        ))?;
+        let failed = answered(&missing, &root)?;
+        let crate::target::HostOutcome::Failed { code, .. } = failed.outcome else {
+            panic!("expected a failed inspection");
+        };
+        assert_eq!(code, DEPLOYMENT_UNKNOWN);
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_state_mutations_resume_without_double_applying() -> anyhow::Result<()> {
+        use crate::target::journal::{JournalLine, JournalStatus, TargetJournal};
+        use crate::target::wire::{HOST_ERR_OPERATION_INVALID, canonical_operation_hash};
+        use std::io::Write as _;
+
+        let (_temp, root) = temp_state()?;
+        serve(&bootstrap_input()?, &mut Vec::new(), &root)?;
+
+        // Simulate a crash after acceptance but before execution: the
+        // pending line exists, no terminal result does.
+        let operation: HostOperation = serde_json::from_slice(&apply_config_input(1)?)?;
+        let journal = TargetJournal::open(&root)?;
+        let pending = serde_json::to_string(&JournalLine {
+            schema: 1,
+            operation_id: operation.operation_id.clone(),
+            operation_hash: canonical_operation_hash(&operation)?,
+            status: JournalStatus::Pending,
+            result: None,
+        })?;
+        let journal_path = root
+            .join("deployments")
+            .join("deploy-alpha")
+            .join("operations.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&journal_path)?;
+        file.write_all(pending.as_bytes())?;
+        file.write_all(b"\n")?;
+        drop(file);
+        drop(journal);
+
+        let resumed = answered(&serde_json::to_vec(&operation)?, &root)?;
+        match resumed.outcome {
+            crate::target::HostOutcome::Completed {
+                body: Body::StateMutateApplied { revision },
+            } => assert_eq!(revision, 2, "resume applies exactly once"),
+            other => panic!("expected the resumed apply to complete: {other:?}"),
+        }
+
+        // The journal now carries bootstrap(pending+terminal), the crashed
+        // pending line, the resume pending line, and the terminal result.
+        let raw = std::fs::read_to_string(
+            root.join("deployments")
+                .join("deploy-alpha")
+                .join("operations.jsonl"),
+        )?;
+        assert_eq!(raw.lines().count(), 5, "{raw}");
+
+        // And a replay of the same bytes returns the stored terminal result.
+        let replayed = answered(&serde_json::to_vec(&operation)?, &root)?;
+        assert_eq!(replayed.outcome, resumed.outcome);
+
+        // Sanity: bootstrap over existing state is refused even via resume.
+        let clash = answered(&bootstrap_input()?, &root)?;
+        let crate::target::HostOutcome::Failed { code, detail } = clash.outcome else {
+            panic!("expected DEPLOYMENT_EXISTS");
+        };
+        assert_ne!(code, HOST_ERR_OPERATION_INVALID);
+        assert!(detail.contains("never overwrites"), "{detail}");
         Ok(())
     }
 }

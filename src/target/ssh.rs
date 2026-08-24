@@ -335,8 +335,8 @@ impl SshTarget {
 
     fn unavailable(method: &str) -> anyhow::Error {
         anyhow::anyhow!(
-            "{TARGET_CAPABILITY_UNAVAILABLE}: {method} executes once the target \
-             DeploymentState (F01) and ControlOperation waves land"
+            "{TARGET_CAPABILITY_UNAVAILABLE}: {method} executes once the ControlOperation \
+             execution wave (E01/E03) lands"
         )
     }
 }
@@ -363,8 +363,23 @@ impl ExecutionTarget for SshTarget {
         })
     }
 
-    fn inspect_instance(&self, _deployment_id: &str) -> anyhow::Result<InstanceInspection> {
-        Err(Self::unavailable("inspect_instance"))
+    fn inspect_instance(&self, deployment_id: &str) -> anyhow::Result<InstanceInspection> {
+        // Live read of the target-side DeploymentState through the fixed
+        // stdio contract (F01). The state-inspect kind is handshake-gated
+        // like every non-probe kind, so an unverified helper can never be
+        // asked about deployments.
+        let operation = HostOperation::state_inspect(Uuid::now_v7().to_string(), deployment_id);
+        match self.execute_host_operation(&operation)?.outcome {
+            HostOutcome::Completed {
+                body: HostCompletionBody::StateInspect { inspection },
+            } => Ok(inspection),
+            HostOutcome::Completed { .. } => bail!(
+                "the helper on '{}' answered an unexpected completion instead of a deployment \
+                 inspection",
+                self.profile
+            ),
+            HostOutcome::Failed { code, detail } => Err(anyhow::anyhow!("{code}: {detail}")),
+        }
     }
 
     fn execute_host_operation(&self, operation: &HostOperation) -> anyhow::Result<HostResult> {
@@ -390,8 +405,14 @@ impl ExecutionTarget for SshTarget {
         Err(Self::unavailable("execute_control_operation"))
     }
 
-    fn read_health(&self, _deployment_id: &str) -> anyhow::Result<HealthSnapshot> {
-        Err(Self::unavailable("read_health"))
+    fn read_health(&self, deployment_id: &str) -> anyhow::Result<HealthSnapshot> {
+        let inspection = self.inspect_instance(deployment_id)?;
+        Ok(HealthSnapshot {
+            deployment_id: inspection.deployment_id,
+            healthy: inspection.healthy,
+            summary: inspection.health_summary,
+            observed_at: inspection.observed_at,
+        })
     }
 }
 
@@ -433,6 +454,16 @@ mod tests {
 
     impl SshStub {
         fn install(scenario: &StubScenario) -> anyhow::Result<Self> {
+            Self::install_with_hello(scenario, None)
+        }
+
+        /// Install a stub whose hello answers come from `hello_response_json`
+        /// while every other kind gets `scenario.response_json`. Used to prove
+        /// the handshake gate really runs before DeploymentState kinds.
+        fn install_with_hello(
+            scenario: &StubScenario,
+            hello_response_json: Option<&str>,
+        ) -> anyhow::Result<Self> {
             let dir = filesystem::PrivateTempDir::new("nazauthctl-ssh-stub")?;
             let root = dir.path();
             filesystem::atomic_write(
@@ -440,6 +471,13 @@ mod tests {
                 scenario.response_json.as_bytes(),
                 0o600,
             )?;
+            if let Some(hello_response_json) = hello_response_json {
+                filesystem::atomic_write(
+                    &root.join("hello-response.json"),
+                    hello_response_json.as_bytes(),
+                    0o600,
+                )?;
+            }
             if let Some(stderr_text) = scenario.stderr_text {
                 filesystem::atomic_write(&root.join("stderr.txt"), stderr_text.as_bytes(), 0o600)?;
             }
@@ -496,7 +534,14 @@ mod tests {
 printf '%s\n' "$*" >> "$(dirname "$0")/argv.txt"
 input=$(cat)
 caller=$(printf '%s' "$input" | sed -n 's/.*"operation_id":"\([0-9a-fA-F-]*\)".*/\1p')
-sed "s/__OPERATION_ID__/${caller:-none}/g" "$(dirname "$0")/response.json"
+response="$(dirname "$0")/response.json"
+case "$input" in
+  *'"kind":"hello"'*)
+    if [ -f "$(dirname "$0")/hello-response.json" ]; then
+      response="$(dirname "$0")/hello-response.json"
+    fi ;;
+esac
+sed "s/__OPERATION_ID__/${caller:-none}/g" "$response"
 if [ -f "$(dirname "$0")/stderr.txt" ]; then
   cat "$(dirname "$0")/stderr.txt" >&2
 fi
@@ -524,7 +569,12 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             "$stdinText = [Console]::In.ReadToEnd()",
             "$m = [regex]::Match($stdinText, '\"operation_id\":\"([0-9a-fA-F-]+)\"')",
             "$callerId = if ($m.Success) { $m.Groups[1].Value } else { '' }",
-            "$template = Get-Content -LiteralPath (Join-Path $here 'response.json') -Raw",
+            "$responsePath = Join-Path $here 'response.json'",
+            "if ($stdinText -match '\"kind\":\"hello\"') {",
+            "  $helloPath = Join-Path $here 'hello-response.json'",
+            "  if (Test-Path -LiteralPath $helloPath) { $responsePath = $helloPath }",
+            "}",
+            "$template = Get-Content -LiteralPath $responsePath -Raw",
             "[Console]::Out.Write($template.Replace('__OPERATION_ID__', $callerId))",
             "[Console]::Out.Write(\"`n\")",
             "$stderrPath = Join-Path $here 'stderr.txt'",
@@ -676,10 +726,113 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             "probes diagnose broken handshakes"
         );
         assert!(!requires_handshake("hello"));
+        // F01 DeploymentState kinds are gated like every other non-probe.
+        assert!(requires_handshake("state-inspect"));
+        assert!(requires_handshake("state-mutate"));
         // Closed-set default: every future mutation kind is gated.
         for kind in ["install", "update", "uninstall", "rollback"] {
             assert!(requires_handshake(kind), "{kind}");
         }
+    }
+
+    fn inspection_response_json(inspection: &InstanceInspection) -> String {
+        serde_json::json!({
+            "schema": HOST_PROTOCOL_SCHEMA,
+            "operation_id": "__OPERATION_ID__",
+            "outcome": {"status": "completed", "body": {
+                "result": "state-inspect",
+                "inspection": serde_json::to_value(inspection).expect("inspection serializes"),
+            }}
+        })
+        .to_string()
+    }
+
+    fn sample_inspection() -> InstanceInspection {
+        InstanceInspection {
+            deployment_id: "deploy-alpha".to_owned(),
+            issuer: "https://auth.example.com".to_owned(),
+            observed_at: chrono::Utc::now(),
+            revision: 4,
+            runtime: crate::target::deployment_state::RuntimeSurface::new(
+                "podman",
+                "nazoauth-main",
+            )
+            .unwrap(),
+            artifact: Default::default(),
+            config_reference: "/etc/nazauth/config.toml".to_owned(),
+            config_schema: "nazauth-config-v1".to_owned(),
+            resources: vec![
+                crate::target::deployment_state::Resource::new(
+                    "shared-db",
+                    "postgres",
+                    "pg-main.example.internal:5432",
+                    crate::target::deployment_state::ResourceOwnership::External,
+                    crate::target::deployment_state::ResourceScope::Shared,
+                )
+                .unwrap(),
+            ],
+            healthy: true,
+            health_summary: "runtime healthy".to_owned(),
+            active_host_operation: None,
+        }
+    }
+
+    #[test]
+    fn state_inspect_runs_only_after_a_verified_handshake() -> anyhow::Result<()> {
+        let inspection = sample_inspection();
+        let stub = SshStub::install_with_hello(
+            &StubScenario {
+                response_json: &inspection_response_json(&inspection),
+                stderr_text: None,
+                exit_code: 0,
+            },
+            Some(&hello_response_json(
+                env!("CARGO_PKG_VERSION"),
+                LOCAL_BUILD_COMMIT,
+            )),
+        )?;
+        let target = ssh_target(HostPrivilege::Direct, &stub)?;
+
+        let seen = target.inspect_instance("deploy-alpha")?;
+        assert_eq!(seen, inspection);
+
+        // Exactly two fixed round trips ran: the gated handshake first, then
+        // the state-inspect operation — both through the same argv shape.
+        let invocations = stub.argv_invocations();
+        assert_eq!(invocations.len(), 2, "{invocations:?}");
+        assert!(
+            invocations
+                .iter()
+                .all(|line| line.ends_with("-- nazoauthctl remote exec")),
+            "{invocations:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_mismatched_helper_is_never_asked_about_deployments() -> anyhow::Result<()> {
+        let stub = SshStub::install_with_hello(
+            &StubScenario {
+                response_json: &inspection_response_json(&sample_inspection()),
+                stderr_text: None,
+                exit_code: 0,
+            },
+            Some(&hello_response_json("0.0.1-old", LOCAL_BUILD_COMMIT)),
+        )?;
+        let target = ssh_target(HostPrivilege::Direct, &stub)?;
+
+        let error = target.inspect_instance("deploy-alpha").expect_err("drift");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(HOST_ERR_REMOTE_HELPER_MISMATCH),
+            "{rendered}"
+        );
+        assert_eq!(
+            stub.argv_invocations().len(),
+            1,
+            "only the failing hello may reach the wire"
+        );
+        Ok(())
     }
 
     #[test]
@@ -941,18 +1094,13 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Direct).unwrap(),
         )
         .unwrap();
-        for error in [
-            target.inspect_instance("deploy-alpha").err().unwrap(),
-            target.read_health("deploy-alpha").err().unwrap(),
-            target
-                .execute_control_operation(&super::super::ControlOperationRequest {
-                    deployment_id: "deploy-alpha".to_owned(),
-                    compact_jws: "jws".to_owned(),
-                })
-                .err()
-                .unwrap(),
-        ] {
-            assert!(format!("{error:#}").contains(TARGET_CAPABILITY_UNAVAILABLE));
-        }
+        let error = target
+            .execute_control_operation(&super::super::ControlOperationRequest {
+                deployment_id: "deploy-alpha".to_owned(),
+                compact_jws: "jws".to_owned(),
+            })
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains(TARGET_CAPABILITY_UNAVAILABLE));
     }
 }

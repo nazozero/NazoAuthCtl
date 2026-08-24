@@ -11,20 +11,30 @@
 //! from [`wire`] through system OpenSSH into the fixed `remote exec` helper
 //! ([`remote_exec`], task C04). No HTTP/Kubernetes/agent targets exist.
 
+pub mod deployment_state;
 pub mod journal;
 pub(crate) mod remote_exec;
 pub mod ssh;
 pub mod wire;
 
-use chrono::{DateTime, Utc};
+use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
+use uuid::Uuid;
+
+pub use deployment_state::{
+    ActiveHostOperationRef, ArtifactRefs, BootstrapParams, CONFIG_REVISION_MISMATCH, ConfigState,
+    DEPLOYMENT_EXISTS, DEPLOYMENT_STATE_SCHEMA, DEPLOYMENT_UNKNOWN, DeploymentState, Failure,
+    HealthRecord, MAX_RESOURCES, RESOURCE_DELETE_FORBIDDEN, RESOURCE_UNKNOWN, Resource,
+    ResourceOwnership, ResourceScope, RuntimeSurface, StateMutationPayload, TargetStateStore,
+};
 pub use journal::{JournalStatus, TargetJournal};
 pub use ssh::SshTarget;
 pub use wire::{
     HELLO_PRODUCT, HOST_ERR_OPERATION_CONFLICT, HOST_ERR_OPERATION_INVALID,
-    HOST_ERR_REMOTE_HELPER_MISMATCH, HOST_ERR_REVISION_MISMATCH, HOST_OPERATION_KINDS,
-    HOST_PROTOCOL_SCHEMA, HostCompletionBody, HostOperation, HostOperationBody, HostOutcome,
-    HostResult, LOCAL_BUILD_COMMIT, MAX_HOST_OPERATION_BYTES, MAX_HOST_RESULT_BYTES,
+    HOST_ERR_REMOTE_HELPER_MISMATCH, HOST_OPERATION_KINDS, HOST_PROTOCOL_SCHEMA,
+    HostCompletionBody, HostOperation, HostOperationBody, HostOutcome, HostResult,
+    InstanceInspection, LOCAL_BUILD_COMMIT, MAX_HOST_OPERATION_BYTES, MAX_HOST_RESULT_BYTES,
     MessageRejection, RejectionCode, RemoteHello, canonical_operation_hash, encode_host_operation,
     encode_host_result, local_hello, parse_host_operation, parse_host_result, verify_remote_hello,
 };
@@ -32,10 +42,34 @@ pub use wire::{
 /// Stable code for capabilities whose owning wave has not landed yet.
 ///
 /// This is a delivery boundary, not a compatibility shim: the contract is
-/// frozen ahead of its executors so C04/C05 can answer identically over
-/// stdio. It disappears once DeploymentState (F01) and ControlOperation
-/// execution (E01/E03) provide real behavior behind these methods.
+/// frozen ahead of its executors so transports can answer identically over
+/// stdio. After the F01 wave only the app-level ControlOperation execution
+/// path (E01/E03) still answers with it.
 pub const TARGET_CAPABILITY_UNAVAILABLE: &str = "TARGET_CAPABILITY_UNAVAILABLE";
+
+/// The formalized target state root (task F01): one private directory holding
+/// every deployment's [`DeploymentState`] document beside its C07 operation
+/// journal. Target administrators may relocate it with
+/// `NAZOAUTHCTL_TARGET_STATE_ROOT`; the layout beneath the root is owned by
+/// [`TargetStateStore`] and [`TargetJournal`] alone.
+pub fn target_state_root() -> anyhow::Result<PathBuf> {
+    if let Some(root) = std::env::var_os("NAZOAUTHCTL_TARGET_STATE_ROOT") {
+        return Ok(PathBuf::from(root));
+    }
+    #[cfg(windows)]
+    {
+        use anyhow::Context as _;
+        let program_data = std::env::var_os("ProgramData")
+            .context("ProgramData is not set; cannot locate the target state root")?;
+        Ok(std::path::PathBuf::from(program_data)
+            .join("nazoauthctl")
+            .join("target-state"))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(PathBuf::from("/var/lib/nazoauthctl/target-state"))
+    }
+}
 
 /// Read-only facts about an execution host (goal plan 03 §6 fields that have
 /// producers today). The remote handshake wave (C08) extends this type with
@@ -50,20 +84,14 @@ pub struct HostOverview {
     pub arch: String,
 }
 
-/// Minimal instance inspection seam. Filled out by the DeploymentState wave.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InstanceInspection {
-    pub deployment_id: String,
-    pub observed_at: DateTime<Utc>,
-}
-
-/// Minimal health snapshot. `read_health` becomes authoritative once the
-/// target-side DeploymentState exists; until then it reports availability.
+/// Minimal health snapshot projected from the target-side DeploymentState
+/// (`read_health` reports the authoritative `local_health` record).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HealthSnapshot {
     pub deployment_id: String,
     pub healthy: bool,
     pub summary: String,
+    pub observed_at: DateTime<Utc>,
 }
 
 /// An app-level NazoAuth operation, signed by the instance's Controller Key
@@ -117,25 +145,44 @@ pub trait ExecutionTarget {
 /// own privileges (goal plan 03 §2): no session keys, no JSON loopback — a local
 /// caller hands typed values straight to native dispatch, exactly what the
 /// remote executor does after parsing the same operation from stdin.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LocalTarget;
+///
+/// Since F01, instance inspection and health reads consult the real target
+/// [`DeploymentState`] document on this machine through
+/// [`TargetStateStore`]; there are no placeholder answers left on those
+/// paths. Production resolves the state root via [`target_state_root`];
+/// tests inject a private temp root with [`LocalTarget::with_state_root`].
+#[derive(Clone, Debug)]
+pub struct LocalTarget {
+    state_root: PathBuf,
+}
 
 impl LocalTarget {
-    pub fn new() -> Self {
-        Self
+    /// Production constructor using the formalized default state root.
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            state_root: target_state_root()?,
+        })
+    }
+
+    /// Test seam: read/write DeploymentState under this explicit root.
+    pub fn with_state_root(root: impl Into<PathBuf>) -> Self {
+        Self {
+            state_root: root.into(),
+        }
     }
 
     fn unavailable(method: &str) -> anyhow::Error {
         anyhow::anyhow!(
-            "{TARGET_CAPABILITY_UNAVAILABLE}: {method} executes once the target \
-             DeploymentState (F01) and ControlOperation waves land"
+            "{TARGET_CAPABILITY_UNAVAILABLE}: {method} executes once the ControlOperation \
+             execution wave (E01/E03) lands"
         )
     }
 
     /// Execute with the target-side journal contract (task C07): a replay of
     /// an accepted id returns the stored result, the same id with a different
     /// payload conflicts, and fresh operations are journaled pending before
-    /// dispatch and finalized after.
+    /// dispatch and finalized after. State mutations (F01) run under this
+    /// contract like every other operation.
     pub fn execute_journaled(
         &self,
         operation: &HostOperation,
@@ -148,14 +195,26 @@ impl LocalTarget {
                 format!("{}: {}", rejection.code.as_str(), rejection.detail),
             ));
         }
-        journal.run_journaled(operation, dispatch_host_operation)
+        let store = TargetStateStore::open(journal.root())?;
+        journal.run_journaled(operation, |operation| {
+            dispatch_host_operation(operation, &store)
+        })
+    }
+}
+
+impl Default for LocalTarget {
+    fn default() -> Self {
+        Self::new().expect("default target state root must resolve")
     }
 }
 
 /// Shared dispatch for validated host operations. [`LocalTarget`] answers
 /// natively with it and the remote exec helper answers through the identical
 /// function after parsing stdin, so both transports cannot drift apart.
-pub(crate) fn dispatch_host_operation(operation: &HostOperation) -> HostResult {
+pub(crate) fn dispatch_host_operation(
+    operation: &HostOperation,
+    store: &TargetStateStore,
+) -> HostResult {
     debug_assert!(
         operation.validate().is_ok(),
         "dispatch requires a validated operation"
@@ -173,6 +232,113 @@ pub(crate) fn dispatch_host_operation(operation: &HostOperation) -> HostResult {
                 hello: local_hello(local_supported_runtimes()),
             },
         ),
+        HostOperationBody::StateInspect {} => answer_inspect(operation, store)
+            .unwrap_or_else(|failure| state_failure(operation, &failure)),
+        HostOperationBody::StateMutate { mutation } => match mutation {
+            StateMutationPayload::Bootstrap {
+                issuer,
+                runtime,
+                artifact,
+                config_reference,
+                config_schema,
+                resources,
+            } => {
+                let deployment_id = operation.deployment_id.clone().unwrap_or_default();
+                let params = BootstrapParams {
+                    issuer: issuer.clone(),
+                    runtime: runtime.clone(),
+                    artifact: artifact.clone(),
+                    config_reference: config_reference.clone(),
+                    config_schema: config_schema.clone(),
+                    resources: resources.clone(),
+                };
+                match store.bootstrap(&deployment_id, params, &operation.operation_id) {
+                    Ok(state) => HostResult::completed(
+                        &operation.operation_id,
+                        HostCompletionBody::StateMutateApplied {
+                            revision: state.config.revision,
+                        },
+                    ),
+                    Err(failure) => state_failure(operation, &failure),
+                }
+            }
+            StateMutationPayload::ApplyConfig { reference, schema } => {
+                // CAS is mandatory at the wire level; validate() already
+                // rejected absent expectations, so treat None defensively.
+                let Some(expected_revision) = operation.expected_revision else {
+                    return state_failure(
+                        operation,
+                        &Failure::new(
+                            HOST_ERR_OPERATION_INVALID,
+                            "apply-config requires expected_revision",
+                        ),
+                    );
+                };
+                let deployment_id = operation.deployment_id.clone().unwrap_or_default();
+                match store.apply_config(
+                    &deployment_id,
+                    expected_revision,
+                    reference.clone(),
+                    schema.clone(),
+                    &operation.operation_id,
+                ) {
+                    Ok(config) => HostResult::completed(
+                        &operation.operation_id,
+                        HostCompletionBody::StateMutateApplied {
+                            revision: config.revision,
+                        },
+                    ),
+                    Err(failure) => state_failure(operation, &failure),
+                }
+            }
+        },
+    }
+}
+
+fn state_failure(operation: &HostOperation, failure: &Failure) -> HostResult {
+    HostResult::failed(
+        &operation.operation_id,
+        failure.code,
+        failure.detail.clone(),
+    )
+}
+
+fn answer_inspect(
+    operation: &HostOperation,
+    store: &TargetStateStore,
+) -> Result<HostResult, Failure> {
+    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
+    let state = store.load_existing(&deployment_id)?;
+    Ok(HostResult::completed(
+        &operation.operation_id,
+        HostCompletionBody::StateInspect {
+            inspection: InstanceInspection {
+                deployment_id: state.deployment_id,
+                issuer: state.issuer,
+                observed_at: Utc::now(),
+                revision: state.config.revision,
+                runtime: state.runtime,
+                artifact: state.artifact,
+                config_reference: state.config.reference,
+                config_schema: state.config.schema,
+                resources: state.resources,
+                healthy: state.local_health.healthy,
+                health_summary: state.local_health.summary,
+                active_host_operation: state
+                    .active_host_operation
+                    .map(|active| active.operation_id),
+            },
+        },
+    ))
+}
+
+/// Project a live inspection into the health view (`read_health`).
+fn health_from_inspection(inspection: &InstanceInspection) -> HealthSnapshot {
+    HealthSnapshot {
+        deployment_id: inspection.deployment_id.clone(),
+        healthy: inspection.healthy,
+        summary: inspection.health_summary.clone(),
+        observed_at: inspection.observed_at,
     }
 }
 
@@ -202,8 +368,20 @@ impl ExecutionTarget for LocalTarget {
         })
     }
 
-    fn inspect_instance(&self, _deployment_id: &str) -> anyhow::Result<InstanceInspection> {
-        Err(Self::unavailable("inspect_instance"))
+    fn inspect_instance(&self, deployment_id: &str) -> anyhow::Result<InstanceInspection> {
+        // Live read of the real state file through the same store and the
+        // same validation the remote helper answers with — no cache, no
+        // Registry shortcut (F01 boundary: the Registry cannot mutate or
+        // impersonate target state).
+        let store = TargetStateStore::open(&self.state_root)?;
+        let operation = HostOperation::state_inspect(Uuid::now_v7().to_string(), deployment_id);
+        match dispatch_host_operation(&operation, &store).outcome {
+            HostOutcome::Completed {
+                body: HostCompletionBody::StateInspect { inspection },
+            } => Ok(inspection),
+            HostOutcome::Completed { .. } => unreachable!("inspect answers with an inspection"),
+            HostOutcome::Failed { code, detail } => Err(anyhow::anyhow!("{code}: {detail}")),
+        }
     }
 
     fn execute_host_operation(&self, operation: &HostOperation) -> anyhow::Result<HostResult> {
@@ -219,7 +397,8 @@ impl ExecutionTarget for LocalTarget {
                 format!("{}: {}", rejection.code.as_str(), rejection.detail),
             ));
         }
-        Ok(dispatch_host_operation(operation))
+        let store = TargetStateStore::open(&self.state_root)?;
+        Ok(dispatch_host_operation(operation, &store))
     }
 
     fn execute_control_operation(
@@ -229,19 +408,73 @@ impl ExecutionTarget for LocalTarget {
         Err(Self::unavailable("execute_control_operation"))
     }
 
-    fn read_health(&self, _deployment_id: &str) -> anyhow::Result<HealthSnapshot> {
-        Err(Self::unavailable("read_health"))
+    fn read_health(&self, deployment_id: &str) -> anyhow::Result<HealthSnapshot> {
+        Ok(health_from_inspection(
+            &self.inspect_instance(deployment_id)?,
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uuid::Uuid;
+    use crate::filesystem::PrivateTempDir;
+
+    fn temp_target() -> anyhow::Result<(PrivateTempDir, LocalTarget, TargetJournal)> {
+        let temp = PrivateTempDir::new("nazauthctl-local-state-test")?;
+        let root = temp.path().join("state");
+        let target = LocalTarget::with_state_root(&root);
+        let journal = TargetJournal::open(&root)?;
+        Ok((temp, target, journal))
+    }
+
+    fn sample_bootstrap(deployment_id: &str) -> HostOperation {
+        HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            deployment_id,
+            None,
+            StateMutationPayload::Bootstrap {
+                issuer: "https://auth.example.com".to_owned(),
+                runtime: RuntimeSurface::new("podman", "nazoauth-main").expect("runtime"),
+                artifact: ArtifactRefs {
+                    current: Some("sha256:abcdef0123456789".to_owned()),
+                    previous: None,
+                },
+                config_reference: "/etc/nazauth/config.toml".to_owned(),
+                config_schema: "nazauth-config-v1".to_owned(),
+                resources: vec![
+                    Resource::new(
+                        "app-container",
+                        "container",
+                        "nazoauth-main",
+                        ResourceOwnership::Managed,
+                        ResourceScope::Deployment,
+                    )
+                    .expect("managed resource"),
+                    Resource::new(
+                        "shared-db",
+                        "postgres",
+                        "pg-main.example.internal:5432",
+                        ResourceOwnership::External,
+                        ResourceScope::Shared,
+                    )
+                    .expect("external resource"),
+                    Resource::new(
+                        "backup-volume",
+                        "volume",
+                        "/srv/backups/deploy-alpha",
+                        ResourceOwnership::External,
+                        ResourceScope::Deployment,
+                    )
+                    .expect("external dedicated resource"),
+                ],
+            },
+        )
+    }
 
     #[test]
     fn local_ping_smoke_executes_without_json_loopback() -> anyhow::Result<()> {
-        let target = LocalTarget::new();
+        let (_temp, target, _journal) = temp_target()?;
         let operation = HostOperation::ping(Uuid::now_v7().to_string(), "smoke-probe");
         let result = target.execute_host_operation(&operation)?;
         assert_eq!(result.operation_id, operation.operation_id);
@@ -262,7 +495,7 @@ mod tests {
 
     #[test]
     fn local_target_reports_host_facts() -> anyhow::Result<()> {
-        let overview = LocalTarget::new().inspect_host()?;
+        let overview = temp_target()?.1.inspect_host()?;
         assert_eq!(overview.product, "nazoauthctl");
         assert_eq!(overview.protocol_schema, HOST_PROTOCOL_SCHEMA);
         assert!(!overview.version.is_empty());
@@ -273,7 +506,7 @@ mod tests {
 
     #[test]
     fn invalid_operations_fail_through_the_shared_model() -> anyhow::Result<()> {
-        let target = LocalTarget::new();
+        let (_temp, target, _journal) = temp_target()?;
         let mut operation = HostOperation::ping(Uuid::now_v7().to_string(), "probe");
         operation.expected_revision = Some(4);
         let result = target.execute_host_operation(&operation)?;
@@ -297,7 +530,7 @@ mod tests {
 
     #[test]
     fn local_hello_reports_the_helper_identity() -> anyhow::Result<()> {
-        let target = LocalTarget::new();
+        let (_temp, target, _journal) = temp_target()?;
         let hello = HostOperation::hello(Uuid::now_v7().to_string());
         let result = target.execute_host_operation(&hello)?;
         let HostOutcome::Completed {
@@ -314,7 +547,7 @@ mod tests {
     fn journaled_execution_replays_and_conflicts_through_local_target() -> anyhow::Result<()> {
         let temp = crate::filesystem::PrivateTempDir::new("nazauthctl-local-journaled")?;
         let journal = TargetJournal::open(temp.path().join("state"))?;
-        let target = LocalTarget::new();
+        let target = LocalTarget::with_state_root(temp.path().join("state"));
 
         let operation = HostOperation::ping(Uuid::now_v7().to_string(), "journaled");
         let first = target.execute_journaled(&operation, &journal)?;
@@ -333,25 +566,229 @@ mod tests {
         Ok(())
     }
 
+    // ---------- F01/F02/F04 local real-file behavior ----------
+
     #[test]
-    fn pending_capabilities_report_a_stable_code() {
-        let target = LocalTarget::new();
-        for error in [
-            target.inspect_instance("deploy-alpha").err().unwrap(),
-            target
-                .execute_control_operation(&ControlOperationRequest {
-                    deployment_id: "deploy-alpha".to_owned(),
-                    compact_jws: "jws".to_owned(),
-                })
-                .err()
-                .unwrap(),
-            target.read_health("deploy-alpha").err().unwrap(),
-        ] {
-            let rendered = format!("{error:#}");
-            assert!(
-                rendered.contains(TARGET_CAPABILITY_UNAVAILABLE),
-                "{rendered}"
+    fn local_inspection_reads_the_real_state_file_on_this_machine() -> anyhow::Result<()> {
+        let (_temp, target, journal) = temp_target()?;
+
+        let unknown = target.inspect_instance("deploy-alpha").err().unwrap();
+        assert!(
+            unknown.to_string().contains(DEPLOYMENT_UNKNOWN),
+            "{unknown}"
+        );
+
+        let bootstrapped = target.execute_journaled(&sample_bootstrap("deploy-alpha"), &journal)?;
+        let HostOutcome::Completed {
+            body: HostCompletionBody::StateMutateApplied { revision },
+        } = bootstrapped.outcome
+        else {
+            panic!("expected a bootstrap completion: {bootstrapped:?}");
+        };
+        assert_eq!(revision, 1);
+
+        // The state document really exists beside its journal.
+        let state_path = journal
+            .root()
+            .join("deployments")
+            .join("deploy-alpha")
+            .join("state.json");
+        let raw = std::fs::read_to_string(&state_path)?;
+        let persisted: DeploymentState = serde_json::from_str(&raw)?;
+        assert_eq!(persisted.deployment_id, "deploy-alpha");
+        assert_eq!(persisted.resources.len(), 3);
+
+        let inspection = target.inspect_instance("deploy-alpha")?;
+        assert_eq!(inspection.deployment_id, "deploy-alpha");
+        assert_eq!(inspection.issuer, "https://auth.example.com");
+        assert_eq!(inspection.revision, 1);
+        assert_eq!(inspection.runtime.kind, "podman");
+        assert_eq!(
+            inspection.artifact.current.as_deref(),
+            Some("sha256:abcdef0123456789")
+        );
+        assert_eq!(inspection.resources.len(), 3);
+        assert!(!inspection.healthy);
+
+        let health = target.read_health("deploy-alpha")?;
+        assert_eq!(health.deployment_id, "deploy-alpha");
+        assert!(!health.healthy);
+        // Each method performs its own live read, so timestamps are
+        // independent; they must still be fresh.
+        let age = (chrono::Utc::now() - health.observed_at).num_milliseconds();
+        assert!((0..60_000).contains(&age), "stale health read: {age}ms");
+        Ok(())
+    }
+
+    #[test]
+    fn config_cas_advances_only_against_the_expected_revision() -> anyhow::Result<()> {
+        let (_temp, target, journal) = temp_target()?;
+        target.execute_journaled(&sample_bootstrap("deploy-alpha"), &journal)?;
+
+        let apply = |expected: Option<u64>| {
+            let operation = HostOperation::state_mutate(
+                Uuid::now_v7().to_string(),
+                "deploy-alpha",
+                expected,
+                StateMutationPayload::ApplyConfig {
+                    reference: "/etc/nazauth/config-v2.toml".to_owned(),
+                    schema: "nazauth-config-v2".to_owned(),
+                },
             );
+            target.execute_journaled(&operation, &journal).unwrap()
+        };
+
+        // Stale expectation: never last-write-wins.
+        let stale = apply(Some(99));
+        let HostOutcome::Failed { code, detail } = stale.outcome else {
+            panic!("expected the CAS failure");
+        };
+        assert_eq!(code, CONFIG_REVISION_MISMATCH, "{detail}");
+
+        // Correct expectation advances exactly one revision.
+        let applied = apply(Some(1));
+        let HostOutcome::Completed {
+            body: HostCompletionBody::StateMutateApplied { revision },
+        } = applied.outcome
+        else {
+            panic!("expected the applied outcome: {applied:?}");
+        };
+        assert_eq!(revision, 2);
+
+        // The same expectation again is now stale too.
+        let stale = apply(Some(1));
+        let HostOutcome::Failed { code, .. } = stale.outcome else {
+            panic!("expected the second CAS failure");
+        };
+        assert_eq!(code, CONFIG_REVISION_MISMATCH);
+
+        let inspection = target.inspect_instance("deploy-alpha")?;
+        assert_eq!(inspection.revision, 2);
+        assert_eq!(inspection.config_reference, "/etc/nazauth/config-v2.toml");
+        assert_eq!(inspection.config_schema, "nazauth-config-v2");
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_over_existing_state_fails_and_replays_interrupted_runs() -> anyhow::Result<()> {
+        let (_temp, target, journal) = temp_target()?;
+        let first = target.execute_journaled(&sample_bootstrap("deploy-alpha"), &journal)?;
+        assert!(matches!(first.outcome, HostOutcome::Completed { .. }));
+
+        // A different bootstrap over existing state fails closed.
+        let clash = target.execute_journaled(&sample_bootstrap("deploy-alpha"), &journal)?;
+        let HostOutcome::Failed { code, .. } = clash.outcome else {
+            panic!("expected DEPLOYMENT_EXISTS");
+        };
+        assert_eq!(code, DEPLOYMENT_EXISTS);
+
+        // The exact interrupted operation replays without advancing.
+        let mut replay_operation = sample_bootstrap("deploy-alpha");
+        replay_operation.operation_id = {
+            // Reuse the id recorded in the stored state.
+            let raw = std::fs::read_to_string(
+                journal
+                    .root()
+                    .join("deployments")
+                    .join("deploy-alpha")
+                    .join("state.json"),
+            )?;
+            let state: DeploymentState = serde_json::from_str(&raw)?;
+            state
+                .active_host_operation
+                .expect("bootstrap op")
+                .operation_id
+        };
+        let replayed = target.execute_journaled(&replay_operation, &journal)?;
+        let HostOutcome::Completed {
+            body: HostCompletionBody::StateMutateApplied { revision },
+        } = replayed.outcome
+        else {
+            panic!("expected the replayed bootstrap to succeed: {replayed:?}");
+        };
+        assert_eq!(revision, 1, "replay must not advance the revision");
+        Ok(())
+    }
+
+    #[test]
+    fn ownership_delete_guard_is_enforced_against_concrete_facts() -> anyhow::Result<()> {
+        let (_temp, target, journal) = temp_target()?;
+        target.execute_journaled(&sample_bootstrap("deploy-alpha"), &journal)?;
+        let store = TargetStateStore::open(journal.root())?;
+        let state = store.load_existing("deploy-alpha")?;
+
+        // managed + deployment: the only deletable classification.
+        let managed = state.exact_managed_deployment_resource("app-container")?;
+        assert_eq!(managed.locator, "nazoauth-main");
+
+        for (resource_id, expected_code) in [
+            ("shared-db", RESOURCE_DELETE_FORBIDDEN),
+            ("backup-volume", RESOURCE_DELETE_FORBIDDEN),
+            ("ghost-resource", RESOURCE_UNKNOWN),
+        ] {
+            let failure = state
+                .exact_managed_deployment_resource(resource_id)
+                .expect_err(resource_id);
+            assert_eq!(failure.code, expected_code, "{}: {failure:?}", resource_id);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_or_foreign_state_fails_closed_with_reset_guidance() -> anyhow::Result<()> {
+        use crate::registry::STATE_RESET_REQUIRED;
+
+        let temp = PrivateTempDir::new("nazauthctl-local-state-test")?;
+        let root = temp.path().join("state");
+        let target = LocalTarget::with_state_root(&root);
+        let store = TargetStateStore::open(&root)?;
+        let dir = root.join("deployments").join("deploy-beta");
+        std::fs::create_dir_all(&dir)?;
+
+        // Store level: the full remediation guidance names the file.
+        crate::filesystem::atomic_write(&dir.join("state.json"), b"{ not json", 0o600)?;
+        let failure = store.load_existing("deploy-beta").expect_err("corrupt");
+        let rendered = format!("{failure:?}");
+        assert!(rendered.contains(STATE_RESET_REQUIRED), "{rendered}");
+        assert!(rendered.contains("back the file up"), "{rendered}");
+        assert!(rendered.contains("state.json"), "{rendered}");
+
+        // Wire level: diagnostics are bounded, but the stable codes survive
+        // sanitization so automation can classify the failure.
+        let error = target.inspect_instance("deploy-beta").err().unwrap();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(DEPLOYMENT_UNKNOWN), "{rendered}");
+        assert!(rendered.contains(STATE_RESET_REQUIRED), "{rendered}");
+
+        // A foreign-schema document (future or hand-edited) is equally
+        // rejected instead of being interpreted leniently.
+        crate::filesystem::atomic_write(
+            &dir.join("state.json"),
+            br#"{"schema":99,"deployment_id":"deploy-beta"}"#,
+            0o600,
+        )?;
+        let failure = store
+            .load_existing("deploy-beta")
+            .expect_err("foreign schema");
+        assert!(failure.detail.contains(STATE_RESET_REQUIRED), "{failure:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn only_the_control_operation_boundary_still_reports_unavailable() -> anyhow::Result<()> {
+        let (_temp, target, _journal) = temp_target()?;
+        let error = target
+            .execute_control_operation(&ControlOperationRequest {
+                deployment_id: "deploy-alpha".to_owned(),
+                compact_jws: "jws".to_owned(),
+            })
+            .err()
+            .unwrap();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(TARGET_CAPABILITY_UNAVAILABLE),
+            "{rendered}"
+        );
+        Ok(())
     }
 }

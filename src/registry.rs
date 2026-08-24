@@ -359,15 +359,26 @@ impl DiscoveryEvidence {
 }
 
 fn validate_key(value: &str, label: &str) -> anyhow::Result<()> {
+    validate_identifier(value, MAX_KEY_CHARS, label)
+}
+
+/// Shared identifier rule for store-legal tokens across ctl stores
+/// (registry keys and target DeploymentState identifiers alike): 1..=max
+/// characters from `[A-Za-z0-9.:_+-]`, never `.` or `..`.
+pub(crate) fn validate_identifier(
+    value: &str,
+    max_chars: usize,
+    label: &str,
+) -> anyhow::Result<()> {
     if value.is_empty()
-        || value.len() > MAX_KEY_CHARS
+        || value.len() > max_chars
         || !value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || ".:_+-".contains(character))
         || value == "."
         || value == ".."
     {
-        bail!("{label} must be 1-{MAX_KEY_CHARS} characters from [A-Za-z0-9.:_+-]");
+        bail!("{label} must be 1-{max_chars} characters from [A-Za-z0-9.:_+-]");
     }
     Ok(())
 }
@@ -384,7 +395,7 @@ fn validate_reference(value: &str, label: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_issuer(value: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_issuer(value: &str) -> anyhow::Result<()> {
     let parsed =
         Url::parse(value).with_context(|| format!("issuer is not a valid URL: {value}"))?;
     if parsed.cannot_be_a_base()
