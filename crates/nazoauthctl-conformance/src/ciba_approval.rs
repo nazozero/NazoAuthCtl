@@ -518,12 +518,7 @@ fn write_callback_response(
             .as_bytes(),
         )
         .map_err(CibaUserApprovalError::CallbackWrite)?;
-    stream
-        .flush()
-        .map_err(CibaUserApprovalError::CallbackWrite)?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .map_err(CibaUserApprovalError::CallbackWrite)
+    stream.flush().map_err(CibaUserApprovalError::CallbackWrite)
 }
 
 #[derive(Debug, Error)]
@@ -646,7 +641,6 @@ mod tests {
     use crate::TransportFailureStage;
     use std::collections::VecDeque;
     use std::io::{Read, Write};
-    use std::net::Shutdown;
     use std::sync::Mutex;
 
     struct FakeTransport {
@@ -834,12 +828,12 @@ mod tests {
         )
         .expect("callback bridge");
         let mut stream = TcpStream::connect(bridge.local_addr()).expect("callback connect");
-        write!(
-            stream,
+        let request = format!(
             "GET /ciba/approve?approval_token={approval_token}&auth_req_id={auth_req_id}&action=allow HTTP/1.1\r\nHost: callback.example\r\n\r\n"
-        )
-        .expect("callback request");
-        stream.shutdown(Shutdown::Write).expect("finish request");
+        );
+        stream
+            .write_all(request.as_bytes())
+            .expect("callback request");
         let mut response = String::new();
         stream
             .read_to_string(&mut response)
