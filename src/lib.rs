@@ -10,10 +10,12 @@ mod install;
 mod lifecycle;
 mod model;
 mod operator;
+pub mod registry;
 mod release;
 mod runtime;
 mod runtime_backend;
 mod secret_provider;
+pub mod target;
 pub mod tenant_resources;
 mod tls;
 
