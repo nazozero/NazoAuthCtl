@@ -90,6 +90,10 @@ pub(crate) enum Command {
     SelfRollback {
         yes: bool,
     },
+    /// Internal fixed stdio executor (`nazoauthctl remote exec`, goal plan 03
+    /// §3.2). Not user-facing automation surface: one bounded HostOperation
+    /// JSON on stdin, one HostResult JSON on stdout, no daemon, no socket.
+    RemoteExec,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -36,7 +36,20 @@ pub const MAX_HOST_RESULT_BYTES: usize = 1024 * 1024;
 /// [`HostOperationBody`] variants on purpose; the wire-level parse classifies
 /// unknown kinds here before typed deserialization, and the
 /// `every_registered_kind_round_trips` test pins this list to the enum.
-pub const HOST_OPERATION_KINDS: &[&str] = &["ping"];
+pub const HOST_OPERATION_KINDS: &[&str] = &["hello", "ping"];
+
+/// Product identity reported by a remote helper and required by the C08
+/// handshake. Anything else is a different program and must never be mutated.
+pub const HELLO_PRODUCT: &str = "nazoauthctl";
+
+/// Build commit embedded by release builds through the
+/// `NAZOAUTHCTL_BUILD_COMMIT` environment variable at compile time. Empty on
+/// both sides means two dev builds of the same source tree; mixed presence or
+/// any differing value fails the handshake closed (goal plan 03 §6).
+pub const LOCAL_BUILD_COMMIT: &str = match option_env!("NAZOAUTHCTL_BUILD_COMMIT") {
+    Some(commit) => commit,
+    None => "",
+};
 
 /// Stable failure code: the operation is well-formed but not valid for its
 /// kind (e.g. a host-level ping carrying an instance binding).
@@ -48,6 +61,16 @@ pub const HOST_ERR_UNSUPPORTED_OPERATION: &str = "UNSUPPORTED_OPERATION";
 /// Stable failure code: expected-revision CAS mismatch against the target
 /// DeploymentState. Consumed by the deployment waves (F04).
 pub const HOST_ERR_REVISION_MISMATCH: &str = "REVISION_MISMATCH";
+
+/// Stable failure code: the same `operation_id` was already accepted with a
+/// different canonical request hash (goal plan 01 rule 13). The retry must
+/// mint a new operation; the journal never overwrites the original intent.
+pub const HOST_ERR_OPERATION_CONFLICT: &str = "OPERATION_CONFLICT";
+
+/// Stable failure code: the remote helper's product, wire schema, or build
+/// identity does not match this binary (task C08). No fallback exists; the
+/// only remedy is upgrading the helper on the target host.
+pub const HOST_ERR_REMOTE_HELPER_MISMATCH: &str = "REMOTE_HELPER_MISMATCH";
 
 /// Stable rejection codes used when a transport cannot even parse a message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,12 +157,16 @@ pub struct HostOperation {
 pub enum HostOperationBody {
     /// Minimal liveness/helper probe. Echoes `nonce`; carries no state.
     Ping { nonce: String },
+    /// Helper identity announcement (task C08). Answered with
+    /// [`HostCompletionBody::Hello`]; carries no state and no binding.
+    Hello {},
 }
 
 impl HostOperationBody {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Ping { .. } => "ping",
+            Self::Hello {} => "hello",
         }
     }
 }
@@ -154,6 +181,17 @@ impl HostOperation {
             operation: HostOperationBody::Ping {
                 nonce: nonce.into(),
             },
+        }
+    }
+
+    /// Helper handshake probe (task C08). Host-level by definition.
+    pub fn hello(operation_id: impl Into<String>) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: None,
+            expected_revision: None,
+            operation: HostOperationBody::Hello {},
         }
     }
 
@@ -191,6 +229,16 @@ impl HostOperation {
                     return Err(MessageRejection::new(
                         RejectionCode::OperationMalformed,
                         "ping must not carry deployment_id or expected_revision",
+                    ));
+                }
+            }
+            HostOperationBody::Hello {} => {
+                // Hello identifies the helper itself; instance bindings and
+                // revision expectations are meaningless against it.
+                if self.deployment_id.is_some() || self.expected_revision.is_some() {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "hello must not carry deployment_id or expected_revision",
                     ));
                 }
             }
@@ -262,6 +310,95 @@ pub enum HostOutcome {
 #[serde(tag = "result", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HostCompletionBody {
     Ping { nonce: String },
+    Hello { hello: RemoteHello },
+}
+
+/// Identity a target helper announces about itself (goal plan 03 §6).
+///
+/// The control side compares `product`, `remote_exec_schema`, `version`, and
+/// `commit` against its own constants before any host-level mutation
+/// ([`verify_remote_hello`]). `os`, `arch`, and `supported_runtimes` are
+/// informational inventory facts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteHello {
+    pub product: String,
+    /// Highest HostOperation/HostResult wire schema the helper answers.
+    pub remote_exec_schema: u32,
+    pub version: String,
+    pub commit: String,
+    pub os: String,
+    pub arch: String,
+    pub supported_runtimes: Vec<String>,
+}
+
+/// The hello payload this binary answers with. Runtime detection stays with
+/// the caller; the identity fields are compile-time facts.
+pub fn local_hello(supported_runtimes: Vec<String>) -> RemoteHello {
+    RemoteHello {
+        product: HELLO_PRODUCT.to_owned(),
+        remote_exec_schema: HOST_PROTOCOL_SCHEMA,
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        commit: LOCAL_BUILD_COMMIT.to_owned(),
+        os: std::env::consts::OS.to_owned(),
+        arch: std::env::consts::ARCH.to_owned(),
+        supported_runtimes,
+    }
+}
+
+/// Task C08 handshake check: the announced helper identity must equal this
+/// binary's constants exactly. Any difference is a mismatch — there is no
+/// compatibility range and no fallback.
+pub fn verify_remote_hello(hello: &RemoteHello) -> Result<(), String> {
+    if !valid_token(&hello.product, 64) {
+        return Err("hello product is not a valid token".to_owned());
+    }
+    if !valid_token(&hello.version, 64) {
+        return Err("hello version is not a valid token".to_owned());
+    }
+    if !(hello.commit.is_empty() || valid_token(&hello.commit, 128)) {
+        return Err("hello commit is not a valid token".to_owned());
+    }
+    for fact in [&hello.os, &hello.arch] {
+        if !valid_token(fact, 32) {
+            return Err("hello platform facts contain invalid tokens".to_owned());
+        }
+    }
+    if hello.supported_runtimes.len() > 16
+        || hello
+            .supported_runtimes
+            .iter()
+            .any(|runtime| !valid_token(runtime, 32))
+    {
+        return Err("hello supported_runtimes is not a bounded token list".to_owned());
+    }
+    if hello.product != HELLO_PRODUCT {
+        return Err(format!(
+            "target answered as product '{}' instead of '{HELLO_PRODUCT}'",
+            sanitize(hello.product.clone())
+        ));
+    }
+    if hello.remote_exec_schema != HOST_PROTOCOL_SCHEMA {
+        return Err(format!(
+            "remote exec schema {} does not match controller schema {HOST_PROTOCOL_SCHEMA}",
+            hello.remote_exec_schema
+        ));
+    }
+    let expected_version = env!("CARGO_PKG_VERSION");
+    if hello.version != expected_version {
+        return Err(format!(
+            "helper version '{}' does not match controller version '{expected_version}'",
+            sanitize(hello.version.clone())
+        ));
+    }
+    if hello.commit != LOCAL_BUILD_COMMIT {
+        return Err(format!(
+            "helper build commit '{}' does not match controller commit '{}'",
+            sanitize(hello.commit.clone()),
+            LOCAL_BUILD_COMMIT
+        ));
+    }
+    Ok(())
 }
 
 /// Serialize a HostOperation for a target's stdin, enforcing the size cap.
@@ -392,7 +529,7 @@ fn valid_token(value: &str, max_chars: usize) -> bool {
 }
 
 /// Bound a diagnostic token: printable ASCII only, hard length cap.
-fn sanitize(value: impl Into<String>) -> String {
+pub(super) fn sanitize(value: impl Into<String>) -> String {
     let value: String = value.into();
     let characters: Vec<char> = value.chars().collect();
     let truncated = characters.len() > 200;
@@ -423,12 +560,55 @@ mod tests {
 
     #[test]
     fn every_registered_kind_round_trips() -> anyhow::Result<()> {
-        assert_eq!(HOST_OPERATION_KINDS, &["ping"]);
+        assert_eq!(HOST_OPERATION_KINDS, &["hello", "ping"]);
         let operation = ping_operation("probe");
         let encoded = encode_host_operation(&operation)?;
         let parsed = parse_host_operation(&encoded)?;
         assert_eq!(parsed, operation);
         assert_eq!(parsed.operation.kind(), "ping");
+
+        let hello = HostOperation::hello(Uuid::now_v7().to_string());
+        let encoded = encode_host_operation(&hello)?;
+        assert!(
+            String::from_utf8(encoded.clone())?.contains(r#""kind":"hello""#),
+            "canonical encoding carries the tagged empty payload"
+        );
+        assert_eq!(parse_host_operation(&encoded)?, hello);
+        Ok(())
+    }
+
+    #[test]
+    fn hello_rejects_deployment_bindings_at_validation() {
+        let mut hello = HostOperation::hello(Uuid::now_v7().to_string());
+        hello.deployment_id = Some("deploy-alpha".to_owned());
+        let rejection = hello.validate().expect_err("binding rejected");
+        assert_eq!(rejection.code, RejectionCode::OperationMalformed);
+        assert!(rejection.detail.contains("deployment_id"));
+
+        let mut hello = HostOperation::hello(Uuid::now_v7().to_string());
+        hello.expected_revision = Some(2);
+        assert!(hello.validate().is_err());
+    }
+
+    #[test]
+    fn local_hello_verifies_against_itself_and_detects_drift() -> anyhow::Result<()> {
+        let hello = local_hello(vec!["podman".to_owned()]);
+        verify_remote_hello(&hello).expect("a helper answers its own handshake");
+        assert_eq!(hello.remote_exec_schema, HOST_PROTOCOL_SCHEMA);
+
+        let mut drift = hello.clone();
+        drift.version = "9.9.9".to_owned();
+        let reason = verify_remote_hello(&drift).expect_err("version drift");
+        assert!(reason.contains("version"), "{reason}");
+
+        let mut drift = hello.clone();
+        drift.product = "other-helper".to_owned();
+        assert!(verify_remote_hello(&drift).is_err());
+
+        let mut drift = hello;
+        drift.commit = "deadbeef".to_owned();
+        let reason = verify_remote_hello(&drift).expect_err("commit drift");
+        assert!(reason.contains("commit"), "{reason}");
         Ok(())
     }
 
@@ -442,6 +622,14 @@ mod tests {
         );
         let parsed = parse_host_result(&encode_host_result(&completed)?)?;
         assert_eq!(parsed, completed);
+
+        let hello = HostResult::completed(
+            Uuid::now_v7().to_string(),
+            HostCompletionBody::Hello {
+                hello: local_hello(vec!["docker".to_owned()]),
+            },
+        );
+        assert_eq!(parse_host_result(&encode_host_result(&hello)?)?, hello);
 
         let failed = HostResult::failed(
             Uuid::now_v7().to_string(),

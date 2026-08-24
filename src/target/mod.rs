@@ -6,21 +6,27 @@
 //! anything enters a target, and transports surface failures through one
 //! result model while preserving diagnostics.
 //!
-//! Only two implementations are planned: [`LocalTarget`] (this module) and
-//! the future SSH transport (task C05), which pipes the frozen wire types
-//! from [`wire`] through system OpenSSH into `remote exec` (task C04). No
-//! HTTP/Kubernetes/agent targets exist by design.
+//! Only two implementations exist by design: [`LocalTarget`] and the
+//! OpenSSH-based [`SshTarget`] (task C05), which pipes the frozen wire types
+//! from [`wire`] through system OpenSSH into the fixed `remote exec` helper
+//! ([`remote_exec`], task C04). No HTTP/Kubernetes/agent targets exist.
 
+pub mod journal;
+pub(crate) mod remote_exec;
+pub mod ssh;
 pub mod wire;
 
 use chrono::{DateTime, Utc};
 
+pub use journal::{JournalStatus, TargetJournal};
+pub use ssh::SshTarget;
 pub use wire::{
-    HOST_ERR_OPERATION_INVALID, HOST_ERR_REVISION_MISMATCH, HOST_ERR_UNSUPPORTED_OPERATION,
+    HELLO_PRODUCT, HOST_ERR_OPERATION_CONFLICT, HOST_ERR_OPERATION_INVALID,
+    HOST_ERR_REMOTE_HELPER_MISMATCH, HOST_ERR_REVISION_MISMATCH, HOST_OPERATION_KINDS,
     HOST_PROTOCOL_SCHEMA, HostCompletionBody, HostOperation, HostOperationBody, HostOutcome,
-    HostResult, MAX_HOST_OPERATION_BYTES, MAX_HOST_RESULT_BYTES, MessageRejection, RejectionCode,
-    canonical_operation_hash, encode_host_operation, encode_host_result, parse_host_operation,
-    parse_host_result,
+    HostResult, LOCAL_BUILD_COMMIT, MAX_HOST_OPERATION_BYTES, MAX_HOST_RESULT_BYTES,
+    MessageRejection, RejectionCode, RemoteHello, canonical_operation_hash, encode_host_operation,
+    encode_host_result, local_hello, parse_host_operation, parse_host_result, verify_remote_hello,
 };
 
 /// Stable code for capabilities whose owning wave has not landed yet.
@@ -125,6 +131,64 @@ impl LocalTarget {
              DeploymentState (F01) and ControlOperation waves land"
         )
     }
+
+    /// Execute with the target-side journal contract (task C07): a replay of
+    /// an accepted id returns the stored result, the same id with a different
+    /// payload conflicts, and fresh operations are journaled pending before
+    /// dispatch and finalized after.
+    pub fn execute_journaled(
+        &self,
+        operation: &HostOperation,
+        journal: &TargetJournal,
+    ) -> anyhow::Result<HostResult> {
+        if let Err(rejection) = operation.validate() {
+            return Ok(HostResult::failed(
+                &operation.operation_id,
+                HOST_ERR_OPERATION_INVALID,
+                format!("{}: {}", rejection.code.as_str(), rejection.detail),
+            ));
+        }
+        journal.run_journaled(operation, dispatch_host_operation)
+    }
+}
+
+/// Shared dispatch for validated host operations. [`LocalTarget`] answers
+/// natively with it and the remote exec helper answers through the identical
+/// function after parsing stdin, so both transports cannot drift apart.
+pub(crate) fn dispatch_host_operation(operation: &HostOperation) -> HostResult {
+    debug_assert!(
+        operation.validate().is_ok(),
+        "dispatch requires a validated operation"
+    );
+    match &operation.operation {
+        HostOperationBody::Ping { nonce } => HostResult::completed(
+            &operation.operation_id,
+            HostCompletionBody::Ping {
+                nonce: nonce.clone(),
+            },
+        ),
+        HostOperationBody::Hello {} => HostResult::completed(
+            &operation.operation_id,
+            HostCompletionBody::Hello {
+                hello: local_hello(local_supported_runtimes()),
+            },
+        ),
+    }
+}
+
+/// Runtimes this installation could drive, detected without spawning engines:
+/// engine binaries present on PATH plus the systemd host backend on Linux.
+fn local_supported_runtimes() -> Vec<String> {
+    let mut runtimes = Vec::new();
+    for engine in ["podman", "docker"] {
+        if crate::process::command_exists(engine) {
+            runtimes.push(engine.to_owned());
+        }
+    }
+    if cfg!(target_os = "linux") {
+        runtimes.push("host".to_owned());
+    }
+    runtimes
 }
 
 impl ExecutionTarget for LocalTarget {
@@ -146,7 +210,8 @@ impl ExecutionTarget for LocalTarget {
         // Mirror the remote executor's admission order (parse → validate →
         // dispatch) so local and remote targets accept the same inputs.
         // [`HostOperation::validate`] owns every semantic rule, including
-        // per-kind payload constraints; dispatch below stays mechanical.
+        // per-kind payload constraints; [`dispatch_host_operation`] stays
+        // mechanical and shared with the remote helper.
         if let Err(rejection) = operation.validate() {
             return Ok(HostResult::failed(
                 &operation.operation_id,
@@ -154,14 +219,7 @@ impl ExecutionTarget for LocalTarget {
                 format!("{}: {}", rejection.code.as_str(), rejection.detail),
             ));
         }
-        match &operation.operation {
-            HostOperationBody::Ping { nonce } => Ok(HostResult::completed(
-                &operation.operation_id,
-                HostCompletionBody::Ping {
-                    nonce: nonce.clone(),
-                },
-            )),
-        }
+        Ok(dispatch_host_operation(operation))
     }
 
     fn execute_control_operation(
@@ -234,6 +292,44 @@ mod tests {
         };
         assert_eq!(code, HOST_ERR_OPERATION_INVALID);
         assert!(detail.contains("UUIDv7"), "{detail}");
+        Ok(())
+    }
+
+    #[test]
+    fn local_hello_reports_the_helper_identity() -> anyhow::Result<()> {
+        let target = LocalTarget::new();
+        let hello = HostOperation::hello(Uuid::now_v7().to_string());
+        let result = target.execute_host_operation(&hello)?;
+        let HostOutcome::Completed {
+            body: HostCompletionBody::Hello { hello },
+        } = result.outcome
+        else {
+            panic!("expected a hello completion");
+        };
+        verify_remote_hello(&hello).expect("local helper answers its own handshake");
+        Ok(())
+    }
+
+    #[test]
+    fn journaled_execution_replays_and_conflicts_through_local_target() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("nazauthctl-local-journaled")?;
+        let journal = TargetJournal::open(temp.path().join("state"))?;
+        let target = LocalTarget::new();
+
+        let operation = HostOperation::ping(Uuid::now_v7().to_string(), "journaled");
+        let first = target.execute_journaled(&operation, &journal)?;
+        let second = target.execute_journaled(&operation, &journal)?;
+        assert_eq!(first, second, "replay returns the stored result");
+
+        let mut conflict = operation.clone();
+        conflict.operation = HostOperationBody::Ping {
+            nonce: "different".to_owned(),
+        };
+        let result = target.execute_journaled(&conflict, &journal)?;
+        let HostOutcome::Failed { code, .. } = result.outcome else {
+            panic!("expected the conflict outcome");
+        };
+        assert_eq!(code, HOST_ERR_OPERATION_CONFLICT);
         Ok(())
     }
 

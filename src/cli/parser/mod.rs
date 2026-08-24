@@ -256,6 +256,11 @@ impl Cli {
                     yes: parse_yes(values, "self rollback")?,
                 }
             }
+            "remote" if values.first().is_some_and(|value| value == "exec") => {
+                values.remove(0);
+                no_arguments(&values, "remote exec")?;
+                Command::RemoteExec
+            }
             other => bail!("unknown command {other}"),
         };
         Ok(Some(Self {

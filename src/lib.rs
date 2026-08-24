@@ -131,6 +131,7 @@ Commands:
   identity      Rotate controller and audit identities
   break-glass   Recover after controller-key loss or suspected theft
   self          Independently check, update, or roll back nazoauthctl
+  remote        Internal stdio executor invoked over SSH on target hosts (no daemon)
 
 Run `nazoauthctl <command> --help` for exact options."
         }

@@ -312,6 +312,9 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
+        // Internal fixed stdio executor (goal plan 03 §3.2). Runs on the
+        // target machine — no legacy lock, no controller state access.
+        Command::RemoteExec => crate::target::remote_exec::run_stdio(),
         Command::Adopt(options) => {
             require_root()?;
             crate::adoption::run(options)

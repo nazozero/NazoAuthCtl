@@ -1275,3 +1275,21 @@ fn legacy_conformance_lease_commands_are_not_part_of_the_controller_cli() {
         assert!(parse(arguments).is_err(), "accepted {arguments:?}");
     }
 }
+
+#[test]
+fn internal_remote_exec_is_a_fixed_no_argument_command() {
+    let command = parse(&["nazoauthctl", "remote", "exec"])
+        .unwrap()
+        .unwrap()
+        .command;
+    assert!(matches!(command, Command::RemoteExec));
+
+    for arguments in [
+        &["nazoauthctl", "remote"][..],
+        &["nazoauthctl", "remote", "listen"][..],
+        &["nazoauthctl", "remote", "exec", "--port", "8080"][..],
+        &["nazoauthctl", "remote", "exec", "extra"][..],
+    ] {
+        assert!(parse(arguments).is_err(), "accepted {arguments:?}");
+    }
+}

@@ -167,6 +167,21 @@ impl Process {
         Ok((output.status, stdout))
     }
 
+    /// Feeds `input` on stdin and captures the complete bounded output,
+    /// including stderr, for protocol transports that classify failures from
+    /// the child's diagnostic stream (for example OpenSSH exec wrappers).
+    pub fn stdin_output(&self, input: &[u8]) -> anyhow::Result<Output> {
+        let mut command = self.command();
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command
+            .spawn()
+            .with_context(|| format!("failed to execute {}", self.display_name()))?;
+        self.collect_output(child, Some(input))
+    }
+
     /// Returns only a closed classification.  Diagnostic output is deliberately
     /// consumed in-process and is never propagated to the caller, logs, or
     /// audit chain because it may contain deployment details.

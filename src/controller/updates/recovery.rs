@@ -38,6 +38,8 @@ pub(crate) fn uses_legacy_lock(command: &Command) -> bool {
             | Command::SelfCheck(_)
             | Command::SelfUpdate { .. }
             | Command::SelfRollback { .. }
+            // The target-side stdio executor never touches controller state.
+            | Command::RemoteExec
     )
 }
 
