@@ -71,7 +71,7 @@ pub(super) fn controller_check(version: Option<&str>) -> anyhow::Result<()> {
     recover_controller_self_operation()?;
     controller_self_audit_signer()?;
     verify_controller_self_audit()?;
-    let release = crate::release::VerifiedControllerRelease::fetch(version, None)?;
+    let release = crate::release::VerifiedControllerRelease::verify(version, None)?;
     enforce_controller_trust(&release.version, &release.sha256)?;
     println!(
         "{}",
@@ -91,7 +91,7 @@ pub(super) fn controller_update(version: Option<&str>) -> anyhow::Result<()> {
     recover_controller_self_operation()?;
     controller_self_audit_signer()?;
     verify_controller_self_audit()?;
-    let release = crate::release::VerifiedControllerRelease::fetch(version, None)?;
+    let release = crate::release::VerifiedControllerRelease::verify(version, None)?;
     enforce_controller_trust(&release.version, &release.sha256)?;
     let directory = controller_state_directory()?;
     ensure_private_directory(&directory, "controller self-update state")?;

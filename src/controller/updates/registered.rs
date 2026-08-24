@@ -24,11 +24,14 @@ pub(crate) fn registered_update_plan(
         .iter()
         .map(|runtime| runtime.backend)
         .find(|backend| *backend != RuntimeBackendKind::Systemd);
-    let release = VerifiedRelease::fetch(
-        SERVER_REPOSITORY,
-        options.version.as_deref(),
+    // The single official-verification entry applies the deployment's
+    // anti-downgrade floor before any handle exists (H01/C6).
+    let release = VerifiedRelease::verify(ReleaseRequest {
+        repository: SERVER_REPOSITORY,
+        requested_version: options.version.as_deref(),
         container_backend,
-    )?;
+        trusted_version_floor: Some(&record.active_release.release),
+    })?;
     let plan = build_registered_update_plan(record, &release.manifest)?;
     println!("{}", serde_json::to_string_pretty(&plan)?);
     Ok(())
@@ -53,11 +56,12 @@ pub(crate) fn registered_update_prepare(
         .iter()
         .map(|runtime| runtime.backend)
         .find(|backend| *backend != RuntimeBackendKind::Systemd);
-    let release = VerifiedRelease::fetch(
-        SERVER_REPOSITORY,
-        options.version.as_deref(),
+    let release = VerifiedRelease::verify(ReleaseRequest {
+        repository: SERVER_REPOSITORY,
+        requested_version: options.version.as_deref(),
         container_backend,
-    )?;
+        trusted_version_floor: Some(&record.active_release.release),
+    })?;
     if release.manifest.rollback.irreversible_migration && !options.accept_migration_barrier {
         bail!(
             "this Release crosses an irreversible migration barrier; inspect update --plan and repeat with --accept-migration-barrier --yes"
@@ -323,7 +327,9 @@ pub(crate) fn build_registered_update_plan(
     record: &DeploymentRecord,
     target: &ReleaseManifest,
 ) -> anyhow::Result<serde_json::Value> {
-    crate::release::enforce_release_trust_floor(&record.active_release.release, target)?;
+    // The anti-downgrade floor is enforced by the single verification entry
+    // before a verified handle exists; this plan reports the remaining
+    // lifecycle blockers only.
     let minimum = format!("v{}", target.rollback.minimum_supported_version);
     let mut blockers = Vec::new();
     if record.trust != crate::deployment::TrustState::Adopted {

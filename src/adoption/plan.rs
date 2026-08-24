@@ -281,7 +281,14 @@ pub(super) fn verified_release(
 ) -> anyhow::Result<VerifiedRelease> {
     let backend = (candidate.runtime.backend != crate::deployment::RuntimeBackendKind::Systemd)
         .then_some(candidate.runtime.backend);
-    VerifiedRelease::fetch(SERVER_REPOSITORY, Some(release), backend)
+    // Adoption verifies the exact Release the target reports; the floor pins
+    // that same version so a downgrade claim can never verify.
+    VerifiedRelease::verify(crate::release::ReleaseRequest {
+        repository: SERVER_REPOSITORY,
+        requested_version: Some(release),
+        container_backend: backend,
+        trusted_version_floor: Some(release),
+    })
 }
 
 pub(super) fn verify_artifact(

@@ -34,7 +34,10 @@ use crate::{
     model::{ReleaseManifest, UpdateConfig},
     operator::{self, ExpectedReleaseTarget},
     process::Process,
-    release::{VerifiedRelease, commit_release_trust, compare_versions, enforce_release_trust},
+    release::{
+        ReleaseRequest, VerifiedRelease, commit_release_trust, compare_versions,
+        enforce_release_trust,
+    },
     runtime::Runtime,
 };
 

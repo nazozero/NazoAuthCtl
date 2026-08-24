@@ -348,7 +348,14 @@ pub(super) fn install_transaction(
 ) -> anyhow::Result<()> {
     crate::operator::append_management_event(config, "install-intent", "pending", "backup")?;
     install::start_managed_dependencies(config)?;
-    let release = VerifiedRelease::fetch(&config.repository, version, config.container_backend())?;
+    // Legacy UpdateConfig flow: floor enforcement stays in the trust-state
+    // file check below until the J-phase retirement.
+    let release = VerifiedRelease::verify(ReleaseRequest {
+        repository: &config.repository,
+        requested_version: version,
+        container_backend: config.container_backend(),
+        trusted_version_floor: None,
+    })?;
     enforce_release_trust(config, &release.manifest)?;
     release.persist_verification_evidence(&release_cache_dir(config, &release.manifest))?;
     install::verify_live_external_dependencies(config)?;

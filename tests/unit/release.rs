@@ -1,8 +1,10 @@
 use super::{
-    AttestationResponse, RELEASE_PREDICATE, ReleaseTrustState, SIGSTORE_BUNDLE_MEDIA_TYPE,
-    VerifiedRelease, accept_verified_manifest, bounded_https_curl_arguments, commit_release_trust,
-    compare_versions, enforce_release_trust, enforce_release_trust_state, manifest_from_bundle,
-    resolve_version, verified_manifest_from_attestations, verify_artifact,
+    ArtifactHandle, ArtifactOrigin, AttestationResponse, CachedArtifactDescriptor,
+    CachedArtifactKind, RELEASE_PREDICATE, ReleaseTrustState, SIGSTORE_BUNDLE_MEDIA_TYPE,
+    VerifiedRelease, accept_verified_manifest, bounded_https_curl_arguments,
+    commit_artifact_handle, commit_release_trust, compare_versions, enforce_release_trust,
+    enforce_release_trust_floor, enforce_release_trust_state, manifest_from_bundle,
+    open_artifact_handle, resolve_version, verified_manifest_from_attestations, verify_artifact,
 };
 use crate::filesystem::{PrivateTempDir, atomic_write, sha256};
 use crate::model::{
@@ -790,7 +792,137 @@ fn verified_release_exposes_only_existing_policy_repository_artifacts() {
             .unwrap(),
         binary.name.as_str()
     );
+}
 
-    atomic_write(&path, b"y", 0o600).unwrap();
-    assert!(release.artifact("binary", "nazozero/NazoAuth").is_err());
+/// H03: the verified handle covers its artifacts exactly once. Re-hashing on
+/// every access duplicated the attestation subject binding; in-place mutation
+/// detection now lives at the durable cache handle (`verify_integrity`), not
+/// on the ephemeral private workspace.
+#[test]
+fn verified_handle_covers_materialized_artifacts_without_repeating_the_proof() {
+    let work = PrivateTempDir::new("verified-release-handle-test").unwrap();
+    let mut value = manifest("v1.2.3");
+    let binary = value.artifacts["binary"].clone();
+    let path = work.path().join(&binary.name);
+    atomic_write(&path, b"x", 0o600).unwrap();
+    value.artifacts.get_mut("binary").unwrap().sha256 = sha256(&path).unwrap();
+    let release = VerifiedRelease {
+        work,
+        manifest: value,
+    };
+    let first = release.artifact("binary", "nazozero/NazoAuth").unwrap();
+
+    // The same handle keeps serving the covered artifact even if an external
+    // actor scribbles into the temporary workspace; supply-chain facts are not
+    // recomputed per access.
+    atomic_write(&first, b"y", 0o600).unwrap();
+    assert_eq!(
+        release.artifact("binary", "nazozero/NazoAuth").unwrap(),
+        first
+    );
+}
+
+fn committed_host_handle(work: &PrivateTempDir, origin: ArtifactOrigin) -> ArtifactHandle {
+    let source = work.path().join("source-binary");
+    atomic_write(&source, b"verified-bytes", 0o600).unwrap();
+    let subject = sha256(&source).unwrap();
+    commit_artifact_handle(
+        &work.path().join("trusted-release-cache"),
+        &CachedArtifactDescriptor {
+            origin,
+            kind: CachedArtifactKind::HostBinary {
+                artifact_name: "nazoauth-fixture".to_owned(),
+            },
+            version: "v1.2.3",
+            target: release_target().unwrap(),
+            subject_sha256: &subject,
+        },
+        &source,
+    )
+    .unwrap()
+}
+
+/// H02 golden path: a verified commit becomes a cache hit that reopens without
+/// any re-verification of supply-chain facts, while mutated bytes fail closed.
+#[test]
+fn content_addressed_cache_reopens_hits_and_detects_mutation() {
+    let work = PrivateTempDir::new("release-cache-hit-test").unwrap();
+    let root = work.path().join("trusted-release-cache");
+    let source = work.path().join("source-binary");
+    atomic_write(&source, b"verified-bytes", 0o600).unwrap();
+    let subject = sha256(&source).unwrap();
+    let handle = commit_artifact_handle(
+        &root,
+        &CachedArtifactDescriptor {
+            origin: ArtifactOrigin::Official,
+            kind: CachedArtifactKind::HostBinary {
+                artifact_name: "nazoauth-fixture".to_owned(),
+            },
+            version: "v1.2.3",
+            target: release_target().unwrap(),
+            subject_sha256: &subject,
+        },
+        &source,
+    )
+    .unwrap();
+
+    let reopened = open_artifact_handle(&root, ArtifactOrigin::Official, &subject).unwrap();
+    assert_eq!(reopened.blob(), handle.blob());
+    reopened.verify_integrity().unwrap();
+    reopened.require_official().unwrap();
+
+    // Tampering with cached bytes is detected by the consumption boundary.
+    atomic_write(handle.blob(), b"tampered-bytes!!", 0o500).unwrap();
+    let error = open_artifact_handle(&root, ArtifactOrigin::Official, &subject).unwrap_err();
+    assert!(error.to_string().contains("modified after verification"));
+
+    // A commit against a tampered entry refuses to bless it.
+    let error = commit_artifact_handle(
+        &root,
+        &CachedArtifactDescriptor {
+            origin: ArtifactOrigin::Official,
+            kind: CachedArtifactKind::HostBinary {
+                artifact_name: "nazoauth-fixture".to_owned(),
+            },
+            version: "v1.2.3",
+            target: release_target().unwrap(),
+            subject_sha256: &subject,
+        },
+        &source,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("modified after verification"));
+}
+
+/// H02 (no blending): LOCAL-origin entries live in their own address section,
+/// never answer official lookups, and always fail the official gate.
+#[test]
+fn local_origin_handles_can_never_satisfy_official_verification() {
+    let work = PrivateTempDir::new("release-cache-local-test").unwrap();
+    let root = work.path().join("trusted-release-cache");
+    let local = committed_host_handle(&work, ArtifactOrigin::Local);
+    let subject = local.record.subject_sha256.clone();
+
+    let error = local.require_official().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("local development artifacts can never satisfy official")
+    );
+
+    // The local entry is unreachable through the official section.
+    assert!(open_artifact_handle(&root, ArtifactOrigin::Official, &subject).is_err());
+    // ...and the local section still opens with full integrity checking.
+    let reopened = open_artifact_handle(&root, ArtifactOrigin::Local, &subject).unwrap();
+    assert_eq!(reopened.record.origin, ArtifactOrigin::Local);
+    reopened.require_official().unwrap_err();
+}
+
+/// The single verification entry carries the version anti-downgrade floor
+/// (C6); the floor itself stays fail-closed for downgrades and passes equals.
+#[test]
+fn release_entry_floor_keeps_downgrades_blocked_and_equals_allowed() {
+    enforce_release_trust_floor("v2.0.0", &manifest("v1.9.9")).unwrap_err();
+    enforce_release_trust_floor("v2.0.0", &manifest("v2.0.0")).unwrap();
+    enforce_release_trust_floor("v2.0.0", &manifest("v2.0.1")).unwrap();
 }

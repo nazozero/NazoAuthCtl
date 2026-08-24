@@ -2659,19 +2659,29 @@ fn active_revision_uses_embedded_identity_without_optional_oci_revision_label() 
 
 #[cfg(target_os = "linux")]
 fn materialize_trusted_recovery_release(config: &UpdateConfig, release: &ReleaseManifest) {
-    let directory = release_cache_dir(config, release);
-    fs::create_dir_all(&directory).unwrap();
-    fs::write(
-        directory.join("server-release-manifest.json"),
-        serde_json::to_vec_pretty(release).unwrap(),
+    fs::create_dir_all(&config.deployment_root).unwrap();
+    let source = config.deployment_root.join("fixture-image.tar");
+    fs::write(&source, b"trusted OCI recovery archive").unwrap();
+    let subject = release
+        .runtime_oci_digest()
+        .unwrap()
+        .trim_start_matches("sha256:")
+        .to_owned();
+    crate::release::commit_artifact_handle(
+        &trusted_release_cache_root(config),
+        &crate::release::CachedArtifactDescriptor {
+            origin: crate::release::ArtifactOrigin::Official,
+            kind: crate::release::CachedArtifactKind::OciArchive {
+                image_reference: release.image_ref().unwrap(),
+            },
+            version: &release.version,
+            target: &release.target,
+            subject_sha256: &subject,
+        },
+        &source,
     )
     .unwrap();
-    crate::filesystem::set_mode(&directory.join("server-release-manifest.json"), 0o400).unwrap();
-    fs::write(
-        directory.join("server-image.tar"),
-        b"trusted OCI recovery archive",
-    )
-    .unwrap();
+    fs::remove_file(&source).unwrap();
 }
 
 #[cfg(unix)]
@@ -3072,28 +3082,13 @@ fn registered_update_rejects_a_downgrade_before_plan_side_effects() {
     let work = PrivateTempDir::new("nazoauth-registered-downgrade").unwrap();
     let active = manifest("v0.1.19", 'a');
     let target = manifest("v0.1.18", 'b');
-    let record = DeploymentRecord {
-        schema: crate::deployment::DEPLOYMENT_SCHEMA,
-        deployment_id: "deployment-downgrade".to_owned(),
-        control_authority: "controller-downgrade".to_owned(),
-        alias: None,
-        issuer: "https://downgrade.example".to_owned(),
-        active_release: active.embedded,
-        trust: crate::deployment::TrustState::Adopted,
-        capabilities: crate::deployment::CapabilityGrants::observed(),
-        runtime_instances: Vec::new(),
-        resources: BTreeMap::new(),
-        recovery: crate::deployment::RecoveryAssessment {
-            conclusion: RecoveryConclusion::Proven,
-            evidence: Vec::new(),
-            off_host_package_required_for_machine_loss: true,
-        },
-        operator_protocol_versions: std::collections::BTreeSet::new(),
-        control_protocol_versions: std::collections::BTreeSet::new(),
-        declaration_revision: 1,
-    };
-
-    let error = build_registered_update_plan(&record, &target).unwrap_err();
+    // H01: the anti-downgrade floor is enforced once, inside the verification
+    // entry, before any verified handle exists. The registered update flow
+    // wires record.active_release as the trusted floor, so a downgrade can
+    // never reach plan building, evidence staging, or transaction side
+    // effects; the plan builder intentionally carries no duplicate gate.
+    let error =
+        crate::release::enforce_release_trust_floor(&active.embedded.release, &target).unwrap_err();
     assert!(error.to_string().contains("anti-downgrade"));
     assert_eq!(fs::read_dir(work.path()).unwrap().count(), 0);
 }

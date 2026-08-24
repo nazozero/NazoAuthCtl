@@ -6,11 +6,15 @@ pub(crate) fn update(
     options: UpdateOptions,
 ) -> anyhow::Result<()> {
     let mut config = config.clone();
-    let release = VerifiedRelease::fetch(
-        &config.repository,
-        options.version.as_deref(),
-        config.container_backend(),
-    )?;
+    // Legacy UpdateConfig flow: the floor lives in the trust-state file and is
+    // enforced by enforce_release_trust immediately below until the J-phase
+    // retirement; the entry itself carries no floor here.
+    let release = VerifiedRelease::verify(ReleaseRequest {
+        repository: &config.repository,
+        requested_version: options.version.as_deref(),
+        container_backend: config.container_backend(),
+        trusted_version_floor: None,
+    })?;
     enforce_release_trust(&config, &release.manifest)?;
     let tenant_resource_controller_changed = if options.plan {
         false
