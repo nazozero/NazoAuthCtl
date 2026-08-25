@@ -20,10 +20,12 @@
 //!   are never echoed back.
 
 use chrono::{DateTime, Utc};
+use nazo_operator_protocol::ControlResult;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::bootstrap_authority::FreshBootstrapMaterialView;
 use super::deployment_state::{ArtifactRefs, RuntimeSurface, StateMutationPayload};
 
 /// Wire schema discriminator for HostOperation and HostResult messages.
@@ -40,11 +42,19 @@ pub const MAX_HOST_RESULT_BYTES: usize = 1024 * 1024;
 /// unknown kinds here before typed deserialization, and the
 /// `every_registered_kind_round_trips` test pins this list to the enum.
 ///
-/// The F01 wave adds exactly two DeploymentState kinds: one read
-/// (`state-inspect`) and one write (`state-mutate`, itself discriminated by
-/// the closed [`StateMutationPayload`] set). The set stays this small until a
-/// real consumer demands more.
-pub const HOST_OPERATION_KINDS: &[&str] = &["hello", "ping", "state-inspect", "state-mutate"];
+/// The F01 wave added the two DeploymentState kinds (`state-inspect`,
+/// `state-mutate`). The G wave extends the `state-mutate` mutation set and
+/// adds exactly one transport kind: `control-operation`, which carries an
+/// already-signed compact-JWS ControlOperation opaquely to the target's
+/// one-shot NazoAuth operator (goal plan 03 §3.3; no secret material, no
+/// signing on the target).
+pub const HOST_OPERATION_KINDS: &[&str] = &[
+    "hello",
+    "ping",
+    "state-inspect",
+    "state-mutate",
+    "control-operation",
+];
 
 /// Product identity reported by a remote helper and required by the C08
 /// handshake. Anything else is a different program and must never be mutated.
@@ -176,9 +186,20 @@ pub enum HostOperationBody {
     /// never applies.
     StateInspect {},
     /// Apply one closed-set mutation to the target DeploymentState (tasks
-    /// F01/F04). Bootstrap creates fresh state; every other mutation is
-    /// CAS-guarded by the mandatory `expected_revision`.
+    /// F01/F04, extended by G03/G04/G06 with the lifecycle variants).
+    /// Bootstrap creates fresh state; every other mutation is CAS-guarded by
+    /// the mandatory `expected_revision`.
     StateMutate { mutation: StateMutationPayload },
+    /// Deliver one signed ControlOperation to the target's local one-shot
+    /// NazoAuth operator (goal plan 05 §6, decision: JWS on stdin, single-line
+    /// ControlResult on stdout). The envelope is opaque here: the target never
+    /// parses or verifies it — admission and execution stay server-side. The
+    /// expected deployment id must equal the operation binding so a ctl bug
+    /// can never aim instance A's envelope at instance B.
+    ControlOperation {
+        compact_jws: String,
+        expected_deployment_id: String,
+    },
 }
 
 impl HostOperationBody {
@@ -188,6 +209,7 @@ impl HostOperationBody {
             Self::Hello {} => "hello",
             Self::StateInspect {} => "state-inspect",
             Self::StateMutate { .. } => "state-mutate",
+            Self::ControlOperation { .. } => "control-operation",
         }
     }
 }
@@ -245,6 +267,27 @@ impl HostOperation {
             deployment_id: Some(deployment_id.into()),
             expected_revision,
             operation: HostOperationBody::StateMutate { mutation },
+        }
+    }
+
+    /// Deliver one signed ControlOperation to the target's local operator.
+    /// The JWS travels opaquely; the binding pair is validated here so a
+    /// mismatched envelope is refused before any transport activity.
+    pub fn control_operation(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        compact_jws: impl Into<String>,
+    ) -> Self {
+        let deployment_id = deployment_id.into();
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.clone()),
+            expected_revision: None,
+            operation: HostOperationBody::ControlOperation {
+                compact_jws: compact_jws.into(),
+                expected_deployment_id: deployment_id,
+            },
         }
     }
 
@@ -346,11 +389,117 @@ impl HostOperation {
                             ));
                         }
                     }
+                    StateMutationPayload::Update { artifact, config } => {
+                        // Every lifecycle mutation replays against the live
+                        // revision; without the expectation a resumed update
+                        // could re-apply over drifted state.
+                        if self.expected_revision.is_none() {
+                            return Err(MessageRejection::new(
+                                RejectionCode::OperationMalformed,
+                                "update requires expected_revision",
+                            ));
+                        }
+                        if artifact.repository.is_empty() || artifact.repository.len() > 128 {
+                            return Err(MessageRejection::new(
+                                RejectionCode::OperationMalformed,
+                                "update artifact repository must be 1-128 characters",
+                            ));
+                        }
+                        if let Some(pin) = &artifact.expected_subject_sha256
+                            && !valid_lower_hex_sha256(pin)
+                        {
+                            return Err(MessageRejection::new(
+                                RejectionCode::OperationMalformed,
+                                "update expected_subject_sha256 must be 64 lowercase \
+                                 hexadecimal characters",
+                            ));
+                        }
+                        if let Some(config) = config
+                            && let Err(rejection) = config.validate()
+                        {
+                            return Err(rejection);
+                        }
+                    }
+                    StateMutationPayload::Rollback {} => {
+                        if self.expected_revision.is_none() {
+                            return Err(MessageRejection::new(
+                                RejectionCode::OperationMalformed,
+                                "rollback requires expected_revision",
+                            ));
+                        }
+                    }
+                    StateMutationPayload::Uninstall { resources } => {
+                        if self.expected_revision.is_none() {
+                            return Err(MessageRejection::new(
+                                RejectionCode::OperationMalformed,
+                                "uninstall requires expected_revision",
+                            ));
+                        }
+                        if resources.len() > super::deployment_state::MAX_RESOURCES {
+                            return Err(MessageRejection::new(
+                                RejectionCode::OperationMalformed,
+                                "uninstall plans more deletions than any deployment declares",
+                            ));
+                        }
+                        for resource in resources {
+                            resource.validate()?;
+                        }
+                    }
+                }
+            }
+            HostOperationBody::ControlOperation {
+                compact_jws,
+                expected_deployment_id,
+            } => {
+                // Instance binding required; revision expectations are
+                // meaningless for a pass-through delivery.
+                if self.deployment_id.is_none() || self.expected_revision.is_some() {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "control-operation requires deployment_id and must not carry \
+                         expected_revision",
+                    ));
+                }
+                if compact_jws.is_empty()
+                    || compact_jws.len() > MAX_CONTROL_JWS_BYTES
+                    || !compact_jws.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
+                {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "control-operation compact_jws must be a bounded base64url JWS",
+                    ));
+                }
+                if compact_jws.split('.').count() != 3 {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "control-operation compact_jws must have exactly three segments",
+                    ));
+                }
+                if expected_deployment_id != self.deployment_id.as_deref().unwrap_or_default() {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "control-operation expected_deployment_id must equal the operation \
+                         binding",
+                    ));
                 }
             }
         }
         Ok(())
     }
+}
+
+/// Upper bound for the opaque compact JWS inside one control-operation kind.
+/// The frozen protocol allows 64 KiB envelopes and the HostOperation total
+/// cap equals it, so the payload keeps that bound minus framing headroom.
+const MAX_CONTROL_JWS_BYTES: usize = 60 * 1024;
+
+fn valid_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 /// The single answer a target returns for one HostOperation.
@@ -419,7 +568,7 @@ pub enum HostOutcome {
 
 /// Typed completion payloads mirroring [`HostOperationBody`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "result", rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(tag = "completion", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HostCompletionBody {
     Ping {
         nonce: String,
@@ -440,6 +589,13 @@ pub enum HostCompletionBody {
     /// InstanceRecord without a second round trip.
     InstallApplied {
         inspection: InstanceInspection,
+    },
+    /// The target's local one-shot NazoAuth operator answered a delivered
+    /// ControlOperation with its durable [`ControlResult`] (goal plan 05 §6).
+    /// Only journal-backed results complete this way; refusals before
+    /// acceptance are Failed outcomes.
+    ControlOperationExecuted {
+        result: ControlResult,
     },
 }
 
@@ -466,6 +622,16 @@ pub struct InstanceInspection {
     /// Operation id that produced the current revision, if any (journal index).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_host_operation: Option<String>,
+    /// Read-only fresh-install bootstrap capability, surfaced ONLY while the
+    /// capability is open and the live state still matches its install
+    /// journal binding (goal plan 07 G-A decision). Absent in every other
+    /// state — closure, consumption, and drift are indistinguishable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_material: Option<FreshBootstrapMaterialView>,
+    /// Embedded build identity facts of `artifact.current`, when the target's
+    /// verification recorded them (G03 ControlOperation envelope source).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_build_identity: Option<super::deployment_state::BuildIdentity>,
 }
 
 /// Identity a target helper announces about itself (goal plan 03 §6).
@@ -717,7 +883,13 @@ mod tests {
     fn every_registered_kind_round_trips() -> anyhow::Result<()> {
         assert_eq!(
             HOST_OPERATION_KINDS,
-            &["hello", "ping", "state-inspect", "state-mutate"]
+            &[
+                "hello",
+                "ping",
+                "state-inspect",
+                "state-mutate",
+                "control-operation"
+            ]
         );
         let operation = ping_operation("probe");
         let encoded = encode_host_operation(&operation)?;
@@ -833,6 +1005,169 @@ mod tests {
         assert_eq!(
             parse_host_operation(&encode_host_operation(&apply)?)?,
             apply
+        );
+
+        // G-wave lifecycle mutations round-trip with their payloads intact.
+        let update = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            Some(4),
+            StateMutationPayload::Update {
+                artifact: super::super::install_exec::OfficialArtifactRef {
+                    repository: "nazozero/NazoAuth".to_owned(),
+                    version: Some("v0.3.0".to_owned()),
+                    expected_subject_sha256: Some("c".repeat(64)),
+                },
+                config: Some(super::super::install_exec::StagedConfig {
+                    content: "{\"issuer\":\"https://auth.example.com\"}".to_owned(),
+                    sha256: "d".repeat(64),
+                    schema: "nazauth-config-v2".to_owned(),
+                }),
+            },
+        );
+        assert_eq!(
+            parse_host_operation(&encode_host_operation(&update)?)?,
+            update
+        );
+
+        let rollback = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            Some(5),
+            StateMutationPayload::Rollback {},
+        );
+        assert_eq!(
+            parse_host_operation(&encode_host_operation(&rollback)?)?,
+            rollback
+        );
+
+        let uninstall = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            Some(5),
+            StateMutationPayload::Uninstall {
+                resources: vec![super::super::install_exec::PlannedResourceDeletion {
+                    resource_id: "app-runtime".to_owned(),
+                    locator: "nazoauth-main".to_owned(),
+                }],
+            },
+        );
+        assert_eq!(
+            parse_host_operation(&encode_host_operation(&uninstall)?)?,
+            uninstall
+        );
+
+        // The control-operation kind carries the opaque JWS plus the binding
+        // cross-check and round-trips byte-stable.
+        let control = HostOperation::control_operation(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            "eyJhbGciOiJFZERTQSJ9.eyJvcGVyYXRpb25faWQiOiJ4In0.sig",
+        );
+        let parsed = parse_host_operation(&encode_host_operation(&control)?)?;
+        assert_eq!(parsed, control);
+        assert_eq!(parsed.operation.kind(), "control-operation");
+        Ok(())
+    }
+
+    #[test]
+    fn control_operation_kind_enforces_binding_and_jws_shape() -> anyhow::Result<()> {
+        let jws = format!("{}.{}.{}", "a".repeat(40), "b".repeat(40), "c".repeat(64));
+
+        // Binding mismatch is refused before any transport activity.
+        let mut crossed =
+            HostOperation::control_operation(Uuid::now_v7().to_string(), "deploy-a", &jws);
+        if let HostOperationBody::ControlOperation {
+            expected_deployment_id,
+            ..
+        } = &mut crossed.operation
+        {
+            *expected_deployment_id = "deploy-b".to_owned();
+        }
+        let rejection = crossed.validate().expect_err("crossed binding");
+        assert!(rejection.detail.contains("must equal"), "{rejection}");
+
+        // A revision expectation is meaningless on a pass-through delivery.
+        let mut revisioned =
+            HostOperation::control_operation(Uuid::now_v7().to_string(), "deploy-a", &jws);
+        revisioned.expected_revision = Some(2);
+        assert!(revisioned.validate().is_err());
+
+        // Non-JWS shapes fail closed.
+        for broken in [
+            "",
+            "one-segment",
+            "a.b.c d",
+            &"x".repeat(MAX_CONTROL_JWS_BYTES + 1),
+        ] {
+            let operation =
+                HostOperation::control_operation(Uuid::now_v7().to_string(), "deploy-a", broken);
+            let rejection = operation.validate().expect_err(broken);
+            assert_eq!(
+                rejection.code,
+                RejectionCode::OperationMalformed,
+                "{rejection}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_mutations_demand_their_revision_expectations() -> anyhow::Result<()> {
+        let cas_free_update = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-a",
+            None,
+            StateMutationPayload::Update {
+                artifact: super::super::install_exec::OfficialArtifactRef {
+                    repository: "nazozero/NazoAuth".to_owned(),
+                    version: None,
+                    expected_subject_sha256: None,
+                },
+                config: None,
+            },
+        );
+        let rejection = cas_free_update.validate().expect_err("update without CAS");
+        assert!(
+            rejection.detail.contains("expected_revision"),
+            "{rejection}"
+        );
+
+        let bad_pin = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-a",
+            Some(1),
+            StateMutationPayload::Update {
+                artifact: super::super::install_exec::OfficialArtifactRef {
+                    repository: "nazozero/NazoAuth".to_owned(),
+                    version: None,
+                    expected_subject_sha256: Some("NOT-A-DIGEST".to_owned()),
+                },
+                config: None,
+            },
+        );
+        assert!(bad_pin.validate().is_err());
+
+        let cas_free_rollback = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-a",
+            None,
+            StateMutationPayload::Rollback {},
+        );
+        assert!(cas_free_rollback.validate().is_err());
+
+        let cas_free_uninstall = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-a",
+            None,
+            StateMutationPayload::Uninstall { resources: vec![] },
+        );
+        let rejection = cas_free_uninstall
+            .validate()
+            .expect_err("uninstall without CAS");
+        assert!(
+            rejection.detail.contains("expected_revision"),
+            "{rejection}"
         );
         Ok(())
     }
@@ -1078,7 +1413,7 @@ mod tests {
     #[test]
     fn result_schema_mismatch_is_reported_separately() {
         let raw = format!(
-            r#"{{"schema":9,"operation_id":"{}","outcome":{{"status":"completed","body":{{"result":"ping","nonce":"n"}}}}}}"#,
+            r#"{{"schema":9,"operation_id":"{}","outcome":{{"status":"completed","body":{{"completion":"ping","nonce":"n"}}}}}}"#,
             Uuid::now_v7()
         );
         let rejection = parse_host_result(raw.as_bytes()).expect_err("schema");

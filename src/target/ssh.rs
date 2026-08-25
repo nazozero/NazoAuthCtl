@@ -41,7 +41,6 @@ use crate::registry::{HostPrivilege, HostRecord, HostTransport};
 
 use super::{
     ControlOperationReceipt, ExecutionTarget, HealthSnapshot, HostOverview, InstanceInspection,
-    TARGET_CAPABILITY_UNAVAILABLE,
     wire::{
         HOST_ERR_OPERATION_INVALID, HOST_ERR_REMOTE_HELPER_MISMATCH, HostCompletionBody,
         HostOperation, HostOutcome, HostResult, RemoteHello, encode_host_operation,
@@ -332,13 +331,6 @@ impl SshTarget {
         }
         Ok(())
     }
-
-    fn unavailable(method: &str) -> anyhow::Error {
-        anyhow::anyhow!(
-            "{TARGET_CAPABILITY_UNAVAILABLE}: {method} executes once the ControlOperation \
-             execution wave (E01/E03) lands"
-        )
-    }
 }
 
 /// Result of probing non-interactive sudo availability.
@@ -400,9 +392,59 @@ impl ExecutionTarget for SshTarget {
 
     fn execute_control_operation(
         &self,
-        _request: &super::ControlOperationRequest,
+        request: &super::ControlOperationRequest,
     ) -> anyhow::Result<ControlOperationReceipt> {
-        Err(Self::unavailable("execute_control_operation"))
+        use super::control_exec::CONTROL_OUTCOME_UNKNOWN;
+        // The signed envelope is public data (no secret material), so it
+        // rides the handshake-gated stdio contract like every other kind and
+        // the target journals the delivery under its C07 contract.
+        let presented = super::control_exec::control_operation_id_from_jws(&request.compact_jws)
+            .map_err(|error| anyhow::anyhow!("{HOST_ERR_OPERATION_INVALID}: {error}"))?;
+        let operation = HostOperation::control_operation(
+            Uuid::now_v7(),
+            request.deployment_id.clone(),
+            request.compact_jws.clone(),
+        );
+        let result = self.execute_host_operation(&operation)?;
+        match result.outcome {
+            HostOutcome::Completed {
+                body:
+                    HostCompletionBody::ControlOperationExecuted {
+                        result: control_result,
+                    },
+            } => {
+                if control_result.operation_id != presented {
+                    bail!(
+                        "{HOST_ERR_OPERATION_INVALID}: the helper answered operation '{}' while \
+                         '{presented}' was presented",
+                        control_result.operation_id
+                    );
+                }
+                Ok(ControlOperationReceipt {
+                    operation_id: presented,
+                    accepted: true,
+                    result: Some(control_result),
+                })
+            }
+            HostOutcome::Completed { .. } => bail!(
+                "{HOST_ERR_OPERATION_INVALID}: the helper on '{}' answered an unexpected \
+                 completion instead of a ControlOperation result",
+                self.profile
+            ),
+            HostOutcome::Failed { code, detail } => {
+                if code == CONTROL_OUTCOME_UNKNOWN || detail.contains(CONTROL_OUTCOME_UNKNOWN) {
+                    // The operator may have executed; only a resumed resend of
+                    // the same envelope can resolve the outcome.
+                    bail!("{code}: {detail}")
+                }
+                // Admission-grade refusal before acceptance.
+                Ok(ControlOperationReceipt {
+                    operation_id: presented,
+                    accepted: false,
+                    result: None,
+                })
+            }
+        }
     }
 
     fn read_health(&self, deployment_id: &str) -> anyhow::Result<HealthSnapshot> {
@@ -594,7 +636,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
         serde_json::json!({
             "schema": HOST_PROTOCOL_SCHEMA,
             "operation_id": "__OPERATION_ID__",
-            "outcome": {"status": "completed", "body": {"result": "hello", "hello": {
+            "outcome": {"status": "completed", "body": {"completion": "hello", "hello": {
                 "product": identity.product,
                 "remote_exec_schema": identity.remote_exec_schema,
                 "version": version,
@@ -611,7 +653,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
         serde_json::json!({
             "schema": HOST_PROTOCOL_SCHEMA,
             "operation_id": "__OPERATION_ID__",
-            "outcome": {"status": "completed", "body": {"result": "ping", "nonce": nonce}}
+            "outcome": {"status": "completed", "body": {"completion": "ping", "nonce": nonce}}
         })
         .to_string()
     }
@@ -740,7 +782,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             "schema": HOST_PROTOCOL_SCHEMA,
             "operation_id": "__OPERATION_ID__",
             "outcome": {"status": "completed", "body": {
-                "result": "state-inspect",
+                "completion": "state-inspect",
                 "inspection": serde_json::to_value(inspection).expect("inspection serializes"),
             }}
         })
@@ -749,6 +791,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
 
     fn sample_inspection() -> InstanceInspection {
         InstanceInspection {
+            current_build_identity: None,
             deployment_id: "deploy-alpha".to_owned(),
             issuer: "https://auth.example.com".to_owned(),
             observed_at: chrono::Utc::now(),
@@ -774,6 +817,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             healthy: true,
             health_summary: "runtime healthy".to_owned(),
             active_host_operation: None,
+            bootstrap_material: None,
         }
     }
 
@@ -951,7 +995,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             response_json: &serde_json::json!({
                 "schema": HOST_PROTOCOL_SCHEMA,
                 "operation_id": Uuid::now_v7().to_string(),
-                "outcome": {"status": "completed", "body": {"result": "ping", "nonce": "foreign"}}
+                "outcome": {"status": "completed", "body": {"completion": "ping", "nonce": "foreign"}}
             })
             .to_string(),
             stderr_text: None,
@@ -1089,7 +1133,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     // ---------- shared trait plumbing ----------
 
     #[test]
-    fn unavailable_methods_report_the_stable_boundary_code() {
+    fn control_operations_over_ssh_reject_malformed_envelopes_before_transport() {
         let target = SshTarget::from_record(
             &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Direct).unwrap(),
         )
@@ -1097,10 +1141,11 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
         let error = target
             .execute_control_operation(&super::super::ControlOperationRequest {
                 deployment_id: "deploy-alpha".to_owned(),
-                compact_jws: "jws".to_owned(),
+                compact_jws: "not a jws".to_owned(),
             })
             .err()
             .unwrap();
-        assert!(format!("{error:#}").contains(TARGET_CAPABILITY_UNAVAILABLE));
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(HOST_ERR_OPERATION_INVALID), "{rendered}");
     }
 }

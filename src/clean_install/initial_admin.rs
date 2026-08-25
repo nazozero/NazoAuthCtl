@@ -326,6 +326,7 @@ mod tests {
                 .bootstrap(
                     &deployment_id,
                     crate::target::BootstrapParams {
+                        current_build_identity: None,
                         issuer: ISSUER.to_owned(),
                         runtime: crate::target::RuntimeSurface::new("podman", "nazoauth-x")?,
                         artifact: crate::target::ArtifactRefs {

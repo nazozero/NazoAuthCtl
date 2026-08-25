@@ -10,6 +10,7 @@ mod discovery;
 mod fleet;
 mod governance;
 mod install;
+mod instance_lifecycle;
 mod lifecycle;
 mod model;
 mod operator;

@@ -12,37 +12,46 @@
 //! ([`remote_exec`], task C04). No HTTP/Kubernetes/agent targets exist.
 
 pub(crate) mod bootstrap_authority;
+pub(crate) mod control_exec;
 pub mod deployment_state;
 pub(crate) mod install_exec;
 pub mod journal;
 pub(crate) mod remote_exec;
 pub mod ssh;
+pub(crate) mod uninstall_exec;
+pub(crate) mod update_exec;
 pub mod wire;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use nazo_operator_protocol::ControlResult;
 use uuid::Uuid;
 
 pub use bootstrap_authority::{
     BOOTSTRAP_CLOSED, CONTEXT_FILE_NAME, FRESH_BOOTSTRAP_ALLOWLIST, FRESH_BOOTSTRAP_SCHEMA,
-    FreshBootstrapContext, TOKEN_FILE_NAME,
+    FreshBootstrapContext, FreshBootstrapMaterialView, TOKEN_FILE_NAME,
+};
+pub use control_exec::{
+    CONTROL_EXECUTION_UNAVAILABLE, CONTROL_OUTCOME_UNKNOWN, CONTROL_TARGET_DRIFT,
 };
 pub use deployment_state::{
-    ActiveHostOperationRef, ArtifactRefs, BootstrapParams, CONFIG_REVISION_MISMATCH, ConfigState,
-    DEPLOYMENT_EXISTS, DEPLOYMENT_STATE_SCHEMA, DEPLOYMENT_UNKNOWN, DeploymentState, Failure,
-    HealthRecord, INSTALL_FAILED, MAX_RESOURCES, RESOURCE_DELETE_FORBIDDEN, RESOURCE_UNKNOWN,
+    ActiveHostOperationRef, ArtifactRefs, BUILD_IDENTITY_PRODUCT, BootstrapParams, BuildIdentity,
+    CONFIG_REVISION_MISMATCH, ConfigState, DEPLOYMENT_EXISTS, DEPLOYMENT_STATE_SCHEMA,
+    DEPLOYMENT_UNKNOWN, DeploymentState, Failure, HealthRecord, INSTALL_FAILED, MAX_RESOURCES,
+    OBJECT_IDENTITY_MISMATCH, RESOURCE_DELETE_FORBIDDEN, RESOURCE_UNKNOWN, ROLLBACK_UNAVAILABLE,
     Resource, ResourceOwnership, ResourceScope, RuntimeSurface, StateMutationPayload,
     TargetStateStore,
 };
 pub use install_exec::{
     ARTIFACT_UNVERIFIED, CONFIG_INVALID, CONFIG_PATH_OCCUPIED, EMBEDDED_IDENTITY_MISMATCH,
-    HEALTH_PROBE_FAILED, InstallOrder, OfficialArtifactRef, PlannedSecret, RUNTIME_START_FAILED,
-    SECRET_PROVISION_FAILED, SECRET_PURPOSES,
+    HEALTH_PROBE_FAILED, InstallOrder, OfficialArtifactRef, PlannedResourceDeletion, PlannedSecret,
+    RUNTIME_START_FAILED, SECRET_PROVISION_FAILED, SECRET_PURPOSES, StagedConfig,
 };
 pub use journal::{JournalStatus, TargetJournal};
 pub use ssh::SshTarget;
+pub use update_exec::{ACTIVATION_FAILED, ROLLBACK_ARTIFACT_MISSING};
 pub use wire::{
     HELLO_PRODUCT, HOST_ERR_OPERATION_CONFLICT, HOST_ERR_OPERATION_INVALID,
     HOST_ERR_REMOTE_HELPER_MISMATCH, HOST_OPERATION_KINDS, HOST_PROTOCOL_SCHEMA,
@@ -51,14 +60,6 @@ pub use wire::{
     MessageRejection, RejectionCode, RemoteHello, canonical_operation_hash, encode_host_operation,
     encode_host_result, local_hello, parse_host_operation, parse_host_result, verify_remote_hello,
 };
-
-/// Stable code for capabilities whose owning wave has not landed yet.
-///
-/// This is a delivery boundary, not a compatibility shim: the contract is
-/// frozen ahead of its executors so transports can answer identically over
-/// stdio. After the F01 wave only the app-level ControlOperation execution
-/// path (E01/E03) still answers with it.
-pub const TARGET_CAPABILITY_UNAVAILABLE: &str = "TARGET_CAPABILITY_UNAVAILABLE";
 
 /// The formalized target state root (task F01): one private directory holding
 /// every deployment's [`DeploymentState`] document beside its C07 operation
@@ -116,12 +117,17 @@ pub struct ControlOperationRequest {
     pub compact_jws: String,
 }
 
-/// Receipt of an accepted/rejected app-level operation. Shape stays minimal
-/// until E01 freezes the ControlOperation wire it mirrors.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Receipt of one delivered ControlOperation. `accepted` is true exactly when
+/// the target surfaced the operator's durable [`ControlResult`] — the
+/// operation was journal-accepted server-side. Refusals before acceptance
+/// surface as `Err` from `execute_control_operation` (admission-grade,
+/// outcome unknown), never as a fabricated receipt.
+#[derive(Clone, Debug)]
 pub struct ControlOperationReceipt {
     pub operation_id: String,
     pub accepted: bool,
+    /// The durable application result when the target produced one.
+    pub result: Option<ControlResult>,
 }
 
 /// The complete surface a transport exposes to lifecycle use cases.
@@ -164,6 +170,12 @@ pub trait ExecutionTarget {
 /// [`TargetStateStore`]; there are no placeholder answers left on those
 /// paths. Production resolves the state root via [`target_state_root`];
 /// tests inject a private temp root with [`LocalTarget::with_state_root`].
+///
+/// The G wave replaces every executor placeholder: installs run through the
+/// install seam, delivered ControlOperations through the one-shot NazoAuth
+/// operator, and update/rollback/uninstall orders through their lifecycle
+/// seams. Each seam is individually injectable so development machines never
+/// spawn engines.
 #[derive(Clone)]
 pub struct LocalTarget {
     state_root: PathBuf,
@@ -171,6 +183,12 @@ pub struct LocalTarget {
     /// [`install_exec::HostInstallExecutor`], tests inject scripted doubles so
     /// container engines are never spawned on development machines.
     executor: Arc<dyn install_exec::InstallExecutor>,
+    /// Delivered-ControlOperation seam (G-wave decision 1).
+    control: Arc<dyn control_exec::ControlOperationExecutor>,
+    /// Update/rollback order seam (G03/G04).
+    lifecycle: Arc<dyn update_exec::LifecycleExecutor>,
+    /// Uninstall deletion seam (G06).
+    deletion: Arc<dyn uninstall_exec::DeletionExecutor>,
 }
 
 impl LocalTarget {
@@ -179,6 +197,9 @@ impl LocalTarget {
         Ok(Self {
             state_root: target_state_root()?,
             executor: Arc::new(install_exec::HostInstallExecutor),
+            control: Arc::new(control_exec::HostControlOperator),
+            lifecycle: Arc::new(update_exec::HostLifecycleExecutor),
+            deletion: Arc::new(uninstall_exec::HostDeletionExecutor),
         })
     }
 
@@ -187,6 +208,9 @@ impl LocalTarget {
         Self {
             state_root: root.into(),
             executor: Arc::new(install_exec::HostInstallExecutor),
+            control: Arc::new(control_exec::HostControlOperator),
+            lifecycle: Arc::new(update_exec::HostLifecycleExecutor),
+            deletion: Arc::new(uninstall_exec::HostDeletionExecutor),
         }
     }
 
@@ -200,18 +224,50 @@ impl LocalTarget {
         self
     }
 
-    fn unavailable(method: &str) -> anyhow::Error {
-        anyhow::anyhow!(
-            "{TARGET_CAPABILITY_UNAVAILABLE}: {method} executes once the ControlOperation \
-             execution wave (E01/E03) lands"
-        )
+    /// Test seam: substitute the ControlOperation operator.
+    #[allow(dead_code)] // test seam: consumed by the lifecycle use-case tests
+    pub(crate) fn with_control_executor(
+        mut self,
+        control: Arc<dyn control_exec::ControlOperationExecutor>,
+    ) -> Self {
+        self.control = control;
+        self
+    }
+
+    /// Test seam: substitute the update/rollback executor.
+    #[allow(dead_code)] // test seam: consumed by the lifecycle use-case tests
+    pub(crate) fn with_lifecycle_executor(
+        mut self,
+        lifecycle: Arc<dyn update_exec::LifecycleExecutor>,
+    ) -> Self {
+        self.lifecycle = lifecycle;
+        self
+    }
+
+    /// Test seam: substitute the uninstall deletion executor.
+    #[allow(dead_code)] // test seam: consumed by the lifecycle use-case tests
+    pub(crate) fn with_deletion_executor(
+        mut self,
+        deletion: Arc<dyn uninstall_exec::DeletionExecutor>,
+    ) -> Self {
+        self.deletion = deletion;
+        self
+    }
+
+    fn executors(&self) -> Executors<'_> {
+        Executors {
+            install: &self.executor,
+            control: &self.control,
+            lifecycle: &self.lifecycle,
+            deletion: &self.deletion,
+        }
     }
 
     /// Execute with the target-side journal contract (task C07): a replay of
     /// an accepted id returns the stored result, the same id with a different
     /// payload conflicts, and fresh operations are journaled pending before
-    /// dispatch and finalized after. State mutations (F01) run under this
-    /// contract like every other operation.
+    /// dispatch and finalized after. State mutations and delivered control
+    /// operations run under this contract like every other side-effecting kind.
     pub fn execute_journaled(
         &self,
         operation: &HostOperation,
@@ -225,11 +281,19 @@ impl LocalTarget {
             ));
         }
         let store = TargetStateStore::open(journal.root())?;
-        let executor = self.executor.clone();
+        let executors = self.executors();
         journal.run_journaled(operation, |operation| {
-            dispatch_host_operation(operation, &store, &executor)
+            dispatch_host_operation(operation, &store, &executors)
         })
     }
+}
+
+/// The bundle of target-side executors handed to shared dispatch.
+pub(crate) struct Executors<'a> {
+    pub(crate) install: &'a Arc<dyn install_exec::InstallExecutor>,
+    pub(crate) control: &'a Arc<dyn control_exec::ControlOperationExecutor>,
+    pub(crate) lifecycle: &'a Arc<dyn update_exec::LifecycleExecutor>,
+    pub(crate) deletion: &'a Arc<dyn uninstall_exec::DeletionExecutor>,
 }
 
 impl Default for LocalTarget {
@@ -253,7 +317,7 @@ impl std::fmt::Debug for LocalTarget {
 pub(crate) fn dispatch_host_operation(
     operation: &HostOperation,
     store: &TargetStateStore,
-    executor: &Arc<dyn install_exec::InstallExecutor>,
+    executors: &Executors<'_>,
 ) -> HostResult {
     debug_assert!(
         operation.validate().is_ok(),
@@ -274,6 +338,10 @@ pub(crate) fn dispatch_host_operation(
         ),
         HostOperationBody::StateInspect {} => answer_inspect(operation, store)
             .unwrap_or_else(|failure| state_failure(operation, &failure)),
+        HostOperationBody::ControlOperation { compact_jws, .. } => {
+            answer_control_operation(operation, store, compact_jws, executors.control)
+                .unwrap_or_else(|failure| state_failure(operation, &failure))
+        }
         HostOperationBody::StateMutate { mutation } => match mutation {
             StateMutationPayload::Bootstrap {
                 issuer,
@@ -308,7 +376,7 @@ pub(crate) fn dispatch_host_operation(
                         };
                         // The executor rolls back its own partial work on any
                         // failure: nothing is registered, no state is created.
-                        let facts = match executor.execute_install(&job) {
+                        let facts = match executors.install.execute_install(&job) {
                             Ok(facts) => facts,
                             Err(failure) => return state_failure(operation, &failure),
                         };
@@ -322,6 +390,7 @@ pub(crate) fn dispatch_host_operation(
                             config_reference: config_reference.clone(),
                             config_schema: config_schema.clone(),
                             resources: resources.clone(),
+                            current_build_identity: facts.build_identity.clone(),
                         };
                         match commit_clean_install(store, &deployment_id, params, operation) {
                             Ok(inspection) => HostResult::completed(
@@ -339,6 +408,7 @@ pub(crate) fn dispatch_host_operation(
                             config_reference: config_reference.clone(),
                             config_schema: config_schema.clone(),
                             resources: resources.clone(),
+                            current_build_identity: None,
                         };
                         match store.bootstrap(&deployment_id, params, &operation.operation_id) {
                             Ok(state) => HostResult::completed(
@@ -381,8 +451,204 @@ pub(crate) fn dispatch_host_operation(
                     Err(failure) => state_failure(operation, &failure),
                 }
             }
+            StateMutationPayload::Update { artifact, config } => answer_update(
+                operation,
+                store,
+                artifact,
+                config.as_ref(),
+                executors.lifecycle,
+            )
+            .unwrap_or_else(|failure| state_failure(operation, &failure)),
+            StateMutationPayload::Rollback {} => {
+                answer_rollback(operation, store, executors.lifecycle)
+                    .unwrap_or_else(|failure| state_failure(operation, &failure))
+            }
+            StateMutationPayload::Uninstall { resources } => {
+                answer_uninstall(operation, store, resources, executors.deletion)
+                    .unwrap_or_else(|failure| state_failure(operation, &failure))
+            }
         },
     }
+}
+
+/// Execute one G03 update order: the lifecycle executor performs the full
+/// staged sequence (verify → snapshot → stage config → activate → health →
+/// commit) inside this journaled operation and rolls its own partial work
+/// back on failure.
+fn answer_update(
+    operation: &HostOperation,
+    store: &TargetStateStore,
+    artifact: &OfficialArtifactRef,
+    config: Option<&StagedConfig>,
+    lifecycle: &Arc<dyn update_exec::LifecycleExecutor>,
+) -> Result<HostResult, Failure> {
+    let Some(expected_revision) = operation.expected_revision else {
+        return Err(Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "update requires expected_revision",
+        ));
+    };
+    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
+    let state = store.load_existing(&deployment_id)?;
+    let scope_dir = store.scope_dir(&deployment_id)?;
+    ensure_scope_dir(&scope_dir);
+    let Some(current_artifact) = state.artifact.current.clone() else {
+        return Err(Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "the deployment records no current artifact reference; adopt or install it first",
+        ));
+    };
+    let job = update_exec::UpdateJob {
+        operation_id: &operation.operation_id,
+        deployment_id: &deployment_id,
+        issuer: &state.issuer.clone(),
+        runtime_kind: &state.runtime.kind,
+        runtime_object: &state.runtime.object,
+        config_reference: &state.config.reference.clone(),
+        config_schema: &state.config.schema.clone(),
+        current_artifact: &current_artifact,
+        expected_revision,
+        artifact,
+        config,
+        scope_dir: &scope_dir,
+        store,
+    };
+    let facts = lifecycle.execute_update(&job)?;
+    Ok(HostResult::completed(
+        &operation.operation_id,
+        HostCompletionBody::StateMutateApplied {
+            revision: facts.revision,
+        },
+    ))
+}
+
+/// Execute one explicit G04 rollback order.
+fn answer_rollback(
+    operation: &HostOperation,
+    store: &TargetStateStore,
+    lifecycle: &Arc<dyn update_exec::LifecycleExecutor>,
+) -> Result<HostResult, Failure> {
+    let Some(expected_revision) = operation.expected_revision else {
+        return Err(Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "rollback requires expected_revision",
+        ));
+    };
+    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
+    let state = store.load_existing(&deployment_id)?;
+    let scope_dir = store.scope_dir(&deployment_id)?;
+    ensure_scope_dir(&scope_dir);
+    let Some(current_artifact) = state.artifact.current.clone() else {
+        return Err(Failure::new(
+            ROLLBACK_UNAVAILABLE,
+            "the deployment records no current artifact reference",
+        ));
+    };
+    let job = update_exec::RollbackJob {
+        operation_id: &operation.operation_id,
+        deployment_id: &deployment_id,
+        issuer: &state.issuer.clone(),
+        runtime_kind: &state.runtime.kind,
+        runtime_object: &state.runtime.object,
+        config_reference: &state.config.reference.clone(),
+        config_schema: &state.config.schema.clone(),
+        current_artifact: &current_artifact,
+        previous_artifact: state.artifact.previous.as_deref(),
+        expected_revision,
+        scope_dir: &scope_dir,
+        store,
+    };
+    let facts = lifecycle.execute_rollback(&job)?;
+    Ok(HostResult::completed(
+        &operation.operation_id,
+        HostCompletionBody::StateMutateApplied {
+            revision: facts.revision,
+        },
+    ))
+}
+
+/// Execute one G06 uninstall order: zero-delete enforcement runs against the
+/// live state here (managed+deployment only), then the deletion executor
+/// removes the planned objects physically with identity re-confirmation.
+fn answer_uninstall(
+    operation: &HostOperation,
+    store: &TargetStateStore,
+    resources: &[PlannedResourceDeletion],
+    deletion: &Arc<dyn uninstall_exec::DeletionExecutor>,
+) -> Result<HostResult, Failure> {
+    let Some(expected_revision) = operation.expected_revision else {
+        return Err(Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "uninstall requires expected_revision",
+        ));
+    };
+    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
+    let state = store.load_existing(&deployment_id)?;
+    for planned in resources {
+        state.exact_managed_deployment_resource(&planned.resource_id)?;
+    }
+    let scope_dir = store.scope_dir(&deployment_id)?;
+    ensure_scope_dir(&scope_dir);
+    let current_artifact = state.artifact.current.clone().unwrap_or_default();
+    let job = uninstall_exec::DeletionJob {
+        operation_id: &operation.operation_id,
+        deployment_id: &deployment_id,
+        runtime_kind: &state.runtime.kind.clone(),
+        runtime_object: &state.runtime.object,
+        current_artifact: &current_artifact,
+        config_reference: &state.config.reference.clone(),
+        resources,
+        declared: &state.resources,
+        expected_revision,
+        scope_dir: &scope_dir,
+        store,
+    };
+    deletion.execute_deletion(&job)?;
+    Ok(HostResult::completed(
+        &operation.operation_id,
+        HostCompletionBody::StateMutateApplied {
+            revision: state.config.revision,
+        },
+    ))
+}
+
+/// Deliver one signed ControlOperation to the local one-shot NazoAuth
+/// operator through the injected seam (G-wave decision 1). The target never
+/// parses or verifies the envelope; it refuses only when the live facts do
+/// not match the deployment binding.
+fn answer_control_operation(
+    operation: &HostOperation,
+    store: &TargetStateStore,
+    compact_jws: &str,
+    control: &Arc<dyn control_exec::ControlOperationExecutor>,
+) -> Result<HostResult, Failure> {
+    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
+    let presented = control_exec::control_operation_id_from_jws(compact_jws).map_err(|error| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            wire::sanitize(error.to_string()),
+        )
+    })?;
+    let state = store.load_existing(&deployment_id)?;
+    let Some(current_artifact) = state.artifact.current.clone() else {
+        return Err(Failure::new(
+            CONTROL_TARGET_DRIFT,
+            "the deployment records no current artifact reference",
+        ));
+    };
+    let job = control_exec::ControlJob {
+        operation_id: &presented,
+        deployment_id: &deployment_id,
+        artifact_reference: &current_artifact,
+        runtime_kind: &state.runtime.kind,
+        runtime_object: &state.runtime.object,
+        compact_jws,
+    };
+    let result = control.execute(&job)?;
+    Ok(HostResult::completed(
+        &operation.operation_id,
+        HostCompletionBody::ControlOperationExecuted { result },
+    ))
 }
 
 /// Commit the post-install DeploymentState: fresh document plus the healthy
@@ -421,6 +687,8 @@ fn inspection_from_state(state: DeploymentState) -> InstanceInspection {
         active_host_operation: state
             .active_host_operation
             .map(|active| active.operation_id),
+        bootstrap_material: None,
+        current_build_identity: state.current_build_identity,
     }
 }
 
@@ -442,10 +710,35 @@ fn answer_inspect(
 ) -> Result<HostResult, Failure> {
     let deployment_id = operation.deployment_id.clone().unwrap_or_default();
     let state = store.load_existing(&deployment_id)?;
+    // Decision 3 (goal plan 07 G-A): surface the read-only fresh-bootstrap
+    // material ONLY while the capability is open and the live state still
+    // matches its install binding. Every other state answers without it.
+    let bootstrap_material = store
+        .scope_dir(&deployment_id)
+        .ok()
+        .and_then(|scope| bootstrap_authority::surface_material_view(&scope, &state));
     Ok(HostResult::completed(
         &operation.operation_id,
         HostCompletionBody::StateInspect {
-            inspection: inspection_from_state(state),
+            inspection: InstanceInspection {
+                deployment_id: state.deployment_id.clone(),
+                issuer: state.issuer.clone(),
+                observed_at: Utc::now(),
+                revision: state.config.revision,
+                runtime: state.runtime.clone(),
+                artifact: state.artifact.clone(),
+                config_reference: state.config.reference.clone(),
+                config_schema: state.config.schema.clone(),
+                resources: state.resources.clone(),
+                healthy: state.local_health.healthy,
+                health_summary: state.local_health.summary.clone(),
+                active_host_operation: state
+                    .active_host_operation
+                    .as_ref()
+                    .map(|active| active.operation_id.clone()),
+                bootstrap_material,
+                current_build_identity: state.current_build_identity.clone(),
+            },
         },
     ))
 }
@@ -492,8 +785,9 @@ impl ExecutionTarget for LocalTarget {
         // Registry shortcut (F01 boundary: the Registry cannot mutate or
         // impersonate target state).
         let store = TargetStateStore::open(&self.state_root)?;
+        let executors = self.executors();
         let operation = HostOperation::state_inspect(Uuid::now_v7().to_string(), deployment_id);
-        match dispatch_host_operation(&operation, &store, &self.executor).outcome {
+        match dispatch_host_operation(&operation, &store, &executors).outcome {
             HostOutcome::Completed {
                 body: HostCompletionBody::StateInspect { inspection },
             } => Ok(inspection),
@@ -523,14 +817,74 @@ impl ExecutionTarget for LocalTarget {
             return self.execute_journaled(operation, &journal);
         }
         let store = TargetStateStore::open(&self.state_root)?;
-        Ok(dispatch_host_operation(operation, &store, &self.executor))
+        let executors = self.executors();
+        Ok(dispatch_host_operation(operation, &store, &executors))
     }
 
     fn execute_control_operation(
         &self,
-        _request: &ControlOperationRequest,
+        request: &ControlOperationRequest,
     ) -> anyhow::Result<ControlOperationReceipt> {
-        Err(Self::unavailable("execute_control_operation"))
+        use control_exec::CONTROL_OUTCOME_UNKNOWN;
+        // The delivered envelope rides the SAME frozen stdio/journal path as
+        // every other kind (decision 1): validated, journaled, dispatched to
+        // the local one-shot NazoAuth operator. No secret material exists on
+        // this path — the JWS is signed public data.
+        let presented = control_exec::control_operation_id_from_jws(&request.compact_jws)
+            .map_err(|error| anyhow::anyhow!("{HOST_ERR_OPERATION_INVALID}: {error}"))?;
+        if request.deployment_id.is_empty() {
+            anyhow::bail!(
+                "{HOST_ERR_OPERATION_INVALID}: control operations require a deployment binding"
+            );
+        }
+        let operation = HostOperation::control_operation(
+            Uuid::now_v7(),
+            request.deployment_id.clone(),
+            request.compact_jws.clone(),
+        );
+        let journal = TargetJournal::open(&self.state_root)?;
+        let result = self.execute_journaled(&operation, &journal)?;
+        match result.outcome {
+            HostOutcome::Completed {
+                body:
+                    HostCompletionBody::ControlOperationExecuted {
+                        result: control_result,
+                    },
+            } => {
+                if control_result.operation_id != presented {
+                    anyhow::bail!(
+                        "{HOST_ERR_OPERATION_INVALID}: the target answered operation '{}' while \
+                         '{presented}' was presented",
+                        control_result.operation_id
+                    );
+                }
+                Ok(ControlOperationReceipt {
+                    operation_id: presented,
+                    accepted: true,
+                    result: Some(control_result),
+                })
+            }
+            HostOutcome::Completed { .. } => {
+                anyhow::bail!(
+                    "{HOST_ERR_OPERATION_INVALID}: the target answered an unexpected completion \
+                     instead of a ControlOperation result"
+                )
+            }
+            HostOutcome::Failed { code, detail } => {
+                if code == CONTROL_OUTCOME_UNKNOWN || detail.contains(CONTROL_OUTCOME_UNKNOWN) {
+                    // The operator may have executed; only a resumed resend of
+                    // the same envelope can resolve the outcome.
+                    anyhow::bail!("{code}: {detail}")
+                }
+                // Admission-grade refusal before acceptance: no side effect
+                // can have happened, so a corrected retry may mint a new id.
+                Ok(ControlOperationReceipt {
+                    operation_id: presented,
+                    accepted: false,
+                    result: None,
+                })
+            }
+        }
     }
 
     fn read_health(&self, deployment_id: &str) -> anyhow::Result<HealthSnapshot> {
@@ -900,21 +1254,78 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn only_the_control_operation_boundary_still_reports_unavailable() -> anyhow::Result<()> {
-        let (_temp, target, _journal) = temp_target()?;
-        let error = target
-            .execute_control_operation(&ControlOperationRequest {
-                deployment_id: "deploy-alpha".to_owned(),
-                compact_jws: "jws".to_owned(),
+    /// Scripted ControlOperation operator: echoes the presented operation id
+    /// and answers with the scripted durable result.
+    struct ScriptedControl {
+        outcome: nazo_operator_protocol::ControlOutcome,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl control_exec::ControlOperationExecutor for ScriptedControl {
+        fn execute(
+            &self,
+            job: &control_exec::ControlJob<'_>,
+        ) -> Result<nazo_operator_protocol::ControlResult, Failure> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(nazo_operator_protocol::ControlResult {
+                schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
+                operation_id: job.operation_id.to_owned(),
+                request_hash: "0".repeat(64),
+                outcome: self.outcome,
+                error: None,
+                accepted_at: 0,
+                completed_at: Some(1),
+                result: None,
             })
-            .err()
-            .unwrap();
-        let rendered = format!("{error:#}");
-        assert!(
-            rendered.contains(TARGET_CAPABILITY_UNAVAILABLE),
-            "{rendered}"
+        }
+    }
+
+    const CONTROL_JWS_OP_ID: &str = "018f0000-0000-7000-8000-00000000c001";
+
+    /// A syntactically valid three-segment JWS whose payload carries
+    /// `operation_id` = [`CONTROL_JWS_OP_ID`]. Signature verification is the
+    /// server's job; the transport only needs a decodable identity to echo.
+    fn sample_control_jws() -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let payload = serde_json::json!({ "operation_id": CONTROL_JWS_OP_ID });
+        format!(
+            "eyJhbGciOiJFZERTQSJ9.{}.c2ln",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+        )
+    }
+
+    #[test]
+    fn control_operations_reach_the_local_operator_and_map_to_receipts() -> anyhow::Result<()> {
+        let (_temp, plain_target, journal) = temp_target()?;
+        plain_target.execute_journaled(&sample_bootstrap("deploy-alpha"), &journal)?;
+        let scripted = Arc::new(ScriptedControl {
+            outcome: nazo_operator_protocol::ControlOutcome::Succeeded,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let target = plain_target.with_control_executor(scripted.clone());
+
+        let receipt = target.execute_control_operation(&ControlOperationRequest {
+            deployment_id: "deploy-alpha".to_owned(),
+            compact_jws: sample_control_jws(),
+        })?;
+        assert_eq!(receipt.operation_id, CONTROL_JWS_OP_ID);
+        assert!(receipt.accepted);
+        assert_eq!(
+            receipt.result.expect("durable result").outcome,
+            nazo_operator_protocol::ControlOutcome::Succeeded
         );
+        assert_eq!(scripted.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // The delivery was journaled under its own HostOperation id.
+        let raw = std::fs::read_to_string(
+            journal
+                .root()
+                .join("deployments")
+                .join("deploy-alpha")
+                .join("operations.jsonl"),
+        )?;
+        assert!(raw.contains("control-operation"), "{raw}");
         Ok(())
     }
 }

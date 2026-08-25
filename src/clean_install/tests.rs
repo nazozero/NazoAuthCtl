@@ -84,6 +84,7 @@ impl install_exec::InstallExecutor for ScriptedInstall {
         }
         performed.started_runtime = true;
         Ok(install_exec::InstallFacts {
+            build_identity: None,
             artifact_reference: format!("sha256:{}", digest()),
         })
     }
@@ -209,7 +210,7 @@ impl SshStub {
         let hello = serde_json::json!({
             "schema": crate::target::wire::HOST_PROTOCOL_SCHEMA,
             "operation_id": "__OPERATION_ID__",
-            "outcome": {"status": "completed", "body": {"result": "hello", "hello": identity}},
+            "outcome": {"status": "completed", "body": {"completion": "hello", "hello": identity}},
         });
         let inspection = serde_json::json!({
             "deployment_id": "__DEPLOYMENT_ID__",
@@ -229,7 +230,7 @@ impl SshStub {
             "schema": crate::target::wire::HOST_PROTOCOL_SCHEMA,
             "operation_id": "__OPERATION_ID__",
             "outcome": {"status": "completed", "body": {
-                "result": "install-applied", "inspection": inspection}},
+                "completion": "install-applied", "inspection": inspection}},
         });
 
         filesystem::atomic_write(
@@ -285,7 +286,7 @@ case "$input" in
 esac
 case "$input" in
   *'"kind":"ping"'*)
-    printf '{"schema":1,"operation_id":"%s","outcome":{"status":"completed","body":{"result":"ping","nonce":"%s"}}}' "${id:-none}" "${nonce:-none}"
+    printf '{"schema":1,"operation_id":"%s","outcome":{"status":"completed","body":{"completion":"ping","nonce":"%s"}}}' "${id:-none}" "${nonce:-none}"
     exit 0
     ;;
 esac
@@ -333,7 +334,7 @@ fn windows_stub_ps1() -> String {
         "  [Console]::Out.Write($raw.Replace('__OPERATION_ID__', $callerId))",
         "} elseif ($stdinText -match '\"kind\":\"ping\"') {",
         "  $n = [regex]::Match($stdinText, '\"nonce\":\"([0-9A-Za-z._:+-]+)\"').Groups[1].Value",
-        "  $pong = '{\"schema\":1,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"completed\",\"body\":{\"result\":\"ping\",\"nonce\":\"' + $n + '\"}}}'",
+        "  $pong = '{\"schema\":1,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"completed\",\"body\":{\"completion\":\"ping\",\"nonce\":\"' + $n + '\"}}}'",
         "  [Console]::Out.Write($pong)",
         "} elseif ($stdinText -match '\"kind\":\"state-inspect\"') {",
         "  $missing = '{\"schema\":1,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"failed\",\"code\":\"DEPLOYMENT_UNKNOWN\",\"detail\":\"stub fresh target\"}}'",

@@ -857,7 +857,6 @@ mod tests {
     use super::*;
     use crate::target::{
         ControlOperationReceipt, ControlOperationRequest, HealthSnapshot, HostOverview, HostResult,
-        TARGET_CAPABILITY_UNAVAILABLE,
     };
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
@@ -895,6 +894,7 @@ mod tests {
             match self.scenario {
                 Scenario::Offline(text) => bail!("{text}"),
                 Scenario::ForeignDeployment => Ok(InstanceInspection {
+                    current_build_identity: None,
                     deployment_id: format!("elsewhere-{deployment_id}"),
                     issuer: "https://auth.example.com".to_owned(),
                     observed_at: chrono::Utc::now(),
@@ -907,8 +907,10 @@ mod tests {
                     healthy: true,
                     health_summary: "ok".to_owned(),
                     active_host_operation: None,
+                    bootstrap_material: None,
                 }),
                 _ => Ok(InstanceInspection {
+                    current_build_identity: None,
                     deployment_id: deployment_id.to_owned(),
                     issuer: "https://auth.example.com".to_owned(),
                     observed_at: chrono::Utc::now(),
@@ -936,6 +938,7 @@ mod tests {
                     healthy: true,
                     health_summary: "runtime healthy".to_owned(),
                     active_host_operation: None,
+                    bootstrap_material: None,
                 }),
             }
         }
@@ -943,7 +946,7 @@ mod tests {
 
     impl ExecutionTarget for FakeTarget {
         fn inspect_host(&self) -> anyhow::Result<HostOverview> {
-            bail!("{TARGET_CAPABILITY_UNAVAILABLE}: unused in fleet tests")
+            bail!("unused in fleet tests")
         }
 
         fn inspect_instance(&self, deployment_id: &str) -> anyhow::Result<InstanceInspection> {
@@ -977,7 +980,7 @@ mod tests {
             &self,
             _request: &ControlOperationRequest,
         ) -> anyhow::Result<ControlOperationReceipt> {
-            bail!("{TARGET_CAPABILITY_UNAVAILABLE}: unused in fleet tests")
+            bail!("unused in fleet tests")
         }
 
         fn read_health(&self, deployment_id: &str) -> anyhow::Result<HealthSnapshot> {

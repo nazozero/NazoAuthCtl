@@ -95,6 +95,17 @@ pub const CONFIG_REVISION_MISMATCH: &str = "CONFIG_REVISION_MISMATCH";
 /// never created; the journal carries the failure for the resume decision.
 pub const INSTALL_FAILED: &str = "INSTALL_FAILED";
 
+/// Stable failure code: a rollback was requested but no previous verified
+/// artifact reference exists to restore (goal plan 07 §5). Rollback is an
+/// explicit action over saved facts only; it never guesses.
+pub const ROLLBACK_UNAVAILABLE: &str = "ROLLBACK_UNAVAILABLE";
+
+/// Stable failure code: a planned deletion (or runtime identity hook)
+/// disagrees with the live target facts — declared locator drift, a foreign
+/// runtime object under the managed name, or an unsupported physical kind.
+/// Nothing is deleted when this fires.
+pub const OBJECT_IDENTITY_MISMATCH: &str = "OBJECT_IDENTITY_MISMATCH";
+
 /// A stable, bounded failure outcome produced by state operations and mapped
 /// onto [`super::wire::HostOutcome::Failed`] by dispatch. Codes come from the
 /// closed set above; details quote only validated identifiers.
@@ -301,6 +312,41 @@ pub struct HealthRecord {
     pub checked_at: DateTime<Utc>,
 }
 
+/// Embedded build identity of one deployed artifact, recorded by whoever
+/// performed the on-target official verification (goal plan 07 G03): the
+/// ControlOperation envelope's J1 binding needs these facts, so they live in
+/// the target lifecycle authority next to the artifact references they
+/// belong to. Optional because adopted deployments may not know them yet.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildIdentity {
+    pub product: String,
+    pub version: String,
+    pub commit: String,
+}
+
+/// The server product token every NazoAuth build identity carries.
+pub const BUILD_IDENTITY_PRODUCT: &str = "nazauth";
+
+impl BuildIdentity {
+    pub fn new(product: &str, version: &str, commit: &str) -> anyhow::Result<Self> {
+        let identity = Self {
+            product: product.to_owned(),
+            version: version.to_owned(),
+            commit: commit.to_owned(),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        crate::registry::validate_identifier(&self.product, 64, "build identity product")?;
+        crate::registry::validate_identifier(&self.version, 64, "build identity version")?;
+        crate::registry::validate_identifier(&self.commit, 128, "build identity commit")?;
+        Ok(())
+    }
+}
+
 /// Reference to the host operation that produced the current state revision
 /// (the journal index required by goal plan 06 §2). This is a pointer into
 /// the C07 journal — never a second copy of journal state.
@@ -327,6 +373,12 @@ pub struct DeploymentState {
     pub local_health: HealthRecord,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_host_operation: Option<ActiveHostOperationRef>,
+    /// Embedded build identity of `artifact.current`, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_build_identity: Option<BuildIdentity>,
+    /// Embedded build identity of `artifact.previous`, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_build_identity: Option<BuildIdentity>,
 }
 
 impl DeploymentState {
@@ -370,6 +422,12 @@ impl DeploymentState {
             && (active.operation_id.is_empty() || active.operation_id.len() > 128)
         {
             bail!("active_host_operation.operation_id is not a valid token");
+        }
+        for identity in [&self.current_build_identity, &self.previous_build_identity]
+            .into_iter()
+            .flatten()
+        {
+            identity.validate()?;
         }
         Ok(())
     }
@@ -447,6 +505,27 @@ pub enum StateMutationPayload {
     /// CAS-guarded config application (goal plan 06 §4): load current →
     /// build candidate → validate → commit against `expected_revision`.
     ApplyConfig { reference: String, schema: String },
+    /// Lifecycle update (G03): stage the digest-pinned official artifact,
+    /// swap `previous=current`, optionally apply a staged config, activate,
+    /// probe local health, then commit — all inside this one journaled
+    /// operation so an interrupted attempt resumes without repeating side
+    /// effects. The ControlOperation for the application migration is
+    /// dispatched separately by the control side (one pre-signed envelope).
+    Update {
+        artifact: super::install_exec::OfficialArtifactRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config: Option<super::install_exec::StagedConfig>,
+    },
+    /// Explicit rollback to the previous verified artifact reference (G04).
+    /// Never runs application mutations and never touches data restore.
+    Rollback {},
+    /// Uninstall (G06): delete exactly the planned managed+deployment
+    /// resources after target-side identity re-confirmation, remove the
+    /// runtime object and config file, and drop the state document.
+    /// External/shared resources have zero-delete paths by construction.
+    Uninstall {
+        resources: Vec<super::install_exec::PlannedResourceDeletion>,
+    },
 }
 
 /// Caller-supplied content for bootstrapping one fresh DeploymentState.
@@ -460,6 +539,9 @@ pub struct BootstrapParams {
     pub config_reference: String,
     pub config_schema: String,
     pub resources: Vec<Resource>,
+    /// Embedded build identity of the verified artifact when its official
+    /// verification already produced these facts on the target (G01).
+    pub current_build_identity: Option<BuildIdentity>,
 }
 
 /// Handle to one target's DeploymentState store rooted at the formalized
@@ -537,6 +619,7 @@ impl TargetStateStore {
             config_reference,
             config_schema,
             resources,
+            current_build_identity,
         } = params;
         let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
         if let Ok(existing) = self.load_existing(deployment_id) {
@@ -579,6 +662,8 @@ impl TargetStateStore {
                 summary: "bootstrapped; runtime health not yet observed".to_owned(),
                 checked_at: Utc::now(),
             },
+            current_build_identity,
+            previous_build_identity: None,
         };
         state.validate().map_err(|error| {
             Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
@@ -633,6 +718,191 @@ impl TargetStateStore {
         })?;
         persist(&scope_path(&self.root, &scope), &state)?;
         Ok(state.config)
+    }
+
+    /// Commit an update (G03): swap `previous=current`, point `current` at
+    /// the newly verified artifact, optionally advance the config CAS, and
+    /// record this operation as the producing one. Re-executing the same
+    /// interrupted commit replays without advancing again; a stale revision
+    /// expectation fails closed.
+    pub fn apply_update(
+        &self,
+        deployment_id: &str,
+        expected_revision: u64,
+        new_current: String,
+        new_build: Option<BuildIdentity>,
+        config: Option<(String, String)>,
+        operation_id: &str,
+    ) -> Result<DeploymentState, Failure> {
+        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
+        let mut state = self.load_existing(deployment_id)?;
+        if state
+            .active_host_operation
+            .as_ref()
+            .is_some_and(|active| active.operation_id == operation_id)
+        {
+            return Ok(state);
+        }
+        if state.config.revision != expected_revision {
+            return Err(Failure::new(
+                CONFIG_REVISION_MISMATCH,
+                format!(
+                    "expected config revision {expected_revision} but target holds revision {} \
+                     for '{deployment_id}'; re-read the live state and rebuild the change",
+                    state.config.revision
+                ),
+            ));
+        }
+        crate::registry::validate_identifier(&new_current, 256, "artifact reference").map_err(
+            |error| Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string()),
+        )?;
+        if let Some(identity) = &new_build {
+            identity.validate().map_err(|error| {
+                Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
+            })?;
+        }
+        state.artifact.previous = state.artifact.current.take();
+        state.artifact.current = Some(new_current);
+        // The build identity swap mirrors the artifact reference swap so the
+        // envelope facts stay attached to the right generation.
+        state.previous_build_identity = state.current_build_identity.take();
+        state.current_build_identity = new_build;
+        if let Some((reference, schema)) = config {
+            state
+                .config
+                .advance(reference, schema)
+                .map_err(|error| Failure::new(CONFIG_REVISION_MISMATCH, error.to_string()))?;
+        }
+        state.active_host_operation = Some(ActiveHostOperationRef {
+            operation_id: operation_id.to_owned(),
+            applied_at: Utc::now(),
+        });
+        let scope = journal::deployment_scope(deployment_id).map_err(|error| {
+            Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
+        })?;
+        persist(&scope_path(&self.root, &scope), &state)?;
+        Ok(state)
+    }
+
+    /// Commit an explicit rollback (G04): swap `current` and `previous`,
+    /// optionally restore a saved config snapshot under its recorded schema,
+    /// CAS-guarded. Refuses when no previous reference exists — rollback is
+    /// never guessed.
+    pub fn apply_rollback(
+        &self,
+        deployment_id: &str,
+        expected_revision: u64,
+        config: Option<(String, String)>,
+        operation_id: &str,
+    ) -> Result<DeploymentState, Failure> {
+        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
+        let mut state = self.load_existing(deployment_id)?;
+        if state
+            .active_host_operation
+            .as_ref()
+            .is_some_and(|active| active.operation_id == operation_id)
+        {
+            return Ok(state);
+        }
+        if state.config.revision != expected_revision {
+            return Err(Failure::new(
+                CONFIG_REVISION_MISMATCH,
+                format!(
+                    "expected config revision {expected_revision} but target holds revision {} \
+                     for '{deployment_id}'",
+                    state.config.revision
+                ),
+            ));
+        }
+        let Some(previous) = state.artifact.previous.clone() else {
+            return Err(Failure::new(
+                ROLLBACK_UNAVAILABLE,
+                format!(
+                    "no previous verified artifact reference is saved for '{deployment_id}'; \
+                     rollback restores saved facts only and never guesses"
+                ),
+            ));
+        };
+        // Exact swap: current <- old previous, previous <- old current, so a
+        // follow-up rollback can always reverse the reversal (goal plan 07 §5
+        // item 5: atomically update current/previous). The build identity
+        // pairs follow their artifact references.
+        let old_current = state.artifact.current.take();
+        state.artifact.current = Some(previous);
+        state.artifact.previous = old_current;
+        let old_build = state.current_build_identity.take();
+        state.current_build_identity = state.previous_build_identity.take();
+        state.previous_build_identity = old_build;
+        if let Some((reference, schema)) = config {
+            state
+                .config
+                .advance(reference, schema)
+                .map_err(|error| Failure::new(CONFIG_REVISION_MISMATCH, error.to_string()))?;
+        }
+        state.active_host_operation = Some(ActiveHostOperationRef {
+            operation_id: operation_id.to_owned(),
+            applied_at: Utc::now(),
+        });
+        let scope = journal::deployment_scope(deployment_id).map_err(|error| {
+            Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
+        })?;
+        persist(&scope_path(&self.root, &scope), &state)?;
+        Ok(state)
+    }
+
+    /// Remove the state document after a completed uninstall (G06). The
+    /// operation journal survives so a retried uninstall replays its stored
+    /// terminal result instead of re-executing. External/shared resources are
+    /// never consulted here: deletion happened in the executor against
+    /// re-confirmed managed facts only.
+    pub fn remove_deployment(
+        &self,
+        deployment_id: &str,
+        expected_revision: u64,
+        operation_id: &str,
+    ) -> Result<(), Failure> {
+        let scope = journal::deployment_scope(deployment_id).map_err(|error| {
+            Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
+        })?;
+        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
+        let state_path = self.state_path(&scope);
+        if !state_path.exists() {
+            // Already removed by the interrupted attempt this operation id
+            // resumes; completion is idempotent.
+            return Ok(());
+        }
+        let state = self.load_existing(deployment_id)?;
+        if state
+            .active_host_operation
+            .as_ref()
+            .is_some_and(|active| active.operation_id == operation_id)
+        {
+            // The removing attempt already committed; finish the removal.
+            filesystem::remove_file_durable(&state_path).map_err(|error| {
+                Failure::new(
+                    DEPLOYMENT_UNKNOWN,
+                    format!("failed to remove {}: {error}", state_path.display()),
+                )
+            })?;
+            return Ok(());
+        }
+        if state.config.revision != expected_revision {
+            return Err(Failure::new(
+                CONFIG_REVISION_MISMATCH,
+                format!(
+                    "expected config revision {expected_revision} but target holds revision {} \
+                     for '{deployment_id}'",
+                    state.config.revision
+                ),
+            ));
+        }
+        filesystem::remove_file_durable(&state_path).map_err(|error| {
+            Failure::new(
+                DEPLOYMENT_UNKNOWN,
+                format!("failed to remove {}: {error}", state_path.display()),
+            )
+        })?;
+        Ok(())
     }
 
     /// Record a target-local health fact (goal plan 06 §2: `local_health` is

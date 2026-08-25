@@ -379,6 +379,7 @@ mod tests {
             Ok(ControlOperationReceipt {
                 operation_id: extract_operation_id(&request.compact_jws)?,
                 accepted,
+                result: None,
             })
         }
 

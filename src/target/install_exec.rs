@@ -91,6 +91,90 @@ pub struct PlannedSecret {
     pub path: String,
 }
 
+/// New configuration content staged by an update (G03). Values follow the
+/// same rules as the install order's config: bounded content plus the exact
+/// SHA-256 over its bytes so wire corruption can never reach disk. The
+/// declared `schema` token is what makes a later rollback decision possible:
+/// the update's config snapshot records both the replaced and the replacing
+/// schema, and rollback restores the snapshot only while the deployment still
+/// runs the replacing schema (goal plan 07 §5).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagedConfig {
+    pub content: String,
+    pub sha256: String,
+    pub schema: String,
+}
+
+impl StagedConfig {
+    /// Admission-level checks shared by wire validation and executors.
+    pub fn validate(&self) -> Result<(), super::wire::MessageRejection> {
+        if self.content.is_empty() || self.content.len() > MAX_CONFIG_CONTENT_BYTES {
+            return Err(super::wire::MessageRejection::new(
+                super::wire::RejectionCode::OperationMalformed,
+                format!("update config content must be 1-{MAX_CONFIG_CONTENT_BYTES} bytes"),
+            ));
+        }
+        if !valid_lower_hex_sha256(&self.sha256) {
+            return Err(super::wire::MessageRejection::new(
+                super::wire::RejectionCode::OperationMalformed,
+                "update config sha256 must be 64 lowercase hexadecimal characters",
+            ));
+        }
+        crate::registry::validate_identifier(&self.schema, 64, "update config schema").map_err(
+            |error| {
+                super::wire::MessageRejection::new(
+                    super::wire::RejectionCode::OperationMalformed,
+                    error.to_string(),
+                )
+            },
+        )?;
+        Ok(())
+    }
+}
+
+/// One concrete resource deletion planned by an uninstall (G06). The pair is
+/// re-confirmed against the live DeploymentState on the target before any
+/// destructive step; a mismatch fails closed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannedResourceDeletion {
+    pub resource_id: String,
+    /// Exact locator copied from the plan; must equal the declared locator.
+    pub locator: String,
+}
+
+impl PlannedResourceDeletion {
+    pub fn validate(&self) -> Result<(), super::wire::MessageRejection> {
+        let token = |value: &str, max: usize| {
+            !value.is_empty()
+                && value.chars().count() <= max
+                && value
+                    .chars()
+                    .all(|character| character.is_ascii_graphic() && character != ' ')
+        };
+        if !token(&self.resource_id, 128) {
+            return Err(super::wire::MessageRejection::new(
+                super::wire::RejectionCode::OperationMalformed,
+                "uninstall resource_id must be a bounded single-line identifier",
+            ));
+        }
+        if self.locator.is_empty()
+            || self.locator.len() > 512
+            || self
+                .locator
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(super::wire::MessageRejection::new(
+                super::wire::RejectionCode::OperationMalformed,
+                "uninstall resource locator must be a single-line reference",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The typed payload carrying everything the target needs to execute one
 /// clean install (G01). Rides inside the `Bootstrap` state mutation, so the
 /// C07 journal binds the exact order to the operation id via its canonical
@@ -209,10 +293,13 @@ impl InstallJob<'_> {
 }
 
 /// What a completed install reports back to the dispatcher: the content-
-/// addressed digest handle recorded into `DeploymentState.artifact.current`.
+/// addressed digest handle recorded into `DeploymentState.artifact.current`
+/// plus the verified manifest's embedded build identity facts (the G03
+/// ControlOperation envelope binding source).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InstallFacts {
     pub artifact_reference: String,
+    pub build_identity: Option<super::deployment_state::BuildIdentity>,
 }
 
 /// The injectable seam executing one clean-install order on the target.
@@ -402,10 +489,20 @@ impl HostInstallExecutor {
 
         // 6. Local health/readiness probe. Public reachability is deliberately
         // absent here (G08): loopback readiness is the only install gate.
-        probe_local_health(job)?;
+        probe_local_health(job.issuer)?;
 
         Ok(InstallFacts {
             artifact_reference: format!("sha256:{subject_digest}"),
+            build_identity: Some(
+                super::deployment_state::BuildIdentity::new(
+                    super::deployment_state::BUILD_IDENTITY_PRODUCT,
+                    &release.manifest.version,
+                    &release.manifest.backend_commit,
+                )
+                .map_err(|error| {
+                    Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
+                })?,
+            ),
         })
     }
 }
@@ -532,11 +629,13 @@ fn config_mount_source(job: &InstallJob<'_>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/etc/nazauth"))
 }
 
-/// Bounded loopback readiness probe against `{issuer}/readyz`.
-fn probe_local_health(job: &InstallJob<'_>) -> Result<(), Failure> {
-    validate_issuer(job.issuer)
+/// Bounded loopback readiness probe against `{issuer}/readyz`. Shared with
+/// the update/rollback executors (G03/G04): activation is only ever gated by
+/// the same local readiness fact.
+pub(crate) fn probe_local_health(job_issuer: &str) -> Result<(), Failure> {
+    validate_issuer(job_issuer)
         .map_err(|error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())))?;
-    let endpoint = format!("{}/readyz", job.issuer.trim_end_matches('/'));
+    let endpoint = format!("{}/readyz", job_issuer.trim_end_matches('/'));
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut last: Option<Failure> = None;
     while std::time::Instant::now() < deadline {

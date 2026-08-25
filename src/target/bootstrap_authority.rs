@@ -183,6 +183,45 @@ pub(crate) fn delete_material(scope_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Read-only view of an OPEN fresh-install bootstrap capability, surfaced
+/// through `state-inspect` only while the capability is genuinely claimable
+/// (goal plan 07 G-A decision: the frozen stdio contract is the only channel;
+/// there is no ad-hoc token read). The token rides the SSH-encrypted
+/// transport exactly once per inspection and never appears in any other wire
+/// message.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshBootstrapMaterialView {
+    pub allowlist: Vec<String>,
+    pub install_operation_id: String,
+    pub deployment_id: String,
+    pub issuer: String,
+    pub artifact_subject_sha256: String,
+    pub config_revision: u64,
+    pub token: String,
+}
+
+/// Build the view for one deployment's scope directory, or `None` whenever
+/// the capability is absent, closed, drifted, or otherwise unauthorized.
+/// Absence and closure are deliberately indistinguishable from refusal.
+pub(crate) fn surface_material_view(
+    scope_dir: &Path,
+    state: &DeploymentState,
+) -> Option<FreshBootstrapMaterialView> {
+    let context = load_context(scope_dir).ok()??;
+    authorize_claim(Some(&context), FRESH_BOOTSTRAP_ALLOWLIST[0], state).ok()?;
+    let token = read_token(scope_dir).ok()?;
+    Some(FreshBootstrapMaterialView {
+        allowlist: context.allowlist,
+        install_operation_id: context.install_operation_id,
+        deployment_id: context.deployment_id,
+        issuer: context.issuer,
+        artifact_subject_sha256: context.artifact_subject_sha256,
+        config_revision: context.config_revision,
+        token,
+    })
+}
+
 /// The G02 gate: authorize one bootstrap request against the compiled
 /// allowlist, the open capability, and the live fresh-install facts.
 ///

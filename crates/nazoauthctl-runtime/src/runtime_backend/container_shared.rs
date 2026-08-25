@@ -38,7 +38,7 @@ use policy::{assert_managed_container_policy, observed_cap_drop_all};
 /// Numeric uid/gid used for OCI one-shot work.  A name supplied by an image
 /// is not an authorization boundary: the caller must provide the explicit
 /// uid:gid contract and the engine must accept it.
-pub(crate) const NON_ROOT_ONE_SHOT_USER: &str = "10001:10001";
+pub const NON_ROOT_ONE_SHOT_USER: &str = "10001:10001";
 pub(crate) const VALKEY_RESTORE_CHECK_RESOURCE_KIND: &str = "valkey-restore-check";
 
 pub(crate) fn valkey_restore_check_config_digest(

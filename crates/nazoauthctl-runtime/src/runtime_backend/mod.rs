@@ -58,6 +58,10 @@ fn safe_absolute(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The verified NazoAuth OCI artifact declares this immutable numeric
+/// identity; one-shot operator tasks must never inherit engine root merely
+/// because image metadata drifts (exposed for the G-wave control executor).
+pub use container_shared::NON_ROOT_ONE_SHOT_USER;
 pub use container_shared::normalize_local_image_id;
 pub use container_shared::oci_backup_digests;
 pub use docker::DockerBackend;
