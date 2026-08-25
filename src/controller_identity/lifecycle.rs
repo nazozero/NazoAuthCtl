@@ -908,10 +908,12 @@ pub(crate) fn run_controller_command(
             label,
             secret_file,
             rotate_secret,
+            approval_token: _approval_token, // consumed by the recovery API internally
+            admin_access_file,
         } => {
             let explicit = merge_global(selector, global, "controller recover")?;
             let record = resolve_record(&registry, explicit.as_deref())?;
-            let api = make_api(&record.issuer, None)?;
+            let api = make_api(&record.issuer, admin_access_file.as_deref())?;
             if rotate_secret {
                 // D10 first enrollment / D12 proactive rotation.
                 let report = crate::controller_identity::recovery::rotate_root_with_new_secret(

@@ -187,5 +187,7 @@ fn parse_recover(values: &[String]) -> anyhow::Result<ControllerCommand> {
         label: label.unwrap_or_else(|| "recovered-controller".to_owned()),
         secret_file,
         rotate_secret,
+        approval_token: common.approval_token,
+        admin_access_file: common.admin_access_file,
     })
 }

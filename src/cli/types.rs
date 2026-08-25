@@ -167,6 +167,9 @@ pub(crate) enum ControllerCommand {
         label: String,
         secret_file: Option<PathBuf>,
         rotate_secret: bool,
+        /// Fresh-2FA approval token for proactive root rotation (D12).
+        approval_token: Option<String>,
+        admin_access_file: Option<PathBuf>,
     },
 }
 
