@@ -81,6 +81,12 @@ pub(crate) fn plan_uninstall(
     let mut managed_deletions = Vec::new();
     let mut kept_external = Vec::new();
     for resource in &inspection.resources {
+        // Container-kind resources are deleted through the dedicated runtime
+        // surface object (ownership label + digest re-confirmation), never as
+        // a second deletion entry — declaring them here would double-delete.
+        if resource.kind == "container" {
+            continue;
+        }
         let entry = (
             resource.resource_id.clone(),
             resource.kind.clone(),

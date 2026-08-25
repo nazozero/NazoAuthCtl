@@ -127,27 +127,32 @@ pub(crate) fn default_install_paths(deployment_id: &str) -> anyhow::Result<Insta
         let base = PathBuf::from(program_data).join("nazoauth");
         Ok(InstallPaths {
             config_reference: base.join("config").join(deployment_id).join("config.json"),
-            data_root: base.join("data"),
-            secrets_dir: base.join("data").join("secrets"),
+            data_root: base.join("data").join(deployment_id),
+            secrets_dir: base.join("data").join(deployment_id).join("secrets"),
         })
     }
     #[cfg(not(windows))]
     {
-        let _ = deployment_id;
         Ok(InstallPaths {
-            data_root: PathBuf::from("/var/lib/nazoauth"),
+            data_root: PathBuf::from("/var/lib/nazauth")
+                .join("deployments")
+                .join(deployment_id),
             config_reference: PathBuf::from("/etc/nazoauth")
                 .join("deployments")
                 .join(deployment_id)
                 .join("config.json"),
-            secrets_dir: PathBuf::from("/var/lib/nazauth/secrets"),
+            secrets_dir: PathBuf::from("/var/lib/nazauth")
+                .join("deployments")
+                .join(deployment_id)
+                .join("secrets"),
         })
     }
 }
 
 /// Path resolution for one install: the custom root when provided (also the
 /// test seam that keeps development machines off system paths), platform
-/// defaults otherwise.
+/// defaults otherwise. Every path is scoped under the deployment id so two
+/// instances on one host can never share data, secrets, or config (P0-3).
 fn resolve_paths(
     request: &CleanInstallRequest,
     deployment_id: &str,
@@ -155,8 +160,8 @@ fn resolve_paths(
     match &request.install_root {
         Some(root) => Ok(InstallPaths {
             config_reference: root.join("config").join(deployment_id).join("config.json"),
-            data_root: root.join("data"),
-            secrets_dir: root.join("data").join("secrets"),
+            data_root: root.join("data").join(deployment_id),
+            secrets_dir: root.join("data").join(deployment_id).join("secrets"),
         }),
         None => default_install_paths(deployment_id),
     }
@@ -296,7 +301,12 @@ fn prepare_install_operation(
     let runtime_object = format!("nazoauth-{}", deployment_id.trim_start_matches("deploy-"));
     let paths = resolve_paths(request, &deployment_id)?;
     let order = build_install_order(request, &deployment_id, &paths)?;
-    let resources = declare_resources(&runtime_object, &paths.data_root.to_string_lossy())?;
+    let resources = declare_resources(
+        &runtime_object,
+        &paths.data_root.to_string_lossy(),
+        &request.database_endpoint,
+        &request.valkey_endpoint,
+    )?;
     let operation = HostOperation::state_mutate(
         Uuid::now_v7(),
         &deployment_id,
@@ -320,8 +330,15 @@ fn prepare_install_operation(
 }
 
 /// Managed/external resource facts declared at install time. External/shared
-/// classification is what gives them zero-delete protection later.
-fn declare_resources(runtime_object: &str, data_root: &str) -> anyhow::Result<Vec<Resource>> {
+/// classification is what gives them zero-delete protection later. The
+/// locator for each external dependency comes from the operator-supplied
+/// endpoint facts, not a hardcoded loopback address.
+fn declare_resources(
+    runtime_object: &str,
+    data_root: &str,
+    database_endpoint: &crate::target::install_exec::ExternalEndpoint,
+    valkey_endpoint: &crate::target::install_exec::ExternalEndpoint,
+) -> anyhow::Result<Vec<Resource>> {
     Ok(vec![
         Resource::new(
             "app-runtime",
@@ -339,18 +356,22 @@ fn declare_resources(runtime_object: &str, data_root: &str) -> anyhow::Result<Ve
         )?,
         // Dependency processes are not provisioned by the clean-install wave;
         // they stay external + shared so no lifecycle path may ever delete or
-        // replace them (goal plan 06 §3, F03).
+        // replace them (goal plan 06 §3, F03). Locators reflect the actual
+        // operator-supplied endpoints.
         Resource::new(
             "shared-postgres",
             "postgres",
-            "127.0.0.1:5432/oauth",
+            format!(
+                "{}:{}:{}",
+                database_endpoint.host, database_endpoint.port, database_endpoint.name
+            ),
             ResourceOwnership::External,
             ResourceScope::Shared,
         )?,
         Resource::new(
             "shared-valkey",
             "valkey",
-            "127.0.0.1:6379",
+            format!("{}:{}", valkey_endpoint.host, valkey_endpoint.port),
             ResourceOwnership::External,
             ResourceScope::Shared,
         )?,
