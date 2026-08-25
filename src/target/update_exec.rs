@@ -470,7 +470,28 @@ fn verify_pinned_artifact_facts(
             "verified subject digest differs from the requested pin",
         ));
     }
-    let image = release.manifest.image_ref().map_err(|error| {
+    // Container backends always run Linux images regardless of the control
+    // machine's OS; select the manifest by CONTAINER platform, not host
+    // (real-acceptance finding on a Windows host with a Linux daemon).
+    let image = match kind {
+        RuntimeBackendKind::Systemd => release.manifest.image_ref(),
+        _ => {
+            let digest = release
+                .manifest
+                .runtime_oci_digest_for(crate::model::container_oci_platform())
+                .map_err(|error| {
+                    Failure::new(
+                        super::install_exec::ARTIFACT_UNVERIFIED,
+                        sanitize(error.to_string()),
+                    )
+                })?;
+            Ok(format!(
+                "{}@{digest}",
+                release.manifest.oci.repository.trim_end_matches('/')
+            ))
+        }
+    }
+    .map_err(|error| {
         Failure::new(
             super::install_exec::ARTIFACT_UNVERIFIED,
             sanitize(error.to_string()),

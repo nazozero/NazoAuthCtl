@@ -197,6 +197,18 @@ fn run_install(args: InstallArgs) -> anyhow::Result<()> {
         expected_artifact_sha256: args.artifact_sha256,
         runtime: args.runtime,
         install_root: args.install_root,
+        database_endpoint: crate::target::install_exec::ExternalEndpoint {
+            host: args.database_host,
+            port: args.database_port,
+            name: args.database_name,
+            user: args.database_user,
+        },
+        valkey_endpoint: crate::target::install_exec::ExternalEndpoint {
+            host: args.valkey_host,
+            port: args.valkey_port,
+            name: String::new(),
+            user: String::new(),
+        },
     };
     let report = crate::clean_install::run_clean_install(&context, request)?;
     println!("{report}");

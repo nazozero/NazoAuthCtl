@@ -1003,6 +1003,19 @@ mod tests {
                 purpose: "database-url".to_owned(),
                 path: "/var/lib/nazoauth/secrets/database-url".to_owned(),
             }],
+            database_endpoint: crate::target::install_exec::ExternalEndpoint {
+                host: "db.internal".to_owned(),
+                port: 5432,
+                name: "oauth".to_owned(),
+                user: "nazauth".to_owned(),
+            },
+            valkey_endpoint: crate::target::install_exec::ExternalEndpoint {
+                host: "cache.internal".to_owned(),
+                port: 6379,
+                name: String::new(),
+                user: String::new(),
+            },
+
             fresh_bootstrap: true,
             port: 8000,
         };

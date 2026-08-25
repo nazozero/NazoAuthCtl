@@ -131,6 +131,12 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
             "--artifact-sha256",
             "--runtime",
             "--install-root",
+            "--database-host",
+            "--database-port",
+            "--database-name",
+            "--database-user",
+            "--valkey-host",
+            "--valkey-port",
         ],
         &[],
         "install",
@@ -179,6 +185,38 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
         None => None,
     };
     let install_root = parsed.values.get("--install-root").map(PathBuf::from);
+    let database_host = parsed
+        .values
+        .get("--database-host")
+        .context("install requires --database-host HOST (external PostgreSQL endpoint)")?
+        .clone();
+    let database_port = match parsed.values.get("--database-port") {
+        Some(port) => port
+            .parse::<u16>()
+            .context("--database-port must be 1-65535")?,
+        None => bail!("install requires --database-port PORT"),
+    };
+    let database_name = parsed
+        .values
+        .get("--database-name")
+        .context("install requires --database-name DATABASE")?
+        .clone();
+    let database_user = parsed
+        .values
+        .get("--database-user")
+        .context("install requires --database-user ROLE")?
+        .clone();
+    let valkey_host = parsed
+        .values
+        .get("--valkey-host")
+        .context("install requires --valkey-host HOST (external Valkey endpoint)")?
+        .clone();
+    let valkey_port = match parsed.values.get("--valkey-port") {
+        Some(port) => port
+            .parse::<u16>()
+            .context("--valkey-port must be 1-65535")?,
+        None => bail!("install requires --valkey-port PORT"),
+    };
     Ok(InstallArgs {
         host: parsed.values.get("--host").cloned(),
         name: parsed.values.get("--name").cloned(),
@@ -187,6 +225,12 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
         artifact_sha256,
         runtime,
         install_root,
+        database_host,
+        database_port,
+        database_name,
+        database_user,
+        valkey_host,
+        valkey_port,
     })
 }
 

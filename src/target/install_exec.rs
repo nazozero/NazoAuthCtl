@@ -200,12 +200,42 @@ pub struct InstallOrder {
     /// Host port the runtime publishes on (loopback unless a public boundary
     /// is configured later; public reachability is never an install input).
     pub port: u16,
+    /// External PostgreSQL endpoint facts supplied by the operator (G01 item
+    /// 3: real external facts are the only install inputs). The credential is
+    /// still minted on the target and never crosses the wire.
+    pub database_endpoint: ExternalEndpoint,
+    /// External Valkey endpoint facts supplied by the operator.
+    pub valkey_endpoint: ExternalEndpoint,
+}
+
+/// Operator-supplied coordinates of one external dependency. No secret
+/// material: the password is minted target-side around these facts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalEndpoint {
+    pub host: String,
+    pub port: u16,
+    /// PostgreSQL database name; unused by Valkey.
+    pub name: String,
+    /// PostgreSQL role name; unused by Valkey.
+    pub user: String,
 }
 
 impl InstallOrder {
     /// Enforce every invariant dispatch relies on. Called from
     /// `HostOperation::validate` so malformed orders fail at admission.
     pub fn validate(&self) -> Result<(), super::wire::MessageRejection> {
+        for (label, endpoint) in [
+            ("database endpoint host", &self.database_endpoint.host),
+            ("valkey endpoint host", &self.valkey_endpoint.host),
+        ] {
+            if endpoint.is_empty() || endpoint.len() > 253 {
+                return Err(super::wire::MessageRejection::new(
+                    super::wire::RejectionCode::OperationMalformed,
+                    format!("{label} must be 1-253 characters"),
+                ));
+            }
+        }
         if self.config_content.is_empty() || self.config_content.len() > MAX_CONFIG_CONTENT_BYTES {
             return Err(super::wire::MessageRejection::new(
                 super::wire::RejectionCode::OperationMalformed,
@@ -437,15 +467,31 @@ impl HostInstallExecutor {
                         Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string()))
                     })?;
                 }
-                // URL-shaped values need structure around a fresh random
-                // credential; the credential itself is CSPRNG material.
+                // URL-shaped values combine operator-supplied endpoint facts
+                // with a fresh CSPRNG credential minted here, so the password
+                // never crosses the wire. An existing file keeps its original
+                // credential: retries must not rotate what a failed attempt
+                // already handed to the external dependency.
                 "database-url" | "valkey-url" => {
+                    if existed {
+                        continue;
+                    }
                     let credential = hex(rand::random::<[u8; 16]>().as_slice());
                     let value = match secret.purpose.as_str() {
-                        "database-url" => {
-                            format!("postgresql://nazauth:{credential}@127.0.0.1:5432/oauth")
-                        }
-                        _ => format!("valkey://:{credential}@127.0.0.1:6379"),
+                        "database-url" => format!(
+                            "postgresql://{}:{}@{}:{}/{}",
+                            job.order.database_endpoint.user,
+                            credential,
+                            job.order.database_endpoint.host,
+                            job.order.database_endpoint.port,
+                            job.order.database_endpoint.name,
+                        ),
+                        _ => format!(
+                            "valkey://:{}@{}:{}",
+                            credential,
+                            job.order.valkey_endpoint.host,
+                            job.order.valkey_endpoint.port,
+                        ),
                     };
                     atomic_write(&path, value.as_bytes(), 0o440).map_err(|error| {
                         Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string()))

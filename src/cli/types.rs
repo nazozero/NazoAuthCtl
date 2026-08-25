@@ -291,6 +291,12 @@ pub(crate) struct InstallArgs {
     pub(crate) artifact_sha256: Option<String>,
     pub(crate) runtime: Option<String>,
     pub(crate) install_root: Option<PathBuf>,
+    pub(crate) database_host: String,
+    pub(crate) database_port: u16,
+    pub(crate) database_name: String,
+    pub(crate) database_user: String,
+    pub(crate) valkey_host: String,
+    pub(crate) valkey_port: u16,
 }
 
 /// Update arguments (G03); maps onto

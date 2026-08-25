@@ -190,6 +190,18 @@ impl LocalFixture {
             expected_artifact_sha256: None,
             runtime: None,
             install_root: Some(self._temp.path().join("install")),
+            database_endpoint: crate::target::install_exec::ExternalEndpoint {
+                host: "db.internal".to_owned(),
+                port: 5432,
+                name: "oauth".to_owned(),
+                user: "nazauth".to_owned(),
+            },
+            valkey_endpoint: crate::target::install_exec::ExternalEndpoint {
+                host: "cache.internal".to_owned(),
+                port: 6379,
+                name: String::new(),
+                user: String::new(),
+            },
         }
     }
 }
@@ -394,6 +406,18 @@ impl SshFixture {
             expected_artifact_sha256: None,
             runtime: None,
             install_root: Some(self.stub._dir.path().join("install")),
+            database_endpoint: crate::target::install_exec::ExternalEndpoint {
+                host: "db.internal".to_owned(),
+                port: 5432,
+                name: "oauth".to_owned(),
+                user: "nazauth".to_owned(),
+            },
+            valkey_endpoint: crate::target::install_exec::ExternalEndpoint {
+                host: "cache.internal".to_owned(),
+                port: 6379,
+                name: String::new(),
+                user: String::new(),
+            },
         }
     }
 }

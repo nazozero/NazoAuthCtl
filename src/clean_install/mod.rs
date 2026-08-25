@@ -75,6 +75,11 @@ pub(crate) struct CleanInstallRequest {
     /// Optional custom installation root. Absent resolves to the platform
     /// defaults; set, every managed path derives from it.
     pub(crate) install_root: Option<PathBuf>,
+    /// External PostgreSQL endpoint (host, port, database, role). The
+    /// password is minted on the target and never crosses the wire.
+    pub(crate) database_endpoint: crate::target::install_exec::ExternalEndpoint,
+    /// External Valkey endpoint (host, port).
+    pub(crate) valkey_endpoint: crate::target::install_exec::ExternalEndpoint,
 }
 
 /// Injectable context mirroring the fleet command context: the user-scoped
@@ -256,6 +261,8 @@ fn build_install_order(
                 path: mfa_totp_key_file,
             },
         ],
+        database_endpoint: request.database_endpoint.clone(),
+        valkey_endpoint: request.valkey_endpoint.clone(),
         // G02 hook: provision the single-use initial-admin capability bound
         // to this exact install operation.
         fresh_bootstrap: true,

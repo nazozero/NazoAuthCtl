@@ -615,6 +615,10 @@ impl ReleaseManifest {
 
     pub(crate) fn runtime_oci_digest(&self) -> anyhow::Result<&str> {
         let platform = runtime_oci_platform(std::env::consts::OS, std::env::consts::ARCH)?;
+        self.runtime_oci_digest_for(platform)
+    }
+
+    pub(crate) fn runtime_oci_digest_for(&self, platform: &str) -> anyhow::Result<&str> {
         self.oci
             .platform_manifests
             .get(platform)
@@ -680,6 +684,17 @@ fn runtime_oci_platform(os: &str, arch: &str) -> anyhow::Result<&'static str> {
         ("linux", "x86_64") => Ok("linux/amd64"),
         ("linux", "aarch64") => Ok("linux/arm64"),
         _ => bail!("managed OCI runtime is supported only on Linux x86-64 and Arm64"),
+    }
+}
+
+/// Platform key for a container backend: Linux images run identically under
+/// Docker/Podman on any host OS (including Windows hosts with a Linux
+/// daemon), so the container's platform governs — not the host's.
+pub(crate) fn container_oci_platform() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "linux/arm64"
+    } else {
+        "linux/amd64"
     }
 }
 
