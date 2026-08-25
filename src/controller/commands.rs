@@ -298,7 +298,7 @@ pub(crate) fn run_legacy(
             match store.registry_present() {
                 Ok(true) => {
                     let record = store.resolve(selector.as_deref(), false)?;
-                    registered_status(&record, false)
+                    registered_status(&record)
                 }
                 Ok(false) => status(&load_config(&configured_path)?),
                 Err(error) => {
@@ -315,7 +315,7 @@ pub(crate) fn run_legacy(
             match store.registry_present() {
                 Ok(true) => {
                     let record = store.resolve(selector.as_deref(), false)?;
-                    registered_status(&record, true)
+                    registered_status(&record)
                 }
                 Ok(false) => doctor(&load_config(&configured_path)?),
                 Err(error) => {
@@ -329,14 +329,7 @@ pub(crate) fn run_legacy(
         }
         LegacyCommand::BootstrapAdmin(options) => {
             require_root()?;
-            let context = control_config(
-                &configured_path,
-                selector.as_deref(),
-                &[Capability::OperatorTasks],
-                true,
-                false,
-                false,
-            )?;
+            let context = control_config(&configured_path, selector.as_deref(), true, false)?;
             require_confirmation(options.yes, "create the first NazoAuth administrator")?;
             bootstrap_admin(&context.config, options)
         }

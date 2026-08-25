@@ -4,8 +4,6 @@ fn valid_config() -> UpdateConfig {
     let root = std::env::temp_dir().join("nazoauthctl-model-test");
     UpdateConfig {
         schema: 2,
-        trust: crate::deployment::TrustState::Adopted,
-        capabilities: crate::deployment::CapabilityGrants::controller_installed(),
         install_profile: "baseline".to_owned(),
         repository: "nazozero/NazoAuth".to_owned(),
         backup_root: root.join("backups"),
@@ -13,24 +11,8 @@ fn valid_config() -> UpdateConfig {
         operator: Operator {
             deployment_id: "deployment-test".to_owned(),
             controller_key_id: "controller-test".to_owned(),
-            controller_private_key: root.join("operator/controller.key"),
-            controller_public_key: root.join("operator/controller.pub"),
-            receipt_key_id: "receipt-test".to_owned(),
-            receipt_private_key: root.join("operator/receipt.key"),
-            receipt_public_key: root.join("operator/receipt.pub"),
-            audit_key_id: "audit-test".to_owned(),
-            audit_private_key: root.join("operator/audit.key"),
-            audit_public_key: root.join("operator/audit.pub"),
-            break_glass_key_id: "break-glass-test".to_owned(),
-            break_glass_private_key: root.join("recovery/break-glass.key"),
-            break_glass_public_key: root.join("operator/break-glass.pub"),
-            active_identity_file: root.join("operator/active-generation.json"),
-            identity_generations_directory: root.join("operator/generations"),
-            recovery_generations_directory: root.join("recovery/generations"),
             secret_revision_file: root.join("operator/secret-revision"),
             state_directory: root.join("state"),
-            audit_directory: root.join("audit"),
-            trust_state_file: root.join("operator/release-trust.json"),
         },
         dependencies: Dependencies::default(),
         runtime: Runtime {
@@ -352,15 +334,6 @@ fn external_and_container_dependency_modes_resolve_explicitly() {
     config.dependencies.valkey_url_file = root.join("valkey-url");
     config.dependencies.valkey_backup_url_file = root.join("valkey-backup-url");
     config.dependencies.external_valkey_backup_scope = "dedicated-instance".to_owned();
-    config.dependencies.database_runtime_endpoint_sha256 = "a".repeat(64);
-    config.dependencies.database_runtime_principal_sha256 = "b".repeat(64);
-    config.dependencies.migration_database_endpoint_sha256 = "b".repeat(64);
-    config.dependencies.migration_database_principal_sha256 = "c".repeat(64);
-    config.dependencies.database_backup_endpoint_sha256 = "a".repeat(64);
-    config.dependencies.database_backup_principal_sha256 = "d".repeat(64);
-    config.dependencies.valkey_runtime_principal_sha256 = "e".repeat(64);
-    config.dependencies.valkey_backup_endpoint_sha256 = "b".repeat(64);
-    config.dependencies.valkey_backup_principal_sha256 = "f".repeat(64);
     config.validate().unwrap();
     assert_eq!(
         config.container_backend(),
@@ -385,15 +358,6 @@ fn schema_two_keeps_managed_configs_readable_but_rejects_legacy_external_credent
     dependencies.remove("database_backup_url_file");
     dependencies.remove("valkey_backup_url_file");
     dependencies.remove("external_valkey_backup_scope");
-    dependencies.remove("database_runtime_endpoint_sha256");
-    dependencies.remove("database_runtime_principal_sha256");
-    dependencies.remove("migration_database_endpoint_sha256");
-    dependencies.remove("migration_database_principal_sha256");
-    dependencies.remove("database_backup_endpoint_sha256");
-    dependencies.remove("database_backup_principal_sha256");
-    dependencies.remove("valkey_runtime_principal_sha256");
-    dependencies.remove("valkey_backup_endpoint_sha256");
-    dependencies.remove("valkey_backup_principal_sha256");
     let managed_legacy: UpdateConfig = serde_json::from_value(managed_json.clone()).unwrap();
     managed_legacy.validate().unwrap();
 
@@ -419,33 +383,17 @@ fn schema_two_keeps_managed_configs_readable_but_rejects_legacy_external_credent
     external.dependencies.valkey_url_file = root.join("valkey-url");
     external.dependencies.valkey_backup_url_file = root.join("valkey-backup-url");
     external.dependencies.external_valkey_backup_scope = "dedicated-instance".to_owned();
-    external.dependencies.database_runtime_endpoint_sha256 = "a".repeat(64);
-    external.dependencies.database_runtime_principal_sha256 = "b".repeat(64);
-    external.dependencies.migration_database_endpoint_sha256 = "b".repeat(64);
-    external.dependencies.migration_database_principal_sha256 = "c".repeat(64);
-    external.dependencies.database_backup_endpoint_sha256 = "c".repeat(64);
-    external.dependencies.database_backup_principal_sha256 = "d".repeat(64);
-    external.dependencies.valkey_runtime_principal_sha256 = "e".repeat(64);
-    external.dependencies.valkey_backup_endpoint_sha256 = "d".repeat(64);
-    external.dependencies.valkey_backup_principal_sha256 = "f".repeat(64);
-    let mut legacy_external = serde_json::to_value(&external).unwrap();
-    let dependencies = legacy_external["dependencies"].as_object_mut().unwrap();
-    dependencies.remove("database_runtime_endpoint_sha256");
-    dependencies.remove("database_runtime_principal_sha256");
-    dependencies.remove("migration_database_endpoint_sha256");
-    dependencies.remove("migration_database_principal_sha256");
-    dependencies.remove("database_backup_endpoint_sha256");
-    dependencies.remove("database_backup_principal_sha256");
-    dependencies.remove("valkey_runtime_principal_sha256");
-    dependencies.remove("valkey_backup_endpoint_sha256");
-    dependencies.remove("valkey_backup_principal_sha256");
-    let legacy_external: UpdateConfig = serde_json::from_value(legacy_external).unwrap();
+    external.validate().unwrap();
+
+    let mut stale_digest_fields = serde_json::to_value(&external).unwrap();
+    let dependencies = stale_digest_fields["dependencies"].as_object_mut().unwrap();
+    dependencies.insert(
+        "database_runtime_endpoint_sha256".to_owned(),
+        serde_json::Value::String("a".repeat(64)),
+    );
     assert!(
-        legacy_external
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("external PostgreSQL runtime endpoint identity")
+        serde_json::from_value::<UpdateConfig>(stale_digest_fields).is_err(),
+        "removed endpoint/principal SHA matrix fields must fail closed"
     );
 }
 

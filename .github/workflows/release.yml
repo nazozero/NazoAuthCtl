@@ -219,21 +219,17 @@ jobs:
               --source-ref "refs/tags/$version" \
               --deny-self-hosted-runners
           done
-      - name: Update, reject a tampered audit chain, and roll back
+      - name: Update, roll back, and re-check the controller self lifecycle
         shell: bash
         run: |
           set -euo pipefail
           root="$(mktemp -d /tmp/controller-self-lifecycle.XXXXXX)"
-          break_glass_root="/dev/shm/controller-self-lifecycle-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          test ! -e "$break_glass_root"
-          trap 'sudo rm -rf "$root" "$break_glass_root"' EXIT
+          trap 'sudo rm -rf "$root"' EXIT
           chmod 0755 "$root"
           binary="$root/bin/nazoauthctl"
           config_root="$root/config"
           state_root="$root/state"
           mkdir -p "$root/bin" "$config_root" "$state_root"
-          sudo install -d -m 0700 -o 0 -g 0 "$break_glass_root"
-          test "$(stat -c %d "$config_root")" != "$(stat -c %d "$break_glass_root")"
           install -m 0755 previous/nazoauthctl-x86_64-unknown-linux-gnu "$binary"
           previous_sha="$(sha256sum "$binary" | cut -d' ' -f1)"
           candidate_sha="$(sha256sum candidate/nazoauthctl-x86_64-unknown-linux-gnu | cut -d' ' -f1)"
@@ -244,38 +240,18 @@ jobs:
           sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
-            "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
             "$binary" self check --to "$CURRENT_RELEASE"
           sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
-            "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
             "$binary" self update --to "$CURRENT_RELEASE" --yes
           test "$(sha256sum "$binary" | cut -d' ' -f1)" = "$candidate_sha"
-
-          record="$(sudo find "$state_root/controller-self/audit/records" -type f -name '*.json' | sort | head -n 1)"
-          test -n "$record"
-          sudo cp "$record" "$root/audit-record.good"
-          sudo chown "$(id -u):$(id -g)" "$root/audit-record.good"
-          printf 'tampered' | sudo tee -a "$record" >/dev/null
-          if sudo env \
-            "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
-            "NAZOAUTHCTL_STATE_ROOT=$state_root" \
-            "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
-            "$binary" self rollback --yes; then
-            echo 'controller rollback accepted a tampered audit chain' >&2
-            exit 1
-          fi
-          test "$(sha256sum "$binary" | cut -d' ' -f1)" = "$candidate_sha"
-          sudo cp "$root/audit-record.good" "$record"
           sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
-            "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
             "$binary" self rollback --yes
           test "$(sha256sum "$binary" | cut -d' ' -f1)" = "$previous_sha"
           sudo env \
             "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
             "NAZOAUTHCTL_STATE_ROOT=$state_root" \
-            "NAZOAUTHCTL_BREAK_GLASS_ROOT=$break_glass_root" \
             "$binary" self check --to "$PREVIOUS_RELEASE"

@@ -3,7 +3,6 @@ use std::{
     path::PathBuf,
 };
 
-use crate::deployment::{Capability, CapabilityGrants, TrustState};
 use anyhow::{Context, bail};
 pub(crate) use nazoauthctl_runtime::runtime_backend::safe_systemd_path;
 use serde::{Deserialize, Serialize};
@@ -13,8 +12,6 @@ use url::{Host, Url};
 #[serde(deny_unknown_fields)]
 pub(crate) struct UpdateConfig {
     pub(crate) schema: u32,
-    pub(crate) trust: TrustState,
-    pub(crate) capabilities: CapabilityGrants,
     #[serde(default = "baseline_install_profile")]
     pub(crate) install_profile: String,
     pub(crate) repository: String,
@@ -38,30 +35,10 @@ fn baseline_install_profile() -> String {
 pub(crate) struct Operator {
     pub(crate) deployment_id: String,
     pub(crate) controller_key_id: String,
-    pub(crate) controller_private_key: PathBuf,
-    pub(crate) controller_public_key: PathBuf,
-    pub(crate) receipt_key_id: String,
-    pub(crate) receipt_private_key: PathBuf,
-    pub(crate) receipt_public_key: PathBuf,
-    pub(crate) audit_key_id: String,
-    pub(crate) audit_private_key: PathBuf,
-    pub(crate) audit_public_key: PathBuf,
-    pub(crate) break_glass_key_id: String,
-    pub(crate) break_glass_private_key: PathBuf,
-    pub(crate) break_glass_public_key: PathBuf,
-    /// The single durable authority for the active controller/audit/recovery
-    /// generation.  Older installations do not have it; ctl adopts their
-    /// complete legacy keyset before doing any new rotation.
-    #[serde(default)]
-    pub(crate) active_identity_file: PathBuf,
-    #[serde(default)]
-    pub(crate) identity_generations_directory: PathBuf,
-    #[serde(default)]
-    pub(crate) recovery_generations_directory: PathBuf,
+    /// Durable per-deployment state anchors that the frozen legacy
+    /// bootstrap-admin surface still resolves before its J-phase removal.
     pub(crate) secret_revision_file: PathBuf,
     pub(crate) state_directory: PathBuf,
-    pub(crate) audit_directory: PathBuf,
-    pub(crate) trust_state_file: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -81,24 +58,6 @@ pub(crate) struct Dependencies {
     pub(crate) valkey_backup_url_file: PathBuf,
     #[serde(default)]
     pub(crate) external_valkey_backup_scope: String,
-    #[serde(default)]
-    pub(crate) database_runtime_endpoint_sha256: String,
-    #[serde(default)]
-    pub(crate) database_runtime_principal_sha256: String,
-    #[serde(default)]
-    pub(crate) migration_database_endpoint_sha256: String,
-    #[serde(default)]
-    pub(crate) migration_database_principal_sha256: String,
-    #[serde(default)]
-    pub(crate) database_backup_endpoint_sha256: String,
-    #[serde(default)]
-    pub(crate) database_backup_principal_sha256: String,
-    #[serde(default)]
-    pub(crate) valkey_runtime_principal_sha256: String,
-    #[serde(default)]
-    pub(crate) valkey_backup_endpoint_sha256: String,
-    #[serde(default)]
-    pub(crate) valkey_backup_principal_sha256: String,
 }
 
 fn default_dependency_mode() -> String {
@@ -115,15 +74,6 @@ impl Default for Dependencies {
             valkey_url_file: PathBuf::new(),
             valkey_backup_url_file: PathBuf::new(),
             external_valkey_backup_scope: String::new(),
-            database_runtime_endpoint_sha256: String::new(),
-            database_runtime_principal_sha256: String::new(),
-            migration_database_endpoint_sha256: String::new(),
-            migration_database_principal_sha256: String::new(),
-            database_backup_endpoint_sha256: String::new(),
-            database_backup_principal_sha256: String::new(),
-            valkey_runtime_principal_sha256: String::new(),
-            valkey_backup_endpoint_sha256: String::new(),
-            valkey_backup_principal_sha256: String::new(),
         }
     }
 }
@@ -242,17 +192,6 @@ impl UpdateConfig {
         if !matches!(self.schema, 2 | 3) {
             bail!("unsupported update config schema");
         }
-        self.capabilities.validate()?;
-        if self.trust == TrustState::Observed
-            && Capability::ALL.iter().any(|capability| {
-                self.capabilities
-                    .grant(*capability)
-                    .responsibility
-                    .permits_mutation()
-            })
-        {
-            bail!("observed update configuration cannot grant mutation capability");
-        }
         if !matches!(self.install_profile.as_str(), "baseline" | "standards-full") {
             bail!("unsupported install profile {}", self.install_profile);
         }
@@ -285,37 +224,15 @@ impl UpdateConfig {
             &self.backup_root,
             &self.deployment_root,
             &self.ui.releases_root,
-            &self.operator.controller_private_key,
-            &self.operator.controller_public_key,
-            &self.operator.receipt_private_key,
-            &self.operator.receipt_public_key,
-            &self.operator.audit_private_key,
-            &self.operator.audit_public_key,
-            &self.operator.break_glass_private_key,
-            &self.operator.break_glass_public_key,
             &self.operator.secret_revision_file,
             &self.operator.state_directory,
-            &self.operator.audit_directory,
-            &self.operator.trust_state_file,
         ] {
             safe_absolute(path)?;
-        }
-        for path in [
-            &self.operator.active_identity_file,
-            &self.operator.identity_generations_directory,
-            &self.operator.recovery_generations_directory,
-        ] {
-            if !path.as_os_str().is_empty() {
-                safe_absolute(path)?;
-            }
         }
         for identifier in [
             &self.operator.deployment_id,
             &self.runtime.runtime_instance_id,
             &self.operator.controller_key_id,
-            &self.operator.receipt_key_id,
-            &self.operator.audit_key_id,
-            &self.operator.break_glass_key_id,
         ] {
             if !safe_identifier(identifier) {
                 bail!("operator identity is unsafe");
@@ -361,52 +278,6 @@ impl UpdateConfig {
             }
             if self.dependencies.external_valkey_backup_scope != "dedicated-instance" {
                 bail!("external Valkey backup must declare dedicated-instance scope");
-            }
-            for (label, identity) in [
-                (
-                    "external PostgreSQL runtime endpoint identity",
-                    &self.dependencies.database_runtime_endpoint_sha256,
-                ),
-                (
-                    "external PostgreSQL runtime principal identity",
-                    &self.dependencies.database_runtime_principal_sha256,
-                ),
-                (
-                    "external PostgreSQL migration endpoint identity",
-                    &self.dependencies.migration_database_endpoint_sha256,
-                ),
-                (
-                    "external PostgreSQL migration principal identity",
-                    &self.dependencies.migration_database_principal_sha256,
-                ),
-                (
-                    "external PostgreSQL backup endpoint identity",
-                    &self.dependencies.database_backup_endpoint_sha256,
-                ),
-                (
-                    "external PostgreSQL backup principal identity",
-                    &self.dependencies.database_backup_principal_sha256,
-                ),
-                (
-                    "external Valkey runtime principal identity",
-                    &self.dependencies.valkey_runtime_principal_sha256,
-                ),
-                (
-                    "external Valkey backup endpoint identity",
-                    &self.dependencies.valkey_backup_endpoint_sha256,
-                ),
-                (
-                    "external Valkey backup principal identity",
-                    &self.dependencies.valkey_backup_principal_sha256,
-                ),
-            ] {
-                if identity.len() != 64
-                    || !identity
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                {
-                    bail!("{label} must be a lowercase SHA-256 digest");
-                }
             }
             for (index, path) in paths.iter().enumerate() {
                 if paths[..index].contains(path) {

@@ -20,9 +20,8 @@ pub(super) fn list_deployments() -> anyhow::Result<()> {
 
 pub(super) fn registered_status(
     record: &crate::deployment::DeploymentRecord,
-    doctor: bool,
 ) -> anyhow::Result<()> {
-    use crate::deployment::{ArtifactReference, Responsibility};
+    use crate::deployment::ArtifactReference;
     use crate::runtime_backend::backend;
 
     let observations = record
@@ -78,35 +77,15 @@ pub(super) fn registered_status(
             }
         })
         .collect::<Vec<_>>();
-    let managed_runtime_drift = record.capabilities.runtime.responsibility
-        == Responsibility::Managed
-        && observations.iter().any(|observation| {
-            !observation
-                .get("present")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-                || !observation
-                    .get("artifact_matches_declaration")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-        });
     let report = serde_json::json!({
         "schema": 1,
         "deployment_id": record.deployment_id,
         "alias": record.alias,
         "issuer": record.issuer,
         "active_release": record.active_release,
-        "trust": record.trust,
-        "capabilities": record.capabilities,
-        "core_recovery_proven": record.core_recovery_is_proven(),
-        "machine_loss_requires_off_host_package": true,
-        "managed_runtime_drift": managed_runtime_drift,
         "runtime_instances": observations,
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
-    if doctor && managed_runtime_drift {
-        bail!("managed runtime drift requires explicit re-verification; no state was overwritten");
-    }
     Ok(())
 }
 

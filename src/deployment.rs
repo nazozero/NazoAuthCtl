@@ -17,132 +17,7 @@ pub(crate) const DEPLOYMENT_SCHEMA: u32 = 1;
 const REGISTRY_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const DEPLOYMENT_DECLARATION_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum TrustState {
-    Observed,
-    Adopted,
-}
-
-pub(crate) use nazoauthctl_runtime::{
-    ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind, RuntimeInstance,
-};
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Capability {
-    Runtime,
-    Artifact,
-    ServerConfig,
-    Database,
-    Valkey,
-    OperatorTasks,
-    Backups,
-    ProxyTls,
-}
-
-impl Capability {
-    pub(crate) const ALL: [Self; 8] = [
-        Self::Runtime,
-        Self::Artifact,
-        Self::ServerConfig,
-        Self::Database,
-        Self::Valkey,
-        Self::OperatorTasks,
-        Self::Backups,
-        Self::ProxyTls,
-    ];
-
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Runtime => "runtime",
-            Self::Artifact => "artifact",
-            Self::ServerConfig => "server_config",
-            Self::Database => "database",
-            Self::Valkey => "valkey",
-            Self::OperatorTasks => "operator_tasks",
-            Self::Backups => "backups",
-            Self::ProxyTls => "proxy_tls",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CapabilityGrant {
-    pub(crate) responsibility: Responsibility,
-    pub(crate) scope: ResourceScope,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CapabilityGrants {
-    pub(crate) runtime: CapabilityGrant,
-    pub(crate) artifact: CapabilityGrant,
-    pub(crate) server_config: CapabilityGrant,
-    pub(crate) database: CapabilityGrant,
-    pub(crate) valkey: CapabilityGrant,
-    pub(crate) operator_tasks: CapabilityGrant,
-    pub(crate) backups: CapabilityGrant,
-    pub(crate) proxy_tls: CapabilityGrant,
-}
-
-impl CapabilityGrants {
-    /// Test-only fixture: the canonical controller-installed grant set.
-    #[cfg(test)]
-    pub(crate) fn controller_installed() -> Self {
-        let managed = || CapabilityGrant {
-            responsibility: Responsibility::Managed,
-            scope: ResourceScope::Deployment,
-        };
-        Self {
-            runtime: managed(),
-            artifact: managed(),
-            server_config: managed(),
-            database: managed(),
-            valkey: managed(),
-            operator_tasks: managed(),
-            backups: managed(),
-            proxy_tls: CapabilityGrant {
-                responsibility: Responsibility::External,
-                scope: ResourceScope::Shared,
-            },
-        }
-    }
-
-    pub(crate) fn grant(&self, capability: Capability) -> &CapabilityGrant {
-        match capability {
-            Capability::Runtime => &self.runtime,
-            Capability::Artifact => &self.artifact,
-            Capability::ServerConfig => &self.server_config,
-            Capability::Database => &self.database,
-            Capability::Valkey => &self.valkey,
-            Capability::OperatorTasks => &self.operator_tasks,
-            Capability::Backups => &self.backups,
-            Capability::ProxyTls => &self.proxy_tls,
-        }
-    }
-
-    /// Validate the capability lattice at every persistence boundary.
-    ///
-    /// A shared resource may be delegated or left external, but it cannot be
-    /// declared controller-managed: the controller has no exclusive ownership
-    /// or deletion proof for a resource shared with another deployment.
-    pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        for capability in Capability::ALL {
-            let grant = self.grant(capability);
-            if grant.scope == ResourceScope::Shared
-                && grant.responsibility == Responsibility::Managed
-            {
-                bail!(
-                    "capability {} cannot be managed when its resource scope is shared",
-                    capability.name()
-                );
-            }
-        }
-        Ok(())
-    }
-}
+pub(crate) use nazoauthctl_runtime::{ArtifactReference, RuntimeBackendKind, RuntimeInstance};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
@@ -166,22 +41,6 @@ pub(crate) enum SafeReference {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum RecoveryConclusion {
-    Proven,
-    RequiresUserEvidence,
-    Unproven,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RecoveryAssessment {
-    pub(crate) conclusion: RecoveryConclusion,
-    pub(crate) evidence: Vec<String>,
-    pub(crate) off_host_package_required_for_machine_loss: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DeploymentRecord {
     pub(crate) schema: u32,
@@ -190,62 +49,21 @@ pub(crate) struct DeploymentRecord {
     pub(crate) alias: Option<String>,
     pub(crate) issuer: String,
     pub(crate) active_release: nazo_operator_protocol::EmbeddedIdentity,
-    pub(crate) trust: TrustState,
-    pub(crate) capabilities: CapabilityGrants,
     pub(crate) runtime_instances: Vec<RuntimeInstance>,
     pub(crate) resources: BTreeMap<String, SafeReference>,
-    pub(crate) recovery: RecoveryAssessment,
     pub(crate) operator_protocol_versions: BTreeSet<u32>,
     pub(crate) control_protocol_versions: BTreeSet<u32>,
+    /// Config-revision CAS anchor for the surviving TLS certificate-provider
+    /// transactions; every receipt must bind the declaration revision it was
+    /// planned against.
     pub(crate) declaration_revision: u64,
 }
 
 impl DeploymentRecord {
-    pub(crate) fn require_mutation(&self, capabilities: &[Capability]) -> anyhow::Result<()> {
-        if self.trust != TrustState::Adopted {
-            bail!("deployment is observed, not adopted; mutation is forbidden");
-        }
-        let denied = capabilities
-            .iter()
-            .copied()
-            .filter(|capability| {
-                !self
-                    .capabilities
-                    .grant(*capability)
-                    .responsibility
-                    .permits_mutation()
-            })
-            .map(Capability::name)
-            .collect::<Vec<_>>();
-        if !denied.is_empty() {
-            bail!(
-                "operation exceeds granted deployment capabilities: {}",
-                denied.join(", ")
-            );
-        }
-        Ok(())
-    }
-
-    pub(crate) fn core_recovery_is_proven(&self) -> bool {
-        self.trust == TrustState::Adopted
-            && self.recovery.conclusion == RecoveryConclusion::Proven
-            && (matches!(
-                self.resources.get("controller_config"),
-                Some(SafeReference::File { .. })
-            ) || matches!(
-                self.resources.get("lifecycle_contract"),
-                Some(SafeReference::DigestBoundFile { .. })
-            ))
-            && self.capabilities.runtime.responsibility.permits_mutation()
-            && self.capabilities.artifact.responsibility.permits_mutation()
-            && self.capabilities.backups.responsibility.permits_mutation()
-    }
-
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.schema != DEPLOYMENT_SCHEMA {
             bail!("unsupported deployment declaration schema");
         }
-        self.capabilities.validate()?;
         validate_identifier(&self.deployment_id, "deployment ID")?;
         validate_identifier(&self.control_authority, "control authority")?;
         if let Some(alias) = &self.alias {
@@ -292,16 +110,6 @@ impl DeploymentRecord {
                 }
             }
         }
-        if self.trust == TrustState::Observed
-            && Capability::ALL.iter().any(|capability| {
-                self.capabilities
-                    .grant(*capability)
-                    .responsibility
-                    .permits_mutation()
-            })
-        {
-            bail!("observed deployment cannot carry mutation capabilities");
-        }
         Ok(())
     }
 }
@@ -323,34 +131,23 @@ pub(crate) struct RegistryEntry {
 pub(crate) struct DeploymentStore {
     pub(crate) config_root: PathBuf,
     pub(crate) state_root: PathBuf,
-    pub(crate) break_glass_root: PathBuf,
 }
 
 impl DeploymentStore {
     pub(crate) fn system() -> Self {
-        let (config_default, state_default, break_glass_default) = if cfg!(windows) {
+        let (config_default, state_default) = if cfg!(windows) {
             (
                 r"C:\ProgramData\NazoAuthCtl\config",
                 r"C:\ProgramData\NazoAuthCtl\state",
-                r"C:\ProgramData\NazoAuthCtl-BreakGlass",
             )
         } else if cfg!(target_os = "macos") {
-            (
-                "/private/etc/nazoauthctl",
-                "/private/var/lib/nazoauthctl",
-                "/private/var/lib/nazoauthctl-break-glass",
-            )
+            ("/private/etc/nazoauthctl", "/private/var/lib/nazoauthctl")
         } else {
-            (
-                "/etc/nazoauthctl",
-                "/var/lib/nazoauthctl",
-                "/var/lib/nazoauthctl-break-glass",
-            )
+            ("/etc/nazoauthctl", "/var/lib/nazoauthctl")
         };
         Self {
             config_root: root_from_env("NAZOAUTHCTL_CONFIG_ROOT", config_default),
             state_root: root_from_env("NAZOAUTHCTL_STATE_ROOT", state_default),
-            break_glass_root: root_from_env("NAZOAUTHCTL_BREAK_GLASS_ROOT", break_glass_default),
         }
     }
 
@@ -359,8 +156,9 @@ impl DeploymentStore {
     }
 
     /// Return whether the registration registry exists without following a
-    /// link.  Callers use this only to choose the registered/legacy command
-    /// boundary; the subsequent load still validates the same descriptor.
+    /// link.  Callers use this only to choose the registered/unregistered
+    /// control boundary; the subsequent load still validates the same
+    /// descriptor.
     pub(crate) fn registry_present(&self) -> anyhow::Result<bool> {
         self.validate_failure_domains()?;
         if self.registration_pending()? {
@@ -376,7 +174,7 @@ impl DeploymentStore {
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 if self.registered_artifacts_present()? {
                     bail!(
-                        "deployment registry is missing while registered deployment artifacts remain; restore or reconcile the registry before using legacy commands"
+                        "deployment registry is missing while registered deployment artifacts remain; restore or reconcile the registry before running controller commands"
                     );
                 }
                 Ok(false)
@@ -391,7 +189,6 @@ impl DeploymentStore {
         for directory in [
             self.config_root.join("deployments"),
             self.state_root.join("deployments"),
-            self.break_glass_root.join("deployments"),
         ] {
             let metadata = match fs::symlink_metadata(&directory) {
                 Ok(metadata) => metadata,
@@ -460,40 +257,26 @@ impl DeploymentStore {
         for (label, path) in [
             ("controller configuration root", &self.config_root),
             ("controller state root", &self.state_root),
-            ("break-glass root", &self.break_glass_root),
         ] {
-            validate_storage_root(path, label, label == "break-glass root")?;
+            validate_storage_root(path, label)?;
         }
         let config_identity = storage_identity(&self.config_root)?;
         let state_identity = storage_identity(&self.state_root)?;
-        let break_glass_identity = storage_identity(&self.break_glass_root)?;
-        if paths_overlap(&break_glass_identity, &state_identity)
-            || paths_overlap(&state_identity, &config_identity)
-            || paths_overlap(&break_glass_identity, &config_identity)
-        {
-            bail!("controller configuration, state, and break-glass roots must not overlap");
+        if paths_overlap(&state_identity, &config_identity) {
+            bail!("controller configuration and state roots must not overlap");
         }
-        validate_independent_recovery_device(
-            &self.break_glass_root,
-            &[
-                ("controller configuration root", &self.config_root),
-                ("controller state root", &self.state_root),
-            ],
-            "break-glass root",
-        )?;
         Ok(())
     }
 
-    /// Create the three controller roots only after validating every existing
-    /// path component.  The second validation closes the common create-time
+    /// Create the controller roots only after validating every existing path
+    /// component.  The second validation closes the common create-time
     /// symlink substitution window and makes all later atomic writes/locks
     /// inherit a trusted parent chain.
     fn ensure_storage_roots(&self) -> anyhow::Result<()> {
         self.validate_failure_domains()?;
-        for (label, path, private) in [
-            ("controller configuration root", &self.config_root, false),
-            ("controller state root", &self.state_root, false),
-            ("break-glass root", &self.break_glass_root, true),
+        for (label, path) in [
+            ("controller configuration root", &self.config_root),
+            ("controller state root", &self.state_root),
         ] {
             if matches!(fs::symlink_metadata(path), Err(error) if error.kind() == ErrorKind::NotFound)
             {
@@ -501,7 +284,7 @@ impl DeploymentStore {
                     .with_context(|| format!("failed to create {label} {}", path.display()))?;
                 crate::filesystem::set_mode(path, 0o700)?;
             }
-            validate_storage_root(path, label, private)?;
+            validate_storage_root(path, label)?;
         }
         let transactions = self.state_root.join("transactions");
         if !path_present(&transactions)? {
@@ -701,59 +484,13 @@ impl DeploymentStore {
         )
     }
 
-    /// Acquire deterministic operational locks for capabilities whose backing
-    /// resource is shared with another deployment.  The capability name is the
-    /// stable lock identity because declarations intentionally carry provider
-    /// references, not a controller-owned resource locator.
-    pub(crate) fn shared_capability_locks(
-        &self,
-        record: &DeploymentRecord,
-        capabilities: &[Capability],
-    ) -> anyhow::Result<Vec<FileLock>> {
-        let mut shared = capabilities
-            .iter()
-            .copied()
-            .filter(|capability| {
-                record.capabilities.grant(*capability).scope == ResourceScope::Shared
-            })
-            .map(Capability::name)
-            .collect::<Vec<_>>();
-        shared.sort_unstable();
-        shared.dedup();
-        shared
-            .into_iter()
-            .map(|capability| self.shared_resource_lock(capability))
-            .collect()
-    }
-
-    pub(crate) fn shared_capability_shared_locks(
-        &self,
-        record: &DeploymentRecord,
-        capabilities: &[Capability],
-    ) -> anyhow::Result<Vec<FileLock>> {
-        let mut shared = capabilities
-            .iter()
-            .copied()
-            .filter(|capability| {
-                record.capabilities.grant(*capability).scope == ResourceScope::Shared
-            })
-            .map(Capability::name)
-            .collect::<Vec<_>>();
-        shared.sort_unstable();
-        shared.dedup();
-        shared
-            .into_iter()
-            .map(|capability| self.shared_resource_shared_lock(capability))
-            .collect()
-    }
-
     pub(crate) fn controller_self_lock(&self) -> anyhow::Result<FileLock> {
         self.ensure_storage_roots()?;
         FileLock::acquire(&self.state_root.join("locks").join("controller-self.lock"))
     }
 }
 
-fn validate_storage_root(path: &Path, label: &str, break_glass: bool) -> anyhow::Result<()> {
+fn validate_storage_root(path: &Path, label: &str) -> anyhow::Result<()> {
     if !path.is_absolute()
         || path.parent().is_none()
         || path.components().any(|component| {
@@ -797,7 +534,7 @@ fn validate_storage_root(path: &Path, label: &str, break_glass: bool) -> anyhow:
     }
 
     if let Ok(metadata) = fs::symlink_metadata(path) {
-        validate_storage_directory_metadata(&metadata, path, label, break_glass)?;
+        validate_storage_directory_metadata(&metadata, path, label)?;
     }
     Ok(())
 }
@@ -806,7 +543,6 @@ fn validate_storage_directory_metadata(
     metadata: &fs::Metadata,
     path: &Path,
     label: &str,
-    break_glass: bool,
 ) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -815,9 +551,6 @@ fn validate_storage_directory_metadata(
         let mode = metadata.permissions().mode() & 0o777;
         if mode & 0o022 != 0 {
             bail!("{label} is group/world writable: {}", path.display());
-        }
-        if break_glass && mode & 0o077 != 0 {
-            bail!("{label} must be owner-only: {}", path.display());
         }
         if let Some(uid) = effective_uid()
             && metadata.uid() != uid
@@ -830,7 +563,7 @@ fn validate_storage_directory_metadata(
     }
     #[cfg(not(unix))]
     {
-        let _ = (metadata, path, label, break_glass);
+        let _ = (metadata, path, label);
     }
     Ok(())
 }
@@ -892,96 +625,6 @@ fn ensure_real_directory(path: &Path, label: &str) -> anyhow::Result<()> {
         Ok(_) => bail!("{label} is not a real directory: {}", path.display()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
-    }
-}
-
-#[cfg(all(not(test), unix))]
-pub(crate) fn validate_independent_recovery_device(
-    recovery: &Path,
-    primary_roots: &[(&str, &Path)],
-    recovery_label: &str,
-) -> anyhow::Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let metadata = fs::symlink_metadata(recovery).with_context(|| {
-        format!(
-            "{recovery_label} must be a pre-provisioned mounted failure domain: {}",
-            recovery.display()
-        )
-    })?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        bail!("{recovery_label} must be a real pre-provisioned directory");
-    }
-    let recovery_device = metadata.dev();
-    for (label, path) in primary_roots {
-        let existing = nearest_existing_ancestor(path)?;
-        if fs::symlink_metadata(existing)?.dev() == recovery_device {
-            bail!("{recovery_label} must be mounted on a different filesystem device from {label}");
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(not(test), windows))]
-pub(crate) fn validate_independent_recovery_device(
-    recovery: &Path,
-    primary_roots: &[(&str, &Path)],
-    recovery_label: &str,
-) -> anyhow::Result<()> {
-    use std::path::Component;
-
-    if !recovery.is_dir() {
-        bail!("{recovery_label} must be a pre-provisioned mounted failure domain");
-    }
-    let volume = |path: &Path| -> anyhow::Result<std::ffi::OsString> {
-        let existing = nearest_existing_ancestor(path)?;
-        match existing.components().next() {
-            Some(Component::Prefix(prefix)) => Ok(prefix.as_os_str().to_owned()),
-            _ => bail!("storage root has no provable Windows volume boundary"),
-        }
-    };
-    let recovery_volume = volume(recovery)?;
-    for (label, path) in primary_roots {
-        if volume(path)? == recovery_volume {
-            bail!("{recovery_label} must use a different Windows volume from {label}");
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-pub(crate) fn validate_independent_recovery_device(
-    _: &Path,
-    _: &[(&str, &Path)],
-    _: &str,
-) -> anyhow::Result<()> {
-    // Unit-test temporary directories necessarily share one device. Production
-    // binaries compile the platform-specific proof above; overlap and symlink
-    // semantics remain covered in unit tests.
-    Ok(())
-}
-
-#[cfg(all(not(test), not(any(unix, windows))))]
-pub(crate) fn validate_independent_recovery_device(
-    _: &Path,
-    _: &[(&str, &Path)],
-    recovery_label: &str,
-) -> anyhow::Result<()> {
-    bail!("this platform cannot prove an independent {recovery_label} storage device")
-}
-
-#[cfg(not(test))]
-fn nearest_existing_ancestor(mut path: &Path) -> anyhow::Result<&Path> {
-    loop {
-        match fs::symlink_metadata(path) {
-            Ok(_) => return Ok(path),
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                path = path
-                    .parent()
-                    .context("storage root has no existing ancestor")?;
-            }
-            Err(error) => return Err(error).context("failed to inspect storage ancestor"),
-        }
     }
 }
 

@@ -6,19 +6,13 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use base64::{
-    Engine as _,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-};
-use chrono::Utc;
-use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use nazo_operator_protocol::EmbeddedIdentity;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest as _, Sha256};
 
 use crate::deployment::{
-    Capability, DeploymentRecord, DeploymentStore, FileLock, RuntimeBackendKind, SafeReference,
+    DeploymentRecord, DeploymentStore, FileLock, RuntimeBackendKind, SafeReference,
 };
 use crate::{
     cli::legacy_types::{
@@ -57,13 +51,12 @@ pub(crate) struct ControlConfig {
     /// The declaration selected at the same boundary as the configuration.
     ///
     /// Registered commands must use this snapshot instead of resolving the
-    /// selector a second time after acquiring capability/deployment locks.  A
+    /// selector a second time after acquiring the deployment lock.  A
     /// legacy, unregistered configuration has no declaration and therefore
     /// keeps this field as `None`.
     record: Option<DeploymentRecord>,
     _legacy_lock: Option<File>,
     _deployment_lock: Option<FileLock>,
-    _shared_capability_locks: Vec<FileLock>,
 }
 
 impl ControlConfig {
@@ -86,9 +79,7 @@ pub(crate) fn conformance_control_context(
     let context = control_config_with_lock_mode(
         config_path,
         selector,
-        &[Capability::OperatorTasks],
         true,
-        false,
         false,
         DeploymentLockMode::Shared,
     )?;
@@ -148,29 +139,22 @@ pub(crate) fn conformance_control_context(
 fn control_config(
     config_path: &Path,
     selector: Option<&str>,
-    capabilities: &[Capability],
     application_task: bool,
-    core_recovery: bool,
     unsettled: bool,
 ) -> anyhow::Result<ControlConfig> {
     control_config_with_lock_mode(
         config_path,
         selector,
-        capabilities,
         application_task,
-        core_recovery,
         unsettled,
         DeploymentLockMode::Exclusive,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn control_config_with_lock_mode(
     config_path: &Path,
     selector: Option<&str>,
-    capabilities: &[Capability],
     application_task: bool,
-    core_recovery: bool,
     unsettled: bool,
     lock_mode: DeploymentLockMode,
 ) -> anyhow::Result<ControlConfig> {
@@ -195,42 +179,18 @@ fn control_config_with_lock_mode(
             record: None,
             _legacy_lock: legacy_lock,
             _deployment_lock: None,
-            _shared_capability_locks: Vec::new(),
         });
     }
 
-    let destructive = !capabilities.is_empty() || core_recovery;
-    let resolved = store.resolve(selector, destructive)?;
-    let deployment_lock = if destructive {
-        Some(match lock_mode {
-            DeploymentLockMode::Exclusive => store.deployment_lock(&resolved.deployment_id)?,
-            DeploymentLockMode::Shared => store.deployment_shared_lock(&resolved.deployment_id)?,
-        })
-    } else {
-        None
-    };
+    // Every remaining entry into a registered deployment context mutates or
+    // runs application tasks, so the resolver always reports the destructive
+    // ambiguity error when no unique selector exists.
+    let resolved = store.resolve(selector, true)?;
+    let deployment_lock = Some(match lock_mode {
+        DeploymentLockMode::Exclusive => store.deployment_lock(&resolved.deployment_id)?,
+        DeploymentLockMode::Shared => store.deployment_shared_lock(&resolved.deployment_id)?,
+    });
     let record = store.load(&resolved.deployment_id)?;
-    let shared_capability_locks = if destructive {
-        match lock_mode {
-            DeploymentLockMode::Exclusive => {
-                store.shared_capability_locks(&record, capabilities)?
-            }
-            DeploymentLockMode::Shared => {
-                store.shared_capability_shared_locks(&record, capabilities)?
-            }
-        }
-    } else {
-        Vec::new()
-    };
-    if !capabilities.is_empty() {
-        record.require_mutation(capabilities)?;
-    }
-    if core_recovery && !record.core_recovery_is_proven() {
-        bail!(
-            "deployment {} has no proven controller-independent recovery package",
-            record.deployment_id
-        );
-    }
     if !record
         .control_protocol_versions
         .contains(&nazo_operator_protocol::CONTROL_DISCOVERY_SCHEMA)
@@ -276,7 +236,6 @@ fn control_config_with_lock_mode(
         record: Some(record),
         _legacy_lock: None,
         _deployment_lock: deployment_lock,
-        _shared_capability_locks: shared_capability_locks,
     })
 }
 
@@ -388,36 +347,6 @@ struct ControllerUpdateJournal {
     to_version: String,
     to_sha256: String,
     staged_artifact: PathBuf,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ControllerSelfAuditEvent {
-    schema: u32,
-    sequence: u64,
-    previous_sha256: String,
-    operation: String,
-    from_version: String,
-    to_version: String,
-    artifact_sha256: String,
-    recorded_at: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ControllerSelfAuditRecord {
-    schema: u32,
-    key_id: String,
-    event: ControllerSelfAuditEvent,
-    signature: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ControllerSelfAuditHead {
-    schema: u32,
-    sequence: u64,
-    sha256: String,
 }
 
 const BOOTSTRAP_MOUNT_TARGET: &str = "/var/lib/nazo_oauth/bootstrap";
