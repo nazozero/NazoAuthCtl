@@ -13,7 +13,7 @@ use crate::clean_install::{
     CleanInstallContext, CleanInstallRequest, CurlInitialAdminTransport, CurlPublicProber,
     LocalBootstrapMaterial, claim_initial_admin, verify_public,
 };
-use crate::cli::{Cli, Command, InstallArgs, InstanceSelector, UpdateArgs};
+use crate::cli::{Cli, Command, InstallArgs, InstanceCommand, InstanceSelector, UpdateArgs};
 use crate::controller_identity::lifecycle as identity;
 use crate::controller_identity::store::ControllerKeyStore;
 use crate::discover_adopt::{DiscoverRequest, DiscoveryContext};
@@ -29,7 +29,27 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         // ---- primary 18-command surface ------------------------------------
         Command::Host(command) => crate::fleet::run_host(command),
-        Command::Instance(command) => crate::fleet::run_instance(command),
+        Command::Instance(mut command) => {
+            // P1-2: merge the global --instance into any empty selector so
+            // `nazoauthctl --instance prod instance show` resolves correctly
+            // instead of falling through to default/ambiguous selection.
+            match &mut command {
+                InstanceCommand::Show(selector)
+                | InstanceCommand::Forget(selector)
+                | InstanceCommand::Rename {
+                    source: selector, ..
+                }
+                | InstanceCommand::Relocate { selector, .. } => {
+                    if selector.positional.is_none() && selector.named.is_none() {
+                        if let Some(global) = instance_flag {
+                            selector.positional = Some(global.to_owned());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            crate::fleet::run_instance(command)
+        }
         Command::Controller(command) => identity::run_controller_command(command, instance_flag),
         Command::Bind(options) => identity::run_bind(options, instance_flag),
         Command::Install(args) => run_install(args),
