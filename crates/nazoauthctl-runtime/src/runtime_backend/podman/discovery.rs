@@ -72,20 +72,23 @@ pub(super) fn inspect(
         .get("Image")
         .and_then(serde_json::Value::as_str)
         .and_then(|value| container_shared::normalize_local_image_id(value, true));
-    let (artifact, artifact_missing) = match resolve_image_digest(command, &image_reference) {
-        Ok(digest) => (
-            ArtifactReference::Oci {
-                image_reference,
-                digest,
-            },
-            None,
-        ),
-        Err(error) if container_shared::is_engine_unavailable_error(&error) => return Err(error),
-        Err(_) => (
-            ArtifactReference::Unknown,
-            Some("trusted OCI digest could not be resolved".to_owned()),
-        ),
-    };
+    let (artifact, artifact_missing) =
+        match resolve_image_digest(command, &image_reference, local_artifact_id.as_deref()) {
+            Ok(digest) => (
+                ArtifactReference::Oci {
+                    image_reference,
+                    digest,
+                },
+                None,
+            ),
+            Err(error) if container_shared::is_engine_unavailable_error(&error) => {
+                return Err(error);
+            }
+            Err(_) => (
+                ArtifactReference::Unknown,
+                Some("trusted OCI digest could not be resolved".to_owned()),
+            ),
+        };
     let ports = parse_ports(&value)?;
     let networks = value
         .pointer("/NetworkSettings/Networks")
@@ -266,20 +269,26 @@ pub(super) fn inspect_optional(
     Ok(Some(inspect(command, object_reference)?))
 }
 
+/// Resolve the trusted repository digest for an image reference.
+///
+/// `local_image_id` is the container's recorded immutable local image ID.
+/// Podman quirk: a container started from an index (manifest-list) digest
+/// reference can be stored under the platform manifest digest, after which
+/// the index reference stops resolving for `image inspect`. The local image
+/// ID always resolves, and its `RepoDigests` list carries every digest the
+/// engine retained — including the requested one — so it is a pure lookup
+/// fallback, never a trust downgrade: the requested-digest match below is
+/// unchanged.
 pub(super) fn resolve_image_digest(
     command: &OsStr,
     image_reference: &str,
+    local_image_id: Option<&str>,
 ) -> anyhow::Result<String> {
-    let repo_digests = container_shared::command_stdout(
+    let repo_digests = image_inspect_output(
         command,
-        &[
-            "image",
-            "inspect",
-            image_reference,
-            "--format",
-            "{{json .RepoDigests}}",
-        ],
-        "Podman",
+        image_reference,
+        local_image_id,
+        "{{json .RepoDigests}}",
     )?;
     let expected = image_reference
         .rsplit_once('@')
@@ -304,17 +313,7 @@ pub(super) fn resolve_image_digest(
             return Ok(digest.to_ascii_lowercase());
         }
     }
-    let digest = container_shared::command_stdout(
-        command,
-        &[
-            "image",
-            "inspect",
-            image_reference,
-            "--format",
-            "{{.Digest}}",
-        ],
-        "Podman",
-    )?;
+    let digest = image_inspect_output(command, image_reference, local_image_id, "{{.Digest}}")?;
     let digest = digest.trim();
     if !container_shared::valid_digest(digest)
         || !container_shared::requested_digest_matches(image_reference, digest)
@@ -322,6 +321,33 @@ pub(super) fn resolve_image_digest(
         bail!("container engine did not retain the signed OCI digest");
     }
     Ok(digest.to_ascii_lowercase())
+}
+
+/// Run one `image inspect --format` query against the image reference,
+/// falling back to the container's recorded local image ID when Podman no
+/// longer resolves the original reference (index-digest storage quirk).
+fn image_inspect_output(
+    command: &OsStr,
+    image_reference: &str,
+    local_image_id: Option<&str>,
+    format: &str,
+) -> anyhow::Result<String> {
+    match container_shared::command_stdout(
+        command,
+        &["image", "inspect", image_reference, "--format", format],
+        "Podman",
+    ) {
+        Ok(output) => Ok(output),
+        Err(reference_error) => match local_image_id {
+            Some(id) => container_shared::command_stdout(
+                command,
+                &["image", "inspect", id, "--format", format],
+                "Podman",
+            )
+            .map_err(|_| reference_error),
+            None => Err(reference_error),
+        },
+    }
 }
 
 pub(super) fn resolve_local_image_id(
