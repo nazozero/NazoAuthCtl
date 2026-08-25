@@ -586,6 +586,19 @@ impl HostInstallExecutor {
         // absent here (G08): loopback readiness is the only install gate.
         probe_local_health(job.order.port)?;
 
+        // 7. Write the operator's config-revision marker so the one-shot
+        // operator can fence operations against stale configuration (E04
+        // admission step 5).
+        let revision_marker = job.scope_dir.join("config-revision");
+        atomic_write(&revision_marker, job.order.config_sha256.as_bytes(), 0o440).map_err(
+            |error| {
+                Failure::new(
+                    HOST_ERR_OPERATION_INVALID,
+                    sanitize(format!("failed to write config-revision marker: {error}")),
+                )
+            },
+        )?;
+
         // 7. Ownership marker: proves ctl created and manages this directory.
         // Uninstall verifies it before any destructive action (P0-3/W2.4).
         let owned_marker = PathBuf::from(&job.order.data_root).join(".nazoauth-owned");
