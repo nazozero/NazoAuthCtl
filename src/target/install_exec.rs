@@ -586,6 +586,16 @@ impl HostInstallExecutor {
         // absent here (G08): loopback readiness is the only install gate.
         probe_local_health(job.order.port)?;
 
+        // 7. Ownership marker: proves ctl created and manages this directory.
+        // Uninstall verifies it before any destructive action (P0-3/W2.4).
+        let owned_marker = PathBuf::from(&job.order.data_root).join(".nazoauth-owned");
+        atomic_write(&owned_marker, job.deployment_id.as_bytes(), 0o440).map_err(|error| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                sanitize(format!("failed to write ownership marker: {error}")),
+            )
+        })?;
+
         Ok(InstallFacts {
             artifact_reference: format!("sha256:{subject_digest}"),
             build_identity: Some(

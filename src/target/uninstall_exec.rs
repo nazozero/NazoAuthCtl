@@ -181,7 +181,12 @@ impl HostDeletionExecutor {
                     ),
                 ));
             }
-            delete_managed_resource(&declared.kind, &declared.locator, performed)?;
+            delete_managed_resource(
+                &declared.kind,
+                &declared.locator,
+                job.deployment_id,
+                performed,
+            )?;
         }
 
         // 3. The configuration file created by install/managed by the update
@@ -220,6 +225,7 @@ impl HostDeletionExecutor {
 fn delete_managed_resource(
     kind: &str,
     locator: &str,
+    deployment_id: &str,
     performed: &mut PerformedDeletions,
 ) -> Result<(), Failure> {
     match kind {
@@ -247,6 +253,28 @@ fn delete_managed_resource(
                         sanitize(locator.to_owned())
                     ),
                 ));
+            }
+            // W2.4: verify the ownership marker before deleting. The marker
+            // proves ctl created this directory during install.
+            let marker = path.join(".nazoauth-owned");
+            if marker.exists() {
+                let owned_by = std::fs::read_to_string(&marker).map_err(|error| {
+                    Failure::new(
+                        HOST_ERR_OPERATION_INVALID,
+                        format!("failed to read ownership marker: {error}"),
+                    )
+                })?;
+                if owned_by.trim() != deployment_id {
+                    return Err(Failure::new(
+                        super::deployment_state::OBJECT_IDENTITY_MISMATCH,
+                        format!(
+                            "directory '{}' is owned by '{}', not '{}'",
+                            sanitize(locator.to_owned()),
+                            sanitize(owned_by.trim().to_owned()),
+                            sanitize(deployment_id.to_owned())
+                        ),
+                    ));
+                }
             }
             if path.exists() {
                 std::fs::remove_dir_all(path).map_err(|error| {
