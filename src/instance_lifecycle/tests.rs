@@ -142,11 +142,18 @@ impl LifecycleExecutor for ScriptedLifecycle {
 #[derive(Default)]
 struct ScriptedDeletion {
     calls: Mutex<u32>,
+    /// Resource ids actually handed to the deletion executor.
+    planned: Mutex<Vec<String>>,
 }
 
 impl DeletionExecutor for ScriptedDeletion {
-    fn execute_deletion(&self, _job: &DeletionJob<'_>) -> Result<(), Failure> {
+    fn execute_deletion(&self, job: &DeletionJob<'_>) -> Result<(), Failure> {
         *self.calls.lock().unwrap() += 1;
+        self.planned.lock().unwrap().extend(
+            job.resources
+                .iter()
+                .map(|resource| resource.resource_id.clone()),
+        );
         Ok(())
     }
 }
@@ -422,6 +429,119 @@ fn uninstall_removes_only_the_instance_record_and_keeps_siblings() -> anyhow::Re
             .registry
             .host_by_alias(crate::registry::LOCAL_HOST_ALIAS)?
             .is_some()
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------- H04/H06
+
+#[test]
+fn uninstall_plan_and_operation_log_keep_external_resources_listed() -> anyhow::Result<()> {
+    use crate::target::TargetJournal;
+
+    let fixture = Fixture::new()?;
+
+    // The plan lists the external shared database as kept (H06: reference
+    // facts stay visible; nothing external is ever deleted).
+    let plan = plan_uninstall(&fixture.context, Some(&format!("inst-{DEPLOYMENT}")))?;
+    let kept = plan
+        .kept_external
+        .iter()
+        .find(|(id, _, _)| id == "shared-db")
+        .expect("the shared database stays listed as kept");
+    assert_eq!(kept.1, "postgres");
+    let rendered = plan.render();
+    assert!(rendered.contains("shared-db"), "{rendered}");
+    assert!(rendered.contains("ZERO DELETE"), "{rendered}");
+
+    let report = run_uninstall(&fixture.context, Some(&format!("inst-{DEPLOYMENT}")), true)?;
+    assert!(
+        report.contains("external/shared resources were never touched"),
+        "{report}"
+    );
+
+    // The destructive path received ONLY the managed resource — the external
+    // locator never enters a deletion order.
+    let planned = fixture.deletion.planned.lock().unwrap().clone();
+    assert_eq!(planned, vec!["state-dir".to_owned()], "{planned:?}");
+
+    // The journaled operation log records the uninstall as one terminal,
+    // completed mutation beside the retained journal.
+    let entries = TargetJournal::open(&fixture.state_root)?.operation_log(DEPLOYMENT)?;
+    let uninstall_entries: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.status != crate::target::journal::JournalStatus::Pending)
+        .collect();
+    assert_eq!(uninstall_entries.len(), 1, "{entries:?}");
+    assert_eq!(uninstall_entries[0].action, "state-mutate");
+    assert_eq!(
+        uninstall_entries[0].outcome,
+        Some(crate::target::journal::OperationOutcomeSummary::Completed)
+    );
+    Ok(())
+}
+
+// -------------------------------------------------------------------- H05
+
+#[test]
+fn backup_maturity_is_recorded_and_displayed_without_gating_update() -> anyhow::Result<()> {
+    use crate::target::{BackupMaturity, TargetStateStore};
+
+    let fixture = Fixture::new()?;
+    let store = TargetStateStore::open(&fixture.state_root)?;
+
+    // Fresh deployments start Unknown; an explicit backup operation (owning
+    // the live revision) is the only writer.
+    assert_eq!(
+        store.load_existing(DEPLOYMENT)?.backup_maturity,
+        BackupMaturity::Unknown
+    );
+    store.record_backup_maturity(
+        DEPLOYMENT,
+        BackupMaturity::NotConfigured {
+            observed_at: chrono::Utc::now(),
+        },
+        "bootstrap-op-0001",
+    )?;
+
+    // NEGATIVE GATING TEST: update runs to completion on a deployment whose
+    // backup maturity says "no usable data backup" — install/update/status
+    // never require or block on backup facts (goal item 16).
+    let report = run_update(&fixture.context, &fixture.keys, &fixture.update_request())?;
+    assert!(report.contains("updated instance"), "{report}");
+    let state = store.load_existing(DEPLOYMENT)?;
+    assert_eq!(state.artifact.current.as_deref(), Some(NEW_REF));
+    assert!(matches!(
+        state.backup_maturity,
+        BackupMaturity::NotConfigured { .. }
+    ));
+
+    // The maturity fact reaches the status surface (inspection) verbatim.
+    let inspection = crate::target::LocalTarget::with_state_root(&fixture.state_root)
+        .inspect_instance(DEPLOYMENT)?;
+    assert_eq!(inspection.backup_maturity.token(), "not-configured");
+    assert!(inspection.backup_maturity.observed_at().is_some());
+    Ok(())
+}
+
+#[test]
+fn foreign_operations_cannot_report_backup_maturity() -> anyhow::Result<()> {
+    use crate::target::{BackupMaturity, TargetStateStore};
+
+    let fixture = Fixture::new()?;
+    let store = TargetStateStore::open(&fixture.state_root)?;
+    let failure = store
+        .record_backup_maturity(
+            DEPLOYMENT,
+            BackupMaturity::Verified {
+                observed_at: chrono::Utc::now(),
+            },
+            "not-the-owning-operation",
+        )
+        .expect_err("only the owning explicit operation may report");
+    assert!(
+        failure.detail.contains("explicit backup operation"),
+        "{failure:?}"
     );
     Ok(())
 }

@@ -20,6 +20,14 @@
 //! acceptance; this file only lets ctl reuse `operation_id + request_hash`
 //! instead of minting a new identity.
 //!
+//! Operational-log convergence (H04): this journal and the target-side
+//! `operations.jsonl` tell ONE plain-record story. Neither carries signing
+//! keys or signature verification — same-host signing identities prove
+//! nothing (P4), so tamper evidence comes from file hygiene plus external
+//! WORM/SIEM shipping where a deployment needs strong audit. Retention here
+//! is the tightest bound ctl owns: exactly one slot per instance, capped at
+//! one entry, cleared only by a definitive unaccepted rejection.
+//!
 //! Invariants implemented here:
 //!
 //! * Write-ahead: the entry is durable before the signed operation leaves ctl,

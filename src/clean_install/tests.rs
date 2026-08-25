@@ -225,6 +225,7 @@ impl SshStub {
             "healthy": true,
             "health_summary": "local readiness probe passed after clean install",
             "active_host_operation": "__OPERATION_ID__",
+            "backup_maturity": {"state": "unknown"},
         });
         let install = serde_json::json!({
             "schema": crate::target::wire::HOST_PROTOCOL_SCHEMA,

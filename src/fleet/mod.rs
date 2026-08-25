@@ -207,8 +207,18 @@ pub(crate) fn summarize_inspection(inspection: &InstanceInspection) -> String {
         .filter(|resource| resource.ownership == ResourceOwnership::Managed)
         .count();
     let health = if inspection.healthy { "ok" } else { "down" };
+    // Backup/DR maturity (H05): informational display with its observation
+    // timestamp; never a gate for any lifecycle use case.
+    let backup = match inspection.backup_maturity.observed_at() {
+        Some(observed_at) => format!(
+            "{}@{}",
+            inspection.backup_maturity.token(),
+            observed_at.to_rfc3339()
+        ),
+        None => inspection.backup_maturity.token().to_owned(),
+    };
     format!(
-        "rev={} runtime={}/{} config={} artifacts={} resources={} managed={} health={health}",
+        "rev={} runtime={}/{} config={} artifacts={} resources={} managed={} health={health} backup={backup}",
         inspection.revision,
         inspection.runtime.kind,
         inspection.runtime.object,
@@ -942,6 +952,7 @@ mod tests {
                     resources: vec![],
                     healthy: true,
                     health_summary: "ok".to_owned(),
+                    backup_maturity: crate::target::BackupMaturity::Unknown,
                     active_host_operation: None,
                     bootstrap_material: None,
                 }),
@@ -973,6 +984,7 @@ mod tests {
                     ],
                     healthy: true,
                     health_summary: "runtime healthy".to_owned(),
+                    backup_maturity: crate::target::BackupMaturity::Unknown,
                     active_host_operation: None,
                     bootstrap_material: None,
                 }),

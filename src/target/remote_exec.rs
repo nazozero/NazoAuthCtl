@@ -386,9 +386,11 @@ mod tests {
         let operation: HostOperation = serde_json::from_slice(&apply_config_input(1)?)?;
         let journal = TargetJournal::open(&root)?;
         let pending = serde_json::to_string(&JournalLine {
-            schema: 1,
+            schema: crate::target::journal::JOURNAL_SCHEMA,
             operation_id: operation.operation_id.clone(),
             operation_hash: canonical_operation_hash(&operation)?,
+            action: "state-mutate".to_owned(),
+            recorded_at: chrono::Utc::now(),
             status: JournalStatus::Pending,
             result: None,
         })?;

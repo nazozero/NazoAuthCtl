@@ -670,6 +670,11 @@ pub struct InstanceInspection {
     /// verification recorded them (G03 ControlOperation envelope source).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_build_identity: Option<super::deployment_state::BuildIdentity>,
+    /// Backup/DR maturity (H05): informational fact reported by explicit
+    /// backup operations. Status/doctor surfaces display it with its
+    /// observation timestamp; no lifecycle use case ever gates on it.
+    #[serde(default)]
+    pub backup_maturity: super::deployment_state::BackupMaturity,
 }
 
 /// Identity a target helper announces about itself (goal plan 03 §6).
@@ -1194,6 +1199,7 @@ mod tests {
             active_host_operation: None,
             bootstrap_material: None,
             current_build_identity: None,
+            backup_maturity: super::super::deployment_state::BackupMaturity::Unknown,
         };
         let listed = HostResult::completed(
             Uuid::now_v7().to_string(),

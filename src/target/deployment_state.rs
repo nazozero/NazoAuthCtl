@@ -18,8 +18,8 @@
 //! `deployments/<scope>/operations.jsonl`, and the state document shares that
 //! exact directory. Nothing else may construct these paths.
 //!
-//! Ownership model (goal plan 06 §3): resources are concrete
-//! `resource_id/kind/locator` facts classified only by `ownership`
+//! Ownership model (goal plan 06 §3, converged by H06): resources are
+//! concrete `resource_id/kind/locator` facts classified only by `ownership`
 //! (managed/external) and `scope` (deployment/shared). There are no
 //! capability enums, no permits_mutation matrices, and no trust states. Hard
 //! rules enforced at construction *and* load time:
@@ -29,6 +29,16 @@
 //!   external and shared resources have zero-delete paths ([`Failure`] with
 //!   [`RESOURCE_DELETE_FORBIDDEN`]);
 //! - admin identity never changes ownership.
+//!
+//! External/shared PostgreSQL, Valkey, proxy, DNS, or KMS objects are owned by
+//! their own platforms: ctl records ONLY the reference facts above (locator +
+//! scope). It runs no health gating over them, manages none of their secrets,
+//! and exercises no lifecycle control on their paths — uninstall plans print
+//! them as kept and nothing else. Connection facts (URLs, principals,
+//! credentials) live in NazoAuth's own configuration under the config CAS
+//! revision, never in DeploymentState or the control-side Registry; no
+//! endpoint/principal digest matrix exists anywhere on these target-side
+//! paths.
 //!
 //! Concurrency is one explicit fact (F04): the monotonic
 //! [`ConfigState::revision`]. Every mutation carries the expected revision;
@@ -321,6 +331,57 @@ pub struct HealthRecord {
     pub checked_at: DateTime<Utc>,
 }
 
+/// Backup/DR maturity of one deployment (goal plan 08 §5, task H05). This is
+/// an INFORMATIONAL maturity fact only: it records what explicit backup
+/// operations have reported, and nothing in install, update, rollback,
+/// uninstall, status, or doctor ever requires, blocks on, or gates through it
+/// (goal plan README hard constraint: backup/DR never becomes a default gate;
+/// item 16 of the goal definition). There is deliberately no restore-rehearsal
+/// machinery behind it — a rehearsal that returns would re-create the deleted
+/// global recovery gate (A04 §5).
+///
+/// Transitions are written ONLY through
+/// [`TargetStateStore::record_backup_maturity`] by explicit backup operations
+/// under the same operation-ownership discipline as health observations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum BackupMaturity {
+    /// No explicit backup operation has ever reported for this deployment.
+    /// The initial state of every fresh DeploymentState.
+    #[default]
+    Unknown,
+    /// An explicit backup operation reported that no usable data backup is
+    /// configured for this deployment.
+    NotConfigured { observed_at: DateTime<Utc> },
+    /// An explicit backup operation recorded a configured data backup.
+    Configured { observed_at: DateTime<Utc> },
+    /// An explicit backup operation verified restorability (for example a
+    /// restore check performed by the backup tooling itself) at that time.
+    Verified { observed_at: DateTime<Utc> },
+}
+
+impl BackupMaturity {
+    /// Stable lowercase token used by status/doctor style displays.
+    pub fn token(&self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::NotConfigured { .. } => "not-configured",
+            Self::Configured { .. } => "configured",
+            Self::Verified { .. } => "verified",
+        }
+    }
+
+    /// The observation timestamp of the reporting operation, when one exists.
+    pub fn observed_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Unknown => None,
+            Self::NotConfigured { observed_at }
+            | Self::Configured { observed_at }
+            | Self::Verified { observed_at } => Some(*observed_at),
+        }
+    }
+}
+
 /// Embedded build identity of one deployed artifact, recorded by whoever
 /// performed the on-target official verification (goal plan 07 G03): the
 /// ControlOperation envelope's J1 binding needs these facts, so they live in
@@ -380,6 +441,10 @@ pub struct DeploymentState {
     pub config: ConfigState,
     pub resources: Vec<Resource>,
     pub local_health: HealthRecord,
+    /// Backup/DR maturity (H05): informational only, updated exclusively by
+    /// explicit backup operations, never consulted by lifecycle gating.
+    #[serde(default)]
+    pub backup_maturity: BackupMaturity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_host_operation: Option<ActiveHostOperationRef>,
     /// Embedded build identity of `artifact.current`, when known.
@@ -728,6 +793,7 @@ impl TargetStateStore {
                 summary: "bootstrapped; runtime health not yet observed".to_owned(),
                 checked_at: Utc::now(),
             },
+            backup_maturity: BackupMaturity::Unknown,
             current_build_identity,
             previous_build_identity: None,
         };
@@ -1018,6 +1084,42 @@ impl TargetStateStore {
         Ok(record)
     }
 
+    /// Record a backup/DR maturity fact (H05). ONLY explicit backup
+    /// operations may write it, enforced by the same operation-ownership
+    /// discipline as [`Self::record_local_health`]: the reporting operation
+    /// must own the deployment's current state revision. This is an
+    /// observation, not a config change: the CAS revision does not move, and
+    /// no lifecycle use case ever consults this fact for gating.
+    pub fn record_backup_maturity(
+        &self,
+        deployment_id: &str,
+        maturity: BackupMaturity,
+        operation_id: &str,
+    ) -> Result<BackupMaturity, Failure> {
+        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
+        let mut state = self.load_existing(deployment_id)?;
+        let owns = state
+            .active_host_operation
+            .as_ref()
+            .is_some_and(|active| active.operation_id == operation_id);
+        if !owns {
+            return Err(Failure::new(
+                DEPLOYMENT_UNKNOWN,
+                format!(
+                    "backup maturity rejected: '{deployment_id}' is not currently owned by \
+                     operation {operation_id}; only an explicit backup operation over the live \
+                     state revision may report maturity"
+                ),
+            ));
+        }
+        state.backup_maturity = maturity;
+        let scope = journal::deployment_scope(deployment_id).map_err(|error| {
+            Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
+        })?;
+        persist(&scope_path(&self.root, &scope), &state)?;
+        Ok(maturity)
+    }
+
     fn lock_path(&self, deployment_id: &str) -> Result<PathBuf, Failure> {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
@@ -1203,6 +1305,85 @@ mod tests {
         }
         let failure = store.list_deployments().expect_err("over the cap");
         assert_eq!(failure.code, DEPLOYMENT_LIMIT_EXCEEDED, "{failure:?}");
+        Ok(())
+    }
+
+    // ------------------------------------------------------------- H05
+
+    #[test]
+    fn backup_maturity_transitions_are_recorded_by_owning_operations_only() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("nazauthctl-backup-maturity")?;
+        let store = TargetStateStore::open(temp.path().join("state"))?;
+        store.bootstrap(
+            "deploy-alpha",
+            sample_params("https://a.example", "nz-a"),
+            "op-1",
+        )?;
+
+        // Fresh state starts at Unknown: no explicit backup statement yet.
+        let state = store.load_existing("deploy-alpha")?;
+        assert_eq!(state.backup_maturity, BackupMaturity::Unknown);
+        assert_eq!(state.backup_maturity.token(), "unknown");
+        assert!(state.backup_maturity.observed_at().is_none());
+
+        // A foreign operation id is rejected: only an explicit backup
+        // operation owning the live revision may report maturity.
+        let foreign = store.record_backup_maturity(
+            "deploy-alpha",
+            BackupMaturity::NotConfigured {
+                observed_at: Utc::now(),
+            },
+            "not-the-owner",
+        );
+        assert!(foreign.is_err());
+        assert_eq!(
+            store.load_existing("deploy-alpha")?.backup_maturity,
+            BackupMaturity::Unknown,
+            "rejected writes change nothing"
+        );
+
+        let recorded = store.record_backup_maturity(
+            "deploy-alpha",
+            BackupMaturity::NotConfigured {
+                observed_at: Utc::now(),
+            },
+            "op-1",
+        )?;
+        assert_eq!(recorded.token(), "not-configured");
+
+        let configured = store.record_backup_maturity(
+            "deploy-alpha",
+            BackupMaturity::Configured {
+                observed_at: Utc::now(),
+            },
+            "op-1",
+        )?;
+        assert!(matches!(configured, BackupMaturity::Configured { .. }));
+
+        // The fact persists verbatim and never moves the CAS revision.
+        let state = store.load_existing("deploy-alpha")?;
+        assert_eq!(state.backup_maturity.token(), "configured");
+        assert!(state.backup_maturity.observed_at().is_some());
+        assert_eq!(state.config.revision, 1);
+
+        let verified = store.record_backup_maturity(
+            "deploy-alpha",
+            BackupMaturity::Verified {
+                observed_at: Utc::now(),
+            },
+            "op-1",
+        )?;
+        assert_eq!(verified.token(), "verified");
+
+        // Round-trips through strict deserialization.
+        let raw = std::fs::read_to_string(
+            temp.path()
+                .join("state/deployments/deploy-alpha/state.json"),
+        )?;
+        assert!(
+            raw.contains(r#""state": "verified""#) || raw.contains(r#""state":"verified""#),
+            "{raw}"
+        );
         Ok(())
     }
 }

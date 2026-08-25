@@ -37,12 +37,13 @@ pub use control_exec::{
     CONTROL_EXECUTION_UNAVAILABLE, CONTROL_OUTCOME_UNKNOWN, CONTROL_TARGET_DRIFT,
 };
 pub use deployment_state::{
-    ActiveHostOperationRef, ArtifactRefs, BUILD_IDENTITY_PRODUCT, BootstrapParams, BuildIdentity,
-    CONFIG_REVISION_MISMATCH, ConfigState, DEPLOYMENT_EXISTS, DEPLOYMENT_LIMIT_EXCEEDED,
-    DEPLOYMENT_STATE_SCHEMA, DEPLOYMENT_UNKNOWN, DeploymentState, Failure, HealthRecord,
-    INSTALL_FAILED, MAX_LISTED_DEPLOYMENTS, MAX_RESOURCES, OBJECT_IDENTITY_MISMATCH,
-    RESOURCE_DELETE_FORBIDDEN, RESOURCE_UNKNOWN, ROLLBACK_UNAVAILABLE, Resource, ResourceOwnership,
-    ResourceScope, RuntimeSurface, StateMutationPayload, TargetStateStore,
+    ActiveHostOperationRef, ArtifactRefs, BUILD_IDENTITY_PRODUCT, BackupMaturity, BootstrapParams,
+    BuildIdentity, CONFIG_REVISION_MISMATCH, ConfigState, DEPLOYMENT_EXISTS,
+    DEPLOYMENT_LIMIT_EXCEEDED, DEPLOYMENT_STATE_SCHEMA, DEPLOYMENT_UNKNOWN, DeploymentState,
+    Failure, HealthRecord, INSTALL_FAILED, MAX_LISTED_DEPLOYMENTS, MAX_RESOURCES,
+    OBJECT_IDENTITY_MISMATCH, RESOURCE_DELETE_FORBIDDEN, RESOURCE_UNKNOWN, ROLLBACK_UNAVAILABLE,
+    Resource, ResourceOwnership, ResourceScope, RuntimeSurface, StateMutationPayload,
+    TargetStateStore,
 };
 pub use install_exec::{
     ARTIFACT_UNVERIFIED, CONFIG_INVALID, CONFIG_PATH_OCCUPIED, EMBEDDED_IDENTITY_MISMATCH,
@@ -686,6 +687,7 @@ fn inspection_from_state(state: DeploymentState) -> InstanceInspection {
         resources: state.resources,
         healthy: state.local_health.healthy,
         health_summary: state.local_health.summary,
+        backup_maturity: state.backup_maturity,
         active_host_operation: state
             .active_host_operation
             .map(|active| active.operation_id),
@@ -734,6 +736,7 @@ fn answer_inspect(
                 resources: state.resources.clone(),
                 healthy: state.local_health.healthy,
                 health_summary: state.local_health.summary.clone(),
+                backup_maturity: state.backup_maturity,
                 active_host_operation: state
                     .active_host_operation
                     .as_ref()
