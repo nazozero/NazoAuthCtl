@@ -771,3 +771,6 @@ pub(crate) fn stable_code(rendered: &str) -> String {
     }
     error_codes::HOST_UNREACHABLE.to_owned()
 }
+
+#[cfg(test)]
+mod tests;

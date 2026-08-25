@@ -61,13 +61,19 @@ impl ExecutionTarget for ScriptedTarget {
             anyhow::bail!("{text}");
         }
         match &operation.operation {
+            crate::target::HostOperationBody::Hello {} => Ok(HostResult::completed(
+                &operation.operation_id,
+                HostCompletionBody::Hello {
+                    hello: crate::target::wire::local_hello(vec!["podman".to_owned()]),
+                },
+            )),
             crate::target::HostOperationBody::Ping { nonce } => Ok(HostResult::completed(
                 &operation.operation_id,
                 HostCompletionBody::Ping {
                     nonce: nonce.clone(),
                 },
             )),
-            _ => anyhow::bail!("scripted target only answers pings here"),
+            _ => anyhow::bail!("scripted target only answers hello and ping here"),
         }
     }
 
@@ -277,7 +283,16 @@ fn concurrency_is_bounded_by_the_cap() -> anyhow::Result<()> {
         }) as Box<dyn ExecutionTarget + Send>)
     });
     let runner = FleetReadRunner::new(factory, PROBE_CONCURRENCY, Duration::from_secs(10));
-    let outcomes = runner.run(items, Arc::new(|_, _, _| Ok(json!({}))));
+    let probe_job: std::sync::Arc<ReadJob> = Arc::new(
+        |_instance: &InstanceRecord,
+         _host: &HostRecord,
+         target: &dyn ExecutionTarget|
+         -> anyhow::Result<serde_json::Value> {
+            target.inspect_instance("probe")?;
+            Ok(json!({}))
+        },
+    );
+    let outcomes = runner.run(items, probe_job);
     assert_eq!(outcomes.len(), 12);
     assert!(
         max_seen.load(Ordering::SeqCst) <= PROBE_CONCURRENCY,
