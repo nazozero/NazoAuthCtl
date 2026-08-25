@@ -422,11 +422,24 @@ impl HostInstallExecutor {
                     "{}@{digest}",
                     release.manifest.oci.repository.trim_end_matches('/')
                 );
-                runtime_backend::backend(kind)
-                    .pull_image(&image)
-                    .map_err(|error| {
-                        Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string()))
-                    })?;
+                let backend = runtime_backend::backend(kind);
+                if let Err(pull_error) = backend.pull_image(&image) {
+                    // Registry unreachable (restricted network, anonymous
+                    // rate-limiting): the digest pin IS the verification
+                    // anchor, so an image already present locally under the
+                    // exact repo@digest reference is equally trustworthy.
+                    // Anything else (absent, or a different digest) fails.
+                    let present = backend.inspect_optional(&image).ok().flatten().is_some();
+                    if !present {
+                        return Err(Failure::new(
+                            ARTIFACT_UNVERIFIED,
+                            sanitize(format!(
+                                "{pull_error:#}; and no local image matches {image}"
+                            )),
+                        ));
+                    }
+                    // Local exact-digest match: proceed without network.
+                }
                 release
                     .manifest
                     .image_oci_digest()
