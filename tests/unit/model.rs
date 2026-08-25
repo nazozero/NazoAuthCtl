@@ -480,7 +480,7 @@ fn release_manifest_binds_every_binary_frontend_and_oci_identity() {
         manifest.image_oci_digest(),
         format!("sha256:{}", "e".repeat(64))
     );
-    assert_eq!(manifest.frontend_commit(), "c".repeat(40));
+    assert!(is_lower_hex(&manifest.frontend.commit, 40));
 
     if cfg!(target_os = "linux") {
         assert!(

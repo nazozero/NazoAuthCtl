@@ -7,7 +7,8 @@ use crate::{
     controller::{ControlConfig, conformance_control_context},
     deployment::DeploymentStore,
     filesystem::ensure_private_directory,
-    operator::ExpectedReleaseTarget,
+    release::ExpectedReleaseTarget,
+    runtime_identity::verified_runtime_identity_for_uid,
 };
 
 const MAX_PROFILE_TOKEN_BYTES: u64 = 4 * 1024;
@@ -128,8 +129,7 @@ impl ConformanceSession {
         let observation = crate::runtime_backend::backend(self.context.config.runtime.backend)
             .inspect(object_reference)
             .context("failed to inspect the bound NazoAuth runtime")?;
-        let runtime_identity =
-            crate::discovery::verified_runtime_identity_for_uid(&observation, self.runtime_uid)?;
+        let runtime_identity = verified_runtime_identity_for_uid(&observation, self.runtime_uid)?;
         let runtime_identity_is_explicit = self.context.config.runtime.backend
             == crate::deployment::RuntimeBackendKind::Systemd
             || self

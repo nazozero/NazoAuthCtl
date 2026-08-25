@@ -3,8 +3,6 @@ use std::{
     fs::{self, File, TryLockError},
     io::{IsTerminal as _, Read as _, Write as _},
     path::{Path, PathBuf},
-    thread,
-    time::Duration,
 };
 
 use anyhow::{Context, bail};
@@ -14,30 +12,22 @@ use base64::{
 };
 use chrono::Utc;
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
-use nazo_operator_protocol::{EmbeddedIdentity, TaskOperation};
+use nazo_operator_protocol::EmbeddedIdentity;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
 use crate::deployment::{
-    Capability, CapabilityGrant, DeploymentRecord, DeploymentStore, FileLock, MountReference,
-    RecoveryConclusion, ResourceScope, Responsibility, RuntimeBackendKind, SafeReference,
+    Capability, DeploymentRecord, DeploymentStore, FileLock, RuntimeBackendKind, SafeReference,
 };
 use crate::{
-    backup::Backup,
     cli::legacy_types::{
-        BootstrapAdminOptions, CandidateTarget, Command as LegacyCommand, KeysCommand,
-        LocalOciCandidateInstall, UpdateOptions,
+        BootstrapAdminOptions, CandidateTarget, Command as LegacyCommand, LocalOciCandidateInstall,
     },
-    filesystem::{atomic_write, open_lock_file, remove_file_durable, set_mode, symlink_atomic},
-    install::{self, PreparedInstall},
+    filesystem::{atomic_write, open_lock_file, remove_file_durable},
     model::{ReleaseManifest, UpdateConfig},
-    operator::{self, ExpectedReleaseTarget},
     process::Process,
-    release::{
-        ReleaseRequest, VerifiedRelease, commit_release_trust, compare_versions,
-        enforce_release_trust,
-    },
+    release::{ExpectedReleaseTarget, compare_versions, expected_release_target, expected_target},
     runtime::Runtime,
 };
 
@@ -58,7 +48,6 @@ mod updates;
 use bootstrap::*;
 use deployment::*;
 use diagnostics::*;
-use keys::*;
 use self_update::*;
 use updates::*;
 
@@ -126,7 +115,7 @@ pub(crate) fn conformance_control_context(
                 _ => None,
             })
             .context("local OCI deployment declaration has no OCI artifact binding")?;
-        operator::expected_release_target(
+        expected_release_target(
             &context.config,
             active.embedded,
             expected_oci_digest.to_owned(),
@@ -143,7 +132,7 @@ pub(crate) fn conformance_control_context(
         if active.embedded != record.active_release {
             bail!("active local development identity differs from the deployment declaration");
         }
-        operator::expected_release_target(
+        expected_release_target(
             &context.config,
             active.embedded,
             active.image_digest,
@@ -154,51 +143,6 @@ pub(crate) fn conformance_control_context(
         expected_target(&context.config, &release)?
     };
     Ok((context, target, expected))
-}
-
-/// Mutation entry points that operate directly on a registered declaration
-/// (rather than through `control_config`) must observe the same candidate
-/// unsettled-state guard.  Read-only status/transaction presentation remains
-/// available for diagnosis.
-pub(crate) fn reject_pending_local_oci_candidate_record(
-    record: &DeploymentRecord,
-) -> anyhow::Result<()> {
-    let Some(SafeReference::File { path }) = record.resources.get("controller_config") else {
-        return Ok(());
-    };
-    let config = load_config_unsettled(path)?;
-    if deployment::local_oci_candidate_install_is_pending(&config)? {
-        bail!(
-            "local OCI candidate installation is pending; repeat its exact install command before mutating the registered deployment"
-        );
-    }
-    Ok(())
-}
-
-/// A completed local OCI candidate is an immutable conformance artifact, not
-/// an unsigned release channel.  Promotion must be an explicit future
-/// transaction; controller mutations must not silently replace its runtime,
-/// active release, or provenance.
-pub(crate) fn reject_completed_local_oci_candidate_transition(
-    record: &DeploymentRecord,
-) -> anyhow::Result<()> {
-    if !commands::is_local_oci_candidate_record(record) {
-        return Ok(());
-    }
-    let path = match record.resources.get("controller_config") {
-        Some(SafeReference::File { path }) => path,
-        _ => bail!("local OCI candidate declaration has no controller configuration binding"),
-    };
-    let config = load_config_unsettled(path)?;
-    if !deployment::local_oci_candidate_install_is_completed(&config)? {
-        bail!(
-            "local OCI candidate transition is unavailable until its completed state is durably verified"
-        );
-    }
-    deployment::validate_completed_local_oci_candidate_provenance(&config, record)?;
-    bail!(
-        "completed local OCI candidate deployments are frozen; use conformance/read-only diagnostics or an explicit future promotion transaction"
-    )
 }
 
 fn control_config(
@@ -265,58 +209,7 @@ fn control_config_with_lock_mode(
     } else {
         None
     };
-    let mut record = store.load(&resolved.deployment_id)?;
-    let rotation_journal = store.identity_rotation_journal_path(&record.deployment_id);
-    let rotation_pending = match fs::symlink_metadata(&rotation_journal) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => true,
-        Ok(_) => {
-            bail!(
-                "identity rotation journal is not a regular non-symlink file: {}",
-                rotation_journal.display()
-            );
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to inspect identity rotation journal {}",
-                    rotation_journal.display()
-                )
-            });
-        }
-    };
-    if destructive && rotation_pending && lock_mode == DeploymentLockMode::Shared {
-        bail!(
-            "deployment {} has a pending identity rotation; recover it before conformance",
-            record.deployment_id
-        );
-    }
-    if destructive && rotation_pending {
-        // A registered identity transition owns the declaration/config
-        // boundary.  Resume it while the same deployment lock is held before
-        // validating the controller binding; otherwise a crash between CAS
-        // and active-config commit would make every next command unable to
-        // reach its own recovery path.
-        let recovery_path = match record.resources.get("controller_config") {
-            Some(SafeReference::File { path }) => path,
-            _ => config_path,
-        };
-        crate::operator::recover_registered_rotation_locked(&store, recovery_path, &record)?;
-        record = store.load(&resolved.deployment_id)?;
-    }
-    if destructive
-        && lock_mode == DeploymentLockMode::Shared
-        && crate::governance::management_audit_intent_pending(&store, &record.deployment_id)?
-    {
-        bail!(
-            "deployment {} has a pending management audit intent; recover it before conformance",
-            record.deployment_id
-        );
-    }
-    if destructive && lock_mode == DeploymentLockMode::Exclusive {
-        crate::governance::recover_pending_management_audit_intent_locked(&store, &record)?;
-        record = store.load(&resolved.deployment_id)?;
-    }
+    let record = store.load(&resolved.deployment_id)?;
     let shared_capability_locks = if destructive {
         match lock_mode {
             DeploymentLockMode::Exclusive => {
@@ -366,7 +259,7 @@ fn control_config_with_lock_mode(
             record.deployment_id
         ),
     };
-    let mut config = if unsettled {
+    let config = if unsettled {
         load_config_unsettled(&path)?
     } else {
         load_config(&path)?
@@ -376,16 +269,7 @@ fn control_config_with_lock_mode(
             "local OCI candidate installation is pending; repeat its exact install command or inspect status before running controller commands"
         );
     }
-    if lock_mode == DeploymentLockMode::Exclusive {
-        reject_completed_local_oci_candidate_transition(&record)?;
-    }
     verify_control_binding(&record, &config)?;
-    // The declaration is the authoritative capability state.  Keep the
-    // in-memory legacy config aligned after the lock/reload boundary so a
-    // stale file cannot grant extra authority (or deny an intentional
-    // capability transition) to runtime helpers.
-    config.trust = record.trust;
-    config.capabilities = record.capabilities.clone();
     Ok(ControlConfig {
         path,
         config,
@@ -458,98 +342,11 @@ fn verify_control_binding(record: &DeploymentRecord, config: &UpdateConfig) -> a
     Ok(())
 }
 
-/// Load a declaration-bound controller configuration for read-only governance
-/// inspection.  Mutation commands use `control_config`, which additionally
-/// acquires capability/deployment locks; audit presentation calls this helper
-/// only after it has selected and loaded the declaration once.
-pub(crate) fn load_bound_control_config(path: &Path) -> anyhow::Result<UpdateConfig> {
-    load_config(path)
-}
-
-/// Recovery must be able to load the declaration-bound file while an
-/// identity journal intentionally leaves non-active private material pending
-/// retirement.  The caller still validates the deployment/key binding before
-/// any mutation; this helper only skips the settled-state guard that would
-/// otherwise block the recovery itself.
-pub(crate) fn load_bound_control_config_unsettled(path: &Path) -> anyhow::Result<UpdateConfig> {
-    load_config_unsettled(path)
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RollbackState {
-    schema: u32,
-    from_release: ReleaseManifest,
-    to_release: ReleaseManifest,
-    previous_runtime: String,
-    previous_ui: Option<PathBuf>,
-    backup: PathBuf,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum UpdatePhase {
-    Prepared,
-    WriterStopping,
-    WriterStopped,
-    BackupCreating,
-    BackupCreated,
-    MigrationRunning,
-    MigrationApplied,
-    CandidateActivating,
-    CandidateActive,
-    UiActivating,
-    UiActive,
-    HealthChecking,
-    HealthVerified,
-    StateCommitting,
-    StateCommitted,
-    TrustCommitting,
-    TrustCommitted,
-    AuditCommitting,
-    AuditCommitted,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct UpdateJournal {
-    schema: u32,
-    transaction_id: String,
-    started_at: String,
-    phase: UpdatePhase,
-    from_release: ReleaseManifest,
-    to_release: ReleaseManifest,
-    previous_runtime: String,
-    previous_ui: Option<PathBuf>,
-    candidate_runtime: String,
-    candidate_ui: PathBuf,
-    backup: Option<PathBuf>,
-    #[serde(default)]
-    rollback_state_captured: bool,
-    #[serde(default)]
-    previous_rollback_state: Option<RollbackState>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UpdateRecoveryAction {
-    RestorePrevious,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct InstallCompletion {
-    schema: u32,
-    version: String,
-    backend_commit: String,
-    management_event_file: String,
-    management_event_sha256: String,
-    #[serde(default)]
-    recovery_backup: PathBuf,
-}
-
 /// Durable state for the explicit local-OCI install path.  It exists before
 /// the first privileged operator task, so a crash can only be resumed with the
 /// same four identity bindings and immutable local image ID.
+/// The installer entry was removed with the J-A wave; the persisted shape is
+/// still parsed fail-closed by the pending/completed guards.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LocalOciCandidateInstallState {
@@ -743,7 +540,3 @@ fn require_confirmation(yes: bool, action: &str) -> anyhow::Result<()> {
         bail!("operation cancelled")
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/controller.rs"]
-mod tests;

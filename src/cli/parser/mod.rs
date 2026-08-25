@@ -2,27 +2,17 @@
 //!
 //! Command families own their option state and boundary checks in sibling modules.  This module
 //! only consumes global options and routes the remaining tokens to the family parser. The frozen
-//! pre-goal parsers (`admin`, `adoption`, `install`, `keys`, `tls`, `transaction`, `update`)
-//! stay compiled for the frozen legacy runner until J deletes them; argv cannot reach them.
+//! pre-goal parsers (`admin`, `tls`) stay compiled for the frozen legacy runner until the second
+//! J-phase pass deletes them; argv cannot reach them.
 
 #[allow(dead_code)]
 mod admin;
-#[allow(dead_code)]
-mod adoption;
 mod common;
 mod controller;
 mod fleet;
-#[allow(dead_code)]
-mod install;
-#[allow(dead_code)]
-mod keys;
 mod surface;
 #[allow(dead_code)]
 mod tls;
-#[allow(dead_code)]
-mod transaction;
-#[allow(dead_code)]
-mod update;
 
 use std::{env, path::PathBuf};
 

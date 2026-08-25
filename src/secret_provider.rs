@@ -1,3 +1,10 @@
+//! Strict PostgreSQL credential-file materialization for the doctor DDL
+//! privilege probe.
+//!
+//! The external-dependency endpoint/principal digest matrix was part of the
+//! legacy authorization path and was removed with the J-A wave; only the
+//! bounded URL grammar and the pg_service/pgpass writer remain.
+
 use std::{
     fmt::Write as _,
     net::{Ipv4Addr, Ipv6Addr},
@@ -5,7 +12,6 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use sha2::{Digest as _, Sha256};
 
 use crate::filesystem::{PrivateTempDir, atomic_write, read_secure_secret_file};
 
@@ -84,170 +90,6 @@ impl PostgresProvider {
     }
 }
 
-pub(crate) struct ValkeyProvider {
-    pub(crate) host: String,
-    pub(crate) port: u16,
-    pub(crate) username: Option<zeroize::Zeroizing<String>>,
-    pub(crate) database: u32,
-    pub(crate) tls: bool,
-    password: zeroize::Zeroizing<String>,
-}
-
-impl ValkeyProvider {
-    fn from_dependency_url(url: DependencyUrl) -> anyhow::Result<Self> {
-        if !matches!(url.scheme.as_str(), "redis" | "rediss") || !url.query.is_empty() {
-            bail!("Valkey secret provider has an unsupported URL");
-        }
-        let username = (!url.username.is_empty()).then_some(url.username);
-        let password = url.password;
-        let database = url
-            .database
-            .as_str()
-            .parse::<u32>()
-            .context("Valkey database is invalid")?;
-        Ok(Self {
-            host: url.host,
-            port: url.port.unwrap_or(6379),
-            username,
-            database,
-            tls: url.scheme == "rediss",
-            password,
-        })
-    }
-
-    pub(crate) fn password_stdin(&self) -> zeroize::Zeroizing<Vec<u8>> {
-        zeroize::Zeroizing::new(format!("{}\n", self.password.as_str()).into_bytes())
-    }
-}
-
-pub(crate) struct ExternalDependencyBackupBinding {
-    pub(crate) database_runtime_endpoint_sha256: String,
-    pub(crate) database_runtime_principal_sha256: String,
-    pub(crate) migration_database_endpoint_sha256: String,
-    pub(crate) migration_database_principal_sha256: String,
-    pub(crate) database_endpoint_sha256: String,
-    pub(crate) database_principal_sha256: String,
-    pub(crate) valkey_runtime_principal_sha256: String,
-    pub(crate) valkey_endpoint_sha256: String,
-    pub(crate) valkey_principal_sha256: String,
-}
-
-/// The two backup credentials are read and parsed exactly once.  The binding
-/// is verified before the already-parsed providers are handed to subprocesses,
-/// so replacing either source file cannot redirect a backup after validation.
-pub(crate) struct ExternalBackupProviders {
-    pub(crate) binding: ExternalDependencyBackupBinding,
-    pub(crate) postgres: PostgresProvider,
-    pub(crate) valkey: ValkeyProvider,
-}
-
-pub(crate) fn bind_external_dependency_credentials(
-    database_url: &str,
-    migration_database_url: &str,
-    database_backup_url: &str,
-    valkey_url: &str,
-    valkey_backup_url: &str,
-) -> anyhow::Result<ExternalDependencyBackupBinding> {
-    let database = postgres_binding(database_url, "PostgreSQL runtime")?;
-    let migration = postgres_binding(migration_database_url, "PostgreSQL migration")?;
-    let backup = postgres_binding(database_backup_url, "PostgreSQL backup")?;
-    if database.endpoint != migration.endpoint || database.endpoint != backup.endpoint {
-        bail!(
-            "external PostgreSQL runtime, migration, and backup URLs must target one canonical endpoint"
-        );
-    }
-    if database.username == migration.username
-        || database.username == backup.username
-        || migration.username == backup.username
-    {
-        bail!("external PostgreSQL runtime, migration, and backup usernames must be distinct");
-    }
-    let valkey = valkey_binding(valkey_url, "Valkey runtime")?;
-    let valkey_backup = valkey_binding(valkey_backup_url, "Valkey backup")?;
-    if valkey.endpoint != valkey_backup.endpoint {
-        bail!("external Valkey runtime and backup URLs must target one canonical endpoint");
-    }
-    if valkey.username == valkey_backup.username {
-        bail!("external Valkey runtime and backup usernames must be distinct");
-    }
-    Ok(ExternalDependencyBackupBinding {
-        database_runtime_endpoint_sha256: postgres_binding_sha256(&database),
-        database_runtime_principal_sha256: principal_sha256("postgres", database.username.as_str()),
-        migration_database_endpoint_sha256: postgres_binding_sha256(&migration),
-        migration_database_principal_sha256: principal_sha256(
-            "postgres",
-            migration.username.as_str(),
-        ),
-        database_endpoint_sha256: endpoint_sha256(&format!(
-            "{};tls-policy={}",
-            backup.endpoint, backup.tls_policy
-        )),
-        database_principal_sha256: principal_sha256("postgres", backup.username.as_str()),
-        valkey_runtime_principal_sha256: principal_sha256("valkey", valkey.username.as_str()),
-        valkey_endpoint_sha256: endpoint_sha256(&format!(
-            "{};tls-policy={}",
-            valkey_backup.endpoint, valkey_backup.tls_policy
-        )),
-        valkey_principal_sha256: principal_sha256("valkey", valkey_backup.username.as_str()),
-    })
-}
-
-pub(crate) fn read_external_backup_providers(
-    database_backup_url: &Path,
-    valkey_backup_url: &Path,
-) -> anyhow::Result<ExternalBackupProviders> {
-    let database_raw = read_single_line(database_backup_url)?;
-    let valkey_raw = read_single_line(valkey_backup_url)?;
-    let database = parse_dependency_url(database_raw.as_str(), "PostgreSQL backup")?;
-    let valkey = parse_dependency_url(valkey_raw.as_str(), "Valkey backup")?;
-    let database_endpoint_sha256 = postgres_endpoint_sha256(&database, "PostgreSQL backup")?;
-    let database_principal_sha256 = principal_sha256("postgres", database.username.as_str());
-    let valkey_hash = valkey_endpoint_sha256(&valkey, "Valkey backup")?;
-    let valkey_principal_sha256 = principal_sha256("valkey", valkey.username.as_str());
-    Ok(ExternalBackupProviders {
-        binding: ExternalDependencyBackupBinding {
-            database_runtime_endpoint_sha256: String::new(),
-            database_runtime_principal_sha256: String::new(),
-            migration_database_endpoint_sha256: String::new(),
-            migration_database_principal_sha256: String::new(),
-            database_endpoint_sha256,
-            database_principal_sha256,
-            valkey_runtime_principal_sha256: String::new(),
-            valkey_endpoint_sha256: valkey_hash,
-            valkey_principal_sha256,
-        },
-        postgres: PostgresProvider::from_dependency_url(database)?,
-        valkey: ValkeyProvider::from_dependency_url(valkey)?,
-    })
-}
-
-pub(crate) fn bind_external_dependency_url_files(
-    database_url: &Path,
-    migration_database_url: &Path,
-    database_backup_url: &Path,
-    valkey_url: &Path,
-    valkey_backup_url: &Path,
-) -> anyhow::Result<ExternalDependencyBackupBinding> {
-    let database = read_single_line(database_url)?;
-    let migration = read_single_line(migration_database_url)?;
-    let database_backup = read_single_line(database_backup_url)?;
-    let valkey = read_single_line(valkey_url)?;
-    let valkey_backup = read_single_line(valkey_backup_url)?;
-    bind_external_dependency_credentials(
-        database.as_str(),
-        migration.as_str(),
-        database_backup.as_str(),
-        valkey.as_str(),
-        valkey_backup.as_str(),
-    )
-}
-
-struct ProviderBinding {
-    endpoint: String,
-    username: zeroize::Zeroizing<String>,
-    tls_policy: String,
-}
-
 pub(crate) struct DependencyUrl {
     pub(crate) scheme: String,
     pub(crate) host: String,
@@ -260,7 +102,7 @@ pub(crate) struct DependencyUrl {
 
 /// Parses only the strict dependency URL grammar.  It never hands a complete
 /// credential URL to a general URL type with ordinary Drop semantics.
-pub(crate) fn parse_dependency_url(value: &str, label: &str) -> anyhow::Result<DependencyUrl> {
+fn parse_dependency_url(value: &str, label: &str) -> anyhow::Result<DependencyUrl> {
     let (scheme, remainder) = value
         .split_once("://")
         .with_context(|| format!("{label} URL is invalid"))?;
@@ -365,7 +207,7 @@ fn parse_host_port(value: &str, label: &str) -> anyhow::Result<(String, Option<u
     let host = if value.starts_with('[') {
         // The branch above accepts this only after parsing it as Ipv6Addr.
         // Keep the internal representation bare; brackets belong only to URI
-        // authority serialization, never service files or `valkey-cli -h`.
+        // authority serialization.
         host
     } else {
         normalize_host(&host, label)?
@@ -409,145 +251,6 @@ fn normalize_host(value: &str, label: &str) -> anyhow::Result<String> {
         bail!("{label} URL host is not a safe DNS name");
     }
     Ok(value.to_ascii_lowercase())
-}
-
-fn postgres_binding(value: &str, label: &str) -> anyhow::Result<ProviderBinding> {
-    let url = parse_dependency_url(value, label)?;
-    postgres_binding_from_url(url, label)
-}
-
-fn postgres_binding_from_url(url: DependencyUrl, label: &str) -> anyhow::Result<ProviderBinding> {
-    if !matches!(url.scheme.as_str(), "postgres" | "postgresql") {
-        bail!("{label} URL must use a PostgreSQL endpoint");
-    }
-    let mut tls_policy = None;
-    for (key, value) in &url.query {
-        // `sslmode` is transport policy, rather than endpoint or principal
-        // identity.  Preserve the existing supported TLS form without making
-        // equivalent TLS policy spellings change the durable endpoint hash.
-        if key != "sslmode"
-            || !matches!(
-                value.as_ref(),
-                "disable" | "allow" | "prefer" | "require" | "verify-ca" | "verify-full"
-            )
-            || tls_policy.replace(value.as_str().to_owned()).is_some()
-        {
-            bail!("{label} URL has an unsupported PostgreSQL query option");
-        }
-    }
-    Ok(ProviderBinding {
-        endpoint: format!(
-            "postgresql://{}:{}/{}",
-            uri_authority_host(&url.host),
-            url.port.unwrap_or(5432),
-            url.database.as_str()
-        ),
-        username: url.username,
-        tls_policy: tls_policy.unwrap_or("default".to_owned()),
-    })
-}
-
-fn valkey_binding(value: &str, label: &str) -> anyhow::Result<ProviderBinding> {
-    let url = parse_dependency_url(value, label)?;
-    valkey_binding_from_url(url, label)
-}
-
-fn valkey_binding_from_url(url: DependencyUrl, label: &str) -> anyhow::Result<ProviderBinding> {
-    if !matches!(url.scheme.as_str(), "redis" | "rediss") || !url.query.is_empty() {
-        bail!("{label} URL must use a canonical Valkey endpoint without query options");
-    }
-    if url.database.parse::<u32>().is_err() {
-        bail!("{label} URL has an invalid canonical Valkey endpoint");
-    }
-    let tls_policy = url.scheme.clone();
-    Ok(ProviderBinding {
-        endpoint: format!(
-            "{}://{}:{}/{}",
-            tls_policy.as_str(),
-            uri_authority_host(&url.host),
-            url.port.unwrap_or(6379),
-            url.database.as_str()
-        ),
-        username: url.username,
-        tls_policy,
-    })
-}
-
-fn endpoint_sha256(endpoint: &str) -> String {
-    Sha256::digest(endpoint.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn principal_sha256(provider: &str, username: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"nazoauthctl/external-dependency-principal/v1\0");
-    digest.update(provider.as_bytes());
-    digest.update([0]);
-    digest.update(username.as_bytes());
-    digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn postgres_binding_sha256(binding: &ProviderBinding) -> String {
-    endpoint_sha256(&format!(
-        "{};tls-policy={}",
-        binding.endpoint, binding.tls_policy
-    ))
-}
-
-fn postgres_endpoint_sha256(url: &DependencyUrl, label: &str) -> anyhow::Result<String> {
-    if !matches!(url.scheme.as_str(), "postgres" | "postgresql") {
-        bail!("{label} URL must use a PostgreSQL endpoint");
-    }
-    let mut tls_policy = None;
-    for (key, value) in &url.query {
-        if key != "sslmode"
-            || !matches!(
-                value.as_ref(),
-                "disable" | "allow" | "prefer" | "require" | "verify-ca" | "verify-full"
-            )
-            || tls_policy.replace(value.as_str()).is_some()
-        {
-            bail!("{label} URL has an unsupported PostgreSQL query option");
-        }
-    }
-    Ok(endpoint_sha256(&format!(
-        "postgresql://{}:{}/{};tls-policy={}",
-        uri_authority_host(&url.host),
-        url.port.unwrap_or(5432),
-        url.database.as_str(),
-        tls_policy.unwrap_or("default")
-    )))
-}
-
-fn valkey_endpoint_sha256(url: &DependencyUrl, label: &str) -> anyhow::Result<String> {
-    if !matches!(url.scheme.as_str(), "redis" | "rediss") || !url.query.is_empty() {
-        bail!("{label} URL must use a canonical Valkey endpoint without query options");
-    }
-    if url.database.parse::<u32>().is_err() {
-        bail!("{label} URL has an invalid canonical Valkey endpoint");
-    }
-    Ok(endpoint_sha256(&format!(
-        "{}://{}:{}/{};tls-policy={}",
-        url.scheme,
-        uri_authority_host(&url.host),
-        url.port.unwrap_or(6379),
-        url.database.as_str(),
-        url.scheme
-    )))
-}
-
-fn uri_authority_host(host: &str) -> String {
-    if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_owned()
-    }
 }
 
 fn read_single_line(path: &Path) -> anyhow::Result<zeroize::Zeroizing<String>> {
@@ -605,7 +308,7 @@ fn reject_credential_controls(value: &str, label: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn service_value<'a>(value: &'a str, label: &str) -> anyhow::Result<&'a str> {
+fn service_value<'a>(value: &'a str, label: &'a str) -> anyhow::Result<&'a str> {
     if value.contains(['\0', '\r', '\n'])
         || value.chars().next_back().is_some_and(char::is_whitespace)
     {
@@ -617,7 +320,3 @@ fn service_value<'a>(value: &'a str, label: &str) -> anyhow::Result<&'a str> {
 fn pgpass_escape(value: &str) -> zeroize::Zeroizing<String> {
     zeroize::Zeroizing::new(value.replace('\\', "\\\\").replace(':', "\\:"))
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/secret_provider.rs"]
-mod tests;

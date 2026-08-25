@@ -1094,30 +1094,5 @@ pub(super) fn encode_controller_digest(bytes: &[u8]) -> String {
 }
 
 pub(super) const OPENID4VC_CERTIFICATE_BUNDLE: &str = "openid4vc-certificate-bundle.pem";
-pub(super) const OPENID4VC_REVOCATION_SNAPSHOT: &str = "openid4vc-revocation-snapshot.json";
 pub(super) const OPENID4VC_KEYS_MOUNT: &str = "/var/lib/nazo_oauth/keys";
 pub(super) const MAX_OPENID4VC_CERTIFICATE_BUNDLE_BYTES: usize = 1024 * 1024;
-
-#[cfg(test)]
-pub(super) fn self_update_journal_round_trip_for_test(directory: &Path) -> anyhow::Result<bool> {
-    let journal = SelfUpdateJournal {
-        schema: SELF_UPDATE_JOURNAL_SCHEMA,
-        transaction_id: "test-transaction".to_owned(),
-        operation: SelfUpdateOperation::Update,
-        phase: SelfUpdatePhase::CandidateVerified,
-        install_path: directory.join("install"),
-        from_version: "v0.1.0".to_owned(),
-        from_sha256: "a".repeat(64),
-        to_version: "v0.2.0".to_owned(),
-        to_sha256: "b".repeat(64),
-        rollback_artifact: directory.join("rollback-a"),
-        rollback_sha256: "a".repeat(64),
-        staged_artifact: Some(directory.join("candidate-b")),
-    };
-    persist_self_update_journal(directory, &journal)?;
-    let loaded = load_self_update_journal(directory, &directory.join("update-transaction.json"))?;
-    Ok(loaded.schema == SELF_UPDATE_JOURNAL_SCHEMA
-        && loaded.phase == SelfUpdatePhase::CandidateVerified
-        && loaded.from_sha256 == journal.from_sha256
-        && loaded.to_sha256 == journal.to_sha256)
-}

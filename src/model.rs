@@ -231,36 +231,6 @@ pub(crate) struct Ui {
 }
 
 impl UpdateConfig {
-    pub(crate) fn require_managed_lifecycle(&self) -> anyhow::Result<()> {
-        use crate::deployment::Capability;
-
-        if self.trust != TrustState::Adopted {
-            bail!("deployment is not adopted");
-        }
-        let denied = [
-            Capability::Runtime,
-            Capability::Artifact,
-            Capability::Backups,
-        ]
-        .into_iter()
-        .filter(|capability| {
-            !self
-                .capabilities
-                .grant(*capability)
-                .responsibility
-                .permits_mutation()
-        })
-        .map(Capability::name)
-        .collect::<Vec<_>>();
-        if !denied.is_empty() {
-            bail!(
-                "lifecycle operation exceeds granted capabilities: {}",
-                denied.join(", ")
-            );
-        }
-        Ok(())
-    }
-
     pub(crate) fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
         let config: Self =
             serde_json::from_slice(bytes).context("update configuration is not valid JSON")?;
@@ -788,10 +758,6 @@ impl ReleaseManifest {
             .get(platform)
             .map(String::as_str)
             .context("signed Release has no manifest for this OCI platform")
-    }
-
-    pub(crate) fn frontend_commit(&self) -> &str {
-        &self.frontend.commit
     }
 
     fn validate_frontend(&self) -> anyhow::Result<()> {

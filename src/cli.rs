@@ -22,8 +22,8 @@ pub(crate) use types::{
 /// Frozen pre-goal types. The legacy handler bodies (and the J-phase
 /// deletion list) reference them through these stable paths.
 pub(crate) use legacy_types::{
-    AcmeCertificateInput, AcmeCommand, CandidateTarget, TlsCertificateCheckInput,
-    TlsCertificateInput, TlsCertificateSource, TlsCommand,
+    AcmeCertificateInput, AcmeCommand, TlsCertificateCheckInput, TlsCertificateInput,
+    TlsCertificateSource, TlsCommand,
 };
 
 /// Consume the leading options which are shared by every command.

@@ -439,13 +439,6 @@ fn recover(
     {
         validate_receipt_transaction(receipt, &transaction)?;
         cleanup_challenge(&transaction)?;
-        crate::governance::append_management_audit(
-            store,
-            &record,
-            &transaction.jti,
-            "tls-acme-certificate-issue",
-            &receipt.certificate_sha256,
-        )?;
         archive_transaction(store, &transaction)?;
         println!("{}", serde_json::to_string_pretty(&receipt)?);
         return Ok(());
@@ -1241,13 +1234,6 @@ fn commit_issued_material(
     transaction.last_error = None;
     persist_pending(store, transaction)?;
     cleanup_challenge(transaction)?;
-    crate::governance::append_management_audit(
-        store,
-        record,
-        &transaction.jti,
-        "tls-acme-certificate-issue",
-        &receipt.certificate_sha256,
-    )?;
     archive_transaction(store, transaction)?;
     println!("{}", serde_json::to_string_pretty(&receipt)?);
     Ok(())

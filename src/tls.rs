@@ -665,13 +665,6 @@ fn apply(
             persist_receipt(store, &record, &receipt)?;
             transaction.phase = TransactionPhase::Committed;
             persist_pending(store, &transaction)?;
-            crate::governance::append_management_audit(
-                store,
-                &record,
-                &jti,
-                "tls-certificate-apply",
-                &format!("tls-revision-{target_revision}"),
-            )?;
             finalize_transaction(store, &transaction)?;
             println!("{}", serde_json::to_string_pretty(&receipt)?);
             Ok(())
@@ -747,13 +740,6 @@ fn recover(
         persist_receipt(store, &record, receipt)?;
         transaction.phase = TransactionPhase::Committed;
         persist_pending(store, &transaction)?;
-        crate::governance::append_management_audit(
-            store,
-            &record,
-            &transaction.jti,
-            "tls-certificate-apply",
-            &format!("tls-revision-{}", transaction.target_revision),
-        )?;
         finalize_transaction(store, &transaction)?;
         println!("{}", serde_json::to_string_pretty(&transaction)?);
         return Ok(());
@@ -763,13 +749,6 @@ fn recover(
     let provider = loaded_provider_from_transaction(store, &transaction)?;
     rollback_transaction(&mut transaction, previous.as_ref(), &provider)?;
     finalize_transaction(store, &transaction)?;
-    crate::governance::append_management_audit(
-        store,
-        &record,
-        &transaction.jti,
-        "tls-certificate-recover",
-        &format!("tls-revision-{}", transaction.expected_revision),
-    )?;
     println!("{}", serde_json::to_string_pretty(&transaction)?);
     Ok(())
 }

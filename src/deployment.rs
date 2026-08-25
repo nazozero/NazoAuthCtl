@@ -10,14 +10,12 @@ use anyhow::{Context as _, bail};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
-use crate::filesystem::{atomic_write, open_lock_file, read_secure_regular_file};
+use crate::filesystem::{open_lock_file, read_secure_regular_file};
 
 pub(crate) const REGISTRY_SCHEMA: u32 = 1;
 pub(crate) const DEPLOYMENT_SCHEMA: u32 = 1;
-const REGISTRATION_JOURNAL_SCHEMA: u32 = 1;
 const REGISTRY_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const DEPLOYMENT_DECLARATION_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const REGISTRATION_JOURNAL_MAX_BYTES: u64 = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -27,8 +25,7 @@ pub(crate) enum TrustState {
 }
 
 pub(crate) use nazoauthctl_runtime::{
-    ArtifactReference, MountReference, ResourceScope, Responsibility, RuntimeBackendKind,
-    RuntimeInstance,
+    ArtifactReference, ResourceScope, Responsibility, RuntimeBackendKind, RuntimeInstance,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -91,23 +88,8 @@ pub(crate) struct CapabilityGrants {
 }
 
 impl CapabilityGrants {
-    pub(crate) fn observed() -> Self {
-        let external = || CapabilityGrant {
-            responsibility: Responsibility::External,
-            scope: ResourceScope::Deployment,
-        };
-        Self {
-            runtime: external(),
-            artifact: external(),
-            server_config: external(),
-            database: external(),
-            valkey: external(),
-            operator_tasks: external(),
-            backups: external(),
-            proxy_tls: external(),
-        }
-    }
-
+    /// Test-only fixture: the canonical controller-installed grant set.
+    #[cfg(test)]
     pub(crate) fn controller_installed() -> Self {
         let managed = || CapabilityGrant {
             responsibility: Responsibility::Managed,
@@ -138,19 +120,6 @@ impl CapabilityGrants {
             Capability::OperatorTasks => &self.operator_tasks,
             Capability::Backups => &self.backups,
             Capability::ProxyTls => &self.proxy_tls,
-        }
-    }
-
-    pub(crate) fn grant_mut(&mut self, capability: Capability) -> &mut CapabilityGrant {
-        match capability {
-            Capability::Runtime => &mut self.runtime,
-            Capability::Artifact => &mut self.artifact,
-            Capability::ServerConfig => &mut self.server_config,
-            Capability::Database => &mut self.database,
-            Capability::Valkey => &mut self.valkey,
-            Capability::OperatorTasks => &mut self.operator_tasks,
-            Capability::Backups => &mut self.backups,
-            Capability::ProxyTls => &mut self.proxy_tls,
         }
     }
 
@@ -551,26 +520,8 @@ impl DeploymentStore {
             .join("deployment.json")
     }
 
-    pub(crate) fn registration_journal_path(&self, deployment_id: &str) -> PathBuf {
-        self.state_root
-            .join("transactions")
-            .join(format!("registration-{deployment_id}.json"))
-    }
-
-    pub(crate) fn identity_rotation_journal_path(&self, deployment_id: &str) -> PathBuf {
-        self.deployment_state_dir(deployment_id)
-            .join("transactions")
-            .join("identity-rotation.json")
-    }
-
     pub(crate) fn deployment_state_dir(&self, deployment_id: &str) -> PathBuf {
         self.state_root.join("deployments").join(deployment_id)
-    }
-
-    pub(crate) fn break_glass_dir(&self, deployment_id: &str) -> PathBuf {
-        self.break_glass_root
-            .join("deployments")
-            .join(deployment_id)
     }
 
     pub(crate) fn load_registry(&self) -> anyhow::Result<Registry> {
@@ -685,288 +636,6 @@ impl DeploymentStore {
         self.load(&deployment_id)
     }
 
-    pub(crate) fn persist(&self, record: &DeploymentRecord) -> anyhow::Result<()> {
-        self.ensure_storage_roots()?;
-        record.validate()?;
-        let _registry_lock = self.registry_lock()?;
-        let _deployment_lock = self.deployment_lock(&record.deployment_id)?;
-        self.persist_locked(record)
-    }
-
-    pub(crate) fn persist_locked(&self, record: &DeploymentRecord) -> anyhow::Result<()> {
-        self.persist_locked_with_existing_policy(record, false)
-    }
-
-    /// Register only the exact declaration supplied by the caller. This is
-    /// used by fresh local-candidate installation: accepting an older record
-    /// that merely shares a deployment identity would turn a crash retry into
-    /// a false success against a different runtime binding.
-    pub(crate) fn persist_exact_locked(&self, record: &DeploymentRecord) -> anyhow::Result<()> {
-        self.persist_locked_with_existing_policy(record, true)
-    }
-
-    fn persist_locked_with_existing_policy(
-        &self,
-        record: &DeploymentRecord,
-        require_exact: bool,
-    ) -> anyhow::Result<()> {
-        self.ensure_storage_roots()?;
-        record.validate()?;
-        let journal_path = self.registration_journal_path(&record.deployment_id);
-        let registration_journal_present = match fs::symlink_metadata(&journal_path) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
-                    bail!(
-                        "registration journal must be a regular non-symlink file: {}",
-                        journal_path.display()
-                    );
-                }
-                true
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => false,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect {}", journal_path.display()));
-            }
-        };
-        if registration_journal_present {
-            let journal_bytes = read_secure_regular_file(
-                &journal_path,
-                "registration journal",
-                true,
-                REGISTRATION_JOURNAL_MAX_BYTES,
-            )?;
-            let journal: RegistrationJournal = serde_json::from_slice(&journal_bytes)
-                .context("registration journal is invalid")?;
-            if journal.schema != REGISTRATION_JOURNAL_SCHEMA
-                || journal.deployment_id != record.deployment_id
-            {
-                bail!("registration journal does not bind to the requested deployment");
-            }
-            if journal.record != *record
-                && (require_exact || !registration_identity_matches(&journal.record, record))
-            {
-                bail!("a different registration is already pending for this deployment");
-            }
-            self.reconcile_registration_locked(&journal, &journal_path)?;
-            return Ok(());
-        }
-
-        let declaration = self.declaration_path(&record.deployment_id);
-        let mut target_record = record.clone();
-        if path_present(&declaration)? {
-            let existing = self.load(&record.deployment_id)?;
-            if existing != *record {
-                if require_exact || !registration_identity_matches(&existing, record) {
-                    bail!("deployment declaration already exists with different identity");
-                }
-                // A completed install may be retried after later declaration
-                // revisions.  Reconcile the authoritative existing record
-                // and its registry/state fan-out; never replace it with the
-                // stale install snapshot.
-                target_record = existing;
-            }
-        }
-        let registry = self.load_registry()?;
-        if registry.deployments.iter().any(|(id, entry)| {
-            id != &target_record.deployment_id
-                && target_record.alias.is_some()
-                && entry.alias == target_record.alias
-        }) {
-            bail!("deployment alias is already registered");
-        }
-        let journal = RegistrationJournal {
-            schema: REGISTRATION_JOURNAL_SCHEMA,
-            deployment_id: target_record.deployment_id.clone(),
-            phase: RegistrationPhase::Prepared,
-            record: target_record,
-        };
-        self.write_registration_journal(&journal_path, &journal)?;
-        self.reconcile_registration_locked(&journal, &journal_path)?;
-        Ok(())
-    }
-
-    fn write_registration_journal(
-        &self,
-        path: &Path,
-        journal: &RegistrationJournal,
-    ) -> anyhow::Result<()> {
-        let bytes = serde_json::to_vec_pretty(journal)?;
-        if bytes.len() as u64 > REGISTRATION_JOURNAL_MAX_BYTES {
-            bail!("registration journal exceeds its size limit");
-        }
-        atomic_write(path, &bytes, 0o600)
-    }
-
-    fn reconcile_registration_locked(
-        &self,
-        journal: &RegistrationJournal,
-        journal_path: &Path,
-    ) -> anyhow::Result<()> {
-        if journal.schema != REGISTRATION_JOURNAL_SCHEMA
-            || journal.deployment_id != journal.record.deployment_id
-        {
-            bail!("registration journal is invalid");
-        }
-        journal.record.validate()?;
-        let declaration = self.declaration_path(&journal.deployment_id);
-        let deployment_dir = declaration
-            .parent()
-            .context("deployment declaration path has no deployment directory")?;
-        let deployments_dir = deployment_dir
-            .parent()
-            .context("deployment declaration path has no deployments directory")?;
-        ensure_real_directory(deployments_dir, "deployment declarations directory")?;
-        if !path_present(deployments_dir)? {
-            crate::filesystem::ensure_directory_chain(deployments_dir)?;
-            crate::filesystem::set_mode(deployments_dir, 0o700)?;
-        }
-        ensure_real_directory(deployment_dir, "deployment declaration directory")?;
-        if !path_present(deployment_dir)? {
-            crate::filesystem::ensure_directory_chain(deployment_dir)?;
-            crate::filesystem::set_mode(deployment_dir, 0o700)?;
-        }
-        if path_present(&declaration)? {
-            let existing = self.load(&journal.deployment_id)?;
-            if existing != journal.record {
-                bail!("deployment declaration conflicts with registration journal");
-            }
-        } else {
-            atomic_write(
-                &declaration,
-                &serde_json::to_vec_pretty(&journal.record)?,
-                0o640,
-            )?;
-        }
-        if journal.phase == RegistrationPhase::Prepared {
-            let mut next = journal.clone();
-            next.phase = RegistrationPhase::DeclarationCommitted;
-            self.write_registration_journal(journal_path, &next)?;
-        }
-
-        let mut registry = self.load_registry()?;
-        if registry.deployments.iter().any(|(id, entry)| {
-            id != &journal.deployment_id
-                && journal.record.alias.is_some()
-                && entry.alias == journal.record.alias
-        }) {
-            bail!("deployment alias is already registered");
-        }
-        let registry_entry = RegistryEntry {
-            alias: journal.record.alias.clone(),
-            declaration: declaration.clone(),
-        };
-        if registry.deployments.get(&journal.deployment_id) != Some(&registry_entry) {
-            registry
-                .deployments
-                .insert(journal.deployment_id.clone(), registry_entry);
-            atomic_write(
-                &self.registry_path(),
-                &serde_json::to_vec_pretty(&registry)?,
-                0o640,
-            )?;
-        }
-        if journal.phase <= RegistrationPhase::DeclarationCommitted {
-            let mut next = journal.clone();
-            next.phase = RegistrationPhase::RegistryCommitted;
-            self.write_registration_journal(journal_path, &next)?;
-        }
-
-        let state = self.deployment_state_dir(&journal.deployment_id);
-        let deployments = state
-            .parent()
-            .context("deployment state path has no deployments parent")?;
-        ensure_real_directory(deployments, "deployment state deployments directory")?;
-        if !path_present(deployments)? {
-            crate::filesystem::ensure_directory_chain(deployments)?;
-            crate::filesystem::set_mode(deployments, 0o700)?;
-        }
-        ensure_real_directory(&state, "deployment state directory")?;
-        if !path_present(&state)? {
-            crate::filesystem::ensure_directory_chain(&state)?;
-            crate::filesystem::set_mode(&state, 0o700)?;
-        }
-        for directory in ["identities", "audit", "transactions", "recovery"] {
-            let path = state.join(directory);
-            ensure_real_directory(&path, "deployment state subdirectory")?;
-            if !path_present(&path)? {
-                crate::filesystem::ensure_directory_chain(&path)?;
-                crate::filesystem::set_mode(&path, 0o700)?;
-            }
-        }
-        if journal.phase <= RegistrationPhase::RegistryCommitted {
-            let mut next = journal.clone();
-            next.phase = RegistrationPhase::StateCommitted;
-            self.write_registration_journal(journal_path, &next)?;
-        }
-        crate::filesystem::remove_file_durable(journal_path)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn persist_declaration_locked(
-        &self,
-        record: &DeploymentRecord,
-    ) -> anyhow::Result<()> {
-        record.validate()?;
-        let current = self.load(&record.deployment_id)?;
-        let expected_revision = current
-            .declaration_revision
-            .checked_add(1)
-            .context("deployment declaration revision overflow")?;
-        if record.declaration_revision != expected_revision {
-            bail!(
-                "deployment declaration revision is stale; expected {}, got {}",
-                expected_revision,
-                record.declaration_revision
-            );
-        }
-        self.persist_declaration_file_locked(record)
-    }
-
-    /// Persist a declaration only if the caller still owns the exact record it
-    /// loaded while holding the deployment lock.  A revision check alone is
-    /// insufficient: a stale caller could otherwise replay a different
-    /// declaration with the same expected revision.
-    pub(crate) fn persist_declaration_cas_locked(
-        &self,
-        expected: &DeploymentRecord,
-        updated: &DeploymentRecord,
-    ) -> anyhow::Result<()> {
-        expected.validate()?;
-        updated.validate()?;
-        if expected.deployment_id != updated.deployment_id {
-            bail!("deployment declaration CAS crossed deployment boundaries");
-        }
-        let expected_revision = expected
-            .declaration_revision
-            .checked_add(1)
-            .context("deployment declaration revision overflow")?;
-        if updated.declaration_revision != expected_revision {
-            bail!(
-                "deployment declaration CAS must advance revision from {} to {}",
-                expected.declaration_revision,
-                expected_revision
-            );
-        }
-        let current = self.load(&expected.deployment_id)?;
-        if current != *expected {
-            bail!("deployment declaration changed while the operation was in progress");
-        }
-        self.persist_declaration_file_locked(updated)
-    }
-
-    fn persist_declaration_file_locked(&self, record: &DeploymentRecord) -> anyhow::Result<()> {
-        let registry = self.load_registry()?;
-        if !registry.deployments.contains_key(&record.deployment_id) {
-            bail!("deployment declaration is not registered");
-        }
-        atomic_write(
-            &self.declaration_path(&record.deployment_id),
-            &serde_json::to_vec_pretty(record)?,
-            0o640,
-        )
-    }
-
     /// Reload a declaration after its deployment lock has been acquired and
     /// reject a caller that still holds an older snapshot.  This is intentionally
     /// a separate operation from `load`: callers must establish the lock before
@@ -980,11 +649,6 @@ impl DeploymentStore {
             bail!("deployment declaration changed while the operation was being prepared");
         }
         Ok(current)
-    }
-
-    pub(crate) fn registry_lock(&self) -> anyhow::Result<FileLock> {
-        self.ensure_storage_roots()?;
-        FileLock::acquire(&self.state_root.join("locks").join("registry.lock"))
     }
 
     pub(crate) fn deployment_lock(&self, deployment_id: &str) -> anyhow::Result<FileLock> {
@@ -1231,51 +895,6 @@ fn ensure_real_directory(path: &Path, label: &str) -> anyhow::Result<()> {
     }
 }
 
-fn registration_identity_matches(
-    existing: &DeploymentRecord,
-    requested: &DeploymentRecord,
-) -> bool {
-    let runtime_identity = |record: &DeploymentRecord| {
-        record
-            .runtime_instances
-            .iter()
-            .map(|runtime| {
-                (
-                    runtime.runtime_instance_id.clone(),
-                    runtime.backend,
-                    runtime.object_reference.clone(),
-                )
-            })
-            .collect::<BTreeSet<_>>()
-    };
-    existing.deployment_id == requested.deployment_id
-        && existing.control_authority == requested.control_authority
-        && existing.issuer == requested.issuer
-        && runtime_identity(existing) == runtime_identity(requested)
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum RegistrationPhase {
-    Prepared,
-    DeclarationCommitted,
-    RegistryCommitted,
-    StateCommitted,
-}
-
-/// Durable intent for the multi-file registration commit.  Declaration,
-/// registry and state directories live in separate failure domains, so a
-/// retry must know the exact declaration it is reconciling rather than
-/// treating an existing declaration as proof that registration completed.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RegistrationJournal {
-    schema: u32,
-    deployment_id: String,
-    phase: RegistrationPhase,
-    record: DeploymentRecord,
-}
-
 #[cfg(all(not(test), unix))]
 pub(crate) fn validate_independent_recovery_device(
     recovery: &Path,
@@ -1402,7 +1021,3 @@ fn validate_identifier(value: &str, label: &str) -> anyhow::Result<()> {
     nazo_operator_protocol::validate_file_identifier_value(value)
         .with_context(|| format!("invalid {label}"))
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/deployment.rs"]
-mod tests;

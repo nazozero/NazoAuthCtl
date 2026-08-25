@@ -77,13 +77,6 @@ pub(super) fn take_yes(mut values: Vec<String>) -> anyhow::Result<(Vec<String>, 
     Ok((values, yes))
 }
 
-pub(super) fn parse_named_options(
-    values: Vec<String>,
-    expected: &[&str],
-) -> anyhow::Result<BTreeMap<String, String>> {
-    parse_named_options_for(values, expected, "keys operation")
-}
-
 pub(super) fn parse_named_options_for(
     values: Vec<String>,
     expected: &[&str],

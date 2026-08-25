@@ -27,23 +27,7 @@ pub(super) fn audited_bootstrap_admin(
     let normalized_email = normalize_bootstrap_admin_email(&credentials.email)?;
     let mut pending = load_or_create_bootstrap_pending(config, &normalized_email)?;
     let request_id = pending.request_id.clone();
-    let release = load_active_release(config)?.version;
-    let intent_id = format!("{request_id}-intent");
-    crate::operator::append_management_event_idempotent(
-        config,
-        &intent_id,
-        "bootstrap-admin-intent",
-        &release,
-        "single-use-database-claim",
-    )?;
     if pending.status == BootstrapAdminPendingStatus::Succeeded {
-        crate::operator::append_management_event_idempotent(
-            config,
-            &format!("{request_id}-succeeded"),
-            "bootstrap-admin-succeeded",
-            &release,
-            "single-use-database-claim",
-        )?;
         let token_path = bootstrap_token_path(config, expected_owner_uid)?;
         if token_path.exists() {
             let token = read_bootstrap_token(&token_path, expected_owner_uid)?;
@@ -85,18 +69,6 @@ pub(super) fn audited_bootstrap_admin(
         expected_owner_uid,
     ) {
         Ok(receipt) => {
-            crate::operator::append_management_event_idempotent(
-                config,
-                &format!("{request_id}-succeeded"),
-                "bootstrap-admin-succeeded",
-                &release,
-                "single-use-database-claim",
-            )
-            .with_context(|| {
-                format!(
-                    "initial administrator was created but audit finalization failed for request ID {request_id}"
-                )
-            })?;
             pending.status = BootstrapAdminPendingStatus::Succeeded;
             pending.claimed_user_id = Some(receipt.claimed_user_id.to_string());
             pending.token_hmac_sha256 = Some(receipt.token_hmac_sha256);
@@ -111,24 +83,6 @@ pub(super) fn audited_bootstrap_admin(
             Ok(request_id)
         }
         Err(error) => {
-            let outcome_unknown = error.is::<BootstrapOutcomeUnknown>();
-            let (suffix, operation) = if outcome_unknown {
-                ("outcome-unknown", "bootstrap-admin-outcome-unknown")
-            } else {
-                ("failed", "bootstrap-admin-failed")
-            };
-            crate::operator::append_management_event_idempotent(
-                config,
-                &format!("{request_id}-{suffix}"),
-                operation,
-                &release,
-                "single-use-database-claim",
-            )
-            .with_context(|| {
-                format!(
-                    "bootstrap-admin failed and its audit outcome could not be recorded for request ID {request_id}; original error: {error:#}"
-                )
-            })?;
             Err(error).with_context(|| format!("bootstrap-admin request ID {request_id} failed"))
         }
     }
@@ -350,17 +304,6 @@ pub(super) fn current_bootstrap_recovery_epoch(config: &UpdateConfig) -> anyhow:
     crate::filesystem::ensure_directory_chain(&config.operator.state_directory)?;
     let value = format!("recovery-{:032x}", rand::random::<u128>());
     atomic_write(&path, value.as_bytes(), 0o400)?;
-    Ok(value)
-}
-
-pub(super) fn rotate_bootstrap_recovery_epoch(config: &UpdateConfig) -> anyhow::Result<String> {
-    crate::filesystem::ensure_directory_chain(&config.operator.state_directory)?;
-    let value = format!("recovery-{:032x}", rand::random::<u128>());
-    atomic_write(
-        &bootstrap_recovery_epoch_path(config),
-        value.as_bytes(),
-        0o400,
-    )?;
     Ok(value)
 }
 
