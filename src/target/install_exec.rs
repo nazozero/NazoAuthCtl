@@ -502,6 +502,9 @@ impl HostInstallExecutor {
         }
         atomic_write(&config_path, content_bytes, 0o600)
             .map_err(|error| Failure::new(CONFIG_INVALID, sanitize(error.to_string())))?;
+        // The container reads this file as the image's fixed runtime UID;
+        // bind mounts keep host ownership, so hand it over group-readable.
+        set_runtime_identity(&config_path, false)?;
         performed.wrote_config = true;
 
         // 3. Target-local secrets (values are minted here, never shipped).
@@ -509,40 +512,61 @@ impl HostInstallExecutor {
             let path = PathBuf::from(&secret.path);
             let existed = path.exists();
             match secret.purpose.as_str() {
+                // The server decodes this key with base64url-no-pad and
+                // requires exactly 32 bytes (settings.rs
+                // parse_required_32_byte_key); hex would fail that contract.
                 "mfa-totp-key" => {
-                    filesystem::generate_secret(&path).map_err(|error| {
-                        Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string()))
-                    })?;
+                    if !existed {
+                        use base64::Engine as _;
+                        let value = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .encode(rand::random::<[u8; 32]>());
+                        atomic_write(&path, value.as_bytes(), 0o440).map_err(|error| {
+                            Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string()))
+                        })?;
+                    }
                 }
                 // URL-shaped values combine operator-supplied endpoint facts
                 // with a fresh CSPRNG credential minted here, so the password
                 // never crosses the wire. An existing file keeps its original
                 // credential: retries must not rotate what a failed attempt
                 // already handed to the external dependency.
+                //
+                // Operator endpoints address the target HOST; inside the
+                // container namespace loopback would be the container itself,
+                // so a loopback endpoint is rewritten to the engine's
+                // host-gateway name.
                 "database-url" | "valkey-url" => {
-                    if existed {
-                        continue;
+                    if !existed {
+                        let gateway = |host: &str| -> String {
+                            match host {
+                                "127.0.0.1" | "::1" | "localhost" => match kind {
+                                    RuntimeBackendKind::Docker => "host.docker.internal".to_owned(),
+                                    _ => "host.containers.internal".to_owned(),
+                                },
+                                other => other.to_owned(),
+                            }
+                        };
+                        let credential = hex(rand::random::<[u8; 16]>().as_slice());
+                        let value = match secret.purpose.as_str() {
+                            "database-url" => format!(
+                                "postgresql://{}:{}@{}:{}/{}",
+                                job.order.database_endpoint.user,
+                                credential,
+                                gateway(&job.order.database_endpoint.host),
+                                job.order.database_endpoint.port,
+                                job.order.database_endpoint.name,
+                            ),
+                            _ => format!(
+                                "valkey://:{}@{}:{}",
+                                credential,
+                                gateway(&job.order.valkey_endpoint.host),
+                                job.order.valkey_endpoint.port,
+                            ),
+                        };
+                        atomic_write(&path, value.as_bytes(), 0o440).map_err(|error| {
+                            Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string()))
+                        })?;
                     }
-                    let credential = hex(rand::random::<[u8; 16]>().as_slice());
-                    let value = match secret.purpose.as_str() {
-                        "database-url" => format!(
-                            "postgresql://{}:{}@{}:{}/{}",
-                            job.order.database_endpoint.user,
-                            credential,
-                            job.order.database_endpoint.host,
-                            job.order.database_endpoint.port,
-                            job.order.database_endpoint.name,
-                        ),
-                        _ => format!(
-                            "valkey://:{}@{}:{}",
-                            credential,
-                            job.order.valkey_endpoint.host,
-                            job.order.valkey_endpoint.port,
-                        ),
-                    };
-                    atomic_write(&path, value.as_bytes(), 0o440).map_err(|error| {
-                        Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string()))
-                    })?;
                 }
                 other => {
                     return Err(Failure::new(
@@ -551,10 +575,30 @@ impl HostInstallExecutor {
                     ));
                 }
             }
+            set_runtime_identity(&path, false)?;
+            if let Some(parent) = path.parent() {
+                set_runtime_identity_directory(parent)?;
+            }
             if !existed {
                 performed.generated_secrets.push(secret.path.clone());
             }
         }
+
+        // The writable data directory is mounted straight into the container:
+        // it must already exist AND be owned by the runtime UID, or the
+        // engine silently creates a root-owned directory the application
+        // cannot write to.
+        let data_root = PathBuf::from(&job.order.data_root);
+        if filesystem::ensure_directory_chain(&data_root).is_err() {
+            return Err(Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                sanitize(format!(
+                    "failed to prepare data directory {}",
+                    data_root.display()
+                )),
+            ));
+        }
+        set_runtime_identity_directory_data(&data_root)?;
 
         // 4. Fresh-install application setup (G02 hook): the install-binding
         // capability record. The bootstrap token has exactly one authority —
@@ -663,6 +707,12 @@ fn start_container_runtime(
             )
         })?;
     let backend = runtime_backend::backend(kind);
+    // 5a. Initialize the database schema BEFORE activation: `nazauth server`
+    // preflights the active tenant boundary, which requires the migrated and
+    // seeded tables. The diesel migration ledger (deduplicated re-entry) plus
+    // the advisory lock make this idempotent across crash-retry resumes.
+    run_schema_migration(job, backend.as_ref(), kind, &image)?;
+
     let observation = backend.inspect(job.runtime_object);
     if observation.as_ref().is_ok_and(|observed| {
         observed.running && observed.artifact == artifact_reference(&image, &digest)
@@ -783,10 +833,15 @@ fn start_container_runtime(
     let observed = backend
         .inspect(job.runtime_object)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
-    if !observed.running || observed.artifact != artifact_reference(&image, &digest) {
+    let expected = artifact_reference(&image, &digest);
+    if !observed.running || observed.artifact != expected {
         return Err(Failure::new(
             TARGET_IDENTITY_MISMATCH,
-            "the started runtime does not serve the verified artifact",
+            sanitize(format!(
+                "the started runtime does not serve the verified artifact \
+                 (running={}, observed_artifact={:?}, expected_artifact={:?})",
+                observed.running, observed.artifact, expected
+            )),
         ));
     }
     Ok(())
@@ -797,6 +852,176 @@ fn artifact_reference(image: &str, digest: &str) -> runtime_backend::ArtifactRef
         image_reference: image.to_owned(),
         digest: format!("sha256:{digest}"),
     }
+}
+
+/// One-shot `nazauth migrate` against the verified image, sharing the exact
+/// secret mounts the runtime receives. Runs before the long-lived container
+/// so its tenant-boundary preflight sees a migrated database.
+fn run_schema_migration(
+    job: &InstallJob<'_>,
+    backend: &dyn runtime_backend::RuntimeBackend,
+    kind: RuntimeBackendKind,
+    image: &str,
+) -> Result<(), Failure> {
+    let digest = image
+        .rsplit_once('@')
+        .map(|(_, d)| d.trim_start_matches("sha256:").to_owned())
+        .ok_or_else(|| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                sanitize(format!("release image reference has no digest: {image}")),
+            )
+        })?;
+    let secrets_dir = job
+        .order
+        .secrets
+        .first()
+        .and_then(|secret| Path::new(&secret.path).parent())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                "install order carries no secrets; the database URL is required".to_owned(),
+            )
+        })?;
+    let mut environment = std::collections::BTreeMap::new();
+    environment.insert(
+        SERVER_CONFIG_FILE_ENV.to_owned(),
+        CONTAINER_CONFIG_FILE.to_owned(),
+    );
+    for secret in &job.order.secrets {
+        if matches!(secret.purpose.as_str(), "database-url" | "valkey-url") {
+            environment.insert(
+                format!("{}_FILE", secret.purpose.to_uppercase().replace('-', "_")),
+                format!("{CONTAINER_SECRETS_DIR}/{}", secret.purpose),
+            );
+        }
+    }
+    let task = runtime_backend::OneShotTask {
+        artifact: artifact_reference(image, &digest),
+        command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
+        network: None,
+        mounts: vec![
+            mount(
+                PathBuf::from(job.config_reference),
+                CONTAINER_CONFIG_FILE,
+                true,
+            ),
+            mount(secrets_dir, CONTAINER_SECRETS_DIR, true),
+        ],
+        environment,
+        working_directory: Some(std::path::PathBuf::from("/app")),
+        service_user: Some(runtime_backend::NON_ROOT_ONE_SHOT_USER.to_owned()),
+        transient_credentials: std::collections::BTreeMap::new(),
+        read_only_paths: Vec::new(),
+        read_write_paths: Vec::new(),
+        inaccessible_paths: Vec::new(),
+        private_mounts: false,
+        stdin: Vec::new(),
+    };
+    let _ = kind;
+    backend
+        .run_one_shot(&task)
+        .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
+    Ok(())
+}
+
+/// The official NazoAuth image runs as the fixed non-root identity
+/// `10001:10001` (`NON_ROOT_ONE_SHOT_USER`). OCI bind mounts retain host
+/// ownership, so files handed to the runtime must be group-readable by that
+/// exact identity: `root:<uid>` mode 0440, matching the production layout.
+#[cfg(unix)]
+fn set_runtime_identity(path: &Path, _directory: bool) -> Result<(), Failure> {
+    use std::os::unix::fs::{PermissionsExt as _, chown};
+    let apply = || -> std::io::Result<()> {
+        chown(path, Some(0), Some(10_001))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o440))
+    };
+    apply().map_err(|error| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            sanitize(format!(
+                "failed to grant runtime read access to {}: {error}",
+                path.display()
+            )),
+        )
+    })
+}
+
+/// Writable data tree handed to the runtime: every node is owned outright by
+/// the runtime UID so the application can create its keys, bootstrap state
+/// and generated secret files. Recursive because ctl pre-creates nested
+/// directories (e.g. the secrets directory) as root.
+#[cfg(unix)]
+fn set_runtime_identity_directory_data(path: &Path) -> Result<(), Failure> {
+    use std::os::unix::fs::{PermissionsExt as _, chown};
+    let apply_node = |node: &Path| -> std::io::Result<()> {
+        chown(node, Some(10_001), Some(10_001))?;
+        if node.is_dir() {
+            std::fs::set_permissions(node, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    };
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        apply_node(&dir).map_err(|error| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                sanitize(format!(
+                    "failed to grant runtime ownership of {}: {error}",
+                    dir.display()
+                )),
+            )
+        })?;
+        for entry in std::fs::read_dir(&dir).map_err(|error| {
+            Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
+        })? {
+            let child = entry
+                .map_err(|error| {
+                    Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
+                })?
+                .path();
+            if child.is_dir() && !child.is_symlink() {
+                stack.push(child);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read-only secrets directory: the runtime UID needs traverse (`x`) to open
+/// the files beneath it, but never write access.
+#[cfg(unix)]
+fn set_runtime_identity_directory(path: &Path) -> Result<(), Failure> {
+    use std::os::unix::fs::{PermissionsExt as _, chown};
+    let apply = || -> std::io::Result<()> {
+        chown(path, Some(0), Some(10_001))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o750))
+    };
+    apply().map_err(|error| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            sanitize(format!(
+                "failed to grant runtime traverse on {}: {error}",
+                path.display()
+            )),
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn set_runtime_identity(_path: &Path, _directory: bool) -> Result<(), Failure> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_runtime_identity_directory_data(_path: &Path) -> Result<(), Failure> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_runtime_identity_directory(_path: &Path) -> Result<(), Failure> {
+    Ok(())
 }
 
 fn mount(source: PathBuf, destination: &str, read_only: bool) -> runtime_backend::NeutralMount {

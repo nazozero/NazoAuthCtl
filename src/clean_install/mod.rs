@@ -171,14 +171,36 @@ fn resolve_paths(
 /// NazoAuth's single loader accepts: uppercase allowlisted keys, secret values
 /// only as container-internal file references, LF endings. The container-side
 /// paths are the frozen mount contract in `target::install_exec`.
+///
+/// TRANSPORT_MODE is `trusted-proxy`: the container terminates plain HTTP on
+/// a loopback-published port and the public TLS endpoint is an external
+/// reverse proxy — the only topology a containerized install creates. A
+/// loopback HTTP issuer keeps the server-side default (loopback-http).
 fn render_config_yaml(issuer: &str) -> anyhow::Result<String> {
     if issuer.contains(['"', '\\']) || issuer.chars().any(|c| c.is_control()) {
         bail!("issuer must not contain YAML-special characters");
     }
     use crate::target::install_exec::{CONTAINER_DATA_DIR, CONTAINER_SECRETS_DIR};
+    let transport_mode = if issuer.starts_with("https://") {
+        // The engine-default bridge networks and the host loopback are the
+        // only sources that can reach the loopback-published container port.
+        // Operators with a dedicated proxy network tighten this via
+        // `update --config-file`.
+        let cidrs = "TRUSTED_PROXY_CIDRS: \"127.0.0.0/8,::1/128,10.88.0.0/16\"\n";
+        // trusted-proxy requires an explicit mTLS certificate source; a
+        // fresh install has no client-certificate proxy contract yet, so it
+        // starts disabled instead of claiming an mTLS capability the edge
+        // does not provide. Enable rfc9440 explicitly once the proxy forwards
+        // `Client-Cert`.
+        let mtls = "MTLS_CERTIFICATE_SOURCE: \"disabled\"\n";
+        format!("TRANSPORT_MODE: \"trusted-proxy\"\n{cidrs}{mtls}")
+    } else {
+        String::new()
+    };
     Ok(format!(
         "BIND: \"0.0.0.0:{DEFAULT_PORT}\"\n\
          PUBLIC_BASE_URL: \"{issuer}\"\n\
+         {transport_mode}\
          DATABASE_URL_FILE: \"{CONTAINER_SECRETS_DIR}/database-url\"\n\
          VALKEY_URL_FILE: \"{CONTAINER_SECRETS_DIR}/valkey-url\"\n\
          MFA_TOTP_ENCRYPTION_KEY_FILE: \"{CONTAINER_SECRETS_DIR}/mfa-totp-key\"\n\
