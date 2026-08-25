@@ -71,7 +71,7 @@ impl PreparedOperation {
 }
 
 /// What the target told ctl about one dispatch attempt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DispatchVerdict {
     /// The server-side journal accepted (or had already accepted) the
     /// operation; its result is authoritative and durable.
@@ -84,6 +84,13 @@ pub enum DispatchVerdict {
     /// kept: only a resumed resend can distinguish "lost response" from "never
     /// arrived".
     OutcomeUnknown,
+    /// The operation was accepted and executed to a durable FAILED result.
+    /// The business side effect did not succeed; lifecycle callers must stop
+    /// instead of continuing (P0-5). The record stays terminal for its id:
+    /// rerunning the same inputs replays the same durable failure.
+    FailedDurably {
+        outcome: nazo_operator_protocol::ControlResult,
+    },
 }
 
 /// Resolve a selector exactly like the signing helper does.
@@ -242,6 +249,17 @@ pub fn dispatch_via_target(
         );
     }
     if receipt.accepted {
+        // A durable terminal result rides with the receipt when the target
+        // produced one. A FAILED business outcome must be visible to callers:
+        // acceptance only means the operation was journaled, never that the
+        // migration/keys work succeeded (P0-5).
+        if let Some(result) = &receipt.result
+            && result.outcome == nazo_operator_protocol::ControlOutcome::Failed
+        {
+            return Ok(DispatchVerdict::FailedDurably {
+                outcome: result.clone(),
+            });
+        }
         Ok(DispatchVerdict::Accepted)
     } else {
         Ok(DispatchVerdict::DefinitivelyRejected)
@@ -258,10 +276,16 @@ pub fn dispatch_via_target(
 pub fn settle_journal(
     journal: &OperationJournal,
     prepared: &PreparedOperation,
-    verdict: DispatchVerdict,
+    verdict: &DispatchVerdict,
 ) -> anyhow::Result<()> {
     match verdict {
         DispatchVerdict::Accepted => journal.mark_accepted(&prepared.signed.operation_id),
+        // A durably failed business result is terminal for this id: the
+        // record stays accepted so rerunning identical inputs replays the
+        // identical durable failure instead of re-executing (P0-5).
+        DispatchVerdict::FailedDurably { .. } => {
+            journal.mark_accepted(&prepared.signed.operation_id)
+        }
         DispatchVerdict::DefinitivelyRejected => journal.clear(),
         DispatchVerdict::OutcomeUnknown => Ok(()),
     }
@@ -439,7 +463,7 @@ mod tests {
         target.push_acceptance(true);
         let verdict = dispatch_via_target(&target, &prepared)?;
         assert_eq!(verdict, DispatchVerdict::Accepted);
-        settle_journal(&journal, &prepared, verdict)?;
+        settle_journal(&journal, &prepared, &verdict)?;
         assert_eq!(journal.load()?.expect("kept").state, JournalState::Accepted);
         assert_eq!(target.executed.borrow().len(), 1);
         Ok(())
@@ -484,7 +508,7 @@ mod tests {
         // A crash before settle is harmless: the resume path still works.
         let v2 = dispatch_via_target(&target, &second)?;
         assert_eq!(v2, DispatchVerdict::Accepted);
-        settle_journal(&journal, &second, v2)?;
+        settle_journal(&journal, &second, &v2)?;
 
         let sent = target.executed.borrow().clone();
         assert_eq!(sent.len(), 2, "resumed once");
@@ -509,7 +533,7 @@ mod tests {
         target.push_acceptance(false);
         let verdict = dispatch_via_target(&target, &first)?;
         assert_eq!(verdict, DispatchVerdict::DefinitivelyRejected);
-        settle_journal(&journal, &first, verdict)?;
+        settle_journal(&journal, &first, &verdict)?;
         assert!(journal.load()?.is_none(), "rejected entry cleared");
 
         // After FIXING THE CAUSE (here: config revision bump) the next attempt

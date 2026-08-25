@@ -38,7 +38,8 @@ const NEW_REF: &str = "sha256:bbbb0000000000000000000000000000000000000000000000
 /// refusal, driven by the current slot.
 struct ScriptedControl {
     presented: Mutex<Vec<String>>,
-    answer: Mutex<Option<()>>, // None => outcome unknown
+    answer: Mutex<Option<()>>,  // None => outcome unknown
+    fail_business: Mutex<bool>, // Some(true) => durable Failed result
 }
 
 impl ControlOperationExecutor for ScriptedControl {
@@ -53,6 +54,21 @@ impl ControlOperationExecutor for ScriptedControl {
                 CONTROL_OUTCOME_UNKNOWN,
                 "scripted: the operator produced no parsable answer",
             ));
+        }
+        if *self.fail_business.lock().unwrap() {
+            // Durable terminal FAILED result, exactly like a real operator
+            // whose migration executed and failed (P0-5).
+            let now = chrono::Utc::now().timestamp();
+            return Ok(ControlResult {
+                schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
+                operation_id: job.operation_id.to_owned(),
+                request_hash: "scripted-request-hash".to_owned(),
+                outcome: ControlOutcome::Failed,
+                error: Some(nazo_operator_protocol::ControlErrorCode::ExecutionFailed),
+                accepted_at: now,
+                completed_at: Some(now),
+                result: None,
+            });
         }
         let now = chrono::Utc::now().timestamp();
         Ok(ControlResult {
@@ -238,6 +254,7 @@ impl Fixture {
         let control = Arc::new(ScriptedControl {
             presented: Mutex::new(Vec::new()),
             answer: Mutex::new(Some(())),
+            fail_business: Mutex::new(false),
         });
         let lifecycle = Arc::new(ScriptedLifecycle {
             fail_update_activation: Mutex::new(false),
@@ -592,4 +609,73 @@ fn engine_access_check_names_the_step_and_never_runs_sudo() {
 
     let shell = if cfg!(windows) { "cmd" } else { "sh" };
     ensure_engine_access(shell, &Responsive(true)).expect("a responsive engine passes");
+}
+
+// ------------------------------------------------------------------ P0-5
+
+#[test]
+fn durable_failed_migration_terminates_update_before_activation() -> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    *fixture.control.fail_business.lock().unwrap() = true;
+
+    let request = UpdateRequest {
+        instance: Some(format!("inst-{DEPLOYMENT}")),
+        version: None,
+        expected_artifact_sha256: None,
+        config_content: None,
+        config_schema: None,
+    };
+    let error = super::update::run_update(&fixture.context, &fixture.keys, &request)
+        .expect_err("a durably failed migration must terminate the update");
+
+    assert!(
+        error.to_string().contains("migration failed durably"),
+        "{error}"
+    );
+
+    // The lifecycle order never ran: no activation, no state advance.
+    assert_eq!(*fixture.lifecycle.update_calls.lock().unwrap(), 0);
+    let state = fixture.store()?.load_existing(DEPLOYMENT)?;
+    assert_eq!(state.artifact.current.as_deref(), Some(CURRENT_REF));
+    assert_eq!(state.config.revision, 1);
+
+    // The journal keeps the accepted record terminal for this id so a rerun
+    // with identical inputs replays the identical durable failure.
+    let presented = fixture.control.presented.lock().unwrap();
+    assert_eq!(presented.len(), 1, "one dispatch per attempt");
+    Ok(())
+}
+
+#[test]
+fn durable_failed_migration_rerun_replays_failure_without_new_dispatch_identities()
+-> anyhow::Result<()> {
+    // Two sequential attempts with the same inputs must both dispatch (the
+    // first is replayed from the accepted record), and both must fail; the
+    // second attempt reuses the same operation id because the record is
+    // terminal-accepted for these exact inputs.
+    let fixture = Fixture::new()?;
+    *fixture.control.fail_business.lock().unwrap() = true;
+    let request = UpdateRequest {
+        instance: Some(format!("inst-{DEPLOYMENT}")),
+        version: None,
+        expected_artifact_sha256: None,
+        config_content: None,
+        config_schema: None,
+    };
+    for _ in 0..2 {
+        let error = super::update::run_update(&fixture.context, &fixture.keys, &request)
+            .expect_err("durable failure repeats");
+        assert!(error.to_string().contains("migration failed durably"));
+    }
+    let presented = fixture.control.presented.lock().unwrap();
+    assert!(!presented.is_empty());
+    assert_eq!(
+        presented
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1,
+        "identical inputs keep one operation identity across replays"
+    );
+    Ok(())
 }

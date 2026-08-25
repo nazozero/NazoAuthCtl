@@ -132,8 +132,25 @@ pub(crate) fn run_update(
     let verdict = dispatch_via_target(target.as_ref(), &prepared)?;
     match &verdict {
         DispatchVerdict::Accepted => {}
+        DispatchVerdict::FailedDurably { outcome } => {
+            // P0-5: a durable business failure (migration executed and
+            // failed) must terminate the update BEFORE any activation or
+            // state mutation. The journal record stays terminal for this id;
+            // rerunning identical inputs replays the identical durable
+            // failure instead of re-executing.
+            settle_journal(&journal, &prepared, &verdict)?;
+            let error_code = outcome
+                .error
+                .map(|code| format!("{code:?}"))
+                .unwrap_or_else(|| "unspecified".to_owned());
+            bail!(
+                "the application migration failed durably (operation {lifecycle_id}, error \
+                 {error_code}); the target artifact/config were NOT activated — inspect \
+                 `nazoauthctl operation` for the durable result"
+            );
+        }
         DispatchVerdict::DefinitivelyRejected => {
-            settle_journal(&journal, &prepared, verdict)?;
+            settle_journal(&journal, &prepared, &verdict)?;
             bail!(
                 "the migration was refused before acceptance; fix the cause and retry — \
                  the update changed nothing"
@@ -166,7 +183,7 @@ pub(crate) fn run_update(
         "update",
     )?;
 
-    settle_journal(&journal, &prepared, verdict)?;
+    settle_journal(&journal, &prepared, &verdict)?;
 
     // Refresh the observation cache from a real post-update inspection
     // (display-only; the target state stays the authority).
