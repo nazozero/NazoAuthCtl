@@ -410,9 +410,18 @@ impl HostInstallExecutor {
                 })?
             }
             RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
-                let image = release.manifest.image_ref().map_err(|error| {
-                    Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string()))
-                })?;
+                // Container backends always run Linux images regardless of the
+                // control machine's OS (real-acceptance finding on Windows).
+                let digest = release
+                    .manifest
+                    .runtime_oci_digest_for(crate::model::container_oci_platform())
+                    .map_err(|error| {
+                        Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string()))
+                    })?;
+                let image = format!(
+                    "{}@{digest}",
+                    release.manifest.oci.repository.trim_end_matches('/')
+                );
                 runtime_backend::backend(kind)
                     .pull_image(&image)
                     .map_err(|error| {
@@ -559,10 +568,22 @@ fn start_container_runtime(
     kind: RuntimeBackendKind,
     performed: &mut PerformedSteps,
 ) -> Result<(), Failure> {
-    let image = release
-        .manifest
-        .image_ref()
-        .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
+    let image = match kind {
+        RuntimeBackendKind::Systemd => release
+            .manifest
+            .image_ref()
+            .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?,
+        _ => {
+            let digest = release
+                .manifest
+                .runtime_oci_digest_for(crate::model::container_oci_platform())
+                .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
+            format!(
+                "{}@{digest}",
+                release.manifest.oci.repository.trim_end_matches('/')
+            )
+        }
+    };
     let digest = release
         .manifest
         .image_oci_digest()
