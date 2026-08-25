@@ -16,7 +16,11 @@ Operator -> nazoauthctl|- SSH server-b -- NazoAuth staging
 
 ```bash
 nazoauthctl host add server-a --ssh prod-a --privilege sudo
-nazoauthctl install --host server-a --name production --public-url https://auth.example.com
+nazoauthctl install --host server-a --name production \
+  --public-url https://auth.example.com \
+  --database-host db.internal --database-port 5432 \
+  --database-name oauth --database-user nazauth \
+  --valkey-host cache.internal --valkey-port 6379
 nazoauthctl bind --instance production
 nazoauthctl status
 nazoauthctl update
