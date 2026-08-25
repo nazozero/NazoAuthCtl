@@ -713,6 +713,15 @@ fn start_container_runtime(
     ]
     .into_iter()
     .collect();
+    // Config-revision marker: the one-shot operator reads this file during
+    // E04 admission step 5 to fence operations against stale configuration.
+    let config_revision_host = job.scope_dir.join("config-revision");
+    let config_revision_container = "/run/nazoauth-operator/config-revision";
+    mounts.push(mount(config_revision_host, config_revision_container, true));
+    environment.insert(
+        "NAZOAUTH_OPERATOR_CONFIG_REVISION_FILE".to_owned(),
+        config_revision_container.to_owned(),
+    );
     for secret in &job.order.secrets {
         let key = match secret.purpose.as_str() {
             "database-url" => "DATABASE_URL_FILE",
