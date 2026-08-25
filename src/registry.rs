@@ -362,6 +362,11 @@ fn validate_key(value: &str, label: &str) -> anyhow::Result<()> {
     validate_identifier(value, MAX_KEY_CHARS, label)
 }
 
+/// Crate-visible alias for sibling stores (clean-install id generation).
+pub(crate) fn validate_registry_key(value: &str, label: &str) -> anyhow::Result<()> {
+    validate_key(value, label)
+}
+
 /// Shared identifier rule for store-legal tokens across ctl stores
 /// (registry keys and target DeploymentState identifiers alike): 1..=max
 /// characters from `[A-Za-z0-9.:_+-]`, never `.` or `..`.

@@ -5,13 +5,14 @@
 //! runtime crate.
 
 pub(crate) use nazoauthctl_runtime::runtime_backend::{
-    BlobAttestationVerification, ContainerRuntimePolicy, HostServiceInstall,
+    ArtifactReference, BlobAttestationVerification, ContainerRuntimePolicy, HostServiceInstall,
     MANAGED_VALKEY_BACKUP_USER, MANAGED_VALKEY_RUNTIME_USER, ManagedDependencies,
     ManagedDependencyBackup, ManagedDependencyIdentity, ManagedNetwork, ManagedPostgresCommand,
-    ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount, OneShotTask, RuntimeBackend,
-    RuntimeBackendKind, RuntimeDatabasePrivilegeProbe, RuntimeObservation, RuntimeReplacement,
-    SystemdBackend, compare_declared_runtime_surface, managed_dependency_identity,
-    normalize_local_image_id, oci_backup_digests,
+    ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount, OneShotTask,
+    ResourceScope as RuntimeResourceScope, Responsibility, RuntimeBackend, RuntimeBackendKind,
+    RuntimeDatabasePrivilegeProbe, RuntimeObservation, RuntimeReplacement, SystemdBackend,
+    compare_declared_runtime_surface, managed_dependency_identity, normalize_local_image_id,
+    oci_backup_digests,
 };
 
 #[cfg(test)]

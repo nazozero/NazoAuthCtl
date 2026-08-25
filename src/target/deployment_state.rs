@@ -57,6 +57,7 @@ use serde::{Deserialize, Serialize};
 use crate::filesystem;
 use crate::registry::{STATE_RESET_REQUIRED, validate_issuer};
 
+use super::install_exec::InstallOrder;
 use super::journal;
 
 /// Schema discriminator carried by the persisted DeploymentState document.
@@ -88,6 +89,11 @@ pub const RESOURCE_DELETE_FORBIDDEN: &str = "RESOURCE_DELETE_FORBIDDEN";
 /// caller must re-read live state and rebuild its intent; last-write-wins
 /// does not exist.
 pub const CONFIG_REVISION_MISMATCH: &str = "CONFIG_REVISION_MISMATCH";
+
+/// Stable failure code: a clean-install execution order failed on the target
+/// and the target rolled its own partial work back. The DeploymentState was
+/// never created; the journal carries the failure for the resume decision.
+pub const INSTALL_FAILED: &str = "INSTALL_FAILED";
 
 /// A stable, bounded failure outcome produced by state operations and mapped
 /// onto [`super::wire::HostOutcome::Failed`] by dispatch. Codes come from the
@@ -413,9 +419,21 @@ impl DeploymentState {
 /// here ever deletes a resource.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mutation", rename_all = "kebab-case", deny_unknown_fields)]
+// The G01 install order makes Bootstrap deliberately the dominant variant;
+// StateMutationPayload is a short-lived wire value where an indirection would
+// buy nothing but churn at every match site (same call as HostOutcome).
+#[allow(clippy::large_enum_variant)]
 pub enum StateMutationPayload {
     /// Create fresh state at revision 1. Fails with `DEPLOYMENT_EXISTS`
     /// over any existing state.
+    ///
+    /// The G01 clean-install wave extends the bare seed with an optional
+    /// [`InstallOrder`]: when present, the target executes the full
+    /// fresh-install sequence (verify artifact → atomic config write →
+    /// fresh-install setup → start runtime → identity + health) *before* the
+    /// state document is created, and only a fully healthy target commits
+    /// `local_healthy` state. Replay of an interrupted bootstrap re-runs the
+    /// resumable order and then replays the stored state.
     Bootstrap {
         issuer: String,
         runtime: RuntimeSurface,
@@ -423,6 +441,8 @@ pub enum StateMutationPayload {
         config_reference: String,
         config_schema: String,
         resources: Vec<Resource>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        install: Option<InstallOrder>,
     },
     /// CAS-guarded config application (goal plan 06 §4): load current →
     /// build candidate → validate → commit against `expected_revision`.
@@ -458,6 +478,16 @@ impl TargetStateStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The per-deployment scope directory (state document + journal +
+    /// fresh-install bootstrap material). Path construction stays inside the
+    /// target modules.
+    pub(crate) fn scope_dir(&self, deployment_id: &str) -> Result<PathBuf, Failure> {
+        let scope = journal::deployment_scope(deployment_id).map_err(|error| {
+            Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
+        })?;
+        Ok(scope_path(&self.root, &scope))
     }
 
     /// The single decision point for where one deployment's state document
@@ -603,6 +633,53 @@ impl TargetStateStore {
         })?;
         persist(&scope_path(&self.root, &scope), &state)?;
         Ok(state.config)
+    }
+
+    /// Record a target-local health fact (goal plan 06 §2: `local_health` is
+    /// written by whoever can actually observe the runtime). This is an
+    /// observation, not a config change: the CAS revision does not move.
+    /// Only the operation that produced the current state revision may write
+    /// the health record — a stale or foreign operation id is rejected so
+    /// interrupted lifecycles cannot stamp observations they never made.
+    pub fn record_local_health(
+        &self,
+        deployment_id: &str,
+        healthy: bool,
+        summary: String,
+        operation_id: &str,
+    ) -> Result<HealthRecord, Failure> {
+        if summary.len() > 512 {
+            return Err(Failure::new(
+                super::wire::HOST_ERR_OPERATION_INVALID,
+                "health summary must be at most 512 characters",
+            ));
+        }
+        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
+        let mut state = self.load_existing(deployment_id)?;
+        let owns = state
+            .active_host_operation
+            .as_ref()
+            .is_some_and(|active| active.operation_id == operation_id);
+        if !owns {
+            return Err(Failure::new(
+                DEPLOYMENT_UNKNOWN,
+                format!(
+                    "health observation rejected: '{deployment_id}' is not currently owned by \
+                     operation {operation_id}"
+                ),
+            ));
+        }
+        let record = HealthRecord {
+            healthy,
+            summary,
+            checked_at: Utc::now(),
+        };
+        state.local_health = record.clone();
+        let scope = journal::deployment_scope(deployment_id).map_err(|error| {
+            Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
+        })?;
+        persist(&scope_path(&self.root, &scope), &state)?;
+        Ok(record)
     }
 
     fn lock_path(&self, deployment_id: &str) -> Result<PathBuf, Failure> {

@@ -112,7 +112,9 @@ pub struct MessageRejection {
 }
 
 impl MessageRejection {
-    fn new(code: RejectionCode, detail: impl Into<String>) -> Self {
+    /// Crate-visible constructor: sibling target modules (install order
+    /// admission) build typed rejections through the same bounded shape.
+    pub(crate) fn new(code: RejectionCode, detail: impl Into<String>) -> Self {
         Self {
             code,
             detail: detail.into(),
@@ -156,6 +158,11 @@ pub struct HostOperation {
 }
 
 /// Typed operation payloads, discriminated by the closed `kind` tag.
+//
+// `large_enum_variant` is intentional for the same reason as HostOutcome:
+// StateMutate carries the typed Bootstrap payload (which includes the G01
+// install order) and these are short-lived wire values.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HostOperationBody {
@@ -311,13 +318,21 @@ impl HostOperation {
                     ));
                 }
                 match mutation {
-                    StateMutationPayload::Bootstrap { .. } => {
+                    StateMutationPayload::Bootstrap { install, .. } => {
                         // There is no prior revision to expect on creation.
                         if self.expected_revision.is_some() {
                             return Err(MessageRejection::new(
                                 RejectionCode::OperationMalformed,
                                 "bootstrap must not carry expected_revision",
                             ));
+                        }
+                        // A carried install order must itself be well-formed;
+                        // admission rejects broken orders before any target
+                        // side effect.
+                        if let Some(order) = install
+                            && let Err(rejection) = order.validate()
+                        {
+                            return Err(rejection);
                         }
                     }
                     StateMutationPayload::ApplyConfig { .. } => {
@@ -419,6 +434,12 @@ pub enum HostCompletionBody {
     /// The revision a successful mutation produced (F04).
     StateMutateApplied {
         revision: u64,
+    },
+    /// A clean install committed `local_healthy` state on the target (G01).
+    /// Carries the full live inspection so the control side can register the
+    /// InstanceRecord without a second round trip.
+    InstallApplied {
+        inspection: InstanceInspection,
     },
 }
 
@@ -738,11 +759,67 @@ mod tests {
                     super::super::deployment_state::ResourceOwnership::External,
                     super::super::deployment_state::ResourceScope::Shared,
                 )?],
+                install: None,
             },
         );
         let parsed = parse_host_operation(&encode_host_operation(&bootstrap)?)?;
         assert_eq!(parsed, bootstrap);
         assert_eq!(parsed.operation.kind(), "state-mutate");
+
+        // The G01 clean-install order rides inside the Bootstrap mutation and
+        // round-trips with its typed payload intact.
+        let order = super::super::install_exec::InstallOrder {
+            artifact: super::super::install_exec::OfficialArtifactRef {
+                repository: "nazozero/NazoAuth".to_owned(),
+                version: Some("v0.2.0".to_owned()),
+                expected_subject_sha256: Some("a".repeat(64)),
+            },
+            config_content: "{\"issuer\":\"https://auth.example.com\"}".to_owned(),
+            config_sha256: "b".repeat(64),
+            data_root: "/var/lib/nazoauth".to_owned(),
+            secrets: vec![super::super::install_exec::PlannedSecret {
+                purpose: "database-url".to_owned(),
+                path: "/var/lib/nazoauth/secrets/database-url".to_owned(),
+            }],
+            fresh_bootstrap: true,
+            port: 8000,
+        };
+        let mut install = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            None,
+            StateMutationPayload::Bootstrap {
+                issuer: "https://auth.example.com".to_owned(),
+                runtime: super::super::deployment_state::RuntimeSurface::new(
+                    "podman",
+                    "nazoauth-main",
+                )?,
+                artifact: Default::default(),
+                config_reference: "/etc/nazauth/deployments/deploy-alpha/config.json".to_owned(),
+                config_schema: "nazauth-seed-v1".to_owned(),
+                resources: Vec::new(),
+                install: Some(order.clone()),
+            },
+        );
+        let parsed = parse_host_operation(&encode_host_operation(&install)?)?;
+        assert_eq!(parsed, install);
+        assert!(
+            String::from_utf8(encode_host_operation(&install)?)?
+                .contains(r#""kind":"state-mutate""#)
+        );
+
+        // A broken order fails at admission, before any target side effect.
+        let mut broken_order = order;
+        broken_order.config_sha256 = "not-a-digest".to_owned();
+        if let HostOperationBody::StateMutate {
+            mutation: StateMutationPayload::Bootstrap { install, .. },
+        } = &mut install.operation
+        {
+            *install = Some(broken_order);
+        }
+        let rejection = install.validate().expect_err("broken order");
+        assert_eq!(rejection.code, RejectionCode::OperationMalformed);
+        assert!(rejection.detail.contains("config_sha256"), "{rejection}");
 
         let apply = HostOperation::state_mutate(
             Uuid::now_v7().to_string(),
@@ -808,6 +885,7 @@ mod tests {
                 config_reference: "/cfg".to_owned(),
                 config_schema: "v1".to_owned(),
                 resources: Vec::new(),
+                install: None,
             },
         };
         let rejection = cas_free.validate().expect_err("bootstrap with revision");

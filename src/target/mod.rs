@@ -11,22 +11,35 @@
 //! from [`wire`] through system OpenSSH into the fixed `remote exec` helper
 //! ([`remote_exec`], task C04). No HTTP/Kubernetes/agent targets exist.
 
+pub(crate) mod bootstrap_authority;
 pub mod deployment_state;
+pub(crate) mod install_exec;
 pub mod journal;
 pub(crate) mod remote_exec;
 pub mod ssh;
 pub mod wire;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+pub use bootstrap_authority::{
+    BOOTSTRAP_CLOSED, CONTEXT_FILE_NAME, FRESH_BOOTSTRAP_ALLOWLIST, FRESH_BOOTSTRAP_SCHEMA,
+    FreshBootstrapContext, TOKEN_FILE_NAME,
+};
 pub use deployment_state::{
     ActiveHostOperationRef, ArtifactRefs, BootstrapParams, CONFIG_REVISION_MISMATCH, ConfigState,
     DEPLOYMENT_EXISTS, DEPLOYMENT_STATE_SCHEMA, DEPLOYMENT_UNKNOWN, DeploymentState, Failure,
-    HealthRecord, MAX_RESOURCES, RESOURCE_DELETE_FORBIDDEN, RESOURCE_UNKNOWN, Resource,
-    ResourceOwnership, ResourceScope, RuntimeSurface, StateMutationPayload, TargetStateStore,
+    HealthRecord, INSTALL_FAILED, MAX_RESOURCES, RESOURCE_DELETE_FORBIDDEN, RESOURCE_UNKNOWN,
+    Resource, ResourceOwnership, ResourceScope, RuntimeSurface, StateMutationPayload,
+    TargetStateStore,
+};
+pub use install_exec::{
+    ARTIFACT_UNVERIFIED, CONFIG_INVALID, CONFIG_PATH_OCCUPIED, EMBEDDED_IDENTITY_MISMATCH,
+    HEALTH_PROBE_FAILED, InstallOrder, OfficialArtifactRef, PlannedSecret, RUNTIME_START_FAILED,
+    SECRET_PROVISION_FAILED, SECRET_PURPOSES,
 };
 pub use journal::{JournalStatus, TargetJournal};
 pub use ssh::SshTarget;
@@ -151,9 +164,13 @@ pub trait ExecutionTarget {
 /// [`TargetStateStore`]; there are no placeholder answers left on those
 /// paths. Production resolves the state root via [`target_state_root`];
 /// tests inject a private temp root with [`LocalTarget::with_state_root`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LocalTarget {
     state_root: PathBuf,
+    /// Target-side install execution seam (G01): production wires
+    /// [`install_exec::HostInstallExecutor`], tests inject scripted doubles so
+    /// container engines are never spawned on development machines.
+    executor: Arc<dyn install_exec::InstallExecutor>,
 }
 
 impl LocalTarget {
@@ -161,6 +178,7 @@ impl LocalTarget {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
             state_root: target_state_root()?,
+            executor: Arc::new(install_exec::HostInstallExecutor),
         })
     }
 
@@ -168,7 +186,18 @@ impl LocalTarget {
     pub fn with_state_root(root: impl Into<PathBuf>) -> Self {
         Self {
             state_root: root.into(),
+            executor: Arc::new(install_exec::HostInstallExecutor),
         }
+    }
+
+    /// Test seam: substitute the install executor.
+    #[allow(dead_code)] // test seam: consumed by the clean-install use-case tests
+    pub(crate) fn with_install_executor(
+        mut self,
+        executor: Arc<dyn install_exec::InstallExecutor>,
+    ) -> Self {
+        self.executor = executor;
+        self
     }
 
     fn unavailable(method: &str) -> anyhow::Error {
@@ -196,8 +225,9 @@ impl LocalTarget {
             ));
         }
         let store = TargetStateStore::open(journal.root())?;
+        let executor = self.executor.clone();
         journal.run_journaled(operation, |operation| {
-            dispatch_host_operation(operation, &store)
+            dispatch_host_operation(operation, &store, &executor)
         })
     }
 }
@@ -208,12 +238,22 @@ impl Default for LocalTarget {
     }
 }
 
+impl std::fmt::Debug for LocalTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalTarget")
+            .field("state_root", &self.state_root)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Shared dispatch for validated host operations. [`LocalTarget`] answers
 /// natively with it and the remote exec helper answers through the identical
 /// function after parsing stdin, so both transports cannot drift apart.
 pub(crate) fn dispatch_host_operation(
     operation: &HostOperation,
     store: &TargetStateStore,
+    executor: &Arc<dyn install_exec::InstallExecutor>,
 ) -> HostResult {
     debug_assert!(
         operation.validate().is_ok(),
@@ -242,24 +282,74 @@ pub(crate) fn dispatch_host_operation(
                 config_reference,
                 config_schema,
                 resources,
+                install,
             } => {
                 let deployment_id = operation.deployment_id.clone().unwrap_or_default();
-                let params = BootstrapParams {
-                    issuer: issuer.clone(),
-                    runtime: runtime.clone(),
-                    artifact: artifact.clone(),
-                    config_reference: config_reference.clone(),
-                    config_schema: config_schema.clone(),
-                    resources: resources.clone(),
-                };
-                match store.bootstrap(&deployment_id, params, &operation.operation_id) {
-                    Ok(state) => HostResult::completed(
-                        &operation.operation_id,
-                        HostCompletionBody::StateMutateApplied {
-                            revision: state.config.revision,
-                        },
-                    ),
-                    Err(failure) => state_failure(operation, &failure),
+                match install {
+                    // G01 clean install: execute the full order first; only a
+                    // fully healthy target commits `local_healthy` state. The
+                    // artifact refs recorded in state come from the verified
+                    // facts the executor returns — never from the request.
+                    Some(order) => {
+                        let scope_dir = match store.scope_dir(&deployment_id) {
+                            Ok(dir) => dir,
+                            Err(failure) => return state_failure(operation, &failure),
+                        };
+                        ensure_scope_dir(&scope_dir);
+                        let job = install_exec::InstallJob {
+                            operation_id: &operation.operation_id,
+                            deployment_id: &deployment_id,
+                            issuer,
+                            runtime_kind: &runtime.kind,
+                            runtime_object: &runtime.object,
+                            config_reference,
+                            scope_dir: &scope_dir,
+                            order,
+                        };
+                        // The executor rolls back its own partial work on any
+                        // failure: nothing is registered, no state is created.
+                        let facts = match executor.execute_install(&job) {
+                            Ok(facts) => facts,
+                            Err(failure) => return state_failure(operation, &failure),
+                        };
+                        let params = BootstrapParams {
+                            issuer: issuer.clone(),
+                            runtime: runtime.clone(),
+                            artifact: ArtifactRefs {
+                                current: Some(facts.artifact_reference.clone()),
+                                previous: None,
+                            },
+                            config_reference: config_reference.clone(),
+                            config_schema: config_schema.clone(),
+                            resources: resources.clone(),
+                        };
+                        match commit_clean_install(store, &deployment_id, params, operation) {
+                            Ok(inspection) => HostResult::completed(
+                                &operation.operation_id,
+                                HostCompletionBody::InstallApplied { inspection },
+                            ),
+                            Err(failure) => state_failure(operation, &failure),
+                        }
+                    }
+                    None => {
+                        let params = BootstrapParams {
+                            issuer: issuer.clone(),
+                            runtime: runtime.clone(),
+                            artifact: artifact.clone(),
+                            config_reference: config_reference.clone(),
+                            config_schema: config_schema.clone(),
+                            resources: resources.clone(),
+                        };
+                        match store.bootstrap(&deployment_id, params, &operation.operation_id) {
+                            Ok(state) => HostResult::completed(
+                                &operation.operation_id,
+                                HostCompletionBody::StateMutateApplied {
+                                    revision: state.config.revision,
+                                },
+                            ),
+                            Err(failure) => state_failure(operation, &failure),
+                        }
+                    }
                 }
             }
             StateMutationPayload::ApplyConfig { reference, schema } => {
@@ -295,6 +385,49 @@ pub(crate) fn dispatch_host_operation(
     }
 }
 
+/// Commit the post-install DeploymentState: fresh document plus the healthy
+/// local-health fact, both under the install operation's idempotency. An
+/// interrupted commit replays safely because both writes key off the same
+/// operation id.
+fn commit_clean_install(
+    store: &TargetStateStore,
+    deployment_id: &str,
+    params: BootstrapParams,
+    operation: &HostOperation,
+) -> Result<InstanceInspection, Failure> {
+    store.bootstrap(deployment_id, params, &operation.operation_id)?;
+    store.record_local_health(
+        deployment_id,
+        true,
+        "local readiness probe passed after clean install".to_owned(),
+        &operation.operation_id,
+    )?;
+    Ok(inspection_from_state(store.load_existing(deployment_id)?))
+}
+
+fn inspection_from_state(state: DeploymentState) -> InstanceInspection {
+    InstanceInspection {
+        deployment_id: state.deployment_id,
+        issuer: state.issuer,
+        observed_at: Utc::now(),
+        revision: state.config.revision,
+        runtime: state.runtime,
+        artifact: state.artifact,
+        config_reference: state.config.reference,
+        config_schema: state.config.schema,
+        resources: state.resources,
+        healthy: state.local_health.healthy,
+        health_summary: state.local_health.summary,
+        active_host_operation: state
+            .active_host_operation
+            .map(|active| active.operation_id),
+    }
+}
+
+fn ensure_scope_dir(scope_dir: &std::path::Path) {
+    let _ = crate::filesystem::ensure_directory_chain(scope_dir);
+}
+
 fn state_failure(operation: &HostOperation, failure: &Failure) -> HostResult {
     HostResult::failed(
         &operation.operation_id,
@@ -312,22 +445,7 @@ fn answer_inspect(
     Ok(HostResult::completed(
         &operation.operation_id,
         HostCompletionBody::StateInspect {
-            inspection: InstanceInspection {
-                deployment_id: state.deployment_id,
-                issuer: state.issuer,
-                observed_at: Utc::now(),
-                revision: state.config.revision,
-                runtime: state.runtime,
-                artifact: state.artifact,
-                config_reference: state.config.reference,
-                config_schema: state.config.schema,
-                resources: state.resources,
-                healthy: state.local_health.healthy,
-                health_summary: state.local_health.summary,
-                active_host_operation: state
-                    .active_host_operation
-                    .map(|active| active.operation_id),
-            },
+            inspection: inspection_from_state(state),
         },
     ))
 }
@@ -375,7 +493,7 @@ impl ExecutionTarget for LocalTarget {
         // impersonate target state).
         let store = TargetStateStore::open(&self.state_root)?;
         let operation = HostOperation::state_inspect(Uuid::now_v7().to_string(), deployment_id);
-        match dispatch_host_operation(&operation, &store).outcome {
+        match dispatch_host_operation(&operation, &store, &self.executor).outcome {
             HostOutcome::Completed {
                 body: HostCompletionBody::StateInspect { inspection },
             } => Ok(inspection),
@@ -397,8 +515,15 @@ impl ExecutionTarget for LocalTarget {
                 format!("{}: {}", rejection.code.as_str(), rejection.detail),
             ));
         }
+        // State mutations run under the C07 journal contract on this machine
+        // exactly as the remote exec helper journals them on a target host —
+        // the install use case cannot tell the transports apart.
+        if matches!(operation.operation, HostOperationBody::StateMutate { .. }) {
+            let journal = TargetJournal::open(&self.state_root)?;
+            return self.execute_journaled(operation, &journal);
+        }
         let store = TargetStateStore::open(&self.state_root)?;
-        Ok(dispatch_host_operation(operation, &store))
+        Ok(dispatch_host_operation(operation, &store, &self.executor))
     }
 
     fn execute_control_operation(
@@ -468,6 +593,7 @@ mod tests {
                     )
                     .expect("external dedicated resource"),
                 ],
+                install: None,
             },
         )
     }

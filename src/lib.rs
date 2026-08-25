@@ -1,5 +1,6 @@
 mod adoption;
 mod backup;
+mod clean_install;
 mod cli;
 mod conformance;
 pub mod controller_identity;

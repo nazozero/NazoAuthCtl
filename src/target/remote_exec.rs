@@ -226,6 +226,7 @@ mod tests {
                         ResourceScope::Shared,
                     )?,
                 ],
+                install: None,
             },
         );
         Ok(serde_json::to_vec(&operation)?)

@@ -68,7 +68,9 @@ impl FleetContext {
     }
 }
 
-fn production_target(record: &HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget>> {
+/// Production transport selection, shared with the lifecycle use-case waves
+/// (G01+): local hosts answer natively, SSH hosts through system OpenSSH.
+pub(crate) fn production_target(record: &HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget>> {
     match record.transport {
         HostTransport::Local => Ok(Box::new(LocalTarget::new()?)),
         HostTransport::Ssh => Ok(Box::new(SshTarget::from_record(record)?)),
@@ -125,7 +127,7 @@ pub(crate) fn run_instance(command: InstanceCommand) -> anyhow::Result<()> {
 
 /// One full live contact: verified hello identity plus a nonce-echoed ping.
 /// Both transports answer through the identical [`ExecutionTarget`] contract.
-fn live_probe(target: &dyn ExecutionTarget) -> anyhow::Result<RemoteHello> {
+pub(crate) fn live_probe(target: &dyn ExecutionTarget) -> anyhow::Result<RemoteHello> {
     let answered =
         target.execute_host_operation(&HostOperation::hello(Uuid::now_v7().to_string()))?;
     let hello = match answered.outcome {
@@ -190,7 +192,7 @@ fn summarize_hello(hello: &RemoteHello) -> String {
 /// (task F01). This is what `--refresh` writes into the instance observation
 /// cache — real inspection data, never a placeholder sentence. The cache is
 /// still display-only: it never authorizes or overwrites target state.
-fn summarize_inspection(inspection: &InstanceInspection) -> String {
+pub(crate) fn summarize_inspection(inspection: &InstanceInspection) -> String {
     let artifacts = match (&inspection.artifact.current, &inspection.artifact.previous) {
         (None, None) => "-".to_owned(),
         (current, previous) => {
@@ -470,7 +472,7 @@ fn host_forget(context: &FleetContext, alias: &str, cascade: bool) -> anyhow::Re
 /// Task B05 selector rules: exact alias or exact deployment id only; a single
 /// registered instance may omit the selector entirely; a multi-instance
 /// Registry demands an explicit selector and lists the candidates.
-fn resolve_instance(
+pub(crate) fn resolve_instance(
     store: &RegistryStore,
     explicit: Option<&str>,
     action: &str,
