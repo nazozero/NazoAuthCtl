@@ -6,6 +6,7 @@ mod conformance;
 pub mod controller_identity;
 mod coordination;
 mod deployment;
+mod discover_adopt;
 mod discovery;
 mod fleet;
 mod governance;

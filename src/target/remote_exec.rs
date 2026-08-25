@@ -322,6 +322,57 @@ mod tests {
     }
 
     #[test]
+    fn state_list_sweeps_deployments_over_the_remote_exec_contract() -> anyhow::Result<()> {
+        let (_temp, root) = temp_state()?;
+
+        // A fresh target answers with an empty listing.
+        let empty = answered(
+            &serde_json::to_vec(&HostOperation::state_list(Uuid::now_v7().to_string()))?,
+            &root,
+        )?;
+        let crate::target::HostOutcome::Completed {
+            body: Body::StateListed { deployments },
+        } = empty.outcome
+        else {
+            panic!("expected a listing completion: {empty:?}");
+        };
+        assert!(deployments.is_empty(), "{deployments:?}");
+
+        // After one bootstrap the sweep reports exactly that deployment with
+        // its authoritative facts.
+        serve(&bootstrap_input()?, &mut Vec::new(), &root)?;
+        let swept = answered(
+            &serde_json::to_vec(&HostOperation::state_list(Uuid::now_v7().to_string()))?,
+            &root,
+        )?;
+        let crate::target::HostOutcome::Completed {
+            body: Body::StateListed { deployments },
+        } = swept.outcome
+        else {
+            panic!("expected a listing completion: {swept:?}");
+        };
+        assert_eq!(deployments.len(), 1);
+        assert_eq!(deployments[0].deployment_id, "deploy-alpha");
+        assert_eq!(deployments[0].issuer, "https://auth.example.com");
+        assert_eq!(deployments[0].runtime.kind, "podman");
+        assert_eq!(deployments[0].resources.len(), 2);
+
+        // A bound sweep is rejected at admission: the helper exits nonzero
+        // without writing stdout, exactly like any other protocol failure.
+        let mut bound = HostOperation::state_list(Uuid::now_v7().to_string());
+        bound.deployment_id = Some("deploy-alpha".to_owned());
+        let mut output = Vec::new();
+        let error = serve(&serde_json::to_vec(&bound)?, &mut output, &root)
+            .expect_err("bound sweep refused");
+        assert!(
+            error.to_string().contains("state-list must not carry"),
+            "{error}"
+        );
+        assert!(output.is_empty(), "no stdout on admission failure");
+        Ok(())
+    }
+
+    #[test]
     fn interrupted_state_mutations_resume_without_double_applying() -> anyhow::Result<()> {
         use crate::target::journal::{JournalLine, JournalStatus, TargetJournal};
         use crate::target::wire::{HOST_ERR_OPERATION_INVALID, canonical_operation_hash};

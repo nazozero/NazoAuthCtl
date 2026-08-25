@@ -771,6 +771,9 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
         // F01 DeploymentState kinds are gated like every other non-probe.
         assert!(requires_handshake("state-inspect"));
         assert!(requires_handshake("state-mutate"));
+        // The G05 discovery sweep is read-only but still gated: an unverified
+        // helper is never asked what deployments exist.
+        assert!(requires_handshake("state-list"));
         // Closed-set default: every future mutation kind is gated.
         for kind in ["install", "update", "uninstall", "rollback"] {
             assert!(requires_handshake(kind), "{kind}");

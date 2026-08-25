@@ -28,7 +28,7 @@ use anyhow::{Context as _, bail};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use crate::fleet::{live_probe, production_target, summarize_inspection};
+use crate::fleet::{live_probe, production_target, resolve_host_selector, summarize_inspection};
 use crate::registry::{
     DiscoveryEvidence, ObservationCache, RegistryStore, validate_issuer,
     validate_registry_key as validate_key,
@@ -162,41 +162,6 @@ struct ServerConfigSeed<'a> {
     database_url_file: &'a str,
     valkey_url_file: &'a str,
     mfa_totp_key_file: &'a str,
-}
-
-/// Resolve the install host per the CLI selector rules (G01 step 1): an
-/// explicit alias must match exactly; without one, the built-in local host is
-/// ensured and a single-host registry selects itself while a multi-host
-/// registry demands disambiguation.
-fn resolve_install_host(
-    registry: &RegistryStore,
-    explicit: Option<&str>,
-) -> anyhow::Result<crate::registry::HostRecord> {
-    if let Some(alias) = explicit {
-        return registry.host_by_alias(alias)?.with_context(|| {
-            format!(
-                "unknown host alias '{alias}'; register it first with \
-                     `nazoauthctl host add {alias} --ssh <profile>`"
-            )
-        });
-    }
-    registry.ensure_local_host()?;
-    let hosts = registry.list_hosts()?;
-    match hosts.as_slice() {
-        [only] => Ok(only.clone()),
-        [] => bail!("no hosts are available for installation"),
-        many => {
-            let aliases = many
-                .iter()
-                .map(|host| host.alias.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "{} hosts are registered ({aliases}); choose one explicitly with --host",
-                many.len()
-            )
-        }
-    }
 }
 
 /// Pick the runtime class from what the verified helper actually announced.
@@ -391,7 +356,7 @@ pub(crate) fn run_clean_install(
     validate_issuer(&request.issuer).context("--public-url must be an http(s) origin URL")?;
 
     // 1. Resolve --host via the registry selector rules.
-    let host_record = resolve_install_host(&context.registry, request.host.as_deref())?;
+    let host_record = resolve_host_selector(&context.registry, request.host.as_deref())?;
 
     // 2. Live verified contact before anything else (C08 gate upstream of
     //    every mutation kind).

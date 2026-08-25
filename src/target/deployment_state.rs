@@ -69,6 +69,15 @@ const MAX_STATE_BYTES: u64 = 1024 * 1024;
 /// Maximum number of concrete resources one deployment may declare.
 pub const MAX_RESOURCES: usize = 64;
 
+/// Upper bound for one discovery sweep (task G05): a target holding more
+/// deployments than this fails the listing closed instead of silently
+/// truncating discovery output.
+pub const MAX_LISTED_DEPLOYMENTS: usize = 256;
+
+/// Stable failure code: a discovery sweep exceeded
+/// [`MAX_LISTED_DEPLOYMENTS`]; nothing is truncated away silently.
+pub const DEPLOYMENT_LIMIT_EXCEEDED: &str = "DEPLOYMENT_LIMIT_EXCEEDED";
+
 /// Stable failure code: no DeploymentState exists for the addressed
 /// deployment id on this target.
 pub const DEPLOYMENT_UNKNOWN: &str = "DEPLOYMENT_UNKNOWN";
@@ -602,6 +611,63 @@ impl TargetStateStore {
         Ok(state)
     }
 
+    /// Enumerate every deployment whose state document exists under this root
+    /// (task G05), sorted by deployment id for deterministic discovery
+    /// output. Directories without a `state.json` — the host-level journal
+    /// scope, or a scope left behind by an interrupted install that never
+    /// committed — are not deployments. A directory that claims a state
+    /// document which fails to load fails the whole sweep closed with the
+    /// same stable codes as [`Self::load_existing`]: discovery exists exactly
+    /// to surface broken target state, so corruption is never skipped over.
+    pub fn list_deployments(&self) -> Result<Vec<DeploymentState>, Failure> {
+        let deployments_dir = self.root.join("deployments");
+        let entries = match std::fs::read_dir(&deployments_dir) {
+            Ok(entries) => entries.collect::<Result<Vec<_>, _>>().map_err(|error| {
+                Failure::new(
+                    DEPLOYMENT_UNKNOWN,
+                    format!("failed to list {}: {error}", deployments_dir.display()),
+                )
+            })?,
+            // A fresh target has no deployments directory yet: zero findings.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(Failure::new(
+                    DEPLOYMENT_UNKNOWN,
+                    format!("failed to list {}: {error}", deployments_dir.display()),
+                ));
+            }
+        };
+        let mut scopes: Vec<String> = Vec::new();
+        for entry in entries {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if !path.join("state.json").is_file() {
+                continue;
+            }
+            match path.file_name().and_then(|name| name.to_str()) {
+                Some(scope) => scopes.push(scope.to_owned()),
+                None => scopes.push(String::from("")),
+            }
+        }
+        scopes.sort();
+        let mut states = Vec::with_capacity(scopes.len());
+        for scope in scopes {
+            if states.len() >= MAX_LISTED_DEPLOYMENTS {
+                return Err(Failure::new(
+                    DEPLOYMENT_LIMIT_EXCEEDED,
+                    format!(
+                        "this target holds more than {MAX_LISTED_DEPLOYMENTS} deployments; \
+                         split or retire hosts instead of truncating discovery output"
+                    ),
+                ));
+            }
+            states.push(self.load_existing(&scope)?);
+        }
+        Ok(states)
+    }
+
     /// Bootstrap (F01): create the initial state document for a fresh
     /// deployment at revision 1. Re-executing the same interrupted bootstrap
     /// replays the stored state; bootstrapping over different existing state
@@ -1057,4 +1123,86 @@ fn sanitize_detail(text: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_params(issuer: &str, runtime_object: &str) -> BootstrapParams {
+        BootstrapParams {
+            issuer: issuer.to_owned(),
+            runtime: RuntimeSurface::new("podman", runtime_object).expect("runtime"),
+            artifact: ArtifactRefs::default(),
+            config_reference: "/etc/nazauth/config.toml".to_owned(),
+            config_schema: "nazauth-config-v1".to_owned(),
+            resources: Vec::new(),
+            current_build_identity: None,
+        }
+    }
+
+    #[test]
+    fn list_deployments_is_sorted_skips_journal_only_scopes_and_fails_closed() -> anyhow::Result<()>
+    {
+        let temp = crate::filesystem::PrivateTempDir::new("nazauthctl-state-list")?;
+        let store = TargetStateStore::open(temp.path().join("state"))?;
+
+        // A fresh target without a deployments directory lists empty.
+        assert!(store.list_deployments()?.is_empty());
+
+        // Two real deployments plus a journal-only scope (the host-level
+        // journal lives under deployments/host) and a stray non-directory.
+        store.bootstrap(
+            "deploy-zeta",
+            sample_params("https://z.example", "nz-z"),
+            "op",
+        )?;
+        store.bootstrap(
+            "deploy-alpha",
+            sample_params("https://a.example", "nz-a"),
+            "op",
+        )?;
+        let host_scope = temp.path().join("state").join("deployments").join("host");
+        crate::filesystem::ensure_directory_chain(&host_scope)?;
+        crate::filesystem::atomic_write(&host_scope.join("operations.jsonl"), b"\n", 0o600)?;
+        let loose_file = temp
+            .path()
+            .join("state")
+            .join("deployments")
+            .join("loose-file");
+        crate::filesystem::atomic_write(&loose_file, b"not a deployment", 0o600)?;
+
+        let listed = store.list_deployments()?;
+        let ids: Vec<&str> = listed.iter().map(|s| s.deployment_id.as_str()).collect();
+        assert_eq!(ids, ["deploy-alpha", "deploy-zeta"], "sorted, scoped");
+
+        // A present-but-corrupt state document fails the whole sweep closed
+        // with the stable reset code — discovery never skips corruption.
+        let broken_dir = temp
+            .path()
+            .join("state")
+            .join("deployments")
+            .join("deploy-broken");
+        crate::filesystem::ensure_directory_chain(&broken_dir)?;
+        crate::filesystem::atomic_write(&broken_dir.join("state.json"), b"{ not json", 0o600)?;
+        let error = store.list_deployments().expect_err("corrupt document");
+        assert!(
+            error.detail.contains(crate::registry::STATE_RESET_REQUIRED),
+            "{error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn list_deployments_refuses_to_truncate_beyond_the_cap() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("nazauthctl-state-list-cap")?;
+        let store = TargetStateStore::open(temp.path().join("state"))?;
+        for index in 0..=MAX_LISTED_DEPLOYMENTS {
+            let id = format!("deploy-{index:03}");
+            store.bootstrap(&id, sample_params("https://x.example", &id), "op")?;
+        }
+        let failure = store.list_deployments().expect_err("over the cap");
+        assert_eq!(failure.code, DEPLOYMENT_LIMIT_EXCEEDED, "{failure:?}");
+        Ok(())
+    }
 }

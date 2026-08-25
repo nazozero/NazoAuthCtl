@@ -38,11 +38,11 @@ pub use control_exec::{
 };
 pub use deployment_state::{
     ActiveHostOperationRef, ArtifactRefs, BUILD_IDENTITY_PRODUCT, BootstrapParams, BuildIdentity,
-    CONFIG_REVISION_MISMATCH, ConfigState, DEPLOYMENT_EXISTS, DEPLOYMENT_STATE_SCHEMA,
-    DEPLOYMENT_UNKNOWN, DeploymentState, Failure, HealthRecord, INSTALL_FAILED, MAX_RESOURCES,
-    OBJECT_IDENTITY_MISMATCH, RESOURCE_DELETE_FORBIDDEN, RESOURCE_UNKNOWN, ROLLBACK_UNAVAILABLE,
-    Resource, ResourceOwnership, ResourceScope, RuntimeSurface, StateMutationPayload,
-    TargetStateStore,
+    CONFIG_REVISION_MISMATCH, ConfigState, DEPLOYMENT_EXISTS, DEPLOYMENT_LIMIT_EXCEEDED,
+    DEPLOYMENT_STATE_SCHEMA, DEPLOYMENT_UNKNOWN, DeploymentState, Failure, HealthRecord,
+    INSTALL_FAILED, MAX_LISTED_DEPLOYMENTS, MAX_RESOURCES, OBJECT_IDENTITY_MISMATCH,
+    RESOURCE_DELETE_FORBIDDEN, RESOURCE_UNKNOWN, ROLLBACK_UNAVAILABLE, Resource, ResourceOwnership,
+    ResourceScope, RuntimeSurface, StateMutationPayload, TargetStateStore,
 };
 pub use install_exec::{
     ARTIFACT_UNVERIFIED, CONFIG_INVALID, CONFIG_PATH_OCCUPIED, EMBEDDED_IDENTITY_MISMATCH,
@@ -337,6 +337,8 @@ pub(crate) fn dispatch_host_operation(
             },
         ),
         HostOperationBody::StateInspect {} => answer_inspect(operation, store)
+            .unwrap_or_else(|failure| state_failure(operation, &failure)),
+        HostOperationBody::StateList {} => answer_state_list(operation, store)
             .unwrap_or_else(|failure| state_failure(operation, &failure)),
         HostOperationBody::ControlOperation { compact_jws, .. } => {
             answer_control_operation(operation, store, compact_jws, executors.control)
@@ -740,6 +742,23 @@ fn answer_inspect(
                 current_build_identity: state.current_build_identity.clone(),
             },
         },
+    ))
+}
+
+/// Answer one G05 discovery sweep: every DeploymentState on this target,
+/// projected through the same inspection shape as state-inspect and sorted by
+/// deployment id. Strictly read-only — no journal line, no state write, and
+/// never any fresh-install bootstrap material (that surfaces only through the
+/// per-deployment inspect kind).
+fn answer_state_list(
+    operation: &HostOperation,
+    store: &TargetStateStore,
+) -> Result<HostResult, Failure> {
+    let states = store.list_deployments()?;
+    let deployments = states.into_iter().map(inspection_from_state).collect();
+    Ok(HostResult::completed(
+        &operation.operation_id,
+        HostCompletionBody::StateListed { deployments },
     ))
 }
 

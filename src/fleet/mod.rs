@@ -171,7 +171,7 @@ pub(crate) fn live_probe(target: &dyn ExecutionTarget) -> anyhow::Result<RemoteH
 
 /// Compact single-line identity string stored in the observation cache. Drift
 /// reporting compares these summaries verbatim.
-fn summarize_hello(hello: &RemoteHello) -> String {
+pub(crate) fn summarize_hello(hello: &RemoteHello) -> String {
     let commit = if hello.commit.is_empty() {
         "-"
     } else {
@@ -272,6 +272,42 @@ fn observation_summary_line(observation: Option<&ObservationCache>) -> String {
     match observation {
         None => String::new(),
         Some(observation) => format!("      last contact: {}", observation.summary),
+    }
+}
+
+/// Shared host selector rules (goal plan 07 G01 step 1, reused by discover /
+/// adopt in G05 and by the I-wave CLI): an explicit alias must match exactly;
+/// without one the built-in local host is ensured and a single-host registry
+/// selects itself while a multi-host registry demands disambiguation. This is
+/// the single authority for that rule; clean-install consumes it too.
+pub(crate) fn resolve_host_selector(
+    registry: &RegistryStore,
+    explicit: Option<&str>,
+) -> anyhow::Result<HostRecord> {
+    if let Some(alias) = explicit {
+        return registry.host_by_alias(alias)?.with_context(|| {
+            format!(
+                "unknown host alias '{alias}'; register it first with \
+                     `nazoauthctl host add {alias} --ssh <profile>`"
+            )
+        });
+    }
+    registry.ensure_local_host()?;
+    let hosts = registry.list_hosts()?;
+    match hosts.as_slice() {
+        [only] => Ok(only.clone()),
+        [] => bail!("no hosts are available for installation"),
+        many => {
+            let aliases = many
+                .iter()
+                .map(|host| host.alias.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "{} hosts are registered ({aliases}); choose one explicitly with --host",
+                many.len()
+            )
+        }
     }
 }
 

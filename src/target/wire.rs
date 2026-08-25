@@ -43,17 +43,19 @@ pub const MAX_HOST_RESULT_BYTES: usize = 1024 * 1024;
 /// `every_registered_kind_round_trips` test pins this list to the enum.
 ///
 /// The F01 wave added the two DeploymentState kinds (`state-inspect`,
-/// `state-mutate`). The G wave extends the `state-mutate` mutation set and
+/// `state-mutate`). The G wave extends the `state-mutate` mutation set,
 /// adds exactly one transport kind: `control-operation`, which carries an
 /// already-signed compact-JWS ControlOperation opaquely to the target's
 /// one-shot NazoAuth operator (goal plan 03 §3.3; no secret material, no
-/// signing on the target).
+/// signing on the target), and adds the read-only host-level enumeration
+/// kind `state-list` for discovery (goal plan 07 §6, task G05).
 pub const HOST_OPERATION_KINDS: &[&str] = &[
     "hello",
     "ping",
     "state-inspect",
     "state-mutate",
     "control-operation",
+    "state-list",
 ];
 
 /// Product identity reported by a remote helper and required by the C08
@@ -200,6 +202,11 @@ pub enum HostOperationBody {
         compact_jws: String,
         expected_deployment_id: String,
     },
+    /// Enumerate every NazoAuth DeploymentState on this target (goal plan 07
+    /// §6, task G05). Host-level and strictly read-only: no instance binding,
+    /// no revision expectation, no side effect. Answered with
+    /// [`HostCompletionBody::StateListed`].
+    StateList {},
 }
 
 impl HostOperationBody {
@@ -210,6 +217,7 @@ impl HostOperationBody {
             Self::StateInspect {} => "state-inspect",
             Self::StateMutate { .. } => "state-mutate",
             Self::ControlOperation { .. } => "control-operation",
+            Self::StateList {} => "state-list",
         }
     }
 }
@@ -249,6 +257,19 @@ impl HostOperation {
             deployment_id: Some(deployment_id.into()),
             expected_revision: None,
             operation: HostOperationBody::StateInspect {},
+        }
+    }
+
+    /// Enumerate every NazoAuth DeploymentState on this target (task G05).
+    /// Host-level by definition: discovery addresses the whole target, never
+    /// one deployment.
+    pub fn state_list(operation_id: impl Into<String>) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: None,
+            expected_revision: None,
+            operation: HostOperationBody::StateList {},
         }
     }
 
@@ -350,6 +371,16 @@ impl HostOperation {
                         RejectionCode::OperationMalformed,
                         "state-inspect requires deployment_id and must not carry \
                          expected_revision",
+                    ));
+                }
+            }
+            HostOperationBody::StateList {} => {
+                // Enumeration is host-level and read-only: instance bindings
+                // and revision expectations are meaningless against it.
+                if self.deployment_id.is_some() || self.expected_revision.is_some() {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "state-list must not carry deployment_id or expected_revision",
                     ));
                 }
             }
@@ -596,6 +627,13 @@ pub enum HostCompletionBody {
     /// acceptance are Failed outcomes.
     ControlOperationExecuted {
         result: ControlResult,
+    },
+    /// Every NazoAuth DeploymentState found on this target (task G05),
+    /// sorted by deployment id. Read-only discovery output; never carries
+    /// fresh-install bootstrap material — that surfaces only through the
+    /// per-deployment state-inspect kind.
+    StateListed {
+        deployments: Vec<InstanceInspection>,
     },
 }
 
@@ -888,7 +926,8 @@ mod tests {
                 "ping",
                 "state-inspect",
                 "state-mutate",
-                "control-operation"
+                "control-operation",
+                "state-list"
             ]
         );
         let operation = ping_operation("probe");
@@ -1109,6 +1148,60 @@ mod tests {
                 "{rejection}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn state_list_is_host_level_read_only_and_round_trips_its_listing() -> anyhow::Result<()> {
+        // The kind carries no binding and no revision by construction.
+        let operation = HostOperation::state_list(Uuid::now_v7().to_string());
+        assert_eq!(operation.operation.kind(), "state-list");
+        assert!(operation.deployment_id.is_none());
+        assert!(operation.expected_revision.is_none());
+        operation.validate().expect("well-formed sweep");
+        assert_eq!(
+            parse_host_operation(&encode_host_operation(&operation)?)?,
+            operation
+        );
+
+        // A carried binding would turn enumeration into addressing: rejected.
+        let mut bound = HostOperation::state_list(Uuid::now_v7().to_string());
+        bound.deployment_id = Some("deploy-alpha".to_owned());
+        let rejection = bound.validate().expect_err("bound sweep");
+        assert_eq!(rejection.code, RejectionCode::OperationMalformed);
+        assert!(rejection.detail.contains("state-list"), "{rejection}");
+
+        let mut revisioned = HostOperation::state_list(Uuid::now_v7().to_string());
+        revisioned.expected_revision = Some(2);
+        assert!(revisioned.validate().is_err());
+
+        // The completed listing round-trips with its inspections intact.
+        let inspection = InstanceInspection {
+            deployment_id: "deploy-alpha".to_owned(),
+            issuer: "https://auth.example.com".to_owned(),
+            observed_at: chrono::Utc::now(),
+            revision: 2,
+            runtime: super::super::deployment_state::RuntimeSurface::new("podman", "nz-a")?,
+            artifact: super::super::deployment_state::ArtifactRefs {
+                current: Some("sha256:abcdef0123456789".to_owned()),
+                previous: None,
+            },
+            config_reference: "/etc/nazauth/config.toml".to_owned(),
+            config_schema: "nazauth-config-v1".to_owned(),
+            resources: vec![],
+            healthy: true,
+            health_summary: "runtime healthy".to_owned(),
+            active_host_operation: None,
+            bootstrap_material: None,
+            current_build_identity: None,
+        };
+        let listed = HostResult::completed(
+            Uuid::now_v7().to_string(),
+            HostCompletionBody::StateListed {
+                deployments: vec![inspection],
+            },
+        );
+        assert_eq!(parse_host_result(&encode_host_result(&listed)?)?, listed);
         Ok(())
     }
 

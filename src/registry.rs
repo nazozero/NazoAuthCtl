@@ -279,12 +279,15 @@ pub const DISCOVERY_EVIDENCE_KIND: &str = "instance-discovery-v1";
 ///
 /// `instance register` accepts deployment identities only through this
 /// artifact; hand-typed `deployment_id` + `issuer` pairs have no input path.
-/// INTERIM boundary (revisited by G05/I01): until target-side DeploymentState
-/// discovery exists, the `deployment` fields are captured from operator input
-/// at observation time while everything around them — host identity, verified
-/// [`RemoteHello`], timestamp — is genuinely live-observed. Registration
-/// re-verifies the live helper identity against the artifact before trusting
-/// it, so a stale or fabricated envelope fails closed.
+/// Producers: since G05, `discover_adopt::run_adopt` fills the `deployment`
+/// fields from the target's own DeploymentState over a verified channel —
+/// operator input no longer supplies them there. The interim `instance
+/// observe` helper still captures them from operator input at observation
+/// time until the I-wave CLI rewiring retires it; everything around those
+/// fields — host identity, verified [`RemoteHello`], timestamp — is
+/// live-observed on every path. Registration re-verifies the live helper
+/// identity against the artifact before trusting it, so a stale or
+/// fabricated envelope fails closed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiscoveryEvidence {
