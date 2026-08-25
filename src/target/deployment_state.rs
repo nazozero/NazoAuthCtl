@@ -27,7 +27,7 @@
 //! - `managed + shared` is unrepresentable — rejected as a schema violation;
 //! - destructive paths may touch exactly `managed + deployment` resources;
 //!   external and shared resources have zero-delete paths ([`Failure`] with
-//!   [`RESOURCE_DELETE_FORBIDDEN`]);
+//!   [`EXTERNAL_RESOURCE_PROTECTED`]);
 //! - admin identity never changes ownership.
 //!
 //! External/shared PostgreSQL, Valkey, proxy, DNS, or KMS objects are owned by
@@ -102,12 +102,15 @@ pub const RESOURCE_UNKNOWN: &str = "RESOURCE_UNKNOWN";
 
 /// Stable failure code: the resource exists but has zero-delete protection
 /// (external ownership, or a shared resource of any kind).
-pub const RESOURCE_DELETE_FORBIDDEN: &str = "RESOURCE_DELETE_FORBIDDEN";
+pub const EXTERNAL_RESOURCE_PROTECTED: &str = "EXTERNAL_RESOURCE_PROTECTED";
 
 /// Stable failure code: config/state CAS mismatch (goal plan 06 F04). The
 /// caller must re-read live state and rebuild its intent; last-write-wins
 /// does not exist.
-pub const CONFIG_REVISION_MISMATCH: &str = "CONFIG_REVISION_MISMATCH";
+///
+/// Canonical name lives in [`crate::error_codes`]; re-exported here so the
+/// historical call sites keep one stable path.
+pub use crate::error_codes::CONFIG_REVISION_MISMATCH;
 
 /// Stable failure code: a clean-install execution order failed on the target
 /// and the target rolled its own partial work back. The DeploymentState was
@@ -527,7 +530,7 @@ impl DeploymentState {
         match (resource.ownership, resource.scope) {
             (ResourceOwnership::Managed, ResourceScope::Deployment) => Ok(resource),
             (ResourceOwnership::External, _) => Err(Failure::new(
-                RESOURCE_DELETE_FORBIDDEN,
+                EXTERNAL_RESOURCE_PROTECTED,
                 format!(
                     "resource '{}' is external; external resources have zero-delete paths",
                     resource.resource_id
@@ -535,7 +538,7 @@ impl DeploymentState {
             )),
             // Unreachable through the schema, but fail closed rather than trust it.
             (ResourceOwnership::Managed, ResourceScope::Shared) => Err(Failure::new(
-                RESOURCE_DELETE_FORBIDDEN,
+                EXTERNAL_RESOURCE_PROTECTED,
                 format!(
                     "resource '{}' is shared; shared resources have zero-delete paths",
                     resource.resource_id

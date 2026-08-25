@@ -13,7 +13,7 @@ use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use crate::{
-    cli::{InstallOptions, StandardsProfileSecrets},
+    cli::legacy_types::{InstallOptions, StandardsProfileSecrets},
     deployment::RuntimeBackendKind,
     filesystem::{atomic_write, generate_secret, set_mode},
     model::{
@@ -68,7 +68,7 @@ const TENANT_RESOURCE_CONTROLLER_CONTAINER_KEY_PATH: &str = "/run/nazoauth-contr
 pub(crate) struct PreparedInstall {
     pub(crate) config: UpdateConfig,
     pub(crate) config_path: PathBuf,
-    pub(crate) local_oci_candidate: Option<crate::cli::LocalOciCandidateInstall>,
+    pub(crate) local_oci_candidate: Option<crate::cli::legacy_types::LocalOciCandidateInstall>,
 }
 
 /// Durable sibling intent for the otherwise unjournaled interval between
@@ -77,7 +77,7 @@ pub(crate) struct PreparedInstall {
 #[serde(deny_unknown_fields)]
 pub(crate) struct LocalOciCandidatePrepareIntent {
     schema: u32,
-    candidate: crate::cli::LocalOciCandidateInstall,
+    candidate: crate::cli::legacy_types::LocalOciCandidateInstall,
     config: UpdateConfig,
     config_sha256: String,
 }
@@ -130,7 +130,7 @@ pub(crate) fn load_local_oci_candidate_prepare_intent(
 
 pub(crate) fn restore_local_oci_candidate_prepare_intent(
     config_path: &Path,
-    candidate: &crate::cli::LocalOciCandidateInstall,
+    candidate: &crate::cli::legacy_types::LocalOciCandidateInstall,
 ) -> anyhow::Result<()> {
     let intent = load_local_oci_candidate_prepare_intent(config_path)?
         .context("local OCI candidate config is absent and no durable prepare intent exists")?;
@@ -145,7 +145,7 @@ pub(crate) fn restore_local_oci_candidate_prepare_intent(
 pub(crate) fn validate_existing_local_oci_candidate_prepare_intent(
     config_path: &Path,
     config: &UpdateConfig,
-    candidate: &crate::cli::LocalOciCandidateInstall,
+    candidate: &crate::cli::legacy_types::LocalOciCandidateInstall,
 ) -> anyhow::Result<()> {
     let intent = load_local_oci_candidate_prepare_intent(config_path)?
         .context("local OCI candidate install has no durable fresh-prepare intent")?;
@@ -159,7 +159,7 @@ pub(crate) fn validate_existing_local_oci_candidate_prepare_intent(
 
 fn validate_local_oci_candidate_prepare_intent(
     intent: &LocalOciCandidatePrepareIntent,
-    candidate: &crate::cli::LocalOciCandidateInstall,
+    candidate: &crate::cli::legacy_types::LocalOciCandidateInstall,
 ) -> anyhow::Result<()> {
     if intent.schema != 1 || intent.candidate != *candidate {
         bail!("local OCI candidate prepare intent does not match the exact requested candidate");

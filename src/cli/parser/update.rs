@@ -1,6 +1,6 @@
 use anyhow::{Context, bail};
 
-use super::super::types::UpdateOptions;
+use super::super::legacy_types::UpdateOptions;
 use super::common::validate_version;
 
 pub(super) fn parse_update_options(values: Vec<String>) -> anyhow::Result<UpdateOptions> {

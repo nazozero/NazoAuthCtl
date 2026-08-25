@@ -2,13 +2,11 @@
 //!
 //! The grammars are intentionally narrow: fixed subcommands, closed option
 //! sets, and at most a couple of positional arguments. Registration accepts no
-//! hand-typed deployment identity at all — the only deployment-bearing input
-//! is the evidence file path consumed by `instance register`.
+//! hand-typed deployment identity at all — the deployment binding of
+//! `instance register` comes from the target's own DeploymentState over a
+//! verified handshake (G05).
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context as _, bail};
 
@@ -73,7 +71,7 @@ fn parse_host_add(values: &[String]) -> anyhow::Result<HostCommand> {
 pub(super) fn parse_instance(values: Vec<String>) -> anyhow::Result<InstanceCommand> {
     let (subcommand, rest) = split_subcommand(
         &values,
-        "instance list|show|observe|register|rename|forget|relocate",
+        "instance list|show|register|rename|forget|relocate",
     )?;
     match subcommand {
         "list" => {
@@ -90,46 +88,24 @@ pub(super) fn parse_instance(values: Vec<String>) -> anyhow::Result<InstanceComm
                 named: parts.named,
             }))
         }
-        "observe" => {
-            let parsed = parse_options(
-                rest.to_vec(),
-                &["--host", "--deployment-id", "--issuer", "--output"],
-                &[],
-                "instance observe",
-            )?;
-            require_no_positionals(&parsed.positionals, "instance observe")?;
-            for flag in ["--host", "--deployment-id", "--issuer", "--output"] {
-                parsed
-                    .values
-                    .get(flag)
-                    .with_context(|| format!("instance observe requires {flag}"))?;
-            }
-            checked_name("--host", &parsed.values["--host"])?;
-            checked_name("--deployment-id", &parsed.values["--deployment-id"])?;
-            Ok(InstanceCommand::Observe {
-                host: parsed.values["--host"].clone(),
-                deployment_id: parsed.values["--deployment-id"].clone(),
-                issuer: parsed.values["--issuer"].clone(),
-                output: PathBuf::from(&parsed.values["--output"]),
-            })
-        }
         "register" => {
+            // Controlled takeover (G05): the deployment binding comes from the
+            // target's own DeploymentState over a verified handshake.
             let parsed = parse_options(
                 rest.to_vec(),
-                &["--from-discovery", "--alias"],
+                &["--host", "--deployment-id", "--alias"],
                 &[],
                 "instance register",
             )?;
             require_no_positionals(&parsed.positionals, "instance register")?;
-            let from_discovery = parsed
-                .values
-                .get("--from-discovery")
-                .context(
-                    "instance register requires --from-discovery PATH: deployment identities \
-                     are accepted only from a live-observed evidence artifact produced by \
-                     `instance observe`; hand-typed values are never trusted",
-                )?
-                .clone();
+            for flag in ["--host", "--deployment-id"] {
+                parsed
+                    .values
+                    .get(flag)
+                    .with_context(|| format!("instance register requires {flag}"))?;
+            }
+            checked_name("--host", &parsed.values["--host"])?;
+            checked_name("--deployment-id", &parsed.values["--deployment-id"])?;
             let alias = match parsed.values.get("--alias") {
                 Some(alias) => {
                     checked_name("--alias", alias)?;
@@ -138,7 +114,8 @@ pub(super) fn parse_instance(values: Vec<String>) -> anyhow::Result<InstanceComm
                 None => None,
             };
             Ok(InstanceCommand::Register {
-                from_discovery: PathBuf::from(from_discovery),
+                host: parsed.values["--host"].clone(),
+                deployment_id: parsed.values["--deployment-id"].clone(),
                 alias,
             })
         }
@@ -210,7 +187,7 @@ pub(super) fn parse_instance(values: Vec<String>) -> anyhow::Result<InstanceComm
 
 /// Merge the positional selector argument with the explicit `--instance`
 /// channel. Extra named flags ride along in `values`.
-fn selector_parts(
+pub(super) fn selector_parts(
     values: &[String],
     extra_value_flags: &[&str],
     bool_flags: &[&str],
@@ -233,13 +210,15 @@ fn selector_parts(
         positional: parsed.positionals.into_iter().next(),
         named,
         values: parsed.values,
+        flags: parsed.flags,
     })
 }
 
-struct SelectorParts {
-    positional: Option<String>,
-    named: Option<String>,
-    values: BTreeMap<String, String>,
+pub(super) struct SelectorParts {
+    pub(super) positional: Option<String>,
+    pub(super) named: Option<String>,
+    pub(super) values: BTreeMap<String, String>,
+    pub(super) flags: BTreeSet<String>,
 }
 
 fn split_subcommand<'a>(

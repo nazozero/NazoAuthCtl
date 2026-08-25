@@ -156,7 +156,7 @@ impl LocalFixture {
             factory: Box::new(move |_record| {
                 Ok(Box::new(HelloOverride {
                     inner: local.clone(),
-                }) as Box<dyn ExecutionTarget>)
+                }) as Box<dyn ExecutionTarget + Send>)
             }),
         };
         Ok(Self {
@@ -167,7 +167,7 @@ impl LocalFixture {
         })
     }
 
-    fn local_target(&self) -> anyhow::Result<Box<dyn ExecutionTarget>> {
+    fn local_target(&self) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> {
         (self.context.factory)(
             self.context
                 .registry
@@ -375,7 +375,7 @@ impl SshFixture {
             factory: Box::new(move |record| {
                 Ok(Box::new(
                     crate::target::SshTarget::from_record(record)?.with_program(program.clone()),
-                ) as Box<dyn ExecutionTarget>)
+                ) as Box<dyn ExecutionTarget + Send>)
             }),
         };
         Ok(Self {

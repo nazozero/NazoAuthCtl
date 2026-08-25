@@ -135,7 +135,10 @@ fn guard_fresh_operation_expiry(
 }
 
 /// Stable error code surfaced when a fresh operation is refused locally.
-pub const CONTROLLER_KEY_EXPIRED: &str = "CONTROLLER_KEY_EXPIRED";
+///
+/// Canonical name lives in [`crate::error_codes`]; re-exported here so the
+/// historical call sites keep one stable path.
+pub use crate::error_codes::CONTROLLER_KEY_EXPIRED;
 
 /// Prepare one control operation for `instance_selector`, resuming the
 /// journaled operation when the rebuilt envelope is byte-identical in hash.

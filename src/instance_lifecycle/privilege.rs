@@ -20,7 +20,10 @@
 use anyhow::Context as _;
 
 /// Stable failure code for every sunk privilege refusal.
-pub const PRIVILEGE_REQUIRED: &str = "PRIVILEGE_REQUIRED";
+///
+/// Canonical name lives in [`crate::error_codes`]; re-exported here so the
+/// historical call sites keep one stable path.
+pub use crate::error_codes::PRIVILEGE_REQUIRED;
 
 /// The closed set of steps whose privilege requirements this module owns.
 // Delivery boundary: the CLI surface (I wave) consumes every variant; until

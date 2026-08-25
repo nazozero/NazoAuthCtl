@@ -38,7 +38,7 @@ impl Fixture {
         let context = DiscoveryContext {
             registry,
             factory: Box::new(move |_record| {
-                Ok(Box::new(local.clone()) as Box<dyn ExecutionTarget>)
+                Ok(Box::new(local.clone()) as Box<dyn ExecutionTarget + Send>)
             }),
         };
         Ok(Self {

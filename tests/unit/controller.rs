@@ -5,6 +5,10 @@ use std::{
 };
 
 use super::*;
+use crate::cli::legacy_types::{
+    BootstrapAdminOptions, CandidateTarget, Command, KeysCommand, LocalOciCandidateInstall,
+    UpdateOptions,
+};
 #[cfg(unix)]
 use crate::test_support::write_shell_executable;
 use crate::{
@@ -1813,13 +1817,7 @@ fn public_command_dispatch_fails_closed_before_every_confirmed_mutation() {
     let work = PrivateTempDir::new("nazoauth-command-dispatch").unwrap();
     let (config_path, config) = settled_config(&work);
     let config_before = fs::read(&config_path).unwrap();
-    let invoke = |command| {
-        run(Cli {
-            config: config_path.clone(),
-            deployment: None,
-            command,
-        })
-    };
+    let invoke = |command| run_legacy(config_path.clone(), None, command);
     let root_available = require_root().is_ok();
     let assert_root_or_error = |result: anyhow::Result<()>, expected: &str| {
         let error = result.unwrap_err().to_string();

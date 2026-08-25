@@ -42,9 +42,9 @@ use crate::registry::{HostPrivilege, HostRecord, HostTransport};
 use super::{
     ControlOperationReceipt, ExecutionTarget, HealthSnapshot, HostOverview, InstanceInspection,
     wire::{
-        HOST_ERR_OPERATION_INVALID, HOST_ERR_REMOTE_HELPER_MISMATCH, HostCompletionBody,
-        HostOperation, HostOutcome, HostResult, RemoteHello, encode_host_operation,
-        parse_host_result, sanitize, verify_remote_hello,
+        HOST_ERR_OPERATION_INVALID, HostCompletionBody, HostOperation, HostOutcome, HostResult,
+        REMOTE_HELPER_MISMATCH, RemoteHello, encode_host_operation, parse_host_result, sanitize,
+        verify_remote_hello,
     },
 };
 
@@ -59,7 +59,7 @@ pub const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Stable prefix for sudo failures that need human credentials. Automation
 /// reads the instruction; nothing ever captures the password itself.
-const HOST_ERR_SUDO_PASSWORD_REQUIRED: &str = "SUDO_PASSWORD_REQUIRED";
+const HOST_ERR_SUDO_PASSWORD_REQUIRED: &str = crate::error_codes::SUDO_PASSWORD_REQUIRED;
 
 /// An SSH-attached host reached through the system OpenSSH client.
 #[derive(Debug)]
@@ -207,15 +207,18 @@ impl SshTarget {
             )
         } else if lossy.contains("Host key verification failed") {
             format!(
-                "OpenSSH host key verification failed for '{}'; resolve the unknown or changed \
+                "{}: OpenSSH host key verification failed for '{}'; resolve the unknown or changed \
                  host key in your own SSH configuration — disabling StrictHostKeyChecking is \
                  never an option ({excerpt})",
+                crate::error_codes::SSH_HOST_KEY_FAILED,
                 self.profile
             )
         } else if lossy.contains("Permission denied") {
+            let profile = &self.profile;
             format!(
-                "OpenSSH authentication failed for '{0}' ({excerpt})",
-                self.profile
+                "{}: OpenSSH authentication failed for '{profile}' ({excerpt}); fix the \
+                 credentials or key setup for this profile in your own SSH configuration",
+                crate::error_codes::SSH_AUTH_FAILED,
             )
         } else {
             format!("ssh to '{}' exited with {status} ({excerpt})", self.profile)
@@ -250,7 +253,7 @@ impl SshTarget {
         })();
         let hello = answered.map_err(|error| {
             anyhow::anyhow!(
-                "{HOST_ERR_REMOTE_HELPER_MISMATCH}: the helper on '{}' does not speak the \
+                "{REMOTE_HELPER_MISMATCH}: the helper on '{}' does not speak the \
                  current remote exec contract ({error}). Upgrade the target helper first: \
                  `ssh {0} -- {} self update --yes`, then retry; no fallback exists.",
                 self.profile,
@@ -259,7 +262,7 @@ impl SshTarget {
         })?;
         if let Err(reason) = verify_remote_hello(&hello) {
             bail!(
-                "{HOST_ERR_REMOTE_HELPER_MISMATCH}: {reason}. Upgrade the target helper first: \
+                "{REMOTE_HELPER_MISMATCH}: {reason}. Upgrade the target helper first: \
                  `ssh {} -- {} self update --yes`, then retry; no fallback exists.",
                 self.profile,
                 self.remote_exec_basename
@@ -871,10 +874,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
 
         let error = target.inspect_instance("deploy-alpha").expect_err("drift");
         let rendered = format!("{error:#}");
-        assert!(
-            rendered.contains(HOST_ERR_REMOTE_HELPER_MISMATCH),
-            "{rendered}"
-        );
+        assert!(rendered.contains(REMOTE_HELPER_MISMATCH), "{rendered}");
         assert_eq!(
             stub.argv_invocations().len(),
             1,
@@ -895,10 +895,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
 
         let error = target.inspect_host().expect_err("version drift rejected");
         let rendered = format!("{error:#}");
-        assert!(
-            rendered.contains(HOST_ERR_REMOTE_HELPER_MISMATCH),
-            "{rendered}"
-        );
+        assert!(rendered.contains(REMOTE_HELPER_MISMATCH), "{rendered}");
         assert!(
             rendered.contains(&format!(
                 "ssh {PROFILE} -- {DEFAULT_REMOTE_EXEC_BASENAME} self update --yes"
@@ -927,10 +924,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
 
         let error = target.inspect_host().expect_err("old helper");
         let rendered = format!("{error:#}");
-        assert!(
-            rendered.contains(HOST_ERR_REMOTE_HELPER_MISMATCH),
-            "{rendered}"
-        );
+        assert!(rendered.contains(REMOTE_HELPER_MISMATCH), "{rendered}");
         assert!(rendered.contains("self update --yes"), "{rendered}");
     }
 

@@ -8,7 +8,7 @@
 //!
 //! - same id + same canonical hash ⇒ replay; the stored result is returned
 //!   verbatim (idempotent);
-//! - same id + different hash ⇒ stable `OPERATION_CONFLICT`; the original
+//! - same id + different hash ⇒ stable `OPERATION_ID_CONFLICT`; the original
 //!   intent is never overwritten;
 //! - an interrupted operation stays `pending` and is resumed by re-execution —
 //!   which is only safe because every journaled kind must be resumable by its
@@ -74,7 +74,7 @@ use uuid::Uuid;
 use crate::filesystem;
 
 use super::wire::{
-    HOST_ERR_OPERATION_CONFLICT, HOST_OPERATION_KINDS, HostOperation, HostResult,
+    HOST_OPERATION_KINDS, HostOperation, HostResult, OPERATION_ID_CONFLICT,
     canonical_operation_hash,
 };
 
@@ -164,7 +164,7 @@ pub struct JournalLine {
 /// Read-only projection of one journal line for status/doctor style surfaces
 /// (H04; CLI wiring lands with the I wave). Never carries secret material:
 /// HostResult payloads are already sanitized at the wire boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OperationLogEntry {
     pub operation_id: String,
     /// Closed wire kind token (`state-mutate`, `control-operation`, ...).
@@ -176,7 +176,7 @@ pub struct OperationLogEntry {
 }
 
 /// Outcome half of an [`OperationLogEntry`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum OperationOutcomeSummary {
     Completed,
     Failed { code: String, detail: String },
@@ -254,7 +254,7 @@ impl TargetJournal {
             if line.operation_hash != operation_hash {
                 return Ok(HostResult::failed(
                     operation.operation_id.clone(),
-                    HOST_ERR_OPERATION_CONFLICT,
+                    OPERATION_ID_CONFLICT,
                     format!(
                         "generate a new operation_id instead of retrying; this id was already \
                          accepted with request hash {} instead of {}",
@@ -697,7 +697,7 @@ mod tests {
         let HostOutcome::Failed { code, detail } = conflict.outcome else {
             panic!("conflict must surface as a failed outcome");
         };
-        assert_eq!(code, HOST_ERR_OPERATION_CONFLICT);
+        assert_eq!(code, OPERATION_ID_CONFLICT);
         assert!(detail.contains("generate a new operation_id"), "{detail}");
         Ok(())
     }

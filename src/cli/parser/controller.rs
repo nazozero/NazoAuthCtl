@@ -1,31 +1,28 @@
-//! Token parser for the `controller` command family (goal plan 04, tasks
-//! D04–D09).
+//! Token parser for the `controller` command family (goal plan 09 §1).
 //!
 //! Grammar mirrors the fleet families: fixed subcommands, closed option sets,
 //! and the shared positional/`--instance` selector merge. Approval tokens are
 //! accepted as `--approval-token` for automation; interactive runs prompt on
-//! the terminal with echo disabled instead.
+//! the terminal with echo disabled instead. `revoke` takes the exact
+//! controller id as its single positional argument.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-};
+use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
 
 use super::super::types::{ControllerCommand, InstanceSelector};
-use super::fleet::{checked_name, parse_options};
+use super::fleet::{checked_name, parse_options, selector_parts};
 
 pub(super) fn parse_controller(values: Vec<String>) -> anyhow::Result<ControllerCommand> {
     let (subcommand, rest) = values
         .split_first()
-        .with_context(|| "expected controller bind|add|rotate|revoke|slots")?;
+        .with_context(|| "expected controller list|add|rotate|revoke|recover")?;
     match subcommand.as_str() {
-        "bind" => parse_slot_change(rest, "bind"),
-        "add" => parse_slot_change(rest, "add"),
+        "list" => parse_list(rest),
+        "add" => parse_add(rest),
         "rotate" => parse_rotate(rest),
         "revoke" => parse_revoke(rest),
-        "slots" => parse_slots(rest),
+        "recover" => parse_recover(rest),
         other => bail!("unknown controller subcommand '{other}'"),
     }
 }
@@ -35,8 +32,8 @@ struct Common {
     selector: InstanceSelector,
     approval_token: Option<String>,
     admin_access_file: Option<PathBuf>,
-    values: BTreeMap<String, String>,
-    flags: BTreeSet<String>,
+    values: std::collections::BTreeMap<String, String>,
+    flags: std::collections::BTreeSet<String>,
 }
 
 fn parse_common(
@@ -70,12 +67,8 @@ fn parse_common(
         None => None,
     };
     let admin_access_file = match parsed.values.get("--admin-access-file") {
-        Some(path) => {
-            if path.is_empty() {
-                bail!("--admin-access-file requires a file path");
-            }
-            Some(PathBuf::from(path))
-        }
+        Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
+        Some(_) => bail!("--admin-access-file requires a file path"),
         None => None,
     };
     Ok(Common {
@@ -91,7 +84,7 @@ fn parse_common(
 }
 
 fn require_label(
-    values: &BTreeMap<String, String>,
+    values: &std::collections::BTreeMap<String, String>,
     optional: bool,
 ) -> anyhow::Result<Option<String>> {
     match values.get("--label") {
@@ -104,82 +97,95 @@ fn require_label(
     }
 }
 
-fn parse_slot_change(values: &[String], action: &'static str) -> anyhow::Result<ControllerCommand> {
-    let command = format!("controller {action}");
-    let common = parse_common(values.to_vec(), &["--label"], &[], &command)?;
+fn parse_list(values: &[String]) -> anyhow::Result<ControllerCommand> {
+    let common = parse_common(values.to_vec(), &[], &[], "controller list")?;
+    if common.approval_token.is_some() {
+        bail!("controller list does not accept --approval-token");
+    }
+    Ok(ControllerCommand::List {
+        selector: common.selector,
+        admin_access_file: common.admin_access_file,
+    })
+}
+
+fn parse_add(values: &[String]) -> anyhow::Result<ControllerCommand> {
+    let common = parse_common(values.to_vec(), &["--label"], &[], "controller add")?;
     let label = require_label(&common.values, false)?.expect("required above");
-    let selector = common.selector;
-    let approval_token = common.approval_token;
-    let admin_access_file = common.admin_access_file;
-    Ok(match action {
-        "bind" => ControllerCommand::Bind {
-            selector,
-            label,
-            approval_token,
-            admin_access_file,
-        },
-        _ => ControllerCommand::Add {
-            selector,
-            label,
-            approval_token,
-            admin_access_file,
-        },
+    Ok(ControllerCommand::Add {
+        selector: common.selector,
+        label,
+        approval_token: common.approval_token,
+        admin_access_file: common.admin_access_file,
     })
 }
 
 fn parse_rotate(values: &[String]) -> anyhow::Result<ControllerCommand> {
     let common = parse_common(values.to_vec(), &["--label"], &[], "controller rotate")?;
     let label = require_label(&common.values, true)?;
-    let selector = common.selector;
-    let approval_token = common.approval_token;
-    let admin_access_file = common.admin_access_file;
     Ok(ControllerCommand::Rotate {
-        selector,
+        selector: common.selector,
         label,
-        approval_token,
-        admin_access_file,
+        approval_token: common.approval_token,
+        admin_access_file: common.admin_access_file,
     })
 }
 
 fn parse_revoke(values: &[String]) -> anyhow::Result<ControllerCommand> {
-    let common = parse_common(
-        values.to_vec(),
-        &["--controller-id"],
+    // Grammar per goal plan 09 §1: controller revoke <controller-id>.
+    let parts = selector_parts(
+        values,
+        &["--approval-token", "--admin-access-file"],
         &["--yes"],
         "controller revoke",
     )?;
-    let controller_id = common
-        .values
-        .get("--controller-id")
-        .with_context(
-            || "controller revoke requires --controller-id ID (the exact id, never a label)",
-        )?
-        .clone();
+    let controller_id = parts
+        .positional
+        .clone()
+        .with_context(|| "controller revoke requires the exact <controller-id>")?;
     checked_name("--controller-id", &controller_id)?;
-    if !common.flags.contains("--yes") {
+    if !parts.flags.contains("--yes") {
         bail!("controller revoke is destructive and requires --yes");
     }
-    let selector = common.selector;
-    let approval_token = common.approval_token;
-    let admin_access_file = common.admin_access_file;
     Ok(ControllerCommand::Revoke {
-        selector,
+        selector: InstanceSelector {
+            positional: None,
+            named: parts.named,
+        },
         controller_id,
         yes: true,
-        approval_token,
-        admin_access_file,
+        approval_token: parts.values.get("--approval-token").cloned(),
+        admin_access_file: parts.values.get("--admin-access-file").map(PathBuf::from),
     })
 }
 
-fn parse_slots(values: &[String]) -> anyhow::Result<ControllerCommand> {
-    let common = parse_common(values.to_vec(), &[], &[], "controller slots")?;
-    if common.approval_token.is_some() {
-        bail!("controller slots does not accept --approval-token");
+fn parse_recover(values: &[String]) -> anyhow::Result<ControllerCommand> {
+    let common = parse_common(
+        values.to_vec(),
+        &["--label", "--secret-file"],
+        &["--rotate-secret"],
+        "controller recover",
+    )?;
+    let rotate_secret = common.flags.contains("--rotate-secret");
+    let secret_file = match common.values.get("--secret-file") {
+        Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
+        Some(_) => bail!("--secret-file requires a file path"),
+        None => None,
+    };
+    if rotate_secret && secret_file.is_some() {
+        bail!(
+            "--secret-file belongs to the recovery flow and cannot be combined with --rotate-secret"
+        );
     }
-    let selector = common.selector;
-    let admin_access_file = common.admin_access_file;
-    Ok(ControllerCommand::Slots {
-        selector,
-        admin_access_file,
+    if rotate_secret {
+        // D10/D12 commit under fresh-2FA approval exactly like a slot change;
+        // the token itself is still obtained through the normal callback.
+        let _ = common.approval_token;
+    }
+    let label = require_label(&common.values, rotate_secret)?;
+    Ok(ControllerCommand::Recover {
+        selector: common.selector,
+        label: label.unwrap_or_else(|| "recovered-controller".to_owned()),
+        secret_file,
+        rotate_secret,
     })
 }

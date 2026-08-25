@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, path::PathBuf};
 
 use anyhow::{Context, bail};
 
-use super::super::types::{CandidateTarget, InstallOptions, LocalOciCandidateInstall};
+use super::super::legacy_types::{CandidateTarget, InstallOptions, LocalOciCandidateInstall};
 use super::common::validate_version;
 use crate::install::{
     normalize_public_url_for_profile, normalize_single_host_cidr,

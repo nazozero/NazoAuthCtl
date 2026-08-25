@@ -136,6 +136,54 @@ pub(crate) fn verify_public(prober: &dyn PublicProber, issuer: &str) -> PublicVe
     }
 }
 
+/// Production prober: bounded curl for both checks, matching the transport
+/// precedent of the bootstrap claim. A TLS/transport failure surfaces as a
+/// nonzero curl exit; any HTTP answer counts for the handshake half because
+/// this check owns reachability, not application semantics.
+pub(crate) struct CurlPublicProber;
+
+impl PublicProber for CurlPublicProber {
+    fn tls_handshake(&self, issuer: &Url) -> Result<(), String> {
+        crate::process::Process::new("curl")
+            .args([
+                "--silent",
+                "--show-error",
+                "--head",
+                "--connect-timeout",
+                "10",
+                "--max-time",
+                "20",
+            ])
+            .arg(issuer.as_str())
+            .stdout()
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn oidc_discovery(&self, issuer: &Url) -> Result<(), String> {
+        let mut discovery = issuer.clone();
+        discovery.set_path(".well-known/openid-configuration");
+        let body = crate::process::Process::new("curl")
+            .args([
+                "--silent",
+                "--show-error",
+                "--fail-with-body",
+                "--connect-timeout",
+                "10",
+                "--max-time",
+                "20",
+            ])
+            .arg(discovery.as_str())
+            .stdout()
+            .map_err(|error| format!("{error:#}"))?;
+        if body.contains("\"issuer\"") {
+            Ok(())
+        } else {
+            Err("discovery document does not carry an issuer field".to_owned())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

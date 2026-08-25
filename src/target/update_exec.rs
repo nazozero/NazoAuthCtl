@@ -46,7 +46,7 @@ use crate::{
 pub const ACTIVATION_FAILED: &str = "ACTIVATION_FAILED";
 /// Stable failure code: the running object does not serve the artifact it was
 /// expected to serve at this point of the order.
-pub const EMBEDDED_IDENTITY_MISMATCH: &str = "EMBEDDED_IDENTITY_MISMATCH";
+pub const TARGET_IDENTITY_MISMATCH: &str = "TARGET_IDENTITY_MISMATCH";
 /// Stable failure code: the previous artifact is not present in the local
 /// engine image store, so an offline rollback cannot proceed.
 pub const ROLLBACK_ARTIFACT_MISSING: &str = "ROLLBACK_ARTIFACT_MISSING";
@@ -236,7 +236,7 @@ impl HostLifecycleExecutor {
             || observation_digest(&activated).as_deref() != Some(new_digest.as_str())
         {
             return Err(Failure::new(
-                EMBEDDED_IDENTITY_MISMATCH,
+                TARGET_IDENTITY_MISMATCH,
                 "the started runtime does not serve the verified artifact",
             ));
         }
@@ -333,7 +333,7 @@ impl HostLifecycleExecutor {
             || observation_digest(&activated).as_deref() != Some(previous_digest.as_str())
         {
             return Err(Failure::new(
-                EMBEDDED_IDENTITY_MISMATCH,
+                TARGET_IDENTITY_MISMATCH,
                 "the rolled-back runtime does not serve the previous verified artifact",
             ));
         }

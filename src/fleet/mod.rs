@@ -9,39 +9,30 @@
 //! Target construction goes through an injectable factory so unit tests drive
 //! scripted [`ExecutionTarget`] doubles instead of OpenSSH or the network.
 
-use std::path::Path;
+pub(crate) mod fleet_read;
 
 use anyhow::{Context, bail};
 use uuid::Uuid;
 
 use crate::cli::{HostCommand, InstanceCommand, InstanceSelector};
-use crate::filesystem;
+use crate::discover_adopt::DiscoveryContext;
 use crate::registry::{
-    DiscoveryEvidence, HostPrivilege, HostRecord, HostTransport, InstanceRecord, ObservationCache,
-    RegistryStore,
+    HostPrivilege, HostRecord, HostTransport, InstanceRecord, ObservationCache, RegistryStore,
 };
 use crate::target::{
-    ExecutionTarget, HOST_ERR_REMOTE_HELPER_MISMATCH, HostCompletionBody, HostOperation,
-    HostOutcome, InstanceInspection, LocalTarget, RemoteHello, ResourceOwnership, SshTarget,
+    ExecutionTarget, HostCompletionBody, HostOperation, HostOutcome, InstanceInspection,
+    LocalTarget, REMOTE_HELPER_MISMATCH, RemoteHello, ResourceOwnership, SshTarget,
     verify_remote_hello,
 };
 
-/// Stable rejection: a multi-instance Registry demands an explicit selector.
-pub(crate) const INSTANCE_SELECTOR_REQUIRED: &str = "INSTANCE_SELECTOR_REQUIRED";
-/// Stable rejection: the selector matched no instance exactly.
-pub(crate) const INSTANCE_SELECTOR_UNKNOWN: &str = "INSTANCE_SELECTOR_UNKNOWN";
-/// Stable rejection: registration without a well-formed discovery artifact.
-pub(crate) const REGISTRATION_EVIDENCE_REQUIRED: &str = "REGISTRATION_EVIDENCE_REQUIRED";
-/// Stable rejection: the evidence artifact contradicts the live helper.
-pub(crate) const EVIDENCE_IDENTITY_DRIFT: &str = "EVIDENCE_IDENTITY_DRIFT";
-
-/// Upper bound for a parsed discovery evidence artifact (~1 MiB).
-const MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
+// Canonical names live in `crate::error_codes`; re-exported here so the
+// historical call sites keep one stable path.
+pub(crate) use crate::error_codes::{INSTANCE_AMBIGUOUS, INSTANCE_NOT_REGISTERED};
 
 /// Cached observations older than this are displayed as stale.
 const STALE_AFTER_HOURS: i64 = 24;
 
-type TargetFactory = dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget>>;
+type TargetFactory = dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>>;
 
 /// Everything the fleet commands need: the user-scoped store and a way to
 /// reach hosts. Production wires the real transports; tests substitute
@@ -63,14 +54,16 @@ impl FleetContext {
         ))
     }
 
-    fn target_for(&self, record: &HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget>> {
+    fn target_for(&self, record: &HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> {
         (self.factory)(record)
     }
 }
 
 /// Production transport selection, shared with the lifecycle use-case waves
 /// (G01+): local hosts answer natively, SSH hosts through system OpenSSH.
-pub(crate) fn production_target(record: &HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget>> {
+pub(crate) fn production_target(
+    record: &HostRecord,
+) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> {
     match record.transport {
         HostTransport::Local => Ok(Box::new(LocalTarget::new()?)),
         HostTransport::Ssh => Ok(Box::new(SshTarget::from_record(record)?)),
@@ -101,16 +94,26 @@ pub(crate) fn run_instance(command: InstanceCommand) -> anyhow::Result<()> {
     let report = match command {
         InstanceCommand::List { refresh } => instance_list(&context, refresh)?,
         InstanceCommand::Show(selector) => instance_show(&context, &selector)?,
-        InstanceCommand::Observe {
+        // Controlled takeover (G05): the deployment binding comes from the
+        // target's own DeploymentState over a verified handshake.
+        InstanceCommand::Register {
             host,
             deployment_id,
-            issuer,
-            output,
-        } => instance_observe(&context, &host, &deployment_id, &issuer, &output)?,
-        InstanceCommand::Register {
-            from_discovery,
             alias,
-        } => instance_register(&context, &from_discovery, alias.as_deref())?,
+        } => {
+            let discovery = DiscoveryContext {
+                registry: context.store.clone(),
+                factory: Box::new(move |record| (context.factory)(record)),
+            };
+            crate::discover_adopt::run_adopt(
+                &discovery,
+                crate::discover_adopt::AdoptRequest {
+                    host: Some(host),
+                    deployment_id,
+                    alias,
+                },
+            )?
+        }
         InstanceCommand::Rename { source, new_alias } => {
             instance_rename(&context, &source, &new_alias)?
         }
@@ -143,7 +146,7 @@ pub(crate) fn live_probe(target: &dyn ExecutionTarget) -> anyhow::Result<RemoteH
     };
     verify_remote_hello(&hello).map_err(|reason| {
         anyhow::anyhow!(
-            "{HOST_ERR_REMOTE_HELPER_MISMATCH}: {reason}. Upgrade the target helper first \
+            "{REMOTE_HELPER_MISMATCH}: {reason}. Upgrade the target helper first \
              (`nazoauthctl self update --yes` on the host), then retry; no fallback exists."
         )
     })?;
@@ -297,8 +300,9 @@ pub(crate) fn resolve_host_selector(
     if let Some(alias) = explicit {
         return registry.host_by_alias(alias)?.with_context(|| {
             format!(
-                "unknown host alias '{alias}'; register it first with \
-                     `nazoauthctl host add {alias} --ssh <profile>`"
+                "{}: unknown host alias '{alias}'; register it first with \
+                     `nazoauthctl host add {alias} --ssh <profile>`",
+                crate::error_codes::HOST_NOT_REGISTERED
             )
         });
     }
@@ -531,7 +535,7 @@ pub(crate) fn resolve_instance(
             .cloned()
             .with_context(|| {
                 format!(
-                    "{INSTANCE_SELECTOR_UNKNOWN}: no registered instance matches '{selector}' \
+                    "{INSTANCE_NOT_REGISTERED}: no registered instance matches '{selector}' \
                      exactly. Selectors accept an exact alias or an exact deployment id only — \
                      substring, fuzzy, and discovery-order selection are never attempted"
                 )
@@ -547,7 +551,7 @@ pub(crate) fn resolve_instance(
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
-                "{INSTANCE_SELECTOR_REQUIRED}: {action} requires an explicit --instance selector \
+                "{INSTANCE_AMBIGUOUS}: {action} requires an explicit --instance selector \
                  because {} instances are registered: {candidates}",
                 many.len()
             )
@@ -686,110 +690,6 @@ fn instance_show(context: &FleetContext, selector: &InstanceSelector) -> anyhow:
     }))?)
 }
 
-/// Interim discovery helper (task B04): perform a live verified observation of
-/// one managed host and emit the typed evidence artifact consumed by
-/// `instance register`. G05/I01 replace the operator-supplied deployment
-/// binding with real target-side discovery.
-fn instance_observe(
-    context: &FleetContext,
-    host_alias: &str,
-    deployment_id: &str,
-    issuer: &str,
-    output: &Path,
-) -> anyhow::Result<String> {
-    let host = context.store.host_by_alias(host_alias)?.with_context(|| {
-        format!("unknown host alias '{host_alias}'; register it with `host add` first")
-    })?;
-    let target = context.target_for(&host)?;
-    let hello = live_probe(target.as_ref())
-        .context("live observation failed; no evidence artifact was written")?;
-    let evidence = DiscoveryEvidence::new(&host, hello, deployment_id, issuer)?;
-    let bytes = serde_json::to_vec_pretty(&evidence)?;
-    filesystem::atomic_write(output, &bytes, 0o600)
-        .with_context(|| format!("failed to write the evidence artifact {}", output.display()))?;
-    Ok(format!(
-        "observed host '{}' (verified: {})\nevidence written to {}\nregister with: nazoauthctl instance register --from-discovery {}\nnote: the deployment binding is captured at observe time until target-side discovery (G05/I01) lands; registration re-verifies the live helper identity against this artifact\n",
-        host.alias,
-        summarize_hello(&evidence.hello),
-        output.display(),
-        output.display(),
-    ))
-}
-
-fn instance_register(
-    context: &FleetContext,
-    from_discovery: &Path,
-    alias: Option<&str>,
-) -> anyhow::Result<String> {
-    let raw = filesystem::read_secure_regular_file(
-        from_discovery,
-        "discovery evidence",
-        false,
-        MAX_EVIDENCE_BYTES,
-    )
-    .map_err(|error| {
-        anyhow::anyhow!(
-            "{REGISTRATION_EVIDENCE_REQUIRED}: failed to read the discovery evidence artifact \
-             ({}): {error}. Registration accepts deployment identities only from an artifact \
-             produced by `instance observe`; hand-typed values are never trusted",
-            from_discovery.display()
-        )
-    })?;
-    if raw.is_empty() {
-        bail!(
-            "{REGISTRATION_EVIDENCE_REQUIRED}: the evidence artifact is empty. Produce one with \
-             `instance observe`; hand-typed deployment identities are never accepted"
-        );
-    }
-    let evidence: DiscoveryEvidence = serde_json::from_slice(&raw).map_err(|error| {
-        anyhow::anyhow!(
-            "{REGISTRATION_EVIDENCE_REQUIRED}: {} does not parse as discovery evidence emitted \
-             by `instance observe` ({error}); hand-typed deployment identities are never accepted",
-            from_discovery.display()
-        )
-    })?;
-    evidence
-        .validate()
-        .map_err(|error| anyhow::anyhow!("{REGISTRATION_EVIDENCE_REQUIRED}: {error}"))?;
-
-    // Mutations always live-resolve: the cached envelope is re-proven against
-    // the host before the record is created (task B06/B07).
-    let host = context
-        .store
-        .host_by_id(evidence.host_id)?
-        .with_context(|| {
-            format!(
-                "the registry no longer contains host {} named by the evidence",
-                evidence.host_id
-            )
-        })?;
-    let target = context.target_for(&host)?;
-    let live = live_probe(target.as_ref())
-        .context("live re-verification failed; nothing was registered")?;
-    if live != evidence.hello {
-        bail!(
-            "{EVIDENCE_IDENTITY_DRIFT}: the live helper identity differs from the evidence \
-             artifact.\n  evidence: {}\n  live:     {}\nRe-run `instance observe` to capture a \
-             fresh artifact; stale envelopes are never silently accepted.",
-            summarize_hello(&evidence.hello),
-            summarize_hello(&live)
-        );
-    }
-
-    let record = context
-        .store
-        .register_instance(
-            &evidence,
-            alias,
-            ObservationCache::now(true, summarize_hello(&live)),
-        )
-        .context("registration failed; nothing was changed")?;
-    Ok(format!(
-        "registered instance '{}' (deployment {}) on host '{}'\nlive helper identity verified against the evidence\nobservation recorded\n",
-        record.alias, record.deployment_id, host.alias
-    ))
-}
-
 fn instance_rename(
     context: &FleetContext,
     source: &InstanceSelector,
@@ -899,13 +799,20 @@ fn instance_relocate(
 }
 
 #[cfg(test)]
+use crate::filesystem;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::target::{
         ControlOperationReceipt, ControlOperationRequest, HealthSnapshot, HostOverview, HostResult,
     };
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     // ---------- scripted target double ----------
 
@@ -924,7 +831,7 @@ mod tests {
 
     struct FakeTarget {
         scenario: Scenario,
-        calls: Rc<Cell<usize>>,
+        calls: Arc<AtomicUsize>,
     }
 
     impl FakeTarget {
@@ -998,12 +905,12 @@ mod tests {
         }
 
         fn inspect_instance(&self, deployment_id: &str) -> anyhow::Result<InstanceInspection> {
-            self.calls.set(self.calls.get() + 1);
+            self.calls.fetch_add(1, Ordering::Relaxed);
             self.inspection(deployment_id)
         }
 
         fn execute_host_operation(&self, operation: &HostOperation) -> anyhow::Result<HostResult> {
-            self.calls.set(self.calls.get() + 1);
+            self.calls.fetch_add(1, Ordering::Relaxed);
             if let Scenario::Offline(text) = self.scenario {
                 bail!("{text}");
             }
@@ -1044,7 +951,7 @@ mod tests {
 
     // ---------- fixtures ----------
 
-    type SharedCalls = Rc<Cell<usize>>;
+    type SharedCalls = Arc<AtomicUsize>;
 
     struct Fixture {
         _temp: filesystem::PrivateTempDir,
@@ -1061,7 +968,7 @@ mod tests {
         fn with_host_scenarios(pick: Box<dyn Fn(&HostRecord) -> Scenario>) -> anyhow::Result<Self> {
             let temp = filesystem::PrivateTempDir::new("nazauthctl-fleet-test")?;
             let store = RegistryStore::open(temp.path().join("registry"))?;
-            let calls: SharedCalls = Rc::new(Cell::new(0));
+            let calls: SharedCalls = Arc::new(AtomicUsize::new(0));
             let calls_for_factory = calls.clone();
             let context = FleetContext::new(
                 store,
@@ -1121,7 +1028,11 @@ mod tests {
             observation.summary.starts_with("helper="),
             "{observation:?}"
         );
-        assert_eq!(fixture.calls.get(), 2, "one hello plus one ping");
+        assert_eq!(
+            fixture.calls.load(Ordering::Relaxed),
+            2,
+            "one hello plus one ping"
+        );
         Ok(())
     }
 
@@ -1142,10 +1053,7 @@ mod tests {
         let error = host_add(&drift.context, "server-b", "prod-b", HostPrivilege::Direct)
             .expect_err("mismatched helper");
         let rendered = format!("{error:#}");
-        assert!(
-            rendered.contains(HOST_ERR_REMOTE_HELPER_MISMATCH),
-            "{rendered}"
-        );
+        assert!(rendered.contains(REMOTE_HELPER_MISMATCH), "{rendered}");
         assert!(drift.store().host_by_alias("server-b")?.is_none());
         Ok(())
     }
@@ -1165,7 +1073,11 @@ mod tests {
             error.to_string().contains("duplicate host alias"),
             "{error}"
         );
-        assert_eq!(fixture.calls.get(), 0, "duplicate never reaches the wire");
+        assert_eq!(
+            fixture.calls.load(Ordering::Relaxed),
+            0,
+            "duplicate never reaches the wire"
+        );
         Ok(())
     }
 
@@ -1175,11 +1087,18 @@ mod tests {
         fixture.seed_ssh_host("server-a", "prod-a")?;
         let report = host_list(&fixture.context, false)?;
         assert!(report.contains("never observed"), "{report}");
-        assert_eq!(fixture.calls.get(), 0, "default list never goes live");
+        assert_eq!(
+            fixture.calls.load(Ordering::Relaxed),
+            0,
+            "default list never goes live"
+        );
 
         let report = host_list(&fixture.context, true)?;
         assert!(report.contains("fresh ("), "{report}");
-        assert!(fixture.calls.get() > 0, "refresh went live");
+        assert!(
+            fixture.calls.load(Ordering::Relaxed) > 0,
+            "refresh went live"
+        );
         Ok(())
     }
 
@@ -1285,96 +1204,15 @@ mod tests {
         assert!(report.contains("no remote operation"), "{report}");
         assert!(fixture.store().host_by_alias("server-a")?.is_none());
         assert!(fixture.store().list_instances()?.is_empty());
-        assert_eq!(fixture.calls.get(), 0, "forget is registry-only");
+        assert_eq!(
+            fixture.calls.load(Ordering::Relaxed),
+            0,
+            "forget is registry-only"
+        );
         Ok(())
     }
 
     // ---------- B04 instance commands ----------
-
-    #[test]
-    fn observe_emits_evidence_that_register_accepts_exactly_once() -> anyhow::Result<()> {
-        let fixture = Fixture::with_scenario(Scenario::Online)?;
-        let host = fixture.seed_ssh_host("server-a", "prod-a")?;
-        let evidence_path = fixture._temp.path().join("evidence.json");
-
-        let report = instance_observe(
-            &fixture.context,
-            "server-a",
-            "deploy-alpha",
-            "https://auth.example.com",
-            &evidence_path,
-        )?;
-        assert!(report.contains("evidence written"), "{report}");
-
-        let report = instance_register(&fixture.context, &evidence_path, Some("prod"))?;
-        assert!(report.contains("registered instance 'prod'"), "{report}");
-        let record = fixture.store().instance_by_alias("prod")?.expect("stored");
-        assert_eq!(record.host_id, host.host_id);
-        assert!(record.last_observation.is_some());
-
-        let error =
-            instance_register(&fixture.context, &evidence_path, None).expect_err("duplicate");
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains("relocate"), "{rendered}");
-        Ok(())
-    }
-
-    #[test]
-    fn register_rejects_missing_and_malformed_evidence_with_stable_codes() -> anyhow::Result<()> {
-        let fixture = Fixture::with_scenario(Scenario::Online)?;
-        let missing = fixture._temp.path().join("absent.json");
-        let error = instance_register(&fixture.context, &missing, None).expect_err("missing");
-        assert!(
-            error.to_string().contains(REGISTRATION_EVIDENCE_REQUIRED),
-            "{error}"
-        );
-
-        let garbage = fixture._temp.path().join("garbage.json");
-        filesystem::atomic_write(
-            &garbage,
-            b"{\"deployment_id\": \"typo\", \"issuer\": \"x\"}",
-            0o600,
-        )?;
-        let error =
-            instance_register(&fixture.context, &garbage, None).expect_err("hand-written json");
-        let rendered = error.to_string();
-        assert!(
-            rendered.contains(REGISTRATION_EVIDENCE_REQUIRED),
-            "{rendered}"
-        );
-        assert!(rendered.contains("never accepted"), "{rendered}");
-        assert_eq!(fixture.calls.get(), 0, "bad evidence never reaches a host");
-        Ok(())
-    }
-
-    #[test]
-    fn register_rejects_evidence_whose_live_identity_drifted() -> anyhow::Result<()> {
-        let fixture = Fixture::with_scenario(Scenario::Online)?;
-        let host = fixture.seed_ssh_host("server-a", "prod-a")?;
-        let evidence_path = fixture._temp.path().join("evidence.json");
-        instance_observe(
-            &fixture.context,
-            "server-a",
-            "deploy-alpha",
-            "https://auth.example.com",
-            &evidence_path,
-        )?;
-
-        // Same registry identity, but the live helper now answers with a
-        // drifted version — registration must fail closed.
-        let drifted = Fixture::with_scenario(Scenario::HelperDrift)?;
-        let mut twin = HostRecord::new_ssh("server-a", "prod-a", HostPrivilege::Direct)?;
-        twin.host_id = host.host_id;
-        drifted.store().add_host(twin)?;
-        let error = instance_register(&drifted.context, &evidence_path, None).expect_err("drift");
-        let rendered = format!("{error:#}");
-        assert!(
-            rendered.contains(HOST_ERR_REMOTE_HELPER_MISMATCH),
-            "{rendered}"
-        );
-        assert!(drifted.store().list_instances()?.is_empty());
-        Ok(())
-    }
 
     #[test]
     fn instance_forget_warns_on_controller_bindings_but_never_revokes() -> anyhow::Result<()> {
@@ -1415,7 +1253,11 @@ mod tests {
             },
         )?;
         assert!(!report.contains("warning:"), "{report}");
-        assert_eq!(fixture.calls.get(), 0, "forget never contacts targets");
+        assert_eq!(
+            fixture.calls.load(Ordering::Relaxed),
+            0,
+            "forget never contacts targets"
+        );
         Ok(())
     }
 
@@ -1445,7 +1287,7 @@ mod tests {
         let error = instance_forget(&fixture.context, &InstanceSelector::default())
             .expect_err("ambiguous mutation");
         let rendered = error.to_string();
-        assert!(rendered.contains(INSTANCE_SELECTOR_REQUIRED), "{rendered}");
+        assert!(rendered.contains(INSTANCE_AMBIGUOUS), "{rendered}");
         assert!(rendered.contains("alpha"), "{rendered}");
         assert!(rendered.contains("beta"), "{rendered}");
 
@@ -1468,7 +1310,7 @@ mod tests {
             let error = resolve_instance(fixture.store(), Some(selector), "test")
                 .expect_err("fuzzy selection");
             assert!(
-                error.to_string().contains(INSTANCE_SELECTOR_UNKNOWN),
+                error.to_string().contains(INSTANCE_NOT_REGISTERED),
                 "{selector}: {error}"
             );
         }
@@ -1492,7 +1334,11 @@ mod tests {
         let report = instance_list(&fixture.context, false)?;
         assert!(report.contains("fresh ("), "{report}");
         assert!(report.contains("helper verified"), "{report}");
-        assert_eq!(fixture.calls.get(), 0, "cache-only list stays offline");
+        assert_eq!(
+            fixture.calls.load(Ordering::Relaxed),
+            0,
+            "cache-only list stays offline"
+        );
         Ok(())
     }
 
@@ -1514,7 +1360,7 @@ mod tests {
         fixture.store().add_instance(record)?;
 
         // Cheap guards fire before any live contact.
-        let calls_after_guards = fixture.calls.get();
+        let calls_after_guards = fixture.calls.load(Ordering::Relaxed);
         let error = instance_relocate(
             &fixture.context,
             &InstanceSelector {
@@ -1536,7 +1382,7 @@ mod tests {
         .expect_err("unknown target");
         assert!(error.to_string().contains("unknown target host"), "{error}");
         assert_eq!(
-            fixture.calls.get(),
+            fixture.calls.load(Ordering::Relaxed),
             calls_after_guards,
             "guards precede the network"
         );

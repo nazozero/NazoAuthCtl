@@ -96,7 +96,7 @@ fn parse_artifact_plan_invocation(
                 .context("artifact plan arguments must be valid UTF-8")
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    if values.first().map(String::as_str) != Some("conformance")
+    if values.first().map(String::as_str) != Some("oidf")
         || values.get(1).map(String::as_str) != Some("artifact")
         || values.get(2).map(String::as_str) != Some("plan")
     {
@@ -121,9 +121,9 @@ fn parse_artifact_plan_invocation(
         let option = values[index].as_str();
         if !matches!(
             option,
-            "--trust-policy" | "--cache-dir" | "--digest" | "--capability" | "--group" | "--plan"
+            "--trust-policy" | "--cache-dir" | "--digest" | "--require" | "--group" | "--plan"
         ) {
-            bail!("unknown conformance artifact plan option: {option}");
+            bail!("unknown oidf artifact plan option: {option}");
         }
         let value = values
             .get(index + 1)
@@ -133,7 +133,7 @@ fn parse_artifact_plan_invocation(
             "--trust-policy" => set_once(&mut trust_policy, PathBuf::from(value), option)?,
             "--cache-dir" => set_once(&mut cache_directory, PathBuf::from(value), option)?,
             "--digest" => set_once(&mut manifest_digest, value, option)?,
-            "--capability" => push_unique(&mut capabilities, value, option)?,
+            "--require" => push_unique(&mut capabilities, value, option)?,
             "--group" => push_unique_vec(&mut groups, value, option)?,
             "--plan" => push_unique_vec(&mut plans, value, option)?,
             _ => unreachable!(),
@@ -168,7 +168,7 @@ fn execute_artifact_plan(invocation: ArtifactPlanInvocation) -> anyhow::Result<(
 
 fn print_artifact_plan_help() {
     println!(
-        "Usage:\n  nazoauthctl conformance artifact plan --trust-policy PATH --cache-dir PATH --digest SHA256 [--capability NAME ...] [--group ID ...] [--plan ID ...]\n\nThis is a read-only, offline inspection plan. It revalidates one exact cached artifact and compiles exact signed Matrix selections. Caller-supplied capability names are not attested negotiation. The output is explicitly not deployment-bound or executable and creates no run journal or resources."
+        "Usage:\n  nazoauthctl oidf artifact plan --trust-policy PATH --cache-dir PATH --digest SHA256 [--require NAME ...] [--group ID ...] [--plan ID ...]\n\nThis is a read-only, offline inspection plan. It revalidates one exact cached artifact and compiles exact signed Matrix selections. Caller-supplied capability names are not attested negotiation. The output is explicitly not deployment-bound or executable and creates no run journal or resources."
     );
 }
 
@@ -192,7 +192,7 @@ fn parse_artifact_open_invocation(
                 .context("artifact cache arguments must be valid UTF-8")
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    if values.first().map(String::as_str) != Some("conformance")
+    if values.first().map(String::as_str) != Some("oidf")
         || values.get(1).map(String::as_str) != Some("artifact")
         || values.get(2).map(String::as_str) != Some("open")
     {
@@ -215,9 +215,9 @@ fn parse_artifact_open_invocation(
         let option = values[index].as_str();
         if !matches!(
             option,
-            "--trust-policy" | "--cache-dir" | "--digest" | "--capability"
+            "--trust-policy" | "--cache-dir" | "--digest" | "--require"
         ) {
-            bail!("unknown conformance artifact open option: {option}");
+            bail!("unknown oidf artifact open option: {option}");
         }
         let value = values
             .get(index + 1)
@@ -231,9 +231,9 @@ fn parse_artifact_open_invocation(
                 set_once(&mut cache_directory, PathBuf::from(value), option)?;
             }
             "--digest" => set_once(&mut manifest_digest, value, option)?,
-            "--capability" => {
+            "--require" => {
                 if !capabilities.insert(value) {
-                    bail!("--capability values must be unique");
+                    bail!("--require values must be unique");
                 }
             }
             _ => unreachable!(),
@@ -273,7 +273,7 @@ fn execute_artifact_open(invocation: ArtifactOpenInvocation) -> anyhow::Result<(
 
 fn print_artifact_open_help() {
     println!(
-        "Usage:\n  nazoauthctl conformance artifact open --trust-policy PATH --cache-dir PATH --digest SHA256 [--capability NAME ...]\n\nThe command performs no network request or mutation. It opens only the exact immutable digest entry and revalidates its commit record, source, ES256 signature, current validity window, Suite identity, declarative driver and Matrix digests/sizes/schemas, resource bounds, engine protocol, and every caller-supplied capability requirement."
+        "Usage:\n  nazoauthctl oidf artifact open --trust-policy PATH --cache-dir PATH --digest SHA256 [--require NAME ...]\n\nThe command performs no network request or mutation. It opens only the exact immutable digest entry and revalidates its commit record, source, ES256 signature, current validity window, Suite identity, declarative driver and Matrix digests/sizes/schemas, resource bounds, engine protocol, and every caller-supplied capability requirement."
     );
 }
 
@@ -297,7 +297,7 @@ fn parse_artifact_resolve_invocation(
                 .context("artifact resolution arguments must be valid UTF-8")
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    if values.first().map(String::as_str) != Some("conformance")
+    if values.first().map(String::as_str) != Some("oidf")
         || values.get(1).map(String::as_str) != Some("artifact")
         || values.get(2).map(String::as_str) != Some("resolve")
     {
@@ -320,9 +320,9 @@ fn parse_artifact_resolve_invocation(
         let option = values[index].as_str();
         if !matches!(
             option,
-            "--trust-policy" | "--manifest-url" | "--cache-dir" | "--capability"
+            "--trust-policy" | "--manifest-url" | "--cache-dir" | "--require"
         ) {
-            bail!("unknown conformance artifact resolve option: {option}");
+            bail!("unknown oidf artifact resolve option: {option}");
         }
         let value = values
             .get(index + 1)
@@ -336,9 +336,9 @@ fn parse_artifact_resolve_invocation(
             "--cache-dir" => {
                 set_once(&mut cache_directory, PathBuf::from(value), option)?;
             }
-            "--capability" => {
+            "--require" => {
                 if !capabilities.insert(value) {
-                    bail!("--capability values must be unique");
+                    bail!("--require values must be unique");
                 }
             }
             _ => unreachable!(),
@@ -378,7 +378,7 @@ fn execute_artifact_resolve(invocation: ArtifactResolveInvocation) -> anyhow::Re
 
 fn print_artifact_resolve_help() {
     println!(
-        "Usage:\n  nazoauthctl conformance artifact resolve --trust-policy PATH --manifest-url HTTPS_URL --cache-dir PATH [--capability NAME ...]\n\nThe command fetches a bounded manifest without redirects, verifies it before following the signed declarative driver and Matrix URLs, verifies both exact payloads, and commits an immutable owner-only cache entry with a final verified record marker. It performs no NazoAuth or Suite mutation."
+        "Usage:\n  nazoauthctl oidf artifact resolve --trust-policy PATH --manifest-url HTTPS_URL --cache-dir PATH [--require NAME ...]\n\nThe command fetches a bounded manifest without redirects, verifies it before following the signed declarative driver and Matrix URLs, verifies both exact payloads, and commits an immutable owner-only cache entry with a final verified record marker. It performs no NazoAuth or Suite mutation."
     );
 }
 
@@ -403,7 +403,7 @@ fn parse_artifact_verify_invocation(
                 .context("artifact verification arguments must be valid UTF-8")
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    if values.first().map(String::as_str) != Some("conformance")
+    if values.first().map(String::as_str) != Some("oidf")
         || values.get(1).map(String::as_str) != Some("artifact")
         || values.get(2).map(String::as_str) != Some("verify")
     {
@@ -427,9 +427,9 @@ fn parse_artifact_verify_invocation(
         let option = values[index].as_str();
         if !matches!(
             option,
-            "--trust-policy" | "--manifest" | "--driver" | "--matrix" | "--capability"
+            "--trust-policy" | "--manifest" | "--driver" | "--matrix" | "--require"
         ) {
-            bail!("unknown conformance artifact verify option: {option}");
+            bail!("unknown oidf artifact verify option: {option}");
         }
         let value = values
             .get(index + 1)
@@ -442,9 +442,9 @@ fn parse_artifact_verify_invocation(
             "--manifest" => set_once(&mut manifest, PathBuf::from(value), option)?,
             "--driver" => set_once(&mut driver, PathBuf::from(value), option)?,
             "--matrix" => set_once(&mut matrix, PathBuf::from(value), option)?,
-            "--capability" => {
+            "--require" => {
                 if !capabilities.insert(value) {
-                    bail!("--capability values must be unique");
+                    bail!("--require values must be unique");
                 }
             }
             _ => unreachable!(),
@@ -500,7 +500,7 @@ fn current_unix_time() -> anyhow::Result<i64> {
 
 fn print_artifact_verify_help() {
     println!(
-        "Usage:\n  nazoauthctl conformance artifact verify --trust-policy PATH --manifest PATH --driver PATH --matrix PATH [--capability NAME ...]\n\nThe command performs no NazoAuth or Suite mutation. It emits a verified identity only after the local trust policy, ES256 signature, source, validity window, Suite identity, declarative driver digest/size/schema, matrix digest/size/schema, resource bounds, and all required capabilities have been accepted."
+        "Usage:\n  nazoauthctl oidf artifact verify --trust-policy PATH --manifest PATH --driver PATH --matrix PATH [--require NAME ...]\n\nThe command performs no NazoAuth or Suite mutation. It emits a verified identity only after the local trust policy, ES256 signature, source, validity window, Suite identity, declarative driver digest/size/schema, matrix digest/size/schema, resource bounds, and all required capabilities have been accepted."
     );
 }
 
@@ -577,7 +577,7 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
             _ => unreachable!(),
         }
     }
-    if values.first().map(String::as_str) != Some("conformance")
+    if values.first().map(String::as_str) != Some("oidf")
         || values.get(1).map(String::as_str) != Some("run")
     {
         return Ok(None);
@@ -722,7 +722,7 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
                 upload_review_screenshots = true;
                 index += 1;
             }
-            _ => bail!("unknown conformance run option: {option}"),
+            _ => bail!("unknown oidf run option: {option}"),
         }
     }
     let token_sources = usize::from(token.is_some())
@@ -862,7 +862,7 @@ mod tests {
         let digest = "a".repeat(64);
         let parsed = parse_artifact_open_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "artifact",
             "open",
             "--trust-policy",
@@ -871,7 +871,7 @@ mod tests {
             "/var/lib/nazoauthctl/oidf-cache",
             "--digest",
             &digest,
-            "--capability",
+            "--require",
             "nazoauth.client.create",
         ]))
         .expect("parse")
@@ -883,7 +883,7 @@ mod tests {
         );
         assert!(parsed.capabilities.contains("nazoauth.client.create"));
         assert!(
-            parse_run_invocation(&args(&["nazoauthctl", "conformance", "artifact", "open",]))
+            parse_run_invocation(&args(&["nazoauthctl", "oidf", "artifact", "open",]))
                 .expect("run parser")
                 .is_none()
         );
@@ -891,7 +891,7 @@ mod tests {
         assert!(
             parse_artifact_open_invocation(&args(&[
                 "nazoauthctl",
-                "conformance",
+                "oidf",
                 "artifact",
                 "open",
                 "--trust-policy",
@@ -904,7 +904,7 @@ mod tests {
         assert!(
             parse_artifact_open_invocation(&args(&[
                 "nazoauthctl",
-                "conformance",
+                "oidf",
                 "artifact",
                 "open",
                 "--trust-policy",
@@ -913,9 +913,9 @@ mod tests {
                 "/cache",
                 "--digest",
                 &digest,
-                "--capability",
+                "--require",
                 "nazoauth.client.create",
-                "--capability",
+                "--require",
                 "nazoauth.client.create",
             ]))
             .is_err()
@@ -927,7 +927,7 @@ mod tests {
         let digest = "a".repeat(64);
         let parsed = parse_artifact_plan_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "artifact",
             "plan",
             "--trust-policy",
@@ -936,7 +936,7 @@ mod tests {
             "/var/lib/nazoauthctl/oidf-cache",
             "--digest",
             &digest,
-            "--capability",
+            "--require",
             "nazoauth.client.create",
             "--group",
             "oidc",
@@ -950,7 +950,7 @@ mod tests {
         assert_eq!(parsed.selection.plans, ["p001"]);
         assert!(parsed.capabilities.contains("nazoauth.client.create"));
         assert!(
-            parse_run_invocation(&args(&["nazoauthctl", "conformance", "artifact", "plan"]))
+            parse_run_invocation(&args(&["nazoauthctl", "oidf", "artifact", "plan"]))
                 .expect("run parser")
                 .is_none()
         );
@@ -962,7 +962,7 @@ mod tests {
         assert!(
             parse_artifact_plan_invocation(&args(&[
                 "nazoauthctl",
-                "conformance",
+                "oidf",
                 "artifact",
                 "plan",
                 "--trust-policy",
@@ -972,11 +972,11 @@ mod tests {
             ]))
             .is_err()
         );
-        for option in ["--capability", "--group", "--plan"] {
+        for option in ["--require", "--group", "--plan"] {
             assert!(
                 parse_artifact_plan_invocation(&args(&[
                     "nazoauthctl",
-                    "conformance",
+                    "oidf",
                     "artifact",
                     "plan",
                     "--trust-policy",
@@ -1000,7 +1000,7 @@ mod tests {
     fn artifact_verify_is_a_separate_non_deployment_command() {
         let parsed = parse_artifact_verify_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "artifact",
             "verify",
             "--trust-policy",
@@ -1011,7 +1011,7 @@ mod tests {
             "/tmp/driver.json",
             "--matrix",
             "/tmp/matrix.json",
-            "--capability",
+            "--require",
             "nazoauth.client.create",
         ]))
         .expect("parse")
@@ -1023,11 +1023,9 @@ mod tests {
         assert!(parsed.capabilities.contains("nazoauth.client.create"));
         assert_eq!(parsed.driver, PathBuf::from("/tmp/driver.json"));
         assert!(
-            parse_run_invocation(&args(
-                &["nazoauthctl", "conformance", "artifact", "verify",]
-            ))
-            .expect("run parser")
-            .is_none()
+            parse_run_invocation(&args(&["nazoauthctl", "oidf", "artifact", "verify",]))
+                .expect("run parser")
+                .is_none()
         );
     }
 
@@ -1036,7 +1034,7 @@ mod tests {
         assert!(
             parse_artifact_verify_invocation(&args(&[
                 "nazoauthctl",
-                "conformance",
+                "oidf",
                 "artifact",
                 "verify",
                 "--trust-policy",
@@ -1047,7 +1045,7 @@ mod tests {
         assert!(
             parse_artifact_verify_invocation(&args(&[
                 "nazoauthctl",
-                "conformance",
+                "oidf",
                 "artifact",
                 "verify",
                 "--trust-policy",
@@ -1058,9 +1056,9 @@ mod tests {
                 "/driver.json",
                 "--matrix",
                 "/matrix.json",
-                "--capability",
+                "--require",
                 "nazoauth.client.create",
-                "--capability",
+                "--require",
                 "nazoauth.client.create",
             ]))
             .is_err()
@@ -1071,7 +1069,7 @@ mod tests {
     fn artifact_resolve_requires_trust_channel_cache_and_unique_capabilities() {
         let parsed = parse_artifact_resolve_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "artifact",
             "resolve",
             "--trust-policy",
@@ -1080,7 +1078,7 @@ mod tests {
             "https://artifacts.example/oidf/stable/driver.jws",
             "--cache-dir",
             "/var/lib/nazoauthctl/oidf-cache",
-            "--capability",
+            "--require",
             "nazoauth.client.create",
         ]))
         .expect("parse")
@@ -1098,7 +1096,7 @@ mod tests {
         assert!(
             parse_artifact_resolve_invocation(&args(&[
                 "nazoauthctl",
-                "conformance",
+                "oidf",
                 "artifact",
                 "resolve",
                 "--trust-policy",
@@ -1111,7 +1109,7 @@ mod tests {
         assert!(
             parse_artifact_resolve_invocation(&args(&[
                 "nazoauthctl",
-                "conformance",
+                "oidf",
                 "artifact",
                 "resolve",
                 "--trust-policy",
@@ -1120,9 +1118,9 @@ mod tests {
                 "https://artifacts.example/driver.jws",
                 "--cache-dir",
                 "/cache",
-                "--capability",
+                "--require",
                 "nazoauth.client.create",
-                "--capability",
+                "--require",
                 "nazoauth.client.create",
             ]))
             .is_err()
@@ -1137,7 +1135,7 @@ mod tests {
             "prod",
             "--config",
             "/x/update.json",
-            "conformance",
+            "oidf",
             "run",
             "--trust-policy",
             "/x/trust.json",
@@ -1184,7 +1182,7 @@ mod tests {
     fn review_screenshot_capture_requires_an_explicit_evidence_directory() {
         let error = parse_run_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "run",
             "--trust-policy",
             "/x/trust.json",
@@ -1205,7 +1203,7 @@ mod tests {
     fn review_screenshot_upload_requires_capture_and_certification_retention() {
         let error = parse_run_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "run",
             "--trust-policy",
             "/x/trust.json",
@@ -1231,7 +1229,7 @@ mod tests {
         for jobs in ["0", "5"] {
             let error = match parse_run_invocation(&args(&[
                 "nazoauthctl",
-                "conformance",
+                "oidf",
                 "run",
                 "--trust-policy",
                 "/x/trust.json",
@@ -1255,7 +1253,7 @@ mod tests {
     fn run_rejects_poll_timeout_above_the_validated_bound() {
         let error = match parse_run_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "run",
             "--trust-policy",
             "/x/trust.json",
@@ -1280,7 +1278,7 @@ mod tests {
 
     #[test]
     fn run_requires_exact_ordinary_identity_and_rejects_lease_options() {
-        let missing = parse_run_invocation(&args(&["nazoauthctl", "conformance", "run"]));
+        let missing = parse_run_invocation(&args(&["nazoauthctl", "oidf", "run"]));
         let missing = match missing {
             Err(error) => error,
             Ok(_) => panic!("ordinary identity is required"),
@@ -1289,7 +1287,7 @@ mod tests {
 
         let lease = parse_run_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "run",
             "--trust-policy",
             "/x/trust.json",
@@ -1309,12 +1307,12 @@ mod tests {
         assert!(
             lease
                 .to_string()
-                .contains("unknown conformance run option: --lease-ttl")
+                .contains("unknown oidf run option: --lease-ttl")
         );
 
         let uppercase_digest = parse_run_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "run",
             "--trust-policy",
             "/x/trust.json",
@@ -1337,7 +1335,7 @@ mod tests {
 
         let noncanonical_tenant = parse_run_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "run",
             "--trust-policy",
             "/x/trust.json",
@@ -1359,7 +1357,7 @@ mod tests {
     fn proxy_trust_bundle_and_reload_executable_are_atomic_pair() {
         let missing_reload = parse_run_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "run",
             "--trust-policy",
             "/x/trust.json",
@@ -1376,7 +1374,7 @@ mod tests {
 
         let parsed = parse_run_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "run",
             "--trust-policy",
             "/x/trust.json",
@@ -1407,7 +1405,7 @@ mod tests {
     fn explicit_webdrivers_are_distinct_and_one_per_job() {
         let one = parse_run_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "run",
             "--trust-policy",
             "/x/trust.json",
@@ -1426,7 +1424,7 @@ mod tests {
 
         let duplicate = parse_run_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "run",
             "--trust-policy",
             "/x/trust.json",
@@ -1447,7 +1445,7 @@ mod tests {
 
         let distinct = parse_run_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "run",
             "--trust-policy",
             "/x/trust.json",
@@ -1473,7 +1471,7 @@ mod tests {
     fn token_sources_are_mutually_exclusive() {
         let result = parse_run_invocation(&args(&[
             "nazoauthctl",
-            "conformance",
+            "oidf",
             "run",
             "--token",
             "secret",

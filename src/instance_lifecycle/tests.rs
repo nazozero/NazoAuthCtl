@@ -252,7 +252,7 @@ impl Fixture {
         let context = LifecycleContext {
             registry,
             factory: Box::new(move |_record| {
-                Ok(Box::new(target.clone()) as Box<dyn ExecutionTarget>)
+                Ok(Box::new(target.clone()) as Box<dyn ExecutionTarget + Send>)
             }),
         };
         Ok(Self {

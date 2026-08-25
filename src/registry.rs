@@ -50,7 +50,10 @@ const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 /// Stable error code emitted when any registry file cannot be parsed as the
 /// current schema. The only supported remedy is backing up salvageable files
 /// and clearing the registry store; no fallback parsing exists.
-pub const STATE_RESET_REQUIRED: &str = "STATE_RESET_REQUIRED";
+///
+/// Canonical name lives in [`crate::error_codes`]; re-exported here so every
+/// historical call site keeps one stable path.
+pub use crate::error_codes::STATE_RESET_REQUIRED;
 
 /// Maximum length of a user-facing selector or reference string.
 const MAX_KEY_CHARS: usize = 128;

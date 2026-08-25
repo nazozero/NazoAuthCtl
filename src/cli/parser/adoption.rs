@@ -7,7 +7,7 @@ use crate::deployment::{
     Capability, CapabilityGrant, CapabilityGrants, ResourceScope, Responsibility,
 };
 
-use super::super::types::{PermissionOptions, RelinquishOptions};
+use super::super::legacy_types::{PermissionOptions, RelinquishOptions};
 use super::common::take_yes;
 
 pub(super) fn parse_adoption(values: Vec<String>) -> anyhow::Result<AdoptionOptions> {

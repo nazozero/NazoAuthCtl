@@ -1,35 +1,41 @@
-//! Token parser for the command-line façade.
+//! Token parser for the final 18-command façade (goal plan 09 §1, I01).
 //!
 //! Command families own their option state and boundary checks in sibling modules.  This module
-//! only consumes global options and routes the remaining tokens to the family parser, preserving
-//! the existing `Cli::parse` contract and diagnostics.
+//! only consumes global options and routes the remaining tokens to the family parser. The frozen
+//! pre-goal parsers (`admin`, `adoption`, `install`, `keys`, `tls`, `transaction`, `update`)
+//! stay compiled for the frozen legacy runner until J deletes them; argv cannot reach them.
 
+#[allow(dead_code)]
 mod admin;
+#[allow(dead_code)]
 mod adoption;
 mod common;
 mod controller;
 mod fleet;
+#[allow(dead_code)]
 mod install;
+#[allow(dead_code)]
 mod keys;
+mod surface;
+#[allow(dead_code)]
 mod tls;
+#[allow(dead_code)]
 mod transaction;
+#[allow(dead_code)]
 mod update;
 
 use std::{env, path::PathBuf};
 
 use anyhow::{Context, bail};
 
-use super::types::*;
-use admin::parse_bootstrap_admin;
-use adoption::{parse_adoption, parse_permission_options, parse_relinquish_options};
-use common::{no_arguments, parse_candidate_target, parse_version_option, parse_yes, take_yes};
+use super::types::{self, Cli, Command};
+use common::{no_arguments, parse_version_option, parse_yes, take_yes};
 use controller::parse_controller;
 use fleet::{parse_host, parse_instance};
-use install::parse_install;
-use keys::parse_keys;
-use tls::parse_tls;
-use transaction::{parse_transaction_evidence, parse_transaction_resume};
-use update::parse_update_options;
+use surface::{
+    parse_backup, parse_bind, parse_bootstrap_admin_args, parse_install_args,
+    parse_read_view_selector, parse_update_args,
+};
 
 impl Cli {
     pub(crate) fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Self>> {
@@ -40,13 +46,9 @@ impl Cli {
             return Ok(None);
         }
         let globals = super::parse_global_options(&values)?;
-        let mut config = env::var_os("NAZOAUTH_UPDATE_CONFIG")
+        let config = env::var_os("NAZOAUTH_UPDATE_CONFIG")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG));
-        if let Some(global_config) = globals.config {
-            config = global_config;
-        }
-        let deployment = globals.deployment;
+            .unwrap_or_else(|| PathBuf::from(types::DEFAULT_CONFIG));
         values.drain(..globals.consumed);
         if values
             .iter()
@@ -57,193 +59,76 @@ impl Cli {
         let command = values.first().cloned().context("a command is required")?;
         values.remove(0);
         let command = match command.as_str() {
-            "discover" => {
-                no_arguments(&values, "discover")?;
-                Command::Discover
-            }
-            "adopt" => Command::Adopt(parse_adoption(values)?),
-            "deployments" if values == ["list"] => Command::DeploymentsList,
-            "transaction" if values == ["show"] => Command::TransactionShow,
-            "transaction" if values.first().is_some_and(|value| value == "evidence") => {
-                values.remove(0);
-                let (file, yes) = parse_transaction_evidence(values)?;
-                Command::TransactionEvidence { file, yes }
-            }
-            "transaction" if values.first().is_some_and(|value| value == "resume") => {
-                values.remove(0);
-                let (yes, accept_migration_barrier) = parse_transaction_resume(values)?;
-                Command::TransactionResume {
-                    yes,
-                    accept_migration_barrier,
-                }
-            }
-            "permissions" if values.first().is_some_and(|value| value == "set") => {
-                values.remove(0);
-                Command::PermissionsSet(parse_permission_options(values)?)
-            }
-            "relinquish" => Command::Relinquish(parse_relinquish_options(values)?),
-            "reconcile" => {
-                no_arguments(&values, "reconcile")?;
-                Command::Reconcile
-            }
-            "install" => Command::Install(Box::new(parse_install(values)?)),
-            "bootstrap-admin" => Command::BootstrapAdmin(parse_bootstrap_admin(values)?),
-            "status" => {
-                no_arguments(&values, "status")?;
-                Command::Status
-            }
-            "doctor" => {
-                no_arguments(&values, "doctor")?;
-                Command::Doctor
-            }
-            "check" => Command::Check(parse_version_option(values)?),
-            "update" => Command::Update(parse_update_options(values)?),
-            "development" if values.first().is_some_and(|value| value == "activate") => {
-                values.remove(0);
-                let mut artifact = None;
-                let mut yes = false;
-                let mut index = 0;
-                while index < values.len() {
-                    match values[index].as_str() {
-                        "--artifact" => {
-                            let value = values.get(index + 1).context(
-                                "--artifact requires a local image reference or binary path",
-                            )?;
-                            if value.is_empty() || value.len() > 4096 || value.contains('\0') {
-                                bail!("development artifact reference is invalid");
-                            }
-                            if artifact.replace(value.clone()).is_some() {
-                                bail!("--artifact may be specified only once");
-                            }
-                            index += 2;
-                        }
-                        "--yes" => {
-                            if yes {
-                                bail!("development activate --yes may be specified only once");
-                            }
-                            yes = true;
-                            index += 1;
-                        }
-                        other => bail!("unknown development activate option {other}"),
-                    }
-                }
-                Command::DevelopmentActivate(DevelopmentActivateOptions {
-                    artifact: artifact
-                        .context("development activate requires --artifact IMAGE_OR_BINARY")?,
-                    yes,
-                })
-            }
-            "rollback" => Command::Rollback {
-                yes: parse_yes(values, "rollback")?,
-            },
-            "recover" => Command::Recover {
-                yes: parse_yes(values, "recover")?,
-            },
-            "recover-update" => Command::RecoverUpdate {
-                yes: parse_yes(values, "recover-update")?,
-            },
-            "recover-identity" => Command::RecoverIdentity {
-                yes: parse_yes(values, "recover-identity")?,
-            },
-            "migrate" => {
-                let (values, yes) = take_yes(values)?;
-                Command::Migrate {
-                    yes,
-                    candidate: parse_candidate_target(values)?,
-                }
-            }
-            "keys" => Command::Keys(parse_keys(values)?),
+            // ---- primary 18-command surface --------------------------------
             "host" => Command::Host(parse_host(values)?),
             "instance" => Command::Instance(parse_instance(values)?),
             "controller" => Command::Controller(parse_controller(values)?),
-            "tls" => Command::Tls(parse_tls(values)?),
-            "audit" if values == ["verify"] => Command::AuditVerify,
-            "audit" if values.first().is_some_and(|value| value == "show") => {
-                values.remove(0);
-                let request_id = if values.is_empty() {
-                    None
-                } else if values.len() == 2 && values[0] == "--request-id" {
-                    let value = values[1].clone();
-                    if value.is_empty()
-                        || value.len() > 128
-                        || !value.chars().all(|character| {
-                            character.is_ascii_alphanumeric() || "._-".contains(character)
-                        })
-                    {
-                        bail!("audit request ID is unsafe");
+            "install" => Command::Install(parse_install_args(values)?),
+            "discover" => {
+                let parsed = fleet::parse_options(values.to_vec(), &["--host"], &[], "discover")?;
+                no_arguments(&parsed.positionals, "discover")?;
+                Command::Discover {
+                    host: parsed.values.get("--host").cloned(),
+                }
+            }
+            "bind" => Command::Bind(parse_bind(values)?),
+            "status" => {
+                let (selector, all) = parse_read_view_selector(values, "status")?;
+                Command::Status { selector, all }
+            }
+            "logs" => Command::Logs {
+                selector: parse_read_view_selector(values, "logs")?.0,
+            },
+            "doctor" => {
+                let (selector, all) = parse_read_view_selector(values, "doctor")?;
+                Command::Doctor { selector, all }
+            }
+            "verify" => Command::Verify {
+                selector: parse_read_view_selector(values, "verify")?.0,
+            },
+            "update" => Command::Update(parse_update_args(values)?),
+            "rollback" => {
+                let (selector, yes) =
+                    surface::parse_confirm_scoped(values, &["--yes"], "rollback")?;
+                Command::Rollback { selector, yes }
+            }
+            "operation" => {
+                let parsed = fleet::parse_options(values.to_vec(), &["--limit"], &[], "operation")?;
+                let parts = surface::selector_from_parsed(&parsed)?;
+                let limit = match parsed.values.get("--limit") {
+                    Some(raw) => {
+                        let value = raw.parse::<usize>().context("--limit must be an integer")?;
+                        if value == 0 || value > 1000 {
+                            bail!("--limit must be between 1 and 1000");
+                        }
+                        value
                     }
-                    Some(value)
-                } else {
-                    bail!("audit show accepts only --request-id ID");
+                    None => 20,
                 };
-                Command::AuditShow { request_id }
-            }
-            "identity" if values.first().is_some_and(|value| value == "rotate") => {
-                values.remove(0);
-                Command::IdentityRotate {
-                    yes: parse_yes(values, "identity rotate")?,
+                Command::Operation {
+                    selector: parts,
+                    limit,
                 }
             }
-            "break-glass"
-                if values
-                    .first()
-                    .is_some_and(|value| value == "controller-availability") =>
-            {
-                values.remove(0);
-                no_arguments(&values, "break-glass controller-availability")?;
-                Command::BreakGlassControllerAvailability
+            "policy" => {
+                no_arguments(&values, "policy")?;
+                Command::Policy
             }
-            "break-glass"
-                if values
-                    .first()
-                    .is_some_and(|value| value == "rehearse-controller-loss") =>
-            {
-                values.remove(0);
-                Command::BreakGlassRehearseControllerLoss {
-                    yes: parse_yes(values, "break-glass controller-loss rehearsal")?,
-                }
+            "backup" => Command::Backup(parse_backup(values)?),
+            "recover" => Command::Recover {
+                selector: parse_read_view_selector(values, "recover")?.0,
+            },
+            "uninstall" => {
+                let (selector, yes) =
+                    surface::parse_confirm_scoped(values, &["--yes"], "uninstall")?;
+                Command::Uninstall { selector, yes }
             }
-            "break-glass"
-                if values
-                    .first()
-                    .is_some_and(|value| value == "recover-controller") =>
-            {
+            // ---- final-model maintenance surface ---------------------------
+            "bootstrap-admin" => Command::BootstrapAdmin(parse_bootstrap_admin_args(values)?),
+            "remote" if values.first().is_some_and(|value| value == "exec") => {
                 values.remove(0);
-                let mut yes = false;
-                let mut reason = None;
-                let mut index = 0;
-                while index < values.len() {
-                    match values[index].as_str() {
-                        "--yes" => {
-                            if yes {
-                                bail!(
-                                    "break-glass recover-controller --yes may be specified only once"
-                                );
-                            }
-                            yes = true;
-                            index += 1;
-                        }
-                        "--reason" => {
-                            if reason.is_some() {
-                                bail!("--reason may be specified only once");
-                            }
-                            reason = Some(
-                                values
-                                    .get(index + 1)
-                                    .context("--reason requires lost or stolen")?
-                                    .clone(),
-                            );
-                            index += 2;
-                        }
-                        other => bail!("unknown break-glass option {other}"),
-                    }
-                }
-                let reason =
-                    reason.context("break-glass recovery requires --reason lost|stolen")?;
-                if !matches!(reason.as_str(), "lost" | "stolen") {
-                    bail!("--reason must be lost or stolen");
-                }
-                Command::BreakGlassRecover { yes, reason }
+                no_arguments(&values, "remote exec")?;
+                Command::RemoteExec
             }
             "self" if values.first().is_some_and(|value| value == "check") => {
                 values.remove(0);
@@ -263,16 +148,15 @@ impl Cli {
                     yes: parse_yes(values, "self rollback")?,
                 }
             }
-            "remote" if values.first().is_some_and(|value| value == "exec") => {
-                values.remove(0);
-                no_arguments(&values, "remote exec")?;
-                Command::RemoteExec
-            }
-            other => bail!("unknown command {other}"),
+            other => bail!(
+                "unknown command {other}; run `nazoauthctl --help` to see the current surface"
+            ),
         };
         Ok(Some(Self {
             config,
-            deployment,
+            deployment: None,
+            instance: globals.instance,
+            json: globals.json,
             command,
         }))
     }

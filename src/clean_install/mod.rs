@@ -22,6 +22,13 @@
 mod initial_admin;
 mod public_verify;
 
+// CLI-surface re-exports (I wave): the dispatcher consumes these without the
+// private module paths.
+pub(crate) use initial_admin::{
+    AdminCredentials, CurlInitialAdminTransport, LocalBootstrapMaterial, claim_initial_admin,
+};
+pub(crate) use public_verify::{CurlPublicProber, verify_public};
+
 use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
@@ -34,9 +41,9 @@ use crate::registry::{
     validate_registry_key as validate_key,
 };
 use crate::target::{
-    DEPLOYMENT_UNKNOWN, ExecutionTarget, HOST_ERR_REMOTE_HELPER_MISMATCH, HostCompletionBody,
-    HostOperation, HostOutcome, HostResult, InstallOrder, OfficialArtifactRef, PlannedSecret,
-    Resource, ResourceOwnership, ResourceScope, RuntimeSurface, StateMutationPayload,
+    DEPLOYMENT_UNKNOWN, ExecutionTarget, HostCompletionBody, HostOperation, HostOutcome,
+    HostResult, InstallOrder, OfficialArtifactRef, PlannedSecret, REMOTE_HELPER_MISMATCH, Resource,
+    ResourceOwnership, ResourceScope, RuntimeSurface, StateMutationPayload,
 };
 
 /// Official server release repository pinned for clean installs.
@@ -73,7 +80,7 @@ pub(crate) struct CleanInstallRequest {
 /// Injectable context mirroring the fleet command context: the user-scoped
 /// registry plus a way to reach hosts. Tests substitute scripted targets.
 pub(crate) type TargetFactory =
-    dyn Fn(&crate::registry::HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget>>;
+    dyn Fn(&crate::registry::HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>>;
 
 pub(crate) struct CleanInstallContext {
     pub(crate) registry: RegistryStore,
@@ -93,7 +100,7 @@ impl CleanInstallContext {
     fn target_for(
         &self,
         record: &crate::registry::HostRecord,
-    ) -> anyhow::Result<Box<dyn ExecutionTarget>> {
+    ) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> {
         (self.factory)(record)
     }
 }
@@ -413,9 +420,7 @@ fn interpret_result(result: &HostResult) -> anyhow::Result<&crate::target::Insta
             bail!("the target answered an unexpected completion instead of an install receipt")
         }
         HostOutcome::Failed { code, detail } => {
-            if code == HOST_ERR_REMOTE_HELPER_MISMATCH
-                || detail.contains(HOST_ERR_REMOTE_HELPER_MISMATCH)
-            {
+            if code == REMOTE_HELPER_MISMATCH || detail.contains(REMOTE_HELPER_MISMATCH) {
                 bail!("{code}: {detail}")
             }
             bail!("install failed on the target and was rolled back locally: {code}: {detail}")

@@ -111,15 +111,18 @@ pub fn build_signed_control_operation_with_id(
     let record = resolve_instance(registry, instance_selector)?;
     let key_ref = record.controller_key_ref.as_deref().with_context(|| {
         format!(
-            "instance '{}' has no bound controller key; run the bind flow first",
+            "{}: instance '{}' has no bound controller key; run `nazoauthctl bind --instance {}` first",
+            crate::error_codes::CONTROL_BINDING_REQUIRED,
+            record.alias,
             record.alias
         )
     })?;
     let ref_deployment = deployment_from_key_ref(key_ref)?;
     if ref_deployment != record.deployment_id {
         bail!(
-            "instance '{}' carries controller key ref for deployment '{ref_deployment}' but is \
+            "{}: instance '{}' carries controller key ref for deployment '{ref_deployment}' but is \
              registered as '{}'; refusing to sign with mismatched binding",
+            crate::error_codes::CONTROL_BINDING_REQUIRED,
             record.alias,
             record.deployment_id
         );
@@ -389,7 +392,13 @@ mod tests {
         f.registry.add_instance(bare)?;
         let error = build_signed_control_operation(&f.registry, &f.keys, "bare", sample_input())
             .expect_err("unbound instance");
-        assert!(error.to_string().contains("bind flow"), "{error}");
+        assert!(
+            error.to_string().contains("has no bound controller key")
+                && error
+                    .to_string()
+                    .contains("nazoauthctl bind --instance bare"),
+            "{error}"
+        );
 
         // Misbound: ref points at another deployment's directory.
         let mut misbound = InstanceRecord::new(

@@ -53,7 +53,7 @@ pub const CONFIG_PATH_OCCUPIED: &str = "CONFIG_PATH_OCCUPIED";
 pub const CONFIG_INVALID: &str = "CONFIG_INVALID";
 pub const SECRET_PROVISION_FAILED: &str = "SECRET_PROVISION_FAILED";
 pub const RUNTIME_START_FAILED: &str = "RUNTIME_START_FAILED";
-pub const EMBEDDED_IDENTITY_MISMATCH: &str = "EMBEDDED_IDENTITY_MISMATCH";
+pub const TARGET_IDENTITY_MISMATCH: &str = "TARGET_IDENTITY_MISMATCH";
 pub const HEALTH_PROBE_FAILED: &str = "HEALTH_PROBE_FAILED";
 
 /// Closed vocabulary of target-generated secret files. The control side names
@@ -535,7 +535,7 @@ fn start_container_runtime(
         // An object under our name that is NOT the verified artifact is a
         // conflict, never a silent replacement target.
         return Err(Failure::new(
-            EMBEDDED_IDENTITY_MISMATCH,
+            TARGET_IDENTITY_MISMATCH,
             format!(
                 "runtime object '{}' already exists serving a different artifact ({})",
                 job.runtime_object,
@@ -597,7 +597,7 @@ fn start_container_runtime(
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
     if !observed.running || observed.artifact != artifact_reference(&image, &digest) {
         return Err(Failure::new(
-            EMBEDDED_IDENTITY_MISMATCH,
+            TARGET_IDENTITY_MISMATCH,
             "the started runtime does not serve the verified artifact",
         ));
     }

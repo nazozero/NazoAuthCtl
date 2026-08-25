@@ -303,39 +303,55 @@ pub(crate) fn active_local_oci_candidate_build_target(
     validate_active_local_oci_candidate_runtime(record, config, &candidate, local_artifact_id)
 }
 
-pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
-    let configured_path = cli.config.clone();
-    let selector = cli.deployment.clone();
-    match cli.command {
-        Command::Discover => {
+/// Frozen pre-goal dispatcher. Argv cannot reach it any more (I01); it stays
+/// compiled so the legacy handler bodies keep building until J deletes them
+/// together with this function and [`crate::cli::legacy_types`].
+#[allow(dead_code)]
+pub(crate) fn run_legacy(
+    configured_path: PathBuf,
+    selector: Option<String>,
+    command: LegacyCommand,
+) -> anyhow::Result<()> {
+    match command {
+        LegacyCommand::Discover => {
             let report = crate::discovery::discover()?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
         // Internal fixed stdio executor (goal plan 03 §3.2). Runs on the
         // target machine — no legacy lock, no controller state access.
-        Command::RemoteExec => crate::target::remote_exec::run_stdio(),
+        LegacyCommand::RemoteExec => crate::target::remote_exec::run_stdio(),
         // Fleet registry commands (goal plan 02): user-scoped store, their own
         // registry lock, no lifecycle lock and no root requirement.
-        Command::Host(command) => crate::fleet::run_host(command),
-        Command::Instance(command) => crate::fleet::run_instance(command),
+        LegacyCommand::Host(command) => crate::fleet::run_host(command),
+        LegacyCommand::Instance(command) => {
+            // The final surface (09 §1) owns `instance`; argv can no longer
+            // reach this arm. Kept compiling until J-phase removes it.
+            let _ = command;
+            anyhow::bail!(
+                "{}: the legacy instance surface was replaced by `nazoauthctl instance`",
+                crate::error_codes::NOT_IMPLEMENTED_BEFORE_K_PHASE
+            );
+        }
         // Controller identity lifecycle (goal plan 04 D04–D09): user-scoped
         // Registry + key store; the only network peer is the instance issuer's
         // admin surface. No root and no legacy lock for the same reasons.
-        Command::Controller(command) => crate::controller_identity::lifecycle::run_command(command),
-        Command::Adopt(options) => {
+        LegacyCommand::Controller(command) => {
+            crate::controller_identity::lifecycle::run_command_legacy(command)
+        }
+        LegacyCommand::Adopt(options) => {
             require_root()?;
             crate::adoption::run(options)
         }
-        Command::DeploymentsList => list_deployments(),
-        Command::TransactionShow => {
+        LegacyCommand::DeploymentsList => list_deployments(),
+        LegacyCommand::TransactionShow => {
             let store = DeploymentStore::system();
             let record = store.resolve(selector.as_deref(), false)?;
             let transaction = crate::coordination::show(&store, &record)?;
             println!("{}", serde_json::to_string_pretty(&transaction)?);
             Ok(())
         }
-        Command::TransactionEvidence { file, yes } => {
+        LegacyCommand::TransactionEvidence { file, yes } => {
             require_root()?;
             require_confirmation(yes, "accept deployment-bound external step evidence")?;
             let store = DeploymentStore::system();
@@ -346,7 +362,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&transaction)?);
             Ok(())
         }
-        Command::TransactionResume {
+        LegacyCommand::TransactionResume {
             yes,
             accept_migration_barrier,
         } => {
@@ -419,15 +435,15 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&transaction)?);
             Ok(())
         }
-        Command::PermissionsSet(options) => {
+        LegacyCommand::PermissionsSet(options) => {
             require_root()?;
             require_confirmation(options.yes, "change deployment capability grants")?;
             let store = DeploymentStore::system();
             let record = store.resolve(selector.as_deref(), true)?;
             reject_registered_local_oci_candidate_mutation(&record)?;
-            crate::governance::set_permissions(cli.deployment.as_deref(), &options.changes)
+            crate::governance::set_permissions(selector.as_deref(), &options.changes)
         }
-        Command::Relinquish(options) => {
+        LegacyCommand::Relinquish(options) => {
             require_root()?;
             require_confirmation(
                 options.yes,
@@ -436,20 +452,20 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             let store = DeploymentStore::system();
             let record = store.resolve(selector.as_deref(), true)?;
             reject_registered_local_oci_candidate_mutation(&record)?;
-            crate::governance::relinquish(cli.deployment.as_deref(), &options.capabilities)
+            crate::governance::relinquish(selector.as_deref(), &options.capabilities)
         }
-        Command::Reconcile => crate::governance::reconcile(cli.deployment.as_deref()),
-        Command::Install(options) => install(cli.config, *options),
-        Command::Status => {
+        LegacyCommand::Reconcile => crate::governance::reconcile(selector.as_deref()),
+        LegacyCommand::Install(options) => install(configured_path, *options),
+        LegacyCommand::Status => {
             let store = crate::deployment::DeploymentStore::system();
             match store.registry_present() {
                 Ok(true) => {
-                    let record = store.resolve(cli.deployment.as_deref(), false)?;
+                    let record = store.resolve(selector.as_deref(), false)?;
                     registered_status(&record, false)
                 }
-                Ok(false) => status(&load_config(&cli.config)?),
+                Ok(false) => status(&load_config(&configured_path)?),
                 Err(error) => {
-                    let config = load_config_unsettled(&cli.config)?;
+                    let config = load_config_unsettled(&configured_path)?;
                     if deployment::local_oci_candidate_install_is_pending(&config)? {
                         return status(&config);
                     }
@@ -457,16 +473,16 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Doctor => {
+        LegacyCommand::Doctor => {
             let store = crate::deployment::DeploymentStore::system();
             match store.registry_present() {
                 Ok(true) => {
-                    let record = store.resolve(cli.deployment.as_deref(), false)?;
+                    let record = store.resolve(selector.as_deref(), false)?;
                     registered_status(&record, true)
                 }
-                Ok(false) => doctor(&load_config(&cli.config)?),
+                Ok(false) => doctor(&load_config(&configured_path)?),
                 Err(error) => {
-                    let config = load_config_unsettled(&cli.config)?;
+                    let config = load_config_unsettled(&configured_path)?;
                     if deployment::local_oci_candidate_install_is_pending(&config)? {
                         return doctor(&config);
                     }
@@ -474,7 +490,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
-        Command::BootstrapAdmin(options) => {
+        LegacyCommand::BootstrapAdmin(options) => {
             require_root()?;
             let context = control_config(
                 &configured_path,
@@ -487,7 +503,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             require_confirmation(options.yes, "create the first NazoAuth administrator")?;
             bootstrap_admin(&context.config, options)
         }
-        Command::Check(version) => {
+        LegacyCommand::Check(version) => {
             if DeploymentStore::system().registry_present()? {
                 let record = DeploymentStore::system().resolve(selector.as_deref(), false)?;
                 return registered_update_plan(
@@ -519,7 +535,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 },
             )
         }
-        Command::Update(options) => {
+        LegacyCommand::Update(options) => {
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
                 let record = store.resolve(selector.as_deref(), !options.plan)?;
@@ -555,7 +571,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 update(&context.path, &context.config, options)
             }
         }
-        Command::DevelopmentActivate(options) => {
+        LegacyCommand::DevelopmentActivate(options) => {
             require_root()?;
             require_confirmation(
                 options.yes,
@@ -665,7 +681,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Command::Rollback { yes } => {
+        LegacyCommand::Rollback { yes } => {
             require_root()?;
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
@@ -704,7 +720,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             )?;
             public_rollback(&context.config)
         }
-        Command::Recover { yes } => {
+        LegacyCommand::Recover { yes } => {
             require_root()?;
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
@@ -745,7 +761,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             )?;
             recover_from_backup(&context.config)
         }
-        Command::RecoverUpdate { yes } => {
+        LegacyCommand::RecoverUpdate { yes } => {
             require_root()?;
             if DeploymentStore::system().registry_present()? {
                 let store = DeploymentStore::system();
@@ -865,7 +881,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             recover_pending_update(&context.path, &context.config)?;
             load_config(&context.path).map(|_| ())
         }
-        Command::RecoverIdentity { yes } => {
+        LegacyCommand::RecoverIdentity { yes } => {
             require_root()?;
             let mut context = control_config(
                 &configured_path,
@@ -883,7 +899,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             crate::operator::recover_pending_rotation(&context.path, &mut context.config)?;
             load_config(&context.path).map(|_| ())
         }
-        Command::Migrate { yes, candidate } => {
+        LegacyCommand::Migrate { yes, candidate } => {
             require_root()?;
             let context = control_config(
                 &configured_path,
@@ -901,7 +917,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 app_command(&context.config, TaskOperation::MigrateApply, None)
             }
         }
-        Command::Keys(command) => {
+        LegacyCommand::Keys(command) => {
             require_root()?;
             let context = control_config(
                 &configured_path,
@@ -953,13 +969,13 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             }
             result
         }
-        Command::Tls(command) => crate::tls::run(
+        LegacyCommand::Tls(command) => crate::tls::run(
             selector.as_deref(),
             command,
             require_root,
             require_confirmation,
         ),
-        Command::AuditVerify => {
+        LegacyCommand::AuditVerify => {
             if let Some((store, record, config)) = registered_audit_context(selector.as_deref())? {
                 let (governance_sequence, governance_head) =
                     crate::governance::verify_management_audit(&store, &record)?;
@@ -997,7 +1013,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 crate::operator::verify_audit(&context.config)
             }
         }
-        Command::AuditShow { request_id } => {
+        LegacyCommand::AuditShow { request_id } => {
             if let Some((store, record, config)) = registered_audit_context(selector.as_deref())? {
                 let governance = crate::governance::management_audit_entries(
                     &store,
@@ -1031,7 +1047,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 crate::operator::show_audit(&context.config, request_id.as_deref())
             }
         }
-        Command::IdentityRotate { yes } => {
+        LegacyCommand::IdentityRotate { yes } => {
             require_root()?;
             let context = control_config(
                 &configured_path,
@@ -1064,7 +1080,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 &expected,
             )
         }
-        Command::BreakGlassControllerAvailability => {
+        LegacyCommand::BreakGlassControllerAvailability => {
             require_root()?;
             let context = control_config(
                 &configured_path,
@@ -1076,7 +1092,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             )?;
             crate::operator::report_controller_availability(&context.config).map(|_| ())
         }
-        Command::BreakGlassRehearseControllerLoss { yes } => {
+        LegacyCommand::BreakGlassRehearseControllerLoss { yes } => {
             require_root()?;
             let context = control_config(
                 &configured_path,
@@ -1116,7 +1132,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 &expected,
             )
         }
-        Command::BreakGlassRecover { yes, reason } => {
+        LegacyCommand::BreakGlassRecover { yes, reason } => {
             require_root()?;
             let context = control_config(
                 &configured_path,
@@ -1167,13 +1183,13 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 &expected,
             )
         }
-        Command::SelfCheck(version) => controller_check(version.as_deref()),
-        Command::SelfUpdate { version, yes } => {
+        LegacyCommand::SelfCheck(version) => controller_check(version.as_deref()),
+        LegacyCommand::SelfUpdate { version, yes } => {
             require_root()?;
             require_confirmation(yes, "replace nazoauthctl with a signed controller Release")?;
             controller_update(version.as_deref())
         }
-        Command::SelfRollback { yes } => {
+        LegacyCommand::SelfRollback { yes } => {
             require_root()?;
             require_confirmation(yes, "restore the previous signed nazoauthctl binary")?;
             controller_rollback()

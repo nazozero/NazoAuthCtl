@@ -11,20 +11,13 @@ pub(crate) fn help_topic(args: &[String]) -> Option<HelpTopic> {
     }
     let command = values.get(globals.consumed).map(String::as_str);
     Some(match command {
+        Some("host") => HelpTopic::Host,
+        Some("instance") => HelpTopic::Instance,
+        Some("controller") => HelpTopic::Controller,
         Some("install") => HelpTopic::Install,
+        Some("update" | "rollback" | "uninstall" | "verify") => HelpTopic::Update,
+        Some("self") => HelpTopic::SelfUpdate,
         Some("bootstrap-admin") => HelpTopic::BootstrapAdmin,
-        Some(
-            "update" | "check" | "rollback" | "recover" | "recover-update" | "recover-identity"
-            | "migrate",
-        ) => HelpTopic::Update,
-        Some("keys") => HelpTopic::Keys,
-        Some("conformance") => HelpTopic::Conformance,
-        Some("tls") => HelpTopic::Tls,
-        Some("audit") => HelpTopic::Audit,
-        Some("identity") => HelpTopic::Identity,
-        Some("break-glass") => HelpTopic::BreakGlass,
-        Some("controller") => HelpTopic::ControllerIdentity,
-        Some("self") => HelpTopic::Controller,
         _ => HelpTopic::TopLevel,
     })
 }

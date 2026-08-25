@@ -4,8 +4,9 @@ use anyhow::{Context, bail};
 
 use crate::model::semantic_tag;
 
-use super::super::types::CandidateTarget;
+use super::super::legacy_types::CandidateTarget;
 
+#[allow(dead_code)] // legacy parser helper; dies with legacy_types in J
 pub(super) fn parse_candidate_target(
     values: Vec<String>,
 ) -> anyhow::Result<Option<CandidateTarget>> {

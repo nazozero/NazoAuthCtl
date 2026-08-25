@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 
-use super::super::types::KeysCommand;
+use super::super::legacy_types::KeysCommand;
 use super::common::{parse_named_options, take_yes};
 
 pub(super) fn parse_keys(values: Vec<String>) -> anyhow::Result<KeysCommand> {

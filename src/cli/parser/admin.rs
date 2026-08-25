@@ -1,6 +1,6 @@
 use anyhow::bail;
 
-use super::super::types::BootstrapAdminOptions;
+use super::super::legacy_types::BootstrapAdminOptions;
 
 pub(super) fn parse_bootstrap_admin(values: Vec<String>) -> anyhow::Result<BootstrapAdminOptions> {
     let mut credentials_stdin = false;

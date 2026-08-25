@@ -28,6 +28,11 @@ mod update;
 #[cfg(test)]
 mod tests;
 
+// CLI-surface re-exports (I wave).
+pub(crate) use rollback::run_rollback;
+pub(crate) use uninstall::run_uninstall;
+pub(crate) use update::{UpdateRequest, run_update};
+
 use anyhow::Context as _;
 
 use crate::fleet::{live_probe, production_target, resolve_instance};
@@ -41,7 +46,8 @@ pub(crate) const SERVER_REPOSITORY: &str = "nazozero/NazoAuth";
 
 /// Injectable context mirroring the clean-install context: the user-scoped
 /// registry plus a way to reach hosts. Tests substitute scripted targets.
-pub(crate) type TargetFactory = dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget>>;
+pub(crate) type TargetFactory =
+    dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>>;
 
 pub(crate) struct LifecycleContext {
     pub(crate) registry: RegistryStore,
@@ -58,7 +64,7 @@ impl LifecycleContext {
         })
     }
 
-    fn target_for(&self, record: &HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget>> {
+    fn target_for(&self, record: &HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> {
         (self.factory)(record)
     }
 }
@@ -73,7 +79,7 @@ fn resolve_live_instance(
 ) -> anyhow::Result<(
     crate::registry::InstanceRecord,
     HostRecord,
-    Box<dyn ExecutionTarget>,
+    Box<dyn ExecutionTarget + Send>,
     InstanceInspection,
 )> {
     let record = resolve_instance(&context.registry, selector, action)?;

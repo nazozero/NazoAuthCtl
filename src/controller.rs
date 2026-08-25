@@ -25,8 +25,8 @@ use crate::deployment::{
 };
 use crate::{
     backup::Backup,
-    cli::{
-        BootstrapAdminOptions, CandidateTarget, Cli, Command, KeysCommand,
+    cli::legacy_types::{
+        BootstrapAdminOptions, CandidateTarget, Command as LegacyCommand, KeysCommand,
         LocalOciCandidateInstall, UpdateOptions,
     },
     filesystem::{atomic_write, open_lock_file, remove_file_durable, set_mode, symlink_atomic},
@@ -46,10 +46,14 @@ mod commands;
 mod deployment;
 mod diagnostics;
 mod keys;
+#[allow(unused_imports)] // J-phase removes the frozen dispatch together with its tests
+pub(crate) use commands::run_legacy;
 pub(crate) use keys::{
     extract_openid4vc_trust_anchors, managed_openid4vc_bundle_path, read_managed_openid4vc_bundle,
 };
 mod self_update;
+mod surface_run;
+pub(crate) use surface_run::run;
 mod updates;
 use bootstrap::*;
 use deployment::*;
@@ -686,15 +690,13 @@ impl std::fmt::Display for BootstrapOutcomeUnknown {
 
 impl std::error::Error for BootstrapOutcomeUnknown {}
 
-pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
-    commands::run(cli)
-}
-
-pub(crate) fn acquire_lock(command: &Command) -> anyhow::Result<File> {
+#[allow(dead_code)] // J-phase removes the legacy global lock with its tests
+pub(crate) fn acquire_lock(command: &LegacyCommand) -> anyhow::Result<File> {
     deployment::acquire_lock(command)
 }
 
-pub(crate) fn uses_legacy_lock(command: &Command) -> bool {
+#[allow(dead_code)] // J-phase removes the legacy global lock with its tests
+pub(crate) fn uses_legacy_lock(command: &LegacyCommand) -> bool {
     updates::recovery_uses_legacy_lock(command)
 }
 

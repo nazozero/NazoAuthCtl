@@ -532,7 +532,8 @@ impl fmt::Display for AdminApiError {
             Self::SlotLimit(summaries) => {
                 write!(
                     formatter,
-                    "CONTROLLER_SLOT_LIMIT: the deployment already has three unrevoked controller slots; revoke one first. Active slots:"
+                    "{}: the deployment already has three unrevoked controller slots; revoke one first. Active slots:",
+                    crate::error_codes::CONTROLLER_SLOT_LIMIT
                 )?;
                 for summary in summaries {
                     write!(

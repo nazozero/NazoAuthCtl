@@ -1,134 +1,109 @@
-# NazoAuthCtl
+# nazoauthctl
 
-`nazoauthctl` is the independently built host controller for NazoAuth. It owns
-installation, signed update, rollback, recovery, runtime orchestration,
-operator-task issuance and verification, controller audit state, diagnostics,
-and the bootstrap-admin client.
+`nazoauthctl` is the local and SSH-remote, multi-host, multi-instance operator
+console for [NazoAuth](https://github.com/nazozero/NazoAuth). One console
+remembers every host and instance you register; the target machine always stays
+the authority for its own runtime state.
 
-The NazoAuth server remains the authority for application migrations, production
-keys, consistency leases, and the `operator-task` executor. Protocol types are
-not copied here: this repository consumes `nazo-operator-protocol` from an exact
-NazoAuth commit and an exact package version.
-
-## Trust and recovery boundary
-
-- Normal application management (`migrate`, `keys`, and `conformance`) may run a
-  signed one-shot `nazoauth operator-task` when the selected server artifact is
-  still executable.
-- `rollback`, `recover`, `recover-update`, `recover-identity`, backup restore,
-  and activation of the previous trusted artifact must not require the running
-  NazoAuth HTTP service, the current container, the current server binary, or an
-  operator-task.
-- Controller journals, audit state, trusted Release metadata, and cached recovery
-  artifacts live outside the NazoAuth application mounts.
-- A controller on the same machine cannot recover a lost machine. That boundary
-  requires a separately stored, encrypted off-host recovery package.
-
-See [architecture](docs/architecture.md), [recovery boundaries](docs/recovery.md),
-[discovery and adoption](docs/discovery-adoption.md),
-[signed OIDF driver artifacts](docs/oidf-artifacts.md), and
-[compatibility](docs/compatibility.md). The strict manual-deployment input is
-documented in the [lifecycle contract](docs/lifecycle-contract.md).
-Deployment-owned public certificate rotation uses the independent
-[TLS certificate provider contract](docs/tls-certificate-provider.md). Public
-certificate issuance through a preconfigured HTTP-01 webroot is defined by the
-[ACME issuance contract](docs/tls-acme-http01.md).
-
-On Linux, install an independently attested Release with GitHub CLI available:
-
-```sh
-sudo ./scripts/install_nazoauthctl.sh --version v0.1.47
+```text
+                      |- local host
+                      |- SSH server-a -- NazoAuth production
+Operator -> nazoauthctl|- SSH server-b -- NazoAuth staging
+                      |- SSH server-c -- NazoAuth test-1 / test-2
 ```
 
-The installer verifies the exact tag, repository, hosted release workflow, and
-GitHub build-provenance attestation before atomically replacing a regular
-install target. Other platforms use the corresponding attested Release asset.
+## The happy path
 
-## Existing deployments
-
-Discovery is read-only and does not require a controller registry:
-
-```sh
-nazoauthctl discover
-nazoauthctl adopt --target podman:actual-object-name --lifecycle /secure/deployment-lifecycle.json --plan
-nazoauthctl adopt --target podman:actual-object-name --lifecycle /secure/deployment-lifecycle.json --yes
-nazoauthctl deployments list
-nazoauthctl --deployment DEPLOYMENT_ID status
+```bash
+nazoauthctl host add server-a --ssh prod-a --privilege sudo
+nazoauthctl install --host server-a --name production --public-url https://auth.example.com
+nazoauthctl bind --instance production
+nazoauthctl status
+nazoauthctl update
+nazoauthctl instance list
+nazoauthctl status --all
 ```
 
-Adoption records trust; it does not silently take ownership. Runtime, artifact,
-configuration, database, Valkey, operator-task, backup, and proxy/TLS authority
-are granted separately as `external`, `delegated`, or `managed`. Mixed updates
-persist their plan and pause at external steps:
+That is the whole deployment story: register the host, install, bind a
+Controller Key, operate. `install` commits as soon as the target reports local
+health - public DNS/TLS verification (`verify`) and backup setup are separate
+next steps, never hidden gates.
 
-Manual deployments remain `observed` unless a deployment-bound lifecycle
-contract and recovery package pass an isolated restore rehearsal. The contract
-contains exact runtime replacement specifications and a digest-bound recovery
-driver; it contains credential references, never credential values. A successful
-rehearsal creates an adoption receipt and an offline trusted-runtime cache before
-the requested capability grants become active.
+## Commands
 
-```sh
-nazoauthctl --deployment DEPLOYMENT_ID update --yes
-nazoauthctl --deployment DEPLOYMENT_ID transaction show
-nazoauthctl --deployment DEPLOYMENT_ID transaction evidence --file evidence.json --yes
-nazoauthctl --deployment DEPLOYMENT_ID transaction resume --yes
-```
+| Command | Purpose |
+|---|---|
+| `host add/list/show/check/forget` | Register and inspect SSH targets or the local machine |
+| `instance list/show/rename/forget/relocate` | Inventory of NazoAuth deployments per host |
+| `controller list/add/rotate/revoke/recover` | Per-instance Controller Key lifecycle |
+| `install` | Clean install onto a registered host |
+| `discover` | Read-only sweep for existing NazoAuth deployments |
+| `bind` | Attach this console's Controller Key to an instance |
+| `status` / `doctor` | Live or cached fleet views (`--all`, `--json`) |
+| `verify` | Public TLS + issuer discovery report |
+| `update` / `rollback` | Crash-safe artifact/config lifecycle with one signed migration |
+| `operation` | Recent operation journal entries per instance |
+| `backup` | Backup maturity facts (informational) |
+| `uninstall` | Remove exactly the resources this deployment owns |
 
-Accepted evidence is digest-bound coordination input. It does not by itself
-claim that an external operation is semantically complete; final acceptance
-must still observe the declared issuer, artifact, readiness, and replica state.
-Controller-owned steps create a recovery checkpoint, activate each replica from
-the staged exact-digest cache, persist progress after every replica, verify the
-embedded Release identity, and atomically commit the new declaration. `rollback`
-only activates the previous artifact. `recover` also invokes the declared data
-restore. `recover-update` resumes the interrupted update journal.
+## Concepts you actually need
+
+**Hosts vs instances.** A *host* is a machine (local or an OpenSSH profile
+alias). An *instance* is one NazoAuth deployment on that host, identified by
+its immutable `deployment_id`; friendly aliases are selectors only.
+
+**System OpenSSH only.** Remote execution shells out to your installed `ssh`
+with your config, your agent, your `known_hosts`. ctl stores just the profile
+alias - no keys, no host-key databases, no daemons on targets. Host-key
+failures are OpenSSH failures, on purpose.
+
+**Controller Key (30 days).** Every instance trusts up to three Ed25519
+Controller Keys minted on the control machine; private keys never leave it.
+Every key expires after exactly 30 days and any lifecycle change needs a fresh
+administrator 2FA approval in NazoAuth. Expired keys fail admission;
+`controller rotate` replaces them.
+
+**Recovery Secret.** On first enrollment you receive a one-time offline secret
+(shown once, stored nowhere). If every Controller Key slot is lost,
+`controller recover` uses it to sign a challenge and reinstall exactly one new
+slot - nothing else. It is not a data backup and not an admin password.
+
+**forget / revoke / uninstall are three different things.**
+
+- `instance forget` - remove the local inventory entry only; the target keeps
+  running and its slots are untouched.
+- `controller revoke` - revoke one slot in NazoAuth; the instance and files
+  stay.
+- `uninstall` - delete exactly the managed, deployment-scoped resources after
+  showing you the plan. External/shared PostgreSQL, Valkey, and proxies are
+  never deleted.
+
+**Maturity, not gates.** Backup readiness and public reachability are reported
+facts with timestamps. They never block install/update/status.
+
+**Existing deployments.** `discover` sweeps a host read-only; adopting one
+records the facts the target itself reports and classifies everything that ctl
+did not provably create as external. `bind` then attaches your Controller Key.
+
+## Errors
+
+Failures carry stable codes (`HOST_UNREACHABLE`, `SSH_AUTH_FAILED`,
+`CONFIG_REVISION_MISMATCH`, `EXTERNAL_RESOURCE_PROTECTED`, ...) plus the next
+command to run. Use `--json` for machine-readable output with one result or
+error per instance.
 
 ## Development
 
 The published binary is `nazoauthctl`; CI formats, tests, lints, and builds the
-complete Cargo workspace. The server compatibility workflow downloads signed
-NazoAuth Release binaries and OCI images; it never rebuilds the server. Tagged
-controller Releases call that workflow with the exact tag commit and cannot
-publish unless the compatibility jobs succeed.
+complete Cargo workspace. Server compatibility jobs download signed NazoAuth
+Release binaries and OCI images; they never rebuild the server.
 
-An adopted deployment with managed runtime and artifact capabilities can also
-activate an unsigned artifact built on the same machine. This is a generic local
-development boundary for Podman, Docker, and systemd; it does not depend on
-GitHub or on a particular host. For example, from a NazoAuth checkout:
-
-```sh
-revision="$(git rev-parse HEAD)"
-short_revision="$(printf '%s' "$revision" | cut -c1-8)"
-podman build \
-  --build-arg "NAZOAUTH_BUILD_RELEASE=v0.2.0-dev.$short_revision" \
-  --build-arg "NAZOAUTH_BUILD_REVISION=$revision" \
-  --build-arg "NAZOAUTH_BUILD_ID=local:$revision" \
-  --tag "localhost/nazoauth:dev-$short_revision" \
-  .
-sudo nazoauthctl --deployment DEPLOYMENT_ID development activate \
-  --artifact "localhost/nazoauth:dev-$short_revision" --yes
+```bash
+cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --check
+cargo test --workspace
 ```
 
-The artifact must embed the current operator protocol, a full lowercase commit
-revision, an exact `local:<full-revision>` build ID, and a semantic prerelease
-containing the first eight revision characters. The controller resolves an OCI
-reference to its immutable local image ID (or hashes a local systemd binary),
-caches the previously active runtime, performs the existing managed replacement,
-and verifies the identity after activation. It deliberately does not run
-migrations, fetch or publish a GitHub Release, or update the signed Release trust
-floor. The normal `update` command remains the signed path back to a published
-Release. Conformance tasks detect this declared local mode and bind their
-one-shot task to the currently observed local build identity and OCI manifest
-digest; all other application tasks retain the signed Release expectation.
-
-```sh
-cargo fmt --all -- --check
-cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-cargo test --locked --workspace --all-targets --all-features
-cargo build --locked --workspace --all-targets --all-features
-```
-
-Controller Releases are built, tested, attested, and published only from this
-repository. A workflow dispatch performs the same six-platform build without
-publishing; only an exact version tag can create a Release.
+License: AGPL-3.0-or-later (see [LICENSES/AGPL-3.0-or-later.txt](LICENSES/AGPL-3.0-or-later.txt));
+commercial licensing in [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).

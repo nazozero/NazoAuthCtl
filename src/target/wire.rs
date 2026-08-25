@@ -81,12 +81,18 @@ pub const HOST_ERR_UNSUPPORTED_OPERATION: &str = "UNSUPPORTED_OPERATION";
 /// Stable failure code: the same `operation_id` was already accepted with a
 /// different canonical request hash (goal plan 01 rule 13). The retry must
 /// mint a new operation; the journal never overwrites the original intent.
-pub const HOST_ERR_OPERATION_CONFLICT: &str = "OPERATION_CONFLICT";
+///
+/// Canonical name lives in [`crate::error_codes`]; re-exported here so the
+/// historical call sites keep one stable path.
+pub use crate::error_codes::OPERATION_ID_CONFLICT;
 
 /// Stable failure code: the remote helper's product, wire schema, or build
 /// identity does not match this binary (task C08). No fallback exists; the
 /// only remedy is upgrading the helper on the target host.
-pub const HOST_ERR_REMOTE_HELPER_MISMATCH: &str = "REMOTE_HELPER_MISMATCH";
+///
+/// Canonical name lives in [`crate::error_codes`]; re-exported here so the
+/// historical call sites keep one stable path.
+pub use crate::error_codes::REMOTE_HELPER_MISMATCH;
 
 /// Stable rejection codes used when a transport cannot even parse a message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -110,24 +110,26 @@ pub(super) fn registered_status(
     Ok(())
 }
 
-pub(super) fn command_is_read_only(command: &Command) -> bool {
+#[allow(dead_code)] // J-phase removes the legacy read-only classification with its tests
+pub(super) fn command_is_read_only(command: &LegacyCommand) -> bool {
     match command {
-        Command::Discover
-        | Command::DeploymentsList
-        | Command::TransactionShow
-        | Command::Reconcile
-        | Command::Status
-        | Command::Doctor
-        | Command::Check(_)
-        | Command::AuditVerify
-        | Command::AuditShow { .. }
-        | Command::BreakGlassControllerAvailability => true,
-        Command::Update(options) => options.plan,
+        LegacyCommand::Discover
+        | LegacyCommand::DeploymentsList
+        | LegacyCommand::TransactionShow
+        | LegacyCommand::Reconcile
+        | LegacyCommand::Status
+        | LegacyCommand::Doctor
+        | LegacyCommand::Check(_)
+        | LegacyCommand::AuditVerify
+        | LegacyCommand::AuditShow { .. }
+        | LegacyCommand::BreakGlassControllerAvailability => true,
+        LegacyCommand::Update(options) => options.plan,
         _ => false,
     }
 }
 
-pub(super) fn acquire_lock(command: &Command) -> anyhow::Result<File> {
+#[allow(dead_code)] // J-phase removes the legacy global lock with its tests
+pub(super) fn acquire_lock(command: &LegacyCommand) -> anyhow::Result<File> {
     // Installation, update, identity rotation and break-glass recovery mutate
     // one lifecycle state machine and therefore must share one lock even when
     // a test or operator overrides its location.
@@ -161,7 +163,8 @@ pub(super) fn acquire_oidf_run_shared_lock_at(path: &Path) -> anyhow::Result<Fil
     }
 }
 
-pub(super) fn acquire_lock_at(path: &Path, command: &Command) -> anyhow::Result<File> {
+#[allow(dead_code)] // consumed by tests/unit/controller.rs until J deletes both
+pub(super) fn acquire_lock_at(path: &Path, command: &LegacyCommand) -> anyhow::Result<File> {
     let read_only = command_is_read_only(command);
     let file = open_lock_file(path, read_only, "lifecycle lock").with_context(|| {
         if read_only {
@@ -189,7 +192,7 @@ pub(super) fn acquire_lock_at(path: &Path, command: &Command) -> anyhow::Result<
 
 pub(super) fn install(
     config_path: PathBuf,
-    options: crate::cli::InstallOptions,
+    options: crate::cli::legacy_types::InstallOptions,
 ) -> anyhow::Result<()> {
     require_root()?;
     let mut config_present = match fs::symlink_metadata(&config_path) {

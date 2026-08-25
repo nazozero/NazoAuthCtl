@@ -34,7 +34,8 @@
 
 use anyhow::{Context as _, bail};
 
-use crate::cli::{ControllerCommand, InstanceSelector};
+use crate::cli::legacy_types::ControllerCommand as LegacyControllerCommand;
+use crate::cli::{BindOptions, ControllerCommand, InstanceSelector};
 use crate::filesystem;
 use crate::registry::{InstanceRecord, ObservationCache, RegistryStore, validate_issuer};
 
@@ -110,7 +111,12 @@ fn resolve_record(
             .iter()
             .find(|record| record.alias == selector || record.deployment_id == selector)
             .cloned()
-            .with_context(|| format!("no registered instance matches '{selector}' exactly"));
+            .with_context(|| {
+                format!(
+                    "{}: no registered instance matches '{selector}' exactly",
+                    crate::error_codes::INSTANCE_NOT_REGISTERED
+                )
+            });
     }
     match instances.as_slice() {
         [] => bail!("no instances are registered yet"),
@@ -122,8 +128,9 @@ fn resolve_record(
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
-                "INSTANCE_SELECTOR_REQUIRED: multiple instances are registered ({candidates}); \
-                 pass --instance SELECTOR"
+                "{}: multiple instances are registered ({candidates}); \
+                 pass --instance SELECTOR",
+                crate::error_codes::INSTANCE_AMBIGUOUS
             )
         }
     }
@@ -553,8 +560,9 @@ pub fn add_flow<A: ControllerRegistryApi>(
     let active = snapshot.active_slots().len();
     if active >= max as usize {
         let mut message = format!(
-            "CONTROLLER_SLOT_LIMIT: '{}' already has {active} of {max} active controller slots; \
+            "{}: '{}' already has {active} of {max} active controller slots; \
              revoke one before adding:",
+            crate::error_codes::CONTROLLER_SLOT_LIMIT,
             record.alias
         );
         for slot in snapshot.active_slots() {
@@ -815,30 +823,25 @@ fn merged_selector(selector: InstanceSelector) -> anyhow::Result<Option<String>>
     selector.explicit().context("conflicting selectors")
 }
 
-/// Dispatch `nazauthctl controller …` commands (goal plan 04, tasks
-/// D04–D09). Runs entirely against user-scoped stores; no root, no legacy
-/// lifecycle lock.
-pub(crate) fn run_command(command: ControllerCommand) -> anyhow::Result<()> {
+/// Dispatch `nazauthctl controller …` commands (goal plan 09 §1). Runs
+/// entirely against user-scoped stores; no root, no legacy lifecycle lock.
+/// The global `--instance` channel is merged here under the I02 exactly-one
+/// rule.
+pub(crate) fn run_controller_command(
+    command: ControllerCommand,
+    global: Option<&str>,
+) -> anyhow::Result<()> {
     let registry = RegistryStore::open_default()?;
     let keys = ControllerKeyStore::open_default()?;
     match command {
-        ControllerCommand::Bind {
+        ControllerCommand::List {
             selector,
-            label,
-            approval_token,
             admin_access_file,
         } => {
-            let explicit = merged_selector(selector)?;
+            let explicit = merge_global(selector, global, "controller list")?;
             let record = resolve_record(&registry, explicit.as_deref())?;
             let api = make_api(&record.issuer, admin_access_file.as_deref())?;
-            let report = bind_flow(
-                &api,
-                &registry,
-                &keys,
-                explicit.as_deref(),
-                &label,
-                approval_callback(approval_token.as_deref()),
-            )?;
+            let report = slots_flow(&api, &registry, &keys, explicit.as_deref())?;
             println!("{report}");
         }
         ControllerCommand::Add {
@@ -847,7 +850,7 @@ pub(crate) fn run_command(command: ControllerCommand) -> anyhow::Result<()> {
             approval_token,
             admin_access_file,
         } => {
-            let explicit = merged_selector(selector)?;
+            let explicit = merge_global(selector, global, "controller add")?;
             let record = resolve_record(&registry, explicit.as_deref())?;
             let api = make_api(&record.issuer, admin_access_file.as_deref())?;
             let report = add_flow(
@@ -866,7 +869,7 @@ pub(crate) fn run_command(command: ControllerCommand) -> anyhow::Result<()> {
             approval_token,
             admin_access_file,
         } => {
-            let explicit = merged_selector(selector)?;
+            let explicit = merge_global(selector, global, "controller rotate")?;
             let record = resolve_record(&registry, explicit.as_deref())?;
             let api = make_api(&record.issuer, admin_access_file.as_deref())?;
             let report = rotate_flow(
@@ -892,6 +895,211 @@ pub(crate) fn run_command(command: ControllerCommand) -> anyhow::Result<()> {
                      controller id"
                 );
             }
+            let explicit = merge_global(selector, global, "controller revoke")?;
+            let record = resolve_record(&registry, explicit.as_deref())?;
+            let api = make_api(&record.issuer, admin_access_file.as_deref())?;
+            let report = revoke_flow(
+                &api,
+                &registry,
+                &keys,
+                explicit.as_deref(),
+                &controller_id,
+                approval_callback(approval_token.as_deref()),
+            )?;
+            println!("{report}");
+        }
+        ControllerCommand::Recover {
+            selector,
+            label,
+            secret_file,
+            rotate_secret,
+        } => {
+            let explicit = merge_global(selector, global, "controller recover")?;
+            let record = resolve_record(&registry, explicit.as_deref())?;
+            let api = make_api(&record.issuer, None)?;
+            if rotate_secret {
+                // D10 first enrollment / D12 proactive rotation.
+                let report = crate::controller_identity::recovery::rotate_root_with_new_secret(
+                    &api,
+                    &record.deployment_id,
+                )?;
+                println!("{report}");
+            } else {
+                let secret_text = read_recovery_secret(secret_file.as_deref())?;
+                let recovered = crate::controller_identity::recovery::recover_controller_identity(
+                    &registry,
+                    &keys,
+                    &api,
+                    explicit.as_deref(),
+                    &secret_text,
+                    &label,
+                )?;
+                println!("{}", render_recovered(&record.alias, &recovered));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Top-level `nazoauthctl bind …` (goal plan 09 §6): the initial slot change
+/// for one instance.
+pub(crate) fn run_bind(options: BindOptions, global: Option<&str>) -> anyhow::Result<()> {
+    let BindOptions {
+        selector,
+        label,
+        approval_token,
+        admin_access_file,
+    } = options;
+    let registry = RegistryStore::open_default()?;
+    let keys = ControllerKeyStore::open_default()?;
+    let explicit = merge_global(selector, global, "bind")?;
+    let record = resolve_record(&registry, explicit.as_deref())?;
+    let api = make_api(&record.issuer, admin_access_file.as_deref())?;
+    let report = bind_flow(
+        &api,
+        &registry,
+        &keys,
+        explicit.as_deref(),
+        &label,
+        approval_callback(approval_token.as_deref()),
+    )?;
+    println!("{report}");
+    Ok(())
+}
+
+fn merge_global(
+    selector: InstanceSelector,
+    global: Option<&str>,
+    action: &str,
+) -> anyhow::Result<Option<String>> {
+    selector.merge_global(global, action)
+}
+
+/// Recovery Secret input: a private file when given, otherwise one hidden
+/// prompt (TTY) or one piped stdin line. Never argv, never echoed.
+fn read_recovery_secret(path: Option<&std::path::Path>) -> anyhow::Result<String> {
+    const MAX_SECRET_BYTES: u64 = 4096;
+    if let Some(path) = path {
+        let bytes =
+            filesystem::read_secure_regular_file(path, "recovery secret", true, MAX_SECRET_BYTES)?;
+        let text =
+            String::from_utf8(bytes.to_vec()).context("recovery secret is not valid UTF-8")?;
+        return Ok(text.trim().to_owned());
+    }
+    use std::io::IsTerminal as _;
+    if std::io::stdin().is_terminal() {
+        let secret =
+            rpassword::prompt_password("Paste the offline Recovery Secret (input hidden): ")
+                .context("failed to read the recovery secret")?;
+        Ok(secret.trim().to_owned())
+    } else {
+        eprintln!("Paste the offline Recovery Secret on one line:");
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("failed to read the recovery secret from stdin")?;
+        Ok(line.trim().to_owned())
+    }
+}
+
+fn render_recovered(
+    alias: &str,
+    recovered: &crate::controller_identity::recovery::RecoveredIdentity,
+) -> String {
+    format!(
+        "controller identity recovered for instance '{alias}'\n\
+         controller id: {}\n\
+         kid: {}\n\
+         expires: {} (30-day lifetime from the server clock)\n\
+         recovery root generation: {}\n\
+         \n\
+         the OLD recovery secret stopped verifying the moment the commit landed; store the NEW \
+         one printed during this flow's proposal — it is shown exactly once\n\
+         next: nazoauthctl status --instance {alias}\n",
+        recovered.controller_id,
+        short_kid(&recovered.kid),
+        recovered.expires_at.to_rfc3339(),
+        recovered.recovery_generation,
+    )
+}
+
+/// Frozen pre-goal dispatcher for the legacy controller family. Argv cannot
+/// reach it any more (I01); kept compiling until J deletes it.
+#[allow(dead_code)]
+pub(crate) fn run_command_legacy(command: LegacyControllerCommand) -> anyhow::Result<()> {
+    let registry = RegistryStore::open_default()?;
+    let keys = ControllerKeyStore::open_default()?;
+    match command {
+        LegacyControllerCommand::Bind {
+            selector,
+            label,
+            approval_token,
+            admin_access_file,
+        } => {
+            let explicit = merged_selector(selector)?;
+            let record = resolve_record(&registry, explicit.as_deref())?;
+            let api = make_api(&record.issuer, admin_access_file.as_deref())?;
+            let report = bind_flow(
+                &api,
+                &registry,
+                &keys,
+                explicit.as_deref(),
+                &label,
+                approval_callback(approval_token.as_deref()),
+            )?;
+            println!("{report}");
+        }
+        LegacyControllerCommand::Add {
+            selector,
+            label,
+            approval_token,
+            admin_access_file,
+        } => {
+            let explicit = merged_selector(selector)?;
+            let record = resolve_record(&registry, explicit.as_deref())?;
+            let api = make_api(&record.issuer, admin_access_file.as_deref())?;
+            let report = add_flow(
+                &api,
+                &registry,
+                &keys,
+                explicit.as_deref(),
+                &label,
+                approval_callback(approval_token.as_deref()),
+            )?;
+            println!("{report}");
+        }
+        LegacyControllerCommand::Rotate {
+            selector,
+            label,
+            approval_token,
+            admin_access_file,
+        } => {
+            let explicit = merged_selector(selector)?;
+            let record = resolve_record(&registry, explicit.as_deref())?;
+            let api = make_api(&record.issuer, admin_access_file.as_deref())?;
+            let report = rotate_flow(
+                &api,
+                &registry,
+                &keys,
+                explicit.as_deref(),
+                label.as_deref(),
+                approval_callback(approval_token.as_deref()),
+            )?;
+            println!("{report}");
+        }
+        LegacyControllerCommand::Revoke {
+            selector,
+            controller_id,
+            yes,
+            approval_token,
+            admin_access_file,
+        } => {
+            if !yes {
+                bail!(
+                    "revocation is destructive: re-run with --yes after confirming the exact \
+                     controller id"
+                );
+            }
             let explicit = merged_selector(selector)?;
             let record = resolve_record(&registry, explicit.as_deref())?;
             let api = make_api(&record.issuer, admin_access_file.as_deref())?;
@@ -905,7 +1113,7 @@ pub(crate) fn run_command(command: ControllerCommand) -> anyhow::Result<()> {
             )?;
             println!("{report}");
         }
-        ControllerCommand::Slots {
+        LegacyControllerCommand::Slots {
             selector,
             admin_access_file,
         } => {

@@ -40,26 +40,25 @@ pub use deployment_state::{
     ActiveHostOperationRef, ArtifactRefs, BUILD_IDENTITY_PRODUCT, BackupMaturity, BootstrapParams,
     BuildIdentity, CONFIG_REVISION_MISMATCH, ConfigState, DEPLOYMENT_EXISTS,
     DEPLOYMENT_LIMIT_EXCEEDED, DEPLOYMENT_STATE_SCHEMA, DEPLOYMENT_UNKNOWN, DeploymentState,
-    Failure, HealthRecord, INSTALL_FAILED, MAX_LISTED_DEPLOYMENTS, MAX_RESOURCES,
-    OBJECT_IDENTITY_MISMATCH, RESOURCE_DELETE_FORBIDDEN, RESOURCE_UNKNOWN, ROLLBACK_UNAVAILABLE,
-    Resource, ResourceOwnership, ResourceScope, RuntimeSurface, StateMutationPayload,
-    TargetStateStore,
+    EXTERNAL_RESOURCE_PROTECTED, Failure, HealthRecord, INSTALL_FAILED, MAX_LISTED_DEPLOYMENTS,
+    MAX_RESOURCES, OBJECT_IDENTITY_MISMATCH, RESOURCE_UNKNOWN, ROLLBACK_UNAVAILABLE, Resource,
+    ResourceOwnership, ResourceScope, RuntimeSurface, StateMutationPayload, TargetStateStore,
 };
 pub use install_exec::{
-    ARTIFACT_UNVERIFIED, CONFIG_INVALID, CONFIG_PATH_OCCUPIED, EMBEDDED_IDENTITY_MISMATCH,
-    HEALTH_PROBE_FAILED, InstallOrder, OfficialArtifactRef, PlannedResourceDeletion, PlannedSecret,
-    RUNTIME_START_FAILED, SECRET_PROVISION_FAILED, SECRET_PURPOSES, StagedConfig,
+    ARTIFACT_UNVERIFIED, CONFIG_INVALID, CONFIG_PATH_OCCUPIED, HEALTH_PROBE_FAILED, InstallOrder,
+    OfficialArtifactRef, PlannedResourceDeletion, PlannedSecret, RUNTIME_START_FAILED,
+    SECRET_PROVISION_FAILED, SECRET_PURPOSES, StagedConfig, TARGET_IDENTITY_MISMATCH,
 };
-pub use journal::{JournalStatus, TargetJournal};
+pub use journal::{JournalStatus, OperationLogEntry, OperationOutcomeSummary, TargetJournal};
 pub use ssh::SshTarget;
 pub use update_exec::{ACTIVATION_FAILED, ROLLBACK_ARTIFACT_MISSING};
 pub use wire::{
-    HELLO_PRODUCT, HOST_ERR_OPERATION_CONFLICT, HOST_ERR_OPERATION_INVALID,
-    HOST_ERR_REMOTE_HELPER_MISMATCH, HOST_OPERATION_KINDS, HOST_PROTOCOL_SCHEMA,
+    HELLO_PRODUCT, HOST_ERR_OPERATION_INVALID, HOST_OPERATION_KINDS, HOST_PROTOCOL_SCHEMA,
     HostCompletionBody, HostOperation, HostOperationBody, HostOutcome, HostResult,
     InstanceInspection, LOCAL_BUILD_COMMIT, MAX_HOST_OPERATION_BYTES, MAX_HOST_RESULT_BYTES,
-    MessageRejection, RejectionCode, RemoteHello, canonical_operation_hash, encode_host_operation,
-    encode_host_result, local_hello, parse_host_operation, parse_host_result, verify_remote_hello,
+    MessageRejection, OPERATION_ID_CONFLICT, REMOTE_HELPER_MISMATCH, RejectionCode, RemoteHello,
+    canonical_operation_hash, encode_host_operation, encode_host_result, local_hello,
+    parse_host_operation, parse_host_result, verify_remote_hello,
 };
 
 /// The formalized target state root (task F01): one private directory holding
@@ -1064,7 +1063,7 @@ mod tests {
         let HostOutcome::Failed { code, .. } = result.outcome else {
             panic!("expected the conflict outcome");
         };
-        assert_eq!(code, HOST_ERR_OPERATION_CONFLICT);
+        assert_eq!(code, OPERATION_ID_CONFLICT);
         Ok(())
     }
 
@@ -1224,8 +1223,8 @@ mod tests {
         assert_eq!(managed.locator, "nazoauth-main");
 
         for (resource_id, expected_code) in [
-            ("shared-db", RESOURCE_DELETE_FORBIDDEN),
-            ("backup-volume", RESOURCE_DELETE_FORBIDDEN),
+            ("shared-db", EXTERNAL_RESOURCE_PROTECTED),
+            ("backup-volume", EXTERNAL_RESOURCE_PROTECTED),
             ("ghost-resource", RESOURCE_UNKNOWN),
         ] {
             let failure = state

@@ -20,33 +20,33 @@ pub(crate) fn recovery_action(
     UpdateRecoveryAction::RestorePrevious
 }
 
-pub(crate) fn uses_legacy_lock(command: &Command) -> bool {
+pub(crate) fn uses_legacy_lock(command: &LegacyCommand) -> bool {
     if DeploymentStore::system().registry_path().exists() {
-        return matches!(command, Command::Install(_));
+        return matches!(command, LegacyCommand::Install(_));
     }
     !matches!(
         command,
-        Command::Discover
-            | Command::Adopt(_)
-            | Command::DeploymentsList
-            | Command::TransactionShow
-            | Command::TransactionEvidence { .. }
-            | Command::TransactionResume { .. }
-            | Command::PermissionsSet(_)
-            | Command::Relinquish(_)
-            | Command::Reconcile
-            | Command::SelfCheck(_)
-            | Command::SelfUpdate { .. }
-            | Command::SelfRollback { .. }
+        LegacyCommand::Discover
+            | LegacyCommand::Adopt(_)
+            | LegacyCommand::DeploymentsList
+            | LegacyCommand::TransactionShow
+            | LegacyCommand::TransactionEvidence { .. }
+            | LegacyCommand::TransactionResume { .. }
+            | LegacyCommand::PermissionsSet(_)
+            | LegacyCommand::Relinquish(_)
+            | LegacyCommand::Reconcile
+            | LegacyCommand::SelfCheck(_)
+            | LegacyCommand::SelfUpdate { .. }
+            | LegacyCommand::SelfRollback { .. }
             // The target-side stdio executor never touches controller state.
-            | Command::RemoteExec
+            | LegacyCommand::RemoteExec
             // Fleet registry commands own their user-scoped store lock and
             // never touch the deployment lifecycle state machine.
-            | Command::Host(_)
-            | Command::Instance(_)
+            | LegacyCommand::Host(_)
+            | LegacyCommand::Instance(_)
             // Controller identity lifecycle owns the user-scoped Registry and
             // key stores; it never touches the legacy deployment state either.
-            | Command::Controller(_)
+            | LegacyCommand::Controller(_)
     )
 }
 

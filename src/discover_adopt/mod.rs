@@ -62,7 +62,8 @@ pub(crate) const ADOPT_ALREADY_REGISTERED: &str = "ADOPT_ALREADY_REGISTERED";
 
 /// Injectable context mirroring the clean-install context: the user-scoped
 /// registry plus a way to reach hosts. Tests substitute scripted targets.
-pub(crate) type TargetFactory = dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget>>;
+pub(crate) type TargetFactory =
+    dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>>;
 
 pub(crate) struct DiscoveryContext {
     pub(crate) registry: RegistryStore,
@@ -79,7 +80,7 @@ impl DiscoveryContext {
         })
     }
 
-    fn target_for(&self, record: &HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget>> {
+    fn target_for(&self, record: &HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> {
         (self.factory)(record)
     }
 }

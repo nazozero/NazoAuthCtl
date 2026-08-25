@@ -1,91 +1,133 @@
+//! Command-line model for the final 18-command surface (goal plan 09 §1, I01).
+//!
+//! The parser can only ever produce the commands in [`Command`] plus the
+//! small set of non-legacy maintenance commands that the final model itself
+//! requires (`remote exec` transport boundary, controller self-updates, and
+//! the G02 fresh-install bootstrap claim). The frozen pre-goal command set
+//! lives in [`super::legacy_types`]; argv cannot reach it.
+
 use std::path::PathBuf;
 
-use anyhow::bail;
+use anyhow::{Context as _, bail};
 
-use crate::adoption::AdoptionOptions;
-use crate::deployment::{Capability, CapabilityGrant};
 use crate::registry::HostPrivilege;
 
-pub(crate) const DEFAULT_CONFIG: &str = "/etc/nazoauth/update.json";
+/// Default legacy configuration path. Only the frozen legacy runner still
+/// consumes it; the final surface has no per-deployment config file.
+pub(crate) const DEFAULT_CONFIG: &str = "/etc/nazauth/update.json";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HelpTopic {
     TopLevel,
-    Install,
-    BootstrapAdmin,
-    Update,
-    Keys,
-    Conformance,
-    Tls,
-    Audit,
-    Identity,
-    BreakGlass,
+    Host,
+    Instance,
     Controller,
-    ControllerIdentity,
+    Install,
+    Update,
+    SelfUpdate,
+    BootstrapAdmin,
 }
 
+/// Global options shared by every invocation (I02). `--instance` is accepted
+/// before the command; instance-scoped families additionally accept a
+/// command-level selector channel, and the two are merged with an
+/// exactly-one rule.
+#[derive(Debug)]
 pub(crate) struct Cli {
+    /// Legacy runner compatibility field. Nothing on the final surface
+    /// reads it; it is never populated from argv any more.
+    #[allow(dead_code)]
     pub(crate) config: PathBuf,
+    /// Legacy runner compatibility field, same status as `config`.
+    #[allow(dead_code)]
     pub(crate) deployment: Option<String>,
+    /// Explicit instance selector from the global `--instance` flag.
+    pub(crate) instance: Option<String>,
+    /// Machine-readable output switch (`--json`), read-only view commands.
+    pub(crate) json: bool,
     pub(crate) command: Command,
 }
 
+/// The complete user-facing top-level surface (goal plan 09 §1):
+///
+/// ```text
+/// host instance controller install discover bind status logs doctor verify
+/// update rollback operation policy backup recover oidf uninstall
+/// ```
+///
+/// `oidf` is parsed by the binary entrypoint (`crates/nazoauthctl`) before
+/// this library parser runs, so it has no variant here. `RemoteExec`,
+/// `SelfCheck`, `SelfUpdate`, `SelfRollback`, and `BootstrapAdmin` are part
+/// of the final model's own machinery, not legacy surface.
+#[derive(Debug)]
 pub(crate) enum Command {
-    Discover,
-    Adopt(AdoptionOptions),
-    DeploymentsList,
-    TransactionShow,
-    TransactionEvidence {
-        file: PathBuf,
-        yes: bool,
+    /// Fleet host registry (add/list/show/check/forget).
+    Host(HostCommand),
+    /// Fleet instance registry (list/show/register/rename/forget/relocate).
+    Instance(InstanceCommand),
+    /// Per-instance Controller Key lifecycle: list/add/rotate/revoke/recover.
+    Controller(ControllerCommand),
+    /// Initial Controller Key enrollment for one instance (top-level form of
+    /// the first `controller add`-shaped slot change; goal plan 09 §6).
+    Bind(BindOptions),
+    /// Clean install of a fresh NazoAuth instance onto one host (G01).
+    Install(InstallArgs),
+    /// Read-only DeploymentState sweep over one target host (G05).
+    Discover {
+        host: Option<String>,
     },
-    TransactionResume {
-        yes: bool,
-        accept_migration_barrier: bool,
+    /// Instance state summary; `--all` fans out over the whole fleet (I03).
+    Status {
+        selector: InstanceSelector,
+        all: bool,
     },
-    PermissionsSet(PermissionOptions),
-    Relinquish(RelinquishOptions),
-    Reconcile,
-    Install(Box<InstallOptions>),
-    BootstrapAdmin(BootstrapAdminOptions),
-    Status,
-    Doctor,
-    Check(Option<String>),
-    Update(UpdateOptions),
-    DevelopmentActivate(DevelopmentActivateOptions),
+    /// Application log view of one instance (primitive lands in K phase).
+    Logs {
+        #[allow(dead_code)] // selector applies once the K-phase read kind exists
+        selector: InstanceSelector,
+    },
+    /// Health/security diagnostics; `--all` fans out over the fleet.
+    Doctor {
+        selector: InstanceSelector,
+        all: bool,
+    },
+    /// Independent public DNS/TLS/OIDC verification report (G08).
+    Verify {
+        selector: InstanceSelector,
+    },
+    /// Crash-safe update to a verified official artifact (G03).
+    Update(UpdateArgs),
+    /// Explicit rollback to the previous verified artifact (G04).
     Rollback {
+        selector: InstanceSelector,
         yes: bool,
     },
+    /// Read-only operation-log view over the two journals (H04).
+    Operation {
+        selector: InstanceSelector,
+        limit: usize,
+    },
+    /// Explicit policy store (lands in K phase).
+    Policy,
+    /// Backup maturity facts plus the explicit snapshot entry point (H05).
+    Backup(BackupArgs),
+    /// Data/artifact disaster recovery beyond rollback (lands in K phase).
     Recover {
+        #[allow(dead_code)] // selector applies once the K-phase restore exists
+        selector: InstanceSelector,
+    },
+    /// Exact deletion of managed + deployment-scoped resources (G06).
+    Uninstall {
+        selector: InstanceSelector,
         yes: bool,
     },
-    RecoverUpdate {
-        yes: bool,
-    },
-    RecoverIdentity {
-        yes: bool,
-    },
-    Migrate {
-        yes: bool,
-        candidate: Option<CandidateTarget>,
-    },
-    Keys(KeysCommand),
-    Tls(TlsCommand),
-    AuditVerify,
-    AuditShow {
-        request_id: Option<String>,
-    },
-    IdentityRotate {
-        yes: bool,
-    },
-    BreakGlassControllerAvailability,
-    BreakGlassRehearseControllerLoss {
-        yes: bool,
-    },
-    BreakGlassRecover {
-        yes: bool,
-        reason: String,
-    },
+    /// Fresh-install bootstrap authority claim (G02).
+    BootstrapAdmin(BootstrapAdminArgs),
+    /// Internal fixed stdio executor (`nazoauthctl remote exec`, goal plan 03
+    /// §3.2): one bounded HostOperation JSON on stdin, one HostResult JSON on
+    /// stdout, no daemon. Invoked only through OpenSSH by the control side.
+    RemoteExec,
+    /// Controller self-maintenance: signed NazoAuthCtl releases only.
     SelfCheck(Option<String>),
     SelfUpdate {
         version: Option<String>,
@@ -94,29 +136,16 @@ pub(crate) enum Command {
     SelfRollback {
         yes: bool,
     },
-    /// Internal fixed stdio executor (`nazoauthctl remote exec`, goal plan 03
-    /// §3.2). Not user-facing automation surface: one bounded HostOperation
-    /// JSON on stdin, one HostResult JSON on stdout, no daemon, no socket.
-    RemoteExec,
-    /// Fleet host registry commands (goal plan 02, tasks B03/B06/B07).
-    Host(HostCommand),
-    /// Fleet instance registry commands (goal plan 02, tasks B04–B07).
-    Instance(InstanceCommand),
-    /// Controller identity lifecycle commands (goal plan 04, tasks D04–D09):
-    /// bind/add/rotate/revoke against the instance Controller Registry plus
-    /// the authoritative slots view.
-    Controller(ControllerCommand),
 }
 
-/// `controller` command family (tasks D04–D09). Everything runs against the
+/// `controller` family (goal plan 09 §1): everything runs against the
 /// user-scoped Registry and per-instance key store; the only network peer is
 /// the instance issuer's admin surface.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ControllerCommand {
-    Bind {
+    /// Authoritative slots view (the D09 read-only surface).
+    List {
         selector: InstanceSelector,
-        label: String,
-        approval_token: Option<String>,
         admin_access_file: Option<PathBuf>,
     },
     Add {
@@ -138,10 +167,24 @@ pub(crate) enum ControllerCommand {
         approval_token: Option<String>,
         admin_access_file: Option<PathBuf>,
     },
-    Slots {
+    /// Recovery-Secret flows: default recovers the Controller Identity from
+    /// the offline secret (D11); `--rotate-secret` issues a replacement
+    /// secret under fresh 2FA (D10/D12).
+    Recover {
         selector: InstanceSelector,
-        admin_access_file: Option<PathBuf>,
+        label: String,
+        secret_file: Option<PathBuf>,
+        rotate_secret: bool,
     },
+}
+
+/// Options shared by `bind` (and shaped identically by `controller add`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BindOptions {
+    pub(crate) selector: InstanceSelector,
+    pub(crate) label: String,
+    pub(crate) approval_token: Option<String>,
+    pub(crate) admin_access_file: Option<PathBuf>,
 }
 
 /// `host` command family (task B03). All of it operates on the user-scoped
@@ -169,10 +212,11 @@ pub(crate) enum HostCommand {
     },
 }
 
-/// The two selector channels shared by the instance subcommands (task B05):
-/// the positional argument and the explicit `--instance` flag. The command
-/// layer merges them; supplying both is rejected so the effective selector is
-/// never ambiguous.
+/// The two selector channels shared by the instance-scoped subcommands
+/// (task B05): the positional argument and the explicit per-command
+/// `--instance` flag. The command layer merges them with the global
+/// `--instance`; supplying more than one source is rejected so the effective
+/// selector is never ambiguous.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct InstanceSelector {
     pub(crate) positional: Option<String>,
@@ -180,6 +224,9 @@ pub(crate) struct InstanceSelector {
 }
 
 impl InstanceSelector {
+    /// Merge the positional and per-command channels. Both set — even to the
+    /// same value — is rejected: one action carries at most one explicit
+    /// selection channel.
     pub(crate) fn explicit(&self) -> anyhow::Result<Option<String>> {
         match (&self.positional, &self.named) {
             (Some(_), Some(_)) => {
@@ -191,25 +238,43 @@ impl InstanceSelector {
             (None, None) => Ok(None),
         }
     }
+
+    /// Fold the global `--instance` into this selector under the I02
+    /// exactly-one rule: the global channel and any command-level channel are
+    /// mutually exclusive, whatever their values.
+    pub(crate) fn merge_global(
+        &self,
+        global: Option<&str>,
+        action: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let local = self
+            .explicit()
+            .with_context(|| format!("{action}: conflicting selectors"))?;
+        match (global, local) {
+            (Some(global_value), Some(local_value)) => bail!(
+                "{action}: select the instance once — either the global \
+                 --instance {global_value} or the command-level selector \
+                 '{local_value}', not both"
+            ),
+            (Some(global_value), None) => Ok(Some(global_value.to_owned())),
+            (None, local) => Ok(local),
+        }
+    }
 }
 
-/// `instance` command family (tasks B04–B07).
+/// `instance` command family (tasks B04–B07 + G05 takeover).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InstanceCommand {
     List {
         refresh: bool,
     },
     Show(InstanceSelector),
-    /// Interim discovery helper: observe one host live and emit the typed
-    /// evidence artifact consumed by `instance register`.
-    Observe {
+    /// Controlled takeover of one live-discovered deployment (G05): the
+    /// deployment binding comes from the target's own DeploymentState over a
+    /// verified handshake; nothing else binds.
+    Register {
         host: String,
         deployment_id: String,
-        issuer: String,
-        output: PathBuf,
-    },
-    Register {
-        from_discovery: PathBuf,
         alias: Option<String>,
     },
     Rename {
@@ -223,212 +288,41 @@ pub(crate) enum InstanceCommand {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TlsCertificateInput {
-    pub(crate) provider_config: PathBuf,
-    pub(crate) tenant: String,
-    pub(crate) hostname: String,
-    pub(crate) source: TlsCertificateSource,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TlsCertificateSource {
-    ExternalFiles {
-        certificate: PathBuf,
-        private_key: PathBuf,
-    },
-    CurrentAcmeReceipt,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TlsCertificateCheckInput {
-    pub(crate) provider_config: PathBuf,
-    pub(crate) tenant: String,
-    pub(crate) hostname: String,
-    pub(crate) warning_window_seconds: Option<u64>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AcmeCertificateInput {
-    pub(crate) acme_config: PathBuf,
-    pub(crate) provider_config: PathBuf,
-    pub(crate) tenant: String,
-    pub(crate) hostname: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum AcmeCommand {
-    Plan(AcmeCertificateInput),
-    Issue {
-        input: AcmeCertificateInput,
-        agree_terms: bool,
-        yes: bool,
-    },
-    Recover {
-        tenant: String,
-        hostname: String,
-        yes: bool,
-    },
-    Show {
-        tenant: String,
-        hostname: String,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TlsCommand {
-    Check(TlsCertificateCheckInput),
-    Plan(TlsCertificateInput),
-    Apply {
-        input: TlsCertificateInput,
-        yes: bool,
-    },
-    Recover {
-        tenant: String,
-        hostname: String,
-        yes: bool,
-    },
-    Show {
-        tenant: String,
-        hostname: String,
-    },
-    Acme(AcmeCommand),
-}
-
+/// Clean-install arguments (G01); maps onto
+/// [`crate::clean_install::CleanInstallRequest`].
 #[derive(Debug)]
-pub(crate) struct DevelopmentActivateOptions {
-    pub(crate) artifact: String,
-    pub(crate) yes: bool,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PermissionOptions {
-    pub(crate) changes: Vec<(Capability, CapabilityGrant)>,
-    pub(crate) yes: bool,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct RelinquishOptions {
-    pub(crate) capabilities: Vec<Capability>,
-    pub(crate) yes: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub(crate) struct CandidateTarget {
-    pub(crate) release: String,
-    pub(crate) revision: String,
-    pub(crate) build_id: String,
-    pub(crate) oci_digest: String,
-}
-
-/// A deliberately local-only OCI target for a fresh standards installation.
-///
-/// This is not an unsigned replacement for `update` or `development activate`:
-/// the caller supplies the release identity and the expected OCI manifest digest,
-/// and install proves them against an image that is already present in the
-/// selected container runtime.  No registry resolution or pull is performed.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub(crate) struct LocalOciCandidateInstall {
-    pub(crate) image: String,
-    pub(crate) target: CandidateTarget,
-}
-
-#[derive(Debug)]
-pub(crate) enum KeysCommand {
-    List,
-    Validate,
-    ExportOpenid4vcTrust {
-        output: PathBuf,
-    },
-    GenerateLocal {
-        alg: String,
-        purposes: Vec<String>,
-        yes: bool,
-    },
-    RegisterExternal {
-        kid: String,
-        alg: String,
-        key_ref: String,
-        public_jwk: PathBuf,
-        yes: bool,
-    },
-}
-
-#[derive(Debug)]
-pub(crate) struct UpdateOptions {
-    pub(crate) version: Option<String>,
-    pub(crate) plan: bool,
-    pub(crate) yes: bool,
-    pub(crate) accept_migration_barrier: bool,
-}
-
-pub(crate) struct InstallOptions {
-    pub(crate) runtime: String,
+pub(crate) struct InstallArgs {
+    pub(crate) host: Option<String>,
+    pub(crate) name: Option<String>,
     pub(crate) public_url: String,
-    pub(crate) profile: String,
-    pub(crate) profile_material: Option<PathBuf>,
-    pub(crate) trusted_proxy_cidr: Option<String>,
-    pub(crate) data_root: PathBuf,
-    pub(crate) control_root: PathBuf,
-    pub(crate) recovery_root: PathBuf,
-    pub(crate) port: u16,
-    pub(crate) network_subnet: Option<String>,
-    pub(crate) runtime_ip: Option<String>,
-    pub(crate) database_url: Option<String>,
-    pub(crate) migration_database_url: Option<String>,
-    pub(crate) database_backup_url: Option<String>,
-    pub(crate) valkey_url: Option<String>,
-    pub(crate) valkey_backup_url: Option<String>,
-    pub(crate) external_valkey_backup_scope: Option<String>,
-    pub(crate) database_runtime_endpoint_sha256: Option<String>,
-    pub(crate) database_runtime_principal_sha256: Option<String>,
-    pub(crate) migration_database_endpoint_sha256: Option<String>,
-    pub(crate) migration_database_principal_sha256: Option<String>,
-    pub(crate) database_backup_endpoint_sha256: Option<String>,
-    pub(crate) database_backup_principal_sha256: Option<String>,
-    pub(crate) valkey_runtime_principal_sha256: Option<String>,
-    pub(crate) valkey_backup_endpoint_sha256: Option<String>,
-    pub(crate) valkey_backup_principal_sha256: Option<String>,
-    pub(crate) external_dependencies: bool,
-    pub(crate) secrets_stdin: bool,
-    pub(crate) secret_fd: Option<u32>,
-    pub(crate) profile_secrets_stdin: bool,
-    pub(crate) profile_secret_fd: Option<u32>,
-    pub(crate) profile_secrets: Option<StandardsProfileSecrets>,
     pub(crate) version: Option<String>,
-    pub(crate) local_oci_candidate: Option<LocalOciCandidateInstall>,
+    pub(crate) artifact_sha256: Option<String>,
+    pub(crate) runtime: Option<String>,
+    pub(crate) install_root: Option<PathBuf>,
 }
 
-impl Drop for InstallOptions {
-    fn drop(&mut self) {
-        for value in [
-            &mut self.database_url,
-            &mut self.migration_database_url,
-            &mut self.database_backup_url,
-            &mut self.valkey_url,
-            &mut self.valkey_backup_url,
-        ] {
-            if let Some(value) = value.as_mut() {
-                zeroize::Zeroize::zeroize(value);
-            }
-        }
-    }
-}
-
-/// Profile-scoped bearer secrets. This deliberately has no `Debug` implementation,
-/// and its owned values are zeroized on drop: command parsing and error paths must
-/// never render its contents or retain avoidable plaintext copies.
-#[derive(serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct StandardsProfileSecrets {
-    pub(crate) dynamic_registration_initial_access_token: String,
-    pub(crate) ciba_automated_decision_token: String,
-    pub(crate) openid4vci_management_token: String,
-    pub(crate) openid4vp_management_token: String,
-}
-
+/// Update arguments (G03); maps onto
+/// [`crate::instance_lifecycle::UpdateRequest`].
 #[derive(Debug)]
-pub(crate) struct BootstrapAdminOptions {
-    pub(crate) credentials_stdin: bool,
+pub(crate) struct UpdateArgs {
+    pub(crate) selector: InstanceSelector,
+    pub(crate) version: Option<String>,
+    pub(crate) artifact_sha256: Option<String>,
+    pub(crate) config_file: Option<PathBuf>,
+    pub(crate) config_schema: Option<String>,
     pub(crate) yes: bool,
+}
+
+/// Backup arguments (H05 display + K-phase snapshot entry point).
+#[derive(Debug)]
+pub(crate) struct BackupArgs {
+    pub(crate) selector: InstanceSelector,
+    pub(crate) snapshot: bool,
+}
+
+/// Bootstrap claim arguments (G02).
+#[derive(Debug)]
+pub(crate) struct BootstrapAdminArgs {
+    pub(crate) selector: InstanceSelector,
+    pub(crate) credentials_stdin: bool,
 }

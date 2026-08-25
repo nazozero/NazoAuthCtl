@@ -74,9 +74,7 @@ fn read_bounded_stdin() -> anyhow::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::filesystem::PrivateTempDir;
-    use crate::target::wire::{
-        HOST_ERR_OPERATION_CONFLICT, MAX_HOST_OPERATION_BYTES, parse_host_result,
-    };
+    use crate::target::wire::{MAX_HOST_OPERATION_BYTES, OPERATION_ID_CONFLICT, parse_host_result};
     use uuid::Uuid;
 
     fn temp_state() -> anyhow::Result<(PrivateTempDir, std::path::PathBuf)> {
@@ -162,7 +160,7 @@ mod tests {
         let result = parse_host_result(&output)?;
         match result.outcome {
             crate::target::HostOutcome::Failed { code, .. } => {
-                assert_eq!(code, HOST_ERR_OPERATION_CONFLICT);
+                assert_eq!(code, OPERATION_ID_CONFLICT);
             }
             _ => panic!("expected the conflict outcome"),
         }
