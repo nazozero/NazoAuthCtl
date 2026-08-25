@@ -40,10 +40,11 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                     source: selector, ..
                 }
                 | InstanceCommand::Relocate { selector, .. } => {
-                    if selector.positional.is_none() && selector.named.is_none() {
-                        if let Some(global) = instance_flag {
-                            selector.positional = Some(global.to_owned());
-                        }
+                    if selector.positional.is_none()
+                        && selector.named.is_none()
+                        && let Some(global) = instance_flag
+                    {
+                        selector.positional = Some(global.to_owned());
                     }
                 }
                 _ => {}
