@@ -1097,6 +1097,47 @@ mod tests {
                 warning: None,
             })
         }
+
+        fn recovery_root_view(
+            &self,
+            deployment_id: &str,
+        ) -> Result<super::admin_api::RecoveryRootView, AdminApiError> {
+            Ok(super::admin_api::RecoveryRootView {
+                deployment_id: deployment_id.to_owned(),
+                present: false,
+                recovery_kid: None,
+                kdf: None,
+                generation: None,
+            })
+        }
+
+        fn issue_recovery_root_approval(
+            &self,
+            _body: &super::admin_api::RecoveryRootApprovalBody,
+        ) -> Result<IssuedApproval, AdminApiError> {
+            unimplemented!("recovery-root approvals are not part of the lifecycle flows")
+        }
+
+        fn rotate_recovery_root(
+            &self,
+            _body: &super::admin_api::RecoveryRootRotateBody,
+        ) -> Result<super::admin_api::RecoveryRootView, AdminApiError> {
+            unimplemented!("recovery-root rotations are not part of the lifecycle flows")
+        }
+
+        fn issue_recovery_challenge(
+            &self,
+            _body: &super::admin_api::RecoveryChallengeBody,
+        ) -> Result<super::admin_api::IssuedRecoveryChallenge, AdminApiError> {
+            unimplemented!("break-glass challenges are not part of the lifecycle flows")
+        }
+
+        fn submit_recovery_answer(
+            &self,
+            _body: &super::admin_api::RecoveryAnswerBody,
+        ) -> Result<super::admin_api::RecoveryCommitView, AdminApiError> {
+            unimplemented!("break-glass commits are not part of the lifecycle flows")
+        }
     }
 
     fn fixed_approval(

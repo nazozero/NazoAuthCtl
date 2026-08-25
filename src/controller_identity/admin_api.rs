@@ -584,6 +584,30 @@ pub trait ControllerRegistryApi {
     fn commit_slot(&self, body: &SlotCommitBody) -> Result<ControllerSlotView, AdminApiError>;
     fn rotate_slot(&self, body: &RotateCommitBody) -> Result<ControllerSlotView, AdminApiError>;
     fn revoke_slot(&self, body: &RevokeCommitBody) -> Result<ControllerSlotView, AdminApiError>;
+    /// Read-only Recovery Root view (D12 admin surface).
+    fn recovery_root_view(&self, deployment_id: &str) -> Result<RecoveryRootView, AdminApiError>;
+    /// Issue a fresh-2FA approval for one exact root-rotation digest.
+    fn issue_recovery_root_approval(
+        &self,
+        body: &RecoveryRootApprovalBody,
+    ) -> Result<IssuedApproval, AdminApiError>;
+    /// Commit an approved replacement; consumption and replacement are
+    /// atomic server-side.
+    fn rotate_recovery_root(
+        &self,
+        body: &RecoveryRootRotateBody,
+    ) -> Result<RecoveryRootView, AdminApiError>;
+    /// Request one break-glass challenge (unauthenticated by design).
+    fn issue_recovery_challenge(
+        &self,
+        body: &RecoveryChallengeBody,
+    ) -> Result<IssuedRecoveryChallenge, AdminApiError>;
+    /// Submit the signed answer; on success the server revokes every slot,
+    /// installs exactly one recovered slot, and bumps the root generation.
+    fn submit_recovery_answer(
+        &self,
+        body: &RecoveryAnswerBody,
+    ) -> Result<RecoveryCommitView, AdminApiError>;
 }
 
 /// Production [`ControllerRegistryApi`] over one pinned issuer origin.
@@ -778,6 +802,127 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
         )?;
         decode_slot_envelope(raw)
     }
+
+    fn recovery_root_view(&self, deployment_id: &str) -> Result<RecoveryRootView, AdminApiError> {
+        let raw = self.send_json(
+            "GET",
+            "/admin/controller-registry/recovery-root",
+            Some(("deployment_id", deployment_id)),
+            None,
+        )?;
+        decode_recovery_root_view(raw)
+    }
+
+    fn issue_recovery_root_approval(
+        &self,
+        body: &RecoveryRootApprovalBody,
+    ) -> Result<IssuedApproval, AdminApiError> {
+        let raw = self.send_json(
+            "POST",
+            "/admin/controller-registry/recovery-root/approvals",
+            None,
+            Some(serialize_body(body)?),
+        )?;
+        let wire: IssuedApprovalWire = serde_json::from_slice(&raw).map_err(malformed_response)?;
+        Ok(IssuedApproval {
+            approval_token: wire.approval_token,
+            action: wire.action,
+            action_sha256: wire.action_sha256,
+            expires_at: parse_timestamp(&wire.expires_at, "expires_at")
+                .map_err(AdminApiError::MalformedResponse)?,
+            single_use: wire.single_use,
+        })
+    }
+
+    fn rotate_recovery_root(
+        &self,
+        body: &RecoveryRootRotateBody,
+    ) -> Result<RecoveryRootView, AdminApiError> {
+        let raw = self.send_json(
+            "POST",
+            "/admin/controller-registry/recovery-root/rotate",
+            None,
+            Some(serialize_body(body)?),
+        )?;
+        let value: serde_json::Value = serde_json::from_slice(&raw).map_err(malformed_response)?;
+        // The commit response wraps the root object without the `present`
+        // discriminant (it is implicitly present); normalize before decoding.
+        let mut inner = value
+            .get("recovery_root")
+            .cloned()
+            .and_then(|inner| inner.as_object().cloned())
+            .ok_or_else(|| malformed_response(anyhow::anyhow!("missing 'recovery_root'")))?;
+        if inner.contains_key("present") {
+            return Err(malformed_response(anyhow::anyhow!(
+                "recovery_root must not carry 'present'"
+            )));
+        }
+        inner.insert("present".to_owned(), serde_json::Value::Bool(true));
+        decode_recovery_root_view(
+            serde_json::to_vec(&serde_json::Value::Object(inner)).map_err(malformed_response)?,
+        )
+    }
+
+    fn issue_recovery_challenge(
+        &self,
+        body: &RecoveryChallengeBody,
+    ) -> Result<IssuedRecoveryChallenge, AdminApiError> {
+        use base64::Engine as _;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ChallengeWire {
+            challenge_id: String,
+            /// Echoed binding; the server repeats it for operator clarity.
+            #[allow(dead_code)]
+            deployment_id: String,
+            nonce: String,
+            expires_at: String,
+            /// Echoed algorithm description; Ed25519 is the only negotiated
+            /// suite today, echoed verbatim by the server.
+            #[allow(dead_code)]
+            algorithm: serde_json::Value,
+            single_use: bool,
+        }
+        // Break-glass route carries no session semantics; the shared header
+        // helper still runs and the server simply ignores the values.
+        let raw = self.send_json(
+            "POST",
+            "/controller-recovery/challenges",
+            None,
+            Some(serialize_body(body)?),
+        )?;
+        let wire: ChallengeWire = serde_json::from_slice(&raw).map_err(malformed_response)?;
+        if !wire.single_use {
+            return Err(malformed_response(anyhow::anyhow!(
+                "server issued a non-single-use challenge"
+            )));
+        }
+        let nonce_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(wire.nonce.as_bytes())
+            .map_err(malformed_response)?;
+        let nonce: [u8; 32] = nonce_bytes
+            .try_into()
+            .map_err(|_| malformed_response(anyhow::anyhow!("challenge nonce is not 32 bytes")))?;
+        Ok(IssuedRecoveryChallenge {
+            challenge_id: wire.challenge_id,
+            nonce,
+            expires_at: parse_timestamp(&wire.expires_at, "expires_at")
+                .map_err(AdminApiError::MalformedResponse)?,
+        })
+    }
+
+    fn submit_recovery_answer(
+        &self,
+        body: &RecoveryAnswerBody,
+    ) -> Result<RecoveryCommitView, AdminApiError> {
+        let raw = self.send_json(
+            "POST",
+            "/controller-recovery/recover",
+            None,
+            Some(serialize_body(body)?),
+        )?;
+        decode_recovery_commit(raw)
+    }
 }
 
 fn decode_slot_envelope(raw: Vec<u8>) -> Result<ControllerSlotView, AdminApiError> {
@@ -786,6 +931,158 @@ fn decode_slot_envelope(raw: Vec<u8>) -> Result<ControllerSlotView, AdminApiErro
     wire.slot
         .into_view()
         .map_err(AdminApiError::MalformedResponse)
+}
+
+// ---------------------------------------------------------------------------
+// recovery-root + break-glass recovery contract (goal plan 04A, D10–D12;
+// server shapes frozen at NazoAuth commit `9e4499dd`)
+// ---------------------------------------------------------------------------
+
+/// Body of `POST /admin/controller-registry/recovery-root/approvals`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryRootApprovalBody {
+    pub deployment_id: String,
+    /// Unpadded base64url of the 32-byte replacement Recovery Public Key.
+    pub recovery_public_key: String,
+    pub kid: String,
+}
+
+/// Body of `POST /admin/controller-registry/recovery-root/rotate`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryRootRotateBody {
+    pub approval_token: String,
+    pub deployment_id: String,
+    pub recovery_public_key: String,
+    pub kid: String,
+}
+
+/// Body of `POST /controller-recovery/challenges`.  The `recovery_*` fields
+/// name the REPLACEMENT root installed on success; the answer itself is
+/// signed by the OLD secret's key against the CURRENT root.
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryChallengeBody {
+    pub deployment_id: String,
+    pub label: String,
+    pub controller_public_key: String,
+    pub kid: String,
+    pub recovery_public_key: String,
+    pub recovery_kid: String,
+}
+
+/// Body of `POST /controller-recovery/recover`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryAnswerBody {
+    pub deployment_id: String,
+    pub challenge_id: String,
+    pub nonce: String,
+    pub signature: String,
+}
+
+/// Read-only admin view of one deployment's Recovery Root. Public key bytes
+/// are never part of this view by server design.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryRootView {
+    pub deployment_id: String,
+    pub present: bool,
+    pub recovery_kid: Option<String>,
+    pub kdf: Option<String>,
+    pub generation: Option<u64>,
+}
+
+/// One issued break-glass challenge.
+#[derive(Clone, Debug)]
+pub struct IssuedRecoveryChallenge {
+    pub challenge_id: String,
+    pub nonce: [u8; 32],
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Authoritative result of one accepted recovery commit.
+#[derive(Clone, Debug)]
+pub struct RecoveryCommitView {
+    pub slot: ControllerSlotView,
+    pub recovery_generation: u64,
+}
+
+fn malformed_response(error: impl Into<anyhow::Error>) -> AdminApiError {
+    AdminApiError::MalformedResponse(error.into())
+}
+
+fn decode_recovery_root_view(raw: Vec<u8>) -> Result<RecoveryRootView, AdminApiError> {
+    let mut object =
+        match serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&raw) {
+            Ok(object) => object,
+            Err(error) => return Err(malformed_response(error)),
+        };
+    let present = object
+        .get("present")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| malformed_response(anyhow::anyhow!("missing boolean 'present'")))?;
+    // Strip the discriminant so each branch can stay deny_unknown_fields.
+    object.remove("present");
+    let value = serde_json::Value::Object(object);
+    if !present {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AbsentWire {
+            deployment_id: String,
+        }
+        let wire: AbsentWire = serde_json::from_value(value).map_err(malformed_response)?;
+        return Ok(RecoveryRootView {
+            deployment_id: wire.deployment_id,
+            present: false,
+            recovery_kid: None,
+            kdf: None,
+            generation: None,
+        });
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PresentWire {
+        deployment_id: String,
+        recovery_kid: String,
+        kdf: String,
+        generation: u64,
+    }
+    let wire: PresentWire = serde_json::from_value(value).map_err(malformed_response)?;
+    Ok(RecoveryRootView {
+        deployment_id: wire.deployment_id,
+        present: true,
+        recovery_kid: Some(wire.recovery_kid),
+        kdf: Some(wire.kdf),
+        generation: Some(wire.generation),
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryCommitWire {
+    slot: SlotViewWire,
+    recovery_generation: u64,
+    /// Public confirmation that the previous generation stopped verifying at
+    /// commit time; asserted so contract drift cannot silently weaken it.
+    #[serde(default)]
+    old_recovery_secret_invalid: Option<bool>,
+}
+
+fn decode_recovery_commit(raw: Vec<u8>) -> Result<RecoveryCommitView, AdminApiError> {
+    let wire: RecoveryCommitWire = serde_json::from_slice(&raw).map_err(malformed_response)?;
+    if wire.old_recovery_secret_invalid != Some(true) {
+        return Err(malformed_response(anyhow::anyhow!(
+            "recovery commit did not confirm previous-generation invalidation"
+        )));
+    }
+    Ok(RecoveryCommitView {
+        slot: wire
+            .slot
+            .into_view()
+            .map_err(AdminApiError::MalformedResponse)?,
+        recovery_generation: wire.recovery_generation,
+    })
 }
 
 #[cfg(test)]

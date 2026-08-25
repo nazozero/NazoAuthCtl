@@ -51,6 +51,9 @@
 //! * [`journal`] — E06 ctl-half write-ahead dispatch journal.
 //! * [`dispatch`] — prepare/resume/dispatch glue keeping "one authorization =
 //!   one operation lifetime".
+//! * [`recovery`] — Recovery Secret client half (D10/D11/D12): offline-root
+//!   enrollment/rotation and the break-glass challenge flow. Secret bytes and
+//!   derived seeds exist only inside these functions and are zeroized.
 
 pub mod admin_api;
 pub mod dispatch;
@@ -58,6 +61,7 @@ pub mod expiry;
 pub mod journal;
 pub mod lifecycle;
 pub mod operation;
+pub(crate) mod recovery;
 pub mod store;
 
 pub use dispatch::{
