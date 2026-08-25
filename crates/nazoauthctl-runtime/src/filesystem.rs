@@ -805,6 +805,16 @@ pub fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
 
 #[cfg(not(unix))]
 pub fn set_mode(_path: &Path, _mode: u32) -> anyhow::Result<()> {
+    // P1-4 known limitation: Windows does not enforce POSIX modes. On NTFS,
+    // files created by a user process inherit the parent directory's ACL,
+    // which under %USERPROFILE% or %APPDATA% is already owner-restricted by
+    // default. Explicit ACL hardening via `icacls` or the Win32 Security API
+    // is deferred to the K-phase integration environment where the resulting
+    // security descriptors can be verified against a real domain-joined host.
+    //
+    // The secure-file READ path (`read_secure_regular_file`) still validates
+    // that the file is not accessible through symlink/reparse/hardlink
+    // attacks on all platforms.
     Ok(())
 }
 
