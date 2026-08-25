@@ -53,7 +53,7 @@ pub(crate) const SERVER_REPOSITORY: &str = "nazozero/NazoAuth";
 pub(crate) const DEFAULT_PORT: u16 = 8000;
 
 /// Config schema token recorded in the DeploymentState for seed documents.
-pub(crate) const CONFIG_SCHEMA_SEED: &str = "nazauth-seed-v1";
+pub(crate) const CONFIG_SCHEMA_SEED: &str = "nazauth-seed-v2";
 
 /// One clean-install invocation. Defaults are deliberately minimal: only the
 /// issuer is mandatory because it is a real external fact that cannot be
@@ -167,18 +167,23 @@ fn resolve_paths(
     }
 }
 
-/// Rendered server configuration seed. Secret values appear strictly as file
-/// references into the target-generated secret set.
-#[derive(serde::Serialize)]
-#[serde(deny_unknown_fields)]
-struct ServerConfigSeed<'a> {
-    schema: u32,
-    deployment_id: &'a str,
-    issuer: &'a str,
-    listen_port: u16,
-    database_url_file: &'a str,
-    valkey_url_file: &'a str,
-    mfa_totp_key_file: &'a str,
+/// Render the server configuration seed as the exact `.env.yaml` document
+/// NazoAuth's single loader accepts: uppercase allowlisted keys, secret values
+/// only as container-internal file references, LF endings. The container-side
+/// paths are the frozen mount contract in `target::install_exec`.
+fn render_config_yaml(issuer: &str) -> anyhow::Result<String> {
+    if issuer.contains(['"', '\\']) || issuer.chars().any(|c| c.is_control()) {
+        bail!("issuer must not contain YAML-special characters");
+    }
+    use crate::target::install_exec::{CONTAINER_DATA_DIR, CONTAINER_SECRETS_DIR};
+    Ok(format!(
+        "BIND: \"0.0.0.0:{DEFAULT_PORT}\"\n\
+         PUBLIC_BASE_URL: \"{issuer}\"\n\
+         DATABASE_URL_FILE: \"{CONTAINER_SECRETS_DIR}/database-url\"\n\
+         VALKEY_URL_FILE: \"{CONTAINER_SECRETS_DIR}/valkey-url\"\n\
+         MFA_TOTP_ENCRYPTION_KEY_FILE: \"{CONTAINER_SECRETS_DIR}/mfa-totp-key\"\n\
+         DATA_DIR: \"{CONTAINER_DATA_DIR}\"\n"
+    ))
 }
 
 /// Pick the runtime class from what the verified helper actually announced.
@@ -210,7 +215,6 @@ fn select_runtime(hello_runtimes: &[String], requested: Option<&str>) -> anyhow:
 /// Build everything the target needs for one clean-install operation.
 fn build_install_order(
     request: &CleanInstallRequest,
-    deployment_id: &str,
     paths: &InstallPaths,
 ) -> anyhow::Result<InstallOrder> {
     let database_url_file = paths
@@ -229,18 +233,9 @@ fn build_install_order(
         .to_string_lossy()
         .into_owned();
 
-    let seed = ServerConfigSeed {
-        schema: 1,
-        deployment_id,
-        issuer: &request.issuer,
-        listen_port: DEFAULT_PORT,
-        database_url_file: &database_url_file,
-        valkey_url_file: &valkey_url_file,
-        mfa_totp_key_file: &mfa_totp_key_file,
-    };
-    let config_bytes = serde_json::to_vec_pretty(&seed)?;
-    // LF line endings are mandatory for every ctl-written artifact.
-    let config_content = String::from_utf8(config_bytes)?;
+    // The seed is the real `.env.yaml` the server loads; secret values are
+    // only container-internal file references into the mounted secrets dir.
+    let config_content = render_config_yaml(&request.issuer)?;
     let config_sha256 = hex_digest(config_content.as_bytes());
 
     let order = InstallOrder {
@@ -300,7 +295,7 @@ fn prepare_install_operation(
     let runtime_kind = select_runtime(&hello.supported_runtimes, request.runtime.as_deref())?;
     let runtime_object = format!("nazoauth-{}", deployment_id.trim_start_matches("deploy-"));
     let paths = resolve_paths(request, &deployment_id)?;
-    let order = build_install_order(request, &deployment_id, &paths)?;
+    let order = build_install_order(request, &paths)?;
     let resources = declare_resources(
         &runtime_object,
         &paths.data_root.to_string_lossy(),

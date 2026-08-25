@@ -1,22 +1,20 @@
 //! Control-side half of the fresh-install bootstrap authority (task G02).
 //!
-//! The target provisions the single-use capability during install (see
-//! `target::bootstrap_authority`); this module is everything that happens
-//! afterwards, from the control machine:
+//! NazoAuth owns the bootstrap token end to end: at startup it generates the
+//! one-time token at `DATA_DIR/bootstrap/initial-admin-token` and validates
+//! every claim against it plus the deployment identity. This module is the
+//! control-side flow, from the control machine:
 //!
 //! 1. resolve the instance and refuse any deployment that already carries a
 //!    controller binding (bootstrap is for the unbound window only);
-//! 2. read the live DeploymentState plus the capability material;
+//! 2. read the live DeploymentState, the install-binding context, and the
+//!    SERVER-generated token through the target's inspect/read surface;
 //! 3. pass the hardcoded allowlist/journal/artifact/config gate;
-//! 4. POST the exact legacy `/auth/bootstrap-admin` contract — credentials
-//!    ride only in the HTTPS request body, never in argv/env/logs/output;
-//! 5. close the capability durably: token + context files are deleted, and
-//!    because bootstrap mutations fail closed over existing state they can
-//!    never be regenerated. Every later attempt answers `BOOTSTRAP_CLOSED`.
-//!
-//! Server-side enforcement points (NazoAuth treating the token as an ordinary
-//! operator credential afterwards, single-use binding to a fresh-install
-//! marker) are outside this repository; see the task report's open questions.
+//! 4. POST the `/auth/bootstrap-admin` contract — credentials ride only in
+//!    the HTTPS request body, never in argv/env/logs/output;
+//! 5. close the capability durably on success; because bootstrap mutations
+//!    fail closed over existing state they can never be regenerated. Every
+//!    later attempt answers `BOOTSTRAP_CLOSED`.
 
 use anyhow::{Context as _, bail};
 use url::Url;
@@ -38,12 +36,14 @@ pub(crate) struct AdminCredentials {
 }
 
 /// Request payload mirroring NazoAuth's frozen `/auth/bootstrap-admin`
-/// contract (legacy client: `controller/bootstrap.rs`).
+/// contract: the server-generated token, the deployment identity being
+/// claimed, and the initial administrator credentials.
 #[derive(serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct BootstrapAdminRequest<'a> {
     request_id: &'a str,
     token: &'a str,
+    deployment_id: &'a str,
     email: &'a str,
     password: &'a str,
 }
@@ -167,7 +167,9 @@ impl BootstrapMaterialSource for LocalBootstrapMaterial {
         let scope = self.scope_dir(deployment_id)?;
         let context = bootstrap_authority::load_context(&scope)?
             .with_context(|| format!("{BOOTSTRAP_CLOSED}: no fresh-install capability exists"))?;
-        let token = Zeroizing::new(bootstrap_authority::read_token(&scope)?);
+        // The token is the SERVER-generated one inside the deployment's data
+        // root; ctl only reads it while the capability is open.
+        let token = Zeroizing::new(bootstrap_authority::read_server_token(&context)?);
         Ok((context, token))
     }
 
@@ -254,6 +256,7 @@ pub(crate) fn claim_initial_admin(
     let body = serde_json::to_vec(&BootstrapAdminRequest {
         request_id: &request_id,
         token: &token,
+        deployment_id: &record.deployment_id,
         email: &credentials.email,
         password: &credentials.password,
     })?;
@@ -273,8 +276,10 @@ pub(crate) fn claim_initial_admin(
         bail!("initial administrator endpoint returned an unexpected response contract");
     }
 
-    // 4. Close permanently: delete token + context. Regeneration is
-    // impossible because bootstrap mutations fail closed over existing state.
+    // 4. Close permanently: delete the install-binding context. The
+    // server-owned token file is consumed by NazoAuth itself; regeneration of
+    // the capability is impossible because bootstrap mutations fail closed
+    // over existing state.
     material.close(&record.deployment_id)?;
 
     Ok(format!(
@@ -300,6 +305,8 @@ mod tests {
 
     const ISSUER: &str = "https://auth.example.com";
     const OP_ID: &str = "018f0000-0000-7000-8000-000000000001";
+    /// Server-generated token shape (48 bytes unpadded base64url).
+    const SERVER_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     fn digest() -> String {
         format!("c0ffee{:0>58}", "")
@@ -310,6 +317,7 @@ mod tests {
         registry: RegistryStore,
         material: LocalBootstrapMaterial,
         deployment_id: String,
+        data_root: std::path::PathBuf,
     }
 
     impl Fixture {
@@ -332,7 +340,7 @@ mod tests {
                             previous: None,
                         },
                         config_reference: "/cfg/config.json".to_owned(),
-                        config_schema: "nazauth-seed-v1".to_owned(),
+                        config_schema: "nazauth-seed-v2".to_owned(),
                         resources: Vec::new(),
                     },
                     OP_ID,
@@ -341,7 +349,8 @@ mod tests {
             // Provision the capability bound to the install operation.
             let scope = state_root.join("deployments").join(&deployment_id);
             filesystem::ensure_directory_chain(&scope)?;
-            let order = minimal_order();
+            let data_root = temp.path().join("data-root");
+            let order = minimal_order(&data_root);
             bootstrap_authority::provision(
                 &scope,
                 &install_exec::InstallJob {
@@ -355,6 +364,19 @@ mod tests {
                     order: &order,
                 },
                 &digest(),
+            )?;
+            // Simulate the running NazoAuth having published its own token
+            // inside the mounted data root.
+            filesystem::ensure_directory_chain(
+                data_root
+                    .join(bootstrap_authority::SERVER_TOKEN_RELATIVE_PATH)
+                    .parent()
+                    .expect("token parent"),
+            )?;
+            filesystem::atomic_write(
+                &data_root.join(bootstrap_authority::SERVER_TOKEN_RELATIVE_PATH),
+                SERVER_TOKEN.as_bytes(),
+                0o600,
             )?;
 
             registry.add_instance(InstanceRecord::new(
@@ -370,6 +392,7 @@ mod tests {
                 registry,
                 material: LocalBootstrapMaterial::with_state_root(&state_root),
                 deployment_id,
+                data_root,
             })
         }
 
@@ -381,16 +404,16 @@ mod tests {
         }
     }
 
-    fn minimal_order() -> install_exec::InstallOrder {
+    fn minimal_order(data_root: &std::path::Path) -> install_exec::InstallOrder {
         install_exec::InstallOrder {
             artifact: install_exec::OfficialArtifactRef {
                 repository: "nazozero/NazoAuth".to_owned(),
                 version: None,
                 expected_subject_sha256: None,
             },
-            config_content: "{}".to_owned(),
+            config_content: "BIND: \"0.0.0.0:8000\"".to_owned(),
             config_sha256: "0".repeat(64),
-            data_root: "/data".to_owned(),
+            data_root: data_root.to_string_lossy().into_owned(),
             secrets: vec![],
             database_endpoint: crate::target::install_exec::ExternalEndpoint {
                 host: "db.internal".to_owned(),
@@ -412,6 +435,7 @@ mod tests {
     struct FakeTransport {
         expected_status: u16,
         seen_endpoint: std::sync::Mutex<Option<Url>>,
+        seen_request: std::sync::Mutex<Option<serde_json::Value>>,
     }
 
     impl FakeTransport {
@@ -419,6 +443,7 @@ mod tests {
             Self {
                 expected_status: 201,
                 seen_endpoint: std::sync::Mutex::new(None),
+                seen_request: std::sync::Mutex::new(None),
             }
         }
     }
@@ -431,6 +456,7 @@ mod tests {
         ) -> anyhow::Result<(u16, Vec<u8>)> {
             *self.seen_endpoint.lock().unwrap() = Some(endpoint.clone());
             let request: serde_json::Value = serde_json::from_slice(body)?;
+            *self.seen_request.lock().unwrap() = Some(request.clone());
             let response = serde_json::json!({
                 "id": uuid::Uuid::now_v7(),
                 "request_id": request["request_id"],
@@ -443,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_claim_uses_the_legacy_contract_then_closes_the_capability_forever()
+    fn successful_claim_posts_the_server_token_then_closes_the_capability_forever()
     -> anyhow::Result<()> {
         let fixture = Fixture::new()?;
         let transport = FakeTransport::ok();
@@ -467,15 +493,27 @@ mod tests {
             "{report}"
         );
 
-        // Closure deleted token and context durably.
+        // The claim carried the SERVER-generated token and this exact
+        // deployment identity — never a ctl-minted credential.
+        let request = transport.seen_request.lock().unwrap().clone().unwrap();
+        assert_eq!(request["token"], SERVER_TOKEN);
+        assert_eq!(request["deployment_id"], fixture.deployment_id);
+
+        // Closure deleted the install-binding context; the token file itself
+        // stays under NazoAuth's exclusive ownership.
         let scope = fixture
             ._temp
             .path()
             .join("state")
             .join("deployments")
             .join(&fixture.deployment_id);
-        assert!(!scope.join(bootstrap_authority::TOKEN_FILE_NAME).exists());
         assert!(!scope.join(bootstrap_authority::CONTEXT_FILE_NAME).exists());
+        assert!(
+            fixture
+                .data_root
+                .join(bootstrap_authority::SERVER_TOKEN_RELATIVE_PATH)
+                .exists()
+        );
 
         // Any retry — even with valid credentials — is refused forever.
         let error = claim_initial_admin(
@@ -594,6 +632,7 @@ mod tests {
         let transport = FakeTransport {
             expected_status: 409,
             seen_endpoint: std::sync::Mutex::new(None),
+            seen_request: std::sync::Mutex::new(None),
         };
         let error = claim_initial_admin(
             &fixture.registry,

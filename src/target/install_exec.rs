@@ -63,6 +63,20 @@ pub const SECRET_PURPOSES: &[&str] = &["database-url", "valkey-url", "mfa-totp-k
 /// (the whole operation must stay under `MAX_HOST_OPERATION_BYTES`).
 pub const MAX_CONFIG_CONTENT_BYTES: usize = 32 * 1024;
 
+// Container-internal contract frozen with NazoAuth's configuration loader:
+// the server loads `.env.yaml` (or `NAZOAUTH_SERVER_CONFIG_FILE`) at startup,
+// resolves secret files by path, and persists under DATA_DIR. The control
+// side renders these exact references into the seed configuration and mounts
+// the host facts onto exactly these destinations.
+/// Configuration file inside the container (`WORKDIR /app`).
+pub const CONTAINER_CONFIG_FILE: &str = "/app/.env.yaml";
+/// Read-only mount point for the target-generated secret files.
+pub const CONTAINER_SECRETS_DIR: &str = "/run/secrets";
+/// Persistent data directory inside the container.
+pub const CONTAINER_DATA_DIR: &str = "/var/lib/nazo_oauth";
+/// NazoAuth environment key overriding the configuration file location.
+pub const SERVER_CONFIG_FILE_ENV: &str = "NAZOAUTH_SERVER_CONFIG_FILE";
+
 /// The official artifact a fresh install obtains and verifies on the target.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -278,6 +292,19 @@ impl InstallOrder {
                 ));
             }
             seen.push(secret.purpose.clone());
+        }
+        // The runtime mounts exactly one read-only secrets directory; the
+        // rendered configuration references every file through it.
+        if let Some((first, rest)) = self.secrets.split_first()
+            && let Some(shared) = Path::new(&first.path).parent()
+            && rest
+                .iter()
+                .any(|secret| Path::new(&secret.path).parent() != Some(shared))
+        {
+            return Err(super::wire::MessageRejection::new(
+                super::wire::RejectionCode::OperationMalformed,
+                "install secret files must live in one shared host directory",
+            ));
         }
         Ok(())
     }
@@ -530,9 +557,10 @@ impl HostInstallExecutor {
             }
         }
 
-        // 4. Fresh-install application setup (G02 hook): the single-use
-        // initial-admin capability, hard-bound to this install operation's
-        // journal identity and the verified artifact digest.
+        // 4. Fresh-install application setup (G02 hook): the install-binding
+        // capability record. The bootstrap token has exactly one authority —
+        // NazoAuth itself generates it inside DATA_DIR at startup; nothing is
+        // provisioned or mounted here.
         if job.order.fresh_bootstrap {
             bootstrap_authority::provision(job.scope_dir, job, &subject_digest).map_err(
                 |error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())),
@@ -623,19 +651,64 @@ fn start_container_runtime(
         ));
     }
     let mut mounts = vec![
-        mount(config_mount_source(job), "/etc/nazauth", true),
+        mount(
+            PathBuf::from(job.config_reference),
+            CONTAINER_CONFIG_FILE,
+            true,
+        ),
         mount(
             PathBuf::from(&job.order.data_root),
-            "/var/lib/nazo_oauth",
+            CONTAINER_DATA_DIR,
             false,
         ),
     ];
-    if job.order.fresh_bootstrap {
+    // Secret files share one host directory (enforced by InstallOrder
+    // validation); it is mounted read-only at the fixed container location
+    // the seed configuration references.
+    if let Some(secrets_dir) = job
+        .order
+        .secrets
+        .first()
+        .and_then(|secret| Path::new(&secret.path).parent())
+    {
         mounts.push(mount(
-            job.scope_dir.join(bootstrap_authority::TOKEN_FILE_NAME),
-            "/run/nazoauth-bootstrap/token",
+            secrets_dir.to_path_buf(),
+            CONTAINER_SECRETS_DIR,
             true,
         ));
+    }
+    // The issuer lives ONLY in the mounted configuration (`PUBLIC_BASE_URL`);
+    // duplicating it here would let updates of the file drift from a stale
+    // environment variable.
+    let mut environment: std::collections::BTreeMap<String, String> = [
+        (
+            SERVER_CONFIG_FILE_ENV.to_owned(),
+            CONTAINER_CONFIG_FILE.to_owned(),
+        ),
+        ("DATA_DIR".to_owned(), CONTAINER_DATA_DIR.to_owned()),
+        ("DEPLOYMENT_ID".to_owned(), job.deployment_id.to_owned()),
+    ]
+    .into_iter()
+    .collect();
+    for secret in &job.order.secrets {
+        let key = match secret.purpose.as_str() {
+            "database-url" => "DATABASE_URL_FILE",
+            "valkey-url" => "VALKEY_URL_FILE",
+            "mfa-totp-key" => "MFA_TOTP_ENCRYPTION_KEY_FILE",
+            other => {
+                return Err(Failure::new(
+                    HOST_ERR_OPERATION_INVALID,
+                    format!(
+                        "unsupported install secret purpose '{}'",
+                        sanitize(other.to_owned())
+                    ),
+                ));
+            }
+        };
+        environment.insert(
+            key.to_owned(),
+            format!("{CONTAINER_SECRETS_DIR}/{}", secret.purpose),
+        );
     }
     let replacement = runtime_backend::RuntimeReplacement {
         object_reference: job.runtime_object.to_owned(),
@@ -643,13 +716,7 @@ fn start_container_runtime(
         local_artifact_id: None,
         command: vec!["nazoauth".to_owned(), "server".to_owned()],
         mounts,
-        environment: [
-            ("ISSUER".to_owned(), job.issuer.to_owned()),
-            ("DATA_DIR".to_owned(), "/var/lib/nazo_oauth".to_owned()),
-            ("DEPLOYMENT_ID".to_owned(), job.deployment_id.to_owned()),
-        ]
-        .into_iter()
-        .collect(),
+        environment,
         networks: Vec::new(),
         ip_address: None,
         ports: vec![format!("127.0.0.1:{}:8000/tcp", job.order.port)],
@@ -699,13 +766,6 @@ fn mount(source: PathBuf, destination: &str, read_only: bool) -> runtime_backend
         ownership: runtime_backend::Responsibility::Managed,
         scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
     }
-}
-
-fn config_mount_source(job: &InstallJob<'_>) -> PathBuf {
-    PathBuf::from(job.config_reference)
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("/etc/nazauth"))
 }
 
 /// Bounded loopback readiness probe against `http://127.0.0.1:{port}/readyz`.

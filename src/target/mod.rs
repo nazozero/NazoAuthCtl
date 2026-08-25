@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 pub use bootstrap_authority::{
     BOOTSTRAP_CLOSED, CONTEXT_FILE_NAME, FRESH_BOOTSTRAP_ALLOWLIST, FRESH_BOOTSTRAP_SCHEMA,
-    FreshBootstrapContext, FreshBootstrapMaterialView, TOKEN_FILE_NAME,
+    FreshBootstrapContext, FreshBootstrapMaterialView, SERVER_TOKEN_RELATIVE_PATH,
 };
 pub use control_exec::{
     CONTROL_EXECUTION_UNAVAILABLE, CONTROL_OUTCOME_UNKNOWN, CONTROL_TARGET_DRIFT,

@@ -478,13 +478,14 @@ fn local_happy_path_commits_state_and_writes_instance_record() -> anyhow::Result
     assert!(raw.contains("\"pending\""), "{raw}");
     assert!(raw.contains("\"completed\""), "{raw}");
 
-    // Fresh-install bootstrap capability is OPEN after install (G02 hook).
+    // Fresh-install bootstrap capability is OPEN after install (G02 hook):
+    // the install-binding context exists, and NO ctl-side token was minted
+    // (the bootstrap token is NazoAuth's own, inside its data root).
     let scope = fixture
         .state_root
         .join("deployments")
         .join(&record.deployment_id);
     assert!(scope.join(bootstrap_authority::CONTEXT_FILE_NAME).is_file());
-    assert!(scope.join(bootstrap_authority::TOKEN_FILE_NAME).is_file());
 
     // Ordering pin: verification strictly precedes runtime start.
     assert_eq!(
@@ -620,10 +621,6 @@ fn health_failure_rolls_back_config_secrets_and_bootstrap_material_locally() -> 
         );
     }
     let scope = fixture.state_root.join("deployments").join(&deployment_id);
-    assert!(
-        !scope.join(bootstrap_authority::TOKEN_FILE_NAME).exists(),
-        "bootstrap token must be deleted on rollback"
-    );
     assert!(
         !scope.join(bootstrap_authority::CONTEXT_FILE_NAME).exists(),
         "bootstrap context must be deleted on rollback"

@@ -1,32 +1,31 @@
 //! Fresh-install bootstrap authority (goal plan 07, task G02).
 //!
 //! A fresh NazoAuth cannot enroll an administrator before it runs, and its
-//! very first administrator cannot exist before initialization. The clean
-//! install closes exactly this loop — and nothing more: the target provisions
-//! one single-use capability that may create the initial admin account, and
-//! the capability dies at its first successful use (or with a failed install).
-//!
-//! Hard rules, all enforced in code:
+//! very first administrator cannot exist before initialization. NazoAuth
+//! itself owns that capability: at startup it generates the one-time token at
+//! `DATA_DIR/bootstrap/initial-admin-token` and validates every claim against
+//! it. This module is the control-side half — and nothing more:
 //!
 //! 1. The allowlist is a compile-time constant: [`FRESH_BOOTSTRAP_ALLOWLIST`]
 //!    contains exactly `create-initial-admin`. No other operation can ever be
-//!    provisioned or authorized through this path.
-//! 2. The capability is bound to the fresh-install journal: authorization
+//!    authorized through this path.
+//! 2. There is exactly ONE bootstrap token authority: the server. Ctl never
+//!    mints, stores, or mounts a second token; it only records the
+//!    install-binding context ([`FreshBootstrapContext`], including the data
+//!    root where the server publishes its token) and later reads the
+//!    server-generated token back through the target's inspect surface.
+//! 3. The capability is bound to the fresh-install journal: authorization
 //!    requires that the live DeploymentState was produced by the exact install
 //!    operation id recorded in the context, carries the exact verified
 //!    artifact digest and the untouched config revision recorded then. Any
 //!    drift (tampered artifact/config, later operation) rejects.
-//! 3. Closure deletes the token and context files durably. Because
-//!    `bootstrap` state mutations fail closed over existing state
-//!    (`DEPLOYMENT_EXISTS`), a deleted capability can never be regenerated:
-//!    there is no permanent unsigned operator and no `--force-bootstrap`.
-//!
-//! Server-side note: NazoAuth's `/auth/bootstrap-admin` endpoint accepts the
-//! one-time token for exactly one account creation; treating the token as an
-//! ordinary operator credential afterwards is a server-side enforcement point
-//! outside this repository's control surface (tracked as an open question).
+//! 4. Closure deletes the context durably. Because `bootstrap` state
+//!    mutations fail closed over existing state (`DEPLOYMENT_EXISTS`), a
+//!    deleted capability can never be regenerated: there is no permanent
+//!    unsigned operator and no `--force-bootstrap`. The token file itself is
+//!    owned — and consumed — by NazoAuth alone.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 use chrono::{DateTime, Utc};
@@ -51,14 +50,15 @@ pub const FRESH_BOOTSTRAP_ALLOWLIST: &[&str] = &["create-initial-admin"];
 pub const BOOTSTRAP_CLOSED: &str = "BOOTSTRAP_CLOSED";
 
 /// Schema discriminator for the persisted context document.
-pub const FRESH_BOOTSTRAP_SCHEMA: u32 = 1;
+pub const FRESH_BOOTSTRAP_SCHEMA: u32 = 2;
 
 /// Context file name inside the deployment scope directory.
 pub const CONTEXT_FILE_NAME: &str = "fresh-bootstrap.json";
 
-/// Token file name inside the deployment scope directory. Root-private by
-/// directory mode; read once per claim attempt and never logged.
-pub const TOKEN_FILE_NAME: &str = "fresh-bootstrap-token";
+/// Server-owned token location relative to the deployment data root
+/// (`DATA_DIR` inside the runtime). NazoAuth generates and consumes this file;
+/// ctl only reads it while the fresh-install capability is open.
+pub const SERVER_TOKEN_RELATIVE_PATH: &str = "bootstrap/initial-admin-token";
 
 /// Durable record binding the bootstrap capability to one exact fresh install.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -77,6 +77,9 @@ pub struct FreshBootstrapContext {
     /// Config revision at install commit (fresh installs commit revision 1);
     /// claims after any config change reject.
     pub config_revision: u64,
+    /// Host-side data root backing the runtime's `DATA_DIR`; the deployment
+    /// fact that locates the server-generated bootstrap token.
+    pub data_root: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -92,11 +95,10 @@ impl FreshBootstrapContext {
     }
 }
 
-/// Provision the single-use initial-admin capability for a fresh install.
-/// Called by the install executor *before* the runtime starts (the runtime
-/// bind-mounts the token); refuses to shadow an existing capability. The
-/// capability is bound to the exact install operation id and the exact
-/// verified artifact digest.
+/// Provision the fresh-install capability record for a clean install. Called
+/// by the install executor before the runtime starts. No token exists here:
+/// the running NazoAuth creates the single authoritative token inside the
+/// mounted data root when it initializes its bootstrap endpoint.
 pub(crate) fn provision(
     scope_dir: &Path,
     job: &InstallJob<'_>,
@@ -105,8 +107,6 @@ pub(crate) fn provision(
     if load_context(scope_dir)?.is_some() {
         bail!("a fresh-bootstrap capability already exists; refusing to re-provision");
     }
-    filesystem::generate_secret(&scope_dir.join(TOKEN_FILE_NAME))
-        .context("failed to persist the fresh-bootstrap token")?;
     let context = FreshBootstrapContext {
         schema: FRESH_BOOTSTRAP_SCHEMA,
         allowlist: FRESH_BOOTSTRAP_ALLOWLIST
@@ -118,6 +118,7 @@ pub(crate) fn provision(
         issuer: job.issuer.to_owned(),
         artifact_subject_sha256: subject_digest.to_owned(),
         config_revision: 1,
+        data_root: job.order.data_root.clone(),
         created_at: Utc::now(),
     };
     filesystem::atomic_write(
@@ -146,38 +147,60 @@ pub(crate) fn load_context(scope_dir: &Path) -> anyhow::Result<Option<FreshBoots
     Ok(Some(context))
 }
 
-/// Read the one-time token. Exists only while the capability is open.
-pub(crate) fn read_token(scope_dir: &Path) -> anyhow::Result<String> {
-    let path = scope_dir.join(TOKEN_FILE_NAME);
-    let bytes = filesystem::read_secure_regular_file(&path, "fresh-bootstrap token", true, 4096)?;
+fn server_token_path(context: &FreshBootstrapContext) -> PathBuf {
+    Path::new(&context.data_root).join(SERVER_TOKEN_RELATIVE_PATH)
+}
+
+/// Same shape NazoAuth enforces for its generated tokens (48 random bytes,
+/// unpadded base64url).
+fn valid_initial_admin_token(token: &str) -> bool {
+    token.len() == 64
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Read the SERVER-generated one-time token from the deployment's data root.
+/// Exists exactly while NazoAuth keeps the bootstrap window open; ctl never
+/// writes or regenerates it.
+pub(crate) fn read_server_token(context: &FreshBootstrapContext) -> anyhow::Result<String> {
+    let path = server_token_path(context);
+    let bytes = filesystem::read_secure_regular_file(
+        &path,
+        "initial administrator bootstrap token",
+        true,
+        4096,
+    )?;
     let token = std::str::from_utf8(&bytes)
         .with_context(|| format!("{} is not valid UTF-8", path.display()))?
-        .trim_end_matches(['\r', '\n'])
+        .trim()
         .to_owned();
-    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("fresh-bootstrap token has an invalid format");
+    if !valid_initial_admin_token(&token) {
+        bail!(
+            "the server-generated bootstrap token at {} has an unexpected format",
+            path.display()
+        );
     }
     Ok(token)
 }
 
-/// Delete token + context durably. Missing files are tolerated so rollback
-/// paths and claim paths can both call it unconditionally.
+/// Delete the capability context durably. Missing files are tolerated so
+/// rollback paths and claim paths can both call it unconditionally. The
+/// server-owned token file is deliberately left to NazoAuth's own lifecycle.
 pub(crate) fn delete_material(scope_dir: &Path) -> anyhow::Result<()> {
-    for name in [TOKEN_FILE_NAME, CONTEXT_FILE_NAME] {
-        let path = scope_dir.join(name);
-        match filesystem::remove_file_durable(&path) {
-            Ok(()) => {}
-            Err(error) if !path.exists() => {
-                let _ = error; // already gone — closure is idempotent
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to delete fresh-bootstrap material {}",
-                        path.display()
-                    )
-                });
-            }
+    let path = scope_dir.join(CONTEXT_FILE_NAME);
+    match filesystem::remove_file_durable(&path) {
+        Ok(()) => {}
+        Err(error) if !path.exists() => {
+            let _ = error; // already gone — closure is idempotent
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to delete fresh-bootstrap material {}",
+                    path.display()
+                )
+            });
         }
     }
     Ok(())
@@ -210,7 +233,7 @@ pub(crate) fn surface_material_view(
 ) -> Option<FreshBootstrapMaterialView> {
     let context = load_context(scope_dir).ok()??;
     authorize_claim(Some(&context), FRESH_BOOTSTRAP_ALLOWLIST[0], state).ok()?;
-    let token = read_token(scope_dir).ok()?;
+    let token = read_server_token(&context).ok()?;
     Some(FreshBootstrapMaterialView {
         allowlist: context.allowlist,
         install_operation_id: context.install_operation_id,
