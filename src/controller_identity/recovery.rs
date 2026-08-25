@@ -120,14 +120,15 @@ pub(crate) fn rotate_root_with_new_secret(
 }
 
 /// Authoritative result of one successful break-glass recovery.
-// Delivery boundary: rendered by the I-wave CLI; asserted by the tests below.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct RecoveredIdentity {
     pub controller_id: String,
     pub kid: String,
     pub expires_at: chrono::DateTime<chrono::Utc>,
     pub recovery_generation: u64,
+    /// The NEW Recovery Secret, shown exactly once after the commit lands.
+    /// The caller MUST present this to the operator before exiting.
+    pub new_recovery_secret_display: String,
 }
 
 /// D11 break-glass flow: re-establish one Controller Key from the offline
@@ -241,6 +242,10 @@ pub(crate) fn recover_controller_identity(
         kid: commit.slot.kid,
         expires_at: commit.slot.expires_at,
         recovery_generation: commit.recovery_generation,
+        // W3.3: the replacement secret MUST reach the operator; without it the
+        // next recovery is impossible because this commit already invalidated
+        // the old root.
+        new_recovery_secret_display: replacement.display,
     })
 }
 
