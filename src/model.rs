@@ -316,15 +316,6 @@ impl UpdateConfig {
         }
         Ok(())
     }
-
-    pub(crate) fn container_backend(&self) -> Option<crate::deployment::RuntimeBackendKind> {
-        if self.runtime.backend == crate::deployment::RuntimeBackendKind::Systemd {
-            self.runtime.dependency_backend
-        } else {
-            Some(self.runtime.backend)
-        }
-        .filter(|backend| *backend != crate::deployment::RuntimeBackendKind::Systemd)
-    }
 }
 
 fn validate_public_runtime_urls(runtime: &Runtime) -> anyhow::Result<()> {

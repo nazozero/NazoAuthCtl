@@ -14,7 +14,6 @@ mod release;
 mod runtime;
 mod runtime_backend;
 mod runtime_identity;
-mod secret_provider;
 pub mod target;
 pub mod tenant_resources;
 mod tls;
@@ -104,6 +103,7 @@ fn command_action(command: &cli::Command) -> &'static str {
         cli::Command::Recover { .. } => "recover",
         cli::Command::Uninstall { .. } => "uninstall",
         cli::Command::BootstrapAdmin(_) => "bootstrap-admin",
+        cli::Command::Tls(_) => "tls",
         cli::Command::RemoteExec => "remote exec",
         cli::Command::SelfCheck(_) => "self check",
         cli::Command::SelfUpdate { .. } => "self update",
@@ -164,6 +164,8 @@ Selectors:
 Maintenance:
   self check|update|rollback   Update nazoauthctl itself (signed releases)
   bootstrap-admin              Claim the fresh-install initial administrator
+  tls certificate|acme ...     Deployment-owned TLS material via the
+                               external file-provider contract
   remote exec                  Internal stdio executor used over OpenSSH
 
 Run `nazoauthctl <command> --help` for exact options."
@@ -249,6 +251,23 @@ changes nothing; external/shared resources always have zero-delete protection."
 
 Controller updates consume only signed NazoAuthCtl Release binaries and
 provenance. They never select keys or state from a NazoAuth deployment."
+        }
+        cli::HelpTopic::Tls => {
+            "Usage:
+  nazoauthctl tls certificate check --provider-config PATH --tenant T --hostname H
+                                    [--warning-window-seconds S]
+  nazoauthctl tls certificate plan   --provider-config PATH --tenant T --hostname H
+                                     (--certificate F --private-key F | --from-acme-current)
+  nazoauthctl tls certificate apply  ...same inputs... [--yes]
+  nazoauthctl tls certificate recover --tenant T --hostname H --yes
+  nazoauthctl tls certificate show   --tenant T --hostname H
+  nazoauthctl tls acme plan|issue|recover|show ... (issue requires --agree-terms [--yes])
+
+Installs deployment-owned public TLS material through the external file-provider
+contract: offline chain/SAN/key validation, an atomic generation switch, a
+provider validate/reload pair, independent public verification, and a committed
+receipt bound to the declaration revision. `recover` restores the exact previous
+or committed generation; nothing else deletes provider material."
         }
         cli::HelpTopic::BootstrapAdmin => {
             "Usage:

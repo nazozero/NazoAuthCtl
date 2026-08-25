@@ -26,8 +26,8 @@ use anyhow::Context as _;
 pub use crate::error_codes::PRIVILEGE_REQUIRED;
 
 /// The closed set of steps whose privilege requirements this module owns.
-// Delivery boundary: the CLI surface (I wave) consumes every variant; until
-// then the classification itself is pinned by the unit tests below.
+// Only EngineSocketAccess has a live production check today; the full matrix
+// is pinned by tests so a future step cannot silently skip its classification.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PrivilegeStep {
@@ -58,10 +58,10 @@ impl PrivilegeStep {
         }
     }
 
-    /// The matrix itself. Everything not listed here is unprivileged by
-    /// construction — adding a step means extending this match, never gating
-    /// a command up front.
-    #[allow(dead_code)] // delivery boundary: I-wave CLI consumes this too
+    /// The matrix itself, pinned by the unit tests below. Everything not
+    /// listed here is unprivileged by construction — adding a step means
+    /// extending this match, never gating a command up front.
+    #[cfg(test)]
     pub(crate) fn requires_elevation(self) -> bool {
         matches!(
             self,

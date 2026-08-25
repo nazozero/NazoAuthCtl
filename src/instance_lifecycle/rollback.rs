@@ -22,7 +22,6 @@ use crate::target::{
 };
 
 /// The G04 entry point. Delivery boundary: wired into the CLI by the I wave.
-#[allow(dead_code)] // delivery boundary: CLI wiring lands with I-wave
 pub(crate) fn run_rollback(
     context: &LifecycleContext,
     selector: Option<&str>,

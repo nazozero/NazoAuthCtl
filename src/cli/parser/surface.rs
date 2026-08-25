@@ -119,8 +119,7 @@ pub(super) fn parse_bind(values: Vec<String>) -> anyhow::Result<BindOptions> {
 /// `nazoauthctl install [--host HOST] [--name ALIAS] --public-url URL
 /// [--to VERSION] [--artifact-sha256 SHA256] [--runtime CLASS] [--install-root PATH]`
 ///
-/// This is the G01 clean install; the retired per-deployment installer keeps
-/// compiling behind the frozen legacy runner only.
+/// This is the G01 clean install; the retired per-deployment installer is gone.
 pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallArgs> {
     let parsed = parse_options(
         values,

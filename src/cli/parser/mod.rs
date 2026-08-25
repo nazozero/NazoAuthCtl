@@ -1,24 +1,17 @@
-//! Token parser for the final 18-command façade (goal plan 09 §1, I01).
+//! Token parser for the final command façade (goal plan 09 §1, I01).
 //!
 //! Command families own their option state and boundary checks in sibling modules.  This module
-//! only consumes global options and routes the remaining tokens to the family parser. The frozen
-//! pre-goal parsers (`admin`, `tls`) stay compiled for the frozen legacy runner until the second
-//! J-phase pass deletes them; argv cannot reach them.
+//! only consumes global options and routes the remaining tokens to the family parser.
 
-#[allow(dead_code)]
-mod admin;
 mod common;
 mod controller;
 mod fleet;
 mod surface;
-#[allow(dead_code)]
 mod tls;
 
-use std::{env, path::PathBuf};
+use anyhow::{Context as _, bail};
 
-use anyhow::{Context, bail};
-
-use super::types::{self, Cli, Command};
+use super::types::{Cli, Command};
 use common::{no_arguments, parse_version_option, parse_yes, take_yes};
 use controller::parse_controller;
 use fleet::{parse_host, parse_instance};
@@ -26,6 +19,7 @@ use surface::{
     parse_backup, parse_bind, parse_bootstrap_admin_args, parse_install_args,
     parse_read_view_selector, parse_update_args,
 };
+use tls::parse_tls;
 
 impl Cli {
     pub(crate) fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Self>> {
@@ -36,9 +30,6 @@ impl Cli {
             return Ok(None);
         }
         let globals = super::parse_global_options(&values)?;
-        let config = env::var_os("NAZOAUTH_UPDATE_CONFIG")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(types::DEFAULT_CONFIG));
         values.drain(..globals.consumed);
         if values
             .iter()
@@ -115,6 +106,7 @@ impl Cli {
             }
             // ---- final-model maintenance surface ---------------------------
             "bootstrap-admin" => Command::BootstrapAdmin(parse_bootstrap_admin_args(values)?),
+            "tls" => Command::Tls(parse_tls(values)?),
             "remote" if values.first().is_some_and(|value| value == "exec") => {
                 values.remove(0);
                 no_arguments(&values, "remote exec")?;
@@ -143,8 +135,6 @@ impl Cli {
             ),
         };
         Ok(Some(Self {
-            config,
-            deployment: None,
             instance: globals.instance,
             json: globals.json,
             command,

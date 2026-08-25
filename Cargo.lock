@@ -1298,7 +1298,6 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "fs2",
- "hmac",
  "http",
  "http-body-util",
  "hyper-rustls",
@@ -1321,7 +1320,6 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
- "wait-timeout",
  "x509-parser",
  "zeroize",
 ]

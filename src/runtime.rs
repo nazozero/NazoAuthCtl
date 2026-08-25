@@ -2,9 +2,7 @@
 //!
 //! Mutation entry points moved to the target executors (`target/*_exec`) with
 //! the J-A deletion wave; what remains is the identity/digest observation
-//! surface shared by status, doctor and the conformance session.
-
-use std::fs;
+//! surface shared by the conformance session and the local-OCI guards.
 
 use anyhow::{Context as _, bail};
 
@@ -44,15 +42,6 @@ pub(crate) struct ActiveBuildTarget {
 impl<'a> Runtime<'a> {
     pub(crate) fn new(config: &'a UpdateConfig) -> Self {
         Self { config }
-    }
-
-    pub(crate) fn active_revision(&self) -> anyhow::Result<String> {
-        if self.backend_kind()? == RuntimeBackendKind::Systemd {
-            return Ok(self
-                .embedded_identity(&self.config.runtime.binary_path.to_string_lossy())?
-                .revision);
-        }
-        Ok(self.active_build_target()?.embedded.revision)
     }
 
     pub(crate) fn active_image(&self) -> anyhow::Result<String> {
@@ -137,57 +126,6 @@ impl<'a> Runtime<'a> {
             binary_digest,
             local_artifact_id: observation.local_artifact_id,
         })
-    }
-
-    pub(crate) fn image_digest(&self, image: &str) -> anyhow::Result<String> {
-        if let Some(expected_local_id) = runtime_backend::normalize_local_image_id(image, false) {
-            let actual_local_id = self.backend()?.resolve_local_image_id(image)?;
-            if actual_local_id != expected_local_id {
-                bail!("container engine retained a different local OCI identity");
-            }
-            return self.backend()?.resolve_image_digest(image);
-        }
-        let (_, expected_digest) = image
-            .rsplit_once('@')
-            .context("managed OCI image reference is not pinned by digest")?;
-        let normalized = expected_digest.strip_prefix("sha256:").unwrap_or("");
-        if normalized.len() != 64
-            || !normalized
-                .chars()
-                .all(|character| character.is_ascii_hexdigit())
-        {
-            bail!("managed OCI image reference has an invalid digest");
-        }
-        let actual = self.backend()?.resolve_image_digest(image)?;
-        if actual != expected_digest.to_ascii_lowercase() {
-            bail!("container engine retained a different OCI digest");
-        }
-        Ok(actual)
-    }
-
-    pub(crate) fn embedded_identity(
-        &self,
-        image_or_binary: &str,
-    ) -> anyhow::Result<nazo_operator_protocol::EmbeddedIdentity> {
-        let kind = self.backend_kind()?;
-        let artifact = match kind {
-            RuntimeBackendKind::Systemd => {
-                let path = fs::canonicalize(image_or_binary)
-                    .context("failed to resolve host binary for build identity")?;
-                ArtifactReference::HostBinary {
-                    sha256: sha256(&path)?,
-                    path,
-                }
-            }
-            RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => ArtifactReference::Oci {
-                image_reference: image_or_binary.to_owned(),
-                digest: self.image_digest(image_or_binary)?,
-            },
-        };
-        self.backend()?
-            .read_build_identity(&artifact, None)
-            .context("runtime embedded build identity is invalid")?
-            .context("runtime backend returned no build identity")
     }
 }
 

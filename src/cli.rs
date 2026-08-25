@@ -1,29 +1,21 @@
 //! Command-line model and parser façade.
 //!
 //! The public-in-crate surface stays here so controller and integration tests keep their stable
-//! paths. Definitions live in [`types`], the frozen pre-goal command set in [`legacy_types`],
-//! help routing in [`help`], and token parsing in [`parser`]; none of those modules owns
-//! command execution.
+//! paths. Definitions live in [`types`], help routing in [`help`], and token parsing in
+//! [`parser`]; none of those modules owns command execution.
 
 pub(crate) mod envelope;
 mod help;
-pub(crate) mod legacy_types;
 mod parser;
 mod types;
 
-use anyhow::{Context, bail};
+use anyhow::{Context as _, bail};
 
 pub(crate) use help::help_topic;
 pub(crate) use types::{
-    BindOptions, BootstrapAdminArgs, Cli, Command, ControllerCommand, HelpTopic, HostCommand,
-    InstallArgs, InstanceCommand, InstanceSelector, UpdateArgs,
-};
-
-/// Frozen pre-goal types. The legacy handler bodies (and the J-phase
-/// deletion list) reference them through these stable paths.
-pub(crate) use legacy_types::{
-    AcmeCertificateInput, AcmeCommand, TlsCertificateCheckInput, TlsCertificateInput,
-    TlsCertificateSource, TlsCommand,
+    AcmeCertificateInput, AcmeCommand, BindOptions, BootstrapAdminArgs, Cli, Command,
+    ControllerCommand, HelpTopic, HostCommand, InstallArgs, InstanceCommand, InstanceSelector,
+    TlsCertificateCheckInput, TlsCertificateInput, TlsCertificateSource, TlsCommand, UpdateArgs,
 };
 
 /// Consume the leading options which are shared by every command.

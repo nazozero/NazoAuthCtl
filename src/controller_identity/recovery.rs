@@ -69,7 +69,6 @@ fn b64(bytes: &[u8]) -> String {
 /// Recovery Root with a freshly generated one under fresh-2FA approval.
 /// The returned report contains the NEW secret exactly once — nothing in ctl
 /// or NazoAuth retains it.
-#[allow(dead_code)] // delivery boundary: CLI wiring lands with I-wave
 pub(crate) fn rotate_root_with_new_secret(
     api: &dyn ControllerRegistryApi,
     deployment_id: &str,
@@ -143,7 +142,6 @@ pub(crate) struct RecoveredIdentity {
 /// * local activation + registry binding happen strictly AFTER the server's
 ///   authoritative commit, and both are derivable from the server state
 ///   (rerunning after a crash reconciles instead of duplicating).
-#[allow(dead_code)] // delivery boundary: CLI wiring lands with I-wave
 pub(crate) fn recover_controller_identity(
     registry: &RegistryStore,
     keys: &ControllerKeyStore,

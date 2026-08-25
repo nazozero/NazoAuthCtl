@@ -47,7 +47,6 @@ pub(crate) struct PublicVerificationReport {
 
 impl PublicVerificationReport {
     /// Human rendering for the future `verify` CLI surface.
-    #[allow(dead_code)] // delivery boundary: rendered by the I-wave CLI
     pub(crate) fn render(&self) -> String {
         let mut lines = vec![format!(
             "public verification of {} at {}",
@@ -92,7 +91,6 @@ fn is_loopback(issuer: &Url) -> bool {
 /// guarantee, enforced by the type system rather than by discipline.
 ///
 /// Delivery boundary: wired into the CLI by the I wave (`verify`).
-#[allow(dead_code)] // delivery boundary: CLI wiring lands with I-wave
 pub(crate) fn verify_public(prober: &dyn PublicProber, issuer: &str) -> PublicVerificationReport {
     let checked_at = Utc::now();
     let mut failures = Vec::new();

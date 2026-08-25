@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 
-use super::super::legacy_types::{
+use super::super::types::{
     AcmeCertificateInput, AcmeCommand, TlsCertificateCheckInput, TlsCertificateInput,
     TlsCertificateSource, TlsCommand,
 };

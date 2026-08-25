@@ -355,7 +355,6 @@ fn declare_resources(runtime_object: &str, data_root: &str) -> anyhow::Result<Ve
 ///
 /// Delivery boundary: the I-wave wires this into the CLI parser; until then
 /// the use case and its shared test suite are the contract.
-#[allow(dead_code)] // delivery boundary: CLI wiring lands with I-wave
 pub(crate) fn run_clean_install(
     context: &CleanInstallContext,
     request: CleanInstallRequest,

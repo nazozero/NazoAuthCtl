@@ -79,7 +79,6 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 /// The G03 entry point. Delivery boundary: wired into the CLI by the I wave.
-#[allow(dead_code)] // delivery boundary: CLI wiring lands with I-wave
 pub(crate) fn run_update(
     context: &LifecycleContext,
     keys: &ControllerKeyStore,

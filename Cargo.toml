@@ -43,7 +43,6 @@ bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 ed25519-dalek = "3.0.0"
 fs2 = "0.4.3"
-hmac = "0.13.0"
 http = "1.5.0"
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "native-tokio", "tls12", "rustls-platform-verifier"] }
 hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
@@ -68,7 +67,6 @@ tokio = { version = "1.53.1", features = ["rt", "time"] }
 url = "2.5.8"
 urlencoding = "2.1.3"
 uuid = { version = "1.24.1", features = ["v7", "serde"] }
-wait-timeout = "0.2.1"
 x509-parser = "0.18.1"
 zeroize = { version = "1.8.2", features = ["derive"] }
 

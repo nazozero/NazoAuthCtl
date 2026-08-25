@@ -362,7 +362,6 @@ impl TargetJournal {
     /// Read-only operation-log view for one deployment (H04): most recent
     /// operations in journal order with status and outcome projections.
     /// Purely observational — never consulted for authorization.
-    #[allow(dead_code)] // delivery boundary: CLI wiring lands with I-wave
     pub fn operation_log(&self, deployment_id: &str) -> anyhow::Result<Vec<OperationLogEntry>> {
         let scope = deployment_scope(deployment_id)?;
         self.project_log(&self.path_for(&scope))
@@ -370,7 +369,6 @@ impl TargetJournal {
 
     /// Read-only operation-log view for the host-level scope (operations
     /// carrying no deployment binding).
-    #[allow(dead_code)] // delivery boundary: CLI wiring lands with I-wave
     pub fn host_operation_log(&self) -> anyhow::Result<Vec<OperationLogEntry>> {
         self.project_log(&self.path_for(HOST_SCOPE))
     }

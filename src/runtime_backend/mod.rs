@@ -7,8 +7,7 @@
 pub(crate) use nazoauthctl_runtime::runtime_backend::{
     ArtifactReference, BlobAttestationVerification, ContainerRuntimePolicy, NON_ROOT_ONE_SHOT_USER,
     NeutralMount, OneShotTask, ResourceScope as RuntimeResourceScope, Responsibility,
-    RuntimeBackend, RuntimeBackendKind, RuntimeDatabasePrivilegeProbe, RuntimeObservation,
-    RuntimeReplacement, SystemdBackend, normalize_local_image_id,
+    RuntimeBackend, RuntimeBackendKind, RuntimeObservation, RuntimeReplacement, SystemdBackend,
 };
 
 #[cfg(all(test, target_os = "linux"))]

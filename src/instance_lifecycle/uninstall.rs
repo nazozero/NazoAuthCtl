@@ -72,7 +72,6 @@ impl UninstallPlan {
 }
 
 /// Generate the exact deletion plan from live facts (read-only).
-#[allow(dead_code)] // delivery boundary: CLI wiring lands with I-wave
 pub(crate) fn plan_uninstall(
     context: &LifecycleContext,
     selector: Option<&str>,
@@ -110,7 +109,6 @@ pub(crate) fn plan_uninstall(
 /// decision; without it only the plan is rendered. The plan is regenerated
 /// from live facts immediately before execution so drift between show-time
 /// and execution fails closed on the target's identity re-confirmation.
-#[allow(dead_code)] // delivery boundary: CLI wiring lands with I-wave
 pub(crate) fn run_uninstall(
     context: &LifecycleContext,
     selector: Option<&str>,

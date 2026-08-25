@@ -34,7 +34,6 @@
 
 use anyhow::{Context as _, bail};
 
-use crate::cli::legacy_types::ControllerCommand as LegacyControllerCommand;
 use crate::cli::{BindOptions, ControllerCommand, InstanceSelector};
 use crate::filesystem;
 use crate::registry::{InstanceRecord, ObservationCache, RegistryStore, validate_issuer};
@@ -819,10 +818,6 @@ fn approval_callback<'a>(
     }
 }
 
-fn merged_selector(selector: InstanceSelector) -> anyhow::Result<Option<String>> {
-    selector.explicit().context("conflicting selectors")
-}
-
 /// Dispatch `nazauthctl controller …` commands (goal plan 09 §1). Runs
 /// entirely against user-scoped stores; no root, no legacy lifecycle lock.
 /// The global `--instance` channel is merged here under the I02 exactly-one
@@ -1021,110 +1016,6 @@ fn render_recovered(
         recovered.expires_at.to_rfc3339(),
         recovered.recovery_generation,
     )
-}
-
-/// Frozen pre-goal dispatcher for the legacy controller family. Argv cannot
-/// reach it any more (I01); kept compiling until J deletes it.
-#[allow(dead_code)]
-pub(crate) fn run_command_legacy(command: LegacyControllerCommand) -> anyhow::Result<()> {
-    let registry = RegistryStore::open_default()?;
-    let keys = ControllerKeyStore::open_default()?;
-    match command {
-        LegacyControllerCommand::Bind {
-            selector,
-            label,
-            approval_token,
-            admin_access_file,
-        } => {
-            let explicit = merged_selector(selector)?;
-            let record = resolve_record(&registry, explicit.as_deref())?;
-            let api = make_api(&record.issuer, admin_access_file.as_deref())?;
-            let report = bind_flow(
-                &api,
-                &registry,
-                &keys,
-                explicit.as_deref(),
-                &label,
-                approval_callback(approval_token.as_deref()),
-            )?;
-            println!("{report}");
-        }
-        LegacyControllerCommand::Add {
-            selector,
-            label,
-            approval_token,
-            admin_access_file,
-        } => {
-            let explicit = merged_selector(selector)?;
-            let record = resolve_record(&registry, explicit.as_deref())?;
-            let api = make_api(&record.issuer, admin_access_file.as_deref())?;
-            let report = add_flow(
-                &api,
-                &registry,
-                &keys,
-                explicit.as_deref(),
-                &label,
-                approval_callback(approval_token.as_deref()),
-            )?;
-            println!("{report}");
-        }
-        LegacyControllerCommand::Rotate {
-            selector,
-            label,
-            approval_token,
-            admin_access_file,
-        } => {
-            let explicit = merged_selector(selector)?;
-            let record = resolve_record(&registry, explicit.as_deref())?;
-            let api = make_api(&record.issuer, admin_access_file.as_deref())?;
-            let report = rotate_flow(
-                &api,
-                &registry,
-                &keys,
-                explicit.as_deref(),
-                label.as_deref(),
-                approval_callback(approval_token.as_deref()),
-            )?;
-            println!("{report}");
-        }
-        LegacyControllerCommand::Revoke {
-            selector,
-            controller_id,
-            yes,
-            approval_token,
-            admin_access_file,
-        } => {
-            if !yes {
-                bail!(
-                    "revocation is destructive: re-run with --yes after confirming the exact \
-                     controller id"
-                );
-            }
-            let explicit = merged_selector(selector)?;
-            let record = resolve_record(&registry, explicit.as_deref())?;
-            let api = make_api(&record.issuer, admin_access_file.as_deref())?;
-            let report = revoke_flow(
-                &api,
-                &registry,
-                &keys,
-                explicit.as_deref(),
-                &controller_id,
-                approval_callback(approval_token.as_deref()),
-            )?;
-            println!("{report}");
-        }
-        LegacyControllerCommand::Slots {
-            selector,
-            admin_access_file,
-        } => {
-            let explicit = merged_selector(selector)?;
-            let record = resolve_record(&registry, explicit.as_deref())?;
-            let api = make_api(&record.issuer, admin_access_file.as_deref())?;
-            let report = slots_flow(&api, &registry, &keys, explicit.as_deref())?;
-            println!("{report}");
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

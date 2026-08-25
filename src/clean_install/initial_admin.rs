@@ -65,7 +65,6 @@ pub(crate) trait InitialAdminTransport {
 }
 
 /// Production transport: one bounded HTTPS POST (HTTP allowed on loopback).
-#[allow(dead_code)] // delivery boundary: constructed by the I-wave CLI wiring
 pub(crate) struct CurlInitialAdminTransport;
 
 impl InitialAdminTransport for CurlInitialAdminTransport {
@@ -224,7 +223,6 @@ fn validate_credentials(credentials: &AdminCredentials) -> anyhow::Result<()> {
 /// and the report names the MFA-enrollment next step at NazoAuth itself.
 ///
 /// Delivery boundary: wired into the CLI by the I wave.
-#[allow(dead_code)] // delivery boundary: CLI wiring lands with I-wave
 pub(crate) fn claim_initial_admin(
     registry: &RegistryStore,
     material: &dyn BootstrapMaterialSource,

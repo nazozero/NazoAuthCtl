@@ -223,10 +223,6 @@ fn runtime_environment_requires_normalized_file_locators() {
 fn update_config_accepts_only_closed_safe_runtime_boundaries() {
     let config = valid_config();
     config.validate().unwrap();
-    assert_eq!(
-        config.container_backend(),
-        Some(crate::deployment::RuntimeBackendKind::Podman)
-    );
     UpdateConfig::parse(&serde_json::to_vec(&config).unwrap()).unwrap();
 
     let mut invalid = config.clone();
@@ -335,10 +331,6 @@ fn external_and_container_dependency_modes_resolve_explicitly() {
     config.dependencies.valkey_backup_url_file = root.join("valkey-backup-url");
     config.dependencies.external_valkey_backup_scope = "dedicated-instance".to_owned();
     config.validate().unwrap();
-    assert_eq!(
-        config.container_backend(),
-        Some(crate::deployment::RuntimeBackendKind::Docker)
-    );
 
     config.dependencies.database_url_file = "relative".into();
     assert!(config.validate().is_err());

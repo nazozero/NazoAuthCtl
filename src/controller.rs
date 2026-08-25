@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeSet,
     fs::{self, File, TryLockError},
-    io::{IsTerminal as _, Read as _, Write as _},
     path::{Path, PathBuf},
 };
 
@@ -15,9 +14,6 @@ use crate::deployment::{
     DeploymentRecord, DeploymentStore, FileLock, RuntimeBackendKind, SafeReference,
 };
 use crate::{
-    cli::legacy_types::{
-        BootstrapAdminOptions, CandidateTarget, Command as LegacyCommand, LocalOciCandidateInstall,
-    },
     filesystem::{atomic_write, open_lock_file, remove_file_durable},
     model::{ReleaseManifest, UpdateConfig},
     process::Process,
@@ -25,13 +21,9 @@ use crate::{
     runtime::Runtime,
 };
 
-mod bootstrap;
 mod commands;
 mod deployment;
-mod diagnostics;
 mod keys;
-#[allow(unused_imports)] // J-phase removes the frozen dispatch together with its tests
-pub(crate) use commands::run_legacy;
 pub(crate) use keys::{
     extract_openid4vc_trust_anchors, managed_openid4vc_bundle_path, read_managed_openid4vc_bundle,
 };
@@ -39,11 +31,25 @@ mod self_update;
 mod surface_run;
 pub(crate) use surface_run::run;
 mod updates;
-use bootstrap::*;
-use deployment::*;
-use diagnostics::*;
 use self_update::*;
 use updates::*;
+
+/// Durable provenance for a deliberately local-only OCI target.  The installer
+/// entry is gone; the shape survives as the persisted candidate state that the
+/// pending/completed guards parse fail-closed.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct LocalOciCandidateInstall {
+    pub(crate) image: String,
+    pub(crate) target: CandidateTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct CandidateTarget {
+    pub(crate) release: String,
+    pub(crate) revision: String,
+    pub(crate) build_id: String,
+    pub(crate) oci_digest: String,
+}
 
 pub(crate) struct ControlConfig {
     path: PathBuf,
@@ -65,24 +71,12 @@ impl ControlConfig {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum DeploymentLockMode {
-    Exclusive,
-    Shared,
-}
-
 pub(crate) fn conformance_control_context(
     config_path: &Path,
     selector: Option<&str>,
 ) -> anyhow::Result<(ControlConfig, String, ExpectedReleaseTarget)> {
     require_root()?;
-    let context = control_config_with_lock_mode(
-        config_path,
-        selector,
-        true,
-        false,
-        DeploymentLockMode::Shared,
-    )?;
+    let context = control_config(config_path, selector, true, false)?;
     let runtime = Runtime::new(&context.config);
     let target = if context.config.runtime.backend == RuntimeBackendKind::Systemd {
         context
@@ -142,27 +136,9 @@ fn control_config(
     application_task: bool,
     unsettled: bool,
 ) -> anyhow::Result<ControlConfig> {
-    control_config_with_lock_mode(
-        config_path,
-        selector,
-        application_task,
-        unsettled,
-        DeploymentLockMode::Exclusive,
-    )
-}
-
-fn control_config_with_lock_mode(
-    config_path: &Path,
-    selector: Option<&str>,
-    application_task: bool,
-    unsettled: bool,
-    lock_mode: DeploymentLockMode,
-) -> anyhow::Result<ControlConfig> {
     let store = DeploymentStore::system();
     if !store.registry_present()? {
-        let legacy_lock = (lock_mode == DeploymentLockMode::Shared)
-            .then(deployment::acquire_oidf_run_shared_lock)
-            .transpose()?;
+        let _legacy_lock = deployment::acquire_oidf_run_shared_lock()?;
         let config = if unsettled {
             load_config_unsettled(config_path)?
         } else {
@@ -177,19 +153,15 @@ fn control_config_with_lock_mode(
             path: config_path.to_path_buf(),
             config,
             record: None,
-            _legacy_lock: legacy_lock,
+            _legacy_lock: Some(_legacy_lock),
             _deployment_lock: None,
         });
     }
 
-    // Every remaining entry into a registered deployment context mutates or
-    // runs application tasks, so the resolver always reports the destructive
-    // ambiguity error when no unique selector exists.
+    // Every remaining entry into a registered deployment context runs
+    // application tasks against one shared deployment snapshot.
     let resolved = store.resolve(selector, true)?;
-    let deployment_lock = Some(match lock_mode {
-        DeploymentLockMode::Exclusive => store.deployment_lock(&resolved.deployment_id)?,
-        DeploymentLockMode::Shared => store.deployment_shared_lock(&resolved.deployment_id)?,
-    });
+    let deployment_lock = Some(store.deployment_shared_lock(&resolved.deployment_id)?);
     let record = store.load(&resolved.deployment_id)?;
     if !record
         .control_protocol_versions
@@ -347,83 +319,6 @@ struct ControllerUpdateJournal {
     to_version: String,
     to_sha256: String,
     staged_artifact: PathBuf,
-}
-
-const BOOTSTRAP_MOUNT_TARGET: &str = "/var/lib/nazo_oauth/bootstrap";
-const BOOTSTRAP_TOKEN_FILE: &str = "initial-admin-token";
-const MAX_BOOTSTRAP_CREDENTIAL_BYTES: u64 = 8 * 1024;
-#[cfg(unix)]
-const MAX_BOOTSTRAP_TOKEN_BYTES: u64 = 2 * 1024;
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct BootstrapAdminCredentials {
-    email: String,
-    password: String,
-}
-
-#[derive(Debug, Serialize)]
-struct BootstrapAdminRequest<'a> {
-    request_id: &'a str,
-    token: &'a str,
-    email: &'a str,
-    password: &'a str,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BootstrapAdminResponse {
-    request_id: String,
-    id: String,
-    email: String,
-    role: String,
-    next: String,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum BootstrapAdminPendingStatus {
-    Intent,
-    Succeeded,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct BootstrapAdminPending {
-    schema: u32,
-    request_id: String,
-    email_hmac_sha256: String,
-    recovery_epoch: String,
-    status: BootstrapAdminPendingStatus,
-    claimed_user_id: Option<String>,
-    token_hmac_sha256: Option<String>,
-}
-
-#[derive(Debug)]
-struct VerifiedBootstrapReceipt {
-    claimed_user_id: uuid::Uuid,
-    token_hmac_sha256: String,
-}
-
-#[derive(Debug)]
-struct BootstrapOutcomeUnknown;
-
-impl std::fmt::Display for BootstrapOutcomeUnknown {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("initial administrator request outcome is unknown")
-    }
-}
-
-impl std::error::Error for BootstrapOutcomeUnknown {}
-
-#[allow(dead_code)] // J-phase removes the legacy global lock with its tests
-pub(crate) fn acquire_lock(command: &LegacyCommand) -> anyhow::Result<File> {
-    deployment::acquire_lock(command)
-}
-
-#[allow(dead_code)] // J-phase removes the legacy global lock with its tests
-pub(crate) fn uses_legacy_lock(command: &LegacyCommand) -> bool {
-    updates::recovery_uses_legacy_lock(command)
 }
 
 fn require_root() -> anyhow::Result<()> {

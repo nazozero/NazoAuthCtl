@@ -1,9 +1,8 @@
-//! Dispatcher for the final 18-command surface (goal plan 09 §1, I01/I02).
+//! Dispatcher for the final command surface (goal plan 09 §1, I01/I02).
 //!
 //! Every arm wires one tested use-case module; this file contains no business
 //! logic of its own beyond selector merging, confirmation prompts, and the
-//! stable K-phase placeholders. Legacy handlers stay frozen behind
-//! [`super::commands::run_legacy`], unreachable from argv.
+//! stable K-phase placeholders.
 
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
@@ -134,6 +133,12 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         }
         // ---- final-model maintenance surface --------------------------------
         Command::BootstrapAdmin(args) => run_bootstrap_admin(args, instance_flag),
+        Command::Tls(command) => crate::tls::run(
+            instance_flag,
+            command,
+            super::require_root,
+            super::require_confirmation,
+        ),
         Command::RemoteExec => crate::target::remote_exec::run_stdio(),
         Command::SelfCheck(version) => super::self_update::controller_check(version.as_deref()),
         Command::SelfUpdate { version, yes } => {

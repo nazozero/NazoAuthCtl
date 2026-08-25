@@ -1,20 +1,15 @@
-//! Command-line model for the final 18-command surface (goal plan 09 §1, I01).
+//! Command-line model for the final command surface (goal plan 09 §1, I01).
 //!
 //! The parser can only ever produce the commands in [`Command`] plus the
-//! small set of non-legacy maintenance commands that the final model itself
-//! requires (`remote exec` transport boundary, controller self-updates, and
-//! the G02 fresh-install bootstrap claim). The frozen pre-goal command set
-//! lives in [`super::legacy_types`]; argv cannot reach it.
+//! small set of maintenance commands that the final model itself requires
+//! (`remote exec` transport boundary, controller self-updates, the G02
+//! fresh-install bootstrap claim, and the TLS certificate-provider family).
 
 use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
 
 use crate::registry::HostPrivilege;
-
-/// Default legacy configuration path. Only the frozen legacy runner still
-/// consumes it; the final surface has no per-deployment config file.
-pub(crate) const DEFAULT_CONFIG: &str = "/etc/nazauth/update.json";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HelpTopic {
@@ -24,6 +19,7 @@ pub(crate) enum HelpTopic {
     Controller,
     Install,
     Update,
+    Tls,
     SelfUpdate,
     BootstrapAdmin,
 }
@@ -34,13 +30,6 @@ pub(crate) enum HelpTopic {
 /// exactly-one rule.
 #[derive(Debug)]
 pub(crate) struct Cli {
-    /// Legacy runner compatibility field. Nothing on the final surface
-    /// reads it; it is never populated from argv any more.
-    #[allow(dead_code)]
-    pub(crate) config: PathBuf,
-    /// Legacy runner compatibility field, same status as `config`.
-    #[allow(dead_code)]
-    pub(crate) deployment: Option<String>,
     /// Explicit instance selector from the global `--instance` flag.
     pub(crate) instance: Option<String>,
     /// Machine-readable output switch (`--json`), read-only view commands.
@@ -123,6 +112,9 @@ pub(crate) enum Command {
     },
     /// Fresh-install bootstrap authority claim (G02).
     BootstrapAdmin(BootstrapAdminArgs),
+    /// Deployment-owned TLS certificate material via the external
+    /// file-provider contract (`tls certificate|acme ...`).
+    Tls(TlsCommand),
     /// Internal fixed stdio executor (`nazoauthctl remote exec`, goal plan 03
     /// §3.2): one bounded HostOperation JSON on stdin, one HostResult JSON on
     /// stdout, no daemon. Invoked only through OpenSSH by the control side.
@@ -325,4 +317,79 @@ pub(crate) struct BackupArgs {
 pub(crate) struct BootstrapAdminArgs {
     pub(crate) selector: InstanceSelector,
     pub(crate) credentials_stdin: bool,
+}
+
+/// TLS certificate-provider family (surviving provider contract, J wave):
+/// the inputs are file paths plus tenant/hostname bindings; no secret ever
+/// travels through argv.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TlsCertificateInput {
+    pub(crate) provider_config: PathBuf,
+    pub(crate) tenant: String,
+    pub(crate) hostname: String,
+    pub(crate) source: TlsCertificateSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TlsCertificateSource {
+    ExternalFiles {
+        certificate: PathBuf,
+        private_key: PathBuf,
+    },
+    CurrentAcmeReceipt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TlsCertificateCheckInput {
+    pub(crate) provider_config: PathBuf,
+    pub(crate) tenant: String,
+    pub(crate) hostname: String,
+    pub(crate) warning_window_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AcmeCertificateInput {
+    pub(crate) acme_config: PathBuf,
+    pub(crate) provider_config: PathBuf,
+    pub(crate) tenant: String,
+    pub(crate) hostname: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AcmeCommand {
+    Plan(AcmeCertificateInput),
+    Issue {
+        input: AcmeCertificateInput,
+        agree_terms: bool,
+        yes: bool,
+    },
+    Recover {
+        tenant: String,
+        hostname: String,
+        yes: bool,
+    },
+    Show {
+        tenant: String,
+        hostname: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TlsCommand {
+    Check(TlsCertificateCheckInput),
+    Plan(TlsCertificateInput),
+    Apply {
+        input: TlsCertificateInput,
+        yes: bool,
+    },
+    Recover {
+        tenant: String,
+        hostname: String,
+        yes: bool,
+    },
+    Show {
+        tenant: String,
+        hostname: String,
+    },
+    Acme(AcmeCommand),
 }
