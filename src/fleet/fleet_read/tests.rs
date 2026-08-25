@@ -3,7 +3,7 @@ use crate::filesystem::PrivateTempDir;
 use crate::registry::{HostPrivilege, InstanceRecord, RegistryStore};
 use crate::target::{
     ControlOperationReceipt, ControlOperationRequest, HealthSnapshot, HostCompletionBody,
-    HostOperation, HostOutcome, HostOverview, HostResult, RemoteHello, RuntimeSurface,
+    HostOperation, HostOverview, HostResult, RuntimeSurface,
 };
 use std::sync::atomic::AtomicUsize;
 
@@ -165,9 +165,9 @@ fn partial_failure_is_isolated_and_order_is_stable() -> anyhow::Result<()> {
     let aliases: Vec<String> = items.iter().map(|(i, _)| i.alias.clone()).collect();
     assert_eq!(aliases, ["prod-a", "prod-b", "prod-c"]);
 
-    let factory: Arc<
-        dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync,
-    > = Arc::new(|record: &HostRecord| {
+    type Factory =
+        Arc<dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync>;
+    let factory: Factory = Arc::new(|record: &HostRecord| {
         let scenario = if record.alias == "server-c" {
             Scenario::Offline("ssh to 'x' exited 255")
         } else {
@@ -191,9 +191,9 @@ fn partial_failure_is_isolated_and_order_is_stable() -> anyhow::Result<()> {
 
 #[test]
 fn slow_targets_time_out_without_blocking_the_rest() -> anyhow::Result<()> {
-    let factory: Arc<
-        dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync,
-    > = Arc::new(|record: &HostRecord| {
+    type Factory =
+        Arc<dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync>;
+    let factory: Factory = Arc::new(|record: &HostRecord| {
         let scenario = if record.alias == "server-a" {
             Scenario::Slow(400)
         } else {
@@ -274,9 +274,9 @@ fn concurrency_is_bounded_by_the_cap() -> anyhow::Result<()> {
     }
     let in_flight_clone = in_flight.clone();
     let max_clone = max_seen.clone();
-    let factory: Arc<
-        dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync,
-    > = Arc::new(move |_record: &HostRecord| {
+    type Factory =
+        Arc<dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync>;
+    let factory: Factory = Arc::new(move |_record: &HostRecord| {
         Ok(Box::new(GateTarget {
             in_flight: in_flight_clone.clone(),
             max_seen: max_clone.clone(),
@@ -299,7 +299,10 @@ fn concurrency_is_bounded_by_the_cap() -> anyhow::Result<()> {
         "cap violated: {}",
         max_seen.load(Ordering::SeqCst)
     );
-    assert!(max_seen.load(Ordering::SeqCst) >= 2, "some concurrency expected");
+    assert!(
+        max_seen.load(Ordering::SeqCst) >= 2,
+        "some concurrency expected"
+    );
     Ok(())
 }
 

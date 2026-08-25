@@ -120,6 +120,8 @@ pub(crate) fn rotate_root_with_new_secret(
 }
 
 /// Authoritative result of one successful break-glass recovery.
+// Delivery boundary: the I-wave CLI renders new_recovery_secret_display.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct RecoveredIdentity {
     pub controller_id: String,
