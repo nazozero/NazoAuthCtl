@@ -836,10 +836,16 @@ impl RegistryStore {
         if record.host_id == new_host_id {
             bail!("instance '{deployment_id}' is already bound to host {new_host_id}");
         }
-        if self.find_host_by_id_locked(new_host_id)?.is_none() {
-            bail!("cannot relocate to unknown host {new_host_id}");
-        }
+        let new_host = self
+            .find_host_by_id_locked(new_host_id)?
+            .with_context(|| format!("cannot relocate to unknown host {new_host_id}"))?;
+        // P1-2: update the target_state_ref to encode the new host so stale
+        // references to the old host's state directory are never trusted.
         record.host_id = new_host_id;
+        record.target_state_ref = format!(
+            "target-state/{}/{}",
+            new_host_id, record.deployment_id
+        );
         record.last_observation = None;
         record.validate()?;
         write_record(
