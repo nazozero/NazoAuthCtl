@@ -836,7 +836,7 @@ impl RegistryStore {
         if record.host_id == new_host_id {
             bail!("instance '{deployment_id}' is already bound to host {new_host_id}");
         }
-        let new_host = self
+        let _new_host = self
             .find_host_by_id_locked(new_host_id)?
             .with_context(|| format!("cannot relocate to unknown host {new_host_id}"))?;
         // P1-2: update the target_state_ref to encode the new host so stale
