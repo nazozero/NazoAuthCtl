@@ -35,7 +35,6 @@ use crate::{
     deployment::RuntimeBackendKind,
     filesystem::{self, atomic_write},
     process::Process,
-    registry::validate_issuer,
     release::{ReleaseRequest, VerifiedRelease},
     runtime_backend,
 };
@@ -557,7 +556,7 @@ impl HostInstallExecutor {
 
         // 6. Local health/readiness probe. Public reachability is deliberately
         // absent here (G08): loopback readiness is the only install gate.
-        probe_local_health(job.issuer)?;
+        probe_local_health(job.order.port)?;
 
         Ok(InstallFacts {
             artifact_reference: format!("sha256:{subject_digest}"),
@@ -709,13 +708,12 @@ fn config_mount_source(job: &InstallJob<'_>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/etc/nazauth"))
 }
 
-/// Bounded loopback readiness probe against `{issuer}/readyz`. Shared with
-/// the update/rollback executors (G03/G04): activation is only ever gated by
-/// the same local readiness fact.
-pub(crate) fn probe_local_health(job_issuer: &str) -> Result<(), Failure> {
-    validate_issuer(job_issuer)
-        .map_err(|error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())))?;
-    let endpoint = format!("{}/readyz", job_issuer.trim_end_matches('/'));
+/// Bounded loopback readiness probe against `http://127.0.0.1:{port}/readyz`.
+/// Shared with the update/rollback executors (G03/G04): activation is only
+/// ever gated by the same local readiness fact. This is a LOOPBACK probe —
+/// it must never depend on public DNS, TLS, or any external boundary (G08).
+pub(crate) fn probe_local_health(port: u16) -> Result<(), Failure> {
+    let endpoint = format!("http://127.0.0.1:{port}/readyz");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut last: Option<Failure> = None;
     while std::time::Instant::now() < deadline {

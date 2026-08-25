@@ -22,7 +22,9 @@ use url::Url;
 /// Probe seam so tests classify outcomes without a network.
 pub(crate) trait PublicProber {
     fn tls_handshake(&self, issuer: &Url) -> Result<(), String>;
-    fn oidc_discovery(&self, issuer: &Url) -> Result<(), String>;
+    /// Returns the `issuer` value from the discovery document for
+    /// exact-match comparison against the expected origin (P1-5).
+    fn oidc_discovery(&self, issuer: &Url) -> Result<String, String>;
 }
 
 /// Outcome of one public verification run.
@@ -95,7 +97,9 @@ pub(crate) fn verify_public(prober: &dyn PublicProber, issuer: &str) -> PublicVe
     let checked_at = Utc::now();
     let mut failures = Vec::new();
     let parsed = Url::parse(issuer).ok().filter(|url| {
-        matches!(url.scheme(), "http" | "https")
+        // P1-5: public verify requires HTTPS — HTTP is never acceptable for a
+        // production issuer origin.
+        url.scheme() == "https"
             && url.username().is_empty()
             && url.password().is_none()
             && matches!(url.path(), "" | "/")
@@ -106,7 +110,9 @@ pub(crate) fn verify_public(prober: &dyn PublicProber, issuer: &str) -> PublicVe
             issuer: issuer.to_owned(),
             loopback_trial: false,
             verdict: PublicVerdict::Failed {
-                failures: vec!["issuer is not a valid http(s) origin URL".to_owned()],
+                failures: vec![
+                    "issuer must be a valid HTTPS origin URL (HTTP is not accepted)".to_owned(),
+                ],
             },
         };
     };
@@ -118,8 +124,20 @@ pub(crate) fn verify_public(prober: &dyn PublicProber, issuer: &str) -> PublicVe
     if let Err(reason) = prober.tls_handshake(&parsed) {
         failures.push(format!("TLS handshake failed: {reason}"));
     }
-    if let Err(reason) = prober.oidc_discovery(&parsed) {
-        failures.push(format!("OIDC discovery failed: {reason}"));
+    match prober.oidc_discovery(&parsed) {
+        Err(reason) => failures.push(format!("OIDC discovery failed: {reason}")),
+        Ok(discovered_issuer) => {
+            // P1-5: the discovery document's own issuer must equal the
+            // target issuer exactly — a mismatch means a proxy or CDN is
+            // serving someone else's identity.
+            let normalized_target = parsed.as_str().trim_end_matches('/');
+            let normalized_discovered = discovered_issuer.trim_end_matches('/');
+            if normalized_discovered != normalized_target {
+                failures.push(format!(
+                    "discovery issuer mismatch: expected '{normalized_target}' but discovery reports '{normalized_discovered}'"
+                ));
+            }
+        }
     }
     let verdict = if failures.is_empty() {
         PublicVerdict::Passed
@@ -158,7 +176,7 @@ impl PublicProber for CurlPublicProber {
             .map_err(|error| format!("{error:#}"))
     }
 
-    fn oidc_discovery(&self, issuer: &Url) -> Result<(), String> {
+    fn oidc_discovery(&self, issuer: &Url) -> Result<String, String> {
         let mut discovery = issuer.clone();
         discovery.set_path(".well-known/openid-configuration");
         let body = crate::process::Process::new("curl")
@@ -174,10 +192,10 @@ impl PublicProber for CurlPublicProber {
             .arg(discovery.as_str())
             .stdout()
             .map_err(|error| format!("{error:#}"))?;
-        if body.contains("\"issuer\"") {
-            Ok(())
-        } else {
-            Err("discovery document does not carry an issuer field".to_owned())
+        // P1-5: extract the discovery issuer for exact-match comparison.
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(doc) => Ok(doc["issuer"].as_str().unwrap_or_default().to_owned()),
+            Err(_) => Err("discovery document is not valid JSON".to_owned()),
         }
     }
 }
@@ -188,14 +206,15 @@ mod tests {
 
     struct Prober {
         tls: Result<(), String>,
-        discovery: Result<(), String>,
+        /// Some(discovered_issuer) on success.
+        discovery: Result<String, String>,
     }
 
     impl PublicProber for Prober {
         fn tls_handshake(&self, _issuer: &Url) -> Result<(), String> {
             self.tls.clone()
         }
-        fn oidc_discovery(&self, _issuer: &Url) -> Result<(), String> {
+        fn oidc_discovery(&self, _issuer: &Url) -> Result<String, String> {
             self.discovery.clone()
         }
     }
@@ -205,7 +224,7 @@ mod tests {
         let report = verify_public(
             &Prober {
                 tls: Ok(()),
-                discovery: Ok(()),
+                discovery: Ok("https://auth.example.com".to_owned()),
             },
             "https://auth.example.com",
         );
@@ -241,9 +260,9 @@ mod tests {
         let report = verify_public(
             &Prober {
                 tls: Ok(()),
-                discovery: Ok(()),
+                discovery: Ok("https://127.0.0.1:8000".to_owned()),
             },
-            "http://127.0.0.1:8000",
+            "https://127.0.0.1:8000",
         );
         assert!(report.loopback_trial);
         assert!(
@@ -256,11 +275,23 @@ mod tests {
         let localhost = verify_public(
             &Prober {
                 tls: Ok(()),
-                discovery: Ok(()),
+                discovery: Ok("https://localhost:8000".to_owned()),
             },
-            "http://localhost:8000",
+            "https://localhost:8000",
         );
         assert!(localhost.loopback_trial);
+
+        // P1-5: plain-HTTP issuers are rejected before any probe runs, so an
+        // HTTP loopback URL is not even classified as a loopback trial.
+        let plaintext = verify_public(
+            &Prober {
+                tls: Ok(()),
+                discovery: Ok("http://127.0.0.1:8000".to_owned()),
+            },
+            "http://127.0.0.1:8000",
+        );
+        assert!(!plaintext.loopback_trial);
+        assert!(matches!(plaintext.verdict, PublicVerdict::Failed { .. }));
     }
 
     #[test]
@@ -269,7 +300,7 @@ mod tests {
             let report = verify_public(
                 &Prober {
                     tls: Ok(()),
-                    discovery: Ok(()),
+                    discovery: Ok("https://auth.example.com".to_owned()),
                 },
                 issuer,
             );

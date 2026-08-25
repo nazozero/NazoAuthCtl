@@ -724,7 +724,7 @@ fn public_verification_failure_never_touches_committed_local_state() -> anyhow::
         fn tls_handshake(&self, _issuer: &url::Url) -> Result<(), String> {
             Err("DNS did not resolve".to_owned())
         }
-        fn oidc_discovery(&self, _issuer: &url::Url) -> Result<(), String> {
+        fn oidc_discovery(&self, _issuer: &url::Url) -> Result<String, String> {
             Err("connection refused".to_owned())
         }
     }

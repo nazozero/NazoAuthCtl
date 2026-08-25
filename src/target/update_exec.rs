@@ -55,12 +55,13 @@ pub const ROLLBACK_ARTIFACT_MISSING: &str = "ROLLBACK_ARTIFACT_MISSING";
 pub(crate) struct UpdateJob<'a> {
     pub operation_id: &'a str,
     pub deployment_id: &'a str,
-    pub issuer: &'a str,
     /// Runtime class token from the live DeploymentState surface.
     pub runtime_kind: &'a str,
     pub runtime_object: &'a str,
     /// Absolute config path recorded in the DeploymentState.
     pub config_reference: &'a str,
+    /// The published loopback port for local health probes.
+    pub port: u16,
     /// The deployment's current config schema token (pre-update).
     pub config_schema: &'a str,
     /// The deployment's recorded current artifact reference (`sha256:<hex>`).
@@ -78,10 +79,11 @@ pub(crate) struct UpdateJob<'a> {
 pub(crate) struct RollbackJob<'a> {
     pub operation_id: &'a str,
     pub deployment_id: &'a str,
-    pub issuer: &'a str,
     pub runtime_kind: &'a str,
     pub runtime_object: &'a str,
     pub config_reference: &'a str,
+    /// The published loopback port for local health probes.
+    pub port: u16,
     pub config_schema: &'a str,
     pub current_artifact: &'a str,
     pub previous_artifact: Option<&'a str>,
@@ -242,7 +244,7 @@ impl HostLifecycleExecutor {
         }
 
         // 6. Local readiness gate (G08 boundary: loopback only).
-        probe_local_health(job.issuer)?;
+        probe_local_health(job.port)?;
 
         // 7. Commit: previous <- old current, current <- new (+ its build
         // identity), optional config CAS advance — replay-safe under this
@@ -337,7 +339,7 @@ impl HostLifecycleExecutor {
                 "the rolled-back runtime does not serve the previous verified artifact",
             ));
         }
-        probe_local_health(job.issuer)?;
+        probe_local_health(job.port)?;
 
         // 5. Restore the snapshot bytes when the decision said so.
         if let Some((bytes, _)) = &restored_config {

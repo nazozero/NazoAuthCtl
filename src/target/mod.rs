@@ -61,6 +61,12 @@ pub use wire::{
     parse_host_operation, parse_host_result, verify_remote_hello,
 };
 
+/// The loopback port the local health probe hits when a lifecycle job carries
+/// no explicit published port (update/rollback orders). Install orders always
+/// carry their own `InstallOrder::port`; this default only covers jobs whose
+/// DeploymentState does not yet record one.
+pub(crate) const LOCAL_PROBE_PORT: u16 = 8000;
+
 /// The formalized target state root (task F01): one private directory holding
 /// every deployment's [`DeploymentState`] document beside its C07 operation
 /// journal. Target administrators may relocate it with
@@ -503,10 +509,10 @@ fn answer_update(
     let job = update_exec::UpdateJob {
         operation_id: &operation.operation_id,
         deployment_id: &deployment_id,
-        issuer: &state.issuer.clone(),
         runtime_kind: &state.runtime.kind,
         runtime_object: &state.runtime.object,
         config_reference: &state.config.reference.clone(),
+        port: LOCAL_PROBE_PORT,
         config_schema: &state.config.schema.clone(),
         current_artifact: &current_artifact,
         expected_revision,
@@ -549,10 +555,10 @@ fn answer_rollback(
     let job = update_exec::RollbackJob {
         operation_id: &operation.operation_id,
         deployment_id: &deployment_id,
-        issuer: &state.issuer.clone(),
         runtime_kind: &state.runtime.kind,
         runtime_object: &state.runtime.object,
         config_reference: &state.config.reference.clone(),
+        port: LOCAL_PROBE_PORT,
         config_schema: &state.config.schema.clone(),
         current_artifact: &current_artifact,
         previous_artifact: state.artifact.previous.as_deref(),
