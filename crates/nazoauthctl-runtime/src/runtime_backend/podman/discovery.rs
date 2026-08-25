@@ -269,6 +269,37 @@ pub(super) fn inspect_optional(
     Ok(Some(inspect(command, object_reference)?))
 }
 
+/// Whether any locally cached image carries exactly the repository digest
+/// embedded in `image_reference`. Errors are reported as `false`: a failed
+/// existence check must never authorize proceeding without the registry.
+pub(super) fn local_image_matches_digest(command: &OsStr, image_reference: &str) -> bool {
+    let Some(requested) = image_reference
+        .rsplit_once('@')
+        .map(|(_, digest)| digest.trim().to_ascii_lowercase())
+        .filter(|digest| container_shared::valid_digest(digest))
+    else {
+        return false;
+    };
+    let Ok(output) = container_shared::command_stdout(
+        command,
+        &["images", "--format", "{{json .RepoDigests}}"],
+        "Podman",
+    ) else {
+        return false;
+    };
+    output.lines().any(|line| {
+        serde_json::from_str::<Vec<String>>(line.trim())
+            .ok()
+            .is_some_and(|digests| {
+                digests.iter().any(|entry| {
+                    entry
+                        .rsplit_once('@')
+                        .is_some_and(|(_, digest)| digest.trim().to_ascii_lowercase() == requested)
+                })
+            })
+    })
+}
+
 /// Resolve the trusted repository digest for an image reference.
 ///
 /// `local_image_id` is the container's recorded immutable local image ID.

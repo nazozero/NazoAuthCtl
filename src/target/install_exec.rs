@@ -455,8 +455,7 @@ impl HostInstallExecutor {
                     // anchor, so an image already present locally under the
                     // exact repo@digest reference is equally trustworthy.
                     // Anything else (absent, or a different digest) fails.
-                    let present = backend.inspect_optional(&image).ok().flatten().is_some();
-                    if !present {
+                    if !backend.local_image_matches_digest(&image) {
                         return Err(Failure::new(
                             ARTIFACT_UNVERIFIED,
                             sanitize(format!(

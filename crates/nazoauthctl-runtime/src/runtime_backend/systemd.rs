@@ -578,6 +578,10 @@ impl RuntimeBackend for SystemdBackend {
         bail!("systemd backend does not manage OCI images")
     }
 
+    fn local_image_matches_digest(&self, _image_reference: &str) -> bool {
+        false
+    }
+
     fn resolve_local_image_id(&self, _image_reference: &str) -> anyhow::Result<String> {
         bail!("systemd backend does not manage OCI images")
     }
