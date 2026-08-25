@@ -648,11 +648,21 @@ fn start_container_runtime(
             )
         }
     };
-    let digest = release
-        .manifest
-        .image_oci_digest()
-        .trim_start_matches("sha256:")
-        .to_owned();
+    // The runtime identity anchor is the digest embedded in `image` itself:
+    // the platform manifest digest for container backends (what the engine
+    // records in RepoDigests and what inspection resolves back) or the
+    // host-platform runtime digest for systemd. The manifest-list index
+    // digest is a separate verification anchor consumed upstream; asserting
+    // it against the running object would compare two different layers.
+    let digest = image
+        .rsplit_once('@')
+        .map(|(_, digest)| digest.trim_start_matches("sha256:").to_owned())
+        .ok_or_else(|| {
+            Failure::new(
+                RUNTIME_START_FAILED,
+                sanitize(format!("release image reference has no digest: {image}")),
+            )
+        })?;
     let backend = runtime_backend::backend(kind);
     let observation = backend.inspect(job.runtime_object);
     if observation.as_ref().is_ok_and(|observed| {
