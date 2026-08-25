@@ -568,7 +568,21 @@ impl HostInstallExecutor {
             performed.provisioned_bootstrap = true;
         }
 
-        // 5. Start the runtime and confirm it serves the verified artifact.
+        // 5. Write the operator's config-revision marker BEFORE the runtime
+        // starts: the container backend bind-mounts this exact file, and a
+        // missing mount source fails the run with exit 125 (E04 admission
+        // step 5 reads it back through the mount).
+        let revision_marker = job.scope_dir.join("config-revision");
+        atomic_write(&revision_marker, job.order.config_sha256.as_bytes(), 0o440).map_err(
+            |error| {
+                Failure::new(
+                    HOST_ERR_OPERATION_INVALID,
+                    sanitize(format!("failed to write config-revision marker: {error}")),
+                )
+            },
+        )?;
+
+        // 6. Start the runtime and confirm it serves the verified artifact.
         match kind {
             RuntimeBackendKind::Systemd => {
                 return Err(Failure::new(
@@ -582,24 +596,11 @@ impl HostInstallExecutor {
             }
         }
 
-        // 6. Local health/readiness probe. Public reachability is deliberately
+        // 7. Local health/readiness probe. Public reachability is deliberately
         // absent here (G08): loopback readiness is the only install gate.
         probe_local_health(job.order.port)?;
 
-        // 7. Write the operator's config-revision marker so the one-shot
-        // operator can fence operations against stale configuration (E04
-        // admission step 5).
-        let revision_marker = job.scope_dir.join("config-revision");
-        atomic_write(&revision_marker, job.order.config_sha256.as_bytes(), 0o440).map_err(
-            |error| {
-                Failure::new(
-                    HOST_ERR_OPERATION_INVALID,
-                    sanitize(format!("failed to write config-revision marker: {error}")),
-                )
-            },
-        )?;
-
-        // 7. Ownership marker: proves ctl created and manages this directory.
+        // 8. Ownership marker: proves ctl created and manages this directory.
         // Uninstall verifies it before any destructive action (P0-3/W2.4).
         let owned_marker = PathBuf::from(&job.order.data_root).join(".nazoauth-owned");
         atomic_write(&owned_marker, job.deployment_id.as_bytes(), 0o440).map_err(|error| {
