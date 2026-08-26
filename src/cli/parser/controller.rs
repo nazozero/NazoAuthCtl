@@ -161,7 +161,7 @@ fn parse_revoke(values: &[String]) -> anyhow::Result<ControllerCommand> {
 fn parse_recover(values: &[String]) -> anyhow::Result<ControllerCommand> {
     let common = parse_common(
         values.to_vec(),
-        &["--label", "--secret-file"],
+        &["--label", "--secret-file", "--output-secret-file"],
         &["--rotate-secret"],
         "controller recover",
     )?;
@@ -171,9 +171,22 @@ fn parse_recover(values: &[String]) -> anyhow::Result<ControllerCommand> {
         Some(_) => bail!("--secret-file requires a file path"),
         None => None,
     };
+    let output_secret_file = match common.values.get("--output-secret-file") {
+        Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
+        Some(_) => bail!("--output-secret-file requires a file path"),
+        None => None,
+    };
     if rotate_secret && secret_file.is_some() {
         bail!(
             "--secret-file belongs to the recovery flow and cannot be combined with --rotate-secret"
+        );
+    }
+    if let (Some(input), Some(output)) = (&secret_file, &output_secret_file)
+        && input == output
+    {
+        bail!(
+            "--output-secret-file must differ from --secret-file; the commit invalidates the \
+             old secret and the new one must never overwrite it"
         );
     }
     if rotate_secret {
@@ -189,5 +202,6 @@ fn parse_recover(values: &[String]) -> anyhow::Result<ControllerCommand> {
         rotate_secret,
         approval_token: common.approval_token,
         admin_access_file: common.admin_access_file,
+        output_secret_file,
     })
 }

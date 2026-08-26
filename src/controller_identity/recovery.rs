@@ -65,13 +65,96 @@ fn b64(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Delivery channel for a REPLACEMENT Recovery Secret (W3.3/P0-4). The
+/// implementation MUST get the secret into the operator's hands — and, for
+/// file delivery, persist it durably — before the caller performs the
+/// irreversible root commit.
+pub(crate) trait ReplacementSecretDelivery {
+    fn deliver(&self, display: &str) -> anyhow::Result<()>;
+}
+
+/// Terminal delivery: print once and require an explicit acknowledgement so
+/// a scripted pipe can never silently swallow the only copy.
+pub(crate) struct InteractiveSecretDelivery;
+
+impl ReplacementSecretDelivery for InteractiveSecretDelivery {
+    fn deliver(&self, display: &str) -> anyhow::Result<()> {
+        use std::io::Write as _;
+        println!(
+            "NEW RECOVERY SECRET — shown once, never stored by ctl or NazoAuth:\n \x20   {display}\n\
+             \nStore it offline NOW (password manager printout or paper in a safe place). \
+             Whoever holds it can recover the Controller Key when every slot is lost."
+        );
+        let _ = std::io::stdout().flush();
+        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            bail!(
+                "the replacement Recovery Secret was printed but stdin is not a terminal, so \
+                 the acknowledgement cannot be confirmed; rerun with --output-secret-file in \
+                 non-interactive environments"
+            );
+        }
+        print!("type STORED after the secret is saved offline: ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("failed to read the delivery acknowledgement")?;
+        if line.trim() != "STORED" {
+            bail!(
+                "delivery not acknowledged; aborting BEFORE any server-side change — nothing \
+                 was rotated or recovered"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// File delivery: create-new, owner-only. Refuses to clobber an existing
+/// file so a rerun can never silently overwrite the only good copy.
+pub(crate) struct OutputFileSecretDelivery {
+    pub path: std::path::PathBuf,
+}
+
+impl ReplacementSecretDelivery for OutputFileSecretDelivery {
+    fn deliver(&self, display: &str) -> anyhow::Result<()> {
+        use std::io::Write as _;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&self.path)
+                .context("creating the output secret file failed (it must not exist yet)")?;
+            file.write_all(display.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.path)
+                .context("creating the output secret file failed (it must not exist yet)")?;
+            file.write_all(display.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
 /// D10 enrollment / D12 proactive rotation: replace the deployment's
 /// Recovery Root with a freshly generated one under fresh-2FA approval.
-/// The returned report contains the NEW secret exactly once — nothing in ctl
-/// or NazoAuth retains it.
+/// The replacement secret is handed to `delivery` BEFORE the approval is
+/// issued and the commit runs, so an aborted flow leaves the old root valid;
+/// the returned report no longer carries the secret at all.
 pub(crate) fn rotate_root_with_new_secret(
     api: &dyn ControllerRegistryApi,
     deployment_id: &str,
+    delivery: &dyn ReplacementSecretDelivery,
 ) -> anyhow::Result<String> {
     let view = api
         .recovery_root_view(deployment_id)
@@ -81,6 +164,12 @@ pub(crate) fn rotate_root_with_new_secret(
     let _ = view.present; // rotation over an existing root IS the D12 use case
 
     let material = generate_material(deployment_id);
+    // P0-4: deliver BEFORE anything irreversible. If delivery fails or is
+    // not acknowledged, no approval exists and the old root stays valid.
+    delivery.deliver(&material.display).context(
+        "replacement secret delivery failed; no approval was issued and nothing changed",
+    )?;
+
     let approval = api
         .issue_recovery_root_approval(&RecoveryRootApprovalBody {
             deployment_id: deployment_id.to_owned(),
@@ -107,15 +196,10 @@ pub(crate) fn rotate_root_with_new_secret(
         "recovery root ready for deployment '{deployment_id}' (generation {generation}, kdf {})\n\
          replaced generation: {}\n\
          \n\
-         NEW RECOVERY SECRET — shown once, never stored by ctl or NazoAuth:\n\
-         \x20   {}\n\
-         \n\
-         write it down offline now (password manager printout or paper in a safe place). \
-         Whoever holds it can recover the Controller Key when every slot is lost; nobody can \
-         use it for anything else.\n",
+         the replacement secret was delivered and acknowledged BEFORE this commit ran; the old \
+         generation stopped verifying when the commit landed.\n",
         root.kdf.as_deref().unwrap_or("-"),
         previous.map_or("none (first enrollment)".to_owned(), |g| g.to_string()),
-        material.display,
     ))
 }
 
@@ -152,6 +236,7 @@ pub(crate) fn recover_controller_identity(
     selector: Option<&str>,
     old_secret_text: &str,
     label: &str,
+    delivery: &dyn ReplacementSecretDelivery,
 ) -> anyhow::Result<RecoveredIdentity> {
     let action = "controller recovery";
     let record = resolve_instance(registry, selector, action)?;
@@ -214,6 +299,16 @@ pub(crate) fn recover_controller_identity(
             "internal error: the computed answer failed its own verification; aborting before submission"
         );
     }
+
+    // P0-4: deliver the replacement secret BEFORE the answer is submitted.
+    // The commit invalidates the old root the moment it lands, so the only
+    // safe ordering is: new secret in the operator's hands first, commit
+    // second. A failed or unacknowledged delivery leaves the challenge
+    // pending (it expires server-side) and the old root fully valid.
+    delivery.deliver(&replacement.display).context(
+        "replacement secret delivery failed; the challenge stays pending and the old recovery \
+         secret remains valid",
+    )?;
 
     let commit = api
         .submit_recovery_answer(&RecoveryAnswerBody {
@@ -337,6 +432,25 @@ mod tests {
         }
     }
 
+    /// P0-4 test double: records every delivery so tests can assert the
+    /// secret reached the operator before any mutating request was sent.
+    struct RecordingDelivery {
+        delivered: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingDelivery {
+        fn snapshot(&self) -> Vec<String> {
+            self.delivered.lock().unwrap().clone()
+        }
+    }
+
+    impl ReplacementSecretDelivery for RecordingDelivery {
+        fn deliver(&self, display: &str) -> anyhow::Result<()> {
+            self.delivered.lock().unwrap().push(display.to_owned());
+            Ok(())
+        }
+    }
+
     struct Fixture {
         _temp: PrivateTempDir,
         registry: RegistryStore,
@@ -380,11 +494,25 @@ mod tests {
             200,
             r#"{"deployment_id":"deploy-recovery-test","present":false}"#,
         );
-        let report = rotate_root_with_new_secret(&canned_api(canned.clone()), DEPLOYMENT)
-            .expect("rotation succeeded");
-        assert!(report.contains("NAZO-RECOVERY-"), "{report}");
+        let delivery = RecordingDelivery {
+            delivered: std::sync::Mutex::new(Vec::new()),
+        };
+        let report =
+            rotate_root_with_new_secret(&canned_api(canned.clone()), DEPLOYMENT, &delivery)
+                .expect("rotation succeeded");
+        assert!(!report.contains("NAZO-RECOVERY-"), "{report}");
         assert!(report.contains("generation 1"), "{report}");
-        assert!(report.contains("shown once"), "{report}");
+        // P0-4: exactly one delivery, and it happened before any mutating
+        // request — the only request before approval issuance is the read-only
+        // root view (GET).
+        let delivered = delivery.delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].starts_with("NAZO-RECOVERY-"));
+        assert_eq!(
+            canned.requests()[0].0,
+            "GET",
+            "the view precedes the delivery"
+        );
 
         assert_eq!(
             canned.requests(),
@@ -432,11 +560,16 @@ mod tests {
             200,
             r#"{"deployment_id":"deploy-recovery-test","present":true,"recovery_kid":"kid-a","kdf":"hkdf-sha256-v1","generation":3}"#,
         );
-        let report = rotate_root_with_new_secret(&canned_api(canned.clone()), DEPLOYMENT)
-            .expect("rotation over an existing root is the D12 use case");
+        let delivery = RecordingDelivery {
+            delivered: std::sync::Mutex::new(Vec::new()),
+        };
+        let report =
+            rotate_root_with_new_secret(&canned_api(canned.clone()), DEPLOYMENT, &delivery)
+                .expect("rotation over an existing root is the D12 use case");
         assert!(report.contains("generation 4"), "{report}");
         assert!(report.contains("replaced generation: 3"), "{report}");
         assert_eq!(canned.requests().len(), 3);
+        assert_eq!(delivery.delivered.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -465,6 +598,9 @@ mod tests {
             ),
         );
 
+        let delivery = RecordingDelivery {
+            delivered: std::sync::Mutex::new(Vec::new()),
+        };
         let recovered = recover_controller_identity(
             &fixture.registry,
             &fixture.keys,
@@ -472,6 +608,7 @@ mod tests {
             Some("prod"),
             &old.display,
             "ops laptop",
+            &delivery,
         )
         .expect("recovery succeeded");
 
@@ -480,6 +617,11 @@ mod tests {
             "01900000-0000-7000-8000-000000000009"
         );
         assert_eq!(recovered.recovery_generation, 4);
+        // P0-4: the replacement secret was delivered before the commit.
+        let delivered = delivery.delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].starts_with("NAZO-RECOVERY-"));
+        assert_ne!(delivered[0], old.display);
 
         let requests = canned.requests();
         assert_eq!(requests.len(), 2);
@@ -558,6 +700,9 @@ mod tests {
     fn recover_refuses_unparsable_secrets_before_any_network_call() {
         let fixture = Fixture::new().expect("fixture");
         let canned = Canned::default();
+        let delivery = RecordingDelivery {
+            delivered: std::sync::Mutex::new(Vec::new()),
+        };
         let error = recover_controller_identity(
             &fixture.registry,
             &fixture.keys,
@@ -565,9 +710,11 @@ mod tests {
             Some("prod"),
             "not-a-secret",
             "ops",
+            &delivery,
         )
         .expect_err("garbage secret must fail closed");
         assert!(error.to_string().contains("did not parse"), "{error}");
         assert!(canned.requests().is_empty());
+        assert!(delivery.delivered.lock().unwrap().is_empty());
     }
 }

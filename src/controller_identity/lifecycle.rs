@@ -910,15 +910,33 @@ pub(crate) fn run_controller_command(
             rotate_secret,
             approval_token: _approval_token, // consumed by the recovery API internally
             admin_access_file,
+            output_secret_file,
         } => {
             let explicit = merge_global(selector, global, "controller recover")?;
             let record = resolve_record(&registry, explicit.as_deref())?;
             let api = make_api(&record.issuer, admin_access_file.as_deref())?;
+            // P0-4 delivery channel: an explicit create-new owner-only file
+            // for non-interactive runs; the terminal handshake everywhere
+            // else. A missing channel fails closed instead of losing the
+            // only copy of the replacement secret.
+            let delivery: std::sync::Arc<
+                dyn crate::controller_identity::recovery::ReplacementSecretDelivery,
+            > = match output_secret_file.as_ref() {
+                Some(path) => std::sync::Arc::new(
+                    crate::controller_identity::recovery::OutputFileSecretDelivery {
+                        path: path.clone(),
+                    },
+                ),
+                None => std::sync::Arc::new(
+                    crate::controller_identity::recovery::InteractiveSecretDelivery,
+                ),
+            };
             if rotate_secret {
                 // D10 first enrollment / D12 proactive rotation.
                 let report = crate::controller_identity::recovery::rotate_root_with_new_secret(
                     &api,
                     &record.deployment_id,
+                    delivery.as_ref(),
                 )?;
                 println!("{report}");
             } else {
@@ -930,6 +948,7 @@ pub(crate) fn run_controller_command(
                     explicit.as_deref(),
                     &secret_text,
                     &label,
+                    delivery.as_ref(),
                 )?;
                 println!("{}", render_recovered(&record.alias, &recovered));
             }
@@ -1010,8 +1029,9 @@ fn render_recovered(
          expires: {} (30-day lifetime from the server clock)\n\
          recovery root generation: {}\n\
          \n\
-         the OLD recovery secret stopped verifying the moment the commit landed; store the NEW \
-         one printed during this flow's proposal — it is shown exactly once\n\
+         the replacement Recovery Secret was delivered and acknowledged BEFORE this commit ran; \
+         the old secret stopped verifying when it landed. Verify your offline copy now — it is \
+         the only way to run this recovery again.\n\
          next: nazoauthctl status --instance {alias}\n",
         recovered.controller_id,
         short_kid(&recovered.kid),

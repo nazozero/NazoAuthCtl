@@ -170,6 +170,11 @@ pub(crate) enum ControllerCommand {
         /// Fresh-2FA approval token for proactive root rotation (D12).
         approval_token: Option<String>,
         admin_access_file: Option<PathBuf>,
+        /// Delivery channel for the REPLACEMENT Recovery Secret. The secret
+        /// is delivered BEFORE the irreversible commit; interactive runs
+        /// confirm on the terminal, non-TTY runs must name a create-new,
+        /// owner-only output file.
+        output_secret_file: Option<PathBuf>,
     },
 }
 
