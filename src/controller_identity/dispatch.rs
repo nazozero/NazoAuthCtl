@@ -196,6 +196,20 @@ pub fn prepare_control_operation(
                 kind: AttemptKind::Resumed,
             });
         }
+        // P1-2: the journal slot is single-occupancy. A changed payload under
+        // an existing entry used to mint a fresh id and silently overwrite
+        // the old record, destroying the replay anchor for an operation that
+        // may still be in flight server-side. Fail closed instead: the
+        // operator settles (rerun identical inputs to reach a terminal
+        // outcome) or clears the entry explicitly.
+        bail!(
+            "the operation journal holds '{}' ({:?}) for instance '{}' with DIFFERENT content; \
+             refusing to sign a new operation. Re-run the previous command unchanged to settle \
+             it, or remove the journal explicitly if that attempt was abandoned",
+            entry.operation_id,
+            entry.state,
+            record.alias
+        );
     }
 
     // Fresh attempt: expiry pre-screen BEFORE signing (D09), keyed on the
@@ -619,10 +633,11 @@ mod tests {
     #[test]
     fn changed_content_after_unknown_outcome_mints_a_new_id_but_only_for_a_fixed_cause()
     -> anyhow::Result<()> {
-        // This test pins the documented boundary: content changes mean the
-        // caller deliberately abandoned the old envelope; the old id is never
-        // replayed with different bytes (server would answer
-        // OPERATION_ID_CONFLICT forever).
+        // P1-2 boundary: the journal slot is single-occupancy. Changed content
+        // under an existing entry used to mint a new id and silently overwrite
+        // the old record, destroying the replay anchor for an operation that
+        // might still be in flight server-side. It now fails closed and the
+        // journaled operation id is preserved untouched.
         let f = fixture()?;
         f.keys.get_or_create_active("deploy-alpha")?;
         let journal = f.journal()?;
@@ -634,18 +649,18 @@ mod tests {
             "production",
             input("rev-1"),
         )?;
-        let second = prepare_control_operation(
-            &f.registry,
-            &f.keys,
-            &journal,
-            "production",
-            input("rev-2"),
-        )?;
-        assert_eq!(second.kind, AttemptKind::Fresh);
-        assert_ne!(second.signed.operation_id, first.signed.operation_id);
+        let error =
+            prepare_control_operation(&f.registry, &f.keys, &journal, "production", input("rev-2"))
+                .expect_err("a conflicting payload must not steal the journal slot");
+        assert!(
+            error
+                .to_string()
+                .contains("DIFFERENT content; refusing to sign"),
+            "{error}"
+        );
         assert_eq!(
             journal.load()?.unwrap().operation_id,
-            second.signed.operation_id
+            first.signed.operation_id
         );
         Ok(())
     }

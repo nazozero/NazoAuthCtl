@@ -375,7 +375,9 @@ pub(crate) fn validate_registry_key(value: &str, label: &str) -> anyhow::Result<
 
 /// Shared identifier rule for store-legal tokens across ctl stores
 /// (registry keys and target DeploymentState identifiers alike): 1..=max
-/// characters from `[A-Za-z0-9.:_+-]`, never `.` or `..`.
+/// characters from `[A-Za-z0-9.:_+-]`, never `.` or `..`, and never a
+/// leading `-` (P1-7: identifiers flow into positions where a leading dash
+/// would be parsed as an option, e.g. `ssh <profile>`).
 pub(crate) fn validate_identifier(
     value: &str,
     max_chars: usize,
@@ -386,10 +388,13 @@ pub(crate) fn validate_identifier(
         || !value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || ".:_+-".contains(character))
+        || value.starts_with('-')
         || value == "."
         || value == ".."
     {
-        bail!("{label} must be 1-{max_chars} characters from [A-Za-z0-9.:_+-]");
+        bail!(
+            "{label} must be 1-{max_chars} characters from [A-Za-z0-9.:_+-] and must not start with '-'"
+        );
     }
     Ok(())
 }
@@ -930,7 +935,7 @@ impl RegistryStore {
                 .and_then(|stem| stem.to_str())
                 .with_context(|| format!("unreadable record name {}", path.display()))?
                 .to_owned();
-            records.push((stem, read_record::<T>(&path)?));
+            records.push((stem.clone(), read_record::<T>(&path, &stem)?));
         }
         Ok(records)
     }
@@ -954,11 +959,18 @@ fn write_record<T: Serialize>(path: &Path, label: &str, record: &T) -> anyhow::R
 /// the current schema, so drift fails closed as STATE_RESET_REQUIRED.
 trait ConformingRecord: serde::de::DeserializeOwned {
     fn validate_loaded(&self) -> anyhow::Result<()>;
+    /// P1-6: the identity the FILENAME claims. A record whose internal id
+    /// differs from its `<id>.json` stem is tampered or misnamed and must
+    /// fail closed instead of being silently adopted under either name.
+    fn matches_stem(&self, stem: &str) -> bool;
 }
 
 impl ConformingRecord for HostRecord {
     fn validate_loaded(&self) -> anyhow::Result<()> {
         self.validate()
+    }
+    fn matches_stem(&self, stem: &str) -> bool {
+        self.host_id.to_string() == stem
     }
 }
 
@@ -966,9 +978,12 @@ impl ConformingRecord for InstanceRecord {
     fn validate_loaded(&self) -> anyhow::Result<()> {
         self.validate()
     }
+    fn matches_stem(&self, stem: &str) -> bool {
+        self.deployment_id == stem
+    }
 }
 
-fn read_record<T: ConformingRecord>(path: &Path) -> anyhow::Result<T> {
+fn read_record<T: ConformingRecord>(path: &Path, stem: &str) -> anyhow::Result<T> {
     let bytes =
         filesystem::read_secure_regular_file(path, "registry record", false, MAX_RECORD_BYTES)
             .map_err(|error| {
@@ -990,6 +1005,14 @@ fn read_record<T: ConformingRecord>(path: &Path) -> anyhow::Result<T> {
             path.display()
         ))
     })?;
+    // P1-6: filename ↔ internal identity must agree in both directions.
+    if !record.matches_stem(stem) {
+        bail!(
+            "{STATE_RESET_REQUIRED}: record file '{stem}.json' carries a different internal id; \
+             the registry tree is inconsistent ({})",
+            path.display()
+        );
+    }
     Ok(record)
 }
 

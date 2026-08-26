@@ -776,6 +776,17 @@ fn instance_relocate(
             record.deployment_id
         );
     }
+    // P1-5: the relocated instance must serve the SAME issuer, not merely the
+    // same deployment id — a foreign deployment that happens to reuse the id
+    // would otherwise be adopted silently.
+    if inspection.issuer != record.issuer {
+        bail!(
+            "the deployment inspected through '{to_host}' reports issuer '{}' instead of '{}'; \
+             the binding was not changed",
+            inspection.issuer,
+            record.issuer
+        );
+    }
 
     let moved = context
         .store

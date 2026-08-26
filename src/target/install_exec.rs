@@ -512,6 +512,15 @@ impl HostInstallExecutor {
         // The container reads this file as the image's fixed runtime UID;
         // bind mounts keep host ownership, so hand it over group-readable.
         set_runtime_identity(&config_path, false)?;
+        // P1-1: the deletion credential for the uninstall executor — proves
+        // ctl created this exact file during install.
+        let config_owned = PathBuf::from(format!("{}.nazauth-owned", config_path.display()));
+        atomic_write(&config_owned, job.deployment_id.as_bytes(), 0o440).map_err(|error| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                sanitize(format!("failed to write config ownership marker: {error}")),
+            )
+        })?;
         performed.wrote_config = true;
 
         // 3. Target-local secrets (values are minted here, never shipped).

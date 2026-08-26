@@ -191,6 +191,11 @@ impl OperationJournal {
     }
 
     /// Durably persist the write-ahead entry before dispatch.
+    ///
+    /// P1-2: the journal slot is single-occupancy. An existing entry in any
+    /// state must never be silently replaced — the caller reconciles through
+    /// [`Self::load`] first, and a conflicting operation id means a different
+    /// logical attempt is trying to steal the slot.
     pub fn record_dispatched(&self, entry: &OperationJournalEntry) -> anyhow::Result<()> {
         Self::validate_entry(entry, &self.path)?;
         if entry.state != JournalState::Dispatched {
@@ -201,6 +206,29 @@ impl OperationJournal {
                 .parent()
                 .context("journal path has no parent directory")?,
         )?;
+        if let Some(existing) = self.load()? {
+            if existing.operation_id == entry.operation_id {
+                // Byte-identical rebuild of the SAME attempt: safe to persist
+                // again (idempotent retry of the write itself).
+                if existing.state != JournalState::Dispatched {
+                    bail!(
+                        "operation '{}' is already journaled as {:?}; refusing to rewind it to \
+                         dispatched",
+                        existing.operation_id,
+                        existing.state
+                    );
+                }
+            } else {
+                let existing_state = format!("{:?}", existing.state);
+                bail!(
+                    "the operation journal already holds operation '{}' ({existing_state}); a \
+                     different operation '{}' may not overwrite it — settle or clear the \
+                     existing entry explicitly",
+                    existing.operation_id,
+                    entry.operation_id
+                );
+            }
+        }
         let bytes = serde_json::to_vec_pretty(entry)
             .context("failed to serialize the operation journal entry")?;
         filesystem::atomic_write(&self.path, &bytes, 0o600)

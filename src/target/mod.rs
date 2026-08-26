@@ -508,6 +508,12 @@ fn answer_update(
             "the deployment records no current artifact reference; adopt or install it first",
         ));
     };
+    // P1-11: the recorded build identity version is the signed
+    // anti-downgrade floor for this update.
+    let current_version = state
+        .current_build_identity
+        .as_ref()
+        .map(|identity| identity.version.clone());
     let job = update_exec::UpdateJob {
         operation_id: &operation.operation_id,
         deployment_id: &deployment_id,
@@ -517,6 +523,7 @@ fn answer_update(
         port: LOCAL_PROBE_PORT,
         config_schema: &state.config.schema.clone(),
         current_artifact: &current_artifact,
+        current_version: current_version.as_deref(),
         expected_revision,
         artifact,
         config,

@@ -66,6 +66,9 @@ pub(crate) struct UpdateJob<'a> {
     pub config_schema: &'a str,
     /// The deployment's recorded current artifact reference (`sha256:<hex>`).
     pub current_artifact: &'a str,
+    /// P1-11 anti-downgrade floor: the version embedded in the current
+    /// build identity, when the target recorded one.
+    pub current_version: Option<&'a str>,
     pub expected_revision: u64,
     pub artifact: &'a OfficialArtifactRef,
     pub config: Option<&'a StagedConfig>,
@@ -180,7 +183,9 @@ impl HostLifecycleExecutor {
 
         // 1. Verify + pull the pinned official artifact (download-on-target;
         // re-running verify/pull is idempotent for interrupted resumes).
-        let verified = verify_pinned_artifact_facts(job.artifact, kind)?;
+        // P1-11: the recorded current version is the signed anti-downgrade
+        // floor — a verified-but-older Release is rejected before download.
+        let verified = verify_pinned_artifact_facts(job.artifact, kind, job.current_version)?;
         let new_digest = verified.digest.clone();
 
         // 2. Snapshot the current config so a failed activation restores the
@@ -446,12 +451,13 @@ fn require_observation_serves(
 fn verify_pinned_artifact_facts(
     artifact: &OfficialArtifactRef,
     kind: RuntimeBackendKind,
+    version_floor: Option<&str>,
 ) -> Result<VerifiedArtifactFacts, Failure> {
     let release = VerifiedRelease::verify(ReleaseRequest {
         repository: &artifact.repository,
         requested_version: artifact.version.as_deref(),
         container_backend: Some(kind),
-        trusted_version_floor: None,
+        trusted_version_floor: version_floor,
     })
     .map_err(|error| {
         Failure::new(

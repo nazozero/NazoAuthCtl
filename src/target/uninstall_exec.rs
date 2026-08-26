@@ -254,27 +254,36 @@ fn delete_managed_resource(
                     ),
                 ));
             }
-            // W2.4: verify the ownership marker before deleting. The marker
-            // proves ctl created this directory during install.
+            // W2.4/P1-1: the ownership marker is the deletion credential. A
+            // missing marker means ctl did not create this directory (or the
+            // state tree was tampered with); either way fail closed.
             let marker = path.join(".nazoauth-owned");
-            if marker.exists() {
-                let owned_by = std::fs::read_to_string(&marker).map_err(|error| {
-                    Failure::new(
-                        HOST_ERR_OPERATION_INVALID,
-                        format!("failed to read ownership marker: {error}"),
-                    )
-                })?;
-                if owned_by.trim() != deployment_id {
-                    return Err(Failure::new(
-                        super::deployment_state::OBJECT_IDENTITY_MISMATCH,
-                        format!(
-                            "directory '{}' is owned by '{}', not '{}'",
-                            sanitize(locator.to_owned()),
-                            sanitize(owned_by.trim().to_owned()),
-                            sanitize(deployment_id.to_owned())
-                        ),
-                    ));
-                }
+            if !marker.exists() {
+                return Err(Failure::new(
+                    super::deployment_state::OBJECT_IDENTITY_MISMATCH,
+                    format!(
+                        "refusing to delete directory '{}': no .nazoauth-owned marker; ctl did \
+                         not create it",
+                        sanitize(locator.to_owned())
+                    ),
+                ));
+            }
+            let owned_by = std::fs::read_to_string(&marker).map_err(|error| {
+                Failure::new(
+                    HOST_ERR_OPERATION_INVALID,
+                    format!("failed to read ownership marker: {error}"),
+                )
+            })?;
+            if owned_by.trim() != deployment_id {
+                return Err(Failure::new(
+                    super::deployment_state::OBJECT_IDENTITY_MISMATCH,
+                    format!(
+                        "directory '{}' is owned by '{}', not '{}'",
+                        sanitize(locator.to_owned()),
+                        sanitize(owned_by.trim().to_owned()),
+                        sanitize(deployment_id.to_owned())
+                    ),
+                ));
             }
             if path.exists() {
                 std::fs::remove_dir_all(path).map_err(|error| {
@@ -289,6 +298,37 @@ fn delete_managed_resource(
         }
         "file" => {
             let path = Path::new(locator);
+            // P1-1: config files carry the same ownership proof as
+            // directories — a sibling marker file named `<path>.nazoauth-owned`
+            // written at install time must exist and match.
+            let marker_path = format!("{locator}.nazauth-owned");
+            let marker = Path::new(marker_path.as_str());
+            if !marker.exists() {
+                return Err(Failure::new(
+                    super::deployment_state::OBJECT_IDENTITY_MISMATCH,
+                    format!(
+                        "refusing to delete file '{}': no .nazauth-owned proof marker",
+                        sanitize(locator.to_owned())
+                    ),
+                ));
+            }
+            let owned_by = std::fs::read_to_string(marker).map_err(|error| {
+                Failure::new(
+                    HOST_ERR_OPERATION_INVALID,
+                    format!("failed to read ownership marker: {error}"),
+                )
+            })?;
+            if owned_by.trim() != deployment_id {
+                return Err(Failure::new(
+                    super::deployment_state::OBJECT_IDENTITY_MISMATCH,
+                    format!(
+                        "file '{}' is owned by '{}', not '{}'",
+                        sanitize(locator.to_owned()),
+                        sanitize(owned_by.trim().to_owned()),
+                        sanitize(deployment_id.to_owned())
+                    ),
+                ));
+            }
             if path.exists() {
                 filesystem::remove_file_durable(path).map_err(|error| {
                     Failure::new(

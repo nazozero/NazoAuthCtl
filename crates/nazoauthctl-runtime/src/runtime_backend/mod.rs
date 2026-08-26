@@ -72,13 +72,12 @@ pub use systemd::{SystemdBackend, parse_systemd_version, render_host_service_uni
 #[serde(rename_all = "kebab-case")]
 pub enum Responsibility {
     External,
-    Delegated,
     Managed,
 }
 
 impl Responsibility {
     pub fn permits_mutation(self) -> bool {
-        matches!(self, Self::Delegated | Self::Managed)
+        matches!(self, Self::Managed)
     }
 }
 

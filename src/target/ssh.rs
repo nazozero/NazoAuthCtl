@@ -273,6 +273,12 @@ impl SshTarget {
     }
 
     /// Non-interactive sudo probe over the same fixed argv pattern.
+    ///
+    /// P1-8: exit status alone cannot distinguish "sudo wants a password"
+    /// from "the transport itself failed". A transport failure surfaces as
+    /// the OpenSSH client's own error text (host-key refusal, auth failure,
+    /// network unreachable) and must propagate as a typed host failure, not
+    /// masquerade as `PasswordRequired`.
     pub fn probe_sudo(&self) -> anyhow::Result<SudoPreflight> {
         if self.privilege != HostPrivilege::Sudo {
             bail!("host privilege is direct; sudo preflight does not apply");
@@ -282,11 +288,29 @@ impl SshTarget {
             .timeout(self.timeout)
             .stdin_output(b"")
             .context("failed to start the OpenSSH client for the sudo probe")?;
-        Ok(if output.status.success() {
-            SudoPreflight::Ready
-        } else {
-            SudoPreflight::PasswordRequired
-        })
+        if output.status.success() {
+            return Ok(SudoPreflight::Ready);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let transport_failed = [
+            "permission denied (publickey",
+            "host key verification failed",
+            "connection refused",
+            "connection timed out",
+            "could not resolve hostname",
+            "network is unreachable",
+            "port 22: connection",
+        ]
+        .iter()
+        .any(|needle| stderr.to_ascii_lowercase().contains(needle));
+        if transport_failed {
+            bail!(
+                "HOST_UNREACHABLE: the sudo probe failed inside the SSH transport, not at \
+                 sudo: {}",
+                stderr.trim().chars().take(200).collect::<String>()
+            );
+        }
+        Ok(SudoPreflight::PasswordRequired)
     }
 
     /// Establish a sudo timestamp interactively — at most one real
