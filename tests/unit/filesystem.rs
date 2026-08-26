@@ -227,3 +227,64 @@ fn symlink_activation_preserves_foreign_staging_and_commits_only_its_unique_link
         vec![staging.file_name().unwrap().to_string_lossy().into_owned()]
     );
 }
+
+/// P1-13 positive + negative real-machine test (Windows): after set_mode the
+/// ACL must carry NO inherited ACEs, must not include broad groups such as
+/// Users/Everyone/Authenticated Users, and must still grant the current
+/// account. The negative half proves the read-only mode strips write access
+/// for the owner as well.
+#[cfg(windows)]
+#[test]
+fn windows_owner_only_acl_strips_inheritance_and_broad_groups() {
+    use std::process::Command;
+
+    fn icacls_dump(path: &Path) -> String {
+        let output = Command::new("icacls").arg(path).output().unwrap();
+        assert!(output.status.success(), "icacls dump failed");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    let work = PrivateTempDir::new("nazoauthctl-windows-acl").unwrap();
+    let dir = work.path().join("secure-dir");
+    fs::create_dir(&dir).unwrap();
+    set_secure_directory_mode(&dir, "test secure directory", 0o700).unwrap();
+
+    let dir_acl = icacls_dump(&dir);
+    // Negative half: stripping inheritance must remove every broad-group
+    // ACE that the parent granted. The only remaining grants are SYSTEM,
+    // Administrators and the current account.
+    for group in ["BUILTIN\\Users", "Everyone", "Authenticated Users"] {
+        assert!(
+            !dir_acl.contains(group),
+            "{group} must not hold an ACE: {dir_acl}"
+        );
+    }
+    let account = std::env::var("USERNAME").unwrap();
+    assert!(
+        dir_acl.contains(r"\SYSTEM") && dir_acl.contains("Administrators"),
+        "SYSTEM/Administrators grants missing: {dir_acl}"
+    );
+    assert!(
+        dir_acl.contains(&format!("\\{account}:")),
+        "the current account lost its grant: {dir_acl}"
+    );
+
+    // Negative: a 0440 file keeps READ but loses write/full grants — even
+    // for the owner.
+    let file = dir.join("secret.txt");
+    fs::write(&file, b"payload").unwrap();
+    set_mode(&file, 0o440).unwrap();
+    let file_acl = icacls_dump(&file);
+    assert!(
+        !file_acl.contains("(F)") && !file_acl.contains("(W)") && !file_acl.contains("(M)"),
+        "write/full grants must be stripped from a 0440 file: {file_acl}"
+    );
+
+    // Positive contrast: a 0600 file DOES keep full control for the owner.
+    set_mode(&file, 0o600).unwrap();
+    let writable_acl = icacls_dump(&file);
+    assert!(
+        writable_acl.contains("(F)"),
+        "owner full control missing on the 0600 file: {writable_acl}"
+    );
+}

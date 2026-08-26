@@ -339,11 +339,11 @@ fn set_secure_directory_mode(path: &Path, label: &str, mode: u32) -> anyhow::Res
 }
 
 #[cfg(not(unix))]
-fn set_secure_directory_mode(path: &Path, label: &str, _mode: u32) -> anyhow::Result<()> {
-    // Windows ACLs are not represented by the portable std metadata API.  Do
-    // not open the directory as a regular File (which fails on Windows), and
-    // do not silently present this branch as equivalent to Unix 0700.
-    validate_secure_directory(path, label, false)
+fn set_secure_directory_mode(path: &Path, label: &str, mode: u32) -> anyhow::Result<()> {
+    // Windows ACLs are not represented by the portable std metadata API; do
+    // not open the directory as a regular File (which fails on Windows).
+    validate_secure_directory(path, label, false)?;
+    apply_windows_owner_only_acl(path, mode)
 }
 
 fn validate_secure_ancestors(path: &Path, label: &str) -> anyhow::Result<()> {
@@ -804,17 +804,64 @@ pub fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
-pub fn set_mode(_path: &Path, _mode: u32) -> anyhow::Result<()> {
-    // P1-4 known limitation: Windows does not enforce POSIX modes. On NTFS,
-    // files created by a user process inherit the parent directory's ACL,
-    // which under %USERPROFILE% or %APPDATA% is already owner-restricted by
-    // default. Explicit ACL hardening via `icacls` or the Win32 Security API
-    // is deferred to the K-phase integration environment where the resulting
-    // security descriptors can be verified against a real domain-joined host.
-    //
-    // The secure-file READ path (`read_secure_regular_file`) still validates
-    // that the file is not accessible through symlink/reparse/hardlink
-    // attacks on all platforms.
+pub fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
+    // P1-13: NTFS has no POSIX modes, but the security INTENT of the Unix
+    // modes used across this codebase (0700 dirs, 0600/0440 files) is exactly
+    // an owner-only ACL. Enforce it with the system `icacls`: strip inherited
+    // ACEs and grant only SYSTEM, Administrators and the current account.
+    // Read-only modes map to read-only ACEs.
+    apply_windows_owner_only_acl(path, mode)
+}
+
+/// P1-13 Windows implementation detail. SIDs are used for SYSTEM and
+/// Administrators so localized group names cannot break the call; the
+/// current account comes from the process environment.
+#[cfg(not(unix))]
+fn apply_windows_owner_only_acl(path: &Path, mode: u32) -> anyhow::Result<()> {
+    use crate::process::Process;
+
+    let write_allowed = mode & 0o200 != 0;
+    let read_grant = "R";
+    let full_grant = "F";
+    let grant = if write_allowed {
+        full_grant
+    } else {
+        read_grant
+    };
+    let inheritance = if path.is_dir() { "(OI)(CI)" } else { "" };
+
+    let user = std::env::var("USERNAME")
+        .with_context(|| "USERNAME is not set; cannot build the owner-only ACL")?;
+    let account = match std::env::var("USERDOMAIN") {
+        Ok(domain) if !domain.is_empty() => format!(r"{domain}\{user}"),
+        _ => user,
+    };
+
+    let output = Process::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r"])
+        .args([
+            "/grant:r".to_owned(),
+            format!("*S-1-5-18:{inheritance}({grant})"),
+        ])
+        .args([
+            "/grant:r".to_owned(),
+            format!("*S-1-5-32-544:{inheritance}({grant})"),
+        ])
+        .args([
+            "/grant:r".to_owned(),
+            format!("{account}:{inheritance}({grant})"),
+        ])
+        .output()
+        .with_context(|| "failed to start icacls for the owner-only ACL")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "icacls refused to set the owner-only ACL on {}: {}",
+            path.display(),
+            stderr.trim().chars().take(200).collect::<String>()
+        );
+    }
     Ok(())
 }
 
