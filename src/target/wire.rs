@@ -213,6 +213,11 @@ pub enum HostOperationBody {
     /// no revision expectation, no side effect. Answered with
     /// [`HostCompletionBody::StateListed`].
     StateList {},
+    /// P0-2: close one fresh-install bootstrap capability on the target by
+    /// deleting its install-binding context file. Requires the instance
+    /// binding. The server consumes the bootstrap token itself, so this is
+    /// hygiene, not the security boundary — but it must be explicit.
+    BootstrapClose {},
 }
 
 impl HostOperationBody {
@@ -224,6 +229,7 @@ impl HostOperationBody {
             Self::StateMutate { .. } => "state-mutate",
             Self::ControlOperation { .. } => "control-operation",
             Self::StateList {} => "state-list",
+            Self::BootstrapClose {} => "bootstrap-close",
         }
     }
 }
@@ -318,6 +324,20 @@ impl HostOperation {
         }
     }
 
+    /// P0-2: close one fresh-install bootstrap capability on the target.
+    pub fn bootstrap_close(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::BootstrapClose {},
+        }
+    }
+
     pub fn validate(&self) -> Result<(), MessageRejection> {
         if self.schema != HOST_PROTOCOL_SCHEMA {
             return Err(MessageRejection::new(
@@ -376,6 +396,18 @@ impl HostOperation {
                     return Err(MessageRejection::new(
                         RejectionCode::OperationMalformed,
                         "state-inspect requires deployment_id and must not carry \
+                         expected_revision",
+                    ));
+                }
+            }
+            HostOperationBody::BootstrapClose {} => {
+                // Closing addresses exactly one registered deployment,
+                // destroys only the capability file, and never races a CAS
+                // revision.
+                if self.deployment_id.is_none() || self.expected_revision.is_some() {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "bootstrap-close requires deployment_id and must not carry \
                          expected_revision",
                     ));
                 }
@@ -641,6 +673,10 @@ pub enum HostCompletionBody {
     StateListed {
         deployments: Vec<InstanceInspection>,
     },
+    /// P0-2: the fresh-install bootstrap capability file was deleted on the
+    /// target. Pure acknowledgement; the security boundary is the server's
+    /// own token consumption.
+    BootstrapClosed {},
 }
 
 /// Live inspection of one registered instance read from the target-side

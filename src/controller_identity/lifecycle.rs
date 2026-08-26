@@ -43,6 +43,7 @@ use super::admin_api::{
     RevokeCommitBody, RotateCommitBody, SlotCommitBody, SlotStatus, SlotsSnapshot, short_kid,
 };
 use super::expiry;
+use super::recovery::{self as recovery, generate_material};
 use super::store::{ControllerKeyStore, controller_key_ref_for};
 
 /// What one flow presents to the human approver (goal plan 04 §3): exact
@@ -391,14 +392,14 @@ fn finish_activation<A: ControllerRegistryApi>(
 /// P0-3: the SAME transaction enrolls a freshly generated Recovery Root, and
 /// its secret is delivered to the operator BEFORE the commit — a first
 /// binding can never exist without a recoverable root.
-pub fn bind_flow<A: ControllerRegistryApi>(
+pub(crate) fn bind_flow<A: ControllerRegistryApi>(
     api: &A,
     registry: &RegistryStore,
     keys: &ControllerKeyStore,
     selector: Option<&str>,
     label: &str,
     approval: impl FnOnce(&ProposalPresentation) -> anyhow::Result<String>,
-    delivery: &dyn crate::controller_identity::recovery::ReplacementSecretDelivery,
+    delivery: &dyn recovery::ReplacementSecretDelivery,
 ) -> anyhow::Result<String> {
     let record = resolve_record(registry, selector)?;
     validate_label(label)?;
@@ -427,7 +428,7 @@ pub fn bind_flow<A: ControllerRegistryApi>(
 
     // The Recovery Root born with this binding. Its secret is delivered
     // before the commit below; nothing but this one display ever holds it.
-    let recovery_material = crate::controller_identity::recovery::generate_material(&deployment);
+    let recovery_material = generate_material(&deployment);
 
     let presentation = ProposalPresentation {
         action: "bind",
@@ -963,21 +964,16 @@ pub(crate) fn run_controller_command(
             // for non-interactive runs; the terminal handshake everywhere
             // else. A missing channel fails closed instead of losing the
             // only copy of the replacement secret.
-            let delivery: std::sync::Arc<
-                dyn crate::controller_identity::recovery::ReplacementSecretDelivery,
-            > = match output_secret_file.as_ref() {
-                Some(path) => std::sync::Arc::new(
-                    crate::controller_identity::recovery::OutputFileSecretDelivery {
+            let delivery: std::sync::Arc<dyn recovery::ReplacementSecretDelivery> =
+                match output_secret_file.as_ref() {
+                    Some(path) => std::sync::Arc::new(recovery::OutputFileSecretDelivery {
                         path: path.clone(),
-                    },
-                ),
-                None => std::sync::Arc::new(
-                    crate::controller_identity::recovery::InteractiveSecretDelivery,
-                ),
-            };
+                    }),
+                    None => std::sync::Arc::new(recovery::InteractiveSecretDelivery),
+                };
             if rotate_secret {
                 // D10 first enrollment / D12 proactive rotation.
-                let report = crate::controller_identity::recovery::rotate_root_with_new_secret(
+                let report = recovery::rotate_root_with_new_secret(
                     &api,
                     &record.deployment_id,
                     delivery.as_ref(),
@@ -985,7 +981,7 @@ pub(crate) fn run_controller_command(
                 println!("{report}");
             } else {
                 let secret_text = read_recovery_secret(secret_file.as_deref())?;
-                let recovered = crate::controller_identity::recovery::recover_controller_identity(
+                let recovered = recovery::recover_controller_identity(
                     &registry,
                     &keys,
                     &api,
@@ -1018,16 +1014,13 @@ pub(crate) fn run_bind(options: BindOptions, global: Option<&str>) -> anyhow::Re
     let api = make_api(&record.issuer, admin_access_file.as_deref())?;
     // P0-4/P0-3: bind now also mints the Recovery Root, so its secret needs a
     // delivery channel with exactly the same fail-closed rules as recovery.
-    let delivery: std::sync::Arc<
-        dyn crate::controller_identity::recovery::ReplacementSecretDelivery,
-    > = match output_secret_file.as_ref() {
-        Some(path) => std::sync::Arc::new(
-            crate::controller_identity::recovery::OutputFileSecretDelivery { path: path.clone() },
-        ),
-        None => {
-            std::sync::Arc::new(crate::controller_identity::recovery::InteractiveSecretDelivery)
-        }
-    };
+    let delivery: std::sync::Arc<dyn recovery::ReplacementSecretDelivery> =
+        match output_secret_file.as_ref() {
+            Some(path) => {
+                std::sync::Arc::new(recovery::OutputFileSecretDelivery { path: path.clone() })
+            }
+            None => std::sync::Arc::new(recovery::InteractiveSecretDelivery),
+        };
     let report = bind_flow(
         &api,
         &registry,
@@ -1076,10 +1069,7 @@ fn read_recovery_secret(path: Option<&std::path::Path>) -> anyhow::Result<String
     }
 }
 
-fn render_recovered(
-    alias: &str,
-    recovered: &crate::controller_identity::recovery::RecoveredIdentity,
-) -> String {
+fn render_recovered(alias: &str, recovered: &recovery::RecoveredIdentity) -> String {
     format!(
         "controller identity recovered for instance '{alias}'\n\
          controller id: {}\n\
@@ -1343,7 +1333,7 @@ mod tests {
     /// P0-3 test double: accepts the delivery silently so flows can run.
     struct SilentDelivery;
 
-    impl crate::controller_identity::recovery::ReplacementSecretDelivery for SilentDelivery {
+    impl recovery::ReplacementSecretDelivery for SilentDelivery {
         fn deliver(&self, _display: &str) -> anyhow::Result<()> {
             Ok(())
         }

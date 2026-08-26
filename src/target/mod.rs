@@ -346,6 +346,8 @@ pub(crate) fn dispatch_host_operation(
             .unwrap_or_else(|failure| state_failure(operation, &failure)),
         HostOperationBody::StateList {} => answer_state_list(operation, store)
             .unwrap_or_else(|failure| state_failure(operation, &failure)),
+        HostOperationBody::BootstrapClose {} => answer_bootstrap_close(operation, store)
+            .unwrap_or_else(|failure| state_failure(operation, &failure)),
         HostOperationBody::ControlOperation { compact_jws, .. } => {
             answer_control_operation(operation, store, compact_jws, executors.control)
                 .unwrap_or_else(|failure| state_failure(operation, &failure))
@@ -760,6 +762,29 @@ fn answer_inspect(
                 current_build_identity: state.current_build_identity.clone(),
             },
         },
+    ))
+}
+
+/// P0-2: delete one fresh-install bootstrap capability file. The security
+/// boundary is the server's own token consumption; this explicit close keeps
+/// the target state tree clean so a stale capability can never resurface.
+fn answer_bootstrap_close(
+    operation: &HostOperation,
+    store: &TargetStateStore,
+) -> Result<HostResult, Failure> {
+    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
+    // Load-first proves the deployment exists; deleting an already-absent
+    // capability stays idempotent (the goal is "closed", however reached).
+    let _state = store.load_existing(&deployment_id)?;
+    let scope = store
+        .scope_dir(&deployment_id)
+        .map_err(|failure| Failure::new(failure.code, failure.detail))?;
+    bootstrap_authority::delete_material(&scope).map_err(|error| {
+        Failure::new(crate::target::HOST_ERR_OPERATION_INVALID, error.to_string())
+    })?;
+    Ok(HostResult::completed(
+        &operation.operation_id,
+        HostCompletionBody::BootstrapClosed {},
     ))
 }
 

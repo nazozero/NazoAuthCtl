@@ -25,7 +25,7 @@ use crate::fleet::resolve_instance;
 use crate::process::Process;
 use crate::registry::RegistryStore;
 use crate::target::{
-    BOOTSTRAP_CLOSED, DeploymentState, FreshBootstrapContext, TargetStateStore,
+    BOOTSTRAP_CLOSED, ExecutionTarget, FreshBootstrapContext, TargetStateStore,
     bootstrap_authority, target_state_root,
 };
 
@@ -111,15 +111,16 @@ impl InitialAdminTransport for CurlInitialAdminTransport {
 /// Where the control side reads the capability material and live state from.
 ///
 /// The local implementation reads the formalized target state root directly.
-/// A remote (SSH) reader needs a dedicated read-only host operation kind so
-/// the token never rides an ad-hoc channel; that decision belongs to the I
-/// wave and is tracked in the task report's open questions.
+/// The remote implementation drives the read-only state-inspect (which
+/// surfaces the capability view) and the explicit `bootstrap-close` host
+/// operation over the fixed SSH transport, so the token only ever rides the
+/// encrypted channel (P0-2).
 pub(crate) trait BootstrapMaterialSource {
-    fn read_state(&self, deployment_id: &str) -> anyhow::Result<DeploymentState>;
-    fn read_material(
-        &self,
-        deployment_id: &str,
-    ) -> anyhow::Result<(FreshBootstrapContext, Zeroizing<String>)>;
+    /// Full G02 gate: allowlist, open capability, install-operation ownership,
+    /// exact artifact, unchanged config revision.
+    fn authorize(&self, deployment_id: &str) -> anyhow::Result<()>;
+    /// The server-generated bootstrap token, while the capability is open.
+    fn read_token(&self, deployment_id: &str) -> anyhow::Result<Zeroizing<String>>;
     fn close(&self, deployment_id: &str) -> anyhow::Result<()>;
 }
 
@@ -152,29 +153,117 @@ impl LocalBootstrapMaterial {
     }
 }
 
+impl LocalBootstrapMaterial {
+    fn load_open_context(&self, deployment_id: &str) -> anyhow::Result<FreshBootstrapContext> {
+        let scope = self.scope_dir(deployment_id)?;
+        bootstrap_authority::load_context(&scope)?
+            .with_context(|| format!("{BOOTSTRAP_CLOSED}: no fresh-install capability exists"))
+    }
+}
+
 impl BootstrapMaterialSource for LocalBootstrapMaterial {
-    fn read_state(&self, deployment_id: &str) -> anyhow::Result<DeploymentState> {
+    fn authorize(&self, deployment_id: &str) -> anyhow::Result<()> {
         let store = TargetStateStore::open(&self.state_root)?;
-        store
+        let state = store
             .load_existing(deployment_id)
+            .map_err(|failure| anyhow::anyhow!("{}: {}", failure.code, failure.detail))?;
+        let context = self.load_open_context(deployment_id)?;
+        bootstrap_authority::authorize_claim(Some(&context), "create-initial-admin", &state)
             .map_err(|failure| anyhow::anyhow!("{}: {}", failure.code, failure.detail))
     }
 
-    fn read_material(
-        &self,
-        deployment_id: &str,
-    ) -> anyhow::Result<(FreshBootstrapContext, Zeroizing<String>)> {
-        let scope = self.scope_dir(deployment_id)?;
-        let context = bootstrap_authority::load_context(&scope)?
-            .with_context(|| format!("{BOOTSTRAP_CLOSED}: no fresh-install capability exists"))?;
+    fn read_token(&self, deployment_id: &str) -> anyhow::Result<Zeroizing<String>> {
         // The token is the SERVER-generated one inside the deployment's data
         // root; ctl only reads it while the capability is open.
-        let token = Zeroizing::new(bootstrap_authority::read_server_token(&context)?);
-        Ok((context, token))
+        let context = self.load_open_context(deployment_id)?;
+        Ok(Zeroizing::new(bootstrap_authority::read_server_token(
+            &context,
+        )?))
     }
 
     fn close(&self, deployment_id: &str) -> anyhow::Result<()> {
         bootstrap_authority::delete_material(&self.scope_dir(deployment_id)?)
+    }
+}
+
+/// P0-2 remote source: every fact arrives through the fixed SSH transport.
+/// The target-side state-inspect already runs the FULL authorization gate
+/// (allowlist, ownership, artifact/config binding) before it surfaces the
+/// material view — an absent view is exactly `BOOTSTRAP_CLOSED`. Closing
+/// drives the explicit `bootstrap-close` host operation; the security
+/// boundary remains the server's own token consumption.
+pub(crate) struct RemoteBootstrapMaterial {
+    pub(crate) target: std::sync::Arc<std::sync::Mutex<Box<dyn ExecutionTarget + Send>>>,
+}
+
+impl RemoteBootstrapMaterial {
+    fn open_material(
+        &self,
+        deployment_id: &str,
+    ) -> anyhow::Result<crate::target::FreshBootstrapMaterialView> {
+        let guard = self
+            .target
+            .lock()
+            .map_err(|_| anyhow::anyhow!("target transport poisoned"))?;
+        let inspection = guard.inspect_instance(deployment_id)?;
+        inspection.bootstrap_material.ok_or_else(|| {
+            anyhow::anyhow!("{BOOTSTRAP_CLOSED}: no fresh-install capability exists")
+        })
+    }
+}
+
+impl BootstrapMaterialSource for RemoteBootstrapMaterial {
+    fn authorize(&self, deployment_id: &str) -> anyhow::Result<()> {
+        self.open_material(deployment_id).map(|_| ())
+    }
+
+    fn read_token(&self, deployment_id: &str) -> anyhow::Result<Zeroizing<String>> {
+        let view = self.open_material(deployment_id)?;
+        Ok(Zeroizing::new(view.token))
+    }
+
+    fn close(&self, deployment_id: &str) -> anyhow::Result<()> {
+        use crate::target::{HostCompletionBody, HostOperation, HostOutcome};
+        let operation = HostOperation::bootstrap_close(
+            format!("bootstrap-close-{:032x}", rand::random::<u128>()),
+            deployment_id,
+        );
+        if let Err(rejection) = operation.validate() {
+            return Err(anyhow::anyhow!(
+                "internal error: close operation rejected: {}",
+                rejection.detail
+            ));
+        }
+        let guard = self
+            .target
+            .lock()
+            .map_err(|_| anyhow::anyhow!("target transport poisoned"))?;
+        let outcome = guard
+            .execute_host_operation(&operation)
+            .map_err(|error| anyhow::anyhow!("{error:#}"))?
+            .outcome;
+        match outcome {
+            HostOutcome::Completed {
+                body: HostCompletionBody::BootstrapClosed {},
+            } => Ok(()),
+            HostOutcome::Completed { .. } => {
+                unreachable!("close answers with a bootstrap-closed completion")
+            }
+            HostOutcome::Failed { code, detail } => {
+                // An older target helper without this kind reports
+                // OPERATION_KIND_UNKNOWN. The server already consumed the
+                // token on success, so the capability cannot be reused; the
+                // residual file is hygiene only and the operator is told so.
+                if detail.contains("unknown kind") || detail.contains("KIND_UNKNOWN") {
+                    anyhow::bail!(
+                        "{BOOTSTRAP_CLOSED}: the target helper predates `bootstrap-close`; the \
+                         capability token was consumed by NazoAuth itself, but remove the \
+                         stale context file on the target manually"
+                    );
+                }
+                anyhow::bail!("{code}: {detail}")
+            }
+        }
     }
 }
 
@@ -244,11 +333,10 @@ pub(crate) fn claim_initial_admin(
         );
     }
 
-    // 2. Live facts + capability material, then the full gate.
-    let state = material.read_state(&record.deployment_id)?;
-    let (context, token) = material.read_material(&record.deployment_id)?;
-    bootstrap_authority::authorize_claim(Some(&context), "create-initial-admin", &state)
-        .map_err(|failure| anyhow::anyhow!("{}: {}", failure.code, failure.detail))?;
+    // 2. Full gate first, then the token — both through the source that owns
+    // the transport (local files or the fixed SSH channel, P0-2).
+    material.authorize(&record.deployment_id)?;
+    let token = material.read_token(&record.deployment_id)?;
 
     // 3. Exact legacy endpoint contract.
     let endpoint = initial_admin_endpoint(&record.issuer)?;
@@ -645,7 +733,7 @@ mod tests {
         assert!(format!("{error:#}").contains("409"), "{error:#}");
 
         // The capability stays open so the operator can retry after fixing.
-        let (context, _token) = fixture.material.read_material(&fixture.deployment_id)?;
+        let context = fixture.material.load_open_context(&fixture.deployment_id)?;
         assert_eq!(context.install_operation_id, OP_ID);
         Ok(())
     }

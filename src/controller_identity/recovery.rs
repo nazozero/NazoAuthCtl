@@ -438,12 +438,6 @@ mod tests {
         delivered: std::sync::Mutex<Vec<String>>,
     }
 
-    impl RecordingDelivery {
-        fn snapshot(&self) -> Vec<String> {
-            self.delivered.lock().unwrap().clone()
-        }
-    }
-
     impl ReplacementSecretDelivery for RecordingDelivery {
         fn deliver(&self, display: &str) -> anyhow::Result<()> {
             self.delivered.lock().unwrap().push(display.to_owned());

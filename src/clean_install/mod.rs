@@ -25,7 +25,8 @@ mod public_verify;
 // CLI-surface re-exports (I wave): the dispatcher consumes these without the
 // private module paths.
 pub(crate) use initial_admin::{
-    AdminCredentials, CurlInitialAdminTransport, LocalBootstrapMaterial, claim_initial_admin,
+    AdminCredentials, CurlInitialAdminTransport, LocalBootstrapMaterial, RemoteBootstrapMaterial,
+    claim_initial_admin,
 };
 pub(crate) use public_verify::{CurlPublicProber, verify_public};
 

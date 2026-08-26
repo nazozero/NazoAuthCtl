@@ -11,7 +11,7 @@ use anyhow::{Context as _, bail};
 
 use crate::clean_install::{
     CleanInstallContext, CleanInstallRequest, CurlInitialAdminTransport, CurlPublicProber,
-    LocalBootstrapMaterial, claim_initial_admin, verify_public,
+    LocalBootstrapMaterial, RemoteBootstrapMaterial, claim_initial_admin, verify_public,
 };
 use crate::cli::{Cli, Command, InstallArgs, InstanceCommand, InstanceSelector, UpdateArgs};
 use crate::controller_identity::lifecycle as identity;
@@ -306,15 +306,39 @@ fn run_bootstrap_admin(
 ) -> anyhow::Result<()> {
     let merged = merge(&args.selector, global, "bootstrap-admin")?;
     let registry = RegistryStore::open_default()?;
-    let material = LocalBootstrapMaterial::production()?;
     let credentials = read_admin_credentials(args.credentials_stdin)?;
-    let report = claim_initial_admin(
-        &registry,
-        &material,
-        &CurlInitialAdminTransport,
-        merged.as_deref(),
-        credentials,
-    )?;
+    // P0-2: resolve the instance's HOST and pick the material source that
+    // owns its transport. Local hosts read the state root directly; SSH
+    // hosts drive inspect/bootstrap-close over the fixed stdio executor so
+    // the token only rides the encrypted channel.
+    let record = crate::fleet::resolve_instance(&registry, merged.as_deref(), "bootstrap-admin")?;
+    let host = registry
+        .host_by_id(record.host_id)?
+        .with_context(|| format!("instance '{}' references a missing host", record.alias))?;
+
+    let report = if host.transport == crate::registry::HostTransport::Local {
+        let material = LocalBootstrapMaterial::production()?;
+        claim_initial_admin(
+            &registry,
+            &material,
+            &CurlInitialAdminTransport,
+            merged.as_deref(),
+            credentials,
+        )?
+    } else {
+        let context = crate::clean_install::CleanInstallContext::production()?;
+        let target = (context.factory)(&host)?;
+        let material = RemoteBootstrapMaterial {
+            target: std::sync::Arc::new(std::sync::Mutex::new(target)),
+        };
+        claim_initial_admin(
+            &registry,
+            &material,
+            &CurlInitialAdminTransport,
+            merged.as_deref(),
+            credentials,
+        )?
+    };
     println!("{report}");
     Ok(())
 }
