@@ -185,6 +185,9 @@ pub(crate) struct BindOptions {
     pub(crate) label: String,
     pub(crate) approval_token: Option<String>,
     pub(crate) admin_access_file: Option<PathBuf>,
+    /// P0-3/P0-4 delivery channel for the Recovery Root minted with the
+    /// first binding; interactive runs confirm on the terminal instead.
+    pub(crate) output_secret_file: Option<PathBuf>,
 }
 
 /// `host` command family (task B03). All of it operates on the user-scoped

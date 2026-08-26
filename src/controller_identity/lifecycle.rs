@@ -58,6 +58,11 @@ pub struct ProposalPresentation {
     pub controller_id: Option<String>,
     pub kid: String,
     pub public_key_b64: String,
+    /// P0-3 atomic first binding: present ONLY for bind. The approver must
+    /// enter these into the admin console so the approval digest covers the
+    /// same recovery material the commit will enroll.
+    pub recovery_kid: Option<String>,
+    pub recovery_public_key_b64: Option<String>,
 }
 
 impl ProposalPresentation {
@@ -81,6 +86,15 @@ impl ProposalPresentation {
             short_kid(&self.kid),
             &self.public_key_b64[..self.public_key_b64.len().min(16)]
         ));
+        if let (Some(recovery_kid), Some(recovery_public_key)) =
+            (&self.recovery_kid, &self.recovery_public_key_b64)
+        {
+            text.push_str(&format!(
+                "  recovery kid: {}\n  recovery public key: {}…\n",
+                short_kid(recovery_kid),
+                &recovery_public_key[..recovery_public_key.len().min(16)]
+            ));
+        }
         text.push_str(
             "\nApprove this exact payload in the instance admin console (fresh 2FA) within \
              10 minutes; the key expires 30 days after enrollment. Then paste the single-use \
@@ -374,6 +388,9 @@ fn finish_activation<A: ControllerRegistryApi>(
 
 /// First bind: propose the newest unused local candidate (or mint exactly one
 /// new keypair), obtain the single-use approval, and commit atomically.
+/// P0-3: the SAME transaction enrolls a freshly generated Recovery Root, and
+/// its secret is delivered to the operator BEFORE the commit — a first
+/// binding can never exist without a recoverable root.
 pub fn bind_flow<A: ControllerRegistryApi>(
     api: &A,
     registry: &RegistryStore,
@@ -381,6 +398,7 @@ pub fn bind_flow<A: ControllerRegistryApi>(
     selector: Option<&str>,
     label: &str,
     approval: impl FnOnce(&ProposalPresentation) -> anyhow::Result<String>,
+    delivery: &dyn crate::controller_identity::recovery::ReplacementSecretDelivery,
 ) -> anyhow::Result<String> {
     let record = resolve_record(registry, selector)?;
     validate_label(label)?;
@@ -407,6 +425,10 @@ pub fn bind_flow<A: ControllerRegistryApi>(
     };
     let public_key = load_public_key(keys, &deployment, &kid)?;
 
+    // The Recovery Root born with this binding. Its secret is delivered
+    // before the commit below; nothing but this one display ever holds it.
+    let recovery_material = crate::controller_identity::recovery::generate_material(&deployment);
+
     let presentation = ProposalPresentation {
         action: "bind",
         alias: record.alias.clone(),
@@ -416,8 +438,15 @@ pub fn bind_flow<A: ControllerRegistryApi>(
         controller_id: None,
         kid: kid.clone(),
         public_key_b64: public_key.clone(),
+        recovery_kid: Some(recovery_material.kid.clone()),
+        recovery_public_key_b64: Some(b64url(&recovery_material.public_key)),
     };
     let token = approval(&presentation)?;
+
+    delivery.deliver(&recovery_material.display).context(
+        "replacement secret delivery was not acknowledged; NOTHING was committed — the \
+             pending proposal can be resumed after fixing delivery",
+    )?;
 
     let slot = api.commit_slot(&SlotCommitBody {
         approval_token: token,
@@ -426,10 +455,17 @@ pub fn bind_flow<A: ControllerRegistryApi>(
         label: label.to_owned(),
         public_key,
         kid: kid.clone(),
+        recovery_public_key: Some(b64url(&recovery_material.public_key)),
+        recovery_kid: Some(recovery_material.kid.clone()),
     })?;
     verify_committed_slot(&slot, &deployment, &kid, "bind")?;
 
     finish_activation(api, registry, keys, &record.alias, &deployment, &kid, slot)
+}
+
+fn b64url(bytes: &[u8]) -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +528,8 @@ pub fn rotate_flow<A: ControllerRegistryApi>(
         controller_id: Some(controller_id.clone()),
         kid: kid.clone(),
         public_key_b64: public_key.clone(),
+        recovery_kid: None,
+        recovery_public_key_b64: None,
     };
     let token = approval(&presentation)?;
 
@@ -591,6 +629,8 @@ pub fn add_flow<A: ControllerRegistryApi>(
         controller_id: None,
         kid: kid.clone(),
         public_key_b64: public_key.clone(),
+        recovery_kid: None,
+        recovery_public_key_b64: None,
     };
     let token = approval(&presentation)?;
 
@@ -601,6 +641,8 @@ pub fn add_flow<A: ControllerRegistryApi>(
         label: label.to_owned(),
         public_key,
         kid: kid.clone(),
+        recovery_public_key: None,
+        recovery_kid: None,
     })?;
     verify_committed_slot(&slot, &deployment, &kid, "add")?;
 
@@ -658,6 +700,8 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
         controller_id: Some(target.controller_id.clone()),
         kid: target.kid.clone(),
         public_key_b64: String::new(),
+        recovery_kid: None,
+        recovery_public_key_b64: None,
     };
     let token = approval(&presentation)?;
 
@@ -965,12 +1009,25 @@ pub(crate) fn run_bind(options: BindOptions, global: Option<&str>) -> anyhow::Re
         label,
         approval_token,
         admin_access_file,
+        output_secret_file,
     } = options;
     let registry = RegistryStore::open_default()?;
     let keys = ControllerKeyStore::open_default()?;
     let explicit = merge_global(selector, global, "bind")?;
     let record = resolve_record(&registry, explicit.as_deref())?;
     let api = make_api(&record.issuer, admin_access_file.as_deref())?;
+    // P0-4/P0-3: bind now also mints the Recovery Root, so its secret needs a
+    // delivery channel with exactly the same fail-closed rules as recovery.
+    let delivery: std::sync::Arc<
+        dyn crate::controller_identity::recovery::ReplacementSecretDelivery,
+    > = match output_secret_file.as_ref() {
+        Some(path) => std::sync::Arc::new(
+            crate::controller_identity::recovery::OutputFileSecretDelivery { path: path.clone() },
+        ),
+        None => {
+            std::sync::Arc::new(crate::controller_identity::recovery::InteractiveSecretDelivery)
+        }
+    };
     let report = bind_flow(
         &api,
         &registry,
@@ -978,6 +1035,7 @@ pub(crate) fn run_bind(options: BindOptions, global: Option<&str>) -> anyhow::Re
         explicit.as_deref(),
         &label,
         approval_callback(approval_token.as_deref()),
+        delivery.as_ref(),
     )?;
     println!("{report}");
     Ok(())
@@ -1282,6 +1340,15 @@ mod tests {
         URL_SAFE_NO_PAD.encode([7u8; 32]).len() == 43
     }
 
+    /// P0-3 test double: accepts the delivery silently so flows can run.
+    struct SilentDelivery;
+
+    impl crate::controller_identity::recovery::ReplacementSecretDelivery for SilentDelivery {
+        fn deliver(&self, _display: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn bind_generates_exactly_one_candidate_and_persists_the_binding() -> anyhow::Result<()> {
         assert!(real_public_key_length());
@@ -1297,6 +1364,7 @@ mod tests {
             None,
             "ops",
             fixed_approval("approval-token-1"),
+            &SilentDelivery,
         )?;
         assert!(report.contains("committed for 'production'"), "{report}");
 
@@ -1317,6 +1385,11 @@ mod tests {
             commit["public_key"],
             f.keys.list_keys("deploy-alpha")?[0].public_key
         );
+        // P0-3: the atomic first binding carries the recovery material.
+        assert!(
+            commit["recovery_public_key"].is_string() && commit["recovery_kid"].is_string(),
+            "bind must enroll a Recovery Root in the same transaction: {commit}"
+        );
 
         let cached = expiry::parse_cached_slots(&record.last_observation.unwrap().summary);
         assert!(cached.is_some(), "slot facts cached for D09");
@@ -1335,6 +1408,7 @@ mod tests {
             None,
             "ops",
             fixed_approval("approval-token-2"),
+            &SilentDelivery,
         )
         .expect_err("already bound");
         assert!(
@@ -1366,6 +1440,7 @@ mod tests {
             None,
             "ops",
             fixed_approval("expired-token-0001"),
+            &SilentDelivery,
         )
         .expect_err("rejected");
         assert!(error.downcast_ref::<AdminApiError>().is_some(), "{error:#}");
@@ -1390,6 +1465,7 @@ mod tests {
             None,
             "ops",
             fixed_approval("good-token-000002"),
+            &SilentDelivery,
         )?;
         let active = f.keys.load_active("deploy-alpha")?.expect("activated");
         assert_eq!(active.kid(), first_candidate);
@@ -1763,12 +1839,15 @@ mod tests {
             controller_id: None,
             kid: candidate.kid.clone(),
             public_key_b64: summary.public_key.clone(),
+            recovery_kid: Some("recovery-kid-placeholder".to_owned()),
+            recovery_public_key_b64: Some("recovery-public-key-placeholder".to_owned()),
         };
         let rendered = presentation.render();
         assert!(rendered.contains("deployment: deploy-alpha"), "{rendered}");
         assert!(rendered.contains("action:     bind"), "{rendered}");
         assert!(rendered.contains("fresh 2FA"), "{rendered}");
         assert!(rendered.contains("port forward"), "{rendered}");
+        assert!(rendered.contains("recovery kid"), "{rendered}");
         // Public fingerprint only; the full kid and any seed bytes never show.
         assert!(!rendered.contains(candidate.kid.as_str()), "{rendered}");
         assert!(!rendered.contains(&summary.public_key), "{rendered}");

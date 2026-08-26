@@ -61,7 +61,7 @@ pub(super) fn selector_from_parsed(
 }
 
 /// `nazoauthctl bind [--instance SELECTOR] --label NAME [--approval-token T]
-/// [--admin-access-file PATH]`
+/// [--admin-access-file PATH] [--output-secret-file PATH]`
 pub(super) fn parse_bind(values: Vec<String>) -> anyhow::Result<BindOptions> {
     let parsed = parse_options(
         values,
@@ -70,6 +70,7 @@ pub(super) fn parse_bind(values: Vec<String>) -> anyhow::Result<BindOptions> {
             "--label",
             "--approval-token",
             "--admin-access-file",
+            "--output-secret-file",
         ],
         &[],
         "bind",
@@ -105,6 +106,11 @@ pub(super) fn parse_bind(values: Vec<String>) -> anyhow::Result<BindOptions> {
         Some(_) => bail!("--admin-access-file requires a file path"),
         None => None,
     };
+    let output_secret_file = match parsed.values.get("--output-secret-file") {
+        Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
+        Some(_) => bail!("--output-secret-file requires a file path"),
+        None => None,
+    };
     Ok(BindOptions {
         selector: InstanceSelector {
             positional: parsed.positionals.into_iter().next(),
@@ -113,6 +119,7 @@ pub(super) fn parse_bind(values: Vec<String>) -> anyhow::Result<BindOptions> {
         label,
         approval_token,
         admin_access_file,
+        output_secret_file,
     })
 }
 

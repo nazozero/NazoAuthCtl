@@ -468,6 +468,13 @@ pub struct ApprovalRequestBody {
     pub public_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kid: Option<String>,
+    /// P0-3 atomic first binding: carried ONLY by `bind`; the canonical
+    /// server-side digest covers it, so the approval and the commit stay
+    /// bound to the same recovery material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_kid: Option<String>,
 }
 
 /// Body of `POST /slots` (bind/add commit).
@@ -480,6 +487,12 @@ pub struct SlotCommitBody {
     pub label: String,
     pub public_key: String,
     pub kid: String,
+    /// P0-3: present on `bind`, absent otherwise; must match the approved
+    /// payload byte-for-byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_kid: Option<String>,
 }
 
 /// Body of `POST /slots/rotate`.
@@ -1241,6 +1254,8 @@ mod tests {
                 label: "ops".to_owned(),
                 public_key: "pk".to_owned(),
                 kid: "k".to_owned(),
+                recovery_public_key: Some("rpk".to_owned()),
+                recovery_kid: Some("rkid".to_owned()),
             })
             .expect("committed");
         assert_eq!(view.controller_id, "01900000-0000-7000-8000-000000000001");
@@ -1274,7 +1289,7 @@ mod tests {
         let body_text = std::str::from_utf8(request.body.as_deref().unwrap()).unwrap();
         assert_eq!(
             body_text,
-            r#"{"approval_token":"tok","action":"bind","deployment_id":"deploy-alpha","label":"ops","public_key":"pk","kid":"k"}"#
+            r#"{"approval_token":"tok","action":"bind","deployment_id":"deploy-alpha","label":"ops","public_key":"pk","kid":"k","recovery_public_key":"rpk","recovery_kid":"rkid"}"#
         );
     }
 
@@ -1342,6 +1357,8 @@ mod tests {
                 label: Some("ops".to_owned()),
                 public_key: Some("pk".to_owned()),
                 kid: Some("kid".to_owned()),
+                recovery_public_key: None,
+                recovery_kid: None,
             })
             .expect("approval");
         assert_eq!(issued.action, "bind");
