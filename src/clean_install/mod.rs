@@ -206,6 +206,7 @@ fn render_config_yaml(issuer: &str) -> anyhow::Result<String> {
         "BIND: \"0.0.0.0:{DEFAULT_PORT}\"\n\
          PUBLIC_BASE_URL: \"{issuer}\"\n\
          {transport_mode}\
+         SECURITY_AUDIT_REQUIRE_LEAST_PRIVILEGE: \"false\"\n\
          DATABASE_URL_FILE: \"{CONTAINER_SECRETS_DIR}/database-url\"\n\
          VALKEY_URL_FILE: \"{CONTAINER_SECRETS_DIR}/valkey-url\"\n\
          MFA_TOTP_ENCRYPTION_KEY_FILE: \"{CONTAINER_SECRETS_DIR}/mfa-totp-key\"\n\
