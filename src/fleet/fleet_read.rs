@@ -96,6 +96,12 @@ impl FleetReadRunner {
         let items = Arc::new(items);
         let (sender, receiver) = mpsc::channel::<(usize, FleetItemOutcome)>();
         let sender = Arc::new(sender);
+        // P1-10: a hung transport keeps its inner thread alive after the
+        // timeout abandons it. Counting those live threads against the
+        // concurrency budget is what keeps the budget real — without this
+        // counter N hung hosts would let unbounded extra targets run.
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let budget = self.concurrency.min(total);
         let mut workers = Vec::new();
         for worker_index in 0..self.concurrency.min(total) {
             let cursor = cursor.clone();
@@ -104,6 +110,7 @@ impl FleetReadRunner {
             let sender = sender.clone();
             let job = job.clone();
             let timeout = self.per_target_timeout;
+            let in_flight = in_flight.clone();
             workers.push(
                 std::thread::Builder::new()
                     .name(format!("nazoauthctl-fleet-worker-{worker_index}"))
@@ -113,9 +120,21 @@ impl FleetReadRunner {
                             if index >= items.len() {
                                 break;
                             }
+                            // Wait until the live-thread count drops below the
+                            // budget: an abandoned-but-running transport holds
+                            // its slot until its thread actually finishes.
+                            while in_flight.load(Ordering::SeqCst) >= budget {
+                                std::thread::sleep(std::time::Duration::from_millis(25));
+                            }
                             let (instance, host) = (&items[index].0, &items[index].1);
-                            let result =
-                                execute_one(instance, host, factory.as_ref(), job.clone(), timeout);
+                            let result = execute_one(
+                                instance,
+                                host,
+                                factory.as_ref(),
+                                job.clone(),
+                                timeout,
+                                in_flight.clone(),
+                            );
                             let _ = sender.send((
                                 index,
                                 FleetItemOutcome {
@@ -162,6 +181,7 @@ fn execute_one(
      ),
     job: Arc<ReadJob>,
     timeout: Duration,
+    in_flight: std::sync::Arc<AtomicUsize>,
 ) -> Result<Value, (String, String)> {
     // Transport construction happens INSIDE the worker thread; the produced
     // target never crosses a thread boundary afterwards.
@@ -177,27 +197,35 @@ fn execute_one(
     let instance = instance.clone();
     let host = host.clone();
     let host_for_thread = host.clone();
+    let in_flight_inner = in_flight.clone();
     let (sender, receiver) = mpsc::channel::<anyhow::Result<Value>>();
+    in_flight.fetch_add(1, Ordering::SeqCst);
+    // P1-10: the inner thread owns the counter decrement — on success AND on
+    // the abandoned-timeout path — so a hung transport keeps holding its
+    // concurrency slot until its thread actually exits.
     let handle = std::thread::Builder::new()
         .name(format!("nazauthctl-target-{}", host.alias))
         .spawn(move || {
             // A send after the receiver was dropped (timeout abandonment)
             // fails harmlessly; the job is read-only so nothing is lost.
             let _ = sender.send(job(&instance, &host_for_thread, target.as_ref()));
+            in_flight_inner.fetch_sub(1, Ordering::SeqCst);
         });
     let handle = match handle {
         Ok(handle) => handle,
         Err(error) => {
+            in_flight.fetch_sub(1, Ordering::SeqCst);
             return Err((
                 error_codes::HOST_UNREACHABLE.to_owned(),
                 format!("failed to spawn the per-target worker: {error}"),
             ));
         }
     };
+    drop(handle);
     // Deliberately detached on timeout: the report never blocks behind a hung
-    // transport. Joining here would defeat the whole timeout design, so the
-    // handle is only used to keep the thread's lifetime explicit.
-    let _ = handle;
+    // transport. Joining here would defeat the whole timeout design. The
+    // thread outlives this call while `in_flight` keeps it inside the
+    // concurrency budget.
     match receiver.recv_timeout(timeout) {
         Ok(result) => {
             result.map_err(|error| (stable_code(&format!("{error:#}")), format!("{error:#}")))

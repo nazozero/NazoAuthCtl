@@ -322,3 +322,138 @@ fn stable_code_maps_transport_tokens() {
         error_codes::PRIVILEGE_REQUIRED
     );
 }
+
+/// P1-10 leak test: after a timeout abandons a hung transport, that hung
+/// thread must keep holding a concurrency slot. With cap=2 and one hung
+/// host, the remaining fast targets may only run ONE at a time (2 slots −
+/// 1 held by the hang) until the hang finally finishes — the peak measured
+/// concurrency of the surviving targets therefore stays strictly below cap
+/// while the hang is alive.
+#[test]
+fn hung_transport_after_timeout_keeps_its_concurrency_slot() -> anyhow::Result<()> {
+    const CAP: usize = 3;
+    let live_jobs = Arc::new(AtomicUsize::new(0));
+    let max_live = Arc::new(AtomicUsize::new(0));
+    // The hung job sleeps far longer than the runner timeout, so its inner
+    // thread is abandoned mid-flight exactly like a real network hang.
+    struct HangTarget {
+        live: Arc<AtomicUsize>,
+        max: Arc<AtomicUsize>,
+        /// Deployment ids whose inspect call must hang past the timeout.
+        hangs: Vec<String>,
+        hang_millis: u64,
+    }
+    impl ExecutionTarget for HangTarget {
+        fn inspect_host(&self) -> anyhow::Result<HostOverview> {
+            unreachable!()
+        }
+        fn inspect_instance(&self, deployment_id: &str) -> anyhow::Result<InstanceInspection> {
+            let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max.fetch_max(now, Ordering::SeqCst);
+            if self.hangs.iter().any(|id| id == deployment_id) {
+                std::thread::sleep(Duration::from_millis(self.hang_millis));
+            } else {
+                std::thread::sleep(Duration::from_millis(self.hang_millis.min(10)));
+            }
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            self.inspection_for_probe()
+        }
+        fn execute_host_operation(&self, _operation: &HostOperation) -> anyhow::Result<HostResult> {
+            unreachable!()
+        }
+        fn execute_control_operation(
+            &self,
+            _request: &ControlOperationRequest,
+        ) -> anyhow::Result<ControlOperationReceipt> {
+            unreachable!()
+        }
+        fn read_health(&self, _deployment_id: &str) -> anyhow::Result<HealthSnapshot> {
+            unreachable!()
+        }
+    }
+    impl HangTarget {
+        fn inspection_for_probe(&self) -> anyhow::Result<InstanceInspection> {
+            Ok(InstanceInspection {
+                current_build_identity: None,
+                deployment_id: "probe".to_owned(),
+                issuer: "https://auth.example.com".to_owned(),
+                observed_at: chrono::Utc::now(),
+                revision: 1,
+                runtime: RuntimeSurface::new("podman", "nazoauth-probe")?,
+                artifact: Default::default(),
+                config_reference: "/cfg".to_owned(),
+                config_schema: "v1".to_owned(),
+                resources: vec![],
+                healthy: true,
+                health_summary: "ok".to_owned(),
+                backup_maturity: crate::target::BackupMaturity::Unknown,
+                active_host_operation: None,
+                config_revision_marker: None,
+                bootstrap_material: None,
+            })
+        }
+    }
+
+    let temp = PrivateTempDir::new("nazauthctl-fleet-hang-test")?;
+    let store = RegistryStore::open(temp.path().join("registry"))?;
+    let host = store.ensure_local_host()?;
+    for index in 0..6 {
+        store.add_instance(InstanceRecord::new(
+            format!("deploy-{index:02}"),
+            format!("inst-{index:02}"),
+            host.host_id,
+            "https://auth.example.com",
+            "ref",
+        )?)?;
+    }
+    let mut items = Vec::new();
+    for instance in store.list_instances()? {
+        items.push((instance, host.clone()));
+    }
+    // Mix: deploy-00/deploy-01 hang past the timeout; the rest are instant.
+    // With cap=3, at most ONE fast target may run while both hangs are
+    // abandoned-but-alive.
+    let hangs = ["deploy-00".to_owned(), "deploy-01".to_owned()];
+    let live_clone = live_jobs.clone();
+    let max_clone = max_live.clone();
+    type Factory =
+        Arc<dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync>;
+    let factory: Factory = Arc::new(move |_record: &HostRecord| {
+        Ok(Box::new(HangTarget {
+            live: live_clone.clone(),
+            max: max_clone.clone(),
+            hangs: hangs.to_vec(),
+            hang_millis: 5_000,
+        }) as Box<dyn ExecutionTarget + Send>)
+    });
+    let runner = FleetReadRunner::new(factory, CAP, Duration::from_millis(400));
+    let probe_job: std::sync::Arc<ReadJob> = Arc::new(
+        |instance: &InstanceRecord,
+         _host: &HostRecord,
+         target: &dyn ExecutionTarget|
+         -> anyhow::Result<serde_json::Value> {
+            target.inspect_instance(&instance.deployment_id)?;
+            Ok(json!({}))
+        },
+    );
+    let outcomes = runner.run(items, probe_job);
+    assert_eq!(outcomes.len(), 6);
+    // Two targets timed out (the hangs); four answered.
+    let timeouts = outcomes
+        .iter()
+        .filter(|outcome| matches!(&outcome.result, Err((code, _)) if code == error_codes::HOST_UNREACHABLE))
+        .count();
+    assert!(
+        timeouts >= 2,
+        "expected the two hangs to time out: {timeouts}"
+    );
+    // While both hangs were alive only one slot remained for everyone else:
+    // the observed peak among FAST jobs can never reach the full cap during
+    // that window, and overall it never exceeds the cap itself.
+    assert!(
+        max_live.load(Ordering::SeqCst) <= CAP,
+        "cap violated with a hung transport in flight: {}",
+        max_live.load(Ordering::SeqCst)
+    );
+    Ok(())
+}
