@@ -15,14 +15,7 @@ repository = "https://github.com/nazozero/NazoAuthCtl"
 rust-version = "1.97"
 
 [workspace.dependencies]
-nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", rev = "25166bb92a73f9500715bededd83687e5e8af9bf" }
-
-# Dev-time bridge: consume the frozen ControlOperation contract from the
-# sibling NazoAuth checkout instead of the pushed rev above. Final
-# integration repoints nazo-operator-protocol to a pushed rev and removes
-# this overlay.
-[patch."https://github.com/nazozero/NazoAuth.git"]
-nazo-operator-protocol = { path = "../NazoAuth/crates/operator-protocol" }
+nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", branch = "goal/control-plane-contract" }
 
 [package]
 name = "nazoauthctl-core"
