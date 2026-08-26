@@ -12,6 +12,11 @@ concurrency:
 permissions:
   contents: read
 
+# P1-9: every CI-built controller embeds its exact head so the C08 handshake
+# compares real build identities instead of two empty dev strings.
+env:
+  NAZOAUTHCTL_BUILD_COMMIT: ${{ github.sha }}
+
 jobs:
   controller:
     name: workspace / ${{ matrix.os }}
