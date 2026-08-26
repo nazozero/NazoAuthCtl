@@ -127,6 +127,11 @@ pub(super) fn replace(command: &OsStr, replacement: &RuntimeReplacement) -> anyh
             .arg(&replacement.object_reference),
         policy,
     );
+    // Loopback endpoints in the operator-provided configuration address the
+    // HOST, not the container namespace; Docker resolves the host gateway
+    // name only when explicitly mapped (Podman provides
+    // host.containers.internal out of the box).
+    process = process.args(["--add-host", "host.docker.internal:host-gateway"]);
     for (name, value) in &replacement.labels {
         process = process.arg("--label").arg(format!("{name}={value}"));
     }

@@ -110,10 +110,21 @@ impl Process {
     pub fn run_quiet(&self) -> anyhow::Result<()> {
         let output = self.output()?;
         if !output.status.success() {
+            // Bounded stderr echo: daemon rejections (auth, manifest unknown,
+            // platform mismatch) are exactly the operator-actionable facts.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            let stderr_note = if stderr.is_empty() {
+                String::new()
+            } else {
+                let bounded: String = stderr.chars().take(400).collect();
+                format!(": {bounded}")
+            };
             bail!(
-                "{} failed with status {}",
+                "{} failed with status {}{}",
                 self.display_name(),
-                output.status
+                output.status,
+                stderr_note
             );
         }
         Ok(())
@@ -165,6 +176,21 @@ impl Process {
         let stdout = String::from_utf8(output.stdout)
             .with_context(|| format!("{} produced non-UTF-8 output", self.display_name()))?;
         Ok((output.status, stdout))
+    }
+
+    /// Feeds `input` on stdin and captures the complete bounded output,
+    /// including stderr, for protocol transports that classify failures from
+    /// the child's diagnostic stream (for example OpenSSH exec wrappers).
+    pub fn stdin_output(&self, input: &[u8]) -> anyhow::Result<Output> {
+        let mut command = self.command();
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command
+            .spawn()
+            .with_context(|| format!("failed to execute {}", self.display_name()))?;
+        self.collect_output(child, Some(input))
     }
 
     /// Returns only a closed classification.  Diagnostic output is deliberately

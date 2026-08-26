@@ -1,73 +1,72 @@
 //! Command-line model and parser façade.
 //!
 //! The public-in-crate surface stays here so controller and integration tests keep their stable
-//! paths.  Definitions live in [`types`], help routing in [`help`], and token parsing in
+//! paths. Definitions live in [`types`], help routing in [`help`], and token parsing in
 //! [`parser`]; none of those modules owns command execution.
 
+pub(crate) mod envelope;
 mod help;
 mod parser;
 mod types;
 
-use std::path::PathBuf;
-
-use anyhow::{Context, bail};
+use anyhow::{Context as _, bail};
 
 pub(crate) use help::help_topic;
-#[cfg(test)]
-pub(crate) use types::RelinquishOptions;
 pub(crate) use types::{
-    AcmeCertificateInput, AcmeCommand, BootstrapAdminOptions, CandidateTarget, Cli, Command,
-    HelpTopic, InstallOptions, KeysCommand, LocalOciCandidateInstall, StandardsProfileSecrets,
-    TlsCertificateCheckInput, TlsCertificateInput, TlsCertificateSource, TlsCommand, UpdateOptions,
+    AcmeCertificateInput, AcmeCommand, BindOptions, BootstrapAdminArgs, Cli, Command,
+    ControllerCommand, HelpTopic, HostCommand, InstallArgs, InstanceCommand, InstanceSelector,
+    TlsCertificateCheckInput, TlsCertificateInput, TlsCertificateSource, TlsCommand, UpdateArgs,
 };
 
 /// Consume the leading options which are shared by every command.
 ///
 /// Keeping this boundary in the CLI façade means command parsing and help routing agree on
-/// which token is the command.  Scalar global options are intentionally single-use: accepting
-/// a second value would make a typo silently select a different configuration or deployment.
+/// which token is the command. Scalar global options are intentionally single-use: accepting
+/// a second value would make a typo silently select a different instance or output mode.
+/// The final surface has exactly two global flags: `--instance SELECTOR` and `--json`.
 pub(crate) struct GlobalOptions {
-    pub(crate) config: Option<PathBuf>,
-    pub(crate) deployment: Option<String>,
+    pub(crate) instance: Option<String>,
+    pub(crate) json: bool,
     pub(crate) consumed: usize,
 }
 
 pub(crate) fn parse_global_options(values: &[String]) -> anyhow::Result<GlobalOptions> {
-    let mut config = None;
-    let mut deployment = None;
+    let mut instance = None;
+    let mut json = false;
     let mut consumed = 0;
     while consumed < values.len() {
         let flag = values[consumed].as_str();
-        if !matches!(flag, "--config" | "--deployment") {
-            break;
-        }
-        let value = values
-            .get(consumed + 1)
-            .with_context(|| format!("{flag} requires a value"))?;
         match flag {
-            "--config" => {
-                if config.is_some() {
-                    bail!("--config may be specified only once");
+            "--instance" => {
+                if instance.is_some() {
+                    bail!("--instance may be specified only once");
                 }
-                config = Some(PathBuf::from(value));
-            }
-            "--deployment" => {
-                if deployment.is_some() {
-                    bail!("--deployment may be specified only once");
+                let value = values
+                    .get(consumed + 1)
+                    .with_context(|| format!("{flag} requires a value"))?;
+                if value.is_empty() {
+                    bail!("--instance requires a non-empty selector");
                 }
-                deployment = Some(value.clone());
+                instance = Some(value.clone());
+                consumed += 2;
             }
-            _ => unreachable!(),
+            "--json" => {
+                if json {
+                    bail!("--json may be specified only once");
+                }
+                json = true;
+                consumed += 1;
+            }
+            "--config" | "--deployment" => bail!(
+                "{flag} belonged to the retired per-deployment control model; \
+                 select an instance with --instance instead"
+            ),
+            _ => break,
         }
-        consumed += 2;
     }
     Ok(GlobalOptions {
-        config,
-        deployment,
+        instance,
+        json,
         consumed,
     })
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/cli.rs"]
-mod tests;

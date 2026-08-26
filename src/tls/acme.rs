@@ -29,7 +29,7 @@ use super::{
 };
 use crate::{
     cli::{AcmeCertificateInput, AcmeCommand},
-    deployment::{Capability, DeploymentRecord, DeploymentStore},
+    deployment::{DeploymentRecord, DeploymentStore},
     filesystem::{
         atomic_write, ensure_private_directory, read_secure_regular_file, remove_file_durable,
         validate_secure_directory,
@@ -83,7 +83,6 @@ struct AcmePlan {
     declaration_revision: u64,
     tenant: String,
     hostname: String,
-    capability: &'static str,
     acme_protocol: String,
     acme_config_sha256: String,
     provider_config_sha256: String,
@@ -123,7 +122,6 @@ struct AcmeTransaction {
     declaration_revision: u64,
     tenant: String,
     hostname: String,
-    capability: String,
     expected_revision: u64,
     target_revision: u64,
     acme_config_sha256: String,
@@ -171,7 +169,6 @@ struct AcmeReceipt {
     declaration_revision: u64,
     tenant: String,
     hostname: String,
-    capability: String,
     revision: u64,
     acme_protocol: String,
     acme_config_sha256: String,
@@ -310,7 +307,6 @@ fn plan(
     input: &AcmeCertificateInput,
 ) -> anyhow::Result<()> {
     let record = store.resolve(selector, true)?;
-    record.require_mutation(&[Capability::ProxyTls])?;
     let provider = load_provider(
         store,
         &input.provider_config,
@@ -337,7 +333,6 @@ fn issue(
     input: &AcmeCertificateInput,
 ) -> anyhow::Result<()> {
     let record = store.resolve(selector, true)?;
-    record.require_mutation(&[Capability::ProxyTls])?;
     let provider = load_provider(
         store,
         &input.provider_config,
@@ -368,7 +363,6 @@ fn issue(
         declaration_revision: plan.declaration_revision,
         tenant,
         hostname,
-        capability: Capability::ProxyTls.name().to_owned(),
         expected_revision: plan.current_revision,
         target_revision: plan.target_revision,
         acme_config_sha256: plan.acme_config_sha256,
@@ -403,7 +397,6 @@ fn recover(
     hostname: &str,
 ) -> anyhow::Result<()> {
     let record = store.resolve(selector, true)?;
-    record.require_mutation(&[Capability::ProxyTls])?;
     let tenant = canonical_tenant(tenant)?;
     let hostname = canonical_hostname(hostname)?;
     let mut transaction = load_pending(store, &record, &tenant, &hostname)?
@@ -439,13 +432,6 @@ fn recover(
     {
         validate_receipt_transaction(receipt, &transaction)?;
         cleanup_challenge(&transaction)?;
-        crate::governance::append_management_audit(
-            store,
-            &record,
-            &transaction.jti,
-            "tls-acme-certificate-issue",
-            &receipt.certificate_sha256,
-        )?;
         archive_transaction(store, &transaction)?;
         println!("{}", serde_json::to_string_pretty(&receipt)?);
         return Ok(());
@@ -628,7 +614,6 @@ fn validate_config(
     for root in [
         &store.config_root,
         &store.state_root,
-        &store.break_glass_root,
         &provider.config.material_root,
     ] {
         if config.challenge_webroot.starts_with(root) || root.starts_with(&config.challenge_webroot)
@@ -673,7 +658,6 @@ fn build_plan(
         declaration_revision: record.declaration_revision,
         tenant,
         hostname,
-        capability: Capability::ProxyTls.name(),
         acme_protocol: CONFIG_PROTOCOL.to_owned(),
         acme_config_sha256: acme.sha256.clone(),
         provider_config_sha256: provider.config_sha256.clone(),
@@ -1204,7 +1188,6 @@ fn commit_issued_material(
         declaration_revision: transaction.declaration_revision,
         tenant: transaction.tenant.clone(),
         hostname: transaction.hostname.clone(),
-        capability: transaction.capability.clone(),
         revision: transaction.target_revision,
         acme_protocol: CONFIG_PROTOCOL.to_owned(),
         acme_config_sha256: acme.sha256.clone(),
@@ -1241,13 +1224,6 @@ fn commit_issued_material(
     transaction.last_error = None;
     persist_pending(store, transaction)?;
     cleanup_challenge(transaction)?;
-    crate::governance::append_management_audit(
-        store,
-        record,
-        &transaction.jti,
-        "tls-acme-certificate-issue",
-        &receipt.certificate_sha256,
-    )?;
     archive_transaction(store, transaction)?;
     println!("{}", serde_json::to_string_pretty(&receipt)?);
     Ok(())
@@ -1272,7 +1248,6 @@ fn validate_transaction_binding(
         || transaction.declaration_revision != record.declaration_revision
         || transaction.tenant != canonical_tenant(tenant)?
         || transaction.hostname != canonical_hostname(hostname)?
-        || transaction.capability != Capability::ProxyTls.name()
         || transaction.target_revision
             != transaction
                 .expected_revision
@@ -1570,7 +1545,6 @@ fn validate_receipt_transaction(
         || receipt.declaration_revision != transaction.declaration_revision
         || receipt.tenant != transaction.tenant
         || receipt.hostname != transaction.hostname
-        || receipt.capability != transaction.capability
         || receipt.revision != transaction.target_revision
         || receipt.acme_config_sha256 != transaction.acme_config_sha256
         || receipt.provider_config_sha256 != transaction.provider_config_sha256
@@ -1616,8 +1590,7 @@ fn validate_previous_receipt(
                 && receipt.revision == expected
                 && receipt.deployment_id == transaction.deployment_id
                 && receipt.tenant == transaction.tenant
-                && receipt.hostname == transaction.hostname
-                && receipt.capability == transaction.capability =>
+                && receipt.hostname == transaction.hostname =>
         {
             Ok(())
         }
@@ -1719,7 +1692,6 @@ fn load_receipt_record(
         || receipt.deployment_id != record.deployment_id
         || receipt.tenant != canonical_tenant(tenant)?
         || receipt.hostname != canonical_hostname(hostname)?
-        || receipt.capability != Capability::ProxyTls.name()
     {
         bail!("ACME issuance receipt differs from the selected binding");
     }
@@ -1982,7 +1954,6 @@ mod tests {
         let store = DeploymentStore {
             config_root: work.path().join("config"),
             state_root: work.path().join("state"),
-            break_glass_root: work.path().join("break-glass"),
         };
         let mut transaction = test_transaction_for_store(&store);
         ensure_private_directory(&transaction.workspace, "test ACME workspace").unwrap();
@@ -2007,7 +1978,6 @@ mod tests {
         let store = DeploymentStore {
             config_root: work.path().join("config"),
             state_root: work.path().join("state"),
-            break_glass_root: work.path().join("break-glass"),
         };
         let mut transaction = test_transaction_for_store(&store);
         transaction.phase = Phase::Prepared;
@@ -2101,7 +2071,6 @@ mod tests {
         let store = DeploymentStore {
             config_root: work.path().join("config"),
             state_root: work.path().join("state"),
-            break_glass_root: work.path().join("break-glass"),
         };
         let transaction = test_transaction_for_store(&store);
         let mut receipt = test_receipt(&transaction);
@@ -2128,7 +2097,6 @@ mod tests {
         let store = DeploymentStore {
             config_root: work.path().join("config"),
             state_root: work.path().join("state"),
-            break_glass_root: work.path().join("break-glass"),
         };
         let transaction = test_transaction_for_store(&store);
         let receipt = test_receipt(&transaction);
@@ -2175,7 +2143,6 @@ mod tests {
             declaration_revision: 7,
             tenant: "tenant-a".to_owned(),
             hostname: "auth.example".to_owned(),
-            capability: Capability::ProxyTls.name().to_owned(),
             expected_revision: 0,
             target_revision: 1,
             acme_config_sha256: "a".repeat(64),
@@ -2230,7 +2197,6 @@ mod tests {
             declaration_revision: transaction.declaration_revision,
             tenant: transaction.tenant.clone(),
             hostname: transaction.hostname.clone(),
-            capability: transaction.capability.clone(),
             revision: transaction.target_revision,
             acme_protocol: CONFIG_PROTOCOL.to_owned(),
             acme_config_sha256: transaction.acme_config_sha256.clone(),

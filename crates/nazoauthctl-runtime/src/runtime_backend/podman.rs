@@ -165,7 +165,11 @@ impl RuntimeBackend for PodmanBackend {
     }
 
     fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String> {
-        discovery::resolve_image_digest(&self.command, image_reference)
+        discovery::resolve_image_digest(&self.command, image_reference, None)
+    }
+
+    fn local_image_matches_digest(&self, image_reference: &str) -> bool {
+        discovery::local_image_matches_digest(&self.command, image_reference)
     }
 
     fn resolve_local_image_id(&self, image_reference: &str) -> anyhow::Result<String> {

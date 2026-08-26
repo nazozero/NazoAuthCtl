@@ -2,7 +2,7 @@
 //!
 //! This module deliberately does not configure NazoAuth's protocol keys or
 //! select a runtime tenant. It owns only the file-provider lifecycle behind the
-//! deployment's `proxy_tls` capability.
+//! deployment's public TLS certificate lifecycle.
 
 use std::{
     collections::BTreeSet,
@@ -20,7 +20,7 @@ use url::Url;
 
 use crate::{
     cli::{TlsCertificateCheckInput, TlsCertificateInput, TlsCertificateSource, TlsCommand},
-    deployment::{Capability, DeploymentRecord, DeploymentStore},
+    deployment::{DeploymentRecord, DeploymentStore},
     filesystem::{
         atomic_write, ensure_private_directory, read_secure_regular_file, remove_file_durable,
         symlink_atomic, sync_parent, validate_secure_directory,
@@ -156,9 +156,6 @@ struct CertificatePlan {
     declaration_revision: u64,
     tenant: String,
     hostname: String,
-    capability: &'static str,
-    capability_responsibility: String,
-    capability_scope: String,
     provider_protocol: String,
     provider_config_sha256: String,
     trust_anchors_sha256: String,
@@ -183,9 +180,6 @@ struct CertificateReadiness {
     declaration_revision: u64,
     tenant: String,
     hostname: String,
-    capability: &'static str,
-    capability_responsibility: String,
-    capability_scope: String,
     provider_protocol: String,
     provider_config_sha256: String,
     trust_anchors_sha256: String,
@@ -242,7 +236,6 @@ struct CertificateTransaction {
     declaration_revision: u64,
     tenant: String,
     hostname: String,
-    capability: String,
     expected_revision: u64,
     target_revision: u64,
     source: CertificateSourceBinding,
@@ -273,7 +266,6 @@ struct CertificateReceipt {
     declaration_revision: u64,
     tenant: String,
     hostname: String,
-    capability: String,
     revision: u64,
     source: CertificateSourceBinding,
     material_sha256: String,
@@ -306,7 +298,6 @@ pub(crate) fn run(
         TlsCommand::Plan(input) => {
             require_root()?;
             let record = store.resolve(selector, true)?;
-            record.require_mutation(&[Capability::ProxyTls])?;
             let provider = load_provider(
                 &store,
                 &input.provider_config,
@@ -386,7 +377,6 @@ fn check(
     let selected = store.resolve(selector, true)?;
     let _deployment_lock = store.deployment_shared_lock(&selected.deployment_id)?;
     let record = store.reload_locked(&selected)?;
-    record.require_mutation(&[Capability::ProxyTls])?;
     let tenant = canonical_tenant(&input.tenant)?;
     let hostname = canonical_hostname(&input.hostname)?;
     let provider = load_provider(store, &input.provider_config, &tenant, &hostname)?;
@@ -458,7 +448,6 @@ fn check(
         .checked_add(READINESS_EVIDENCE_TTL_SECONDS)
         .context("TLS readiness evidence expiry overflow")?
         .min(renewal_required_at);
-    let grant = record.capabilities.grant(Capability::ProxyTls);
     let readiness = CertificateReadiness {
         schema: 1,
         check_jti: uuid::Uuid::now_v7().to_string(),
@@ -468,9 +457,6 @@ fn check(
         declaration_revision: record.declaration_revision,
         tenant,
         hostname,
-        capability: "proxy_tls",
-        capability_responsibility: format!("{:?}", grant.responsibility).to_ascii_lowercase(),
-        capability_scope: format!("{:?}", grant.scope).to_ascii_lowercase(),
         provider_protocol: PROVIDER_PROTOCOL.to_owned(),
         provider_config_sha256: provider.config_sha256,
         trust_anchors_sha256: provider.trust_anchors_sha256,
@@ -531,8 +517,6 @@ fn apply(
     let selected = store.resolve(selector, true)?;
     let _deployment_lock = store.deployment_lock(&selected.deployment_id)?;
     let record = store.reload_locked(&selected)?;
-    let _shared_locks = store.shared_capability_locks(&record, &[Capability::ProxyTls])?;
-    record.require_mutation(&[Capability::ProxyTls])?;
 
     let tenant = canonical_tenant(&input.tenant)?;
     let hostname = canonical_hostname(&input.hostname)?;
@@ -581,7 +565,6 @@ fn apply(
         declaration_revision: record.declaration_revision,
         tenant: tenant.clone(),
         hostname: hostname.clone(),
-        capability: "proxy_tls".to_owned(),
         expected_revision,
         target_revision,
         source: source.clone(),
@@ -642,7 +625,6 @@ fn apply(
             declaration_revision: record.declaration_revision,
             tenant,
             hostname,
-            capability: "proxy_tls".to_owned(),
             revision: target_revision,
             source: transaction.source.clone(),
             material_sha256: material.material_sha256.clone(),
@@ -665,13 +647,6 @@ fn apply(
             persist_receipt(store, &record, &receipt)?;
             transaction.phase = TransactionPhase::Committed;
             persist_pending(store, &transaction)?;
-            crate::governance::append_management_audit(
-                store,
-                &record,
-                &jti,
-                "tls-certificate-apply",
-                &format!("tls-revision-{target_revision}"),
-            )?;
             finalize_transaction(store, &transaction)?;
             println!("{}", serde_json::to_string_pretty(&receipt)?);
             Ok(())
@@ -708,8 +683,6 @@ fn recover(
     let selected = store.resolve(selector, true)?;
     let _deployment_lock = store.deployment_lock(&selected.deployment_id)?;
     let record = store.reload_locked(&selected)?;
-    let _shared_locks = store.shared_capability_locks(&record, &[Capability::ProxyTls])?;
-    record.require_mutation(&[Capability::ProxyTls])?;
     let tenant = canonical_tenant(tenant)?;
     let hostname = canonical_hostname(hostname)?;
     let mut transaction = load_pending(store, &record, &tenant, &hostname)?
@@ -747,13 +720,6 @@ fn recover(
         persist_receipt(store, &record, receipt)?;
         transaction.phase = TransactionPhase::Committed;
         persist_pending(store, &transaction)?;
-        crate::governance::append_management_audit(
-            store,
-            &record,
-            &transaction.jti,
-            "tls-certificate-apply",
-            &format!("tls-revision-{}", transaction.target_revision),
-        )?;
         finalize_transaction(store, &transaction)?;
         println!("{}", serde_json::to_string_pretty(&transaction)?);
         return Ok(());
@@ -763,13 +729,6 @@ fn recover(
     let provider = loaded_provider_from_transaction(store, &transaction)?;
     rollback_transaction(&mut transaction, previous.as_ref(), &provider)?;
     finalize_transaction(store, &transaction)?;
-    crate::governance::append_management_audit(
-        store,
-        &record,
-        &transaction.jti,
-        "tls-certificate-recover",
-        &format!("tls-revision-{}", transaction.expected_revision),
-    )?;
     println!("{}", serde_json::to_string_pretty(&transaction)?);
     Ok(())
 }
@@ -889,7 +848,6 @@ fn build_plan(
     }
     ensure_source_not_current(current, source)?;
     let current_revision = current.map_or(0, |receipt| receipt.revision);
-    let grant = record.capabilities.grant(Capability::ProxyTls);
     Ok(CertificatePlan {
         schema: PLAN_SCHEMA,
         jti: uuid::Uuid::now_v7().to_string(),
@@ -897,9 +855,6 @@ fn build_plan(
         declaration_revision: record.declaration_revision,
         tenant: canonical_tenant(&input.tenant)?,
         hostname: canonical_hostname(&input.hostname)?,
-        capability: "proxy_tls",
-        capability_responsibility: format!("{:?}", grant.responsibility).to_ascii_lowercase(),
-        capability_scope: format!("{:?}", grant.scope).to_ascii_lowercase(),
         provider_protocol: PROVIDER_PROTOCOL.to_owned(),
         provider_config_sha256: provider.config_sha256.clone(),
         trust_anchors_sha256: provider.trust_anchors_sha256.clone(),
@@ -1016,13 +971,9 @@ fn validate_provider_config(
     if config.activation_link != config.material_root.join("current") {
         bail!("TLS activation_link must be material_root/current");
     }
-    for root in [
-        &store.config_root,
-        &store.state_root,
-        &store.break_glass_root,
-    ] {
+    for root in [&store.config_root, &store.state_root] {
         if config.material_root.starts_with(root) || root.starts_with(&config.material_root) {
-            bail!("TLS material root must not overlap controller state or recovery roots");
+            bail!("TLS material root must not overlap controller roots");
         }
     }
     let url = Url::parse(&config.public_url).context("TLS provider public_url is invalid")?;
@@ -1107,7 +1058,6 @@ fn stage_generation(
             "declaration_revision": transaction.declaration_revision,
             "tenant": transaction.tenant,
             "hostname": transaction.hostname,
-            "capability": transaction.capability,
             "revision": transaction.target_revision,
             "material_sha256": transaction.material_sha256,
             "leaf_certificate_sha256": transaction.leaf_certificate_sha256,
@@ -1409,7 +1359,6 @@ fn validate_committed_receipt_binding(
         || receipt.declaration_revision != transaction.declaration_revision
         || receipt.tenant != transaction.tenant
         || receipt.hostname != transaction.hostname
-        || receipt.capability != transaction.capability
         || receipt.revision != transaction.target_revision
         || receipt.source != transaction.source
         || receipt.material_sha256 != transaction.material_sha256
@@ -1806,7 +1755,6 @@ fn load_receipt_at(
         || receipt.declaration_revision > record.declaration_revision
         || receipt.tenant != tenant
         || receipt.hostname != hostname
-        || receipt.capability != "proxy_tls"
         || receipt.provider_protocol != PROVIDER_PROTOCOL
         || receipt.transaction_expires_at
             != receipt.transaction_created_at + TRANSACTION_TTL_SECONDS
@@ -1869,7 +1817,6 @@ fn validate_transaction_binding(
         || transaction.declaration_revision != record.declaration_revision
         || transaction.tenant != tenant
         || transaction.hostname != hostname
-        || transaction.capability != "proxy_tls"
         || transaction.provider.protocol != PROVIDER_PROTOCOL
         || transaction.provider.schema != PROVIDER_SCHEMA
         || transaction.target_revision != target_revision

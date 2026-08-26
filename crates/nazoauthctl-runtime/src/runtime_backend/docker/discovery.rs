@@ -70,20 +70,23 @@ pub(super) fn inspect(
         .get("Image")
         .and_then(serde_json::Value::as_str)
         .and_then(|value| container_shared::normalize_local_image_id(value, false));
-    let (artifact, artifact_missing) = match resolve_image_digest(command, &image_reference) {
-        Ok(digest) => (
-            ArtifactReference::Oci {
-                image_reference,
-                digest,
-            },
-            None,
-        ),
-        Err(error) if container_shared::is_engine_unavailable_error(&error) => return Err(error),
-        Err(_) => (
-            ArtifactReference::Unknown,
-            Some("trusted OCI digest could not be resolved".to_owned()),
-        ),
-    };
+    let (artifact, artifact_missing) =
+        match resolve_image_digest(command, &image_reference, local_artifact_id.as_deref()) {
+            Ok(digest) => (
+                ArtifactReference::Oci {
+                    image_reference,
+                    digest,
+                },
+                None,
+            ),
+            Err(error) if container_shared::is_engine_unavailable_error(&error) => {
+                return Err(error);
+            }
+            Err(_) => (
+                ArtifactReference::Unknown,
+                Some("trusted OCI digest could not be resolved".to_owned()),
+            ),
+        };
     let ports = parse_ports(&value)?;
     let networks = value
         .pointer("/NetworkSettings/Networks")
@@ -257,20 +260,53 @@ pub(super) fn inspect_optional(
     Ok(Some(inspect(command, object_reference)?))
 }
 
+/// Whether any locally cached image carries exactly the repository digest
+/// embedded in `image_reference`. Errors are reported as `false`: a failed
+/// existence check must never authorize proceeding without the registry.
+pub(super) fn local_image_matches_digest(command: &OsStr, image_reference: &str) -> bool {
+    let Some(requested) = image_reference
+        .rsplit_once('@')
+        .map(|(_, digest)| digest.trim().to_ascii_lowercase())
+        .filter(|digest| container_shared::valid_digest(digest))
+    else {
+        return false;
+    };
+    let Ok(output) = container_shared::command_stdout(
+        command,
+        &["images", "--format", "{{json .RepoDigests}}"],
+        "Docker",
+    ) else {
+        return false;
+    };
+    output.lines().any(|line| {
+        serde_json::from_str::<Vec<String>>(line.trim())
+            .ok()
+            .is_some_and(|digests| {
+                digests.iter().any(|entry| {
+                    entry
+                        .rsplit_once('@')
+                        .is_some_and(|(_, digest)| digest.trim().to_ascii_lowercase() == requested)
+                })
+            })
+    })
+}
+
+/// Resolve the trusted repository digest for an image reference.
+///
+/// `local_image_id` is the container's recorded immutable local image ID and
+/// serves as a pure lookup fallback when the engine no longer resolves the
+/// original reference (e.g. index-digest storage quirks). The trust model is
+/// unchanged: the digest only validates through the requested-digest match.
 pub(super) fn resolve_image_digest(
     command: &OsStr,
     image_reference: &str,
+    local_image_id: Option<&str>,
 ) -> anyhow::Result<String> {
-    let output = container_shared::command_stdout(
+    let output = image_inspect_output(
         command,
-        &[
-            "image",
-            "inspect",
-            image_reference,
-            "--format",
-            "{{json .RepoDigests}}",
-        ],
-        "Docker",
+        image_reference,
+        local_image_id,
+        "{{json .RepoDigests}}",
     )?;
     let digests: Vec<String> = serde_json::from_str(output.trim())
         .context("Docker image inspect returned invalid RepoDigests")?;
@@ -291,6 +327,33 @@ pub(super) fn resolve_image_digest(
             )
         })?;
     Ok(digest.to_ascii_lowercase())
+}
+
+/// Run one `image inspect --format` query against the image reference,
+/// falling back to the container's recorded local image ID when the engine
+/// no longer resolves that reference.
+fn image_inspect_output(
+    command: &OsStr,
+    image_reference: &str,
+    local_image_id: Option<&str>,
+    format: &str,
+) -> anyhow::Result<String> {
+    match container_shared::command_stdout(
+        command,
+        &["image", "inspect", image_reference, "--format", format],
+        "Docker",
+    ) {
+        Ok(output) => Ok(output),
+        Err(reference_error) => match local_image_id {
+            Some(id) => container_shared::command_stdout(
+                command,
+                &["image", "inspect", id, "--format", format],
+                "Docker",
+            )
+            .map_err(|_| reference_error),
+            None => Err(reference_error),
+        },
+    }
 }
 
 pub(super) fn resolve_local_image_id(

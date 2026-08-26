@@ -4,14 +4,13 @@ use super::*;
 fn every_public_help_topic_is_complete_without_runtime_state() {
     for (topic, expected) in [
         (cli::HelpTopic::TopLevel, "Commands:"),
-        (cli::HelpTopic::Install, "--external-dependencies"),
+        (cli::HelpTopic::Host, "host forget"),
+        (cli::HelpTopic::Instance, "instance relocate"),
+        (cli::HelpTopic::Controller, "controller revoke"),
+        (cli::HelpTopic::Install, "--public-url"),
         (cli::HelpTopic::BootstrapAdmin, "--credentials-stdin"),
-        (cli::HelpTopic::Update, "--accept-migration-barrier"),
-        (cli::HelpTopic::Keys, "register-external"),
-        (cli::HelpTopic::Tls, "external-generation-v1"),
-        (cli::HelpTopic::Audit, "audit verify"),
-        (cli::HelpTopic::Identity, "identity rotate"),
-        (cli::HelpTopic::BreakGlass, "recover-controller"),
+        (cli::HelpTopic::Update, "--artifact-sha256"),
+        (cli::HelpTopic::SelfUpdate, "self update"),
     ] {
         let help = help_text(topic);
         assert!(help.starts_with("Usage:") || help.starts_with("nazoauthctl"));
@@ -131,10 +130,7 @@ fn release_self_update_validation_uses_a_generic_current_previous_transition() {
         "self update --to \"$CURRENT_RELEASE\" --yes",
         "self check --to \"$PREVIOUS_RELEASE\"",
         "mktemp -d /tmp/controller-self-lifecycle.XXXXXX",
-        "break_glass_root=\"/dev/shm/controller-self-lifecycle-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\"",
-        "trap 'sudo rm -rf \"$root\" \"$break_glass_root\"' EXIT",
-        "sudo install -d -m 0700 -o 0 -g 0 \"$break_glass_root\"",
-        "test \"$(stat -c %d \"$config_root\")\" != \"$(stat -c %d \"$break_glass_root\")\"",
+        "trap 'sudo rm -rf \"$root\"' EXIT",
         "sudo chown -R 0:0 \"$root\"",
     ] {
         assert!(

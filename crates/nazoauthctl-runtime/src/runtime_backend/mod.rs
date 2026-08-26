@@ -58,6 +58,10 @@ fn safe_absolute(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The verified NazoAuth OCI artifact declares this immutable numeric
+/// identity; one-shot operator tasks must never inherit engine root merely
+/// because image metadata drifts (exposed for the G-wave control executor).
+pub use container_shared::NON_ROOT_ONE_SHOT_USER;
 pub use container_shared::normalize_local_image_id;
 pub use container_shared::oci_backup_digests;
 pub use docker::DockerBackend;
@@ -68,13 +72,12 @@ pub use systemd::{SystemdBackend, parse_systemd_version, render_host_service_uni
 #[serde(rename_all = "kebab-case")]
 pub enum Responsibility {
     External,
-    Delegated,
     Managed,
 }
 
 impl Responsibility {
     pub fn permits_mutation(self) -> bool {
-        matches!(self, Self::Delegated | Self::Managed)
+        matches!(self, Self::Managed)
     }
 }
 
@@ -619,7 +622,6 @@ pub struct HostServiceInstall {
     pub recovery_directory: PathBuf,
     pub migration_url: PathBuf,
     pub restricted_secret_paths: Vec<PathBuf>,
-    pub receipt_private_key: PathBuf,
     pub runtime_readable_secret_names: Vec<String>,
 }
 
@@ -663,6 +665,12 @@ pub trait RuntimeBackend {
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String>;
     fn run_one_shot_authorization_probe(&self, task: &OneShotTask) -> anyhow::Result<bool>;
     fn pull_image(&self, image_reference: &str) -> anyhow::Result<()>;
+    /// Whether the local image store already holds an image whose repository
+    /// digests contain exactly the digest embedded in `image_reference`.
+    /// Digest-pinned installs fall back to this when the registry is
+    /// unreachable: a locally cached exact-digest image is equally
+    /// trustworthy because the signed Release manifest anchors that digest.
+    fn local_image_matches_digest(&self, image_reference: &str) -> bool;
     fn export_image(&self, image_reference: &str, archive: &std::path::Path) -> anyhow::Result<()>;
     fn import_image(&self, archive: &std::path::Path) -> anyhow::Result<()>;
     fn restore_managed_postgres(&self, restore: &ManagedPostgresRestore) -> anyhow::Result<()>;

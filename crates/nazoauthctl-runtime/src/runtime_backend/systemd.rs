@@ -521,11 +521,8 @@ impl RuntimeBackend for SystemdBackend {
                 .run_quiet()?;
             set_mode(&path, if runtime_readable { 0o440 } else { 0o600 })?;
         }
-        Process::new("chown")
-            .arg("root:root")
-            .arg(&install.receipt_private_key)
-            .run_quiet()?;
-        set_mode(&install.receipt_private_key, 0o600)?;
+        // J/P1-12: the retired receipt private-key model is gone; its
+        // root:root/0600 stanza was removed with it.
         for path in [&install.app_root, &install.ui_releases] {
             Process::new("chown")
                 .arg("-R")
@@ -576,6 +573,10 @@ impl RuntimeBackend for SystemdBackend {
 
     fn resolve_image_digest(&self, _image_reference: &str) -> anyhow::Result<String> {
         bail!("systemd backend does not manage OCI images")
+    }
+
+    fn local_image_matches_digest(&self, _image_reference: &str) -> bool {
+        false
     }
 
     fn resolve_local_image_id(&self, _image_reference: &str) -> anyhow::Result<String> {
@@ -700,7 +701,6 @@ fn validate_host_service_install(install: &HostServiceInstall) -> anyhow::Result
         ("operator directory", &install.operator_directory),
         ("recovery directory", &install.recovery_directory),
         ("migration URL path", &install.migration_url),
-        ("receipt private key path", &install.receipt_private_key),
     ] {
         safe_systemd_path(path).with_context(|| format!("{name} is unsafe for a systemd unit"))?;
     }

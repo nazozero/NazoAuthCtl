@@ -306,7 +306,6 @@ fn pending_journal_fences_one_activation_resource_across_deployments() {
     let store = DeploymentStore {
         config_root: work.path().join("config"),
         state_root: work.path().join("state"),
-        break_glass_root: work.path().join("break-glass"),
     };
     let transaction = test_transaction(PathBuf::from("/srv/nazoauth/tls/tenant-a/auth.example"));
     let pending = pending_path(&store, &transaction);
@@ -667,7 +666,6 @@ fn activated_generation_is_deactivated_before_rollback_public_proof() {
         declaration_revision: 7,
         tenant: "tenant-a".to_owned(),
         hostname: "auth.example".to_owned(),
-        capability: "proxy_tls".to_owned(),
         expected_revision: 0,
         target_revision: 1,
         source: CertificateSourceBinding::ExternalFiles {
@@ -746,7 +744,6 @@ fn test_transaction(material_root: PathBuf) -> CertificateTransaction {
         declaration_revision: 7,
         tenant: "tenant-a".to_owned(),
         hostname: "auth.example".to_owned(),
-        capability: "proxy_tls".to_owned(),
         expected_revision: 0,
         target_revision: 1,
         source: CertificateSourceBinding::ExternalFiles {
@@ -811,7 +808,6 @@ fn test_receipt(
         declaration_revision: transaction.declaration_revision,
         tenant: transaction.tenant.clone(),
         hostname: transaction.hostname.clone(),
-        capability: transaction.capability.clone(),
         revision,
         source: transaction.source.clone(),
         material_sha256: transaction.material_sha256.clone(),
