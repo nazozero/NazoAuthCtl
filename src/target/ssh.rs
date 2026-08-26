@@ -824,6 +824,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             health_summary: "runtime healthy".to_owned(),
             backup_maturity: crate::target::deployment_state::BackupMaturity::Unknown,
             active_host_operation: None,
+            config_revision_marker: None,
             bootstrap_material: None,
         }
     }

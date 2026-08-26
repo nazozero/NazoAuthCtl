@@ -861,6 +861,7 @@ mod tests {
                     health_summary: "ok".to_owned(),
                     backup_maturity: crate::target::BackupMaturity::Unknown,
                     active_host_operation: None,
+                    config_revision_marker: None,
                     bootstrap_material: None,
                 }),
                 _ => Ok(InstanceInspection {
@@ -893,6 +894,7 @@ mod tests {
                     health_summary: "runtime healthy".to_owned(),
                     backup_maturity: crate::target::BackupMaturity::Unknown,
                     active_host_operation: None,
+                    config_revision_marker: None,
                     bootstrap_material: None,
                 }),
             }

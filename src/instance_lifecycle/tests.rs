@@ -245,6 +245,16 @@ impl Fixture {
             "bootstrap-op-0001",
         )?;
 
+        // The config-revision marker is the single CAS authority the signed
+        // operation must carry (P0-6); a real install writes it on the scope
+        // directory before the runtime starts.
+        let scope_marker = state_root
+            .join("deployments")
+            .join(DEPLOYMENT)
+            .join("config-revision");
+        std::fs::create_dir_all(scope_marker.parent().expect("scope parent"))?;
+        std::fs::write(&scope_marker, "c".repeat(64))?;
+
         // Bind the controller key store so migrations can be signed.
         let keys = ControllerKeyStore::open(temp.path().join("controller-keys"))?;
         keys.get_or_create_active(DEPLOYMENT)?;

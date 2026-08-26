@@ -666,6 +666,14 @@ pub struct InstanceInspection {
     /// Operation id that produced the current revision, if any (journal index).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_host_operation: Option<String>,
+    /// The EXACT content of the target-side config-revision marker, when the
+    /// marker file exists (P0-6 single authority). ControlOperation
+    /// `config_revision` MUST carry this value verbatim: the NazoAuth
+    /// operator compares it byte-for-byte against the mounted marker. `None`
+    /// means the marker is absent and every signed operation must fail
+    /// closed instead of guessing a revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_revision_marker: Option<String>,
     /// Read-only fresh-install bootstrap capability, surfaced ONLY while the
     /// capability is open and the live state still matches its install
     /// journal binding (goal plan 07 G-A decision). Absent in every other
@@ -1216,6 +1224,7 @@ mod tests {
             healthy: true,
             health_summary: "runtime healthy".to_owned(),
             active_host_operation: None,
+            config_revision_marker: None,
             bootstrap_material: None,
             current_build_identity: None,
             backup_maturity: super::super::deployment_state::BackupMaturity::Unknown,

@@ -696,6 +696,9 @@ fn inspection_from_state(state: DeploymentState) -> InstanceInspection {
         active_host_operation: state
             .active_host_operation
             .map(|active| active.operation_id),
+        // The discovery sweep never reads the marker: it is a per-deployment
+        // fact that only the dedicated inspect kind surfaces.
+        config_revision_marker: None,
         bootstrap_material: None,
         current_build_identity: state.current_build_identity,
     }
@@ -722,10 +725,16 @@ fn answer_inspect(
     // Decision 3 (goal plan 07 G-A): surface the read-only fresh-bootstrap
     // material ONLY while the capability is open and the live state still
     // matches its install binding. Every other state answers without it.
-    let bootstrap_material = store
-        .scope_dir(&deployment_id)
-        .ok()
-        .and_then(|scope| bootstrap_authority::surface_material_view(&scope, &state));
+    let scope_dir = store.scope_dir(&deployment_id).ok();
+    let bootstrap_material = scope_dir
+        .as_ref()
+        .and_then(|scope| bootstrap_authority::surface_material_view(scope, &state));
+    let config_revision_marker = scope_dir.as_ref().and_then(|scope| {
+        std::fs::read(scope.join("config-revision"))
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(bytes.trim_ascii()).into_owned())
+            .filter(|value| !value.is_empty())
+    });
     Ok(HostResult::completed(
         &operation.operation_id,
         HostCompletionBody::StateInspect {
@@ -746,6 +755,7 @@ fn answer_inspect(
                     .active_host_operation
                     .as_ref()
                     .map(|active| active.operation_id.clone()),
+                config_revision_marker,
                 bootstrap_material,
                 current_build_identity: state.current_build_identity.clone(),
             },

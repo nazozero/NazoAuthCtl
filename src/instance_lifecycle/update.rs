@@ -115,6 +115,18 @@ pub(crate) fn run_update(
     // below reuses it verbatim so retries of one logical attempt carry one
     // identity on both journals (goal plan 07 §4). prepare_control_operation
     // resumes byte-identically after any drop or crash.
+    //
+    // config_revision is the target's marker content verbatim (P0-6 single
+    // authority): the operator admission compares the envelope against the
+    // mounted marker byte-for-byte. A missing marker fails closed — guessing
+    // the CAS counter would sign an operation that can never be admitted.
+    let config_revision = inspection.config_revision_marker.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{action}: deployment '{deployment_id}' has no config-revision marker on its \
+             scope directory; the operator would reject any signed operation, so refusing \
+             to sign one"
+        )
+    })?;
     let journal = OperationJournal::open(keys.instance_dir(&record.deployment_id)?)?;
     let prepared = prepare_control_operation(
         &context.registry,
@@ -124,7 +136,7 @@ pub(crate) fn run_update(
         ControlOperationInput {
             operation: ControlOperationPayload::MigrateApply,
             artifact_target: control_target_for(&current_artifact, &build_identity),
-            config_revision: revision.to_string(),
+            config_revision,
         },
     )
     .context("preparing the migration operation failed; the update changed nothing")?;
