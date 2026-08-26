@@ -102,6 +102,13 @@ pub struct PlannedSecret {
     /// One of [`SECRET_PURPOSES`].
     pub purpose: String,
     pub path: String,
+    /// P0-1: operator-provided credential content for external-dependency
+    /// URLs (`database-url`, `valkey-url`). The external PostgreSQL role and
+    /// Valkey ACL already know these values — ctl never invents them. Absent
+    /// for target-minted material (`mfa-totp-key`). Rides the encrypted
+    /// transport exactly once; the journal directory is root-only 0700.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 /// New configuration content staged by an update (G03). Values follow the
@@ -526,10 +533,11 @@ impl HostInstallExecutor {
                     }
                 }
                 // URL-shaped values combine operator-supplied endpoint facts
-                // with a fresh CSPRNG credential minted here, so the password
-                // never crosses the wire. An existing file keeps its original
-                // credential: retries must not rotate what a failed attempt
-                // already handed to the external dependency.
+                // with the operator-provided external credential (P0-1): the
+                // PostgreSQL role and Valkey ACL already know this password,
+                // so ctl must never invent one. An existing file keeps its
+                // original value: retries must not rotate what a failed
+                // attempt already handed to the external dependency.
                 //
                 // Operator endpoints address the target HOST; inside the
                 // container namespace loopback would be the container itself,
@@ -537,6 +545,16 @@ impl HostInstallExecutor {
                 // host-gateway name.
                 "database-url" | "valkey-url" => {
                     if !existed {
+                        let credential = secret.value.as_deref().ok_or_else(|| {
+                            Failure::new(
+                                SECRET_PROVISION_FAILED,
+                                format!(
+                                    "no operator credential for '{}'; the external dependency \
+                                     would reject an invented password",
+                                    secret.purpose
+                                ),
+                            )
+                        })?;
                         let gateway = |host: &str| -> String {
                             match host {
                                 "127.0.0.1" | "::1" | "localhost" => match kind {
@@ -546,19 +564,18 @@ impl HostInstallExecutor {
                                 other => other.to_owned(),
                             }
                         };
-                        let credential = hex(rand::random::<[u8; 16]>().as_slice());
                         let value = match secret.purpose.as_str() {
                             "database-url" => format!(
                                 "postgresql://{}:{}@{}:{}/{}",
                                 job.order.database_endpoint.user,
-                                credential,
+                                percent_encode_credential(credential),
                                 gateway(&job.order.database_endpoint.host),
                                 job.order.database_endpoint.port,
                                 job.order.database_endpoint.name,
                             ),
                             _ => format!(
                                 "valkey://:{}@{}:{}",
-                                credential,
+                                percent_encode_credential(credential),
                                 gateway(&job.order.valkey_endpoint.host),
                                 job.order.valkey_endpoint.port,
                             ),
@@ -852,6 +869,23 @@ fn artifact_reference(image: &str, digest: &str) -> runtime_backend::ArtifactRef
         image_reference: image.to_owned(),
         digest: format!("sha256:{digest}"),
     }
+}
+
+/// Percent-encode an operator-provided credential for safe inclusion in a
+/// URL userinfo component. Unreserved characters (RFC 3986 §2.3) pass
+/// through; everything else becomes `%XX` so `@:/?#` and control bytes can
+/// never break the URL or smuggle a host change.
+pub fn percent_encode_credential(credential: &str) -> String {
+    let mut encoded = String::with_capacity(credential.len());
+    for byte in credential.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char)
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
 }
 
 /// One-shot `nazauth migrate` against the verified image, sharing the exact

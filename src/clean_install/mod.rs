@@ -75,11 +75,15 @@ pub(crate) struct CleanInstallRequest {
     /// Optional custom installation root. Absent resolves to the platform
     /// defaults; set, every managed path derives from it.
     pub(crate) install_root: Option<PathBuf>,
-    /// External PostgreSQL endpoint (host, port, database, role). The
-    /// password is minted on the target and never crosses the wire.
+    /// External PostgreSQL endpoint (host, port, database, role).
     pub(crate) database_endpoint: crate::target::install_exec::ExternalEndpoint,
     /// External Valkey endpoint (host, port).
     pub(crate) valkey_endpoint: crate::target::install_exec::ExternalEndpoint,
+    /// P0-1: the ALREADY-KNOWN external credentials. The PostgreSQL role and
+    /// Valkey ACL predate this install; ctl never invents passwords those
+    /// systems do not accept.
+    pub(crate) database_password: String,
+    pub(crate) valkey_password: String,
 }
 
 /// Injectable context mirroring the fleet command context: the user-scoped
@@ -273,14 +277,33 @@ fn build_install_order(
             PlannedSecret {
                 purpose: "database-url".to_owned(),
                 path: database_url_file,
+                value: Some(format!(
+                    "postgresql://{}:{}@{}:{}/{}",
+                    request.database_endpoint.user,
+                    crate::target::install_exec::percent_encode_credential(
+                        &request.database_password
+                    ),
+                    request.database_endpoint.host,
+                    request.database_endpoint.port,
+                    request.database_endpoint.name,
+                )),
             },
             PlannedSecret {
                 purpose: "valkey-url".to_owned(),
                 path: valkey_url_file,
+                value: Some(format!(
+                    "valkey://:{}@{}:{}",
+                    crate::target::install_exec::percent_encode_credential(
+                        &request.valkey_password
+                    ),
+                    request.valkey_endpoint.host,
+                    request.valkey_endpoint.port,
+                )),
             },
             PlannedSecret {
                 purpose: "mfa-totp-key".to_owned(),
                 path: mfa_totp_key_file,
+                value: None,
             },
         ],
         database_endpoint: request.database_endpoint.clone(),

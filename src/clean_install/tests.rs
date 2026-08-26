@@ -202,6 +202,8 @@ impl LocalFixture {
                 name: String::new(),
                 user: String::new(),
             },
+            database_password: "db-secret".to_owned(),
+            valkey_password: "cache-secret".to_owned(),
         }
     }
 }
@@ -418,6 +420,8 @@ impl SshFixture {
                 name: String::new(),
                 user: String::new(),
             },
+            database_password: "db-secret".to_owned(),
+            valkey_password: "cache-secret".to_owned(),
         }
     }
 }

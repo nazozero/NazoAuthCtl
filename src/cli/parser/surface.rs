@@ -142,8 +142,10 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
             "--database-port",
             "--database-name",
             "--database-user",
+            "--database-password-file",
             "--valkey-host",
             "--valkey-port",
+            "--valkey-password-file",
         ],
         &[],
         "install",
@@ -224,6 +226,22 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
             .context("--valkey-port must be 1-65535")?,
         None => bail!("install requires --valkey-port PORT"),
     };
+    let database_password_file = match parsed.values.get("--database-password-file") {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        Some(_) => bail!("--database-password-file requires a file path"),
+        None => bail!(
+            "install requires --database-password-file PATH (the EXISTING PostgreSQL role \
+             password; ctl never invents credentials the external system does not know)"
+        ),
+    };
+    let valkey_password_file = match parsed.values.get("--valkey-password-file") {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        Some(_) => bail!("--valkey-password-file requires a file path"),
+        None => bail!(
+            "install requires --valkey-password-file PATH (the EXISTING Valkey password; ctl \
+             never invents credentials the external system does not know)"
+        ),
+    };
     Ok(InstallArgs {
         host: parsed.values.get("--host").cloned(),
         name: parsed.values.get("--name").cloned(),
@@ -236,8 +254,10 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
         database_port,
         database_name,
         database_user,
+        database_password_file,
         valkey_host,
         valkey_port,
+        valkey_password_file,
     })
 }
 

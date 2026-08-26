@@ -221,17 +221,20 @@ re-establishes the Controller Key from the offline Recovery Secret (or, with
   nazoauthctl install [--host HOST] [--name ALIAS] --public-url URL
                      --database-host HOST --database-port PORT
                      --database-name NAME --database-user USER
+                     --database-password-file PATH
                      --valkey-host HOST --valkey-port PORT
+                     --valkey-password-file PATH
                      [--to VERSION] [--artifact-sha256 SHA256]
                      [--runtime podman|docker|host] [--install-root PATH]
 
 One verified handshake, one typed install order, one committed DeploymentState
 (local=healthy, control unbound, public unknown). The PostgreSQL and Valkey
-endpoints are operator-provided external facts; credentials are minted on the
-target host. No backups, no public checks, no recovery media are required.
+endpoints AND their passwords are operator-provided external facts — ctl never
+invents a credential the external system does not know; password files are
+read once and never logged. No backups, no public checks, no recovery media.
 Next steps after install:
   nazoauthctl bootstrap-admin --instance ALIAS
-  nazoauthctl bind --instance ALIAS --label NAME
+  nazoauthctl bind --instance ALIAS --label NAME --output-secret-file PATH
   nazoauthctl verify --instance ALIAS"
         }
         cli::HelpTopic::Update => {

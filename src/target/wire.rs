@@ -1010,6 +1010,7 @@ mod tests {
             secrets: vec![super::super::install_exec::PlannedSecret {
                 purpose: "database-url".to_owned(),
                 path: "/var/lib/nazoauth/secrets/database-url".to_owned(),
+                value: Some("postgresql://nazauth:secret@db.internal:5432/oauth".to_owned()),
             }],
             database_endpoint: crate::target::install_exec::ExternalEndpoint {
                 host: "db.internal".to_owned(),

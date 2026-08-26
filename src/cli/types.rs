@@ -306,8 +306,11 @@ pub(crate) struct InstallArgs {
     pub(crate) database_port: u16,
     pub(crate) database_name: String,
     pub(crate) database_user: String,
+    /// P0-1: the ALREADY-KNOWN external password (file-read, never argv).
+    pub(crate) database_password_file: PathBuf,
     pub(crate) valkey_host: String,
     pub(crate) valkey_port: u16,
+    pub(crate) valkey_password_file: PathBuf,
 }
 
 /// Update arguments (G03); maps onto

@@ -208,8 +208,23 @@ fn not_implemented(what: &str, detail: &str) -> anyhow::Error {
     )
 }
 
+fn read_password_file(path: &std::path::Path, flag: &str) -> anyhow::Result<String> {
+    let raw = std::fs::read(path)
+        .with_context(|| format!("{flag}: failed to read {}", path.display()))?;
+    let value = String::from_utf8(raw)
+        .with_context(|| format!("{flag}: {} is not UTF-8", path.display()))?;
+    let trimmed = value.trim_end_matches(['\r', '\n']);
+    if trimmed.is_empty() {
+        bail!("{flag}: {} is empty", path.display());
+    }
+    Ok(trimmed.to_owned())
+}
+
 fn run_install(args: InstallArgs) -> anyhow::Result<()> {
     let context = CleanInstallContext::production()?;
+    let database_password =
+        read_password_file(&args.database_password_file, "--database-password-file")?;
+    let valkey_password = read_password_file(&args.valkey_password_file, "--valkey-password-file")?;
     let request = CleanInstallRequest {
         host: args.host,
         instance_alias: args.name,
@@ -230,6 +245,8 @@ fn run_install(args: InstallArgs) -> anyhow::Result<()> {
             name: String::new(),
             user: String::new(),
         },
+        database_password,
+        valkey_password,
     };
     let report = crate::clean_install::run_clean_install(&context, request)?;
     println!("{report}");
