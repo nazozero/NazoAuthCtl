@@ -26,8 +26,8 @@ use nazo_operator_protocol::controller_key_id;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize as _;
 
+use crate::error_codes::STATE_RESET_REQUIRED;
 use crate::filesystem;
-use crate::registry::STATE_RESET_REQUIRED;
 
 /// Schema discriminator carried by every persisted controller-key record.
 pub const CONTROLLER_KEY_STORE_SCHEMA: u32 = 1;

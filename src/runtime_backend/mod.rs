@@ -11,9 +11,6 @@ pub(crate) use nazoauthctl_runtime::runtime_backend::{
     SystemdBackend,
 };
 
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) use nazoauthctl_runtime::runtime_backend::managed_network_config_digest;
-
 pub(crate) fn backend(kind: RuntimeBackendKind) -> Box<dyn RuntimeBackend> {
     match kind {
         RuntimeBackendKind::Podman => {

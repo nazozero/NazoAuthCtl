@@ -23,10 +23,6 @@ pub use conformance::{
     ConformanceDeploymentEvidence, ConformanceRuntimeEvidence, ConformanceSession,
 };
 
-#[cfg(all(test, unix))]
-#[path = "../tests/unit/support.rs"]
-mod test_support;
-
 pub fn main_entry() {
     let args = match std::env::args_os()
         .map(|argument| {

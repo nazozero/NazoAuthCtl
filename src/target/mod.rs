@@ -1455,7 +1455,7 @@ mod tests {
 
     #[test]
     fn corrupt_or_foreign_state_fails_closed_with_reset_guidance() -> anyhow::Result<()> {
-        use crate::registry::STATE_RESET_REQUIRED;
+        use crate::error_codes::STATE_RESET_REQUIRED;
 
         let temp = PrivateTempDir::new("nazauthctl-local-state-test")?;
         let root = temp.path().join("state");

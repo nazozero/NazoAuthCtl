@@ -54,7 +54,7 @@
 //! regular-file reads with size caps, `deny_unknown_fields` plus an explicit
 //! schema discriminator, exclusive fs2 locking for read-modify-write, and
 //! fail-closed errors. A document that does not parse as the current schema
-//! fails with the stable [`crate::registry::STATE_RESET_REQUIRED`] code
+//! fails with the stable [`crate::error_codes::STATE_RESET_REQUIRED`] code
 //! naming the file; there is no lenient reader and no conversion.
 
 use std::path::{Path, PathBuf};
@@ -64,8 +64,9 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
+use crate::error_codes::STATE_RESET_REQUIRED;
 use crate::filesystem;
-use crate::registry::{STATE_RESET_REQUIRED, validate_issuer};
+use crate::registry::validate_issuer;
 
 use super::install_exec::InstallOrder;
 use super::journal;
@@ -1295,7 +1296,9 @@ mod tests {
         crate::filesystem::atomic_write(&broken_dir.join("state.json"), b"{ not json", 0o600)?;
         let error = store.list_deployments().expect_err("corrupt document");
         assert!(
-            error.detail.contains(crate::registry::STATE_RESET_REQUIRED),
+            error
+                .detail
+                .contains(crate::error_codes::STATE_RESET_REQUIRED),
             "{error:?}"
         );
         Ok(())

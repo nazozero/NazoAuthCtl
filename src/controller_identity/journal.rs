@@ -46,8 +46,8 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
+use crate::error_codes::STATE_RESET_REQUIRED;
 use crate::filesystem;
-use crate::registry::STATE_RESET_REQUIRED;
 
 /// Exclusive per-instance lock shared with the Controller Key store, so
 /// journal writes serialize against key-store mutations of the same

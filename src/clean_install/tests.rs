@@ -289,7 +289,7 @@ fn unix_stub() -> String {
     r#"#!/bin/sh
 printf '%s\n' "$*" >> "$(dirname "$0")/argv.txt"
 input=$(cat)
-id=$(printf '%s' "$input" | sed -n 's/.*"operation_id":"\([0-9a-fA-F-]*\)".*/\1p')
+id=$(printf '%s' "$input" | sed -n 's/.*"operation_id":"\([0-9a-fA-F-]*\)".*/\1/p')
 dep=$(printf '%s' "$input" | sed -n 's/.*"deployment_id":"\([0-9a-zA-Z._:+-]*\)".*/\1p')
 nonce=$(printf '%s' "$input" | sed -n 's/.*"nonce":"\([0-9A-Za-z._:+-]*\)".*/\1p')
 case "$input" in

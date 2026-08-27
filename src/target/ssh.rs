@@ -608,7 +608,7 @@ mod tests {
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "$(dirname "$0")/argv.txt"
 input=$(cat)
-caller=$(printf '%s' "$input" | sed -n 's/.*"operation_id":"\([0-9a-fA-F-]*\)".*/\1p')
+caller=$(printf '%s' "$input" | sed -n 's/.*"operation_id":"\([0-9a-fA-F-]*\)".*/\1/p')
 response="$(dirname "$0")/response.json"
 case "$input" in
   *'"kind":"hello"'*)
@@ -625,6 +625,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
         .to_owned()
     }
 
+    #[cfg(windows)]
     fn windows_stub_cmd() -> String {
         [
             "@echo off",
@@ -636,6 +637,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
         .join("\r\n")
     }
 
+    #[cfg(windows)]
     fn windows_stub_ps1() -> String {
         [
             "$ErrorActionPreference = 'Stop'",
