@@ -1182,9 +1182,10 @@ mod tests {
     fn host_check_on_the_local_transport_skips_the_network() -> anyhow::Result<()> {
         let temp = filesystem::PrivateTempDir::new("nazauthctl-fleet-local-test")?;
         let store = RegistryStore::open(temp.path().join("registry"))?;
+        let state_root = temp.path().join("target-state");
         let local = store.ensure_local_host()?;
-        let saw_ssh: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-        let saw = saw_ssh.clone();
+        let factory_called: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        let called = factory_called.clone();
         let context = FleetContext::new(
             store,
             Box::new(move |record| {
@@ -1193,13 +1194,13 @@ mod tests {
                     HostTransport::Local,
                     "only the local host exists here"
                 );
-                *saw.borrow_mut() = true;
-                Ok(Box::new(LocalTarget::new()?))
+                *called.borrow_mut() = true;
+                Ok(Box::new(LocalTarget::with_state_root(&state_root)))
             }),
         );
         let report = host_check(&context, "local")?;
         assert!(report.contains("ping echo verified"), "{report}");
-        assert!(*saw_ssh.borrow());
+        assert!(*factory_called.borrow());
         let updated = context.store.host_by_id(local.host_id)?.unwrap();
         assert!(updated.last_observation.unwrap().reachable);
         Ok(())
