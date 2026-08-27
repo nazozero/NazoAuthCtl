@@ -49,18 +49,71 @@ pub(crate) const SERVER_REPOSITORY: &str = "nazozero/NazoAuth";
 pub(crate) type TargetFactory =
     dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedTargetArtifact {
+    pub digest: String,
+    pub identity: crate::target::BuildIdentity,
+}
+
+pub(crate) trait TargetArtifactResolver: Send + Sync {
+    fn resolve_target_artifact(
+        &self,
+        pinned: &crate::target::OfficialArtifactRef,
+        inspection: &InstanceInspection,
+    ) -> anyhow::Result<VerifiedTargetArtifact>;
+}
+
+pub(crate) struct ProductionTargetArtifactResolver;
+
+impl TargetArtifactResolver for ProductionTargetArtifactResolver {
+    fn resolve_target_artifact(
+        &self,
+        pinned: &crate::target::OfficialArtifactRef,
+        inspection: &InstanceInspection,
+    ) -> anyhow::Result<VerifiedTargetArtifact> {
+        let release = crate::release::VerifiedRelease::verify(crate::release::ReleaseRequest {
+            repository: &pinned.repository,
+            requested_version: pinned.version.as_deref(),
+            container_backend: None,
+            trusted_version_floor: inspection
+                .current_build_identity
+                .as_ref()
+                .map(|id| id.version.as_str()),
+        })?;
+        let subject = release
+            .manifest
+            .image_oci_digest()
+            .trim_start_matches("sha256:")
+            .to_owned();
+        if let Some(expected) = &pinned.expected_subject_sha256
+            && *expected != subject
+        {
+            anyhow::bail!(
+                "verified subject digest sha256:{subject} differs from the requested pin sha256:{expected}"
+            );
+        }
+        let digest = format!("sha256:{subject}");
+        let identity = crate::target::BuildIdentity::new(
+            nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT,
+            &release.manifest.version,
+            &release.manifest.backend_commit,
+        )?;
+        Ok(VerifiedTargetArtifact { digest, identity })
+    }
+}
+
 pub(crate) struct LifecycleContext {
     pub(crate) registry: RegistryStore,
     pub(crate) factory: Box<TargetFactory>,
+    pub(crate) resolver: std::sync::Arc<dyn TargetArtifactResolver>,
 }
 
 impl LifecycleContext {
-    /// Delivery boundary: the I wave wires this into the CLI parser.
-    #[allow(dead_code)]
     pub(crate) fn production() -> anyhow::Result<Self> {
         Ok(Self {
             registry: RegistryStore::open_default()?,
             factory: Box::new(production_target),
+            resolver: std::sync::Arc::new(ProductionTargetArtifactResolver),
         })
     }
 

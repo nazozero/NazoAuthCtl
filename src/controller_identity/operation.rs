@@ -335,7 +335,7 @@ mod tests {
             target: ControlTarget::HostBinary {
                 sha256: "ab".repeat(32),
                 embedded: ControlBuildIdentity {
-                    product: "nazauth".to_owned(),
+                    product: nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT.to_owned(),
                     version: "1.0.0".to_owned(),
                     commit: "9f2c1a7".to_owned(),
                 },

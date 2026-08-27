@@ -33,7 +33,6 @@ fn text_envelope_covers_the_stable_codes() {
         crate::error_codes::CONFIG_REVISION_MISMATCH,
         crate::error_codes::TARGET_IDENTITY_MISMATCH,
         crate::error_codes::EXTERNAL_RESOURCE_PROTECTED,
-        crate::error_codes::NOT_IMPLEMENTED_BEFORE_K_PHASE,
     ] {
         let rendered = render(code, false);
         assert!(rendered.starts_with("action:"), "{rendered}");

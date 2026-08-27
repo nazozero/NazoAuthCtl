@@ -25,19 +25,21 @@
 //! The executor is an injected seam ([`LifecycleExecutor`]): production uses
 //! [`HostLifecycleExecutor`], tests substitute scripted doubles.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::deployment_state::{Failure, OBJECT_IDENTITY_MISMATCH, TargetStateStore};
-use super::install_exec::{OfficialArtifactRef, StagedConfig, probe_local_health};
+use super::install_exec::{
+    OfficialArtifactRef, StagedConfig, cache_systemd_artifact, probe_local_health,
+};
 use super::wire::{HOST_ERR_OPERATION_INVALID, sanitize};
 use crate::{
-    deployment::RuntimeBackendKind,
     filesystem,
     release::{ReleaseRequest, VerifiedRelease},
-    runtime_backend,
+    runtime_backend::{self, RuntimeBackendKind},
 };
 
 /// Stable failure code: activation or the local readiness gate failed after
@@ -62,6 +64,9 @@ pub(crate) struct UpdateJob<'a> {
     pub config_reference: &'a str,
     /// The published loopback port for local health probes.
     pub port: u16,
+    pub data_root: &'a str,
+    /// Managed systemd binary root. Container deployments do not have one.
+    pub runtime_root: Option<&'a str>,
     /// The deployment's current config schema token (pre-update).
     pub config_schema: &'a str,
     /// The deployment's recorded current artifact reference (`sha256:<hex>`).
@@ -72,6 +77,7 @@ pub(crate) struct UpdateJob<'a> {
     pub expected_revision: u64,
     pub artifact: &'a OfficialArtifactRef,
     pub config: Option<&'a StagedConfig>,
+    pub migration_jws: Option<&'a str>,
     /// `<state root>/deployments/<deployment id>/` — where the rollback
     /// snapshot lives beside the journal.
     pub scope_dir: &'a Path,
@@ -87,6 +93,8 @@ pub(crate) struct RollbackJob<'a> {
     pub config_reference: &'a str,
     /// The published loopback port for local health probes.
     pub port: u16,
+    /// Managed systemd binary root. Container deployments do not have one.
+    pub runtime_root: Option<&'a str>,
     pub config_schema: &'a str,
     pub current_artifact: &'a str,
     pub previous_artifact: Option<&'a str>,
@@ -119,6 +127,7 @@ pub(crate) struct PerformedSteps {
     pub(crate) snapshotted_config: bool,
     pub(crate) wrote_config: bool,
     pub(crate) replaced_runtime: bool,
+    pub(crate) config_before_rollback: Option<Vec<u8>>,
 }
 
 /// Production executor backed by the real adapters.
@@ -130,10 +139,16 @@ impl LifecycleExecutor for HostLifecycleExecutor {
         let mut performed = PerformedSteps::default();
         match self.run_update(job, &mut performed) {
             Ok(facts) => Ok(facts),
-            Err(failure) => {
-                rollback_update(job, &performed);
-                Err(failure)
-            }
+            Err(failure) => match rollback_update(job, &performed) {
+                Ok(()) => Err(failure),
+                Err(cleanup) => Err(Failure::new(
+                    failure.code,
+                    format!(
+                        "{}; rollback was incomplete: {}",
+                        failure.detail, cleanup.detail
+                    ),
+                )),
+            },
         }
     }
 
@@ -141,10 +156,16 @@ impl LifecycleExecutor for HostLifecycleExecutor {
         let mut performed = PerformedSteps::default();
         match self.run_rollback(job, &mut performed) {
             Ok(facts) => Ok(facts),
-            Err(failure) => {
-                restore_current_after_failed_rollback(job, &performed);
-                Err(failure)
-            }
+            Err(failure) => match restore_current_after_failed_rollback(job, &performed) {
+                Ok(()) => Err(failure),
+                Err(cleanup) => Err(Failure::new(
+                    failure.code,
+                    format!(
+                        "{}; rollback recovery was incomplete: {}",
+                        failure.detail, cleanup.detail
+                    ),
+                )),
+            },
         }
     }
 }
@@ -153,13 +174,12 @@ fn backend_kind(runtime_kind: &str) -> Result<RuntimeBackendKind, Failure> {
     match runtime_kind {
         "podman" => Ok(RuntimeBackendKind::Podman),
         "docker" => Ok(RuntimeBackendKind::Docker),
-        // The systemd host backend joins the lifecycle waves with the
-        // K-phase integration, exactly like the install order.
+        "host" | "systemd" => Ok(RuntimeBackendKind::Systemd),
         other => Err(Failure::new(
             HOST_ERR_OPERATION_INVALID,
             format!(
-                "the '{}' runtime backend joins the lifecycle waves with the K-phase \
-                 integration; use Podman or Docker deployments",
+                "the '{}' runtime backend is not supported for lifecycle mutations; \
+                 use Podman or Docker deployments",
                 sanitize(other.to_owned())
             ),
         )),
@@ -185,7 +205,12 @@ impl HostLifecycleExecutor {
         // re-running verify/pull is idempotent for interrupted resumes).
         // P1-11: the recorded current version is the signed anti-downgrade
         // floor — a verified-but-older Release is rejected before download.
-        let verified = verify_pinned_artifact_facts(job.artifact, kind, job.current_version)?;
+        let verified = verify_pinned_artifact_facts(
+            job.artifact,
+            kind,
+            job.current_version,
+            job.runtime_root,
+        )?;
         let new_digest = verified.digest.clone();
 
         // 2. Snapshot the current config so a failed activation restores the
@@ -222,11 +247,88 @@ impl HostLifecycleExecutor {
             performed.wrote_config = true;
         }
 
+        // 3.5. Application migration: run one-shot task using the VERIFIED target artifact.
+        if let Some(migration_jws) = job.migration_jws {
+            let systemd = kind == RuntimeBackendKind::Systemd;
+            let service_user = systemd.then(|| systemd_service_user(job.deployment_id));
+            let mut environment = BTreeMap::new();
+            let mut read_only_paths = Vec::new();
+            let mut read_write_paths = Vec::new();
+            if systemd {
+                environment.insert(
+                    super::install_exec::SERVER_CONFIG_FILE_ENV.to_owned(),
+                    job.config_reference.to_owned(),
+                );
+                environment.insert(
+                    "NAZOAUTH_OPERATOR_CONFIG_REVISION_FILE".to_owned(),
+                    job.scope_dir
+                        .join("config-revision")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                environment.insert(
+                    "NAZOAUTH_OPERATOR_STATE_DIRECTORY".to_owned(),
+                    Path::new(job.data_root)
+                        .join("operator-state")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                read_only_paths.push(PathBuf::from(job.config_reference));
+                read_write_paths.push(PathBuf::from(job.data_root));
+            }
+            let task = runtime_backend::OneShotTask {
+                artifact: verified.runtime_artifact.clone(),
+                command: vec!["nazoauth".to_owned(), "operator-task".to_owned()],
+                network: observation.networks.first().cloned(),
+                mounts: observation.mounts.clone(),
+                environment,
+                working_directory: (kind != RuntimeBackendKind::Systemd)
+                    .then(|| std::path::PathBuf::from("/app")),
+                service_user: if systemd {
+                    service_user
+                } else {
+                    Some(crate::runtime_backend::NON_ROOT_ONE_SHOT_USER.to_owned())
+                },
+                transient_credentials: BTreeMap::new(),
+                read_only_paths,
+                read_write_paths,
+                inaccessible_paths: Vec::new(),
+                private_mounts: false,
+                stdin: format!("{}\n", migration_jws).into_bytes(),
+            };
+            let stdout = backend.run_one_shot(&task).map_err(|error| {
+                Failure::new("CONTROL_OUTCOME_UNKNOWN", sanitize(error.to_string()))
+            })?;
+            let control_result =
+                super::control_exec::decode_operator_answer(&stdout, job.operation_id)?;
+            match control_result.outcome {
+                nazo_operator_protocol::ControlOutcome::Succeeded => {}
+                nazo_operator_protocol::ControlOutcome::Failed => {
+                    return Err(Failure::new(
+                        "MIGRATION_FAILED",
+                        format!(
+                            "the application migration failed durably with {:?}",
+                            control_result.error
+                        ),
+                    ));
+                }
+                nazo_operator_protocol::ControlOutcome::InProgress => {
+                    return Err(Failure::new(
+                        "CONTROL_OUTCOME_UNKNOWN",
+                        "the application migration is still in progress; resume the same operation",
+                    ));
+                }
+            }
+        }
+
         // 4. Redeploy the runtime object onto the new artifact. Resume-safe:
         // an object already serving the verified digest is left untouched.
         if observation_digest(&observation).as_deref() != Some(new_digest.as_str()) {
-            let replacement =
-                replacement_from_observation(&observation, job.runtime_object, &new_digest);
+            let replacement = replacement_from_observation(
+                &observation,
+                job.runtime_object,
+                &verified.runtime_artifact,
+            )?;
             backend
                 .replace(&replacement)
                 .map_err(|error| Failure::new(ACTIVATION_FAILED, sanitize(error.to_string())))?;
@@ -297,23 +399,56 @@ impl HostLifecycleExecutor {
         // 1. Offline handle verification: the previous artifact must exist in
         // the local engine image store right now (no network fetch — a
         // rollback depends only on already-verified local bytes).
-        let image_repo = observation_image_reference(&observation).ok_or_else(|| {
-            Failure::new(
-                OBJECT_IDENTITY_MISMATCH,
-                "the running runtime object does not report a digest-bound OCI artifact",
-            )
-        })?;
-        let previous_image = format!("{image_repo}@{previous}");
-        if !image_exists_locally(kind, &previous_image)? {
-            return Err(Failure::new(
-                ROLLBACK_ARTIFACT_MISSING,
-                format!(
-                    "previous artifact {previous} is not present in the local image store; \
-                     pull it explicitly before rolling back"
-                ),
-            ));
-        }
         let previous_digest = previous.trim_start_matches("sha256:").to_owned();
+        let previous_runtime_artifact = match kind {
+            RuntimeBackendKind::Systemd => {
+                let runtime_root = job.runtime_root.ok_or_else(|| {
+                    Failure::new(
+                        HOST_ERR_OPERATION_INVALID,
+                        "systemd deployment state has no app-binary directory resource",
+                    )
+                })?;
+                let path = Path::new(runtime_root)
+                    .join("artifacts")
+                    .join(&previous_digest)
+                    .join("nazoauth");
+                if filesystem::sha256(&path).ok().as_deref() != Some(previous_digest.as_str()) {
+                    return Err(Failure::new(
+                        ROLLBACK_ARTIFACT_MISSING,
+                        format!(
+                            "previous host binary {previous} is not present in the verified \
+                             target cache"
+                        ),
+                    ));
+                }
+                runtime_backend::ArtifactReference::HostBinary {
+                    path,
+                    sha256: previous_digest.clone(),
+                }
+            }
+            RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
+                let image_repo = observation_image_reference(&observation).ok_or_else(|| {
+                    Failure::new(
+                        OBJECT_IDENTITY_MISMATCH,
+                        "the running runtime object does not report a digest-bound OCI artifact",
+                    )
+                })?;
+                let previous_image = format!("{image_repo}@{previous}");
+                if !image_exists_locally(kind, &previous_image)? {
+                    return Err(Failure::new(
+                        ROLLBACK_ARTIFACT_MISSING,
+                        format!(
+                            "previous artifact {previous} is not present in the local image \
+                             store; pull it explicitly before rolling back"
+                        ),
+                    ));
+                }
+                runtime_backend::ArtifactReference::Oci {
+                    image_reference: image_repo,
+                    digest: previous.to_owned(),
+                }
+            }
+        };
 
         // 2. Config snapshot decision BEFORE touching the runtime: restore
         // only when explicitly saved, integrity-intact, and still belonging to
@@ -324,8 +459,11 @@ impl HostLifecycleExecutor {
             })?;
 
         // 3. Swap the runtime object back onto the previous artifact.
-        let replacement =
-            replacement_from_observation(&observation, job.runtime_object, &previous_digest);
+        let replacement = replacement_from_observation(
+            &observation,
+            job.runtime_object,
+            &previous_runtime_artifact,
+        )?;
         backend
             .replace(&replacement)
             .map_err(|error| Failure::new(ACTIVATION_FAILED, sanitize(error.to_string())))?;
@@ -348,6 +486,21 @@ impl HostLifecycleExecutor {
 
         // 5. Restore the snapshot bytes when the decision said so.
         if let Some((bytes, _)) = &restored_config {
+            performed.config_before_rollback = Some(
+                filesystem::read_secure_regular_file(
+                    Path::new(job.config_reference),
+                    "current configuration",
+                    false,
+                    super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
+                )
+                .map_err(|error| {
+                    Failure::new(
+                        super::install_exec::CONFIG_INVALID,
+                        sanitize(error.to_string()),
+                    )
+                })?
+                .to_vec(),
+            );
             filesystem::atomic_write(Path::new(job.config_reference), bytes, 0o600).map_err(
                 |error| {
                     Failure::new(
@@ -383,6 +536,17 @@ impl HostLifecycleExecutor {
     }
 }
 
+pub(super) fn systemd_service_user(deployment_id: &str) -> String {
+    format!(
+        "nazoauth-{}",
+        deployment_id
+            .trim_start_matches("deploy-")
+            .chars()
+            .take(12)
+            .collect::<String>()
+    )
+}
+
 fn privilege_gate(runtime_kind: &str) -> Result<(), Failure> {
     if matches!(runtime_kind, "podman" | "docker") {
         crate::instance_lifecycle::privilege::ensure_engine_access(
@@ -391,7 +555,8 @@ fn privilege_gate(runtime_kind: &str) -> Result<(), Failure> {
         )
         .map_err(|error| Failure::new(error.code(), sanitize(error.to_string())))
     } else {
-        Ok(())
+        crate::instance_lifecycle::privilege::ensure_systemd_access()
+            .map_err(|error| Failure::new(error.code(), sanitize(error.to_string())))
     }
 }
 
@@ -410,7 +575,8 @@ fn observation_digest(observation: &runtime_backend::RuntimeObservation) -> Opti
         runtime_backend::ArtifactReference::Oci { digest, .. } => {
             Some(digest.trim_start_matches("sha256:").to_owned())
         }
-        _ => None,
+        runtime_backend::ArtifactReference::HostBinary { sha256, .. } => Some(sha256.clone()),
+        runtime_backend::ArtifactReference::Unknown => None,
     }
 }
 
@@ -432,7 +598,7 @@ fn require_observation_serves(
     let digest = observation_digest(observation).ok_or_else(|| {
         Failure::new(
             OBJECT_IDENTITY_MISMATCH,
-            "the running runtime object does not report a digest-bound OCI artifact",
+            "the running runtime object does not report a digest-bound artifact",
         )
     })?;
     if digest != expected.trim_start_matches("sha256:") {
@@ -452,11 +618,12 @@ fn verify_pinned_artifact_facts(
     artifact: &OfficialArtifactRef,
     kind: RuntimeBackendKind,
     version_floor: Option<&str>,
+    runtime_root: Option<&str>,
 ) -> Result<VerifiedArtifactFacts, Failure> {
     let release = VerifiedRelease::verify(ReleaseRequest {
         repository: &artifact.repository,
         requested_version: artifact.version.as_deref(),
-        container_backend: Some(kind),
+        container_backend: (kind != RuntimeBackendKind::Systemd).then_some(kind),
         trusted_version_floor: version_floor,
     })
     .map_err(|error| {
@@ -465,25 +632,42 @@ fn verify_pinned_artifact_facts(
             sanitize(error.to_string()),
         )
     })?;
-    let subject = release
-        .manifest
-        .image_oci_digest()
-        .trim_start_matches("sha256:")
-        .to_owned();
-    if let Some(expected) = &artifact.expected_subject_sha256
-        && *expected != subject
-    {
-        return Err(Failure::new(
-            super::install_exec::ARTIFACT_UNVERIFIED,
-            "verified subject digest differs from the requested pin",
-        ));
-    }
-    // Container backends always run Linux images regardless of the control
-    // machine's OS; select the manifest by CONTAINER platform, not host
-    // (real-acceptance finding on a Windows host with a Linux daemon).
-    let image = match kind {
-        RuntimeBackendKind::Systemd => release.manifest.image_ref(),
-        _ => {
+    let (digest, pin_subject, runtime_artifact) = match kind {
+        RuntimeBackendKind::Systemd => {
+            let runtime_root = runtime_root.ok_or_else(|| {
+                Failure::new(
+                    HOST_ERR_OPERATION_INVALID,
+                    "systemd deployment state has no app-binary directory resource",
+                )
+            })?;
+            let source = release
+                .artifact("binary", &artifact.repository)
+                .map_err(|error| {
+                    Failure::new(
+                        super::install_exec::ARTIFACT_UNVERIFIED,
+                        sanitize(error.to_string()),
+                    )
+                })?;
+            let digest = filesystem::sha256(&source).map_err(|error| {
+                Failure::new(
+                    super::install_exec::ARTIFACT_UNVERIFIED,
+                    sanitize(error.to_string()),
+                )
+            })?;
+            let cached = cache_systemd_artifact(&source, Path::new(runtime_root), &digest)
+                .map_err(|error| {
+                    Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
+                })?;
+            (
+                digest.clone(),
+                digest.clone(),
+                runtime_backend::ArtifactReference::HostBinary {
+                    path: cached,
+                    sha256: digest,
+                },
+            )
+        }
+        RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
             let digest = release
                 .manifest
                 .runtime_oci_digest_for(crate::model::container_oci_platform())
@@ -493,28 +677,44 @@ fn verify_pinned_artifact_facts(
                         sanitize(error.to_string()),
                     )
                 })?;
-            Ok(format!(
+            let image = format!(
                 "{}@{digest}",
                 release.manifest.oci.repository.trim_end_matches('/')
-            ))
-        }
-    }
-    .map_err(|error| {
-        Failure::new(
-            super::install_exec::ARTIFACT_UNVERIFIED,
-            sanitize(error.to_string()),
-        )
-    })?;
-    runtime_backend::backend(kind)
-        .pull_image(&image)
-        .map_err(|error| {
-            Failure::new(
-                super::install_exec::ARTIFACT_UNVERIFIED,
-                sanitize(error.to_string()),
+            );
+            runtime_backend::backend(kind)
+                .pull_image(&image)
+                .map_err(|error| {
+                    Failure::new(
+                        super::install_exec::ARTIFACT_UNVERIFIED,
+                        sanitize(error.to_string()),
+                    )
+                })?;
+            let digest = digest.trim_start_matches("sha256:").to_owned();
+            (
+                digest.clone(),
+                release
+                    .manifest
+                    .image_oci_digest()
+                    .trim_start_matches("sha256:")
+                    .to_owned(),
+                runtime_backend::ArtifactReference::Oci {
+                    image_reference: release.manifest.oci.repository.clone(),
+                    digest: format!("sha256:{digest}"),
+                },
             )
-        })?;
+        }
+    };
+    if let Some(expected) = &artifact.expected_subject_sha256
+        && *expected != pin_subject
+    {
+        return Err(Failure::new(
+            super::install_exec::ARTIFACT_UNVERIFIED,
+            "verified subject digest differs from the requested pin",
+        ));
+    }
     Ok(VerifiedArtifactFacts {
-        digest: subject,
+        digest,
+        runtime_artifact,
         build_identity: Some(
             super::deployment_state::BuildIdentity::new(
                 super::deployment_state::BUILD_IDENTITY_PRODUCT,
@@ -532,6 +732,7 @@ fn verify_pinned_artifact_facts(
 /// subject digest and the embedded build identity.
 struct VerifiedArtifactFacts {
     digest: String,
+    runtime_artifact: runtime_backend::ArtifactReference,
     build_identity: Option<super::deployment_state::BuildIdentity>,
 }
 
@@ -541,26 +742,51 @@ struct VerifiedArtifactFacts {
 fn replacement_from_observation(
     observation: &runtime_backend::RuntimeObservation,
     object: &str,
-    digest: &str,
-) -> runtime_backend::RuntimeReplacement {
-    let image_reference =
-        observation_image_reference(observation).unwrap_or_else(|| object.to_owned());
-    runtime_backend::RuntimeReplacement {
+    artifact: &runtime_backend::ArtifactReference,
+) -> Result<runtime_backend::RuntimeReplacement, Failure> {
+    let (command, container_policy) = match artifact {
+        runtime_backend::ArtifactReference::Oci { .. } => (
+            vec!["nazoauth".to_owned(), "server".to_owned()],
+            Some(runtime_backend::ContainerRuntimePolicy::managed_default()),
+        ),
+        runtime_backend::ArtifactReference::HostBinary { .. } => {
+            let executable = match &observation.artifact {
+                runtime_backend::ArtifactReference::HostBinary { path, .. } => path,
+                _ => {
+                    return Err(Failure::new(
+                        OBJECT_IDENTITY_MISMATCH,
+                        "systemd replacement requires a live host-binary observation",
+                    ));
+                }
+            };
+            (
+                vec![
+                    executable.to_string_lossy().into_owned(),
+                    "server".to_owned(),
+                ],
+                None,
+            )
+        }
+        runtime_backend::ArtifactReference::Unknown => {
+            return Err(Failure::new(
+                super::install_exec::ARTIFACT_UNVERIFIED,
+                "runtime replacement requires a verified artifact reference",
+            ));
+        }
+    };
+    Ok(runtime_backend::RuntimeReplacement {
         object_reference: object.to_owned(),
-        artifact: runtime_backend::ArtifactReference::Oci {
-            image_reference,
-            digest: format!("sha256:{digest}"),
-        },
+        artifact: artifact.clone(),
         local_artifact_id: observation.local_artifact_id.clone(),
-        command: vec!["nazauth".to_owned(), "server".to_owned()],
+        command,
         mounts: observation.mounts.clone(),
         environment: observation.safe_environment.clone(),
         networks: observation.networks.clone(),
         ip_address: None,
         ports: observation.ports.clone(),
         labels: observation.labels.clone(),
-        container_policy: Some(runtime_backend::ContainerRuntimePolicy::managed_default()),
-    }
+        container_policy,
+    })
 }
 
 fn image_exists_locally(kind: RuntimeBackendKind, image: &str) -> Result<bool, Failure> {
@@ -685,32 +911,105 @@ fn staged_config_change(
     staged.map(|staged| (config_reference.to_owned(), staged.schema.clone()))
 }
 
-fn rollback_update(job: &UpdateJob<'_>, performed: &PerformedSteps) {
+fn rollback_update(job: &UpdateJob<'_>, performed: &PerformedSteps) -> Result<(), Failure> {
+    let mut errors = Vec::new();
     if performed.wrote_config {
-        restore_snapshot_bytes(job.scope_dir, job.config_reference);
+        let restore = if performed.snapshotted_config {
+            restore_snapshot_bytes(job.scope_dir, job.config_reference)
+        } else {
+            filesystem::remove_file_durable(Path::new(job.config_reference)).map_err(|error| {
+                Failure::new(
+                    super::install_exec::CONFIG_INVALID,
+                    sanitize(format!(
+                        "removing newly staged configuration failed: {error}"
+                    )),
+                )
+            })
+        };
+        if let Err(error) = restore {
+            errors.push(error.detail);
+        }
     }
-    if performed.replaced_runtime || performed.wrote_config {
-        // Best-effort redeployment of the pre-update artifact; the failure
-        // that triggered this path keeps its stable code either way.
-        let _ = redeploy_digest(job.runtime_kind, job.runtime_object, job.current_artifact);
+    if (performed.replaced_runtime || performed.wrote_config)
+        && let Err(error) = redeploy_digest(
+            job.runtime_kind,
+            job.runtime_object,
+            job.current_artifact,
+            job.runtime_root,
+        )
+    {
+        errors.push(format!(
+            "restoring the pre-update runtime failed: {}",
+            error.detail
+        ));
     }
+    rollback_result(errors)
 }
 
-fn restore_current_after_failed_rollback(job: &RollbackJob<'_>, performed: &PerformedSteps) {
-    if performed.replaced_runtime {
-        let _ = redeploy_digest(job.runtime_kind, job.runtime_object, job.current_artifact);
+fn restore_current_after_failed_rollback(
+    job: &RollbackJob<'_>,
+    performed: &PerformedSteps,
+) -> Result<(), Failure> {
+    let mut errors = Vec::new();
+    if performed.wrote_config {
+        match performed.config_before_rollback.as_deref() {
+            Some(bytes) => {
+                if let Err(error) =
+                    filesystem::atomic_write(Path::new(job.config_reference), bytes, 0o600)
+                {
+                    errors.push(format!(
+                        "restoring the pre-rollback configuration failed: {error}"
+                    ));
+                }
+            }
+            None => errors.push(
+                "pre-rollback configuration bytes were not retained before replacement".to_owned(),
+            ),
+        }
     }
+    if performed.replaced_runtime
+        && let Err(error) = redeploy_digest(
+            job.runtime_kind,
+            job.runtime_object,
+            job.current_artifact,
+            job.runtime_root,
+        )
+    {
+        errors.push(format!(
+            "restoring the current runtime failed: {}",
+            error.detail
+        ));
+    }
+    rollback_result(errors)
 }
 
-fn restore_snapshot_bytes(scope_dir: &Path, config_reference: &str) {
+fn restore_snapshot_bytes(scope_dir: &Path, config_reference: &str) -> Result<(), Failure> {
     let bytes_path = scope_dir.join(SNAPSHOT_BYTES_FILE);
-    if let Ok(bytes) = filesystem::read_secure_regular_file(
+    let bytes = filesystem::read_secure_regular_file(
         &bytes_path,
         "config snapshot bytes",
         false,
         super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
-    ) {
-        let _ = filesystem::atomic_write(Path::new(config_reference), &bytes, 0o600);
+    )
+    .map_err(|error| {
+        Failure::new(
+            super::install_exec::CONFIG_INVALID,
+            sanitize(format!("reading the config snapshot failed: {error}")),
+        )
+    })?;
+    filesystem::atomic_write(Path::new(config_reference), &bytes, 0o600).map_err(|error| {
+        Failure::new(
+            super::install_exec::CONFIG_INVALID,
+            sanitize(format!("restoring the config snapshot failed: {error}")),
+        )
+    })
+}
+
+fn rollback_result(errors: Vec<String>) -> Result<(), Failure> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Failure::new(ACTIVATION_FAILED, sanitize(errors.join("; "))))
     }
 }
 
@@ -718,12 +1017,42 @@ fn redeploy_digest(
     runtime_kind: &str,
     runtime_object: &str,
     digest_ref: &str,
+    runtime_root: Option<&str>,
 ) -> Result<(), Failure> {
     let kind = backend_kind(runtime_kind)?;
     let backend = runtime_backend::backend(kind);
     let observation = live_observation(backend.as_ref(), runtime_object)?;
     let digest = digest_ref.trim_start_matches("sha256:").to_owned();
-    let replacement = replacement_from_observation(&observation, runtime_object, &digest);
+    let artifact = match kind {
+        RuntimeBackendKind::Systemd => {
+            let runtime_root = runtime_root.ok_or_else(|| {
+                Failure::new(
+                    HOST_ERR_OPERATION_INVALID,
+                    "systemd deployment state has no app-binary directory resource",
+                )
+            })?;
+            runtime_backend::ArtifactReference::HostBinary {
+                path: Path::new(runtime_root)
+                    .join("artifacts")
+                    .join(&digest)
+                    .join("nazoauth"),
+                sha256: digest,
+            }
+        }
+        RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
+            let image_reference = observation_image_reference(&observation).ok_or_else(|| {
+                Failure::new(
+                    OBJECT_IDENTITY_MISMATCH,
+                    "the runtime object does not report an OCI repository",
+                )
+            })?;
+            runtime_backend::ArtifactReference::Oci {
+                image_reference,
+                digest: format!("sha256:{digest}"),
+            }
+        }
+    };
+    let replacement = replacement_from_observation(&observation, runtime_object, &artifact)?;
     backend
         .replace(&replacement)
         .map_err(|error| Failure::new(ACTIVATION_FAILED, sanitize(error.to_string())))?;

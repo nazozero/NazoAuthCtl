@@ -3,8 +3,8 @@
 //! One runner fans a read-only job out over every registered instance with:
 //!
 //! * bounded concurrency (std threads, hard cap [`MAX_CONCURRENCY`]);
-//! * a per-target wall-clock timeout — a hung SSH target can never stall the
-//!   whole report;
+//! * a transport-owned per-target wall-clock timeout — OpenSSH is terminated
+//!   and reaped by [`crate::process::Process`] before its worker slot returns;
 //! * strict partial-failure isolation — one offline host never hides or
 //!   truncates another host's successful result;
 //! * stable ordering — results are always emitted in Registry order (alias
@@ -13,10 +13,8 @@
 //! * no global mutation lock — the runner touches only the user-scoped
 //!   Registry and the verified per-target handshake.
 //!
-//! Timeout semantics: an abandoned inner thread keeps running until its own
-//! transport deadline expires, but its result is dropped on the floor. At
-//! most [`MAX_CONCURRENCY`] targets are in flight at any moment, and every
-//! job here is strictly read-only, so abandonment cannot leak effects.
+//! There are no detached per-target threads. Each worker owns exactly one
+//! target at a time and a slot is released only after the transport returns.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,6 +23,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::error_codes;
 use crate::registry::{HostRecord, InstanceRecord, RegistryStore};
@@ -55,19 +54,13 @@ pub(crate) struct FleetItemOutcome {
 pub(crate) struct FleetReadRunner {
     factory: Arc<SharedFactory>,
     concurrency: usize,
-    per_target_timeout: Duration,
 }
 
 impl FleetReadRunner {
-    pub(crate) fn new(
-        factory: Arc<SharedFactory>,
-        concurrency: usize,
-        per_target_timeout: Duration,
-    ) -> Self {
+    pub(crate) fn new(factory: Arc<SharedFactory>, concurrency: usize) -> Self {
         Self {
             factory,
             concurrency: concurrency.clamp(1, MAX_CONCURRENCY),
-            per_target_timeout,
         }
     }
 
@@ -75,9 +68,10 @@ impl FleetReadRunner {
     /// per-target timeout.
     pub(crate) fn production() -> Self {
         Self::new(
-            Arc::new(crate::fleet::production_target),
+            Arc::new(|record| {
+                crate::fleet::production_target_with_ssh_timeout(record, DEFAULT_PER_TARGET_TIMEOUT)
+            }),
             MAX_CONCURRENCY,
-            DEFAULT_PER_TARGET_TIMEOUT,
         )
     }
 
@@ -96,21 +90,14 @@ impl FleetReadRunner {
         let items = Arc::new(items);
         let (sender, receiver) = mpsc::channel::<(usize, FleetItemOutcome)>();
         let sender = Arc::new(sender);
-        // P1-10: a hung transport keeps its inner thread alive after the
-        // timeout abandons it. Counting those live threads against the
-        // concurrency budget is what keeps the budget real — without this
-        // counter N hung hosts would let unbounded extra targets run.
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let budget = self.concurrency.min(total);
+        let budget = self.concurrency.clamp(1, MAX_CONCURRENCY).min(total);
         let mut workers = Vec::new();
-        for worker_index in 0..self.concurrency.min(total) {
+        for worker_index in 0..budget {
             let cursor = cursor.clone();
             let items = items.clone();
             let factory = self.factory.clone();
             let sender = sender.clone();
             let job = job.clone();
-            let timeout = self.per_target_timeout;
-            let in_flight = in_flight.clone();
             workers.push(
                 std::thread::Builder::new()
                     .name(format!("nazoauthctl-fleet-worker-{worker_index}"))
@@ -120,21 +107,8 @@ impl FleetReadRunner {
                             if index >= items.len() {
                                 break;
                             }
-                            // Wait until the live-thread count drops below the
-                            // budget: an abandoned-but-running transport holds
-                            // its slot until its thread actually finishes.
-                            while in_flight.load(Ordering::SeqCst) >= budget {
-                                std::thread::sleep(std::time::Duration::from_millis(25));
-                            }
                             let (instance, host) = (&items[index].0, &items[index].1);
-                            let result = execute_one(
-                                instance,
-                                host,
-                                factory.as_ref(),
-                                job.clone(),
-                                timeout,
-                                in_flight.clone(),
-                            );
+                            let result = execute_one(instance, host, factory.as_ref(), job.clone());
                             let _ = sender.send((
                                 index,
                                 FleetItemOutcome {
@@ -180,8 +154,6 @@ fn execute_one(
          dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync
      ),
     job: Arc<ReadJob>,
-    timeout: Duration,
-    in_flight: std::sync::Arc<AtomicUsize>,
 ) -> Result<Value, (String, String)> {
     // Transport construction happens INSIDE the worker thread; the produced
     // target never crosses a thread boundary afterwards.
@@ -194,52 +166,8 @@ fn execute_one(
             ));
         }
     };
-    let instance = instance.clone();
-    let host = host.clone();
-    let host_for_thread = host.clone();
-    let in_flight_inner = in_flight.clone();
-    let (sender, receiver) = mpsc::channel::<anyhow::Result<Value>>();
-    in_flight.fetch_add(1, Ordering::SeqCst);
-    // P1-10: the inner thread owns the counter decrement — on success AND on
-    // the abandoned-timeout path — so a hung transport keeps holding its
-    // concurrency slot until its thread actually exits.
-    let handle = std::thread::Builder::new()
-        .name(format!("nazauthctl-target-{}", host.alias))
-        .spawn(move || {
-            // A send after the receiver was dropped (timeout abandonment)
-            // fails harmlessly; the job is read-only so nothing is lost.
-            let _ = sender.send(job(&instance, &host_for_thread, target.as_ref()));
-            in_flight_inner.fetch_sub(1, Ordering::SeqCst);
-        });
-    let handle = match handle {
-        Ok(handle) => handle,
-        Err(error) => {
-            in_flight.fetch_sub(1, Ordering::SeqCst);
-            return Err((
-                error_codes::HOST_UNREACHABLE.to_owned(),
-                format!("failed to spawn the per-target worker: {error}"),
-            ));
-        }
-    };
-    drop(handle);
-    // Deliberately detached on timeout: the report never blocks behind a hung
-    // transport. Joining here would defeat the whole timeout design. The
-    // thread outlives this call while `in_flight` keeps it inside the
-    // concurrency budget.
-    match receiver.recv_timeout(timeout) {
-        Ok(result) => {
-            result.map_err(|error| (stable_code(&format!("{error:#}")), format!("{error:#}")))
-        }
-        Err(_) => Err((
-            error_codes::HOST_UNREACHABLE.to_owned(),
-            format!(
-                "host '{}' did not answer within {}s; its read-only result was abandoned \
-                 (partial-failure isolation kept every other target's result)",
-                host.alias,
-                timeout.as_secs()
-            ),
-        )),
-    }
+    job(instance, host, target.as_ref())
+        .map_err(|error| (stable_code(&format!("{error:#}")), format!("{error:#}")))
 }
 
 // ------------------------------------------------------------------ jobs
@@ -578,8 +506,9 @@ fn print_single_status(record: &InstanceRecord, host_alias: &str, payload: &Valu
     }
 }
 
-/// Read-only operation-log view (H04): control-side dispatch journal plus,
-/// for local hosts, the authoritative target-side journal projection.
+/// Read-only operation-log view (H04): control-side dispatch journal plus the
+/// authoritative target-side journal projection over the same fixed protocol
+/// for local and SSH targets.
 pub(crate) fn run_operation_view(
     store: &RegistryStore,
     keys: &crate::controller_identity::store::ControllerKeyStore,
@@ -601,16 +530,23 @@ pub(crate) fn run_operation_view(
     )?;
     let pending = journal.load()?;
 
-    // Target side: readable directly only when the deployment actually lives
-    // on THIS machine. Remote journals stay on the target; reading them
-    // through the fixed protocol arrives with K phase.
-    let local_entries = if host.transport == crate::registry::HostTransport::Local {
-        Some(
-            crate::target::TargetJournal::open(crate::target::target_state_root()?)?
-                .operation_log(&record.deployment_id)?,
-        )
-    } else {
-        None
+    let target = crate::fleet::production_target(&host)?;
+    crate::fleet::live_probe(target.as_ref())?;
+    let result = target.execute_host_operation(&crate::target::HostOperation::journal_read(
+        Uuid::now_v7().to_string(),
+        &record.deployment_id,
+        limit,
+    ))?;
+    let entries = match result.outcome {
+        crate::target::HostOutcome::Completed {
+            body: crate::target::HostCompletionBody::JournalRead { entries },
+        } => entries,
+        crate::target::HostOutcome::Completed { .. } => {
+            anyhow::bail!("target returned an unexpected operation-log completion")
+        }
+        crate::target::HostOutcome::Failed { code, detail } => {
+            anyhow::bail!("{code}: {detail}")
+        }
     };
 
     if json_mode {
@@ -621,12 +557,7 @@ pub(crate) fn run_operation_view(
                 "alias": record.alias,
                 "deployment_id": record.deployment_id,
                 "dispatch_journal": pending,
-                "target_operations": local_entries,
-                "remote_note": local_entries.is_none().then(|| format!(
-                    "the operation journal lives on host '{}'; remote journal reading lands \
-                     with the K-phase acceptance work",
-                    host.alias
-                )),
+                "target_operations": entries,
             }))?
         );
         return Ok(());
@@ -646,11 +577,11 @@ pub(crate) fn run_operation_view(
         ),
         None => println!("control dispatch journal: empty"),
     }
-    match &local_entries {
-        Some(entries) if entries.is_empty() => println!("target operations: none recorded"),
-        Some(entries) => {
+    match &entries {
+        entries if entries.is_empty() => println!("target operations: none recorded"),
+        entries => {
             println!("recent target operations:");
-            for entry in entries.iter().rev().take(limit) {
+            for entry in entries.iter().rev() {
                 let outcome = match &entry.outcome {
                     Some(crate::target::OperationOutcomeSummary::Completed) => {
                         "completed".to_owned()
@@ -673,11 +604,55 @@ pub(crate) fn run_operation_view(
                 );
             }
         }
-        None => println!(
-            "target operations: the journal lives on host '{}'; remote journal reading lands \
-             with the K-phase acceptance work",
-            host.alias
-        ),
+    }
+    Ok(())
+}
+
+pub(crate) fn run_logs_view(
+    store: &RegistryStore,
+    selector: Option<&str>,
+    limit: usize,
+    json_mode: bool,
+) -> anyhow::Result<()> {
+    let record = crate::fleet::resolve_instance(store, selector, "logs")?;
+    let host = store.host_by_id(record.host_id)?.with_context(|| {
+        format!(
+            "instance '{}' references missing host {}",
+            record.alias, record.host_id
+        )
+    })?;
+    let target = crate::fleet::production_target(&host)?;
+    crate::fleet::live_probe(target.as_ref())?;
+    let result = target.execute_host_operation(&crate::target::HostOperation::runtime_logs(
+        Uuid::now_v7().to_string(),
+        &record.deployment_id,
+        limit,
+    ))?;
+    let lines = match result.outcome {
+        crate::target::HostOutcome::Completed {
+            body: crate::target::HostCompletionBody::RuntimeLogs { lines },
+        } => lines,
+        crate::target::HostOutcome::Completed { .. } => {
+            anyhow::bail!("target returned an unexpected runtime-log completion")
+        }
+        crate::target::HostOutcome::Failed { code, detail } => {
+            anyhow::bail!("{code}: {detail}")
+        }
+    };
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema": 1,
+                "alias": record.alias,
+                "deployment_id": record.deployment_id,
+                "lines": lines,
+            }))?
+        );
+    } else {
+        for line in lines {
+            println!("{line}");
+        }
     }
     Ok(())
 }
@@ -715,20 +690,13 @@ pub(crate) fn run_backup_view(
         value_str(payload.get("backup_maturity"))
     );
     println!("  maturity is an observation, not a gate: install/update never require it");
-    println!(
-        "  explicit snapshots: nazoauthctl backup snapshot (lands with the K-phase acceptance work)"
-    );
     Ok(())
 }
 
 /// Stable-code classifier shared with the error envelope: scan the rendered
 /// error chain for known stable tokens.
 pub(crate) fn stable_code(rendered: &str) -> String {
-    const ORDERED: [(&str, &str); 15] = [
-        (
-            error_codes::NOT_IMPLEMENTED_BEFORE_K_PHASE,
-            error_codes::NOT_IMPLEMENTED_BEFORE_K_PHASE,
-        ),
+    const ORDERED: [(&str, &str); 14] = [
         (
             error_codes::REMOTE_HELPER_MISMATCH,
             error_codes::REMOTE_HELPER_MISMATCH,

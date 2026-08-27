@@ -56,6 +56,7 @@ pub struct PreparedOperation {
 impl PreparedOperation {
     pub fn request(&self) -> ControlOperationRequest {
         ControlOperationRequest {
+            operation_id: self.signed.operation_id.clone(),
             deployment_id: self.signed.deployment_id.clone(),
             compact_jws: self.signed.compact_jws.clone(),
         }
@@ -371,7 +372,7 @@ mod tests {
             artifact_target: ControlTarget::HostBinary {
                 sha256: "ab".repeat(32),
                 embedded: ControlBuildIdentity {
-                    product: "nazauth".to_owned(),
+                    product: nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT.to_owned(),
                     version: "1.0.0".to_owned(),
                     commit: "9f2c1a7".to_owned(),
                 },

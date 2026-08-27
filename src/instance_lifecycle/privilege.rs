@@ -26,16 +26,16 @@ use anyhow::Context as _;
 pub use crate::error_codes::PRIVILEGE_REQUIRED;
 
 /// The closed set of steps whose privilege requirements this module owns.
-// Only EngineSocketAccess has a live production check today; the full matrix
-// is pinned by tests so a future step cannot silently skip its classification.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PrivilegeStep {
     /// Reading the local instance/host registry.
+    #[cfg(test)]
     RegistryRead,
     /// Reading one deployment's target-side DeploymentState.
+    #[cfg(test)]
     DeploymentStateRead,
     /// Probing `{issuer}/readyz` on loopback.
+    #[cfg(test)]
     HealthProbe,
     /// Talking to the container engine socket (podman/docker info or any
     /// engine mutation).
@@ -43,17 +43,22 @@ pub(crate) enum PrivilegeStep {
     /// Starting/stopping/installing systemd units.
     SystemdUnitManagement,
     /// Binding a privileged (<1024) host port.
+    #[cfg(test)]
     PrivilegedPortBind,
 }
 
 impl PrivilegeStep {
     pub(crate) fn label(self) -> &'static str {
         match self {
+            #[cfg(test)]
             Self::RegistryRead => "registry read",
+            #[cfg(test)]
             Self::DeploymentStateRead => "deployment state read",
+            #[cfg(test)]
             Self::HealthProbe => "local health probe",
             Self::EngineSocketAccess => "container engine socket access",
             Self::SystemdUnitManagement => "systemd unit management",
+            #[cfg(test)]
             Self::PrivilegedPortBind => "privileged port bind",
         }
     }
@@ -78,11 +83,38 @@ impl PrivilegeStep {
             Self::SystemdUnitManagement => {
                 "establish sudo once (`sudo -v` or NOPASSWD) so unit management can run"
             }
+            #[cfg(test)]
             Self::PrivilegedPortBind => {
                 "grant CAP_NET_BIND_SERVICE to the runtime or use an unprivileged port"
             }
+            #[cfg(test)]
             _ => "no elevation is required for this step",
         }
+    }
+}
+
+/// Require the target helper to be running as effective root immediately
+/// before a systemd mutation. Remote transport may establish that identity;
+/// the helper itself never prompts for or stores a password.
+pub(crate) fn ensure_systemd_access() -> Result<(), PrivilegeError> {
+    if !crate::process::command_exists("systemctl") {
+        return Err(PrivilegeError {
+            step: PrivilegeStep::SystemdUnitManagement,
+            detail: "the 'systemctl' binary is not installed on this host".to_owned(),
+        });
+    }
+    let is_root = crate::process::Process::new("id")
+        .arg("-u")
+        .stdout()
+        .map(|uid| uid.trim() == "0")
+        .unwrap_or(false);
+    if is_root {
+        Ok(())
+    } else {
+        Err(PrivilegeError {
+            step: PrivilegeStep::SystemdUnitManagement,
+            detail: "the target helper is not running with effective uid 0".to_owned(),
+        })
     }
 }
 

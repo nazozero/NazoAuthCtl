@@ -19,7 +19,7 @@ use crate::controller_identity::store::{ControllerKeyStore, controller_key_ref_f
 use crate::filesystem::PrivateTempDir;
 use crate::registry::{DiscoveryEvidence, InstanceRecord, RegistryStore};
 use crate::target::{
-    ExecutionTarget, Failure, LocalTarget, TargetStateStore,
+    ExecutionTarget, Failure, InstanceInspection, LocalTarget, TargetStateStore,
     control_exec::{CONTROL_OUTCOME_UNKNOWN, ControlJob, ControlOperationExecutor},
     uninstall_exec::{DeletionExecutor, DeletionJob},
     update_exec::{ACTIVATION_FAILED, LifecycleExecutor, LifecycleFacts, RollbackJob, UpdateJob},
@@ -84,9 +84,8 @@ impl ControlOperationExecutor for ScriptedControl {
     }
 }
 
-/// Scripted lifecycle order executor performing the REAL state commit the
-/// production executor performs at its tail.
 struct ScriptedLifecycle {
+    control: Arc<ScriptedControl>,
     fail_update_activation: Mutex<bool>,
     update_calls: Mutex<u32>,
     rollback_calls: Mutex<u32>,
@@ -101,6 +100,22 @@ impl ScriptedLifecycle {
 impl LifecycleExecutor for ScriptedLifecycle {
     fn execute_update(&self, job: &UpdateJob<'_>) -> Result<LifecycleFacts, Failure> {
         *self.update_calls.lock().unwrap() += 1;
+        if let Some(jws) = job.migration_jws {
+            let res = self.control.execute(&ControlJob {
+                operation_id: job.operation_id,
+                deployment_id: job.deployment_id,
+                runtime_kind: job.runtime_kind,
+                runtime_object: job.runtime_object,
+                artifact_reference: job.current_artifact,
+                config_reference: job.config_reference,
+                data_root: job.data_root,
+                scope_dir: job.scope_dir,
+                compact_jws: jws,
+            })?;
+            if res.outcome != ControlOutcome::Succeeded {
+                return Err(Failure::new("MIGRATION_FAILED", "migration failed durably"));
+            }
+        }
         if *self.fail_update_activation.lock().unwrap() {
             // Contract: undo own partial work before failing; the state
             // document was never touched because apply_update runs last.
@@ -116,7 +131,7 @@ impl LifecycleExecutor for ScriptedLifecycle {
             job.deployment_id,
             job.expected_revision,
             NEW_REF.to_owned(),
-            Some(crate::target::BuildIdentity::new("nazauth", "v9", "commit").expect("identity")),
+            Some(crate::target::BuildIdentity::new("nazoauth", "v9", "commit").expect("identity")),
             config,
             job.operation_id,
         )?;
@@ -129,7 +144,7 @@ impl LifecycleExecutor for ScriptedLifecycle {
         Ok(LifecycleFacts {
             revision: state.config.revision,
             build_identity: Some(
-                crate::target::BuildIdentity::new("nazauth", "v9", "commit").expect("identity"),
+                crate::target::BuildIdentity::new("nazoauth", "v9", "commit").expect("identity"),
             ),
         })
     }
@@ -174,6 +189,27 @@ impl DeletionExecutor for ScriptedDeletion {
     }
 }
 
+struct ScriptedArtifactResolver {
+    target_digest: String,
+    fail_verify: Mutex<bool>,
+}
+
+impl super::TargetArtifactResolver for ScriptedArtifactResolver {
+    fn resolve_target_artifact(
+        &self,
+        _pinned: &crate::target::OfficialArtifactRef,
+        _inspection: &InstanceInspection,
+    ) -> anyhow::Result<super::VerifiedTargetArtifact> {
+        if *self.fail_verify.lock().unwrap() {
+            anyhow::bail!("simulated official release verification failure");
+        }
+        Ok(super::VerifiedTargetArtifact {
+            digest: self.target_digest.clone(),
+            identity: crate::target::BuildIdentity::new("nazoauth", "v9.9.9", "commit-new")?,
+        })
+    }
+}
+
 struct Fixture {
     _temp: PrivateTempDir,
     context: LifecycleContext,
@@ -181,8 +217,8 @@ struct Fixture {
     state_root: std::path::PathBuf,
     control: Arc<ScriptedControl>,
     lifecycle: Arc<ScriptedLifecycle>,
-    #[allow(dead_code)] // asserted indirectly via call counters
     deletion: Arc<ScriptedDeletion>,
+    resolver: Arc<ScriptedArtifactResolver>,
 }
 
 impl Fixture {
@@ -215,7 +251,7 @@ impl Fixture {
         };
         let resources = vec![
             crate::target::Resource::new(
-                "state-dir",
+                "app-data",
                 "directory",
                 temp.path().join("data").to_string_lossy().as_ref(),
                 crate::target::ResourceOwnership::Managed,
@@ -239,7 +275,7 @@ impl Fixture {
                 config_schema: "nazauth-seed-v1".to_owned(),
                 resources,
                 current_build_identity: Some(
-                    crate::target::BuildIdentity::new("nazauth", "v1", "base").expect("identity"),
+                    crate::target::BuildIdentity::new("nazoauth", "v1", "base").expect("identity"),
                 ),
             },
             "bootstrap-op-0001",
@@ -267,6 +303,7 @@ impl Fixture {
             fail_business: Mutex::new(false),
         });
         let lifecycle = Arc::new(ScriptedLifecycle {
+            control: control.clone(),
             fail_update_activation: Mutex::new(false),
             update_calls: Mutex::new(0),
             rollback_calls: Mutex::new(0),
@@ -276,11 +313,16 @@ impl Fixture {
             .with_control_executor(control.clone())
             .with_lifecycle_executor(lifecycle.clone())
             .with_deletion_executor(deletion.clone());
+        let resolver = Arc::new(ScriptedArtifactResolver {
+            target_digest: NEW_REF.to_owned(),
+            fail_verify: Mutex::new(false),
+        });
         let context = LifecycleContext {
             registry,
             factory: Box::new(move |_record| {
                 Ok(Box::new(target.clone()) as Box<dyn ExecutionTarget + Send>)
             }),
+            resolver: resolver.clone(),
         };
         Ok(Self {
             _temp: temp,
@@ -290,6 +332,7 @@ impl Fixture {
             control,
             lifecycle,
             deletion,
+            resolver,
         })
     }
 
@@ -490,7 +533,7 @@ fn uninstall_plan_and_operation_log_keep_external_resources_listed() -> anyhow::
     // The destructive path received ONLY the managed resource — the external
     // locator never enters a deletion order.
     let planned = fixture.deletion.planned.lock().unwrap().clone();
-    assert_eq!(planned, vec!["state-dir".to_owned()], "{planned:?}");
+    assert_eq!(planned, vec!["app-data".to_owned()], "{planned:?}");
 
     // The journaled operation log records the uninstall as one terminal,
     // completed mutation beside the retained journal.
@@ -643,8 +686,8 @@ fn durable_failed_migration_terminates_update_before_activation() -> anyhow::Res
         "{error}"
     );
 
-    // The lifecycle order never ran: no activation, no state advance.
-    assert_eq!(*fixture.lifecycle.update_calls.lock().unwrap(), 0);
+    // The update order ran migration, aborted before activation, and committed no state advance.
+    assert_eq!(*fixture.lifecycle.update_calls.lock().unwrap(), 1);
     let state = fixture.store()?.load_existing(DEPLOYMENT)?;
     assert_eq!(state.artifact.current.as_deref(), Some(CURRENT_REF));
     assert_eq!(state.config.revision, 1);
@@ -687,5 +730,36 @@ fn durable_failed_migration_rerun_replays_failure_without_new_dispatch_identitie
         1,
         "identical inputs keep one operation identity across replays"
     );
+    Ok(())
+}
+
+#[test]
+fn release_verification_failure_fails_closed_without_touching_state() -> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    *fixture.resolver.fail_verify.lock().unwrap() = true;
+
+    let request = UpdateRequest {
+        instance: Some(format!("inst-{DEPLOYMENT}")),
+        version: Some("v9.9.9".to_owned()),
+        expected_artifact_sha256: None,
+        config_content: None,
+        config_schema: None,
+    };
+    let error = super::update::run_update(&fixture.context, &fixture.keys, &request)
+        .expect_err("verification failure must fail-closed immediately");
+
+    assert!(
+        error
+            .to_string()
+            .contains("official release verification failure"),
+        "{error}"
+    );
+
+    // Target state and control dispatch were never touched.
+    assert_eq!(*fixture.lifecycle.update_calls.lock().unwrap(), 0);
+    assert!(fixture.control.presented.lock().unwrap().is_empty());
+    let state = fixture.store()?.load_existing(DEPLOYMENT)?;
+    assert_eq!(state.artifact.current.as_deref(), Some(CURRENT_REF));
+    assert_eq!(state.config.revision, 1);
     Ok(())
 }

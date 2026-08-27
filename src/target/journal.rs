@@ -164,7 +164,8 @@ pub struct JournalLine {
 /// Read-only projection of one journal line for status/doctor style surfaces
 /// (H04; CLI wiring lands with the I wave). Never carries secret material:
 /// HostResult payloads are already sanitized at the wire boundary.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationLogEntry {
     pub operation_id: String,
     /// Closed wire kind token (`state-mutate`, `control-operation`, ...).
@@ -176,7 +177,8 @@ pub struct OperationLogEntry {
 }
 
 /// Outcome half of an [`OperationLogEntry`].
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum OperationOutcomeSummary {
     Completed,
     Failed { code: String, detail: String },
@@ -290,6 +292,11 @@ impl TargetJournal {
         )?;
         self.compact_if_needed(&path)?;
         let result = execute(operation);
+        if let super::wire::HostOutcome::Failed { ref code, .. } = result.outcome
+            && (code == "CONTROL_OUTCOME_UNKNOWN" || code == "OUTCOME_UNKNOWN")
+        {
+            return Ok(result);
+        }
         self.append(
             &path,
             &JournalLine {

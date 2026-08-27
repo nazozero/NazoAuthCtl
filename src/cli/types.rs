@@ -41,7 +41,7 @@ pub(crate) struct Cli {
 ///
 /// ```text
 /// host instance controller install discover bind status logs doctor verify
-/// update rollback operation policy backup recover oidf uninstall
+/// update rollback operation backup oidf uninstall
 /// ```
 ///
 /// `oidf` is parsed by the binary entrypoint (`crates/nazoauthctl`) before
@@ -70,10 +70,10 @@ pub(crate) enum Command {
         selector: InstanceSelector,
         all: bool,
     },
-    /// Application log view of one instance (primitive lands in K phase).
+    /// Bounded, redacted application log tail for one instance.
     Logs {
-        #[allow(dead_code)] // selector applies once the K-phase read kind exists
         selector: InstanceSelector,
+        limit: usize,
     },
     /// Health/security diagnostics; `--all` fans out over the fleet.
     Doctor {
@@ -96,15 +96,8 @@ pub(crate) enum Command {
         selector: InstanceSelector,
         limit: usize,
     },
-    /// Explicit policy store (lands in K phase).
-    Policy,
-    /// Backup maturity facts plus the explicit snapshot entry point (H05).
+    /// Backup maturity facts observed from the deployment (H05).
     Backup(BackupArgs),
-    /// Data/artifact disaster recovery beyond rollback (lands in K phase).
-    Recover {
-        #[allow(dead_code)] // selector applies once the K-phase restore exists
-        selector: InstanceSelector,
-    },
     /// Exact deletion of managed + deployment-scoped resources (G06).
     Uninstall {
         selector: InstanceSelector,
@@ -167,8 +160,6 @@ pub(crate) enum ControllerCommand {
         label: String,
         secret_file: Option<PathBuf>,
         rotate_secret: bool,
-        /// Fresh-2FA approval token for proactive root rotation (D12).
-        approval_token: Option<String>,
         admin_access_file: Option<PathBuf>,
         /// Delivery channel for the REPLACEMENT Recovery Secret. The secret
         /// is delivered BEFORE the irreversible commit; interactive runs
@@ -325,11 +316,10 @@ pub(crate) struct UpdateArgs {
     pub(crate) yes: bool,
 }
 
-/// Backup arguments (H05 display + K-phase snapshot entry point).
+/// Backup maturity display arguments (H05).
 #[derive(Debug)]
 pub(crate) struct BackupArgs {
     pub(crate) selector: InstanceSelector,
-    pub(crate) snapshot: bool,
 }
 
 /// Bootstrap claim arguments (G02).

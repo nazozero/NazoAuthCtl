@@ -2,10 +2,8 @@
 //! task G-wave decision 1).
 //!
 //! A `control-operation` HostOperation makes the target invoke its LOCAL
-//! NazoAuth one-shot operator — the exact binary the legacy runtime drove as
-//! `nazauth operator-task` inside the deployment's verified OCI artifact (or
-//! the `operator-task` host binary on systemd targets, see legacy
-//! `src/runtime.rs` argv patterns) — with the compact JWS on stdin and a
+//! NazoAuth one-shot operator inside the deployment's verified OCI artifact,
+//! with the compact JWS on stdin and a
 //! single-line durable [`ControlResult`] on stdout under a bounded timeout.
 //! The target never parses, verifies, or authorizes the envelope: admission,
 //! accept-once journaling, and execution stay entirely server-side.
@@ -24,8 +22,8 @@
 //! engines never spawn on development machines.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nazo_operator_protocol::ControlResult;
 
 use super::deployment_state::Failure;
@@ -37,7 +35,7 @@ use super::wire::{HOST_ERR_OPERATION_INVALID, sanitize};
 pub const CONTROL_OUTCOME_UNKNOWN: &str = "CONTROL_OUTCOME_UNKNOWN";
 
 /// Stable failure code: the local NazoAuth operator could not be invoked at
-/// all (engine missing, systemd backend not integrated in this wave). No
+/// all (engine missing or unsupported runtime backend). No
 /// envelope was presented to any authority.
 pub const CONTROL_EXECUTION_UNAVAILABLE: &str = "CONTROL_EXECUTION_UNAVAILABLE";
 
@@ -55,6 +53,9 @@ pub(crate) struct ControlJob<'a> {
     pub artifact_reference: &'a str,
     pub runtime_kind: &'a str,
     pub runtime_object: &'a str,
+    pub config_reference: &'a str,
+    pub data_root: &'a str,
+    pub scope_dir: &'a Path,
     pub compact_jws: &'a str,
 }
 
@@ -72,40 +73,42 @@ pub(crate) struct HostControlOperator;
 impl ControlOperationExecutor for HostControlOperator {
     fn execute(&self, job: &ControlJob<'_>) -> Result<ControlResult, Failure> {
         let kind = match job.runtime_kind {
-            "podman" => crate::deployment::RuntimeBackendKind::Podman,
-            "docker" => crate::deployment::RuntimeBackendKind::Docker,
-            // The systemd host backend joins the lifecycle waves with the
-            // K-phase integration, exactly like the install order.
+            "podman" => crate::runtime_backend::RuntimeBackendKind::Podman,
+            "docker" => crate::runtime_backend::RuntimeBackendKind::Docker,
+            "host" | "systemd" => crate::runtime_backend::RuntimeBackendKind::Systemd,
             other => {
                 return Err(Failure::new(
                     CONTROL_EXECUTION_UNAVAILABLE,
                     format!(
-                        "deployment '{}': the '{other}' runtime backend cannot drive the local \
-                         NazoAuth operator yet; use Podman or Docker deployments",
+                        "deployment '{}': unsupported runtime backend '{other}'",
                         sanitize(job.deployment_id.to_owned())
                     ),
                 ));
             }
         };
         let backend = crate::runtime_backend::backend(kind);
-        if let Err(error) = crate::instance_lifecycle::privilege::ensure_engine_access(
-            job.runtime_kind,
-            &crate::instance_lifecycle::privilege::ProcessPrivilegeProbe,
-        ) {
+        if kind != crate::runtime_backend::RuntimeBackendKind::Systemd {
+            if let Err(error) = crate::instance_lifecycle::privilege::ensure_engine_access(
+                job.runtime_kind,
+                &crate::instance_lifecycle::privilege::ProcessPrivilegeProbe,
+            ) {
+                return Err(Failure::new(error.code(), sanitize(error.to_string())));
+            }
+        } else if let Err(error) = crate::instance_lifecycle::privilege::ensure_systemd_access() {
             return Err(Failure::new(error.code(), sanitize(error.to_string())));
         }
         let observation = backend
             .inspect(job.runtime_object)
             .map_err(|error| Failure::new(CONTROL_TARGET_DRIFT, sanitize(error.to_string())))?;
-        let crate::runtime_backend::ArtifactReference::Oci {
-            image_reference: _,
-            digest,
-        } = &observation.artifact
-        else {
-            return Err(Failure::new(
-                CONTROL_TARGET_DRIFT,
-                "the running runtime object does not report a digest-bound OCI artifact",
-            ));
+        let digest = match &observation.artifact {
+            crate::runtime_backend::ArtifactReference::Oci { digest, .. } => digest,
+            crate::runtime_backend::ArtifactReference::HostBinary { sha256, .. } => sha256,
+            crate::runtime_backend::ArtifactReference::Unknown => {
+                return Err(Failure::new(
+                    CONTROL_TARGET_DRIFT,
+                    "the running runtime object does not report a digest-bound artifact",
+                ));
+            }
         };
         let expected = job
             .artifact_reference
@@ -123,19 +126,53 @@ impl ControlOperationExecutor for HostControlOperator {
             ));
         }
 
+        let systemd = kind == crate::runtime_backend::RuntimeBackendKind::Systemd;
+        let mut environment = BTreeMap::new();
+        let mut read_only_paths = Vec::new();
+        let mut read_write_paths = Vec::new();
+        if systemd {
+            environment.insert(
+                super::install_exec::SERVER_CONFIG_FILE_ENV.to_owned(),
+                job.config_reference.to_owned(),
+            );
+            environment.insert(
+                "NAZOAUTH_OPERATOR_CONFIG_REVISION_FILE".to_owned(),
+                job.scope_dir
+                    .join("config-revision")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            environment.insert(
+                "NAZOAUTH_OPERATOR_STATE_DIRECTORY".to_owned(),
+                Path::new(job.data_root)
+                    .join("operator-state")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            read_only_paths.push(PathBuf::from(job.config_reference));
+            read_write_paths.push(PathBuf::from(job.data_root));
+        }
         let task = crate::runtime_backend::OneShotTask {
             artifact: observation.artifact.clone(),
             // The frozen NazoAuth one-shot entry: compact JWS on stdin, the
-            // durable ControlResult JSON on stdout (legacy `operator-task`).
-            command: vec!["nazauth".to_owned(), "operator-task".to_owned()],
+            // durable ControlResult JSON on stdout.
+            command: vec!["nazoauth".to_owned(), "operator-task".to_owned()],
             network: observation.networks.first().cloned(),
             mounts: observation.mounts.clone(),
-            environment: BTreeMap::new(),
-            working_directory: Some(std::path::PathBuf::from("/app")),
-            service_user: Some(crate::runtime_backend::NON_ROOT_ONE_SHOT_USER.to_owned()),
+            environment,
+            working_directory: if systemd {
+                Some(PathBuf::from(job.data_root))
+            } else {
+                Some(PathBuf::from("/app"))
+            },
+            service_user: Some(if systemd {
+                super::update_exec::systemd_service_user(job.deployment_id)
+            } else {
+                crate::runtime_backend::NON_ROOT_ONE_SHOT_USER.to_owned()
+            }),
             transient_credentials: BTreeMap::new(),
-            read_only_paths: Vec::new(),
-            read_write_paths: Vec::new(),
+            read_only_paths,
+            read_write_paths,
             inaccessible_paths: Vec::new(),
             private_mounts: false,
             stdin: format!("{}\n", job.compact_jws).into_bytes(),
@@ -185,25 +222,4 @@ pub(crate) fn decode_operator_answer(
         ));
     }
     Ok(result)
-}
-
-/// Extract the operation id carried by a compact JWS payload segment without
-/// verifying it. Verification is the server's job; this exists only so the
-/// transport can refuse answers that do not echo the presented identity.
-pub(crate) fn control_operation_id_from_jws(compact_jws: &str) -> anyhow::Result<String> {
-    use anyhow::Context as _;
-    let mut segments = compact_jws.split('.');
-    let (_, payload, _) = match (segments.next(), segments.next(), segments.next()) {
-        (Some(p), Some(l), Some(s)) if !p.is_empty() && !l.is_empty() && !s.is_empty() => (p, l, s),
-        _ => anyhow::bail!("compact_jws is not a three-segment JWS"),
-    };
-    let bytes = URL_SAFE_NO_PAD
-        .decode(payload.as_bytes())
-        .context("compact_jws payload is not base64url")?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).context("compact_jws payload is not JSON")?;
-    Ok(value["operation_id"]
-        .as_str()
-        .context("compact_jws payload carries no operation_id")?
-        .to_owned())
 }

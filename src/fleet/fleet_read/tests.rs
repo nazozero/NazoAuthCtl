@@ -11,8 +11,6 @@ use std::sync::atomic::AtomicUsize;
 enum Scenario {
     Online,
     Offline(&'static str),
-    /// Sleep longer than the runner timeout before answering.
-    Slow(u64),
 }
 
 struct ScriptedTarget {
@@ -40,7 +38,6 @@ impl ScriptedTarget {
             backup_maturity: crate::target::BackupMaturity::Unknown,
             active_host_operation: None,
             config_revision_marker: None,
-            bootstrap_material: None,
         })
     }
 }
@@ -51,9 +48,6 @@ impl ExecutionTarget for ScriptedTarget {
     }
 
     fn inspect_instance(&self, deployment_id: &str) -> anyhow::Result<InstanceInspection> {
-        if let Scenario::Slow(millis) = self.scenario {
-            std::thread::sleep(std::time::Duration::from_millis(millis));
-        }
         self.inspection(deployment_id)
     }
 
@@ -176,7 +170,7 @@ fn partial_failure_is_isolated_and_order_is_stable() -> anyhow::Result<()> {
         };
         Ok(Box::new(ScriptedTarget { scenario }) as Box<dyn ExecutionTarget + Send>)
     });
-    let runner = FleetReadRunner::new(factory, MAX_CONCURRENCY, Duration::from_secs(5));
+    let runner = FleetReadRunner::new(factory, MAX_CONCURRENCY);
     let outcomes = runner.run(items, job());
     assert_eq!(outcomes.len(), 3);
     assert_eq!(outcomes[0].instance.alias, "prod-a");
@@ -187,36 +181,6 @@ fn partial_failure_is_isolated_and_order_is_stable() -> anyhow::Result<()> {
     let (code, detail) = outcomes[2].result.as_ref().expect_err("offline").clone();
     assert_eq!(code, error_codes::HOST_UNREACHABLE, "{detail}");
     assert!(detail.contains("exited 255"), "{detail}");
-    Ok(())
-}
-
-#[test]
-fn slow_targets_time_out_without_blocking_the_rest() -> anyhow::Result<()> {
-    type Factory =
-        Arc<dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync>;
-    let factory: Factory = Arc::new(|record: &HostRecord| {
-        let scenario = if record.alias == "server-a" {
-            Scenario::Slow(400)
-        } else {
-            Scenario::Online
-        };
-        Ok(Box::new(ScriptedTarget { scenario }) as Box<dyn ExecutionTarget + Send>)
-    });
-    let runner = FleetReadRunner::new(factory, 4, Duration::from_millis(80));
-    let fixture = Fixture::new()?;
-    let items = fixture.items()?;
-    let start = std::time::Instant::now();
-    let outcomes = runner.run(items, job());
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(3),
-        "timeout must bound the run: {elapsed:?}"
-    );
-    let (code, detail) = outcomes[0].result.as_ref().expect_err("slow").clone();
-    assert_eq!(code, error_codes::HOST_UNREACHABLE, "{detail}");
-    assert!(detail.contains("did not answer within"), "{detail}");
-    assert!(outcomes[1].result.is_ok());
-    assert!(outcomes[2].result.is_ok());
     Ok(())
 }
 
@@ -283,7 +247,7 @@ fn concurrency_is_bounded_by_the_cap() -> anyhow::Result<()> {
             max_seen: max_clone.clone(),
         }) as Box<dyn ExecutionTarget + Send>)
     });
-    let runner = FleetReadRunner::new(factory, PROBE_CONCURRENCY, Duration::from_secs(10));
+    let runner = FleetReadRunner::new(factory, PROBE_CONCURRENCY);
     let probe_job: std::sync::Arc<ReadJob> = Arc::new(
         |_instance: &InstanceRecord,
          _host: &HostRecord,
@@ -321,139 +285,4 @@ fn stable_code_maps_transport_tokens() {
         stable_code("SUDO_PASSWORD_REQUIRED: sudo refused"),
         error_codes::PRIVILEGE_REQUIRED
     );
-}
-
-/// P1-10 leak test: after a timeout abandons a hung transport, that hung
-/// thread must keep holding a concurrency slot. With cap=2 and one hung
-/// host, the remaining fast targets may only run ONE at a time (2 slots −
-/// 1 held by the hang) until the hang finally finishes — the peak measured
-/// concurrency of the surviving targets therefore stays strictly below cap
-/// while the hang is alive.
-#[test]
-fn hung_transport_after_timeout_keeps_its_concurrency_slot() -> anyhow::Result<()> {
-    const CAP: usize = 3;
-    let live_jobs = Arc::new(AtomicUsize::new(0));
-    let max_live = Arc::new(AtomicUsize::new(0));
-    // The hung job sleeps far longer than the runner timeout, so its inner
-    // thread is abandoned mid-flight exactly like a real network hang.
-    struct HangTarget {
-        live: Arc<AtomicUsize>,
-        max: Arc<AtomicUsize>,
-        /// Deployment ids whose inspect call must hang past the timeout.
-        hangs: Vec<String>,
-        hang_millis: u64,
-    }
-    impl ExecutionTarget for HangTarget {
-        fn inspect_host(&self) -> anyhow::Result<HostOverview> {
-            unreachable!()
-        }
-        fn inspect_instance(&self, deployment_id: &str) -> anyhow::Result<InstanceInspection> {
-            let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max.fetch_max(now, Ordering::SeqCst);
-            if self.hangs.iter().any(|id| id == deployment_id) {
-                std::thread::sleep(Duration::from_millis(self.hang_millis));
-            } else {
-                std::thread::sleep(Duration::from_millis(self.hang_millis.min(10)));
-            }
-            self.live.fetch_sub(1, Ordering::SeqCst);
-            self.inspection_for_probe()
-        }
-        fn execute_host_operation(&self, _operation: &HostOperation) -> anyhow::Result<HostResult> {
-            unreachable!()
-        }
-        fn execute_control_operation(
-            &self,
-            _request: &ControlOperationRequest,
-        ) -> anyhow::Result<ControlOperationReceipt> {
-            unreachable!()
-        }
-        fn read_health(&self, _deployment_id: &str) -> anyhow::Result<HealthSnapshot> {
-            unreachable!()
-        }
-    }
-    impl HangTarget {
-        fn inspection_for_probe(&self) -> anyhow::Result<InstanceInspection> {
-            Ok(InstanceInspection {
-                current_build_identity: None,
-                deployment_id: "probe".to_owned(),
-                issuer: "https://auth.example.com".to_owned(),
-                observed_at: chrono::Utc::now(),
-                revision: 1,
-                runtime: RuntimeSurface::new("podman", "nazoauth-probe")?,
-                artifact: Default::default(),
-                config_reference: "/cfg".to_owned(),
-                config_schema: "v1".to_owned(),
-                resources: vec![],
-                healthy: true,
-                health_summary: "ok".to_owned(),
-                backup_maturity: crate::target::BackupMaturity::Unknown,
-                active_host_operation: None,
-                config_revision_marker: None,
-                bootstrap_material: None,
-            })
-        }
-    }
-
-    let temp = PrivateTempDir::new("nazauthctl-fleet-hang-test")?;
-    let store = RegistryStore::open(temp.path().join("registry"))?;
-    let host = store.ensure_local_host()?;
-    for index in 0..6 {
-        store.add_instance(InstanceRecord::new(
-            format!("deploy-{index:02}"),
-            format!("inst-{index:02}"),
-            host.host_id,
-            "https://auth.example.com",
-            "ref",
-        )?)?;
-    }
-    let mut items = Vec::new();
-    for instance in store.list_instances()? {
-        items.push((instance, host.clone()));
-    }
-    // Mix: deploy-00/deploy-01 hang past the timeout; the rest are instant.
-    // With cap=3, at most ONE fast target may run while both hangs are
-    // abandoned-but-alive.
-    let hangs = ["deploy-00".to_owned(), "deploy-01".to_owned()];
-    let live_clone = live_jobs.clone();
-    let max_clone = max_live.clone();
-    type Factory =
-        Arc<dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync>;
-    let factory: Factory = Arc::new(move |_record: &HostRecord| {
-        Ok(Box::new(HangTarget {
-            live: live_clone.clone(),
-            max: max_clone.clone(),
-            hangs: hangs.to_vec(),
-            hang_millis: 5_000,
-        }) as Box<dyn ExecutionTarget + Send>)
-    });
-    let runner = FleetReadRunner::new(factory, CAP, Duration::from_millis(400));
-    let probe_job: std::sync::Arc<ReadJob> = Arc::new(
-        |instance: &InstanceRecord,
-         _host: &HostRecord,
-         target: &dyn ExecutionTarget|
-         -> anyhow::Result<serde_json::Value> {
-            target.inspect_instance(&instance.deployment_id)?;
-            Ok(json!({}))
-        },
-    );
-    let outcomes = runner.run(items, probe_job);
-    assert_eq!(outcomes.len(), 6);
-    // Two targets timed out (the hangs); four answered.
-    let timeouts = outcomes
-        .iter()
-        .filter(|outcome| matches!(&outcome.result, Err((code, _)) if code == error_codes::HOST_UNREACHABLE))
-        .count();
-    assert!(
-        timeouts >= 2,
-        "expected the two hangs to time out: {timeouts}"
-    );
-    // While both hangs were alive only one slot remained for everyone else:
-    // the observed peak among FAST jobs can never reach the full cap during
-    // that window, and overall it never exceeds the cap itself.
-    assert!(
-        max_live.load(Ordering::SeqCst) <= CAP,
-        "cap violated with a hung transport in flight: {}",
-        max_live.load(Ordering::SeqCst)
-    );
-    Ok(())
 }

@@ -55,6 +55,25 @@ const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 /// historical call site keeps one stable path.
 pub use crate::error_codes::STATE_RESET_REQUIRED;
 
+fn check_obsolete_paths_absent() -> anyhow::Result<()> {
+    let obsolete_paths = [
+        PathBuf::from("/etc/nazoauthctl/registry.json"),
+        PathBuf::from("/var/lib/nazoauthctl/deployments"),
+        #[cfg(windows)]
+        PathBuf::from(r"C:\ProgramData\nazoauthctl\registry.json"),
+    ];
+    for path in obsolete_paths {
+        if path.exists() {
+            anyhow::bail!(
+                "{STATE_RESET_REQUIRED}: obsolete ctl state detected at {}; back up application \
+                 data, remove the obsolete ctl state, then discover or adopt the deployment again",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Maximum length of a user-facing selector or reference string.
 const MAX_KEY_CHARS: usize = 128;
 
@@ -453,6 +472,7 @@ pub struct RegistryStore {
 impl RegistryStore {
     /// Open (creating if needed) the store layout under `root`.
     pub fn open(root: PathBuf) -> anyhow::Result<Self> {
+        check_obsolete_paths_absent()?;
         filesystem::ensure_private_directory(&root, "registry root")?;
         let store = Self { root };
         filesystem::ensure_private_directory(&store.hosts_dir(), "registry hosts directory")
@@ -950,6 +970,14 @@ enum Directory {
 fn write_record<T: Serialize>(path: &Path, label: &str, record: &T) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec_pretty(record)
         .with_context(|| format!("failed to serialize {label} {}", path.display()))?;
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        anyhow::bail!(
+            "refusing to persist {label} {}: serialized size {} bytes exceeds limit of {} bytes",
+            path.display(),
+            bytes.len(),
+            MAX_RECORD_BYTES
+        );
+    }
     filesystem::atomic_write(path, &bytes, 0o600)
         .with_context(|| format!("failed to persist {label} {}", path.display()))
 }

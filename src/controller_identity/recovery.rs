@@ -28,15 +28,161 @@ use nazo_operator_protocol::{
     RecoveryProposal, derive_recovery_seed, format_recovery_secret, parse_recovery_secret,
     recovery_kid, recovery_public_key_bytes,
 };
+use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize as _, Zeroizing};
 
 use super::admin_api::{
-    ControllerRegistryApi, RecoveryAnswerBody, RecoveryChallengeBody, RecoveryRootApprovalBody,
-    RecoveryRootRotateBody,
+    AdminApiError, ControllerRegistryApi, RecoveryAnswerBody, RecoveryChallengeBody,
+    RecoveryRootApprovalBody, RecoveryRootRotateBody,
 };
 use crate::controller_identity::store::{ControllerKeyStore, controller_key_ref_for};
+use crate::file_lock::FileLock;
+use crate::filesystem;
 use crate::fleet::resolve_instance;
 use crate::registry::RegistryStore;
+
+const PENDING_RECOVERY_SCHEMA: u32 = 1;
+const MAX_PENDING_RECOVERY_BYTES: u64 = 16 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingRecovery {
+    schema: u32,
+    deployment_id: String,
+    candidate_kid: String,
+    answer: RecoveryAnswerBody,
+}
+
+fn pending_recovery_path(
+    keys: &ControllerKeyStore,
+    deployment_id: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    Ok(keys
+        .instance_dir(deployment_id)?
+        .join("recovery-pending.json"))
+}
+
+fn load_pending_recovery(
+    keys: &ControllerKeyStore,
+    deployment_id: &str,
+) -> anyhow::Result<Option<PendingRecovery>> {
+    let path = pending_recovery_path(keys, deployment_id)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    }
+    let bytes = filesystem::read_secure_regular_file(
+        &path,
+        "pending recovery submission",
+        false,
+        MAX_PENDING_RECOVERY_BYTES,
+    )?;
+    let pending: PendingRecovery = serde_json::from_slice(&bytes)
+        .with_context(|| format!("pending recovery submission is invalid: {}", path.display()))?;
+    if pending.schema != PENDING_RECOVERY_SCHEMA
+        || pending.deployment_id != deployment_id
+        || pending.answer.deployment_id != deployment_id
+        || pending.candidate_kid.is_empty()
+    {
+        bail!("pending recovery submission does not match deployment '{deployment_id}'");
+    }
+    Ok(Some(pending))
+}
+
+fn save_pending_recovery(
+    keys: &ControllerKeyStore,
+    pending: &PendingRecovery,
+) -> anyhow::Result<()> {
+    let path = pending_recovery_path(keys, &pending.deployment_id)?;
+    let bytes =
+        serde_json::to_vec_pretty(pending).context("serializing pending recovery failed")?;
+    filesystem::atomic_write(&path, &bytes, 0o600)
+        .with_context(|| format!("failed to persist resumable recovery at {}", path.display()))
+}
+
+fn clear_pending_recovery(keys: &ControllerKeyStore, deployment_id: &str) -> anyhow::Result<()> {
+    let path = pending_recovery_path(keys, deployment_id)?;
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Ok(());
+    }
+    filesystem::remove_file_durable(&path)
+        .with_context(|| format!("failed to clear {}", path.display()))
+}
+
+fn finish_recovery(
+    registry: &RegistryStore,
+    keys: &ControllerKeyStore,
+    deployment_id: &str,
+    candidate_kid: &str,
+    commit: super::admin_api::RecoveryCommitView,
+) -> anyhow::Result<RecoveredIdentity> {
+    if commit.slot.deployment_id != deployment_id || commit.slot.kid != candidate_kid {
+        bail!("recovery result does not match the locally staged controller identity");
+    }
+    keys.set_active_kid(deployment_id, candidate_kid)?;
+    let key_ref = controller_key_ref_for(deployment_id)?;
+    registry.update_controller_binding(
+        deployment_id,
+        Some(commit.slot.controller_id.as_str()),
+        Some(key_ref.as_str()),
+    )?;
+    clear_pending_recovery(keys, deployment_id)?;
+    Ok(RecoveredIdentity {
+        controller_id: commit.slot.controller_id,
+        kid: commit.slot.kid,
+        expires_at: commit.slot.expires_at,
+        recovery_generation: commit.recovery_generation,
+    })
+}
+
+fn submit_pending_recovery(
+    registry: &RegistryStore,
+    keys: &ControllerKeyStore,
+    api: &dyn ControllerRegistryApi,
+    pending: &PendingRecovery,
+) -> anyhow::Result<RecoveredIdentity> {
+    match api.submit_recovery_answer(&pending.answer) {
+        Ok(commit) => finish_recovery(
+            registry,
+            keys,
+            &pending.deployment_id,
+            &pending.candidate_kid,
+            commit,
+        ),
+        Err(error @ (AdminApiError::Transport(_) | AdminApiError::MalformedResponse(_))) => {
+            let path = pending_recovery_path(keys, &pending.deployment_id)?;
+            Err(anyhow::anyhow!(error)).with_context(|| {
+                format!(
+                    "recovery outcome is unknown; the exact signed submission remains at {} \
+                     and will be resumed on the next run",
+                    path.display()
+                )
+            })
+        }
+        Err(error) => {
+            let mut cleanup_errors = Vec::new();
+            if let Err(cleanup) = keys.retire_kid(&pending.deployment_id, &pending.candidate_kid) {
+                cleanup_errors.push(format!(
+                    "retiring the rejected candidate failed: {cleanup:#}"
+                ));
+            }
+            if let Err(cleanup) = clear_pending_recovery(keys, &pending.deployment_id) {
+                cleanup_errors.push(format!(
+                    "clearing the rejected submission failed: {cleanup:#}"
+                ));
+            }
+            let suffix = if cleanup_errors.is_empty() {
+                String::new()
+            } else {
+                format!("; cleanup was incomplete: {}", cleanup_errors.join("; "))
+            };
+            bail!("recovery was authoritatively rejected: {error}{suffix}");
+        }
+    }
+}
 
 /// Freshly generated replacement material. `display` is the one-time
 /// `NAZO-RECOVERY-…` string, shown to the operator exactly once.
@@ -127,20 +273,46 @@ impl ReplacementSecretDelivery for OutputFileSecretDelivery {
                 .mode(0o600)
                 .open(&self.path)
                 .context("creating the output secret file failed (it must not exist yet)")?;
-            file.write_all(display.as_bytes())?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
+            let result = (|| -> anyhow::Result<()> {
+                file.write_all(display.as_bytes())?;
+                file.write_all(b"\n")?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let _ = std::fs::remove_file(&self.path);
+                return Err(error)
+                    .context("writing the output secret file failed; partial file removed");
+            }
         }
         #[cfg(not(unix))]
         {
-            let mut file = std::fs::OpenOptions::new()
+            let file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&self.path)
                 .context("creating the output secret file failed (it must not exist yet)")?;
-            file.write_all(display.as_bytes())?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
+            drop(file);
+            if let Err(error) = crate::filesystem::set_mode(&self.path, 0o600) {
+                let _ = std::fs::remove_file(&self.path);
+                return Err(error)
+                    .context("protecting output secret file ACL failed; empty file removed");
+            }
+            let result = (|| -> anyhow::Result<()> {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&self.path)
+                    .context("reopening output secret file failed")?;
+                file.write_all(display.as_bytes())?;
+                file.write_all(b"\n")?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let _ = std::fs::remove_file(&self.path);
+                return Err(error)
+                    .context("writing the output secret file failed; partial file removed");
+            }
         }
         Ok(())
     }
@@ -178,10 +350,11 @@ pub(crate) fn rotate_root_with_new_secret(
         })
         .map_err(|error| anyhow::anyhow!("{error}"))
         .context("approval issuance failed; no root change happened")?;
+    let token = approval.approval_token;
 
     let root = api
         .rotate_recovery_root(&RecoveryRootRotateBody {
-            approval_token: approval.approval_token,
+            approval_token: token,
             deployment_id: deployment_id.to_owned(),
             recovery_public_key: b64(&material.public_key),
             kid: material.kid.clone(),
@@ -204,17 +377,12 @@ pub(crate) fn rotate_root_with_new_secret(
 }
 
 /// Authoritative result of one successful break-glass recovery.
-// Delivery boundary: the I-wave CLI renders new_recovery_secret_display.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct RecoveredIdentity {
     pub controller_id: String,
     pub kid: String,
     pub expires_at: chrono::DateTime<chrono::Utc>,
     pub recovery_generation: u64,
-    /// The NEW Recovery Secret, shown exactly once after the commit lands.
-    /// The caller MUST present this to the operator before exiting.
-    pub new_recovery_secret_display: String,
 }
 
 /// D11 break-glass flow: re-establish one Controller Key from the offline
@@ -241,6 +409,17 @@ pub(crate) fn recover_controller_identity(
     let action = "controller recovery";
     let record = resolve_instance(registry, selector, action)?;
     let deployment_id = record.deployment_id.clone();
+    let instance_dir = keys.instance_dir(&deployment_id)?;
+    filesystem::ensure_private_directory(&instance_dir, "controller key directory")?;
+    let _recovery_lock = FileLock::acquire(&instance_dir.join("recovery.lock"))?;
+
+    // A previous process may have lost the HTTP response after the server
+    // committed. Resume the exact persisted answer before deriving or
+    // generating any new authority. The server returns the atomic receipt
+    // only when the signature hash matches the accepted submission.
+    if let Some(pending) = load_pending_recovery(keys, &deployment_id)? {
+        return submit_pending_recovery(registry, keys, api, &pending);
+    }
 
     // Old material: parsed from the operator-supplied offline secret, then
     // immediately reduced to the derived (zeroizing) seed.
@@ -310,40 +489,19 @@ pub(crate) fn recover_controller_identity(
          secret remains valid",
     )?;
 
-    let commit = api
-        .submit_recovery_answer(&RecoveryAnswerBody {
-            deployment_id: deployment_id.clone(),
-            challenge_id: challenge.challenge_id.clone(),
+    let pending = PendingRecovery {
+        schema: PENDING_RECOVERY_SCHEMA,
+        deployment_id: deployment_id.clone(),
+        candidate_kid: candidate.kid,
+        answer: RecoveryAnswerBody {
+            deployment_id,
+            challenge_id: challenge.challenge_id,
             nonce: b64(&challenge.nonce),
             signature: b64(&signature),
-        })
-        .map_err(|error| anyhow::anyhow!("{error}"))
-        .context(
-            "recovery commit failed; the challenge stays pending until its expiry and the same \
-             inputs can be resubmitted",
-        )?;
-
-    // Server committed authoritatively — now mirror locally. Both steps are
-    // idempotent given the server facts, so a crash between them is repaired
-    // by simply rerunning this command with the same secret.
-    keys.set_active_kid(&deployment_id, &candidate.kid)?;
-    let key_ref = controller_key_ref_for(&deployment_id)?;
-    registry.update_controller_binding(
-        &deployment_id,
-        Some(commit.slot.controller_id.as_str()),
-        Some(key_ref.as_str()),
-    )?;
-
-    Ok(RecoveredIdentity {
-        controller_id: commit.slot.controller_id,
-        kid: commit.slot.kid,
-        expires_at: commit.slot.expires_at,
-        recovery_generation: commit.recovery_generation,
-        // W3.3: the replacement secret MUST reach the operator; without it the
-        // next recovery is impossible because this commit already invalidated
-        // the old root.
-        new_recovery_secret_display: replacement.display,
-    })
+        },
+    };
+    save_pending_recovery(keys, &pending)?;
+    submit_pending_recovery(registry, keys, api, &pending)
 }
 
 #[cfg(test)]
@@ -399,6 +557,14 @@ mod tests {
                 }));
         }
 
+        fn push_error(&self, message: &str) {
+            self.inner
+                .responses
+                .lock()
+                .unwrap()
+                .push(Err(anyhow::anyhow!(message.to_owned())));
+        }
+
         fn requests(&self) -> Vec<(String, String)> {
             self.inner
                 .seen
@@ -423,12 +589,36 @@ mod tests {
     impl AdminApiTransport for Canned {
         fn send(&self, request: AdminHttpRequest) -> anyhow::Result<AdminHttpResponse> {
             self.inner.seen.lock().unwrap().push(request);
-            self.inner
+            let mut response = self
+                .inner
                 .responses
                 .lock()
                 .unwrap()
                 .pop()
-                .expect("no canned response left")
+                .expect("no canned response left")?;
+            let body = String::from_utf8_lossy(&response.body);
+            if body.contains("candidate-kid-from-server") {
+                let challenge_body = self
+                    .inner
+                    .seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|seen| seen.url.ends_with("/controller-recovery/challenges"))
+                    .and_then(|seen| seen.body.as_deref())
+                    .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+                    .and_then(|value| {
+                        value
+                            .get("kid")
+                            .and_then(|kid| kid.as_str())
+                            .map(str::to_owned)
+                    })
+                    .expect("challenge request carries candidate kid");
+                response.body = body
+                    .replace("candidate-kid-from-server", &challenge_body)
+                    .into_bytes();
+            }
+            Ok(response)
         }
     }
 
@@ -710,5 +900,80 @@ mod tests {
         assert!(error.to_string().contains("did not parse"), "{error}");
         assert!(canned.requests().is_empty());
         assert!(delivery.delivered.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recover_resumes_the_exact_submission_after_an_unknown_outcome() {
+        let fixture = Fixture::new().expect("fixture");
+        let old = generate_material(DEPLOYMENT);
+        let nonce = [9u8; 32];
+        let first = Canned::default();
+        first.push_error("response lost after send");
+        first.push(
+            200,
+            &format!(
+                r#"{{"challenge_id":"ch-resume","deployment_id":"{DEPLOYMENT}","nonce":"{}","expires_at":"2026-08-24T00:10:00Z","algorithm":{{"type":"Ed25519"}},"single_use":true}}"#,
+                b64(&nonce)
+            ),
+        );
+        let delivered = RecordingDelivery {
+            delivered: std::sync::Mutex::new(Vec::new()),
+        };
+        let error = recover_controller_identity(
+            &fixture.registry,
+            &fixture.keys,
+            &canned_api(first.clone()),
+            Some("prod"),
+            &old.display,
+            "recovered",
+            &delivered,
+        )
+        .expect_err("lost response leaves a resumable submission");
+        assert!(
+            error.to_string().contains("outcome is unknown"),
+            "{error:#}"
+        );
+        let first_answer = first.bodies()[1].clone();
+        assert!(
+            pending_recovery_path(&fixture.keys, DEPLOYMENT)
+                .unwrap()
+                .is_file()
+        );
+        let pending = load_pending_recovery(&fixture.keys, DEPLOYMENT)
+            .unwrap()
+            .expect("pending recovery");
+
+        let resumed = Canned::default();
+        resumed.push(
+            200,
+            &format!(
+                r#"{{"slot":{},"recovery_generation":7,"old_recovery_secret_invalid":true}}"#,
+                slot_json(
+                    &pending.candidate_kid,
+                    "01900000-0000-7000-8000-000000000010"
+                )
+            ),
+        );
+        let no_second_delivery = RecordingDelivery {
+            delivered: std::sync::Mutex::new(Vec::new()),
+        };
+        let recovered = recover_controller_identity(
+            &fixture.registry,
+            &fixture.keys,
+            &canned_api(resumed.clone()),
+            Some("prod"),
+            "the old secret is not consulted while resuming",
+            "ignored",
+            &no_second_delivery,
+        )
+        .expect("the persisted answer resumes to the server receipt");
+        assert_eq!(recovered.recovery_generation, 7);
+        assert_eq!(resumed.bodies(), vec![first_answer]);
+        assert!(no_second_delivery.delivered.lock().unwrap().is_empty());
+        assert!(
+            !pending_recovery_path(&fixture.keys, DEPLOYMENT)
+                .unwrap()
+                .exists()
+        );
     }
 }

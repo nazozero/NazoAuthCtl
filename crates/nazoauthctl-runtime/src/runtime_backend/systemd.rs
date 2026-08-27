@@ -10,7 +10,8 @@ use crate::{
     ArtifactReference, RuntimeBackendKind,
     filesystem::{
         atomic_write, copy_atomic_from_file, ensure_directory_chain, open_secure_regular_file,
-        read_secure_regular_file, set_mode, sha256, sha256_file, validate_secure_directory,
+        read_secure_regular_file, remove_file_durable, set_mode, sha256, sha256_file,
+        validate_secure_directory,
     },
     process::Process,
 };
@@ -31,7 +32,7 @@ const SYSTEMD_MEMORY_MAX: &str = "1G";
 const SYSTEMD_CPU_QUOTA: &str = "200%";
 const SYSTEMD_START_LIMIT_INTERVAL: &str = "60s";
 const SYSTEMD_START_LIMIT_BURST: &str = "5";
-const OPERATOR_CREDENTIAL_ENVIRONMENT: [(&str, &str); 3] = [
+const OPERATOR_CREDENTIAL_ENVIRONMENT: [(&str, &str); 4] = [
     ("NAZOAUTH_OPERATOR_CONTEXT_FILE", "operator-context"),
     (
         "NAZOAUTH_OPERATOR_CONTROLLER_PUBLIC_KEY_FILE",
@@ -40,6 +41,10 @@ const OPERATOR_CREDENTIAL_ENVIRONMENT: [(&str, &str); 3] = [
     (
         "NAZOAUTH_OPERATOR_CONFIG_MANIFEST_FILE",
         "operator-config-manifest",
+    ),
+    (
+        "NAZOAUTH_OPERATOR_CONFIG_REVISION_FILE",
+        "operator-config-revision",
     ),
 ];
 
@@ -174,7 +179,7 @@ impl RuntimeBackend for SystemdBackend {
                 missing.push(format!("systemd {property} hardening is not observable"));
             }
         }
-        for variable in ["DEPLOYMENT_ID", "RUNTIME_INSTANCE_ID", "CONTROL_AUTHORITY"] {
+        for variable in ["DEPLOYMENT_ID"] {
             if !safe_environment.contains_key(variable) {
                 missing.push(format!("systemd Environment is missing {variable}"));
             }
@@ -236,51 +241,19 @@ impl RuntimeBackend for SystemdBackend {
         self.inspect(object_reference).map(Some)
     }
 
-    fn verify_ownership(
-        &self,
-        object_reference: &str,
-        deployment_id: &str,
-        runtime_instance_id: &str,
-        control_authority: &str,
-    ) -> anyhow::Result<()> {
+    fn read_logs(&self, object_reference: &str, limit: usize) -> anyhow::Result<Vec<String>> {
         validate_mutable_unit(object_reference)?;
-        let observation = self.inspect(object_reference)?;
-        if !observation.server_command_verified
-            || !observation
-                .safe_environment
-                .get("DEPLOYMENT_ID")
-                .is_some_and(|value| value == deployment_id)
-            || !observation
-                .safe_environment
-                .get("RUNTIME_INSTANCE_ID")
-                .is_some_and(|value| value == runtime_instance_id)
-            || !observation
-                .safe_environment
-                .get("CONTROL_AUTHORITY")
-                .is_some_and(|value| value == control_authority)
-        {
-            bail!("systemd unit identity does not match the authorized runtime");
-        }
-        let fragment_path = Process::new("systemctl")
+        self.inspect(object_reference)?;
+        let output = Process::new("journalctl")
             .args([
-                "show",
+                "--unit",
                 object_reference,
-                "--property=FragmentPath",
-                "--value",
+                "--no-pager",
+                "--output=short-iso",
             ])
-            .stdout()?
-            .trim()
-            .to_owned();
-        let fragment = read_secure_regular_file(
-            Path::new(&fragment_path),
-            "managed systemd unit",
-            false,
-            1024 * 1024,
-        )?;
-        if !fragment.starts_with(b"# Managed by nazoauthctl\n") {
-            bail!("systemd unit is not an authorized nazoauthctl-managed file");
-        }
-        Ok(())
+            .arg(format!("--lines={limit}"))
+            .stdout()?;
+        Ok(output.lines().map(str::to_owned).collect())
     }
 
     fn start(&self, object_reference: &str) -> anyhow::Result<()> {
@@ -332,8 +305,42 @@ impl RuntimeBackend for SystemdBackend {
             .run_quiet()
     }
 
-    fn remove(&self, _object_reference: &str) -> anyhow::Result<()> {
-        bail!("systemd unit removal is not an implicit runtime operation")
+    fn remove(&self, object_reference: &str) -> anyhow::Result<()> {
+        validate_mutable_unit(object_reference)?;
+        if self.inspect_optional(object_reference)?.is_some() {
+            let fragment_path = PathBuf::from(
+                Process::new("systemctl")
+                    .args([
+                        "show",
+                        object_reference,
+                        "--property=FragmentPath",
+                        "--value",
+                    ])
+                    .stdout()?
+                    .trim(),
+            );
+            let fragment = read_secure_regular_file(
+                &fragment_path,
+                "managed systemd unit",
+                false,
+                1024 * 1024,
+            )?;
+            if !fragment.starts_with(b"# Managed by nazoauthctl\n") {
+                bail!("refusing to remove an unmanaged systemd unit");
+            }
+            if self.inspect(object_reference)?.running {
+                self.stop(object_reference)?;
+            }
+            Process::new("systemctl")
+                .args(["disable", object_reference])
+                .run_quiet()?;
+            remove_file_durable(&fragment_path)?;
+            Process::new("systemctl").arg("daemon-reload").run_quiet()?;
+            Process::new("systemctl")
+                .args(["reset-failed", object_reference])
+                .run_quiet()?;
+        }
+        remove_managed_service_user(object_reference)
     }
 
     fn replace(&self, replacement: &RuntimeReplacement) -> anyhow::Result<()> {
@@ -396,7 +403,7 @@ impl RuntimeBackend for SystemdBackend {
         if sha256_file(&mut target_file, &target.display().to_string())? != *expected {
             bail!("systemd replacement target digest changed during activation");
         }
-        self.start(&replacement.object_reference)
+        Ok(())
     }
 
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String> {
@@ -462,13 +469,17 @@ impl RuntimeBackend for SystemdBackend {
 
     fn install_host_service(&self, install: &HostServiceInstall) -> anyhow::Result<()> {
         validate_host_service_install(install)?;
-        if !Process::new("id")
+        if Process::new("id")
             .args(["-u", install.service_user.as_str()])
             .succeeds()
         {
+            require_managed_service_user(&install.service_user, &install.service_name)?;
+        } else {
             Process::new("useradd")
                 .args(["--system", "--home"])
-                .arg(&install.working_directory)
+                .arg(&install.data_root)
+                .arg("--comment")
+                .arg(format!("nazoauthctl:{}", install.service_name))
                 .args([
                     "--shell",
                     "/usr/sbin/nologin",
@@ -477,59 +488,50 @@ impl RuntimeBackend for SystemdBackend {
                 .run_quiet()?;
         }
         require_non_root_service_user(&install.service_user)?;
-        configure_operator_state_permissions(install)?;
-        let secrets_directory = install.working_directory.join("secrets");
+        ensure_directory_chain(&install.data_root)?;
+        let binary_directory = install
+            .binary
+            .parent()
+            .context("systemd binary has no parent directory")?;
+        ensure_directory_chain(binary_directory)?;
+        set_mode(binary_directory, 0o755)?;
+        Process::new("chown")
+            .arg("-R")
+            .arg(format!("{}:{}", install.service_user, install.service_user))
+            .arg(&install.data_root)
+            .run_quiet()?;
+        set_mode(&install.data_root, 0o750)?;
         Process::new("chown")
             .arg(format!("root:{}", install.service_user))
-            .arg(&install.working_directory)
-            .arg(install.working_directory.join(".env.yaml"))
-            .arg(&secrets_directory)
+            .arg(&install.config)
+            .args(&install.secret_paths)
             .run_quiet()?;
-        set_mode(&install.working_directory, 0o750)?;
-        set_mode(&secrets_directory, 0o750)?;
-        set_mode(&install.working_directory.join(".env.yaml"), 0o440)?;
-        // The generation directory contains controller/audit private keys and
-        // remains root-only.  Operator-task public context, controller key,
-        // and config manifest are injected through LoadCredential below; do
-        // not widen this directory merely to make those public files visible.
-        for entry in fs::read_dir(&secrets_directory)? {
-            let path = entry?.path();
-            if path.file_name().is_some_and(|name| name == "dependencies") {
-                Process::new("chown")
-                    .arg("root:root")
-                    .arg(&path)
-                    .run_quiet()?;
-                set_mode(&path, 0o700)?;
-                continue;
+        let mut readable_directories = BTreeSet::new();
+        if let Some(parent) = install.config.parent() {
+            readable_directories.insert(parent.to_path_buf());
+        }
+        for secret in &install.secret_paths {
+            if let Some(parent) = secret.parent() {
+                readable_directories.insert(parent.to_path_buf());
             }
-            let runtime_readable =
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        install
-                            .runtime_readable_secret_names
-                            .iter()
-                            .any(|allowed| allowed == name)
-                    });
-            Process::new("chown")
-                .arg(if runtime_readable {
-                    format!("root:{}", install.service_user)
-                } else {
-                    "root:root".to_owned()
-                })
-                .arg(&path)
-                .run_quiet()?;
-            set_mode(&path, if runtime_readable { 0o440 } else { 0o600 })?;
         }
-        // J/P1-12: the retired receipt private-key model is gone; its
-        // root:root/0600 stanza was removed with it.
-        for path in [&install.app_root, &install.ui_releases] {
+        for directory in readable_directories {
             Process::new("chown")
-                .arg("-R")
-                .arg(format!("{}:{}", install.service_user, install.service_user))
-                .arg(path)
+                .arg(format!("root:{}", install.service_user))
+                .arg(&directory)
                 .run_quiet()?;
+            set_mode(&directory, 0o750)?;
         }
+        set_mode(&install.config, 0o440)?;
+        for path in &install.secret_paths {
+            set_mode(path, 0o440)?;
+        }
+        let mut source = open_secure_regular_file(
+            &install.source_binary,
+            "verified systemd source binary",
+            false,
+        )?;
+        copy_atomic_from_file(&mut source, &install.binary, 0o755)?;
         let unit_directory = env::var_os("NAZOAUTH_SYSTEMD_UNIT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/etc/systemd/system"));
@@ -607,6 +609,12 @@ impl RuntimeBackend for SystemdBackend {
 
 pub fn render_host_service_unit(install: &HostServiceInstall) -> anyhow::Result<String> {
     validate_host_service_install(install)?;
+    let secret_paths = install
+        .secret_paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
     Ok(format!(
         "# Managed by nazoauthctl\n\
          [Unit]\n\
@@ -619,13 +627,11 @@ pub fn render_host_service_unit(install: &HostServiceInstall) -> anyhow::Result<
          Type=simple\n\
          User={user}\n\
          Group={user}\n\
-         WorkingDirectory={working}\n\
+         WorkingDirectory={data_root}\n\
          ExecStart={binary} server\n\
          Environment=DEPLOYMENT_ID={deployment_id}\n\
-         Environment=RUNTIME_INSTANCE_ID={runtime_instance_id}\n\
-         Environment=CONTROL_AUTHORITY={control_authority}\n\
-         Environment=DATA_DIR={app_root}\n\
-         Environment=INSTANCE_IDENTITY_DIR={instance_dir}\n\
+         Environment=NAZOAUTH_SERVER_CONFIG_FILE={config}\n\
+         Environment=DATA_DIR={data_root}\n\
          Restart=on-failure\n\
          RestartSec=2\n\
          TasksMax={tasks_max}\n\
@@ -643,39 +649,21 @@ pub fn render_host_service_unit(install: &HostServiceInstall) -> anyhow::Result<
          LockPersonality=true\n\
          CapabilityBoundingSet=\n\
          AmbientCapabilities=\n\
-         ReadWritePaths={keys} {avatars} {secrets} {bootstrap} {instance} {ui_releases}\n\
-         InaccessiblePaths={operator_state} {operator_dir} {recovery_dir} {migration_url} {restricted_secrets}\n\n\
+         ReadOnlyPaths={config} {secret_paths}\n\
+         ReadWritePaths={data_root}\n\n\
          [Install]\n\
          WantedBy=multi-user.target\n",
         user = install.service_user,
         deployment_id = install.deployment_id,
-        runtime_instance_id = install.runtime_instance_id,
-        control_authority = install.control_authority,
         tasks_max = SYSTEMD_TASKS_MAX,
         memory_max = SYSTEMD_MEMORY_MAX,
         cpu_quota = SYSTEMD_CPU_QUOTA,
         start_limit_interval = SYSTEMD_START_LIMIT_INTERVAL,
         start_limit_burst = SYSTEMD_START_LIMIT_BURST,
-        working = install.working_directory.display(),
         binary = install.binary.display(),
-        app_root = install.app_root.display(),
-        instance_dir = install.app_root.join("instance").display(),
-        keys = install.app_root.join("keys").display(),
-        avatars = install.app_root.join("avatars").display(),
-        secrets = install.app_root.join("secrets").display(),
-        bootstrap = install.app_root.join("bootstrap").display(),
-        instance = install.app_root.join("instance").display(),
-        ui_releases = install.ui_releases.display(),
-        operator_state = install.operator_state.display(),
-        operator_dir = install.operator_directory.display(),
-        recovery_dir = install.recovery_directory.display(),
-        migration_url = install.migration_url.display(),
-        restricted_secrets = install
-            .restricted_secret_paths
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(" "),
+        config = install.config.display(),
+        data_root = install.data_root.display(),
+        secret_paths = secret_paths,
     ))
 }
 
@@ -684,8 +672,6 @@ fn validate_host_service_install(install: &HostServiceInstall) -> anyhow::Result
     for (name, value) in [
         ("service user", install.service_user.as_str()),
         ("deployment id", install.deployment_id.as_str()),
-        ("runtime instance id", install.runtime_instance_id.as_str()),
-        ("control authority", install.control_authority.as_str()),
     ] {
         validate_systemd_scalar(name, value)?;
     }
@@ -693,23 +679,18 @@ fn validate_host_service_install(install: &HostServiceInstall) -> anyhow::Result
         bail!("systemd service user must not be root");
     }
     for (name, path) in [
-        ("working directory", &install.working_directory),
+        ("source binary path", &install.source_binary),
         ("binary path", &install.binary),
-        ("application root", &install.app_root),
-        ("UI releases path", &install.ui_releases),
-        ("operator state path", &install.operator_state),
-        ("operator directory", &install.operator_directory),
-        ("recovery directory", &install.recovery_directory),
-        ("migration URL path", &install.migration_url),
+        ("configuration path", &install.config),
+        ("data root", &install.data_root),
     ] {
         safe_systemd_path(path).with_context(|| format!("{name} is unsafe for a systemd unit"))?;
     }
-    for path in &install.restricted_secret_paths {
-        safe_systemd_path(path)
-            .context("restricted dependency secret path is unsafe for a systemd unit")?;
+    if install.secret_paths.is_empty() {
+        bail!("systemd service requires explicit secret paths");
     }
-    for name in &install.runtime_readable_secret_names {
-        validate_systemd_scalar("runtime secret name", name)?;
+    for path in &install.secret_paths {
+        safe_systemd_path(path).context("secret path is unsafe for a systemd unit")?;
     }
     Ok(())
 }
@@ -733,48 +714,45 @@ fn require_non_root_service_user(user: &str) -> anyhow::Result<u32> {
     validate_non_root_service_uid(&output)
 }
 
-fn configure_operator_state_permissions(install: &HostServiceInstall) -> anyhow::Result<()> {
-    let state_parent = install
-        .operator_state
-        .parent()
-        .context("operator state path has no parent directory")?;
-    if install
-        .operator_state
-        .file_name()
-        .and_then(|name| name.to_str())
-        != Some("operator-state")
-    {
-        bail!("operator state path must end in operator-state");
+fn remove_managed_service_user(service_name: &str) -> anyhow::Result<()> {
+    let Some(stem) = service_name.strip_suffix(".service") else {
+        bail!("managed NazoAuth unit name has no .service suffix");
+    };
+    let suffix = stem
+        .strip_prefix("nazoauth-")
+        .context("managed NazoAuth unit name has an invalid prefix")?;
+    let user = format!("nazoauth-{}", suffix.chars().take(12).collect::<String>());
+    let output = Process::new("getent").args(["passwd", &user]).output()?;
+    if !output.status.success() {
+        return Ok(());
     }
-    validate_secure_directory(state_parent, "operator state parent", false)?;
-    let state_metadata = fs::symlink_metadata(&install.operator_state).with_context(|| {
-        format!(
-            "failed to inspect operator state {}",
-            install.operator_state.display()
-        )
-    })?;
-    if state_metadata.file_type().is_symlink() || !state_metadata.is_dir() {
-        bail!(
-            "operator state must be a real directory: {}",
-            install.operator_state.display()
-        );
+    let passwd = String::from_utf8(output.stdout).context("passwd entry is not UTF-8")?;
+    let comment = passwd
+        .trim_end()
+        .split(':')
+        .nth(4)
+        .context("passwd entry has no comment field")?;
+    if comment != format!("nazoauthctl:{service_name}") {
+        bail!("refusing to remove a systemd service user without nazoauthctl ownership proof");
     }
+    Process::new("userdel").arg(&user).run_quiet()
+}
 
-    // The control root contains controller-owned siblings (audit and
-    // deployment state).  Give the service group traverse-only access to the
-    // root and make only the operator-state leaf service-owned.  This avoids
-    // widening any private controller directory while allowing systemd-run's
-    // service UID to reach its read/write state.
-    Process::new("chown")
-        .arg(format!("root:{}", install.service_user))
-        .arg(state_parent)
-        .run_quiet()?;
-    set_mode(state_parent, 0o710)?;
-    Process::new("chown")
-        .arg(format!("{}:{}", install.service_user, install.service_user))
-        .arg(&install.operator_state)
-        .run_quiet()?;
-    set_mode(&install.operator_state, 0o700)
+fn require_managed_service_user(user: &str, service_name: &str) -> anyhow::Result<()> {
+    let output = Process::new("getent").args(["passwd", user]).output()?;
+    if !output.status.success() {
+        bail!("systemd service user disappeared during ownership verification");
+    }
+    let passwd = String::from_utf8(output.stdout).context("passwd entry is not UTF-8")?;
+    let comment = passwd
+        .trim_end()
+        .split(':')
+        .nth(4)
+        .context("passwd entry has no comment field")?;
+    if comment != format!("nazoauthctl:{service_name}") {
+        bail!("refusing to reuse a systemd service user without nazoauthctl ownership proof");
+    }
+    Ok(())
 }
 
 fn validate_systemd_scalar(name: &str, value: &str) -> anyhow::Result<()> {
@@ -897,7 +875,11 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
             mount.destination.display()
         ));
     }
-    Ok(process.arg(path).args(&task.command))
+    let arguments = task
+        .command
+        .strip_prefix(&["nazoauth".to_owned()])
+        .unwrap_or(task.command.as_slice());
+    Ok(process.arg(path).args(arguments))
 }
 
 fn add_operator_credentials(
@@ -912,9 +894,8 @@ fn add_operator_credentials(
             continue;
         };
         // A caller that already supplied a credential-directory locator has
-        // completed this translation.  This keeps the backend compatible with
-        // pre-materialized tasks while ensuring legacy absolute paths are
-        // never exposed to the service process.
+        // completed this translation; absolute sources never reach the
+        // service process.
         if source.starts_with("%d/") {
             let expected = format!("%d/{credential}");
             if source.as_str() != expected || !task.transient_credentials.contains_key(credential) {

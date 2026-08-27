@@ -130,8 +130,6 @@ pub(crate) struct LocalBootstrapMaterial {
 }
 
 impl LocalBootstrapMaterial {
-    /// Delivery boundary: the I wave wires this into the CLI parser.
-    #[allow(dead_code)]
     pub(crate) fn production() -> anyhow::Result<Self> {
         Ok(Self {
             state_root: target_state_root()?,
@@ -201,14 +199,36 @@ impl RemoteBootstrapMaterial {
         &self,
         deployment_id: &str,
     ) -> anyhow::Result<crate::target::FreshBootstrapMaterialView> {
+        use crate::target::{HostCompletionBody, HostOperation, HostOutcome};
+        let operation = HostOperation::bootstrap_read(
+            format!("bootstrap-read-{:032x}", rand::random::<u128>()),
+            deployment_id,
+        );
+        if let Err(rejection) = operation.validate() {
+            return Err(anyhow::anyhow!(
+                "internal error: bootstrap-read operation rejected: {}",
+                rejection.detail
+            ));
+        }
         let guard = self
             .target
             .lock()
             .map_err(|_| anyhow::anyhow!("target transport poisoned"))?;
-        let inspection = guard.inspect_instance(deployment_id)?;
-        inspection.bootstrap_material.ok_or_else(|| {
-            anyhow::anyhow!("{BOOTSTRAP_CLOSED}: no fresh-install capability exists")
-        })
+        let outcome = guard
+            .execute_host_operation(&operation)
+            .map_err(|error| anyhow::anyhow!("{error:#}"))?
+            .outcome;
+        match outcome {
+            HostOutcome::Completed {
+                body: HostCompletionBody::BootstrapRead { material },
+            } => Ok(material),
+            HostOutcome::Completed { .. } => {
+                unreachable!("bootstrap-read answers with a bootstrap-read completion")
+            }
+            HostOutcome::Failed { code, detail } => Err(anyhow::anyhow!(
+                "{BOOTSTRAP_CLOSED}: no fresh-install capability exists ({code}: {detail})"
+            )),
+        }
     }
 }
 
@@ -249,26 +269,12 @@ impl BootstrapMaterialSource for RemoteBootstrapMaterial {
             HostOutcome::Completed { .. } => {
                 unreachable!("close answers with a bootstrap-closed completion")
             }
-            HostOutcome::Failed { code, detail } => {
-                // An older target helper without this kind reports
-                // OPERATION_KIND_UNKNOWN. The server already consumed the
-                // token on success, so the capability cannot be reused; the
-                // residual file is hygiene only and the operator is told so.
-                if detail.contains("unknown kind") || detail.contains("KIND_UNKNOWN") {
-                    anyhow::bail!(
-                        "{BOOTSTRAP_CLOSED}: the target helper predates `bootstrap-close`; the \
-                         capability token was consumed by NazoAuth itself, but remove the \
-                         stale context file on the target manually"
-                    );
-                }
-                anyhow::bail!("{code}: {detail}")
-            }
+            HostOutcome::Failed { code, detail } => anyhow::bail!("{code}: {detail}"),
         }
     }
 }
 
-/// `{issuer}/auth/bootstrap-admin` with the loopback-only plain-HTTP rule the
-/// legacy client enforced.
+/// `{issuer}/auth/bootstrap-admin` with loopback-only plain HTTP.
 fn initial_admin_endpoint(issuer: &str) -> anyhow::Result<Url> {
     let mut endpoint =
         Url::parse(issuer).with_context(|| format!("issuer is not a valid URL: {issuer}"))?;
@@ -338,7 +344,7 @@ pub(crate) fn claim_initial_admin(
     material.authorize(&record.deployment_id)?;
     let token = material.read_token(&record.deployment_id)?;
 
-    // 3. Exact legacy endpoint contract.
+    // 3. Exact bootstrap endpoint contract.
     let endpoint = initial_admin_endpoint(&record.issuer)?;
     let request_id = format!("bootstrap-admin-{:032x}", rand::random::<u128>());
     let body = serde_json::to_vec(&BootstrapAdminRequest {
@@ -502,12 +508,13 @@ mod tests {
             config_content: "BIND: \"0.0.0.0:8000\"".to_owned(),
             config_sha256: "0".repeat(64),
             data_root: data_root.to_string_lossy().into_owned(),
+            runtime_root: None,
             secrets: vec![],
             database_endpoint: crate::target::install_exec::ExternalEndpoint {
                 host: "db.internal".to_owned(),
                 port: 5432,
                 name: "oauth".to_owned(),
-                user: "nazauth".to_owned(),
+                user: "nazoauth".to_owned(),
             },
             valkey_endpoint: crate::target::install_exec::ExternalEndpoint {
                 host: "cache.internal".to_owned(),

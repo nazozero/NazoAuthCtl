@@ -189,10 +189,10 @@ fn parse_recover(values: &[String]) -> anyhow::Result<ControllerCommand> {
              old secret and the new one must never overwrite it"
         );
     }
-    if rotate_secret {
-        // D10/D12 commit under fresh-2FA approval exactly like a slot change;
-        // the token itself is still obtained through the normal callback.
-        let _ = common.approval_token;
+    if common.approval_token.is_some() {
+        bail!(
+            "--approval-token is not accepted on controller recover; break-glass recovery authenticates with the recovery secret, and --rotate-secret issues approval directly through the admin API"
+        );
     }
     let label = require_label(&common.values, rotate_secret)?;
     Ok(ControllerCommand::Recover {
@@ -200,7 +200,6 @@ fn parse_recover(values: &[String]) -> anyhow::Result<ControllerCommand> {
         label: label.unwrap_or_else(|| "recovered-controller".to_owned()),
         secret_file,
         rotate_secret,
-        approval_token: common.approval_token,
         admin_access_file: common.admin_access_file,
         output_secret_file,
     })

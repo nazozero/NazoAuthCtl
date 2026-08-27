@@ -67,6 +67,16 @@ impl RuntimeBackend for PodmanBackend {
         discovery::inspect_optional(&self.command, object_reference)
     }
 
+    fn read_logs(&self, object_reference: &str, limit: usize) -> anyhow::Result<Vec<String>> {
+        discovery::inspect(&self.command, object_reference)?;
+        let output = crate::process::Process::new(self.command.clone())
+            .args(["logs", "--tail"])
+            .arg(limit.to_string())
+            .arg(object_reference)
+            .stdout()?;
+        Ok(output.lines().map(str::to_owned).collect())
+    }
+
     fn start(&self, object_reference: &str) -> anyhow::Result<()> {
         operations::start(&self.command, object_reference)
     }

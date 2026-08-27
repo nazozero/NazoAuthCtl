@@ -64,9 +64,18 @@ impl FleetContext {
 pub(crate) fn production_target(
     record: &HostRecord,
 ) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> {
+    production_target_with_ssh_timeout(record, crate::target::ssh::DEFAULT_EXEC_TIMEOUT)
+}
+
+pub(crate) fn production_target_with_ssh_timeout(
+    record: &HostRecord,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> {
     match record.transport {
         HostTransport::Local => Ok(Box::new(LocalTarget::new()?)),
-        HostTransport::Ssh => Ok(Box::new(SshTarget::from_record(record)?)),
+        HostTransport::Ssh => Ok(Box::new(
+            SshTarget::from_record(record)?.with_timeout(timeout),
+        )),
     }
 }
 
@@ -873,7 +882,6 @@ mod tests {
                     backup_maturity: crate::target::BackupMaturity::Unknown,
                     active_host_operation: None,
                     config_revision_marker: None,
-                    bootstrap_material: None,
                 }),
                 _ => Ok(InstanceInspection {
                     current_build_identity: None,
@@ -906,7 +914,6 @@ mod tests {
                     backup_maturity: crate::target::BackupMaturity::Unknown,
                     active_host_operation: None,
                     config_revision_marker: None,
-                    bootstrap_material: None,
                 }),
             }
         }

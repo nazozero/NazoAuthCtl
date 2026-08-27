@@ -425,13 +425,18 @@ impl ExecutionTarget for SshTarget {
         // The signed envelope is public data (no secret material), so it
         // rides the handshake-gated stdio contract like every other kind and
         // the target journals the delivery under its C07 contract.
-        let presented = super::control_exec::control_operation_id_from_jws(&request.compact_jws)
-            .map_err(|error| anyhow::anyhow!("{HOST_ERR_OPERATION_INVALID}: {error}"))?;
         let operation = HostOperation::control_operation(
-            Uuid::now_v7(),
+            request.operation_id.clone(),
             request.deployment_id.clone(),
             request.compact_jws.clone(),
         );
+        operation.validate().map_err(|rejection| {
+            anyhow::anyhow!(
+                "{HOST_ERR_OPERATION_INVALID}: {}: {}",
+                rejection.code.as_str(),
+                rejection.detail
+            )
+        })?;
         let result = self.execute_host_operation(&operation)?;
         match result.outcome {
             HostOutcome::Completed {
@@ -440,15 +445,16 @@ impl ExecutionTarget for SshTarget {
                         result: control_result,
                     },
             } => {
-                if control_result.operation_id != presented {
+                if control_result.operation_id != request.operation_id {
                     bail!(
                         "{HOST_ERR_OPERATION_INVALID}: the helper answered operation '{}' while \
-                         '{presented}' was presented",
-                        control_result.operation_id
+                         '{}' was presented",
+                        control_result.operation_id,
+                        request.operation_id
                     );
                 }
                 Ok(ControlOperationReceipt {
-                    operation_id: presented,
+                    operation_id: request.operation_id.clone(),
                     accepted: true,
                     result: Some(control_result),
                 })
@@ -466,7 +472,7 @@ impl ExecutionTarget for SshTarget {
                 }
                 // Admission-grade refusal before acceptance.
                 Ok(ControlOperationReceipt {
-                    operation_id: presented,
+                    operation_id: request.operation_id.clone(),
                     accepted: false,
                     result: None,
                 })
@@ -849,7 +855,6 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             backup_maturity: crate::target::deployment_state::BackupMaturity::Unknown,
             active_host_operation: None,
             config_revision_marker: None,
-            bootstrap_material: None,
         }
     }
 
@@ -1156,13 +1161,14 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     // ---------- shared trait plumbing ----------
 
     #[test]
-    fn control_operations_over_ssh_reject_malformed_envelopes_before_transport() {
+    fn control_operations_over_ssh_reject_invalid_operation_ids_before_transport() {
         let target = SshTarget::from_record(
             &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Direct).unwrap(),
         )
         .unwrap();
         let error = target
             .execute_control_operation(&super::super::ControlOperationRequest {
+                operation_id: String::new(),
                 deployment_id: "deploy-alpha".to_owned(),
                 compact_jws: "not a jws".to_owned(),
             })

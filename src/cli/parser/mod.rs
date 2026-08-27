@@ -11,7 +11,7 @@ mod tls;
 
 use anyhow::{Context as _, bail};
 
-use super::types::{Cli, Command};
+use super::types::{Cli, Command, InstanceSelector};
 use common::{no_arguments, parse_version_option, parse_yes, take_yes};
 use controller::parse_controller;
 use fleet::{parse_host, parse_instance};
@@ -57,9 +57,10 @@ impl Cli {
                 let (selector, all) = parse_read_view_selector(values, "status")?;
                 Command::Status { selector, all }
             }
-            "logs" => Command::Logs {
-                selector: parse_read_view_selector(values, "logs")?.0,
-            },
+            "logs" => {
+                let (selector, limit) = parse_limited_selector(values, "logs", 200, 500)?;
+                Command::Logs { selector, limit }
+            }
             "doctor" => {
                 let (selector, all) = parse_read_view_selector(values, "doctor")?;
                 Command::Doctor { selector, all }
@@ -74,31 +75,13 @@ impl Cli {
                 Command::Rollback { selector, yes }
             }
             "operation" => {
-                let parsed = fleet::parse_options(values.to_vec(), &["--limit"], &[], "operation")?;
-                let parts = surface::selector_from_parsed(&parsed)?;
-                let limit = match parsed.values.get("--limit") {
-                    Some(raw) => {
-                        let value = raw.parse::<usize>().context("--limit must be an integer")?;
-                        if value == 0 || value > 1000 {
-                            bail!("--limit must be between 1 and 1000");
-                        }
-                        value
-                    }
-                    None => 20,
-                };
+                let (parts, limit) = parse_limited_selector(values, "operation", 20, 1000)?;
                 Command::Operation {
                     selector: parts,
                     limit,
                 }
             }
-            "policy" => {
-                no_arguments(&values, "policy")?;
-                Command::Policy
-            }
             "backup" => Command::Backup(parse_backup(values)?),
-            "recover" => Command::Recover {
-                selector: parse_read_view_selector(values, "recover")?.0,
-            },
             "uninstall" => {
                 let (selector, yes) =
                     surface::parse_confirm_scoped(values, &["--yes"], "uninstall")?;
@@ -140,4 +123,24 @@ impl Cli {
             command,
         }))
     }
+}
+
+fn parse_limited_selector(
+    values: Vec<String>,
+    command: &str,
+    default: usize,
+    maximum: usize,
+) -> anyhow::Result<(InstanceSelector, usize)> {
+    let parsed = fleet::parse_options(values, &["--limit"], &[], command)?;
+    let selector = surface::selector_from_parsed(&parsed)?;
+    let limit = match parsed.values.get("--limit") {
+        Some(raw) => raw
+            .parse::<usize>()
+            .with_context(|| format!("{command} --limit must be an integer"))?,
+        None => default,
+    };
+    if !(1..=maximum).contains(&limit) {
+        bail!("{command} --limit must be between 1 and {maximum}");
+    }
+    Ok((selector, limit))
 }

@@ -2,18 +2,16 @@ mod clean_install;
 mod cli;
 mod conformance;
 pub mod controller_identity;
-mod deployment;
 mod discover_adopt;
 mod error_codes;
+mod file_lock;
 mod fleet;
 mod install;
 mod instance_lifecycle;
 mod model;
 pub mod registry;
 mod release;
-mod runtime;
 mod runtime_backend;
-mod runtime_identity;
 pub mod target;
 pub mod tenant_resources;
 mod tls;
@@ -98,9 +96,7 @@ fn command_action(command: &cli::Command) -> &'static str {
         cli::Command::Update(_) => "update",
         cli::Command::Rollback { .. } => "rollback",
         cli::Command::Operation { .. } => "operation",
-        cli::Command::Policy => "policy",
         cli::Command::Backup(_) => "backup",
-        cli::Command::Recover { .. } => "recover",
         cli::Command::Uninstall { .. } => "uninstall",
         cli::Command::BootstrapAdmin(_) => "bootstrap-admin",
         cli::Command::Tls(_) => "tls",
@@ -145,15 +141,13 @@ Commands:
   discover    Read-only sweep of every NazoAuth deployment on one target
   bind        Initial Controller Key enrollment for one instance
   status      Instance state summary (--all for the whole fleet)
-  logs        Application log view (lands with K-phase acceptance)
+  logs        Bounded, redacted application log tail (--limit 1-500)
   doctor      Health and security diagnostics (--all supported)
   verify      Independent public DNS/TLS/OIDC verification report
   update      Crash-safe update to a verified official artifact
   rollback    Return to the previous verified artifact reference
   operation   Read-only operation log from the two journals
-  policy      Explicit policy entries (lands with K-phase acceptance)
-  backup      Backup maturity facts; explicit snapshots land with K phase
-  recover     Data restore beyond rollback (lands with K-phase acceptance)
+  backup      Observed backup maturity facts (informational, never a gate)
   oidf        Official OIDF/OID4 conformance artifacts and runs
   uninstall   Delete exactly this instance's managed resources
 

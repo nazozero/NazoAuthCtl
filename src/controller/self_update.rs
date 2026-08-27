@@ -1,12 +1,35 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, bail};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
+use crate::file_lock::FileLock;
 use crate::filesystem::{
-    copy_atomic_from_file, ensure_private_directory, open_secure_regular_file,
-    read_secure_regular_file, sha256_file,
+    atomic_write, copy_atomic_from_file, ensure_private_directory, open_secure_regular_file,
+    read_secure_regular_file, remove_file_durable, sha256_file,
 };
+use crate::process::Process;
+use crate::release::compare_versions;
 
-use super::*;
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ControllerTrustState {
+    pub(super) schema: u32,
+    pub(super) version: String,
+    pub(super) sha256: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ControllerRollbackState {
+    pub(super) schema: u32,
+    pub(super) version: String,
+    pub(super) sha256: String,
+    pub(super) artifact: PathBuf,
+}
 
 const SELF_UPDATE_JOURNAL_SCHEMA: u32 = 2;
 const SELF_UPDATE_JOURNAL_MAX_BYTES: u64 = 64 * 1024;
@@ -49,14 +72,14 @@ struct SelfUpdateJournal {
 }
 
 pub(super) fn controller_state_directory() -> anyhow::Result<PathBuf> {
-    let store = DeploymentStore::system();
-    store.validate_failure_domains()?;
-    Ok(store.state_root.join("controller-self"))
+    let registry = crate::registry::RegistryStore::open_default()?;
+    Ok(registry.root().join("controller-self"))
 }
 
 pub(super) fn controller_check(version: Option<&str>) -> anyhow::Result<()> {
-    let store = DeploymentStore::system();
-    let _lock = store.controller_self_lock()?;
+    let directory = controller_state_directory()?;
+    ensure_private_directory(&directory, "controller self-update state")?;
+    let _lock = FileLock::acquire(&directory.join(".lock"))?;
     recover_controller_self_operation()?;
     let release = crate::release::VerifiedControllerRelease::verify(version, None)?;
     enforce_controller_trust(&release.version, &release.sha256)?;
@@ -73,13 +96,12 @@ pub(super) fn controller_check(version: Option<&str>) -> anyhow::Result<()> {
 }
 
 pub(super) fn controller_update(version: Option<&str>) -> anyhow::Result<()> {
-    let store = DeploymentStore::system();
-    let _lock = store.controller_self_lock()?;
+    let directory = controller_state_directory()?;
+    ensure_private_directory(&directory, "controller self-update state")?;
+    let _lock = FileLock::acquire(&directory.join(".lock"))?;
     recover_controller_self_operation()?;
     let release = crate::release::VerifiedControllerRelease::verify(version, None)?;
     enforce_controller_trust(&release.version, &release.sha256)?;
-    let directory = controller_state_directory()?;
-    ensure_private_directory(&directory, "controller self-update state")?;
     release.persist_evidence(&directory.join("evidence").join(&release.version))?;
     let current = std::env::current_exe().context("failed to resolve the running controller")?;
     let install_path = controller_install_path(&current)?;
@@ -143,11 +165,10 @@ pub(super) fn controller_update(version: Option<&str>) -> anyhow::Result<()> {
 }
 
 pub(super) fn controller_rollback() -> anyhow::Result<()> {
-    let store = DeploymentStore::system();
-    let _lock = store.controller_self_lock()?;
-    recover_controller_self_operation()?;
     let directory = controller_state_directory()?;
     ensure_private_directory(&directory, "controller self-update state")?;
+    let _lock = FileLock::acquire(&directory.join(".lock"))?;
+    recover_controller_self_operation()?;
     let state: ControllerRollbackState = read_secure_json(
         &directory.join("rollback.json"),
         "controller rollback state",
@@ -334,40 +355,23 @@ fn recover_controller_self_operation() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_self_update_journal(directory: &Path, path: &Path) -> anyhow::Result<SelfUpdateJournal> {
+fn load_self_update_journal(_directory: &Path, path: &Path) -> anyhow::Result<SelfUpdateJournal> {
     let bytes = read_secure_regular_file(
         path,
         "controller self-update journal",
         true,
         SELF_UPDATE_JOURNAL_MAX_BYTES,
     )?;
-    let value: serde_json::Value = serde_json::from_slice(bytes.as_slice())
+    let journal: SelfUpdateJournal = serde_json::from_slice(bytes.as_slice())
         .context("controller self-update journal is invalid")?;
-    if value.get("schema").and_then(serde_json::Value::as_u64) == Some(1) {
-        let legacy: ControllerUpdateJournal = serde_json::from_value(value)?;
-        validate_digest(&legacy.from_sha256, "legacy controller source digest")?;
-        validate_digest(&legacy.to_sha256, "legacy controller candidate digest")?;
-        let current =
-            std::env::current_exe().context("failed to resolve the running controller")?;
-        let install_path = controller_install_path(&current)?;
-        return Ok(SelfUpdateJournal {
-            schema: SELF_UPDATE_JOURNAL_SCHEMA,
-            transaction_id: "legacy-controller-update".to_owned(),
-            operation: SelfUpdateOperation::Update,
-            // The legacy journal was written after staging and verification,
-            // immediately before the install replacement.
-            phase: SelfUpdatePhase::CandidateVerified,
-            install_path,
-            from_version: legacy.from_version,
-            from_sha256: legacy.from_sha256.clone(),
-            to_version: legacy.to_version,
-            to_sha256: legacy.to_sha256.clone(),
-            rollback_artifact: directory.join(format!("rollback-{}", legacy.from_sha256)),
-            rollback_sha256: legacy.from_sha256,
-            staged_artifact: Some(legacy.staged_artifact),
-        });
+    if journal.schema != SELF_UPDATE_JOURNAL_SCHEMA {
+        bail!(
+            "{}: unsupported controller self-update journal schema {}",
+            crate::error_codes::STATE_RESET_REQUIRED,
+            journal.schema
+        );
     }
-    serde_json::from_value(value).context("controller self-update journal is invalid")
+    Ok(journal)
 }
 
 fn recover_update_journal(directory: &Path, journal: &mut SelfUpdateJournal) -> anyhow::Result<()> {
@@ -634,7 +638,3 @@ fn validate_bound_path(path: &Path, label: &str) -> anyhow::Result<()> {
     }
     Ok(())
 }
-
-pub(super) const OPENID4VC_CERTIFICATE_BUNDLE: &str = "openid4vc-certificate-bundle.pem";
-pub(super) const OPENID4VC_KEYS_MOUNT: &str = "/var/lib/nazo_oauth/keys";
-pub(super) const MAX_OPENID4VC_CERTIFICATE_BUNDLE_BYTES: usize = 1024 * 1024;

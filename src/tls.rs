@@ -20,13 +20,97 @@ use url::Url;
 
 use crate::{
     cli::{TlsCertificateCheckInput, TlsCertificateInput, TlsCertificateSource, TlsCommand},
-    deployment::{DeploymentRecord, DeploymentStore},
+    file_lock::FileLock,
     filesystem::{
         atomic_write, ensure_private_directory, read_secure_regular_file, remove_file_durable,
         symlink_atomic, sync_parent, validate_secure_directory,
     },
     process::Process,
 };
+
+#[derive(Clone, Debug)]
+pub(crate) struct TlsRecord {
+    pub(crate) deployment_id: String,
+    pub(crate) declaration_revision: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TlsStore {
+    pub(crate) config_root: PathBuf,
+    pub(crate) state_root: PathBuf,
+}
+
+impl TlsStore {
+    pub(crate) fn system() -> anyhow::Result<Self> {
+        let root = crate::registry::RegistryStore::default_root()?.join("tls");
+        Ok(Self {
+            config_root: root.join("config"),
+            state_root: root.join("state"),
+        })
+    }
+
+    pub(crate) fn deployment_state_dir(&self, deployment_id: &str) -> PathBuf {
+        self.state_root.join("deployments").join(deployment_id)
+    }
+
+    pub(crate) fn deployment_lock(&self, deployment_id: &str) -> anyhow::Result<FileLock> {
+        let lock_dir = self.state_root.join("locks");
+        fs::create_dir_all(&lock_dir)?;
+        FileLock::acquire(&lock_dir.join(format!("{deployment_id}.lock")))
+    }
+
+    pub(crate) fn deployment_shared_lock(&self, deployment_id: &str) -> anyhow::Result<FileLock> {
+        let lock_dir = self.state_root.join("locks");
+        fs::create_dir_all(&lock_dir)?;
+        FileLock::acquire_shared(&lock_dir.join(format!("{deployment_id}.lock")))
+    }
+
+    pub(crate) fn shared_resource_lock(&self, resource_id: &str) -> anyhow::Result<FileLock> {
+        let lock_dir = self.state_root.join("locks");
+        fs::create_dir_all(&lock_dir)?;
+        FileLock::acquire(&lock_dir.join(format!("{resource_id}.lock")))
+    }
+
+    pub(crate) fn shared_resource_shared_lock(
+        &self,
+        resource_id: &str,
+    ) -> anyhow::Result<FileLock> {
+        let lock_dir = self.state_root.join("locks");
+        fs::create_dir_all(&lock_dir)?;
+        FileLock::acquire_shared(&lock_dir.join(format!("{resource_id}.lock")))
+    }
+
+    pub(crate) fn resolve(&self, selector: Option<&str>) -> anyhow::Result<TlsRecord> {
+        let registry = crate::registry::RegistryStore::open_default()?;
+        let instance = crate::fleet::resolve_instance(&registry, selector, "tls")?;
+        let host = registry
+            .host_by_id(instance.host_id)?
+            .context("TLS instance references a missing host")?;
+        let target = crate::fleet::production_target(&host)?;
+        crate::fleet::live_probe(target.as_ref())
+            .context("TLS target helper verification failed")?;
+        let inspection = target.inspect_instance(&instance.deployment_id)?;
+        if inspection.deployment_id != instance.deployment_id
+            || inspection.issuer != instance.issuer
+        {
+            bail!(
+                "TLS target identity drift: registry binds deployment '{}' to issuer '{}', target reported '{}' and '{}'",
+                instance.deployment_id,
+                instance.issuer,
+                inspection.deployment_id,
+                inspection.issuer
+            );
+        }
+        Ok(TlsRecord {
+            deployment_id: instance.deployment_id,
+            declaration_revision: inspection.revision,
+        })
+    }
+
+    pub(crate) fn reload_locked(&self, record: &TlsRecord) -> anyhow::Result<TlsRecord> {
+        self.resolve(Some(&record.deployment_id))
+    }
+}
 
 const PROVIDER_PROTOCOL: &str = "nazoauthctl.tls.external-generation.v1";
 const PROVIDER_SNAPSHOT_DIGEST_PROTOCOL: &str = "nazoauthctl.tls.provider-snapshot-digest.v1";
@@ -288,7 +372,7 @@ pub(crate) fn run(
     require_root: impl Fn() -> anyhow::Result<()>,
     confirm: impl Fn(bool, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let store = DeploymentStore::system();
+    let store = TlsStore::system()?;
     match command {
         TlsCommand::Acme(command) => acme::run(selector, command, require_root, confirm),
         TlsCommand::Check(input) => {
@@ -297,7 +381,7 @@ pub(crate) fn run(
         }
         TlsCommand::Plan(input) => {
             require_root()?;
-            let record = store.resolve(selector, true)?;
+            let record = store.resolve(selector)?;
             let provider = load_provider(
                 &store,
                 &input.provider_config,
@@ -352,7 +436,7 @@ pub(crate) fn run(
         }
         TlsCommand::Show { tenant, hostname } => {
             require_root()?;
-            let record = store.resolve(selector, false)?;
+            let record = store.resolve(selector)?;
             let receipt = load_receipt(&store, &record, &tenant, &hostname)?;
             println!(
                 "{}",
@@ -370,11 +454,11 @@ pub(crate) fn run(
 }
 
 fn check(
-    store: &DeploymentStore,
+    store: &TlsStore,
     selector: Option<&str>,
     input: &TlsCertificateCheckInput,
 ) -> anyhow::Result<()> {
-    let selected = store.resolve(selector, true)?;
+    let selected = store.resolve(selector)?;
     let _deployment_lock = store.deployment_shared_lock(&selected.deployment_id)?;
     let record = store.reload_locked(&selected)?;
     let tenant = canonical_tenant(&input.tenant)?;
@@ -510,11 +594,11 @@ fn ensure_outside_warning_window(
 }
 
 fn apply(
-    store: &DeploymentStore,
+    store: &TlsStore,
     selector: Option<&str>,
     input: &TlsCertificateInput,
 ) -> anyhow::Result<()> {
-    let selected = store.resolve(selector, true)?;
+    let selected = store.resolve(selector)?;
     let _deployment_lock = store.deployment_lock(&selected.deployment_id)?;
     let record = store.reload_locked(&selected)?;
 
@@ -675,12 +759,12 @@ fn apply(
 }
 
 fn recover(
-    store: &DeploymentStore,
+    store: &TlsStore,
     selector: Option<&str>,
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<()> {
-    let selected = store.resolve(selector, true)?;
+    let selected = store.resolve(selector)?;
     let _deployment_lock = store.deployment_lock(&selected.deployment_id)?;
     let record = store.reload_locked(&selected)?;
     let tenant = canonical_tenant(tenant)?;
@@ -734,8 +818,8 @@ fn recover(
 }
 
 fn resolve_certificate_source(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     input: &TlsCertificateInput,
     provider: &LoadedProvider,
 ) -> anyhow::Result<ResolvedCertificateSource> {
@@ -835,7 +919,7 @@ fn source_file_sha256(source: &CertificateSourceBinding) -> (&str, &str) {
 }
 
 fn build_plan(
-    record: &DeploymentRecord,
+    record: &TlsRecord,
     input: &TlsCertificateInput,
     provider: &LoadedProvider,
     source: &CertificateSourceBinding,
@@ -890,7 +974,7 @@ fn ensure_source_not_current(
 }
 
 fn load_provider(
-    store: &DeploymentStore,
+    store: &TlsStore,
     path: &Path,
     requested_tenant: &str,
     requested_hostname: &str,
@@ -922,7 +1006,7 @@ fn load_provider(
 }
 
 fn loaded_provider_from_transaction(
-    store: &DeploymentStore,
+    store: &TlsStore,
     transaction: &CertificateTransaction,
 ) -> anyhow::Result<LoadedProvider> {
     validate_provider_config(
@@ -950,7 +1034,7 @@ fn loaded_provider_from_transaction(
 }
 
 fn validate_provider_config(
-    store: &DeploymentStore,
+    store: &TlsStore,
     config: &ProviderConfig,
     requested_tenant: &str,
     requested_hostname: &str,
@@ -1378,7 +1462,7 @@ fn validate_committed_receipt_binding(
 }
 
 fn binding_directory(
-    store: &DeploymentStore,
+    store: &TlsStore,
     deployment_id: &str,
     tenant: &str,
     hostname: &str,
@@ -1397,7 +1481,7 @@ fn provider_lock_id(provider: &ProviderConfig) -> String {
     )
 }
 
-fn pending_path(store: &DeploymentStore, transaction: &CertificateTransaction) -> PathBuf {
+fn pending_path(store: &TlsStore, transaction: &CertificateTransaction) -> PathBuf {
     binding_directory(
         store,
         &transaction.deployment_id,
@@ -1407,10 +1491,7 @@ fn pending_path(store: &DeploymentStore, transaction: &CertificateTransaction) -
     .join("pending.json")
 }
 
-fn persist_pending(
-    store: &DeploymentStore,
-    transaction: &CertificateTransaction,
-) -> anyhow::Result<()> {
+fn persist_pending(store: &TlsStore, transaction: &CertificateTransaction) -> anyhow::Result<()> {
     atomic_write(
         &pending_path(store, transaction),
         &serde_json::to_vec_pretty(transaction)?,
@@ -1419,8 +1500,8 @@ fn persist_pending(
 }
 
 fn load_pending(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<Option<CertificateTransaction>> {
@@ -1448,8 +1529,8 @@ fn load_pending(
 }
 
 fn ensure_no_pending(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<()> {
@@ -1460,7 +1541,7 @@ fn ensure_no_pending(
 }
 
 fn ensure_provider_not_pending(
-    store: &DeploymentStore,
+    store: &TlsStore,
     current_deployment_id: &str,
     provider: &ProviderConfig,
     tenant: &str,
@@ -1545,7 +1626,7 @@ fn ensure_provider_not_pending(
 }
 
 fn finalize_transaction(
-    store: &DeploymentStore,
+    store: &TlsStore,
     transaction: &CertificateTransaction,
 ) -> anyhow::Result<()> {
     let directory = pending_path(store, transaction)
@@ -1561,8 +1642,8 @@ fn finalize_transaction(
 }
 
 fn persist_receipt(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     receipt: &CertificateReceipt,
 ) -> anyhow::Result<()> {
     let directory = binding_directory(
@@ -1657,8 +1738,8 @@ fn validate_provider_snapshot(transaction: &CertificateTransaction) -> anyhow::R
 }
 
 fn ensure_receipt_revision_available(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     tenant: &str,
     hostname: &str,
     revision: u64,
@@ -1700,8 +1781,8 @@ fn read_optional_receipt_bytes(
 }
 
 fn load_receipt(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<Option<CertificateReceipt>> {
@@ -1713,8 +1794,8 @@ fn load_receipt(
 }
 
 fn load_revision_receipt(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     tenant: &str,
     hostname: &str,
     revision: u64,
@@ -1741,7 +1822,7 @@ fn load_revision_receipt(
 fn load_receipt_at(
     path: &Path,
     label: &str,
-    record: &DeploymentRecord,
+    record: &TlsRecord,
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<Option<CertificateReceipt>> {
@@ -1786,9 +1867,9 @@ fn load_receipt_at(
 }
 
 fn validate_transaction_binding(
-    store: &DeploymentStore,
+    store: &TlsStore,
     transaction: &CertificateTransaction,
-    record: &DeploymentRecord,
+    record: &TlsRecord,
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<()> {

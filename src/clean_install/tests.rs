@@ -76,7 +76,7 @@ impl install_exec::InstallExecutor for ScriptedInstall {
         self.steps.lock().unwrap().push("start");
         if self.fail_at == Some(FailAt::Health) {
             // Executor contract: undo own partial work before failing.
-            install_exec::rollback(job, &performed);
+            install_exec::rollback(job, &performed).expect("fixture rollback");
             return Err(crate::target::Failure::new(
                 HEALTH_PROBE_FAILED,
                 "readiness never answered",
@@ -194,7 +194,7 @@ impl LocalFixture {
                 host: "db.internal".to_owned(),
                 port: 5432,
                 name: "oauth".to_owned(),
-                user: "nazauth".to_owned(),
+                user: "nazoauth".to_owned(),
             },
             valkey_endpoint: crate::target::install_exec::ExternalEndpoint {
                 host: "cache.internal".to_owned(),
@@ -301,18 +301,18 @@ case "$input" in
 esac
 case "$input" in
   *'"kind":"ping"'*)
-    printf '{"schema":1,"operation_id":"%s","outcome":{"status":"completed","body":{"completion":"ping","nonce":"%s"}}}' "${id:-none}" "${nonce:-none}"
+    printf '{"schema":2,"operation_id":"%s","outcome":{"status":"completed","body":{"completion":"ping","nonce":"%s"}}}' "${id:-none}" "${nonce:-none}"
     exit 0
     ;;
 esac
 case "$input" in
   *'"kind":"state-inspect"'*)
-    printf '{"schema":1,"operation_id":"%s","outcome":{"status":"failed","code":"DEPLOYMENT_UNKNOWN","detail":"stub fresh target"}}' "${id:-none}"
+    printf '{"schema":2,"operation_id":"%s","outcome":{"status":"failed","code":"DEPLOYMENT_UNKNOWN","detail":"stub fresh target"}}' "${id:-none}"
     exit 0
     ;;
 esac
 if printf '%s' "$input" | grep -q '"kind":"state-mutate"' && [ "$(cat "$(dirname "$0")/mode.txt")" = "fail" ]; then
-  printf '{"schema":1,"operation_id":"%s","outcome":{"status":"failed","code":"ARTIFACT_UNVERIFIED","detail":"stub refuses"}}' "${id:-none}"
+  printf '{"schema":2,"operation_id":"%s","outcome":{"status":"failed","code":"ARTIFACT_UNVERIFIED","detail":"stub refuses"}}' "${id:-none}"
   exit 0
 fi
 sed -e "s/__OPERATION_ID__/${id:-none}/g" -e "s/__DEPLOYMENT_ID__/${dep:-none}/g" \
@@ -349,13 +349,13 @@ fn windows_stub_ps1() -> String {
         "  [Console]::Out.Write($raw.Replace('__OPERATION_ID__', $callerId))",
         "} elseif ($stdinText -match '\"kind\":\"ping\"') {",
         "  $n = [regex]::Match($stdinText, '\"nonce\":\"([0-9A-Za-z._:+-]+)\"').Groups[1].Value",
-        "  $pong = '{\"schema\":1,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"completed\",\"body\":{\"completion\":\"ping\",\"nonce\":\"' + $n + '\"}}}'",
+        "  $pong = '{\"schema\":2,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"completed\",\"body\":{\"completion\":\"ping\",\"nonce\":\"' + $n + '\"}}}'",
         "  [Console]::Out.Write($pong)",
         "} elseif ($stdinText -match '\"kind\":\"state-inspect\"') {",
-        "  $missing = '{\"schema\":1,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"failed\",\"code\":\"DEPLOYMENT_UNKNOWN\",\"detail\":\"stub fresh target\"}}'",
+        "  $missing = '{\"schema\":2,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"failed\",\"code\":\"DEPLOYMENT_UNKNOWN\",\"detail\":\"stub fresh target\"}}'",
         "  [Console]::Out.Write($missing)",
         "} elseif ((Get-Content (Join-Path $here 'mode.txt')) -eq 'fail') {",
-        "  $failed = '{\"schema\":1,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"failed\",\"code\":\"ARTIFACT_UNVERIFIED\",\"detail\":\"stub refuses\"}}'",
+        "  $failed = '{\"schema\":2,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"failed\",\"code\":\"ARTIFACT_UNVERIFIED\",\"detail\":\"stub refuses\"}}'",
         "  [Console]::Out.Write($failed)",
         "} else {",
         "  $raw = Get-Content -LiteralPath (Join-Path $here 'response-install.json') -Raw",
@@ -412,7 +412,7 @@ impl SshFixture {
                 host: "db.internal".to_owned(),
                 port: 5432,
                 name: "oauth".to_owned(),
-                user: "nazauth".to_owned(),
+                user: "nazoauth".to_owned(),
             },
             valkey_endpoint: crate::target::install_exec::ExternalEndpoint {
                 host: "cache.internal".to_owned(),

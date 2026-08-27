@@ -40,10 +40,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 
 use crate::{
-    deployment::RuntimeBackendKind,
     filesystem::{PrivateTempDir, atomic_write, read_secure_regular_file, sha256},
     model::{Artifact, ReleaseManifest, release_target, semantic_tag},
     process::{Process, command_exists},
+    runtime_backend::RuntimeBackendKind,
     runtime_backend::{BlobAttestationVerification, backend},
 };
 
@@ -60,59 +60,6 @@ const MAX_UNATTESTED_UPDATER_BYTES: u64 = 256 * 1024 * 1024;
 const GITHUB_REQUEST_SECONDS: u64 = 30;
 const RELEASE_DOWNLOAD_SECONDS: u64 = 300;
 const IN_TOTO_STATEMENT_V1: &str = "https://in-toto.io/Statement/v1";
-
-/// The exact runtime identity a verified Release must present once activated:
-/// the signed embedded build identity plus the digest of the OCI image or
-/// host binary that has to serve it. Task execution and conformance sessions
-/// compare their observations against this expectation.
-#[derive(Clone, Debug)]
-pub(crate) struct ExpectedReleaseTarget {
-    pub(crate) embedded: nazo_operator_protocol::EmbeddedIdentity,
-    pub(crate) image_digest: String,
-    pub(crate) binary_digest: String,
-}
-
-pub(crate) fn expected_release_target(
-    config: &crate::model::UpdateConfig,
-    embedded: nazo_operator_protocol::EmbeddedIdentity,
-    image_digest: String,
-    binary_digest: String,
-) -> anyhow::Result<ExpectedReleaseTarget> {
-    if embedded.protocol != nazo_operator_protocol::PROTOCOL_VERSION {
-        bail!("Release operator protocol version is unsupported");
-    }
-    if config.runtime.backend == RuntimeBackendKind::Systemd && binary_digest.len() != 64 {
-        bail!("Release binary digest is invalid");
-    }
-    Ok(ExpectedReleaseTarget {
-        embedded,
-        image_digest,
-        binary_digest,
-    })
-}
-
-/// Derive the expected runtime target from a verified Release manifest.
-pub(crate) fn expected_target(
-    config: &crate::model::UpdateConfig,
-    manifest: &ReleaseManifest,
-) -> anyhow::Result<ExpectedReleaseTarget> {
-    expected_release_target(
-        config,
-        manifest.embedded.clone(),
-        if config.runtime.backend == RuntimeBackendKind::Systemd {
-            manifest.image_oci_digest()
-        } else {
-            manifest.runtime_oci_digest()?
-        }
-        .to_owned(),
-        manifest
-            .artifacts
-            .get("binary")
-            .context("Release manifest has no binary artifact")?
-            .sha256
-            .clone(),
-    )
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -165,9 +112,8 @@ pub(crate) struct VerifiedControllerRelease {
 ///
 /// `trusted_version_floor` carries the version anti-downgrade floor (C6) into
 /// the one authoritative entry so every consumer is floored identically; flows
-/// whose floor lives in richer state (the UpdateConfig trust-state file or the
-/// controller trust state) keep enforcing that state directly at the call site
-/// until the J-phase cleanup retires it.
+/// whose floor lives in richer state keep enforcing that state directly at the
+/// call site.
 pub(crate) struct ReleaseRequest<'a> {
     pub(crate) repository: &'a str,
     pub(crate) requested_version: Option<&'a str>,

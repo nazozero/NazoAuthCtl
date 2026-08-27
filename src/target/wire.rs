@@ -29,7 +29,7 @@ use super::bootstrap_authority::FreshBootstrapMaterialView;
 use super::deployment_state::{ArtifactRefs, RuntimeSurface, StateMutationPayload};
 
 /// Wire schema discriminator for HostOperation and HostResult messages.
-pub const HOST_PROTOCOL_SCHEMA: u32 = 1;
+pub const HOST_PROTOCOL_SCHEMA: u32 = 2;
 
 /// Maximum serialized HostOperation accepted from stdin or a local caller.
 pub const MAX_HOST_OPERATION_BYTES: usize = 64 * 1024;
@@ -49,6 +49,8 @@ pub const MAX_HOST_RESULT_BYTES: usize = 1024 * 1024;
 /// one-shot NazoAuth operator (goal plan 03 §3.3; no secret material, no
 /// signing on the target), and adds the read-only host-level enumeration
 /// kind `state-list` for discovery (goal plan 07 §6, task G05).
+/// `bootstrap-close` and `bootstrap-read` are the two fresh-install
+/// capability operations (P0-2).
 pub const HOST_OPERATION_KINDS: &[&str] = &[
     "hello",
     "ping",
@@ -56,6 +58,10 @@ pub const HOST_OPERATION_KINDS: &[&str] = &[
     "state-mutate",
     "control-operation",
     "state-list",
+    "bootstrap-close",
+    "bootstrap-read",
+    "runtime-logs",
+    "journal-read",
 ];
 
 /// Product identity reported by a remote helper and required by the C08
@@ -218,6 +224,20 @@ pub enum HostOperationBody {
     /// binding. The server consumes the bootstrap token itself, so this is
     /// hygiene, not the security boundary — but it must be explicit.
     BootstrapClose {},
+    /// Read the fresh-install bootstrap capability for one deployment.
+    /// Requires the instance binding. Returns the material view while the
+    /// capability is open and the live state matches its install journal
+    /// binding; fails closed in every other state (closed, consumed, drifted).
+    /// Separated from `StateInspect` so bootstrap material never travels in
+    /// the generic inspection path.
+    BootstrapRead {},
+    /// Read a bounded tail of application logs from the deployment's live
+    /// runtime. The target resolves the runtime object from DeploymentState;
+    /// callers cannot supply an arbitrary container or systemd unit name.
+    RuntimeLogs { limit: usize },
+    /// Read the bounded target-side operation journal projection for one
+    /// deployment. This is the same authority used for local operation views.
+    JournalRead { limit: usize },
 }
 
 impl HostOperationBody {
@@ -230,6 +250,9 @@ impl HostOperationBody {
             Self::ControlOperation { .. } => "control-operation",
             Self::StateList {} => "state-list",
             Self::BootstrapClose {} => "bootstrap-close",
+            Self::BootstrapRead {} => "bootstrap-read",
+            Self::RuntimeLogs { .. } => "runtime-logs",
+            Self::JournalRead { .. } => "journal-read",
         }
     }
 }
@@ -338,6 +361,48 @@ impl HostOperation {
         }
     }
 
+    /// Read the fresh-install bootstrap capability for one deployment.
+    pub fn bootstrap_read(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::BootstrapRead {},
+        }
+    }
+
+    pub fn runtime_logs(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        limit: usize,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::RuntimeLogs { limit },
+        }
+    }
+
+    pub fn journal_read(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        limit: usize,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::JournalRead { limit },
+        }
+    }
+
     pub fn validate(&self) -> Result<(), MessageRejection> {
         if self.schema != HOST_PROTOCOL_SCHEMA {
             return Err(MessageRejection::new(
@@ -412,6 +477,17 @@ impl HostOperation {
                     ));
                 }
             }
+            HostOperationBody::BootstrapRead {} => {
+                // Reading the bootstrap capability addresses exactly one
+                // registered deployment and is strictly read-only.
+                if self.deployment_id.is_none() || self.expected_revision.is_some() {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "bootstrap-read requires deployment_id and must not carry \
+                         expected_revision",
+                    ));
+                }
+            }
             HostOperationBody::StateList {} => {
                 // Enumeration is host-level and read-only: instance bindings
                 // and revision expectations are meaningless against it.
@@ -430,12 +506,20 @@ impl HostOperation {
                     ));
                 }
                 match mutation {
-                    StateMutationPayload::Bootstrap { install, .. } => {
+                    StateMutationPayload::Bootstrap {
+                        artifact, install, ..
+                    } => {
                         // There is no prior revision to expect on creation.
                         if self.expected_revision.is_some() {
                             return Err(MessageRejection::new(
                                 RejectionCode::OperationMalformed,
                                 "bootstrap must not carry expected_revision",
+                            ));
+                        }
+                        if install.is_some() == artifact.is_some() {
+                            return Err(MessageRejection::new(
+                                RejectionCode::OperationMalformed,
+                                "bootstrap requires exactly one of install or artifact",
                             ));
                         }
                         // A carried install order must itself be well-formed;
@@ -458,7 +542,9 @@ impl HostOperation {
                             ));
                         }
                     }
-                    StateMutationPayload::Update { artifact, config } => {
+                    StateMutationPayload::Update {
+                        artifact, config, ..
+                    } => {
                         // Every lifecycle mutation replays against the live
                         // revision; without the expectation a resumed update
                         // could re-apply over drifted state.
@@ -551,6 +637,28 @@ impl HostOperation {
                         RejectionCode::OperationMalformed,
                         "control-operation expected_deployment_id must equal the operation \
                          binding",
+                    ));
+                }
+            }
+            HostOperationBody::RuntimeLogs { limit } => {
+                if self.deployment_id.is_none()
+                    || self.expected_revision.is_some()
+                    || !(1..=500).contains(limit)
+                {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "runtime-logs requires deployment_id, no revision, and limit 1-500",
+                    ));
+                }
+            }
+            HostOperationBody::JournalRead { limit } => {
+                if self.deployment_id.is_none()
+                    || self.expected_revision.is_some()
+                    || !(1..=1000).contains(limit)
+                {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "journal-read requires deployment_id, no revision, and limit 1-1000",
                     ));
                 }
             }
@@ -677,6 +785,18 @@ pub enum HostCompletionBody {
     /// target. Pure acknowledgement; the security boundary is the server's
     /// own token consumption.
     BootstrapClosed {},
+    /// The fresh-install bootstrap material for one deployment. Returned by
+    /// the `BootstrapRead` host operation while the capability is open; fails
+    /// closed in every other state.
+    BootstrapRead {
+        material: FreshBootstrapMaterialView,
+    },
+    RuntimeLogs {
+        lines: Vec<String>,
+    },
+    JournalRead {
+        entries: Vec<super::journal::OperationLogEntry>,
+    },
 }
 
 /// Live inspection of one registered instance read from the target-side
@@ -710,12 +830,6 @@ pub struct InstanceInspection {
     /// closed instead of guessing a revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_revision_marker: Option<String>,
-    /// Read-only fresh-install bootstrap capability, surfaced ONLY while the
-    /// capability is open and the live state still matches its install
-    /// journal binding (goal plan 07 G-A decision). Absent in every other
-    /// state — closure, consumption, and drift are indistinguishable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bootstrap_material: Option<FreshBootstrapMaterialView>,
     /// Embedded build identity facts of `artifact.current`, when the target's
     /// verification recorded them (G03 ControlOperation envelope source).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -982,7 +1096,11 @@ mod tests {
                 "state-inspect",
                 "state-mutate",
                 "control-operation",
-                "state-list"
+                "state-list",
+                "bootstrap-close",
+                "bootstrap-read",
+                "runtime-logs",
+                "journal-read",
             ]
         );
         let operation = ping_operation("probe");
@@ -1015,7 +1133,10 @@ mod tests {
                     "podman",
                     "nazoauth-main",
                 )?,
-                artifact: Default::default(),
+                artifact: Some(super::super::deployment_state::ArtifactRefs {
+                    current: Some("sha256:abcdef0123456789".to_owned()),
+                    previous: None,
+                }),
                 config_reference: "/etc/nazauth/config.toml".to_owned(),
                 config_schema: "nazauth-config-v1".to_owned(),
                 resources: vec![super::super::deployment_state::Resource::new(
@@ -1043,16 +1164,17 @@ mod tests {
             config_content: "{\"issuer\":\"https://auth.example.com\"}".to_owned(),
             config_sha256: "b".repeat(64),
             data_root: "/var/lib/nazoauth".to_owned(),
+            runtime_root: None,
             secrets: vec![super::super::install_exec::PlannedSecret {
                 purpose: "database-url".to_owned(),
                 path: "/var/lib/nazoauth/secrets/database-url".to_owned(),
-                value: Some("postgresql://nazauth:secret@db.internal:5432/oauth".to_owned()),
+                value: Some("secret".to_owned()),
             }],
             database_endpoint: crate::target::install_exec::ExternalEndpoint {
                 host: "db.internal".to_owned(),
                 port: 5432,
                 name: "oauth".to_owned(),
-                user: "nazauth".to_owned(),
+                user: "nazoauth".to_owned(),
             },
             valkey_endpoint: crate::target::install_exec::ExternalEndpoint {
                 host: "cache.internal".to_owned(),
@@ -1074,7 +1196,7 @@ mod tests {
                     "podman",
                     "nazoauth-main",
                 )?,
-                artifact: Default::default(),
+                artifact: None,
                 config_reference: "/etc/nazauth/deployments/deploy-alpha/config.json".to_owned(),
                 config_schema: "nazauth-seed-v1".to_owned(),
                 resources: Vec::new(),
@@ -1131,6 +1253,7 @@ mod tests {
                     sha256: "d".repeat(64),
                     schema: "nazauth-config-v2".to_owned(),
                 }),
+                migration_jws: None,
             },
         );
         assert_eq!(
@@ -1175,6 +1298,18 @@ mod tests {
         let parsed = parse_host_operation(&encode_host_operation(&control)?)?;
         assert_eq!(parsed, control);
         assert_eq!(parsed.operation.kind(), "control-operation");
+
+        // bootstrap-close and bootstrap-read require a deployment binding and
+        // no revision expectation.
+        let close = HostOperation::bootstrap_close(Uuid::now_v7().to_string(), "deploy-alpha");
+        let parsed = parse_host_operation(&encode_host_operation(&close)?)?;
+        assert_eq!(parsed, close);
+        assert_eq!(parsed.operation.kind(), "bootstrap-close");
+
+        let read = HostOperation::bootstrap_read(Uuid::now_v7().to_string(), "deploy-alpha");
+        let parsed = parse_host_operation(&encode_host_operation(&read)?)?;
+        assert_eq!(parsed, read);
+        assert_eq!(parsed.operation.kind(), "bootstrap-read");
         Ok(())
     }
 
@@ -1262,7 +1397,6 @@ mod tests {
             health_summary: "runtime healthy".to_owned(),
             active_host_operation: None,
             config_revision_marker: None,
-            bootstrap_material: None,
             current_build_identity: None,
             backup_maturity: super::super::deployment_state::BackupMaturity::Unknown,
         };
@@ -1289,6 +1423,7 @@ mod tests {
                     expected_subject_sha256: None,
                 },
                 config: None,
+                migration_jws: None,
             },
         );
         let rejection = cas_free_update.validate().expect_err("update without CAS");
@@ -1308,6 +1443,7 @@ mod tests {
                     expected_subject_sha256: Some("NOT-A-DIGEST".to_owned()),
                 },
                 config: None,
+                migration_jws: None,
             },
         );
         assert!(bad_pin.validate().is_err());
@@ -1380,7 +1516,10 @@ mod tests {
             mutation: StateMutationPayload::Bootstrap {
                 issuer: "https://auth.example.com".to_owned(),
                 runtime: super::super::deployment_state::RuntimeSurface::new("host", "unit")?,
-                artifact: Default::default(),
+                artifact: Some(super::super::deployment_state::ArtifactRefs {
+                    current: Some("sha256:abcdef0123456789".to_owned()),
+                    previous: None,
+                }),
                 config_reference: "/cfg".to_owned(),
                 config_schema: "v1".to_owned(),
                 resources: Vec::new(),

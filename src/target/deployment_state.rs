@@ -71,7 +71,7 @@ use super::install_exec::InstallOrder;
 use super::journal;
 
 /// Schema discriminator carried by the persisted DeploymentState document.
-pub const DEPLOYMENT_STATE_SCHEMA: u32 = 1;
+pub const DEPLOYMENT_STATE_SCHEMA: u32 = 2;
 
 /// Upper bound for one persisted DeploymentState document (~1 MiB).
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
@@ -399,7 +399,7 @@ pub struct BuildIdentity {
 }
 
 /// The server product token every NazoAuth build identity carries.
-pub const BUILD_IDENTITY_PRODUCT: &str = "nazauth";
+pub const BUILD_IDENTITY_PRODUCT: &str = nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT;
 
 impl BuildIdentity {
     pub fn new(product: &str, version: &str, commit: &str) -> anyhow::Result<Self> {
@@ -463,7 +463,7 @@ impl DeploymentState {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.schema != DEPLOYMENT_STATE_SCHEMA {
             bail!(
-                "unsupported DeploymentState schema {} (expected {DEPLOYMENT_STATE_SCHEMA})",
+                "STATE_RESET_REQUIRED: unsupported DeploymentState schema {} (expected {DEPLOYMENT_STATE_SCHEMA}); please clean up obsolete ctl state and run adopt/clean-install",
                 self.schema
             );
         }
@@ -572,7 +572,8 @@ pub enum StateMutationPayload {
     Bootstrap {
         issuer: String,
         runtime: RuntimeSurface,
-        artifact: ArtifactRefs,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<ArtifactRefs>,
         config_reference: String,
         config_schema: String,
         resources: Vec<Resource>,
@@ -592,6 +593,8 @@ pub enum StateMutationPayload {
         artifact: super::install_exec::OfficialArtifactRef,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         config: Option<super::install_exec::StagedConfig>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        migration_jws: Option<String>,
     },
     /// Explicit rollback to the previous verified artifact reference (G04).
     /// Never runs application mutations and never touches data restore.

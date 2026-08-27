@@ -98,7 +98,7 @@ pub trait AdminApiTransport: Send + Sync {
 // production transport (hyper-rustls, platform verifier, https-only)
 // ---------------------------------------------------------------------------
 
-type LegacyClient = hyper_util::client::legacy::Client<
+type HttpClient = hyper_util::client::legacy::Client<
     hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
     http_body_util::Full<bytes::Bytes>,
 >;
@@ -107,7 +107,7 @@ type LegacyClient = hyper_util::client::legacy::Client<
 /// request timeout, response-size cap.
 pub struct HttpsAdminTransport {
     runtime: tokio::runtime::Runtime,
-    client: LegacyClient,
+    client: HttpClient,
 }
 
 impl fmt::Debug for HttpsAdminTransport {
@@ -129,7 +129,7 @@ impl HttpsAdminTransport {
             .enable_http1()
             .enable_http2()
             .build();
-        let client: LegacyClient =
+        let client: HttpClient =
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
                 .build(connector);
         Ok(Self { runtime, client })
@@ -886,14 +886,9 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
         #[serde(deny_unknown_fields)]
         struct ChallengeWire {
             challenge_id: String,
-            /// Echoed binding; the server repeats it for operator clarity.
-            #[allow(dead_code)]
             deployment_id: String,
             nonce: String,
             expires_at: String,
-            /// Echoed algorithm description; Ed25519 is the only negotiated
-            /// suite today, echoed verbatim by the server.
-            #[allow(dead_code)]
             algorithm: serde_json::Value,
             single_use: bool,
         }
@@ -906,6 +901,16 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             Some(serialize_body(body)?),
         )?;
         let wire: ChallengeWire = serde_json::from_slice(&raw).map_err(malformed_response)?;
+        if wire.deployment_id != body.deployment_id {
+            return Err(malformed_response(anyhow::anyhow!(
+                "server challenge echoed a different deployment id"
+            )));
+        }
+        if wire.algorithm != serde_json::json!({"type": "Ed25519"}) {
+            return Err(malformed_response(anyhow::anyhow!(
+                "server challenge selected an unsupported signature algorithm"
+            )));
+        }
         if !wire.single_use {
             return Err(malformed_response(anyhow::anyhow!(
                 "server issued a non-single-use challenge"
@@ -987,7 +992,7 @@ pub struct RecoveryChallengeBody {
 }
 
 /// Body of `POST /controller-recovery/recover`.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryAnswerBody {
     pub deployment_id: String,

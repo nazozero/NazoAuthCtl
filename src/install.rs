@@ -11,25 +11,10 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::SigningKey;
 
 const TENANT_RESOURCE_CONTROLLER_PRIVATE_FILE: &str = "tenant-resource-controller.key";
-const TENANT_RESOURCE_CONTROLLER_PUBLIC_FILE: &str = "tenant-resource-controller.pub";
-const TENANT_RESOURCE_CONTROLLER_KEY_ID_FILE: &str = "tenant-resource-controller.kid";
-
 pub(crate) fn tenant_resource_controller_private_key_path(config_dir: &Path) -> PathBuf {
     config_dir
         .join("operator")
         .join(TENANT_RESOURCE_CONTROLLER_PRIVATE_FILE)
-}
-
-pub(crate) fn tenant_resource_controller_public_key_path(config_dir: &Path) -> PathBuf {
-    config_dir
-        .join("operator")
-        .join(TENANT_RESOURCE_CONTROLLER_PUBLIC_FILE)
-}
-
-pub(crate) fn tenant_resource_controller_key_id_path(config_dir: &Path) -> PathBuf {
-    config_dir
-        .join("operator")
-        .join(TENANT_RESOURCE_CONTROLLER_KEY_ID_FILE)
 }
 
 pub(crate) fn read_tenant_resource_controller_signing_key(

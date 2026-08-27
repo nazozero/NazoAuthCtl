@@ -10,7 +10,7 @@
 //!
 //! Artifact transfer decision (recorded per the task brief): verified bytes
 //! are **obtained on the target** ("download-on-target"), reusing the same
-//! official-verification pipeline the legacy install ran on the host —
+//! official-verification pipeline used on the target —
 //! `VerifiedRelease::verify` plus the runtime backend pull. The control side
 //! sends only reference/digest facts (repository, optional version pin,
 //! optional expected subject digest); multi-hundred-megabyte blobs never
@@ -32,16 +32,15 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    deployment::RuntimeBackendKind,
     filesystem::{self, atomic_write},
     process::Process,
     release::{ReleaseRequest, VerifiedRelease},
-    runtime_backend,
+    runtime_backend::{self, RuntimeBackendKind},
 };
 
 use super::{
     bootstrap_authority,
-    deployment_state::Failure,
+    deployment_state::{Failure, INSTALL_FAILED},
     wire::{HOST_ERR_OPERATION_INVALID, sanitize},
 };
 
@@ -212,6 +211,10 @@ pub struct InstallOrder {
     pub config_sha256: String,
     /// Absolute directories/files the deployment owns (managed facts).
     pub data_root: String,
+    /// Permanent binary directory for the systemd host runtime. Absent for
+    /// container runtimes, whose executable lives inside the verified image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_root: Option<String>,
     /// Target-generated secret files backing the config references.
     pub secrets: Vec<PlannedSecret>,
     /// G02 hook: provision the single-use initial-admin bootstrap capability
@@ -268,10 +271,20 @@ impl InstallOrder {
                 "install config_sha256 must be 64 lowercase hexadecimal characters",
             ));
         }
-        if self.data_root.is_empty() || self.data_root.len() > 512 {
+        if !safe_absolute_install_path(&self.data_root) {
             return Err(super::wire::MessageRejection::new(
                 super::wire::RejectionCode::OperationMalformed,
                 "install data_root must be a bounded absolute path",
+            ));
+        }
+        if self
+            .runtime_root
+            .as_ref()
+            .is_some_and(|path| !safe_absolute_install_path(path))
+        {
+            return Err(super::wire::MessageRejection::new(
+                super::wire::RejectionCode::OperationMalformed,
+                "install runtime_root must be a bounded absolute path",
             ));
         }
         if self.secrets.len() > SECRET_PURPOSES.len() {
@@ -292,7 +305,9 @@ impl InstallOrder {
                     ),
                 ));
             }
-            if secret.path.is_empty() || secret.path.len() > 512 {
+            if !safe_absolute_install_path(&secret.path)
+                || Path::new(&secret.path).parent().is_none()
+            {
                 return Err(super::wire::MessageRejection::new(
                     super::wire::RejectionCode::OperationMalformed,
                     "install secret path must be a bounded absolute path",
@@ -324,14 +339,27 @@ fn valid_lower_hex_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+fn safe_absolute_install_path(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && value.len() <= 512
+        && (path.is_absolute() || value.starts_with('/'))
+        && !value.chars().any(char::is_control)
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+}
+
 /// Everything the executor needs besides the order itself. Built by dispatch
 /// from the accepted operation; never serialized.
 pub(crate) struct InstallJob<'a> {
     pub operation_id: &'a str,
     pub deployment_id: &'a str,
     pub issuer: &'a str,
-    /// Runtime class token from the Bootstrap surface (`podman`, `docker`,
-    /// `host`).
+    /// Runtime class token from the Bootstrap surface (`podman`, `docker`).
     pub runtime_kind: &'a str,
     pub runtime_object: &'a str,
     pub config_reference: &'a str,
@@ -385,10 +413,16 @@ impl InstallExecutor for HostInstallExecutor {
         let mut performed = PerformedSteps::default();
         match self.run(job, &mut performed) {
             Ok(facts) => Ok(facts),
-            Err(failure) => {
-                rollback(job, &performed);
-                Err(failure)
-            }
+            Err(failure) => match rollback(job, &performed) {
+                Ok(()) => Err(failure),
+                Err(cleanup) => Err(Failure::new(
+                    failure.code,
+                    format!(
+                        "{}; rollback was incomplete: {}",
+                        failure.detail, cleanup.detail
+                    ),
+                )),
+            },
         }
     }
 }
@@ -399,9 +433,12 @@ impl InstallExecutor for HostInstallExecutor {
 #[derive(Default)]
 pub(crate) struct PerformedSteps {
     pub(crate) wrote_config: bool,
+    pub(crate) wrote_config_marker: bool,
     pub(crate) generated_secrets: Vec<String>,
     pub(crate) provisioned_bootstrap: bool,
+    pub(crate) installed_runtime: bool,
     pub(crate) started_runtime: bool,
+    pub(crate) created_directories: Vec<PathBuf>,
 }
 
 impl HostInstallExecutor {
@@ -411,15 +448,73 @@ impl HostInstallExecutor {
         performed: &mut PerformedSteps,
     ) -> Result<InstallFacts, Failure> {
         let config_path = PathBuf::from(job.config_reference);
-        // Fresh installs never overwrite an existing configuration.
-        if config_path.exists() {
+        if !safe_absolute_install_path(job.config_reference) {
+            return Err(Failure::new(
+                CONFIG_INVALID,
+                "clean install requires an absolute configuration path without traversal",
+            ));
+        }
+        let config_owned = PathBuf::from(format!("{}.nazoauth-owned", config_path.display()));
+        let config_metadata = std::fs::symlink_metadata(&config_path).ok();
+        let config_or_marker_exists =
+            config_metadata.is_some() || std::fs::symlink_metadata(&config_owned).is_ok();
+        if config_or_marker_exists
+            && (!config_metadata
+                .is_some_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                || !ownership_marker_matches(&config_owned, job.deployment_id))
+        {
             return Err(Failure::new(
                 CONFIG_PATH_OCCUPIED,
                 format!(
-                    "{} already exists; clean install never replaces an existing configuration",
+                    "{} exists without this install operation's ownership proof",
                     config_path.display()
                 ),
             ));
+        }
+
+        let secret_root = job
+            .order
+            .secrets
+            .first()
+            .and_then(|secret| Path::new(&secret.path).parent())
+            .ok_or_else(|| {
+                Failure::new(
+                    SECRET_PROVISION_FAILED,
+                    "clean install requires one explicit secrets directory",
+                )
+            })?
+            .to_path_buf();
+        let mut managed_directories = vec![PathBuf::from(&job.order.data_root), secret_root];
+        if let Some(runtime_root) = &job.order.runtime_root {
+            managed_directories.push(PathBuf::from(runtime_root));
+        }
+        for (index, path) in managed_directories.iter().enumerate() {
+            if let Ok(metadata) = std::fs::symlink_metadata(path)
+                && (!metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || !ownership_marker_matches(&path.join(".nazoauth-owned"), job.deployment_id))
+            {
+                return Err(Failure::new(
+                    CONFIG_PATH_OCCUPIED,
+                    format!(
+                        "{} exists without this install operation's ownership proof",
+                        path.display()
+                    ),
+                ));
+            }
+            if config_path.starts_with(path)
+                || managed_directories
+                    .iter()
+                    .enumerate()
+                    .any(|(other_index, other)| {
+                        index != other_index && (path.starts_with(other) || other.starts_with(path))
+                    })
+            {
+                return Err(Failure::new(
+                    CONFIG_INVALID,
+                    "clean-install config, data, secrets, and runtime paths must be disjoint",
+                ));
+            }
         }
 
         // 1. Official artifact: verify first, use afterwards (H01 single entry).
@@ -431,16 +526,17 @@ impl HostInstallExecutor {
             trusted_version_floor: None,
         })
         .map_err(|error| Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string())))?;
-        let subject_digest = match kind {
+        let (subject_digest, pin_digest) = match kind {
             RuntimeBackendKind::Systemd => {
                 let binary = release
                     .artifact("binary", &job.order.artifact.repository)
                     .map_err(|error| {
                         Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string()))
                     })?;
-                filesystem::sha256(&binary).map_err(|error| {
+                let digest = filesystem::sha256(&binary).map_err(|error| {
                     Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string()))
-                })?
+                })?;
+                (digest.clone(), digest)
             }
             RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
                 // Container backends always run Linux images regardless of the
@@ -472,20 +568,26 @@ impl HostInstallExecutor {
                     }
                     // Local exact-digest match: proceed without network.
                 }
-                release
+                let platform_digest = digest.trim_start_matches("sha256:").to_owned();
+                let index_digest = release
                     .manifest
                     .image_oci_digest()
                     .trim_start_matches("sha256:")
-                    .to_owned()
+                    .to_owned();
+                (platform_digest, index_digest)
             }
         };
         if let Some(expected) = &job.order.artifact.expected_subject_sha256
-            && expected != &subject_digest
+            && expected != &pin_digest
         {
             return Err(Failure::new(
                 ARTIFACT_UNVERIFIED,
                 "verified subject digest differs from the requested pin",
             ));
+        }
+
+        for directory in &managed_directories {
+            prepare_owned_directory(directory, job.deployment_id, performed)?;
         }
 
         // 2. Atomic config write with integrity check.
@@ -509,24 +611,32 @@ impl HostInstallExecutor {
         }
         atomic_write(&config_path, content_bytes, 0o600)
             .map_err(|error| Failure::new(CONFIG_INVALID, sanitize(error.to_string())))?;
+        performed.wrote_config = true;
         // The container reads this file as the image's fixed runtime UID;
         // bind mounts keep host ownership, so hand it over group-readable.
-        set_runtime_identity(&config_path, false)?;
+        if kind != RuntimeBackendKind::Systemd {
+            set_runtime_identity(&config_path, false)?;
+        }
         // P1-1: the deletion credential for the uninstall executor — proves
         // ctl created this exact file during install.
-        let config_owned = PathBuf::from(format!("{}.nazauth-owned", config_path.display()));
         atomic_write(&config_owned, job.deployment_id.as_bytes(), 0o440).map_err(|error| {
             Failure::new(
                 HOST_ERR_OPERATION_INVALID,
                 sanitize(format!("failed to write config ownership marker: {error}")),
             )
         })?;
-        performed.wrote_config = true;
+        performed.wrote_config_marker = true;
 
         // 3. Target-local secrets (values are minted here, never shipped).
         for secret in &job.order.secrets {
             let path = PathBuf::from(&secret.path);
             let existed = path.exists();
+            if existed {
+                filesystem::open_secure_regular_file(&path, "resumed install secret", false)
+                    .map_err(|error| {
+                        Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string()))
+                    })?;
+            }
             match secret.purpose.as_str() {
                 // The server decodes this key with base64url-no-pad and
                 // requires exactly 32 bytes (settings.rs
@@ -568,7 +678,10 @@ impl HostInstallExecutor {
                             match host {
                                 "127.0.0.1" | "::1" | "localhost" => match kind {
                                     RuntimeBackendKind::Docker => "host.docker.internal".to_owned(),
-                                    _ => "host.containers.internal".to_owned(),
+                                    RuntimeBackendKind::Podman => {
+                                        "host.containers.internal".to_owned()
+                                    }
+                                    RuntimeBackendKind::Systemd => host.to_owned(),
                                 },
                                 other => other.to_owned(),
                             }
@@ -601,13 +714,13 @@ impl HostInstallExecutor {
                     ));
                 }
             }
-            set_runtime_identity(&path, false)?;
-            if let Some(parent) = path.parent() {
-                set_runtime_identity_directory(parent)?;
+            if kind != RuntimeBackendKind::Systemd {
+                set_runtime_identity(&path, false)?;
+                if let Some(parent) = path.parent() {
+                    set_runtime_identity_directory(parent)?;
+                }
             }
-            if !existed {
-                performed.generated_secrets.push(secret.path.clone());
-            }
+            performed.generated_secrets.push(secret.path.clone());
         }
 
         // The writable data directory is mounted straight into the container:
@@ -624,7 +737,9 @@ impl HostInstallExecutor {
                 )),
             ));
         }
-        set_runtime_identity_directory_data(&data_root)?;
+        if kind != RuntimeBackendKind::Systemd {
+            set_runtime_identity_directory_data(&data_root)?;
+        }
 
         // 4. Fresh-install application setup (G02 hook): the install-binding
         // capability record. The bootstrap token has exactly one authority —
@@ -654,11 +769,7 @@ impl HostInstallExecutor {
         // 6. Start the runtime and confirm it serves the verified artifact.
         match kind {
             RuntimeBackendKind::Systemd => {
-                return Err(Failure::new(
-                    RUNTIME_START_FAILED,
-                    "the systemd host backend joins the lifecycle waves with the K-phase \
-                     integration; use Podman or Docker for the clean-install path",
-                ));
+                start_systemd_runtime(job, &release, &subject_digest, performed)?;
             }
             RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
                 start_container_runtime(job, &release, kind, performed)?;
@@ -668,16 +779,6 @@ impl HostInstallExecutor {
         // 7. Local health/readiness probe. Public reachability is deliberately
         // absent here (G08): loopback readiness is the only install gate.
         probe_local_health(job.order.port)?;
-
-        // 8. Ownership marker: proves ctl created and manages this directory.
-        // Uninstall verifies it before any destructive action (P0-3/W2.4).
-        let owned_marker = PathBuf::from(&job.order.data_root).join(".nazoauth-owned");
-        atomic_write(&owned_marker, job.deployment_id.as_bytes(), 0o440).map_err(|error| {
-            Failure::new(
-                HOST_ERR_OPERATION_INVALID,
-                sanitize(format!("failed to write ownership marker: {error}")),
-            )
-        })?;
 
         Ok(InstallFacts {
             artifact_reference: format!("sha256:{subject_digest}"),
@@ -693,6 +794,29 @@ impl HostInstallExecutor {
             ),
         })
     }
+}
+
+fn prepare_owned_directory(
+    path: &Path,
+    deployment_id: &str,
+    performed: &mut PerformedSteps,
+) -> Result<(), Failure> {
+    filesystem::ensure_directory_chain(path)
+        .map_err(|error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())))?;
+    let marker = path.join(".nazoauth-owned");
+    atomic_write(&marker, deployment_id.as_bytes(), 0o440)
+        .map_err(|error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())))?;
+    performed.created_directories.push(path.to_path_buf());
+    Ok(())
+}
+
+fn ownership_marker_matches(marker: &Path, deployment_id: &str) -> bool {
+    let Ok(bytes) =
+        filesystem::read_secure_regular_file(marker, "install ownership marker", false, 256)
+    else {
+        return false;
+    };
+    std::str::from_utf8(bytes.as_ref()).is_ok_and(|owner| owner.trim() == deployment_id)
 }
 
 fn start_container_runtime(
@@ -744,6 +868,7 @@ fn start_container_runtime(
         observed.running && observed.artifact == artifact_reference(&image, &digest)
     }) {
         // Resume: the exact verified runtime is already up.
+        performed.installed_runtime = true;
         performed.started_runtime = true;
         return Ok(());
     }
@@ -852,6 +977,7 @@ fn start_container_runtime(
     backend
         .start(job.runtime_object)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
+    performed.installed_runtime = true;
     performed.started_runtime = true;
 
     // Embedded identity check: the running object must report the verified
@@ -895,6 +1021,133 @@ pub fn percent_encode_credential(credential: &str) -> String {
         }
     }
     encoded
+}
+
+fn start_systemd_runtime(
+    job: &InstallJob<'_>,
+    release: &VerifiedRelease,
+    digest: &str,
+    performed: &mut PerformedSteps,
+) -> Result<(), Failure> {
+    crate::instance_lifecycle::privilege::ensure_systemd_access()
+        .map_err(|error| Failure::new(error.code(), sanitize(error.to_string())))?;
+    let runtime_root = job.order.runtime_root.as_deref().ok_or_else(|| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "systemd install requires an explicit runtime_root",
+        )
+    })?;
+    let verified_source = release
+        .artifact("binary", &job.order.artifact.repository)
+        .map_err(|error| Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string())))?;
+    let source_binary =
+        cache_systemd_artifact(&verified_source, Path::new(runtime_root), digest)
+            .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
+    let binary = PathBuf::from(runtime_root).join("nazoauth");
+    let service_user = format!(
+        "nazoauth-{}",
+        job.deployment_id
+            .trim_start_matches("deploy-")
+            .chars()
+            .take(12)
+            .collect::<String>()
+    );
+    let secret_paths = job
+        .order
+        .secrets
+        .iter()
+        .map(|secret| PathBuf::from(&secret.path))
+        .collect::<Vec<_>>();
+    let backend = runtime_backend::backend(RuntimeBackendKind::Systemd);
+    // From this point rollback must remove both a partial unit and the
+    // deployment-specific service account created by the backend.
+    performed.installed_runtime = true;
+    backend
+        .install_host_service(&runtime_backend::HostServiceInstall {
+            service_name: job.runtime_object.to_owned(),
+            deployment_id: job.deployment_id.to_owned(),
+            service_user: service_user.clone(),
+            source_binary,
+            binary: binary.clone(),
+            config: PathBuf::from(job.config_reference),
+            data_root: PathBuf::from(&job.order.data_root),
+            secret_paths: secret_paths.clone(),
+        })
+        .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
+    let mut environment = std::collections::BTreeMap::new();
+    environment.insert(
+        SERVER_CONFIG_FILE_ENV.to_owned(),
+        job.config_reference.to_owned(),
+    );
+    let task = runtime_backend::OneShotTask {
+        artifact: runtime_backend::ArtifactReference::HostBinary {
+            path: binary.clone(),
+            sha256: digest.to_owned(),
+        },
+        command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
+        network: Some("host".to_owned()),
+        mounts: Vec::new(),
+        environment,
+        working_directory: Some(PathBuf::from(&job.order.data_root)),
+        service_user: Some(service_user),
+        transient_credentials: std::collections::BTreeMap::new(),
+        read_only_paths: std::iter::once(PathBuf::from(job.config_reference))
+            .chain(secret_paths)
+            .collect(),
+        read_write_paths: vec![PathBuf::from(&job.order.data_root)],
+        inaccessible_paths: Vec::new(),
+        private_mounts: false,
+        stdin: Vec::new(),
+    };
+    backend
+        .run_one_shot(&task)
+        .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
+    backend
+        .start(job.runtime_object)
+        .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
+    performed.started_runtime = true;
+    let observed = backend
+        .inspect(job.runtime_object)
+        .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
+    let expected = runtime_backend::ArtifactReference::HostBinary {
+        path: binary,
+        sha256: digest.to_owned(),
+    };
+    if !observed.running || observed.artifact != expected {
+        return Err(Failure::new(
+            TARGET_IDENTITY_MISMATCH,
+            "the started systemd unit does not serve the verified host binary",
+        ));
+    }
+    Ok(())
+}
+
+/// Store one verified host binary in the deployment-owned rollback cache.
+/// Cache directories are root-owned and traversable but not writable by the
+/// service account; the binary itself is executable for pre-activation
+/// migration tasks.
+pub(super) fn cache_systemd_artifact(
+    source: &Path,
+    runtime_root: &Path,
+    digest: &str,
+) -> anyhow::Result<PathBuf> {
+    if filesystem::sha256(source)? != digest {
+        anyhow::bail!("verified systemd binary changed before caching");
+    }
+    let artifacts_root = runtime_root.join("artifacts");
+    let cache_dir = artifacts_root.join(digest);
+    filesystem::ensure_directory_chain(&cache_dir)?;
+    for directory in [runtime_root, artifacts_root.as_path(), cache_dir.as_path()] {
+        filesystem::set_mode(directory, 0o755)?;
+    }
+    let cached = cache_dir.join("nazoauth");
+    let mut source_file =
+        filesystem::open_secure_regular_file(source, "verified systemd release binary", false)?;
+    filesystem::copy_atomic_from_file(&mut source_file, &cached, 0o555)?;
+    if filesystem::sha256(&cached)? != digest {
+        anyhow::bail!("cached systemd binary does not match its verified digest");
+    }
+    Ok(cached)
 }
 
 /// One-shot `nazauth migrate` against the verified image, sharing the exact
@@ -1114,25 +1367,68 @@ pub(crate) fn probe_local_health(port: u16) -> Result<(), Failure> {
         .unwrap_or_else(|| Failure::new(HEALTH_PROBE_FAILED, "local readiness probe timed out")))
 }
 
-/// Roll every performed step back. Best-effort per step but total in intent:
-/// a failed clean install leaves the target exactly as it found it.
-pub(crate) fn rollback(job: &InstallJob<'_>, performed: &PerformedSteps) {
-    if performed.started_runtime
+/// Roll every performed step back. Every cleanup is attempted, and any
+/// residue is returned to the caller instead of being hidden behind the
+/// original install failure.
+pub(crate) fn rollback(job: &InstallJob<'_>, performed: &PerformedSteps) -> Result<(), Failure> {
+    let mut errors = Vec::new();
+    if performed.installed_runtime
         && let Ok(kind) = job.backend_kind()
-        && kind != RuntimeBackendKind::Systemd
     {
         let backend = runtime_backend::backend(kind);
-        let _ = backend.stop(job.runtime_object);
-        let _ = backend.remove(job.runtime_object);
+        if performed.started_runtime
+            && let Err(error) = backend.stop(job.runtime_object)
+        {
+            errors.push(format!("stopping runtime failed: {error}"));
+        }
+        if let Err(error) = backend.remove(job.runtime_object) {
+            errors.push(format!("removing runtime failed: {error}"));
+        }
     }
-    if performed.provisioned_bootstrap {
-        let _ = bootstrap_authority::delete_material(job.scope_dir);
+    if performed.provisioned_bootstrap
+        && let Err(error) = bootstrap_authority::delete_material(job.scope_dir)
+    {
+        errors.push(format!("removing bootstrap material failed: {error}"));
     }
     for path in &performed.generated_secrets {
-        let _ = filesystem::remove_file_durable(Path::new(path));
+        if let Err(error) = filesystem::remove_file_durable(Path::new(path)) {
+            errors.push(format!("removing secret file failed: {error}"));
+        }
     }
-    if performed.wrote_config {
-        let _ = filesystem::remove_file_durable(Path::new(job.config_reference));
+    if performed.wrote_config
+        && let Err(error) = filesystem::remove_file_durable(Path::new(job.config_reference))
+    {
+        errors.push(format!("removing configuration failed: {error}"));
+    }
+    if performed.wrote_config_marker {
+        let config_marker = PathBuf::from(format!("{}.nazoauth-owned", job.config_reference));
+        if let Err(error) = filesystem::remove_file_durable(&config_marker) {
+            errors.push(format!("removing configuration marker failed: {error}"));
+        }
+    }
+    for directory in performed.created_directories.iter().rev() {
+        let marker = directory.join(".nazoauth-owned");
+        let owned = std::fs::read_to_string(&marker)
+            .map(|value| value.trim() == job.deployment_id)
+            .unwrap_or(false);
+        if !owned {
+            errors.push(format!(
+                "refusing to remove created directory without its ownership marker: {}",
+                directory.display()
+            ));
+            continue;
+        }
+        if let Err(error) = std::fs::remove_dir_all(directory) {
+            errors.push(format!(
+                "removing created directory {} failed: {error}",
+                directory.display()
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Failure::new(INSTALL_FAILED, sanitize(errors.join("; "))))
     }
 }
 

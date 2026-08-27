@@ -27,18 +27,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Checkout NazoAuth sibling for operator-protocol patch
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: nazozero/NazoAuth
-          ref: main
-          path: NazoAuth
-          persist-credentials: false
-      - name: Symlink sibling for Cargo patch resolution
-        run: |
-          mkdir -p "$(dirname "$GITHUB_WORKSPACE/../NazoAuth")"
-          ln -sfn "$GITHUB_WORKSPACE/NazoAuth" "$GITHUB_WORKSPACE/../NazoAuth"
-        shell: bash
       - name: Verify formatting
         run: cargo fmt --all -- --check
       - name: Verify Linux installer syntax

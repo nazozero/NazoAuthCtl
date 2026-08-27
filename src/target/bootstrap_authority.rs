@@ -212,7 +212,7 @@ pub(crate) fn delete_material(scope_dir: &Path) -> anyhow::Result<()> {
 /// there is no ad-hoc token read). The token rides the SSH-encrypted
 /// transport exactly once per inspection and never appears in any other wire
 /// message.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreshBootstrapMaterialView {
     pub allowlist: Vec<String>,
@@ -222,6 +222,20 @@ pub struct FreshBootstrapMaterialView {
     pub artifact_subject_sha256: String,
     pub config_revision: u64,
     pub token: String,
+}
+
+impl std::fmt::Debug for FreshBootstrapMaterialView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FreshBootstrapMaterialView")
+            .field("allowlist", &self.allowlist)
+            .field("install_operation_id", &self.install_operation_id)
+            .field("deployment_id", &self.deployment_id)
+            .field("issuer", &self.issuer)
+            .field("artifact_subject_sha256", &self.artifact_subject_sha256)
+            .field("config_revision", &self.config_revision)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Build the view for one deployment's scope directory, or `None` whenever

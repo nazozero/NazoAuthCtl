@@ -70,12 +70,6 @@ pub const TARGET_IDENTITY_MISMATCH: &str = "TARGET_IDENTITY_MISMATCH";
 /// External/shared resources have zero-delete protection on every path.
 pub const EXTERNAL_RESOURCE_PROTECTED: &str = "EXTERNAL_RESOURCE_PROTECTED";
 
-/// Stable rejection for surface commands whose backing primitive lands with
-/// the K-phase acceptance work (data restore, remote application log view,
-/// explicit policy store, explicit backup snapshot). Never a silent no-op:
-/// the message names what will exist and what to use meanwhile.
-pub const NOT_IMPLEMENTED_BEFORE_K_PHASE: &str = "NOT_IMPLEMENTED_BEFORE_K_PHASE";
-
 /// Transport-level sudo refusal code (C06). Not part of the 16-code CLI set:
 /// the envelope maps it onto [`PRIVILEGE_REQUIRED`] because the remedy is the
 /// same one-time interactive credential establishment.

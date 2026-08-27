@@ -328,12 +328,11 @@ pub(super) fn parse_update_args(values: Vec<String>) -> anyhow::Result<UpdateArg
     })
 }
 
-/// `nazoauthctl backup [show] [--instance SELECTOR]` or
-/// `nazoauthctl backup snapshot [--instance SELECTOR]`.
+/// `nazoauthctl backup [show] [--instance SELECTOR]`.
 pub(super) fn parse_backup(values: Vec<String>) -> anyhow::Result<BackupArgs> {
-    let (subcommand, rest) = match values.split_first() {
-        Some((first, rest)) if first == "show" || first == "snapshot" => (first.as_str(), rest),
-        _ => ("show", values.as_slice()),
+    let rest = match values.split_first() {
+        Some((first, rest)) if first == "show" => rest,
+        _ => values.as_slice(),
     };
     let parts = selector_parts(rest, &[], &[], "backup")?;
     if parts.positional.is_some() {
@@ -344,7 +343,6 @@ pub(super) fn parse_backup(values: Vec<String>) -> anyhow::Result<BackupArgs> {
             positional: None,
             named: parts.named,
         },
-        snapshot: subcommand == "snapshot",
     })
 }
 

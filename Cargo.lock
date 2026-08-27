@@ -1214,8 +1214,8 @@ dependencies = [
 
 [[package]]
 name = "nazo-operator-protocol"
-version = "0.2.0"
-source = "git+https://github.com/nazozero/NazoAuth.git?branch=goal%2Fcontrol-plane-contract#ecafd351dca9a24f6aa4acb752797be9dd197f43"
+version = "0.2.1"
+source = "git+https://github.com/nazozero/NazoAuth.git?tag=v0.2.1#84baae78d45d8c0a94943a106d6c53dea123c335"
 dependencies = [
  "base64 0.23.1",
  "chrono",

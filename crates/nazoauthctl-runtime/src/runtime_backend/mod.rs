@@ -610,19 +610,14 @@ pub struct RuntimeDatabasePrivilegeProbe {
 pub struct HostServiceInstall {
     pub service_name: String,
     pub deployment_id: String,
-    pub runtime_instance_id: String,
-    pub control_authority: String,
     pub service_user: String,
-    pub working_directory: PathBuf,
+    /// Verified, immutable source bytes held by the target operation.
+    pub source_binary: PathBuf,
+    /// Permanent executable path referenced by the unit.
     pub binary: PathBuf,
-    pub app_root: PathBuf,
-    pub ui_releases: PathBuf,
-    pub operator_state: PathBuf,
-    pub operator_directory: PathBuf,
-    pub recovery_directory: PathBuf,
-    pub migration_url: PathBuf,
-    pub restricted_secret_paths: Vec<PathBuf>,
-    pub runtime_readable_secret_names: Vec<String>,
+    pub config: PathBuf,
+    pub data_root: PathBuf,
+    pub secret_paths: Vec<PathBuf>,
 }
 
 #[cfg(debug_assertions)]
@@ -656,6 +651,9 @@ pub trait RuntimeBackend {
     ) -> anyhow::Result<Option<RuntimeObservation>> {
         self.inspect(object_reference).map(Some)
     }
+    /// Read a bounded tail of application logs for an already-authorized
+    /// runtime object. Callers own redaction before crossing a public wire.
+    fn read_logs(&self, object_reference: &str, limit: usize) -> anyhow::Result<Vec<String>>;
     fn start(&self, object_reference: &str) -> anyhow::Result<()>;
     fn stop(&self, object_reference: &str) -> anyhow::Result<()>;
     fn quiesce_for_recovery(&self, object_reference: &str) -> anyhow::Result<()>;
@@ -700,31 +698,6 @@ pub trait RuntimeBackend {
     ) -> anyhow::Result<Option<nazo_operator_protocol::EmbeddedIdentity>>;
     fn describe_mounts(&self, object_reference: &str) -> anyhow::Result<Vec<NeutralMount>> {
         Ok(self.inspect(object_reference)?.mounts)
-    }
-    fn verify_ownership(
-        &self,
-        object_reference: &str,
-        deployment_id: &str,
-        runtime_instance_id: &str,
-        control_authority: &str,
-    ) -> anyhow::Result<()> {
-        let observation = self.inspect(object_reference)?;
-        let deployment_matches = observation
-            .labels
-            .get("io.nazoauth.deployment-id")
-            .is_some_and(|value| value == deployment_id);
-        let authority_matches = observation
-            .labels
-            .get("io.nazoauth.control-authority")
-            .is_some_and(|value| value == control_authority);
-        let runtime_matches = observation
-            .labels
-            .get("io.nazoauth.runtime-instance-id")
-            .is_some_and(|value| value == runtime_instance_id);
-        if !deployment_matches || !runtime_matches || !authority_matches {
-            bail!("runtime ownership labels do not match the authorized deployment and runtime")
-        }
-        Ok(())
     }
 }
 

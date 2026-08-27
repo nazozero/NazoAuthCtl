@@ -98,8 +98,6 @@ pub(crate) struct CleanInstallContext {
 }
 
 impl CleanInstallContext {
-    /// Delivery boundary: the I wave wires this into the CLI parser.
-    #[allow(dead_code)]
     pub(crate) fn production() -> anyhow::Result<Self> {
         Ok(Self {
             registry: RegistryStore::open_default()?,
@@ -122,6 +120,7 @@ pub(crate) struct InstallPaths {
     pub(crate) data_root: PathBuf,
     pub(crate) config_reference: PathBuf,
     pub(crate) secrets_dir: PathBuf,
+    pub(crate) runtime_root: PathBuf,
 }
 
 pub(crate) fn default_install_paths(deployment_id: &str) -> anyhow::Result<InstallPaths> {
@@ -133,7 +132,8 @@ pub(crate) fn default_install_paths(deployment_id: &str) -> anyhow::Result<Insta
         Ok(InstallPaths {
             config_reference: base.join("config").join(deployment_id).join("config.json"),
             data_root: base.join("data").join(deployment_id),
-            secrets_dir: base.join("data").join(deployment_id).join("secrets"),
+            secrets_dir: base.join("secrets").join(deployment_id),
+            runtime_root: base.join("runtime").join(deployment_id),
         })
     }
     #[cfg(not(windows))]
@@ -147,9 +147,9 @@ pub(crate) fn default_install_paths(deployment_id: &str) -> anyhow::Result<Insta
                 .join(deployment_id)
                 .join("config.json"),
             secrets_dir: PathBuf::from("/var/lib/nazauth")
-                .join("deployments")
-                .join(deployment_id)
-                .join("secrets"),
+                .join("secrets")
+                .join(deployment_id),
+            runtime_root: PathBuf::from("/usr/local/lib/nazauth").join(deployment_id),
         })
     }
 }
@@ -166,7 +166,8 @@ fn resolve_paths(
         Some(root) => Ok(InstallPaths {
             config_reference: root.join("config").join(deployment_id).join("config.json"),
             data_root: root.join("data").join(deployment_id),
-            secrets_dir: root.join("data").join(deployment_id).join("secrets"),
+            secrets_dir: root.join("secrets").join(deployment_id),
+            runtime_root: root.join("runtime").join(deployment_id),
         }),
         None => default_install_paths(deployment_id),
     }
@@ -181,17 +182,23 @@ fn resolve_paths(
 /// a loopback-published port and the public TLS endpoint is an external
 /// reverse proxy — the only topology a containerized install creates. A
 /// loopback HTTP issuer keeps the server-side default (loopback-http).
-fn render_config_yaml(issuer: &str) -> anyhow::Result<String> {
+fn render_config_yaml(
+    issuer: &str,
+    deployment_id: &str,
+    bind: &str,
+    trusted_proxy_cidrs: &str,
+    data_dir: &str,
+    secrets_dir: &str,
+) -> anyhow::Result<String> {
     if issuer.contains(['"', '\\']) || issuer.chars().any(|c| c.is_control()) {
         bail!("issuer must not contain YAML-special characters");
     }
-    use crate::target::install_exec::{CONTAINER_DATA_DIR, CONTAINER_SECRETS_DIR};
     let transport_mode = if issuer.starts_with("https://") {
         // The engine-default bridge networks and the host loopback are the
         // only sources that can reach the loopback-published container port.
         // Operators with a dedicated proxy network tighten this via
         // `update --config-file`.
-        let cidrs = "TRUSTED_PROXY_CIDRS: \"127.0.0.0/8,::1/128,10.88.0.0/16\"\n";
+        let cidrs = format!("TRUSTED_PROXY_CIDRS: \"{trusted_proxy_cidrs}\"\n");
         // trusted-proxy requires an explicit mTLS certificate source; a
         // fresh install has no client-certificate proxy contract yet, so it
         // starts disabled instead of claiming an mTLS capability the edge
@@ -203,14 +210,15 @@ fn render_config_yaml(issuer: &str) -> anyhow::Result<String> {
         String::new()
     };
     Ok(format!(
-        "BIND: \"0.0.0.0:{DEFAULT_PORT}\"\n\
+        "BIND: \"{bind}\"\n\
          PUBLIC_BASE_URL: \"{issuer}\"\n\
+         DEPLOYMENT_ID: \"{deployment_id}\"\n\
          {transport_mode}\
          SECURITY_AUDIT_REQUIRE_LEAST_PRIVILEGE: \"false\"\n\
-         DATABASE_URL_FILE: \"{CONTAINER_SECRETS_DIR}/database-url\"\n\
-         VALKEY_URL_FILE: \"{CONTAINER_SECRETS_DIR}/valkey-url\"\n\
-         MFA_TOTP_ENCRYPTION_KEY_FILE: \"{CONTAINER_SECRETS_DIR}/mfa-totp-key\"\n\
-         DATA_DIR: \"{CONTAINER_DATA_DIR}\"\n"
+         DATABASE_URL_FILE: \"{secrets_dir}/database-url\"\n\
+         VALKEY_URL_FILE: \"{secrets_dir}/valkey-url\"\n\
+         MFA_TOTP_ENCRYPTION_KEY_FILE: \"{secrets_dir}/mfa-totp-key\"\n\
+         DATA_DIR: \"{data_dir}\"\n"
     ))
 }
 
@@ -235,8 +243,8 @@ fn select_runtime(hello_runtimes: &[String], requested: Option<&str>) -> anyhow:
         .find(|candidate| hello_runtimes.iter().any(|runtime| runtime == candidate))
         .map(str::to_owned)
         .with_context(|| {
-            "the target helper announced no supported runtime; install Podman or Docker there \
-             first"
+            "the target helper announced no supported runtime; install Podman, Docker, or \
+             systemd there first"
         })
 }
 
@@ -244,6 +252,7 @@ fn select_runtime(hello_runtimes: &[String], requested: Option<&str>) -> anyhow:
 fn build_install_order(
     request: &CleanInstallRequest,
     paths: &InstallPaths,
+    runtime_kind: &str,
 ) -> anyhow::Result<InstallOrder> {
     let database_url_file = paths
         .secrets_dir
@@ -261,9 +270,34 @@ fn build_install_order(
         .to_string_lossy()
         .into_owned();
 
-    // The seed is the real `.env.yaml` the server loads; secret values are
-    // only container-internal file references into the mounted secrets dir.
-    let config_content = render_config_yaml(&request.issuer)?;
+    let (runtime_data, runtime_secrets, bind, trusted_proxy_cidrs) = if runtime_kind == "host" {
+        (
+            paths.data_root.to_string_lossy().into_owned(),
+            paths.secrets_dir.to_string_lossy().into_owned(),
+            format!("127.0.0.1:{DEFAULT_PORT}"),
+            "127.0.0.0/8,::1/128".to_owned(),
+        )
+    } else {
+        (
+            crate::target::install_exec::CONTAINER_DATA_DIR.to_owned(),
+            crate::target::install_exec::CONTAINER_SECRETS_DIR.to_owned(),
+            format!("0.0.0.0:{DEFAULT_PORT}"),
+            "127.0.0.0/8,::1/128,10.88.0.0/16".to_owned(),
+        )
+    };
+    let deployment_id = paths
+        .data_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("install data root has no deployment id component")?;
+    let config_content = render_config_yaml(
+        &request.issuer,
+        deployment_id,
+        &bind,
+        &trusted_proxy_cidrs,
+        &runtime_data,
+        &runtime_secrets,
+    )?;
     let config_sha256 = hex_digest(config_content.as_bytes());
 
     let order = InstallOrder {
@@ -275,32 +309,18 @@ fn build_install_order(
         config_content,
         config_sha256,
         data_root: paths.data_root.to_string_lossy().into_owned(),
+        runtime_root: (runtime_kind == "host")
+            .then(|| paths.runtime_root.to_string_lossy().into_owned()),
         secrets: vec![
             PlannedSecret {
                 purpose: "database-url".to_owned(),
                 path: database_url_file,
-                value: Some(format!(
-                    "postgresql://{}:{}@{}:{}/{}",
-                    request.database_endpoint.user,
-                    crate::target::install_exec::percent_encode_credential(
-                        &request.database_password
-                    ),
-                    request.database_endpoint.host,
-                    request.database_endpoint.port,
-                    request.database_endpoint.name,
-                )),
+                value: Some(request.database_password.clone()),
             },
             PlannedSecret {
                 purpose: "valkey-url".to_owned(),
                 path: valkey_url_file,
-                value: Some(format!(
-                    "valkey://:{}@{}:{}",
-                    crate::target::install_exec::percent_encode_credential(
-                        &request.valkey_password
-                    ),
-                    request.valkey_endpoint.host,
-                    request.valkey_endpoint.port,
-                )),
+                value: Some(request.valkey_password.clone()),
             },
             PlannedSecret {
                 purpose: "mfa-totp-key".to_owned(),
@@ -340,12 +360,20 @@ fn prepare_install_operation(
     let deployment_id = format!("deploy-{}", Uuid::now_v7().simple());
     validate_key(&deployment_id, "generated deployment id")?;
     let runtime_kind = select_runtime(&hello.supported_runtimes, request.runtime.as_deref())?;
-    let runtime_object = format!("nazoauth-{}", deployment_id.trim_start_matches("deploy-"));
+    let runtime_object = if runtime_kind == "host" {
+        format!(
+            "nazoauth-{}.service",
+            deployment_id.trim_start_matches("deploy-")
+        )
+    } else {
+        format!("nazoauth-{}", deployment_id.trim_start_matches("deploy-"))
+    };
     let paths = resolve_paths(request, &deployment_id)?;
-    let order = build_install_order(request, &paths)?;
+    let order = build_install_order(request, &paths, &runtime_kind)?;
     let resources = declare_resources(
-        &runtime_object,
         &paths.data_root.to_string_lossy(),
+        &paths.secrets_dir.to_string_lossy(),
+        (runtime_kind == "host").then(|| paths.runtime_root.to_string_lossy().into_owned()),
         &request.database_endpoint,
         &request.valkey_endpoint,
     )?;
@@ -356,9 +384,7 @@ fn prepare_install_operation(
         StateMutationPayload::Bootstrap {
             issuer: request.issuer.clone(),
             runtime: RuntimeSurface::new(&runtime_kind, &runtime_object)?,
-            // Placeholder overwritten by the target's verified facts; kept
-            // empty here so no unverified identity ever crosses the wire.
-            artifact: Default::default(),
+            artifact: None,
             config_reference: paths.config_reference.to_string_lossy().into_owned(),
             config_schema: CONFIG_SCHEMA_SEED.to_owned(),
             resources,
@@ -376,23 +402,24 @@ fn prepare_install_operation(
 /// locator for each external dependency comes from the operator-supplied
 /// endpoint facts, not a hardcoded loopback address.
 fn declare_resources(
-    runtime_object: &str,
     data_root: &str,
+    secrets_root: &str,
+    runtime_root: Option<String>,
     database_endpoint: &crate::target::install_exec::ExternalEndpoint,
     valkey_endpoint: &crate::target::install_exec::ExternalEndpoint,
 ) -> anyhow::Result<Vec<Resource>> {
-    Ok(vec![
-        Resource::new(
-            "app-runtime",
-            "container",
-            runtime_object,
-            ResourceOwnership::Managed,
-            ResourceScope::Deployment,
-        )?,
+    let mut resources = vec![
         Resource::new(
             "app-data",
             "directory",
             data_root,
+            ResourceOwnership::Managed,
+            ResourceScope::Deployment,
+        )?,
+        Resource::new(
+            "app-secrets",
+            "directory",
+            secrets_root,
             ResourceOwnership::Managed,
             ResourceScope::Deployment,
         )?,
@@ -417,7 +444,17 @@ fn declare_resources(
             ResourceOwnership::External,
             ResourceScope::Shared,
         )?,
-    ])
+    ];
+    if let Some(runtime_root) = runtime_root {
+        resources.push(Resource::new(
+            "app-binary",
+            "directory",
+            runtime_root,
+            ResourceOwnership::Managed,
+            ResourceScope::Deployment,
+        )?);
+    }
+    Ok(resources)
 }
 
 /// The G01 entry point. Returns the full human report including the precise

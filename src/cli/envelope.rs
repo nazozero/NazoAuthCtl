@@ -16,8 +16,7 @@
 //!
 //! Rules pinned here:
 //!
-//! * codes come from the closed set in [`crate::error_codes`] plus the K-phase
-//!   marker;
+//! * codes come from the closed set in [`crate::error_codes`];
 //! * secrets can never appear: only stable tokens and the bounded error chain
 //!   are echoed;
 //! * `next_command` is always a runnable command or absent — never prose.
@@ -83,9 +82,6 @@ fn next_command(code: &str) -> Option<&'static str> {
         }
         error_codes::EXTERNAL_RESOURCE_PROTECTED => {
             "the resource is external/shared; deletion is refused by design"
-        }
-        error_codes::NOT_IMPLEMENTED_BEFORE_K_PHASE => {
-            "see the message above for what lands in K phase"
         }
         _ => return None,
     })

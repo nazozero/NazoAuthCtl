@@ -82,32 +82,42 @@ impl HostDeletionExecutor {
         job: &DeletionJob<'_>,
         performed: &mut PerformedDeletions,
     ) -> Result<(), Failure> {
-        if !matches!(job.runtime_kind, "podman" | "docker") {
+        if !matches!(job.runtime_kind, "podman" | "docker" | "host" | "systemd") {
             return Err(Failure::new(
                 HOST_ERR_OPERATION_INVALID,
                 format!(
-                    "the '{}' runtime backend joins the lifecycle waves with the K-phase \
-                     integration; use Podman or Docker deployments",
+                    "the '{}' runtime backend is not supported for lifecycle mutations; \
+                     use Podman, Docker, or systemd deployments",
                     sanitize(job.runtime_kind.to_owned())
                 ),
             ));
         }
         privilege_gate(job.runtime_kind)?;
         let kind = match job.runtime_kind {
-            "podman" => crate::deployment::RuntimeBackendKind::Podman,
-            _ => crate::deployment::RuntimeBackendKind::Docker,
+            "podman" => crate::runtime_backend::RuntimeBackendKind::Podman,
+            "docker" => crate::runtime_backend::RuntimeBackendKind::Docker,
+            _ => crate::runtime_backend::RuntimeBackendKind::Systemd,
         };
         let backend = crate::runtime_backend::backend(kind);
 
         // 1. Runtime object with identity re-confirmation. The label written
         // at install time is the ownership proof; an unlabeled or foreign
         // object under our name is never removed.
-        if let Ok(Some(observation)) = backend.inspect_optional(job.runtime_object) {
-            let owned = observation
-                .labels
-                .get("io.nazoauth.deployment-id")
-                .is_some_and(|label| label == job.deployment_id);
-            if !owned {
+        let observation = backend
+            .inspect_optional(job.runtime_object)
+            .map_err(|error| {
+                Failure::new(
+                    super::install_exec::RUNTIME_START_FAILED,
+                    sanitize(error.to_string()),
+                )
+            })?;
+        if let Some(observation) = observation {
+            if kind != crate::runtime_backend::RuntimeBackendKind::Systemd
+                && !observation
+                    .labels
+                    .get("io.nazoauth.deployment-id")
+                    .is_some_and(|label| label == job.deployment_id)
+            {
                 return Err(Failure::new(
                     super::deployment_state::OBJECT_IDENTITY_MISMATCH,
                     format!(
@@ -119,29 +129,39 @@ impl HostDeletionExecutor {
             }
             // Second confirmation: a labeled object must still serve exactly
             // the artifact the deployment state records before deletion.
-            if let crate::runtime_backend::ArtifactReference::Oci { digest, .. } =
-                &observation.artifact
-            {
-                let expected = job.current_artifact.trim_start_matches("sha256:");
-                if *digest != expected {
+            let observed_digest = match &observation.artifact {
+                crate::runtime_backend::ArtifactReference::Oci { digest, .. }
+                | crate::runtime_backend::ArtifactReference::HostBinary {
+                    sha256: digest, ..
+                } => digest.trim_start_matches("sha256:"),
+                crate::runtime_backend::ArtifactReference::Unknown => {
                     return Err(Failure::new(
                         super::deployment_state::OBJECT_IDENTITY_MISMATCH,
-                        format!(
-                            "runtime object '{}' serves '{}' while the deployment state records \
-                             '{}'; refusing to delete drifted state",
-                            sanitize(job.runtime_object.to_owned()),
-                            sanitize(digest.clone()),
-                            sanitize(expected.to_owned())
-                        ),
+                        "runtime object has no verifiable artifact identity",
                     ));
                 }
+            };
+            let expected = job.current_artifact.trim_start_matches("sha256:");
+            if observed_digest != expected {
+                return Err(Failure::new(
+                    super::deployment_state::OBJECT_IDENTITY_MISMATCH,
+                    format!(
+                        "runtime object '{}' serves '{}' while the deployment state records \
+                         '{}'; refusing to delete drifted state",
+                        sanitize(job.runtime_object.to_owned()),
+                        sanitize(observed_digest.to_owned()),
+                        sanitize(expected.to_owned())
+                    ),
+                ));
             }
-            backend.stop(job.runtime_object).map_err(|error| {
-                Failure::new(
-                    super::install_exec::RUNTIME_START_FAILED,
-                    sanitize(error.to_string()),
-                )
-            })?;
+            if kind != crate::runtime_backend::RuntimeBackendKind::Systemd {
+                backend.stop(job.runtime_object).map_err(|error| {
+                    Failure::new(
+                        super::install_exec::RUNTIME_START_FAILED,
+                        sanitize(error.to_string()),
+                    )
+                })?;
+            }
             backend.remove(job.runtime_object).map_err(|error| {
                 Failure::new(
                     super::install_exec::RUNTIME_START_FAILED,
@@ -193,6 +213,8 @@ impl HostDeletionExecutor {
         // flow. Its path is the DeploymentState's own reference — never a
         // wildcard, never derived from user input here.
         let config_path = Path::new(job.config_reference);
+        let config_marker =
+            std::path::PathBuf::from(format!("{}.nazoauth-owned", job.config_reference));
         if config_path.exists() {
             filesystem::remove_file_durable(config_path).map_err(|error| {
                 Failure::new(
@@ -203,6 +225,14 @@ impl HostDeletionExecutor {
             performed
                 .removed_paths
                 .push(job.config_reference.to_owned());
+        }
+        if config_marker.exists() {
+            filesystem::remove_file_durable(&config_marker).map_err(|error| {
+                Failure::new(
+                    HOST_ERR_OPERATION_INVALID,
+                    format!("failed to remove {}: {error}", config_marker.display()),
+                )
+            })?;
         }
 
         // 4. Fresh-install bootstrap material, whatever its state.
@@ -229,15 +259,6 @@ fn delete_managed_resource(
     performed: &mut PerformedDeletions,
 ) -> Result<(), Failure> {
     match kind {
-        "container" => {
-            // Container objects are removed through the runtime-object step
-            // above; a second container-kind declaration would name a
-            // different object and is not understood here.
-            Err(Failure::new(
-                super::deployment_state::OBJECT_IDENTITY_MISMATCH,
-                "container resources are deleted only through the runtime surface object",
-            ))
-        }
         "directory" => {
             let path = Path::new(locator);
             let safe = path.is_absolute()
@@ -301,13 +322,13 @@ fn delete_managed_resource(
             // P1-1: config files carry the same ownership proof as
             // directories — a sibling marker file named `<path>.nazoauth-owned`
             // written at install time must exist and match.
-            let marker_path = format!("{locator}.nazauth-owned");
+            let marker_path = format!("{locator}.nazoauth-owned");
             let marker = Path::new(marker_path.as_str());
             if !marker.exists() {
                 return Err(Failure::new(
                     super::deployment_state::OBJECT_IDENTITY_MISMATCH,
                     format!(
-                        "refusing to delete file '{}': no .nazauth-owned proof marker",
+                        "refusing to delete file '{}': no .nazoauth-owned proof marker",
                         sanitize(locator.to_owned())
                     ),
                 ));
@@ -338,6 +359,14 @@ fn delete_managed_resource(
                 })?;
                 performed.removed_paths.push(locator.to_owned());
             }
+            if marker.exists() {
+                filesystem::remove_file_durable(marker).map_err(|error| {
+                    Failure::new(
+                        HOST_ERR_OPERATION_INVALID,
+                        format!("failed to delete marker {}: {error}", marker.display()),
+                    )
+                })?;
+            }
             Ok(())
         }
         other => Err(Failure::new(
@@ -352,9 +381,13 @@ fn delete_managed_resource(
 }
 
 fn privilege_gate(runtime_kind: &str) -> Result<(), Failure> {
-    crate::instance_lifecycle::privilege::ensure_engine_access(
-        runtime_kind,
-        &crate::instance_lifecycle::privilege::ProcessPrivilegeProbe,
-    )
-    .map_err(|error| Failure::new(error.code(), sanitize(error.to_string())))
+    let result = if matches!(runtime_kind, "podman" | "docker") {
+        crate::instance_lifecycle::privilege::ensure_engine_access(
+            runtime_kind,
+            &crate::instance_lifecycle::privilege::ProcessPrivilegeProbe,
+        )
+    } else {
+        crate::instance_lifecycle::privilege::ensure_systemd_access()
+    };
+    result.map_err(|error| Failure::new(error.code(), sanitize(error.to_string())))
 }

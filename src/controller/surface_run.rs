@@ -2,10 +2,9 @@
 //!
 //! Every arm wires one tested use-case module; this file contains no business
 //! logic of its own beyond selector merging, confirmation prompts, and the
-//! stable K-phase placeholders.
+//! stable error rendering.
 
 use std::io::IsTerminal as _;
-use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
 
@@ -17,7 +16,6 @@ use crate::cli::{Cli, Command, InstallArgs, InstanceCommand, InstanceSelector, U
 use crate::controller_identity::lifecycle as identity;
 use crate::controller_identity::store::ControllerKeyStore;
 use crate::discover_adopt::{DiscoverRequest, DiscoveryContext};
-use crate::error_codes;
 use crate::instance_lifecycle::{LifecycleContext, UpdateRequest};
 use crate::registry::RegistryStore;
 
@@ -30,22 +28,23 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         // ---- primary 18-command surface ------------------------------------
         Command::Host(command) => crate::fleet::run_host(command),
         Command::Instance(mut command) => {
-            // P1-2: merge the global --instance into any empty selector so
-            // `nazoauthctl --instance prod instance show` resolves correctly
-            // instead of falling through to default/ambiguous selection.
-            match &mut command {
-                InstanceCommand::Show(selector)
-                | InstanceCommand::Forget(selector)
-                | InstanceCommand::Rename {
-                    source: selector, ..
+            // P1-2: fold the global --instance into the command-level selector,
+            // strictly rejecting collisions where both channels are present.
+            let apply_merge = |sel: &mut InstanceSelector, label: &str| -> anyhow::Result<()> {
+                if let Some(merged) = sel.merge_global(instance_flag, label)? {
+                    sel.positional = Some(merged);
+                    sel.named = None;
                 }
-                | InstanceCommand::Relocate { selector, .. } => {
-                    if selector.positional.is_none()
-                        && selector.named.is_none()
-                        && let Some(global) = instance_flag
-                    {
-                        selector.positional = Some(global.to_owned());
-                    }
+                Ok(())
+            };
+            match &mut command {
+                InstanceCommand::Show(selector) => apply_merge(selector, "instance show")?,
+                InstanceCommand::Forget(selector) => apply_merge(selector, "instance forget")?,
+                InstanceCommand::Rename {
+                    source: selector, ..
+                } => apply_merge(selector, "instance rename")?,
+                InstanceCommand::Relocate { selector, .. } => {
+                    apply_merge(selector, "instance relocate")?
                 }
                 _ => {}
             }
@@ -86,11 +85,12 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 )
             })
         }
-        Command::Logs { .. } => Err(not_implemented(
-            "the remote application log view",
-            "`logs` reads NazoAuth runtime logs through the fixed target protocol; that read-only \
-             kind lands with the K-phase acceptance work",
-        )),
+        Command::Logs { selector, limit } => {
+            selector_scoped(&selector, instance_flag, "logs", |merged| {
+                let store = RegistryStore::open_default()?;
+                crate::fleet::fleet_read::run_logs_view(&store, merged.as_deref(), limit, json_mode)
+            })
+        }
         Command::Verify { selector } => {
             selector_scoped(&selector, instance_flag, "verify", run_verify)
         }
@@ -120,30 +120,12 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 )
             })
         }
-        Command::Policy => Err(not_implemented(
-            "the explicit policy store",
-            "policies such as `backup-before-update` become explicit, off-by-default entries in \
-             the K-phase acceptance work; nothing is policy-gated today",
-        )),
-        Command::Backup(args) if args.snapshot => {
-            let _ = merge(&args.selector, instance_flag, "backup snapshot")?;
-            Err(not_implemented(
-                "the explicit backup snapshot operation",
-                "snapshot execution over external dependency endpoints lands with the K-phase \
-                 acceptance work; maturity facts are available via `nazoauthctl backup`",
-            ))
-        }
         Command::Backup(args) => {
             selector_scoped(&args.selector, instance_flag, "backup", |merged| {
                 let store = RegistryStore::open_default()?;
                 crate::fleet::fleet_read::run_backup_view(&store, merged.as_deref(), json_mode)
             })
         }
-        Command::Recover { .. } => Err(not_implemented(
-            "data restore beyond artifact rollback",
-            "`recover` performs the explicit data restore; it lands with the K-phase acceptance \
-             work. Artifact/config rollback stays available via `nazoauthctl rollback --yes`",
-        )),
         Command::Uninstall { selector, yes } => {
             let merged = merge(&selector, instance_flag, "uninstall")?;
             let context = LifecycleContext::production()?;
@@ -199,19 +181,12 @@ fn selector_scoped<T>(
     body(merge(selector, global, action)?)
 }
 
-fn not_implemented(what: &str, detail: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "{}: {} is not available yet — {}",
-        error_codes::NOT_IMPLEMENTED_BEFORE_K_PHASE,
-        what,
-        detail
-    )
-}
-
 fn read_password_file(path: &std::path::Path, flag: &str) -> anyhow::Result<String> {
-    let raw = std::fs::read(path)
-        .with_context(|| format!("{flag}: failed to read {}", path.display()))?;
-    let value = String::from_utf8(raw)
+    const MAX_PASSWORD_FILE_BYTES: u64 = 4096;
+    let raw =
+        crate::filesystem::read_secure_regular_file(path, flag, true, MAX_PASSWORD_FILE_BYTES)
+            .with_context(|| format!("{flag}: failed to read {}", path.display()))?;
+    let value = String::from_utf8(raw.to_vec())
         .with_context(|| format!("{flag}: {} is not UTF-8", path.display()))?;
     let trimmed = value.trim_end_matches(['\r', '\n']);
     if trimmed.is_empty() {
@@ -383,8 +358,3 @@ fn read_admin_credentials(
         password: Zeroizing::new(password),
     })
 }
-
-/// Keep PathBuf referenced so unused-import lints stay honest when arms
-/// evolve during J-phase deletions.
-#[allow(dead_code)]
-fn _touch(_: PathBuf) {}

@@ -202,10 +202,10 @@ mod tests {
             StateMutationPayload::Bootstrap {
                 issuer: "https://auth.example.com".to_owned(),
                 runtime: RuntimeSurface::new("podman", "nazoauth-main")?,
-                artifact: ArtifactRefs {
+                artifact: Some(ArtifactRefs {
                     current: Some("sha256:abcdef0123456789".to_owned()),
                     previous: None,
-                },
+                }),
                 config_reference: "/etc/nazauth/config.toml".to_owned(),
                 config_schema: "nazauth-config-v1".to_owned(),
                 resources: vec![

@@ -21,16 +21,16 @@ use anyhow::{Context as _, bail};
 use nazo_operator_protocol::{ControlBuildIdentity, ControlOperationPayload, ControlTarget};
 use sha2::{Digest as _, Sha256};
 
-use super::{LifecycleContext, record_observation, require_completed, resolve_live_instance};
+use super::{LifecycleContext, record_observation, resolve_live_instance};
 use crate::controller_identity::dispatch::{
-    DispatchVerdict, dispatch_via_target, prepare_control_operation, settle_journal,
+    DispatchVerdict, prepare_control_operation, settle_journal,
 };
 use crate::controller_identity::journal::OperationJournal;
 use crate::controller_identity::operation::ControlOperationInput;
 use crate::controller_identity::store::ControllerKeyStore;
 use crate::target::{
-    BuildIdentity, HostCompletionBody, HostOperation, OfficialArtifactRef, StagedConfig,
-    StateMutationPayload,
+    BuildIdentity, HostCompletionBody, HostOperation, HostOutcome, OfficialArtifactRef,
+    StagedConfig, StateMutationPayload,
 };
 
 /// One update invocation. Defaults are minimal: only facts that cannot be
@@ -91,24 +91,30 @@ pub(crate) fn run_update(
         resolve_live_instance(context, request.instance.as_deref(), action)?;
     let deployment_id = inspection.deployment_id.clone();
     let revision = inspection.revision;
-    let Some(current_artifact) = inspection.artifact.current.clone() else {
+    if inspection.artifact.current.is_none() {
         bail!(
             "{action}: deployment '{deployment_id}' records no current artifact reference; \
              adopt or install it first"
         );
-    };
-    let Some(build_identity) = inspection.current_build_identity.clone() else {
+    }
+    if inspection.current_build_identity.is_none() {
         bail!(
             "{action}: deployment '{deployment_id}' carries no recorded build identity for its \
              current artifact; re-register the instance with verified facts or reinstall"
         );
-    };
+    }
 
     let pinned = OfficialArtifactRef {
         repository: super::SERVER_REPOSITORY.to_owned(),
         version: request.version.clone(),
         expected_subject_sha256: request.expected_artifact_sha256.clone(),
     };
+
+    let verified_target = context
+        .resolver
+        .resolve_target_artifact(&pinned, &inspection)?;
+    let target_artifact = verified_target.digest;
+    let target_build_identity = verified_target.identity;
 
     // 3.+4. Application migration: exactly ONE pre-signed ControlOperation.
     // Its operation id IS the lifecycle id of this attempt — the HostOperation
@@ -135,47 +141,15 @@ pub(crate) fn run_update(
         &record.deployment_id,
         ControlOperationInput {
             operation: ControlOperationPayload::MigrateApply,
-            artifact_target: control_target_for(&current_artifact, &build_identity),
+            artifact_target: control_target_for(&target_artifact, &target_build_identity),
             config_revision,
         },
     )
     .context("preparing the migration operation failed; the update changed nothing")?;
     let lifecycle_id = prepared.signed.operation_id.clone();
-    let verdict = dispatch_via_target(target.as_ref(), &prepared)?;
-    match &verdict {
-        DispatchVerdict::Accepted => {}
-        DispatchVerdict::FailedDurably { outcome } => {
-            // P0-5: a durable business failure (migration executed and
-            // failed) must terminate the update BEFORE any activation or
-            // state mutation. The journal record stays terminal for this id;
-            // rerunning identical inputs replays the identical durable
-            // failure instead of re-executing.
-            settle_journal(&journal, &prepared, &verdict)?;
-            let error_code = outcome
-                .error
-                .map(|code| format!("{code:?}"))
-                .unwrap_or_else(|| "unspecified".to_owned());
-            bail!(
-                "the application migration failed durably (operation {lifecycle_id}, error \
-                 {error_code}); the target artifact/config were NOT activated — inspect \
-                 `nazoauthctl operation` for the durable result"
-            );
-        }
-        DispatchVerdict::DefinitivelyRejected => {
-            settle_journal(&journal, &prepared, &verdict)?;
-            bail!(
-                "the migration was refused before acceptance; fix the cause and retry — \
-                 the update changed nothing"
-            );
-        }
-        DispatchVerdict::OutcomeUnknown => bail!(
-            "the migration outcome is unknown (dispatch failed after journaling); re-run the \
-             same update to resume operation {lifecycle_id} instead of starting over"
-        ),
-    }
 
     // 5.-7. Stage + activate + local health + commit inside ONE journaled
-    // HostOperation carrying the single lifecycle operation id.
+    // HostOperation carrying the single lifecycle operation id and signed migration.
     let operation = HostOperation::state_mutate(
         lifecycle_id.clone(),
         deployment_id.clone(),
@@ -183,19 +157,43 @@ pub(crate) fn run_update(
         StateMutationPayload::Update {
             artifact: pinned,
             config: request.staged_config()?,
+            migration_jws: Some(prepared.signed.compact_jws.clone()),
         },
     );
     let result = target.execute_host_operation(&operation)?;
-    let applied_revision = require_completed(
-        &result,
-        |body| match body {
-            HostCompletionBody::StateMutateApplied { revision } => Some(revision.to_string()),
-            _ => None,
+    let applied_revision = match &result.outcome {
+        HostOutcome::Completed { body } => match body {
+            HostCompletionBody::StateMutateApplied { revision } => {
+                settle_journal(&journal, &prepared, &DispatchVerdict::Accepted)?;
+                revision.to_string()
+            }
+            _ => bail!("update: the target answered an unexpected completion body"),
         },
-        "update",
-    )?;
-
-    settle_journal(&journal, &prepared, &verdict)?;
+        HostOutcome::Failed { code, detail } => {
+            if code == "MIGRATION_FAILED" || detail.contains("migration failed durably") {
+                // A terminal FAILED ControlResult means NazoAuth accepted the
+                // signed operation. The exact result remains authoritative in
+                // NazoAuth's durable journal; the ctl journal only records the
+                // accepted authorization snapshot and must never fabricate a
+                // replacement ControlResult with invented timestamps.
+                settle_journal(&journal, &prepared, &DispatchVerdict::Accepted)?;
+                bail!(
+                    "the application migration failed durably (operation {lifecycle_id}, error \
+                     {code}); the target artifact/config were NOT activated — inspect \
+                     `nazoauthctl operation` for the durable result"
+                );
+            }
+            if code == "CONTROL_OUTCOME_UNKNOWN" || detail.contains("CONTROL_OUTCOME_UNKNOWN") {
+                settle_journal(&journal, &prepared, &DispatchVerdict::OutcomeUnknown)?;
+                bail!(
+                    "the migration outcome is unknown (dispatch failed after journaling); re-run the \
+                     same update to resume operation {lifecycle_id} instead of starting over ({code}: {detail})"
+                );
+            }
+            settle_journal(&journal, &prepared, &DispatchVerdict::DefinitivelyRejected)?;
+            bail!("update failed on the target: {code}: {detail}");
+        }
+    };
 
     // Refresh the observation cache from a real post-update inspection
     // (display-only; the target state stays the authority).
@@ -224,9 +222,9 @@ pub(crate) fn run_update(
 
 /// Build the artifact identity binding for the ControlOperation envelope from
 /// the facts recorded at install/update time on the target.
-fn control_target_for(current_artifact: &str, identity: &BuildIdentity) -> ControlTarget {
+fn control_target_for(target_artifact: &str, identity: &BuildIdentity) -> ControlTarget {
     ControlTarget::OciImage {
-        image_digest: current_artifact.to_owned(),
+        image_digest: target_artifact.to_owned(),
         embedded: ControlBuildIdentity {
             product: identity.product.clone(),
             version: identity.version.clone(),

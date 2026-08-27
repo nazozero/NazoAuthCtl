@@ -71,8 +71,6 @@ pub(crate) struct DiscoveryContext {
 }
 
 impl DiscoveryContext {
-    /// Delivery boundary: the I wave wires this into the CLI parser.
-    #[allow(dead_code)]
     pub(crate) fn production() -> anyhow::Result<Self> {
         Ok(Self {
             registry: RegistryStore::open_default()?,

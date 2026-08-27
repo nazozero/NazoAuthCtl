@@ -29,6 +29,8 @@ use chrono::{DateTime, Utc};
 use nazo_operator_protocol::ControlResult;
 use uuid::Uuid;
 
+use crate::runtime_backend;
+
 pub use bootstrap_authority::{
     BOOTSTRAP_CLOSED, CONTEXT_FILE_NAME, FRESH_BOOTSTRAP_ALLOWLIST, FRESH_BOOTSTRAP_SCHEMA,
     FreshBootstrapContext, FreshBootstrapMaterialView, SERVER_TOKEN_RELATIVE_PATH,
@@ -119,6 +121,7 @@ pub struct HealthSnapshot {
 /// The compact JWS form keeps private-key bytes on the control machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlOperationRequest {
+    pub operation_id: String,
     pub deployment_id: String,
     pub compact_jws: String,
 }
@@ -221,7 +224,7 @@ impl LocalTarget {
     }
 
     /// Test seam: substitute the install executor.
-    #[allow(dead_code)] // test seam: consumed by the clean-install use-case tests
+    #[cfg(test)]
     pub(crate) fn with_install_executor(
         mut self,
         executor: Arc<dyn install_exec::InstallExecutor>,
@@ -231,7 +234,7 @@ impl LocalTarget {
     }
 
     /// Test seam: substitute the ControlOperation operator.
-    #[allow(dead_code)] // test seam: consumed by the lifecycle use-case tests
+    #[cfg(test)]
     pub(crate) fn with_control_executor(
         mut self,
         control: Arc<dyn control_exec::ControlOperationExecutor>,
@@ -241,7 +244,7 @@ impl LocalTarget {
     }
 
     /// Test seam: substitute the update/rollback executor.
-    #[allow(dead_code)] // test seam: consumed by the lifecycle use-case tests
+    #[cfg(test)]
     pub(crate) fn with_lifecycle_executor(
         mut self,
         lifecycle: Arc<dyn update_exec::LifecycleExecutor>,
@@ -251,7 +254,7 @@ impl LocalTarget {
     }
 
     /// Test seam: substitute the uninstall deletion executor.
-    #[allow(dead_code)] // test seam: consumed by the lifecycle use-case tests
+    #[cfg(test)]
     pub(crate) fn with_deletion_executor(
         mut self,
         deletion: Arc<dyn uninstall_exec::DeletionExecutor>,
@@ -348,6 +351,12 @@ pub(crate) fn dispatch_host_operation(
             .unwrap_or_else(|failure| state_failure(operation, &failure)),
         HostOperationBody::BootstrapClose {} => answer_bootstrap_close(operation, store)
             .unwrap_or_else(|failure| state_failure(operation, &failure)),
+        HostOperationBody::BootstrapRead {} => answer_bootstrap_read(operation, store)
+            .unwrap_or_else(|failure| state_failure(operation, &failure)),
+        HostOperationBody::RuntimeLogs { limit } => answer_runtime_logs(operation, store, *limit)
+            .unwrap_or_else(|failure| state_failure(operation, &failure)),
+        HostOperationBody::JournalRead { limit } => answer_journal_read(operation, store, *limit)
+            .unwrap_or_else(|failure| state_failure(operation, &failure)),
         HostOperationBody::ControlOperation { compact_jws, .. } => {
             answer_control_operation(operation, store, compact_jws, executors.control)
                 .unwrap_or_else(|failure| state_failure(operation, &failure))
@@ -373,7 +382,9 @@ pub(crate) fn dispatch_host_operation(
                             Ok(dir) => dir,
                             Err(failure) => return state_failure(operation, &failure),
                         };
-                        ensure_scope_dir(&scope_dir);
+                        if let Err(failure) = ensure_scope_dir(&scope_dir) {
+                            return state_failure(operation, &failure);
+                        }
                         let job = install_exec::InstallJob {
                             operation_id: &operation.operation_id,
                             deployment_id: &deployment_id,
@@ -411,6 +422,9 @@ pub(crate) fn dispatch_host_operation(
                         }
                     }
                     None => {
+                        let Some(artifact) = artifact else {
+                            unreachable!("wire validation requires an artifact for state adoption")
+                        };
                         let params = BootstrapParams {
                             issuer: issuer.clone(),
                             runtime: runtime.clone(),
@@ -461,11 +475,16 @@ pub(crate) fn dispatch_host_operation(
                     Err(failure) => state_failure(operation, &failure),
                 }
             }
-            StateMutationPayload::Update { artifact, config } => answer_update(
+            StateMutationPayload::Update {
+                artifact,
+                config,
+                migration_jws,
+            } => answer_update(
                 operation,
                 store,
                 artifact,
                 config.as_ref(),
+                migration_jws.as_deref(),
                 executors.lifecycle,
             )
             .unwrap_or_else(|failure| state_failure(operation, &failure)),
@@ -481,6 +500,95 @@ pub(crate) fn dispatch_host_operation(
     }
 }
 
+fn answer_runtime_logs(
+    operation: &HostOperation,
+    store: &TargetStateStore,
+    limit: usize,
+) -> Result<HostResult, Failure> {
+    let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+    let state = store.load_existing(deployment_id)?;
+    let kind = match state.runtime.kind.as_str() {
+        "podman" => runtime_backend::RuntimeBackendKind::Podman,
+        "docker" => runtime_backend::RuntimeBackendKind::Docker,
+        "host" | "systemd" => runtime_backend::RuntimeBackendKind::Systemd,
+        other => {
+            return Err(Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                format!(
+                    "unsupported runtime kind '{}'",
+                    wire::sanitize(other.to_owned())
+                ),
+            ));
+        }
+    };
+    let backend = runtime_backend::backend(kind);
+    let lines = backend
+        .read_logs(&state.runtime.object, limit)
+        .map_err(|error| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                wire::sanitize(error.to_string()),
+            )
+        })?
+        .into_iter()
+        .map(|line| redact_log_line(&line))
+        .collect();
+    Ok(HostResult::completed(
+        &operation.operation_id,
+        HostCompletionBody::RuntimeLogs { lines },
+    ))
+}
+
+fn answer_journal_read(
+    operation: &HostOperation,
+    store: &TargetStateStore,
+    limit: usize,
+) -> Result<HostResult, Failure> {
+    let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+    store.load_existing(deployment_id)?;
+    let mut entries = TargetJournal::open(store.root())
+        .map_err(|error| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                wire::sanitize(error.to_string()),
+            )
+        })?
+        .operation_log(deployment_id)
+        .map_err(|error| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                wire::sanitize(error.to_string()),
+            )
+        })?;
+    if entries.len() > limit {
+        entries = entries.split_off(entries.len() - limit);
+    }
+    Ok(HostResult::completed(
+        &operation.operation_id,
+        HostCompletionBody::JournalRead { entries },
+    ))
+}
+
+fn redact_log_line(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    if [
+        "authorization",
+        "password",
+        "secret",
+        "token",
+        "cookie",
+        "database_url",
+        "valkey_url",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        "[redacted sensitive log line]".to_owned()
+    } else {
+        wire::sanitize(line.to_owned())
+    }
+}
+
 /// Execute one G03 update order: the lifecycle executor performs the full
 /// staged sequence (verify → snapshot → stage config → activate → health →
 /// commit) inside this journaled operation and rolls its own partial work
@@ -490,6 +598,7 @@ fn answer_update(
     store: &TargetStateStore,
     artifact: &OfficialArtifactRef,
     config: Option<&StagedConfig>,
+    migration_jws: Option<&str>,
     lifecycle: &Arc<dyn update_exec::LifecycleExecutor>,
 ) -> Result<HostResult, Failure> {
     let Some(expected_revision) = operation.expected_revision else {
@@ -501,7 +610,7 @@ fn answer_update(
     let deployment_id = operation.deployment_id.clone().unwrap_or_default();
     let state = store.load_existing(&deployment_id)?;
     let scope_dir = store.scope_dir(&deployment_id)?;
-    ensure_scope_dir(&scope_dir);
+    ensure_scope_dir(&scope_dir)?;
     let Some(current_artifact) = state.artifact.current.clone() else {
         return Err(Failure::new(
             HOST_ERR_OPERATION_INVALID,
@@ -514,6 +623,22 @@ fn answer_update(
         .current_build_identity
         .as_ref()
         .map(|identity| identity.version.clone());
+    let data_root = state
+        .resources
+        .iter()
+        .find(|resource| resource.resource_id == "app-data" && resource.kind == "directory")
+        .map(|resource| resource.locator.clone())
+        .ok_or_else(|| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                "deployment state has no app-data directory resource",
+            )
+        })?;
+    let runtime_root = state
+        .resources
+        .iter()
+        .find(|resource| resource.resource_id == "app-binary" && resource.kind == "directory")
+        .map(|resource| resource.locator.clone());
     let job = update_exec::UpdateJob {
         operation_id: &operation.operation_id,
         deployment_id: &deployment_id,
@@ -521,12 +646,15 @@ fn answer_update(
         runtime_object: &state.runtime.object,
         config_reference: &state.config.reference.clone(),
         port: LOCAL_PROBE_PORT,
+        data_root: &data_root,
+        runtime_root: runtime_root.as_deref(),
         config_schema: &state.config.schema.clone(),
         current_artifact: &current_artifact,
         current_version: current_version.as_deref(),
         expected_revision,
         artifact,
         config,
+        migration_jws,
         scope_dir: &scope_dir,
         store,
     };
@@ -554,13 +682,18 @@ fn answer_rollback(
     let deployment_id = operation.deployment_id.clone().unwrap_or_default();
     let state = store.load_existing(&deployment_id)?;
     let scope_dir = store.scope_dir(&deployment_id)?;
-    ensure_scope_dir(&scope_dir);
+    ensure_scope_dir(&scope_dir)?;
     let Some(current_artifact) = state.artifact.current.clone() else {
         return Err(Failure::new(
             ROLLBACK_UNAVAILABLE,
             "the deployment records no current artifact reference",
         ));
     };
+    let runtime_root = state
+        .resources
+        .iter()
+        .find(|resource| resource.resource_id == "app-binary" && resource.kind == "directory")
+        .map(|resource| resource.locator.clone());
     let job = update_exec::RollbackJob {
         operation_id: &operation.operation_id,
         deployment_id: &deployment_id,
@@ -568,6 +701,7 @@ fn answer_rollback(
         runtime_object: &state.runtime.object,
         config_reference: &state.config.reference.clone(),
         port: LOCAL_PROBE_PORT,
+        runtime_root: runtime_root.as_deref(),
         config_schema: &state.config.schema.clone(),
         current_artifact: &current_artifact,
         previous_artifact: state.artifact.previous.as_deref(),
@@ -605,7 +739,7 @@ fn answer_uninstall(
         state.exact_managed_deployment_resource(&planned.resource_id)?;
     }
     let scope_dir = store.scope_dir(&deployment_id)?;
-    ensure_scope_dir(&scope_dir);
+    ensure_scope_dir(&scope_dir)?;
     let current_artifact = state.artifact.current.clone().unwrap_or_default();
     let job = uninstall_exec::DeletionJob {
         operation_id: &operation.operation_id,
@@ -640,12 +774,6 @@ fn answer_control_operation(
     control: &Arc<dyn control_exec::ControlOperationExecutor>,
 ) -> Result<HostResult, Failure> {
     let deployment_id = operation.deployment_id.clone().unwrap_or_default();
-    let presented = control_exec::control_operation_id_from_jws(compact_jws).map_err(|error| {
-        Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            wire::sanitize(error.to_string()),
-        )
-    })?;
     let state = store.load_existing(&deployment_id)?;
     let Some(current_artifact) = state.artifact.current.clone() else {
         return Err(Failure::new(
@@ -653,12 +781,27 @@ fn answer_control_operation(
             "the deployment records no current artifact reference",
         ));
     };
+    let data_root = state
+        .resources
+        .iter()
+        .find(|resource| resource.resource_id == "app-data" && resource.kind == "directory")
+        .map(|resource| resource.locator.clone())
+        .ok_or_else(|| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                "deployment state has no app-data directory resource",
+            )
+        })?;
+    let scope_dir = store.scope_dir(&deployment_id)?;
     let job = control_exec::ControlJob {
-        operation_id: &presented,
+        operation_id: &operation.operation_id,
         deployment_id: &deployment_id,
         artifact_reference: &current_artifact,
         runtime_kind: &state.runtime.kind,
         runtime_object: &state.runtime.object,
+        config_reference: &state.config.reference,
+        data_root: &data_root,
+        scope_dir: &scope_dir,
         compact_jws,
     };
     let result = control.execute(&job)?;
@@ -708,13 +851,17 @@ fn inspection_from_state(state: DeploymentState) -> InstanceInspection {
         // The discovery sweep never reads the marker: it is a per-deployment
         // fact that only the dedicated inspect kind surfaces.
         config_revision_marker: None,
-        bootstrap_material: None,
         current_build_identity: state.current_build_identity,
     }
 }
 
-fn ensure_scope_dir(scope_dir: &std::path::Path) {
-    let _ = crate::filesystem::ensure_directory_chain(scope_dir);
+fn ensure_scope_dir(scope_dir: &std::path::Path) -> Result<(), Failure> {
+    crate::filesystem::ensure_directory_chain(scope_dir).map_err(|error| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            format!("failed to prepare target state directory: {error}"),
+        )
+    })
 }
 
 fn state_failure(operation: &HostOperation, failure: &Failure) -> HostResult {
@@ -731,13 +878,7 @@ fn answer_inspect(
 ) -> Result<HostResult, Failure> {
     let deployment_id = operation.deployment_id.clone().unwrap_or_default();
     let state = store.load_existing(&deployment_id)?;
-    // Decision 3 (goal plan 07 G-A): surface the read-only fresh-bootstrap
-    // material ONLY while the capability is open and the live state still
-    // matches its install binding. Every other state answers without it.
     let scope_dir = store.scope_dir(&deployment_id).ok();
-    let bootstrap_material = scope_dir
-        .as_ref()
-        .and_then(|scope| bootstrap_authority::surface_material_view(scope, &state));
     let config_revision_marker = scope_dir.as_ref().and_then(|scope| {
         std::fs::read(scope.join("config-revision"))
             .ok()
@@ -765,10 +906,36 @@ fn answer_inspect(
                     .as_ref()
                     .map(|active| active.operation_id.clone()),
                 config_revision_marker,
-                bootstrap_material,
                 current_build_identity: state.current_build_identity.clone(),
             },
         },
+    ))
+}
+
+/// Read the fresh-install bootstrap capability for one deployment. The
+/// material view is surfaced ONLY while the capability is open and the live
+/// state still matches its install journal binding (goal plan 07 G-A
+/// decision). Every other state — closed, consumed, drifted — fails closed.
+/// Separated from state-inspect so bootstrap material never travels in the
+/// generic inspection path.
+fn answer_bootstrap_read(
+    operation: &HostOperation,
+    store: &TargetStateStore,
+) -> Result<HostResult, Failure> {
+    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
+    let state = store.load_existing(&deployment_id)?;
+    let scope = store
+        .scope_dir(&deployment_id)
+        .map_err(|failure| Failure::new(failure.code, failure.detail))?;
+    let material = bootstrap_authority::surface_material_view(&scope, &state).ok_or_else(|| {
+        Failure::new(
+            crate::target::HOST_ERR_OPERATION_INVALID,
+            "no fresh-install bootstrap capability exists for this deployment".to_owned(),
+        )
+    })?;
+    Ok(HostResult::completed(
+        &operation.operation_id,
+        HostCompletionBody::BootstrapRead { material },
     ))
 }
 
@@ -799,7 +966,7 @@ fn answer_bootstrap_close(
 /// projected through the same inspection shape as state-inspect and sorted by
 /// deployment id. Strictly read-only — no journal line, no state write, and
 /// never any fresh-install bootstrap material (that surfaces only through the
-/// per-deployment inspect kind).
+/// dedicated bootstrap-read kind).
 fn answer_state_list(
     operation: &HostOperation,
     store: &TargetStateStore,
@@ -822,8 +989,9 @@ fn health_from_inspection(inspection: &InstanceInspection) -> HealthSnapshot {
     }
 }
 
-/// Runtimes this installation could drive, detected without spawning engines:
-/// engine binaries present on PATH plus the systemd host backend on Linux.
+/// Runtimes this installation can drive end-to-end, detected without spawning
+/// engines. Read-only discovery support is not advertised as lifecycle
+/// capability.
 fn local_supported_runtimes() -> Vec<String> {
     let mut runtimes = Vec::new();
     for engine in ["podman", "docker"] {
@@ -831,7 +999,10 @@ fn local_supported_runtimes() -> Vec<String> {
             runtimes.push(engine.to_owned());
         }
     }
-    if cfg!(target_os = "linux") {
+    if cfg!(target_os = "linux")
+        && crate::runtime_backend::backend(crate::runtime_backend::RuntimeBackendKind::Systemd)
+            .available()
+    {
         runtimes.push("host".to_owned());
     }
     runtimes
@@ -899,15 +1070,13 @@ impl ExecutionTarget for LocalTarget {
         // every other kind (decision 1): validated, journaled, dispatched to
         // the local one-shot NazoAuth operator. No secret material exists on
         // this path — the JWS is signed public data.
-        let presented = control_exec::control_operation_id_from_jws(&request.compact_jws)
-            .map_err(|error| anyhow::anyhow!("{HOST_ERR_OPERATION_INVALID}: {error}"))?;
         if request.deployment_id.is_empty() {
             anyhow::bail!(
                 "{HOST_ERR_OPERATION_INVALID}: control operations require a deployment binding"
             );
         }
         let operation = HostOperation::control_operation(
-            Uuid::now_v7(),
+            request.operation_id.clone(),
             request.deployment_id.clone(),
             request.compact_jws.clone(),
         );
@@ -920,15 +1089,16 @@ impl ExecutionTarget for LocalTarget {
                         result: control_result,
                     },
             } => {
-                if control_result.operation_id != presented {
+                if control_result.operation_id != request.operation_id {
                     anyhow::bail!(
                         "{HOST_ERR_OPERATION_INVALID}: the target answered operation '{}' while \
-                         '{presented}' was presented",
-                        control_result.operation_id
+                         '{}' was presented",
+                        control_result.operation_id,
+                        request.operation_id
                     );
                 }
                 Ok(ControlOperationReceipt {
-                    operation_id: presented,
+                    operation_id: request.operation_id.clone(),
                     accepted: true,
                     result: Some(control_result),
                 })
@@ -948,7 +1118,7 @@ impl ExecutionTarget for LocalTarget {
                 // Admission-grade refusal before acceptance: no side effect
                 // can have happened, so a corrected retry may mint a new id.
                 Ok(ControlOperationReceipt {
-                    operation_id: presented,
+                    operation_id: request.operation_id.clone(),
                     accepted: false,
                     result: None,
                 })
@@ -984,21 +1154,21 @@ mod tests {
             StateMutationPayload::Bootstrap {
                 issuer: "https://auth.example.com".to_owned(),
                 runtime: RuntimeSurface::new("podman", "nazoauth-main").expect("runtime"),
-                artifact: ArtifactRefs {
+                artifact: Some(ArtifactRefs {
                     current: Some("sha256:abcdef0123456789".to_owned()),
                     previous: None,
-                },
+                }),
                 config_reference: "/etc/nazauth/config.toml".to_owned(),
                 config_schema: "nazauth-config-v1".to_owned(),
                 resources: vec![
                     Resource::new(
-                        "app-container",
-                        "container",
-                        "nazoauth-main",
+                        "app-data",
+                        "directory",
+                        "/var/lib/nazoauth/deploy-alpha",
                         ResourceOwnership::Managed,
                         ResourceScope::Deployment,
                     )
-                    .expect("managed resource"),
+                    .expect("managed data resource"),
                     Resource::new(
                         "shared-db",
                         "postgres",
@@ -1267,8 +1437,8 @@ mod tests {
         let state = store.load_existing("deploy-alpha")?;
 
         // managed + deployment: the only deletable classification.
-        let managed = state.exact_managed_deployment_resource("app-container")?;
-        assert_eq!(managed.locator, "nazoauth-main");
+        let managed = state.exact_managed_deployment_resource("app-data")?;
+        assert_eq!(managed.locator, "/var/lib/nazoauth/deploy-alpha");
 
         for (resource_id, expected_code) in [
             ("shared-db", EXTERNAL_RESOURCE_PROTECTED),
@@ -1375,6 +1545,7 @@ mod tests {
         let target = plain_target.with_control_executor(scripted.clone());
 
         let receipt = target.execute_control_operation(&ControlOperationRequest {
+            operation_id: CONTROL_JWS_OP_ID.to_owned(),
             deployment_id: "deploy-alpha".to_owned(),
             compact_jws: sample_control_jws(),
         })?;

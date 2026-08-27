@@ -29,11 +29,11 @@ use super::{
 };
 use crate::{
     cli::{AcmeCertificateInput, AcmeCommand},
-    deployment::{DeploymentRecord, DeploymentStore},
     filesystem::{
         atomic_write, ensure_private_directory, read_secure_regular_file, remove_file_durable,
         validate_secure_directory,
     },
+    tls::{TlsRecord, TlsStore},
 };
 
 const CONFIG_SCHEMA: u32 = 2;
@@ -218,7 +218,7 @@ pub(super) fn run(
     confirm: impl Fn(bool, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     require_root()?;
-    let store = DeploymentStore::system();
+    let store = TlsStore::system()?;
     match command {
         AcmeCommand::Plan(input) => plan(&store, selector, &input),
         AcmeCommand::Issue {
@@ -248,8 +248,8 @@ pub(super) fn run(
 }
 
 pub(super) fn current_install_source(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     provider: &LoadedProvider,
     tenant: &str,
     hostname: &str,
@@ -302,11 +302,11 @@ fn validate_install_authority(
 }
 
 fn plan(
-    store: &DeploymentStore,
+    store: &TlsStore,
     selector: Option<&str>,
     input: &AcmeCertificateInput,
 ) -> anyhow::Result<()> {
-    let record = store.resolve(selector, true)?;
+    let record = store.resolve(selector)?;
     let provider = load_provider(
         store,
         &input.provider_config,
@@ -328,11 +328,11 @@ fn plan(
 }
 
 fn issue(
-    store: &DeploymentStore,
+    store: &TlsStore,
     selector: Option<&str>,
     input: &AcmeCertificateInput,
 ) -> anyhow::Result<()> {
-    let record = store.resolve(selector, true)?;
+    let record = store.resolve(selector)?;
     let provider = load_provider(
         store,
         &input.provider_config,
@@ -391,12 +391,12 @@ fn issue(
 }
 
 fn recover(
-    store: &DeploymentStore,
+    store: &TlsStore,
     selector: Option<&str>,
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<()> {
-    let record = store.resolve(selector, true)?;
+    let record = store.resolve(selector)?;
     let tenant = canonical_tenant(tenant)?;
     let hostname = canonical_hostname(hostname)?;
     let mut transaction = load_pending(store, &record, &tenant, &hostname)?
@@ -445,12 +445,12 @@ fn recover(
 }
 
 fn show(
-    store: &DeploymentStore,
+    store: &TlsStore,
     selector: Option<&str>,
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<()> {
-    let record = store.resolve(selector, false)?;
+    let record = store.resolve(selector)?;
     let tenant = canonical_tenant(tenant)?;
     let hostname = canonical_hostname(hostname)?;
     let pending = load_pending(store, &record, &tenant, &hostname)?;
@@ -473,7 +473,7 @@ fn show(
 }
 
 fn load_config(
-    store: &DeploymentStore,
+    store: &TlsStore,
     path: &Path,
     provider: &LoadedProvider,
     requested_tenant: &str,
@@ -499,7 +499,7 @@ fn load_config(
 }
 
 fn load_snapshot_config(
-    store: &DeploymentStore,
+    store: &TlsStore,
     path: &Path,
     provider: &LoadedProvider,
     requested_tenant: &str,
@@ -565,7 +565,7 @@ fn load_directory_trust_anchor(config: &AcmeConfig) -> anyhow::Result<Option<Vec
 }
 
 fn validate_config(
-    store: &DeploymentStore,
+    store: &TlsStore,
     config: &AcmeConfig,
     provider: &LoadedProvider,
     requested_tenant: &str,
@@ -634,8 +634,8 @@ fn validate_config(
 }
 
 fn build_plan(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     provider: &LoadedProvider,
     acme: &LoadedAcmeConfig,
     current: Option<&AcmeReceipt>,
@@ -724,8 +724,8 @@ fn persist_config_snapshots(
 }
 
 fn drive_transaction(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     provider: &LoadedProvider,
     acme: &LoadedAcmeConfig,
     transaction: &mut AcmeTransaction,
@@ -772,8 +772,8 @@ fn drive_transaction(
 }
 
 async fn drive_async(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     provider: &LoadedProvider,
     acme: &LoadedAcmeConfig,
     transaction: &mut AcmeTransaction,
@@ -862,7 +862,7 @@ async fn drive_async(
 }
 
 async fn load_or_create_account(
-    store: &DeploymentStore,
+    store: &TlsStore,
     acme: &LoadedAcmeConfig,
     transaction: &mut AcmeTransaction,
 ) -> anyhow::Result<Account> {
@@ -1008,7 +1008,7 @@ fn load_or_create_account_key(
 }
 
 fn bind_account_key_digest(
-    store: &DeploymentStore,
+    store: &TlsStore,
     transaction: &mut AcmeTransaction,
     digest: &str,
 ) -> anyhow::Result<()> {
@@ -1060,7 +1060,7 @@ async fn validate_order_identifiers(
 }
 
 async fn satisfy_authorization(
-    store: &DeploymentStore,
+    store: &TlsStore,
     acme: &LoadedAcmeConfig,
     transaction: &mut AcmeTransaction,
     order: &mut instant_acme::Order,
@@ -1106,7 +1106,7 @@ async fn satisfy_authorization(
 }
 
 fn load_or_create_csr(
-    store: &DeploymentStore,
+    store: &TlsStore,
     transaction: &mut AcmeTransaction,
 ) -> anyhow::Result<Vec<u8>> {
     let key_path = transaction.workspace.join("private-key.pem");
@@ -1155,8 +1155,8 @@ fn load_or_create_csr(
 
 #[allow(clippy::too_many_arguments)]
 fn commit_issued_material(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     provider: &LoadedProvider,
     acme: &LoadedAcmeConfig,
     transaction: &mut AcmeTransaction,
@@ -1237,9 +1237,9 @@ fn ensure_transaction_fresh(transaction: &AcmeTransaction) -> anyhow::Result<()>
 }
 
 fn validate_transaction_binding(
-    store: &DeploymentStore,
+    store: &TlsStore,
     transaction: &AcmeTransaction,
-    record: &DeploymentRecord,
+    record: &TlsRecord,
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<()> {
@@ -1402,7 +1402,7 @@ fn validate_transaction_config(
     Ok(())
 }
 
-fn validate_receipt_shape(store: &DeploymentStore, receipt: &AcmeReceipt) -> anyhow::Result<()> {
+fn validate_receipt_shape(store: &TlsStore, receipt: &AcmeReceipt) -> anyhow::Result<()> {
     validate_uuid_v7(&receipt.jti, "ACME receipt JTI")?;
     for (digest, label) in [
         (
@@ -1495,7 +1495,7 @@ fn validate_digest(value: &str, label: &str) -> anyhow::Result<()> {
 }
 
 fn load_provider_snapshot(
-    store: &DeploymentStore,
+    store: &TlsStore,
     path: &Path,
     tenant: &str,
     hostname: &str,
@@ -1598,7 +1598,7 @@ fn validate_previous_receipt(
     }
 }
 
-fn persist_pending(store: &DeploymentStore, transaction: &AcmeTransaction) -> anyhow::Result<()> {
+fn persist_pending(store: &TlsStore, transaction: &AcmeTransaction) -> anyhow::Result<()> {
     atomic_write(
         &pending_path(store, transaction),
         &serde_json::to_vec_pretty(transaction)?,
@@ -1607,8 +1607,8 @@ fn persist_pending(store: &DeploymentStore, transaction: &AcmeTransaction) -> an
 }
 
 fn load_pending(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<Option<AcmeTransaction>> {
@@ -1628,8 +1628,8 @@ fn load_pending(
 }
 
 fn ensure_no_pending(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<()> {
@@ -1640,7 +1640,7 @@ fn ensure_no_pending(
 }
 
 fn persist_receipt(
-    store: &DeploymentStore,
+    store: &TlsStore,
     transaction: &AcmeTransaction,
     receipt: &AcmeReceipt,
 ) -> anyhow::Result<()> {
@@ -1665,8 +1665,8 @@ fn persist_receipt(
 }
 
 fn load_receipt(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<Option<AcmeReceipt>> {
@@ -1674,8 +1674,8 @@ fn load_receipt(
 }
 
 fn load_receipt_record(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
+    store: &TlsStore,
+    record: &TlsRecord,
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<Option<LoadedAcmeReceipt>> {
@@ -1703,10 +1703,7 @@ fn load_receipt_record(
     }))
 }
 
-fn validate_receipt_artifacts(
-    store: &DeploymentStore,
-    receipt: &AcmeReceipt,
-) -> anyhow::Result<()> {
+fn validate_receipt_artifacts(store: &TlsStore, receipt: &AcmeReceipt) -> anyhow::Result<()> {
     let certificate = read_secure_regular_file(
         &receipt.certificate_path,
         "ACME receipt certificate chain",
@@ -1758,10 +1755,7 @@ fn read_optional_private(
     }
 }
 
-fn archive_transaction(
-    store: &DeploymentStore,
-    transaction: &AcmeTransaction,
-) -> anyhow::Result<()> {
+fn archive_transaction(store: &TlsStore, transaction: &AcmeTransaction) -> anyhow::Result<()> {
     atomic_write(
         &transaction.workspace.join("transaction.json"),
         &serde_json::to_vec_pretty(transaction)?,
@@ -1771,7 +1765,7 @@ fn archive_transaction(
 }
 
 fn abort_transaction(
-    store: &DeploymentStore,
+    store: &TlsStore,
     transaction: &mut AcmeTransaction,
     reason: &str,
 ) -> anyhow::Result<()> {
@@ -1815,7 +1809,7 @@ fn cleanup_challenge(transaction: &AcmeTransaction) -> anyhow::Result<()> {
     }
 }
 
-fn pending_path(store: &DeploymentStore, transaction: &AcmeTransaction) -> PathBuf {
+fn pending_path(store: &TlsStore, transaction: &AcmeTransaction) -> PathBuf {
     acme_binding_directory(
         store,
         &transaction.deployment_id,
@@ -1826,7 +1820,7 @@ fn pending_path(store: &DeploymentStore, transaction: &AcmeTransaction) -> PathB
 }
 
 fn acme_binding_directory(
-    store: &DeploymentStore,
+    store: &TlsStore,
     deployment_id: &str,
     tenant: &str,
     hostname: &str,
@@ -1839,11 +1833,7 @@ fn acme_binding_directory(
         .join(identity)
 }
 
-fn account_path(
-    store: &DeploymentStore,
-    record: &DeploymentRecord,
-    acme: &LoadedAcmeConfig,
-) -> PathBuf {
+fn account_path(store: &TlsStore, record: &TlsRecord, acme: &LoadedAcmeConfig) -> PathBuf {
     account_path_for_binding(
         store,
         &record.deployment_id,
@@ -1853,7 +1843,7 @@ fn account_path(
 }
 
 fn account_path_for_binding(
-    store: &DeploymentStore,
+    store: &TlsStore,
     deployment_id: &str,
     directory_url: &str,
     acme_config_sha256: &str,
@@ -1951,7 +1941,7 @@ mod tests {
     #[test]
     fn abort_preserves_evidence_and_releases_the_pending_binding() {
         let work = PrivateTempDir::new("nazoauthctl-acme-abort").unwrap();
-        let store = DeploymentStore {
+        let store = TlsStore {
             config_root: work.path().join("config"),
             state_root: work.path().join("state"),
         };
@@ -1975,7 +1965,7 @@ mod tests {
     #[test]
     fn account_key_is_persisted_and_journal_bound_before_network_use() {
         let work = PrivateTempDir::new("nazoauthctl-acme-account-key").unwrap();
-        let store = DeploymentStore {
+        let store = TlsStore {
             config_root: work.path().join("config"),
             state_root: work.path().join("state"),
         };
@@ -2068,7 +2058,7 @@ mod tests {
     #[test]
     fn receipt_shape_binds_protocol_and_material_identity() {
         let work = PrivateTempDir::new("nazoauthctl-acme-receipt-shape").unwrap();
-        let store = DeploymentStore {
+        let store = TlsStore {
             config_root: work.path().join("config"),
             state_root: work.path().join("state"),
         };
@@ -2094,7 +2084,7 @@ mod tests {
     #[test]
     fn receipt_commit_archives_exact_revision_before_current_pointer() {
         let work = PrivateTempDir::new("nazoauthctl-acme-receipt-archive").unwrap();
-        let store = DeploymentStore {
+        let store = TlsStore {
             config_root: work.path().join("config"),
             state_root: work.path().join("state"),
         };
@@ -2168,7 +2158,7 @@ mod tests {
         }
     }
 
-    fn test_transaction_for_store(store: &DeploymentStore) -> AcmeTransaction {
+    fn test_transaction_for_store(store: &TlsStore) -> AcmeTransaction {
         let mut transaction = test_transaction(&store.state_root);
         transaction.workspace = acme_binding_directory(
             store,

@@ -133,7 +133,7 @@ fn discover_reports_every_declared_fact_per_deployment() -> anyhow::Result<()> {
         "https://alpha.example.com",
         "nz-alpha",
         managed_runtime("nz-alpha")?,
-        Some(BuildIdentity::new("nazauth", "0.2.0", "abc1234")?),
+        Some(BuildIdentity::new("nazoauth", "0.2.0", "abc1234")?),
     )?;
     fixture.seed_deployment(
         "deploy-beta",
@@ -160,7 +160,7 @@ fn discover_reports_every_declared_fact_per_deployment() -> anyhow::Result<()> {
     assert!(report.contains(CONFIG_SCHEMA), "{report}");
     assert!(report.contains(ARTIFACT), "{report}");
     assert!(
-        report.contains("build identity: nazauth v0.2.0 (commit abc1234)"),
+        report.contains("build identity: nazoauth v0.2.0 (commit abc1234)"),
         "{report}"
     );
     assert!(
@@ -275,7 +275,7 @@ fn adopt_registers_with_target_derived_evidence_and_classification() -> anyhow::
         "https://alpha.example.com",
         "nz-alpha",
         managed_runtime("nz-alpha")?,
-        Some(BuildIdentity::new("nazauth", "0.2.0", "abc1234")?),
+        Some(BuildIdentity::new("nazoauth", "0.2.0", "abc1234")?),
     )?;
     let state_path = fixture
         .state_root

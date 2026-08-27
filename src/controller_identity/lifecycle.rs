@@ -953,7 +953,6 @@ pub(crate) fn run_controller_command(
             label,
             secret_file,
             rotate_secret,
-            approval_token: _approval_token, // consumed by the recovery API internally
             admin_access_file,
             output_secret_file,
         } => {

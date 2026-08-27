@@ -303,7 +303,7 @@ fn readiness_revalidates_active_material_and_renewal_window() {
 #[test]
 fn pending_journal_fences_one_activation_resource_across_deployments() {
     let work = PrivateTempDir::new("nazoauth-tls-provider-fence").unwrap();
-    let store = DeploymentStore {
+    let store = TlsStore {
         config_root: work.path().join("config"),
         state_root: work.path().join("state"),
     };
