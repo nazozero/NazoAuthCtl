@@ -290,10 +290,10 @@ fn unix_stub() -> String {
 printf '%s\n' "$*" >> "$(dirname "$0")/argv.txt"
 input=$(cat)
 id=$(printf '%s' "$input" | sed -n 's/.*"operation_id":"\([0-9a-fA-F-]*\)".*/\1/p')
-dep=$(printf '%s' "$input" | sed -n 's/.*"deployment_id":"\([0-9a-zA-Z._:+-]*\)".*/\1p')
-nonce=$(printf '%s' "$input" | sed -n 's/.*"nonce":"\([0-9A-Za-z._:+-]*\)".*/\1p')
+dep=$(printf '%s' "$input" | sed -n 's/.*"deployment_id":"\([0-9a-zA-Z._:+-]*\)".*/\1/p')
+nonce=$(printf '%s' "$input" | sed -n 's/.*"nonce":"\([0-9A-Za-z._:+-]*\)".*/\1/p')
 case "$input" in
-  *'"kind":"hello'"'"''*)
+  *'"kind":"hello"'*)
     out="$(dirname "$0")/response-hello.json"
     sed "s/__OPERATION_ID__/${id:-none}/g" "$out"
     exit 0
