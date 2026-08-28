@@ -238,20 +238,19 @@ impl SshTarget {
         command
     }
 
-    /// Full argv for one remote exec round trip.
-    pub(crate) fn exec_argv(&self) -> Vec<OsString> {
-        let mut argv: Vec<OsString> = Vec::with_capacity(3 + self.remote_command_argv().len());
-        argv.push(self.program.clone().into_os_string());
-        argv.push(self.profile.clone().into());
-        argv.push("--".into());
-        argv.extend(self.remote_command_argv().into_iter().map(OsString::from));
-        argv
+    /// Arguments for one remote exec round trip. The executable is supplied
+    /// separately to [`Process::new`], so it must never appear in this list.
+    pub(crate) fn exec_args(&self) -> Vec<OsString> {
+        let mut args: Vec<OsString> = Vec::with_capacity(2 + self.remote_command_argv().len());
+        args.push(self.profile.clone().into());
+        args.push("--".into());
+        args.extend(self.remote_command_argv().into_iter().map(OsString::from));
+        args
     }
 
     /// Probe argv for non-interactive sudo availability (goal plan 03 §4).
-    pub(crate) fn sudo_probe_argv(&self) -> Vec<OsString> {
+    pub(crate) fn sudo_probe_args(&self) -> Vec<OsString> {
         vec![
-            self.program.clone().into_os_string(),
             self.profile.clone().into(),
             "--".into(),
             "sudo".into(),
@@ -261,9 +260,8 @@ impl SshTarget {
     }
 
     /// Interactive pre-authorization argv. Options precede the destination.
-    pub(crate) fn sudo_interactive_argv(&self) -> Vec<OsString> {
+    pub(crate) fn sudo_interactive_args(&self) -> Vec<OsString> {
         vec![
-            self.program.clone().into_os_string(),
             "-t".into(),
             self.profile.clone().into(),
             "sudo".into(),
@@ -275,7 +273,7 @@ impl SshTarget {
     fn transmit(&self, operation: &HostOperation) -> anyhow::Result<HostResult> {
         let payload = encode_host_operation(operation)?;
         let output = Process::new(self.program.clone())
-            .args(self.exec_argv())
+            .args(self.exec_args())
             .timeout(self.timeout)
             .stdin_output(&payload)
             .context(format!(
@@ -400,7 +398,7 @@ impl SshTarget {
             bail!("host privilege is direct; sudo preflight does not apply");
         }
         let output = Process::new(self.program.clone())
-            .args(self.sudo_probe_argv())
+            .args(self.sudo_probe_args())
             .timeout(self.timeout)
             .stdin_output(b"")
             .context("failed to start the OpenSSH client for the sudo probe")?;
@@ -456,7 +454,7 @@ impl SshTarget {
             self.profile
         );
         let status = StdCommand::new(&self.program)
-            .args(self.sudo_interactive_argv())
+            .args(self.sudo_interactive_args())
             .status()
             .context("failed to run the interactive sudo pre-authorization")?;
         if !status.success() {
@@ -719,18 +717,9 @@ mod tests {
             fs::read_to_string(self.dir.path().join("stdin.json")).expect("stub records its stdin")
         }
 
-        /// Invocation arguments after the program token (the stub prepends
-        /// its own path on some platforms), one entry per recorded call.
+        /// Invocation arguments after the program token, one entry per call.
         fn argv_invocations(&self) -> Vec<String> {
-            self.recorded_argv()
-                .lines()
-                .map(|line| {
-                    let start = line
-                        .find(PROFILE)
-                        .expect("profile present in recorded argv");
-                    line[start..].to_owned()
-                })
-                .collect()
+            self.recorded_argv().lines().map(str::to_owned).collect()
         }
     }
 
@@ -839,15 +828,15 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     // ---------- argv shape (no spawning required) ----------
 
     #[test]
-    fn exec_argv_is_fixed_and_delegation_only() {
+    fn exec_args_are_fixed_and_delegation_only() {
         let direct = SshTarget::from_record(
             &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Direct, Uuid::now_v7())
                 .unwrap(),
         )
         .unwrap();
         assert_eq!(
-            direct.exec_argv(),
-            ["ssh", PROFILE, "--", "nazoauthctl", "remote", "exec"]
+            direct.exec_args(),
+            [PROFILE, "--", "nazoauthctl", "remote", "exec"]
         );
 
         let sudo = SshTarget::from_record(
@@ -855,17 +844,8 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
         )
         .unwrap();
         assert_eq!(
-            sudo.exec_argv(),
-            [
-                "ssh",
-                PROFILE,
-                "--",
-                "sudo",
-                "-n",
-                "nazoauthctl",
-                "remote",
-                "exec"
-            ]
+            sudo.exec_args(),
+            [PROFILE, "--", "sudo", "-n", "nazoauthctl", "remote", "exec"]
         );
 
         let mut custom =
@@ -874,12 +854,12 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
         custom.remote_exec_path = Some(CUSTOM_BASENAME.to_owned());
         let custom = SshTarget::from_record(&custom).unwrap();
         assert_eq!(
-            custom.exec_argv(),
-            ["ssh", PROFILE, "--", CUSTOM_BASENAME, "remote", "exec"]
+            custom.exec_args(),
+            [PROFILE, "--", CUSTOM_BASENAME, "remote", "exec"]
         );
 
         // Delegation by construction: no option overrides of any kind, ever.
-        for argv in [direct.exec_argv(), sudo.exec_argv(), custom.exec_argv()] {
+        for argv in [direct.exec_args(), sudo.exec_args(), custom.exec_args()] {
             for token in argv {
                 let token = token.to_string_lossy();
                 assert!(!token.contains("StrictHostKeyChecking"), "{token}");
@@ -898,13 +878,10 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
         )
         .unwrap();
         assert_eq!(
-            sudo.sudo_probe_argv(),
-            ["ssh", PROFILE, "--", "sudo", "-n", "true"]
+            sudo.sudo_probe_args(),
+            [PROFILE, "--", "sudo", "-n", "true"]
         );
-        assert_eq!(
-            sudo.sudo_interactive_argv(),
-            ["ssh", "-t", PROFILE, "sudo", "-v"]
-        );
+        assert_eq!(sudo.sudo_interactive_args(), ["-t", PROFILE, "sudo", "-v"]);
     }
 
     // ---------- behavior over the stub transport ----------
@@ -1314,7 +1291,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
         )
         .unwrap();
         let joined = target
-            .exec_argv()
+            .exec_args()
             .into_iter()
             .map(|token| token.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
