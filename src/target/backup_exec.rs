@@ -26,7 +26,7 @@ use super::{
     deployment_state::{BuildIdentity, DeploymentState, Failure, ResourceOwnership, ResourceScope},
     install_exec::{
         CONTAINER_CONFIG_FILE, CONTAINER_DATA_DIR, CONTAINER_SECRETS_DIR, LOCAL_READINESS_PATH,
-        SERVER_CONFIG_FILE_ENV,
+        MIGRATION_RUNTIME_ROLE_ENV, SERVER_CONFIG_FILE_ENV,
     },
     wire::{
         BackupTransferBytes, BackupTransferChunk, HOST_ERR_OPERATION_INVALID,
@@ -35,7 +35,8 @@ use super::{
 };
 use crate::runtime_backend::{
     self, ArtifactReference, ContainerRuntimePolicy, NeutralMount, RecoveryCandidateEndpoint,
-    RecoveryCandidateRequest, RuntimeBackend, RuntimeBackendKind, RuntimeReplacement,
+    RecoveryCandidateRequest, Responsibility, RuntimeBackend, RuntimeBackendKind,
+    RuntimeReplacement,
 };
 
 pub const BACKUP_EXECUTION_FAILED: &str = "BACKUP_EXECUTION_FAILED";
@@ -1194,6 +1195,21 @@ fn run_restore_rehearsal(
                 == manifest.database_sentinel_sha256,
             "restored database sentinel does not match the snapshot"
         );
+        // The snapshot was taken with --no-privileges, so the restored
+        // database carries no runtime grants. `nazoauth migrate` is the sole
+        // grant authority: run the same one-shot the install uses, pointed at
+        // the isolated database, before the candidate starts.
+        let runtime_role = {
+            let connection = postgres_connection(&runtime_url_path)?;
+            connection.url_without_password.username().to_owned()
+        };
+        run_restore_migration(
+            backend.as_ref(),
+            &manifest.runtime_artifact,
+            &config,
+            &secrets,
+            &runtime_role,
+        )?;
         start_candidate(
             backend.as_ref(),
             backend_kind,
@@ -1236,6 +1252,68 @@ fn run_restore_rehearsal(
             cleanup_errors.join("; ")
         ),
     }
+}
+
+/// Run the product's one-shot `nazoauth migrate` against the isolated restore
+/// database so `configure_runtime_role` re-converges the runtime grant the
+/// privilege-free dump dropped. Mirrors the install one-shot contract: the
+/// lifecycle URL travels only through the read-only secret mount.
+fn run_restore_migration(
+    backend: &dyn RuntimeBackend,
+    artifact: &crate::runtime_backend::ArtifactReference,
+    config: &Path,
+    secrets: &Path,
+    runtime_role: &str,
+) -> anyhow::Result<()> {
+    let task = runtime_backend::OneShotTask {
+        artifact: artifact.clone(),
+        command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
+        network: Some("bridge".to_owned()),
+        mounts: vec![
+            NeutralMount {
+                source: config.to_path_buf(),
+                destination: PathBuf::from(CONTAINER_CONFIG_FILE),
+                read_only: true,
+                selinux_relabel: false,
+                ownership: Responsibility::Managed,
+                scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
+            },
+            NeutralMount {
+                source: secrets.to_path_buf(),
+                destination: PathBuf::from(CONTAINER_SECRETS_DIR),
+                read_only: true,
+                selinux_relabel: false,
+                ownership: Responsibility::Managed,
+                scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
+            },
+        ],
+        environment: BTreeMap::from([
+            (
+                SERVER_CONFIG_FILE_ENV.to_owned(),
+                CONTAINER_CONFIG_FILE.to_owned(),
+            ),
+            (
+                "DATABASE_URL_FILE".to_owned(),
+                format!("{CONTAINER_SECRETS_DIR}/database-lifecycle-url"),
+            ),
+            (
+                MIGRATION_RUNTIME_ROLE_ENV.to_owned(),
+                runtime_role.to_owned(),
+            ),
+        ]),
+        working_directory: Some(PathBuf::from("/app")),
+        service_user: Some(runtime_backend::NON_ROOT_ONE_SHOT_USER.to_owned()),
+        transient_credentials: BTreeMap::new(),
+        read_only_paths: Vec::new(),
+        read_write_paths: Vec::new(),
+        inaccessible_paths: Vec::new(),
+        private_mounts: false,
+        stdin: Vec::new(),
+    };
+    backend
+        .run_one_shot(&task)
+        .map(|_: String| ())
+        .map_err(|error| anyhow::anyhow!(sanitize(error.to_string())))
 }
 
 fn managed_directory(state: &DeploymentState, id: &str) -> anyhow::Result<PathBuf> {
@@ -2159,7 +2237,7 @@ fn cleanup_valkey_namespace(
         crate::filesystem::read_secure_regular_file(valkey_url_file, "Valkey URL", false, 4096)?;
     let mut url = Url::parse(std::str::from_utf8(&bytes)?.trim())?;
     ensure!(
-        matches!(url.scheme(), "redis" | "rediss"),
+        matches!(url.scheme(), "redis" | "rediss" | "valkey"),
         "Valkey URL has an invalid scheme"
     );
     let password = url
