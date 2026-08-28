@@ -6,8 +6,6 @@
 //! substituting returned resource identifiers into the Suite configuration.
 
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(all(test, unix))]
-use std::fs;
 use std::path::Path;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};

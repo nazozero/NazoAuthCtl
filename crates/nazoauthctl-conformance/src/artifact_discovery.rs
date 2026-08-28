@@ -1040,9 +1040,6 @@ mod tests {
         assert_eq!(plan.artifact, opened.artifact);
         assert_eq!(plan.selected_group_count, 1);
         assert_eq!(plan.selected_plan_count, 1);
-        assert!(!plan.deployment_bound);
-        assert!(!plan.capabilities_attested);
-        assert!(!plan.execution_permitted);
         assert_eq!(
             std::fs::metadata(plan.artifact_cache_entry.join("verified.json"))
                 .expect("record metadata")

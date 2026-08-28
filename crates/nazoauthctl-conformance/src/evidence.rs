@@ -158,7 +158,6 @@ struct ReviewScreenshotAudit {
     trigger_origin: String,
     trigger_path: String,
     trigger_url_sha256: String,
-    #[serde(default)]
     source: crate::BrowserReviewScreenshotSource,
     #[serde(default)]
     verification_receipt: Option<crate::OpenId4VpVerificationReceiptProvenance>,
@@ -452,7 +451,7 @@ fn validate_control_vp_receipts(
                 variant: &module.variant,
                 trigger_origin: &audit.trigger_origin,
             };
-            if !verify_control_vp_receipt(receipt, anchor, binding, &context) {
+            if !verify_control_vp_receipt(receipt, anchor, recovery_binding, &context) {
                 return Err(EvidenceError::Identity);
             }
         }
