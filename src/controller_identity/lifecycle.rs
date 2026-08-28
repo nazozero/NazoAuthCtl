@@ -8,8 +8,9 @@
 //!   → crash reconciliation (D06: adopt a committed candidate; retire
 //!      material the server no longer lists)
 //!   → build proposal payload (public key/kid/deployment binding only)
-//!   → obtain a single-use approval token (browser 2FA happens at the
-//!      instance admin surface; ctl only ever carries the token)
+//!   → obtain a single-use approval token (the server enforces fresh 2FA;
+//!      ctl can issue the exact proposal through an owner-only admin session
+//!      or accept an explicitly supplied token)
 //!   → atomic server commit (approval consumption + registry mutation share
 //!      one transaction on the NazoAuth side)
 //!   → local activation (pointer switch / registry fields), ordered so the
@@ -28,9 +29,8 @@
 //! * self-revocation clears the local active pointer only after the server
 //!   confirmed the terminal state, so no dangling pointer can brick loads.
 //!
-//! Approval tokens are secrets: they arrive through the injected approval
-//! callback (CLI: `--approval-token` flag for automation, hidden prompt or
-//! piped stdin for humans), and are never logged, echoed, or persisted.
+//! Approval tokens are secrets: they stay inside the injected approval
+//! callback and are never logged, echoed, or persisted.
 
 use anyhow::{Context as _, bail};
 use serde::{Deserialize, Serialize};
@@ -42,8 +42,9 @@ use crate::filesystem;
 use crate::registry::{InstanceRecord, RegistryStore, validate_issuer};
 
 use super::admin_api::{
-    self, AdminAccess, AdminAccessFile, ControllerRegistryApi, ControllerSlotView,
-    RevokeCommitBody, RotateCommitBody, SlotCommitBody, SlotStatus, SlotsSnapshot, short_kid,
+    self, AdminAccess, AdminAccessFile, ApprovalRequestBody, ControllerRegistryApi,
+    ControllerSlotView, IssuedApproval, RevokeCommitBody, RotateCommitBody, SlotCommitBody,
+    SlotStatus, SlotsSnapshot, short_kid,
 };
 use super::expiry;
 use super::recovery::{self as recovery, generate_material, material_from_display};
@@ -146,8 +147,7 @@ fn clear_pending_bind_recovery(
     }
 }
 
-/// What one flow presents to the human approver (goal plan 04 §3): exact
-/// action/deployment/label/kid fingerprints, never private bytes.
+/// Exact public proposal facts used for display and approval issuance.
 #[derive(Clone, Debug)]
 pub struct ProposalPresentation {
     pub action: &'static str,
@@ -159,9 +159,8 @@ pub struct ProposalPresentation {
     pub controller_id: Option<String>,
     pub kid: String,
     pub public_key_b64: String,
-    /// P0-3 atomic first binding: present ONLY for bind. The approver must
-    /// enter these into the admin console so the approval digest covers the
-    /// same recovery material the commit will enroll.
+    /// P0-3 atomic first binding: present ONLY for bind, so approval and
+    /// commit cover the same recovery material.
     pub recovery_kid: Option<String>,
     pub recovery_public_key_b64: Option<String>,
 }
@@ -197,16 +196,9 @@ impl ProposalPresentation {
             ));
         }
         text.push_str(
-            "\nApprove this exact payload in the instance admin console (fresh 2FA) within \
-             10 minutes; the key expires 30 days after enrollment. Then paste the single-use \
-             approval token here, or abort.\n",
+            "\nApproval must cover this exact payload and a fresh administrator 2FA ceremony \
+             within 10 minutes; the key expires 30 days after enrollment.\n",
         );
-        if self.action == "bind" {
-            text.push_str(
-                "If the admin console is only reachable from the target host, an OpenSSH port \
-                 forward of its admin port is supported; ctl never reads SSH secrets.\n",
-            );
-        }
         text
     }
 }
@@ -977,12 +969,58 @@ fn make_api(
     admin_api::HttpControllerRegistryApi::new(issuer, access)
 }
 
-fn approval_callback<'a>(
+fn approval_request(presentation: &ProposalPresentation) -> anyhow::Result<ApprovalRequestBody> {
+    let common = || ApprovalRequestBody {
+        action: presentation.action,
+        deployment_id: presentation.deployment_id.clone(),
+        controller_id: presentation.controller_id.clone(),
+        label: Some(presentation.label.clone()),
+        public_key: Some(presentation.public_key_b64.clone()),
+        kid: Some(presentation.kid.clone()),
+        recovery_public_key: None,
+        recovery_kid: None,
+    };
+    Ok(match presentation.action {
+        "bind" => ApprovalRequestBody {
+            recovery_public_key: presentation.recovery_public_key_b64.clone(),
+            recovery_kid: presentation.recovery_kid.clone(),
+            ..common()
+        },
+        "add" | "rotate" => common(),
+        "revoke" => ApprovalRequestBody {
+            action: "revoke",
+            deployment_id: presentation.deployment_id.clone(),
+            controller_id: presentation.controller_id.clone(),
+            label: None,
+            public_key: None,
+            kid: None,
+            recovery_public_key: None,
+            recovery_kid: None,
+        },
+        action => bail!("unsupported controller approval action '{action}'"),
+    })
+}
+
+fn validate_issued_approval(issued: &IssuedApproval, expected_action: &str) -> anyhow::Result<()> {
+    if issued.action != expected_action || !issued.single_use {
+        bail!("the server returned an invalid fresh controller approval");
+    }
+    Ok(())
+}
+
+fn approval_callback<'a, A: ControllerRegistryApi>(
+    api: &'a A,
     token: Option<&'a str>,
+    issue_with_admin_access: bool,
 ) -> impl FnOnce(&ProposalPresentation) -> anyhow::Result<String> + 'a {
     move |presentation| {
         println!("{}", presentation.render());
-        obtain_approval_token(token, presentation.action)
+        if token.is_some() || !issue_with_admin_access {
+            return obtain_approval_token(token, presentation.action);
+        }
+        let issued = api.issue_approval(&approval_request(presentation)?)?;
+        validate_issued_approval(&issued, presentation.action)?;
+        Ok(issued.approval_token)
     }
 }
 
@@ -1016,13 +1054,14 @@ pub(crate) fn run_controller_command(
             let explicit = merge_global(selector, global, "controller add")?;
             let record = resolve_record(&registry, explicit.as_deref())?;
             let api = make_api(&record.issuer, admin_access_file.as_deref())?;
+            let issue_approval = admin_access_file.is_some();
             let report = add_flow(
                 &api,
                 &registry,
                 &keys,
                 explicit.as_deref(),
                 &label,
-                approval_callback(approval_token.as_deref()),
+                approval_callback(&api, approval_token.as_deref(), issue_approval),
             )?;
             println!("{report}");
         }
@@ -1035,13 +1074,14 @@ pub(crate) fn run_controller_command(
             let explicit = merge_global(selector, global, "controller rotate")?;
             let record = resolve_record(&registry, explicit.as_deref())?;
             let api = make_api(&record.issuer, admin_access_file.as_deref())?;
+            let issue_approval = admin_access_file.is_some();
             let report = rotate_flow(
                 &api,
                 &registry,
                 &keys,
                 explicit.as_deref(),
                 label.as_deref(),
-                approval_callback(approval_token.as_deref()),
+                approval_callback(&api, approval_token.as_deref(), issue_approval),
             )?;
             println!("{report}");
         }
@@ -1061,13 +1101,14 @@ pub(crate) fn run_controller_command(
             let explicit = merge_global(selector, global, "controller revoke")?;
             let record = resolve_record(&registry, explicit.as_deref())?;
             let api = make_api(&record.issuer, admin_access_file.as_deref())?;
+            let issue_approval = admin_access_file.is_some();
             let report = revoke_flow(
                 &api,
                 &registry,
                 &keys,
                 explicit.as_deref(),
                 &controller_id,
-                approval_callback(approval_token.as_deref()),
+                approval_callback(&api, approval_token.as_deref(), issue_approval),
             )?;
             println!("{report}");
         }
@@ -1134,6 +1175,7 @@ pub(crate) fn run_bind(options: BindOptions, global: Option<&str>) -> anyhow::Re
     let explicit = merge_global(selector, global, "bind")?;
     let record = resolve_record(&registry, explicit.as_deref())?;
     let api = make_api(&record.issuer, admin_access_file.as_deref())?;
+    let issue_approval = admin_access_file.is_some();
     // P0-4/P0-3: bind now also mints the Recovery Root, so its secret needs a
     // delivery channel with exactly the same fail-closed rules as recovery.
     let delivery: std::sync::Arc<dyn recovery::ReplacementSecretDelivery> =
@@ -1149,7 +1191,7 @@ pub(crate) fn run_bind(options: BindOptions, global: Option<&str>) -> anyhow::Re
         &keys,
         explicit.as_deref(),
         &label,
-        approval_callback(approval_token.as_deref()),
+        approval_callback(&api, approval_token.as_deref(), issue_approval),
         delivery.as_ref(),
     )?;
     println!("{report}");
@@ -1289,6 +1331,8 @@ mod tests {
         commit_attempts: std::cell::RefCell<Vec<SlotCommitBody>>,
         rotate_calls: std::cell::RefCell<Vec<RotateCommitBody>>,
         revoke_calls: std::cell::RefCell<Vec<RevokeCommitBody>>,
+        approval_requests: std::cell::RefCell<Vec<ApprovalRequestBody>>,
+        approval_errors: std::cell::RefCell<Vec<AdminApiError>>,
         commit_errors: std::cell::RefCell<Vec<AdminApiError>>,
         assigned_controller_ids: std::cell::RefCell<Vec<String>>,
     }
@@ -1307,6 +1351,10 @@ mod tests {
             self.commit_errors.borrow_mut().push(error);
         }
 
+        fn fail_next_approval(&self, error: AdminApiError) {
+            self.approval_errors.borrow_mut().push(error);
+        }
+
         fn assign_next_commit_controller_id(&self, controller_id: &str) {
             self.assigned_controller_ids
                 .borrow_mut()
@@ -1323,9 +1371,19 @@ mod tests {
 
         fn issue_approval(
             &self,
-            _body: &ApprovalRequestBody,
+            body: &ApprovalRequestBody,
         ) -> Result<IssuedApproval, AdminApiError> {
-            unimplemented!("approvals are issued by humans in the browser flow")
+            self.approval_requests.borrow_mut().push(body.clone());
+            if let Some(error) = self.approval_errors.borrow_mut().pop() {
+                return Err(error);
+            }
+            Ok(IssuedApproval {
+                approval_token: "fresh-approval-token".to_owned(),
+                action: body.action.to_owned(),
+                action_sha256: "a".repeat(64),
+                expires_at: Utc::now() + Duration::minutes(10),
+                single_use: true,
+            })
         }
 
         fn commit_slot(&self, body: &SlotCommitBody) -> Result<ControllerSlotView, AdminApiError> {
@@ -1485,7 +1543,7 @@ mod tests {
             &f.keys,
             None,
             "ops",
-            fixed_approval("approval-token-1"),
+            approval_callback(&api, None, true),
             &SilentDelivery,
         )?;
         assert!(report.contains("committed for 'production'"), "{report}");
@@ -1511,6 +1569,26 @@ mod tests {
         assert!(
             commit["recovery_public_key"].is_string() && commit["recovery_kid"].is_string(),
             "bind must enroll a Recovery Root in the same transaction: {commit}"
+        );
+        let approval = &api.approval_requests.borrow()[0];
+        assert_eq!(approval.action, "bind");
+        assert_eq!(
+            Some(approval.deployment_id.as_str()),
+            commit["deployment_id"].as_str()
+        );
+        assert_eq!(approval.label.as_deref(), commit["label"].as_str());
+        assert_eq!(
+            approval.public_key.as_deref(),
+            commit["public_key"].as_str()
+        );
+        assert_eq!(approval.kid.as_deref(), commit["kid"].as_str());
+        assert_eq!(
+            approval.recovery_public_key.as_deref(),
+            commit["recovery_public_key"].as_str()
+        );
+        assert_eq!(
+            approval.recovery_kid.as_deref(),
+            commit["recovery_kid"].as_str()
         );
 
         assert!(
@@ -1541,6 +1619,56 @@ mod tests {
                 .contains("already has an active controller"),
             "{error}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_approval_token_never_requests_a_second_approval() -> anyhow::Result<()> {
+        let f = fixture()?;
+        let api = FakeApi::default();
+        api.push_snapshot(vec![]);
+        bind_flow(
+            &api,
+            &f.registry,
+            &f.keys,
+            None,
+            "ops",
+            approval_callback(&api, Some("explicit-approval-token"), true),
+            &SilentDelivery,
+        )?;
+        assert!(api.approval_requests.borrow().is_empty());
+        assert_eq!(
+            api.commit_attempts.borrow()[0].approval_token,
+            "explicit-approval-token"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_fresh_approval_never_commits_a_slot() -> anyhow::Result<()> {
+        let f = fixture()?;
+        let api = FakeApi::default();
+        api.push_snapshot(vec![]);
+        api.fail_next_approval(AdminApiError::Rejected {
+            status: 403,
+            error: "fresh_mfa_required".to_owned(),
+            description: "fresh MFA required".to_owned(),
+        });
+        let error = bind_flow(
+            &api,
+            &f.registry,
+            &f.keys,
+            None,
+            "ops",
+            approval_callback(&api, None, true),
+            &SilentDelivery,
+        )
+        .expect_err("approval rejection must stop bind");
+        assert!(
+            error.to_string().contains("fresh_mfa_required"),
+            "{error:#}"
+        );
+        assert!(api.commit_attempts.borrow().is_empty());
         Ok(())
     }
 
@@ -1973,8 +2101,9 @@ mod tests {
         let rendered = presentation.render();
         assert!(rendered.contains("deployment: deploy-alpha"), "{rendered}");
         assert!(rendered.contains("action:     bind"), "{rendered}");
-        assert!(rendered.contains("fresh 2FA"), "{rendered}");
-        assert!(rendered.contains("port forward"), "{rendered}");
+        assert!(rendered.contains("fresh administrator 2FA"), "{rendered}");
+        assert!(rendered.contains("exact payload"), "{rendered}");
+        assert!(!rendered.contains("port forward"), "{rendered}");
         assert!(rendered.contains("recovery kid"), "{rendered}");
         // Public fingerprint only; the full kid and any seed bytes never show.
         assert!(!rendered.contains(candidate.kid.as_str()), "{rendered}");

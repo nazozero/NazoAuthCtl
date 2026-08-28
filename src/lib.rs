@@ -203,9 +203,10 @@ a slot is `controller revoke`."
   nazoauthctl [--instance SEL] controller recover [--label NAME]
   nazoauthctl [--instance SEL] controller recover --rotate-secret
 
-Every identity change needs a single-use approval token created with fresh
-2FA at the instance admin console; interactive runs read it hidden. Keys
-expire 30 days after enrollment. `controller revoke <id>` revokes exactly one
+Every identity change needs a single-use approval backed by fresh administrator
+2FA. With an owner-only `--admin-access-file`, ctl requests approval for its
+exact in-memory proposal; otherwise it accepts an explicit or hidden token.
+Keys expire 30 days after enrollment. `controller revoke <id>` revokes exactly one
 NazoAuth Controller Slot; it never forgets the local instance record and
 never deletes artifacts or other resources. `controller recover`
 re-establishes the Controller Key from the offline Recovery Secret (or, with

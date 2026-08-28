@@ -8,8 +8,7 @@
 //! ```text
 //! GET  /slots?deployment_id=…            authoritative slot snapshot
 //! POST /approvals                        single-use approval token issuance
-//!                                        (fresh admin MFA happens in the
-//!                                        browser, never inside ctl)
+//!                                        (the server enforces fresh admin MFA)
 //! POST /slots                            bind/add commit
 //! POST /slots/rotate                     rotate commit
 //! POST /slots/revoke                     revoke commit
@@ -708,7 +707,7 @@ impl HttpControllerRegistryApi {
         body: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, AdminApiError> {
         // A Recovery Secret is its own authority and must never share an
-        // administrator browser session.  This is structural: even the
+        // administrator session. This is structural: even the
         // normal `controller recover` command cannot send Cookie/CSRF there.
         let mut headers = if matches!(
             path,
