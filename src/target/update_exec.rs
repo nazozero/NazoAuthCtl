@@ -523,7 +523,7 @@ impl HostLifecycleExecutor {
         // 7. Commit: previous <- old current, current <- new (+ its build
         // identity), optional config CAS advance — replay-safe under this
         // operation id.
-        let state = job.store.apply_update(
+        let state = job.store.apply_update_healthy(
             job.deployment_id,
             job.expected_revision,
             super::deployment_state::UpdateCommit {
@@ -533,12 +533,6 @@ impl HostLifecycleExecutor {
                 config: staged_config_change(job.config_reference, job.config),
                 operation_id: job.operation_id.to_owned(),
             },
-        )?;
-        job.store.record_local_health(
-            job.deployment_id,
-            true,
-            "local readiness probe passed after update".to_owned(),
-            job.operation_id,
         )?;
         Ok(UpdateExecution::Activated(LifecycleFacts {
             revision: state.config.revision,
@@ -698,16 +692,10 @@ impl HostLifecycleExecutor {
         let config_change = restored_config
             .as_ref()
             .map(|(_, schema)| (job.config_reference.to_owned(), schema.clone()));
-        let state = job.store.apply_rollback(
+        let state = job.store.apply_rollback_healthy(
             job.deployment_id,
             job.expected_revision,
             config_change,
-            job.operation_id,
-        )?;
-        job.store.record_local_health(
-            job.deployment_id,
-            true,
-            "local readiness probe passed after rollback".to_owned(),
             job.operation_id,
         )?;
         Ok(LifecycleFacts {

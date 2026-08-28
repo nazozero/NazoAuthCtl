@@ -154,7 +154,7 @@ impl LifecycleExecutor for ScriptedLifecycle {
         let config = job
             .config
             .map(|staged| (job.config_reference.to_owned(), staged.schema.clone()));
-        let state = job.store.apply_update(
+        let state = job.store.apply_update_healthy(
             job.deployment_id,
             job.expected_revision,
             crate::target::deployment_state::UpdateCommit {
@@ -168,12 +168,6 @@ impl LifecycleExecutor for ScriptedLifecycle {
                 operation_id: job.operation_id.to_owned(),
             },
         )?;
-        job.store.record_local_health(
-            job.deployment_id,
-            true,
-            "scripted local readiness passed".to_owned(),
-            job.operation_id,
-        )?;
         Ok(UpdateExecution::Activated(LifecycleFacts {
             revision: state.config.revision,
             build_identity: Some(
@@ -185,16 +179,10 @@ impl LifecycleExecutor for ScriptedLifecycle {
 
     fn execute_rollback(&self, job: &RollbackJob<'_>) -> Result<LifecycleFacts, Failure> {
         *self.rollback_calls.lock().unwrap() += 1;
-        let state = job.store.apply_rollback(
+        let state = job.store.apply_rollback_healthy(
             job.deployment_id,
             job.expected_revision,
             None,
-            job.operation_id,
-        )?;
-        job.store.record_local_health(
-            job.deployment_id,
-            true,
-            "scripted local readiness passed after rollback".to_owned(),
             job.operation_id,
         )?;
         Ok(LifecycleFacts {
@@ -551,7 +539,7 @@ fn rollback_without_previous_reference_refuses_to_guess() -> anyhow::Result<()> 
 fn rollback_restores_the_previous_verified_reference() -> anyhow::Result<()> {
     let fixture = Fixture::new()?;
     // Establish previous=current history exactly like a prior update would.
-    fixture.store()?.apply_update(
+    fixture.store()?.apply_update_healthy(
         DEPLOYMENT,
         1,
         crate::target::deployment_state::UpdateCommit {

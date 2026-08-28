@@ -42,7 +42,7 @@ use crate::{
 use super::{
     bootstrap_authority,
     deployment_state::{Failure, INSTALL_FAILED},
-    wire::{HOST_ERR_OPERATION_INVALID, sanitize},
+    wire::{HOST_ERR_OPERATION_INVALID, InstanceInspection, sanitize},
 };
 
 /// Stable failure codes for the clean-install sequence. All abort before or
@@ -54,6 +54,10 @@ pub const SECRET_PROVISION_FAILED: &str = "SECRET_PROVISION_FAILED";
 pub const RUNTIME_START_FAILED: &str = "RUNTIME_START_FAILED";
 pub const TARGET_IDENTITY_MISMATCH: &str = "TARGET_IDENTITY_MISMATCH";
 pub const HEALTH_PROBE_FAILED: &str = "HEALTH_PROBE_FAILED";
+/// Cleanup could not prove whether the install still owns live resources.
+/// The target journal deliberately keeps this operation pending and the
+/// control-side prepared-install pointer must be retained for exact replay.
+pub const INSTALL_OUTCOME_UNKNOWN: &str = "OUTCOME_UNKNOWN";
 
 /// Closed vocabulary of secret files written on the target. External
 /// dependency credentials are supplied by the operator and cross a remote
@@ -705,11 +709,17 @@ pub(crate) struct InstallFacts {
 
 /// The injectable seam executing one clean-install order on the target.
 ///
-/// Contract: resumable by re-execution; on any failure the implementation has
-/// already rolled back its own partial work (config, secrets, bootstrap
-/// material, started runtime) before returning `Err`.
+/// Contract: resumable by re-execution. The executor retains its exact
+/// performed-step receipt until `commit` has durably published the matching
+/// DeploymentState; any execution or commit failure is rolled back before an
+/// ordinary `Err` is returned. Incomplete cleanup returns
+/// [`INSTALL_OUTCOME_UNKNOWN`] so the same operation can be replayed.
 pub(crate) trait InstallExecutor: Send + Sync {
-    fn execute_install(&self, job: &InstallJob<'_>) -> Result<InstallFacts, Failure>;
+    fn execute_install(
+        &self,
+        job: &InstallJob<'_>,
+        commit: &mut dyn FnMut(&InstallFacts) -> Result<InstanceInspection, Failure>,
+    ) -> Result<InstanceInspection, Failure>;
 }
 
 /// Production executor backed by the real adapters: the H01/H02 official
@@ -719,21 +729,34 @@ pub(crate) trait InstallExecutor: Send + Sync {
 pub(crate) struct HostInstallExecutor;
 
 impl InstallExecutor for HostInstallExecutor {
-    fn execute_install(&self, job: &InstallJob<'_>) -> Result<InstallFacts, Failure> {
+    fn execute_install(
+        &self,
+        job: &InstallJob<'_>,
+        commit: &mut dyn FnMut(&InstallFacts) -> Result<InstanceInspection, Failure>,
+    ) -> Result<InstanceInspection, Failure> {
         let mut performed = PerformedSteps::default();
         match self.run(job, &mut performed) {
-            Ok(facts) => Ok(facts),
-            Err(failure) => match rollback(job, &performed) {
-                Ok(()) => Err(failure),
-                Err(cleanup) => Err(Failure::new(
-                    failure.code,
-                    format!(
-                        "{}; rollback was incomplete: {}",
-                        failure.detail, cleanup.detail
-                    ),
-                )),
-            },
+            Ok(facts) => commit(&facts)
+                .map_err(|failure| rollback_or_outcome_unknown(job, &performed, failure)),
+            Err(failure) => Err(rollback_or_outcome_unknown(job, &performed, failure)),
         }
+    }
+}
+
+pub(crate) fn rollback_or_outcome_unknown(
+    job: &InstallJob<'_>,
+    performed: &PerformedSteps,
+    failure: Failure,
+) -> Failure {
+    match rollback(job, performed) {
+        Ok(()) => failure,
+        Err(cleanup) => Failure::new(
+            INSTALL_OUTCOME_UNKNOWN,
+            format!(
+                "{}; install rollback was incomplete: {}",
+                failure.detail, cleanup.detail
+            ),
+        ),
     }
 }
 

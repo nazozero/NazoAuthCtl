@@ -45,8 +45,9 @@ use crate::registry::{
 use crate::runtime_backend::RuntimeBackendKind;
 use crate::target::{
     DEPLOYMENT_UNKNOWN, ExecutionTarget, HostCompletionBody, HostOperation, HostOutcome,
-    HostResult, InstallOrder, OfficialArtifactRef, PlannedSecret, Resource, ResourceOwnership,
-    ResourceScope, RuntimeSurface, SecretMaterial, StateMutationPayload,
+    HostResult, INSTALL_OUTCOME_UNKNOWN, InstallOrder, OfficialArtifactRef, PlannedSecret,
+    Resource, ResourceOwnership, ResourceScope, RuntimeSurface, SecretMaterial,
+    StateMutationPayload,
 };
 
 /// Official server release repository pinned for clean installs.
@@ -856,8 +857,14 @@ pub(crate) fn run_clean_install(
     // 4. Execute: LocalTarget runs natively under its journal, SshTarget over
     //    one fixed remote exec round trip — identical result model.
     let result = target.execute_host_operation(&prepared.operation)?;
-    if matches!(&result.outcome, HostOutcome::Failed { .. }) {
-        lease.clear()?;
+    if let HostOutcome::Failed { code, .. } = &result.outcome {
+        // An incomplete target rollback is intentionally non-terminal: the
+        // target journal remains pending and this exact prepared identity is
+        // the only safe replay key. Ordinary failures proved full cleanup and
+        // may release the pointer so a corrected request starts fresh.
+        if code != INSTALL_OUTCOME_UNKNOWN {
+            lease.clear()?;
+        }
         return Err(interpret_result(&result).expect_err("failed host outcome must be an error"));
     }
     let inspection = interpret_result(&result)?;

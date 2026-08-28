@@ -70,6 +70,7 @@ fn test_secret(value: &str) -> Option<crate::target::SecretMaterial> {
 enum FailAt {
     ArtifactVerify,
     Health,
+    StateCommit,
 }
 
 /// Scripted executor performing REAL filesystem work with REAL rollback so
@@ -83,7 +84,11 @@ impl install_exec::InstallExecutor for ScriptedInstall {
     fn execute_install(
         &self,
         job: &install_exec::InstallJob<'_>,
-    ) -> Result<install_exec::InstallFacts, crate::target::Failure> {
+        commit: &mut dyn FnMut(
+            &install_exec::InstallFacts,
+        )
+            -> Result<crate::target::InstanceInspection, crate::target::Failure>,
+    ) -> Result<crate::target::InstanceInspection, crate::target::Failure> {
         let mut performed = install_exec::PerformedSteps::default();
         self.steps.lock().unwrap().push("verify");
         if self.fail_at == Some(FailAt::ArtifactVerify) {
@@ -122,11 +127,17 @@ impl install_exec::InstallExecutor for ScriptedInstall {
             ));
         }
         performed.started_runtime = true;
-        Ok(install_exec::InstallFacts {
+        if self.fail_at == Some(FailAt::StateCommit) {
+            std::fs::create_dir(job.scope_dir.join("state.json"))
+                .expect("block the scripted state commit");
+        }
+        let facts = install_exec::InstallFacts {
             build_identity: None,
             artifact_reference: format!("sha256:{}", digest()),
             rollback_policy: crate::model::test_release_rollback_policy(),
-        })
+        };
+        commit(&facts)
+            .map_err(|failure| install_exec::rollback_or_outcome_unknown(job, &performed, failure))
     }
 }
 
@@ -714,6 +725,37 @@ fn health_failure_rolls_back_config_secrets_and_bootstrap_material_locally() -> 
     assert_eq!(
         fixture.executor.steps.lock().unwrap().clone(),
         vec!["verify", "start"]
+    );
+    Ok(())
+}
+
+#[test]
+fn state_commit_failure_rolls_back_the_completed_install() -> anyhow::Result<()> {
+    let fixture = LocalFixture::new(Some(FailAt::StateCommit))?;
+    let hello = test_hello(vec!["podman".to_owned()]);
+    let mut request = fixture.request(Some("production"));
+    let prepared = prepare_install_operation(&mut request, &hello)?;
+    let install_root = request.install_root.clone().unwrap();
+    let deployment_id = prepared.deployment_id.clone();
+
+    let result = fixture
+        .local_target()?
+        .execute_host_operation(&prepared.operation)?;
+    assert!(matches!(result.outcome, HostOutcome::Failed { .. }));
+
+    let config = install_root
+        .join("config")
+        .join(&deployment_id)
+        .join("config.json");
+    assert!(!config.exists(), "state failure must roll the config back");
+    let scope = fixture.state_root.join("deployments").join(deployment_id);
+    assert!(
+        !scope.join(bootstrap_authority::CONTEXT_FILE_NAME).exists(),
+        "state failure must close the bootstrap capability"
+    );
+    assert!(
+        !scope.join("state.json").is_file(),
+        "a failed commit must not publish DeploymentState"
     );
     Ok(())
 }

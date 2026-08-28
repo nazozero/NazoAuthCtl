@@ -809,6 +809,47 @@ impl TargetStateStore {
         params: BootstrapParams,
         operation_id: &str,
     ) -> Result<DeploymentState, Failure> {
+        self.bootstrap_with_health(
+            deployment_id,
+            params,
+            operation_id,
+            HealthRecord {
+                healthy: false,
+                summary: "bootstrapped; runtime health not yet observed".to_owned(),
+                checked_at: Utc::now(),
+            },
+        )
+    }
+
+    /// Commit a fresh clean install in one state write after the executor has
+    /// already proved local readiness. Runtime activation and its authoritative
+    /// healthy DeploymentState therefore cannot be separated by a second
+    /// persistence step.
+    pub fn bootstrap_healthy(
+        &self,
+        deployment_id: &str,
+        params: BootstrapParams,
+        operation_id: &str,
+    ) -> Result<DeploymentState, Failure> {
+        self.bootstrap_with_health(
+            deployment_id,
+            params,
+            operation_id,
+            HealthRecord {
+                healthy: true,
+                summary: "local readiness probe passed after clean install".to_owned(),
+                checked_at: Utc::now(),
+            },
+        )
+    }
+
+    fn bootstrap_with_health(
+        &self,
+        deployment_id: &str,
+        params: BootstrapParams,
+        operation_id: &str,
+        local_health: HealthRecord,
+    ) -> Result<DeploymentState, Failure> {
         let BootstrapParams {
             issuer,
             runtime,
@@ -826,7 +867,16 @@ impl TargetStateStore {
                 .as_ref()
                 .is_some_and(|active| active.operation_id == operation_id)
             {
-                return Ok(existing);
+                return if existing.local_health.healthy == local_health.healthy {
+                    Ok(existing)
+                } else {
+                    Err(Failure::new(
+                        DEPLOYMENT_EXISTS,
+                        format!(
+                            "deployment '{deployment_id}' holds an incomplete state for operation {operation_id}"
+                        ),
+                    ))
+                };
             }
             return Err(Failure::new(
                 DEPLOYMENT_EXISTS,
@@ -855,11 +905,7 @@ impl TargetStateStore {
             artifact,
             config,
             resources,
-            local_health: HealthRecord {
-                healthy: false,
-                summary: "bootstrapped; runtime health not yet observed".to_owned(),
-                checked_at: Utc::now(),
-            },
+            local_health,
             current_build_identity,
             previous_build_identity: None,
             current_rollback_policy,
@@ -869,8 +915,7 @@ impl TargetStateStore {
         state.validate().map_err(|error| {
             Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
         })?;
-        persist(&scope_path(&self.root, &scope), &state)?;
-        Ok(state)
+        self.persist_exact_or_recover(deployment_id, &scope, state)
     }
 
     /// Apply a config change under revision CAS (F04). `expected_revision`
@@ -1000,7 +1045,7 @@ impl TargetStateStore {
     /// record this operation as the producing one. Re-executing the same
     /// interrupted commit replays without advancing again; a stale revision
     /// expectation fails closed.
-    pub(crate) fn apply_update(
+    pub(crate) fn apply_update_healthy(
         &self,
         deployment_id: &str,
         expected_revision: u64,
@@ -1062,11 +1107,15 @@ impl TargetStateStore {
             operation_id,
             applied_at: Utc::now(),
         });
+        state.local_health = HealthRecord {
+            healthy: true,
+            summary: "local readiness probe passed after update".to_owned(),
+            checked_at: Utc::now(),
+        };
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
-        persist(&scope_path(&self.root, &scope), &state)?;
-        Ok(state)
+        self.persist_exact_or_recover(deployment_id, &scope, state)
     }
 
     /// Commit the state facts produced by a completed recovery (H06). The
@@ -1148,7 +1197,7 @@ impl TargetStateStore {
     /// optionally restore a saved config snapshot under its recorded schema,
     /// CAS-guarded. Refuses when no previous reference exists — rollback is
     /// never guessed.
-    pub fn apply_rollback(
+    pub fn apply_rollback_healthy(
         &self,
         deployment_id: &str,
         expected_revision: u64,
@@ -1222,11 +1271,15 @@ impl TargetStateStore {
             operation_id: operation_id.to_owned(),
             applied_at: Utc::now(),
         });
+        state.local_health = HealthRecord {
+            healthy: true,
+            summary: "local readiness probe passed after rollback".to_owned(),
+            checked_at: Utc::now(),
+        };
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
-        persist(&scope_path(&self.root, &scope), &state)?;
-        Ok(state)
+        self.persist_exact_or_recover(deployment_id, &scope, state)
     }
 
     /// Remove the state document after a completed uninstall (G06). An exact
@@ -1383,6 +1436,28 @@ impl TargetStateStore {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
         Ok(scope_path(&self.root, &scope).with_extension("lock"))
+    }
+
+    /// Persist one complete state generation while its StateLock is held.
+    /// A failed parent-directory sync can occur after the atomic rename; only
+    /// an exact re-read of the attempted state proves that commit succeeded.
+    fn persist_exact_or_recover(
+        &self,
+        deployment_id: &str,
+        scope: &str,
+        state: DeploymentState,
+    ) -> Result<DeploymentState, Failure> {
+        match persist(&scope_path(&self.root, scope), &state) {
+            Ok(()) => Ok(state),
+            Err(_)
+                if self
+                    .load_existing(deployment_id)
+                    .is_ok_and(|stored| stored == state) =>
+            {
+                Ok(state)
+            }
+            Err(failure) => Err(failure),
+        }
     }
 }
 
@@ -1649,12 +1724,12 @@ mod tests {
             &irreversible_policy(),
         )?;
         let fenced = store
-            .apply_rollback("deploy-fence", 1, None, "rollback-op")
+            .apply_rollback_healthy("deploy-fence", 1, None, "rollback-op")
             .expect_err("an applied migration fence must refuse rollback");
         assert_eq!(fenced.code, ROLLBACK_RECOVERY_REQUIRED);
 
         store.clear_applied_migration("deploy-fence", migration_operation)?;
-        store.apply_update(
+        store.apply_update_healthy(
             "deploy-fence",
             1,
             UpdateCommit {
@@ -1666,7 +1741,7 @@ mod tests {
             },
         )?;
         let irreversible = store
-            .apply_rollback("deploy-fence", 1, None, "rollback-op-2")
+            .apply_rollback_healthy("deploy-fence", 1, None, "rollback-op-2")
             .expect_err("irreversible release policy must refuse rollback");
         assert_eq!(irreversible.code, ROLLBACK_RECOVERY_REQUIRED);
         Ok(())

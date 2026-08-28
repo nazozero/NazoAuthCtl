@@ -73,9 +73,10 @@ pub use deployment_state::{
     TargetStateStore, UpdateBackupPrecondition,
 };
 pub use install_exec::{
-    ARTIFACT_UNVERIFIED, CONFIG_INVALID, CONFIG_PATH_OCCUPIED, HEALTH_PROBE_FAILED, InstallOrder,
-    OfficialArtifactRef, PlannedResourceDeletion, PlannedSecret, RUNTIME_START_FAILED,
-    SECRET_PROVISION_FAILED, SECRET_PURPOSES, StagedConfig, TARGET_IDENTITY_MISMATCH,
+    ARTIFACT_UNVERIFIED, CONFIG_INVALID, CONFIG_PATH_OCCUPIED, HEALTH_PROBE_FAILED,
+    INSTALL_OUTCOME_UNKNOWN, InstallOrder, OfficialArtifactRef, PlannedResourceDeletion,
+    PlannedSecret, RUNTIME_START_FAILED, SECRET_PROVISION_FAILED, SECRET_PURPOSES, StagedConfig,
+    TARGET_IDENTITY_MISMATCH,
 };
 pub use journal::{JournalStatus, OperationLogEntry, OperationOutcomeSummary, TargetJournal};
 pub use ssh::SshTarget;
@@ -777,26 +778,25 @@ pub(crate) fn dispatch_host_operation(
                             scope_dir: &scope_dir,
                             order,
                         };
-                        // The executor rolls back its own partial work on any
-                        // failure: nothing is registered, no state is created.
-                        let facts = match executors.install.execute_install(&job) {
-                            Ok(facts) => facts,
-                            Err(failure) => return state_failure(operation, &failure),
-                        };
-                        let params = BootstrapParams {
-                            issuer: issuer.clone(),
-                            runtime: runtime.clone(),
-                            artifact: ArtifactRefs {
-                                current: Some(facts.artifact_reference.clone()),
-                                previous: None,
-                            },
-                            config_reference: config_reference.clone(),
-                            config_schema: config_schema.clone(),
-                            resources: resources.clone(),
-                            current_build_identity: facts.build_identity.clone(),
-                            current_rollback_policy: facts.rollback_policy.clone(),
-                        };
-                        match commit_clean_install(store, &deployment_id, params, operation) {
+                        // The executor owns its performed-step receipt through
+                        // the single authoritative state commit. A failure in
+                        // either phase therefore rolls the same install back.
+                        match executors.install.execute_install(&job, &mut |facts| {
+                            let params = BootstrapParams {
+                                issuer: issuer.clone(),
+                                runtime: runtime.clone(),
+                                artifact: ArtifactRefs {
+                                    current: Some(facts.artifact_reference.clone()),
+                                    previous: None,
+                                },
+                                config_reference: config_reference.clone(),
+                                config_schema: config_schema.clone(),
+                                resources: resources.clone(),
+                                current_build_identity: facts.build_identity.clone(),
+                                current_rollback_policy: facts.rollback_policy.clone(),
+                            };
+                            commit_clean_install(store, &deployment_id, params, operation)
+                        }) {
                             Ok(inspection) => HostResult::completed(
                                 &operation.operation_id,
                                 HostCompletionBody::InstallApplied { inspection },
@@ -1310,24 +1310,16 @@ fn execute_bound_control_operation(
     control.execute(&job)
 }
 
-/// Commit the post-install DeploymentState: fresh document plus the healthy
-/// local-health fact, both under the install operation's idempotency. An
-/// interrupted commit replays safely because both writes key off the same
-/// operation id.
+/// Commit the complete post-install DeploymentState in one atomic write. The
+/// executor keeps its rollback receipt until this returns successfully.
 fn commit_clean_install(
     store: &TargetStateStore,
     deployment_id: &str,
     params: BootstrapParams,
     operation: &HostOperation,
 ) -> Result<InstanceInspection, Failure> {
-    store.bootstrap(deployment_id, params, &operation.operation_id)?;
-    store.record_local_health(
-        deployment_id,
-        true,
-        "local readiness probe passed after clean install".to_owned(),
-        &operation.operation_id,
-    )?;
-    inspection_from_state(store, store.load_existing(deployment_id)?)
+    let state = store.bootstrap_healthy(deployment_id, params, &operation.operation_id)?;
+    inspection_from_state(store, state)
 }
 
 const DEFAULT_INSTANCE_IDENTITY_DIRECTORY: &str = "instance";
