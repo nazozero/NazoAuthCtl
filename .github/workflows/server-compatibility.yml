@@ -83,7 +83,7 @@ jobs:
           SERVER_RELEASE: ${{ inputs.server_release }}
         run: |
           set -euo pipefail
-          test "$SERVER_RELEASE" = v0.2.2
+          test "$SERVER_RELEASE" = v0.2.3
       - name: Resolve one immutable current server identity
         shell: bash
         env:
@@ -91,7 +91,7 @@ jobs:
           SERVER_RELEASE: ${{ inputs.server_release }}
         run: |
           set -euo pipefail
-          test "$SERVER_RELEASE" = v0.2.2
+          test "$SERVER_RELEASE" = v0.2.3
           ref_type="$(gh api "/repos/nazozero/NazoAuth/git/ref/tags/$SERVER_RELEASE" --jq '.object.type')"
           ref_sha="$(gh api "/repos/nazozero/NazoAuth/git/ref/tags/$SERVER_RELEASE" --jq '.object.sha')"
           for _ in 1 2 3 4; do

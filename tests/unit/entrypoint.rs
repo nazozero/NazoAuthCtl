@@ -74,6 +74,13 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
     assert!(top_level.contains("server_release:"));
     assert!(top_level.contains("description: Exact supported NazoAuth release tag"));
     assert!(top_level.contains("NAZOAUTHCTL_BUILD_COMMIT: ${{ inputs.controller_ref }}"));
+    assert_eq!(
+        workflow
+            .matches("test \"$SERVER_RELEASE\" = v0.2.3")
+            .count(),
+        2
+    );
+    assert!(!workflow.contains("v0.2.2"));
     assert!(!workflow.contains("previous-v"));
     assert!(!workflow.contains("python3"));
     assert!(!workflow.contains("- name: Recover"));
