@@ -687,8 +687,11 @@ mod tests {
             )?;
             #[cfg(unix)]
             let program = {
+                use std::os::unix::fs::PermissionsExt;
+
                 let script = root.join("ssh");
-                filesystem::atomic_write(&script, unix_stub_script().as_bytes(), 0o755)?;
+                fs::write(&script, unix_stub_script().as_bytes())?;
+                fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
                 script
             };
             #[cfg(windows)]
