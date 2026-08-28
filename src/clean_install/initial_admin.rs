@@ -469,7 +469,7 @@ mod tests {
                         current_build_identity: None,
                         current_rollback_policy: crate::model::test_release_rollback_policy(),
                         issuer: ISSUER.to_owned(),
-                        runtime: crate::target::RuntimeSurface::new("podman", "nazoauth-x")?,
+                        runtime: crate::target::RuntimeSurface::new("podman", "nazoauth-x", 8000)?,
                         artifact: crate::target::ArtifactRefs {
                             current: Some(format!("sha256:{}", digest())),
                             previous: None,
@@ -491,8 +491,7 @@ mod tests {
                 &install_exec::InstallJob {
                     operation_id: OP_ID,
                     deployment_id: &deployment_id,
-                    runtime_kind: crate::runtime_backend::RuntimeBackendKind::Podman,
-                    runtime_object: "nazoauth-x",
+                    runtime: &crate::target::RuntimeSurface::new("podman", "nazoauth-x", 8000)?,
                     config_reference: "/cfg/config.json",
                     scope_dir: &scope,
                     order: &order,
@@ -568,7 +567,6 @@ mod tests {
                 user: String::new(),
             },
             fresh_bootstrap: false,
-            port: 8000,
         }
     }
 

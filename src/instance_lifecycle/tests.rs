@@ -274,7 +274,7 @@ impl Fixture {
             0o600,
         )?;
         let runtime =
-            crate::target::RuntimeSurface::new("podman", format!("nazauth-{DEPLOYMENT}"))?;
+            crate::target::RuntimeSurface::new("podman", format!("nazauth-{DEPLOYMENT}"), 8000)?;
         let artifact = crate::target::ArtifactRefs {
             current: Some(CURRENT_REF.to_owned()),
             previous: None,

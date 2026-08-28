@@ -30,7 +30,7 @@ use super::bootstrap_authority::FreshBootstrapMaterialView;
 use super::deployment_state::{ArtifactRefs, RuntimeSurface, StateMutationPayload};
 
 /// Wire schema discriminator for HostOperation and HostResult messages.
-pub const HOST_PROTOCOL_SCHEMA: u32 = 4;
+pub const HOST_PROTOCOL_SCHEMA: u32 = 5;
 
 /// Maximum serialized HostOperation accepted from stdin or a local caller.
 /// A tenant-resource Apply may carry one 4 MiB change set encoded as base64,
@@ -830,7 +830,10 @@ impl HostOperation {
                 }
                 match mutation {
                     StateMutationPayload::Bootstrap {
-                        artifact, install, ..
+                        runtime,
+                        artifact,
+                        install,
+                        ..
                     } => {
                         // There is no prior revision to expect on creation.
                         if self.expected_revision.is_some() {
@@ -843,6 +846,12 @@ impl HostOperation {
                             return Err(MessageRejection::new(
                                 RejectionCode::OperationMalformed,
                                 "bootstrap requires exactly one of install or artifact",
+                            ));
+                        }
+                        if let Err(error) = runtime.validate() {
+                            return Err(MessageRejection::new(
+                                RejectionCode::OperationMalformed,
+                                error.to_string(),
                             ));
                         }
                         // A carried install order must itself be well-formed;
@@ -1816,7 +1825,7 @@ mod tests {
             None,
             StateMutationPayload::Bootstrap {
                 issuer: "https://auth.example.com".to_owned(),
-                runtime: RuntimeSurface::new("host", "nazoauth-runtime-cutover.service")?,
+                runtime: RuntimeSurface::new("host", "nazoauth-runtime-cutover.service", 8000)?,
                 artifact: None,
                 config_reference: "/etc/nazoauth/config.yaml".to_owned(),
                 config_schema: "nazoauth-config-v1".to_owned(),
@@ -1829,6 +1838,38 @@ mod tests {
         assert_ne!(legacy, canonical, "fixture must replace the runtime token");
 
         let rejection = parse_host_operation(legacy.as_bytes()).expect_err("legacy token accepted");
+        assert_eq!(rejection.code, RejectionCode::OperationMalformed);
+        Ok(())
+    }
+
+    #[test]
+    fn privileged_runtime_port_is_rejected_at_operation_admission() -> anyhow::Result<()> {
+        let operation = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-runtime-port",
+            None,
+            StateMutationPayload::Bootstrap {
+                issuer: "https://auth.example.com".to_owned(),
+                runtime: RuntimeSurface::new("podman", "nazoauth-runtime-port", 8000)?,
+                artifact: Some(ArtifactRefs {
+                    current: Some("sha256:abcdef0123456789".to_owned()),
+                    previous: None,
+                }),
+                config_reference: "/etc/nazoauth/config.yaml".to_owned(),
+                config_schema: "nazoauth-config-v1".to_owned(),
+                resources: Vec::new(),
+                install: None,
+            },
+        );
+        let canonical = String::from_utf8(encode_host_operation(&operation)?)?;
+        let malformed = canonical.replace("\"loopback_port\":8000", "\"loopback_port\":443");
+        assert_ne!(
+            malformed, canonical,
+            "fixture must replace the runtime port"
+        );
+
+        let rejection = parse_host_operation(malformed.as_bytes())
+            .expect_err("privileged runtime port reached dispatch");
         assert_eq!(rejection.code, RejectionCode::OperationMalformed);
         Ok(())
     }
@@ -1911,6 +1952,7 @@ mod tests {
                 runtime: super::super::deployment_state::RuntimeSurface::new(
                     "podman",
                     "nazoauth-main",
+                    8000,
                 )?,
                 artifact: Some(super::super::deployment_state::ArtifactRefs {
                     current: Some("sha256:abcdef0123456789".to_owned()),
@@ -1979,7 +2021,6 @@ mod tests {
             },
 
             fresh_bootstrap: true,
-            port: 8000,
         };
         let mut broken_order: super::super::install_exec::InstallOrder =
             serde_json::from_slice(&serde_json::to_vec(&order)?)?;
@@ -1993,6 +2034,7 @@ mod tests {
                 runtime: super::super::deployment_state::RuntimeSurface::new(
                     "podman",
                     "nazoauth-main",
+                    8000,
                 )?,
                 artifact: None,
                 config_reference: "/etc/nazauth/deployments/deploy-alpha/config.json".to_owned(),
@@ -2219,7 +2261,7 @@ mod tests {
             issuer: "https://auth.example.com".to_owned(),
             observed_at: chrono::Utc::now(),
             revision: 2,
-            runtime: super::super::deployment_state::RuntimeSurface::new("podman", "nz-a")?,
+            runtime: super::super::deployment_state::RuntimeSurface::new("podman", "nz-a", 8000)?,
             artifact: super::super::deployment_state::ArtifactRefs {
                 current: Some("sha256:abcdef0123456789".to_owned()),
                 previous: None,
@@ -2407,7 +2449,7 @@ mod tests {
         cas_free.operation = HostOperationBody::StateMutate {
             mutation: StateMutationPayload::Bootstrap {
                 issuer: "https://auth.example.com".to_owned(),
-                runtime: super::super::deployment_state::RuntimeSurface::new("host", "unit")?,
+                runtime: super::super::deployment_state::RuntimeSurface::new("host", "unit", 8000)?,
                 artifact: Some(super::super::deployment_state::ArtifactRefs {
                     current: Some("sha256:abcdef0123456789".to_owned()),
                     previous: None,

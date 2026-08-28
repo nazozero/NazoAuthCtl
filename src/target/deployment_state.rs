@@ -74,7 +74,7 @@ use super::install_exec::InstallOrder;
 use super::journal;
 
 /// Schema discriminator carried by the persisted DeploymentState document.
-pub const DEPLOYMENT_STATE_SCHEMA: u32 = 5;
+pub const DEPLOYMENT_STATE_SCHEMA: u32 = 6;
 
 /// Upper bound for one persisted DeploymentState document (~1 MiB).
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
@@ -254,19 +254,27 @@ pub struct RuntimeSurface {
     pub kind: RuntimeBackendKind,
     /// Concrete object name (container name or systemd unit).
     pub object: String,
+    /// Target-local loopback port published by this runtime. This is part of
+    /// the runtime surface itself, not an independently managed resource.
+    pub loopback_port: u16,
 }
 
 impl RuntimeSurface {
-    pub fn new(kind: impl AsRef<str>, object: impl Into<String>) -> anyhow::Result<Self> {
+    pub fn new(
+        kind: impl AsRef<str>,
+        object: impl Into<String>,
+        loopback_port: u16,
+    ) -> anyhow::Result<Self> {
         let surface = Self {
             kind: kind.as_ref().parse()?,
             object: object.into(),
+            loopback_port,
         };
         surface.validate()?;
         Ok(surface)
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.object.is_empty()
             || self.object.len() > 256
             || self
@@ -275,6 +283,9 @@ impl RuntimeSurface {
                 .any(|character| character.is_whitespace() || character.is_control())
         {
             bail!("runtime object must be a single-line name of at most 256 characters");
+        }
+        if self.loopback_port < 1024 {
+            bail!("runtime loopback port must be an unprivileged non-zero port");
         }
         Ok(())
     }
@@ -1688,7 +1699,7 @@ mod tests {
     fn sample_params(issuer: &str, runtime_object: &str) -> BootstrapParams {
         BootstrapParams {
             issuer: issuer.to_owned(),
-            runtime: RuntimeSurface::new("podman", runtime_object).expect("runtime"),
+            runtime: RuntimeSurface::new("podman", runtime_object, 8000).expect("runtime"),
             artifact: ArtifactRefs::default(),
             config_reference: "/etc/nazauth/config.toml".to_owned(),
             config_schema: "nazauth-config-v1".to_owned(),
@@ -1749,12 +1760,12 @@ mod tests {
 
     #[test]
     fn legacy_runtime_state_requires_explicit_reset() -> anyhow::Result<()> {
-        assert!(RuntimeSurface::new("systemd", "nazoauth.service").is_err());
+        assert!(RuntimeSurface::new("systemd", "nazoauth.service", 8000).is_err());
 
         let temp = crate::filesystem::PrivateTempDir::new("nazoauthctl-runtime-cutover")?;
         let store = TargetStateStore::open(temp.path().join("state"))?;
         let mut params = sample_params("https://auth.example.com", "nazoauth.service");
-        params.runtime = RuntimeSurface::new("host", "nazoauth.service")?;
+        params.runtime = RuntimeSurface::new("host", "nazoauth.service", 8000)?;
         let state = store.bootstrap("deploy-runtime-cutover", params, "bootstrap")?;
         let canonical = serde_json::to_string(&state)?;
         let legacy = canonical.replace("\"kind\":\"host\"", "\"kind\":\"systemd\"");
@@ -1766,6 +1777,17 @@ mod tests {
             .load_existing("deploy-runtime-cutover")
             .expect_err("legacy runtime state accepted");
         assert_eq!(failure.code, STATE_RESET_REQUIRED);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_surface_requires_an_unprivileged_loopback_port() -> anyhow::Result<()> {
+        assert!(RuntimeSurface::new("podman", "nazoauth-main", 0).is_err());
+        assert!(RuntimeSurface::new("podman", "nazoauth-main", 443).is_err());
+        assert_eq!(
+            RuntimeSurface::new("podman", "nazoauth-main", 1024)?.loopback_port,
+            1024
+        );
         Ok(())
     }
 

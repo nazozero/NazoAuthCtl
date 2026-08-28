@@ -79,7 +79,7 @@ impl Fixture {
             deployment_id,
             BootstrapParams {
                 issuer: issuer.to_owned(),
-                runtime: RuntimeSurface::new("podman", runtime_object)?,
+                runtime: RuntimeSurface::new("podman", runtime_object, 8000)?,
                 artifact: ArtifactRefs {
                     current: Some(ARTIFACT.to_owned()),
                     previous: None,

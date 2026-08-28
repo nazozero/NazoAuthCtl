@@ -954,6 +954,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             runtime: crate::target::deployment_state::RuntimeSurface::new(
                 "podman",
                 "nazoauth-main",
+                8000,
             )
             .unwrap(),
             artifact: Default::default(),

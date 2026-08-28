@@ -299,7 +299,7 @@ impl SshStub {
             "issuer": ISSUER,
             "observed_at": chrono::Utc::now(),
             "revision": 1,
-            "runtime": {"kind": "podman", "object": "nazoauth-main"},
+            "runtime": {"kind": "podman", "object": "nazoauth-main", "loopback_port": 8000},
             "artifact": {"current": format!("sha256:{}", digest()), "previous": null},
             "config_reference": "/cfg/config.json",
             "config_schema": CONFIG_SCHEMA_SEED,
@@ -373,18 +373,18 @@ case "$input" in
 esac
 case "$input" in
   *'"kind":"ping"'*)
-    printf '{"schema":4,"operation_id":"%s","outcome":{"status":"completed","body":{"completion":"ping","nonce":"%s"}}}' "${id:-none}" "${nonce:-none}"
+    printf '{"schema":5,"operation_id":"%s","outcome":{"status":"completed","body":{"completion":"ping","nonce":"%s"}}}' "${id:-none}" "${nonce:-none}"
     exit 0
     ;;
 esac
 case "$input" in
   *'"kind":"state-inspect"'*)
-    printf '{"schema":4,"operation_id":"%s","outcome":{"status":"failed","code":"DEPLOYMENT_UNKNOWN","detail":"stub fresh target"}}' "${id:-none}"
+    printf '{"schema":5,"operation_id":"%s","outcome":{"status":"failed","code":"DEPLOYMENT_UNKNOWN","detail":"stub fresh target"}}' "${id:-none}"
     exit 0
     ;;
 esac
 if printf '%s' "$input" | grep -q '"kind":"state-mutate"' && [ "$(cat "$(dirname "$0")/mode.txt")" = "fail" ]; then
-  printf '{"schema":4,"operation_id":"%s","outcome":{"status":"failed","code":"ARTIFACT_UNVERIFIED","detail":"stub refuses"}}' "${id:-none}"
+  printf '{"schema":5,"operation_id":"%s","outcome":{"status":"failed","code":"ARTIFACT_UNVERIFIED","detail":"stub refuses"}}' "${id:-none}"
   exit 0
 fi
 sed -e "s/__OPERATION_ID__/${id:-none}/g" -e "s/__DEPLOYMENT_ID__/${dep:-none}/g" \
@@ -421,13 +421,13 @@ fn windows_stub_ps1() -> String {
         "  [Console]::Out.Write($raw.Replace('__OPERATION_ID__', $callerId))",
         "} elseif ($stdinText -match '\"kind\":\"ping\"') {",
         "  $n = [regex]::Match($stdinText, '\"nonce\":\"([0-9A-Za-z._:+-]+)\"').Groups[1].Value",
-        "  $pong = '{\"schema\":4,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"completed\",\"body\":{\"completion\":\"ping\",\"nonce\":\"' + $n + '\"}}}'",
+        "  $pong = '{\"schema\":5,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"completed\",\"body\":{\"completion\":\"ping\",\"nonce\":\"' + $n + '\"}}}'",
         "  [Console]::Out.Write($pong)",
         "} elseif ($stdinText -match '\"kind\":\"state-inspect\"') {",
-        "  $missing = '{\"schema\":4,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"failed\",\"code\":\"DEPLOYMENT_UNKNOWN\",\"detail\":\"stub fresh target\"}}'",
+        "  $missing = '{\"schema\":5,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"failed\",\"code\":\"DEPLOYMENT_UNKNOWN\",\"detail\":\"stub fresh target\"}}'",
         "  [Console]::Out.Write($missing)",
         "} elseif ((Get-Content (Join-Path $here 'mode.txt')) -eq 'fail') {",
-        "  $failed = '{\"schema\":4,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"failed\",\"code\":\"ARTIFACT_UNVERIFIED\",\"detail\":\"stub refuses\"}}'",
+        "  $failed = '{\"schema\":5,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"failed\",\"code\":\"ARTIFACT_UNVERIFIED\",\"detail\":\"stub refuses\"}}'",
         "  [Console]::Out.Write($failed)",
         "} else {",
         "  $raw = Get-Content -LiteralPath (Join-Path $here 'response-install.json') -Raw",
@@ -817,6 +817,50 @@ fn every_prepared_deployment_has_one_distinct_non_nil_valkey_epoch() -> anyhow::
     assert!(!second_epoch.is_nil());
     assert_ne!(first_epoch, second_epoch);
     Ok(())
+}
+
+#[test]
+fn prepared_install_records_its_deployment_specific_loopback_port() -> anyhow::Result<()> {
+    let fixture = LocalFixture::new(None)?;
+    let hello = test_hello(vec!["podman".to_owned()]);
+    let prepared = prepare_install_operation(&mut fixture.request(None), &hello)?;
+    let order = install_order(&prepared.operation);
+    assert!(order.config_content.contains("BIND: \"0.0.0.0:8000\""));
+
+    let StateMutationPayload::Bootstrap {
+        runtime, resources, ..
+    } = (match &prepared.operation.operation {
+        crate::target::HostOperationBody::StateMutate { mutation } => mutation,
+        _ => panic!("prepared install is not a state mutation"),
+    })
+    else {
+        panic!("prepared install is not a bootstrap mutation");
+    };
+    assert!(
+        (LOOPBACK_PORT_FIRST..LOOPBACK_PORT_FIRST + LOOPBACK_PORT_COUNT)
+            .contains(&runtime.loopback_port)
+    );
+    assert!(
+        !resources
+            .iter()
+            .any(|resource| resource.resource_id == "app-loopback")
+    );
+    assert_eq!(
+        runtime.loopback_port,
+        deployment_loopback_port(&prepared.deployment_id)
+    );
+    Ok(())
+}
+
+#[test]
+fn deployment_loopback_port_is_stable_and_identity_specific() {
+    let first = deployment_loopback_port("deploy-00000000-0000-7000-8000-000000000001");
+    let repeat = deployment_loopback_port("deploy-00000000-0000-7000-8000-000000000001");
+    let second = deployment_loopback_port("deploy-00000000-0000-7000-8000-000000000002");
+    assert_eq!(first, repeat);
+    assert_ne!(first, second);
+    assert!((LOOPBACK_PORT_FIRST..LOOPBACK_PORT_FIRST + LOOPBACK_PORT_COUNT).contains(&first));
+    assert!((LOOPBACK_PORT_FIRST..LOOPBACK_PORT_FIRST + LOOPBACK_PORT_COUNT).contains(&second));
 }
 
 #[test]

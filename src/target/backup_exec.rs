@@ -2223,6 +2223,7 @@ mod tests {
                 runtime: super::super::deployment_state::RuntimeSurface::new(
                     "host",
                     "nazoauth.service",
+                    8000,
                 )?,
                 artifact: super::super::deployment_state::ArtifactRefs {
                     current: Some(format!("sha256:{artifact_digest}")),

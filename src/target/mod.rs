@@ -91,12 +91,6 @@ pub use wire::{
     parse_host_operation, parse_host_result, verify_remote_hello,
 };
 
-/// The loopback port the local health probe hits when a lifecycle job carries
-/// no explicit published port (update/rollback orders). Install orders always
-/// carry their own `InstallOrder::port`; this default only covers jobs whose
-/// DeploymentState does not yet record one.
-pub(crate) const LOCAL_PROBE_PORT: u16 = 8000;
-
 /// The formalized target state root (task F01): one private directory holding
 /// every deployment's [`DeploymentState`] document beside its C07 operation
 /// journal. Target administrators may relocate it with
@@ -771,8 +765,7 @@ pub(crate) fn dispatch_host_operation(
                         let job = install_exec::InstallJob {
                             operation_id: &operation.operation_id,
                             deployment_id: &deployment_id,
-                            runtime_kind: runtime.kind,
-                            runtime_object: &runtime.object,
+                            runtime,
                             config_reference,
                             scope_dir: &scope_dir,
                             order,
@@ -1088,7 +1081,7 @@ fn answer_update(
         runtime_kind: state.runtime.kind,
         runtime_object: &state.runtime.object,
         config_reference: &state.config.reference.clone(),
-        port: LOCAL_PROBE_PORT,
+        port: state.runtime.loopback_port,
         data_root: &data_root,
         runtime_root: runtime_root.as_deref(),
         config_schema: &state.config.schema.clone(),
@@ -1170,7 +1163,7 @@ fn answer_rollback(
         runtime_kind: state.runtime.kind,
         runtime_object: &state.runtime.object,
         config_reference: &state.config.reference.clone(),
-        port: LOCAL_PROBE_PORT,
+        port: state.runtime.loopback_port,
         runtime_root: runtime_root.as_deref(),
         config_schema: &state.config.schema.clone(),
         current_artifact: &current_artifact,
@@ -1834,7 +1827,7 @@ mod tests {
             None,
             StateMutationPayload::Bootstrap {
                 issuer: "https://auth.example.com".to_owned(),
-                runtime: RuntimeSurface::new("podman", "nazoauth-main").expect("runtime"),
+                runtime: RuntimeSurface::new("podman", "nazoauth-main", 8000).expect("runtime"),
                 artifact: Some(ArtifactRefs {
                     current: Some("sha256:abcdef0123456789".to_owned()),
                     previous: None,
@@ -1877,7 +1870,7 @@ mod tests {
             deployment_id,
             BootstrapParams {
                 issuer: "https://auth.example.com".to_owned(),
-                runtime: RuntimeSurface::new("podman", "nazoauth-main")?,
+                runtime: RuntimeSurface::new("podman", "nazoauth-main", 8000)?,
                 artifact: ArtifactRefs {
                     current: Some("sha256:abcdef0123456789".to_owned()),
                     previous: None,
@@ -2109,7 +2102,7 @@ mod tests {
                 "deploy-alpha",
                 BootstrapParams {
                     issuer: "https://auth.example.com".to_owned(),
-                    runtime: RuntimeSurface::new("podman", "nazoauth-main")?,
+                    runtime: RuntimeSurface::new("podman", "nazoauth-main", 8000)?,
                     artifact: ArtifactRefs {
                         current: Some(format!("sha256:{}", "a".repeat(64))),
                         previous: None,
@@ -2542,7 +2535,7 @@ mod tests {
             "deploy-alpha",
             BootstrapParams {
                 issuer: "https://auth.example.com".to_owned(),
-                runtime: RuntimeSurface::new("podman", "nazoauth-main")?,
+                runtime: RuntimeSurface::new("podman", "nazoauth-main", 8000)?,
                 artifact: ArtifactRefs {
                     current: Some(format!("sha256:{}", "a".repeat(64))),
                     previous: None,

@@ -202,7 +202,7 @@ mod tests {
             None,
             StateMutationPayload::Bootstrap {
                 issuer: "https://auth.example.com".to_owned(),
-                runtime: RuntimeSurface::new("podman", "nazoauth-main")?,
+                runtime: RuntimeSurface::new("podman", "nazoauth-main", 8000)?,
                 artifact: Some(ArtifactRefs {
                     current: Some("sha256:abcdef0123456789".to_owned()),
                     previous: None,
@@ -236,7 +236,7 @@ mod tests {
             "deploy-alpha",
             crate::target::deployment_state::BootstrapParams {
                 issuer: "https://auth.example.com".to_owned(),
-                runtime: RuntimeSurface::new("podman", "nazoauth-main")?,
+                runtime: RuntimeSurface::new("podman", "nazoauth-main", 8000)?,
                 artifact: ArtifactRefs {
                     current: Some(format!("sha256:{}", "a".repeat(64))),
                     previous: None,

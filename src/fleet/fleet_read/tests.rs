@@ -30,7 +30,7 @@ impl ScriptedTarget {
             issuer: "https://auth.example.com".to_owned(),
             observed_at: chrono::Utc::now(),
             revision: 3,
-            runtime: RuntimeSurface::new("podman", "nazoauth-main")?,
+            runtime: RuntimeSurface::new("podman", "nazoauth-main", 8000)?,
             artifact: Default::default(),
             config_reference: "/cfg".to_owned(),
             config_schema: "v1".to_owned(),
@@ -139,6 +139,7 @@ fn controller_status_never_recovers_expiry_from_observation_text() -> anyhow::Re
             target_id: host.host_id,
         },
     )?;
+    assert_eq!(doctor["runtime"]["loopback_port"], 8000);
     let diagnostics = doctor["diagnostics"]
         .as_array()
         .context("doctor diagnostics")?;

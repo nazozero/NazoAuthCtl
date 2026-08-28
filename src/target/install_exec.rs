@@ -41,7 +41,7 @@ use crate::{
 
 use super::{
     bootstrap_authority,
-    deployment_state::{Failure, INSTALL_FAILED},
+    deployment_state::{Failure, INSTALL_FAILED, RuntimeSurface},
     wire::{HOST_ERR_OPERATION_INVALID, InstanceInspection, sanitize},
 };
 
@@ -239,9 +239,6 @@ pub struct InstallOrder {
     /// G02 hook: provision the single-use initial-admin bootstrap capability
     /// bound to this exact install operation id.
     pub fresh_bootstrap: bool,
-    /// Host port the runtime publishes on (loopback unless a public boundary
-    /// is configured later; public reachability is never an install input).
-    pub port: u16,
     /// External PostgreSQL endpoint facts supplied by the operator (G01 item
     /// 3: real external facts are the only install inputs). Credentials live
     /// in the matching planned secret entries, not in this public endpoint.
@@ -685,9 +682,8 @@ fn copy_import_file(source: &Path, destination: &Path, label: &str) -> Result<()
 pub(crate) struct InstallJob<'a> {
     pub operation_id: &'a str,
     pub deployment_id: &'a str,
-    /// Runtime class from the validated Bootstrap surface.
-    pub runtime_kind: RuntimeBackendKind,
-    pub runtime_object: &'a str,
+    /// The single validated runtime fact source from the Bootstrap surface.
+    pub runtime: &'a RuntimeSurface,
     pub config_reference: &'a str,
     /// `<state root>/deployments/<deployment id>/` — where the fresh-install
     /// bootstrap context and token live beside the journal.
@@ -850,7 +846,8 @@ impl HostInstallExecutor {
         }
 
         // 1. Official artifact: verify first, use afterwards (H01 single entry).
-        let kind = job.runtime_kind;
+        let kind = job.runtime.kind;
+        require_loopback_port_available(kind, &job.runtime.object, job.runtime.loopback_port)?;
         for (label, endpoint) in [
             ("database runtime", &job.order.database_runtime_endpoint),
             ("database lifecycle", &job.order.database_lifecycle_endpoint),
@@ -1106,7 +1103,7 @@ impl HostInstallExecutor {
 
         // 7. Local health/readiness probe. Public reachability is deliberately
         // absent here (G08): loopback readiness is the only install gate.
-        probe_local_health(job.order.port)?;
+        probe_local_health(job.runtime.loopback_port)?;
 
         Ok(InstallFacts {
             artifact_reference: format!("sha256:{subject_digest}"),
@@ -1123,6 +1120,28 @@ impl HostInstallExecutor {
             rollback_policy: release.rollback_policy(),
         })
     }
+}
+
+fn require_loopback_port_available(
+    kind: RuntimeBackendKind,
+    runtime_object: &str,
+    port: u16,
+) -> Result<(), Failure> {
+    let backend = runtime_backend::backend(kind);
+    if backend
+        .inspect(runtime_object)
+        .is_ok_and(|observation| observation.running)
+    {
+        return Ok(());
+    }
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .map(drop)
+        .map_err(|_| {
+            Failure::new(
+                RUNTIME_START_FAILED,
+                format!("loopback port {port} is already in use on the target"),
+            )
+        })
 }
 
 fn validate_endpoint_reachability(
@@ -1212,7 +1231,7 @@ fn start_container_runtime(
     // the advisory lock make this idempotent across crash-retry resumes.
     run_schema_migration(job, backend.as_ref(), kind, &image)?;
 
-    let observation = backend.inspect(job.runtime_object);
+    let observation = backend.inspect(&job.runtime.object);
     if observation.as_ref().is_ok_and(|observed| {
         observed.running && observed.artifact == artifact_reference(&image, &digest)
     }) {
@@ -1228,7 +1247,7 @@ fn start_container_runtime(
             TARGET_IDENTITY_MISMATCH,
             format!(
                 "runtime object '{}' already exists serving a different artifact ({})",
-                job.runtime_object,
+                job.runtime.object,
                 sanitize(format!("{:?}", observed.artifact))
             ),
         ));
@@ -1302,7 +1321,7 @@ fn start_container_runtime(
         );
     }
     let replacement = runtime_backend::RuntimeReplacement {
-        object_reference: job.runtime_object.to_owned(),
+        object_reference: job.runtime.object.clone(),
         artifact: artifact_reference(&image, &digest),
         local_artifact_id: None,
         command: vec!["nazoauth".to_owned(), "server".to_owned()],
@@ -1310,7 +1329,7 @@ fn start_container_runtime(
         environment,
         networks: Vec::new(),
         ip_address: None,
-        ports: vec![format!("127.0.0.1:{}:8000/tcp", job.order.port)],
+        ports: vec![format!("127.0.0.1:{}:8000/tcp", job.runtime.loopback_port)],
         labels: [(
             "io.nazoauth.deployment-id".to_owned(),
             job.deployment_id.to_owned(),
@@ -1323,7 +1342,7 @@ fn start_container_runtime(
         .replace(&replacement)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
     backend
-        .start(job.runtime_object)
+        .start(&job.runtime.object)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
     performed.installed_runtime = true;
     performed.started_runtime = true;
@@ -1331,7 +1350,7 @@ fn start_container_runtime(
     // Embedded identity check: the running object must report the verified
     // image digest and be running. Drift here fails the install.
     let observed = backend
-        .inspect(job.runtime_object)
+        .inspect(&job.runtime.object)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
     let expected = artifact_reference(&image, &digest);
     if !observed.running || observed.artifact != expected {
@@ -1414,7 +1433,7 @@ fn start_systemd_runtime(
     performed.installed_runtime = true;
     backend
         .install_host_service(&runtime_backend::HostServiceInstall {
-            service_name: job.runtime_object.to_owned(),
+            service_name: job.runtime.object.clone(),
             deployment_id: job.deployment_id.to_owned(),
             service_user: service_user.clone(),
             source_binary,
@@ -1465,11 +1484,11 @@ fn start_systemd_runtime(
         .run_one_shot(&task)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
     backend
-        .start(job.runtime_object)
+        .start(&job.runtime.object)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
     performed.started_runtime = true;
     let observed = backend
-        .inspect(job.runtime_object)
+        .inspect(&job.runtime.object)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
     let expected = runtime_backend::ArtifactReference::HostBinary {
         path: binary,
@@ -1771,13 +1790,13 @@ pub(crate) fn probe_local_health(port: u16) -> Result<(), Failure> {
 pub(crate) fn rollback(job: &InstallJob<'_>, performed: &PerformedSteps) -> Result<(), Failure> {
     let mut errors = Vec::new();
     if performed.installed_runtime {
-        let backend = runtime_backend::backend(job.runtime_kind);
+        let backend = runtime_backend::backend(job.runtime.kind);
         if performed.started_runtime
-            && let Err(error) = backend.stop(job.runtime_object)
+            && let Err(error) = backend.stop(&job.runtime.object)
         {
             errors.push(format!("stopping runtime failed: {error}"));
         }
-        if let Err(error) = backend.remove(job.runtime_object) {
+        if let Err(error) = backend.remove(&job.runtime.object) {
             errors.push(format!("removing runtime failed: {error}"));
         }
     }

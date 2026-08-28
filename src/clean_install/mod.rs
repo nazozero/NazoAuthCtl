@@ -53,8 +53,11 @@ use crate::target::{
 /// Official server release repository pinned for clean installs.
 pub(crate) const SERVER_REPOSITORY: &str = "nazozero/NazoAuth";
 
-/// Default listen port; the only port default that is safe to infer.
-pub(crate) const DEFAULT_PORT: u16 = 8000;
+/// NazoAuth's internal container listen port. The target-facing loopback port
+/// is deployment-specific so one host can run more than one instance.
+pub(crate) const CONTAINER_PORT: u16 = 8000;
+const LOOPBACK_PORT_FIRST: u16 = 20_000;
+const LOOPBACK_PORT_COUNT: u16 = 20_000;
 
 /// Config schema token recorded in the DeploymentState for seed documents.
 pub(crate) const CONFIG_SCHEMA_SEED: &str = "nazauth-seed-v2";
@@ -405,6 +408,7 @@ fn build_install_order(
     runtime_kind: RuntimeBackendKind,
     deployment_id: &str,
     state_epoch: &str,
+    loopback_port: u16,
 ) -> anyhow::Result<InstallOrder> {
     let database_runtime_url_file =
         target_os.join(&paths.secrets_dir, &["database-runtime-url"])?;
@@ -419,7 +423,7 @@ fn build_install_order(
             database_url_file: config_path(target_os, &database_runtime_url_file),
             valkey_url_file: config_path(target_os, &valkey_url_file),
             mfa_totp_key_file: config_path(target_os, &mfa_totp_key_file),
-            bind: format!("127.0.0.1:{DEFAULT_PORT}"),
+            bind: format!("127.0.0.1:{loopback_port}"),
             trusted_proxy_cidrs: "127.0.0.0/8,::1/128".to_owned(),
         }
     } else {
@@ -437,7 +441,7 @@ fn build_install_order(
                 "{}/mfa-totp-key",
                 crate::target::install_exec::CONTAINER_SECRETS_DIR
             ),
-            bind: format!("0.0.0.0:{DEFAULT_PORT}"),
+            bind: format!("0.0.0.0:{CONTAINER_PORT}"),
             trusted_proxy_cidrs: "127.0.0.0/8,::1/128,10.88.0.0/16".to_owned(),
         }
     };
@@ -497,7 +501,6 @@ fn build_install_order(
             // G02 hook: provision the single-use initial-admin capability bound
             // to this exact install operation.
             fresh_bootstrap: true,
-            port: DEFAULT_PORT,
         };
     Ok(order)
 }
@@ -507,6 +510,12 @@ fn hex_digest(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn deployment_loopback_port(deployment_id: &str) -> u16 {
+    let digest = Sha256::digest(deployment_id.as_bytes());
+    let offset = u16::from_be_bytes([digest[0], digest[1]]) % LOOPBACK_PORT_COUNT;
+    LOOPBACK_PORT_FIRST + offset
 }
 
 #[derive(Serialize)]
@@ -628,6 +637,7 @@ fn prepare_install_operation_with_identity(
         format!("nazoauth-{}", deployment_id.trim_start_matches("deploy-"))
     };
     let paths = resolve_paths(request, &hello.os, deployment_id)?;
+    let loopback_port = deployment_loopback_port(deployment_id);
     let order = build_install_order(
         request,
         &paths,
@@ -635,6 +645,7 @@ fn prepare_install_operation_with_identity(
         runtime_kind,
         deployment_id,
         &state_epoch.to_string(),
+        loopback_port,
     )?;
     let resources = declare_resources(
         &paths.data_root,
@@ -649,7 +660,7 @@ fn prepare_install_operation_with_identity(
         None,
         StateMutationPayload::Bootstrap {
             issuer: request.issuer.clone(),
-            runtime: RuntimeSurface::new(runtime_kind.as_str(), &runtime_object)?,
+            runtime: RuntimeSurface::new(runtime_kind.as_str(), &runtime_object, loopback_port)?,
             artifact: None,
             config_reference: paths.config_reference,
             config_schema: CONFIG_SCHEMA_SEED.to_owned(),

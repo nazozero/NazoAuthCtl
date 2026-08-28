@@ -229,7 +229,11 @@ pub(crate) fn status_document(
         "issuer": inspection.issuer,
         "helper": helper,
         "revision": inspection.revision,
-        "runtime": {"kind": inspection.runtime.kind, "object": inspection.runtime.object},
+        "runtime": {
+            "kind": inspection.runtime.kind,
+            "object": inspection.runtime.object,
+            "loopback_port": inspection.runtime.loopback_port,
+        },
         "config": {"reference": inspection.config_reference, "schema": inspection.config_schema},
         "artifact": {"current": inspection.artifact.current, "previous": inspection.artifact.previous},
         "health": {"state": if inspection.healthy { "ok" } else { "down" }, "summary": inspection.health_summary},
@@ -430,9 +434,13 @@ fn print_single_status(record: &InstanceRecord, host_alias: &str, payload: &Valu
     println!("issuer: {}", value_str(payload.get("issuer")));
     println!("helper: {}", value_str(payload.get("helper")));
     println!(
-        "runtime: {}/{} revision {}",
+        "runtime: {}/{} on 127.0.0.1:{} revision {}",
         value_str(payload.pointer("/runtime/kind")),
         value_str(payload.pointer("/runtime/object")),
+        payload
+            .pointer("/runtime/loopback_port")
+            .and_then(Value::as_u64)
+            .map_or_else(|| "-".to_owned(), |v| v.to_string()),
         payload
             .get("revision")
             .and_then(Value::as_u64)
