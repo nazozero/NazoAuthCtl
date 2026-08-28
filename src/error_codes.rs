@@ -9,6 +9,10 @@
 /// The host alias is not in the control-side Host Registry.
 pub const HOST_NOT_REGISTERED: &str = "HOST_NOT_REGISTERED";
 
+/// A command-local argument or input file failed validation before any target
+/// operation was attempted.
+pub const INPUT_INVALID: &str = "INPUT_INVALID";
+
 /// The host could not be contacted (network failure or per-target timeout).
 pub const HOST_UNREACHABLE: &str = "HOST_UNREACHABLE";
 

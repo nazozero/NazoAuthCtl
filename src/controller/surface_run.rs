@@ -1093,6 +1093,14 @@ fn read_password_file(
     path: &std::path::Path,
     flag: &str,
 ) -> anyhow::Result<crate::target::SecretMaterial> {
+    read_password_file_inner(path, flag)
+        .map_err(|error| anyhow::anyhow!("{}: {error:#}", crate::error_codes::INPUT_INVALID))
+}
+
+fn read_password_file_inner(
+    path: &std::path::Path,
+    flag: &str,
+) -> anyhow::Result<crate::target::SecretMaterial> {
     const MAX_PASSWORD_FILE_BYTES: u64 = 4096;
     let raw =
         crate::filesystem::read_secure_regular_file(path, flag, true, MAX_PASSWORD_FILE_BYTES)
@@ -1309,6 +1317,24 @@ fn read_admin_credentials(
         email: email.trim().to_owned(),
         password: Zeroizing::new(password),
     })
+}
+
+#[cfg(test)]
+mod install_input_tests {
+    use super::read_password_file;
+
+    #[test]
+    fn local_password_file_failures_are_typed_as_invalid_input() {
+        let error = read_password_file(
+            std::path::Path::new("relative-password-file"),
+            "--database-runtime-password-file",
+        )
+        .expect_err("relative input path must be rejected");
+        assert!(
+            format!("{error:#}").starts_with(crate::error_codes::INPUT_INVALID),
+            "{error:#}"
+        );
+    }
 }
 
 #[cfg(test)]

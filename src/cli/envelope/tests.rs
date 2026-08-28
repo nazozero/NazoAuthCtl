@@ -53,6 +53,15 @@ fn text_envelope_covers_the_stable_codes() {
 }
 
 #[test]
+fn invalid_local_input_is_not_reported_as_a_host_failure() {
+    let rendered = render(crate::error_codes::INPUT_INVALID, true);
+    let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+    assert_eq!(value["code"], crate::error_codes::INPUT_INVALID);
+    assert_eq!(value["side_effects"], "none");
+    assert_eq!(value["next_command"], serde_json::Value::Null);
+}
+
+#[test]
 fn json_envelope_carries_every_field() {
     for code in [
         crate::error_codes::HOST_UNREACHABLE,
