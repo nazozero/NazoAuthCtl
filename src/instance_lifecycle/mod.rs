@@ -72,6 +72,20 @@ impl TargetArtifactResolver for ProductionTargetArtifactResolver {
         pinned: &crate::target::OfficialArtifactRef,
         inspection: &InstanceInspection,
     ) -> anyhow::Result<VerifiedTargetArtifact> {
+        #[cfg(feature = "pre-release-validation")]
+        if let Some(candidate) = crate::pre_release::resolve(pinned)? {
+            candidate.enforce_floor(
+                inspection
+                    .current_build_identity
+                    .as_ref()
+                    .map(|identity| identity.version.as_str()),
+            )?;
+            return Ok(VerifiedTargetArtifact {
+                digest: candidate.oci_digest.clone(),
+                identity: candidate.identity()?,
+                rollback_policy: candidate.rollback,
+            });
+        }
         let release = crate::release::VerifiedRelease::verify(crate::release::ReleaseRequest {
             repository: &pinned.repository,
             requested_version: pinned.version.as_deref(),

@@ -358,11 +358,13 @@ impl HostLifecycleExecutor {
         let replacement = (observation_digest(&observation).as_deref()
             != Some(new_digest.as_str()))
         .then(|| {
-            replacement_from_observation(
+            let mut replacement = replacement_from_observation(
                 &observation,
                 job.runtime_object,
                 &verified.runtime_artifact,
-            )
+            )?;
+            replacement.local_artifact_id = verified.local_artifact_id.clone();
+            Ok::<_, Failure>(replacement)
         })
         .transpose()?;
 
@@ -869,6 +871,42 @@ mod tests {
         );
         assert!(error.detail.contains("operation contract"));
     }
+
+    #[test]
+    fn replacement_never_reuses_another_artifacts_local_image_id() {
+        let current = runtime_backend::ArtifactReference::Oci {
+            image_reference: "registry.example/nazoauth".to_owned(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+        };
+        let next = runtime_backend::ArtifactReference::Oci {
+            image_reference: "registry.example/nazoauth".to_owned(),
+            digest: format!("sha256:{}", "b".repeat(64)),
+        };
+        let observation = runtime_backend::RuntimeObservation {
+            backend: RuntimeBackendKind::Podman,
+            object_reference: "nazoauth".to_owned(),
+            display_name: "nazoauth".to_owned(),
+            running: true,
+            server_command_verified: true,
+            artifact: current.clone(),
+            local_artifact_id: Some(format!("sha256:{}", "c".repeat(64))),
+            ports: Vec::new(),
+            networks: Vec::new(),
+            mounts: Vec::new(),
+            safe_environment: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            evidence: Vec::new(),
+            missing: Vec::new(),
+        };
+
+        let unchanged = replacement_from_observation(&observation, "nazoauth", &current)
+            .expect("same artifact replacement");
+        assert_eq!(unchanged.local_artifact_id, observation.local_artifact_id);
+
+        let changed = replacement_from_observation(&observation, "nazoauth", &next)
+            .expect("changed artifact replacement");
+        assert_eq!(changed.local_artifact_id, None);
+    }
 }
 
 pub(super) fn systemd_service_user(deployment_id: &str) -> String {
@@ -955,6 +993,91 @@ fn verify_pinned_artifact_facts(
     version_floor: Option<&str>,
     runtime_root: Option<&str>,
 ) -> Result<VerifiedArtifactFacts, Failure> {
+    #[cfg(feature = "pre-release-validation")]
+    if let Some(candidate) = crate::pre_release::resolve(artifact).map_err(|error| {
+        Failure::new(
+            super::install_exec::ARTIFACT_UNVERIFIED,
+            sanitize(error.to_string()),
+        )
+    })? {
+        candidate.enforce_floor(version_floor).map_err(|error| {
+            Failure::new(
+                super::install_exec::ARTIFACT_UNVERIFIED,
+                sanitize(error.to_string()),
+            )
+        })?;
+        if !kind.is_container() {
+            return Err(Failure::new(
+                super::install_exec::ARTIFACT_UNVERIFIED,
+                "pre-release candidate validation requires a container runtime",
+            ));
+        }
+        let backend = runtime_backend::backend(kind);
+        let observed_digest =
+            backend
+                .resolve_image_digest(&candidate.oci_image)
+                .map_err(|error| {
+                    Failure::new(
+                        super::install_exec::ARTIFACT_UNVERIFIED,
+                        sanitize(error.to_string()),
+                    )
+                })?;
+        if observed_digest != candidate.oci_digest {
+            return Err(Failure::new(
+                super::install_exec::ARTIFACT_UNVERIFIED,
+                "local pre-release candidate digest does not match its embedded manifest",
+            ));
+        }
+        let local_artifact_id = backend
+            .resolve_local_image_id(&candidate.oci_image)
+            .map_err(|error| {
+                Failure::new(
+                    super::install_exec::ARTIFACT_UNVERIFIED,
+                    sanitize(error.to_string()),
+                )
+            })?;
+        let runtime_artifact = runtime_backend::ArtifactReference::Oci {
+            image_reference: candidate.oci_image.clone(),
+            digest: candidate.oci_digest.clone(),
+        };
+        let embedded = backend
+            .read_build_identity(&runtime_artifact, Some(&local_artifact_id))
+            .map_err(|error| {
+                Failure::new(
+                    super::install_exec::ARTIFACT_UNVERIFIED,
+                    sanitize(error.to_string()),
+                )
+            })?
+            .ok_or_else(|| {
+                Failure::new(
+                    super::install_exec::ARTIFACT_UNVERIFIED,
+                    "local pre-release candidate has no embedded build identity",
+                )
+            })?;
+        let build_identity = candidate.identity().map_err(|error| {
+            Failure::new(
+                super::install_exec::ARTIFACT_UNVERIFIED,
+                sanitize(error.to_string()),
+            )
+        })?;
+        if embedded.release != build_identity.version || embedded.revision != build_identity.commit
+        {
+            return Err(Failure::new(
+                super::install_exec::ARTIFACT_UNVERIFIED,
+                "local pre-release candidate identity does not match its embedded manifest",
+            ));
+        }
+        return Ok(VerifiedArtifactFacts {
+            digest: candidate
+                .oci_digest
+                .trim_start_matches("sha256:")
+                .to_owned(),
+            runtime_artifact,
+            local_artifact_id: Some(local_artifact_id),
+            build_identity: Some(build_identity),
+            rollback_policy: candidate.rollback,
+        });
+    }
     let release = VerifiedRelease::verify(ReleaseRequest {
         repository: &artifact.repository,
         requested_version: artifact.version.as_deref(),
@@ -967,7 +1090,7 @@ fn verify_pinned_artifact_facts(
             sanitize(error.to_string()),
         )
     })?;
-    let (digest, runtime_artifact) = match kind {
+    let (digest, runtime_artifact, local_artifact_id) = match kind {
         RuntimeBackendKind::Host => {
             let runtime_root = runtime_root.ok_or_else(|| {
                 Failure::new(
@@ -999,6 +1122,7 @@ fn verify_pinned_artifact_facts(
                     path: cached,
                     sha256: digest,
                 },
+                None,
             )
         }
         RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
@@ -1023,6 +1147,14 @@ fn verify_pinned_artifact_facts(
                         sanitize(error.to_string()),
                     )
                 })?;
+            let local_artifact_id = runtime_backend::backend(kind)
+                .resolve_local_image_id(&image)
+                .map_err(|error| {
+                    Failure::new(
+                        super::install_exec::ARTIFACT_UNVERIFIED,
+                        sanitize(error.to_string()),
+                    )
+                })?;
             let digest = digest.trim_start_matches("sha256:").to_owned();
             (
                 digest.clone(),
@@ -1030,12 +1162,14 @@ fn verify_pinned_artifact_facts(
                     image_reference: release.manifest.oci.repository.clone(),
                     digest: format!("sha256:{digest}"),
                 },
+                Some(local_artifact_id),
             )
         }
     };
     Ok(VerifiedArtifactFacts {
         digest,
         runtime_artifact,
+        local_artifact_id,
         rollback_policy: release.rollback_policy(),
         build_identity: Some(
             super::deployment_state::BuildIdentity::new(
@@ -1055,6 +1189,7 @@ fn verify_pinned_artifact_facts(
 struct VerifiedArtifactFacts {
     digest: String,
     runtime_artifact: runtime_backend::ArtifactReference,
+    local_artifact_id: Option<String>,
     build_identity: Option<super::deployment_state::BuildIdentity>,
     rollback_policy: crate::model::ReleaseRollbackPolicy,
 }
@@ -1100,7 +1235,11 @@ pub(crate) fn replacement_from_observation(
     Ok(runtime_backend::RuntimeReplacement {
         object_reference: object.to_owned(),
         artifact: artifact.clone(),
-        local_artifact_id: observation.local_artifact_id.clone(),
+        local_artifact_id: if observation.artifact == *artifact {
+            observation.local_artifact_id.clone()
+        } else {
+            None
+        },
         command,
         mounts: observation.mounts.clone(),
         environment: observation.safe_environment.clone(),

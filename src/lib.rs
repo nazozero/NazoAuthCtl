@@ -8,6 +8,8 @@ mod file_lock;
 mod fleet;
 mod instance_lifecycle;
 mod model;
+#[cfg(feature = "pre-release-validation")]
+mod pre_release;
 pub mod registry;
 mod release;
 mod runtime_backend;
