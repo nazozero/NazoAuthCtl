@@ -45,7 +45,7 @@ executables must be root-owned and must not be replaceable by another user.
   "material_root": "/etc/nazoauth/tls/tenant-a/auth.example",
   "activation_link": "/etc/nazoauth/tls/tenant-a/auth.example/current",
   "trust_anchors": "/etc/ssl/certs/import-root.pem",
-  "public_url": "https://auth.example/health/ready",
+  "public_url": "https://auth.example/health",
   "accepted_statuses": [200],
   "minimum_validity_seconds": 604800,
   "connect_timeout_seconds": 10,

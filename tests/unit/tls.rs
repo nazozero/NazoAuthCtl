@@ -32,7 +32,7 @@ fn provider_and_journal_reject_unknown_fields() {
         "material_root": "/srv/nazoauth/tls/auth.example",
         "activation_link": "/srv/nazoauth/tls/auth.example/current",
         "trust_anchors": "/etc/ssl/auth-root.pem",
-        "public_url": "https://auth.example/health/ready",
+        "public_url": "https://auth.example/health",
         "accepted_statuses": [200],
         "minimum_validity_seconds": 86400,
         "connect_timeout_seconds": 5,
@@ -389,7 +389,7 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
             material_root: work.path().join("material"),
             activation_link: work.path().join("material/current"),
             trust_anchors: work.path().join("root.pem"),
-            public_url: "https://auth.example/health/ready".to_owned(),
+            public_url: "https://auth.example/health".to_owned(),
             accepted_statuses: BTreeSet::from([200]),
             minimum_validity_seconds: 3600,
             connect_timeout_seconds: 1,
@@ -406,7 +406,7 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
         config_sha256: "a".repeat(64),
         trust_anchors: ca.pem().into_bytes(),
         trust_anchors_sha256: "b".repeat(64),
-        public_url: Url::parse("https://auth.example/health/ready").unwrap(),
+        public_url: Url::parse("https://auth.example/health").unwrap(),
     };
     let input = TlsCertificateInput {
         provider_config: work.path().join("provider.json"),
@@ -547,7 +547,7 @@ fn public_verification_observes_real_tls_leaf_and_http_health() {
         material_root: PathBuf::from("/srv/nazoauth/tls/tenant-a/auth.example"),
         activation_link: PathBuf::from("/srv/nazoauth/tls/tenant-a/auth.example/current"),
         trust_anchors: PathBuf::from("/etc/ssl/auth-root.pem"),
-        public_url: "https://auth.example/health/ready".to_owned(),
+        public_url: "https://auth.example/health".to_owned(),
         accepted_statuses: BTreeSet::from([200]),
         minimum_validity_seconds: 3600,
         connect_timeout_seconds: 2,
@@ -562,7 +562,7 @@ fn public_verification_observes_real_tls_leaf_and_http_health() {
         },
     };
     verify_public_address(
-        &Url::parse("https://auth.example/health/ready").unwrap(),
+        &Url::parse("https://auth.example/health").unwrap(),
         "auth.example",
         address,
         &sha256(leaf_der.as_ref()),
@@ -571,7 +571,7 @@ fn public_verification_observes_real_tls_leaf_and_http_health() {
     )
     .unwrap();
     verify_public_address_not_leaf(
-        &Url::parse("https://auth.example/health/ready").unwrap(),
+        &Url::parse("https://auth.example/health").unwrap(),
         "auth.example",
         address,
         &"0".repeat(64),
@@ -580,7 +580,7 @@ fn public_verification_observes_real_tls_leaf_and_http_health() {
     )
     .unwrap();
     let error = verify_public_address_not_leaf(
-        &Url::parse("https://auth.example/health/ready").unwrap(),
+        &Url::parse("https://auth.example/health").unwrap(),
         "auth.example",
         address,
         &sha256(leaf_der.as_ref()),
@@ -619,7 +619,7 @@ fn public_verification_uses_an_absolute_request_deadline() {
         test_transaction(PathBuf::from("/srv/nazoauth/tls/tenant-a/auth.example")).provider;
     provider.request_timeout_seconds = 1;
     let error = verify_public_address(
-        &Url::parse("https://auth.example/health/ready").unwrap(),
+        &Url::parse("https://auth.example/health").unwrap(),
         "auth.example",
         address,
         &sha256(leaf_der.as_ref()),
@@ -644,7 +644,7 @@ fn activated_generation_is_deactivated_before_rollback_public_proof() {
         activation_link: material_root.join("current"),
         material_root: material_root.clone(),
         trust_anchors: work.path().join("root.pem"),
-        public_url: "https://auth.example/health/ready".to_owned(),
+        public_url: "https://auth.example/health".to_owned(),
         accepted_statuses: BTreeSet::from([200]),
         minimum_validity_seconds: 3600,
         connect_timeout_seconds: 1,
@@ -722,7 +722,7 @@ fn test_transaction(material_root: PathBuf) -> CertificateTransaction {
         activation_link: material_root.join("current"),
         material_root: material_root.clone(),
         trust_anchors: PathBuf::from("/etc/ssl/auth-root.pem"),
-        public_url: "https://auth.example/health/ready".to_owned(),
+        public_url: "https://auth.example/health".to_owned(),
         accepted_statuses: BTreeSet::from([200]),
         minimum_validity_seconds: 3600,
         connect_timeout_seconds: 1,
