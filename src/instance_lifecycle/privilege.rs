@@ -30,7 +30,7 @@ pub(crate) enum PrivilegeStep {
     /// Reading one deployment's target-side DeploymentState.
     #[cfg(test)]
     DeploymentStateRead,
-    /// Probing `{issuer}/readyz` on loopback.
+    /// Probing the runtime readiness endpoint on loopback.
     #[cfg(test)]
     HealthProbe,
     /// Talking to the container engine socket (podman/docker info or any

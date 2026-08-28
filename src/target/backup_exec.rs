@@ -25,7 +25,8 @@ use super::{
     backup::{self, RestoreTestEnvironment, RestoreTestReceipt, SnapshotFile, SnapshotManifest},
     deployment_state::{BuildIdentity, DeploymentState, Failure, ResourceOwnership, ResourceScope},
     install_exec::{
-        CONTAINER_CONFIG_FILE, CONTAINER_DATA_DIR, CONTAINER_SECRETS_DIR, SERVER_CONFIG_FILE_ENV,
+        CONTAINER_CONFIG_FILE, CONTAINER_DATA_DIR, CONTAINER_SECRETS_DIR, LOCAL_READINESS_PATH,
+        SERVER_CONFIG_FILE_ENV,
     },
     wire::{
         BackupTransferBytes, BackupTransferChunk, HOST_ERR_OPERATION_INVALID,
@@ -993,8 +994,7 @@ pub(crate) fn stage_recovery_candidate(
         .stage_recovery_candidate(&request)
         .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
     let checked = (|| -> anyhow::Result<()> {
-        fetch_http(endpoint.loopback_port, "/health")?;
-        fetch_http(endpoint.loopback_port, "/readyz")?;
+        fetch_http(endpoint.loopback_port, LOCAL_READINESS_PATH)?;
         ensure!(
             oidc_signing_key_ids(endpoint.loopback_port, &state.issuer)?
                 == manifest.oidc_signing_key_ids,
@@ -1874,8 +1874,7 @@ fn start_candidate(
         container_policy: Some(ContainerRuntimePolicy::managed_app()),
     };
     backend.replace(&replacement)?;
-    fetch_http(port, "/health")?;
-    fetch_http(port, "/readyz")?;
+    fetch_http(port, LOCAL_READINESS_PATH)?;
     ensure!(
         oidc_signing_key_ids(port, &state.issuer)? == manifest.oidc_signing_key_ids,
         "candidate OIDC signing keys differ from the snapshot"

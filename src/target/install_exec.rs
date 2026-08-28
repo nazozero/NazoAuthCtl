@@ -54,6 +54,7 @@ pub const SECRET_PROVISION_FAILED: &str = "SECRET_PROVISION_FAILED";
 pub const RUNTIME_START_FAILED: &str = "RUNTIME_START_FAILED";
 pub const TARGET_IDENTITY_MISMATCH: &str = "TARGET_IDENTITY_MISMATCH";
 pub const HEALTH_PROBE_FAILED: &str = "HEALTH_PROBE_FAILED";
+pub(crate) const LOCAL_READINESS_PATH: &str = "/health";
 /// Cleanup could not prove whether the install still owns live resources.
 /// The target journal deliberately keeps this operation pending and the
 /// control-side prepared-install pointer must be retained for exact replay.
@@ -1749,12 +1750,12 @@ fn mount(source: PathBuf, destination: &str, read_only: bool) -> runtime_backend
     }
 }
 
-/// Bounded loopback readiness probe against `http://127.0.0.1:{port}/readyz`.
+/// Bounded loopback readiness probe against `http://127.0.0.1:{port}/health`.
 /// Shared with the update/rollback executors (G03/G04): activation is only
 /// ever gated by the same local readiness fact. This is a LOOPBACK probe —
 /// it must never depend on public DNS, TLS, or any external boundary (G08).
 pub(crate) fn probe_local_health(port: u16) -> Result<(), Failure> {
-    let endpoint = format!("http://127.0.0.1:{port}/readyz");
+    let endpoint = format!("http://127.0.0.1:{port}{LOCAL_READINESS_PATH}");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut last: Option<Failure> = None;
     while std::time::Instant::now() < deadline {
