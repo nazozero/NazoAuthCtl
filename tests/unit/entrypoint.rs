@@ -91,7 +91,7 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
     assert!(workflow.contains("VerifiedRelease::verify"));
     assert!(workflow.contains("SERVER_PEELED_COMMIT"));
     assert!(workflow.contains("OPERATOR_PROTOCOL_REV"));
-    assert!(workflow.contains("cosign verify \"$image\""));
+    assert!(workflow.contains("cosign verify \"$tagged_image\""));
     assert!(
         workflow.contains("sudo install -m 0755 \"$(command -v cosign)\" /usr/local/bin/cosign")
     );
@@ -111,10 +111,8 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
     let signed_current_server = workflow.split_once("\n  signed-current-server:").unwrap().1;
     assert!(!signed_current_server.contains("\n    env:\n      GH_TOKEN:"));
     assert!(!signed_current_server.contains("packages: read"));
-    assert!(
-        signed_current_server
-            .contains("docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e")
-    );
+    assert!(!signed_current_server.contains("docker/setup-buildx-action@"));
+    assert!(signed_current_server.contains("docker manifest inspect \"$image\""));
 
     for step in [
         "Execute the exact controller artifact through its production protocol path",
