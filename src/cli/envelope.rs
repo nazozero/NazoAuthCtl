@@ -16,7 +16,8 @@
 //!
 //! Rules pinned here:
 //!
-//! * codes come from the closed set in [`crate::error_codes`];
+//! * codes come from the CLI set in [`crate::error_codes`] or a target
+//!   operation's stable failure vocabulary;
 //! * secrets can never appear: only stable tokens and the bounded error chain
 //!   are echoed;
 //! * `next_command` is always a runnable command or absent — never prose.
@@ -39,7 +40,8 @@ fn side_effects_hint(code: &str) -> &'static str {
     match code {
         error_codes::OPERATION_ID_CONFLICT
         | error_codes::CONFIG_REVISION_MISMATCH
-        | error_codes::TARGET_IDENTITY_MISMATCH => {
+        | error_codes::TARGET_IDENTITY_MISMATCH
+        | crate::target::INSTALL_OUTCOME_UNKNOWN => {
             "possible from an earlier attempt; re-run the SAME command to resume idempotently"
         }
         _ => "none",

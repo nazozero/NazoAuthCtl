@@ -664,9 +664,13 @@ fn copy_import_regular(
 fn copy_import_file(source: &Path, destination: &Path, label: &str) -> Result<(), Failure> {
     let bytes = filesystem::read_secure_regular_file(source, label, false, 128)
         .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+    let mut end = bytes.len();
+    while end > 0 && matches!(bytes[end - 1], b'\r' | b'\n') {
+        end -= 1;
+    }
     use base64::Engine as _;
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(bytes.as_slice())
+        .decode(&bytes[..end])
         .map_err(|_| Failure::new(SECRET_PROVISION_FAILED, "imported MFA key is not base64url"))?;
     if decoded.len() != 32 {
         return Err(Failure::new(
@@ -1618,35 +1622,68 @@ fn set_runtime_identity(path: &Path, _directory: bool) -> Result<(), Failure> {
 /// directories (e.g. the secrets directory) as root.
 #[cfg(unix)]
 fn set_runtime_identity_directory_data(path: &Path) -> Result<(), Failure> {
-    use std::os::unix::fs::{PermissionsExt as _, chown};
-    let apply_node = |node: &Path| -> std::io::Result<()> {
-        chown(node, Some(10_001), Some(10_001))?;
-        if node.is_dir() {
-            std::fs::set_permissions(node, std::fs::Permissions::from_mode(0o700))?;
-        }
-        Ok(())
-    };
+    use std::os::unix::fs::{PermissionsExt as _, lchown};
     let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        apply_node(&dir).map_err(|error| {
+    while let Some(node) = stack.pop() {
+        let metadata = fs::symlink_metadata(&node).map_err(|error| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                sanitize(format!(
+                    "failed to inspect runtime data node {}: {error}",
+                    node.display()
+                )),
+            )
+        })?;
+
+        if metadata.file_type().is_symlink() {
+            return Err(Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                sanitize(format!(
+                    "runtime data ownership rejects symlink {}",
+                    node.display()
+                )),
+            ));
+        }
+        let is_directory = metadata.is_dir();
+        if !is_directory && !metadata.is_file() {
+            return Err(Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                sanitize(format!(
+                    "runtime data ownership rejects special file {}",
+                    node.display()
+                )),
+            ));
+        }
+
+        lchown(&node, Some(10_001), Some(10_001)).map_err(|error| {
             Failure::new(
                 HOST_ERR_OPERATION_INVALID,
                 sanitize(format!(
                     "failed to grant runtime ownership of {}: {error}",
-                    dir.display()
+                    node.display()
                 )),
             )
         })?;
-        for entry in std::fs::read_dir(&dir).map_err(|error| {
-            Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
-        })? {
-            let child = entry
-                .map_err(|error| {
-                    Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
-                })?
-                .path();
-            if child.is_dir() && !child.is_symlink() {
-                stack.push(child);
+        if is_directory {
+            fs::set_permissions(&node, fs::Permissions::from_mode(0o700)).map_err(|error| {
+                Failure::new(
+                    HOST_ERR_OPERATION_INVALID,
+                    sanitize(format!(
+                        "failed to restrict runtime data directory {}: {error}",
+                        node.display()
+                    )),
+                )
+            })?;
+            for entry in std::fs::read_dir(&node).map_err(|error| {
+                Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
+            })? {
+                stack.push(
+                    entry
+                        .map_err(|error| {
+                            Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
+                        })?
+                        .path(),
+                );
             }
         }
     }
@@ -1872,6 +1909,92 @@ mod current_data_import_tests {
             .map_err(|failure| anyhow::anyhow!(failure.detail))?;
         fs::write(&mfa_source, b"invalid")?;
         assert!(copy_import_file(&mfa_source, &mfa_destination, "MFA").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn mfa_import_accepts_terminal_line_endings_but_rejects_other_whitespace() -> anyhow::Result<()>
+    {
+        let temp = crate::filesystem::PrivateTempDir::new("mfa-import-format")?;
+        use base64::Engine as _;
+        let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+
+        for (suffix, name) in [("\n", "lf"), ("\r\n", "crlf")] {
+            let source = temp.path().join(format!("source-{name}"));
+            let destination = temp.path().join(format!("destination-{name}"));
+            fs::write(&source, format!("{key}{suffix}"))?;
+            copy_import_file(&source, &destination, "MFA")
+                .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        }
+
+        for (value, name) in [
+            (format!(" {key}"), "leading-space"),
+            (format!("\n{key}"), "leading-lf"),
+            (format!("{}\n{}", &key[..20], &key[20..]), "internal-lf"),
+            (format!("{key} "), "trailing-space"),
+            (format!("{key}="), "padding"),
+            ("0123456789abcdef".repeat(4), "hex"),
+        ] {
+            let source = temp.path().join(format!("invalid-source-{name}"));
+            let destination = temp.path().join(format!("invalid-destination-{name}"));
+            fs::write(&source, value)?;
+            assert!(
+                copy_import_file(&source, &destination, "MFA").is_err(),
+                "{name}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_data_ownership_covers_nested_files_without_changing_file_modes() -> anyhow::Result<()>
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, chown, symlink};
+
+        let temp = crate::filesystem::PrivateTempDir::new("runtime-data-ownership")?;
+        let root = temp.path().join("data");
+        let nested = root.join("nested/deeper");
+        fs::create_dir_all(&nested)?;
+        let file = nested.join("secret");
+        fs::write(&file, b"secret")?;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600))?;
+
+        let probe = temp.path().join("chown-probe");
+        fs::write(&probe, b"probe")?;
+        match chown(&probe, Some(10_001), Some(10_001)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+
+        set_runtime_identity_directory_data(&root)
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+
+        let root_metadata = fs::metadata(&root)?;
+        assert_eq!(root_metadata.uid(), 10_001);
+        assert_eq!(root_metadata.gid(), 10_001);
+        assert_eq!(root_metadata.permissions().mode() & 0o7777, 0o700);
+        let nested_metadata = fs::metadata(&nested)?;
+        assert_eq!(nested_metadata.uid(), 10_001);
+        assert_eq!(nested_metadata.gid(), 10_001);
+        assert_eq!(nested_metadata.permissions().mode() & 0o7777, 0o700);
+        let file_metadata = fs::metadata(&file)?;
+        assert_eq!(file_metadata.uid(), 10_001);
+        assert_eq!(file_metadata.gid(), 10_001);
+        assert_eq!(file_metadata.permissions().mode() & 0o7777, 0o600);
+
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"outside")?;
+        let outside_before = fs::metadata(&outside)?;
+        let link = nested.join("link");
+        symlink(&outside, &link)?;
+        assert!(set_runtime_identity_directory_data(&root).is_err());
+        let outside_after = fs::metadata(&outside)?;
+        assert_eq!(outside_after.uid(), outside_before.uid());
+        assert_eq!(outside_after.gid(), outside_before.gid());
+        assert!(fs::symlink_metadata(&link)?.file_type().is_symlink());
         Ok(())
     }
 

@@ -346,3 +346,22 @@ fn stable_code_maps_transport_tokens() {
         error_codes::PRIVILEGE_REQUIRED
     );
 }
+
+#[test]
+fn stable_code_preserves_target_install_failures() {
+    for code in [
+        crate::target::ARTIFACT_UNVERIFIED,
+        crate::target::CONFIG_PATH_OCCUPIED,
+        crate::target::CONFIG_INVALID,
+        crate::target::SECRET_PROVISION_FAILED,
+        crate::target::RUNTIME_START_FAILED,
+        crate::target::HEALTH_PROBE_FAILED,
+        crate::target::INSTALL_FAILED,
+        crate::target::INSTALL_OUTCOME_UNKNOWN,
+    ] {
+        assert_eq!(
+            stable_code(&format!("install failed: {code}: detail")),
+            code
+        );
+    }
+}

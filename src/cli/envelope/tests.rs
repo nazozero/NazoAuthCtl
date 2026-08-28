@@ -100,6 +100,12 @@ fn side_effect_hints_distinguish_conflict_from_precondition() {
         .find(|line| line.starts_with("side_effects:"))
         .expect("side_effects line");
     assert!(side_effects.contains("none"), "{precondition}");
+
+    let incomplete_install = render(crate::target::INSTALL_OUTCOME_UNKNOWN, false);
+    assert!(
+        incomplete_install.contains("possible from an earlier attempt"),
+        "{incomplete_install}"
+    );
 }
 
 #[test]
@@ -125,4 +131,25 @@ fn unknown_failures_fall_back_to_a_conservative_code() {
             .any(|line| line.contains(crate::error_codes::HOST_UNREACHABLE)),
         "{rendered}"
     );
+}
+
+#[test]
+fn target_install_failure_keeps_remote_code_and_does_not_suggest_host_check() {
+    let detail = "install failed on the target and was rolled back locally: SECRET_PROVISION_FAILED: imported MFA key is not base64url";
+    let error = anyhow::anyhow!(detail);
+    let rendered = render_failure(
+        "install",
+        &EnvelopeContext {
+            host: Some("hostinger".to_owned()),
+            instance: Some("production".to_owned()),
+        },
+        &error,
+        true,
+    );
+    let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+    assert_eq!(value["code"], crate::target::SECRET_PROVISION_FAILED);
+    assert_eq!(value["detail"], detail);
+    assert_eq!(value["side_effects"], "none");
+    assert_eq!(value["next_command"], serde_json::Value::Null);
 }

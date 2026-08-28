@@ -664,7 +664,7 @@ pub(crate) fn run_backup_view(
 /// Stable-code classifier shared with the error envelope: scan the rendered
 /// error chain for known stable tokens.
 pub(crate) fn stable_code(rendered: &str) -> String {
-    const ORDERED: [(&str, &str); 14] = [
+    const ORDERED: [(&str, &str); 22] = [
         (
             error_codes::REMOTE_HELPER_MISMATCH,
             error_codes::REMOTE_HELPER_MISMATCH,
@@ -717,6 +717,35 @@ pub(crate) fn stable_code(rendered: &str) -> String {
         (
             error_codes::TARGET_IDENTITY_MISMATCH,
             error_codes::TARGET_IDENTITY_MISMATCH,
+        ),
+        // Target-side clean-install failures are already stable wire codes.
+        // Preserve them at the CLI boundary instead of treating a valid
+        // remote answer as an SSH transport failure.
+        (
+            crate::target::ARTIFACT_UNVERIFIED,
+            crate::target::ARTIFACT_UNVERIFIED,
+        ),
+        (
+            crate::target::CONFIG_PATH_OCCUPIED,
+            crate::target::CONFIG_PATH_OCCUPIED,
+        ),
+        (crate::target::CONFIG_INVALID, crate::target::CONFIG_INVALID),
+        (
+            crate::target::SECRET_PROVISION_FAILED,
+            crate::target::SECRET_PROVISION_FAILED,
+        ),
+        (
+            crate::target::RUNTIME_START_FAILED,
+            crate::target::RUNTIME_START_FAILED,
+        ),
+        (
+            crate::target::HEALTH_PROBE_FAILED,
+            crate::target::HEALTH_PROBE_FAILED,
+        ),
+        (crate::target::INSTALL_FAILED, crate::target::INSTALL_FAILED),
+        (
+            crate::target::INSTALL_OUTCOME_UNKNOWN,
+            crate::target::INSTALL_OUTCOME_UNKNOWN,
         ),
     ];
     for (token, code) in ORDERED {
