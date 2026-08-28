@@ -1156,16 +1156,19 @@ fn start_container_runtime(
     run_schema_migration(job, backend.as_ref(), &runtime_artifact)?;
 
     let observation = backend.inspect(&job.runtime.object);
-    if observation
-        .as_ref()
-        .is_ok_and(|observed| observed.running && observed.artifact == runtime_artifact)
-    {
-        // Resume: the exact verified runtime is already up.
-        performed.installed_runtime = true;
-        performed.started_runtime = true;
-        return Ok(());
-    }
     if let Ok(observed) = &observation {
+        if super::update_exec::observation_digest(observed).as_deref()
+            == Some(verified.digest.as_str())
+        {
+            performed.installed_runtime = true;
+            if !observed.running {
+                backend.start(&job.runtime.object).map_err(|error| {
+                    Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string()))
+                })?;
+            }
+            performed.started_runtime = true;
+            return Ok(());
+        }
         // An object under our name that is NOT the verified artifact is a
         // conflict, never a silent replacement target.
         return Err(Failure::new(
@@ -1277,14 +1280,16 @@ fn start_container_runtime(
     let observed = backend
         .inspect(&job.runtime.object)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
-    let expected = runtime_artifact;
-    if !observed.running || observed.artifact != expected {
+    if !observed.running
+        || super::update_exec::observation_digest(&observed).as_deref()
+            != Some(verified.digest.as_str())
+    {
         return Err(Failure::new(
             TARGET_IDENTITY_MISMATCH,
             sanitize(format!(
-                "the started runtime does not serve the verified artifact \
-                 (running={}, observed_artifact={:?}, expected_artifact={:?})",
-                observed.running, observed.artifact, expected
+                "the started runtime does not serve the verified artifact digest \
+                 (running={}, observed_artifact={:?})",
+                observed.running, observed.artifact
             )),
         ));
     }

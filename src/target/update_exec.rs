@@ -943,7 +943,9 @@ fn live_observation(
 }
 
 /// The digest half of an Oci observation reference (`sha256:` stripped).
-fn observation_digest(observation: &runtime_backend::RuntimeObservation) -> Option<String> {
+pub(crate) fn observation_digest(
+    observation: &runtime_backend::RuntimeObservation,
+) -> Option<String> {
     match &observation.artifact {
         runtime_backend::ArtifactReference::Oci { digest, .. } => {
             Some(digest.trim_start_matches("sha256:").to_owned())
