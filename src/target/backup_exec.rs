@@ -1616,7 +1616,7 @@ fn run_pg_dump(database_url_file: &Path, output: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 fn create_database(connection: &PostgresConnection, database: &str) -> anyhow::Result<()> {
-    run_postgres_command("createdb", &connection.maintenance(), [database])?;
+    run_postgres_util("createdb", &connection.maintenance(), [database])?;
     Ok(())
 }
 fn restore_database(
@@ -1637,7 +1637,7 @@ fn restore_database(
     Ok(())
 }
 fn drop_database(connection: &PostgresConnection, database: &str) -> anyhow::Result<()> {
-    run_postgres_command(
+    run_postgres_util(
         "dropdb",
         &connection.maintenance(),
         ["--if-exists", database],
@@ -1703,6 +1703,36 @@ fn run_postgres_command<'a>(
         .env("PGPASSWORD", &connection.password)
         .output()
         .with_context(|| format!("failed to start {program}"))?;
+    ensure_postgres_output(program, output)
+}
+
+/// `createdb` and `dropdb` take the database name positionally and have no
+/// `--dbname` connection flag; they receive the connection as flags instead.
+fn run_postgres_util<'a>(
+    program: &str,
+    connection: &PostgresConnection,
+    extra: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<Output> {
+    let url = &connection.url_without_password;
+    let host = url.host_str().context("database URL has no host")?;
+    let port = url.port().unwrap_or(5432);
+    let user = url.username();
+    ensure!(!user.is_empty(), "database URL has no user");
+    let output = Command::new(program)
+        .arg("--host")
+        .arg(host)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--username")
+        .arg(user)
+        .args(extra)
+        .env("PGPASSWORD", &connection.password)
+        .output()
+        .with_context(|| format!("failed to start {program}"))?;
+    ensure_postgres_output(program, output)
+}
+
+fn ensure_postgres_output(program: &str, output: std::process::Output) -> anyhow::Result<Output> {
     if !output.status.success() {
         bail!(
             "{program} failed with {}: {}",
