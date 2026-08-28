@@ -78,7 +78,6 @@ impl InitialAdminTransport for CurlInitialAdminTransport {
             .args([
                 "--silent",
                 "--show-error",
-                "--fail-with-body",
                 "--proto",
                 protocol,
                 "--connect-timeout",
@@ -754,6 +753,35 @@ mod tests {
         );
         assert!(initial_admin_endpoint("ftp://x").is_err());
         assert!(initial_admin_endpoint("https://u:p@example.com").is_err());
+    }
+
+    #[test]
+    fn curl_transport_returns_http_rejections_to_the_protocol_layer() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let body = br#"{"error":"bootstrap_closed"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 410 Gone\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+
+        let endpoint = Url::parse(&format!("http://{address}/auth/bootstrap-admin")).unwrap();
+        let (status, body) = CurlInitialAdminTransport
+            .post_initial_admin(&endpoint, br#"{}"#)
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(status, 410);
+        assert_eq!(body, br#"{"error":"bootstrap_closed"}"#);
     }
 
     #[test]
