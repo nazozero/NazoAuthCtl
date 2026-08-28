@@ -107,10 +107,16 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
 
     let signed_current_server = workflow.split_once("\n  signed-current-server:").unwrap().1;
     assert!(!signed_current_server.contains("\n    env:\n      GH_TOKEN:"));
+    assert!(!signed_current_server.contains("packages: read"));
+    assert!(
+        signed_current_server
+            .contains("docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e")
+    );
 
     for step in [
         "Execute the exact controller artifact through its production protocol path",
         "Verify the protocol-2 host identity",
+        "Verify the signed OCI identity at its immutable digest",
         "Execute VerifiedRelease current production verification",
     ] {
         let marker = format!("- name: {step}");
@@ -122,17 +128,6 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
                 .contains("GH_TOKEN")
         );
     }
-
-    let oci_verification = workflow
-        .split_once("- name: Verify the signed OCI identity at its immutable digest")
-        .unwrap()
-        .1
-        .split_once("\n      - name:")
-        .unwrap()
-        .0;
-    assert!(oci_verification.contains("GH_TOKEN: ${{ github.token }}"));
-    assert!(oci_verification.contains("docker login ghcr.io"));
-    assert!(oci_verification.contains("docker logout ghcr.io"));
 }
 
 #[test]
