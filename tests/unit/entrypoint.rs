@@ -133,7 +133,7 @@ fn release_compatibility_gate_pins_the_current_protocol_two_server() {
         .unwrap()
         .0;
     assert!(gate.contains("controller_ref: ${{ github.sha }}"));
-    assert!(gate.contains("server_release: v0.2.2"));
+    assert!(gate.contains("server_release: v0.2.3"));
     assert!(!gate.contains("previous"));
 }
 

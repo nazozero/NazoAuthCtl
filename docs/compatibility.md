@@ -8,7 +8,7 @@ range fail closed.
 
 The release gate builds the exact NazoAuthCtl tag commit once and validates it
 against the explicitly selected supported NazoAuth Release. For the v0.2.0
-controller release, that server release is v0.2.2. The gate downloads the signed
+controller release, that server release is v0.2.3. The gate downloads the signed
 host binary and OCI image without rebuilding the server, verifies their GitHub
 provenance and Sigstore identity, resolves the OCI tag to an immutable digest,
 executes that immutable OCI artifact, and requires identical protocol-2 build
@@ -23,4 +23,4 @@ verified current-format snapshot through the current controller.
 
 Both manual dispatch and reusable invocation require an exact controller commit
 and an explicit server release tag. The controller release workflow pins the
-server input to v0.2.2, and its publish jobs depend on this exact-commit gate.
+server input to v0.2.3, and its publish jobs depend on this exact-commit gate.
