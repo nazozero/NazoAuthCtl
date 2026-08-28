@@ -171,9 +171,13 @@ jobs:
       - name: Verify the signed OCI identity at its immutable digest
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           SERVER_RELEASE: ${{ inputs.server_release }}
         run: |
           set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io \
+            --username "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
           repository=ghcr.io/nazozero/nazoauth
           tagged_image="$repository:$SERVER_RELEASE"
           index_digest="$(docker buildx imagetools inspect "$tagged_image" | awk '$1 == "Digest:" { print $2; exit }')"
