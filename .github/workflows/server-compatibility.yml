@@ -112,7 +112,7 @@ jobs:
 
           lock_line="$(grep -A4 '^name = "nazo-operator-protocol"$' Cargo.lock | grep '^source = ' || true)"
           test -n "$lock_line"
-          protocol_rev="$(sed -n 's#.*git+https://github.com/nazozero/NazoAuth?rev=\([0-9a-f]\{40\}\).*#\1#p' <<<"$lock_line")"
+          protocol_rev="$(sed -n 's#.*git+https://github.com/nazozero/NazoAuth\.git?rev=\([0-9a-f]\{40\}\).*#\1#p' <<<"$lock_line")"
           [[ "$protocol_rev" =~ ^[0-9a-f]{40}$ ]]
           test "$protocol_rev" = "$ref_sha"
 
@@ -160,7 +160,6 @@ jobs:
         shell: bash
         env:
           SERVER_RELEASE: ${{ inputs.server_release }}
-          SERVER_PEELED_COMMIT: ${{ env.SERVER_PEELED_COMMIT }}
         run: |
           set -euo pipefail
           server=signed-server/nazoauth-x86_64-unknown-linux-gnu
@@ -173,7 +172,6 @@ jobs:
         shell: bash
         env:
           SERVER_RELEASE: ${{ inputs.server_release }}
-          SERVER_PEELED_COMMIT: ${{ env.SERVER_PEELED_COMMIT }}
         run: |
           set -euo pipefail
           repository=ghcr.io/nazozero/nazoauth
@@ -203,12 +201,12 @@ jobs:
         env:
           NAZOAUTHCTL_COMPAT_VERIFY_RELEASE: '1'
           EXPECTED_SERVER_RELEASE: ${{ inputs.server_release }}
-          EXPECTED_SERVER_PEELED_COMMIT: ${{ env.SERVER_PEELED_COMMIT }}
-          EXPECTED_OPERATOR_PROTOCOL_REV: ${{ env.OPERATOR_PROTOCOL_REV }}
-          EXPECTED_OCI_INDEX_DIGEST: ${{ env.SERVER_OCI_INDEX_DIGEST }}
-          EXPECTED_OCI_PLATFORM_DIGEST: ${{ env.SERVER_OCI_PLATFORM_DIGEST }}
         run: |
           set -euo pipefail
+          export EXPECTED_SERVER_PEELED_COMMIT="$SERVER_PEELED_COMMIT"
+          export EXPECTED_OPERATOR_PROTOCOL_REV="$OPERATOR_PROTOCOL_REV"
+          export EXPECTED_OCI_INDEX_DIGEST="$SERVER_OCI_INDEX_DIGEST"
+          export EXPECTED_OCI_PLATFORM_DIGEST="$SERVER_OCI_PLATFORM_DIGEST"
           # This selected test calls VerifiedRelease::verify directly; the
           # identity assertions below bind that verified manifest to the
           # independently attested host and Cosign-verified OCI artifacts.
