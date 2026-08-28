@@ -1569,7 +1569,7 @@ fn verify_runtime_identity(
     build: &BuildIdentity,
 ) -> anyhow::Result<String> {
     let identity_dir = data.join("instance");
-    let public_bytes = crate::filesystem::read_secure_regular_file(
+    let public_bytes = super::read_runtime_owned_file(
         &identity_dir.join("identity.pub"),
         "runtime instance public key",
         false,
@@ -1578,7 +1578,7 @@ fn verify_runtime_identity(
     let encoded = std::str::from_utf8(public_bytes.trim_ascii())?;
     let public_key = nazo_operator_protocol::decode_instance_public_key(encoded)?;
     let key_id = nazo_operator_protocol::instance_key_id(&public_key);
-    let statement_bytes = crate::filesystem::read_secure_regular_file(
+    let statement_bytes = super::read_runtime_owned_file(
         &identity_dir.join("deployment-statement.jws"),
         "runtime deployment statement",
         false,
