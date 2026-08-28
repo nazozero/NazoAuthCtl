@@ -155,38 +155,16 @@ impl Process {
     }
 
     pub fn stdin_stdout(&self, input: &[u8]) -> anyhow::Result<String> {
-        let (status, stdout) = self.stdin_stdout_with_status(input)?;
-        if !status.success() {
-            bail!("{} failed with status {status}", self.display_name());
+        let output = self.stdin_output(input)?;
+        if !output.status.success() {
+            bail!(
+                "{} failed with status {}",
+                self.display_name(),
+                output.status
+            );
         }
-        Ok(stdout)
-    }
-
-    /// Captures UTF-8 stdout together with the child status.
-    ///
-    /// Most callers must use [`Self::stdin_stdout`] so a failed executable is
-    /// rejected before its output is consumed.  A small number of protocol
-    /// transports deliberately authenticate their stdout independently (for
-    /// example an idempotent runtime task receipt).  Those callers need the
-    /// status for diagnostics, but must not discard an already durable,
-    /// cryptographically verifiable response merely because the container
-    /// engine reports a later non-zero cleanup status.
-    pub fn stdin_stdout_with_status(
-        &self,
-        input: &[u8],
-    ) -> anyhow::Result<(std::process::ExitStatus, String)> {
-        let mut command = self.command();
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = command
-            .spawn()
-            .with_context(|| format!("failed to execute {}", self.display_name()))?;
-        let output = self.collect_output(child, Some(input))?;
-        let stdout = String::from_utf8(output.stdout)
-            .with_context(|| format!("{} produced non-UTF-8 output", self.display_name()))?;
-        Ok((output.status, stdout))
+        String::from_utf8(output.stdout)
+            .with_context(|| format!("{} produced non-UTF-8 output", self.display_name()))
     }
 
     /// Feeds `input` on stdin and captures the complete bounded output,
@@ -495,25 +473,21 @@ mod process_tests {
 
     #[cfg(unix)]
     #[test]
-    fn captures_stdout_when_the_child_exits_nonzero() {
-        let (status, stdout) = Process::new("/bin/sh")
-            .args(["-c", "printf durable-receipt; exit 3"])
-            .stdin_stdout_with_status(b"")
-            .expect("the process output is still captured");
-
-        assert!(!status.success());
-        assert_eq!(stdout.trim_end(), "durable-receipt");
+    fn stdin_stdout_rejects_nonzero_exit_even_when_stdout_exists() {
+        let error = Process::new("/bin/sh")
+            .args(["-c", "printf ignored-output; exit 3"])
+            .stdin_stdout(b"")
+            .expect_err("nonzero one-shot exit must fail");
+        assert!(error.to_string().contains("status"));
     }
 
     #[cfg(windows)]
     #[test]
-    fn captures_stdout_when_the_child_exits_nonzero() {
-        let (status, stdout) = Process::new("cmd")
-            .args(["/C", "<nul set /p =durable-receipt & exit /b 3"])
-            .stdin_stdout_with_status(b"")
-            .expect("the process output is still captured");
-
-        assert!(!status.success());
-        assert_eq!(stdout.trim_end(), "durable-receipt");
+    fn stdin_stdout_rejects_nonzero_exit_even_when_stdout_exists() {
+        let error = Process::new("cmd")
+            .args(["/C", "<nul set /p =ignored-output & exit /b 3"])
+            .stdin_stdout(b"")
+            .expect_err("nonzero one-shot exit must fail");
+        assert!(error.to_string().contains("status"));
     }
 }

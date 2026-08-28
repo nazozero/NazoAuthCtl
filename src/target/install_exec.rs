@@ -1497,7 +1497,7 @@ fn run_schema_migration(
     let task = runtime_backend::OneShotTask {
         artifact: artifact.clone(),
         command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
-        network: None,
+        network: Some("bridge".to_owned()),
         mounts: vec![
             mount(
                 PathBuf::from(job.config_reference),
