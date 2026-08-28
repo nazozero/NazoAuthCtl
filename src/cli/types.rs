@@ -48,6 +48,10 @@ pub(crate) struct Cli {
 /// this library parser runs, so it has no variant here. `RemoteExec`,
 /// `SelfCheck`, `SelfUpdate`, `SelfRollback`, and `BootstrapAdmin` are part
 /// of the final model's own machinery, not legacy surface.
+// Install carries the complete one-shot external dependency fact set. Command
+// values are parsed once and immediately consumed; boxing this sole large
+// variant would add allocation and indirection without reducing retained state.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum Command {
     /// Fleet host registry (add/list/show/check/forget).
@@ -98,6 +102,12 @@ pub(crate) enum Command {
     },
     /// Backup maturity facts observed from the deployment (H05).
     Backup(BackupArgs),
+    /// Configure the one explicit backup-before-update gate for one instance.
+    Policy(PolicyArgs),
+    /// Restore is intentionally separate from rollback.  The current surface
+    /// only permits a recorded recovery transaction once server-side token
+    /// invalidation authority is available.
+    Recover(RecoverArgs),
     /// Exact deletion of managed + deployment-scoped resources (G06).
     Uninstall {
         selector: InstanceSelector,
@@ -291,17 +301,22 @@ pub(crate) struct InstallArgs {
     pub(crate) public_url: String,
     pub(crate) version: Option<String>,
     pub(crate) artifact_sha256: Option<String>,
-    pub(crate) runtime: Option<String>,
+    pub(crate) runtime: Option<crate::runtime_backend::RuntimeBackendKind>,
     pub(crate) install_root: Option<PathBuf>,
     pub(crate) database_host: String,
     pub(crate) database_port: u16,
     pub(crate) database_name: String,
-    pub(crate) database_user: String,
-    /// P0-1: the ALREADY-KNOWN external password (file-read, never argv).
-    pub(crate) database_password_file: PathBuf,
+    pub(crate) database_runtime_user: String,
+    pub(crate) database_runtime_password_file: PathBuf,
+    pub(crate) database_lifecycle_user: String,
+    pub(crate) database_lifecycle_password_file: PathBuf,
     pub(crate) valkey_host: String,
     pub(crate) valkey_port: u16,
     pub(crate) valkey_password_file: PathBuf,
+    /// Optional target-local current-format material. These paths are sent as
+    /// path facts only; no imported bytes cross the control transport.
+    pub(crate) import_data_root: Option<PathBuf>,
+    pub(crate) import_mfa_key_file: Option<PathBuf>,
 }
 
 /// Update arguments (G03); maps onto
@@ -320,6 +335,31 @@ pub(crate) struct UpdateArgs {
 #[derive(Debug)]
 pub(crate) struct BackupArgs {
     pub(crate) selector: InstanceSelector,
+    pub(crate) command: BackupCommand,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BackupCommand {
+    Show,
+    Snapshot,
+    RestoreTest,
+    Copy { to_host: String },
+}
+
+#[derive(Debug)]
+pub(crate) struct PolicyArgs {
+    pub(crate) selector: InstanceSelector,
+    pub(crate) mode: crate::registry::BackupBeforeUpdatePolicy,
+}
+
+#[derive(Debug)]
+pub(crate) struct RecoverArgs {
+    pub(crate) selector: InstanceSelector,
+    pub(crate) yes: bool,
+    /// Optional owner-only file containing the offline Recovery Secret.  It
+    /// is read only if the restored registry rejects the current controller
+    /// identity; the value is never an argv token or target payload.
+    pub(crate) recovery_secret_file: Option<std::path::PathBuf>,
 }
 
 /// Bootstrap claim arguments (G02).

@@ -42,12 +42,12 @@ jobs:
           touch "$work/existing"
           ln -s "$work/existing" "$work/controller"
           if sudo sh scripts/install_nazoauthctl.sh \
-            --version v0.1.20.invalid --install-path "$work/plain"; then
+            --version v0.2.0.invalid --install-path "$work/plain"; then
             echo "installer accepted a non-release version" >&2
             exit 1
           fi
           if sudo sh scripts/install_nazoauthctl.sh \
-            --version v0.1.20 --install-path "$work/controller"; then
+            --version v0.2.0 --install-path "$work/controller"; then
             echo "installer accepted a symlink target" >&2
             exit 1
           fi

@@ -20,12 +20,11 @@ pub(crate) struct ReleaseManifest {
     pub(crate) backend_commit: String,
     pub(crate) release_identity: String,
     pub(crate) embedded: nazo_operator_protocol::EmbeddedIdentity,
-    #[serde(default)]
-    pub(crate) operator_protocol: Option<OperatorProtocolCompatibility>,
+    pub(crate) operator_protocol: OperatorProtocolCompatibility,
     pub(crate) artifacts: BTreeMap<String, Artifact>,
     pub(crate) frontend: FrontendRelease,
     pub(crate) oci: OciRelease,
-    pub(crate) rollback: Rollback,
+    pub(crate) rollback: ReleaseRollbackPolicy,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -65,28 +64,67 @@ pub(crate) struct OciRelease {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Rollback {
-    pub(crate) artifact: bool,
-    pub(crate) schema_compatible: bool,
-    pub(crate) database_restore: DatabaseRestore,
-    pub(crate) irreversible_migration: bool,
-    pub(crate) minimum_supported_version: String,
-    pub(crate) migration_floor: String,
-    pub(crate) rationale: String,
+pub struct ReleaseRollbackPolicy {
+    pub artifact: bool,
+    pub schema_compatible: bool,
+    pub database_restore: DatabaseRestore,
+    pub irreversible_migration: bool,
+    pub minimum_supported_version: String,
+    pub migration_floor: String,
+    pub rationale: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum DatabaseRestore {
+pub enum DatabaseRestore {
     Backup,
     Pitr,
     None,
 }
 
+impl ReleaseRollbackPolicy {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.rationale.trim().is_empty()
+            || !semantic_tag(&format!("v{}", self.minimum_supported_version))
+            || self.migration_floor.is_empty()
+            || !self
+                .migration_floor
+                .chars()
+                .all(|character| character.is_ascii_digit())
+        {
+            bail!("signed release manifest has invalid recovery policy");
+        }
+        if self.irreversible_migration && self.schema_compatible {
+            bail!("irreversible migrations cannot claim schema-compatible rollback");
+        }
+        if self.schema_compatible && !self.artifact {
+            bail!("schema-compatible rollback requires a retained artifact");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn artifact_rollback_allowed_after_migration(&self) -> bool {
+        self.artifact && self.schema_compatible && !self.irreversible_migration
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_release_rollback_policy() -> ReleaseRollbackPolicy {
+    ReleaseRollbackPolicy {
+        artifact: true,
+        schema_compatible: true,
+        database_restore: DatabaseRestore::Backup,
+        irreversible_migration: false,
+        minimum_supported_version: "0.2.0".to_owned(),
+        migration_floor: "20260828000600".to_owned(),
+        rationale: "test release permits schema-compatible artifact rollback".to_owned(),
+    }
+}
+
 impl ReleaseManifest {
     pub(crate) fn validate(&self, version: &str, expected_identity: &str) -> anyhow::Result<()> {
         let target = release_target().context("this platform has no official Release target")?;
-        if !matches!(self.schema, 4 | 5)
+        if self.schema != 5
             || self.version != version
             || self.target != target
             || self.release_identity != expected_identity
@@ -98,32 +136,11 @@ impl ReleaseManifest {
         {
             bail!("signed release manifest failed policy validation");
         }
-        match (self.schema, &self.operator_protocol) {
-            (4, None) => {}
-            (5, Some(protocol)) if protocol.version == self.embedded.protocol => {}
-            _ => bail!("signed release manifest has an invalid operator protocol contract"),
+        if self.operator_protocol.version != self.embedded.protocol {
+            bail!("signed release manifest has an invalid operator protocol contract");
         }
-        if self.rollback.rationale.trim().is_empty()
-            || !semantic_tag(&format!("v{}", self.rollback.minimum_supported_version))
-            || !self
-                .rollback
-                .migration_floor
-                .chars()
-                .all(|character| character.is_ascii_digit())
-        {
-            bail!("signed release manifest has invalid recovery policy");
-        }
-        if self.rollback.irreversible_migration && self.rollback.schema_compatible {
-            bail!("irreversible migrations cannot claim schema-compatible rollback");
-        }
-        if self.rollback.schema_compatible && !self.rollback.artifact {
-            bail!("schema-compatible rollback requires a retained artifact");
-        }
-        let expected = if self.schema == 4 {
-            BTreeSet::from(["binary".to_owned(), "updater".to_owned()])
-        } else {
-            BTreeSet::from(["binary".to_owned()])
-        };
+        self.rollback.validate()?;
+        let expected = BTreeSet::from(["binary".to_owned()]);
         if self.artifacts.keys().cloned().collect::<BTreeSet<_>>() != expected {
             bail!("signed release manifest has an unexpected artifact set");
         }
@@ -131,12 +148,6 @@ impl ReleaseManifest {
         let expected_binary = format!("nazoauth-{}{executable_suffix}", self.target);
         if self.artifacts["binary"].name != expected_binary {
             bail!("signed release manifest artifact does not match its target");
-        }
-        if self.schema == 4 {
-            let expected_updater = format!("nazoauthctl-{}{executable_suffix}", self.target);
-            if self.artifacts["updater"].name != expected_updater {
-                bail!("signed release manifest artifact does not match its target");
-            }
         }
         for artifact in self.artifacts.values() {
             if artifact.size == 0
@@ -153,18 +164,7 @@ impl ReleaseManifest {
     }
 
     pub(crate) fn validate_controller_compatibility(&self) -> anyhow::Result<()> {
-        if self.schema == 4 {
-            if !matches!(self.version.as_str(), "v0.1.18" | "v0.1.19")
-                || self.embedded.protocol != nazo_operator_protocol::PROTOCOL_VERSION
-            {
-                bail!("legacy server Release is outside the closed extraction baseline");
-            }
-            return Ok(());
-        }
-        let protocol = self
-            .operator_protocol
-            .as_ref()
-            .context("server Release has no operator protocol compatibility contract")?;
+        let protocol = &self.operator_protocol;
         if protocol.version != nazo_operator_protocol::PROTOCOL_VERSION {
             bail!("server Release operator protocol version is unsupported");
         }

@@ -1,21 +1,14 @@
 //! Pure, offline compilation of a verified artifact Matrix into an inspection plan.
 //!
 //! This boundary intentionally does not create an executable deployment run.
-//! A signed executable driver and sandbox, authenticated capability negotiation,
-//! ordinary NazoAuth resource providers, target/Suite origin policy, and a
-//! deployment-bound recovery journal do not exist yet; the plan records those
-//! blockers instead of treating caller-supplied capability names as proof.
-//! Execution-stage code may later supply an authenticated provider
-//! authorization fact through [`authorize_oidf_driver_execution`].  This
-//! module checks that fact's bindings and freshness but does not parse or
-//! reimplement the provider's compact-JWS verifier.
+//! Execution is deliberately outside this offline boundary. Runtime control
+//! authorization is supplied only by the current controller operation API.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
 };
 
-use nazo_operator_protocol::{TenantResourceKind, TenantResourceOperation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -31,53 +24,6 @@ pub struct OidfPlanSelection {
     pub groups: Vec<String>,
     #[serde(default)]
     pub plans: Vec<String>,
-}
-
-/// The deployment/runtime identity and capability facts expected by the
-/// execution stage.  These values come from the authenticated task/capability
-/// exchange; an offline inspection plan must not invent them.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OidfProviderExecutionBinding {
-    pub deployment_id: String,
-    pub tenant_id: String,
-    pub runtime_instance_id: String,
-    pub runtime_build_id: String,
-    pub capability_jti: String,
-    pub capability_sha256: String,
-    /// Capabilities required by the signed driver/runner. These are not
-    /// tenant-resource operations and must remain a separate fact set.
-    pub runner_capabilities: BTreeSet<String>,
-    /// Provider actions authorized for this run; all three closed operations
-    /// are required regardless of runner capability names.
-    pub provider_actions: BTreeSet<TenantResourceOperation>,
-    pub provider_resource_kinds: BTreeSet<TenantResourceKind>,
-    pub current_revision: u64,
-    pub current_manifest_sha256: String,
-    pub artifact_source: String,
-    pub suite_origin: String,
-}
-
-/// A freshness-verified provider authorization fact supplied only at the
-/// execution boundary.  The compact capability itself is intentionally kept
-/// outside this crate; its authenticated digest/JTI and decoded claims are
-/// passed in after the provider verifier has accepted it.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuthenticatedProviderAuthorization {
-    pub deployment_id: String,
-    pub tenant_id: String,
-    pub runtime_instance_id: String,
-    pub runtime_build_id: String,
-    pub capability_jti: String,
-    pub capability_sha256: String,
-    pub capability_issued_at: i64,
-    pub capability_expires_at: i64,
-    pub runner_capabilities: BTreeSet<String>,
-    pub provider_actions: BTreeSet<TenantResourceOperation>,
-    pub provider_resource_kinds: BTreeSet<TenantResourceKind>,
-    pub current_revision: u64,
-    pub current_manifest_sha256: String,
-    pub artifact_source: String,
-    pub suite_origin: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -127,10 +73,6 @@ pub struct OidfDriverInspectionPlan {
     pub latest_execution_start_at: i64,
     pub runner: OidfBoundedRunnerContract,
     pub plans: Vec<OidfDriverPlanEntry>,
-    pub deployment_bound: bool,
-    pub capabilities_attested: bool,
-    pub execution_permitted: bool,
-    pub execution_blockers: Vec<&'static str>,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -151,23 +93,7 @@ pub enum OidfPlanError {
     ResourceBound,
     #[error("artifact validity cannot contain the selected resource budget")]
     ArtifactValidity,
-    #[error("execution authorization is missing, stale, or not bound to the plan")]
-    ExecutionAuthorization,
 }
-
-const CAPABILITY_MAX_LIFETIME_SECONDS: i64 = 60;
-const REQUIRED_PROVIDER_ACTIONS: [TenantResourceOperation; 3] = [
-    TenantResourceOperation::Apply,
-    TenantResourceOperation::Enumerate,
-    TenantResourceOperation::Revoke,
-];
-const REQUIRED_PROVIDER_RESOURCE_KINDS: [TenantResourceKind; 5] = [
-    TenantResourceKind::OauthClient,
-    TenantResourceKind::MtlsTrustAnchor,
-    TenantResourceKind::Openid4vcDataset,
-    TenantResourceKind::Openid4vcTrustPolicy,
-    TenantResourceKind::User,
-];
 
 pub(crate) fn compile_oidf_driver_inspection_plan(
     cached: CachedOidfArtifact,
@@ -324,185 +250,7 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
             finally_cleanup_required: true,
         },
         plans: entries,
-        deployment_bound: false,
-        capabilities_attested: false,
-        execution_permitted: false,
-        execution_blockers: vec![
-            "authenticated-capability-negotiation",
-            "ordinary-resource-provider",
-            "target-and-suite-origin-policy",
-            "deployment-bound-crash-safe-execution-journal",
-        ],
     })
-}
-
-/// Apply an authenticated provider authorization to an inspection plan.
-///
-/// Offline compilation intentionally leaves execution disabled.  This helper
-/// is the only transition that can set `execution_permitted`; it validates
-/// every identity, capability, action/kind, revision/manifest, and
-/// artifact/Suite origin binding before mutating the plan.  A failed check
-/// leaves the plan in its offline, non-executable state.
-pub fn authorize_oidf_driver_execution(
-    plan: &mut OidfDriverInspectionPlan,
-    binding: &OidfProviderExecutionBinding,
-    authorization: &AuthenticatedProviderAuthorization,
-    now: i64,
-) -> Result<(), OidfPlanError> {
-    if plan.deployment_bound || plan.capabilities_attested || plan.execution_permitted {
-        return Err(OidfPlanError::ExecutionAuthorization);
-    }
-    validate_provider_execution_binding(plan, binding)?;
-    validate_authenticated_provider_authorization(binding, authorization, now)?;
-    plan.deployment_bound = true;
-    plan.capabilities_attested = true;
-    plan.execution_permitted = true;
-    plan.execution_blockers.clear();
-    Ok(())
-}
-
-fn validate_provider_execution_binding(
-    plan: &OidfDriverInspectionPlan,
-    binding: &OidfProviderExecutionBinding,
-) -> Result<(), OidfPlanError> {
-    for identity in [
-        &binding.deployment_id,
-        &binding.tenant_id,
-        &binding.runtime_instance_id,
-        &binding.runtime_build_id,
-        &binding.capability_jti,
-    ] {
-        if crate::artifact::validate_identifier(identity, 256).is_err() {
-            return Err(OidfPlanError::ExecutionAuthorization);
-        }
-    }
-    if !is_lower_hex_sha256(&binding.capability_sha256)
-        || !is_lower_hex_sha256(&binding.current_manifest_sha256)
-        || binding.artifact_source != plan.artifact.source
-        || !artifact_source_covers_manifest(&binding.artifact_source, &plan.manifest_url)
-        || !is_suite_origin(&binding.suite_origin)
-        || binding.suite_origin != plan.artifact.suite.origin
-    {
-        return Err(OidfPlanError::ExecutionAuthorization);
-    }
-    validate_runner_capabilities(&binding.runner_capabilities)?;
-    validate_provider_actions(&binding.provider_actions)?;
-    validate_provider_resource_kinds(&binding.provider_resource_kinds)?;
-    let mut runner_capabilities = BTreeSet::new();
-    runner_capabilities.extend(plan.artifact.required_capabilities.iter().cloned());
-    for entry in &plan.plans {
-        runner_capabilities.extend(entry.required_capabilities.iter().cloned());
-    }
-    if binding.runner_capabilities != runner_capabilities {
-        return Err(OidfPlanError::ExecutionAuthorization);
-    }
-    Ok(())
-}
-
-fn validate_authenticated_provider_authorization(
-    binding: &OidfProviderExecutionBinding,
-    authorization: &AuthenticatedProviderAuthorization,
-    now: i64,
-) -> Result<(), OidfPlanError> {
-    if authorization.deployment_id != binding.deployment_id
-        || authorization.tenant_id != binding.tenant_id
-        || authorization.runtime_instance_id != binding.runtime_instance_id
-        || authorization.runtime_build_id != binding.runtime_build_id
-        || authorization.capability_jti != binding.capability_jti
-        || authorization.capability_sha256 != binding.capability_sha256
-        || authorization.current_revision != binding.current_revision
-        || authorization.current_manifest_sha256 != binding.current_manifest_sha256
-        || authorization.artifact_source != binding.artifact_source
-        || authorization.suite_origin != binding.suite_origin
-        || authorization.runner_capabilities != binding.runner_capabilities
-        || authorization.provider_actions != binding.provider_actions
-        || authorization.provider_resource_kinds != binding.provider_resource_kinds
-    {
-        return Err(OidfPlanError::ExecutionAuthorization);
-    }
-    if !is_lower_hex_sha256(&authorization.capability_sha256)
-        || !is_lower_hex_sha256(&authorization.current_manifest_sha256)
-        || !is_suite_origin(&authorization.suite_origin)
-        || authorization.capability_issued_at <= 0
-        || authorization.capability_expires_at <= authorization.capability_issued_at
-        || authorization
-            .capability_expires_at
-            .checked_sub(authorization.capability_issued_at)
-            .is_none_or(|lifetime| lifetime > CAPABILITY_MAX_LIFETIME_SECONDS)
-        || now < authorization.capability_issued_at
-        || now >= authorization.capability_expires_at
-    {
-        return Err(OidfPlanError::ExecutionAuthorization);
-    }
-    validate_runner_capabilities(&authorization.runner_capabilities)?;
-    validate_provider_actions(&authorization.provider_actions)?;
-    validate_provider_resource_kinds(&authorization.provider_resource_kinds)?;
-    Ok(())
-}
-
-fn validate_runner_capabilities(values: &BTreeSet<String>) -> Result<(), OidfPlanError> {
-    if values.is_empty()
-        || values.len() > 64
-        || values
-            .iter()
-            .any(|value| crate::artifact::validate_identifier(value, 128).is_err())
-    {
-        return Err(OidfPlanError::ExecutionAuthorization);
-    }
-    Ok(())
-}
-
-fn validate_provider_actions(
-    values: &BTreeSet<TenantResourceOperation>,
-) -> Result<(), OidfPlanError> {
-    if values.is_empty()
-        || values.len() > 16
-        || REQUIRED_PROVIDER_ACTIONS
-            .iter()
-            .any(|required| !values.contains(required))
-    {
-        return Err(OidfPlanError::ExecutionAuthorization);
-    }
-    Ok(())
-}
-
-fn validate_provider_resource_kinds(
-    values: &BTreeSet<TenantResourceKind>,
-) -> Result<(), OidfPlanError> {
-    if values.is_empty()
-        || values.len() > 16
-        || REQUIRED_PROVIDER_RESOURCE_KINDS
-            .iter()
-            .any(|required| !values.contains(required))
-    {
-        return Err(OidfPlanError::ExecutionAuthorization);
-    }
-    Ok(())
-}
-
-fn is_lower_hex_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-}
-
-fn is_suite_origin(value: &str) -> bool {
-    crate::origin::Origin::parse_suite(value).is_ok_and(|origin| origin.as_str() == value)
-}
-
-fn artifact_source_covers_manifest(source: &str, manifest: &str) -> bool {
-    let Ok(source) = url::Url::parse(source) else {
-        return false;
-    };
-    let Ok(manifest) = url::Url::parse(manifest) else {
-        return false;
-    };
-    source.scheme() == manifest.scheme()
-        && source.host() == manifest.host()
-        && source.port_or_known_default() == manifest.port_or_known_default()
-        && manifest.path().starts_with(source.path())
-        && manifest.path().len() > source.path().len()
 }
 
 fn selection_set(values: &[String]) -> Result<BTreeSet<String>, OidfPlanError> {
@@ -538,7 +286,7 @@ mod tests {
     };
 
     #[test]
-    fn compiles_exact_selection_without_claiming_execution_readiness() {
+    fn compiles_exact_selection() {
         let matrix = matrix_bytes();
         let plan = compile_oidf_driver_inspection_plan(
             cached(&matrix),
@@ -589,105 +337,6 @@ mod tests {
         assert!(plan.runner.independent_evidence_required);
         assert!(plan.runner.failure_collection_required);
         assert!(plan.runner.finally_cleanup_required);
-        assert!(!plan.deployment_bound);
-        assert!(!plan.capabilities_attested);
-        assert!(!plan.execution_permitted);
-        assert_eq!(plan.execution_blockers.len(), 4);
-    }
-
-    #[test]
-    fn execution_requires_authenticated_provider_authorization_and_exact_bindings() {
-        let matrix = matrix_bytes();
-        let now = 1_800_000_000;
-        let mut plan = compile_oidf_driver_inspection_plan(
-            cached(&matrix),
-            &matrix,
-            &BTreeSet::from(["nazoauth.client.create".to_owned()]),
-            OidfPlanSelection::default(),
-            now,
-        )
-        .expect("inspection plan");
-        let binding = OidfProviderExecutionBinding {
-            deployment_id: "deployment-1".to_owned(),
-            tenant_id: "tenant-1".to_owned(),
-            runtime_instance_id: "runtime-1".to_owned(),
-            runtime_build_id: "build-2026.08".to_owned(),
-            capability_jti: "capability-1".to_owned(),
-            capability_sha256: "a".repeat(64),
-            runner_capabilities: BTreeSet::from(["nazoauth.client.create".to_owned()]),
-            provider_actions: BTreeSet::from([
-                nazo_operator_protocol::TenantResourceOperation::Apply,
-                nazo_operator_protocol::TenantResourceOperation::Enumerate,
-                nazo_operator_protocol::TenantResourceOperation::Revoke,
-            ]),
-            provider_resource_kinds: BTreeSet::from([
-                nazo_operator_protocol::TenantResourceKind::OauthClient,
-                nazo_operator_protocol::TenantResourceKind::MtlsTrustAnchor,
-                nazo_operator_protocol::TenantResourceKind::Openid4vcDataset,
-                nazo_operator_protocol::TenantResourceKind::Openid4vcTrustPolicy,
-                nazo_operator_protocol::TenantResourceKind::User,
-            ]),
-            current_revision: 7,
-            current_manifest_sha256: "b".repeat(64),
-            artifact_source: plan.artifact.source.clone(),
-            suite_origin: "https://suite.example".to_owned(),
-        };
-        let authorization = AuthenticatedProviderAuthorization {
-            deployment_id: binding.deployment_id.clone(),
-            tenant_id: binding.tenant_id.clone(),
-            runtime_instance_id: binding.runtime_instance_id.clone(),
-            runtime_build_id: binding.runtime_build_id.clone(),
-            capability_jti: binding.capability_jti.clone(),
-            capability_sha256: binding.capability_sha256.clone(),
-            capability_issued_at: now - 10,
-            capability_expires_at: now + 50,
-            runner_capabilities: binding.runner_capabilities.clone(),
-            provider_actions: binding.provider_actions.clone(),
-            provider_resource_kinds: binding.provider_resource_kinds.clone(),
-            current_revision: binding.current_revision,
-            current_manifest_sha256: binding.current_manifest_sha256.clone(),
-            artifact_source: binding.artifact_source.clone(),
-            suite_origin: binding.suite_origin.clone(),
-        };
-
-        let mut invalid = authorization.clone();
-        invalid.capability_expires_at = now;
-        assert!(authorize_oidf_driver_execution(&mut plan, &binding, &invalid, now).is_err());
-        assert!(!plan.execution_permitted);
-
-        let mut invalid = authorization.clone();
-        invalid
-            .runner_capabilities
-            .insert("provider.apply".to_owned());
-        assert!(authorize_oidf_driver_execution(&mut plan, &binding, &invalid, now).is_err());
-        let mut invalid = authorization.clone();
-        invalid.current_revision += 1;
-        assert!(authorize_oidf_driver_execution(&mut plan, &binding, &invalid, now).is_err());
-        let mut invalid = binding.clone();
-        invalid.tenant_id.clear();
-        assert!(authorize_oidf_driver_execution(&mut plan, &invalid, &authorization, now).is_err());
-        let mut invalid = binding.clone();
-        invalid.suite_origin = "https://suite.example/path".to_owned();
-        assert!(authorize_oidf_driver_execution(&mut plan, &invalid, &authorization, now).is_err());
-        let mut invalid = binding.clone();
-        invalid.suite_origin = "https://other-suite.example".to_owned();
-        assert!(authorize_oidf_driver_execution(&mut plan, &invalid, &authorization, now).is_err());
-        let mut invalid = binding.clone();
-        invalid.provider_actions =
-            BTreeSet::from([nazo_operator_protocol::TenantResourceOperation::Enumerate]);
-        assert!(authorize_oidf_driver_execution(&mut plan, &invalid, &authorization, now).is_err());
-        let mut invalid = binding.clone();
-        invalid.provider_resource_kinds =
-            BTreeSet::from([nazo_operator_protocol::TenantResourceKind::User]);
-        assert!(authorize_oidf_driver_execution(&mut plan, &invalid, &authorization, now).is_err());
-
-        authorize_oidf_driver_execution(&mut plan, &binding, &authorization, now)
-            .expect("all authenticated authorization facts are bound");
-        assert!(plan.deployment_bound);
-        assert!(plan.capabilities_attested);
-        assert!(plan.execution_permitted);
-        assert!(plan.execution_blockers.is_empty());
-        assert!(authorize_oidf_driver_execution(&mut plan, &binding, &authorization, now).is_err());
     }
 
     #[test]
@@ -713,7 +362,6 @@ mod tests {
                 .len()
                 == plan.plans.len()
         );
-        assert!(!plan.execution_permitted);
     }
 
     #[test]

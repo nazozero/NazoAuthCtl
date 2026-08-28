@@ -31,7 +31,7 @@ mod tests;
 // CLI-surface re-exports (I wave).
 pub(crate) use rollback::run_rollback;
 pub(crate) use uninstall::run_uninstall;
-pub(crate) use update::{UpdateRequest, run_update};
+pub(crate) use update::{UpdateRequest, control_target_for, run_update};
 
 use anyhow::Context as _;
 
@@ -53,6 +53,7 @@ pub(crate) type TargetFactory =
 pub(crate) struct VerifiedTargetArtifact {
     pub digest: String,
     pub identity: crate::target::BuildIdentity,
+    pub rollback_policy: crate::model::ReleaseRollbackPolicy,
 }
 
 pub(crate) trait TargetArtifactResolver: Send + Sync {
@@ -98,7 +99,12 @@ impl TargetArtifactResolver for ProductionTargetArtifactResolver {
             &release.manifest.version,
             &release.manifest.backend_commit,
         )?;
-        Ok(VerifiedTargetArtifact { digest, identity })
+        let rollback_policy = release.rollback_policy();
+        Ok(VerifiedTargetArtifact {
+            digest,
+            identity,
+            rollback_policy,
+        })
     }
 }
 
@@ -125,7 +131,7 @@ impl LifecycleContext {
 /// Resolve the instance selector, reach its host through a verified live
 /// probe, and read the authoritative DeploymentState inspection. Every
 /// lifecycle action starts here so plans are always built from live facts.
-fn resolve_live_instance(
+pub(crate) fn resolve_live_instance(
     context: &LifecycleContext,
     selector: Option<&str>,
     action: &str,
@@ -143,7 +149,7 @@ fn resolve_live_instance(
     let target = context.target_for(&host)?;
     // C08 gate upstream of every mutation kind: no lifecycle action talks to
     // an unverified helper.
-    live_probe(target.as_ref()).with_context(|| {
+    live_probe(target.as_ref(), &host).with_context(|| {
         format!(
             "host '{}' failed its live verification; {} changed nothing",
             host.alias, action

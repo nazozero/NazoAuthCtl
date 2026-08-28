@@ -17,6 +17,7 @@ base64 = "0.23.1"
 ctrlc = "3.5.2"
 nazoauthctl-core = { path = "../.." }
 nazoauthctl-conformance = { path = "../nazoauthctl-conformance" }
+nazo-operator-protocol.workspace = true
 rand = "0.10.1"
 rpassword = "7.4.0"
 serde = { version = "1.0.228", features = ["derive"] }

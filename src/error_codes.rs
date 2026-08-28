@@ -6,14 +6,6 @@
 //! API — and this module only names them once so the error envelope, tests,
 //! and documentation cannot drift apart.
 //!
-//! Historical constant/value renames unified here (I05):
-//!
-//! * `OPERATION_ID_CONFLICT` → [`OPERATION_ID_CONFLICT`]
-//! * `TARGET_IDENTITY_MISMATCH` → [`TARGET_IDENTITY_MISMATCH`]
-//! * `EXTERNAL_RESOURCE_PROTECTED` → [`EXTERNAL_RESOURCE_PROTECTED`]
-//! * `INSTANCE_NOT_REGISTERED` → [`INSTANCE_NOT_REGISTERED`]
-//! * `INSTANCE_AMBIGUOUS` → [`INSTANCE_AMBIGUOUS`]
-
 /// The host alias is not in the control-side Host Registry.
 pub const HOST_NOT_REGISTERED: &str = "HOST_NOT_REGISTERED";
 
@@ -46,7 +38,7 @@ pub const INSTANCE_AMBIGUOUS: &str = "INSTANCE_AMBIGUOUS";
 pub const STATE_RESET_REQUIRED: &str = "STATE_RESET_REQUIRED";
 
 /// An application-level operation requires a controller binding that the
-/// instance does not have yet (`controller bind` first).
+/// instance does not have yet (`bind` first).
 pub const CONTROL_BINDING_REQUIRED: &str = "CONTROL_BINDING_REQUIRED";
 
 /// The instance's controller key is expired; rotation is required before any

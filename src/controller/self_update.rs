@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -29,6 +29,32 @@ pub(super) struct ControllerRollbackState {
     pub(super) version: String,
     pub(super) sha256: String,
     pub(super) artifact: PathBuf,
+}
+
+/// A controller self-update state file has exactly one supported on-disk
+/// schema.  Reading a different or unsafe state must stop before it can
+/// influence an update or rollback; this is deliberately not a migration
+/// boundary.
+trait CurrentSelfState {
+    const SCHEMA: u32;
+
+    fn schema(&self) -> u32;
+}
+
+impl CurrentSelfState for ControllerTrustState {
+    const SCHEMA: u32 = 1;
+
+    fn schema(&self) -> u32 {
+        self.schema
+    }
+}
+
+impl CurrentSelfState for ControllerRollbackState {
+    const SCHEMA: u32 = 1;
+
+    fn schema(&self) -> u32 {
+        self.schema
+    }
 }
 
 const SELF_UPDATE_JOURNAL_SCHEMA: u32 = 2;
@@ -69,6 +95,14 @@ struct SelfUpdateJournal {
     rollback_sha256: String,
     #[serde(default)]
     staged_artifact: Option<PathBuf>,
+}
+
+impl CurrentSelfState for SelfUpdateJournal {
+    const SCHEMA: u32 = SELF_UPDATE_JOURNAL_SCHEMA;
+
+    fn schema(&self) -> u32 {
+        self.schema
+    }
 }
 
 pub(super) fn controller_state_directory() -> anyhow::Result<PathBuf> {
@@ -169,16 +203,15 @@ pub(super) fn controller_rollback() -> anyhow::Result<()> {
     ensure_private_directory(&directory, "controller self-update state")?;
     let _lock = FileLock::acquire(&directory.join(".lock"))?;
     recover_controller_self_operation()?;
-    let state: ControllerRollbackState = read_secure_json(
-        &directory.join("rollback.json"),
-        "controller rollback state",
-        true,
-        SELF_UPDATE_JOURNAL_MAX_BYTES,
-    )
-    .context("controller rollback state is unavailable")?;
-    if state.schema != 1 {
-        bail!("controller rollback state is invalid");
+    let rollback_path = directory.join("rollback.json");
+    if !current_self_state_is_present(&rollback_path, "controller rollback state")? {
+        bail!(
+            "controller rollback state is unavailable: no rollback state at {}",
+            rollback_path.display()
+        );
     }
+    let state: ControllerRollbackState =
+        read_current_self_state(&rollback_path, "controller rollback state")?;
     validate_digest(&state.sha256, "controller rollback state digest")?;
     validate_bound_path(&state.artifact, "controller rollback artifact")?;
     ensure_digest(
@@ -224,19 +257,10 @@ pub(super) fn controller_rollback() -> anyhow::Result<()> {
 
 pub(super) fn controller_trust_state() -> anyhow::Result<Option<ControllerTrustState>> {
     let path = controller_state_directory()?.join("trust.json");
-    if !path_is_present(&path)? {
+    if !current_self_state_is_present(&path, "controller trust state")? {
         return Ok(None);
     }
-    let state: ControllerTrustState = read_secure_json(
-        &path,
-        "controller trust state",
-        true,
-        SELF_UPDATE_JOURNAL_MAX_BYTES,
-    )
-    .context("controller trust state is invalid")?;
-    if state.schema != 1 {
-        bail!("controller trust state has an unsupported schema");
-    }
+    let state: ControllerTrustState = read_current_self_state(&path, "controller trust state")?;
     validate_digest(&state.sha256, "controller trust state digest")?;
     compare_versions(&state.version, &state.version)?;
     Ok(Some(state))
@@ -320,13 +344,10 @@ pub(super) fn controller_install_path(current: &Path) -> anyhow::Result<PathBuf>
 fn recover_controller_self_operation() -> anyhow::Result<()> {
     let directory = controller_state_directory()?;
     let path = directory.join("update-transaction.json");
-    if !path_is_present(&path)? {
+    if !current_self_state_is_present(&path, "controller self-update journal")? {
         return Ok(());
     }
-    let mut journal = load_self_update_journal(&directory, &path)?;
-    if journal.schema != SELF_UPDATE_JOURNAL_SCHEMA {
-        bail!("controller self-update journal has an unsupported schema");
-    }
+    let mut journal = load_self_update_journal(&path)?;
     if journal.transaction_id.trim().is_empty() {
         bail!("controller self-update journal has no transaction id");
     }
@@ -355,23 +376,8 @@ fn recover_controller_self_operation() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_self_update_journal(_directory: &Path, path: &Path) -> anyhow::Result<SelfUpdateJournal> {
-    let bytes = read_secure_regular_file(
-        path,
-        "controller self-update journal",
-        true,
-        SELF_UPDATE_JOURNAL_MAX_BYTES,
-    )?;
-    let journal: SelfUpdateJournal = serde_json::from_slice(bytes.as_slice())
-        .context("controller self-update journal is invalid")?;
-    if journal.schema != SELF_UPDATE_JOURNAL_SCHEMA {
-        bail!(
-            "{}: unsupported controller self-update journal schema {}",
-            crate::error_codes::STATE_RESET_REQUIRED,
-            journal.schema
-        );
-    }
-    Ok(journal)
+fn load_self_update_journal(path: &Path) -> anyhow::Result<SelfUpdateJournal> {
+    read_current_self_state(path, "controller self-update journal")
 }
 
 fn recover_update_journal(directory: &Path, journal: &mut SelfUpdateJournal) -> anyhow::Result<()> {
@@ -578,14 +584,47 @@ fn commit_controller_rollback_state(
     )
 }
 
-fn read_secure_json<T: DeserializeOwned>(
+fn read_current_self_state<T: CurrentSelfState + DeserializeOwned>(
     path: &Path,
     label: &str,
-    private: bool,
-    max_bytes: u64,
 ) -> anyhow::Result<T> {
-    let bytes = read_secure_regular_file(path, label, private, max_bytes)?;
-    serde_json::from_slice(bytes.as_slice()).with_context(|| format!("{label} is invalid"))
+    let bytes = read_secure_regular_file(path, label, true, SELF_UPDATE_JOURNAL_MAX_BYTES)
+        .map_err(|error| {
+            state_reset_required(path, label, format!("cannot read it safely: {error:#}"))
+        })?;
+    let state: T = serde_json::from_slice(bytes.as_slice()).map_err(|error| {
+        state_reset_required(
+            path,
+            label,
+            format!("it is not valid current JSON: {error}"),
+        )
+    })?;
+    if state.schema() != T::SCHEMA {
+        return Err(state_reset_required(
+            path,
+            label,
+            format!(
+                "unsupported schema {} (the current controller accepts only schema {})",
+                state.schema(),
+                T::SCHEMA
+            ),
+        ));
+    }
+    Ok(state)
+}
+
+fn state_reset_required(path: &Path, label: &str, reason: String) -> anyhow::Error {
+    anyhow!(
+        "{}: {label} at {} is not safe for the current controller: {reason}. Back up this file first, then delete it and reinstall the current nazoauthctl release before retrying. Do not migrate, reinterpret, or reuse this state.",
+        crate::error_codes::STATE_RESET_REQUIRED,
+        path.display(),
+    )
+}
+
+fn current_self_state_is_present(path: &Path, label: &str) -> anyhow::Result<bool> {
+    path_is_present(path).map_err(|error| {
+        state_reset_required(path, label, format!("cannot inspect it safely: {error:#}"))
+    })
 }
 
 fn path_is_present(path: &Path) -> anyhow::Result<bool> {
@@ -637,4 +676,70 @@ fn validate_bound_path(path: &Path, label: &str) -> anyhow::Result<()> {
         bail!("{label} must be a normalized absolute path");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_state_reset_required(error: anyhow::Error, path: &Path) {
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(crate::error_codes::STATE_RESET_REQUIRED));
+        assert!(rendered.contains(&path.display().to_string()));
+        assert!(rendered.contains("Back up this file first, then delete it"));
+        assert!(rendered.contains("reinstall the current nazoauthctl release"));
+        assert!(rendered.contains("Do not migrate, reinterpret, or reuse this state"));
+    }
+
+    #[test]
+    fn trust_state_rejects_unknown_schema_with_clean_lineage_remediation() -> anyhow::Result<()> {
+        let directory = crate::filesystem::PrivateTempDir::new("nazoauthctl-self-state")?;
+        let path = directory.path().join("trust.json");
+        atomic_write(
+            &path,
+            br#"{"schema":999,"version":"v0.2.0","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+            0o600,
+        )?;
+
+        let error =
+            read_current_self_state::<ControllerTrustState>(&path, "controller trust state")
+                .expect_err("unknown trust schema must fail closed");
+        assert_state_reset_required(error, &path);
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_state_rejects_unknown_schema_with_clean_lineage_remediation() -> anyhow::Result<()>
+    {
+        let directory = crate::filesystem::PrivateTempDir::new("nazoauthctl-self-state")?;
+        let path = directory.path().join("rollback.json");
+        atomic_write(
+            &path,
+            br#"{"schema":999,"version":"v0.2.0","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","artifact":"/current/rollback"}"#,
+            0o600,
+        )?;
+
+        let error =
+            read_current_self_state::<ControllerRollbackState>(&path, "controller rollback state")
+                .expect_err("unknown rollback schema must fail closed");
+        assert_state_reset_required(error, &path);
+        Ok(())
+    }
+
+    #[test]
+    fn self_update_journal_rejects_unknown_schema_with_clean_lineage_remediation()
+    -> anyhow::Result<()> {
+        let directory = crate::filesystem::PrivateTempDir::new("nazoauthctl-self-state")?;
+        let path = directory.path().join("update-transaction.json");
+        atomic_write(
+            &path,
+            br#"{"schema":999,"transaction_id":"018f5555-5555-7555-8555-555555555555","operation":"update","phase":"intent","install_path":"/current/nazoauthctl","from_version":"v0.2.0","from_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","to_version":"v0.2.1","to_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","rollback_artifact":"/current/rollback","rollback_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+            0o600,
+        )?;
+
+        let error = load_self_update_journal(&path)
+            .expect_err("unknown self-update journal schema must fail closed");
+        assert_state_reset_required(error, &path);
+        Ok(())
+    }
 }

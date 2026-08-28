@@ -380,7 +380,7 @@ pub(crate) fn claim_initial_admin(
         "initial administrator created (request ID: {request_id}); the fresh-install bootstrap \
          capability is now closed and its secret material deleted\n\
          continue with MFA enrollment at {}/ui/auth using fresh 2FA, then:\n\
-         nazoauthctl controller bind --instance {}\n",
+         nazoauthctl bind --instance {}\n",
         record.issuer.trim_end_matches('/'),
         record.alias
     ))
@@ -427,6 +427,7 @@ mod tests {
                     &deployment_id,
                     crate::target::BootstrapParams {
                         current_build_identity: None,
+                        current_rollback_policy: crate::model::test_release_rollback_policy(),
                         issuer: ISSUER.to_owned(),
                         runtime: crate::target::RuntimeSurface::new("podman", "nazoauth-x")?,
                         artifact: crate::target::ArtifactRefs {
@@ -451,7 +452,7 @@ mod tests {
                     operation_id: OP_ID,
                     deployment_id: &deployment_id,
                     issuer: ISSUER,
-                    runtime_kind: "podman",
+                    runtime_kind: crate::runtime_backend::RuntimeBackendKind::Podman,
                     runtime_object: "nazoauth-x",
                     config_reference: "/cfg/config.json",
                     scope_dir: &scope,
@@ -478,7 +479,6 @@ mod tests {
                 "production",
                 host.host_id,
                 ISSUER,
-                "target-state/x",
             )?)?;
 
             Ok(Self {
@@ -510,11 +510,18 @@ mod tests {
             data_root: data_root.to_string_lossy().into_owned(),
             runtime_root: None,
             secrets: vec![],
-            database_endpoint: crate::target::install_exec::ExternalEndpoint {
+            current_data_import: None,
+            database_runtime_endpoint: crate::target::install_exec::ExternalEndpoint {
                 host: "db.internal".to_owned(),
                 port: 5432,
                 name: "oauth".to_owned(),
-                user: "nazoauth".to_owned(),
+                user: "nazoauth_runtime".to_owned(),
+            },
+            database_lifecycle_endpoint: crate::target::install_exec::ExternalEndpoint {
+                host: "db.internal".to_owned(),
+                port: 5432,
+                name: "oauth".to_owned(),
+                user: "nazoauth_lifecycle".to_owned(),
             },
             valkey_endpoint: crate::target::install_exec::ExternalEndpoint {
                 host: "cache.internal".to_owned(),
@@ -584,7 +591,7 @@ mod tests {
         assert!(report.contains("closed"), "{report}");
         assert!(report.contains("MFA enrollment"), "{report}");
         assert!(
-            report.contains("controller bind --instance production"),
+            report.contains("nazoauthctl bind --instance production"),
             "{report}"
         );
 

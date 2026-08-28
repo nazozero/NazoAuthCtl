@@ -14,64 +14,75 @@ use zeroize::Zeroizing;
 
 mod ordinary_run;
 
-const DEFAULT_CONFIG: &str = "/etc/nazoauth/update.json";
 const DEFAULT_POLL_TIMEOUT_SECONDS: u64 = 1_800;
 const DEFAULT_JOBS: usize = 4;
 
 fn main() {
     let args = env::args_os().collect::<Vec<_>>();
-    let plan = match parse_artifact_plan_invocation(&args) {
+    let invocation = match parse_invocation(&args) {
         Ok(invocation) => invocation,
         Err(error) => exit_with_error(&error),
     };
-    if let Some(invocation) = plan {
-        match execute_artifact_plan(invocation) {
-            Ok(()) => return,
-            Err(error) => exit_with_error(&error),
-        }
-    }
-    let cached = match parse_artifact_open_invocation(&args) {
-        Ok(invocation) => invocation,
-        Err(error) => exit_with_error(&error),
-    };
-    if let Some(invocation) = cached {
-        match execute_artifact_open(invocation) {
-            Ok(()) => return,
-            Err(error) => exit_with_error(&error),
-        }
-    }
-    let resolution = match parse_artifact_resolve_invocation(&args) {
-        Ok(invocation) => invocation,
-        Err(error) => exit_with_error(&error),
-    };
-    if let Some(invocation) = resolution {
-        match execute_artifact_resolve(invocation) {
-            Ok(()) => return,
-            Err(error) => exit_with_error(&error),
-        }
-    }
-    let artifact = match parse_artifact_verify_invocation(&args) {
-        Ok(invocation) => invocation,
-        Err(error) => exit_with_error(&error),
-    };
-    if let Some(invocation) = artifact {
-        match execute_artifact_verify(invocation) {
-            Ok(()) => return,
-            Err(error) => exit_with_error(&error),
-        }
-    }
-    let invocation = match parse_run_invocation(&args) {
-        Ok(Some(invocation)) => invocation,
-        Ok(None) => {
+    let result = match invocation {
+        Invocation::Core => {
             nazoauthctl_core::main_entry();
             return;
         }
-        Err(error) => exit_with_error(&error),
+        Invocation::ArtifactPlan(invocation) => execute_artifact_plan(invocation),
+        Invocation::ArtifactOpen(invocation) => execute_artifact_open(invocation),
+        Invocation::ArtifactResolve(invocation) => execute_artifact_resolve(invocation),
+        Invocation::ArtifactVerify(invocation) => execute_artifact_verify(invocation),
+        Invocation::Run(invocation) => ordinary_run::execute(*invocation).map(|code| {
+            std::process::exit(code);
+        }),
     };
+    if let Err(error) = result {
+        exit_with_error(&error);
+    }
+}
 
-    match ordinary_run::execute(invocation) {
-        Ok(code) => std::process::exit(code),
-        Err(error) => exit_with_error(&error),
+enum Invocation {
+    Core,
+    ArtifactPlan(ArtifactPlanInvocation),
+    ArtifactOpen(ArtifactOpenInvocation),
+    ArtifactResolve(ArtifactResolveInvocation),
+    ArtifactVerify(ArtifactVerifyInvocation),
+    Run(Box<RunInvocation>),
+}
+
+fn parse_invocation(args: &[OsString]) -> anyhow::Result<Invocation> {
+    let values = args
+        .iter()
+        .skip(1)
+        .map(|value| {
+            value
+                .to_str()
+                .map(ToOwned::to_owned)
+                .context("command-line arguments must be valid UTF-8")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let globals = nazoauthctl_core::parse_global_options(&values)?;
+    let command = &values[globals.consumed..];
+    let Some((family, command)) = command.split_first() else {
+        return Ok(Invocation::Core);
+    };
+    if family != "oidf" {
+        return Ok(Invocation::Core);
+    }
+
+    match command {
+        [artifact, operation, options @ ..] if artifact == "artifact" => match operation.as_str() {
+            "plan" => parse_artifact_plan_options(options).map(Invocation::ArtifactPlan),
+            "open" => parse_artifact_open_options(options).map(Invocation::ArtifactOpen),
+            "resolve" => parse_artifact_resolve_options(options).map(Invocation::ArtifactResolve),
+            "verify" => parse_artifact_verify_options(options).map(Invocation::ArtifactVerify),
+            other => bail!("unknown oidf artifact command: {other}"),
+        },
+        [command, options @ ..] if command == "run" => parse_run_options(options, globals.instance)
+            .map(Box::new)
+            .map(Invocation::Run),
+        [command, ..] => bail!("unknown oidf command: {command}"),
+        [] => bail!("an oidf command is required"),
     }
 }
 
@@ -83,26 +94,7 @@ struct ArtifactPlanInvocation {
     selection: OidfPlanSelection,
 }
 
-fn parse_artifact_plan_invocation(
-    args: &[OsString],
-) -> anyhow::Result<Option<ArtifactPlanInvocation>> {
-    let mut values = args
-        .iter()
-        .skip(1)
-        .map(|value| {
-            value
-                .to_str()
-                .map(ToOwned::to_owned)
-                .context("artifact plan arguments must be valid UTF-8")
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    if values.first().map(String::as_str) != Some("oidf")
-        || values.get(1).map(String::as_str) != Some("artifact")
-        || values.get(2).map(String::as_str) != Some("plan")
-    {
-        return Ok(None);
-    }
-    values.drain(..3);
+fn parse_artifact_plan_options(values: &[String]) -> anyhow::Result<ArtifactPlanInvocation> {
     if values
         .iter()
         .any(|value| matches!(value.as_str(), "-h" | "--help"))
@@ -140,13 +132,13 @@ fn parse_artifact_plan_invocation(
         }
         index += 2;
     }
-    Ok(Some(ArtifactPlanInvocation {
+    Ok(ArtifactPlanInvocation {
         trust_policy: trust_policy.context("--trust-policy is required")?,
         cache_directory: cache_directory.context("--cache-dir is required")?,
         manifest_digest: manifest_digest.context("--digest is required")?,
         capabilities,
         selection: OidfPlanSelection { groups, plans },
-    }))
+    })
 }
 
 fn execute_artifact_plan(invocation: ArtifactPlanInvocation) -> anyhow::Result<()> {
@@ -179,26 +171,7 @@ struct ArtifactOpenInvocation {
     capabilities: std::collections::BTreeSet<String>,
 }
 
-fn parse_artifact_open_invocation(
-    args: &[OsString],
-) -> anyhow::Result<Option<ArtifactOpenInvocation>> {
-    let mut values = args
-        .iter()
-        .skip(1)
-        .map(|value| {
-            value
-                .to_str()
-                .map(ToOwned::to_owned)
-                .context("artifact cache arguments must be valid UTF-8")
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    if values.first().map(String::as_str) != Some("oidf")
-        || values.get(1).map(String::as_str) != Some("artifact")
-        || values.get(2).map(String::as_str) != Some("open")
-    {
-        return Ok(None);
-    }
-    values.drain(..3);
+fn parse_artifact_open_options(values: &[String]) -> anyhow::Result<ArtifactOpenInvocation> {
     if values
         .iter()
         .any(|value| matches!(value.as_str(), "-h" | "--help"))
@@ -240,12 +213,12 @@ fn parse_artifact_open_invocation(
         }
         index += 2;
     }
-    Ok(Some(ArtifactOpenInvocation {
+    Ok(ArtifactOpenInvocation {
         trust_policy: trust_policy.context("--trust-policy is required")?,
         cache_directory: cache_directory.context("--cache-dir is required")?,
         manifest_digest: manifest_digest.context("--digest is required")?,
         capabilities,
-    }))
+    })
 }
 
 fn execute_artifact_open(invocation: ArtifactOpenInvocation) -> anyhow::Result<()> {
@@ -284,26 +257,7 @@ struct ArtifactResolveInvocation {
     capabilities: std::collections::BTreeSet<String>,
 }
 
-fn parse_artifact_resolve_invocation(
-    args: &[OsString],
-) -> anyhow::Result<Option<ArtifactResolveInvocation>> {
-    let mut values = args
-        .iter()
-        .skip(1)
-        .map(|value| {
-            value
-                .to_str()
-                .map(ToOwned::to_owned)
-                .context("artifact resolution arguments must be valid UTF-8")
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    if values.first().map(String::as_str) != Some("oidf")
-        || values.get(1).map(String::as_str) != Some("artifact")
-        || values.get(2).map(String::as_str) != Some("resolve")
-    {
-        return Ok(None);
-    }
-    values.drain(..3);
+fn parse_artifact_resolve_options(values: &[String]) -> anyhow::Result<ArtifactResolveInvocation> {
     if values
         .iter()
         .any(|value| matches!(value.as_str(), "-h" | "--help"))
@@ -345,12 +299,12 @@ fn parse_artifact_resolve_invocation(
         }
         index += 2;
     }
-    Ok(Some(ArtifactResolveInvocation {
+    Ok(ArtifactResolveInvocation {
         trust_policy: trust_policy.context("--trust-policy is required")?,
         manifest_url: manifest_url.context("--manifest-url is required")?,
         cache_directory: cache_directory.context("--cache-dir is required")?,
         capabilities,
-    }))
+    })
 }
 
 fn execute_artifact_resolve(invocation: ArtifactResolveInvocation) -> anyhow::Result<()> {
@@ -390,26 +344,7 @@ struct ArtifactVerifyInvocation {
     capabilities: std::collections::BTreeSet<String>,
 }
 
-fn parse_artifact_verify_invocation(
-    args: &[OsString],
-) -> anyhow::Result<Option<ArtifactVerifyInvocation>> {
-    let mut values = args
-        .iter()
-        .skip(1)
-        .map(|value| {
-            value
-                .to_str()
-                .map(ToOwned::to_owned)
-                .context("artifact verification arguments must be valid UTF-8")
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    if values.first().map(String::as_str) != Some("oidf")
-        || values.get(1).map(String::as_str) != Some("artifact")
-        || values.get(2).map(String::as_str) != Some("verify")
-    {
-        return Ok(None);
-    }
-    values.drain(..3);
+fn parse_artifact_verify_options(values: &[String]) -> anyhow::Result<ArtifactVerifyInvocation> {
     if values
         .iter()
         .any(|value| matches!(value.as_str(), "-h" | "--help"))
@@ -451,13 +386,13 @@ fn parse_artifact_verify_invocation(
         }
         index += 2;
     }
-    Ok(Some(ArtifactVerifyInvocation {
+    Ok(ArtifactVerifyInvocation {
         trust_policy: trust_policy.context("--trust-policy is required")?,
         manifest: manifest.context("--manifest is required")?,
         driver: driver.context("--driver is required")?,
         matrix: matrix.context("--matrix is required")?,
         capabilities,
-    }))
+    })
 }
 
 fn execute_artifact_verify(invocation: ArtifactVerifyInvocation) -> anyhow::Result<()> {
@@ -518,8 +453,7 @@ fn exit_with_error(error: &anyhow::Error) -> ! {
 }
 
 pub(crate) struct RunInvocation {
-    pub(crate) config: PathBuf,
-    pub(crate) deployment: Option<String>,
+    pub(crate) instance: Option<String>,
     pub(crate) trust_policy: PathBuf,
     pub(crate) artifact_cache: PathBuf,
     pub(crate) artifact_digest: String,
@@ -544,45 +478,7 @@ pub(crate) struct RunInvocation {
     pub(crate) jobs: usize,
 }
 
-fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocation>> {
-    let mut values = args
-        .iter()
-        .skip(1)
-        .map(|value| {
-            value
-                .to_str()
-                .map(ToOwned::to_owned)
-                .context("conformance arguments must be valid UTF-8")
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let mut config = env::var_os("NAZOAUTH_UPDATE_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG));
-    let mut deployment = None;
-    while values
-        .first()
-        .is_some_and(|value| matches!(value.as_str(), "--config" | "--deployment"))
-    {
-        if values.len() < 2 {
-            bail!("{} requires a value", values[0]);
-        }
-        let value = values.remove(1);
-        match values.remove(0).as_str() {
-            "--config" => config = PathBuf::from(value),
-            "--deployment" => {
-                if deployment.replace(value).is_some() {
-                    bail!("--deployment may be specified only once");
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-    if values.first().map(String::as_str) != Some("oidf")
-        || values.get(1).map(String::as_str) != Some("run")
-    {
-        return Ok(None);
-    }
-    values.drain(..2);
+fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Result<RunInvocation> {
     if values
         .iter()
         .any(|value| matches!(value.as_str(), "-h" | "--help"))
@@ -777,9 +673,8 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
             "poll timeout must be between 1 and {MAX_POLL_TIMEOUT_SECONDS} seconds, jobs must be between 1 and {MAX_PARALLEL_JOBS}, and explicit WebDriver endpoints must be distinct and repeated exactly once per job"
         );
     }
-    Ok(Some(RunInvocation {
-        config,
-        deployment,
+    Ok(RunInvocation {
+        instance,
         trust_policy,
         artifact_cache,
         artifact_digest,
@@ -802,7 +697,7 @@ fn parse_run_invocation(args: &[OsString]) -> anyhow::Result<Option<RunInvocatio
         plans,
         poll_timeout,
         jobs,
-    }))
+    })
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T, option: &str) -> anyhow::Result<()> {
@@ -833,7 +728,7 @@ fn push_unique_vec(values: &mut Vec<String>, value: String, option: &str) -> any
 
 fn print_run_help() {
     println!(
-        "Usage:\n  nazoauthctl [--deployment ID_OR_ALIAS] [--config PATH] conformance run --trust-policy PATH --artifact-cache PATH --artifact-digest SHA256 --tenant-id UUID [options]\n\nRequired:\n  --trust-policy PATH            Signed-artifact trust policy\n  --artifact-cache PATH          Private immutable artifact cache root\n  --artifact-digest SHA256       Exact cached compact-manifest digest (64 lowercase hex)\n  --tenant-id UUID               Canonical target tenant UUID\n\nOptions:\n  --suite URL                    OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN                  API token; visible in argv/shell history\n  --token-file PATH              Read token from a private regular file\n  --token-stdin                  Read token from stdin\n  --token-fd FD                  Read token from an inherited private descriptor\n  --webdriver URL                Dedicated W3C endpoint; repeat exactly once per job\n  --evidence-dir PATH            Commit a unique provider-bound private evidence bundle\n  --capture-review-screenshots   Capture signed review placeholders locally into --evidence-dir\n  --upload-review-screenshots    Upload each captured PNG to its exact Suite placeholder and wait for REVIEW\n  --retain-suite-plans-for-certification\n                               Retain terminal plans, or an audited deferred OIDF review boundary, at the official Suite\n  --proxy-trust-bundle PATH      Atomically install this run's public client CAs\n  --proxy-reload-executable PATH Root-owned executable that validates/reloads the proxy\n  --group ID                     Run one signed Matrix group; repeat to select more\n  --plan ID                      Run one signed Matrix plan; repeat to select more\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
+        "Usage:\n  nazoauthctl [--instance SELECTOR] [--json] oidf run --trust-policy PATH --artifact-cache PATH --artifact-digest SHA256 --tenant-id UUID [options]\n\nRequired:\n  --trust-policy PATH            Signed-artifact trust policy\n  --artifact-cache PATH          Private immutable artifact cache root\n  --artifact-digest SHA256       Exact cached compact-manifest digest (64 lowercase hex)\n  --tenant-id UUID               Canonical target tenant UUID\n\nOptions:\n  --suite URL                    OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN                  API token; visible in argv/shell history\n  --token-file PATH              Read token from a private regular file\n  --token-stdin                  Read token from stdin\n  --token-fd FD                  Read token from an inherited private descriptor\n  --webdriver URL                Dedicated W3C endpoint; repeat exactly once per job\n  --evidence-dir PATH            Commit a unique controller-operation-bound private evidence bundle\n  --capture-review-screenshots   Capture signed review placeholders locally into --evidence-dir\n  --upload-review-screenshots    Upload each captured PNG to its exact Suite placeholder and wait for REVIEW\n  --retain-suite-plans-for-certification\n                               Retain terminal plans, or an audited deferred OIDF review boundary, at the official Suite\n  --proxy-trust-bundle PATH      Atomically install this run's public client CAs\n  --proxy-reload-executable PATH Root-owned executable that validates/reloads the proxy\n  --group ID                     Run one signed Matrix group; repeat to select more\n  --plan ID                      Run one signed Matrix plan; repeat to select more\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
     );
     println!(
         "  --ciba-user-approval-callback-url URL  Public HTTPS callback forwarded only to the local Ctl listener\n  --ciba-user-approval-listen ADDR       Loopback IP:port for that callback"
@@ -848,10 +743,49 @@ mod tests {
         values.iter().map(OsString::from).collect()
     }
 
+    fn routed_run(args: &[OsString]) -> anyhow::Result<Option<RunInvocation>> {
+        match parse_invocation(args)? {
+            Invocation::Run(invocation) => Ok(Some(*invocation)),
+            _ => Ok(None),
+        }
+    }
+
+    fn routed_artifact_open(args: &[OsString]) -> anyhow::Result<Option<ArtifactOpenInvocation>> {
+        match parse_invocation(args)? {
+            Invocation::ArtifactOpen(invocation) => Ok(Some(invocation)),
+            _ => Ok(None),
+        }
+    }
+
+    fn routed_artifact_plan(args: &[OsString]) -> anyhow::Result<Option<ArtifactPlanInvocation>> {
+        match parse_invocation(args)? {
+            Invocation::ArtifactPlan(invocation) => Ok(Some(invocation)),
+            _ => Ok(None),
+        }
+    }
+
+    fn routed_artifact_resolve(
+        args: &[OsString],
+    ) -> anyhow::Result<Option<ArtifactResolveInvocation>> {
+        match parse_invocation(args)? {
+            Invocation::ArtifactResolve(invocation) => Ok(Some(invocation)),
+            _ => Ok(None),
+        }
+    }
+
+    fn routed_artifact_verify(
+        args: &[OsString],
+    ) -> anyhow::Result<Option<ArtifactVerifyInvocation>> {
+        match parse_invocation(args)? {
+            Invocation::ArtifactVerify(invocation) => Ok(Some(invocation)),
+            _ => Ok(None),
+        }
+    }
+
     #[test]
     fn unrelated_command_is_owned_by_core() {
         assert!(
-            parse_run_invocation(&args(&["nazoauthctl", "status"]))
+            routed_run(&args(&["nazoauthctl", "status"]))
                 .expect("parse")
                 .is_none()
         );
@@ -860,7 +794,7 @@ mod tests {
     #[test]
     fn artifact_open_requires_exact_cache_identity_and_unique_capabilities() {
         let digest = "a".repeat(64);
-        let parsed = parse_artifact_open_invocation(&args(&[
+        let parsed = routed_artifact_open(&args(&[
             "nazoauthctl",
             "oidf",
             "artifact",
@@ -883,13 +817,7 @@ mod tests {
         );
         assert!(parsed.capabilities.contains("nazoauth.client.create"));
         assert!(
-            parse_run_invocation(&args(&["nazoauthctl", "oidf", "artifact", "open",]))
-                .expect("run parser")
-                .is_none()
-        );
-
-        assert!(
-            parse_artifact_open_invocation(&args(&[
+            routed_artifact_open(&args(&[
                 "nazoauthctl",
                 "oidf",
                 "artifact",
@@ -902,7 +830,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            parse_artifact_open_invocation(&args(&[
+            routed_artifact_open(&args(&[
                 "nazoauthctl",
                 "oidf",
                 "artifact",
@@ -925,7 +853,7 @@ mod tests {
     #[test]
     fn artifact_plan_is_a_separate_read_only_selection_command() {
         let digest = "a".repeat(64);
-        let parsed = parse_artifact_plan_invocation(&args(&[
+        let parsed = routed_artifact_plan(&args(&[
             "nazoauthctl",
             "oidf",
             "artifact",
@@ -949,18 +877,13 @@ mod tests {
         assert_eq!(parsed.selection.groups, ["oidc"]);
         assert_eq!(parsed.selection.plans, ["p001"]);
         assert!(parsed.capabilities.contains("nazoauth.client.create"));
-        assert!(
-            parse_run_invocation(&args(&["nazoauthctl", "oidf", "artifact", "plan"]))
-                .expect("run parser")
-                .is_none()
-        );
     }
 
     #[test]
     fn artifact_plan_requires_closed_unique_inputs() {
         let digest = "a".repeat(64);
         assert!(
-            parse_artifact_plan_invocation(&args(&[
+            routed_artifact_plan(&args(&[
                 "nazoauthctl",
                 "oidf",
                 "artifact",
@@ -974,7 +897,7 @@ mod tests {
         );
         for option in ["--require", "--group", "--plan"] {
             assert!(
-                parse_artifact_plan_invocation(&args(&[
+                routed_artifact_plan(&args(&[
                     "nazoauthctl",
                     "oidf",
                     "artifact",
@@ -998,7 +921,7 @@ mod tests {
 
     #[test]
     fn artifact_verify_is_a_separate_non_deployment_command() {
-        let parsed = parse_artifact_verify_invocation(&args(&[
+        let parsed = routed_artifact_verify(&args(&[
             "nazoauthctl",
             "oidf",
             "artifact",
@@ -1022,17 +945,12 @@ mod tests {
         );
         assert!(parsed.capabilities.contains("nazoauth.client.create"));
         assert_eq!(parsed.driver, PathBuf::from("/tmp/driver.json"));
-        assert!(
-            parse_run_invocation(&args(&["nazoauthctl", "oidf", "artifact", "verify",]))
-                .expect("run parser")
-                .is_none()
-        );
     }
 
     #[test]
     fn artifact_verify_requires_closed_unique_inputs() {
         assert!(
-            parse_artifact_verify_invocation(&args(&[
+            routed_artifact_verify(&args(&[
                 "nazoauthctl",
                 "oidf",
                 "artifact",
@@ -1043,7 +961,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            parse_artifact_verify_invocation(&args(&[
+            routed_artifact_verify(&args(&[
                 "nazoauthctl",
                 "oidf",
                 "artifact",
@@ -1067,7 +985,7 @@ mod tests {
 
     #[test]
     fn artifact_resolve_requires_trust_channel_cache_and_unique_capabilities() {
-        let parsed = parse_artifact_resolve_invocation(&args(&[
+        let parsed = routed_artifact_resolve(&args(&[
             "nazoauthctl",
             "oidf",
             "artifact",
@@ -1094,7 +1012,7 @@ mod tests {
         assert!(parsed.capabilities.contains("nazoauth.client.create"));
 
         assert!(
-            parse_artifact_resolve_invocation(&args(&[
+            routed_artifact_resolve(&args(&[
                 "nazoauthctl",
                 "oidf",
                 "artifact",
@@ -1107,7 +1025,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            parse_artifact_resolve_invocation(&args(&[
+            routed_artifact_resolve(&args(&[
                 "nazoauthctl",
                 "oidf",
                 "artifact",
@@ -1129,12 +1047,10 @@ mod tests {
 
     #[test]
     fn run_parses_global_and_automation_options() {
-        let parsed = parse_run_invocation(&args(&[
+        let parsed = routed_run(&args(&[
             "nazoauthctl",
-            "--deployment",
+            "--instance",
             "prod",
-            "--config",
-            "/x/update.json",
             "oidf",
             "run",
             "--trust-policy",
@@ -1163,8 +1079,7 @@ mod tests {
         ]))
         .expect("parse")
         .expect("run");
-        assert_eq!(parsed.deployment.as_deref(), Some("prod"));
-        assert_eq!(parsed.config, PathBuf::from("/x/update.json"));
+        assert_eq!(parsed.instance.as_deref(), Some("prod"));
         assert_eq!(parsed.trust_policy, PathBuf::from("/x/trust.json"));
         assert_eq!(parsed.artifact_cache, PathBuf::from("/x/cache"));
         assert_eq!(parsed.artifact_digest, "a".repeat(64));
@@ -1180,7 +1095,7 @@ mod tests {
 
     #[test]
     fn review_screenshot_capture_requires_an_explicit_evidence_directory() {
-        let error = parse_run_invocation(&args(&[
+        let error = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",
@@ -1201,7 +1116,7 @@ mod tests {
 
     #[test]
     fn review_screenshot_upload_requires_capture_and_certification_retention() {
-        let error = parse_run_invocation(&args(&[
+        let error = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",
@@ -1227,7 +1142,7 @@ mod tests {
     #[test]
     fn run_rejects_jobs_outside_the_validated_bound() {
         for jobs in ["0", "5"] {
-            let error = match parse_run_invocation(&args(&[
+            let error = match routed_run(&args(&[
                 "nazoauthctl",
                 "oidf",
                 "run",
@@ -1251,7 +1166,7 @@ mod tests {
 
     #[test]
     fn run_rejects_poll_timeout_above_the_validated_bound() {
-        let error = match parse_run_invocation(&args(&[
+        let error = match routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",
@@ -1278,14 +1193,14 @@ mod tests {
 
     #[test]
     fn run_requires_exact_ordinary_identity_and_rejects_lease_options() {
-        let missing = parse_run_invocation(&args(&["nazoauthctl", "oidf", "run"]));
+        let missing = routed_run(&args(&["nazoauthctl", "oidf", "run"]));
         let missing = match missing {
             Err(error) => error,
             Ok(_) => panic!("ordinary identity is required"),
         };
         assert!(missing.to_string().contains("--trust-policy is required"));
 
-        let lease = parse_run_invocation(&args(&[
+        let lease = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",
@@ -1310,7 +1225,7 @@ mod tests {
                 .contains("unknown oidf run option: --lease-ttl")
         );
 
-        let uppercase_digest = parse_run_invocation(&args(&[
+        let uppercase_digest = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",
@@ -1333,7 +1248,7 @@ mod tests {
                 .contains("64 lowercase hexadecimal characters")
         );
 
-        let noncanonical_tenant = parse_run_invocation(&args(&[
+        let noncanonical_tenant = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",
@@ -1355,7 +1270,7 @@ mod tests {
 
     #[test]
     fn proxy_trust_bundle_and_reload_executable_are_atomic_pair() {
-        let missing_reload = parse_run_invocation(&args(&[
+        let missing_reload = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",
@@ -1372,7 +1287,7 @@ mod tests {
         ]));
         assert!(missing_reload.is_err());
 
-        let parsed = parse_run_invocation(&args(&[
+        let parsed = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",
@@ -1403,7 +1318,7 @@ mod tests {
 
     #[test]
     fn explicit_webdrivers_are_distinct_and_one_per_job() {
-        let one = parse_run_invocation(&args(&[
+        let one = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",
@@ -1422,7 +1337,7 @@ mod tests {
         ]));
         assert!(one.is_err());
 
-        let duplicate = parse_run_invocation(&args(&[
+        let duplicate = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",
@@ -1443,7 +1358,7 @@ mod tests {
         ]));
         assert!(duplicate.is_err());
 
-        let distinct = parse_run_invocation(&args(&[
+        let distinct = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",
@@ -1469,7 +1384,7 @@ mod tests {
 
     #[test]
     fn token_sources_are_mutually_exclusive() {
-        let result = parse_run_invocation(&args(&[
+        let result = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",

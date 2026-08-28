@@ -64,7 +64,3 @@ impl BrowserRunnerState {
         &self.visited
     }
 }
-
-/// Backward-compatible name for callers that used the original, overly
-/// specific type name. Runner browser state is shared by OIDC and OpenID4VC.
-pub type OpenId4VcBrowserState = BrowserRunnerState;

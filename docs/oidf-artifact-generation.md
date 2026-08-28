@@ -149,12 +149,12 @@ prefix=/opt/nazoauth-e2e/candidate-deps-oidf-20260820T1300Z
 private="$prefix/state/oidf-artifact-private"
 public="$prefix/evidence/oidf-artifact-public"
 
-"$prefix/bin/nazoauthctl" conformance artifact verify \
+"$prefix/bin/nazoauthctl" oidf artifact verify \
   --trust-policy "$private/trust-policy.json" \
   --manifest "$public/manifest.jws" \
   --driver "$public/driver.json" \
   --matrix "$public/matrix.json" \
-  --capability nazoauth.client.create
+  --require nazoauth.client.create
 ```
 
 Keep the Suite token in its pre-provisioned owner-only token file and pass it only through the

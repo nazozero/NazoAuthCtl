@@ -509,7 +509,7 @@ pub(crate) fn remove_managed_container_by_name(
     )
 }
 
-fn inspect_image_environment(
+pub(crate) fn inspect_image_environment(
     command: &OsStr,
     image: &str,
     backend_name: &str,

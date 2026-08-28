@@ -9,6 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nazo_operator_protocol::{ControlOutcome, ControlResult};
 
 use super::privilege::{PrivilegeStep, ensure_engine_access};
@@ -19,10 +20,14 @@ use crate::controller_identity::store::{ControllerKeyStore, controller_key_ref_f
 use crate::filesystem::PrivateTempDir;
 use crate::registry::{DiscoveryEvidence, InstanceRecord, RegistryStore};
 use crate::target::{
-    ExecutionTarget, Failure, InstanceInspection, LocalTarget, TargetStateStore,
+    ExecutionTarget, Failure, HostOperation, HostOutcome, InstanceInspection, LocalTarget,
+    StateMutationPayload, TargetStateStore, UpdateBackupPrecondition,
     control_exec::{CONTROL_OUTCOME_UNKNOWN, ControlJob, ControlOperationExecutor},
     uninstall_exec::{DeletionExecutor, DeletionJob},
-    update_exec::{ACTIVATION_FAILED, LifecycleExecutor, LifecycleFacts, RollbackJob, UpdateJob},
+    update_exec::{
+        ACTIVATION_FAILED, LifecycleExecutor, LifecycleFacts, RollbackJob, UpdateExecution,
+        UpdateJob,
+    },
     wire::local_hello,
 };
 
@@ -55,6 +60,19 @@ impl ControlOperationExecutor for ScriptedControl {
                 "scripted: the operator produced no parsable answer",
             ));
         }
+        let payload = job
+            .compact_jws
+            .split('.')
+            .nth(1)
+            .ok_or_else(|| Failure::new("CONTROL_OUTCOME_UNKNOWN", "scripted malformed JWS"))?;
+        let operation: nazo_operator_protocol::ControlOperation = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(payload)
+                .map_err(|_| Failure::new("CONTROL_OUTCOME_UNKNOWN", "scripted malformed JWS"))?,
+        )
+        .map_err(|_| Failure::new("CONTROL_OUTCOME_UNKNOWN", "scripted malformed JWS"))?;
+        let request_hash = nazo_operator_protocol::control_operation_request_hash(&operation)
+            .map_err(|_| Failure::new("CONTROL_OUTCOME_UNKNOWN", "scripted request hash failed"))?;
         if *self.fail_business.lock().unwrap() {
             // Durable terminal FAILED result, exactly like a real operator
             // whose migration executed and failed (P0-5).
@@ -62,7 +80,7 @@ impl ControlOperationExecutor for ScriptedControl {
             return Ok(ControlResult {
                 schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
                 operation_id: job.operation_id.to_owned(),
-                request_hash: "scripted-request-hash".to_owned(),
+                request_hash,
                 outcome: ControlOutcome::Failed,
                 error: Some(nazo_operator_protocol::ControlErrorCode::ExecutionFailed),
                 accepted_at: now,
@@ -74,7 +92,7 @@ impl ControlOperationExecutor for ScriptedControl {
         Ok(ControlResult {
             schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
             operation_id: job.operation_id.to_owned(),
-            request_hash: "scripted-request-hash".to_owned(),
+            request_hash,
             outcome: ControlOutcome::Succeeded,
             error: None,
             accepted_at: now,
@@ -98,8 +116,9 @@ impl ScriptedLifecycle {
 }
 
 impl LifecycleExecutor for ScriptedLifecycle {
-    fn execute_update(&self, job: &UpdateJob<'_>) -> Result<LifecycleFacts, Failure> {
+    fn execute_update(&self, job: &UpdateJob<'_>) -> Result<UpdateExecution, Failure> {
         *self.update_calls.lock().unwrap() += 1;
+        let mut migration_result = None;
         if let Some(jws) = job.migration_jws {
             let res = self.control.execute(&ControlJob {
                 operation_id: job.operation_id,
@@ -111,10 +130,18 @@ impl LifecycleExecutor for ScriptedLifecycle {
                 data_root: job.data_root,
                 scope_dir: job.scope_dir,
                 compact_jws: jws,
+                change_set: None,
             })?;
-            if res.outcome != ControlOutcome::Succeeded {
-                return Err(Failure::new("MIGRATION_FAILED", "migration failed durably"));
+            if res.outcome == ControlOutcome::Failed {
+                return Ok(UpdateExecution::MigrationFailed(res));
             }
+            if res.outcome != ControlOutcome::Succeeded {
+                return Err(Failure::new(
+                    "CONTROL_OUTCOME_UNKNOWN",
+                    "migration remains in progress",
+                ));
+            }
+            migration_result = Some(res);
         }
         if *self.fail_update_activation.lock().unwrap() {
             // Contract: undo own partial work before failing; the state
@@ -130,10 +157,16 @@ impl LifecycleExecutor for ScriptedLifecycle {
         let state = job.store.apply_update(
             job.deployment_id,
             job.expected_revision,
-            NEW_REF.to_owned(),
-            Some(crate::target::BuildIdentity::new("nazoauth", "v9", "commit").expect("identity")),
-            config,
-            job.operation_id,
+            crate::target::deployment_state::UpdateCommit {
+                artifact: NEW_REF.to_owned(),
+                build_identity: Some(
+                    crate::target::BuildIdentity::new("nazoauth", "v9", "commit")
+                        .expect("identity"),
+                ),
+                rollback_policy: job.rollback_policy.clone(),
+                config,
+                operation_id: job.operation_id.to_owned(),
+            },
         )?;
         job.store.record_local_health(
             job.deployment_id,
@@ -141,12 +174,13 @@ impl LifecycleExecutor for ScriptedLifecycle {
             "scripted local readiness passed".to_owned(),
             job.operation_id,
         )?;
-        Ok(LifecycleFacts {
+        Ok(UpdateExecution::Activated(LifecycleFacts {
             revision: state.config.revision,
             build_identity: Some(
                 crate::target::BuildIdentity::new("nazoauth", "v9", "commit").expect("identity"),
             ),
-        })
+            migration_result,
+        }))
     }
 
     fn execute_rollback(&self, job: &RollbackJob<'_>) -> Result<LifecycleFacts, Failure> {
@@ -166,6 +200,7 @@ impl LifecycleExecutor for ScriptedLifecycle {
         Ok(LifecycleFacts {
             revision: state.config.revision,
             build_identity: None,
+            migration_result: None,
         })
     }
 }
@@ -206,6 +241,7 @@ impl super::TargetArtifactResolver for ScriptedArtifactResolver {
         Ok(super::VerifiedTargetArtifact {
             digest: self.target_digest.clone(),
             identity: crate::target::BuildIdentity::new("nazoauth", "v9.9.9", "commit-new")?,
+            rollback_policy: crate::model::test_release_rollback_policy(),
         })
     }
 }
@@ -226,7 +262,8 @@ impl Fixture {
         let temp = PrivateTempDir::new("nazauthctl-instance-lifecycle")?;
         let registry = RegistryStore::open(temp.path().join("registry"))?;
         let host = registry.ensure_local_host()?;
-        let hello = local_hello(vec!["podman".to_owned()]);
+        let mut hello = local_hello(vec!["podman".to_owned()]);
+        hello.target_id = host.host_id.to_string();
         let state_root = temp.path().join("state");
 
         // Two sibling instances on one host prove uninstall isolation.
@@ -243,6 +280,11 @@ impl Fixture {
         // one managed file resource plus one external shared database, and a
         // verified current artifact reference.
         let store = TargetStateStore::open(&state_root)?;
+        crate::filesystem::atomic_write(
+            &state_root.join("target-id"),
+            host.host_id.to_string().as_bytes(),
+            0o600,
+        )?;
         let runtime =
             crate::target::RuntimeSurface::new("podman", format!("nazauth-{DEPLOYMENT}"))?;
         let artifact = crate::target::ArtifactRefs {
@@ -277,6 +319,7 @@ impl Fixture {
                 current_build_identity: Some(
                     crate::target::BuildIdentity::new("nazoauth", "v1", "base").expect("identity"),
                 ),
+                current_rollback_policy: crate::model::test_release_rollback_policy(),
             },
             "bootstrap-op-0001",
         )?;
@@ -378,6 +421,77 @@ fn update_dispatches_migration_once_and_commits_new_revision() -> anyhow::Result
 }
 
 #[test]
+fn target_backup_gate_runs_before_lifecycle_and_update_replay_is_idempotent() -> anyhow::Result<()>
+{
+    let fixture = Fixture::new()?;
+    let target = LocalTarget::with_state_root(&fixture.state_root)
+        .with_lifecycle_executor(fixture.lifecycle.clone());
+    let artifact = || crate::target::OfficialArtifactRef {
+        repository: "nazozero/NazoAuth".to_owned(),
+        version: Some("v9.9.9".to_owned()),
+        expected_subject_sha256: None,
+    };
+    let rejected = HostOperation::state_mutate(
+        uuid::Uuid::now_v7().to_string(),
+        DEPLOYMENT,
+        Some(1),
+        StateMutationPayload::Update {
+            artifact: artifact(),
+            rollback_policy: crate::model::test_release_rollback_policy(),
+            backup_precondition: UpdateBackupPrecondition::Require {
+                manifest_sha256: "a".repeat(64),
+                restore_tested_at: chrono::Utc::now(),
+                max_age_seconds: 300,
+            },
+            config: None,
+            migration_jws: None,
+            migration_request_hash: None,
+        },
+    );
+    let result = target.execute_host_operation(&rejected)?;
+    let HostOutcome::Failed { code, .. } = result.outcome else {
+        panic!("missing backup evidence must reject the update")
+    };
+    assert_eq!(
+        code,
+        crate::target::update_exec::BACKUP_UPDATE_PRECONDITION_FAILED
+    );
+    assert_eq!(
+        *fixture.lifecycle.update_calls.lock().unwrap(),
+        0,
+        "backup drift must reject before artifact or migration execution"
+    );
+
+    let accepted = HostOperation::state_mutate(
+        uuid::Uuid::now_v7().to_string(),
+        DEPLOYMENT,
+        Some(1),
+        StateMutationPayload::Update {
+            artifact: artifact(),
+            rollback_policy: crate::model::test_release_rollback_policy(),
+            backup_precondition: UpdateBackupPrecondition::NotRequired,
+            config: None,
+            migration_jws: None,
+            migration_request_hash: None,
+        },
+    );
+    assert!(matches!(
+        target.execute_host_operation(&accepted)?.outcome,
+        HostOutcome::Completed { .. }
+    ));
+    assert!(matches!(
+        target.execute_host_operation(&accepted)?.outcome,
+        HostOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        *fixture.lifecycle.update_calls.lock().unwrap(),
+        1,
+        "the same accepted operation replays its stored terminal result"
+    );
+    Ok(())
+}
+
+#[test]
 fn update_activation_failure_commits_nothing_and_reports_stable_code() -> anyhow::Result<()> {
     let fixture = Fixture::new()?;
     fixture.lifecycle.set_fail_update(true);
@@ -440,10 +554,13 @@ fn rollback_restores_the_previous_verified_reference() -> anyhow::Result<()> {
     fixture.store()?.apply_update(
         DEPLOYMENT,
         1,
-        NEW_REF.to_owned(),
-        None,
-        None,
-        "prior-update-op",
+        crate::target::deployment_state::UpdateCommit {
+            artifact: NEW_REF.to_owned(),
+            build_identity: None,
+            rollback_policy: crate::model::test_release_rollback_policy(),
+            config: None,
+            operation_id: "prior-update-op".to_owned(),
+        },
     )?;
 
     let report = run_rollback(&fixture.context, Some(&format!("inst-{DEPLOYMENT}")))?;
@@ -551,71 +668,6 @@ fn uninstall_plan_and_operation_log_keep_external_resources_listed() -> anyhow::
     Ok(())
 }
 
-// -------------------------------------------------------------------- H05
-
-#[test]
-fn backup_maturity_is_recorded_and_displayed_without_gating_update() -> anyhow::Result<()> {
-    use crate::target::{BackupMaturity, TargetStateStore};
-
-    let fixture = Fixture::new()?;
-    let store = TargetStateStore::open(&fixture.state_root)?;
-
-    // Fresh deployments start Unknown; an explicit backup operation (owning
-    // the live revision) is the only writer.
-    assert_eq!(
-        store.load_existing(DEPLOYMENT)?.backup_maturity,
-        BackupMaturity::Unknown
-    );
-    store.record_backup_maturity(
-        DEPLOYMENT,
-        BackupMaturity::NotConfigured {
-            observed_at: chrono::Utc::now(),
-        },
-        "bootstrap-op-0001",
-    )?;
-
-    // NEGATIVE GATING TEST: update runs to completion on a deployment whose
-    // backup maturity says "no usable data backup" — install/update/status
-    // never require or block on backup facts (goal item 16).
-    let report = run_update(&fixture.context, &fixture.keys, &fixture.update_request())?;
-    assert!(report.contains("updated instance"), "{report}");
-    let state = store.load_existing(DEPLOYMENT)?;
-    assert_eq!(state.artifact.current.as_deref(), Some(NEW_REF));
-    assert!(matches!(
-        state.backup_maturity,
-        BackupMaturity::NotConfigured { .. }
-    ));
-
-    // The maturity fact reaches the status surface (inspection) verbatim.
-    let inspection = crate::target::LocalTarget::with_state_root(&fixture.state_root)
-        .inspect_instance(DEPLOYMENT)?;
-    assert_eq!(inspection.backup_maturity.token(), "not-configured");
-    assert!(inspection.backup_maturity.observed_at().is_some());
-    Ok(())
-}
-
-#[test]
-fn foreign_operations_cannot_report_backup_maturity() -> anyhow::Result<()> {
-    use crate::target::{BackupMaturity, TargetStateStore};
-
-    let fixture = Fixture::new()?;
-    let store = TargetStateStore::open(&fixture.state_root)?;
-    let failure = store
-        .record_backup_maturity(
-            DEPLOYMENT,
-            BackupMaturity::Verified {
-                observed_at: chrono::Utc::now(),
-            },
-            "not-the-owning-operation",
-        )
-        .expect_err("only the owning explicit operation may report");
-    assert!(
-        failure.detail.contains("explicit backup operation"),
-        "{failure:?}"
-    );
-    Ok(())
-}
-
 // -------------------------------------------------------------------- G07
 
 #[test]
@@ -700,12 +752,11 @@ fn durable_failed_migration_terminates_update_before_activation() -> anyhow::Res
 }
 
 #[test]
-fn durable_failed_migration_rerun_replays_failure_without_new_dispatch_identities()
--> anyhow::Result<()> {
+fn durable_failed_migration_clears_controller_slot_after_persistence() -> anyhow::Result<()> {
     // Two sequential attempts with the same inputs must both dispatch (the
-    // first is replayed from the accepted record), and both must fail; the
-    // second attempt reuses the same operation id because the record is
-    // terminal-accepted for these exact inputs.
+    // first terminal answer is durably carried by the target host journal and
+    // then clears ctl's single slot. A new invocation is a new attempt, so it
+    // receives a new operation identity rather than pinning the controller.
     let fixture = Fixture::new()?;
     *fixture.control.fail_business.lock().unwrap() = true;
     let request = UpdateRequest {
@@ -727,8 +778,8 @@ fn durable_failed_migration_rerun_replays_failure_without_new_dispatch_identitie
             .iter()
             .collect::<std::collections::BTreeSet<_>>()
             .len(),
-        1,
-        "identical inputs keep one operation identity across replays"
+        2,
+        "each post-terminal invocation receives a fresh operation identity"
     );
     Ok(())
 }

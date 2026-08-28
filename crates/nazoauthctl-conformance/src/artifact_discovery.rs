@@ -952,11 +952,11 @@ mod tests {
         ));
 
         record.manifest_url = MANIFEST_URL.to_owned();
-        let mut legacy = serde_json::to_value(&record).expect("cache record");
-        legacy["resolved_at"] = serde_json::json!(NOW);
+        let mut unknown_field = serde_json::to_value(&record).expect("cache record");
+        unknown_field["resolved_at"] = serde_json::json!(NOW);
         assert!(matches!(
             verify_cached_entry(
-                &serde_json::to_vec(&legacy).expect("legacy cache record"),
+                &serde_json::to_vec(&unknown_field).expect("cache record with unknown field"),
                 fetched.compact_manifest.as_bytes(),
                 &fetched.matrix,
                 &fetched.artifact.driver_manifest_sha256,

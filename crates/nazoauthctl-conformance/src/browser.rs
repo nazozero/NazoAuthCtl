@@ -557,7 +557,7 @@ pub use openid4vp::{
     OpenId4VpVerifierClient,
 };
 pub use parser::{parse_browser_entries, parse_browser_entries_owned};
-pub use plan::{BrowserRunnerState, OpenId4VcBrowserState};
+pub use plan::BrowserRunnerState;
 pub use schema::{
     BrowserCommand, BrowserEntry, BrowserSelector, BrowserTask, ReviewScreenshotMarker,
 };
@@ -667,11 +667,8 @@ pub trait BrowserDriver: Send {
 /// result, preserving the official PASS/FAIL decision.
 pub trait BrowserAutomation: Send {
     /// Establish a clean browser boundary for the next Suite module. The
-    /// default keeps non-browser test doubles source-compatible; production
-    /// WebDriver automation overrides this and deletes every browser cookie.
-    fn reset_session(&mut self) -> Result<(), BrowserError> {
-        Ok(())
-    }
+    /// implementation must explicitly establish its own isolation semantics.
+    fn reset_session(&mut self) -> Result<(), BrowserError>;
 
     fn execute(
         &mut self,
@@ -680,8 +677,8 @@ pub trait BrowserAutomation: Send {
     ) -> Result<BrowserRunReport, BrowserError>;
 
     /// Execute a signed browser program with module-scoped local review
-    /// capture. Existing test doubles remain source-compatible, but cannot
-    /// silently satisfy a required screenshot instruction.
+    /// capture. The default preserves the ordinary executor contract while
+    /// failing closed for required screenshot instructions.
     fn execute_with_review_capture(
         &mut self,
         authorization_url: &Url,
@@ -1249,10 +1246,9 @@ pub struct BrowserReviewScreenshotReceipt {
 
 /// The only two review image origins. The NazoAuthWeb source is admitted only
 /// after a same-module, runtime-signed OpenID4VP receipt was verified.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum BrowserReviewScreenshotSource {
     #[serde(rename = "suite-verification-evidence")]
-    #[default]
     SuiteVerificationEvidence,
     #[serde(rename = "nazo-vp-verification-result/live-webdriver")]
     NazoVpVerificationResultLiveWebdriver,

@@ -18,6 +18,7 @@
 //! No provider/DR gates exist anywhere here, and there is no `--all`.
 
 use anyhow::{Context as _, bail};
+use chrono::Utc;
 use nazo_operator_protocol::{ControlBuildIdentity, ControlOperationPayload, ControlTarget};
 use sha2::{Digest as _, Sha256};
 
@@ -28,9 +29,10 @@ use crate::controller_identity::dispatch::{
 use crate::controller_identity::journal::OperationJournal;
 use crate::controller_identity::operation::ControlOperationInput;
 use crate::controller_identity::store::ControllerKeyStore;
+use crate::registry::BackupBeforeUpdatePolicy;
 use crate::target::{
     BuildIdentity, HostCompletionBody, HostOperation, HostOutcome, OfficialArtifactRef,
-    StagedConfig, StateMutationPayload,
+    StagedConfig, StateMutationPayload, UpdateBackupPrecondition,
 };
 
 /// One update invocation. Defaults are minimal: only facts that cannot be
@@ -103,6 +105,51 @@ pub(crate) fn run_update(
              current artifact; re-register the instance with verified facts or reinstall"
         );
     }
+    let backup_precondition = match &record.backup_before_update {
+        BackupBeforeUpdatePolicy::Off => UpdateBackupPrecondition::NotRequired,
+        BackupBeforeUpdatePolicy::Warn => {
+            if restore_test_age_seconds(&inspection).is_none() {
+                eprintln!(
+                    "nazoauthctl: warning: update proceeds without a current restore-tested snapshot for '{}'",
+                    record.alias
+                );
+            }
+            UpdateBackupPrecondition::NotRequired
+        }
+        BackupBeforeUpdatePolicy::Require { max_age_seconds } => {
+            let Some(snapshot) = inspection.backup.snapshot.as_ref() else {
+                bail!(
+                    "update: backup-before-update=require for '{}' needs a restore-tested snapshot",
+                    record.alias
+                );
+            };
+            let Some(restore_tested_at) = snapshot.restore_tested_at else {
+                bail!(
+                    "update: backup-before-update=require for '{}' needs a restore-tested snapshot",
+                    record.alias
+                );
+            };
+            let Some(age_seconds) = restore_test_age_seconds(&inspection) else {
+                bail!(
+                    "update: backup-before-update=require for '{}' has a restore-test timestamp in the future",
+                    record.alias
+                );
+            };
+            if age_seconds > *max_age_seconds {
+                bail!(
+                    "update: backup-before-update=require for '{}' needs a restore-test no older than {} seconds (current age {} seconds)",
+                    record.alias,
+                    max_age_seconds,
+                    age_seconds
+                );
+            }
+            UpdateBackupPrecondition::Require {
+                manifest_sha256: snapshot.manifest_sha256.clone(),
+                restore_tested_at,
+                max_age_seconds: *max_age_seconds,
+            }
+        }
+    };
 
     let pinned = OfficialArtifactRef {
         repository: super::SERVER_REPOSITORY.to_owned(),
@@ -115,6 +162,8 @@ pub(crate) fn run_update(
         .resolve_target_artifact(&pinned, &inspection)?;
     let target_artifact = verified_target.digest;
     let target_build_identity = verified_target.identity;
+    let rollback_policy = verified_target.rollback_policy;
+    let artifact_rollback_allowed = rollback_policy.artifact_rollback_allowed_after_migration();
 
     // 3.+4. Application migration: exactly ONE pre-signed ControlOperation.
     // Its operation id IS the lifecycle id of this attempt — the HostOperation
@@ -156,17 +205,55 @@ pub(crate) fn run_update(
         Some(revision),
         StateMutationPayload::Update {
             artifact: pinned,
+            rollback_policy,
+            backup_precondition,
             config: request.staged_config()?,
             migration_jws: Some(prepared.signed.compact_jws.clone()),
+            migration_request_hash: Some(prepared.signed.request_hash.clone()),
         },
     );
     let result = target.execute_host_operation(&operation)?;
     let applied_revision = match &result.outcome {
         HostOutcome::Completed { body } => match body {
-            HostCompletionBody::StateMutateApplied { revision } => {
-                settle_journal(&journal, &prepared, &DispatchVerdict::Accepted)?;
+            HostCompletionBody::StateMutateApplied {
+                revision,
+                control_result: Some(control_result),
+            } => {
+                settle_journal(
+                    &journal,
+                    &prepared,
+                    &DispatchVerdict::Terminal(control_result.clone()),
+                    |_| Ok(()),
+                )?;
                 revision.to_string()
             }
+            HostCompletionBody::StateMutateMigrationFailed { result } => {
+                settle_journal(
+                    &journal,
+                    &prepared,
+                    &DispatchVerdict::Terminal(result.clone()),
+                    |_| Ok(()),
+                )?;
+                bail!(
+                    "the application migration failed durably (operation {lifecycle_id}); target artifact/config were NOT activated"
+                );
+            }
+            HostCompletionBody::StateMutateRecoveryRequired { result, detail } => {
+                settle_journal(
+                    &journal,
+                    &prepared,
+                    &DispatchVerdict::Terminal(result.clone()),
+                    |_| Ok(()),
+                )?;
+                bail!(
+                    "{}: migration succeeded but activation/readiness could not commit safely; {detail}",
+                    crate::target::ROLLBACK_RECOVERY_REQUIRED
+                );
+            }
+            HostCompletionBody::StateMutateApplied {
+                control_result: None,
+                ..
+            } => bail!("update: target omitted the MigrateApply ControlResult"),
             _ => bail!("update: the target answered an unexpected completion body"),
         },
         HostOutcome::Failed { code, detail } => {
@@ -176,7 +263,6 @@ pub(crate) fn run_update(
                 // NazoAuth's durable journal; the ctl journal only records the
                 // accepted authorization snapshot and must never fabricate a
                 // replacement ControlResult with invented timestamps.
-                settle_journal(&journal, &prepared, &DispatchVerdict::Accepted)?;
                 bail!(
                     "the application migration failed durably (operation {lifecycle_id}, error \
                      {code}); the target artifact/config were NOT activated — inspect \
@@ -184,13 +270,25 @@ pub(crate) fn run_update(
                 );
             }
             if code == "CONTROL_OUTCOME_UNKNOWN" || detail.contains("CONTROL_OUTCOME_UNKNOWN") {
-                settle_journal(&journal, &prepared, &DispatchVerdict::OutcomeUnknown)?;
+                settle_journal(
+                    &journal,
+                    &prepared,
+                    &DispatchVerdict::OutcomeUnknown,
+                    |_| Ok(()),
+                )?;
                 bail!(
                     "the migration outcome is unknown (dispatch failed after journaling); re-run the \
                      same update to resume operation {lifecycle_id} instead of starting over ({code}: {detail})"
                 );
             }
-            settle_journal(&journal, &prepared, &DispatchVerdict::DefinitivelyRejected)?;
+            settle_journal(
+                &journal,
+                &prepared,
+                &DispatchVerdict::DefinitivelyRejected {
+                    code: "REJECTED".to_owned(),
+                },
+                |_| Ok(()),
+            )?;
             bail!("update failed on the target: {code}: {detail}");
         }
     };
@@ -202,7 +300,7 @@ pub(crate) fn run_update(
 
     Ok(format!(
         "updated instance '{}' (deployment {deployment_id}) to artifact {}\n\
-         previous artifact preserved for explicit rollback\n\
+         {}\n\
          migration: migrate-apply via ControlOperation {lifecycle_id} (accepted once)\n\
          state committed at revision {applied_revision}; local health verified\n\
          \n\
@@ -216,13 +314,24 @@ pub(crate) fn run_update(
             .current
             .clone()
             .unwrap_or_else(|| "-".to_owned()),
+        if artifact_rollback_allowed {
+            "previous artifact preserved for explicit rollback"
+        } else {
+            "previous artifact retained as evidence; verified Release policy forbids rollback after migration"
+        },
         record.alias,
     ))
 }
 
+fn restore_test_age_seconds(inspection: &crate::target::InstanceInspection) -> Option<u64> {
+    let restored_at = inspection.backup.snapshot.as_ref()?.restore_tested_at?;
+    let age = Utc::now().signed_duration_since(restored_at).num_seconds();
+    u64::try_from(age).ok()
+}
+
 /// Build the artifact identity binding for the ControlOperation envelope from
 /// the facts recorded at install/update time on the target.
-fn control_target_for(target_artifact: &str, identity: &BuildIdentity) -> ControlTarget {
+pub(crate) fn control_target_for(target_artifact: &str, identity: &BuildIdentity) -> ControlTarget {
     ControlTarget::OciImage {
         image_digest: target_artifact.to_owned(),
         embedded: ControlBuildIdentity {

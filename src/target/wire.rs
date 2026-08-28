@@ -19,9 +19,10 @@
 //! - diagnostics quote only bounded, sanitized tokens — raw payload bytes
 //!   are never echoed back.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use nazo_operator_protocol::ControlResult;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -29,13 +30,25 @@ use super::bootstrap_authority::FreshBootstrapMaterialView;
 use super::deployment_state::{ArtifactRefs, RuntimeSurface, StateMutationPayload};
 
 /// Wire schema discriminator for HostOperation and HostResult messages.
-pub const HOST_PROTOCOL_SCHEMA: u32 = 2;
+pub const HOST_PROTOCOL_SCHEMA: u32 = 3;
 
 /// Maximum serialized HostOperation accepted from stdin or a local caller.
-pub const MAX_HOST_OPERATION_BYTES: usize = 64 * 1024;
+/// A tenant-resource Apply may carry one 4 MiB change set encoded as base64,
+/// plus its signed ControlOperation and JSON framing.
+pub const MAX_HOST_OPERATION_BYTES: usize = 6 * 1024 * 1024;
+
+/// Maximum raw Apply material carried alongside a signed ControlOperation.
+/// This equals the server operator's material-file admission limit.
+pub const MAX_CONTROL_CHANGE_SET_BYTES: usize = 4 * 1024 * 1024;
 
 /// Maximum serialized HostResult accepted from stdout before parsing fails.
 pub const MAX_HOST_RESULT_BYTES: usize = 1024 * 1024;
+
+/// Raw bytes in one backup-transfer message.  The base64 wire expansion and
+/// JSON envelope still stay comfortably within the 1 MiB HostResult cap.
+pub const MAX_BACKUP_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
+/// A transfer can never exceed one accepted snapshot artifact.
+pub const MAX_BACKUP_TRANSFER_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Closed registry of operation kinds. Kept literally beside the
 /// [`HostOperationBody`] variants on purpose; the wire-level parse classifies
@@ -62,6 +75,19 @@ pub const HOST_OPERATION_KINDS: &[&str] = &[
     "bootstrap-read",
     "runtime-logs",
     "journal-read",
+    "backup-snapshot",
+    "backup-restore-test",
+    "backup-recover",
+    "backup-recovery-candidate-stage",
+    "backup-recovery-candidate-cleanup",
+    "backup-recovery-activate",
+    "backup-export-prepare",
+    "backup-import-prepare",
+    "backup-transfer-read",
+    "backup-transfer-write",
+    "backup-import-finalize",
+    "backup-offhost-record",
+    "backup-transfer-cleanup",
 ];
 
 /// Product identity reported by a remote helper and required by the C08
@@ -83,22 +109,6 @@ pub const HOST_ERR_OPERATION_INVALID: &str = "OPERATION_INVALID";
 
 /// Stable failure code: the target does not implement the requested kind.
 pub const HOST_ERR_UNSUPPORTED_OPERATION: &str = "UNSUPPORTED_OPERATION";
-
-/// Stable failure code: the same `operation_id` was already accepted with a
-/// different canonical request hash (goal plan 01 rule 13). The retry must
-/// mint a new operation; the journal never overwrites the original intent.
-///
-/// Canonical name lives in [`crate::error_codes`]; re-exported here so the
-/// historical call sites keep one stable path.
-pub use crate::error_codes::OPERATION_ID_CONFLICT;
-
-/// Stable failure code: the remote helper's product, wire schema, or build
-/// identity does not match this binary (task C08). No fallback exists; the
-/// only remedy is upgrading the helper on the target host.
-///
-/// Canonical name lives in [`crate::error_codes`]; re-exported here so the
-/// historical call sites keep one stable path.
-pub use crate::error_codes::REMOTE_HELPER_MISMATCH;
 
 /// Stable rejection codes used when a transport cannot even parse a message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,7 +173,7 @@ impl std::error::Error for MessageRejection {}
 /// The payload rides in an explicit `operation` object (not `serde(flatten)`:
 /// flatten silently disables `deny_unknown_fields` and does not compose with
 /// internally tagged enums), so both nesting levels reject unknown fields.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostOperation {
     pub schema: u32,
@@ -187,7 +197,7 @@ pub struct HostOperation {
 // StateMutate carries the typed Bootstrap payload (which includes the G01
 // install order) and these are short-lived wire values.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HostOperationBody {
     /// Minimal liveness/helper probe. Echoes `nonce`; carries no state.
@@ -213,6 +223,8 @@ pub enum HostOperationBody {
     ControlOperation {
         compact_jws: String,
         expected_deployment_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        change_set: Option<SecretMaterial>,
     },
     /// Enumerate every NazoAuth DeploymentState on this target (goal plan 07
     /// §6, task G05). Host-level and strictly read-only: no instance binding,
@@ -238,6 +250,81 @@ pub enum HostOperationBody {
     /// Read the bounded target-side operation journal projection for one
     /// deployment. This is the same authority used for local operation views.
     JournalRead { limit: usize },
+    /// Create one target-local, checksummed snapshot over the deployment's
+    /// declared data, secret and configuration roots plus a PostgreSQL dump.
+    /// The target chooses every path; callers supply no filesystem or command
+    /// string.
+    BackupSnapshot {},
+    /// Perform an actual isolated PostgreSQL restore of the exact current
+    /// snapshot and persist a receipt bound to its manifest hash.
+    BackupRestoreTest {},
+    /// Restore one immutable snapshot while the target keeps the deployment
+    /// runtime quiesced.  This is a state mutation: its revision CAS prevents
+    /// a restored filesystem from being presented as a newer deployment.
+    BackupRecover { expected_manifest_sha256: String },
+    /// Start the already-restored deployment as its one loopback-only
+    /// candidate.  This does not open public ingress or start the original
+    /// runtime.
+    BackupRecoveryCandidateStage {
+        recovery_operation_id: String,
+        state_epoch: String,
+    },
+    /// Remove precisely the candidate returned by a prior stage operation.
+    BackupRecoveryCandidateCleanup {
+        endpoint: crate::runtime_backend::RecoveryCandidateEndpoint,
+    },
+    /// Replace and start the original runtime from the recovered snapshot.
+    /// The controller may issue this only after its target-host clock gate has
+    /// passed the signed RecoveryInvalidate deadline.
+    BackupRecoveryActivate {
+        recovery_operation_id: String,
+        state_epoch: String,
+        not_before: i64,
+    },
+    /// Prepare the source's fixed, owner-only transfer directory for an
+    /// already-verified snapshot. The controller moves only these returned
+    /// files with system OpenSSH; no caller path enters target execution.
+    BackupExportPrepare {},
+    /// Prepare the destination's fixed partial transfer directory. It may be
+    /// bound to a deployment which is not installed on that host.
+    BackupImportPrepare {},
+    /// Read one bounded immutable-export chunk through the source target's
+    /// ordinary journaled HostOperation channel.
+    BackupTransferRead {
+        transfer_operation_id: String,
+        file_name: String,
+        offset: u64,
+        maximum_bytes: u32,
+    },
+    /// Write one bounded chunk to the destination's operation-bound partial
+    /// directory.  The exact offset makes replay idempotent.
+    BackupTransferWrite {
+        transfer_operation_id: String,
+        file_name: String,
+        offset: u64,
+        total_bytes: u64,
+        file_sha256: String,
+        bytes: BackupTransferBytes,
+    },
+    /// Verify received bytes against the immutable manifest and atomically
+    /// publish the destination snapshot.
+    BackupImportFinalize {
+        /// The fixed import staging directory is bound to the transfer id;
+        /// this is intentionally distinct from the HostOperation journal id.
+        transfer_operation_id: String,
+        expected_manifest_sha256: String,
+        source_host_id: String,
+        destination_host_id: String,
+    },
+    /// Persist the destination's distinct-host receipt at the source only
+    /// after the controller received it from target finalization.
+    BackupOffHostRecord {
+        receipt: super::backup::OffHostCopyReceipt,
+    },
+    /// Remove one fixed transfer staging directory; the transfer operation id
+    /// is separate from the host journal operation id to keep replay hashes
+    /// unambiguous.
+    BackupTransferCleanup { transfer_operation_id: String },
 }
 
 impl HostOperationBody {
@@ -253,7 +340,24 @@ impl HostOperationBody {
             Self::BootstrapRead {} => "bootstrap-read",
             Self::RuntimeLogs { .. } => "runtime-logs",
             Self::JournalRead { .. } => "journal-read",
+            Self::BackupSnapshot {} => "backup-snapshot",
+            Self::BackupRestoreTest {} => "backup-restore-test",
+            Self::BackupRecover { .. } => "backup-recover",
+            Self::BackupRecoveryCandidateStage { .. } => "backup-recovery-candidate-stage",
+            Self::BackupRecoveryCandidateCleanup { .. } => "backup-recovery-candidate-cleanup",
+            Self::BackupRecoveryActivate { .. } => "backup-recovery-activate",
+            Self::BackupExportPrepare {} => "backup-export-prepare",
+            Self::BackupImportPrepare {} => "backup-import-prepare",
+            Self::BackupTransferRead { .. } => "backup-transfer-read",
+            Self::BackupTransferWrite { .. } => "backup-transfer-write",
+            Self::BackupImportFinalize { .. } => "backup-import-finalize",
+            Self::BackupOffHostRecord { .. } => "backup-offhost-record",
+            Self::BackupTransferCleanup { .. } => "backup-transfer-cleanup",
         }
+    }
+
+    pub(crate) fn is_ephemeral_backup_read(&self) -> bool {
+        matches!(self, Self::BackupTransferRead { .. })
     }
 }
 
@@ -326,6 +430,224 @@ impl HostOperation {
         }
     }
 
+    pub fn backup_snapshot(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::BackupSnapshot {},
+        }
+    }
+
+    pub fn backup_restore_test(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::BackupRestoreTest {},
+        }
+    }
+
+    pub fn backup_recover(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        expected_revision: u64,
+        expected_manifest_sha256: String,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: Some(expected_revision),
+            operation: HostOperationBody::BackupRecover {
+                expected_manifest_sha256,
+            },
+        }
+    }
+
+    pub fn backup_recovery_candidate_stage(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        expected_revision: u64,
+        recovery_operation_id: impl Into<String>,
+        state_epoch: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: Some(expected_revision),
+            operation: HostOperationBody::BackupRecoveryCandidateStage {
+                recovery_operation_id: recovery_operation_id.into(),
+                state_epoch: state_epoch.into(),
+            },
+        }
+    }
+
+    pub fn backup_recovery_candidate_cleanup(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        endpoint: crate::runtime_backend::RecoveryCandidateEndpoint,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::BackupRecoveryCandidateCleanup { endpoint },
+        }
+    }
+
+    pub fn backup_recovery_activate(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        expected_revision: u64,
+        recovery_operation_id: impl Into<String>,
+        state_epoch: impl Into<String>,
+        not_before: i64,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: Some(expected_revision),
+            operation: HostOperationBody::BackupRecoveryActivate {
+                recovery_operation_id: recovery_operation_id.into(),
+                state_epoch: state_epoch.into(),
+                not_before,
+            },
+        }
+    }
+
+    pub fn backup_export_prepare(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::BackupExportPrepare {},
+        }
+    }
+
+    pub fn backup_import_prepare(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::BackupImportPrepare {},
+        }
+    }
+
+    pub fn backup_transfer_read(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        transfer_operation_id: impl Into<String>,
+        file_name: impl Into<String>,
+        offset: u64,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::BackupTransferRead {
+                transfer_operation_id: transfer_operation_id.into(),
+                file_name: file_name.into(),
+                offset,
+                maximum_bytes: MAX_BACKUP_TRANSFER_CHUNK_BYTES as u32,
+            },
+        }
+    }
+
+    pub fn backup_transfer_write(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        transfer_operation_id: impl Into<String>,
+        chunk: BackupTransferChunk,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::BackupTransferWrite {
+                transfer_operation_id: transfer_operation_id.into(),
+                file_name: chunk.file_name,
+                offset: chunk.offset,
+                total_bytes: chunk.total_bytes,
+                file_sha256: chunk.file_sha256,
+                bytes: chunk.bytes,
+            },
+        }
+    }
+
+    pub fn backup_import_finalize(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        transfer_operation_id: String,
+        expected_manifest_sha256: String,
+        source_host_id: String,
+        destination_host_id: String,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::BackupImportFinalize {
+                transfer_operation_id,
+                expected_manifest_sha256,
+                source_host_id,
+                destination_host_id,
+            },
+        }
+    }
+
+    pub fn backup_offhost_record(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        receipt: super::backup::OffHostCopyReceipt,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::BackupOffHostRecord { receipt },
+        }
+    }
+
+    pub fn backup_transfer_cleanup(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        transfer_operation_id: String,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::BackupTransferCleanup {
+                transfer_operation_id,
+            },
+        }
+    }
+
     /// Deliver one signed ControlOperation to the target's local operator.
     /// The JWS travels opaquely; the binding pair is validated here so a
     /// mismatched envelope is refused before any transport activity.
@@ -333,6 +655,7 @@ impl HostOperation {
         operation_id: impl Into<String>,
         deployment_id: impl Into<String>,
         compact_jws: impl Into<String>,
+        change_set: Option<SecretMaterial>,
     ) -> Self {
         let deployment_id = deployment_id.into();
         Self {
@@ -343,6 +666,7 @@ impl HostOperation {
             operation: HostOperationBody::ControlOperation {
                 compact_jws: compact_jws.into(),
                 expected_deployment_id: deployment_id,
+                change_set,
             },
         }
     }
@@ -543,7 +867,11 @@ impl HostOperation {
                         }
                     }
                     StateMutationPayload::Update {
-                        artifact, config, ..
+                        artifact,
+                        rollback_policy,
+                        backup_precondition,
+                        config,
+                        ..
                     } => {
                         // Every lifecycle mutation replays against the live
                         // revision; without the expectation a resumed update
@@ -574,6 +902,18 @@ impl HostOperation {
                         {
                             return Err(rejection);
                         }
+                        if let Err(error) = rollback_policy.validate() {
+                            return Err(MessageRejection::new(
+                                RejectionCode::OperationMalformed,
+                                error.to_string(),
+                            ));
+                        }
+                        if let Err(error) = backup_precondition.validate() {
+                            return Err(MessageRejection::new(
+                                RejectionCode::OperationMalformed,
+                                error.to_string(),
+                            ));
+                        }
                     }
                     StateMutationPayload::Rollback {} => {
                         if self.expected_revision.is_none() {
@@ -602,9 +942,158 @@ impl HostOperation {
                     }
                 }
             }
+            HostOperationBody::BackupSnapshot {}
+            | HostOperationBody::BackupRestoreTest {}
+            | HostOperationBody::BackupExportPrepare {}
+            | HostOperationBody::BackupImportPrepare {}
+            | HostOperationBody::BackupOffHostRecord { .. } => {
+                if self.deployment_id.is_none() || self.expected_revision.is_some() {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "backup operations require deployment_id and must not carry expected_revision",
+                    ));
+                }
+            }
+            HostOperationBody::BackupTransferRead {
+                transfer_operation_id,
+                file_name,
+                offset: _,
+                maximum_bytes,
+            } => {
+                if self.deployment_id.is_none()
+                    || self.expected_revision.is_some()
+                    || !is_uuid_v7(transfer_operation_id)
+                    || !valid_backup_transfer_file(file_name)
+                    || *maximum_bytes == 0
+                    || *maximum_bytes as usize > MAX_BACKUP_TRANSFER_CHUNK_BYTES
+                {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "backup transfer read has invalid bounded chunk binding",
+                    ));
+                }
+            }
+            HostOperationBody::BackupTransferWrite {
+                transfer_operation_id,
+                file_name,
+                offset,
+                total_bytes,
+                file_sha256,
+                bytes,
+            } => {
+                let end = offset.checked_add(bytes.as_bytes().len() as u64);
+                if self.deployment_id.is_none()
+                    || self.expected_revision.is_some()
+                    || !is_uuid_v7(transfer_operation_id)
+                    || !valid_backup_transfer_file(file_name)
+                    || *total_bytes == 0
+                    || *total_bytes > MAX_BACKUP_TRANSFER_FILE_BYTES
+                    || !valid_lower_hex_sha256(file_sha256)
+                    || bytes.as_bytes().is_empty()
+                    || end.is_none_or(|end| end > *total_bytes)
+                {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "backup transfer write has invalid bounded chunk binding",
+                    ));
+                }
+            }
+            HostOperationBody::BackupRecover {
+                expected_manifest_sha256,
+            } => {
+                if self.deployment_id.is_none()
+                    || self.expected_revision.is_none()
+                    || !valid_lower_hex_sha256(expected_manifest_sha256)
+                {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "backup recover requires a deployment revision and manifest hash",
+                    ));
+                }
+            }
+            HostOperationBody::BackupRecoveryCandidateStage {
+                recovery_operation_id,
+                state_epoch,
+            } => {
+                if self.deployment_id.is_none()
+                    || self.expected_revision.is_none()
+                    || !is_uuid_v7(recovery_operation_id)
+                    || !is_uuid_v7(state_epoch)
+                {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "backup recovery candidate stage requires deployment, revision, and UUIDv7 recovery bindings",
+                    ));
+                }
+            }
+            HostOperationBody::BackupRecoveryCandidateCleanup { endpoint } => {
+                if self.deployment_id.as_deref() != Some(endpoint.deployment_id.as_str())
+                    || self.expected_revision.is_some()
+                    || !is_uuid_v7(&endpoint.operation_id)
+                    || endpoint.object_reference.is_empty()
+                    || endpoint.object_id.is_empty()
+                    || endpoint.loopback_port == 0
+                {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "backup recovery candidate cleanup has invalid immutable endpoint binding",
+                    ));
+                }
+            }
+            HostOperationBody::BackupRecoveryActivate {
+                recovery_operation_id,
+                state_epoch,
+                not_before,
+            } => {
+                if self.deployment_id.is_none()
+                    || self.expected_revision.is_none()
+                    || !is_uuid_v7(recovery_operation_id)
+                    || !is_uuid_v7(state_epoch)
+                    || *not_before <= 0
+                {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "backup recovery activation requires deployment, revision, and UUIDv7 recovery bindings",
+                    ));
+                }
+            }
+            HostOperationBody::BackupImportFinalize {
+                transfer_operation_id,
+                expected_manifest_sha256,
+                source_host_id,
+                destination_host_id,
+            } => {
+                if self.deployment_id.is_none()
+                    || self.expected_revision.is_some()
+                    || uuid::Uuid::parse_str(transfer_operation_id).is_err()
+                    || !valid_lower_hex_sha256(expected_manifest_sha256)
+                    || uuid::Uuid::parse_str(source_host_id).is_err()
+                    || uuid::Uuid::parse_str(destination_host_id).is_err()
+                    || source_host_id == destination_host_id
+                {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "backup import finalize has invalid binding",
+                    ));
+                }
+            }
+            HostOperationBody::BackupTransferCleanup {
+                transfer_operation_id,
+            } => {
+                if self.deployment_id.is_none()
+                    || self.expected_revision.is_some()
+                    || uuid::Uuid::parse_str(transfer_operation_id).is_err()
+                {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "backup transfer cleanup has invalid binding",
+                    ));
+                }
+            }
             HostOperationBody::ControlOperation {
                 compact_jws,
                 expected_deployment_id,
+                change_set,
             } => {
                 // Instance binding required; revision expectations are
                 // meaningless for a pass-through delivery.
@@ -639,6 +1128,15 @@ impl HostOperation {
                          binding",
                     ));
                 }
+                if change_set.as_ref().is_some_and(|material| {
+                    material.as_bytes().is_empty()
+                        || material.as_bytes().len() > MAX_CONTROL_CHANGE_SET_BYTES
+                }) {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "control-operation change_set must be 1 byte to 4 MiB",
+                    ));
+                }
             }
             HostOperationBody::RuntimeLogs { limit } => {
                 if self.deployment_id.is_none()
@@ -671,6 +1169,162 @@ impl HostOperation {
 /// The frozen protocol allows 64 KiB envelopes and the HostOperation total
 /// cap equals it, so the payload keeps that bound minus framing headroom.
 const MAX_CONTROL_JWS_BYTES: usize = 60 * 1024;
+
+const BACKUP_TRANSFER_FILES: [&str; 3] = [
+    "postgresql.dump",
+    "deployment.tar",
+    "snapshot-manifest.json",
+];
+
+fn valid_backup_transfer_file(value: &str) -> bool {
+    BACKUP_TRANSFER_FILES.contains(&value)
+}
+
+/// Opaque backup bytes carried only inside the authenticated HostOperation
+/// channel.  It has a deliberately redacted Debug implementation so archive
+/// contents never enter diagnostics.  Journal lines retain only the request
+/// hash, not this payload.
+#[derive(Clone, Eq, PartialEq)]
+pub struct BackupTransferBytes(Vec<u8>);
+
+impl BackupTransferBytes {
+    pub fn try_new(bytes: Vec<u8>) -> Result<Self, MessageRejection> {
+        if bytes.is_empty() || bytes.len() > MAX_BACKUP_TRANSFER_CHUNK_BYTES {
+            return Err(MessageRejection::new(
+                RejectionCode::OperationMalformed,
+                "backup transfer chunk must be 1 through 256 KiB",
+            ));
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for BackupTransferBytes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BackupTransferBytes")
+            .field("redacted", &true)
+            .field("byte_len", &self.0.len())
+            .finish()
+    }
+}
+
+impl Serialize for BackupTransferBytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for BackupTransferBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let maximum_encoded = MAX_BACKUP_TRANSFER_CHUNK_BYTES.div_ceil(3) * 4;
+        if encoded.len() > maximum_encoded {
+            return Err(serde::de::Error::custom(
+                "backup transfer chunk exceeds 256 KiB",
+            ));
+        }
+        let bytes = STANDARD.decode(encoded).map_err(serde::de::Error::custom)?;
+        Self::try_new(bytes).map_err(|error| serde::de::Error::custom(error.detail))
+    }
+}
+
+/// One source-read response; the controller sends it unchanged as the typed
+/// destination write request.  Every offset and full-file hash is explicit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupTransferChunk {
+    pub transfer_operation_id: String,
+    pub file_name: String,
+    pub offset: u64,
+    pub total_bytes: u64,
+    pub file_sha256: String,
+    pub bytes: BackupTransferBytes,
+}
+
+/// Raw Apply material with a compact base64 JSON representation. It is the
+/// one opaque secret carrier for this protocol: never Debug or Clone it.
+/// Construction and deserialization enforce the server's fixed 4 MiB ceiling.
+#[derive(Eq, PartialEq)]
+pub struct SecretMaterial(Vec<u8>);
+
+impl SecretMaterial {
+    pub fn try_new(bytes: Vec<u8>) -> Result<Self, MessageRejection> {
+        if bytes.is_empty() || bytes.len() > MAX_CONTROL_CHANGE_SET_BYTES {
+            return Err(MessageRejection::new(
+                RejectionCode::OperationMalformed,
+                "secret material must be 1 byte to 4 MiB",
+            ));
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretMaterial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretMaterial")
+            .field("redacted", &true)
+            .field("byte_len", &self.0.len())
+            .finish()
+    }
+}
+
+impl Drop for SecretMaterial {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl Serialize for SecretMaterial {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.0.len() > MAX_CONTROL_CHANGE_SET_BYTES {
+            return Err(serde::ser::Error::custom(
+                "secret material exceeds the 4 MiB limit",
+            ));
+        }
+        serializer.serialize_str(&STANDARD.encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretMaterial {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let maximum_encoded = MAX_CONTROL_CHANGE_SET_BYTES.div_ceil(3) * 4;
+        if encoded.len() > maximum_encoded {
+            return Err(serde::de::Error::custom(
+                "secret material exceeds the 4 MiB limit",
+            ));
+        }
+        let bytes = STANDARD.decode(encoded).map_err(serde::de::Error::custom)?;
+        if bytes.len() > MAX_CONTROL_CHANGE_SET_BYTES {
+            return Err(serde::de::Error::custom(
+                "secret material exceeds the 4 MiB limit",
+            ));
+        }
+        Self::try_new(bytes).map_err(|error| serde::de::Error::custom(error.detail))
+    }
+}
 
 fn valid_lower_hex_sha256(value: &str) -> bool {
     value.len() == 64
@@ -760,6 +1414,23 @@ pub enum HostCompletionBody {
     /// The revision a successful mutation produced (F04).
     StateMutateApplied {
         revision: u64,
+        /// Present only for an Update carrying MigrateApply. The exact
+        /// server-durable answer is echoed so ctl can apply its one shared
+        /// ControlOperation validator before clearing its journal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        control_result: Option<ControlResult>,
+    },
+    /// The nested MigrateApply completed durably as Failed.  The host order
+    /// intentionally did not activate artifact/config; ctl must validate and
+    /// settle the exact result before reporting the business failure.
+    StateMutateMigrationFailed {
+        result: ControlResult,
+    },
+    /// MigrateApply succeeded, but the verified Release policy forbids
+    /// returning to the old writer after activation/readiness failed.
+    StateMutateRecoveryRequired {
+        result: ControlResult,
+        detail: String,
     },
     /// A clean install committed `local_healthy` state on the target (G01).
     /// Carries the full live inspection so the control side can register the
@@ -797,6 +1468,38 @@ pub enum HostCompletionBody {
     JournalRead {
         entries: Vec<super::journal::OperationLogEntry>,
     },
+    BackupSnapshotCreated {
+        manifest: super::backup::SnapshotManifest,
+    },
+    BackupRestoreTested {
+        receipt: super::backup::RestoreTestReceipt,
+    },
+    /// Recovery has replaced the formal data/config/database paths and
+    /// committed the matching DeploymentState generation.  The runtime is
+    /// intentionally still stopped; later recovery phases own invalidation
+    /// and the local-clock ingress deadline.
+    BackupRecovered {
+        snapshot_id: String,
+        manifest_sha256: String,
+        revision: u64,
+    },
+    BackupRecoveryCandidateStaged {
+        endpoint: crate::runtime_backend::RecoveryCandidateEndpoint,
+    },
+    BackupRecoveryCandidateCleaned {},
+    BackupRecoveryActivated {},
+    BackupTransferPrepared {
+        plan: super::backup_exec::BackupTransferPlan,
+    },
+    BackupTransferChunk {
+        chunk: BackupTransferChunk,
+    },
+    BackupTransferWritten {},
+    BackupImportFinalized {
+        receipt: super::backup::OffHostCopyReceipt,
+    },
+    BackupOffHostRecorded {},
+    BackupTransferCleaned {},
 }
 
 /// Live inspection of one registered instance read from the target-side
@@ -834,11 +1537,24 @@ pub struct InstanceInspection {
     /// verification recorded them (G03 ControlOperation envelope source).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_build_identity: Option<super::deployment_state::BuildIdentity>,
-    /// Backup/DR maturity (H05): informational fact reported by explicit
-    /// backup operations. Status/doctor surfaces display it with its
-    /// observation timestamp; no lifecycle use case ever gates on it.
-    #[serde(default)]
-    pub backup_maturity: super::deployment_state::BackupMaturity,
+    /// Runtime-owned public identity that signs current control-discovery and
+    /// OpenID4VP verification receipts. It is read from the exact managed
+    /// identity directory on the target, never inferred from the public issuer
+    /// and never substituted with a controller key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_instance_identity: Option<RuntimeInstanceIdentity>,
+    /// Derived from the target-owned snapshot manifest and restore-test
+    /// receipt on every inspection.  It is never written into DeploymentState
+    /// or the controller Registry as a second maturity fact.
+    pub backup: super::backup::BackupProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeInstanceIdentity {
+    pub runtime_instance_id: String,
+    pub instance_key_id: String,
+    pub instance_public_key_base64: String,
 }
 
 /// Identity a target helper announces about itself (goal plan 03 §6).
@@ -851,6 +1567,9 @@ pub struct InstanceInspection {
 #[serde(deny_unknown_fields)]
 pub struct RemoteHello {
     pub product: String,
+    /// Immutable target-owned identity.  The target creates it once under its
+    /// private state root; the Registry adopts this as `HostRecord.host_id`.
+    pub target_id: String,
     /// Highest HostOperation/HostResult wire schema the helper answers.
     pub remote_exec_schema: u32,
     pub version: String,
@@ -863,8 +1582,19 @@ pub struct RemoteHello {
 /// The hello payload this binary answers with. Runtime detection stays with
 /// the caller; the identity fields are compile-time facts.
 pub fn local_hello(supported_runtimes: Vec<String>) -> RemoteHello {
+    local_hello_for_target(supported_runtimes, Uuid::now_v7())
+}
+
+/// Build a hello for one already-established target identity.  The plain
+/// helper above is only suitable for in-memory fake targets; real dispatch
+/// must call this function with the durable target-owned UUID.
+pub(crate) fn local_hello_for_target(
+    supported_runtimes: Vec<String>,
+    target_id: Uuid,
+) -> RemoteHello {
     RemoteHello {
         product: HELLO_PRODUCT.to_owned(),
+        target_id: target_id.to_string(),
         remote_exec_schema: HOST_PROTOCOL_SCHEMA,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         commit: LOCAL_BUILD_COMMIT.to_owned(),
@@ -880,6 +1610,9 @@ pub fn local_hello(supported_runtimes: Vec<String>) -> RemoteHello {
 pub fn verify_remote_hello(hello: &RemoteHello) -> Result<(), String> {
     if !valid_token(&hello.product, 64) {
         return Err("hello product is not a valid token".to_owned());
+    }
+    if !matches!(Uuid::parse_str(&hello.target_id), Ok(id) if id.get_version_num() == 7) {
+        return Err("hello target_id is not a UUIDv7".to_owned());
     }
     if !valid_token(&hello.version, 64) {
         return Err("hello version is not a valid token".to_owned());
@@ -1087,6 +1820,31 @@ mod tests {
     }
 
     #[test]
+    fn legacy_systemd_runtime_token_is_operation_malformed() -> anyhow::Result<()> {
+        let operation = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-runtime-cutover",
+            None,
+            StateMutationPayload::Bootstrap {
+                issuer: "https://auth.example.com".to_owned(),
+                runtime: RuntimeSurface::new("host", "nazoauth-runtime-cutover.service")?,
+                artifact: None,
+                config_reference: "/etc/nazoauth/config.yaml".to_owned(),
+                config_schema: "nazoauth-config-v1".to_owned(),
+                resources: Vec::new(),
+                install: None,
+            },
+        );
+        let canonical = String::from_utf8(encode_host_operation(&operation)?)?;
+        let legacy = canonical.replace("\"kind\":\"host\"", "\"kind\":\"systemd\"");
+        assert_ne!(legacy, canonical, "fixture must replace the runtime token");
+
+        let rejection = parse_host_operation(legacy.as_bytes()).expect_err("legacy token accepted");
+        assert_eq!(rejection.code, RejectionCode::OperationMalformed);
+        Ok(())
+    }
+
+    #[test]
     fn every_registered_kind_round_trips() -> anyhow::Result<()> {
         assert_eq!(
             HOST_OPERATION_KINDS,
@@ -1101,6 +1859,19 @@ mod tests {
                 "bootstrap-read",
                 "runtime-logs",
                 "journal-read",
+                "backup-snapshot",
+                "backup-restore-test",
+                "backup-recover",
+                "backup-recovery-candidate-stage",
+                "backup-recovery-candidate-cleanup",
+                "backup-recovery-activate",
+                "backup-export-prepare",
+                "backup-import-prepare",
+                "backup-transfer-read",
+                "backup-transfer-write",
+                "backup-import-finalize",
+                "backup-offhost-record",
+                "backup-transfer-cleanup",
             ]
         );
         let operation = ping_operation("probe");
@@ -1108,6 +1879,25 @@ mod tests {
         let parsed = parse_host_operation(&encoded)?;
         assert_eq!(parsed, operation);
         assert_eq!(parsed.operation.kind(), "ping");
+
+        let chunk = BackupTransferChunk {
+            transfer_operation_id: Uuid::now_v7().to_string(),
+            file_name: "deployment.tar".to_owned(),
+            offset: 0,
+            total_bytes: 3,
+            file_sha256: "a".repeat(64),
+            bytes: BackupTransferBytes::try_new(vec![1, 2, 3])?,
+        };
+        let write = HostOperation::backup_transfer_write(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            chunk.transfer_operation_id.clone(),
+            chunk,
+        );
+        assert_eq!(
+            parse_host_operation(&encode_host_operation(&write)?)?,
+            write
+        );
 
         let hello = HostOperation::hello(Uuid::now_v7().to_string());
         let encoded = encode_host_operation(&hello)?;
@@ -1165,16 +1955,33 @@ mod tests {
             config_sha256: "b".repeat(64),
             data_root: "/var/lib/nazoauth".to_owned(),
             runtime_root: None,
-            secrets: vec![super::super::install_exec::PlannedSecret {
-                purpose: "database-url".to_owned(),
-                path: "/var/lib/nazoauth/secrets/database-url".to_owned(),
-                value: Some("secret".to_owned()),
-            }],
-            database_endpoint: crate::target::install_exec::ExternalEndpoint {
+            secrets: [
+                ("database-runtime-url", true),
+                ("database-lifecycle-url", true),
+                ("valkey-url", true),
+                ("mfa-totp-key", false),
+            ]
+            .into_iter()
+            .map(
+                |(purpose, supplied)| super::super::install_exec::PlannedSecret {
+                    purpose: purpose.to_owned(),
+                    path: format!("/var/lib/nazoauth/secrets/{purpose}"),
+                    value: supplied.then(|| SecretMaterial::try_new(b"secret".to_vec()).unwrap()),
+                },
+            )
+            .collect(),
+            current_data_import: None,
+            database_runtime_endpoint: crate::target::install_exec::ExternalEndpoint {
                 host: "db.internal".to_owned(),
                 port: 5432,
                 name: "oauth".to_owned(),
-                user: "nazoauth".to_owned(),
+                user: "nazoauth_runtime".to_owned(),
+            },
+            database_lifecycle_endpoint: crate::target::install_exec::ExternalEndpoint {
+                host: "db.internal".to_owned(),
+                port: 5432,
+                name: "oauth".to_owned(),
+                user: "nazoauth_lifecycle".to_owned(),
             },
             valkey_endpoint: crate::target::install_exec::ExternalEndpoint {
                 host: "cache.internal".to_owned(),
@@ -1186,6 +1993,9 @@ mod tests {
             fresh_bootstrap: true,
             port: 8000,
         };
+        let mut broken_order: super::super::install_exec::InstallOrder =
+            serde_json::from_slice(&serde_json::to_vec(&order)?)?;
+        broken_order.config_sha256 = "not-a-digest".to_owned();
         let mut install = HostOperation::state_mutate(
             Uuid::now_v7().to_string(),
             "deploy-alpha",
@@ -1200,7 +2010,7 @@ mod tests {
                 config_reference: "/etc/nazauth/deployments/deploy-alpha/config.json".to_owned(),
                 config_schema: "nazauth-seed-v1".to_owned(),
                 resources: Vec::new(),
-                install: Some(order.clone()),
+                install: Some(order),
             },
         );
         let parsed = parse_host_operation(&encode_host_operation(&install)?)?;
@@ -1211,8 +2021,6 @@ mod tests {
         );
 
         // A broken order fails at admission, before any target side effect.
-        let mut broken_order = order;
-        broken_order.config_sha256 = "not-a-digest".to_owned();
         if let HostOperationBody::StateMutate {
             mutation: StateMutationPayload::Bootstrap { install, .. },
         } = &mut install.operation
@@ -1248,12 +2056,16 @@ mod tests {
                     version: Some("v0.3.0".to_owned()),
                     expected_subject_sha256: Some("c".repeat(64)),
                 },
+                rollback_policy: crate::model::test_release_rollback_policy(),
+                backup_precondition:
+                    super::super::deployment_state::UpdateBackupPrecondition::NotRequired,
                 config: Some(super::super::install_exec::StagedConfig {
                     content: "{\"issuer\":\"https://auth.example.com\"}".to_owned(),
                     sha256: "d".repeat(64),
                     schema: "nazauth-config-v2".to_owned(),
                 }),
                 migration_jws: None,
+                migration_request_hash: None,
             },
         );
         assert_eq!(
@@ -1294,6 +2106,7 @@ mod tests {
             Uuid::now_v7().to_string(),
             "deploy-alpha",
             "eyJhbGciOiJFZERTQSJ9.eyJvcGVyYXRpb25faWQiOiJ4In0.sig",
+            None,
         );
         let parsed = parse_host_operation(&encode_host_operation(&control)?)?;
         assert_eq!(parsed, control);
@@ -1319,7 +2132,7 @@ mod tests {
 
         // Binding mismatch is refused before any transport activity.
         let mut crossed =
-            HostOperation::control_operation(Uuid::now_v7().to_string(), "deploy-a", &jws);
+            HostOperation::control_operation(Uuid::now_v7().to_string(), "deploy-a", &jws, None);
         if let HostOperationBody::ControlOperation {
             expected_deployment_id,
             ..
@@ -1332,7 +2145,7 @@ mod tests {
 
         // A revision expectation is meaningless on a pass-through delivery.
         let mut revisioned =
-            HostOperation::control_operation(Uuid::now_v7().to_string(), "deploy-a", &jws);
+            HostOperation::control_operation(Uuid::now_v7().to_string(), "deploy-a", &jws, None);
         revisioned.expected_revision = Some(2);
         assert!(revisioned.validate().is_err());
 
@@ -1343,8 +2156,12 @@ mod tests {
             "a.b.c d",
             &"x".repeat(MAX_CONTROL_JWS_BYTES + 1),
         ] {
-            let operation =
-                HostOperation::control_operation(Uuid::now_v7().to_string(), "deploy-a", broken);
+            let operation = HostOperation::control_operation(
+                Uuid::now_v7().to_string(),
+                "deploy-a",
+                broken,
+                None,
+            );
             let rejection = operation.validate().expect_err(broken);
             assert_eq!(
                 rejection.code,
@@ -1352,6 +2169,36 @@ mod tests {
                 "{rejection}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn control_change_set_round_trips_exact_bytes_and_obeys_the_raw_limit() -> anyhow::Result<()> {
+        let jws = format!("{}.{}.{}", "a".repeat(40), "b".repeat(40), "c".repeat(64));
+        let material = vec![0x5a; MAX_CONTROL_CHANGE_SET_BYTES];
+        let operation = HostOperation::control_operation(
+            Uuid::now_v7().to_string(),
+            "deploy-a",
+            &jws,
+            Some(SecretMaterial::try_new(material.clone())?),
+        );
+        let encoded = encode_host_operation(&operation)?;
+        assert!(encoded.len() <= MAX_HOST_OPERATION_BYTES);
+        let decoded = parse_host_operation(&encoded)?;
+        let HostOperationBody::ControlOperation {
+            change_set: Some(decoded),
+            ..
+        } = decoded.operation
+        else {
+            panic!("expected carried change set")
+        };
+        assert_eq!(decoded.as_bytes(), material);
+        let debug = format!("{decoded:?}");
+        assert!(debug.contains("redacted"));
+        assert!(!debug.contains("ZZZZ"));
+        assert!(std::mem::needs_drop::<SecretMaterial>());
+
+        assert!(SecretMaterial::try_new(vec![0; MAX_CONTROL_CHANGE_SET_BYTES + 1]).is_err());
         Ok(())
     }
 
@@ -1398,7 +2245,15 @@ mod tests {
             active_host_operation: None,
             config_revision_marker: None,
             current_build_identity: None,
-            backup_maturity: super::super::deployment_state::BackupMaturity::Unknown,
+            current_instance_identity: Some(RuntimeInstanceIdentity {
+                runtime_instance_id: "runtime-alpha".to_owned(),
+                instance_key_id: "instance-key-alpha".to_owned(),
+                instance_public_key_base64: "public-key-alpha".to_owned(),
+            }),
+            backup: super::super::backup::BackupProjection {
+                local_rollback_ready: false,
+                snapshot: None,
+            },
         };
         let listed = HostResult::completed(
             Uuid::now_v7().to_string(),
@@ -1422,8 +2277,12 @@ mod tests {
                     version: None,
                     expected_subject_sha256: None,
                 },
+                rollback_policy: crate::model::test_release_rollback_policy(),
+                backup_precondition:
+                    super::super::deployment_state::UpdateBackupPrecondition::NotRequired,
                 config: None,
                 migration_jws: None,
+                migration_request_hash: None,
             },
         );
         let rejection = cas_free_update.validate().expect_err("update without CAS");
@@ -1442,8 +2301,12 @@ mod tests {
                     version: None,
                     expected_subject_sha256: Some("NOT-A-DIGEST".to_owned()),
                 },
+                rollback_policy: crate::model::test_release_rollback_policy(),
+                backup_precondition:
+                    super::super::deployment_state::UpdateBackupPrecondition::NotRequired,
                 config: None,
                 migration_jws: None,
+                migration_request_hash: None,
             },
         );
         assert!(bad_pin.validate().is_err());
@@ -1469,6 +2332,57 @@ mod tests {
             rejection.detail.contains("expected_revision"),
             "{rejection}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn update_wire_requires_an_explicit_backup_precondition() -> anyhow::Result<()> {
+        let update = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-a",
+            Some(1),
+            StateMutationPayload::Update {
+                artifact: super::super::install_exec::OfficialArtifactRef {
+                    repository: "nazozero/NazoAuth".to_owned(),
+                    version: None,
+                    expected_subject_sha256: None,
+                },
+                rollback_policy: crate::model::test_release_rollback_policy(),
+                backup_precondition:
+                    super::super::deployment_state::UpdateBackupPrecondition::NotRequired,
+                config: None,
+                migration_jws: None,
+                migration_request_hash: None,
+            },
+        );
+        let mut old_wire: serde_json::Value =
+            serde_json::from_slice(&encode_host_operation(&update)?)?;
+        old_wire["operation"]["mutation"]
+            .as_object_mut()
+            .expect("update mutation object")
+            .remove("backup_precondition");
+        let rejection = parse_host_operation(&serde_json::to_vec(&old_wire)?)
+            .expect_err("an old update order without the hard-cut field must fail");
+        assert_eq!(rejection.code, RejectionCode::OperationMalformed);
+
+        let mut invalid = update;
+        let HostOperationBody::StateMutate {
+            mutation:
+                StateMutationPayload::Update {
+                    backup_precondition,
+                    ..
+                },
+        } = &mut invalid.operation
+        else {
+            unreachable!("constructed update")
+        };
+        *backup_precondition = super::super::deployment_state::UpdateBackupPrecondition::Require {
+            manifest_sha256: "not-a-sha256".to_owned(),
+            restore_tested_at: Utc::now(),
+            max_age_seconds: 0,
+        };
+        let rejection = invalid.validate().expect_err("invalid backup binding");
+        assert_eq!(rejection.code, RejectionCode::OperationMalformed);
         Ok(())
     }
 
@@ -1668,6 +2582,12 @@ mod tests {
         );
         let rejection = parse_host_operation(wrong_schema.as_bytes()).err().unwrap();
         assert_eq!(rejection.code, RejectionCode::OperationSchemaUnsupported);
+
+        let old_result = format!(
+            r#"{{"schema":2,"operation_id":"{id}","outcome":{{"status":"failed","code":"OLD_HELPER","detail":"old schema"}}}}"#
+        );
+        let rejection = parse_host_result(old_result.as_bytes()).err().unwrap();
+        assert_eq!(rejection.code, RejectionCode::ResultSchemaUnsupported);
 
         let rejection = parse_host_operation(b"{not json").err().unwrap();
         assert_eq!(rejection.code, RejectionCode::OperationMalformed);

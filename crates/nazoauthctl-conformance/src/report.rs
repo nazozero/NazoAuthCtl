@@ -1,18 +1,18 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::client::AuthProbe;
 use crate::progress::ProgressSnapshot;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CleanupFailure {
     pub operation: String,
     pub target: String,
     pub error: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct CleanupReport {
     pub cancelled: Vec<String>,
     pub deleted_plans: Vec<String>,
@@ -23,7 +23,7 @@ pub struct CleanupReport {
     pub failures: Vec<CleanupFailure>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PlanReport {
     pub matrix_plan_id: String,
     pub suite_plan_id: Option<String>,
@@ -32,23 +32,22 @@ pub struct PlanReport {
     pub created_instances: usize,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize)]
 pub struct ModuleReport {
     pub matrix_plan_id: String,
     pub suite_plan_id: String,
     pub module_id: Option<String>,
     pub test_name: String,
-    /// Canonical Suite definition variant. Empty preserves the legacy
-    /// name-only report shape while non-empty variants distinguish otherwise
-    /// identical Suite test names.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// Canonical Suite definition variant. Non-empty variants distinguish
+    /// otherwise identical Suite test names.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub variant: BTreeMap<String, String>,
     pub terminal: bool,
     /// A signed OpenID4VP verifier module which remains at the Suite's
     /// deferred-review boundary. This is deliberately not a Suite terminal
     /// result and can only be retained with a locally verified required
     /// verification-result capture.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub deferred_review_pending: Option<DeferredReviewPending>,
     /// The suite's status is preserved verbatim; it is not mapped to a local
     /// pass/fail result.
@@ -71,17 +70,17 @@ pub struct ModuleReport {
     /// Locally captured, root-private screenshots requested by a signed
     /// browser placeholder command. They are evidence references only; image
     /// bytes, browser URLs, and page content never enter this report.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub review_screenshots: Vec<ReviewScreenshotReport>,
     /// Exact signed required capture obligations reached while executing this
     /// module's authoritative browser URLs.
-    #[serde(default, skip_serializing_if = "is_zero")]
+    #[serde(skip_serializing_if = "is_zero")]
     pub review_screenshots_required: usize,
-    #[serde(default, skip_serializing_if = "is_zero")]
+    #[serde(skip_serializing_if = "is_zero")]
     pub review_screenshots_required_captured: usize,
     /// Optional signed screenshot markers that could not be captured. A
     /// required marker instead fails local orchestration before reporting.
-    #[serde(default, skip_serializing_if = "is_zero")]
+    #[serde(skip_serializing_if = "is_zero")]
     pub review_screenshots_missing: usize,
     /// Public evidence omits config/owner/secret-bearing fields. The complete
     /// objects are retained in the in-memory fields below for evidence sinks.
@@ -93,7 +92,7 @@ pub struct ModuleReport {
     pub raw_log: Value,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct ReviewScreenshotReport {
     pub path: std::path::PathBuf,
     pub sha256: String,
@@ -103,7 +102,7 @@ pub struct ReviewScreenshotReport {
 /// Identity of the sole signed Suite placeholder that remains pending after a
 /// locally verified NazoAuthWeb OpenID4VP result capture. The controller never
 /// calls the Suite image API or marks this placeholder visited.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DeferredReviewPending {
     pub placeholder_path: String,
     pub marker: crate::ReviewScreenshotMarker,
@@ -118,7 +117,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ModuleOutcome {
     Passed,
@@ -139,7 +138,7 @@ pub(crate) struct ModuleReportContext {
     pub expected_result: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct OrchestrationIntegrity {
     pub defined_modules: usize,
     pub created_instances: usize,
@@ -148,37 +147,33 @@ pub struct OrchestrationIntegrity {
     pub all_modules_terminal: bool,
     /// Every module either reached an exact Suite terminal state or the
     /// constrained deferred-review state recorded below.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(skip_serializing_if = "is_false")]
     pub all_modules_settled: bool,
     /// Count of explicit deferred-review modules. These are never Suite pass
     /// or acceptance pass results.
-    #[serde(default, skip_serializing_if = "is_zero")]
+    #[serde(skip_serializing_if = "is_zero")]
     pub deferred_review_modules: usize,
     pub cleanup_complete: bool,
     /// A requested certification retention path is deliberately not cleanup.
-    #[serde(default)]
     pub retention_requested: bool,
     /// Every created module reached an exact terminal or deferred-review
     /// settlement state with no orchestration error.
-    #[serde(default)]
     pub retention_eligible: bool,
     /// All exact Suite allocations are covered by a locally verified
     /// retention candidate, but ownership has not yet moved to its durable
     /// manifest. This lets the ordinary runner stage that handoff without
     /// falsely reporting retention as committed.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(skip_serializing_if = "is_false")]
     pub retention_candidate_settled: bool,
     /// Exact Suite plan ownership was transferred to a retained manifest.
     /// This is deliberately distinct from ordinary cleanup completion.
-    #[serde(default)]
     pub retention_committed: bool,
     /// Set after ordinary cleanup or a durable retained-manifest transition
     /// transfers exact plan ownership.
-    #[serde(default)]
     pub suite_resources_settled: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize)]
 pub struct ConformanceReport {
     pub schema: u32,
     pub matrix_digest: String,
@@ -198,11 +193,10 @@ pub struct ConformanceReport {
     /// Matrix: `PASSED`, or an exact declared `SKIPPED`, with no review,
     /// warning, failed, or incomplete outcome. `suite_pass` intentionally
     /// remains stricter and only represents all-PASSED Suite execution.
-    #[serde(default)]
     pub acceptance_pass: bool,
     /// At least one module is retained at the Suite's deferred-review
     /// boundary. This is auditable local settlement, not certification.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(skip_serializing_if = "is_false")]
     pub review_pending: bool,
     /// True when one or more modules returned REVIEW/WARNING or
     /// emitted a WARNING condition. These modules remain listed in `modules`
@@ -212,28 +206,24 @@ pub struct ConformanceReport {
     pub human_review_modules: Vec<String>,
     /// Variant-qualified modules at the deferred Suite review boundary. These
     /// are settled locally but never terminal/passed Suite outcomes.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deferred_review_modules: Vec<String>,
     /// Variant-qualified identities that the Suite classified as `SKIPPED`. An expected skip
     /// remains skipped and never contributes to `suite_pass`.
     pub skipped_modules: Vec<String>,
     /// Variant-qualified identities that actually finished
     /// `SKIPPED` and were explicitly allowed by the signed Matrix.
-    #[serde(default)]
     pub expected_skipped_modules: Vec<String>,
     /// Variant-qualified identities that actually finished
     /// `SKIPPED` without an exact signed Matrix allowance.
-    #[serde(default)]
     pub unexpected_skipped_modules: Vec<String>,
     /// Signed `SKIPPED` declarations whose test name was absent from, or was
     /// duplicated in, the Suite's definition of that Matrix plan.
-    #[serde(default)]
     pub unknown_declared_skip_modules: Vec<String>,
     /// Whether every declared Matrix skip was unambiguously enumerated by the
     /// Suite and no module unexpectedly finished `SKIPPED`. This is separate
     /// from local orchestration success so evidence can distinguish a clean
     /// execution from an unacceptable signed-expectation mismatch.
-    #[serde(default = "matrix_expectations_satisfied_default")]
     pub matrix_expectations_satisfied: bool,
     /// Variant-qualified identities with an explicit failed/unknown result or a blocking log.
     pub failed_modules: Vec<String>,
@@ -423,10 +413,6 @@ pub(crate) fn module_identity(module: &ModuleReport) -> String {
         "{}/{}?variant={canonical_variant}",
         module.matrix_plan_id, module.test_name
     )
-}
-
-const fn matrix_expectations_satisfied_default() -> bool {
-    false
 }
 
 fn collect_condition_log_results(
@@ -679,87 +665,6 @@ mod tests {
         let expected_only = summarize_module_outcomes(&modules[..1]);
         assert!(expected_only.acceptance_pass);
         assert!(!expected_only.all_passed);
-    }
-
-    #[test]
-    fn legacy_schema_three_report_without_skip_gate_fields_fails_closed() {
-        let current = ConformanceReport {
-            schema: 3,
-            matrix_digest: "d".repeat(64),
-            suite_origin: "https://suite.example".to_owned(),
-            auth_probe: None,
-            errors: Vec::new(),
-            local_success: true,
-            suite_pass: true,
-            acceptance_pass: true,
-            review_pending: false,
-            human_review_required: false,
-            human_review_modules: Vec::new(),
-            deferred_review_modules: Vec::new(),
-            skipped_modules: Vec::new(),
-            expected_skipped_modules: Vec::new(),
-            unexpected_skipped_modules: Vec::new(),
-            unknown_declared_skip_modules: Vec::new(),
-            matrix_expectations_satisfied: true,
-            failed_modules: Vec::new(),
-            incomplete_modules: Vec::new(),
-            orchestration_integrity: OrchestrationIntegrity {
-                defined_modules: 0,
-                created_instances: 0,
-                terminal_modules: 0,
-                all_modules_instantiated: true,
-                all_modules_terminal: true,
-                all_modules_settled: true,
-                deferred_review_modules: 0,
-                cleanup_complete: true,
-                retention_requested: false,
-                retention_eligible: false,
-                retention_candidate_settled: false,
-                retention_committed: false,
-                suite_resources_settled: true,
-            },
-            progress: ProgressSnapshot {
-                completed: 0,
-                total: 0,
-                groups: Vec::new(),
-                passed_groups: 0,
-                review_groups: 0,
-                skipped_groups: 0,
-                failed_groups: 0,
-                running_groups: 0,
-                remaining_groups: 0,
-                passed: 0,
-                reviewed: 0,
-                skipped: 0,
-                failed: 0,
-                running: 0,
-                remaining: 0,
-                current_profile: None,
-                current_variant: None,
-                current_test: None,
-            },
-            plans: Vec::new(),
-            modules: Vec::new(),
-            cleanup: CleanupReport::default(),
-        };
-        let mut legacy = serde_json::to_value(current).expect("current report");
-        for field in [
-            "acceptance_pass",
-            "expected_skipped_modules",
-            "unexpected_skipped_modules",
-            "unknown_declared_skip_modules",
-            "matrix_expectations_satisfied",
-        ] {
-            legacy.as_object_mut().expect("report object").remove(field);
-        }
-
-        let restored: ConformanceReport = serde_json::from_value(legacy).expect("legacy report");
-
-        assert!(!restored.acceptance_pass);
-        assert!(!restored.matrix_expectations_satisfied);
-        assert!(restored.expected_skipped_modules.is_empty());
-        assert!(restored.unexpected_skipped_modules.is_empty());
-        assert!(restored.unknown_declared_skip_modules.is_empty());
     }
 
     #[test]

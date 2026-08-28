@@ -18,6 +18,7 @@ use super::{
 
 mod managed_dependencies;
 mod policy;
+mod recovery;
 
 pub use managed_dependencies::oci_backup_digests;
 pub(crate) use managed_dependencies::{
@@ -25,15 +26,17 @@ pub(crate) use managed_dependencies::{
     persist_dependency_restore_journal, postgres_database_from_service_file,
     temporary_postgres_credentials, validate_sql_identifier, verify_oci_backup_artifacts,
 };
+#[cfg(all(test, unix))]
+use policy::observed_cap_drop_all;
 pub(crate) use policy::{
-    append_container_policy, append_managed_labels, assert_container_image, assert_managed_labels,
-    command_stdout, container_is_running, ensure_container, ensure_volume, inspect_document,
-    inspect_document_optional, inspect_managed_container_id, is_engine_unavailable_error,
+    append_container_policy, append_managed_labels, assert_container_image,
+    assert_managed_container_policy, assert_managed_labels, command_stdout, container_is_running,
+    ensure_container, ensure_volume, inspect_document, inspect_document_optional,
+    inspect_image_environment, inspect_managed_container_id, is_engine_unavailable_error,
     network_config_digest, network_gateway, prepare_managed_volume_ownership, reconcile_bound_file,
     remove_managed_container_by_id, remove_managed_container_by_name, require_digest_pinned_image,
 };
-#[cfg(all(test, unix))]
-use policy::{assert_managed_container_policy, observed_cap_drop_all};
+pub(crate) use recovery::{cleanup_recovery_candidate, stage_recovery_candidate};
 
 /// Numeric uid/gid used for OCI one-shot work.  A name supplied by an image
 /// is not an authorization boundary: the caller must provide the explicit

@@ -19,11 +19,7 @@
 
 use anyhow::Context as _;
 
-/// Stable failure code for every sunk privilege refusal.
-///
-/// Canonical name lives in [`crate::error_codes`]; re-exported here so the
-/// historical call sites keep one stable path.
-pub use crate::error_codes::PRIVILEGE_REQUIRED;
+use crate::error_codes::PRIVILEGE_REQUIRED;
 
 /// The closed set of steps whose privilege requirements this module owns.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

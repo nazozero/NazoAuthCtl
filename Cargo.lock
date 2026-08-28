@@ -1214,8 +1214,8 @@ dependencies = [
 
 [[package]]
 name = "nazo-operator-protocol"
-version = "0.2.1"
-source = "git+https://github.com/nazozero/NazoAuth.git?tag=v0.2.1#84baae78d45d8c0a94943a106d6c53dea123c335"
+version = "0.2.3"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=7538370e8cd5cc8e773bc96d9f2050c6c7dd0982#7538370e8cd5cc8e773bc96d9f2050c6c7dd0982"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1234,6 +1234,7 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "ctrlc",
+ "nazo-operator-protocol",
  "nazoauthctl-conformance",
  "nazoauthctl-core",
  "rand",

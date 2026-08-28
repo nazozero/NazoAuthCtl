@@ -199,7 +199,6 @@ mod tests {
             alias,
             host.host_id,
             "https://auth.example.com",
-            "target-state/x",
         )?;
         instance.controller_key_ref = Some(controller_key_ref_for(deployment_id)?);
         fixture.registry.add_instance(instance)?;
@@ -387,7 +386,6 @@ mod tests {
             "bare",
             host.host_id,
             "https://auth.example.com",
-            "ref",
         )?;
         f.registry.add_instance(bare)?;
         let error = build_signed_control_operation(&f.registry, &f.keys, "bare", sample_input())
@@ -406,7 +404,6 @@ mod tests {
             "mis",
             host.host_id,
             "https://auth.example.com",
-            "ref",
         )?;
         misbound.controller_key_ref = Some(controller_key_ref_for("deploy-other")?);
         f.registry.add_instance(misbound)?;

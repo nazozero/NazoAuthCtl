@@ -78,7 +78,7 @@ pub(crate) fn validate_instance_identifier(value: &str) -> anyhow::Result<()> {
 /// Validate the unpadded base64url shape of a kid (43 characters). The value
 /// itself is re-derived from key material on load; this check only bounds the
 /// string before it is used in paths or comparisons.
-fn validate_kid_shape(kid: &str) -> anyhow::Result<()> {
+pub(super) fn validate_kid_shape(kid: &str) -> anyhow::Result<()> {
     if kid.len() != KID_LENGTH
         || !kid
             .bytes()

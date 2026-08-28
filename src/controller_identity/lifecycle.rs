@@ -33,18 +33,118 @@
 //! piped stdin for humans), and are never logged, echoed, or persisted.
 
 use anyhow::{Context as _, bail};
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroize as _;
 
 use crate::cli::{BindOptions, ControllerCommand, InstanceSelector};
+use crate::file_lock::FileLock;
 use crate::filesystem;
-use crate::registry::{InstanceRecord, ObservationCache, RegistryStore, validate_issuer};
+use crate::registry::{InstanceRecord, RegistryStore, validate_issuer};
 
 use super::admin_api::{
     self, AdminAccess, AdminAccessFile, ControllerRegistryApi, ControllerSlotView,
     RevokeCommitBody, RotateCommitBody, SlotCommitBody, SlotStatus, SlotsSnapshot, short_kid,
 };
 use super::expiry;
-use super::recovery::{self as recovery, generate_material};
+use super::recovery::{self as recovery, generate_material, material_from_display};
 use super::store::{ControllerKeyStore, controller_key_ref_for};
+
+const PENDING_BIND_RECOVERY_SCHEMA: u32 = 1;
+const PENDING_BIND_RECOVERY_FILE: &str = "bind-recovery-pending.json";
+const MAX_PENDING_BIND_RECOVERY_BYTES: u64 = 4 * 1024;
+
+/// The only temporarily persisted Recovery Secret: the one already delivered
+/// for a first-bind proposal whose server commit has not yet completed. It is
+/// scoped to the controller-key directory, never copied into Registry or the
+/// ordinary operation journal, and is erased as soon as reconciliation proves
+/// the bind terminal.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingBindRecovery {
+    schema: u32,
+    deployment_id: String,
+    controller_kid: String,
+    label: String,
+    recovery_secret: String,
+}
+
+impl Drop for PendingBindRecovery {
+    fn drop(&mut self) {
+        self.recovery_secret.zeroize();
+    }
+}
+
+fn pending_bind_recovery_path(
+    keys: &ControllerKeyStore,
+    deployment_id: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    Ok(keys
+        .instance_dir(deployment_id)?
+        .join(PENDING_BIND_RECOVERY_FILE))
+}
+
+fn load_pending_bind_recovery(
+    keys: &ControllerKeyStore,
+    deployment_id: &str,
+) -> anyhow::Result<Option<PendingBindRecovery>> {
+    let path = pending_bind_recovery_path(keys, deployment_id)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    }
+    let bytes = filesystem::read_secure_regular_file(
+        &path,
+        "pending first-bind recovery material",
+        true,
+        MAX_PENDING_BIND_RECOVERY_BYTES,
+    )?;
+    let pending: PendingBindRecovery = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "pending first-bind recovery material is invalid: {}",
+            path.display()
+        )
+    })?;
+    if pending.schema != PENDING_BIND_RECOVERY_SCHEMA
+        || pending.deployment_id != deployment_id
+        || pending.controller_kid.is_empty()
+        || pending.label.is_empty()
+    {
+        bail!("pending first-bind recovery material does not match deployment '{deployment_id}'");
+    }
+    Ok(Some(pending))
+}
+
+fn save_pending_bind_recovery(
+    keys: &ControllerKeyStore,
+    pending: &PendingBindRecovery,
+) -> anyhow::Result<()> {
+    let path = pending_bind_recovery_path(keys, &pending.deployment_id)?;
+    let bytes = zeroize::Zeroizing::new(
+        serde_json::to_vec(pending).context("serializing pending first-bind recovery material")?,
+    );
+    filesystem::atomic_write(&path, &bytes, 0o600).with_context(|| {
+        format!(
+            "failed to persist exact first-bind recovery material at {}",
+            path.display()
+        )
+    })
+}
+
+fn clear_pending_bind_recovery(
+    keys: &ControllerKeyStore,
+    deployment_id: &str,
+) -> anyhow::Result<()> {
+    let path = pending_bind_recovery_path(keys, deployment_id)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => filesystem::remove_file_durable(&path)
+            .with_context(|| format!("failed to erase {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
 
 /// What one flow presents to the human approver (goal plan 04 §3): exact
 /// action/deployment/label/kid fingerprints, never private bytes.
@@ -251,8 +351,6 @@ fn reconcile_from_snapshot(
             return Ok(None);
         }
 
-        cache_snapshot(registry, deployment, snapshot)?;
-
         let mut report = format!(
             "recovered controller binding for '{}' from the authoritative server list\n  \
              controller {} kid {} activated locally\n",
@@ -282,7 +380,7 @@ fn reconcile_from_snapshot(
             keys.clear_active(deployment)?;
             return Ok(Some(format!(
                 "controller identity {controller_id} of '{}' is no longer active at the \
-                 server; the local binding was cleared. Enroll again with `controller bind` \
+                 server; the local binding was cleared. Enroll again with `nazoauthctl bind` \
                  once the cause is resolved\n",
                 record.alias
             )));
@@ -304,24 +402,10 @@ fn persist_binding_fields(
     Ok(())
 }
 
-/// Cache the latest authoritative snapshot in the instance observation so
-/// fleet/status surfaces can show expiry warnings without contact (task D09).
-/// Pure display data; never consulted for authorization.
-fn cache_snapshot(
-    registry: &RegistryStore,
-    deployment_id: &str,
-    snapshot: &SlotsSnapshot,
-) -> anyhow::Result<()> {
-    registry.set_instance_observation(
-        deployment_id,
-        ObservationCache::now(true, expiry::summarize_slots(snapshot)),
-    )
-}
-
 fn require_bound(record: &InstanceRecord) -> anyhow::Result<String> {
     record.controller_id.clone().with_context(|| {
         format!(
-            "instance '{}' has no bound controller identity; run `controller bind` first",
+            "instance '{}' has no bound controller identity; run `nazoauthctl bind` first",
             record.alias
         )
     })
@@ -355,12 +439,11 @@ fn verify_committed_slot(
     Ok(())
 }
 
-/// Shared post-commit tail: refresh the authoritative snapshot, persist the
-/// registry fields, switch the active pointer, and render the completion
-/// report. Server state stays the authority throughout; both local steps are
-/// recoverable via [`reconcile_from_snapshot`] on any later command.
-fn finish_activation<A: ControllerRegistryApi>(
-    api: &A,
+/// Shared post-commit tail: persist the registry fields, switch the active
+/// pointer, and render the live commit response. Server state stays the
+/// authority throughout; both local steps are recoverable via
+/// [`reconcile_from_snapshot`] on any later command.
+fn finish_activation(
     registry: &RegistryStore,
     keys: &ControllerKeyStore,
     alias: &str,
@@ -368,10 +451,8 @@ fn finish_activation<A: ControllerRegistryApi>(
     kid: &str,
     committed_slot: ControllerSlotView,
 ) -> anyhow::Result<String> {
-    let snapshot = api.list_slots(deployment)?;
     persist_binding_fields(registry, deployment, Some(&committed_slot.controller_id))?;
     keys.set_active_kid(deployment, kid)?;
-    cache_snapshot(registry, deployment, &snapshot)?;
     let status = expiry::ExpiryStatus::classify(chrono::Utc::now(), committed_slot.expires_at);
     Ok(format!(
         "controller identity committed for '{alias}' (deployment {deployment})\n  controller \
@@ -404,10 +485,14 @@ pub(crate) fn bind_flow<A: ControllerRegistryApi>(
     let record = resolve_record(registry, selector)?;
     validate_label(label)?;
     let deployment = record.deployment_id.clone();
+    let instance_dir = keys.instance_dir(&deployment)?;
+    filesystem::ensure_private_directory(&instance_dir, "controller key directory")?;
+    let _bind_lock = FileLock::acquire(&instance_dir.join("bind.lock"))?;
     let snapshot = api.list_slots(&deployment)?;
 
     // D06: a previous run may have committed server-side already.
     if let Some(report) = reconcile_from_snapshot(registry, keys, &record, &snapshot)? {
+        clear_pending_bind_recovery(keys, &deployment)?;
         return Ok(format!("bind complete via crash recovery.\n{report}"));
     }
 
@@ -419,16 +504,53 @@ pub(crate) fn bind_flow<A: ControllerRegistryApi>(
         );
     }
 
-    // D04.6: resume a still-pending proposal instead of minting new material.
-    let kid = match select_pending_candidate(keys, &deployment, &snapshot)? {
-        Some(pending) => pending,
-        None => keys.generate_candidate(&deployment)?.kid,
+    // D04.6: resume the exact still-pending proposal. The controller key and
+    // Recovery Root are one approval/commit unit; neither may change after a
+    // secret has been delivered.
+    let pending_recovery = load_pending_bind_recovery(keys, &deployment)?;
+    let kid = match pending_recovery.as_ref() {
+        Some(pending) => {
+            if pending.label != label {
+                bail!(
+                    "a first-bind proposal for label '{}' is already pending; retry that exact label",
+                    pending.label
+                );
+            }
+            if snapshot
+                .items
+                .iter()
+                .any(|slot| slot.kid == pending.controller_kid)
+            {
+                bail!(
+                    "pending first-bind controller key is already present server-side but was not reconcilable"
+                );
+            }
+            pending.controller_kid.clone()
+        }
+        None => match select_pending_candidate(keys, &deployment, &snapshot)? {
+            Some(pending) => pending,
+            None => keys.generate_candidate(&deployment)?.kid,
+        },
     };
     let public_key = load_public_key(keys, &deployment, &kid)?;
 
-    // The Recovery Root born with this binding. Its secret is delivered
-    // before the commit below; nothing but this one display ever holds it.
-    let recovery_material = generate_material(&deployment);
+    let recovery_material = match pending_recovery {
+        Some(pending) => material_from_display(&deployment, &pending.recovery_secret)?,
+        None => {
+            let material = generate_material(&deployment);
+            save_pending_bind_recovery(
+                keys,
+                &PendingBindRecovery {
+                    schema: PENDING_BIND_RECOVERY_SCHEMA,
+                    deployment_id: deployment.clone(),
+                    controller_kid: kid.clone(),
+                    label: label.to_owned(),
+                    recovery_secret: material.display.clone(),
+                },
+            )?;
+            material
+        }
+    };
 
     let presentation = ProposalPresentation {
         action: "bind",
@@ -461,7 +583,9 @@ pub(crate) fn bind_flow<A: ControllerRegistryApi>(
     })?;
     verify_committed_slot(&slot, &deployment, &kid, "bind")?;
 
-    finish_activation(api, registry, keys, &record.alias, &deployment, &kid, slot)
+    let report = finish_activation(registry, keys, &record.alias, &deployment, &kid, slot)?;
+    clear_pending_bind_recovery(keys, &deployment)?;
+    Ok(report)
 }
 
 fn b64url(bytes: &[u8]) -> String {
@@ -554,7 +678,7 @@ pub fn rotate_flow<A: ControllerRegistryApi>(
     let previous = keys
         .load_active(&deployment)?
         .map(|loaded| loaded.kid().to_owned());
-    let report = finish_activation(api, registry, keys, &record.alias, &deployment, &kid, slot)?;
+    let report = finish_activation(registry, keys, &record.alias, &deployment, &kid, slot)?;
 
     // Retire the old private key only after the confirmed atomic replace
     // (the server row now carries the new kid exclusively).
@@ -649,7 +773,7 @@ pub fn add_flow<A: ControllerRegistryApi>(
 
     // This ctl adopts its NEW slot as the identity it signs with; the
     // previous key stays enrolled until its own expiry or explicit revocation.
-    let report = finish_activation(api, registry, keys, &record.alias, &deployment, &kid, slot)?;
+    let report = finish_activation(registry, keys, &record.alias, &deployment, &kid, slot)?;
     Ok(format!(
         "{report}note: the previous controller key remains enrolled and valid until its own \
          expiry or explicit revocation\n"
@@ -675,7 +799,9 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
         .with_context(|| {
             format!(
                 "controller id '{controller_id}' has no slot for deployment '{deployment}'; \
-                 revocation requires the exact id (`controller slots` lists them)"
+                 revocation requires the exact id (`nazoauthctl controller list --instance {}` \
+                 lists them)",
+                record.alias
             )
         })?
         .clone();
@@ -727,7 +853,6 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
         deployment
     );
 
-    let refreshed = api.list_slots(&deployment)?;
     if self_revoked {
         persist_binding_fields(registry, &deployment, None)?;
         keys.clear_active(&deployment)?;
@@ -745,7 +870,6 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
         keys.retire_kid(&deployment, &revoked.kid)?;
         report.push_str("matching stale local key record retired\n");
     }
-    cache_snapshot(registry, &deployment, &refreshed)?;
     Ok(report)
 }
 
@@ -778,7 +902,7 @@ pub fn slots_flow<A: ControllerRegistryApi>(
         record.alias, deployment, record.issuer, snapshot.total, snapshot.max_active_slots
     ));
     if snapshot.items.is_empty() {
-        report.push_str("  none enrolled; run `controller bind`\n");
+        report.push_str("  none enrolled; run `nazoauthctl bind`\n");
     }
     for slot in &snapshot.items {
         for row in expiry::render_slot_line(slot, now).split('\n') {
@@ -787,7 +911,6 @@ pub fn slots_flow<A: ControllerRegistryApi>(
             report.push('\n');
         }
     }
-    cache_snapshot(registry, &deployment, &snapshot)?;
     Ok(report)
 }
 
@@ -1117,7 +1240,6 @@ mod tests {
             "production",
             host.host_id,
             "https://auth.example.com",
-            "ref",
         )?;
         registry.add_instance(instance)?;
         Ok(Fixture {
@@ -1164,6 +1286,7 @@ mod tests {
     struct FakeApi {
         snapshots: std::cell::RefCell<Vec<SlotsSnapshot>>,
         commits: std::cell::RefCell<Vec<serde_json::Value>>,
+        commit_attempts: std::cell::RefCell<Vec<SlotCommitBody>>,
         rotate_calls: std::cell::RefCell<Vec<RotateCommitBody>>,
         revoke_calls: std::cell::RefCell<Vec<RevokeCommitBody>>,
         commit_errors: std::cell::RefCell<Vec<AdminApiError>>,
@@ -1206,6 +1329,7 @@ mod tests {
         }
 
         fn commit_slot(&self, body: &SlotCommitBody) -> Result<ControllerSlotView, AdminApiError> {
+            self.commit_attempts.borrow_mut().push(body.clone());
             if let Some(error) = self.commit_errors.borrow_mut().pop() {
                 return Err(error);
             }
@@ -1338,13 +1462,22 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingDelivery(std::cell::RefCell<Vec<String>>);
+
+    impl recovery::ReplacementSecretDelivery for RecordingDelivery {
+        fn deliver(&self, display: &str) -> anyhow::Result<()> {
+            self.0.borrow_mut().push(display.to_owned());
+            Ok(())
+        }
+    }
+
     #[test]
     fn bind_generates_exactly_one_candidate_and_persists_the_binding() -> anyhow::Result<()> {
         assert!(real_public_key_length());
         let f = fixture()?;
         let api = FakeApi::default();
         api.push_snapshot(vec![]); // pre-commit view
-        api.push_snapshot(vec![slot_view(CONTROLLER_A, KID_A, SlotStatus::Active, 30)]); // post-commit
 
         let report = bind_flow(
             &api,
@@ -1380,8 +1513,10 @@ mod tests {
             "bind must enroll a Recovery Root in the same transaction: {commit}"
         );
 
-        let cached = expiry::parse_cached_slots(&record.last_observation.unwrap().summary);
-        assert!(cached.is_some(), "slot facts cached for D09");
+        assert!(
+            record.last_observation.is_none(),
+            "live slot facts must not be copied into the display observation cache"
+        );
 
         // Re-running bind against a bound instance is refused up front.
         api.push_snapshot(vec![slot_view(
@@ -1413,6 +1548,7 @@ mod tests {
     fn bind_resume_reuses_pending_candidate_instead_of_minting_new_keys() -> anyhow::Result<()> {
         let f = fixture()?;
         let api = FakeApi::default();
+        let delivery = RecordingDelivery::default();
 
         // First attempt dies at the commit (expired approval): the candidate
         // stays, nothing activates locally.
@@ -1429,7 +1565,7 @@ mod tests {
             None,
             "ops",
             fixed_approval("expired-token-0001"),
-            &SilentDelivery,
+            &delivery,
         )
         .expect_err("rejected");
         assert!(error.downcast_ref::<AdminApiError>().is_some(), "{error:#}");
@@ -1438,6 +1574,11 @@ mod tests {
             "not activated"
         );
         let first_candidate = f.keys.list_keys("deploy-alpha")?[0].kid.clone();
+        let pending_path = pending_bind_recovery_path(&f.keys, "deploy-alpha")?;
+        assert!(
+            pending_path.is_file(),
+            "failed commit must retain exact root material"
+        );
 
         // Second attempt resumes with the SAME candidate (D04.6).
         api.push_snapshot(vec![]); // attempt 2 pre-commit
@@ -1454,11 +1595,26 @@ mod tests {
             None,
             "ops",
             fixed_approval("good-token-000002"),
-            &SilentDelivery,
+            &delivery,
         )?;
         let active = f.keys.load_active("deploy-alpha")?.expect("activated");
         assert_eq!(active.kid(), first_candidate);
         assert_eq!(f.keys.list_keys("deploy-alpha")?.len(), 1, "no orphan keys");
+        let attempts = api.commit_attempts.borrow();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].kid, attempts[1].kid);
+        assert_eq!(attempts[0].recovery_kid, attempts[1].recovery_kid);
+        assert_eq!(
+            attempts[0].recovery_public_key,
+            attempts[1].recovery_public_key
+        );
+        let delivered = delivery.0.borrow();
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0], delivered[1]);
+        assert!(
+            !pending_path.exists(),
+            "terminal bind must erase pending secret"
+        );
         Ok(())
     }
 
@@ -1524,12 +1680,6 @@ mod tests {
             SlotStatus::Active,
             2,
         )]); // reconcile view
-        api.push_snapshot(vec![slot_view(
-            CONTROLLER_A,
-            original.kid(),
-            SlotStatus::Active,
-            2,
-        )]); // post-commit refresh
 
         let report = rotate_flow(
             &api,
@@ -1614,15 +1764,6 @@ mod tests {
             SlotStatus::Active,
             20,
         )]);
-        api.push_snapshot(vec![
-            slot_view(CONTROLLER_A, original.kid(), SlotStatus::Active, 20),
-            slot_view(
-                CONTROLLER_B,
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1",
-                SlotStatus::Active,
-                30,
-            ),
-        ]);
         api.assign_next_commit_controller_id(CONTROLLER_B);
 
         let report = add_flow(
@@ -1745,12 +1886,6 @@ mod tests {
             SlotStatus::Active,
             10,
         )]);
-        api.push_snapshot(vec![slot_view(
-            CONTROLLER_A,
-            own_key.kid(),
-            SlotStatus::Revoked,
-            0,
-        )]);
         let report = revoke_flow(
             &api,
             &f.registry,
@@ -1788,7 +1923,8 @@ mod tests {
     }
 
     #[test]
-    fn slots_flow_reports_expiry_classes_and_caches_the_snapshot() -> anyhow::Result<()> {
+    fn slots_flow_reports_live_expiry_classes_without_persisting_the_snapshot() -> anyhow::Result<()>
+    {
         let f = fixture()?;
         let api = FakeApi::default();
         api.push_snapshot(vec![slot_view(CONTROLLER_A, KID_A, SlotStatus::Active, 20)]);
@@ -1805,7 +1941,10 @@ mod tests {
         assert!(report.contains("EXPIRED"), "{report}");
 
         let record = f.registry.instance_by_deployment("deploy-alpha")?.unwrap();
-        assert!(expiry::parse_cached_slots(&record.last_observation.unwrap().summary).is_some());
+        assert!(
+            record.last_observation.is_none(),
+            "explicit live list output must not become a second expiry authority"
+        );
         Ok(())
     }
 

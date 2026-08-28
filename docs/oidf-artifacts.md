@@ -89,18 +89,18 @@ classification rather than a pass.
 ## Local verification boundary
 
 ```text
-nazoauthctl conformance artifact verify \
+nazoauthctl oidf artifact verify \
   --trust-policy /etc/nazoauthctl/oidf-trust.json \
   --manifest ./manifest.jws \
   --driver ./driver.json \
   --matrix ./matrix.json \
-  --capability nazoauth.client.create
+  --require nazoauth.client.create
 ```
 
 The command reads bounded regular non-symlink files and emits a verified public
-identity only after every check succeeds. `--capability` values are the
+identity only after every check succeeds. `--require` values are the
 capability set supplied by the caller; this command does not discover or grant
-NazoAuth capabilities. `conformance run` separately obtains deployment-bound
+NazoAuth capabilities. `oidf run` separately obtains deployment-bound
 provider actions and resource kinds from authenticated capability negotiation;
 runner capability strings and provider authorization are never treated as the
 same authority. The public verifier revalidates the complete trust-policy schema,
@@ -113,11 +113,11 @@ server resources, run the Suite, or clean resources.
 ## Dynamic HTTPS discovery and immutable cache
 
 ```text
-nazoauthctl conformance artifact resolve \
+nazoauthctl oidf artifact resolve \
   --trust-policy /etc/nazoauthctl/oidf-trust.json \
   --manifest-url https://artifacts.example/oidf/stable/driver.jws \
   --cache-dir /var/lib/nazoauthctl/oidf-cache \
-  --capability nazoauth.client.create
+  --require nazoauth.client.create
 ```
 
 The stable channel URL must be below the trusted source. The client accepts
@@ -155,11 +155,11 @@ still verifies the current signed channel and validity window. Offline cache
 selection is therefore exact and has no moving alias:
 
 ```text
-nazoauthctl conformance artifact open \
+nazoauthctl oidf artifact open \
   --trust-policy /etc/nazoauthctl/oidf-trust.json \
   --cache-dir /var/lib/nazoauthctl/oidf-cache \
   --digest 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-  --capability nazoauth.client.create
+  --require nazoauth.client.create
 ```
 
 `--digest` is the exact 64-character lowercase manifest SHA-256. The command
@@ -170,7 +170,7 @@ schema verification, then requires the recomputed identity to equal both the
 requested digest and committed record. Missing, incomplete, expired, tampered,
 future-dated, untrusted, or capability-incompatible entries fail closed.
 
-As with local verification and discovery, `--capability` is an explicit caller
+As with local verification and discovery, `--require` is an explicit caller
 input. Offline opening does not claim that NazoAuth granted or negotiated it.
 A deployment-bound runner must pass the set observed from authenticated server
 capability negotiation. Deployment-bound run journals, that negotiation,
@@ -182,11 +182,11 @@ An operator can compile an exact signed Matrix selection from one revalidated
 cache entry without contacting NazoAuth or the Suite:
 
 ```text
-nazoauthctl conformance artifact plan \
+nazoauthctl oidf artifact plan \
   --trust-policy /etc/nazoauthctl/oidf-trust.json \
   --cache-dir /var/lib/nazoauthctl/oidf-cache \
   --digest 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-  --capability nazoauth.client.create \
+  --require nazoauth.client.create \
   --group oidc \
   --plan p001
 ```
@@ -209,7 +209,7 @@ a plan JTI but deliberately records `deployment_bound: false`,
 the authenticated negotiation, ordinary resource provider, target/Suite origin
 policy, and deployment-bound crash-safe journal blockers. The `plan` command
 creates no NazoAuth resource, Suite plan, execution journal, or cleanup
-obligation. `conformance run` reopens and re-verifies the exact cached bytes,
+obligation. `oidf run` reopens and re-verifies the exact cached bytes,
 binds the plan to authenticated deployment and ordinary-provider capabilities,
 and only then clears those blockers. Signed budgets are contract ceilings; the
 runner enforces them against selected Suite modules, created clients, and
@@ -226,18 +226,17 @@ there is no second scheduler and the release stage must not downgrade the full
 matrix to serial execution. Only authenticated execution authorization can set
 `execution_permitted: true`.
 
-The run evidence sink commits each run into a unique owner-only
-directory with a manifest-last digest envelope, and preserves structured output
-when outer cleanup fails. Provider evidence groups every capability generation
-with its signed receipts, revision and manifest transition, and proves cleanup
-back to the enumerated baseline. This does not claim a Suite signature: Suite
-outcomes and controller/provider evidence remain distinct facts.
+The run evidence sink commits each run into a unique owner-only directory with
+a manifest-last digest envelope, and preserves structured output when outer
+cleanup fails. Control evidence binds every operation to its operation ID,
+canonical request hash, typed result, revision, and manifest transition, and
+proves cleanup back to the enumerated baseline. Suite outcomes and controller
+evidence remain distinct facts; neither is presented as a Suite signature.
 
-Before ordinary Apply, `conformance run` durably stores the exact capability
-JWS, task JWS, request digest, private manifest path, and proxy recovery input.
-Response loss replays the exact prepared request and JTI. Cleanup first
-enumerates the run identities, then issues a digest-fenced Revoke under a fresh
-capability, persists both receipts, restores the proxy, and removes the private
-manifest only through the journal's deletion-intent state machine. The legacy
-lease journal remains readable solely for recovery of runs created by older
-controllers; it is not used by the ordinary production path.
+Before ordinary Apply, `oidf run` durably stores the exact signed
+`ControlOperation`, canonical request hash, private manifest path, and proxy
+recovery input. Response loss replays that same operation. Cleanup first
+enumerates the run identities, then issues a digest-bound Revoke, persists each
+typed terminal result, restores the proxy, and removes the private manifest only
+through the journal's deletion-intent state machine. No older controller journal
+or control protocol is accepted.

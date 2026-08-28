@@ -59,7 +59,7 @@ fn release_workflow_requires_successful_ci_for_the_exact_tag_commit() {
 }
 
 #[test]
-fn server_compatibility_does_not_expose_github_token_to_pr_controller() {
+fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps() {
     let workflow = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/.github/workflows/server-compatibility.yml"
@@ -70,38 +70,42 @@ fn server_compatibility_does_not_expose_github_token_to_pr_controller() {
     assert!(top_level.contains("permissions:\n  contents: read"));
     assert!(!top_level.contains("attestations: read"));
     assert!(!top_level.contains("packages: read"));
+    assert!(!top_level.contains("pull_request:"));
+    assert!(top_level.contains("server_release:"));
+    assert!(top_level.contains("description: Exact supported NazoAuth release tag"));
+    assert!(top_level.contains("NAZOAUTHCTL_BUILD_COMMIT: ${{ inputs.controller_ref }}"));
+    assert!(!workflow.contains("previous-v"));
+    assert!(!workflow.contains("python3"));
+    assert!(!workflow.contains("- name: Recover"));
+    assert!(!workflow.contains("provider"));
+    assert!(!workflow.contains("rollback"));
+    assert!(workflow.contains(".protocol == 2"));
+    assert!(workflow.contains("Execute VerifiedRelease current production verification"));
+    assert!(workflow.contains("VerifiedRelease::verify"));
+    assert!(workflow.contains("SERVER_PEELED_COMMIT"));
+    assert!(workflow.contains("OPERATOR_PROTOCOL_REV"));
+    assert!(workflow.contains("cosign verify \"$image\""));
+    assert!(!workflow.contains("controller/nazoauthctl --help"));
 
     let current_controller = workflow
         .split_once("\n  current-controller:")
         .unwrap()
         .1
-        .split_once("\n  signed-server:")
+        .split_once("\n  signed-current-server:")
         .unwrap()
         .0;
     assert!(current_controller.contains("permissions:\n      contents: read"));
     assert!(current_controller.contains("persist-credentials: false"));
     assert!(!current_controller.contains("GH_TOKEN"));
 
-    for (job, next_job) in [
-        ("signed-server", "real-backend-discovery"),
-        ("real-backend-discovery", "__end__"),
-    ] {
-        let job_marker = format!("\n  {job}:");
-        let section = workflow.split_once(job_marker.as_str()).unwrap().1;
-        let section = if next_job == "__end__" {
-            section
-        } else {
-            let next_job_marker = format!("\n  {next_job}:");
-            section.split_once(next_job_marker.as_str()).unwrap().0
-        };
-        assert!(!section.contains("\n    env:\n      GH_TOKEN:"));
-    }
+    let signed_current_server = workflow.split_once("\n  signed-current-server:").unwrap().1;
+    assert!(!signed_current_server.contains("\n    env:\n      GH_TOKEN:"));
 
     for step in [
-        "Select controller artifact",
-        "Verify server host identity",
-        "Verify the downloaded host server identity",
-        "Prove discovery is read-only",
+        "Execute the exact controller artifact through its production protocol path",
+        "Verify the protocol-2 host identity",
+        "Verify the signed OCI identity at its immutable digest",
+        "Execute VerifiedRelease current production verification",
     ] {
         let marker = format!("- name: {step}");
         let section = workflow.split_once(marker.as_str()).unwrap().1;
@@ -115,31 +119,116 @@ fn server_compatibility_does_not_expose_github_token_to_pr_controller() {
 }
 
 #[test]
-fn release_self_update_validation_uses_a_generic_current_previous_transition() {
+fn release_compatibility_gate_pins_the_current_protocol_two_server() {
+    let workflow = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/release.yml"
+    ))
+    .unwrap();
+    let gate = workflow
+        .split_once("\n  server-compatibility:")
+        .unwrap()
+        .1
+        .split_once("\n  build:")
+        .unwrap()
+        .0;
+    assert!(gate.contains("controller_ref: ${{ github.sha }}"));
+    assert!(gate.contains("server_release: v0.2.2"));
+    assert!(!gate.contains("previous"));
+}
+
+#[test]
+fn release_does_not_treat_pre_cut_controller_as_an_update_source() {
+    let workflow = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/release.yml"
+    ))
+    .unwrap();
+    assert!(!workflow.contains("Resolve the previous controller release"));
+    assert!(!workflow.contains("self_update_matrix"));
+    assert!(!workflow.contains("PREVIOUS_RELEASE"));
+    assert!(!workflow.contains("self-update-rollback:"));
+}
+
+#[test]
+fn release_publish_is_resume_safe_and_accepts_only_the_current_asset_set() {
     let workflow = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/.github/workflows/release.yml"
     ))
     .unwrap();
     for required in [
-        "self_update_matrix: ${{ steps.resolve_self_update.outputs.matrix }}",
-        "matrix: ${{ fromJSON(needs.policy.outputs.self_update_matrix) }}",
-        "CURRENT_RELEASE: ${{ matrix.to_release }}",
-        "PREVIOUS_RELEASE: ${{ matrix.from_release }}",
-        "gh release download \"$CURRENT_RELEASE\"",
-        "self update --to \"$CURRENT_RELEASE\" --yes",
-        "self check --to \"$PREVIOUS_RELEASE\"",
-        "mktemp -d /tmp/controller-self-lifecycle.XXXXXX",
-        "trap 'sudo rm -rf \"$root\"' EXIT",
-        "sudo chown -R 0:0 \"$root\"",
+        "cancel-in-progress: false",
+        "Publish the exact immutable controller asset set",
+        "gh release view \"$RELEASE_TAG\"",
+        "gh release create \"$RELEASE_TAG\"",
+        "gh release upload \"$RELEASE_TAG\"",
+        "cmp --silent \"release/$asset\"",
+        "asset set is not exactly the current controller set",
     ] {
         assert!(
             workflow.contains(required),
             "workflow lost contract: {required}"
         );
     }
-    assert!(!workflow.contains("github.ref_name == 'v0.1.23'"));
-    assert!(!workflow.contains("gh release download v0.1.23"));
-    assert!(!workflow.contains("self update --to v0.1.23"));
-    assert!(!workflow.contains("$RUNNER_TEMP/controller-self-lifecycle"));
+    assert!(!workflow.contains("--clobber"));
+}
+
+/// This is deliberately an ignored network test: the release workflow opts
+/// into it for the one current supported pair.  It invokes the production
+/// `VerifiedRelease::verify` entry point, rather than inferring compatibility
+/// from CLI help or an unauthenticated build-identity command.
+#[test]
+#[ignore = "requires the signed official NazoAuth Release and Sigstore/GitHub attestation services"]
+fn compatibility_executes_verified_release_for_the_current_server() {
+    fn required(name: &str) -> String {
+        std::env::var(name)
+            .unwrap_or_else(|_| panic!("{name} is required by the compatibility gate"))
+    }
+
+    assert_eq!(required("NAZOAUTHCTL_COMPAT_VERIFY_RELEASE"), "1");
+    let version = required("EXPECTED_SERVER_RELEASE");
+    let peeled_commit = required("EXPECTED_SERVER_PEELED_COMMIT");
+    let protocol_revision = required("EXPECTED_OPERATOR_PROTOCOL_REV");
+    let oci_index_digest = required("EXPECTED_OCI_INDEX_DIGEST");
+    let oci_platform_digest = required("EXPECTED_OCI_PLATFORM_DIGEST");
+
+    for (label, value, prefix, length) in [
+        ("server peeled commit", &peeled_commit, "", 40),
+        ("operator protocol revision", &protocol_revision, "", 40),
+        ("OCI index digest", &oci_index_digest, "sha256:", 64),
+        ("OCI platform digest", &oci_platform_digest, "sha256:", 64),
+    ] {
+        let hexadecimal = value.strip_prefix(prefix).unwrap_or("");
+        assert!(
+            hexadecimal.len() == length
+                && hexadecimal
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "{label} must be a lowercase hexadecimal identity"
+        );
+    }
+    assert_eq!(
+        protocol_revision, peeled_commit,
+        "the controller's locked operator protocol must come from the exact peeled server tag commit"
+    );
+
+    let release = crate::release::VerifiedRelease::verify(crate::release::ReleaseRequest {
+        repository: crate::instance_lifecycle::SERVER_REPOSITORY,
+        requested_version: Some(&version),
+        container_backend: None,
+        trusted_version_floor: None,
+    })
+    .expect("the official current server release must pass VerifiedRelease::verify");
+
+    assert_eq!(release.manifest.version, version);
+    assert_eq!(release.manifest.backend_commit, peeled_commit);
+    assert_eq!(release.manifest.image_oci_digest(), oci_index_digest);
+    assert_eq!(
+        release
+            .manifest
+            .runtime_oci_digest_for(crate::model::container_oci_platform())
+            .expect("the signed manifest must declare this runtime platform"),
+        oci_platform_digest
+    );
 }

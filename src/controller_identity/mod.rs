@@ -46,8 +46,8 @@
 //! * [`lifecycle`] — bind/add/rotate/revoke/slots flows (D04/D06/D07/D08)
 //!   and their CLI entry point, including crash reconciliation against the
 //!   authoritative slot list.
-//! * [`expiry`] — D09 classification/rendering of the server-owned 30-day
-//!   clock plus the cached-slot observation format.
+//! * [`expiry`] — D09 rendering of the server-owned 30-day clock from an
+//!   explicit live slot response; display observations never authorize work.
 //! * [`journal`] — E06 ctl-half write-ahead dispatch journal.
 //! * [`dispatch`] — prepare/resume/dispatch glue keeping "one authorization =
 //!   one operation lifetime".
@@ -65,7 +65,9 @@ pub(crate) mod recovery;
 pub mod store;
 
 pub use dispatch::{
-    AttemptKind, DispatchVerdict, PreparedOperation, prepare_control_operation, settle_journal,
+    AttemptKind, DispatchVerdict, PreparedOperation, dispatch_via_target,
+    prepare_control_operation, settle_journal, validate_control_change_set,
+    validate_control_result_binding,
 };
 pub use journal::{JournalState, OperationJournal, OperationJournalEntry};
 pub use operation::{

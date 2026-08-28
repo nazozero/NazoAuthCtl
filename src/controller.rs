@@ -4,8 +4,11 @@
 use crate::process::Process;
 use anyhow::bail;
 
+mod recovery_journal;
+mod recovery_transport;
 mod self_update;
 mod surface_run;
+mod transfer_journal;
 
 pub(crate) use surface_run::run;
 

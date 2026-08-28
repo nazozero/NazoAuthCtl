@@ -10,7 +10,7 @@ filesystem APIs.
 
 ## Ownership boundary
 
-The transaction is available only for an adopted deployment whose `proxy_tls`
+The transaction is available only for a registered current-protocol deployment whose `proxy_tls`
 capability is explicitly `delegated` or `managed`. A fresh ctl installation
 leaves that capability external, so TLS material cannot be changed accidentally.
 
@@ -88,13 +88,13 @@ only after ctl atomically replaces `current`.
 Use the same arguments for plan and apply:
 
 ```text
-nazoauthctl --deployment DEPLOYMENT tls certificate plan \
+nazoauthctl tls certificate plan \
   --provider-config /etc/nazoauth/tls-provider.json \
   --tenant tenant-a --hostname auth.example \
   --certificate /run/cert-import/fullchain.pem \
   --private-key /run/cert-import/private-key.pem
 
-nazoauthctl --deployment DEPLOYMENT tls certificate apply \
+nazoauthctl tls certificate apply \
   --provider-config /etc/nazoauth/tls-provider.json \
   --tenant tenant-a --hostname auth.example \
   --certificate /run/cert-import/fullchain.pem \
@@ -114,7 +114,7 @@ Run the read-only check from an external monitoring scheduler; ctl does not need
 to remain running between checks:
 
 ```text
-nazoauthctl --deployment DEPLOYMENT tls certificate check \
+nazoauthctl tls certificate check \
   --provider-config /etc/nazoauth/tls-provider.json \
   --tenant tenant-a --hostname auth.example \
   --warning-window-seconds 1209600
@@ -151,7 +151,7 @@ recovered by rollback. A crash after it is written is recovered by idempotently
 finishing audit/journal finalization:
 
 ```text
-nazoauthctl --deployment DEPLOYMENT tls certificate recover \
+nazoauthctl tls certificate recover \
   --tenant tenant-a --hostname auth.example --yes
 ```
 

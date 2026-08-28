@@ -91,7 +91,8 @@ pub(crate) struct DiscoverRequest {
     pub(crate) host: Option<String>,
 }
 
-/// One controlled takeover (`adopt --host <alias> --deployment-id ID`).
+/// One controlled takeover
+/// (`instance register --host <alias> --deployment-id ID`).
 #[derive(Debug, Clone)]
 pub(crate) struct AdoptRequest {
     pub(crate) host: Option<String>,
@@ -209,7 +210,7 @@ pub(crate) fn run_discover(
     let host = resolve_host_selector(&context.registry, request.host.as_deref())?;
     let target = context.target_for(&host)?;
     // C08 gate upstream of the read-only kind, like every inspection.
-    let hello = live_probe(target.as_ref()).context(format!(
+    let hello = live_probe(target.as_ref(), &host).context(format!(
         "host '{}' failed its live verification; nothing was discovered and nothing changed",
         host.alias
     ))?;
@@ -304,7 +305,7 @@ fn render_discovery_block(
     }
     match status {
         CandidateStatus::Unregistered => block.push_str(&format!(
-            "    status: adoption candidate\n    next step: nazoauthctl adopt --host {host_alias} --deployment-id {}\n",
+            "    status: registration candidate\n    next step: nazoauthctl instance register --host {host_alias} --deployment-id {}\n",
             inspection.deployment_id
         )),
         CandidateStatus::RegisteredHere { alias } => block.push_str(&format!(
@@ -342,7 +343,7 @@ pub(crate) fn run_adopt(
 
     // 2. Live verified contact before anything else (C08 gate upstream of
     //    the read-only enumeration too).
-    let hello = live_probe(target.as_ref()).context(format!(
+    let hello = live_probe(target.as_ref(), &host).context(format!(
         "host '{}' failed its live verification; nothing was adopted and nothing changed",
         host.alias
     ))?;
@@ -474,7 +475,7 @@ fn render_adopt_report(record: &InstanceRecord, inspection: &InstanceInspection)
          \nnext steps:\n\
          1. create or confirm the instance administrator and enroll MFA at the instance itself\n\
          2. establish the controller binding after MFA enrollment:\n\
-            nazoauthctl controller bind --instance <alias> --label <name>\n",
+            nazoauthctl bind --instance <alias> --label <name>\n",
     );
     report
 }

@@ -16,8 +16,8 @@ use common::{no_arguments, parse_version_option, parse_yes, take_yes};
 use controller::parse_controller;
 use fleet::{parse_host, parse_instance};
 use surface::{
-    parse_backup, parse_bind, parse_bootstrap_admin_args, parse_install_args,
-    parse_read_view_selector, parse_update_args,
+    parse_backup, parse_bind, parse_bootstrap_admin_args, parse_install_args, parse_policy,
+    parse_read_view_selector, parse_recover, parse_update_args,
 };
 use tls::parse_tls;
 
@@ -82,6 +82,8 @@ impl Cli {
                 }
             }
             "backup" => Command::Backup(parse_backup(values)?),
+            "policy" => Command::Policy(parse_policy(values)?),
+            "recover" => Command::Recover(parse_recover(values)?),
             "uninstall" => {
                 let (selector, yes) =
                     surface::parse_confirm_scoped(values, &["--yes"], "uninstall")?;

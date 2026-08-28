@@ -87,7 +87,7 @@ impl TlsStore {
             .host_by_id(instance.host_id)?
             .context("TLS instance references a missing host")?;
         let target = crate::fleet::production_target(&host)?;
-        crate::fleet::live_probe(target.as_ref())
+        crate::fleet::live_probe(target.as_ref(), &host)
             .context("TLS target helper verification failed")?;
         let inspection = target.inspect_instance(&instance.deployment_id)?;
         if inspection.deployment_id != instance.deployment_id

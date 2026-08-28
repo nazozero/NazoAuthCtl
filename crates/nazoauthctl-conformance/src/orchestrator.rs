@@ -109,10 +109,8 @@ pub struct ConformanceRunConfig {
     pub client: SuiteClient,
     pub matrix: SelectedMatrix,
     pub target_origin: Option<BrowserTargetOrigin>,
-    /// The deployment-owned binding allocated for this run. OpenID4VP
-    /// verifier starts carry either an ordinary trust-policy resource id and
-    /// digest or the complete legacy lease/task pair. Keeping the disjoint
-    /// binding on the run config prevents partial and mixed requests.
+    /// The deployment-owned trust-policy resource binding allocated for this
+    /// run. Keeping it on the run config prevents partial requests.
     pub binding: ConformanceBinding,
     pub poll_timeout: Duration,
     pub control: RunControl,
@@ -2580,6 +2578,10 @@ mod tests {
 
     #[cfg(unix)]
     impl BrowserAutomation for DeferredReviewBrowser {
+        fn reset_session(&mut self) -> Result<(), BrowserError> {
+            Ok(())
+        }
+
         fn execute(
             &mut self,
             _authorization_url: &Url,
@@ -2829,9 +2831,9 @@ mod tests {
     }
 
     fn test_binding() -> ConformanceBinding {
-        ConformanceBinding::new(
-            "019ff000-8190-7393-8c33-ab4339c3d85e",
-            "request-0123456789abcdef0123456789abcdef",
+        ConformanceBinding::openid4vc_trust_policy(
+            "openid4vc-trust-policy:test",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )
         .expect("binding")
     }
@@ -3981,6 +3983,10 @@ mod tests {
     }
 
     impl BrowserAutomation for CompletingBrowser {
+        fn reset_session(&mut self) -> Result<(), BrowserError> {
+            Ok(())
+        }
+
         fn execute(
             &mut self,
             authorization_url: &Url,

@@ -29,6 +29,56 @@ use nazo_operator_protocol::ControlResult;
 use super::deployment_state::Failure;
 use super::wire::{HOST_ERR_OPERATION_INVALID, sanitize};
 
+const CHANGE_SET_ENV: &str = "NAZOAUTH_OPERATOR_CHANGE_SET_FILE";
+const CHANGE_SET_CREDENTIAL: &str = "operator-change-set";
+const CONTAINER_CHANGE_SET_PATH: &str = "/run/nazoauth/operator-change-set";
+
+struct StagedChangeSet {
+    _directory: crate::filesystem::PrivateTempDir,
+    path: PathBuf,
+}
+
+fn stage_change_set(bytes: &[u8]) -> anyhow::Result<StagedChangeSet> {
+    let directory = crate::filesystem::PrivateTempDir::new("nazoauthctl-change-set")?;
+    let path = directory.path().join(CHANGE_SET_CREDENTIAL);
+    // The 0700 parent is the host-side privacy boundary. The file itself is
+    // read-only so the non-root OCI task can read its direct bind mount.
+    crate::filesystem::atomic_write(&path, bytes, 0o444)?;
+    Ok(StagedChangeSet {
+        _directory: directory,
+        path,
+    })
+}
+
+fn configure_change_set_access(
+    host: bool,
+    path: &Path,
+    environment: &mut BTreeMap<String, String>,
+    transient_credentials: &mut BTreeMap<String, PathBuf>,
+    mounts: &mut Vec<crate::runtime_backend::NeutralMount>,
+) {
+    if host {
+        transient_credentials.insert(CHANGE_SET_CREDENTIAL.to_owned(), path.to_owned());
+        environment.insert(
+            CHANGE_SET_ENV.to_owned(),
+            format!("%d/{CHANGE_SET_CREDENTIAL}"),
+        );
+    } else {
+        mounts.push(crate::runtime_backend::NeutralMount {
+            source: path.to_owned(),
+            destination: PathBuf::from(CONTAINER_CHANGE_SET_PATH),
+            read_only: true,
+            selinux_relabel: false,
+            ownership: crate::runtime_backend::Responsibility::Managed,
+            scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
+        });
+        environment.insert(
+            CHANGE_SET_ENV.to_owned(),
+            CONTAINER_CHANGE_SET_PATH.to_owned(),
+        );
+    }
+}
+
 /// Stable failure code: the operator ran (or may have run) but produced no
 /// parsable ControlResult. The outcome is unknown by construction; retries
 /// must resume the same operation id instead of minting a new one.
@@ -51,12 +101,13 @@ pub(crate) struct ControlJob<'a> {
     pub deployment_id: &'a str,
     /// The deployment's recorded current artifact reference (`sha256:<hex>`).
     pub artifact_reference: &'a str,
-    pub runtime_kind: &'a str,
+    pub runtime_kind: crate::runtime_backend::RuntimeBackendKind,
     pub runtime_object: &'a str,
     pub config_reference: &'a str,
     pub data_root: &'a str,
     pub scope_dir: &'a Path,
     pub compact_jws: &'a str,
+    pub change_set: Option<&'a [u8]>,
 }
 
 /// The injectable seam executing one delivered ControlOperation on the
@@ -72,24 +123,11 @@ pub(crate) struct HostControlOperator;
 
 impl ControlOperationExecutor for HostControlOperator {
     fn execute(&self, job: &ControlJob<'_>) -> Result<ControlResult, Failure> {
-        let kind = match job.runtime_kind {
-            "podman" => crate::runtime_backend::RuntimeBackendKind::Podman,
-            "docker" => crate::runtime_backend::RuntimeBackendKind::Docker,
-            "host" | "systemd" => crate::runtime_backend::RuntimeBackendKind::Systemd,
-            other => {
-                return Err(Failure::new(
-                    CONTROL_EXECUTION_UNAVAILABLE,
-                    format!(
-                        "deployment '{}': unsupported runtime backend '{other}'",
-                        sanitize(job.deployment_id.to_owned())
-                    ),
-                ));
-            }
-        };
+        let kind = job.runtime_kind;
         let backend = crate::runtime_backend::backend(kind);
-        if kind != crate::runtime_backend::RuntimeBackendKind::Systemd {
+        if kind.is_container() {
             if let Err(error) = crate::instance_lifecycle::privilege::ensure_engine_access(
-                job.runtime_kind,
+                kind.as_str(),
                 &crate::instance_lifecycle::privilege::ProcessPrivilegeProbe,
             ) {
                 return Err(Failure::new(error.code(), sanitize(error.to_string())));
@@ -126,11 +164,21 @@ impl ControlOperationExecutor for HostControlOperator {
             ));
         }
 
-        let systemd = kind == crate::runtime_backend::RuntimeBackendKind::Systemd;
+        let host = kind == crate::runtime_backend::RuntimeBackendKind::Host;
+        let change_set_temp = if let Some(bytes) = job.change_set {
+            Some(stage_change_set(bytes).map_err(|error| {
+                Failure::new(CONTROL_EXECUTION_UNAVAILABLE, sanitize(error.to_string()))
+            })?)
+        } else {
+            None
+        };
         let mut environment = BTreeMap::new();
         let mut read_only_paths = Vec::new();
         let mut read_write_paths = Vec::new();
-        if systemd {
+        let mut transient_credentials = BTreeMap::new();
+        let mut mounts = observation.mounts.clone();
+        super::inject_operator_oci_artifact_fence(&mut environment, &observation.artifact);
+        if host {
             environment.insert(
                 super::install_exec::SERVER_CONFIG_FILE_ENV.to_owned(),
                 job.config_reference.to_owned(),
@@ -152,25 +200,34 @@ impl ControlOperationExecutor for HostControlOperator {
             read_only_paths.push(PathBuf::from(job.config_reference));
             read_write_paths.push(PathBuf::from(job.data_root));
         }
+        if let Some(staged) = &change_set_temp {
+            configure_change_set_access(
+                host,
+                &staged.path,
+                &mut environment,
+                &mut transient_credentials,
+                &mut mounts,
+            );
+        }
         let task = crate::runtime_backend::OneShotTask {
             artifact: observation.artifact.clone(),
             // The frozen NazoAuth one-shot entry: compact JWS on stdin, the
             // durable ControlResult JSON on stdout.
             command: vec!["nazoauth".to_owned(), "operator-task".to_owned()],
             network: observation.networks.first().cloned(),
-            mounts: observation.mounts.clone(),
+            mounts,
             environment,
-            working_directory: if systemd {
+            working_directory: if host {
                 Some(PathBuf::from(job.data_root))
             } else {
                 Some(PathBuf::from("/app"))
             },
-            service_user: Some(if systemd {
+            service_user: Some(if host {
                 super::update_exec::systemd_service_user(job.deployment_id)
             } else {
                 crate::runtime_backend::NON_ROOT_ONE_SHOT_USER.to_owned()
             }),
-            transient_credentials: BTreeMap::new(),
+            transient_credentials,
             read_only_paths,
             read_write_paths,
             inaccessible_paths: Vec::new(),
@@ -180,6 +237,7 @@ impl ControlOperationExecutor for HostControlOperator {
         let stdout = backend
             .run_one_shot(&task)
             .map_err(|error| Failure::new(CONTROL_OUTCOME_UNKNOWN, sanitize(error.to_string())))?;
+        drop(change_set_temp);
         decode_operator_answer(&stdout, job.operation_id)
     }
 }
@@ -199,7 +257,17 @@ pub(crate) fn decode_operator_answer(
              only a resumed resend of the same operation can resolve it",
         ));
     }
-    let line = trimmed.lines().next().unwrap_or(trimmed);
+    let mut frames = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let line = frames.next().unwrap_or(trimmed);
+    if frames.next().is_some() {
+        return Err(Failure::new(
+            CONTROL_OUTCOME_UNKNOWN,
+            "the local NazoAuth operator emitted more than one non-empty ControlResult frame; the outcome is unknown",
+        ));
+    }
     let result =
         nazo_operator_protocol::decode_control_result(line.as_bytes()).map_err(|error| {
             Failure::new(
@@ -222,4 +290,74 @@ pub(crate) fn decode_operator_answer(
         ));
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+    };
+
+    use super::{
+        CHANGE_SET_CREDENTIAL, CHANGE_SET_ENV, CONTAINER_CHANGE_SET_PATH,
+        configure_change_set_access, stage_change_set,
+    };
+
+    #[test]
+    fn staged_change_set_is_exact_and_removed_on_scope_exit() -> anyhow::Result<()> {
+        let staged = stage_change_set(b"exact change-set bytes")?;
+        let path = staged.path.clone();
+        assert_eq!(std::fs::read(&path)?, b"exact change-set bytes");
+        drop(staged);
+        assert!(
+            !path.exists(),
+            "private material must be removed after execution"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn change_set_access_is_read_only_and_backend_specific() {
+        let source = Path::new("/private/change-set");
+
+        let mut environment = BTreeMap::new();
+        let mut credentials = BTreeMap::new();
+        let mut mounts = Vec::new();
+        configure_change_set_access(
+            false,
+            source,
+            &mut environment,
+            &mut credentials,
+            &mut mounts,
+        );
+        assert_eq!(
+            environment.get(CHANGE_SET_ENV).map(String::as_str),
+            Some(CONTAINER_CHANGE_SET_PATH)
+        );
+        assert!(credentials.is_empty());
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].source, source);
+        assert_eq!(mounts[0].destination, Path::new(CONTAINER_CHANGE_SET_PATH));
+        assert!(mounts[0].read_only);
+
+        environment.clear();
+        mounts.clear();
+        configure_change_set_access(
+            true,
+            source,
+            &mut environment,
+            &mut credentials,
+            &mut mounts,
+        );
+        assert_eq!(
+            environment.get(CHANGE_SET_ENV).map(String::as_str),
+            Some("%d/operator-change-set")
+        );
+        assert_eq!(
+            credentials.get(CHANGE_SET_CREDENTIAL).map(PathBuf::as_path),
+            Some(source)
+        );
+        assert!(mounts.is_empty());
+    }
 }

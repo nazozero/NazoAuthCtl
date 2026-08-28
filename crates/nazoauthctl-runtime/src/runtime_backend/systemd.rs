@@ -21,8 +21,9 @@ use super::DebugArtifactTask;
 use super::{
     BlobAttestationVerification, HostServiceInstall, ManagedDependencies, ManagedDependencyBackup,
     ManagedNetwork, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore,
-    OneShotTask, RuntimeBackend, RuntimeDatabasePrivilegeProbe, RuntimeObservation,
-    RuntimeReplacement, safe_environment, safe_systemd_path,
+    OneShotTask, RecoveryCandidateEndpoint, RecoveryCandidateRequest, RuntimeBackend,
+    RuntimeDatabasePrivilegeProbe, RuntimeObservation, RuntimeReplacement, safe_environment,
+    safe_systemd_path,
 };
 
 pub struct SystemdBackend;
@@ -50,7 +51,7 @@ const OPERATOR_CREDENTIAL_ENVIRONMENT: [(&str, &str); 4] = [
 
 impl RuntimeBackend for SystemdBackend {
     fn kind(&self) -> RuntimeBackendKind {
-        RuntimeBackendKind::Systemd
+        RuntimeBackendKind::Host
     }
 
     fn available(&self) -> bool {
@@ -404,6 +405,20 @@ impl RuntimeBackend for SystemdBackend {
             bail!("systemd replacement target digest changed during activation");
         }
         Ok(())
+    }
+
+    fn stage_recovery_candidate(
+        &self,
+        _request: &RecoveryCandidateRequest,
+    ) -> anyhow::Result<RecoveryCandidateEndpoint> {
+        bail!("systemd cannot stage an isolated recovery candidate")
+    }
+
+    fn cleanup_recovery_candidate(
+        &self,
+        _endpoint: &RecoveryCandidateEndpoint,
+    ) -> anyhow::Result<()> {
+        bail!("systemd has no isolated recovery candidate to clean")
     }
 
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String> {
@@ -940,7 +955,7 @@ fn discover_unmanaged_processes() -> anyhow::Result<Vec<RuntimeObservation>> {
                 _ => None,
             };
             Some(RuntimeObservation {
-                backend: RuntimeBackendKind::Systemd,
+                backend: RuntimeBackendKind::Host,
                 object_reference: format!("process:{pid}"),
                 display_name: format!("unmanaged process {pid}"),
                 running: true,

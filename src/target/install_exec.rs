@@ -25,6 +25,7 @@
 //! partial work before returning the stable [`INSTALL_FAILED`] family code.
 
 use std::{
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -56,7 +57,12 @@ pub const HEALTH_PROBE_FAILED: &str = "HEALTH_PROBE_FAILED";
 
 /// Closed vocabulary of target-generated secret files. The control side names
 /// paths only; values are minted on the target and never enter the wire.
-pub const SECRET_PURPOSES: &[&str] = &["database-url", "valkey-url", "mfa-totp-key"];
+pub const SECRET_PURPOSES: &[&str] = &[
+    "database-runtime-url",
+    "database-lifecycle-url",
+    "valkey-url",
+    "mfa-totp-key",
+];
 
 /// Hard cap for the rendered config content riding inside one HostOperation
 /// (the whole operation must stay under `MAX_HOST_OPERATION_BYTES`).
@@ -77,7 +83,7 @@ pub const CONTAINER_DATA_DIR: &str = "/var/lib/nazo_oauth";
 pub const SERVER_CONFIG_FILE_ENV: &str = "NAZOAUTH_SERVER_CONFIG_FILE";
 
 /// The official artifact a fresh install obtains and verifies on the target.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OfficialArtifactRef {
     /// Signed-release repository, e.g. `nazozero/NazoAuth`.
@@ -95,19 +101,28 @@ pub struct OfficialArtifactRef {
 /// One target-generated secret file: purpose token + absolute path. Values
 /// are generated in place by the target (`generate_secret`-class primitives)
 /// and referenced from the rendered config by path, never by value.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlannedSecret {
     /// One of [`SECRET_PURPOSES`].
     pub purpose: String,
     pub path: String,
     /// P0-1: operator-provided credential content for external-dependency
-    /// URLs (`database-url`, `valkey-url`). The external PostgreSQL role and
+    /// URLs (the two PostgreSQL roles and Valkey). The external roles and
     /// Valkey ACL already know these values — ctl never invents them. Absent
     /// for target-minted material (`mfa-totp-key`). Rides the encrypted
     /// transport exactly once; the journal directory is root-only 0700.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
+    pub value: Option<super::wire::SecretMaterial>,
+}
+
+/// Optional current-format material copied entirely on the target before the
+/// first runtime start. It is path-only wire data, never imported bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentDataImport {
+    pub source_data_root: String,
+    pub source_mfa_key_file: String,
 }
 
 /// New configuration content staged by an update (G03). Values follow the
@@ -117,7 +132,7 @@ pub struct PlannedSecret {
 /// the update's config snapshot records both the replaced and the replacing
 /// schema, and rollback restores the snapshot only while the deployment still
 /// runs the replacing schema (goal plan 07 §5).
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StagedConfig {
     pub content: String,
@@ -198,7 +213,7 @@ impl PlannedResourceDeletion {
 /// clean install (G01). Rides inside the `Bootstrap` state mutation, so the
 /// C07 journal binds the exact order to the operation id via its canonical
 /// hash — a tampered order is a conflict, not a retry.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallOrder {
     pub artifact: OfficialArtifactRef,
@@ -217,6 +232,8 @@ pub struct InstallOrder {
     pub runtime_root: Option<String>,
     /// Target-generated secret files backing the config references.
     pub secrets: Vec<PlannedSecret>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_data_import: Option<CurrentDataImport>,
     /// G02 hook: provision the single-use initial-admin bootstrap capability
     /// bound to this exact install operation id.
     pub fresh_bootstrap: bool,
@@ -226,7 +243,8 @@ pub struct InstallOrder {
     /// External PostgreSQL endpoint facts supplied by the operator (G01 item
     /// 3: real external facts are the only install inputs). The credential is
     /// still minted on the target and never crosses the wire.
-    pub database_endpoint: ExternalEndpoint,
+    pub database_runtime_endpoint: ExternalEndpoint,
+    pub database_lifecycle_endpoint: ExternalEndpoint,
     /// External Valkey endpoint facts supplied by the operator.
     pub valkey_endpoint: ExternalEndpoint,
 }
@@ -249,7 +267,14 @@ impl InstallOrder {
     /// `HostOperation::validate` so malformed orders fail at admission.
     pub fn validate(&self) -> Result<(), super::wire::MessageRejection> {
         for (label, endpoint) in [
-            ("database endpoint host", &self.database_endpoint.host),
+            (
+                "database runtime endpoint host",
+                &self.database_runtime_endpoint.host,
+            ),
+            (
+                "database lifecycle endpoint host",
+                &self.database_lifecycle_endpoint.host,
+            ),
             ("valkey endpoint host", &self.valkey_endpoint.host),
         ] {
             if endpoint.is_empty() || endpoint.len() > 253 {
@@ -258,6 +283,32 @@ impl InstallOrder {
                     format!("{label} must be 1-253 characters"),
                 ));
             }
+        }
+        if self.database_runtime_endpoint.port == 0
+            || self.database_lifecycle_endpoint.port == 0
+            || self.valkey_endpoint.port == 0
+        {
+            return Err(super::wire::MessageRejection::new(
+                super::wire::RejectionCode::OperationMalformed,
+                "external dependency ports must be non-zero",
+            ));
+        }
+        let postgres_token = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 63
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        };
+        if !postgres_token(&self.database_runtime_endpoint.name)
+            || !postgres_token(&self.database_runtime_endpoint.user)
+            || !postgres_token(&self.database_lifecycle_endpoint.name)
+            || !postgres_token(&self.database_lifecycle_endpoint.user)
+        {
+            return Err(super::wire::MessageRejection::new(
+                super::wire::RejectionCode::OperationMalformed,
+                "PostgreSQL database and role names must be bounded alphanumeric tokens",
+            ));
         }
         if self.config_content.is_empty() || self.config_content.len() > MAX_CONFIG_CONTENT_BYTES {
             return Err(super::wire::MessageRejection::new(
@@ -287,10 +338,31 @@ impl InstallOrder {
                 "install runtime_root must be a bounded absolute path",
             ));
         }
-        if self.secrets.len() > SECRET_PURPOSES.len() {
+        if self.database_runtime_endpoint.host != self.database_lifecycle_endpoint.host
+            || self.database_runtime_endpoint.port != self.database_lifecycle_endpoint.port
+            || self.database_runtime_endpoint.name != self.database_lifecycle_endpoint.name
+            || self.database_runtime_endpoint.user == self.database_lifecycle_endpoint.user
+        {
             return Err(super::wire::MessageRejection::new(
                 super::wire::RejectionCode::OperationMalformed,
-                "install declares more secrets than the closed purpose set",
+                "install requires distinct runtime/lifecycle roles for one PostgreSQL database",
+            ));
+        }
+        if let Some(import) = &self.current_data_import
+            && (!safe_absolute_install_path(&import.source_data_root)
+                || !safe_absolute_install_path(&import.source_mfa_key_file)
+                || import.source_data_root == self.data_root
+                || Path::new(&import.source_mfa_key_file).starts_with(&self.data_root))
+        {
+            return Err(super::wire::MessageRejection::new(
+                super::wire::RejectionCode::OperationMalformed,
+                "current data import requires distinct bounded absolute target paths",
+            ));
+        }
+        if self.secrets.len() != SECRET_PURPOSES.len() {
+            return Err(super::wire::MessageRejection::new(
+                super::wire::RejectionCode::OperationMalformed,
+                "install must declare the complete closed secret purpose set",
             ));
         }
         let mut seen = Vec::with_capacity(self.secrets.len());
@@ -311,6 +383,13 @@ impl InstallOrder {
                 return Err(super::wire::MessageRejection::new(
                     super::wire::RejectionCode::OperationMalformed,
                     "install secret path must be a bounded absolute path",
+                ));
+            }
+            let should_carry_value = secret.purpose != "mfa-totp-key";
+            if secret.value.is_some() != should_carry_value {
+                return Err(super::wire::MessageRejection::new(
+                    super::wire::RejectionCode::OperationMalformed,
+                    "only external dependency URL secrets carry operator material",
                 ));
             }
             seen.push(secret.purpose.clone());
@@ -353,34 +432,262 @@ fn safe_absolute_install_path(value: &str) -> bool {
         })
 }
 
+const MAX_IMPORT_FILES: usize = 100_000;
+const MAX_IMPORT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_IMPORT_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const IMPORT_APP_SECRETS: &[&str] = &[
+    "client-secret-pepper",
+    "dynamic-client-registration-initial-access-token",
+    "token-issuance-response-encryption-key",
+];
+
+fn import_current_data(source: &Path, destination: &Path) -> Result<(), Failure> {
+    let source_metadata = fs::symlink_metadata(source)
+        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+    if !source_metadata.is_dir() || source_metadata.file_type().is_symlink() {
+        return Err(Failure::new(
+            SECRET_PROVISION_FAILED,
+            "--import-data-root must be a real target-local directory",
+        ));
+    }
+    let source = fs::canonicalize(source)
+        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+    let destination = fs::canonicalize(destination)
+        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+    if source == destination || source.starts_with(&destination) || destination.starts_with(&source)
+    {
+        return Err(Failure::new(
+            SECRET_PROVISION_FAILED,
+            "current data import source and managed data root must be disjoint",
+        ));
+    }
+
+    let mut file_count = 0usize;
+    let mut total_bytes = 0u64;
+    let source_keys = source.join("keys");
+    if !source_keys.exists() {
+        return Err(Failure::new(
+            SECRET_PROVISION_FAILED,
+            "current data import requires the source keys directory",
+        ));
+    }
+    copy_import_tree(
+        &source_keys,
+        &destination.join("keys"),
+        &mut file_count,
+        &mut total_bytes,
+    )?;
+    let source_avatars = source.join("avatars");
+    if source_avatars.exists() {
+        copy_import_tree(
+            &source_avatars,
+            &destination.join("avatars"),
+            &mut file_count,
+            &mut total_bytes,
+        )?;
+    }
+    for name in IMPORT_APP_SECRETS {
+        let source_file = source.join("secrets").join(name);
+        let destination_file = destination.join("secrets").join(name);
+        copy_import_regular(
+            &source_file,
+            &destination_file,
+            &mut file_count,
+            &mut total_bytes,
+            0o600,
+        )?;
+    }
+    Ok(())
+}
+
+fn copy_import_tree(
+    source: &Path,
+    destination: &Path,
+    file_count: &mut usize,
+    total_bytes: &mut u64,
+) -> Result<(), Failure> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(Failure::new(
+            SECRET_PROVISION_FAILED,
+            format!("{} must be a real directory", source.display()),
+        ));
+    }
+    if destination.exists() {
+        let destination_metadata = fs::symlink_metadata(destination)
+            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+        if !destination_metadata.is_dir() || destination_metadata.file_type().is_symlink() {
+            return Err(Failure::new(
+                SECRET_PROVISION_FAILED,
+                format!(
+                    "{} is not a real destination directory",
+                    destination.display()
+                ),
+            ));
+        }
+    } else {
+        fs::create_dir(destination)
+            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+    }
+
+    let mut source_names = std::collections::BTreeSet::new();
+    let entries = fs::read_dir(source)
+        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+        let name = entry.file_name();
+        source_names.insert(name.clone());
+        let source_path = entry.path();
+        let destination_path = destination.join(name);
+        let metadata = fs::symlink_metadata(&source_path)
+            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+        if metadata.file_type().is_symlink() {
+            return Err(Failure::new(
+                SECRET_PROVISION_FAILED,
+                format!(
+                    "current data import rejects symlink {}",
+                    source_path.display()
+                ),
+            ));
+        }
+        if metadata.is_dir() {
+            copy_import_tree(&source_path, &destination_path, file_count, total_bytes)?;
+        } else if metadata.is_file() {
+            copy_import_regular(
+                &source_path,
+                &destination_path,
+                file_count,
+                total_bytes,
+                0o600,
+            )?;
+        } else {
+            return Err(Failure::new(
+                SECRET_PROVISION_FAILED,
+                format!(
+                    "current data import rejects special file {}",
+                    source_path.display()
+                ),
+            ));
+        }
+    }
+    let destination_entries = fs::read_dir(destination)
+        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+    for entry in destination_entries {
+        let entry = entry
+            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+        if !source_names.contains(&entry.file_name()) {
+            return Err(Failure::new(
+                SECRET_PROVISION_FAILED,
+                format!(
+                    "current data import destination contains material absent from the source: {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn copy_import_regular(
+    source: &Path,
+    destination: &Path,
+    file_count: &mut usize,
+    total_bytes: &mut u64,
+    mode: u32,
+) -> Result<(), Failure> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(Failure::new(
+            SECRET_PROVISION_FAILED,
+            format!("{} must be a real regular file", source.display()),
+        ));
+    }
+    if metadata.len() > MAX_IMPORT_FILE_BYTES {
+        return Err(Failure::new(
+            SECRET_PROVISION_FAILED,
+            format!(
+                "current data import file exceeds 256 MiB: {}",
+                source.display()
+            ),
+        ));
+    }
+    *file_count += 1;
+    *total_bytes = total_bytes.saturating_add(metadata.len());
+    if *file_count > MAX_IMPORT_FILES || *total_bytes > MAX_IMPORT_TOTAL_BYTES {
+        return Err(Failure::new(
+            SECRET_PROVISION_FAILED,
+            "current data import exceeds its 100000-file/4-GiB bound",
+        ));
+    }
+    if let Some(parent) = destination.parent() {
+        filesystem::ensure_directory_chain(parent)
+            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+    }
+    if destination.exists() {
+        let destination_metadata = fs::symlink_metadata(destination)
+            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+        if !destination_metadata.is_file()
+            || destination_metadata.file_type().is_symlink()
+            || destination_metadata.len() != metadata.len()
+            || filesystem::sha256(destination).map_err(|error| {
+                Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string()))
+            })? != filesystem::sha256(source).map_err(|error| {
+                Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string()))
+            })?
+        {
+            return Err(Failure::new(
+                SECRET_PROVISION_FAILED,
+                format!(
+                    "current data import destination differs from source: {}",
+                    destination.display()
+                ),
+            ));
+        }
+        return Ok(());
+    }
+    let mut source_file =
+        filesystem::open_secure_regular_file(source, "current data import", false)
+            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+    filesystem::copy_atomic_from_file(&mut source_file, destination, mode)
+        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))
+}
+
+fn copy_import_file(source: &Path, destination: &Path, label: &str) -> Result<(), Failure> {
+    let bytes = filesystem::read_secure_regular_file(source, label, false, 128)
+        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(bytes.as_slice())
+        .map_err(|_| Failure::new(SECRET_PROVISION_FAILED, "imported MFA key is not base64url"))?;
+    if decoded.len() != 32 {
+        return Err(Failure::new(
+            SECRET_PROVISION_FAILED,
+            "imported MFA key must decode to exactly 32 bytes",
+        ));
+    }
+    let mut count = 0;
+    let mut bytes = 0;
+    copy_import_regular(source, destination, &mut count, &mut bytes, 0o440)
+        .map_err(|failure| Failure::new(failure.code, format!("{label}: {}", failure.detail)))
+}
+
 /// Everything the executor needs besides the order itself. Built by dispatch
 /// from the accepted operation; never serialized.
 pub(crate) struct InstallJob<'a> {
     pub operation_id: &'a str,
     pub deployment_id: &'a str,
     pub issuer: &'a str,
-    /// Runtime class token from the Bootstrap surface (`podman`, `docker`).
-    pub runtime_kind: &'a str,
+    /// Runtime class from the validated Bootstrap surface.
+    pub runtime_kind: RuntimeBackendKind,
     pub runtime_object: &'a str,
     pub config_reference: &'a str,
     /// `<state root>/deployments/<deployment id>/` — where the fresh-install
     /// bootstrap context and token live beside the journal.
     pub scope_dir: &'a Path,
     pub order: &'a InstallOrder,
-}
-
-impl InstallJob<'_> {
-    fn backend_kind(&self) -> Result<RuntimeBackendKind, Failure> {
-        match self.runtime_kind {
-            "podman" => Ok(RuntimeBackendKind::Podman),
-            "docker" => Ok(RuntimeBackendKind::Docker),
-            "host" | "systemd" => Ok(RuntimeBackendKind::Systemd),
-            other => Err(Failure::new(
-                HOST_ERR_OPERATION_INVALID,
-                format!("unsupported runtime kind '{}'", sanitize(other.to_owned())),
-            )),
-        }
-    }
 }
 
 /// What a completed install reports back to the dispatcher: the content-
@@ -391,6 +698,7 @@ impl InstallJob<'_> {
 pub(crate) struct InstallFacts {
     pub artifact_reference: String,
     pub build_identity: Option<super::deployment_state::BuildIdentity>,
+    pub rollback_policy: crate::model::ReleaseRollbackPolicy,
 }
 
 /// The injectable seam executing one clean-install order on the target.
@@ -518,16 +826,16 @@ impl HostInstallExecutor {
         }
 
         // 1. Official artifact: verify first, use afterwards (H01 single entry).
-        let kind = job.backend_kind()?;
+        let kind = job.runtime_kind;
         let release = VerifiedRelease::verify(ReleaseRequest {
             repository: &job.order.artifact.repository,
             requested_version: job.order.artifact.version.as_deref(),
-            container_backend: (kind != RuntimeBackendKind::Systemd).then_some(kind),
+            container_backend: kind.is_container().then_some(kind),
             trusted_version_floor: None,
         })
         .map_err(|error| Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string())))?;
         let (subject_digest, pin_digest) = match kind {
-            RuntimeBackendKind::Systemd => {
+            RuntimeBackendKind::Host => {
                 let binary = release
                     .artifact("binary", &job.order.artifact.repository)
                     .map_err(|error| {
@@ -614,7 +922,7 @@ impl HostInstallExecutor {
         performed.wrote_config = true;
         // The container reads this file as the image's fixed runtime UID;
         // bind mounts keep host ownership, so hand it over group-readable.
-        if kind != RuntimeBackendKind::Systemd {
+        if kind.is_container() {
             set_runtime_identity(&config_path, false)?;
         }
         // P1-1: the deletion credential for the uninstall executor — proves
@@ -642,7 +950,13 @@ impl HostInstallExecutor {
                 // requires exactly 32 bytes (settings.rs
                 // parse_required_32_byte_key); hex would fail that contract.
                 "mfa-totp-key" => {
-                    if !existed {
+                    if let Some(import) = &job.order.current_data_import {
+                        copy_import_file(
+                            Path::new(&import.source_mfa_key_file),
+                            &path,
+                            "imported MFA key",
+                        )?;
+                    } else if !existed {
                         use base64::Engine as _;
                         let value = base64::engine::general_purpose::URL_SAFE_NO_PAD
                             .encode(rand::random::<[u8; 32]>());
@@ -662,9 +976,9 @@ impl HostInstallExecutor {
                 // container namespace loopback would be the container itself,
                 // so a loopback endpoint is rewritten to the engine's
                 // host-gateway name.
-                "database-url" | "valkey-url" => {
+                "database-runtime-url" | "database-lifecycle-url" | "valkey-url" => {
                     if !existed {
-                        let credential = secret.value.as_deref().ok_or_else(|| {
+                        let credential = secret.value.as_ref().ok_or_else(|| {
                             Failure::new(
                                 SECRET_PROVISION_FAILED,
                                 format!(
@@ -681,23 +995,31 @@ impl HostInstallExecutor {
                                     RuntimeBackendKind::Podman => {
                                         "host.containers.internal".to_owned()
                                     }
-                                    RuntimeBackendKind::Systemd => host.to_owned(),
+                                    RuntimeBackendKind::Host => host.to_owned(),
                                 },
                                 other => other.to_owned(),
                             }
                         };
                         let value = match secret.purpose.as_str() {
-                            "database-url" => format!(
+                            "database-runtime-url" => format!(
                                 "postgresql://{}:{}@{}:{}/{}",
-                                job.order.database_endpoint.user,
-                                percent_encode_credential(credential),
-                                gateway(&job.order.database_endpoint.host),
-                                job.order.database_endpoint.port,
-                                job.order.database_endpoint.name,
+                                job.order.database_runtime_endpoint.user,
+                                percent_encode_credential(credential.as_bytes()),
+                                gateway(&job.order.database_runtime_endpoint.host),
+                                job.order.database_runtime_endpoint.port,
+                                job.order.database_runtime_endpoint.name,
+                            ),
+                            "database-lifecycle-url" => format!(
+                                "postgresql://{}:{}@{}:{}/{}",
+                                job.order.database_lifecycle_endpoint.user,
+                                percent_encode_credential(credential.as_bytes()),
+                                gateway(&job.order.database_lifecycle_endpoint.host),
+                                job.order.database_lifecycle_endpoint.port,
+                                job.order.database_lifecycle_endpoint.name,
                             ),
                             _ => format!(
                                 "valkey://:{}@{}:{}",
-                                percent_encode_credential(credential),
+                                percent_encode_credential(credential.as_bytes()),
                                 gateway(&job.order.valkey_endpoint.host),
                                 job.order.valkey_endpoint.port,
                             ),
@@ -714,7 +1036,7 @@ impl HostInstallExecutor {
                     ));
                 }
             }
-            if kind != RuntimeBackendKind::Systemd {
+            if kind.is_container() {
                 set_runtime_identity(&path, false)?;
                 if let Some(parent) = path.parent() {
                     set_runtime_identity_directory(parent)?;
@@ -737,7 +1059,10 @@ impl HostInstallExecutor {
                 )),
             ));
         }
-        if kind != RuntimeBackendKind::Systemd {
+        if let Some(import) = &job.order.current_data_import {
+            import_current_data(Path::new(&import.source_data_root), &data_root)?;
+        }
+        if kind.is_container() {
             set_runtime_identity_directory_data(&data_root)?;
         }
 
@@ -768,7 +1093,7 @@ impl HostInstallExecutor {
 
         // 6. Start the runtime and confirm it serves the verified artifact.
         match kind {
-            RuntimeBackendKind::Systemd => {
+            RuntimeBackendKind::Host => {
                 start_systemd_runtime(job, &release, &subject_digest, performed)?;
             }
             RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
@@ -792,6 +1117,7 @@ impl HostInstallExecutor {
                     Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
                 })?,
             ),
+            rollback_policy: release.rollback_policy(),
         })
     }
 }
@@ -826,7 +1152,7 @@ fn start_container_runtime(
     performed: &mut PerformedSteps,
 ) -> Result<(), Failure> {
     let image = match kind {
-        RuntimeBackendKind::Systemd => release
+        RuntimeBackendKind::Host => release
             .manifest
             .image_ref()
             .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?,
@@ -896,18 +1222,16 @@ fn start_container_runtime(
             false,
         ),
     ];
-    // Secret files share one host directory (enforced by InstallOrder
-    // validation); it is mounted read-only at the fixed container location
-    // the seed configuration references.
-    if let Some(secrets_dir) = job
-        .order
-        .secrets
-        .first()
-        .and_then(|secret| Path::new(&secret.path).parent())
-    {
+    // The long-lived runtime receives only its three runtime secrets. The
+    // lifecycle PostgreSQL URL is mounted solely into one-shot lifecycle
+    // tasks and is therefore unreachable from the server process.
+    for secret in &job.order.secrets {
+        if secret.purpose == "database-lifecycle-url" {
+            continue;
+        }
         mounts.push(mount(
-            secrets_dir.to_path_buf(),
-            CONTAINER_SECRETS_DIR,
+            PathBuf::from(&secret.path),
+            &format!("{CONTAINER_SECRETS_DIR}/{}", secret.purpose),
             true,
         ));
     }
@@ -935,7 +1259,8 @@ fn start_container_runtime(
     );
     for secret in &job.order.secrets {
         let key = match secret.purpose.as_str() {
-            "database-url" => "DATABASE_URL_FILE",
+            "database-runtime-url" => "DATABASE_URL_FILE",
+            "database-lifecycle-url" => continue,
             "valkey-url" => "VALKEY_URL_FILE",
             "mfa-totp-key" => "MFA_TOTP_ENCRYPTION_KEY_FILE",
             other => {
@@ -1010,9 +1335,10 @@ fn artifact_reference(image: &str, digest: &str) -> runtime_backend::ArtifactRef
 /// URL userinfo component. Unreserved characters (RFC 3986 §2.3) pass
 /// through; everything else becomes `%XX` so `@:/?#` and control bytes can
 /// never break the URL or smuggle a host change.
-pub fn percent_encode_credential(credential: &str) -> String {
+pub fn percent_encode_credential(credential: impl AsRef<[u8]>) -> String {
+    let credential = credential.as_ref();
     let mut encoded = String::with_capacity(credential.len());
-    for byte in credential.bytes() {
+    for &byte in credential {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 encoded.push(byte as char)
@@ -1056,9 +1382,10 @@ fn start_systemd_runtime(
         .order
         .secrets
         .iter()
+        .filter(|secret| secret.purpose != "database-lifecycle-url")
         .map(|secret| PathBuf::from(&secret.path))
         .collect::<Vec<_>>();
-    let backend = runtime_backend::backend(RuntimeBackendKind::Systemd);
+    let backend = runtime_backend::backend(RuntimeBackendKind::Host);
     // From this point rollback must remove both a partial unit and the
     // deployment-specific service account created by the backend.
     performed.installed_runtime = true;
@@ -1079,6 +1406,18 @@ fn start_systemd_runtime(
         SERVER_CONFIG_FILE_ENV.to_owned(),
         job.config_reference.to_owned(),
     );
+    let lifecycle_url = job
+        .order
+        .secrets
+        .iter()
+        .find(|secret| secret.purpose == "database-lifecycle-url")
+        .ok_or_else(|| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                "systemd migration requires the lifecycle PostgreSQL URL",
+            )
+        })?;
+    environment.insert("DATABASE_URL_FILE".to_owned(), lifecycle_url.path.clone());
     let task = runtime_backend::OneShotTask {
         artifact: runtime_backend::ArtifactReference::HostBinary {
             path: binary.clone(),
@@ -1089,7 +1428,7 @@ fn start_systemd_runtime(
         mounts: Vec::new(),
         environment,
         working_directory: Some(PathBuf::from(&job.order.data_root)),
-        service_user: Some(service_user),
+        service_user: None,
         transient_credentials: std::collections::BTreeMap::new(),
         read_only_paths: std::iter::once(PathBuf::from(job.config_reference))
             .chain(secret_paths)
@@ -1186,12 +1525,15 @@ fn run_schema_migration(
         CONTAINER_CONFIG_FILE.to_owned(),
     );
     for secret in &job.order.secrets {
-        if matches!(secret.purpose.as_str(), "database-url" | "valkey-url") {
-            environment.insert(
-                format!("{}_FILE", secret.purpose.to_uppercase().replace('-', "_")),
-                format!("{CONTAINER_SECRETS_DIR}/{}", secret.purpose),
-            );
-        }
+        let key = match secret.purpose.as_str() {
+            "database-lifecycle-url" => "DATABASE_URL_FILE",
+            "valkey-url" => "VALKEY_URL_FILE",
+            _ => continue,
+        };
+        environment.insert(
+            key.to_owned(),
+            format!("{CONTAINER_SECRETS_DIR}/{}", secret.purpose),
+        );
     }
     let task = runtime_backend::OneShotTask {
         artifact: artifact_reference(image, &digest),
@@ -1372,10 +1714,8 @@ pub(crate) fn probe_local_health(port: u16) -> Result<(), Failure> {
 /// original install failure.
 pub(crate) fn rollback(job: &InstallJob<'_>, performed: &PerformedSteps) -> Result<(), Failure> {
     let mut errors = Vec::new();
-    if performed.installed_runtime
-        && let Ok(kind) = job.backend_kind()
-    {
-        let backend = runtime_backend::backend(kind);
+    if performed.installed_runtime {
+        let backend = runtime_backend::backend(job.runtime_kind);
         if performed.started_runtime
             && let Err(error) = backend.stop(job.runtime_object)
         {
@@ -1436,4 +1776,91 @@ fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod current_data_import_tests {
+    use super::*;
+
+    fn source_fixture(root: &Path) -> anyhow::Result<()> {
+        fs::create_dir_all(root.join("keys"))?;
+        fs::create_dir_all(root.join("avatars"))?;
+        fs::create_dir_all(root.join("secrets"))?;
+        fs::create_dir_all(root.join("instance"))?;
+        fs::create_dir_all(root.join("bootstrap"))?;
+        fs::create_dir_all(root.join("ui-releases"))?;
+        fs::write(root.join("keys/signing.pem"), b"key")?;
+        fs::write(root.join("avatars/user.jpg"), b"avatar")?;
+        for name in IMPORT_APP_SECRETS {
+            fs::write(root.join("secrets").join(name), name.as_bytes())?;
+        }
+        fs::write(root.join("secrets/unknown"), b"excluded")?;
+        fs::write(root.join("instance/state"), b"excluded")?;
+        fs::write(root.join("bootstrap/token"), b"excluded")?;
+        fs::write(root.join("ui-releases/bundle"), b"excluded")?;
+        fs::write(root.join("unknown"), b"excluded")?;
+        Ok(())
+    }
+
+    #[test]
+    fn import_copies_only_current_material_and_resumes_exactly() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("current-data-import")?;
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source)?;
+        fs::create_dir(&destination)?;
+        source_fixture(&source)?;
+
+        import_current_data(&source, &destination)
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        import_current_data(&source, &destination)
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        assert_eq!(fs::read(destination.join("keys/signing.pem"))?, b"key");
+        assert_eq!(fs::read(destination.join("avatars/user.jpg"))?, b"avatar");
+        for name in IMPORT_APP_SECRETS {
+            assert!(destination.join("secrets").join(name).is_file());
+        }
+        for excluded in [
+            "instance",
+            "bootstrap",
+            "ui-releases",
+            "unknown",
+            "secrets/unknown",
+        ] {
+            assert!(!destination.join(excluded).exists(), "copied {excluded}");
+        }
+
+        fs::write(destination.join("keys/signing.pem"), b"drift")?;
+        assert!(import_current_data(&source, &destination).is_err());
+
+        let mfa_source = temp.path().join("mfa-source");
+        let mfa_destination = temp.path().join("mfa-destination");
+        use base64::Engine as _;
+        fs::write(
+            &mfa_source,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]),
+        )?;
+        copy_import_file(&mfa_source, &mfa_destination, "MFA")
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        copy_import_file(&mfa_source, &mfa_destination, "MFA")
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        fs::write(&mfa_source, b"invalid")?;
+        assert!(copy_import_file(&mfa_source, &mfa_destination, "MFA").is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_rejects_symlinks_in_selected_trees() -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp = crate::filesystem::PrivateTempDir::new("current-data-import-link")?;
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source)?;
+        fs::create_dir(&destination)?;
+        source_fixture(&source)?;
+        symlink(source.join("keys/signing.pem"), source.join("keys/link"))?;
+        assert!(import_current_data(&source, &destination).is_err());
+        Ok(())
+    }
 }

@@ -6,9 +6,9 @@
 
 pub(crate) use nazoauthctl_runtime::runtime_backend::{
     ArtifactReference, BlobAttestationVerification, ContainerRuntimePolicy, HostServiceInstall,
-    NON_ROOT_ONE_SHOT_USER, NeutralMount, OneShotTask, ResourceScope as RuntimeResourceScope,
-    Responsibility, RuntimeBackend, RuntimeBackendKind, RuntimeObservation, RuntimeReplacement,
-    SystemdBackend,
+    NON_ROOT_ONE_SHOT_USER, NeutralMount, OneShotTask, RecoveryCandidateEndpoint,
+    RecoveryCandidateRequest, ResourceScope as RuntimeResourceScope, Responsibility,
+    RuntimeBackend, RuntimeBackendKind, RuntimeObservation, RuntimeReplacement, SystemdBackend,
 };
 
 pub(crate) fn backend(kind: RuntimeBackendKind) -> Box<dyn RuntimeBackend> {
@@ -19,6 +19,6 @@ pub(crate) fn backend(kind: RuntimeBackendKind) -> Box<dyn RuntimeBackend> {
         RuntimeBackendKind::Docker => {
             Box::new(nazoauthctl_runtime::runtime_backend::DockerBackend::default())
         }
-        RuntimeBackendKind::Systemd => Box::new(SystemdBackend),
+        RuntimeBackendKind::Host => Box::new(SystemdBackend),
     }
 }

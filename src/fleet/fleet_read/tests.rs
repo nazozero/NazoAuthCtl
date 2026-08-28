@@ -1,6 +1,6 @@
 use super::*;
 use crate::filesystem::PrivateTempDir;
-use crate::registry::{HostPrivilege, InstanceRecord, RegistryStore};
+use crate::registry::{HostPrivilege, InstanceRecord, ObservationCache, RegistryStore};
 use crate::target::{
     ControlOperationReceipt, ControlOperationRequest, HealthSnapshot, HostCompletionBody,
     HostOperation, HostOverview, HostResult, RuntimeSurface,
@@ -15,6 +15,7 @@ enum Scenario {
 
 struct ScriptedTarget {
     scenario: Scenario,
+    target_id: uuid::Uuid,
 }
 
 impl ScriptedTarget {
@@ -24,6 +25,7 @@ impl ScriptedTarget {
         }
         Ok(InstanceInspection {
             current_build_identity: None,
+            current_instance_identity: None,
             deployment_id: deployment_id.to_owned(),
             issuer: "https://auth.example.com".to_owned(),
             observed_at: chrono::Utc::now(),
@@ -35,7 +37,10 @@ impl ScriptedTarget {
             resources: vec![],
             healthy: true,
             health_summary: "ok".to_owned(),
-            backup_maturity: crate::target::BackupMaturity::Unknown,
+            backup: crate::target::BackupProjection {
+                local_rollback_ready: false,
+                snapshot: None,
+            },
             active_host_operation: None,
             config_revision_marker: None,
         })
@@ -56,12 +61,14 @@ impl ExecutionTarget for ScriptedTarget {
             anyhow::bail!("{text}");
         }
         match &operation.operation {
-            crate::target::HostOperationBody::Hello {} => Ok(HostResult::completed(
-                &operation.operation_id,
-                HostCompletionBody::Hello {
-                    hello: crate::target::wire::local_hello(vec!["podman".to_owned()]),
-                },
-            )),
+            crate::target::HostOperationBody::Hello {} => {
+                let mut hello = crate::target::wire::local_hello(vec!["podman".to_owned()]);
+                hello.target_id = self.target_id.to_string();
+                Ok(HostResult::completed(
+                    &operation.operation_id,
+                    HostCompletionBody::Hello { hello },
+                ))
+            }
             crate::target::HostOperationBody::Ping { nonce } => Ok(HostResult::completed(
                 &operation.operation_id,
                 HostCompletionBody::Ping {
@@ -74,7 +81,7 @@ impl ExecutionTarget for ScriptedTarget {
 
     fn execute_control_operation(
         &self,
-        _request: &ControlOperationRequest,
+        _request: ControlOperationRequest,
     ) -> anyhow::Result<ControlOperationReceipt> {
         anyhow::bail!("unused")
     }
@@ -95,6 +102,55 @@ struct Fixture {
     store: RegistryStore,
 }
 
+#[test]
+fn controller_status_never_recovers_expiry_from_observation_text() -> anyhow::Result<()> {
+    let host = crate::registry::HostRecord::new_ssh(
+        "server-a",
+        "prod-a",
+        HostPrivilege::Direct,
+        uuid::Uuid::now_v7(),
+    )?;
+    let mut record = InstanceRecord::new(
+        "deploy-alpha",
+        "production",
+        host.host_id,
+        "https://auth.example.com",
+    )?;
+    record.controller_id = Some("controller-a".to_owned());
+    record.controller_key_ref = Some("controller-keys/deploy-alpha".to_owned());
+    record.last_observation = Some(ObservationCache::now(
+        true,
+        "controller-slots n=1 max=3 | controller-a:kid-a:active:2000-01-01T00:00:00Z",
+    ));
+
+    let line = controller_fact_line(&record);
+    assert_eq!(
+        line,
+        "local binding recorded (live slot status not queried)"
+    );
+    assert!(!line.contains("expired"));
+    assert!(!line.contains("active"));
+
+    let doctor = doctor_job(
+        &record,
+        &host,
+        &ScriptedTarget {
+            scenario: Scenario::Online,
+            target_id: host.host_id,
+        },
+    )?;
+    let diagnostics = doctor["diagnostics"]
+        .as_array()
+        .context("doctor diagnostics")?;
+    assert!(
+        diagnostics
+            .iter()
+            .all(|entry| !entry.as_str().unwrap_or_default().contains("EXPIRED")),
+        "stale observation text must not synthesize an expiry diagnostic: {doctor}"
+    );
+    Ok(())
+}
+
 impl Fixture {
     fn new() -> anyhow::Result<Self> {
         let temp = PrivateTempDir::new("nazauthctl-fleet-read-test")?;
@@ -103,16 +159,19 @@ impl Fixture {
             "server-a",
             "prod-a",
             HostPrivilege::Direct,
+            uuid::Uuid::now_v7(),
         )?)?;
         let host_b = store.add_host(crate::registry::HostRecord::new_ssh(
             "server-b",
             "prod-b",
             HostPrivilege::Direct,
+            uuid::Uuid::now_v7(),
         )?)?;
         let host_c = store.add_host(crate::registry::HostRecord::new_ssh(
             "server-c",
             "prod-c",
             HostPrivilege::Direct,
+            uuid::Uuid::now_v7(),
         )?)?;
         for (host, alias) in [(host_a, "prod-a"), (host_b, "prod-b"), (host_c, "prod-c")] {
             store.add_instance(InstanceRecord::new(
@@ -120,7 +179,6 @@ impl Fixture {
                 alias,
                 host.host_id,
                 "https://auth.example.com",
-                "ref",
             )?)?;
         }
         Ok(Self { _temp: temp, store })
@@ -140,8 +198,8 @@ impl Fixture {
 }
 
 fn job() -> Arc<ReadJob> {
-    Arc::new(|_instance, _host, target| {
-        let hello = crate::fleet::live_probe(target)?;
+    Arc::new(|_instance, host, target| {
+        let hello = crate::fleet::live_probe(target, host)?;
         let inspection = target.inspect_instance("ignored-here")?;
         Ok(json!({
             "helper": crate::fleet::summarize_hello(&hello),
@@ -168,7 +226,10 @@ fn partial_failure_is_isolated_and_order_is_stable() -> anyhow::Result<()> {
         } else {
             Scenario::Online
         };
-        Ok(Box::new(ScriptedTarget { scenario }) as Box<dyn ExecutionTarget + Send>)
+        Ok(Box::new(ScriptedTarget {
+            scenario,
+            target_id: record.host_id,
+        }) as Box<dyn ExecutionTarget + Send>)
     });
     let runner = FleetReadRunner::new(factory, MAX_CONCURRENCY);
     let outcomes = runner.run(items, job());
@@ -211,7 +272,7 @@ fn concurrency_is_bounded_by_the_cap() -> anyhow::Result<()> {
         }
         fn execute_control_operation(
             &self,
-            _request: &ControlOperationRequest,
+            _request: ControlOperationRequest,
         ) -> anyhow::Result<ControlOperationReceipt> {
             unreachable!()
         }
@@ -230,7 +291,6 @@ fn concurrency_is_bounded_by_the_cap() -> anyhow::Result<()> {
             format!("inst-{index:02}"),
             host.host_id,
             "https://auth.example.com",
-            "ref",
         )?)?;
     }
     let mut items = Vec::new();

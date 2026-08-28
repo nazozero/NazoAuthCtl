@@ -3,11 +3,7 @@ mod docker;
 mod podman;
 mod systemd;
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::Write as _,
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf};
 
 use anyhow::{Context as _, bail};
 use serde::{Deserialize, Serialize};
@@ -93,8 +89,42 @@ pub enum ResourceScope {
 pub enum RuntimeBackendKind {
     Podman,
     Docker,
-    #[serde(alias = "host")]
-    Systemd,
+    Host,
+}
+
+impl RuntimeBackendKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Podman => "podman",
+            Self::Docker => "docker",
+            Self::Host => "host",
+        }
+    }
+
+    pub const fn is_container(self) -> bool {
+        matches!(self, Self::Podman | Self::Docker)
+    }
+}
+
+impl std::fmt::Display for RuntimeBackendKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for RuntimeBackendKind {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "podman" => Ok(Self::Podman),
+            "docker" => Ok(Self::Docker),
+            "host" => Ok(Self::Host),
+            other => anyhow::bail!(
+                "unsupported runtime kind '{other}'; expected podman, docker, or host"
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -109,22 +139,6 @@ pub enum ArtifactReference {
         sha256: String,
     },
     Unknown,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeInstance {
-    pub runtime_instance_id: String,
-    pub backend: RuntimeBackendKind,
-    pub object_reference: String,
-    pub artifact: ArtifactReference,
-    #[serde(default)]
-    pub local_artifact_id: Option<String>,
-    pub ports: Vec<String>,
-    pub networks: Vec<String>,
-    pub mounts: Vec<MountReference>,
-    pub instance_key_id: Option<String>,
-    pub deployment_statement: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -171,73 +185,6 @@ pub struct NeutralMount {
     pub scope: ResourceScope,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RuntimeSurfaceDrift {
-    pub ports: bool,
-    pub networks: bool,
-    pub mounts: bool,
-}
-
-pub fn compare_declared_runtime_surface(
-    declared: &RuntimeInstance,
-    observed: &RuntimeObservation,
-) -> anyhow::Result<RuntimeSurfaceDrift> {
-    let container = matches!(
-        declared.backend,
-        RuntimeBackendKind::Podman | RuntimeBackendKind::Docker
-    );
-    let expected_ports = if container {
-        declared
-            .ports
-            .iter()
-            .map(|port| {
-                let Some((host_binding, container_port)) = port.rsplit_once(':') else {
-                    bail!("declared container port has no host binding");
-                };
-                if host_binding.is_empty() || container_port.is_empty() {
-                    bail!("declared container port binding is incomplete");
-                }
-                Ok(format!("{host_binding}->{container_port}/tcp"))
-            })
-            .collect::<anyhow::Result<BTreeSet<_>>>()?
-    } else {
-        declared.ports.iter().cloned().collect()
-    };
-    let observed_ports = observed.ports.iter().cloned().collect::<BTreeSet<_>>();
-
-    let expected_mounts = declared
-        .mounts
-        .iter()
-        .map(|mount| {
-            (
-                mount.source.clone(),
-                mount.destination.clone(),
-                mount.read_only,
-                (!container).then_some(mount.selinux_relabel),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    let observed_mounts = observed
-        .mounts
-        .iter()
-        .map(|mount| {
-            (
-                mount.source.clone(),
-                mount.destination.clone(),
-                mount.read_only,
-                (!container).then_some(mount.selinux_relabel),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-
-    Ok(RuntimeSurfaceDrift {
-        ports: expected_ports != observed_ports,
-        networks: declared.networks.iter().collect::<BTreeSet<_>>()
-            != observed.networks.iter().collect::<BTreeSet<_>>(),
-        mounts: expected_mounts != observed_mounts,
-    })
-}
-
 #[derive(Clone, Debug)]
 pub struct RuntimeReplacement {
     pub object_reference: String,
@@ -251,6 +198,37 @@ pub struct RuntimeReplacement {
     pub ports: Vec<String>,
     pub labels: BTreeMap<String, String>,
     pub container_policy: Option<ContainerRuntimePolicy>,
+}
+
+/// The only container shape accepted for a closed recovery candidate.
+///
+/// This is deliberately not a general clone specification. The backend
+/// inspects one stopped deployment runtime, copies only its safe environment
+/// and single non-host network, replaces exactly the three recovery mounts,
+/// and publishes one application port on IPv4 loopback.
+#[derive(Clone, Debug)]
+pub struct RecoveryCandidateRequest {
+    pub source_object_reference: String,
+    pub candidate_object_reference: String,
+    pub deployment_id: String,
+    pub operation_id: String,
+    pub artifact: ArtifactReference,
+    pub data_source: PathBuf,
+    pub secrets_source: PathBuf,
+    pub config_source: PathBuf,
+    pub valkey_state_epoch: String,
+}
+
+/// Immutable cleanup identity and the sole endpoint exposed by a recovery
+/// candidate. Controllers may forward `127.0.0.1:loopback_port` through their
+/// existing OpenSSH transport; no public address is ever returned.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RecoveryCandidateEndpoint {
+    pub object_reference: String,
+    pub object_id: String,
+    pub deployment_id: String,
+    pub operation_id: String,
+    pub loopback_port: u16,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -322,6 +300,12 @@ impl ContainerRuntimePolicy {
     pub fn managed_app() -> Self {
         let mut policy = Self::managed_default();
         policy.service_user = Some("10001:10001".to_owned());
+        policy
+    }
+
+    fn recovery_candidate() -> Self {
+        let mut policy = Self::managed_app();
+        policy.restart = ContainerRestartPolicy::No;
         policy
     }
 
@@ -660,6 +644,18 @@ pub trait RuntimeBackend {
     fn restart(&self, object_reference: &str) -> anyhow::Result<()>;
     fn remove(&self, object_reference: &str) -> anyhow::Result<()>;
     fn replace(&self, replacement: &RuntimeReplacement) -> anyhow::Result<()>;
+    /// Create a one-use, loopback-only candidate from a stopped runtime after
+    /// proving the complete recover-only container surface.
+    fn stage_recovery_candidate(
+        &self,
+        request: &RecoveryCandidateRequest,
+    ) -> anyhow::Result<RecoveryCandidateEndpoint>;
+    /// Idempotently remove the exact immutable candidate returned by
+    /// [`RuntimeBackend::stage_recovery_candidate`].
+    fn cleanup_recovery_candidate(
+        &self,
+        endpoint: &RecoveryCandidateEndpoint,
+    ) -> anyhow::Result<()>;
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String>;
     fn run_one_shot_authorization_probe(&self, task: &OneShotTask) -> anyhow::Result<bool>;
     fn pull_image(&self, image_reference: &str) -> anyhow::Result<()>;
@@ -739,4 +735,25 @@ pub fn labels(value: Option<&serde_json::Value>) -> BTreeMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeBackendKind;
+
+    #[test]
+    fn runtime_kind_has_exactly_three_wire_tokens() -> anyhow::Result<()> {
+        for (kind, token) in [
+            (RuntimeBackendKind::Podman, "podman"),
+            (RuntimeBackendKind::Docker, "docker"),
+            (RuntimeBackendKind::Host, "host"),
+        ] {
+            assert_eq!(kind.as_str(), token);
+            assert_eq!(serde_json::to_string(&kind)?, format!("\"{token}\""));
+            assert_eq!(token.parse::<RuntimeBackendKind>()?, kind);
+        }
+        assert!("systemd".parse::<RuntimeBackendKind>().is_err());
+        assert!(serde_json::from_str::<RuntimeBackendKind>("\"systemd\"").is_err());
+        Ok(())
+    }
 }

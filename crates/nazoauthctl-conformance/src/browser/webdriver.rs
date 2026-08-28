@@ -24,7 +24,6 @@ use super::{
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_SESSION_ID_BYTES: usize = 256;
 const W3C_ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
-const LEGACY_ELEMENT_KEY: &str = "ELEMENT";
 const MAX_RUNTIME_ROOT_CHILDREN: usize = 4096;
 const MAX_RUNTIME_MODULE_SCRIPTS: usize = 128;
 const MAX_RUNTIME_RESOURCE_SCAN: usize = 512;
@@ -438,7 +437,6 @@ impl BrowserDriver for WebDriverClient {
             .ok_or_else(|| response.protocol())?;
         let id = object
             .get(W3C_ELEMENT_KEY)
-            .or_else(|| object.get(LEGACY_ELEMENT_KEY))
             .and_then(Value::as_str)
             .ok_or_else(|| response.protocol())?;
         if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
@@ -472,7 +470,6 @@ impl BrowserDriver for WebDriverClient {
             .ok_or_else(|| response.protocol())?;
         let id = object
             .get(W3C_ELEMENT_KEY)
-            .or_else(|| object.get(LEGACY_ELEMENT_KEY))
             .and_then(Value::as_str)
             .ok_or_else(|| response.protocol())?;
         if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {

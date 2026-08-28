@@ -16,18 +16,15 @@ use uuid::Uuid;
 
 use crate::cli::{HostCommand, InstanceCommand, InstanceSelector};
 use crate::discover_adopt::DiscoveryContext;
+use crate::error_codes::{INSTANCE_AMBIGUOUS, INSTANCE_NOT_REGISTERED, REMOTE_HELPER_MISMATCH};
 use crate::registry::{
     HostPrivilege, HostRecord, HostTransport, InstanceRecord, ObservationCache, RegistryStore,
+    verify_registered_target_identity,
 };
 use crate::target::{
     ExecutionTarget, HostCompletionBody, HostOperation, HostOutcome, InstanceInspection,
-    LocalTarget, REMOTE_HELPER_MISMATCH, RemoteHello, ResourceOwnership, SshTarget,
-    verify_remote_hello,
+    LocalTarget, RemoteHello, ResourceOwnership, SshTarget, verify_remote_hello,
 };
-
-// Canonical names live in `crate::error_codes`; re-exported here so the
-// historical call sites keep one stable path.
-pub(crate) use crate::error_codes::{INSTANCE_AMBIGUOUS, INSTANCE_NOT_REGISTERED};
 
 /// Cached observations older than this are displayed as stale.
 const STALE_AFTER_HOURS: i64 = 24;
@@ -139,7 +136,10 @@ pub(crate) fn run_instance(command: InstanceCommand) -> anyhow::Result<()> {
 
 /// One full live contact: verified hello identity plus a nonce-echoed ping.
 /// Both transports answer through the identical [`ExecutionTarget`] contract.
-pub(crate) fn live_probe(target: &dyn ExecutionTarget) -> anyhow::Result<RemoteHello> {
+fn probe_target(
+    target: &dyn ExecutionTarget,
+    expected_host: Option<&HostRecord>,
+) -> anyhow::Result<RemoteHello> {
     let answered =
         target.execute_host_operation(&HostOperation::hello(Uuid::now_v7().to_string()))?;
     let hello = match answered.outcome {
@@ -159,6 +159,9 @@ pub(crate) fn live_probe(target: &dyn ExecutionTarget) -> anyhow::Result<RemoteH
              (`nazoauthctl self update --yes` on the host), then retry; no fallback exists."
         )
     })?;
+    if let Some(host) = expected_host {
+        verify_registered_target_identity(host.host_id, &host.alias, &hello)?;
+    }
 
     let nonce = Uuid::now_v7().to_string();
     let echoed = target.execute_host_operation(&HostOperation::ping(
@@ -179,6 +182,16 @@ pub(crate) fn live_probe(target: &dyn ExecutionTarget) -> anyhow::Result<RemoteH
             bail!("the target helper answered failure {code}: {detail}")
         }
     }
+}
+
+/// Verify one already-registered physical target before any read or mutation.
+/// The helper contract and ping prove liveness; the target-owned UUID proves
+/// that the selected registry alias still reaches the physical host it names.
+pub(crate) fn live_probe(
+    target: &dyn ExecutionTarget,
+    host: &HostRecord,
+) -> anyhow::Result<RemoteHello> {
+    probe_target(target, Some(host))
 }
 
 /// Compact single-line identity string stored in the observation cache. Drift
@@ -219,16 +232,19 @@ pub(crate) fn summarize_inspection(inspection: &InstanceInspection) -> String {
         .filter(|resource| resource.ownership == ResourceOwnership::Managed)
         .count();
     let health = if inspection.healthy { "ok" } else { "down" };
-    // Backup/DR maturity (H05): informational display with its observation
-    // timestamp; never a gate for any lifecycle use case.
-    let backup = match inspection.backup_maturity.observed_at() {
-        Some(observed_at) => format!(
-            "{}@{}",
-            inspection.backup_maturity.token(),
-            observed_at.to_rfc3339()
-        ),
-        None => inspection.backup_maturity.token().to_owned(),
-    };
+    let backup = inspection.backup.snapshot.as_ref().map_or_else(
+        || "none".to_owned(),
+        |snapshot| {
+            format!(
+                "snapshot={} restore-tested={}",
+                snapshot.created_at.to_rfc3339(),
+                snapshot
+                    .restore_tested_at
+                    .map(|time| time.to_rfc3339())
+                    .unwrap_or_else(|| "no".to_owned())
+            )
+        },
+    );
     format!(
         "rev={} runtime={}/{} config={} artifacts={} resources={} managed={} health={health} backup={backup}",
         inspection.revision,
@@ -346,14 +362,16 @@ fn host_add(
     if context.store.host_by_alias(alias)?.is_some() {
         bail!("duplicate host alias '{alias}'");
     }
-    let candidate = HostRecord::new_ssh(alias, ssh_profile, privilege)?;
+    let candidate = HostRecord::new_ssh_unbound(alias, ssh_profile, privilege);
     // Task B03 preflight: reach the helper and verify its identity BEFORE
     // anything is persisted. A host this control machine cannot talk to is
     // never registered half-done.
     let target = context.target_for(&candidate)?;
-    let hello =
-        live_probe(target.as_ref()).context("host add preflight failed; nothing was registered")?;
-    let mut record = candidate;
+    let hello = probe_target(target.as_ref(), None)
+        .context("host add preflight failed; nothing was registered")?;
+    let target_id = Uuid::parse_str(&hello.target_id)
+        .context("host add: verified target hello carries an invalid target identity")?;
+    let mut record = HostRecord::new_ssh(alias, ssh_profile, privilege, target_id)?;
     record.set_last_observation(ObservationCache::now(true, summarize_hello(&hello)));
     let stored = context.store.add_host(record)?;
 
@@ -378,7 +396,7 @@ fn host_list(context: &FleetContext, refresh: bool) -> anyhow::Result<String> {
     if refresh {
         for host in context.store.list_hosts()? {
             let target = context.target_for(&host)?;
-            match live_probe(target.as_ref()) {
+            match live_probe(target.as_ref(), &host) {
                 Ok(hello) => context.store.set_host_observation(
                     host.host_id,
                     ObservationCache::now(true, summarize_hello(&hello)),
@@ -468,7 +486,7 @@ fn host_check(context: &FleetContext, alias: &str) -> anyhow::Result<String> {
         .host_by_alias(alias)?
         .with_context(|| format!("unknown host alias '{alias}'"))?;
     let target = context.target_for(&host)?;
-    let probe = live_probe(target.as_ref());
+    let probe = live_probe(target.as_ref(), &host);
     match probe {
         Ok(hello) => {
             let summary = summarize_hello(&hello);
@@ -589,7 +607,7 @@ fn instance_list(context: &FleetContext, refresh: bool) -> anyhow::Result<String
                 continue;
             };
             let target = context.target_for(&host)?;
-            match live_probe(target.as_ref()) {
+            match live_probe(target.as_ref(), &host) {
                 Ok(hello) => {
                     let summary = summarize_hello(&hello);
                     context.store.set_host_observation(
@@ -689,7 +707,6 @@ fn instance_show(context: &FleetContext, selector: &InstanceSelector) -> anyhow:
         "issuer": record.issuer,
         "controller_id": record.controller_id,
         "controller_key_ref": record.controller_key_ref,
-        "target_state_ref": record.target_state_ref,
         "observation": record.last_observation.map(|observation| serde_json::json!({
             "observed_at": observation.observed_at,
             "reachable": observation.reachable,
@@ -765,7 +782,7 @@ fn instance_relocate(
     // then a real DeploymentState inspection proving the same deployment
     // really runs there.
     let target = context.target_for(&destination)?;
-    let hello = live_probe(target.as_ref()).with_context(|| {
+    let hello = live_probe(target.as_ref(), &destination).with_context(|| {
         format!(
             "relocation target '{to_host}' failed its live verification; the binding of '{}' was not changed",
             record.alias
@@ -840,6 +857,8 @@ mod tests {
     enum Scenario {
         /// Verified helper answering hello and ping correctly.
         Online,
+        /// Two configured aliases can resolve to the same physical target.
+        FixedTargetId(Uuid),
         /// Verified helper whose target reports a different deployment id
         /// than the one asked about (relocation must refuse).
         ForeignDeployment,
@@ -852,11 +871,20 @@ mod tests {
     struct FakeTarget {
         scenario: Scenario,
         calls: Arc<AtomicUsize>,
+        target_id: Uuid,
     }
 
     impl FakeTarget {
         fn hello(&self) -> RemoteHello {
             let mut hello = crate::target::wire::local_hello(vec!["podman".to_owned()]);
+            hello.target_id = if let Scenario::FixedTargetId(target_id) = self.scenario {
+                target_id
+            } else if self.target_id.get_version_num() == 7 {
+                self.target_id
+            } else {
+                Uuid::now_v7()
+            }
+            .to_string();
             if matches!(self.scenario, Scenario::HelperDrift) {
                 hello.version = "0.0.9-drift".to_owned();
             }
@@ -868,6 +896,7 @@ mod tests {
                 Scenario::Offline(text) => bail!("{text}"),
                 Scenario::ForeignDeployment => Ok(InstanceInspection {
                     current_build_identity: None,
+                    current_instance_identity: None,
                     deployment_id: format!("elsewhere-{deployment_id}"),
                     issuer: "https://auth.example.com".to_owned(),
                     observed_at: chrono::Utc::now(),
@@ -879,12 +908,16 @@ mod tests {
                     resources: vec![],
                     healthy: true,
                     health_summary: "ok".to_owned(),
-                    backup_maturity: crate::target::BackupMaturity::Unknown,
+                    backup: crate::target::BackupProjection {
+                        local_rollback_ready: false,
+                        snapshot: None,
+                    },
                     active_host_operation: None,
                     config_revision_marker: None,
                 }),
                 _ => Ok(InstanceInspection {
                     current_build_identity: None,
+                    current_instance_identity: None,
                     deployment_id: deployment_id.to_owned(),
                     issuer: "https://auth.example.com".to_owned(),
                     observed_at: chrono::Utc::now(),
@@ -911,7 +944,10 @@ mod tests {
                     ],
                     healthy: true,
                     health_summary: "runtime healthy".to_owned(),
-                    backup_maturity: crate::target::BackupMaturity::Unknown,
+                    backup: crate::target::BackupProjection {
+                        local_rollback_ready: false,
+                        snapshot: None,
+                    },
                     active_host_operation: None,
                     config_revision_marker: None,
                 }),
@@ -953,7 +989,7 @@ mod tests {
 
         fn execute_control_operation(
             &self,
-            _request: &ControlOperationRequest,
+            _request: ControlOperationRequest,
         ) -> anyhow::Result<ControlOperationReceipt> {
             bail!("unused in fleet tests")
         }
@@ -996,6 +1032,7 @@ mod tests {
                     Ok(Box::new(FakeTarget {
                         scenario: pick(record),
                         calls: calls_for_factory.clone(),
+                        target_id: record.host_id,
                     }))
                 }),
             );
@@ -1011,7 +1048,7 @@ mod tests {
         }
 
         fn seed_ssh_host(&self, alias: &str, profile: &str) -> anyhow::Result<HostRecord> {
-            let host = HostRecord::new_ssh(alias, profile, HostPrivilege::Direct)?;
+            let host = HostRecord::new_ssh(alias, profile, HostPrivilege::Direct, Uuid::now_v7())?;
             self.store().add_host(host)
         }
 
@@ -1021,13 +1058,8 @@ mod tests {
             deployment: &str,
             alias: &str,
         ) -> anyhow::Result<InstanceRecord> {
-            let record = InstanceRecord::new(
-                deployment,
-                alias,
-                host_id,
-                "https://auth.example.com",
-                "target-state/x",
-            )?;
+            let record =
+                InstanceRecord::new(deployment, alias, host_id, "https://auth.example.com")?;
             self.store().add_instance(record)
         }
     }
@@ -1098,6 +1130,27 @@ mod tests {
             0,
             "duplicate never reaches the wire"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn host_add_rejects_a_second_alias_for_the_same_target_identity() -> anyhow::Result<()> {
+        let fixture = Fixture::with_scenario(Scenario::FixedTargetId(Uuid::now_v7()))?;
+        host_add(
+            &fixture.context,
+            "server-a",
+            "prod-a",
+            HostPrivilege::Direct,
+        )?;
+        let error = host_add(
+            &fixture.context,
+            "server-b",
+            "prod-b",
+            HostPrivilege::Direct,
+        )
+        .expect_err("same target must not gain another alias");
+        assert!(error.to_string().contains("duplicate host id"), "{error}");
+        assert_eq!(fixture.store().list_hosts()?.len(), 1);
         Ok(())
     }
 
@@ -1179,10 +1232,51 @@ mod tests {
     }
 
     #[test]
-    fn host_check_on_the_local_transport_skips_the_network() -> anyhow::Result<()> {
+    fn registered_alias_cannot_reach_another_current_helper() -> anyhow::Result<()> {
+        let other_target = Uuid::now_v7();
+        let fixture = Fixture::with_scenario(Scenario::FixedTargetId(other_target))?;
+        let registered = fixture.seed_ssh_host("server-a", "prod-a")?;
+        assert_ne!(registered.host_id, other_target);
+
+        let error = host_check(&fixture.context, "server-a")
+            .expect_err("an alias rebound to another physical helper must fail closed");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(crate::error_codes::TARGET_IDENTITY_MISMATCH),
+            "{rendered}"
+        );
+        assert!(rendered.contains("server-a"), "{rendered}");
+        assert!(
+            rendered.contains(&registered.host_id.to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains(&other_target.to_string()), "{rendered}");
+        assert_eq!(
+            fixture.calls.load(Ordering::Relaxed),
+            1,
+            "identity mismatch must stop after hello, before ping or any target read/mutation"
+        );
+        let observation = fixture
+            .store()
+            .host_by_alias("server-a")?
+            .expect("registered host remains")
+            .last_observation
+            .expect("failure observation recorded");
+        assert!(!observation.reachable);
+        assert!(
+            observation
+                .summary
+                .contains(crate::error_codes::TARGET_IDENTITY_MISMATCH),
+            "{observation:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn host_check_verifies_the_local_target_identity() -> anyhow::Result<()> {
         let temp = filesystem::PrivateTempDir::new("nazauthctl-fleet-local-test")?;
         let store = RegistryStore::open(temp.path().join("registry"))?;
-        let state_root = temp.path().join("target-state");
+        let state_root = temp.path().join("registry/local-target-state");
         let local = store.ensure_local_host()?;
         let factory_called: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
         let called = factory_called.clone();
@@ -1244,7 +1338,6 @@ mod tests {
             "bound",
             host.host_id,
             "https://auth.example.com",
-            "target-state/x",
         )?;
         bound.controller_key_ref = Some("keys/deploy-bound/controller".to_owned());
         fixture.store().add_instance(bound)?;
@@ -1375,7 +1468,6 @@ mod tests {
             "production",
             original.host_id,
             "https://auth.example.com",
-            "target-state/x",
         )?;
         record.last_observation = Some(ObservationCache::now(true, "old host view"));
         fixture.store().add_instance(record)?;

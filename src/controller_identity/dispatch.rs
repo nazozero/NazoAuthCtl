@@ -6,16 +6,14 @@
 //! ```text
 //! prepare_control_operation
 //!   ├─ journal hit + same canonical hash  → resume (same operation_id,
-//!   │                                       byte-identical JWS, no expiry
-//!   │                                       re-check: accepted state is the
-//!   │                                       authorization snapshot, 05 §5)
-//!   └─ no hit / changed content           → fresh attempt (new operation_id;
-//!                                           D09 expiry pre-screen runs BEFORE
-//!                                           signing)
+//!   │                                       byte-identical JWS)
+//!   └─ no hit / changed content           → fresh attempt (new operation_id)
 //! → dispatch via the execution target
-//! → settle_journal: Accepted → mark; DefinitivelyRejected → clear so the next
-//!   attempt after fixing the cause mints a new id; OutcomeUnknown → keep the
-//!   entry so a later run resumes instead of replacing the lost operation.
+//! → settle_journal: InProgressAccepted → mark; Terminal → mark, let the
+//!   caller durably persist the exact result, then clear; DefinitivelyRejected
+//!   → clear so the next attempt after fixing the cause mints a new id;
+//!   OutcomeUnknown → keep the entry so a later run resumes instead of
+//!   replacing the lost operation.
 //! ```
 //!
 //! Invariant enforced end to end: `same operation_id ⇒ same request_hash ⇒
@@ -23,16 +21,20 @@
 //! unknown-outcome operations are never replaced by a new one.
 
 use anyhow::{Context as _, bail};
-use chrono::Utc;
+use nazo_operator_protocol::{
+    ControlOperationPayload, ControlOutcome, ControlResult, ControlResultData, constant_time_eq,
+    validate_control_result,
+};
 
-use crate::controller_identity::expiry::{self, CachedSlotFact, ExpiryStatus, rotate_guidance};
 use crate::controller_identity::journal::{JournalState, OperationJournal, OperationJournalEntry};
 use crate::controller_identity::operation::{
     ControlOperationInput, SignedControlOperation, build_signed_control_operation_with_id,
     deployment_from_key_ref,
 };
 use crate::registry::{InstanceRecord, RegistryStore};
-use crate::target::{ControlOperationReceipt, ControlOperationRequest, ExecutionTarget};
+use crate::target::{
+    ControlOperationReceipt, ControlOperationRequest, ExecutionTarget, SecretMaterial,
+};
 
 use super::store::ControllerKeyStore;
 
@@ -54,12 +56,20 @@ pub struct PreparedOperation {
 }
 
 impl PreparedOperation {
-    pub fn request(&self) -> ControlOperationRequest {
-        ControlOperationRequest {
+    pub fn request(
+        &self,
+        change_set: Option<SecretMaterial>,
+    ) -> anyhow::Result<ControlOperationRequest> {
+        validate_control_change_set(
+            &self.signed.operation.operation,
+            change_set.as_ref().map(SecretMaterial::as_bytes),
+        )?;
+        Ok(ControlOperationRequest {
             operation_id: self.signed.operation_id.clone(),
             deployment_id: self.signed.deployment_id.clone(),
             compact_jws: self.signed.compact_jws.clone(),
-        }
+            change_set,
+        })
     }
 
     pub fn journal_entry(&self) -> OperationJournalEntry {
@@ -71,27 +81,46 @@ impl PreparedOperation {
     }
 }
 
+/// Enforce the single material-consumer rule before journaling or transport.
+pub fn validate_control_change_set(
+    operation: &ControlOperationPayload,
+    change_set: Option<&[u8]>,
+) -> anyhow::Result<()> {
+    let apply = matches!(
+        operation,
+        ControlOperationPayload::TenantResourceApply { .. }
+    );
+    match (apply, change_set) {
+        (true, None) => bail!("tenant-resource Apply requires change-set material"),
+        (false, Some(_)) => bail!("only tenant-resource Apply accepts change-set material"),
+        (true, Some([])) => bail!("change-set material must not be empty"),
+        (true, Some(bytes)) if bytes.len() > crate::target::MAX_CONTROL_CHANGE_SET_BYTES => bail!(
+            "change-set material exceeds the {}-byte limit",
+            crate::target::MAX_CONTROL_CHANGE_SET_BYTES
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// What the target told ctl about one dispatch attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DispatchVerdict {
-    /// The server-side journal accepted (or had already accepted) the
-    /// operation; its result is authoritative and durable.
-    Accepted,
     /// The server definitively refused BEFORE accepting (admission failure).
     /// No side effect can have happened, so a corrected retry may mint a new
     /// id.
-    DefinitivelyRejected,
+    DefinitivelyRejected { code: String },
     /// No answer (crash, disconnect, timeout). The journaled identity must be
     /// kept: only a resumed resend can distinguish "lost response" from "never
     /// arrived".
     OutcomeUnknown,
-    /// The operation was accepted and executed to a durable FAILED result.
-    /// The business side effect did not succeed; lifecycle callers must stop
-    /// instead of continuing (P0-5). The record stays terminal for its id:
-    /// rerunning the same inputs replays the same durable failure.
-    FailedDurably {
-        outcome: nazo_operator_protocol::ControlResult,
-    },
+    /// The server accepted the operation, but it has not completed. The local
+    /// journal remains the authorization snapshot for a resumed poll.
+    InProgressAccepted,
+    /// The server returned the authoritative terminal result, whether
+    /// succeeded or failed. The caller must durably persist this exact value;
+    /// [`settle_journal`] clears the single-slot journal only after that
+    /// persistence callback succeeds.
+    Terminal(ControlResult),
 }
 
 /// Resolve a selector exactly like the signing helper does.
@@ -104,49 +133,6 @@ fn resolve_instance(registry: &RegistryStore, selector: &str) -> anyhow::Result<
     }
     bail!("unknown instance selector '{selector}' (no registered deployment id or alias matches)")
 }
-
-/// D09 pre-screen for FRESH attempts: consult only cached server facts. An
-/// expired active identity fails BEFORE signing with rotate guidance; warning
-/// windows print to stderr but never block. Absent cache entries cannot gate
-/// anything — the server stays the authority at admission time.
-fn guard_fresh_operation_expiry(
-    record: &InstanceRecord,
-    facts: &[CachedSlotFact],
-    active_kid: &str,
-) -> anyhow::Result<()> {
-    let Some(fact) = expiry::cached_fact_for(facts, active_kid) else {
-        return Ok(());
-    };
-    match ExpiryStatus::classify(Utc::now(), fact.expires_at) {
-        ExpiryStatus::Expired { seconds_overdue } => {
-            bail!(
-                "{CONTROLLER_KEY_EXPIRED}: the controller key of instance '{}' expired {} ago \
-                 according to the last server observation; {} \
-                 (refresh with `controller slots` after rotating — the NazoAuth server makes \
-                 the final decision)",
-                record.alias,
-                expiry::human_duration(seconds_overdue),
-                rotate_guidance(&record.alias)
-            )
-        }
-        status @ (ExpiryStatus::Urgent { .. } | ExpiryStatus::Warning { .. }) => {
-            eprintln!(
-                "nazauthctl: warning: controller key of instance '{}' {}: {}",
-                record.alias,
-                status.render(),
-                rotate_guidance(&record.alias)
-            );
-            Ok(())
-        }
-        ExpiryStatus::Ok { .. } => Ok(()),
-    }
-}
-
-/// Stable error code surfaced when a fresh operation is refused locally.
-///
-/// Canonical name lives in [`crate::error_codes`]; re-exported here so the
-/// historical call sites keep one stable path.
-pub use crate::error_codes::CONTROLLER_KEY_EXPIRED;
 
 /// Prepare one control operation for `instance_selector`, resuming the
 /// journaled operation when the rebuilt envelope is byte-identical in hash.
@@ -213,24 +199,8 @@ pub fn prepare_control_operation(
         );
     }
 
-    // Fresh attempt: expiry pre-screen BEFORE signing (D09), keyed on the
-    // active kid that is about to sign.
-    let cached = record
-        .last_observation
-        .as_ref()
-        .and_then(|observation| expiry::parse_cached_slots(&observation.summary))
-        .unwrap_or_default();
-    let active_kid = keys
-        .load_active(&record.deployment_id)?
-        .map(|loaded| loaded.kid().to_owned())
-        .with_context(|| {
-            format!(
-                "instance '{}' has no locally stored active controller key",
-                record.alias
-            )
-        })?;
-    guard_fresh_operation_expiry(&record, &cached, &active_kid)?;
-
+    // Display observations are deliberately absent here. The live server's
+    // admission response is the sole controller-validity/expiry decision.
     let signed =
         build_signed_control_operation_with_id(registry, keys, &record.deployment_id, input, None)?;
     let prepared = PreparedOperation {
@@ -254,8 +224,17 @@ fn clone_input(input: &ControlOperationInput) -> ControlOperationInput {
 pub fn dispatch_via_target(
     target: &dyn ExecutionTarget,
     prepared: &PreparedOperation,
+    change_set: Option<SecretMaterial>,
 ) -> anyhow::Result<DispatchVerdict> {
-    let receipt: ControlOperationReceipt = target.execute_control_operation(&prepared.request())?;
+    let receipt: ControlOperationReceipt =
+        target.execute_control_operation(prepared.request(change_set)?)?;
+    classify_receipt(prepared, receipt)
+}
+
+fn classify_receipt(
+    prepared: &PreparedOperation,
+    receipt: ControlOperationReceipt,
+) -> anyhow::Result<DispatchVerdict> {
     if receipt.operation_id != prepared.signed.operation_id {
         bail!(
             "target echoed operation id '{}' for request '{}'; refusing to interpret the result",
@@ -263,46 +242,141 @@ pub fn dispatch_via_target(
             prepared.signed.operation_id
         );
     }
-    if receipt.accepted {
-        // A durable terminal result rides with the receipt when the target
-        // produced one. A FAILED business outcome must be visible to callers:
-        // acceptance only means the operation was journaled, never that the
-        // migration/keys work succeeded (P0-5).
-        if let Some(result) = &receipt.result
-            && result.outcome == nazo_operator_protocol::ControlOutcome::Failed
-        {
-            return Ok(DispatchVerdict::FailedDurably {
-                outcome: result.clone(),
-            });
+
+    if !receipt.accepted {
+        if receipt.result.is_some() {
+            bail!("a definitively rejected operation must not carry a ControlResult");
         }
-        Ok(DispatchVerdict::Accepted)
-    } else {
-        Ok(DispatchVerdict::DefinitivelyRejected)
+        let code = receipt
+            .rejection_code
+            .context("a definitively rejected operation must carry a stable rejection code")?;
+        return Ok(DispatchVerdict::DefinitivelyRejected { code });
     }
+
+    let result = receipt
+        .result
+        .context("an accepted operation receipt must carry its durable ControlResult")?;
+    validate_result_binding(prepared, &result)?;
+    match result.outcome {
+        ControlOutcome::InProgress => Ok(DispatchVerdict::InProgressAccepted),
+        ControlOutcome::Succeeded | ControlOutcome::Failed => Ok(DispatchVerdict::Terminal(result)),
+    }
+}
+
+fn validate_result_binding(
+    prepared: &PreparedOperation,
+    result: &ControlResult,
+) -> anyhow::Result<()> {
+    validate_control_result_binding(
+        &prepared.signed.operation_id,
+        &prepared.signed.request_hash,
+        &prepared.signed.operation.operation,
+        result,
+    )
+}
+
+/// Validate one target result against the exact operation identity and closed
+/// payload contract that produced it. This is the sole binding boundary shared
+/// by ordinary dispatch and host-orchestrated operations such as Update.
+pub fn validate_control_result_binding(
+    expected_operation_id: &str,
+    expected_request_hash: &str,
+    expected_payload: &ControlOperationPayload,
+    result: &ControlResult,
+) -> anyhow::Result<()> {
+    validate_control_result(result)
+        .map_err(|error| anyhow::anyhow!("target returned an invalid ControlResult: {error}"))?;
+    if result.operation_id != expected_operation_id {
+        bail!(
+            "ControlResult operation id '{}' does not match prepared operation '{}'",
+            result.operation_id,
+            expected_operation_id
+        );
+    }
+    if !constant_time_eq(
+        result.request_hash.as_bytes(),
+        expected_request_hash.as_bytes(),
+    ) {
+        bail!(
+            "ControlResult request hash does not match prepared operation '{}'",
+            expected_operation_id
+        );
+    }
+    validate_result_contract(expected_payload, result)?;
+    Ok(())
+}
+
+fn validate_result_contract(
+    operation: &ControlOperationPayload,
+    result: &ControlResult,
+) -> anyhow::Result<()> {
+    if result.outcome != ControlOutcome::Succeeded {
+        return Ok(());
+    }
+
+    let matches_operation = matches!(
+        (operation, result.result.as_ref()),
+        (
+            ControlOperationPayload::TenantResourceApply { .. },
+            Some(ControlResultData::TenantResourceApply { .. }),
+        ) | (
+            ControlOperationPayload::TenantResourceEnumerate { .. },
+            Some(ControlResultData::TenantResourceEnumerate { .. }),
+        ) | (
+            ControlOperationPayload::TenantResourceRevoke { .. },
+            Some(ControlResultData::TenantResourceRevoke { .. }),
+        ) | (
+            ControlOperationPayload::RecoveryInvalidate { .. },
+            Some(ControlResultData::RecoveryInvalidation { .. }),
+        ) | (
+            ControlOperationPayload::MigrateApply
+                | ControlOperationPayload::KeysList
+                | ControlOperationPayload::KeysValidate
+                | ControlOperationPayload::KeysGenerateLocal { .. }
+                | ControlOperationPayload::KeysRegisterExternal { .. },
+            None,
+        )
+    );
+    if !matches_operation {
+        bail!("ControlResult data does not match the prepared operation contract");
+    }
+    Ok(())
 }
 
 /// Apply the verdict to the journal:
 ///
-/// * Accepted → transition to `accepted` (authorization snapshot lives on).
 /// * DefinitivelyRejected → clear the entry; the next attempt after fixing
 ///   the cause mints a fresh id.
 /// * OutcomeUnknown → keep the write-ahead entry untouched so a later run
 ///   resumes with the same operation id instead of issuing a new operation.
+/// * InProgressAccepted → transition to `accepted` so a later run resumes.
+/// * Terminal → transition to `accepted`, invoke `persist_terminal`, and
+///   clear only after the callback reports that the exact result is durable.
+///
+/// A terminal persistence error deliberately leaves the journal accepted. A
+/// later identical invocation can replay the same server result instead of
+/// losing the only recovery anchor.
 pub fn settle_journal(
     journal: &OperationJournal,
     prepared: &PreparedOperation,
     verdict: &DispatchVerdict,
+    persist_terminal: impl FnOnce(&ControlResult) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     match verdict {
-        DispatchVerdict::Accepted => journal.mark_accepted(&prepared.signed.operation_id),
-        // A durably failed business result is terminal for this id: the
-        // record stays accepted so rerunning identical inputs replays the
-        // identical durable failure instead of re-executing (P0-5).
-        DispatchVerdict::FailedDurably { .. } => {
-            journal.mark_accepted(&prepared.signed.operation_id)
-        }
-        DispatchVerdict::DefinitivelyRejected => journal.clear(),
+        DispatchVerdict::DefinitivelyRejected { .. } => journal.clear(),
         DispatchVerdict::OutcomeUnknown => Ok(()),
+        DispatchVerdict::InProgressAccepted => journal.mark_accepted(&prepared.signed.operation_id),
+        DispatchVerdict::Terminal(result) => {
+            validate_result_binding(prepared, result)?;
+            journal.mark_accepted(&prepared.signed.operation_id)?;
+            persist_terminal(result).with_context(|| {
+                format!(
+                    "failed to persist terminal result for operation '{}'",
+                    prepared.signed.operation_id
+                )
+            })?;
+            journal.clear()
+        }
     }
 }
 
@@ -318,6 +392,7 @@ pub fn has_accepted_pending_result(journal: &OperationJournal) -> anyhow::Result
 mod tests {
     use super::*;
     use crate::controller_identity::admin_api::SlotsSnapshot;
+    use crate::controller_identity::expiry;
     use crate::controller_identity::journal::JournalState;
     use crate::controller_identity::store::{ControllerKeyStore, controller_key_ref_for};
     use crate::filesystem;
@@ -326,8 +401,9 @@ mod tests {
         HealthSnapshot, HostOperation, HostOverview, HostResult, InstanceInspection,
     };
     use nazo_operator_protocol::{
-        ControlBuildIdentity, ControlOperationPayload, ControlTarget,
-        verify_control_operation_signature,
+        CONTROL_RESULT_SCHEMA, ControlBuildIdentity, ControlErrorCode, ControlOperation,
+        ControlOperationPayload, ControlTarget, TenantResourceIdentity, TenantResourceKind,
+        control_operation_request_hash, verify_control_operation_signature,
     };
     use std::cell::RefCell;
 
@@ -348,7 +424,6 @@ mod tests {
             "production",
             host.host_id,
             "https://auth.example.com",
-            "ref",
         )?;
         instance.controller_key_ref = Some(controller_key_ref_for("deploy-alpha")?);
         registry.add_instance(instance)?;
@@ -381,12 +456,33 @@ mod tests {
         }
     }
 
+    fn apply_input(revision: &str) -> ControlOperationInput {
+        let mut input = input(revision);
+        input.operation = ControlOperationPayload::TenantResourceApply {
+            tenant_id: "018f0000-0000-7000-8000-000000000001".to_owned(),
+            resources: vec![TenantResourceIdentity {
+                kind: TenantResourceKind::User,
+                resource_id: "suite-user".to_owned(),
+                digest: "ab".repeat(32),
+            }],
+        };
+        input
+    }
+
     /// Target double recording executed control requests; optionally answers
     /// acceptance per call.
     #[derive(Default)]
     struct RecordingTarget {
-        executed: RefCell<Vec<ControlOperationRequest>>,
+        executed: RefCell<Vec<RecordedControlRequest>>,
         accept_next: RefCell<Vec<bool>>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordedControlRequest {
+        operation_id: String,
+        deployment_id: String,
+        compact_jws: String,
+        change_set_len: Option<usize>,
     }
 
     impl RecordingTarget {
@@ -410,18 +506,28 @@ mod tests {
 
         fn execute_control_operation(
             &self,
-            request: &ControlOperationRequest,
+            request: ControlOperationRequest,
         ) -> anyhow::Result<ControlOperationReceipt> {
-            self.executed.borrow_mut().push(request.clone());
             let accepted = self
                 .accept_next
                 .borrow_mut()
                 .pop()
                 .expect("scripted acceptance missing");
+            let operation = decode_control_operation(&request.compact_jws)?;
+            self.executed.borrow_mut().push(RecordedControlRequest {
+                operation_id: request.operation_id,
+                deployment_id: request.deployment_id,
+                compact_jws: request.compact_jws,
+                change_set_len: request
+                    .change_set
+                    .as_ref()
+                    .map(|value| value.as_bytes().len()),
+            });
             Ok(ControlOperationReceipt {
-                operation_id: extract_operation_id(&request.compact_jws)?,
+                operation_id: operation.operation_id.clone(),
                 accepted,
-                result: None,
+                result: accepted.then(|| valid_result(&operation, ControlOutcome::InProgress)),
+                rejection_code: (!accepted).then(|| "REJECTED".to_owned()),
             })
         }
 
@@ -432,15 +538,36 @@ mod tests {
 
     /// Decode the payload back out of the JWS to echo its operation id like a
     /// real target would.
-    fn extract_operation_id(compact_jws: &str) -> anyhow::Result<String> {
+    fn decode_control_operation(compact_jws: &str) -> anyhow::Result<ControlOperation> {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
         let payload = compact_jws.split('.').nth(1).context("malformed jws")?;
         let bytes = URL_SAFE_NO_PAD.decode(payload.as_bytes())?;
-        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-        Ok(value["operation_id"]
-            .as_str()
-            .context("missing operation_id")?
-            .to_owned())
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    fn valid_result(operation: &ControlOperation, outcome: ControlOutcome) -> ControlResult {
+        ControlResult {
+            schema: CONTROL_RESULT_SCHEMA,
+            operation_id: operation.operation_id.clone(),
+            request_hash: control_operation_request_hash(operation).expect("valid operation"),
+            outcome,
+            error: (outcome == ControlOutcome::Failed).then_some(ControlErrorCode::ExecutionFailed),
+            accepted_at: 100,
+            completed_at: (outcome != ControlOutcome::InProgress).then_some(101),
+            result: None,
+        }
+    }
+
+    fn valid_receipt(
+        prepared: &PreparedOperation,
+        outcome: ControlOutcome,
+    ) -> ControlOperationReceipt {
+        ControlOperationReceipt {
+            operation_id: prepared.signed.operation_id.clone(),
+            accepted: true,
+            result: Some(valid_result(&prepared.signed.operation, outcome)),
+            rejection_code: None,
+        }
     }
 
     fn attach_expired_observation(fixture: &Fixture) -> anyhow::Result<()> {
@@ -476,11 +603,175 @@ mod tests {
 
         let target = RecordingTarget::default();
         target.push_acceptance(true);
-        let verdict = dispatch_via_target(&target, &prepared)?;
-        assert_eq!(verdict, DispatchVerdict::Accepted);
-        settle_journal(&journal, &prepared, &verdict)?;
+        let verdict = dispatch_via_target(&target, &prepared, None)?;
+        assert_eq!(verdict, DispatchVerdict::InProgressAccepted);
+        settle_journal(&journal, &prepared, &verdict, |_| {
+            anyhow::bail!("in-progress verdict must not invoke terminal persistence")
+        })?;
         assert_eq!(journal.load()?.expect("kept").state, JournalState::Accepted);
         assert_eq!(target.executed.borrow().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_result_is_preserved_until_caller_persistence_succeeds() -> anyhow::Result<()> {
+        let f = fixture()?;
+        f.keys.get_or_create_active("deploy-alpha")?;
+        let journal = f.journal()?;
+        let prepared = prepare_control_operation(
+            &f.registry,
+            &f.keys,
+            &journal,
+            "production",
+            input("rev-1"),
+        )?;
+
+        for outcome in [ControlOutcome::Succeeded, ControlOutcome::Failed] {
+            let verdict = classify_receipt(&prepared, valid_receipt(&prepared, outcome))?;
+            assert!(matches!(
+                &verdict,
+                DispatchVerdict::Terminal(result) if result.outcome == outcome
+            ));
+        }
+
+        let verdict = classify_receipt(
+            &prepared,
+            valid_receipt(&prepared, ControlOutcome::Succeeded),
+        )?;
+        let persistence_error = settle_journal(&journal, &prepared, &verdict, |_| {
+            anyhow::bail!("durable result store unavailable")
+        })
+        .expect_err("callback failure must abort settlement");
+        assert!(
+            format!("{persistence_error:#}").contains("durable result store unavailable"),
+            "{persistence_error:#}"
+        );
+        assert_eq!(
+            journal.load()?.expect("replay anchor retained").state,
+            JournalState::Accepted
+        );
+
+        let persisted = RefCell::new(None);
+        settle_journal(&journal, &prepared, &verdict, |result| {
+            persisted.replace(Some(result.clone()));
+            Ok(())
+        })?;
+        assert_eq!(
+            persisted.borrow().as_ref(),
+            match &verdict {
+                DispatchVerdict::Terminal(result) => Some(result),
+                _ => None,
+            }
+        );
+        assert!(journal.load()?.is_none(), "terminal journal slot cleared");
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_or_misbinding_receipts_are_rejected() -> anyhow::Result<()> {
+        let f = fixture()?;
+        f.keys.get_or_create_active("deploy-alpha")?;
+        let journal = f.journal()?;
+        let prepared = prepare_control_operation(
+            &f.registry,
+            &f.keys,
+            &journal,
+            "production",
+            input("rev-1"),
+        )?;
+
+        let mut receipt = valid_receipt(&prepared, ControlOutcome::Succeeded);
+        receipt.operation_id = "01900000-0000-7000-8000-000000000001".to_owned();
+        assert!(classify_receipt(&prepared, receipt).is_err());
+
+        let mut receipt = valid_receipt(&prepared, ControlOutcome::Succeeded);
+        receipt.result.as_mut().unwrap().operation_id =
+            "01900000-0000-7000-8000-000000000002".to_owned();
+        assert!(classify_receipt(&prepared, receipt).is_err());
+
+        let mut receipt = valid_receipt(&prepared, ControlOutcome::Succeeded);
+        receipt.result.as_mut().unwrap().request_hash = "cd".repeat(32);
+        assert!(classify_receipt(&prepared, receipt).is_err());
+
+        let mut receipt = valid_receipt(&prepared, ControlOutcome::Succeeded);
+        receipt.result.as_mut().unwrap().error = Some(ControlErrorCode::ExecutionFailed);
+        assert!(classify_receipt(&prepared, receipt).is_err());
+
+        let mut receipt = valid_receipt(&prepared, ControlOutcome::Succeeded);
+        receipt.result.as_mut().unwrap().result =
+            Some(ControlResultData::TenantResourceEnumerate {
+                revision: 1,
+                resources: vec![],
+                resource_manifest_sha256: "ab".repeat(32),
+            });
+        assert!(classify_receipt(&prepared, receipt).is_err());
+
+        let accepted_without_result = ControlOperationReceipt {
+            operation_id: prepared.signed.operation_id.clone(),
+            accepted: true,
+            result: None,
+            rejection_code: None,
+        };
+        assert!(classify_receipt(&prepared, accepted_without_result).is_err());
+
+        let rejected_with_result = ControlOperationReceipt {
+            operation_id: prepared.signed.operation_id.clone(),
+            accepted: false,
+            result: Some(valid_result(
+                &prepared.signed.operation,
+                ControlOutcome::Failed,
+            )),
+            rejection_code: Some("REJECTED".to_owned()),
+        };
+        assert!(classify_receipt(&prepared, rejected_with_result).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn only_apply_accepts_one_bounded_change_set() -> anyhow::Result<()> {
+        let f = fixture()?;
+        f.keys.get_or_create_active("deploy-alpha")?;
+        let journal = f.journal()?;
+        let prepared = prepare_control_operation(
+            &f.registry,
+            &f.keys,
+            &journal,
+            "production",
+            apply_input("rev-1"),
+        )?;
+        assert!(prepared.request(None).is_err());
+        assert!(SecretMaterial::try_new(Vec::new()).is_err());
+        assert!(
+            validate_control_change_set(&prepared.signed.operation.operation, Some(&[])).is_err()
+        );
+        let oversized = vec![0; crate::target::MAX_CONTROL_CHANGE_SET_BYTES + 1];
+        assert!(
+            validate_control_change_set(&prepared.signed.operation.operation, Some(&oversized))
+                .is_err()
+        );
+        assert_eq!(
+            prepared
+                .request(Some(SecretMaterial::try_new(b"material".to_vec())?))?
+                .change_set
+                .as_ref()
+                .map(SecretMaterial::as_bytes),
+            Some(b"material".as_slice())
+        );
+
+        journal.clear()?;
+        let non_apply = prepare_control_operation(
+            &f.registry,
+            &f.keys,
+            &journal,
+            "production",
+            input("rev-1"),
+        )?;
+        assert!(
+            non_apply
+                .request(Some(SecretMaterial::try_new(b"unused".to_vec())?))
+                .is_err()
+        );
+        assert!(non_apply.request(None).is_ok());
         Ok(())
     }
 
@@ -518,12 +809,14 @@ mod tests {
         let target = RecordingTarget::default();
         target.push_acceptance(true);
         target.push_acceptance(true);
-        let v1 = dispatch_via_target(&target, &first)?;
-        assert_eq!(v1, DispatchVerdict::Accepted);
+        let v1 = dispatch_via_target(&target, &first, None)?;
+        assert_eq!(v1, DispatchVerdict::InProgressAccepted);
         // A crash before settle is harmless: the resume path still works.
-        let v2 = dispatch_via_target(&target, &second)?;
-        assert_eq!(v2, DispatchVerdict::Accepted);
-        settle_journal(&journal, &second, &v2)?;
+        let v2 = dispatch_via_target(&target, &second, None)?;
+        assert_eq!(v2, DispatchVerdict::InProgressAccepted);
+        settle_journal(&journal, &second, &v2, |_| {
+            anyhow::bail!("in-progress verdict must not invoke terminal persistence")
+        })?;
 
         let sent = target.executed.borrow().clone();
         assert_eq!(sent.len(), 2, "resumed once");
@@ -546,9 +839,16 @@ mod tests {
         )?;
         let target = RecordingTarget::default();
         target.push_acceptance(false);
-        let verdict = dispatch_via_target(&target, &first)?;
-        assert_eq!(verdict, DispatchVerdict::DefinitivelyRejected);
-        settle_journal(&journal, &first, &verdict)?;
+        let verdict = dispatch_via_target(&target, &first, None)?;
+        assert_eq!(
+            verdict,
+            DispatchVerdict::DefinitivelyRejected {
+                code: "REJECTED".to_owned()
+            }
+        );
+        settle_journal(&journal, &first, &verdict, |_| {
+            anyhow::bail!("rejected verdict must not invoke terminal persistence")
+        })?;
         assert!(journal.load()?.is_none(), "rejected entry cleared");
 
         // After FIXING THE CAUSE (here: config revision bump) the next attempt
@@ -566,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_outcome_keeps_the_entry_and_resume_does_not_recheck_expiry() -> anyhow::Result<()> {
+    fn unknown_outcome_resume_ignores_stale_display_summary() -> anyhow::Result<()> {
         let f = fixture()?;
         let key = f.keys.get_or_create_active("deploy-alpha")?;
         let journal = f.journal()?;
@@ -582,8 +882,7 @@ mod tests {
 
         attach_expired_observation(&f)?;
 
-        // Resume must NOT be blocked by the now-expired cached view: the
-        // authorization snapshot owns the decision (05 §5 / D09).
+        // A stale display summary has no place in the dispatch decision.
         let resumed = prepare_control_operation(
             &f.registry,
             &f.keys,
@@ -598,28 +897,13 @@ mod tests {
     }
 
     #[test]
-    fn fresh_operations_fail_before_signing_when_cache_says_expired() -> anyhow::Result<()> {
+    fn stale_expiry_summary_does_not_block_fresh_dispatch_and_server_rejection_wins()
+    -> anyhow::Result<()> {
         let f = fixture()?;
         let key = f.keys.get_or_create_active("deploy-alpha")?;
         let journal = f.journal()?;
 
         attach_expired_observation(&f)?;
-        let error =
-            prepare_control_operation(&f.registry, &f.keys, &journal, "production", input("rev-9"))
-                .expect_err("expired identity");
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains(CONTROLLER_KEY_EXPIRED), "{rendered}");
-        assert!(
-            rendered.contains("controller rotate --instance production"),
-            "{rendered}"
-        );
-        // Nothing was journaled or minted for the failed attempt.
-        assert!(journal.load()?.is_none());
-        drop(key);
-
-        // Clearing the stale observation restores normal preparation.
-        f.registry
-            .set_instance_observation("deploy-alpha", ObservationCache::now(true, "helper=ok"))?;
         let prepared = prepare_control_operation(
             &f.registry,
             &f.keys,
@@ -628,6 +912,31 @@ mod tests {
             input("rev-9"),
         )?;
         assert_eq!(prepared.kind, AttemptKind::Fresh);
+        assert!(
+            journal.load()?.is_some(),
+            "fresh attempt is signed and journaled"
+        );
+
+        let verdict = classify_receipt(
+            &prepared,
+            ControlOperationReceipt {
+                operation_id: prepared.signed.operation_id.clone(),
+                accepted: false,
+                result: None,
+                rejection_code: Some(crate::error_codes::CONTROLLER_KEY_EXPIRED.to_owned()),
+            },
+        )?;
+        assert_eq!(
+            verdict,
+            DispatchVerdict::DefinitivelyRejected {
+                code: crate::error_codes::CONTROLLER_KEY_EXPIRED.to_owned()
+            }
+        );
+        settle_journal(&journal, &prepared, &verdict, |_| {
+            anyhow::bail!("definitive server rejection has no terminal result")
+        })?;
+        assert!(journal.load()?.is_none());
+        drop(key);
         Ok(())
     }
 

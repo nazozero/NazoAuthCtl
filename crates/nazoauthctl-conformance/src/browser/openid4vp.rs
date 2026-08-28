@@ -45,38 +45,16 @@ const IMMEDIATE_REJECTION_TESTS: [&str; 8] = [
     "oid4vp-1final-verifier-kb-jwt-iat-in-future",
 ];
 
-/// The deployment-owned trust binding that must accompany every target-side
-/// verifier start. The variants are intentionally disjoint so an ordinary
-/// tenant-resource run cannot manufacture legacy conformance lease fields.
+/// The deployment-owned trust-policy binding that must accompany every
+/// target-side verifier start.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ConformanceBinding {
-    LegacyLease { lease_id: Uuid, task_jti: String },
-    OpenId4VcTrustPolicy { resource_id: String, digest: String },
+pub struct ConformanceBinding {
+    resource_id: String,
+    digest: String,
 }
 
 impl ConformanceBinding {
-    /// Construct the legacy Suite-specific lease binding.
-    pub fn new(
-        lease_id: impl AsRef<str>,
-        task_jti: impl Into<String>,
-    ) -> Result<Self, OpenId4VpError> {
-        let lease_id =
-            Uuid::parse_str(lease_id.as_ref()).map_err(|_| OpenId4VpError::InvalidBinding)?;
-        let task_jti = task_jti.into();
-        let suffix = task_jti
-            .strip_prefix("request-")
-            .ok_or(OpenId4VpError::InvalidBinding)?;
-        if suffix.len() != 32
-            || !suffix
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
-            return Err(OpenId4VpError::InvalidBinding);
-        }
-        Ok(Self::LegacyLease { lease_id, task_jti })
-    }
-
-    /// Construct an ordinary deployment trust-policy binding. Only the
+    /// Construct a deployment trust-policy binding. Only the
     /// immutable logical resource id and exact applied payload digest cross
     /// the verifier-create boundary.
     pub fn openid4vc_trust_policy(
@@ -97,24 +75,10 @@ impl ConformanceBinding {
         {
             return Err(OpenId4VpError::InvalidBinding);
         }
-        Ok(Self::OpenId4VcTrustPolicy {
+        Ok(Self {
             resource_id,
             digest,
         })
-    }
-
-    pub fn trust_policy_resource_id(&self) -> Option<&str> {
-        match self {
-            Self::OpenId4VcTrustPolicy { resource_id, .. } => Some(resource_id),
-            Self::LegacyLease { .. } => None,
-        }
-    }
-
-    pub fn trust_policy_digest(&self) -> Option<&str> {
-        match self {
-            Self::OpenId4VcTrustPolicy { digest, .. } => Some(digest),
-            Self::LegacyLease { .. } => None,
-        }
     }
 }
 
@@ -123,42 +87,24 @@ impl ConformanceBinding {
 /// is therefore not caller-known, but must still be present and canonical in
 /// the signed attachment projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ExpectedTrustPolicyBinding {
-    None,
-    Resource { resource_id: String, digest: String },
+struct ExpectedTrustPolicyBinding {
+    resource_id: String,
+    digest: String,
 }
 
 impl ExpectedTrustPolicyBinding {
     fn from_conformance_binding(binding: &ConformanceBinding) -> Self {
-        match binding {
-            ConformanceBinding::LegacyLease { .. } => Self::None,
-            ConformanceBinding::OpenId4VcTrustPolicy {
-                resource_id,
-                digest,
-            } => Self::Resource {
-                resource_id: resource_id.clone(),
-                digest: digest.clone(),
-            },
+        Self {
+            resource_id: binding.resource_id.clone(),
+            digest: binding.digest.clone(),
         }
     }
 
     fn matches(&self, actual: &nazo_operator_protocol::Openid4vpTrustPolicyBinding) -> bool {
-        match self {
-            Self::None => {
-                actual.binding_id.is_none()
-                    && actual.resource_id.is_none()
-                    && actual.resource_digest.is_none()
-            }
-            Self::Resource {
-                resource_id,
-                digest,
-            } => {
-                actual.binding_id.as_deref().is_some_and(|binding_id| {
-                    Uuid::parse_str(binding_id).is_ok_and(|parsed| parsed.to_string() == binding_id)
-                }) && actual.resource_id.as_deref() == Some(resource_id)
-                    && actual.resource_digest.as_deref() == Some(digest)
-            }
-        }
+        actual.binding_id.as_deref().is_some_and(|binding_id| {
+            Uuid::parse_str(binding_id).is_ok_and(|parsed| parsed.to_string() == binding_id)
+        }) && actual.resource_id.as_deref() == Some(self.resource_id.as_str())
+            && actual.resource_digest.as_deref() == Some(self.digest.as_str())
     }
 }
 
@@ -417,9 +363,9 @@ impl OpenId4VpPresentation {
     /// Test-only presentation fixture for orchestration tests. Production
     /// construction remains exclusively in the verified management client.
     pub(crate) fn test_presentation() -> Self {
-        let binding = ConformanceBinding::new(
-            "019ff000-8190-7393-8c33-ab4339c3d85e",
-            "request-0123456789abcdef0123456789abcdef",
+        let binding = ConformanceBinding::openid4vc_trust_policy(
+            "openid4vc-trust-policy:test",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )
         .expect("test binding");
         Self {
@@ -457,25 +403,20 @@ pub trait OpenId4VpVerifier: Send {
     ) -> Result<OpenId4VpCompletionOutcome, OpenId4VpError>;
 
     /// Fetch a completed, runtime-signed evidence receipt for a presentation
-    /// that explicitly requested one. Existing verifier test doubles remain
-    /// source-compatible and fail closed when a run requires this boundary.
+    /// that explicitly requested one.
     fn verification_evidence(
         &mut self,
-        _presentation: &OpenId4VpPresentation,
-    ) -> Result<OpenId4VpVerificationEvidence, OpenId4VpError> {
-        Err(OpenId4VpError::EvidenceUnavailable)
-    }
+        presentation: &OpenId4VpPresentation,
+    ) -> Result<OpenId4VpVerificationEvidence, OpenId4VpError>;
 
     /// Attach a receipt context after the target has returned the concrete
     /// authorization URL and the same browser lane has selected its actual
     /// signed entry. A context is never guessed at create time.
     fn attach_evidence_context(
         &mut self,
-        _presentation: &mut OpenId4VpPresentation,
-        _context: OpenId4VpEvidenceContext,
-    ) -> Result<(), OpenId4VpError> {
-        Err(OpenId4VpError::EvidenceUnavailable)
-    }
+        presentation: &mut OpenId4VpPresentation,
+        context: OpenId4VpEvidenceContext,
+    ) -> Result<(), OpenId4VpError>;
 }
 
 /// The runtime identity pinned by the ordinary tenant-resource capability.
@@ -834,13 +775,8 @@ impl OpenId4VpVerifierClient {
                 "require_cryptographic_holder_binding": true,
             }]
         });
-        let (trust_policy_resource_id, trust_policy_digest) = match &self.binding {
-            ConformanceBinding::LegacyLease { .. } => (None, None),
-            ConformanceBinding::OpenId4VcTrustPolicy {
-                resource_id,
-                digest,
-            } => (Some(resource_id.clone()), Some(digest.clone())),
-        };
+        let trust_policy_resource_id = Some(self.binding.resource_id.clone());
+        let trust_policy_digest = Some(self.binding.digest.clone());
         let normalized = nazo_operator_protocol::Openid4vpNormalizedCreateRequest {
             wallet_authorization_endpoint: wallet_authorization_endpoint.as_str().to_owned(),
             dcql_query: dcql_query.clone(),
@@ -873,31 +809,14 @@ impl OpenId4VpVerifierClient {
             .as_object()
             .ok_or(OpenId4VpError::InvalidInput)?;
         body_object.extend(idempotency.clone());
-        match &self.binding {
-            ConformanceBinding::LegacyLease { lease_id, task_jti } => {
-                body_object.insert(
-                    "conformance_lease_id".to_owned(),
-                    Value::String(lease_id.to_string()),
-                );
-                body_object.insert(
-                    "conformance_task_jti".to_owned(),
-                    Value::String(task_jti.clone()),
-                );
-            }
-            ConformanceBinding::OpenId4VcTrustPolicy {
-                resource_id,
-                digest,
-            } => {
-                body_object.insert(
-                    "openid4vc_trust_policy_resource_id".to_owned(),
-                    Value::String(resource_id.clone()),
-                );
-                body_object.insert(
-                    "openid4vc_trust_policy_digest".to_owned(),
-                    Value::String(digest.clone()),
-                );
-            }
-        }
+        body_object.insert(
+            "openid4vc_trust_policy_resource_id".to_owned(),
+            Value::String(self.binding.resource_id.clone()),
+        );
+        body_object.insert(
+            "openid4vc_trust_policy_digest".to_owned(),
+            Value::String(self.binding.digest.clone()),
+        );
         let body = serde_json::to_vec(&body).map_err(|_| OpenId4VpError::InvalidInput)?;
         let mut attempts = 0usize;
         let response = loop {
@@ -1853,11 +1772,7 @@ mod tests {
     }
 
     fn binding() -> ConformanceBinding {
-        ConformanceBinding::new(
-            "019ff000-8190-7393-8c33-ab4339c3d85e",
-            "request-0123456789abcdef0123456789abcdef",
-        )
-        .expect("binding")
+        trust_policy_binding()
     }
 
     fn trust_policy_binding() -> ConformanceBinding {
@@ -1895,13 +1810,13 @@ mod tests {
         missing_binding_id.binding_id = None;
         assert!(!expected.matches(&missing_binding_id));
 
-        assert!(ExpectedTrustPolicyBinding::None.matches(
-            &nazo_operator_protocol::Openid4vpTrustPolicyBinding {
+        assert!(
+            !expected.matches(&nazo_operator_protocol::Openid4vpTrustPolicyBinding {
                 binding_id: None,
                 resource_id: None,
                 resource_digest: None,
-            }
-        ));
+            })
+        );
     }
 
     #[test]
@@ -2058,72 +1973,6 @@ mod tests {
             client.start(&request).expect_err("mismatched echo"),
             OpenId4VpError::MalformedResponse
         );
-    }
-
-    #[test]
-    fn maps_sd_jwt_and_post_method_without_leaking_token() {
-        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
-        let suite = Origin::parse("https://suite.example").expect("suite");
-        let transport = Arc::new(VerifierTransport {
-            request: std::sync::Mutex::new(None),
-            response: std::sync::Mutex::new(Some(HttpResponse {
-                status: 201,
-                headers: Vec::new(),
-                body: serde_json::to_vec(&serde_json::json!({
-                    "authorization_url": "https://suite.example/test/a/vp/authorize?x=1",
-                    "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
-                    "expires_in": 300
-                }))
-                .expect("response"),
-            })),
-        });
-        let mut client = OpenId4VpVerifierClient::with_transport(
-            target,
-            suite,
-            Zeroizing::new("management-secret".to_owned()),
-            transport.clone(),
-            binding(),
-        )
-        .expect("client");
-        let mut variant = BTreeMap::new();
-        variant.insert("credential_format".to_owned(), "sd_jwt_vc".to_owned());
-        variant.insert("request_method".to_owned(), "request_uri_signed".to_owned());
-        let request =
-            OpenId4VpStartRequest::new("vp", SPECIAL_POST_TEST, variant, false, binding())
-                .expect("request");
-        let presentation = client.start(&request).expect("presentation");
-        assert_eq!(
-            presentation.completion_url.as_str(),
-            "https://issuer.example/openid4vp/complete/550e8400-e29b-41d4-a716-446655440000"
-        );
-        let captured = transport
-            .request
-            .lock()
-            .expect("request lock")
-            .take()
-            .expect("request");
-        assert_eq!(captured.url().path(), "/openid4vp/presentations");
-        assert_eq!(
-            captured.header("Authorization"),
-            Some("Bearer management-secret")
-        );
-        let body: Value = serde_json::from_slice(captured.body().expect("body")).expect("body");
-        assert_eq!(body["request_method"], "request_uri_signed_post");
-        assert_eq!(body["dcql_query"]["credentials"][0]["format"], "dc+sd-jwt");
-        assert_eq!(
-            body["dcql_query"]["credentials"][0]["meta"]["vct_values"][0],
-            "urn:eudi:pid:1"
-        );
-        assert_eq!(
-            body["conformance_lease_id"],
-            "019ff000-8190-7393-8c33-ab4339c3d85e"
-        );
-        assert_eq!(
-            body["conformance_task_jti"],
-            "request-0123456789abcdef0123456789abcdef"
-        );
-        assert!(body.get("openid4vc_trust_policy_resource_id").is_none());
-        assert!(body.get("openid4vc_trust_policy_digest").is_none());
     }
 
     #[test]
@@ -2500,7 +2349,9 @@ mod tests {
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
             create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
-            expected_trust_policy: ExpectedTrustPolicyBinding::None,
+            expected_trust_policy: ExpectedTrustPolicyBinding::from_conformance_binding(
+                &trust_policy_binding(),
+            ),
             evidence_context: Some(evidence_context),
             evidence_attachment: Some(OpenId4VpEvidenceAttachment {
                 presentation_binding_sha256: "d".repeat(64),
@@ -2769,7 +2620,9 @@ mod tests {
             .expect("completion URL"),
             transaction_id,
             create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
-            expected_trust_policy: ExpectedTrustPolicyBinding::None,
+            expected_trust_policy: ExpectedTrustPolicyBinding::from_conformance_binding(
+                &trust_policy_binding(),
+            ),
             evidence_context: Some(context),
             evidence_attachment: Some(attachment),
             issuance_request_jti: Some(issuance_request_jti.to_owned()),
@@ -2828,19 +2681,6 @@ mod tests {
     #[test]
     fn rejects_malformed_or_partial_binding() {
         assert_eq!(
-            ConformanceBinding::new("not-a-uuid", "request-0123456789abcdef0123456789abcdef")
-                .expect_err("invalid lease"),
-            OpenId4VpError::InvalidBinding
-        );
-        assert_eq!(
-            ConformanceBinding::new(
-                "019ff000-8190-7393-8c33-ab4339c3d85e",
-                "request-0123456789abcdef0123456789ABCDEf",
-            )
-            .expect_err("uppercase task jti"),
-            OpenId4VpError::InvalidBinding
-        );
-        assert_eq!(
             ConformanceBinding::openid4vc_trust_policy(
                 "openid4vc trust policy",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -2874,9 +2714,9 @@ mod tests {
             binding(),
         )
         .expect("client");
-        let other_binding = ConformanceBinding::new(
-            "019ff000-8190-7393-8c33-ab4339c3d85f",
-            "request-fedcba9876543210fedcba9876543210",
+        let other_binding = ConformanceBinding::openid4vc_trust_policy(
+            "openid4vc-trust-policy:provider:fedcba9876543210",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         )
         .expect("other binding");
         let request =
@@ -2929,7 +2769,9 @@ mod tests {
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
             create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
-            expected_trust_policy: ExpectedTrustPolicyBinding::None,
+            expected_trust_policy: ExpectedTrustPolicyBinding::from_conformance_binding(
+                &trust_policy_binding(),
+            ),
             evidence_context: None,
             evidence_attachment: None,
             issuance_request_jti: None,
@@ -3033,7 +2875,9 @@ mod tests {
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
             create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
-            expected_trust_policy: ExpectedTrustPolicyBinding::None,
+            expected_trust_policy: ExpectedTrustPolicyBinding::from_conformance_binding(
+                &trust_policy_binding(),
+            ),
             evidence_context: None,
             evidence_attachment: None,
             issuance_request_jti: None,
@@ -3076,7 +2920,9 @@ mod tests {
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
             create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
-            expected_trust_policy: ExpectedTrustPolicyBinding::None,
+            expected_trust_policy: ExpectedTrustPolicyBinding::from_conformance_binding(
+                &trust_policy_binding(),
+            ),
             evidence_context: None,
             evidence_attachment: None,
             issuance_request_jti: None,
@@ -3123,7 +2969,9 @@ mod tests {
             transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
                 .expect("transaction ID"),
             create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
-            expected_trust_policy: ExpectedTrustPolicyBinding::None,
+            expected_trust_policy: ExpectedTrustPolicyBinding::from_conformance_binding(
+                &trust_policy_binding(),
+            ),
             evidence_context: None,
             evidence_attachment: None,
             issuance_request_jti: None,

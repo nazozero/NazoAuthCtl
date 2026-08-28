@@ -13,9 +13,10 @@ use anyhow::{Context as _, bail};
 
 pub(crate) use help::help_topic;
 pub(crate) use types::{
-    AcmeCertificateInput, AcmeCommand, BindOptions, BootstrapAdminArgs, Cli, Command,
-    ControllerCommand, HelpTopic, HostCommand, InstallArgs, InstanceCommand, InstanceSelector,
-    TlsCertificateCheckInput, TlsCertificateInput, TlsCertificateSource, TlsCommand, UpdateArgs,
+    AcmeCertificateInput, AcmeCommand, BackupArgs, BackupCommand, BindOptions, BootstrapAdminArgs,
+    Cli, Command, ControllerCommand, HelpTopic, HostCommand, InstallArgs, InstanceCommand,
+    InstanceSelector, PolicyArgs, RecoverArgs, TlsCertificateCheckInput, TlsCertificateInput,
+    TlsCertificateSource, TlsCommand, UpdateArgs,
 };
 
 /// Consume the leading options which are shared by every command.
@@ -24,13 +25,13 @@ pub(crate) use types::{
 /// which token is the command. Scalar global options are intentionally single-use: accepting
 /// a second value would make a typo silently select a different instance or output mode.
 /// The final surface has exactly two global flags: `--instance SELECTOR` and `--json`.
-pub(crate) struct GlobalOptions {
-    pub(crate) instance: Option<String>,
-    pub(crate) json: bool,
-    pub(crate) consumed: usize,
+pub struct GlobalOptions {
+    pub instance: Option<String>,
+    pub json: bool,
+    pub consumed: usize,
 }
 
-pub(crate) fn parse_global_options(values: &[String]) -> anyhow::Result<GlobalOptions> {
+pub fn parse_global_options(values: &[String]) -> anyhow::Result<GlobalOptions> {
     let mut instance = None;
     let mut json = false;
     let mut consumed = 0;
@@ -57,10 +58,6 @@ pub(crate) fn parse_global_options(values: &[String]) -> anyhow::Result<GlobalOp
                 json = true;
                 consumed += 1;
             }
-            "--config" | "--deployment" => bail!(
-                "{flag} belonged to the retired per-deployment control model; \
-                 select an instance with --instance instead"
-            ),
             _ => break,
         }
     }

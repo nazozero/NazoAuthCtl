@@ -19,11 +19,17 @@ nazoauthctl host add server-a --ssh prod-a --privilege sudo
 nazoauthctl install --host server-a --name production \
   --public-url https://auth.example.com \
   --database-host db.internal --database-port 5432 \
-  --database-name oauth --database-user nazauth \
-  --valkey-host cache.internal --valkey-port 6379
-nazoauthctl bind --instance production
+  --database-name oauth \
+  --database-runtime-user nazo_runtime \
+  --database-runtime-password-file ./database-runtime-password \
+  --database-lifecycle-user nazo_lifecycle \
+  --database-lifecycle-password-file ./database-lifecycle-password \
+  --valkey-host cache.internal --valkey-port 6379 \
+  --valkey-password-file ./valkey-password
+nazoauthctl bind --instance production --label operations \
+  --output-secret-file ./production-recovery-secret
 nazoauthctl status
-nazoauthctl update
+nazoauthctl update --yes
 nazoauthctl instance list
 nazoauthctl status --all
 ```
@@ -33,12 +39,18 @@ Controller Key, operate. `install` commits as soon as the target reports local
 health - public DNS/TLS verification (`verify`) and backup setup are separate
 next steps, never hidden gates.
 
+For a clean install from stopped current-format material already on the target,
+append both `--import-data-root /absolute/target/data` and
+`--import-mfa-key-file /absolute/target/mfa-key`. They are an inseparable pair;
+the import allowlist excludes controller state, DeploymentState, bootstrap
+state, and UI cache.
+
 ## Commands
 
 | Command | Purpose |
 |---|---|
 | `host add/list/show/check/forget` | Register and inspect SSH targets or the local machine |
-| `instance list/show/rename/forget/relocate` | Inventory of NazoAuth deployments per host |
+| `instance register/list/show/rename/forget/relocate` | Register or inventory current-protocol NazoAuth deployments per host |
 | `controller list/add/rotate/revoke/recover` | Per-instance Controller Key lifecycle |
 | `install` | Clean install onto a registered host |
 | `discover` | Read-only sweep for existing NazoAuth deployments |
@@ -47,8 +59,12 @@ next steps, never hidden gates.
 | `verify` | Public TLS + issuer discovery report |
 | `update` / `rollback` | Crash-safe artifact/config lifecycle with one signed migration |
 | `operation` | Recent operation journal entries per instance |
-| `backup` | Backup maturity facts (informational) |
+| `policy backup-before-update` | Select `off`, `warn`, or a blocking maximum restore-test age |
+| `backup` | Create, inspect, restore-test, and byte-verify snapshots |
+| `recover` | Restore a verified snapshot and complete token invalidation |
 | `uninstall` | Remove exactly the resources this deployment owns |
+| `self check/update/rollback` | Maintain the current ctl release; unknown self-state schemas fail closed and must be reset from a backup, never migrated |
+| `bootstrap-admin`, `tls certificate/acme`, `remote exec` | Current-model maintenance for initial access, target TLS, and the fixed remote protocol |
 
 ## Concepts you actually need
 
@@ -56,10 +72,12 @@ next steps, never hidden gates.
 alias). An *instance* is one NazoAuth deployment on that host, identified by
 its immutable `deployment_id`; friendly aliases are selectors only.
 
-**System OpenSSH only.** Remote execution shells out to your installed `ssh`
-with your config, your agent, your `known_hosts`. ctl stores just the profile
-alias - no keys, no host-key databases, no daemons on targets. Host-key
-failures are OpenSSH failures, on purpose.
+**Local and SSH targets.** Local targets execute directly. Remote execution
+shells out to the installed system `ssh` with its config, agent, and
+`known_hosts`. ctl stores only the profile alias; it does not store SSH keys or
+run a target daemon. Backup copy uses the same target abstraction on both
+sides, so either endpoint can be local or SSH as long as they are distinct
+registered hosts.
 
 **Controller Key (30 days).** Every instance trusts up to three Ed25519
 Controller Keys minted on the control machine; private keys never leave it.
@@ -82,12 +100,16 @@ slot - nothing else. It is not a data backup and not an admin password.
   showing you the plan. External/shared PostgreSQL, Valkey, and proxies are
   never deleted.
 
-**Maturity, not gates.** Backup readiness and public reachability are reported
-facts with timestamps. They never block install/update/status.
+**Backup policy is explicit.** Public reachability and backup timestamps remain
+reported facts. `policy backup-before-update require --max-age-seconds N`
+makes update refuse unless the target still has the exact restore-tested
+snapshot manifest within that age. `warn` reports missing evidence and `off`
+does not require it.
 
-**Existing deployments.** `discover` sweeps a host read-only; adopting one
-records the facts the target itself reports and classifies everything that ctl
-did not provably create as external. `bind` then attaches your Controller Key.
+**Current protocol only.** `discover` sweeps a host read-only. `instance
+register` accepts only a deployment whose target-owned state and verified
+helper implement the current protocol. There is no old controller-state,
+command, task-envelope, or deployment-state conversion path.
 
 ## Errors
 

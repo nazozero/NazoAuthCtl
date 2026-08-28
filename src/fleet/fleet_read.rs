@@ -179,7 +179,7 @@ pub(crate) fn status_job(
     host: &HostRecord,
     target: &dyn ExecutionTarget,
 ) -> anyhow::Result<Value> {
-    let hello = crate::fleet::live_probe(target)
+    let hello = crate::fleet::live_probe(target, host)
         .with_context(|| format!("host '{}' failed its live verification", host.alias))?;
     let inspection = target.inspect_instance(&record.deployment_id)?;
     Ok(status_document(
@@ -205,24 +205,6 @@ pub(crate) fn doctor_job(
             diagnostics.push("observation cache: last contact FAILED".to_owned());
         }
         Some(_) => diagnostics.push("observation cache: fresh contact recorded".to_owned()),
-    }
-
-    if let Some(observation) = record.last_observation.as_ref()
-        && let Some(facts) =
-            crate::controller_identity::expiry::parse_cached_slots(&observation.summary)
-    {
-        let now = chrono::Utc::now();
-        for fact in &facts {
-            let class =
-                crate::controller_identity::expiry::ExpiryStatus::classify(now, fact.expires_at);
-            if class.is_expired() {
-                diagnostics.push(format!(
-                    "controller slot {} EXPIRED — {}",
-                    fact.controller_id,
-                    crate::controller_identity::expiry::rotate_guidance(&record.alias)
-                ));
-            }
-        }
     }
 
     diagnostics.push(
@@ -251,41 +233,19 @@ pub(crate) fn status_document(
         "config": {"reference": inspection.config_reference, "schema": inspection.config_schema},
         "artifact": {"current": inspection.artifact.current, "previous": inspection.artifact.previous},
         "health": {"state": if inspection.healthy { "ok" } else { "down" }, "summary": inspection.health_summary},
-        "backup_maturity": inspection.backup_maturity.token(),
+        "backup": inspection.backup,
         "controller": controller_fact_line(record),
     })
 }
 
-/// Controller binding line derived ONLY from display caches; the NazoAuth
-/// server stays the authority and every mutation re-verifies live.
+/// Controller binding line derived only from registry references. Slot status
+/// and expiry are deliberately absent: only an explicit live controller-list
+/// response may present those server-owned facts.
 fn controller_fact_line(record: &InstanceRecord) -> String {
     if record.controller_id.is_none() && record.controller_key_ref.is_none() {
-        return "unbound".to_owned();
-    }
-    let cached = record
-        .last_observation
-        .as_ref()
-        .and_then(|observation| {
-            crate::controller_identity::expiry::parse_cached_slots(&observation.summary)
-        })
-        .unwrap_or_default();
-    let fact = record
-        .controller_id
-        .as_deref()
-        .and_then(|id| cached.iter().find(|fact| fact.controller_id == id));
-    match fact {
-        Some(fact) => {
-            let class = crate::controller_identity::expiry::ExpiryStatus::classify(
-                chrono::Utc::now(),
-                fact.expires_at,
-            );
-            format!(
-                "bound (status {}; expiry {})",
-                fact.status.as_str(),
-                class.code()
-            )
-        }
-        None => "bound (no cached slot facts)".to_owned(),
+        "unbound".to_owned()
+    } else {
+        "local binding recorded (live slot status not queried)".to_owned()
     }
 }
 
@@ -360,7 +320,7 @@ fn compact_summary(payload: &Value) -> String {
             .and_then(Value::as_u64)
             .map_or_else(|| "-".to_owned(), |v| v.to_string()),
         value_str(payload.pointer("/artifact/current")),
-        value_str(payload.get("backup_maturity")),
+        value_str(payload.pointer("/backup/snapshot/created_at")),
         value_str(payload.get("controller")),
     )
 }
@@ -494,8 +454,8 @@ fn print_single_status(record: &InstanceRecord, host_alias: &str, payload: &Valu
         value_str(payload.pointer("/health/summary")),
     );
     println!(
-        "backup maturity: {}",
-        value_str(payload.get("backup_maturity"))
+        "backup snapshot: {}",
+        value_str(payload.pointer("/backup/snapshot/created_at"))
     );
     println!("controller: {}", value_str(payload.get("controller")));
     if doctor && let Some(diagnostics) = payload.get("diagnostics").and_then(Value::as_array) {
@@ -531,7 +491,7 @@ pub(crate) fn run_operation_view(
     let pending = journal.load()?;
 
     let target = crate::fleet::production_target(&host)?;
-    crate::fleet::live_probe(target.as_ref())?;
+    crate::fleet::live_probe(target.as_ref(), &host)?;
     let result = target.execute_host_operation(&crate::target::HostOperation::journal_read(
         Uuid::now_v7().to_string(),
         &record.deployment_id,
@@ -622,7 +582,7 @@ pub(crate) fn run_logs_view(
         )
     })?;
     let target = crate::fleet::production_target(&host)?;
-    crate::fleet::live_probe(target.as_ref())?;
+    crate::fleet::live_probe(target.as_ref(), &host)?;
     let result = target.execute_host_operation(&crate::target::HostOperation::runtime_logs(
         Uuid::now_v7().to_string(),
         &record.deployment_id,
@@ -657,7 +617,8 @@ pub(crate) fn run_logs_view(
     Ok(())
 }
 
-/// Backup maturity facts (H05): informational, never a gate.
+/// Target-owned backup evidence.  This view never invents readiness from a
+/// controller cache: it displays the live manifest/restore-test projection.
 pub(crate) fn run_backup_view(
     store: &RegistryStore,
     selector: Option<&str>,
@@ -682,14 +643,21 @@ pub(crate) fn run_backup_view(
         return Ok(());
     }
     println!(
-        "backup maturity for '{}' (deployment {}):",
+        "backup evidence for '{}' (deployment {}):",
         record.alias, record.deployment_id
     );
     println!(
-        "  observed token: {} (from the last live inspection)",
-        value_str(payload.get("backup_maturity"))
+        "  snapshot: {}",
+        value_str(payload.pointer("/backup/snapshot/created_at"))
     );
-    println!("  maturity is an observation, not a gate: install/update never require it");
+    println!(
+        "  local rollback: {}",
+        value_str(payload.pointer("/backup/local_rollback_ready"))
+    );
+    println!(
+        "  restore tested: {}",
+        value_str(payload.pointer("/backup/snapshot/restore_tested_at"))
+    );
     Ok(())
 }
 

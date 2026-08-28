@@ -33,7 +33,7 @@ use crate::filesystem;
 pub(crate) struct DeletionJob<'a> {
     pub operation_id: &'a str,
     pub deployment_id: &'a str,
-    pub runtime_kind: &'a str,
+    pub runtime_kind: crate::runtime_backend::RuntimeBackendKind,
     pub runtime_object: &'a str,
     pub current_artifact: &'a str,
     pub config_reference: &'a str,
@@ -82,22 +82,8 @@ impl HostDeletionExecutor {
         job: &DeletionJob<'_>,
         performed: &mut PerformedDeletions,
     ) -> Result<(), Failure> {
-        if !matches!(job.runtime_kind, "podman" | "docker" | "host" | "systemd") {
-            return Err(Failure::new(
-                HOST_ERR_OPERATION_INVALID,
-                format!(
-                    "the '{}' runtime backend is not supported for lifecycle mutations; \
-                     use Podman, Docker, or systemd deployments",
-                    sanitize(job.runtime_kind.to_owned())
-                ),
-            ));
-        }
-        privilege_gate(job.runtime_kind)?;
-        let kind = match job.runtime_kind {
-            "podman" => crate::runtime_backend::RuntimeBackendKind::Podman,
-            "docker" => crate::runtime_backend::RuntimeBackendKind::Docker,
-            _ => crate::runtime_backend::RuntimeBackendKind::Systemd,
-        };
+        let kind = job.runtime_kind;
+        privilege_gate(kind)?;
         let backend = crate::runtime_backend::backend(kind);
 
         // 1. Runtime object with identity re-confirmation. The label written
@@ -112,7 +98,7 @@ impl HostDeletionExecutor {
                 )
             })?;
         if let Some(observation) = observation {
-            if kind != crate::runtime_backend::RuntimeBackendKind::Systemd
+            if kind.is_container()
                 && !observation
                     .labels
                     .get("io.nazoauth.deployment-id")
@@ -154,7 +140,7 @@ impl HostDeletionExecutor {
                     ),
                 ));
             }
-            if kind != crate::runtime_backend::RuntimeBackendKind::Systemd {
+            if kind.is_container() {
                 backend.stop(job.runtime_object).map_err(|error| {
                     Failure::new(
                         super::install_exec::RUNTIME_START_FAILED,
@@ -275,6 +261,13 @@ fn delete_managed_resource(
                     ),
                 ));
             }
+            // Absence is the durable completion fact for this exact resource.
+            // The locator was already re-confirmed against DeploymentState
+            // before the first attempt. A crash after remove_dir_all must not
+            // turn the now-absent ownership marker into a replay failure.
+            if !path.exists() {
+                return Ok(());
+            }
             // W2.4/P1-1: the ownership marker is the deletion credential. A
             // missing marker means ctl did not create this directory (or the
             // state tree was tampered with); either way fail closed.
@@ -324,6 +317,9 @@ fn delete_managed_resource(
             // written at install time must exist and match.
             let marker_path = format!("{locator}.nazoauth-owned");
             let marker = Path::new(marker_path.as_str());
+            if !path.exists() && !marker.exists() {
+                return Ok(());
+            }
             if !marker.exists() {
                 return Err(Failure::new(
                     super::deployment_state::OBJECT_IDENTITY_MISMATCH,
@@ -380,14 +376,77 @@ fn delete_managed_resource(
     }
 }
 
-fn privilege_gate(runtime_kind: &str) -> Result<(), Failure> {
-    let result = if matches!(runtime_kind, "podman" | "docker") {
+fn privilege_gate(runtime_kind: crate::runtime_backend::RuntimeBackendKind) -> Result<(), Failure> {
+    let result = if runtime_kind.is_container() {
         crate::instance_lifecycle::privilege::ensure_engine_access(
-            runtime_kind,
+            runtime_kind.as_str(),
             &crate::instance_lifecycle::privilege::ProcessPrivilegeProbe,
         )
     } else {
         crate::instance_lifecycle::privilege::ensure_systemd_access()
     };
     result.map_err(|error| Failure::new(error.code(), sanitize(error.to_string())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_directory_deletion_is_resume_safe_but_still_requires_initial_proof()
+    -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("uninstall-directory-replay")?;
+        let path = temp.path().join("managed").join("data");
+        std::fs::create_dir_all(&path)?;
+        std::fs::write(path.join(".nazoauth-owned"), "deploy-alpha")?;
+        std::fs::write(path.join("value"), b"data")?;
+        let locator = path.to_string_lossy().into_owned();
+        let mut performed = PerformedDeletions::default();
+
+        delete_managed_resource("directory", &locator, "deploy-alpha", &mut performed)?;
+        assert!(!path.exists());
+        delete_managed_resource("directory", &locator, "deploy-alpha", &mut performed)?;
+
+        let foreign = temp.path().join("managed").join("foreign");
+        std::fs::create_dir_all(&foreign)?;
+        let error = delete_managed_resource(
+            "directory",
+            &foreign.to_string_lossy(),
+            "deploy-alpha",
+            &mut performed,
+        )
+        .expect_err("an existing directory without its proof remains protected");
+        assert_eq!(
+            error.code,
+            super::super::deployment_state::OBJECT_IDENTITY_MISMATCH
+        );
+        assert!(foreign.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn managed_file_deletion_converges_after_each_durable_step() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("uninstall-file-replay")?;
+        let path = temp.path().join("managed-file");
+        let locator = path.to_string_lossy().into_owned();
+        let marker = std::path::PathBuf::from(format!("{locator}.nazoauth-owned"));
+        std::fs::write(&marker, "deploy-alpha")?;
+        let mut performed = PerformedDeletions::default();
+
+        // This is the exact crash window after the file was removed but
+        // before its sibling ownership marker was removed.
+        delete_managed_resource("file", &locator, "deploy-alpha", &mut performed)?;
+        assert!(!marker.exists());
+        delete_managed_resource("file", &locator, "deploy-alpha", &mut performed)?;
+
+        std::fs::write(&path, b"foreign")?;
+        let error = delete_managed_resource("file", &locator, "deploy-alpha", &mut performed)
+            .expect_err("an existing file without its proof remains protected");
+        assert_eq!(
+            error.code,
+            super::super::deployment_state::OBJECT_IDENTITY_MISMATCH
+        );
+        assert!(path.exists());
+        Ok(())
+    }
 }

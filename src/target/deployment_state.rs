@@ -12,6 +12,7 @@
 //!     <deployment_id>/           one directory per real deployment
 //!       state.json               this module's DeploymentState document
 //!       operations.jsonl         the C07 host-operation journal (same scope)
+//!       uninstall-complete.json  exact final-state removal checkpoint
 //! ```
 //!
 //! This freezes `TargetJournal::path_for`: the per-scope layout is
@@ -64,18 +65,31 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
-use crate::error_codes::STATE_RESET_REQUIRED;
+use crate::error_codes::{CONFIG_REVISION_MISMATCH, STATE_RESET_REQUIRED};
 use crate::filesystem;
 use crate::registry::validate_issuer;
+use crate::runtime_backend::RuntimeBackendKind;
 
 use super::install_exec::InstallOrder;
 use super::journal;
 
 /// Schema discriminator carried by the persisted DeploymentState document.
-pub const DEPLOYMENT_STATE_SCHEMA: u32 = 2;
+pub const DEPLOYMENT_STATE_SCHEMA: u32 = 5;
 
 /// Upper bound for one persisted DeploymentState document (~1 MiB).
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
+const UNINSTALL_COMPLETION_FILE: &str = "uninstall-complete.json";
+const UNINSTALL_COMPLETION_SCHEMA: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UninstallCompletion {
+    schema: u32,
+    deployment_id: String,
+    operation_id: String,
+    revision: u64,
+    state_sha256: String,
+}
 
 /// Maximum number of concrete resources one deployment may declare.
 pub const MAX_RESOURCES: usize = 64;
@@ -105,14 +119,6 @@ pub const RESOURCE_UNKNOWN: &str = "RESOURCE_UNKNOWN";
 /// (external ownership, or a shared resource of any kind).
 pub const EXTERNAL_RESOURCE_PROTECTED: &str = "EXTERNAL_RESOURCE_PROTECTED";
 
-/// Stable failure code: config/state CAS mismatch (goal plan 06 F04). The
-/// caller must re-read live state and rebuild its intent; last-write-wins
-/// does not exist.
-///
-/// Canonical name lives in [`crate::error_codes`]; re-exported here so the
-/// historical call sites keep one stable path.
-pub use crate::error_codes::CONFIG_REVISION_MISMATCH;
-
 /// Stable failure code: a clean-install execution order failed on the target
 /// and the target rolled its own partial work back. The DeploymentState was
 /// never created; the journal carries the failure for the resume decision.
@@ -122,6 +128,11 @@ pub const INSTALL_FAILED: &str = "INSTALL_FAILED";
 /// artifact reference exists to restore (goal plan 07 §5). Rollback is an
 /// explicit action over saved facts only; it never guesses.
 pub const ROLLBACK_UNAVAILABLE: &str = "ROLLBACK_UNAVAILABLE";
+
+/// Stable failure code: an applied migration made artifact/config rollback
+/// unsafe. Recovery must restore a verified backup; the old writer must not
+/// be restarted against the migrated data.
+pub const ROLLBACK_RECOVERY_REQUIRED: &str = "ROLLBACK_RECOVERY_REQUIRED";
 
 /// Stable failure code: a planned deletion (or runtime identity hook)
 /// disagrees with the live target facts — declared locator drift, a foreign
@@ -237,38 +248,35 @@ impl Resource {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeSurface {
-    /// Runtime class token (`podman`, `docker`, `host`, ...).
-    pub kind: String,
+    /// The single canonical runtime kind. Its wire/persisted tokens are
+    /// exactly `podman`, `docker`, and `host`; serde rejects every other
+    /// value before it can enter DeploymentState.
+    pub kind: RuntimeBackendKind,
     /// Concrete object name (container name or systemd unit).
     pub object: String,
 }
 
 impl RuntimeSurface {
-    pub fn new(kind: impl Into<String>, object: impl Into<String>) -> anyhow::Result<Self> {
+    pub fn new(kind: impl AsRef<str>, object: impl Into<String>) -> anyhow::Result<Self> {
         let surface = Self {
-            kind: kind.into(),
+            kind: kind.as_ref().parse()?,
             object: object.into(),
         };
-        if surface.kind.is_empty() || surface.kind.len() > 32 {
-            bail!("runtime kind must be 1-32 characters");
-        }
-        if !surface
-            .kind
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character))
-        {
-            bail!("runtime kind must be alphanumeric tokens");
-        }
-        if surface.object.is_empty()
-            || surface.object.len() > 256
-            || surface
+        surface.validate()?;
+        Ok(surface)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.object.is_empty()
+            || self.object.len() > 256
+            || self
                 .object
                 .chars()
                 .any(|character| character.is_whitespace() || character.is_control())
         {
             bail!("runtime object must be a single-line name of at most 256 characters");
         }
-        Ok(surface)
+        Ok(())
     }
 }
 
@@ -335,57 +343,6 @@ pub struct HealthRecord {
     pub checked_at: DateTime<Utc>,
 }
 
-/// Backup/DR maturity of one deployment (goal plan 08 §5, task H05). This is
-/// an INFORMATIONAL maturity fact only: it records what explicit backup
-/// operations have reported, and nothing in install, update, rollback,
-/// uninstall, status, or doctor ever requires, blocks on, or gates through it
-/// (goal plan README hard constraint: backup/DR never becomes a default gate;
-/// item 16 of the goal definition). There is deliberately no restore-rehearsal
-/// machinery behind it — a rehearsal that returns would re-create the deleted
-/// global recovery gate (A04 §5).
-///
-/// Transitions are written ONLY through
-/// [`TargetStateStore::record_backup_maturity`] by explicit backup operations
-/// under the same operation-ownership discipline as health observations.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum BackupMaturity {
-    /// No explicit backup operation has ever reported for this deployment.
-    /// The initial state of every fresh DeploymentState.
-    #[default]
-    Unknown,
-    /// An explicit backup operation reported that no usable data backup is
-    /// configured for this deployment.
-    NotConfigured { observed_at: DateTime<Utc> },
-    /// An explicit backup operation recorded a configured data backup.
-    Configured { observed_at: DateTime<Utc> },
-    /// An explicit backup operation verified restorability (for example a
-    /// restore check performed by the backup tooling itself) at that time.
-    Verified { observed_at: DateTime<Utc> },
-}
-
-impl BackupMaturity {
-    /// Stable lowercase token used by status/doctor style displays.
-    pub fn token(&self) -> &'static str {
-        match self {
-            Self::Unknown => "unknown",
-            Self::NotConfigured { .. } => "not-configured",
-            Self::Configured { .. } => "configured",
-            Self::Verified { .. } => "verified",
-        }
-    }
-
-    /// The observation timestamp of the reporting operation, when one exists.
-    pub fn observed_at(&self) -> Option<DateTime<Utc>> {
-        match self {
-            Self::Unknown => None,
-            Self::NotConfigured { observed_at }
-            | Self::Configured { observed_at }
-            | Self::Verified { observed_at } => Some(*observed_at),
-        }
-    }
-}
-
 /// Embedded build identity of one deployed artifact, recorded by whoever
 /// performed the on-target official verification (goal plan 07 G03): the
 /// ControlOperation envelope's J1 binding needs these facts, so they live in
@@ -431,6 +388,18 @@ pub struct ActiveHostOperationRef {
     pub applied_at: DateTime<Utc>,
 }
 
+/// Durable fence written immediately after a successful MigrateApply and
+/// cleared only when the matching release generation commits (or a verified
+/// schema-compatible automatic rollback completes).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppliedMigration {
+    pub operation_id: String,
+    pub target_artifact: String,
+    pub rollback_policy: crate::model::ReleaseRollbackPolicy,
+    pub applied_at: DateTime<Utc>,
+}
+
 /// The target-side lifecycle source of truth (goal plan 06 §2). The control
 /// machine's Registry holds only `deployment_id` references and observation
 /// caches; nothing here may be reconstructed from those caches.
@@ -445,10 +414,13 @@ pub struct DeploymentState {
     pub config: ConfigState,
     pub resources: Vec<Resource>,
     pub local_health: HealthRecord,
-    /// Backup/DR maturity (H05): informational only, updated exclusively by
-    /// explicit backup operations, never consulted by lifecycle gating.
-    #[serde(default)]
-    pub backup_maturity: BackupMaturity,
+    /// Verified Release policy governing a rollback from `artifact.current`
+    /// to `artifact.previous`.
+    pub current_rollback_policy: crate::model::ReleaseRollbackPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_rollback_policy: Option<crate::model::ReleaseRollbackPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_migration: Option<AppliedMigration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_host_operation: Option<ActiveHostOperationRef>,
     /// Embedded build identity of `artifact.current`, when known.
@@ -470,8 +442,33 @@ impl DeploymentState {
         }
         journal::deployment_scope(&self.deployment_id)?;
         validate_issuer(&self.issuer)?;
-        RuntimeSurface::new(self.runtime.kind.clone(), self.runtime.object.clone())?;
+        self.runtime.validate()?;
         self.artifact.validate()?;
+        self.current_rollback_policy.validate()?;
+        if let Some(policy) = &self.previous_rollback_policy {
+            policy.validate()?;
+        }
+        if let Some(migration) = &self.applied_migration {
+            migration.rollback_policy.validate()?;
+            crate::registry::validate_identifier(
+                &migration.operation_id,
+                128,
+                "applied migration operation id",
+            )?;
+            let digest = migration
+                .target_artifact
+                .strip_prefix("sha256:")
+                .ok_or_else(|| {
+                    anyhow::anyhow!("applied migration artifact must be digest-bound")
+                })?;
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                bail!("applied migration artifact must be a lowercase sha256 digest");
+            }
+        }
         if self.config.reference.is_empty() || self.config.reference.len() > 512 {
             bail!("config reference must be 1-512 characters");
         }
@@ -553,7 +550,7 @@ impl DeploymentState {
 /// minimal: bootstrap creates the initial document, apply-config is the one
 /// CAS-guarded config mutation. Lifecycle waves (G) extend this set; nothing
 /// here ever deletes a resource.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mutation", rename_all = "kebab-case", deny_unknown_fields)]
 // The G01 install order makes Bootstrap deliberately the dominant variant;
 // StateMutationPayload is a short-lived wire value where an indirection would
@@ -592,10 +589,22 @@ pub enum StateMutationPayload {
     /// dispatched separately by the control side (one pre-signed envelope).
     Update {
         artifact: super::install_exec::OfficialArtifactRef,
+        /// Exact rollback contract from the independently verified target
+        /// Release. The target re-verifies equality before migration.
+        rollback_policy: crate::model::ReleaseRollbackPolicy,
+        /// Target-side backup gate bound to the exact evidence inspected by
+        /// the controller. This field is mandatory on the wire: omitting it
+        /// is an obsolete update order, not an implicit opt-out.
+        backup_precondition: UpdateBackupPrecondition,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         config: Option<super::install_exec::StagedConfig>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         migration_jws: Option<String>,
+        /// Public request hash echoed by the server's ControlResult.  It is
+        /// carried inside the same host-journaled update so target-side
+        /// activation can reject a swapped terminal answer before replace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        migration_request_hash: Option<String>,
     },
     /// Explicit rollback to the previous verified artifact reference (G04).
     /// Never runs application mutations and never touches data restore.
@@ -609,10 +618,48 @@ pub enum StateMutationPayload {
     },
 }
 
+/// The only backup fact an Update order may authorize against. `NotRequired`
+/// represents the controller's explicit off/warn policy; `Require` binds the
+/// order to the exact target-owned manifest and restore receipt that were
+/// inspected before dispatch.
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "requirement", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum UpdateBackupPrecondition {
+    NotRequired,
+    Require {
+        manifest_sha256: String,
+        restore_tested_at: DateTime<Utc>,
+        max_age_seconds: u64,
+    },
+}
+
+impl UpdateBackupPrecondition {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if let Self::Require {
+            manifest_sha256,
+            max_age_seconds,
+            ..
+        } = self
+        {
+            if manifest_sha256.len() != 64
+                || !manifest_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                bail!("update backup manifest hash must be 64 lowercase hexadecimal characters");
+            }
+            if *max_age_seconds == 0 || *max_age_seconds > 31_536_000 {
+                bail!("update backup max age must be 1 second through 365 days");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Caller-supplied content for bootstrapping one fresh DeploymentState.
 /// Mirrors the flat fields of `StateMutationPayload::Bootstrap` so the wire
 /// shape stays stable while the store API stays readable.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct BootstrapParams {
     pub issuer: String,
     pub runtime: RuntimeSurface,
@@ -623,6 +670,7 @@ pub struct BootstrapParams {
     /// Embedded build identity of the verified artifact when its official
     /// verification already produced these facts on the target (G01).
     pub current_build_identity: Option<BuildIdentity>,
+    pub current_rollback_policy: crate::model::ReleaseRollbackPolicy,
 }
 
 /// Handle to one target's DeploymentState store rooted at the formalized
@@ -630,6 +678,17 @@ pub struct BootstrapParams {
 #[derive(Clone, Debug)]
 pub struct TargetStateStore {
     root: PathBuf,
+}
+
+/// Facts committed together when one verified update generation becomes
+/// current. Keeping them as one value prevents artifact, build identity,
+/// rollback policy, and optional config from drifting across call sites.
+pub(crate) struct UpdateCommit {
+    pub(crate) artifact: String,
+    pub(crate) build_identity: Option<BuildIdentity>,
+    pub(crate) rollback_policy: crate::model::ReleaseRollbackPolicy,
+    pub(crate) config: Option<(String, String)>,
+    pub(crate) operation_id: String,
 }
 
 impl TargetStateStore {
@@ -758,6 +817,7 @@ impl TargetStateStore {
             config_schema,
             resources,
             current_build_identity,
+            current_rollback_policy,
         } = params;
         let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
         if let Ok(existing) = self.load_existing(deployment_id) {
@@ -800,9 +860,11 @@ impl TargetStateStore {
                 summary: "bootstrapped; runtime health not yet observed".to_owned(),
                 checked_at: Utc::now(),
             },
-            backup_maturity: BackupMaturity::Unknown,
             current_build_identity,
             previous_build_identity: None,
+            current_rollback_policy,
+            previous_rollback_policy: None,
+            applied_migration: None,
         };
         state.validate().map_err(|error| {
             Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
@@ -859,20 +921,98 @@ impl TargetStateStore {
         Ok(state.config)
     }
 
+    /// Persist the irreversible boundary before activation. This deliberately
+    /// does not advance the config revision or mark the host operation as
+    /// committed: the matching update still owns the final generation swap.
+    pub(crate) fn record_migration_applied(
+        &self,
+        deployment_id: &str,
+        expected_revision: u64,
+        operation_id: &str,
+        target_artifact: &str,
+        rollback_policy: &crate::model::ReleaseRollbackPolicy,
+    ) -> Result<(), Failure> {
+        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
+        let mut state = self.load_existing(deployment_id)?;
+        if state.config.revision != expected_revision {
+            return Err(Failure::new(
+                CONFIG_REVISION_MISMATCH,
+                format!(
+                    "expected config revision {expected_revision} but target holds revision {} for '{deployment_id}'",
+                    state.config.revision
+                ),
+            ));
+        }
+        let candidate = AppliedMigration {
+            operation_id: operation_id.to_owned(),
+            target_artifact: target_artifact.to_owned(),
+            rollback_policy: rollback_policy.clone(),
+            applied_at: Utc::now(),
+        };
+        if let Some(existing) = &state.applied_migration {
+            if existing.operation_id == operation_id
+                && existing.target_artifact == target_artifact
+                && existing.rollback_policy == *rollback_policy
+            {
+                return Ok(());
+            }
+            return Err(Failure::new(
+                ROLLBACK_RECOVERY_REQUIRED,
+                "a different applied migration already fences this deployment; keep the writer stopped and run verified backup recover",
+            ));
+        }
+        state.applied_migration = Some(candidate);
+        state.validate().map_err(|error| {
+            Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
+        })?;
+        let scope = journal::deployment_scope(deployment_id).map_err(|error| {
+            Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
+        })?;
+        persist(&scope_path(&self.root, &scope), &state)
+    }
+
+    pub(crate) fn clear_applied_migration(
+        &self,
+        deployment_id: &str,
+        operation_id: &str,
+    ) -> Result<(), Failure> {
+        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
+        let mut state = self.load_existing(deployment_id)?;
+        match &state.applied_migration {
+            None => return Ok(()),
+            Some(applied) if applied.operation_id == operation_id => {}
+            Some(_) => {
+                return Err(Failure::new(
+                    ROLLBACK_RECOVERY_REQUIRED,
+                    "refusing to clear a migration fence owned by a different operation",
+                ));
+            }
+        }
+        state.applied_migration = None;
+        let scope = journal::deployment_scope(deployment_id).map_err(|error| {
+            Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
+        })?;
+        persist(&scope_path(&self.root, &scope), &state)
+    }
+
     /// Commit an update (G03): swap `previous=current`, point `current` at
     /// the newly verified artifact, optionally advance the config CAS, and
     /// record this operation as the producing one. Re-executing the same
     /// interrupted commit replays without advancing again; a stale revision
     /// expectation fails closed.
-    pub fn apply_update(
+    pub(crate) fn apply_update(
         &self,
         deployment_id: &str,
         expected_revision: u64,
-        new_current: String,
-        new_build: Option<BuildIdentity>,
-        config: Option<(String, String)>,
-        operation_id: &str,
+        commit: UpdateCommit,
     ) -> Result<DeploymentState, Failure> {
+        let UpdateCommit {
+            artifact: new_current,
+            build_identity: new_build,
+            rollback_policy: new_rollback_policy,
+            config,
+            operation_id,
+        } = commit;
         let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
         let mut state = self.load_existing(deployment_id)?;
         if state
@@ -900,12 +1040,18 @@ impl TargetStateStore {
                 Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
             })?;
         }
+        new_rollback_policy.validate().map_err(|error| {
+            Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
+        })?;
         state.artifact.previous = state.artifact.current.take();
         state.artifact.current = Some(new_current);
         // The build identity swap mirrors the artifact reference swap so the
         // envelope facts stay attached to the right generation.
         state.previous_build_identity = state.current_build_identity.take();
         state.current_build_identity = new_build;
+        state.previous_rollback_policy = Some(state.current_rollback_policy.clone());
+        state.current_rollback_policy = new_rollback_policy;
+        state.applied_migration = None;
         if let Some((reference, schema)) = config {
             state
                 .config
@@ -913,9 +1059,84 @@ impl TargetStateStore {
                 .map_err(|error| Failure::new(CONFIG_REVISION_MISMATCH, error.to_string()))?;
         }
         state.active_host_operation = Some(ActiveHostOperationRef {
+            operation_id,
+            applied_at: Utc::now(),
+        });
+        let scope = journal::deployment_scope(deployment_id).map_err(|error| {
+            Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
+        })?;
+        persist(&scope_path(&self.root, &scope), &state)?;
+        Ok(state)
+    }
+
+    /// Commit the state facts produced by a completed recovery (H06). The
+    /// restored deployment's config revision is deliberately not restored:
+    /// recovery is a new state mutation and advances the live revision by one
+    /// while retaining the live config locator.
+    pub(crate) fn apply_recovery(
+        &self,
+        deployment_id: &str,
+        expected_revision: u64,
+        facts: &super::backup_exec::RecoveryFacts,
+        operation_id: &str,
+    ) -> Result<DeploymentState, Failure> {
+        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
+        let mut state = self.load_existing(deployment_id)?;
+        if state
+            .active_host_operation
+            .as_ref()
+            .is_some_and(|active| active.operation_id == operation_id)
+        {
+            return Ok(state);
+        }
+        if state.config.revision != expected_revision {
+            return Err(Failure::new(
+                CONFIG_REVISION_MISMATCH,
+                format!(
+                    "expected config revision {expected_revision} but target holds revision {} \
+                     for '{deployment_id}'; re-read the live state and rebuild the recovery",
+                    state.config.revision
+                ),
+            ));
+        }
+        if facts.operation_id != operation_id {
+            return Err(Failure::new(
+                super::wire::HOST_ERR_OPERATION_INVALID,
+                "recovery facts do not belong to the active host operation",
+            ));
+        }
+        facts.build_identity.validate().map_err(|error| {
+            Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
+        })?;
+        facts.rollback_policy.validate().map_err(|error| {
+            Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
+        })?;
+        let new_current = canonical_recovery_artifact(&facts.artifact)?;
+
+        // The old generation remains available as the explicit rollback
+        // history. The build identities move with their artifact generations.
+        state.artifact.previous = state.artifact.current.take();
+        state.artifact.current = Some(new_current);
+        state.previous_build_identity = state.current_build_identity.take();
+        state.current_build_identity = Some(facts.build_identity.clone());
+        state.previous_rollback_policy = Some(state.current_rollback_policy.clone());
+        state.current_rollback_policy = facts.rollback_policy.clone();
+        state.applied_migration = None;
+
+        // Keep the formal locator from the live state. Only the schema comes
+        // from the restored snapshot, and the revision remains monotonic.
+        let config_reference = state.config.reference.clone();
+        state
+            .config
+            .advance(config_reference, facts.config_schema.clone())
+            .map_err(|error| Failure::new(CONFIG_REVISION_MISMATCH, error.to_string()))?;
+        state.active_host_operation = Some(ActiveHostOperationRef {
             operation_id: operation_id.to_owned(),
             applied_at: Utc::now(),
         });
+        state.validate().map_err(|error| {
+            Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
+        })?;
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
@@ -953,6 +1174,16 @@ impl TargetStateStore {
                 ),
             ));
         }
+        if state.applied_migration.is_some()
+            || !state
+                .current_rollback_policy
+                .artifact_rollback_allowed_after_migration()
+        {
+            return Err(Failure::new(
+                ROLLBACK_RECOVERY_REQUIRED,
+                "the verified Release migration policy forbids artifact/config rollback; keep the writer stopped and run verified backup recover",
+            ));
+        }
         let Some(previous) = state.artifact.previous.clone() else {
             return Err(Failure::new(
                 ROLLBACK_UNAVAILABLE,
@@ -972,6 +1203,15 @@ impl TargetStateStore {
         let old_build = state.current_build_identity.take();
         state.current_build_identity = state.previous_build_identity.take();
         state.previous_build_identity = old_build;
+        let old_policy = state.current_rollback_policy.clone();
+        let Some(previous_policy) = state.previous_rollback_policy.take() else {
+            return Err(Failure::new(
+                ROLLBACK_UNAVAILABLE,
+                "the previous artifact has no verified Release rollback policy",
+            ));
+        };
+        state.current_rollback_policy = previous_policy;
+        state.previous_rollback_policy = Some(old_policy);
         if let Some((reference, schema)) = config {
             state
                 .config
@@ -989,11 +1229,9 @@ impl TargetStateStore {
         Ok(state)
     }
 
-    /// Remove the state document after a completed uninstall (G06). The
-    /// operation journal survives so a retried uninstall replays its stored
-    /// terminal result instead of re-executing. External/shared resources are
-    /// never consulted here: deletion happened in the executor against
-    /// re-confirmed managed facts only.
+    /// Remove the state document after a completed uninstall (G06). An exact
+    /// operation/revision completion record is committed first, closing the
+    /// crash window before the journal can append its terminal result.
     pub fn remove_deployment(
         &self,
         deployment_id: &str,
@@ -1006,25 +1244,21 @@ impl TargetStateStore {
         let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
         let state_path = self.state_path(&scope);
         if !state_path.exists() {
-            // Already removed by the interrupted attempt this operation id
-            // resumes; completion is idempotent.
-            return Ok(());
+            return if completion_matches(
+                read_uninstall_completion(&scope_path(&self.root, &scope))?.as_ref(),
+                deployment_id,
+                expected_revision,
+                operation_id,
+            ) {
+                Ok(())
+            } else {
+                Err(Failure::new(
+                    DEPLOYMENT_UNKNOWN,
+                    format!("no DeploymentState exists for '{deployment_id}'"),
+                ))
+            };
         }
         let state = self.load_existing(deployment_id)?;
-        if state
-            .active_host_operation
-            .as_ref()
-            .is_some_and(|active| active.operation_id == operation_id)
-        {
-            // The removing attempt already committed; finish the removal.
-            filesystem::remove_file_durable(&state_path).map_err(|error| {
-                Failure::new(
-                    DEPLOYMENT_UNKNOWN,
-                    format!("failed to remove {}: {error}", state_path.display()),
-                )
-            })?;
-            return Ok(());
-        }
         if state.config.revision != expected_revision {
             return Err(Failure::new(
                 CONFIG_REVISION_MISMATCH,
@@ -1035,6 +1269,13 @@ impl TargetStateStore {
                 ),
             ));
         }
+        write_uninstall_completion(
+            &scope_path(&self.root, &scope),
+            &state_path,
+            deployment_id,
+            operation_id,
+            state.config.revision,
+        )?;
         filesystem::remove_file_durable(&state_path).map_err(|error| {
             Failure::new(
                 DEPLOYMENT_UNKNOWN,
@@ -1042,6 +1283,52 @@ impl TargetStateStore {
             )
         })?;
         Ok(())
+    }
+
+    /// Exact completion proof for an uninstall whose terminal journal line is
+    /// absent (crash window) or has aged out of the bounded journal. The proof
+    /// remains across a later bootstrap of the same deployment id so an
+    /// ancient retry cannot uninstall the new deployment generation.
+    pub(crate) fn converge_uninstall_completion(
+        &self,
+        deployment_id: &str,
+        expected_revision: u64,
+        operation_id: &str,
+    ) -> Result<bool, Failure> {
+        let scope = journal::deployment_scope(deployment_id).map_err(|error| {
+            Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
+        })?;
+        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
+        let scope_path = scope_path(&self.root, &scope);
+        let Some(completion) = read_uninstall_completion(&scope_path)? else {
+            return Ok(false);
+        };
+        if !completion_matches(
+            Some(&completion),
+            deployment_id,
+            expected_revision,
+            operation_id,
+        ) {
+            return Ok(false);
+        }
+        let state_path = self.state_path(&scope);
+        if state_path.exists() {
+            let current_sha256 = filesystem::sha256(&state_path).map_err(|error| {
+                Failure::new(
+                    STATE_RESET_REQUIRED,
+                    format!("failed to hash {}: {error}", state_path.display()),
+                )
+            })?;
+            if current_sha256 == completion.state_sha256 {
+                filesystem::remove_file_durable(&state_path).map_err(|error| {
+                    Failure::new(
+                        DEPLOYMENT_UNKNOWN,
+                        format!("failed to remove {}: {error}", state_path.display()),
+                    )
+                })?;
+            }
+        }
+        Ok(true)
     }
 
     /// Record a target-local health fact (goal plan 06 §2: `local_health` is
@@ -1091,42 +1378,6 @@ impl TargetStateStore {
         Ok(record)
     }
 
-    /// Record a backup/DR maturity fact (H05). ONLY explicit backup
-    /// operations may write it, enforced by the same operation-ownership
-    /// discipline as [`Self::record_local_health`]: the reporting operation
-    /// must own the deployment's current state revision. This is an
-    /// observation, not a config change: the CAS revision does not move, and
-    /// no lifecycle use case ever consults this fact for gating.
-    pub fn record_backup_maturity(
-        &self,
-        deployment_id: &str,
-        maturity: BackupMaturity,
-        operation_id: &str,
-    ) -> Result<BackupMaturity, Failure> {
-        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
-        let mut state = self.load_existing(deployment_id)?;
-        let owns = state
-            .active_host_operation
-            .as_ref()
-            .is_some_and(|active| active.operation_id == operation_id);
-        if !owns {
-            return Err(Failure::new(
-                DEPLOYMENT_UNKNOWN,
-                format!(
-                    "backup maturity rejected: '{deployment_id}' is not currently owned by \
-                     operation {operation_id}; only an explicit backup operation over the live \
-                     state revision may report maturity"
-                ),
-            ));
-        }
-        state.backup_maturity = maturity;
-        let scope = journal::deployment_scope(deployment_id).map_err(|error| {
-            Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
-        })?;
-        persist(&scope_path(&self.root, &scope), &state)?;
-        Ok(maturity)
-    }
-
     fn lock_path(&self, deployment_id: &str) -> Result<PathBuf, Failure> {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
@@ -1150,6 +1401,90 @@ fn persist(path: &Path, state: &DeploymentState) -> Result<(), Failure> {
             DEPLOYMENT_UNKNOWN,
             format!("failed to persist {}: {error}", target.display()),
         )
+    })
+}
+
+fn write_uninstall_completion(
+    scope: &Path,
+    state_path: &Path,
+    deployment_id: &str,
+    operation_id: &str,
+    revision: u64,
+) -> Result<(), Failure> {
+    let state_sha256 = filesystem::sha256(state_path).map_err(|error| {
+        Failure::new(
+            STATE_RESET_REQUIRED,
+            format!("failed to hash {}: {error}", state_path.display()),
+        )
+    })?;
+    let completion = UninstallCompletion {
+        schema: UNINSTALL_COMPLETION_SCHEMA,
+        deployment_id: deployment_id.to_owned(),
+        operation_id: operation_id.to_owned(),
+        revision,
+        state_sha256,
+    };
+    let bytes = serde_json::to_vec_pretty(&completion)
+        .map_err(|error| Failure::new(DEPLOYMENT_UNKNOWN, error.to_string()))?;
+    let path = scope.join(UNINSTALL_COMPLETION_FILE);
+    filesystem::atomic_write(&path, &bytes, 0o600).map_err(|error| {
+        Failure::new(
+            DEPLOYMENT_UNKNOWN,
+            format!("failed to persist {}: {error}", path.display()),
+        )
+    })
+}
+
+fn read_uninstall_completion(scope: &Path) -> Result<Option<UninstallCompletion>, Failure> {
+    let path = scope.join(UNINSTALL_COMPLETION_FILE);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Failure::new(
+                STATE_RESET_REQUIRED,
+                format!("failed to inspect {}: {error}", path.display()),
+            ));
+        }
+        Ok(_) => {}
+    }
+    let bytes = filesystem::read_secure_regular_file(&path, "uninstall completion", false, 4096)
+        .map_err(|error| {
+            Failure::new(
+                STATE_RESET_REQUIRED,
+                format!("failed to read {}: {error}", path.display()),
+            )
+        })?;
+    let completion: UninstallCompletion = serde_json::from_slice(&bytes).map_err(|error| {
+        Failure::new(
+            STATE_RESET_REQUIRED,
+            format!("failed to parse {}: {error}", path.display()),
+        )
+    })?;
+    if completion.schema != UNINSTALL_COMPLETION_SCHEMA
+        || completion.state_sha256.len() != 64
+        || !completion
+            .state_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(Failure::new(
+            STATE_RESET_REQUIRED,
+            format!("{} carries an invalid uninstall completion", path.display()),
+        ));
+    }
+    Ok(Some(completion))
+}
+
+fn completion_matches(
+    completion: Option<&UninstallCompletion>,
+    deployment_id: &str,
+    expected_revision: u64,
+    operation_id: &str,
+) -> bool {
+    completion.is_some_and(|completion| {
+        completion.deployment_id == deployment_id
+            && completion.operation_id == operation_id
+            && completion.revision == expected_revision
     })
 }
 
@@ -1199,9 +1534,9 @@ fn unreadable_state(deployment_id: &str, path: &Path, error: &dyn std::fmt::Disp
         );
     }
     Failure::new(
-        DEPLOYMENT_UNKNOWN,
+        STATE_RESET_REQUIRED,
         format!(
-            "{STATE_RESET_REQUIRED}: target DeploymentState is missing, unsafe to read, or \
+            "target DeploymentState is missing, unsafe to read, or \
              oversized ({path_display}): {error}; back the file up, remove the deployment \
              directory, then re-register/bootstrap the instance",
             path_display = path.display()
@@ -1211,9 +1546,9 @@ fn unreadable_state(deployment_id: &str, path: &Path, error: &dyn std::fmt::Disp
 
 fn invalid_state(path: &Path, error: &dyn std::fmt::Display) -> Failure {
     Failure::new(
-        DEPLOYMENT_UNKNOWN,
+        STATE_RESET_REQUIRED,
         format!(
-            "{STATE_RESET_REQUIRED}: target DeploymentState does not conform to the current \
+            "target DeploymentState does not conform to the current \
              schema ({path_display}): {error}; back the file up, remove the deployment \
              directory, then re-register/bootstrap the instance",
             path_display = path.display()
@@ -1234,6 +1569,43 @@ fn sanitize_detail(text: &str) -> String {
         .collect()
 }
 
+fn canonical_recovery_artifact(
+    artifact: &crate::runtime_backend::ArtifactReference,
+) -> Result<String, Failure> {
+    let digest = match artifact {
+        crate::runtime_backend::ArtifactReference::Oci { digest, .. } => {
+            digest.strip_prefix("sha256:").ok_or_else(|| {
+                Failure::new(
+                    super::wire::HOST_ERR_OPERATION_INVALID,
+                    "recovery OCI artifact digest must use sha256",
+                )
+            })?
+        }
+        crate::runtime_backend::ArtifactReference::HostBinary { sha256, .. } => sha256,
+        crate::runtime_backend::ArtifactReference::Unknown => {
+            return Err(Failure::new(
+                super::wire::HOST_ERR_OPERATION_INVALID,
+                "recovery artifact is unknown",
+            ));
+        }
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(Failure::new(
+            super::wire::HOST_ERR_OPERATION_INVALID,
+            "recovery artifact digest must be 64 lowercase hexadecimal characters",
+        ));
+    }
+    let reference = format!("sha256:{digest}");
+    crate::registry::validate_identifier(&reference, 256, "artifact reference").map_err(
+        |error| Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string()),
+    )?;
+    Ok(reference)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1247,7 +1619,234 @@ mod tests {
             config_schema: "nazauth-config-v1".to_owned(),
             resources: Vec::new(),
             current_build_identity: None,
+            current_rollback_policy: crate::model::test_release_rollback_policy(),
         }
+    }
+
+    fn irreversible_policy() -> crate::model::ReleaseRollbackPolicy {
+        let mut policy = crate::model::test_release_rollback_policy();
+        policy.schema_compatible = false;
+        policy.irreversible_migration = true;
+        policy.rationale = "test migration is irreversible".to_owned();
+        policy
+    }
+
+    #[test]
+    fn applied_migration_and_irreversible_release_both_refuse_artifact_rollback()
+    -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("nazoauthctl-migration-fence")?;
+        let store = TargetStateStore::open(temp.path().join("state"))?;
+        let mut params = sample_params("https://auth.example.com", "nazoauth-main");
+        params.artifact.current = Some(format!("sha256:{}", "a".repeat(64)));
+        store.bootstrap("deploy-fence", params, "bootstrap-op")?;
+
+        let migration_operation = "01900000-0000-7000-8000-000000000001";
+        store.record_migration_applied(
+            "deploy-fence",
+            1,
+            migration_operation,
+            &format!("sha256:{}", "b".repeat(64)),
+            &irreversible_policy(),
+        )?;
+        let fenced = store
+            .apply_rollback("deploy-fence", 1, None, "rollback-op")
+            .expect_err("an applied migration fence must refuse rollback");
+        assert_eq!(fenced.code, ROLLBACK_RECOVERY_REQUIRED);
+
+        store.clear_applied_migration("deploy-fence", migration_operation)?;
+        store.apply_update(
+            "deploy-fence",
+            1,
+            UpdateCommit {
+                artifact: format!("sha256:{}", "b".repeat(64)),
+                build_identity: None,
+                rollback_policy: irreversible_policy(),
+                config: None,
+                operation_id: "update-op".to_owned(),
+            },
+        )?;
+        let irreversible = store
+            .apply_rollback("deploy-fence", 1, None, "rollback-op-2")
+            .expect_err("irreversible release policy must refuse rollback");
+        assert_eq!(irreversible.code, ROLLBACK_RECOVERY_REQUIRED);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_runtime_state_requires_explicit_reset() -> anyhow::Result<()> {
+        assert!(RuntimeSurface::new("systemd", "nazoauth.service").is_err());
+
+        let temp = crate::filesystem::PrivateTempDir::new("nazoauthctl-runtime-cutover")?;
+        let store = TargetStateStore::open(temp.path().join("state"))?;
+        let mut params = sample_params("https://auth.example.com", "nazoauth.service");
+        params.runtime = RuntimeSurface::new("host", "nazoauth.service")?;
+        let state = store.bootstrap("deploy-runtime-cutover", params, "bootstrap")?;
+        let canonical = serde_json::to_string(&state)?;
+        let legacy = canonical.replace("\"kind\":\"host\"", "\"kind\":\"systemd\"");
+        assert_ne!(legacy, canonical, "fixture must replace the runtime token");
+        let scope = journal::deployment_scope("deploy-runtime-cutover")?;
+        crate::filesystem::atomic_write(&store.state_path(&scope), legacy.as_bytes(), 0o600)?;
+
+        let failure = store
+            .load_existing("deploy-runtime-cutover")
+            .expect_err("legacy runtime state accepted");
+        assert_eq!(failure.code, STATE_RESET_REQUIRED);
+        Ok(())
+    }
+
+    #[test]
+    fn previous_deployment_state_schema_requires_explicit_reset() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("nazoauthctl-schema-cutover")?;
+        let store = TargetStateStore::open(temp.path().join("state"))?;
+        let state = store.bootstrap(
+            "deploy-schema-cutover",
+            sample_params("https://auth.example.com", "nazoauth-schema"),
+            "bootstrap",
+        )?;
+        let mut value = serde_json::to_value(state)?;
+        value["schema"] = serde_json::Value::from(DEPLOYMENT_STATE_SCHEMA - 1);
+        let scope = journal::deployment_scope("deploy-schema-cutover")?;
+        crate::filesystem::atomic_write(
+            &store.state_path(&scope),
+            &serde_json::to_vec(&value)?,
+            0o600,
+        )?;
+
+        let failure = store
+            .load_existing("deploy-schema-cutover")
+            .expect_err("previous state schema accepted");
+        assert_eq!(failure.code, STATE_RESET_REQUIRED);
+        Ok(())
+    }
+
+    fn recovery_facts(
+        operation_id: &str,
+        artifact: crate::runtime_backend::ArtifactReference,
+        config_schema: &str,
+    ) -> crate::target::backup_exec::RecoveryFacts {
+        crate::target::backup_exec::RecoveryFacts {
+            operation_id: operation_id.to_owned(),
+            snapshot_id: "01900000-0000-7000-8000-000000000001".to_owned(),
+            manifest_sha256: "a".repeat(64),
+            restored_database: "nazo_recovered".to_owned(),
+            artifact,
+            build_identity: BuildIdentity::new(BUILD_IDENTITY_PRODUCT, "v2", "recovered")
+                .expect("build identity"),
+            rollback_policy: crate::model::test_release_rollback_policy(),
+            config_schema: config_schema.to_owned(),
+        }
+    }
+
+    #[test]
+    fn recovery_advances_live_revision_and_preserves_previous_generation() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("nazauthctl-state-recovery")?;
+        let store = TargetStateStore::open(temp.path().join("state"))?;
+        let old_current = format!("sha256:{}", "b".repeat(64));
+        let old_previous = format!("sha256:{}", "c".repeat(64));
+        let old_build = BuildIdentity::new(BUILD_IDENTITY_PRODUCT, "v1", "previous")?;
+        let mut params = sample_params("https://a.example", "nz-a");
+        params.artifact = ArtifactRefs {
+            current: Some(old_current.clone()),
+            previous: Some(old_previous),
+        };
+        params.current_build_identity = Some(old_build.clone());
+        params.current_rollback_policy.rationale = "old generation policy".to_owned();
+        let old_policy = params.current_rollback_policy.clone();
+        store.bootstrap("deploy-alpha", params, "bootstrap")?;
+
+        let facts = recovery_facts(
+            "recover-1",
+            crate::runtime_backend::ArtifactReference::Oci {
+                image_reference: "registry.example/nazoauth".to_owned(),
+                digest: format!("sha256:{}", "d".repeat(64)),
+            },
+            "nazauth-config-v2",
+        );
+        let state = store.apply_recovery("deploy-alpha", 1, &facts, "recover-1")?;
+
+        assert_eq!(state.config.revision, 2);
+        assert_eq!(state.config.reference, "/etc/nazauth/config.toml");
+        assert_eq!(state.config.schema, "nazauth-config-v2");
+        assert_eq!(
+            state.artifact.current,
+            Some(format!("sha256:{}", "d".repeat(64)))
+        );
+        assert_eq!(state.artifact.previous, Some(old_current));
+        assert_eq!(state.previous_build_identity, Some(old_build));
+        assert_eq!(state.current_rollback_policy, facts.rollback_policy);
+        assert_eq!(state.previous_rollback_policy, Some(old_policy));
+        assert_eq!(
+            state
+                .current_build_identity
+                .as_ref()
+                .map(|build| build.version.as_str()),
+            Some("v2")
+        );
+        assert_eq!(
+            state
+                .active_host_operation
+                .as_ref()
+                .map(|active| active.operation_id.as_str()),
+            Some("recover-1")
+        );
+        assert_eq!(store.load_existing("deploy-alpha")?, state);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_replays_same_operation_but_rejects_stale_revision() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("nazauthctl-state-recovery-cas")?;
+        let store = TargetStateStore::open(temp.path().join("state"))?;
+        store.bootstrap(
+            "deploy-alpha",
+            sample_params("https://a.example", "nz-a"),
+            "bootstrap",
+        )?;
+        let facts = recovery_facts(
+            "recover-1",
+            crate::runtime_backend::ArtifactReference::HostBinary {
+                path: std::path::PathBuf::from("/var/lib/nazauthctl/artifacts/nazoauth"),
+                sha256: "e".repeat(64),
+            },
+            "nazauth-config-v2",
+        );
+
+        let first = store.apply_recovery("deploy-alpha", 1, &facts, "recover-1")?;
+        let replay = store.apply_recovery("deploy-alpha", 1, &facts, "recover-1")?;
+        assert_eq!(replay, first, "same active host operation is idempotent");
+
+        let stale = store
+            .apply_recovery("deploy-alpha", 1, &facts, "recover-2")
+            .expect_err("a new operation cannot reuse the old revision");
+        assert_eq!(stale.code, CONFIG_REVISION_MISMATCH);
+        assert_eq!(store.load_existing("deploy-alpha")?, first);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_unknown_artifact_without_mutating_state() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("nazauthctl-state-recovery-artifact")?;
+        let store = TargetStateStore::open(temp.path().join("state"))?;
+        store.bootstrap(
+            "deploy-alpha",
+            sample_params("https://a.example", "nz-a"),
+            "bootstrap",
+        )?;
+        let facts = recovery_facts(
+            "recover-1",
+            crate::runtime_backend::ArtifactReference::Unknown,
+            "nazauth-config-v2",
+        );
+
+        let failure = store
+            .apply_recovery("deploy-alpha", 1, &facts, "recover-1")
+            .expect_err("unknown runtime artifacts are not canonical state references");
+        assert_eq!(
+            failure.code,
+            crate::target::wire::HOST_ERR_OPERATION_INVALID
+        );
+        assert_eq!(store.load_existing("deploy-alpha")?.config.revision, 1);
+        Ok(())
     }
 
     #[test]
@@ -1295,12 +1894,7 @@ mod tests {
         crate::filesystem::ensure_directory_chain(&broken_dir)?;
         crate::filesystem::atomic_write(&broken_dir.join("state.json"), b"{ not json", 0o600)?;
         let error = store.list_deployments().expect_err("corrupt document");
-        assert!(
-            error
-                .detail
-                .contains(crate::error_codes::STATE_RESET_REQUIRED),
-            "{error:?}"
-        );
+        assert_eq!(error.code, crate::error_codes::STATE_RESET_REQUIRED);
         Ok(())
     }
 
@@ -1314,85 +1908,6 @@ mod tests {
         }
         let failure = store.list_deployments().expect_err("over the cap");
         assert_eq!(failure.code, DEPLOYMENT_LIMIT_EXCEEDED, "{failure:?}");
-        Ok(())
-    }
-
-    // ------------------------------------------------------------- H05
-
-    #[test]
-    fn backup_maturity_transitions_are_recorded_by_owning_operations_only() -> anyhow::Result<()> {
-        let temp = crate::filesystem::PrivateTempDir::new("nazauthctl-backup-maturity")?;
-        let store = TargetStateStore::open(temp.path().join("state"))?;
-        store.bootstrap(
-            "deploy-alpha",
-            sample_params("https://a.example", "nz-a"),
-            "op-1",
-        )?;
-
-        // Fresh state starts at Unknown: no explicit backup statement yet.
-        let state = store.load_existing("deploy-alpha")?;
-        assert_eq!(state.backup_maturity, BackupMaturity::Unknown);
-        assert_eq!(state.backup_maturity.token(), "unknown");
-        assert!(state.backup_maturity.observed_at().is_none());
-
-        // A foreign operation id is rejected: only an explicit backup
-        // operation owning the live revision may report maturity.
-        let foreign = store.record_backup_maturity(
-            "deploy-alpha",
-            BackupMaturity::NotConfigured {
-                observed_at: Utc::now(),
-            },
-            "not-the-owner",
-        );
-        assert!(foreign.is_err());
-        assert_eq!(
-            store.load_existing("deploy-alpha")?.backup_maturity,
-            BackupMaturity::Unknown,
-            "rejected writes change nothing"
-        );
-
-        let recorded = store.record_backup_maturity(
-            "deploy-alpha",
-            BackupMaturity::NotConfigured {
-                observed_at: Utc::now(),
-            },
-            "op-1",
-        )?;
-        assert_eq!(recorded.token(), "not-configured");
-
-        let configured = store.record_backup_maturity(
-            "deploy-alpha",
-            BackupMaturity::Configured {
-                observed_at: Utc::now(),
-            },
-            "op-1",
-        )?;
-        assert!(matches!(configured, BackupMaturity::Configured { .. }));
-
-        // The fact persists verbatim and never moves the CAS revision.
-        let state = store.load_existing("deploy-alpha")?;
-        assert_eq!(state.backup_maturity.token(), "configured");
-        assert!(state.backup_maturity.observed_at().is_some());
-        assert_eq!(state.config.revision, 1);
-
-        let verified = store.record_backup_maturity(
-            "deploy-alpha",
-            BackupMaturity::Verified {
-                observed_at: Utc::now(),
-            },
-            "op-1",
-        )?;
-        assert_eq!(verified.token(), "verified");
-
-        // Round-trips through strict deserialization.
-        let raw = std::fs::read_to_string(
-            temp.path()
-                .join("state/deployments/deploy-alpha/state.json"),
-        )?;
-        assert!(
-            raw.contains(r#""state": "verified""#) || raw.contains(r#""state":"verified""#),
-            "{raw}"
-        );
         Ok(())
     }
 }

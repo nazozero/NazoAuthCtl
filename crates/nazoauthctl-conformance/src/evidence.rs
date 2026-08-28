@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
-use nazo_operator_protocol::{PROTOCOL_VERSION, TenantResourceOperation, TenantResourceOutcome};
+use nazo_operator_protocol::{ControlResultData, TenantResourceIdentity};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use sha2::{Digest as _, Sha256};
@@ -19,8 +19,7 @@ const EVIDENCE_BUNDLE_SCHEMA: u32 = 4;
 /// Shared writer/retention-reader ceiling for the public screenshot manifest.
 pub(crate) const MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES: usize = 1024 * 1024;
 /// Schema 6 retains the runtime-signed OpenID4VP receipt provenance needed to
-/// re-verify a NazoAuthWeb result after process restart. Earlier schemas are
-/// accepted only for their Suite-origin screenshot source.
+/// re-verify a NazoAuthWeb result after process restart.
 pub(crate) const REVIEW_SCREENSHOT_MANIFEST_SCHEMA: u32 = 6;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -42,17 +41,10 @@ pub struct EvidenceDeploymentIdentity {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
-pub enum EvidenceSourceIdentity {
-    LegacyOperatorMatrix {
-        source_release: String,
-        matrix_sha256: String,
-        suite_origin: String,
-    },
-    SignedOidfArtifact {
-        suite_origin: String,
-        artifact: Box<VerifiedOidfArtifact>,
-    },
+#[serde(deny_unknown_fields)]
+pub struct EvidenceSourceIdentity {
+    pub suite_origin: String,
+    pub artifact: Box<VerifiedOidfArtifact>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -61,73 +53,37 @@ pub struct EvidenceBundleIdentity {
     pub run_jti: String,
     pub deployment: EvidenceDeploymentIdentity,
     pub source: EvidenceSourceIdentity,
-    /// Optional for legacy Suite-only evidence.  Ordinary provider evidence
-    /// must use [`write_private_provider_evidence_bundle`], which requires
-    /// this binding and validates every receipt before any file is written.
-    #[serde(default)]
-    pub provider: Option<EvidenceProviderIdentity>,
+    /// Controller-signed control operations which created and removed the
+    /// run-scoped resources. Every typed result is validated before any file
+    /// is written.
+    pub control: EvidenceControlIdentity,
     pub outer_cleanup_complete: bool,
 }
 
-/// Ordinary tenant-resource capability provenance captured in a conformance
-/// evidence bundle.  The compact JWS itself is intentionally not persisted;
-/// its digest and signed identity are enough to bind the evidence without
-/// copying capability payload or secret material into the evidence directory.
+/// Controller-operation provenance captured in an ordinary conformance
+/// evidence bundle. The compact JWS itself is intentionally not persisted;
+/// its signed identity and typed result bind the evidence without copying
+/// private material into the evidence directory.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct EvidenceProviderIdentity {
+pub struct EvidenceControlIdentity {
     pub deployment_id: String,
-    pub runtime_instance_id: String,
-    pub runtime: EvidenceRuntimeIdentity,
-    pub release: String,
-    pub runtime_revision: String,
-    pub protocol: u32,
-    pub build_id: String,
-    /// Capabilities are ordered by the provider state they observed.  A
-    /// successful Apply/Revoke advances the state, so later operations must
-    /// use a newly discovered capability at the resulting revision.
-    pub capabilities: Vec<EvidenceProviderCapability>,
+    pub tenant_id: String,
+    /// Ordered current control operations: baseline enumerate, Apply,
+    /// cleanup enumerate, then an optional Revoke when resources remained.
+    pub operations: Vec<EvidenceControlOperation>,
     pub cleanup_complete: bool,
 }
 
-/// One freshness-verified capability generation and only the receipts issued
-/// under that generation.  Deployment/runtime identity is retained once at
-/// [`EvidenceProviderIdentity`] and every receipt repeats the tenant and
-/// capability digest/JTI binding.
+/// One controller-signed operation and the closed result returned by the
+/// server-side operation journal.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct EvidenceProviderCapability {
-    pub capability_compact_sha256: String,
-    pub capability_jti: String,
-    pub tenant_id: String,
-    pub revision: u64,
-    pub resource_manifest_sha256: String,
-    pub receipts: Vec<EvidenceProviderReceipt>,
-}
-
-/// Receipt binding retained for each ordinary provider operation.  It keeps
-/// identity, CAS revision, manifest/change-set, and audit-chain fields while
-/// excluding signed payloads and resource configuration values.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct EvidenceProviderReceipt {
-    pub action: TenantResourceOperation,
-    pub compact_sha256: String,
-    pub jti: String,
+pub struct EvidenceControlOperation {
+    pub operation_id: String,
     pub request_sha256: String,
-    pub deployment_id: String,
-    pub tenant_id: String,
-    pub capability_jti: String,
-    pub capability_compact_sha256: String,
-    pub expected_revision: u64,
-    pub revision: u64,
-    pub change_set_id: String,
-    pub change_set_sha256: String,
-    pub baseline_manifest_sha256: String,
-    pub resource_manifest_sha256: String,
-    pub outcome: TenantResourceOutcome,
-    pub audit_sequence: u64,
-    pub audit_previous_sha256: String,
+    pub controller_kid: String,
+    pub result: ControlResultData,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -236,7 +192,7 @@ struct PrivateModuleEvidence<'a> {
     log: &'a serde_json::Value,
 }
 
-pub fn write_private_evidence_bundle(
+fn write_private_evidence_bundle(
     report: &ConformanceReport,
     root: &Path,
     identity: &EvidenceBundleIdentity,
@@ -440,29 +396,26 @@ fn validate_review_screenshot_path(path: &Path) -> Result<(), EvidenceError> {
     Ok(())
 }
 
-/// Writes evidence for an ordinary tenant-resource provider run.  Legacy
-/// Suite-only callers continue to use [`write_private_evidence_bundle`], but
-/// this entry point refuses to commit a bundle without the signed capability
-/// binding and receipt evidence.
-pub fn write_private_provider_evidence_bundle(
+/// Writes evidence for a controller-operation backed ordinary run.
+pub fn write_private_control_evidence_bundle(
     report: &ConformanceReport,
     root: &Path,
     identity: &EvidenceBundleIdentity,
-    recovery_binding: Option<&crate::recovery::TenantResourceRecoveryBinding>,
+    recovery_binding: &crate::recovery::TenantResourceRecoveryBinding,
 ) -> Result<EvidenceBundleReceipt, EvidenceError> {
-    validate_ordinary_provider_identity(report, identity)?;
-    validate_provider_vp_receipts(report, root, identity, recovery_binding)?;
+    validate_ordinary_control_identity(report, identity)?;
+    validate_control_vp_receipts(report, root, identity, recovery_binding)?;
     write_private_evidence_bundle(report, root, identity)
 }
 
 /// Re-check live-WebDriver VP receipts with the journal-owned discovery
-/// anchor before the final provider bundle copies any screenshot bytes.
+/// anchor before the final evidence bundle copies any screenshot bytes.
 #[cfg(unix)]
-fn validate_provider_vp_receipts(
+fn validate_control_vp_receipts(
     report: &ConformanceReport,
     root: &Path,
     identity: &EvidenceBundleIdentity,
-    recovery_binding: Option<&crate::recovery::TenantResourceRecoveryBinding>,
+    recovery_binding: &crate::recovery::TenantResourceRecoveryBinding,
 ) -> Result<(), EvidenceError> {
     for module in &report.modules {
         for screenshot in &module.review_screenshots {
@@ -482,8 +435,7 @@ fn validate_provider_vp_receipts(
                 continue;
             }
             let artifact_digest = vp_artifact_digest(identity)?;
-            let binding = recovery_binding.ok_or(EvidenceError::Identity)?;
-            let anchor = binding
+            let anchor = recovery_binding
                 .vp_evidence_trust_anchor
                 .as_ref()
                 .ok_or(EvidenceError::Identity)?;
@@ -491,7 +443,7 @@ fn validate_provider_vp_receipts(
                 .verification_receipt
                 .as_ref()
                 .ok_or(EvidenceError::Identity)?;
-            let context = ProviderVpReceiptContext {
+            let context = ControlVpReceiptContext {
                 artifact_digest,
                 matrix_sha256: &report.matrix_digest,
                 suite_plan_id: &module.suite_plan_id,
@@ -500,7 +452,7 @@ fn validate_provider_vp_receipts(
                 variant: &module.variant,
                 trigger_origin: &audit.trigger_origin,
             };
-            if !verify_provider_vp_receipt(receipt, anchor, binding, &context) {
+            if !verify_control_vp_receipt(receipt, anchor, binding, &context) {
                 return Err(EvidenceError::Identity);
             }
         }
@@ -510,29 +462,21 @@ fn validate_provider_vp_receipts(
 
 #[cfg(unix)]
 fn vp_artifact_digest(identity: &EvidenceBundleIdentity) -> Result<&str, EvidenceError> {
-    match &identity.source {
-        EvidenceSourceIdentity::SignedOidfArtifact { artifact, .. } => {
-            Ok(artifact.driver_manifest_sha256.as_str())
-        }
-        // Legacy evidence remains compatible only while it contains no
-        // NazoAuth-sourced VP image. Such an image needs the signed artifact
-        // digest to reconstruct the receipt context.
-        EvidenceSourceIdentity::LegacyOperatorMatrix { .. } => Err(EvidenceError::Identity),
-    }
+    Ok(identity.source.artifact.driver_manifest_sha256.as_str())
 }
 
 #[cfg(not(unix))]
-fn validate_provider_vp_receipts(
+fn validate_control_vp_receipts(
     _report: &ConformanceReport,
     _root: &Path,
     _identity: &EvidenceBundleIdentity,
-    _recovery_binding: Option<&crate::recovery::TenantResourceRecoveryBinding>,
+    _recovery_binding: &crate::recovery::TenantResourceRecoveryBinding,
 ) -> Result<(), EvidenceError> {
     Err(EvidenceError::UnsupportedPlatform)
 }
 
 #[cfg(unix)]
-struct ProviderVpReceiptContext<'a> {
+struct ControlVpReceiptContext<'a> {
     artifact_digest: &'a str,
     matrix_sha256: &'a str,
     suite_plan_id: &'a str,
@@ -543,11 +487,11 @@ struct ProviderVpReceiptContext<'a> {
 }
 
 #[cfg(unix)]
-fn verify_provider_vp_receipt(
+fn verify_control_vp_receipt(
     receipt: &crate::OpenId4VpVerificationReceiptProvenance,
     anchor: &crate::recovery::OpenId4VpEvidenceTrustAnchor,
     binding: &crate::recovery::TenantResourceRecoveryBinding,
-    context: &ProviderVpReceiptContext<'_>,
+    context: &ControlVpReceiptContext<'_>,
 ) -> bool {
     use time::format_description::well_known::Rfc3339;
 
@@ -581,7 +525,7 @@ fn verify_provider_vp_receipt(
         return false;
     };
     let context = nazo_operator_protocol::Openid4vpEvidenceContext {
-        run_jti: binding.request_jti.clone(),
+        run_jti: binding.run_id.clone(),
         artifact_sha256: context.artifact_digest.to_owned(),
         matrix_sha256: context.matrix_sha256.to_owned(),
         suite_plan_id: context.suite_plan_id.to_owned(),
@@ -649,7 +593,7 @@ fn verify_provider_vp_receipt(
 
 /// Commits the screenshot-to-current-module binding before Suite plan
 /// ownership can be retained. It intentionally references the root-private
-/// image files in place; the full provider evidence bundle later copies and
+/// image files in place; the full evidence bundle later copies and
 /// rebinds the same verified files into its own committed directory.
 pub fn write_review_screenshot_manifest(
     report: &ConformanceReport,
@@ -944,19 +888,15 @@ fn validate_review_screenshot_run_limit(report: &ConformanceReport) -> Result<()
     Ok(())
 }
 
-/// Validates ordinary provider evidence without touching the filesystem.  A
+/// Validates ordinary control-operation evidence without touching the filesystem. A
 /// cleanup failure is retained as evidence (`cleanup_complete=false`) and is
 /// therefore deliberately not rejected here; the caller decides whether that
 /// run is successful.
-pub fn validate_ordinary_provider_identity(
+pub fn validate_ordinary_control_identity(
     report: &ConformanceReport,
     identity: &EvidenceBundleIdentity,
 ) -> Result<(), EvidenceError> {
-    validate_identity(report, identity)?;
-    if identity.provider.is_none() {
-        return Err(EvidenceError::Identity);
-    }
-    Ok(())
+    validate_identity(report, identity)
 }
 
 /// Retention evidence must target an existing root-owned safe directory before
@@ -1010,239 +950,163 @@ fn validate_identity(
     if !valid_runtime_identity(&identity.deployment.runtime) {
         return Err(EvidenceError::Identity);
     }
-    let (matrix_sha256, suite_origin) = match &identity.source {
-        EvidenceSourceIdentity::LegacyOperatorMatrix {
-            source_release,
-            matrix_sha256,
-            suite_origin,
-        } => {
-            if !bounded(source_release, 128) || !lower_hex(matrix_sha256, 64) {
-                return Err(EvidenceError::Identity);
-            }
-            (matrix_sha256, suite_origin)
-        }
-        EvidenceSourceIdentity::SignedOidfArtifact {
-            suite_origin,
-            artifact,
-        } => {
-            if !lower_hex(&artifact.matrix_sha256, 64)
-                || !lower_hex(&artifact.driver_manifest_sha256, 64)
-                || !lower_hex(&artifact.driver_sha256, 64)
-            {
-                return Err(EvidenceError::Identity);
-            }
-            (&artifact.matrix_sha256, suite_origin)
-        }
-    };
+    let artifact = &identity.source.artifact;
+    if !lower_hex(&artifact.matrix_sha256, 64)
+        || !lower_hex(&artifact.driver_manifest_sha256, 64)
+        || !lower_hex(&artifact.driver_sha256, 64)
+    {
+        return Err(EvidenceError::Identity);
+    }
+    let matrix_sha256 = &artifact.matrix_sha256;
+    let suite_origin = &identity.source.suite_origin;
     if report.matrix_digest != *matrix_sha256 || report.suite_origin != *suite_origin {
         return Err(EvidenceError::Identity);
     }
-    if let Some(provider) = identity.provider.as_ref() {
-        validate_provider_identity(identity, provider)?;
+    validate_control_identity(identity, &identity.control)?;
+    Ok(())
+}
+
+fn validate_control_identity(
+    identity: &EvidenceBundleIdentity,
+    control: &EvidenceControlIdentity,
+) -> Result<(), EvidenceError> {
+    if control.deployment_id != identity.deployment.deployment_id
+        || !Uuid::parse_str(&control.tenant_id)
+            .ok()
+            .is_some_and(|tenant| tenant.hyphenated().to_string() == control.tenant_id)
+        || control.operations.len() < 3
+        || control.operations.len() > 4
+        || identity.outer_cleanup_complete != control.cleanup_complete
+    {
+        return Err(EvidenceError::Identity);
+    }
+
+    let mut operation_ids = std::collections::BTreeSet::new();
+    let baseline = control.operations.first().ok_or(EvidenceError::Identity)?;
+    let apply = control.operations.get(1).ok_or(EvidenceError::Identity)?;
+    let cleanup_enumerate = control.operations.get(2).ok_or(EvidenceError::Identity)?;
+    if !valid_control_operation(baseline)
+        || !valid_control_operation(apply)
+        || !valid_control_operation(cleanup_enumerate)
+        || !operation_ids.insert(baseline.operation_id.as_str())
+        || !operation_ids.insert(apply.operation_id.as_str())
+        || !operation_ids.insert(cleanup_enumerate.operation_id.as_str())
+    {
+        return Err(EvidenceError::Identity);
+    }
+    let ControlResultData::TenantResourceEnumerate {
+        revision: baseline_revision,
+        resource_manifest_sha256: baseline_manifest,
+        ..
+    } = &baseline.result
+    else {
+        return Err(EvidenceError::Identity);
+    };
+    let ControlResultData::TenantResourceApply {
+        revision: applied_revision,
+        resources: applied_resources,
+        resource_mappings,
+        resource_manifest_sha256: applied_manifest,
+    } = &apply.result
+    else {
+        return Err(EvidenceError::Identity);
+    };
+    let ControlResultData::TenantResourceEnumerate {
+        revision: cleanup_revision,
+        resources: cleanup_resources,
+        resource_manifest_sha256: cleanup_manifest,
+    } = &cleanup_enumerate.result
+    else {
+        return Err(EvidenceError::Identity);
+    };
+    if *applied_revision
+        != baseline_revision
+            .checked_add(1)
+            .ok_or(EvidenceError::Identity)?
+        || *cleanup_revision != *applied_revision
+        || !lower_hex(baseline_manifest, 64)
+        || !lower_hex(applied_manifest, 64)
+        || !lower_hex(cleanup_manifest, 64)
+        || !valid_resource_set(applied_resources)
+        || !valid_apply_mappings(resource_mappings, applied_resources)
+    {
+        return Err(EvidenceError::Identity);
+    }
+
+    match control.operations.get(3) {
+        None if control.cleanup_complete => {
+            if cleanup_resources
+                .iter()
+                .any(|candidate| applied_resources.iter().any(|applied| applied == candidate))
+                || cleanup_manifest != applied_manifest
+            {
+                return Err(EvidenceError::Identity);
+            }
+        }
+        None => {}
+        Some(revoke) => {
+            if !valid_control_operation(revoke)
+                || !operation_ids.insert(revoke.operation_id.as_str())
+            {
+                return Err(EvidenceError::Identity);
+            }
+            let ControlResultData::TenantResourceRevoke {
+                revision,
+                resources,
+                resource_manifest_sha256,
+            } = &revoke.result
+            else {
+                return Err(EvidenceError::Identity);
+            };
+            if *revision
+                != cleanup_revision
+                    .checked_add(1)
+                    .ok_or(EvidenceError::Identity)?
+                || resources != cleanup_resources
+                || resource_manifest_sha256 != baseline_manifest
+                || !valid_resource_set(resources)
+            {
+                return Err(EvidenceError::Identity);
+            }
+        }
     }
     Ok(())
 }
 
-fn validate_provider_identity(
-    identity: &EvidenceBundleIdentity,
-    provider: &EvidenceProviderIdentity,
-) -> Result<(), EvidenceError> {
-    if provider.deployment_id != identity.deployment.deployment_id
-        || provider.release != identity.deployment.release
-        || provider.runtime_revision != identity.deployment.revision
-        || provider.build_id != identity.deployment.build_id
-        || provider.runtime != identity.deployment.runtime
-        || crate::artifact::validate_identifier(&provider.runtime_instance_id, 128).is_err()
-        || !valid_runtime_identity(&provider.runtime)
-        || !bounded(&provider.release, 128)
-        || !bounded(&provider.runtime_revision, 128)
-        || provider.protocol != PROTOCOL_VERSION
-        || !bounded(&provider.build_id, 256)
-        || provider.capabilities.is_empty()
-        || identity.outer_cleanup_complete != provider.cleanup_complete
-    {
-        return Err(EvidenceError::Identity);
-    }
+fn valid_control_operation(operation: &EvidenceControlOperation) -> bool {
+    Uuid::parse_str(&operation.operation_id).is_ok()
+        && lower_hex(&operation.request_sha256, 64)
+        && operation.controller_kid.len() == 43
+        && operation
+            .controller_kid
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
 
-    let mut capability_jtis = std::collections::BTreeSet::new();
-    let mut capability_digests = std::collections::BTreeSet::new();
-    let mut receipt_jtis = std::collections::BTreeSet::new();
-    let mut last_audit_sequence = 0;
-    let mut previous_revision = None;
-    let mut previous_manifest = None;
-    let mut tenant_id = None;
-    let mut saw_apply = false;
-    let mut saw_enumerate = false;
-    let mut saw_revoke = false;
-    let mut apply_capability_index = None;
-    let mut apply_baseline_manifest = None;
-    let mut cleanup_enumerate_capability_index = None;
-    let mut cleanup_enumerate_manifest = None;
-    let mut revoke_capability_index = None;
-    let mut revoke_final_manifest = None;
-    let mut final_capability_has_enumerate = false;
+fn valid_resource_set(resources: &[TenantResourceIdentity]) -> bool {
+    !resources.is_empty()
+        && resources.len() <= nazo_operator_protocol::MAX_TENANT_RESOURCE_IDENTITIES
+        && resources.iter().all(|resource| {
+            crate::artifact::validate_identifier(&resource.resource_id, 256).is_ok()
+                && lower_hex(&resource.digest, 64)
+        })
+}
 
-    for (capability_index, capability) in provider.capabilities.iter().enumerate() {
-        if !lower_hex(&capability.capability_compact_sha256, 64)
-            || crate::artifact::validate_identifier(&capability.capability_jti, 128).is_err()
-            || !Uuid::parse_str(&capability.tenant_id)
-                .ok()
-                .is_some_and(|tenant| tenant.hyphenated().to_string() == capability.tenant_id)
-            || !lower_hex(&capability.resource_manifest_sha256, 64)
-            || capability.receipts.is_empty()
-            || !capability_jtis.insert(capability.capability_jti.as_str())
-            || !capability_digests.insert(capability.capability_compact_sha256.as_str())
-        {
-            return Err(EvidenceError::Identity);
-        }
-
-        if let Some(previous_tenant) = &tenant_id {
-            if previous_tenant != &capability.tenant_id {
-                return Err(EvidenceError::Identity);
-            }
-        } else {
-            tenant_id = Some(capability.tenant_id.clone());
-        }
-        if previous_revision != Some(capability.revision) && previous_revision.is_some() {
-            return Err(EvidenceError::Identity);
-        }
-        if previous_manifest.as_deref() != Some(capability.resource_manifest_sha256.as_str())
-            && previous_manifest.is_some()
-        {
-            return Err(EvidenceError::Identity);
-        }
-
-        let mut state_revision = capability.revision;
-        let mut state_manifest = capability.resource_manifest_sha256.clone();
-        let mut mutation_seen = false;
-        let mut capability_has_enumerate = false;
-        for receipt in &capability.receipts {
-            if mutation_seen
-                || !lower_hex(&receipt.compact_sha256, 64)
-                || crate::artifact::validate_identifier(&receipt.jti, 128).is_err()
-                || !lower_hex(&receipt.request_sha256, 64)
-                || receipt.deployment_id != provider.deployment_id
-                || receipt.tenant_id != capability.tenant_id
-                || receipt.capability_jti != capability.capability_jti
-                || receipt.capability_compact_sha256 != capability.capability_compact_sha256
-                || receipt.expected_revision != capability.revision
-                || receipt.baseline_manifest_sha256 != state_manifest
-                || !crate::artifact::validate_identifier(&receipt.change_set_id, 128).is_ok()
-                || !lower_hex(&receipt.change_set_sha256, 64)
-                || !lower_hex(&receipt.resource_manifest_sha256, 64)
-                || receipt.audit_sequence == 0
-                || receipt.audit_sequence <= last_audit_sequence
-                || !lower_hex(&receipt.audit_previous_sha256, 64)
-                || !receipt_jtis.insert(receipt.jti.as_str())
-            {
-                return Err(EvidenceError::Identity);
-            }
-            last_audit_sequence = receipt.audit_sequence;
-            if matches!(
-                receipt.action,
-                TenantResourceOperation::Apply | TenantResourceOperation::Revoke
-            ) && !capability_has_enumerate
-            {
-                return Err(EvidenceError::Identity);
-            }
-            if receipt.action == TenantResourceOperation::Revoke && !saw_apply {
-                return Err(EvidenceError::Identity);
-            }
-            match &receipt.outcome {
-                TenantResourceOutcome::Failed { code } => {
-                    if !bounded(code, 128) || receipt.revision != receipt.expected_revision {
-                        return Err(EvidenceError::Identity);
-                    }
-                }
-                TenantResourceOutcome::Succeeded => match receipt.action {
-                    TenantResourceOperation::Enumerate => {
-                        if receipt.revision != receipt.expected_revision
-                            || receipt.resource_manifest_sha256 != state_manifest
-                        {
-                            return Err(EvidenceError::Identity);
-                        }
-                        saw_enumerate = true;
-                        capability_has_enumerate = true;
-                        if apply_capability_index.is_some_and(|index| capability_index > index) {
-                            cleanup_enumerate_capability_index.get_or_insert(capability_index);
-                            cleanup_enumerate_manifest
-                                .get_or_insert_with(|| receipt.resource_manifest_sha256.clone());
-                        }
-                    }
-                    TenantResourceOperation::Apply | TenantResourceOperation::Revoke => {
-                        if receipt.revision
-                            != receipt
-                                .expected_revision
-                                .checked_add(1)
-                                .ok_or(EvidenceError::Identity)?
-                        {
-                            return Err(EvidenceError::Identity);
-                        }
-                        mutation_seen = true;
-                        state_revision = receipt.revision;
-                        state_manifest = receipt.resource_manifest_sha256.clone();
-                        if receipt.action == TenantResourceOperation::Apply {
-                            if !capability_has_enumerate || saw_apply {
-                                return Err(EvidenceError::Identity);
-                            }
-                            saw_apply = true;
-                            apply_capability_index.get_or_insert(capability_index);
-                            apply_baseline_manifest =
-                                Some(capability.resource_manifest_sha256.clone());
-                        } else {
-                            if !capability_has_enumerate
-                                || saw_revoke
-                                || !saw_apply
-                                || cleanup_enumerate_capability_index
-                                    .is_none_or(|index| capability_index < index)
-                            {
-                                return Err(EvidenceError::Identity);
-                            }
-                            saw_revoke = true;
-                            revoke_capability_index.get_or_insert(capability_index);
-                            revoke_final_manifest = Some(receipt.resource_manifest_sha256.clone());
-                        }
-                    }
-                },
-            }
-        }
-        previous_revision = Some(state_revision);
-        previous_manifest = Some(state_manifest);
-        final_capability_has_enumerate = capability_has_enumerate;
-    }
-
-    if !saw_apply || !saw_enumerate {
-        return Err(EvidenceError::Identity);
-    }
-    let Some(apply_baseline_manifest) = apply_baseline_manifest else {
-        return Err(EvidenceError::Identity);
-    };
-    if provider.cleanup_complete {
-        let Some(cleanup_enumerate_manifest) = cleanup_enumerate_manifest else {
-            return Err(EvidenceError::Identity);
-        };
-        if !final_capability_has_enumerate {
-            return Err(EvidenceError::Identity);
-        }
-        if cleanup_enumerate_manifest != apply_baseline_manifest {
-            if !saw_revoke
-                || revoke_capability_index <= apply_capability_index
-                || revoke_capability_index != Some(provider.capabilities.len() - 1)
-                || revoke_final_manifest.as_deref() != Some(apply_baseline_manifest.as_str())
-            {
-                return Err(EvidenceError::Identity);
-            }
-        } else if saw_revoke
-            && revoke_final_manifest.as_deref() != Some(apply_baseline_manifest.as_str())
-        {
-            return Err(EvidenceError::Identity);
-        }
-    } else if saw_revoke
-        && revoke_final_manifest.as_deref() != Some(apply_baseline_manifest.as_str())
-    {
-        return Err(EvidenceError::Identity);
-    }
-    Ok(())
+fn valid_apply_mappings(
+    mappings: &[nazo_operator_protocol::TenantResourceMapping],
+    resources: &[TenantResourceIdentity],
+) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    mappings.iter().all(|mapping| {
+        crate::artifact::validate_identifier(&mapping.resource_id, 256).is_ok()
+            && !mapping.public_id.is_empty()
+            && mapping.public_id.len() <= 512
+            && !mapping.public_id.chars().any(char::is_control)
+            && resources.iter().any(|resource| {
+                resource.kind == mapping.kind && resource.resource_id == mapping.resource_id
+            })
+            && seen.insert((mapping.kind, mapping.resource_id.as_str()))
+    })
 }
 
 fn valid_runtime_identity(runtime: &EvidenceRuntimeIdentity) -> bool {
@@ -1313,556 +1177,3 @@ impl std::fmt::Display for EvidenceError {
 }
 
 impl std::error::Error for EvidenceError {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::report::OrchestrationIntegrity;
-    use crate::{CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport, ProgressSnapshot};
-
-    fn report() -> ConformanceReport {
-        ConformanceReport {
-            schema: 3,
-            matrix_digest: "c".repeat(64),
-            suite_origin: "https://suite.example".to_owned(),
-            auth_probe: None,
-            errors: Vec::new(),
-            local_success: true,
-            suite_pass: true,
-            acceptance_pass: true,
-            review_pending: false,
-            human_review_required: false,
-            human_review_modules: Vec::new(),
-            deferred_review_modules: Vec::new(),
-            skipped_modules: Vec::new(),
-            expected_skipped_modules: Vec::new(),
-            unexpected_skipped_modules: Vec::new(),
-            unknown_declared_skip_modules: Vec::new(),
-            matrix_expectations_satisfied: true,
-            failed_modules: Vec::new(),
-            incomplete_modules: Vec::new(),
-            orchestration_integrity: OrchestrationIntegrity {
-                defined_modules: 1,
-                created_instances: 1,
-                terminal_modules: 1,
-                all_modules_instantiated: true,
-                all_modules_terminal: true,
-                all_modules_settled: true,
-                deferred_review_modules: 0,
-                cleanup_complete: true,
-                retention_requested: false,
-                retention_eligible: false,
-                retention_candidate_settled: false,
-                retention_committed: false,
-                suite_resources_settled: true,
-            },
-            progress: ProgressSnapshot {
-                completed: 1,
-                total: 1,
-                groups: Vec::new(),
-                passed_groups: 1,
-                review_groups: 0,
-                skipped_groups: 0,
-                failed_groups: 0,
-                running_groups: 0,
-                remaining_groups: 0,
-                passed: 1,
-                reviewed: 0,
-                skipped: 0,
-                failed: 0,
-                running: 0,
-                remaining: 0,
-                current_profile: None,
-                current_variant: None,
-                current_test: None,
-            },
-            plans: Vec::new(),
-            modules: vec![ModuleReport {
-                matrix_plan_id: "plan-a".to_owned(),
-                suite_plan_id: "suite-plan-a".to_owned(),
-                module_id: Some("module-a".to_owned()),
-                test_name: "test-a".to_owned(),
-                variant: Default::default(),
-                terminal: true,
-                deferred_review_pending: None,
-                official_status: Some("FINISHED".to_owned()),
-                official_result: Some("PASSED".to_owned()),
-                expected_result: None,
-                outcome: ModuleOutcome::Passed,
-                human_review_required: false,
-                blocking_log_results: Vec::new(),
-                advisory_log_results: Vec::new(),
-                review_screenshots: Vec::new(),
-                review_screenshots_required: 0,
-                review_screenshots_required_captured: 0,
-                review_screenshots_missing: 0,
-                info: serde_json::json!({"status":"FINISHED","result":"PASSED"}),
-                log: serde_json::json!({"entries":1,"present":true}),
-                raw_info: serde_json::json!({"status":"FINISHED","secret":"private"}),
-                raw_log: serde_json::json!([{"message":"raw-private"}]),
-            }],
-            cleanup: CleanupReport::default(),
-        }
-    }
-
-    fn identity() -> EvidenceBundleIdentity {
-        EvidenceBundleIdentity {
-            run_jti: "request-0123456789abcdef0123456789abcdef".to_owned(),
-            deployment: EvidenceDeploymentIdentity {
-                deployment_id: "deployment-a".to_owned(),
-                target_issuer: "https://issuer.example".to_owned(),
-                release: "v1.2.3".to_owned(),
-                revision: "a".repeat(40),
-                build_id: "build-a".to_owned(),
-                runtime: EvidenceRuntimeIdentity::HostBinary {
-                    sha256: "b".repeat(64),
-                },
-            },
-            source: EvidenceSourceIdentity::LegacyOperatorMatrix {
-                source_release: "v5.2.2".to_owned(),
-                matrix_sha256: "c".repeat(64),
-                suite_origin: "https://suite.example".to_owned(),
-            },
-            provider: None,
-            outer_cleanup_complete: true,
-        }
-    }
-
-    #[test]
-    fn public_report_includes_stable_skip_expectation_summary() {
-        let encoded = report().to_json_bytes().expect("report JSON");
-        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("report value");
-
-        assert_eq!(value["expected_skipped_modules"], serde_json::json!([]));
-        assert_eq!(value["unexpected_skipped_modules"], serde_json::json!([]));
-        assert_eq!(
-            value["unknown_declared_skip_modules"],
-            serde_json::json!([])
-        );
-        assert_eq!(
-            value["matrix_expectations_satisfied"],
-            serde_json::json!(true)
-        );
-        assert_eq!(value["acceptance_pass"], serde_json::json!(true));
-    }
-
-    #[test]
-    fn screenshot_manifest_writer_rejects_more_than_sixty_four_optional_misses() {
-        let mut report = report();
-        report.modules[0].review_screenshots_missing = 65;
-        assert_eq!(
-            validate_review_screenshot_run_limit(&report),
-            Err(EvidenceError::Identity)
-        );
-    }
-
-    struct ReceiptSpec<'a> {
-        action: TenantResourceOperation,
-        capability_jti: &'a str,
-        capability_compact_sha256: &'a str,
-        expected_revision: u64,
-        revision: u64,
-        baseline_manifest_sha256: &'a str,
-        resource_manifest_sha256: &'a str,
-        jti: &'a str,
-        compact_sha256: &'a str,
-        audit_sequence: u64,
-    }
-
-    fn receipt(spec: ReceiptSpec<'_>) -> EvidenceProviderReceipt {
-        let ReceiptSpec {
-            action,
-            capability_jti,
-            capability_compact_sha256,
-            expected_revision,
-            revision,
-            baseline_manifest_sha256,
-            resource_manifest_sha256,
-            jti,
-            compact_sha256,
-            audit_sequence,
-        } = spec;
-        EvidenceProviderReceipt {
-            action,
-            compact_sha256: compact_sha256.to_owned(),
-            jti: jti.to_owned(),
-            request_sha256: "b".repeat(64),
-            deployment_id: "deployment-a".to_owned(),
-            tenant_id: Uuid::nil().to_string(),
-            capability_jti: capability_jti.to_owned(),
-            capability_compact_sha256: capability_compact_sha256.to_owned(),
-            expected_revision,
-            revision,
-            change_set_id: format!("change-set-{audit_sequence}"),
-            change_set_sha256: "c".repeat(64),
-            baseline_manifest_sha256: baseline_manifest_sha256.to_owned(),
-            resource_manifest_sha256: resource_manifest_sha256.to_owned(),
-            outcome: TenantResourceOutcome::Succeeded,
-            audit_sequence,
-            audit_previous_sha256: "0".repeat(64),
-        }
-    }
-
-    fn provider() -> EvidenceProviderIdentity {
-        let tenant_id = Uuid::nil().to_string();
-        EvidenceProviderIdentity {
-            deployment_id: "deployment-a".to_owned(),
-            runtime_instance_id: "runtime-a".to_owned(),
-            runtime: EvidenceRuntimeIdentity::HostBinary {
-                sha256: "b".repeat(64),
-            },
-            release: "v1.2.3".to_owned(),
-            runtime_revision: "a".repeat(40),
-            protocol: 1,
-            build_id: "build-a".to_owned(),
-            capabilities: vec![
-                EvidenceProviderCapability {
-                    capability_compact_sha256: "d".repeat(64),
-                    capability_jti: "capability-0123456789abcdef".to_owned(),
-                    tenant_id: tenant_id.clone(),
-                    revision: 7,
-                    resource_manifest_sha256: "e".repeat(64),
-                    receipts: vec![
-                        receipt(ReceiptSpec {
-                            action: TenantResourceOperation::Enumerate,
-                            capability_jti: "capability-0123456789abcdef",
-                            capability_compact_sha256: &"d".repeat(64),
-                            expected_revision: 7,
-                            revision: 7,
-                            baseline_manifest_sha256: &"e".repeat(64),
-                            resource_manifest_sha256: &"e".repeat(64),
-                            jti: "receipt-0123456789abcdef",
-                            compact_sha256: &"a".repeat(64),
-                            audit_sequence: 1,
-                        }),
-                        receipt(ReceiptSpec {
-                            action: TenantResourceOperation::Apply,
-                            capability_jti: "capability-0123456789abcdef",
-                            capability_compact_sha256: &"d".repeat(64),
-                            expected_revision: 7,
-                            revision: 8,
-                            baseline_manifest_sha256: &"e".repeat(64),
-                            resource_manifest_sha256: &"f".repeat(64),
-                            jti: "receipt-1123456789abcdef",
-                            compact_sha256: &"b".repeat(64),
-                            audit_sequence: 2,
-                        }),
-                    ],
-                },
-                EvidenceProviderCapability {
-                    capability_compact_sha256: "9".repeat(64),
-                    capability_jti: "capability-1123456789abcdef".to_owned(),
-                    tenant_id,
-                    revision: 8,
-                    resource_manifest_sha256: "f".repeat(64),
-                    receipts: vec![
-                        receipt(ReceiptSpec {
-                            action: TenantResourceOperation::Enumerate,
-                            capability_jti: "capability-1123456789abcdef",
-                            capability_compact_sha256: &"9".repeat(64),
-                            expected_revision: 8,
-                            revision: 8,
-                            baseline_manifest_sha256: &"f".repeat(64),
-                            resource_manifest_sha256: &"f".repeat(64),
-                            jti: "receipt-2123456789abcdef",
-                            compact_sha256: &"c".repeat(64),
-                            audit_sequence: 3,
-                        }),
-                        receipt(ReceiptSpec {
-                            action: TenantResourceOperation::Revoke,
-                            capability_jti: "capability-1123456789abcdef",
-                            capability_compact_sha256: &"9".repeat(64),
-                            expected_revision: 8,
-                            revision: 9,
-                            baseline_manifest_sha256: &"f".repeat(64),
-                            resource_manifest_sha256: &"e".repeat(64),
-                            jti: "receipt-3123456789abcdef",
-                            compact_sha256: &"e".repeat(64),
-                            audit_sequence: 4,
-                        }),
-                    ],
-                },
-            ],
-            cleanup_complete: true,
-        }
-    }
-
-    #[test]
-    fn identity_must_match_report_before_any_filesystem_access() {
-        let mut identity = identity();
-        if let EvidenceSourceIdentity::LegacyOperatorMatrix { matrix_sha256, .. } =
-            &mut identity.source
-        {
-            *matrix_sha256 = "d".repeat(64);
-        }
-        assert_eq!(
-            write_private_evidence_bundle(&report(), Path::new("relative"), &identity),
-            Err(EvidenceError::Identity)
-        );
-    }
-
-    #[test]
-    fn ordinary_provider_evidence_requires_capability_binding() {
-        assert_eq!(
-            validate_ordinary_provider_identity(&report(), &identity()),
-            Err(EvidenceError::Identity)
-        );
-    }
-
-    #[test]
-    fn ordinary_provider_evidence_accepts_same_capability_cleanup_sequence() {
-        let mut identity = identity();
-        identity.provider = Some(provider());
-        validate_ordinary_provider_identity(&report(), &identity)
-            .expect("cleanup capability may enumerate before its exact revoke");
-    }
-
-    #[test]
-    fn ordinary_provider_evidence_accepts_cleanup_failure_as_recorded_state() {
-        let mut identity = identity();
-        let mut provider = provider();
-        provider.cleanup_complete = false;
-        let cleanup = provider
-            .capabilities
-            .last_mut()
-            .expect("cleanup capability")
-            .receipts
-            .last_mut()
-            .expect("cleanup receipt");
-        cleanup.outcome = TenantResourceOutcome::Failed {
-            code: "cleanup-failed".to_owned(),
-        };
-        cleanup.revision = cleanup.expected_revision;
-        cleanup.resource_manifest_sha256 = cleanup.baseline_manifest_sha256.clone();
-        identity.outer_cleanup_complete = false;
-        identity.provider = Some(provider);
-        validate_ordinary_provider_identity(&report(), &identity)
-            .expect("cleanup failure is evidence, not a write blocker");
-    }
-
-    #[test]
-    fn ordinary_provider_evidence_rejects_cross_capability_receipts_and_state_gaps() {
-        let mut first_identity = identity();
-        let mut first_provider = provider();
-        first_provider.capabilities[1].receipts[0].capability_jti =
-            first_provider.capabilities[0].capability_jti.clone();
-        first_identity.provider = Some(first_provider);
-        assert_eq!(
-            validate_ordinary_provider_identity(&report(), &first_identity),
-            Err(EvidenceError::Identity)
-        );
-
-        let mut second_identity = identity();
-        let mut second_provider = provider();
-        second_provider.capabilities[1].revision = 7;
-        second_identity.provider = Some(second_provider);
-        assert_eq!(
-            validate_ordinary_provider_identity(&report(), &second_identity),
-            Err(EvidenceError::Identity)
-        );
-
-        let mut third_identity = identity();
-        let mut third_provider = provider();
-        third_provider.capabilities[1].capability_jti =
-            third_provider.capabilities[0].capability_jti.clone();
-        third_identity.provider = Some(third_provider);
-        assert_eq!(
-            validate_ordinary_provider_identity(&report(), &third_identity),
-            Err(EvidenceError::Identity)
-        );
-    }
-
-    #[test]
-    fn ordinary_provider_evidence_accepts_already_absent_cleanup_without_revoke() {
-        let mut identity = identity();
-        let mut provider = provider();
-        let apply = &mut provider.capabilities[0].receipts[1];
-        apply.resource_manifest_sha256 = "e".repeat(64);
-        let cleanup = &mut provider.capabilities[1];
-        cleanup.resource_manifest_sha256 = "e".repeat(64);
-        cleanup.receipts.truncate(1);
-        cleanup.receipts[0].baseline_manifest_sha256 = "e".repeat(64);
-        cleanup.receipts[0].resource_manifest_sha256 = "e".repeat(64);
-        identity.provider = Some(provider);
-        validate_ordinary_provider_identity(&report(), &identity)
-            .expect("cleanup enumerate proves run resources were already absent");
-    }
-
-    #[test]
-    fn ordinary_provider_evidence_requires_revoke_when_cleanup_enumerate_still_has_run_state() {
-        let mut first_identity = identity();
-        let mut first_provider = provider();
-        first_provider.capabilities[1].receipts.truncate(1);
-        first_identity.provider = Some(first_provider);
-        assert_eq!(
-            validate_ordinary_provider_identity(&report(), &first_identity),
-            Err(EvidenceError::Identity)
-        );
-
-        let mut second_identity = identity();
-        let mut second_provider = provider();
-        second_provider.capabilities[1].receipts[1].resource_manifest_sha256 = "h".repeat(64);
-        second_identity.provider = Some(second_provider);
-        assert_eq!(
-            validate_ordinary_provider_identity(&report(), &second_identity),
-            Err(EvidenceError::Identity)
-        );
-    }
-
-    #[cfg(not(unix))]
-    #[test]
-    fn private_evidence_refuses_platforms_without_owner_only_file_proof() {
-        assert_eq!(
-            write_private_evidence_bundle(&report(), Path::new("relative"), &identity()),
-            Err(EvidenceError::UnsupportedPlatform)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unique_run_bundle_commits_manifest_last_and_binds_raw_files() {
-        let temp_root = std::env::temp_dir()
-            .canonicalize()
-            .expect("resolve system temporary directory");
-        let root = temp_root.join(format!("nazoauth-evidence-{}", uuid::Uuid::now_v7()));
-        let receipt =
-            write_private_evidence_bundle(&report(), &root, &identity()).expect("evidence bundle");
-        assert_eq!(receipt.module_count, 1);
-        let manifest = std::fs::read(receipt.directory.join("manifest.json")).expect("manifest");
-        assert_eq!(sha256(&manifest), receipt.manifest_sha256);
-        let module = std::fs::read_to_string(receipt.directory.join("module-0000.json"))
-            .expect("private module");
-        assert!(module.contains("raw-private"));
-        assert!(module.contains(&receipt.evidence_jti));
-        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn ordinary_provider_bundle_persists_capability_receipt_bindings() {
-        let temp_root = std::env::temp_dir()
-            .canonicalize()
-            .expect("resolve system temporary directory");
-        let root = temp_root.join(format!("nazoauth-provider-evidence-{}", Uuid::now_v7()));
-        let mut identity = identity();
-        identity.provider = Some(provider());
-        let report = report();
-        let expected_report = report.to_json_bytes().expect("serialize public report");
-        let receipt = write_private_provider_evidence_bundle(&report, &root, &identity, None)
-            .expect("ordinary provider evidence bundle");
-        assert_eq!(
-            std::fs::read(receipt.directory.join("report.json")).expect("public report"),
-            expected_report
-        );
-        let manifest =
-            std::fs::read_to_string(receipt.directory.join("manifest.json")).expect("manifest");
-        let manifest: serde_json::Value = serde_json::from_str(&manifest).expect("JSON manifest");
-        let provider = &manifest["identity"]["provider"];
-        assert_eq!(
-            provider["capabilities"][0]["capability_jti"],
-            "capability-0123456789abcdef"
-        );
-        assert_eq!(provider["deployment_id"], "deployment-a");
-        assert_eq!(
-            provider["capabilities"][0]["tenant_id"],
-            Uuid::nil().to_string()
-        );
-        assert_eq!(provider["cleanup_complete"], true);
-        assert_eq!(
-            provider["capabilities"][0]["receipts"][0]["action"],
-            "enumerate"
-        );
-        assert_eq!(
-            provider["capabilities"][0]["receipts"][0]["compact_sha256"],
-            "a".repeat(64)
-        );
-        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn legacy_provider_evidence_without_nazo_vp_screenshots_remains_compatible() {
-        let temp_root = std::env::temp_dir()
-            .canonicalize()
-            .expect("resolve system temporary directory");
-        let root = temp_root.join(format!("nazoauth-provider-legacy-{}", Uuid::now_v7()));
-        let mut legacy = identity();
-        legacy.provider = Some(provider());
-        write_private_provider_evidence_bundle(&report(), &root, &legacy, None)
-            .expect("legacy evidence without a Nazo VP receipt remains supported");
-        assert_eq!(vp_artifact_digest(&legacy), Err(EvidenceError::Identity));
-        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn legacy_provider_evidence_with_nazo_vp_receipt_fails_before_bundle_publish() {
-        let temp_root = std::env::temp_dir()
-            .canonicalize()
-            .expect("resolve system temporary directory");
-        let root = temp_root.join(format!("nazoauth-provider-legacy-vp-{}", Uuid::now_v7()));
-        let root = crate::secure_file::ensure_directory(&root, true).expect("evidence root");
-        let run = "request-0123456789abcdef0123456789abcdef";
-        let relative = PathBuf::from("review-screenshots")
-            .join(run)
-            .join("plan-a--module-a--000.png");
-        let parent = root
-            .join(&relative)
-            .parent()
-            .expect("capture parent")
-            .to_owned();
-        crate::secure_file::ensure_directory(&parent, true).expect("capture parent");
-        let audit = serde_json::json!({
-            "suite_plan_id": "suite-plan-a",
-            "module_id": "module-a",
-            "test_name": "test-a",
-            "variant": {},
-            "marker": "required",
-            "obligation_index": 0,
-            "path": relative,
-            "sha256": "a".repeat(64),
-            "size": 1,
-            "trigger_origin": "https://issuer.example",
-            "trigger_path": "/ui/verification-result",
-            "trigger_url_sha256": "b".repeat(64),
-            "source": "nazo-vp-verification-result/live-webdriver",
-            "verification_receipt": serde_json::Value::Null,
-        });
-        let audit_path = root
-            .join("review-screenshots")
-            .join(run)
-            .join("plan-a--module-a--000.png.receipt.json");
-        crate::secure_file::write_atomic(
-            &audit_path,
-            &serde_json::to_vec(&audit).expect("audit JSON"),
-            true,
-        )
-        .expect("audit receipt");
-        let mut legacy = identity();
-        legacy.provider = Some(provider());
-        let mut report = report();
-        report.modules[0]
-            .review_screenshots
-            .push(crate::ReviewScreenshotReport {
-                path: PathBuf::from("review-screenshots")
-                    .join(run)
-                    .join("plan-a--module-a--000.png"),
-                sha256: "a".repeat(64),
-                size: 1,
-            });
-        assert_eq!(
-            write_private_provider_evidence_bundle(&report, &root, &legacy, None),
-            Err(EvidenceError::Identity)
-        );
-        assert!(
-            !std::fs::read_dir(&root)
-                .expect("evidence root listing")
-                .any(|entry| entry
-                    .expect("evidence entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("run-"))
-        );
-        std::fs::remove_dir_all(&root).expect("remove isolated test directory");
-    }
-}

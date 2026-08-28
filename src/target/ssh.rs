@@ -29,22 +29,30 @@
 //! `REMOTE_HELPER_MISMATCH` and names the exact upgrade command.
 
 use std::{
-    cell::RefCell, ffi::OsString, io::IsTerminal as _, path::PathBuf,
-    process::Command as StdCommand, time::Duration,
+    cell::RefCell,
+    ffi::OsString,
+    io::IsTerminal as _,
+    net::{TcpListener, TcpStream},
+    path::PathBuf,
+    process::{Child, Command as StdCommand, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail};
 use uuid::Uuid;
+
+use crate::error_codes::REMOTE_HELPER_MISMATCH;
 
 use crate::process::Process;
 use crate::registry::{HostPrivilege, HostRecord, HostTransport};
 
 use super::{
     ControlOperationReceipt, ExecutionTarget, HealthSnapshot, HostOverview, InstanceInspection,
+    accepted_control_operation_receipt,
     wire::{
         HOST_ERR_OPERATION_INVALID, HostCompletionBody, HostOperation, HostOutcome, HostResult,
-        REMOTE_HELPER_MISMATCH, RemoteHello, encode_host_operation, parse_host_result, sanitize,
-        verify_remote_hello,
+        RemoteHello, encode_host_operation, parse_host_result, sanitize, verify_remote_hello,
     },
 };
 
@@ -61,10 +69,113 @@ pub const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(600);
 /// reads the instruction; nothing ever captures the password itself.
 const HOST_ERR_SUDO_PASSWORD_REQUIRED: &str = crate::error_codes::SUDO_PASSWORD_REQUIRED;
 
+/// Startup budget for the one-purpose recovery tunnel.  `ExitOnForwardFailure`
+/// makes a bind or remote-connect refusal terminal; the local probe only
+/// distinguishes that refusal from an SSH process which is still starting.
+const RECOVERY_FORWARD_START_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A short-lived, loopback-only OpenSSH forward used exclusively for the
+/// controller-key recovery ceremony.  It deliberately is not a general SSH
+/// transport: callers receive only the randomized local port and no facility
+/// to choose a remote host, destination, or request path.
+pub(crate) struct RecoverySshForward {
+    child: Child,
+    local_port: u16,
+}
+
+impl RecoverySshForward {
+    /// Start `ssh -N -L` with independent argv tokens.  `profile` is the
+    /// registry's already-validated OpenSSH Host alias and `remote_port` is
+    /// the candidate endpoint's immutable loopback port.
+    pub(crate) fn start(profile: &str, remote_port: u16) -> anyhow::Result<Self> {
+        if !is_safe_ssh_profile(profile) {
+            bail!("recovery tunnel requires a valid OpenSSH Host alias");
+        }
+        if remote_port == 0 {
+            bail!("recovery tunnel requires a non-zero candidate loopback port");
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .context("recovery tunnel could not reserve a local loopback port")?;
+        let local_port = listener
+            .local_addr()
+            .context("recovery tunnel could not read the local loopback port")?
+            .port();
+        drop(listener);
+
+        let argv = recovery_forward_argv(profile, local_port, remote_port);
+        let mut child = StdCommand::new(SSH_PROGRAM)
+            .args(argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to start recovery SSH forward for '{profile}'"))?;
+
+        let deadline = Instant::now() + RECOVERY_FORWARD_START_TIMEOUT;
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .context("failed to observe recovery SSH forward startup")?
+            {
+                bail!("recovery SSH forward for '{profile}' exited during startup ({status})");
+            }
+            if TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], local_port)),
+                Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                return Ok(Self { child, local_port });
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("recovery SSH forward for '{profile}' did not open its loopback listener");
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    pub(crate) fn local_port(&self) -> u16 {
+        self.local_port
+    }
+}
+
+impl Drop for RecoverySshForward {
+    fn drop(&mut self) {
+        // This child owns precisely one `-N -L` process.  Always reap it so a
+        // failure or crash-resume never leaves a credential-bearing forward.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn is_safe_ssh_profile(profile: &str) -> bool {
+    !profile.is_empty()
+        && profile.len() <= 128
+        && !profile.starts_with('-')
+        && profile.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b':' | b'_' | b'+' | b'-')
+        })
+}
+
+fn recovery_forward_argv(profile: &str, local_port: u16, remote_port: u16) -> Vec<String> {
+    vec![
+        "-N".to_owned(),
+        "-o".to_owned(),
+        "ExitOnForwardFailure=yes".to_owned(),
+        "-L".to_owned(),
+        format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"),
+        profile.to_owned(),
+    ]
+}
+
 /// An SSH-attached host reached through the system OpenSSH client.
 #[derive(Debug)]
 pub struct SshTarget {
     profile: String,
+    registered_host_id: Option<Uuid>,
+    host_alias: String,
     privilege: HostPrivilege,
     remote_exec_basename: String,
     /// Test seam only. Production value: [`SSH_PROGRAM`].
@@ -84,6 +195,8 @@ impl SshTarget {
             .clone()
             .context("the ssh host record carries no OpenSSH profile")?;
         Ok(Self {
+            registered_host_id: (!record.host_id.is_nil()).then_some(record.host_id),
+            host_alias: record.alias.clone(),
             privilege: record.privilege,
             remote_exec_basename: record
                 .remote_exec_path
@@ -268,6 +381,9 @@ impl SshTarget {
                 self.remote_exec_basename
             );
         }
+        if let Some(host_id) = self.registered_host_id {
+            crate::registry::verify_registered_target_identity(host_id, &self.host_alias, &hello)?;
+        }
         *self.handshake.borrow_mut() = Some(hello.clone());
         Ok(hello)
     }
@@ -419,16 +535,18 @@ impl ExecutionTarget for SshTarget {
 
     fn execute_control_operation(
         &self,
-        request: &super::ControlOperationRequest,
+        request: super::ControlOperationRequest,
     ) -> anyhow::Result<ControlOperationReceipt> {
         use super::control_exec::CONTROL_OUTCOME_UNKNOWN;
         // The signed envelope is public data (no secret material), so it
         // rides the handshake-gated stdio contract like every other kind and
         // the target journals the delivery under its C07 contract.
+        let request_operation_id = request.operation_id.clone();
         let operation = HostOperation::control_operation(
-            request.operation_id.clone(),
-            request.deployment_id.clone(),
-            request.compact_jws.clone(),
+            request.operation_id,
+            request.deployment_id,
+            request.compact_jws,
+            request.change_set,
         );
         operation.validate().map_err(|rejection| {
             anyhow::anyhow!(
@@ -444,21 +562,7 @@ impl ExecutionTarget for SshTarget {
                     HostCompletionBody::ControlOperationExecuted {
                         result: control_result,
                     },
-            } => {
-                if control_result.operation_id != request.operation_id {
-                    bail!(
-                        "{HOST_ERR_OPERATION_INVALID}: the helper answered operation '{}' while \
-                         '{}' was presented",
-                        control_result.operation_id,
-                        request.operation_id
-                    );
-                }
-                Ok(ControlOperationReceipt {
-                    operation_id: request.operation_id.clone(),
-                    accepted: true,
-                    result: Some(control_result),
-                })
-            }
+            } => accepted_control_operation_receipt(request_operation_id.clone(), control_result),
             HostOutcome::Completed { .. } => bail!(
                 "{HOST_ERR_OPERATION_INVALID}: the helper on '{}' answered an unexpected \
                  completion instead of a ControlOperation result",
@@ -472,9 +576,10 @@ impl ExecutionTarget for SshTarget {
                 }
                 // Admission-grade refusal before acceptance.
                 Ok(ControlOperationReceipt {
-                    operation_id: request.operation_id.clone(),
+                    operation_id: request_operation_id,
                     accepted: false,
                     result: None,
+                    rejection_code: Some(code),
                 })
             }
         }
@@ -504,12 +609,31 @@ mod tests {
     use crate::filesystem;
     use crate::registry::HostRecord;
     use crate::target::wire::{
-        HELLO_PRODUCT, HOST_PROTOCOL_SCHEMA, LOCAL_BUILD_COMMIT, local_hello,
+        HELLO_PRODUCT, HOST_PROTOCOL_SCHEMA, HostOperationBody, LOCAL_BUILD_COMMIT, local_hello,
+        parse_host_operation,
     };
     use std::fs;
 
     const PROFILE: &str = "prod-a";
+    const TEST_TARGET_ID: &str = "019d0000-0000-7000-8000-000000000001";
     const CUSTOM_BASENAME: &str = "nazoauthctl.test";
+
+    #[test]
+    fn recovery_forward_is_loopback_only_and_exit_on_forward_failure() {
+        assert_eq!(
+            recovery_forward_argv("hostinger", 43123, 42123),
+            [
+                "-N",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-L",
+                "127.0.0.1:43123:127.0.0.1:42123",
+                "hostinger",
+            ]
+        );
+        assert!(is_safe_ssh_profile("hostinger"));
+        assert!(!is_safe_ssh_profile("-oProxyCommand=bad"));
+    }
 
     // ---------- fixture stub transport ----------
 
@@ -588,6 +712,10 @@ mod tests {
             fs::read_to_string(self.dir.path().join("argv.txt")).expect("stub records its argv")
         }
 
+        fn recorded_stdin(&self) -> String {
+            fs::read_to_string(self.dir.path().join("stdin.json")).expect("stub records its stdin")
+        }
+
         /// Invocation arguments after the program token (the stub prepends
         /// its own path on some platforms), one entry per recorded call.
         fn argv_invocations(&self) -> Vec<String> {
@@ -608,6 +736,7 @@ mod tests {
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "$(dirname "$0")/argv.txt"
 input=$(cat)
+printf '%s' "$input" > "$(dirname "$0")/stdin.json"
 caller=$(printf '%s' "$input" | sed -n 's/.*"operation_id":"\([0-9a-fA-F-]*\)".*/\1/p')
 response="$(dirname "$0")/response.json"
 case "$input" in
@@ -629,8 +758,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     fn windows_stub_cmd() -> String {
         [
             "@echo off",
-            "\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile \
-             -ExecutionPolicy Bypass -File \"%~dp0stub.ps1\" %*",
+            "pwsh -NoProfile -File \"%~dp0stub.ps1\" %*",
             "exit /b %ERRORLEVEL%",
             "",
         ]
@@ -644,6 +772,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             "$here = Split-Path -Parent $MyInvocation.MyCommand.Path",
             "Add-Content -LiteralPath (Join-Path $here 'argv.txt') -Encoding Ascii -Value ($args -join ' ')",
             "$stdinText = [Console]::In.ReadToEnd()",
+            "[IO.File]::WriteAllText((Join-Path $here 'stdin.json'), $stdinText, [Text.UTF8Encoding]::new($false))",
             "$m = [regex]::Match($stdinText, '\"operation_id\":\"([0-9a-fA-F-]+)\"')",
             "$callerId = if ($m.Success) { $m.Groups[1].Value } else { '' }",
             "$responsePath = Join-Path $here 'response.json'",
@@ -673,6 +802,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             "operation_id": "__OPERATION_ID__",
             "outcome": {"status": "completed", "body": {"completion": "hello", "hello": {
                 "product": identity.product,
+                "target_id": TEST_TARGET_ID,
                 "remote_exec_schema": identity.remote_exec_schema,
                 "version": version,
                 "commit": commit,
@@ -694,10 +824,13 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     }
 
     fn ssh_target(privilege: HostPrivilege, stub: &SshStub) -> anyhow::Result<SshTarget> {
-        Ok(
-            SshTarget::from_record(&HostRecord::new_ssh("server-a", PROFILE, privilege)?)?
-                .with_program(stub.program.clone()),
-        )
+        Ok(SshTarget::from_record(&HostRecord::new_ssh(
+            "server-a",
+            PROFILE,
+            privilege,
+            Uuid::parse_str(TEST_TARGET_ID)?,
+        )?)?
+        .with_program(stub.program.clone()))
     }
 
     // ---------- argv shape (no spawning required) ----------
@@ -705,7 +838,8 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     #[test]
     fn exec_argv_is_fixed_and_delegation_only() {
         let direct = SshTarget::from_record(
-            &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Direct).unwrap(),
+            &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Direct, Uuid::now_v7())
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -714,7 +848,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
         );
 
         let sudo = SshTarget::from_record(
-            &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Sudo).unwrap(),
+            &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Sudo, Uuid::now_v7()).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -731,7 +865,9 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             ]
         );
 
-        let mut custom = HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Direct).unwrap();
+        let mut custom =
+            HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Direct, Uuid::now_v7())
+                .unwrap();
         custom.remote_exec_path = Some(CUSTOM_BASENAME.to_owned());
         let custom = SshTarget::from_record(&custom).unwrap();
         assert_eq!(
@@ -755,7 +891,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     #[test]
     fn sudo_probe_and_interactive_argv_have_the_documented_shape() {
         let sudo = SshTarget::from_record(
-            &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Sudo).unwrap(),
+            &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Sudo, Uuid::now_v7()).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -830,6 +966,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     fn sample_inspection() -> InstanceInspection {
         InstanceInspection {
             current_build_identity: None,
+            current_instance_identity: None,
             deployment_id: "deploy-alpha".to_owned(),
             issuer: "https://auth.example.com".to_owned(),
             observed_at: chrono::Utc::now(),
@@ -854,7 +991,10 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             ],
             healthy: true,
             health_summary: "runtime healthy".to_owned(),
-            backup_maturity: crate::target::deployment_state::BackupMaturity::Unknown,
+            backup: crate::target::BackupProjection {
+                local_rollback_ready: false,
+                snapshot: None,
+            },
             active_host_operation: None,
             config_revision_marker: None,
         }
@@ -907,6 +1047,39 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
         let error = target.inspect_instance("deploy-alpha").expect_err("drift");
         let rendered = format!("{error:#}");
         assert!(rendered.contains(REMOTE_HELPER_MISMATCH), "{rendered}");
+        assert_eq!(
+            stub.argv_invocations().len(),
+            1,
+            "only the failing hello may reach the wire"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn another_current_physical_helper_is_never_asked_about_deployments() -> anyhow::Result<()> {
+        let other_target = Uuid::now_v7();
+        let foreign_hello = hello_response_json(env!("CARGO_PKG_VERSION"), LOCAL_BUILD_COMMIT)
+            .replace(TEST_TARGET_ID, &other_target.to_string());
+        let stub = SshStub::install_with_hello(
+            &StubScenario {
+                response_json: &inspection_response_json(&sample_inspection()),
+                stderr_text: None,
+                exit_code: 0,
+            },
+            Some(&foreign_hello),
+        )?;
+        let target = ssh_target(HostPrivilege::Direct, &stub)?;
+
+        let error = target
+            .inspect_instance("deploy-alpha")
+            .expect_err("target-owned identity mismatch");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(crate::error_codes::TARGET_IDENTITY_MISMATCH),
+            "{rendered}"
+        );
+        assert!(rendered.contains(TEST_TARGET_ID), "{rendered}");
+        assert!(rendered.contains(&other_target.to_string()), "{rendered}");
         assert_eq!(
             stub.argv_invocations().len(),
             1,
@@ -1134,7 +1307,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
         // The sudo record's exec argv keeps `sudo -n`; nothing in the flow
         // downgrades to interactive forms for the JSON operation itself.
         let target = SshTarget::from_record(
-            &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Sudo).unwrap(),
+            &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Sudo, Uuid::now_v7()).unwrap(),
         )
         .unwrap();
         let joined = target
@@ -1153,7 +1326,8 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     #[test]
     fn direct_privilege_rejects_sudo_preflight() {
         let target = SshTarget::from_record(
-            &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Direct).unwrap(),
+            &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Direct, Uuid::now_v7())
+                .unwrap(),
         )
         .unwrap();
         let error = target.probe_sudo().expect_err("direct host");
@@ -1165,18 +1339,76 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     #[test]
     fn control_operations_over_ssh_reject_invalid_operation_ids_before_transport() {
         let target = SshTarget::from_record(
-            &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Direct).unwrap(),
+            &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Direct, Uuid::now_v7())
+                .unwrap(),
         )
         .unwrap();
         let error = target
-            .execute_control_operation(&super::super::ControlOperationRequest {
+            .execute_control_operation(super::super::ControlOperationRequest {
                 operation_id: String::new(),
                 deployment_id: "deploy-alpha".to_owned(),
                 compact_jws: "not a jws".to_owned(),
+                change_set: None,
             })
             .err()
             .unwrap();
         let rendered = format!("{error:#}");
         assert!(rendered.contains(HOST_ERR_OPERATION_INVALID), "{rendered}");
+    }
+
+    #[test]
+    fn ssh_control_operation_carries_exact_change_set_bytes() -> anyhow::Result<()> {
+        let response = serde_json::json!({
+            "schema": HOST_PROTOCOL_SCHEMA,
+            "operation_id": "__OPERATION_ID__",
+            "outcome": {"status": "completed", "body": {
+                "completion": "control-operation-executed",
+                "result": {
+                    "schema": nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
+                    "operation_id": "__OPERATION_ID__",
+                    "request_hash": "0".repeat(64),
+                    "outcome": "succeeded",
+                    "error": null,
+                    "accepted_at": 1,
+                    "completed_at": 2
+                }
+            }}
+        })
+        .to_string();
+        let hello = hello_response_json(env!("CARGO_PKG_VERSION"), LOCAL_BUILD_COMMIT);
+        let stub = SshStub::install_with_hello(
+            &StubScenario {
+                response_json: &response,
+                stderr_text: None,
+                exit_code: 0,
+            },
+            Some(&hello),
+        )?;
+        let target = SshTarget::from_record(&HostRecord::new_ssh(
+            "server-a",
+            PROFILE,
+            HostPrivilege::Direct,
+            Uuid::parse_str(TEST_TARGET_ID)?,
+        )?)?
+        .with_program(stub.program.clone());
+        let operation_id = Uuid::now_v7().to_string();
+        let material = vec![0, 1, 2, 0xff, b'\n'];
+        let receipt = target.execute_control_operation(super::super::ControlOperationRequest {
+            operation_id: operation_id.clone(),
+            deployment_id: "deploy-alpha".to_owned(),
+            compact_jws: format!("{}.{}.{}", "a".repeat(40), "b".repeat(40), "c".repeat(64)),
+            change_set: Some(super::super::SecretMaterial::try_new(material.clone())?),
+        })?;
+        assert!(receipt.accepted);
+        let operation = parse_host_operation(stub.recorded_stdin().as_bytes())?;
+        let HostOperationBody::ControlOperation {
+            change_set: Some(change_set),
+            ..
+        } = operation.operation
+        else {
+            panic!("SSH wire omitted the change set")
+        };
+        assert_eq!(change_set.as_bytes(), material);
+        Ok(())
     }
 }

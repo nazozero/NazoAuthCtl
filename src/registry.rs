@@ -37,9 +37,10 @@ use uuid::Uuid;
 
 use crate::filesystem;
 use crate::target::wire::{RemoteHello, verify_remote_hello};
+use crate::target::{ExecutionTarget, HostCompletionBody, HostOperation, HostOutcome, LocalTarget};
 
 /// Schema discriminator carried by every persisted registry record.
-pub const REGISTRY_RECORD_SCHEMA: u32 = 1;
+pub const REGISTRY_RECORD_SCHEMA: u32 = 3;
 
 /// Reserved host alias for the control machine itself.
 pub const LOCAL_HOST_ALIAS: &str = "local";
@@ -47,7 +48,26 @@ pub const LOCAL_HOST_ALIAS: &str = "local";
 /// Upper bound for a single persisted registry record (~4 MiB).
 const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 
-use crate::error_codes::STATE_RESET_REQUIRED;
+use crate::error_codes::{STATE_RESET_REQUIRED, TARGET_IDENTITY_MISMATCH};
+
+/// Enforce the physical-host binding learned when a registry host was added.
+/// Callers first verify the Hello contract, then use this check before any
+/// target read or mutation so an SSH alias cannot silently move to another
+/// current helper.
+pub(crate) fn verify_registered_target_identity(
+    host_id: Uuid,
+    host_alias: &str,
+    hello: &RemoteHello,
+) -> anyhow::Result<()> {
+    let observed = Uuid::parse_str(&hello.target_id)
+        .context("the verified target hello carries an invalid target identity")?;
+    if observed != host_id {
+        bail!(
+            "{TARGET_IDENTITY_MISMATCH}: registered host alias '{host_alias}' names target {host_id}, but the live helper owns target {observed}; refusing to read or change that target"
+        );
+    }
+    Ok(())
+}
 
 fn check_obsolete_paths_absent() -> anyhow::Result<()> {
     let obsolete_paths = [
@@ -118,7 +138,8 @@ impl ObservationCache {
 #[serde(deny_unknown_fields)]
 pub struct HostRecord {
     pub schema: u32,
-    /// Stable inventory identity. Renames and privilege changes never alter it.
+    /// Immutable target-owned identity learned from verified RemoteHello.
+    /// Renames and privilege changes never alter it.
     pub host_id: Uuid,
     /// User-friendly name, unique across the store. `local` is reserved.
     pub alias: String,
@@ -136,10 +157,10 @@ pub struct HostRecord {
 }
 
 impl HostRecord {
-    pub fn new_local() -> Self {
+    pub fn new_local(host_id: Uuid) -> Self {
         Self {
             schema: REGISTRY_RECORD_SCHEMA,
-            host_id: Uuid::now_v7(),
+            host_id,
             alias: LOCAL_HOST_ALIAS.to_owned(),
             transport: HostTransport::Local,
             ssh_profile: None,
@@ -153,15 +174,36 @@ impl HostRecord {
         alias: impl Into<String>,
         ssh_profile: impl Into<String>,
         privilege: HostPrivilege,
+        host_id: Uuid,
     ) -> anyhow::Result<Self> {
-        let mut record = Self::new_local();
-        record.host_id = Uuid::now_v7();
+        let mut record = Self::new_local(host_id);
         record.alias = alias.into();
         record.transport = HostTransport::Ssh;
         record.ssh_profile = Some(ssh_profile.into());
         record.privilege = privilege;
         record.validate()?;
         Ok(record)
+    }
+
+    /// Connection description used only before an SSH target has answered
+    /// Hello. It is deliberately invalid as a registry record (`nil` is not
+    /// UUIDv7), so it cannot be persisted before the target supplies its own
+    /// identity.
+    pub(crate) fn new_ssh_unbound(
+        alias: impl Into<String>,
+        ssh_profile: impl Into<String>,
+        privilege: HostPrivilege,
+    ) -> Self {
+        Self {
+            schema: REGISTRY_RECORD_SCHEMA,
+            host_id: Uuid::nil(),
+            alias: alias.into(),
+            transport: HostTransport::Ssh,
+            ssh_profile: Some(ssh_profile.into()),
+            privilege,
+            remote_exec_path: None,
+            last_observation: None,
+        }
     }
 
     /// Enforce every invariant the store relies on. Called by the
@@ -172,6 +214,9 @@ impl HostRecord {
             bail!("unsupported host record schema {}", self.schema);
         }
         validate_key(&self.alias, "host alias")?;
+        if self.host_id.get_version_num() != 7 {
+            bail!("host id must be a target-owned UUIDv7");
+        }
         if self.transport == HostTransport::Local {
             if self.alias != LOCAL_HOST_ALIAS {
                 bail!("the '{LOCAL_HOST_ALIAS}' alias is reserved for the built-in local host");
@@ -225,11 +270,32 @@ pub struct InstanceRecord {
     /// locator only; private-key bytes are never stored in the Registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller_key_ref: Option<String>,
-    /// Reference to the target-side DeploymentState location (authority ADR row 4);
-    /// interpreted by the deployment waves, opaque here.
-    pub target_state_ref: String,
+    /// The only controller-local update policy.  It is a selector-side
+    /// preference, never a backup fact and never a second DeploymentState.
+    pub backup_before_update: BackupBeforeUpdatePolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_observation: Option<ObservationCache>,
+}
+
+/// Deliberately narrow update gate.  There is no generic policy engine: only
+/// the one backup freshness decision the lifecycle actually consumes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum BackupBeforeUpdatePolicy {
+    Off,
+    Warn,
+    Require { max_age_seconds: u64 },
+}
+
+impl BackupBeforeUpdatePolicy {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Self::Require { max_age_seconds } = self
+            && (*max_age_seconds == 0 || *max_age_seconds > 31_536_000)
+        {
+            bail!("required backup max age must be 1 second through 365 days");
+        }
+        Ok(())
+    }
 }
 
 impl InstanceRecord {
@@ -238,7 +304,6 @@ impl InstanceRecord {
         alias: impl Into<String>,
         host_id: Uuid,
         issuer: impl Into<String>,
-        target_state_ref: impl Into<String>,
     ) -> anyhow::Result<Self> {
         let record = Self {
             schema: REGISTRY_RECORD_SCHEMA,
@@ -248,7 +313,7 @@ impl InstanceRecord {
             issuer: issuer.into(),
             controller_id: None,
             controller_key_ref: None,
-            target_state_ref: target_state_ref.into(),
+            backup_before_update: BackupBeforeUpdatePolicy::Off,
             last_observation: None,
         };
         record.validate()?;
@@ -261,8 +326,8 @@ impl InstanceRecord {
         }
         validate_key(&self.deployment_id, "deployment id")?;
         validate_key(&self.alias, "instance alias")?;
-        validate_reference(&self.target_state_ref, "target state ref")?;
         validate_issuer(&self.issuer)?;
+        self.backup_before_update.validate()?;
         if let Some(id) = self.controller_id.as_deref() {
             validate_key(id, "controller id")?;
         }
@@ -371,10 +436,40 @@ impl DiscoveryEvidence {
         verify_remote_hello(&self.hello).map_err(|reason| {
             anyhow::anyhow!("evidence helper identity is not verifiable: {reason}")
         })?;
+        let target_id = Uuid::parse_str(&self.hello.target_id)
+            .context("evidence target identity is not a UUID")?;
+        if target_id != self.host_id {
+            bail!(
+                "evidence target identity {target_id} does not match evidence host {}",
+                self.host_id
+            );
+        }
         validate_key(&self.deployment.deployment_id, "evidence deployment id")?;
         validate_issuer(&self.deployment.issuer)?;
         Ok(())
     }
+}
+
+/// Read the identity from the target's own Hello answer.  Registry storage
+/// never invents a local inventory id: the target state root owns it, as it
+/// does for every SSH target.
+fn local_target_id(_registry_root: &Path) -> anyhow::Result<Uuid> {
+    #[cfg(test)]
+    let target = LocalTarget::with_state_root(_registry_root.join("local-target-state"));
+    #[cfg(not(test))]
+    let target = LocalTarget::new()?;
+
+    let operation = HostOperation::hello(Uuid::now_v7().to_string());
+    let result = target.execute_host_operation(&operation)?;
+    let HostOutcome::Completed {
+        body: HostCompletionBody::Hello { hello },
+    } = result.outcome
+    else {
+        bail!("local target did not complete its identity hello")
+    };
+    verify_remote_hello(&hello)
+        .map_err(|reason| anyhow::anyhow!("local target hello is not verifiable: {reason}"))?;
+    Uuid::parse_str(&hello.target_id).context("local target hello has an invalid target identity")
 }
 
 fn validate_key(value: &str, label: &str) -> anyhow::Result<()> {
@@ -518,7 +613,7 @@ impl RegistryStore {
         if let Some(existing) = self.find_host_by_alias_locked(LOCAL_HOST_ALIAS)? {
             return Ok(existing);
         }
-        let record = HostRecord::new_local();
+        let record = HostRecord::new_local(local_target_id(&self.root)?);
         self.write_host_locked(&record)?;
         Ok(record)
     }
@@ -533,31 +628,6 @@ impl RegistryStore {
         if self.find_host_by_id_locked(record.host_id)?.is_some() {
             bail!("duplicate host id {}", record.host_id);
         }
-        self.write_host_locked(&record)?;
-        Ok(record)
-    }
-
-    /// Rename a host alias. The `host_id`, transport, profile, and privilege
-    /// are preserved; referencing instance records keep working because they
-    /// bind to `host_id`. The built-in `local` host keeps its reserved alias.
-    pub fn rename_host(
-        &self,
-        old_alias: &str,
-        new_alias: impl Into<String>,
-    ) -> anyhow::Result<HostRecord> {
-        let _lock = self.lock()?;
-        let mut record = self
-            .find_host_by_alias_locked(old_alias)?
-            .with_context(|| format!("unknown host alias '{old_alias}'"))?;
-        let new_alias = new_alias.into();
-        if record.alias == LOCAL_HOST_ALIAS {
-            bail!("the '{LOCAL_HOST_ALIAS}' host cannot be renamed; its alias is reserved");
-        }
-        if new_alias != record.alias && self.find_host_by_alias_locked(&new_alias)?.is_some() {
-            bail!("duplicate host alias '{new_alias}'");
-        }
-        record.alias = new_alias;
-        record.validate()?;
         self.write_host_locked(&record)?;
         Ok(record)
     }
@@ -577,8 +647,10 @@ impl RegistryStore {
         Ok(hosts)
     }
 
-    /// Register a new instance. Duplicate `deployment_id` and duplicate
-    /// `alias` are both rejected; the referenced host must exist.
+    /// Test-only raw record insertion for fixtures that must exercise states
+    /// unavailable through live discovery. Production registration has one
+    /// authority: [`Self::register_instance`].
+    #[cfg(test)]
     pub fn add_instance(&self, record: InstanceRecord) -> anyhow::Result<InstanceRecord> {
         record.validate()?;
         let _lock = self.lock()?;
@@ -680,6 +752,16 @@ impl RegistryStore {
                 host.alias
             );
         }
+        let observed_target_id = Uuid::parse_str(&evidence.hello.target_id)
+            .context("evidence target identity is not a UUID")?;
+        if observed_target_id != host.host_id {
+            bail!(
+                "evidence target identity {} does not match registered host '{}' ({})",
+                observed_target_id,
+                host.alias,
+                host.host_id
+            );
+        }
         if self
             .find_instance_by_deployment_locked(&evidence.deployment.deployment_id)?
             .is_some()
@@ -700,10 +782,6 @@ impl RegistryStore {
             alias,
             evidence.host_id,
             &evidence.deployment.issuer,
-            format!(
-                "target-state/{}/{}",
-                evidence.host_id, evidence.deployment.deployment_id
-            ),
         )?;
         record.last_observation = Some(observation);
         record.validate()?;
@@ -839,6 +917,28 @@ impl RegistryStore {
         Ok(record)
     }
 
+    /// Change the one explicit backup-before-update policy for an instance.
+    /// The target manifest/receipt remains the sole backup authority.
+    pub fn set_backup_before_update(
+        &self,
+        deployment_id: &str,
+        policy: BackupBeforeUpdatePolicy,
+    ) -> anyhow::Result<InstanceRecord> {
+        policy.validate()?;
+        let _lock = self.lock()?;
+        let mut record = self
+            .find_instance_by_deployment_locked(deployment_id)?
+            .with_context(|| format!("unknown instance '{deployment_id}'"))?;
+        record.backup_before_update = policy;
+        record.validate()?;
+        write_record(
+            &self.instance_path(deployment_id),
+            "instance record",
+            &record,
+        )?;
+        Ok(record)
+    }
+
     /// Move an instance to another host. Callers must have verified the target
     /// DeploymentState identity through the new host first (task B07); this
     /// method only performs the local rebinding and clears the stale cache
@@ -858,10 +958,7 @@ impl RegistryStore {
         let _new_host = self
             .find_host_by_id_locked(new_host_id)?
             .with_context(|| format!("cannot relocate to unknown host {new_host_id}"))?;
-        // P1-2: update the target_state_ref to encode the new host so stale
-        // references to the old host's state directory are never trusted.
         record.host_id = new_host_id;
-        record.target_state_ref = format!("target-state/{}/{}", new_host_id, record.deployment_id);
         record.last_observation = None;
         record.validate()?;
         write_record(
@@ -1073,14 +1170,39 @@ mod tests {
         Ok((temp, store))
     }
 
+    fn evidence_for(host: &HostRecord, deployment_id: &str, issuer: &str) -> DiscoveryEvidence {
+        let mut hello = crate::target::wire::local_hello(vec!["podman".to_owned()]);
+        hello.target_id = host.host_id.to_string();
+        DiscoveryEvidence::new(host, hello, deployment_id, issuer).expect("valid evidence")
+    }
+
+    fn register_fixture(
+        store: &RegistryStore,
+        host: &HostRecord,
+        deployment_id: &str,
+        alias: &str,
+    ) -> anyhow::Result<InstanceRecord> {
+        store.register_instance(
+            &evidence_for(host, deployment_id, "https://auth.example.com"),
+            Some(alias),
+            ObservationCache::now(true, "test observation"),
+        )
+    }
+
     #[test]
     fn local_host_is_created_exactly_once() -> anyhow::Result<()> {
-        let (_temp, store) = test_store()?;
+        let (temp, store) = test_store()?;
         let first = store.ensure_local_host()?;
         let second = store.ensure_local_host()?;
         assert_eq!(first, second);
         assert_eq!(first.alias, LOCAL_HOST_ALIAS);
         assert_eq!(first.transport, HostTransport::Local);
+        assert_eq!(first.host_id.get_version_num(), 7);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("registry/local-target-state/target-id"))?
+                .trim(),
+            first.host_id.to_string()
+        );
         assert_eq!(store.list_hosts()?.len(), 1);
         Ok(())
     }
@@ -1146,6 +1268,45 @@ mod tests {
     }
 
     #[test]
+    fn removed_target_state_reference_and_old_registry_schema_fail_closed() -> anyhow::Result<()> {
+        let (_temp, store) = test_store()?;
+        let host = store.ensure_local_host()?;
+        let record = store.add_instance(InstanceRecord::new(
+            "deploy-alpha",
+            "production",
+            host.host_id,
+            "https://auth.example.com",
+        )?)?;
+        let path = store
+            .root()
+            .join("instances")
+            .join(format!("{}.json", record.deployment_id));
+        let mut value = serde_json::to_value(&record)?;
+
+        value
+            .as_object_mut()
+            .expect("instance record serializes to an object")
+            .insert(
+                "target_state_ref".to_owned(),
+                serde_json::Value::from("target-state/legacy/deploy-alpha"),
+            );
+        filesystem::atomic_write(&path, &serde_json::to_vec_pretty(&value)?, 0o600)?;
+        let error = store
+            .list_instances()
+            .expect_err("removed target-state reference must fail");
+        assert!(format!("{error:#}").contains(STATE_RESET_REQUIRED));
+
+        value.as_object_mut().unwrap().remove("target_state_ref");
+        value["schema"] = serde_json::Value::from(REGISTRY_RECORD_SCHEMA - 1);
+        filesystem::atomic_write(&path, &serde_json::to_vec_pretty(&value)?, 0o600)?;
+        let error = store
+            .list_instances()
+            .expect_err("old registry schema must fail");
+        assert!(format!("{error:#}").contains(STATE_RESET_REQUIRED));
+        Ok(())
+    }
+
+    #[test]
     fn oversize_record_fails_closed() -> anyhow::Result<()> {
         let (_temp, store) = test_store()?;
         let host = store.ensure_local_host()?;
@@ -1194,11 +1355,11 @@ mod tests {
     fn duplicate_host_alias_is_rejected() -> anyhow::Result<()> {
         let (_temp, store) = test_store()?;
         store.ensure_local_host()?;
-        let clash = HostRecord::new_ssh("server-a", "prod-a", HostPrivilege::Sudo)?;
+        let clash = HostRecord::new_ssh("server-a", "prod-a", HostPrivilege::Sudo, Uuid::now_v7())?;
         store.add_host(clash)?;
         let duplicate = HostRecord {
             host_id: Uuid::now_v7(),
-            ..HostRecord::new_ssh("server-a", "prod-b", HostPrivilege::Direct)?
+            ..HostRecord::new_ssh("server-a", "prod-b", HostPrivilege::Direct, Uuid::now_v7())?
         };
         let error = store.add_host(duplicate).expect_err("duplicate alias");
         assert!(error.to_string().contains("duplicate host alias"));
@@ -1206,14 +1367,37 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_target_identity_cannot_be_registered_under_another_alias() -> anyhow::Result<()> {
+        let (_temp, store) = test_store()?;
+        let first = store.add_host(HostRecord::new_ssh(
+            "server-a",
+            "prod-a",
+            HostPrivilege::Direct,
+            Uuid::now_v7(),
+        )?)?;
+        let duplicate = HostRecord {
+            host_id: first.host_id,
+            ..HostRecord::new_ssh("server-b", "prod-b", HostPrivilege::Direct, Uuid::now_v7())?
+        };
+        let error = store.add_host(duplicate).expect_err("same target id");
+        assert!(error.to_string().contains("duplicate host id"), "{error}");
+        Ok(())
+    }
+
+    #[test]
     fn local_alias_cannot_be_reused_by_ssh_host() {
-        let record = HostRecord::new_ssh(LOCAL_HOST_ALIAS, "prod-a", HostPrivilege::Sudo);
+        let record = HostRecord::new_ssh(
+            LOCAL_HOST_ALIAS,
+            "prod-a",
+            HostPrivilege::Sudo,
+            Uuid::now_v7(),
+        );
         assert!(record.is_err());
     }
 
     #[test]
     fn ssh_transport_rules_are_enforced() -> anyhow::Result<()> {
-        let ssh = HostRecord::new_ssh("server-a", "prod-a", HostPrivilege::Sudo)?;
+        let ssh = HostRecord::new_ssh("server-a", "prod-a", HostPrivilege::Sudo, Uuid::now_v7())?;
         assert_eq!(ssh.ssh_profile.as_deref(), Some("prod-a"));
 
         let mut missing_profile = ssh.clone();
@@ -1224,13 +1408,13 @@ mod tests {
         );
 
         // A local host must never carry an SSH profile.
-        let mut local = HostRecord::new_local();
+        let mut local = HostRecord::new_local(Uuid::now_v7());
         local.ssh_profile = Some("prod-a".to_owned());
         assert!(local.validate().is_err(), "local host with a profile");
         local.ssh_profile = None;
         assert!(local.validate().is_ok());
 
-        let mut local = HostRecord::new_local();
+        let mut local = HostRecord::new_local(Uuid::now_v7());
         local.remote_exec_path = Some("/usr/bin/nazoauthctl".to_owned());
         assert!(
             local.validate().is_err(),
@@ -1247,36 +1431,25 @@ mod tests {
     fn duplicate_deployment_id_and_alias_are_rejected() -> anyhow::Result<()> {
         let (_temp, store) = test_store()?;
         let host = store.ensure_local_host()?;
-        let issuer = "https://auth.example.com";
-        store.add_instance(InstanceRecord::new(
-            "deploy-alpha",
-            "production",
-            host.host_id,
-            issuer,
-            "targets/deploy-alpha",
-        )?)?;
+        register_fixture(&store, &host, "deploy-alpha", "production")?;
 
-        let same_deployment =
-            InstanceRecord::new("deploy-alpha", "staging", host.host_id, issuer, "ref")?;
         let error = store
-            .add_instance(same_deployment)
+            .register_instance(
+                &evidence_for(&host, "deploy-alpha", "https://auth.example.com"),
+                Some("staging"),
+                ObservationCache::now(true, "duplicate deployment"),
+            )
             .expect_err("duplicate deployment id");
         assert!(error.to_string().contains("duplicate deployment id"));
 
-        let same_alias =
-            InstanceRecord::new("deploy-beta", "production", host.host_id, issuer, "ref")?;
-        let error = store.add_instance(same_alias).expect_err("duplicate alias");
+        let error = store
+            .register_instance(
+                &evidence_for(&host, "deploy-beta", "https://auth.example.com"),
+                Some("production"),
+                ObservationCache::now(true, "duplicate alias"),
+            )
+            .expect_err("duplicate alias");
         assert!(error.to_string().contains("duplicate instance alias"));
-        Ok(())
-    }
-
-    #[test]
-    fn instance_requires_known_host() -> anyhow::Result<()> {
-        let (_temp, store) = test_store()?;
-        let orphan =
-            InstanceRecord::new("deploy-x", "x", Uuid::now_v7(), "https://x.example", "r")?;
-        let error = store.add_instance(orphan).expect_err("unknown host");
-        assert!(error.to_string().contains("unknown host"));
         Ok(())
     }
 
@@ -1284,16 +1457,12 @@ mod tests {
     fn rename_instance_keeps_identity_and_bindings() -> anyhow::Result<()> {
         let (_temp, store) = test_store()?;
         let host = store.ensure_local_host()?;
-        let mut instance = InstanceRecord::new(
+        register_fixture(&store, &host, "deploy-alpha", "production")?;
+        store.update_controller_binding(
             "deploy-alpha",
-            "production",
-            host.host_id,
-            "https://auth.example.com",
-            "targets/deploy-alpha",
+            Some("ctrl-key-1"),
+            Some("keys/deploy-alpha/controller"),
         )?;
-        instance.controller_id = Some("ctrl-key-1".to_owned());
-        instance.controller_key_ref = Some("keys/deploy-alpha/controller".to_owned());
-        store.add_instance(instance)?;
 
         let renamed = store.rename_instance("production", "auth-prod")?;
         assert_eq!(renamed.alias, "auth-prod");
@@ -1316,51 +1485,10 @@ mod tests {
     }
 
     #[test]
-    fn rename_host_keeps_identity_and_instance_binding() -> anyhow::Result<()> {
-        let (_temp, store) = test_store()?;
-        store.ensure_local_host()?;
-        let host = store.add_host(HostRecord::new_ssh(
-            "server-a",
-            "prod-a",
-            HostPrivilege::Sudo,
-        )?)?;
-        store.add_instance(InstanceRecord::new(
-            "deploy-alpha",
-            "production",
-            host.host_id,
-            "https://auth.example.com",
-            "ref",
-        )?)?;
-
-        let renamed = store.rename_host("server-a", "server-a2")?;
-        assert_eq!(renamed.host_id, host.host_id);
-        assert_eq!(renamed.ssh_profile.as_deref(), Some("prod-a"));
-        assert!(store.host_by_alias("server-a")?.is_none());
-
-        let instance = store.instance_by_alias("production")?.expect("instance");
-        let resolved_host = store.host_by_alias("server-a2")?.expect("renamed host");
-        assert_eq!(instance.host_id, resolved_host.host_id);
-
-        // The reserved local alias cannot be moved away.
-        let error = store
-            .rename_host(LOCAL_HOST_ALIAS, "control-machine")
-            .expect_err("reserved");
-        assert!(error.to_string().contains("reserved"), "{error}");
-        assert!(store.host_by_alias(LOCAL_HOST_ALIAS)?.is_some());
-        Ok(())
-    }
-
-    #[test]
     fn update_controller_binding_round_trips_and_clears() -> anyhow::Result<()> {
         let (_temp, store) = test_store()?;
         let host = store.ensure_local_host()?;
-        store.add_instance(InstanceRecord::new(
-            "deploy-alpha",
-            "production",
-            host.host_id,
-            "https://auth.example.com",
-            "ref",
-        )?)?;
+        register_fixture(&store, &host, "deploy-alpha", "production")?;
 
         let bound = store.update_controller_binding(
             "deploy-alpha",
@@ -1405,7 +1533,6 @@ mod tests {
             "production",
             host.host_id,
             "https://auth.example.com",
-            "ref",
         )?;
 
         instance.controller_key_ref = Some("-----BEGIN PRIVATE KEY-----".to_owned());
@@ -1427,17 +1554,11 @@ mod tests {
 
     // ---------- B04 controlled registration / evidence ----------
 
-    fn evidence_for(host: &HostRecord) -> DiscoveryEvidence {
-        let hello = crate::target::wire::local_hello(vec!["podman".to_owned()]);
-        DiscoveryEvidence::new(host, hello, "deploy-alpha", "https://auth.example.com")
-            .expect("valid evidence")
-    }
-
     #[test]
     fn register_instance_persists_the_controlled_binding_with_first_observation() {
         let (_temp, store) = test_store().unwrap();
         let host = store.ensure_local_host().unwrap();
-        let evidence = evidence_for(&host);
+        let evidence = evidence_for(&host, "deploy-alpha", "https://auth.example.com");
 
         let record = store
             .register_instance(&evidence, None, ObservationCache::now(true, "observed"))
@@ -1463,15 +1584,16 @@ mod tests {
     fn register_instance_rejects_unknown_and_drifted_hosts() {
         let (_temp, store) = test_store().unwrap();
         let host = store.ensure_local_host().unwrap();
-        let mut evidence = evidence_for(&host);
+        let mut evidence = evidence_for(&host, "deploy-alpha", "https://auth.example.com");
 
         evidence.host_id = uuid::Uuid::now_v7();
+        evidence.hello.target_id = evidence.host_id.to_string();
         let error = store
             .register_instance(&evidence, None, ObservationCache::now(true, "x"))
             .expect_err("unknown host");
         assert!(error.to_string().contains("unknown host"), "{error}");
 
-        evidence = evidence_for(&host);
+        evidence = evidence_for(&host, "deploy-alpha", "https://auth.example.com");
         evidence.host_alias = "renamed".to_owned();
         let error = store
             .register_instance(&evidence, None, ObservationCache::now(true, "x"))
@@ -1483,7 +1605,7 @@ mod tests {
     fn discovery_evidence_validation_fails_closed() {
         let (_temp, store) = test_store().unwrap();
         let host = store.ensure_local_host().unwrap();
-        let good = evidence_for(&host);
+        let good = evidence_for(&host, "deploy-alpha", "https://auth.example.com");
 
         for mutate in [
             |e: &mut DiscoveryEvidence| e.schema += 1,
@@ -1529,20 +1651,12 @@ mod tests {
         let (_temp, store) = test_store().unwrap();
         store.ensure_local_host().unwrap();
         let host = store
-            .add_host(HostRecord::new_ssh("server-a", "prod-a", HostPrivilege::Sudo).unwrap())
-            .unwrap();
-        store
-            .add_instance(
-                InstanceRecord::new(
-                    "deploy-alpha",
-                    "production",
-                    host.host_id,
-                    "https://auth.example.com",
-                    "ref",
-                )
-                .unwrap(),
+            .add_host(
+                HostRecord::new_ssh("server-a", "prod-a", HostPrivilege::Sudo, Uuid::now_v7())
+                    .unwrap(),
             )
             .unwrap();
+        register_fixture(&store, &host, "deploy-alpha", "production").unwrap();
 
         let error = store.forget_host("server-a", false).expect_err("blocked");
         let rendered = error.to_string();
@@ -1569,16 +1683,10 @@ mod tests {
     fn observation_writers_preserve_every_other_field() {
         let (_temp, store) = test_store().unwrap();
         let host = store.ensure_local_host().unwrap();
-        let mut instance = InstanceRecord::new(
-            "deploy-alpha",
-            "production",
-            host.host_id,
-            "https://auth.example.com",
-            "target-state/x",
-        )
-        .unwrap();
-        instance.controller_key_ref = Some("keys/alpha".to_owned());
-        store.add_instance(instance).unwrap();
+        register_fixture(&store, &host, "deploy-alpha", "production").unwrap();
+        store
+            .update_controller_binding("deploy-alpha", None, Some("keys/alpha"))
+            .unwrap();
 
         store
             .set_host_observation(host.host_id, ObservationCache::now(false, "unreachable"))
@@ -1619,18 +1727,12 @@ mod tests {
         let (_temp, store) = test_store().unwrap();
         let old = store.ensure_local_host().unwrap();
         let new_host = store
-            .add_host(HostRecord::new_ssh("server-b", "prod-b", HostPrivilege::Direct).unwrap())
+            .add_host(
+                HostRecord::new_ssh("server-b", "prod-b", HostPrivilege::Direct, Uuid::now_v7())
+                    .unwrap(),
+            )
             .unwrap();
-        let mut record = InstanceRecord::new(
-            "deploy-alpha",
-            "production",
-            old.host_id,
-            "https://auth.example.com",
-            "target-state/x",
-        )
-        .unwrap();
-        record.last_observation = Some(ObservationCache::now(true, "old host view"));
-        store.add_instance(record).unwrap();
+        register_fixture(&store, &old, "deploy-alpha", "production").unwrap();
 
         let moved = store
             .relocate_instance("deploy-alpha", new_host.host_id)

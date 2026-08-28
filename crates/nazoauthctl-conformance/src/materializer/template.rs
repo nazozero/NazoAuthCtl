@@ -6,8 +6,8 @@ use zeroize::Zeroizing;
 
 use super::crypto::GeneratedAttestationMaterial;
 use super::{
-    MaterializerError, OnboardingOutput, PreparedMaterialization, digest_hex, is_placeholder,
-    parse_placeholder, validate_binding_reference, validate_request_jti,
+    MaterializationBindings, MaterializerError, PreparedMaterialization, digest_hex,
+    is_placeholder, parse_placeholder, validate_binding_reference, validate_request_jti,
 };
 
 const USER_REJECT_MODULES: [&str; 2] = [
@@ -23,23 +23,13 @@ pub(super) fn materialize_value(
     value: &Value,
     bindings: &BTreeMap<String, String>,
     prepared: &PreparedMaterialization,
-    onboarding: &OnboardingOutput,
-    ciba_client_logical: Option<&str>,
+    onboarding: &MaterializationBindings,
     stack: &mut BTreeSet<String>,
 ) -> Result<Value, MaterializerError> {
     match value {
         Value::Array(values) => values
             .iter()
-            .map(|value| {
-                materialize_value(
-                    value,
-                    bindings,
-                    prepared,
-                    onboarding,
-                    ciba_client_logical,
-                    stack,
-                )
-            })
+            .map(|value| materialize_value(value, bindings, prepared, onboarding, stack))
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array),
         Value::Object(values) => {
@@ -47,14 +37,7 @@ pub(super) fn materialize_value(
             for (key, value) in values {
                 output.insert(
                     key.clone(),
-                    materialize_value(
-                        value,
-                        bindings,
-                        prepared,
-                        onboarding,
-                        ciba_client_logical,
-                        stack,
-                    )?,
+                    materialize_value(value, bindings, prepared, onboarding, stack)?,
                 );
             }
             Ok(Value::Object(output))
@@ -64,7 +47,6 @@ pub(super) fn materialize_value(
             bindings,
             prepared,
             onboarding,
-            ciba_client_logical,
             stack,
         ),
         Value::String(text)
@@ -521,8 +503,7 @@ fn resolve_reference(
     name: &str,
     bindings: &BTreeMap<String, String>,
     prepared: &PreparedMaterialization,
-    onboarding: &OnboardingOutput,
-    ciba_client_logical: Option<&str>,
+    onboarding: &MaterializationBindings,
     stack: &mut BTreeSet<String>,
 ) -> Result<Value, MaterializerError> {
     validate_binding_reference(name, bindings, &mut BTreeSet::new())?;
@@ -535,14 +516,7 @@ fn resolve_reference(
                 .get(binding_name)
                 .ok_or(MaterializerError::InvalidPlaceholder)?,
         )?;
-        let result = resolve_reference(
-            nested,
-            bindings,
-            prepared,
-            onboarding,
-            ciba_client_logical,
-            stack,
-        );
+        let result = resolve_reference(nested, bindings, prepared, onboarding, stack);
         stack.remove(binding_name);
         return result;
     }
@@ -552,7 +526,6 @@ fn resolve_reference(
             bindings,
             prepared,
             onboarding,
-            ciba_client_logical,
             stack,
         );
     }
@@ -602,24 +575,6 @@ fn resolve_reference(
             resolve_suite_test_url(&prepared.suite_base_url, &prepared.request_jti, reference,)?
         )));
     }
-    if name == "target.ciba_automated_decision_url" {
-        if prepared.bundle_digest.is_none() {
-            return prepared
-                .ciba_user_approval_callback_url
-                .as_ref()
-                .map(|value| Value::String(value.to_string()))
-                .ok_or_else(|| MaterializerError::UnknownSecretReference(name.to_owned()));
-        }
-        let token = ciba_client_logical
-            .and_then(|logical| prepared.ciba_decision_tokens.get(logical))
-            .or(prepared.ciba_automated_decision_token.as_ref())
-            .ok_or_else(|| MaterializerError::UnknownSecretReference(name.to_owned()))?;
-        return Ok(Value::String(format!(
-            "{}/auth/ciba-automated-decision?token={{auth_req_id}}&type={{action}}&decision_token={}",
-            prepared.target_issuer.trim_end_matches('/'),
-            token.as_str()
-        )));
-    }
     if name == "target.ciba_user_approval_callback_url" {
         return prepared
             .ciba_user_approval_callback_url
@@ -650,14 +605,6 @@ fn resolve_reference(
         return prepared
             .dynamic_registration_initial_access_token
             .as_ref()
-            .map(|value| Value::String(value.to_string()))
-            .ok_or(MaterializerError::UnknownSecretReference(name.to_owned()));
-    }
-    if name == "generated.ciba_automated_decision_token" {
-        let token = ciba_client_logical
-            .and_then(|logical| prepared.ciba_decision_tokens.get(logical))
-            .or(prepared.ciba_automated_decision_token.as_ref());
-        return token
             .map(|value| Value::String(value.to_string()))
             .ok_or(MaterializerError::UnknownSecretReference(name.to_owned()));
     }

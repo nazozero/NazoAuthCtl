@@ -69,17 +69,17 @@ same way.
 ## Plan, issue, and recovery
 
 ```text
-nazoauthctl --deployment DEPLOYMENT tls acme plan \
+nazoauthctl tls acme plan \
   --acme-config /etc/nazoauth/acme.json \
   --provider-config /etc/nazoauth/tls-provider.json \
   --tenant tenant-a --hostname auth.example
 
-nazoauthctl --deployment DEPLOYMENT tls acme issue \
+nazoauthctl tls acme issue \
   --acme-config /etc/nazoauth/acme.json \
   --provider-config /etc/nazoauth/tls-provider.json \
   --tenant tenant-a --hostname auth.example --agree-terms --yes
 
-nazoauthctl --deployment DEPLOYMENT tls acme recover \
+nazoauthctl tls acme recover \
   --tenant tenant-a --hostname auth.example --yes
 ```
 
@@ -115,11 +115,11 @@ is rejected before DNS resolution, connection, or account-signed JWS delivery.
 that authority directly without copying private state paths:
 
 ```text
-nazoauthctl --deployment DEPLOYMENT tls certificate plan \
+nazoauthctl tls certificate plan \
   --provider-config /etc/nazoauth/tls-provider.json \
   --tenant tenant-a --hostname auth.example --from-acme-current
 
-nazoauthctl --deployment DEPLOYMENT tls certificate apply \
+nazoauthctl tls certificate apply \
   --provider-config /etc/nazoauth/tls-provider.json \
   --tenant tenant-a --hostname auth.example --from-acme-current --yes
 ```

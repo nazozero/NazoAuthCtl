@@ -51,7 +51,7 @@ pub(crate) fn run_rollback(
     let applied_revision = require_completed(
         &result,
         |body| match body {
-            HostCompletionBody::StateMutateApplied { revision } => Some(revision.to_string()),
+            HostCompletionBody::StateMutateApplied { revision, .. } => Some(revision.to_string()),
             _ => None,
         },
         action,

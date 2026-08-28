@@ -177,7 +177,7 @@ pub(crate) fn run_uninstall(
          \n\
          independent follow-ups (NOT part of uninstall):\n\
          - revoke the Controller Slot at NazoAuth if one exists:\n\
-             nazoauthctl controller slots --instance {alias}\n\
+             nazoauthctl controller list --instance {alias}\n\
          - local controller key material stays until the revoke flow cleans it up\n",
         plan.alias,
         plan.deployment_id,

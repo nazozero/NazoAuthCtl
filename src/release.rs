@@ -122,6 +122,13 @@ pub(crate) struct ReleaseRequest<'a> {
 }
 
 impl VerifiedRelease {
+    /// Rollback policy from the attested Release manifest. Callers receive
+    /// this only through a fully verified handle, so it can be carried into
+    /// target state without re-parsing unsigned metadata.
+    pub(crate) fn rollback_policy(&self) -> crate::model::ReleaseRollbackPolicy {
+        self.manifest.rollback.clone()
+    }
+
     /// Verify an official server Release through the single entry point.
     ///
     /// Exactly once per accepted artifact this performs: the bounded download,
@@ -143,35 +150,17 @@ impl VerifiedRelease {
             "https://github.com/{}/.github/workflows/release-security.yml@refs/tags/{version}",
             request.repository
         );
-        let mut candidates = vec![format!("nazoauth-{target}{suffix}")];
-        if matches!(version.as_str(), "v0.1.18" | "v0.1.19") {
-            candidates.push(format!("nazoauthctl-{target}{suffix}"));
-        }
-        let mut last_error = None;
-        let mut verified = None;
+        let blob = format!("nazoauth-{target}{suffix}");
         let cache = release_cache_root();
-        for blob in &candidates {
-            match verified_release_candidate(
-                request.repository,
-                &version,
-                work.path(),
-                blob,
-                &identity,
-                request.container_backend,
-                cache.as_deref(),
-            ) {
-                Ok(manifest) => {
-                    verified = Some(manifest);
-                    break;
-                }
-                Err(error) => last_error = Some(error),
-            }
-        }
-        let manifest = verified.ok_or_else(|| {
-            last_error.unwrap_or_else(|| {
-                anyhow::anyhow!("no official Release artifact could be verified")
-            })
-        })?;
+        let manifest = verified_release_candidate(
+            request.repository,
+            &version,
+            work.path(),
+            &blob,
+            &identity,
+            request.container_backend,
+            cache.as_deref(),
+        )?;
         manifest.validate(&version, &identity)?;
         manifest.validate_controller_compatibility()?;
         if let Some(floor) = request.trusted_version_floor {
@@ -355,6 +344,15 @@ fn release_cache_root() -> Option<std::path::PathBuf> {
     }
 }
 
+fn remove_failed_cached_release(path: &Path) -> anyhow::Result<()> {
+    fs::remove_file(path).with_context(|| {
+        format!(
+            "cached Release artifact failed verification but could not be removed: {}",
+            path.display()
+        )
+    })
+}
+
 fn verified_release_candidate(
     repository: &str,
     version: &str,
@@ -382,8 +380,10 @@ fn verified_release_candidate(
     // attestation + cosign chain runs on every verify, so a poisoned or
     // stale cache entry can never become a trust anchor.
     let digest = sha256(&work.join(blob))?;
+    // Fetch errors return before cache invalidation: inability to reach the
+    // attestation authority says nothing about the cached bytes.
     let response = fetch_github_attestation_response(repository, &digest, RELEASE_PREDICATE)?;
-    let manifest = verified_manifest_from_attestations(
+    let first_verification = verified_manifest_from_attestations(
         &response,
         version,
         work,
@@ -400,7 +400,52 @@ fn verified_release_candidate(
                 container_backend,
             )
         },
-    )?;
+    );
+    let manifest = match (first_verification, cached.as_ref()) {
+        (Ok(manifest), _) => manifest,
+        (Err(error), None) => return Err(error),
+        (Err(cached_error), Some(cached_source)) => {
+            remove_failed_cached_release(cached_source)?;
+            download(
+                repository,
+                version,
+                blob,
+                work,
+                MAX_UNATTESTED_UPDATER_BYTES,
+            )
+            .with_context(|| {
+                format!(
+                    "cached Release artifact failed verification ({cached_error:#}); its single fresh download failed"
+                )
+            })?;
+            let fresh_digest = sha256(&work.join(blob))?;
+            let fresh_response =
+                fetch_github_attestation_response(repository, &fresh_digest, RELEASE_PREDICATE)?;
+            verified_manifest_from_attestations(
+                &fresh_response,
+                version,
+                work,
+                blob,
+                &fresh_digest,
+                identity,
+                |work, bundle, blob, identity| {
+                    verify_blob_attestation(
+                        work,
+                        bundle,
+                        blob,
+                        identity,
+                        RELEASE_PREDICATE,
+                        container_backend,
+                    )
+                },
+            )
+            .with_context(|| {
+                format!(
+                    "fresh Release artifact failed verification after the cached item was rejected ({cached_error:#})"
+                )
+            })?
+        }
+    };
     if let Some(root) = cache {
         // Only fully verified bytes reach the persistent store; the
         // recomputed digest above already proved what we are storing.
@@ -745,5 +790,19 @@ mod cache_tests {
         let expected = sha256(&blob_path).unwrap();
         assert_eq!(recomputed, expected);
         assert_eq!(expected.len(), 64);
+    }
+
+    #[test]
+    fn failed_cache_removal_is_scoped_to_the_exact_blob() {
+        let root = PrivateTempDir::new("nazoauth-release-cache-eviction").unwrap();
+        let rejected = root.path().join("nazoauth-linux-x86_64");
+        let sibling = root.path().join("nazoauth-linux-aarch64");
+        fs::write(&rejected, b"rejected").unwrap();
+        fs::write(&sibling, b"still-valid").unwrap();
+
+        remove_failed_cached_release(&rejected).unwrap();
+
+        assert!(!rejected.exists());
+        assert_eq!(fs::read(&sibling).unwrap(), b"still-valid");
     }
 }

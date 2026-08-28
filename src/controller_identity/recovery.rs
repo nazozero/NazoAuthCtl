@@ -2,9 +2,9 @@
 //!
 //! The Recovery Secret is a 32-byte offline value shown to the operator
 //! exactly once. ctl derives the signing key from it with the frozen KDF
-//! (`hkdf-sha256-v1`, authority in `nazo-operator-protocol::recovery`), never
-//! persists either the secret or the derived seed, and never sends secret
-//! bytes anywhere: only public keys and Ed25519 signatures cross the wire.
+//! (`hkdf-sha256-v1`, authority in `nazo-operator-protocol::recovery`) and
+//! never sends secret bytes anywhere: only public keys and Ed25519 signatures
+//! cross the wire.
 //!
 //! Flows:
 //!
@@ -18,6 +18,12 @@
 //!   plus record the server-assigned binding. The replacement root travels
 //!   inside the signed proposal, so the possibly-exposed old secret stops
 //!   verifying the moment the commit lands (`old_recovery_secret_invalid`).
+//!
+//! Persistence has one narrow exception: first bind retains the exact already
+//! delivered display value in the owner-only controller-key directory until
+//! its atomic server commit is terminal. This prevents a retry from silently
+//! replacing the operator's only offline secret; terminal reconciliation
+//! erases it. Derived seeds are never persisted.
 //!
 //! Delivery boundary: CLI wiring (prompt/file handling for the secret) lands
 //! with the I wave; these functions are the complete use-case layer.
@@ -44,7 +50,7 @@ use crate::registry::RegistryStore;
 const PENDING_RECOVERY_SCHEMA: u32 = 1;
 const MAX_PENDING_RECOVERY_BYTES: u64 = 16 * 1024;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PendingRecovery {
     schema: u32,
@@ -192,6 +198,12 @@ pub(crate) struct RecoveryMaterial {
     pub kid: String,
 }
 
+impl Drop for RecoveryMaterial {
+    fn drop(&mut self) {
+        self.display.zeroize();
+    }
+}
+
 /// Generate one fresh Recovery Root candidate for a deployment.
 pub(crate) fn generate_material(deployment_id: &str) -> RecoveryMaterial {
     let mut secret: [u8; 32] = rand::random();
@@ -205,6 +217,27 @@ pub(crate) fn generate_material(deployment_id: &str) -> RecoveryMaterial {
         public_key,
         kid,
     }
+}
+
+/// Rebuild the public Recovery Root facts from one previously delivered
+/// secret. This exists only for the short-lived first-bind retry record: a
+/// retry must submit the exact proposal whose secret the operator already
+/// stored, never silently mint a replacement root.
+pub(crate) fn material_from_display(
+    deployment_id: &str,
+    display: &str,
+) -> anyhow::Result<RecoveryMaterial> {
+    let mut secret = parse_recovery_secret(display)
+        .map_err(|error| anyhow::anyhow!("{error}: pending bind recovery secret is invalid"))?;
+    let seed = Zeroizing::new(derive_recovery_seed(&secret, deployment_id));
+    secret.zeroize();
+    let public_key = recovery_public_key_bytes(&seed);
+    let kid = recovery_kid(&public_key);
+    Ok(RecoveryMaterial {
+        display: display.to_owned(),
+        public_key,
+        kid,
+    })
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -455,6 +488,19 @@ pub(crate) fn recover_controller_identity(
         .validate()
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
+    // Allocation is itself an authorized Recovery Root operation.  Bind a
+    // fresh client nonce and the complete proposal before asking the server
+    // to create any pending state; no address-based heuristic participates in
+    // this authority decision.
+    let allocation_nonce = rand::random::<[u8; 32]>();
+    let allocation_signature = proposal.sign_allocation(&allocation_nonce, &old_seed);
+    if !proposal.verify_allocation_signature(&allocation_nonce, &old_public, &allocation_signature)
+    {
+        bail!(
+            "internal error: the computed allocation proof failed its own verification; aborting before request"
+        );
+    }
+
     let challenge = api
         .issue_recovery_challenge(&RecoveryChallengeBody {
             deployment_id: deployment_id.clone(),
@@ -463,6 +509,8 @@ pub(crate) fn recover_controller_identity(
             kid: candidate.kid.clone(),
             recovery_public_key: b64(&replacement.public_key),
             recovery_kid: replacement.kid.clone(),
+            allocation_nonce: b64(&allocation_nonce),
+            allocation_signature: b64(&allocation_signature),
         })
         .map_err(|error| anyhow::anyhow!("{error}"))
         .context("challenge request failed; nothing was changed")?;
@@ -646,12 +694,9 @@ mod tests {
             let temp = PrivateTempDir::new("nazauthctl-recovery")?;
             let registry = RegistryStore::open(temp.path().join("registry"))?;
             let host = registry.ensure_local_host()?;
-            let evidence = DiscoveryEvidence::new(
-                &host,
-                local_hello(vec!["podman".to_owned()]),
-                DEPLOYMENT,
-                ISSUER,
-            )?;
+            let mut hello = local_hello(vec!["podman".to_owned()]);
+            hello.target_id = host.host_id.to_string();
+            let evidence = DiscoveryEvidence::new(&host, hello, DEPLOYMENT, ISSUER)?;
             registry.register_instance(&evidence, Some("prod"), ObservationCache::now(true, ""))?;
             let keys = ControllerKeyStore::open(temp.path().join("keys"))?;
             Ok(Self {
@@ -839,6 +884,22 @@ mod tests {
                 .try_into()
                 .unwrap(),
         };
+        let allocation_nonce: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(challenge_body["allocation_nonce"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let allocation_signature: [u8; 64] = URL_SAFE_NO_PAD
+            .decode(challenge_body["allocation_signature"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(proposal.verify_allocation_signature(
+            &allocation_nonce,
+            &old.public_key,
+            &allocation_signature,
+        ));
+        assert!(!bodies[0].contains("NAZO-RECOVERY-"));
         let nonce_echo: [u8; 32] = URL_SAFE_NO_PAD
             .decode(answer_body["nonce"].as_str().unwrap())
             .unwrap()

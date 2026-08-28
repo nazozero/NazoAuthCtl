@@ -25,11 +25,11 @@ fn valid_manifest() -> ReleaseManifest {
             protocol: nazo_operator_protocol::PROTOCOL_VERSION,
             build_id: "build:test".to_owned(),
         },
-        operator_protocol: Some(OperatorProtocolCompatibility {
+        operator_protocol: OperatorProtocolCompatibility {
             version: nazo_operator_protocol::PROTOCOL_VERSION,
-            minimum_ctl_version: "0.1.19".to_owned(),
+            minimum_ctl_version: "0.2.0".to_owned(),
             maximum_ctl_version_exclusive: "0.3.0".to_owned(),
-        }),
+        },
         artifacts: BTreeMap::from([(
             "binary".to_owned(),
             artifact(format!("nazoauth-{target}{suffix}")),
@@ -54,7 +54,7 @@ fn valid_manifest() -> ReleaseManifest {
                 ("linux/arm64".to_owned(), format!("sha256:{}", "2".repeat(64))),
             ]),
         },
-        rollback: Rollback {
+        rollback: ReleaseRollbackPolicy {
             artifact: true,
             schema_compatible: true,
             database_restore: DatabaseRestore::Backup,
@@ -98,6 +98,20 @@ fn release_manifest_binds_every_binary_frontend_and_oci_identity() {
         assert!(manifest.runtime_oci_digest().is_err());
     }
 
+    let mut invalid = manifest.clone();
+    invalid.schema = 4;
+    assert!(invalid.validate("v0.2.0", "release-identity").is_err());
+    let mut missing_protocol = serde_json::to_value(&manifest).unwrap();
+    missing_protocol
+        .as_object_mut()
+        .unwrap()
+        .remove("operator_protocol");
+    assert!(serde_json::from_value::<ReleaseManifest>(missing_protocol).is_err());
+    assert_eq!(nazo_operator_protocol::PROTOCOL_VERSION, 2);
+    let mut invalid = manifest.clone();
+    invalid.embedded.protocol = 1;
+    invalid.operator_protocol.version = 1;
+    assert!(invalid.validate("v0.2.0", "release-identity").is_err());
     let mut invalid = manifest.clone();
     invalid.rollback.irreversible_migration = true;
     assert!(invalid.validate("v0.2.0", "release-identity").is_err());

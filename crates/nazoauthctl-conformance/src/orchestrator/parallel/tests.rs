@@ -194,9 +194,9 @@ impl Transport for ParallelFixtureTransport {
 }
 
 fn test_binding() -> ConformanceBinding {
-    ConformanceBinding::new(
-        "019ff000-8190-7393-8c33-ab4339c3d85e",
-        "request-0123456789abcdef0123456789abcdef",
+    ConformanceBinding::openid4vc_trust_policy(
+        "openid4vc-trust-policy:test",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     )
     .expect("binding")
 }

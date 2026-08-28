@@ -42,8 +42,8 @@
 //! * steady-state cap 16 MiB per file — an append that crosses it triggers
 //!   compaction on the next journal use;
 //! * compaction keeps the newest terminal history down to an 8 MiB budget,
-//!   never fewer than the newest 128 terminal lines, and NEVER drops any
-//!   `pending` line (pending entries are the resumable window);
+//!   never fewer than the newest 128 terminal lines, plus exactly the latest
+//!   still-unsettled `pending` line for each interrupted operation;
 //! * reads tolerate up to 32 MiB so a crash between an oversized append and
 //!   its compaction still parses and self-heals instead of wedging.
 //!
@@ -60,6 +60,7 @@
 //! I wave); the controller never needs these lines for authorization.
 
 use std::{
+    collections::HashSet,
     fs::{self, OpenOptions},
     io::Write as _,
     path::{Path, PathBuf},
@@ -71,12 +72,10 @@ use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::error_codes::OPERATION_ID_CONFLICT;
 use crate::filesystem;
 
-use super::wire::{
-    HOST_OPERATION_KINDS, HostOperation, HostResult, OPERATION_ID_CONFLICT,
-    canonical_operation_hash,
-};
+use super::wire::{HOST_OPERATION_KINDS, HostOperation, HostResult, canonical_operation_hash};
 
 /// Schema discriminator for every journal line. Version 2 added `action` and
 /// `recorded_at` so the operation-log view can show what ran and when without
@@ -267,9 +266,15 @@ impl TargetJournal {
             latest = Some(line);
         }
 
+        let resumed = latest
+            .as_ref()
+            .is_some_and(|line| matches!(line.status, JournalStatus::Pending));
+
         // A terminal stored result is the authoritative idempotent answer.
-        // A pending line means an earlier attempt was interrupted after
-        // acceptance but before completion: resume by executing again.
+        // A completed transfer-read intentionally stores no result bytes:
+        // the immutable export can reproduce the same offset/hash response,
+        // while retaining archive chunks here would turn the journal into a
+        // second backup store. A pending line likewise resumes by execution.
         if let Some(line) = latest
             && !matches!(line.status, JournalStatus::Pending)
             && let Some(result) = line.result
@@ -278,19 +283,21 @@ impl TargetJournal {
         }
 
         let action = operation.operation.kind().to_owned();
-        self.append(
-            &path,
-            &JournalLine {
-                schema: JOURNAL_SCHEMA,
-                operation_id: operation.operation_id.clone(),
-                operation_hash: operation_hash.clone(),
-                action: action.clone(),
-                recorded_at: Utc::now(),
-                status: JournalStatus::Pending,
-                result: None,
-            },
-        )?;
-        self.compact_if_needed(&path)?;
+        if !resumed {
+            self.append(
+                &path,
+                &JournalLine {
+                    schema: JOURNAL_SCHEMA,
+                    operation_id: operation.operation_id.clone(),
+                    operation_hash: operation_hash.clone(),
+                    action: action.clone(),
+                    recorded_at: Utc::now(),
+                    status: JournalStatus::Pending,
+                    result: None,
+                },
+            )?;
+            self.compact_if_needed(&path)?;
+        }
         let result = execute(operation);
         if let super::wire::HostOutcome::Failed { ref code, .. } = result.outcome
             && (code == "CONTROL_OUTCOME_UNKNOWN" || code == "OUTCOME_UNKNOWN")
@@ -309,7 +316,13 @@ impl TargetJournal {
                     super::wire::HostOutcome::Completed { .. } => JournalStatus::Completed,
                     super::wire::HostOutcome::Failed { .. } => JournalStatus::Failed,
                 },
-                result: Some(result.clone()),
+                result: if operation.operation.is_ephemeral_backup_read()
+                    && matches!(result.outcome, super::wire::HostOutcome::Completed { .. })
+                {
+                    None
+                } else {
+                    Some(result.clone())
+                },
             },
         )?;
         self.compact_if_needed(&path)?;
@@ -418,22 +431,30 @@ fn project_entry(line: &JournalLine) -> OperationLogEntry {
 
 /// Pure retention decision for compaction (H04): walk newest → oldest and keep
 ///
-/// * every `pending` line unconditionally — pending entries are the resumable
-///   window and are never deleted;
+/// * the newest `pending` line for an operation only when no newer terminal
+///   line settles it;
 /// * terminal lines while the retained byte budget lasts, plus at least
 ///   `bounds.min_terminal_retained` newest terminal lines regardless of size.
 ///
-/// Pending-line bytes do not consume the terminal-history budget: they cannot
-/// be dropped, so counting them would only distort how much history survives.
+/// Superseded and duplicate pending lines carry no recovery information. If
+/// retained forever, every successful operation permanently consumes journal
+/// space and eventually makes the journal exceed its own hard read cap.
 pub(crate) fn keep_mask(lines: &[JournalLine], bounds: &JournalBounds) -> Vec<bool> {
     let mut mask = vec![false; lines.len()];
     let mut budget = bounds.target_bytes;
     let mut retained_terminals = 0usize;
+    let mut terminal_seen = HashSet::new();
+    let mut pending_seen = HashSet::new();
     for index in (0..lines.len()).rev() {
         if matches!(lines[index].status, JournalStatus::Pending) {
-            mask[index] = true;
+            if !terminal_seen.contains(lines[index].operation_id.as_str())
+                && pending_seen.insert(lines[index].operation_id.as_str())
+            {
+                mask[index] = true;
+            }
             continue;
         }
+        terminal_seen.insert(lines[index].operation_id.as_str());
         let size = serde_json::to_vec(&lines[index]).map_or(0, |bytes| bytes.len() as u64);
         if retained_terminals < bounds.min_terminal_retained || budget >= size {
             mask[index] = true;
@@ -571,6 +592,11 @@ fn validate_entry(entry: &JournalLine, line_number: usize) -> anyhow::Result<()>
     }
     match entry.status {
         JournalStatus::Pending if entry.result.is_none() => Ok(()),
+        JournalStatus::Completed
+            if entry.action == "backup-transfer-read" && entry.result.is_none() =>
+        {
+            Ok(())
+        }
         JournalStatus::Completed | JournalStatus::Failed => match &entry.result {
             Some(result) if result.operation_id == entry.operation_id => Ok(()),
             _ => bail!(
@@ -591,6 +617,25 @@ mod tests {
 
     fn ping_operation(nonce: &str) -> HostOperation {
         HostOperation::ping(Uuid::now_v7().to_string(), nonce)
+    }
+
+    #[test]
+    fn transfer_read_terminal_omits_archive_bytes_but_other_terminals_cannot() {
+        let base = JournalLine {
+            schema: JOURNAL_SCHEMA,
+            operation_id: Uuid::now_v7().to_string(),
+            operation_hash: "a".repeat(64),
+            action: "backup-transfer-read".to_owned(),
+            recorded_at: Utc::now(),
+            status: JournalStatus::Completed,
+            result: None,
+        };
+        assert!(validate_entry(&base, 1).is_ok());
+        let ordinary = JournalLine {
+            action: "backup-transfer-write".to_owned(),
+            ..base
+        };
+        assert!(validate_entry(&ordinary, 1).is_err());
     }
 
     fn echo_result(operation: &HostOperation) -> HostResult {
@@ -640,7 +685,10 @@ mod tests {
             .join("deployments")
             .join(HOST_SCOPE);
         let observed_pending = std::sync::Mutex::new(false);
-        let hook_operation = operation.clone();
+        let hook_operation: HostOperation = serde_json::from_slice(
+            &serde_json::to_vec(&operation).expect("serialize public test operation"),
+        )
+        .expect("deserialize public test operation");
         let hook_journal = journal.clone();
         let observed = &observed_pending;
         let result = hook_journal.run_journaled(&hook_operation, |operation| {
@@ -856,11 +904,7 @@ mod tests {
         assert_eq!(executions.get(), 1, "pending entries resume by running");
         assert_eq!(resumed, echo_result(&operation));
         let raw = fs::read_to_string(&path)?;
-        assert_eq!(
-            raw.lines().count(),
-            3,
-            "pending + resume pending + terminal"
-        );
+        assert_eq!(raw.lines().count(), 2, "one pending + terminal");
         Ok(())
     }
 
@@ -876,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn keep_mask_keeps_all_pendings_and_the_newest_terminal_window() {
+    fn keep_mask_keeps_only_unsettled_pendings_and_the_newest_terminal_window() {
         // Oldest -> newest: [terminal_old, pending, terminal_mid, recent1,
         // recent2]. With a zero byte budget and a floor of two retained
         // terminals, exactly the two newest terminals plus the pending line
@@ -911,10 +955,24 @@ mod tests {
             keep_mask(&lines, &generous),
             vec![true, true, true, true, true]
         );
+
+        let settled_id = Uuid::now_v7().to_string();
+        let unresolved_id = Uuid::now_v7().to_string();
+        let lines = vec![
+            synthetic_line(settled_id.clone(), JournalStatus::Pending),
+            synthetic_line(settled_id, JournalStatus::Completed),
+            synthetic_line(unresolved_id.clone(), JournalStatus::Pending),
+            synthetic_line(unresolved_id, JournalStatus::Pending),
+        ];
+        assert_eq!(
+            keep_mask(&lines, &generous),
+            vec![false, true, false, true],
+            "settled and duplicate pending lines carry no recovery state"
+        );
     }
 
     #[test]
-    fn bounding_trims_old_terminals_but_never_pending_entries() -> anyhow::Result<()> {
+    fn bounding_trims_old_terminals_but_keeps_unsettled_pending_entries() -> anyhow::Result<()> {
         let temp = filesystem::PrivateTempDir::new("nazauthctl-journal-bounds")?;
         let journal = TargetJournal::with_bounds(temp.path().join("state"), tiny_bounds())?;
         let path = temp
@@ -955,7 +1013,7 @@ mod tests {
             survivors.iter().any(
                 |line| line.operation_id == pending_id && line.status == JournalStatus::Pending
             ),
-            "pending entries are never trimmed"
+            "the unsettled pending entry must survive"
         );
         // At least the minimum newest-terminal floor survived, and the oldest
         // terminals were actually trimmed away.
@@ -981,6 +1039,45 @@ mod tests {
         // journal.
         let replay = journal.run_journaled(&fresh, echo_result)?;
         assert_eq!(replay, result);
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_drops_historical_pending_lines_settled_by_terminals() -> anyhow::Result<()> {
+        let temp = filesystem::PrivateTempDir::new("nazoauthctl-journal-settled-pending")?;
+        let journal = TargetJournal::with_bounds(temp.path().join("state"), tiny_bounds())?;
+        let path = temp
+            .path()
+            .join("state/deployments/deploy-alpha/operations.jsonl");
+        filesystem::ensure_directory_chain(path.parent().expect("journal parent"))?;
+        for _ in 0..24 {
+            let operation_id = Uuid::now_v7().to_string();
+            journal.append(
+                &path,
+                &synthetic_line(operation_id.clone(), JournalStatus::Pending),
+            )?;
+            journal.append(
+                &path,
+                &synthetic_line(operation_id, JournalStatus::Completed),
+            )?;
+        }
+        assert!(fs::metadata(&path)?.len() > tiny_bounds().max_bytes);
+
+        let mut fresh = ping_operation("compact-settled");
+        fresh.deployment_id = Some("deploy-alpha".to_owned());
+        journal.run_journaled(&fresh, echo_result)?;
+        let survivors: Vec<JournalLine> = fs::read_to_string(&path)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        assert!(
+            survivors
+                .iter()
+                .filter(|line| line.operation_id != fresh.operation_id)
+                .all(|line| !matches!(line.status, JournalStatus::Pending)),
+            "settled pending history must not survive compaction"
+        );
+        assert!(fs::metadata(&path)?.len() <= tiny_bounds().max_bytes);
         Ok(())
     }
 

@@ -19,8 +19,8 @@ use super::DebugArtifactTask;
 use super::{
     BlobAttestationVerification, HostServiceInstall, ManagedDependencies, ManagedDependencyBackup,
     ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount,
-    OneShotTask, RuntimeBackend, RuntimeDatabasePrivilegeProbe, RuntimeObservation,
-    RuntimeReplacement,
+    OneShotTask, RecoveryCandidateEndpoint, RecoveryCandidateRequest, RuntimeBackend,
+    RuntimeDatabasePrivilegeProbe, RuntimeObservation, RuntimeReplacement,
 };
 
 pub struct PodmanBackend {
@@ -99,6 +99,26 @@ impl RuntimeBackend for PodmanBackend {
 
     fn replace(&self, replacement: &RuntimeReplacement) -> anyhow::Result<()> {
         operations::replace(&self.command, replacement)
+    }
+
+    fn stage_recovery_candidate(
+        &self,
+        request: &RecoveryCandidateRequest,
+    ) -> anyhow::Result<RecoveryCandidateEndpoint> {
+        super::container_shared::stage_recovery_candidate(
+            &self.command,
+            "Podman",
+            &discovery::inspect(&self.command, &request.source_object_reference)?,
+            request,
+            false,
+        )
+    }
+
+    fn cleanup_recovery_candidate(
+        &self,
+        endpoint: &RecoveryCandidateEndpoint,
+    ) -> anyhow::Result<()> {
+        super::container_shared::cleanup_recovery_candidate(&self.command, "Podman", endpoint)
     }
 
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String> {

@@ -134,7 +134,11 @@ impl OperationJournal {
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         };
-        if entry.operation_id.is_empty() || !hex(&entry.request_hash) || entry.kid.is_empty() {
+        let operation_id = uuid::Uuid::parse_str(&entry.operation_id).ok();
+        if operation_id.is_none_or(|value| value.get_version_num() != 7)
+            || !hex(&entry.request_hash)
+            || super::store::validate_kid_shape(&entry.kid).is_err()
+        {
             bail!(
                 "{STATE_RESET_REQUIRED}: operation journal entry does not conform ({})",
                 path.display()
@@ -306,11 +310,7 @@ mod tests {
     }
 
     fn sample_entry(operation_id: &str) -> OperationJournalEntry {
-        OperationJournalEntry::new(
-            operation_id.to_owned(),
-            "ab".repeat(32),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0".to_owned(),
-        )
+        OperationJournalEntry::new(operation_id.to_owned(), "ab".repeat(32), "a".repeat(43))
     }
 
     #[test]
@@ -381,6 +381,21 @@ mod tests {
             format!("{error:#}").contains(STATE_RESET_REQUIRED),
             "{error:#}"
         );
+
+        let mut old_operation = sample_entry("01900000-0000-4000-8000-000000000003");
+        filesystem::atomic_write(&path, &serde_json::to_vec_pretty(&old_operation)?, 0o600)?;
+        let error = OperationJournal::open(dir.clone())?
+            .load()
+            .expect_err("non-v7 operation id");
+        assert!(format!("{error:#}").contains(STATE_RESET_REQUIRED));
+
+        old_operation.operation_id = "01900000-0000-7000-8000-000000000003".to_owned();
+        old_operation.kid = "not-a-controller-kid".to_owned();
+        filesystem::atomic_write(&path, &serde_json::to_vec_pretty(&old_operation)?, 0o600)?;
+        let error = OperationJournal::open(dir)?
+            .load()
+            .expect_err("malformed controller kid");
+        assert!(format!("{error:#}").contains(STATE_RESET_REQUIRED));
         Ok(())
     }
 

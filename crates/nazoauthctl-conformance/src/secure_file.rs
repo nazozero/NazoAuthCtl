@@ -224,26 +224,6 @@ pub(crate) fn write_atomic(
     }
 }
 
-/// Re-fsync the already-validated parent directory after a caller has
-/// reconciled an interrupted atomic replacement by reading the final inode.
-/// This is deliberately separate from `write_atomic`: recovery must not turn
-/// a byte-visible rename into a durable ownership transfer until this second
-/// barrier succeeds.
-pub(crate) fn fsync_parent_directory(path: &Path, private: bool) -> Result<(), SecureFileError> {
-    let absolute = normalize_absolute(path)?;
-    #[cfg(not(unix))]
-    {
-        let _ = (absolute, private);
-        Err(SecureFileError::UnsupportedPlatform)
-    }
-    #[cfg(unix)]
-    {
-        let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
-        let parent_file = open_directory_chain(parent, private, false)?;
-        rustix::fs::fsync(&parent_file).map_err(|_| SecureFileError::Io)
-    }
-}
-
 /// Create a secure file exactly once. If a concurrent/crash-resume writer has
 /// already created the destination, the bytes must match exactly; this never
 /// falls back to a rename that could replace evidence owned by that writer.

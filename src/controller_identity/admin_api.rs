@@ -165,23 +165,38 @@ impl AdminApiTransport for HttpsAdminTransport {
         let status = response.status().as_u16();
         let (_, body) = response.into_parts();
 
-        let collected = self
+        let bytes = self
             .runtime
-            .block_on(body.collect())
-            .map_err(anyhow::Error::from)
+            .block_on(async {
+                let mut body = body;
+                let mut bytes = Vec::new();
+                while let Some(frame) = body.frame().await {
+                    let frame = frame.map_err(anyhow::Error::from)?;
+                    if let Ok(data) = frame.into_data() {
+                        append_response_frame(&mut bytes, &data)?;
+                    }
+                }
+                Ok::<_, anyhow::Error>(bytes)
+            })
             .context("failed to read the admin API response body")?;
-        let bytes = collected.to_bytes();
-        if bytes.len() > MAX_RESPONSE_BYTES {
-            bail!(
-                "admin API response exceeds the {} byte limit",
-                MAX_RESPONSE_BYTES
-            );
-        }
         Ok(AdminHttpResponse {
             status,
-            body: bytes.to_vec(),
+            body: bytes,
         })
     }
+}
+
+/// The cap is enforced as each frame arrives so a malicious peer cannot make
+/// ctl collect an oversized response before it notices the limit.
+fn append_response_frame(output: &mut Vec<u8>, frame: &[u8]) -> anyhow::Result<()> {
+    if frame.len() > MAX_RESPONSE_BYTES.saturating_sub(output.len()) {
+        bail!(
+            "admin API response exceeds the {} byte limit",
+            MAX_RESPONSE_BYTES
+        );
+    }
+    output.extend_from_slice(frame);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -611,7 +626,8 @@ pub trait ControllerRegistryApi {
         &self,
         body: &RecoveryRootRotateBody,
     ) -> Result<RecoveryRootView, AdminApiError>;
-    /// Request one break-glass challenge (unauthenticated by design).
+    /// Request one break-glass challenge after proving possession of the
+    /// current Recovery Root in the request body.
     fn issue_recovery_challenge(
         &self,
         body: &RecoveryChallengeBody,
@@ -691,7 +707,17 @@ impl HttpControllerRegistryApi {
         query: Option<(&str, &str)>,
         body: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, AdminApiError> {
-        let mut headers = self.access.headers();
+        // A Recovery Secret is its own authority and must never share an
+        // administrator browser session.  This is structural: even the
+        // normal `controller recover` command cannot send Cookie/CSRF there.
+        let mut headers = if matches!(
+            path,
+            "/controller-recovery/challenges" | "/controller-recovery/recover"
+        ) {
+            Vec::new()
+        } else {
+            self.access.headers()
+        };
         if body.is_some() {
             headers.push(("Content-Type", "application/json".to_owned()));
         }
@@ -892,8 +918,7 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             algorithm: serde_json::Value,
             single_use: bool,
         }
-        // Break-glass route carries no session semantics; the shared header
-        // helper still runs and the server simply ignores the values.
+        // Break-glass route never carries browser-session credentials.
         let raw = self.send_json(
             "POST",
             "/controller-recovery/challenges",
@@ -980,7 +1005,7 @@ pub struct RecoveryRootRotateBody {
 /// Body of `POST /controller-recovery/challenges`.  The `recovery_*` fields
 /// name the REPLACEMENT root installed on success; the answer itself is
 /// signed by the OLD secret's key against the CURRENT root.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryChallengeBody {
     pub deployment_id: String,
@@ -989,10 +1014,12 @@ pub struct RecoveryChallengeBody {
     pub kid: String,
     pub recovery_public_key: String,
     pub recovery_kid: String,
+    pub allocation_nonce: String,
+    pub allocation_signature: String,
 }
 
 /// Body of `POST /controller-recovery/recover`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryAnswerBody {
     pub deployment_id: String,
@@ -1296,6 +1323,41 @@ mod tests {
             body_text,
             r#"{"approval_token":"tok","action":"bind","deployment_id":"deploy-alpha","label":"ops","public_key":"pk","kid":"k","recovery_public_key":"rpk","recovery_kid":"rkid"}"#
         );
+    }
+
+    #[test]
+    fn recovery_ceremony_never_attaches_admin_access_headers() -> anyhow::Result<()> {
+        let transport = CannedTransport::default();
+        transport.push(200, "{}");
+        let client = HttpControllerRegistryApi::with_transport(
+            "https://auth.example.com",
+            AdminAccess::new(
+                Some("session=must-not-leak".to_owned()),
+                Some("csrf-no".to_owned()),
+            ),
+            Box::new(transport.clone()),
+        )?;
+        client.send_json(
+            "POST",
+            "/controller-recovery/challenges",
+            None,
+            Some(b"{}".to_vec()),
+        )?;
+        let request = transport.requests().pop().expect("one request");
+        assert_eq!(
+            request.headers,
+            vec![("Content-Type", "application/json".to_owned())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn response_cap_is_enforced_before_oversized_frame_is_appended() {
+        let mut collected = vec![0; MAX_RESPONSE_BYTES - 1];
+        assert!(append_response_frame(&mut collected, &[1]).is_ok());
+        assert_eq!(collected.len(), MAX_RESPONSE_BYTES);
+        assert!(append_response_frame(&mut collected, &[2]).is_err());
+        assert_eq!(collected.len(), MAX_RESPONSE_BYTES);
     }
 
     #[test]

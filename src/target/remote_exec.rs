@@ -73,8 +73,9 @@ fn read_bounded_stdin() -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error_codes::{CONFIG_REVISION_MISMATCH, OPERATION_ID_CONFLICT};
     use crate::filesystem::PrivateTempDir;
-    use crate::target::wire::{MAX_HOST_OPERATION_BYTES, OPERATION_ID_CONFLICT, parse_host_result};
+    use crate::target::wire::{MAX_HOST_OPERATION_BYTES, parse_host_result};
     use uuid::Uuid;
 
     fn temp_state() -> anyhow::Result<(PrivateTempDir, std::path::PathBuf)> {
@@ -189,8 +190,8 @@ mod tests {
     // ---------- F01/F04 end-to-end over the remote exec protocol ----------
 
     use crate::target::deployment_state::{
-        ArtifactRefs, CONFIG_REVISION_MISMATCH, DEPLOYMENT_UNKNOWN, Resource, ResourceOwnership,
-        ResourceScope, RuntimeSurface, StateMutationPayload,
+        ArtifactRefs, DEPLOYMENT_UNKNOWN, Resource, ResourceOwnership, ResourceScope,
+        RuntimeSurface, StateMutationPayload,
     };
     use crate::target::{HostCompletionBody as Body, HostOperation};
 
@@ -230,6 +231,42 @@ mod tests {
         Ok(serde_json::to_vec(&operation)?)
     }
 
+    fn seed_deployment(root: &std::path::Path) -> anyhow::Result<()> {
+        crate::target::deployment_state::TargetStateStore::open(root)?.bootstrap(
+            "deploy-alpha",
+            crate::target::deployment_state::BootstrapParams {
+                issuer: "https://auth.example.com".to_owned(),
+                runtime: RuntimeSurface::new("podman", "nazoauth-main")?,
+                artifact: ArtifactRefs {
+                    current: Some(format!("sha256:{}", "a".repeat(64))),
+                    previous: None,
+                },
+                config_reference: "/etc/nazauth/config.toml".to_owned(),
+                config_schema: "nazauth-config-v1".to_owned(),
+                resources: vec![
+                    Resource::new(
+                        "app-container",
+                        "container",
+                        "nazoauth-main",
+                        ResourceOwnership::Managed,
+                        ResourceScope::Deployment,
+                    )?,
+                    Resource::new(
+                        "shared-db",
+                        "postgres",
+                        "pg-main.example.internal:5432",
+                        ResourceOwnership::External,
+                        ResourceScope::Shared,
+                    )?,
+                ],
+                current_build_identity: None,
+                current_rollback_policy: crate::model::test_release_rollback_policy(),
+            },
+            &Uuid::now_v7().to_string(),
+        )?;
+        Ok(())
+    }
+
     fn apply_config_input(expected_revision: u64) -> anyhow::Result<Vec<u8>> {
         let operation = HostOperation::state_mutate(
             Uuid::now_v7().to_string(),
@@ -260,15 +297,10 @@ mod tests {
     fn state_kinds_flow_end_to_end_through_the_remote_exec_contract() -> anyhow::Result<()> {
         let (_temp, root) = temp_state()?;
 
-        // Bootstrap creates the target-side authority document.
-        let bootstrapped = answered(&bootstrap_input()?, &root)?;
-        let crate::target::HostOutcome::Completed {
-            body: Body::StateMutateApplied { revision },
-        } = bootstrapped.outcome
-        else {
-            panic!("expected a bootstrap completion: {bootstrapped:?}");
-        };
-        assert_eq!(revision, 1);
+        // Clean install owns bootstrap and is covered by its verified-release
+        // tests. Seed a current state here so this test stays scoped to the
+        // remote exec transport and state-operation contract.
+        seed_deployment(&root)?;
 
         // A stale CAS expectation is refused without last-write-wins.
         let stale = answered(&apply_config_input(99)?, &root)?;
@@ -280,7 +312,7 @@ mod tests {
         // The matching expectation applies and bumps exactly one revision.
         let applied = answered(&apply_config_input(1)?, &root)?;
         let crate::target::HostOutcome::Completed {
-            body: Body::StateMutateApplied { revision },
+            body: Body::StateMutateApplied { revision, .. },
         } = applied.outcome
         else {
             panic!("expected an applied completion: {applied:?}");
@@ -338,7 +370,7 @@ mod tests {
 
         // After one bootstrap the sweep reports exactly that deployment with
         // its authoritative facts.
-        serve(&bootstrap_input()?, &mut Vec::new(), &root)?;
+        seed_deployment(&root)?;
         let swept = answered(
             &serde_json::to_vec(&HostOperation::state_list(Uuid::now_v7().to_string()))?,
             &root,
@@ -352,7 +384,10 @@ mod tests {
         assert_eq!(deployments.len(), 1);
         assert_eq!(deployments[0].deployment_id, "deploy-alpha");
         assert_eq!(deployments[0].issuer, "https://auth.example.com");
-        assert_eq!(deployments[0].runtime.kind, "podman");
+        assert_eq!(
+            deployments[0].runtime.kind,
+            crate::runtime_backend::RuntimeBackendKind::Podman
+        );
         assert_eq!(deployments[0].resources.len(), 2);
 
         // A bound sweep is rejected at admission: the helper exits nonzero
@@ -373,11 +408,11 @@ mod tests {
     #[test]
     fn interrupted_state_mutations_resume_without_double_applying() -> anyhow::Result<()> {
         use crate::target::journal::{JournalLine, JournalStatus, TargetJournal};
-        use crate::target::wire::{HOST_ERR_OPERATION_INVALID, canonical_operation_hash};
+        use crate::target::wire::canonical_operation_hash;
         use std::io::Write as _;
 
         let (_temp, root) = temp_state()?;
-        serve(&bootstrap_input()?, &mut Vec::new(), &root)?;
+        seed_deployment(&root)?;
 
         // Simulate a crash after acceptance but before execution: the
         // pending line exists, no terminal result does.
@@ -408,31 +443,32 @@ mod tests {
         let resumed = answered(&serde_json::to_vec(&operation)?, &root)?;
         match resumed.outcome {
             crate::target::HostOutcome::Completed {
-                body: Body::StateMutateApplied { revision },
+                body: Body::StateMutateApplied { revision, .. },
             } => assert_eq!(revision, 2, "resume applies exactly once"),
             other => panic!("expected the resumed apply to complete: {other:?}"),
         }
 
-        // The journal now carries bootstrap(pending+terminal), the crashed
-        // pending line, the resume pending line, and the terminal result.
+        // The journal compacts the recovered attempt to one pending line and
+        // one terminal result; it must not retain duplicate pending records.
         let raw = std::fs::read_to_string(
             root.join("deployments")
                 .join("deploy-alpha")
                 .join("operations.jsonl"),
         )?;
-        assert_eq!(raw.lines().count(), 5, "{raw}");
+        assert_eq!(raw.lines().count(), 2, "{raw}");
 
         // And a replay of the same bytes returns the stored terminal result.
         let replayed = answered(&serde_json::to_vec(&operation)?, &root)?;
         assert_eq!(replayed.outcome, resumed.outcome);
 
-        // Sanity: bootstrap over existing state is refused even via resume.
+        // Artifact-only adoption remains unavailable over remote exec; only
+        // the verified clean-install path may create a deployment.
         let clash = answered(&bootstrap_input()?, &root)?;
         let crate::target::HostOutcome::Failed { code, detail } = clash.outcome else {
-            panic!("expected DEPLOYMENT_EXISTS");
+            panic!("expected artifact-only adoption to fail");
         };
-        assert_ne!(code, HOST_ERR_OPERATION_INVALID);
-        assert!(detail.contains("never overwrites"), "{detail}");
+        assert_eq!(code, crate::target::ARTIFACT_UNVERIFIED);
+        assert!(detail.contains("rollback policy"), "{detail}");
         Ok(())
     }
 }

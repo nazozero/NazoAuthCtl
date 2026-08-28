@@ -1,58 +1,26 @@
 # Controller and server compatibility
 
-Current NazoAuth Release manifests use a closed compatibility object:
+NazoAuthCtl v0.2.0 supports the NazoAuth operator protocol version 2 only. The
+controller and server share the protocol crate from one immutable Git revision;
+the server Release manifest must also declare a controller range containing
+v0.2.0. Unknown protocol versions, malformed ranges, and releases outside that
+range fail closed.
 
-```json
-{
-  "operator_protocol": {
-    "version": 1,
-    "minimum_ctl_version": "0.1.19",
-    "maximum_ctl_version_exclusive": "0.3.0"
-  }
-}
-```
+The release gate builds the exact NazoAuthCtl tag commit once and validates it
+against the explicitly selected supported NazoAuth Release. For the v0.2.0
+controller release, that server release is v0.2.2. The gate downloads the signed
+host binary and OCI image without rebuilding the server, verifies their GitHub
+provenance and Sigstore identity, resolves the OCI tag to an immutable digest,
+executes that immutable OCI artifact, and requires identical protocol-2 build
+identities from the host and OCI forms.
 
-The controller accepts a server only when the protocol constant (currently `1`)
-equals its pinned `nazo-operator-protocol` constant. The protocol crate source is
-pinned to an immutable Git revision, not to a NazoAuth product version. NazoAuth
-and NazoAuthCtl releases are independent; the ctl SemVer only has to be inside
-the server's declared range.
-Unknown protocol versions and malformed or empty ranges fail closed.
+Only that protocol-2 pair is accepted. NazoAuthCtl v0.2.0 starts from clean
+controller state and manages only target-owned current-protocol DeploymentState.
+Old controller binaries, state directories, rollback slots, task envelopes,
+commands, and deployment-state schemas are rejected rather than converted.
+Database rollback across this cut is unsupported; recovery restores one
+verified current-format snapshot through the current controller.
 
-The independent controller validates the current and previous immutable, signed
-server Releases below without rebuilding them:
-
-| Controller artifact | Server Release | Protocol | Status |
-| --- | --- | --- | --- |
-| current NazoAuthCtl v0.2.0 source, built once | v0.2.0 signed host + OCI | 1 | matrix and real-backend tested |
-| current NazoAuthCtl v0.2.0 source, built once | v0.1.41 signed host + OCI | 1 | artifact/identity matrix sentinel |
-| current NazoAuthCtl v0.2.0 source, built once | v0.1.34 signed host + OCI | 1 | artifact/identity matrix sentinel |
-| current NazoAuthCtl v0.2.0 source, built once | v0.1.24 signed host + OCI | 1 | artifact/identity matrix-tested |
-| current NazoAuthCtl v0.2.0 source, built once | v0.1.20 signed host + OCI | 1 | artifact/identity matrix-tested |
-| current NazoAuthCtl v0.2.0 source, built once | v0.1.19 signed host + OCI | 1 | artifact/identity matrix-tested |
-| signed independent NazoAuthCtl v0.1.23 | v0.1.24 signed host + OCI | 1 | artifact/identity matrix-tested |
-| signed independent NazoAuthCtl v0.1.23 | v0.1.20 signed host + OCI | 1 | artifact/identity matrix-tested |
-| signed independent NazoAuthCtl v0.1.23 | v0.1.19 signed host + OCI | 1 | artifact/identity matrix-tested |
-
-The current NazoAuth v0.2.0 Release carries the explicit controller range and
-the latest migration policy. Its migration floor is `20260822000200`; that
-policy is schema-incompatible and irreversible, so database recovery requires
-the controller's verified backup path rather than a server-artifact rollback.
-v0.1.34 remains a signed compatibility sentinel. The v0.1.19 server predates
-the explicit range; legacy acceptance is restricted to that version and
-protocol 1. The v0.1.20 Release also carries the explicit range; there is no
-open-ended legacy fallback.
-
-The previous ctl cell is the signed independent NazoAuthCtl v0.1.23 Release.
-The matrix verifies its provenance from the controller repository, downloads
-already-built signed server binaries, verifies signed OCI images, and executes
-build identity from both server forms. OCI tags are resolved to a manifest
-digest before Sigstore verification and every subsequent pull, run, cache, and
-recovery use that same digest reference. Destructive recovery scenarios run
-with the current controller against NazoAuth v0.2.0 and verify Docker, Podman,
-and systemd independently. No matrix job rebuilds the server.
-
-The release workflow invokes this compatibility workflow as a reusable job and
-passes the exact controller commit SHA from the tag. The release build and
-publish jobs depend on that job; a compatibility result from another commit
-cannot satisfy the release gate.
+Both manual dispatch and reusable invocation require an exact controller commit
+and an explicit server release tag. The controller release workflow pins the
+server input to v0.2.2, and its publish jobs depend on this exact-commit gate.

@@ -6,21 +6,22 @@ mod discover_adopt;
 mod error_codes;
 mod file_lock;
 mod fleet;
-mod install;
 mod instance_lifecycle;
 mod model;
 pub mod registry;
 mod release;
 mod runtime_backend;
 pub mod target;
-pub mod tenant_resources;
 mod tls;
 
 pub(crate) use nazoauthctl_runtime::filesystem;
 pub(crate) use nazoauthctl_runtime::process;
 
+pub use cli::{GlobalOptions, parse_global_options};
 pub use conformance::{
-    ConformanceDeploymentEvidence, ConformanceRuntimeEvidence, ConformanceSession,
+    ConformanceControlCompletion, ConformanceControlOutcome, ConformanceDeploymentEvidence,
+    ConformanceRuntimeEvidence, ConformanceSession, ControlOperationIdentity,
+    OpenId4VpEvidenceVerifierInputs,
 };
 
 pub fn main_entry() {
@@ -93,6 +94,8 @@ fn command_action(command: &cli::Command) -> &'static str {
         cli::Command::Rollback { .. } => "rollback",
         cli::Command::Operation { .. } => "operation",
         cli::Command::Backup(_) => "backup",
+        cli::Command::Policy(_) => "policy",
+        cli::Command::Recover(_) => "recover",
         cli::Command::Uninstall { .. } => "uninstall",
         cli::Command::BootstrapAdmin(_) => "bootstrap-admin",
         cli::Command::Tls(_) => "tls",
@@ -143,7 +146,9 @@ Commands:
   update      Crash-safe update to a verified official artifact
   rollback    Return to the previous verified artifact reference
   operation   Read-only operation log from the two journals
-  backup      Observed backup maturity facts (informational, never a gate)
+  policy      Set backup-before-update to off, warn, or require(max age)
+  backup      Create, inspect, and actually restore-test target snapshots
+  recover     Restore a recorded snapshot after token invalidation is durable
   oidf        Official OIDF/OID4 conformance artifacts and runs
   uninstall   Delete exactly this instance's managed resources
 
@@ -210,16 +215,21 @@ re-establishes the Controller Key from the offline Recovery Secret (or, with
             "Usage:
   nazoauthctl install [--host HOST] [--name ALIAS] --public-url URL
                      --database-host HOST --database-port PORT
-                     --database-name NAME --database-user USER
-                     --database-password-file PATH
+                     --database-name NAME
+                     --database-runtime-user USER
+                     --database-runtime-password-file PATH
+                     --database-lifecycle-user USER
+                     --database-lifecycle-password-file PATH
                      --valkey-host HOST --valkey-port PORT
                      --valkey-password-file PATH
+                     [--import-data-root TARGET_PATH
+                      --import-mfa-key-file TARGET_PATH]
                      [--to VERSION] [--artifact-sha256 SHA256]
                      [--runtime podman|docker|host] [--install-root PATH]
 
 One verified handshake, one typed install order, one committed DeploymentState
 (local=healthy, control unbound, public unknown). The PostgreSQL and Valkey
-endpoints AND their passwords are operator-provided external facts — ctl never
+runtime/lifecycle PostgreSQL roles and Valkey credentials are operator-provided external facts — ctl never
 invents a credential the external system does not know; password files are
 read once and never logged. No backups, no public checks, no recovery media.
 Next steps after install:

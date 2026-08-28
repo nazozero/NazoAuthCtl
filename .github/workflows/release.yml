@@ -5,14 +5,19 @@ on:
   push:
     tags: ['v*']
 
+# Publishing an immutable tag may be retried after any individual upload
+# failed.  Never cancel a live publisher: a second job could otherwise race
+# the release asset set it is meant to validate.
+concurrency:
+  group: controller-release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
   actions: read
 
 jobs:
   policy:
-    outputs:
-      self_update_matrix: ${{ steps.resolve_self_update.outputs.matrix }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -82,44 +87,12 @@ jobs:
               f"publish={os.environ['RELEASE_REF_TYPE'] == 'tag'}"
           )
           PY
-      - name: Resolve the previous controller release for self-update validation
-        if: github.ref_type == 'tag'
-        id: resolve_self_update
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CURRENT_RELEASE: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          releases="$(gh release list \
-            --repo "$GITHUB_REPOSITORY" \
-            --limit 100 \
-            --exclude-drafts \
-            --exclude-pre-releases \
-            --json tagName,publishedAt)"
-          previous_release="$(printf '%s' "$releases" | jq -r --arg current "$CURRENT_RELEASE" '
-            map(select(.tagName != $current))
-            | sort_by(.publishedAt)
-            | reverse
-            | .[0].tagName // empty
-          ')"
-          if [ -z "$previous_release" ]; then
-            echo "no previous stable controller release is available for self-update validation" >&2
-            exit 1
-          fi
-          case "$previous_release" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "previous release is not an immutable semantic tag: $previous_release" >&2; exit 1 ;;
-          esac
-          matrix="$(jq -cn --arg from "$previous_release" --arg to "$CURRENT_RELEASE" \
-            '{include:[{from_release:$from,to_release:$to}]}')"
-          echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
-          echo "self-update transition: $previous_release -> $CURRENT_RELEASE"
-
   server-compatibility:
     needs: policy
     uses: ./.github/workflows/server-compatibility.yml
     with:
       controller_ref: ${{ github.sha }}
+      server_release: v0.2.2
     permissions:
       actions: read
       contents: read
@@ -176,86 +149,80 @@ jobs:
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release/nazoauthctl-*
-      - name: Publish immutable controller assets
+      - name: Publish the exact immutable controller asset set
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" release/nazoauthctl-* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
-
-  self-update-rollback:
-    if: github.ref_type == 'tag'
-    needs: [policy, attest]
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.policy.outputs.self_update_matrix) }}
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      attestations: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-      CURRENT_RELEASE: ${{ matrix.to_release }}
-      PREVIOUS_RELEASE: ${{ matrix.from_release }}
-    steps:
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: Install Cosign in the controller's sanitized execution path
+          RELEASE_TAG: ${{ github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
-          source="$(command -v cosign)"
-          if [ "$source" != /usr/local/bin/cosign ]; then
-            sudo install -m 0755 "$source" /usr/local/bin/cosign
-          fi
-          /usr/local/bin/cosign version >/dev/null
-      - name: Download and verify both independent controller Releases
-        run: |
-          set -euo pipefail
-          mkdir -p previous candidate
-          gh release download "$PREVIOUS_RELEASE" --repo "$GITHUB_REPOSITORY" \
-            --pattern nazoauthctl-x86_64-unknown-linux-gnu --dir previous
-          gh release download "$CURRENT_RELEASE" --repo "$GITHUB_REPOSITORY" \
-            --pattern nazoauthctl-x86_64-unknown-linux-gnu --dir candidate
-          for version in "$PREVIOUS_RELEASE" "$CURRENT_RELEASE"; do
-            directory=previous
-            [ "$version" = "$PREVIOUS_RELEASE" ] || directory=candidate
-            gh attestation verify "$directory/nazoauthctl-x86_64-unknown-linux-gnu" \
-              --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-              --source-ref "refs/tags/$version" \
-              --deny-self-hosted-runners
+          expected=(
+            nazoauthctl-x86_64-unknown-linux-gnu
+            nazoauthctl-aarch64-unknown-linux-gnu
+            nazoauthctl-x86_64-pc-windows-msvc.exe
+            nazoauthctl-aarch64-pc-windows-msvc.exe
+            nazoauthctl-x86_64-apple-darwin
+            nazoauthctl-aarch64-apple-darwin
+          )
+          for asset in "${expected[@]}"; do
+            test -f "release/$asset"
           done
-      - name: Update, roll back, and re-check the controller self lifecycle
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$(mktemp -d /tmp/controller-self-lifecycle.XXXXXX)"
-          trap 'sudo rm -rf "$root"' EXIT
-          chmod 0755 "$root"
-          binary="$root/bin/nazoauthctl"
-          config_root="$root/config"
-          state_root="$root/state"
-          mkdir -p "$root/bin" "$config_root" "$state_root"
-          install -m 0755 previous/nazoauthctl-x86_64-unknown-linux-gnu "$binary"
-          previous_sha="$(sha256sum "$binary" | cut -d' ' -f1)"
-          candidate_sha="$(sha256sum candidate/nazoauthctl-x86_64-unknown-linux-gnu | cut -d' ' -f1)"
-          # Self-management runs as root. Keep the fixture directly below the
-          # root-owned sticky /tmp boundary, then transfer it only after the
-          # runner has finished authoring every initial fixture path.
-          sudo chown -R 0:0 "$root"
-          sudo env \
-            "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
-            "NAZOAUTHCTL_STATE_ROOT=$state_root" \
-            "$binary" self check --to "$CURRENT_RELEASE"
-          sudo env \
-            "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
-            "NAZOAUTHCTL_STATE_ROOT=$state_root" \
-            "$binary" self update --to "$CURRENT_RELEASE" --yes
-          test "$(sha256sum "$binary" | cut -d' ' -f1)" = "$candidate_sha"
-          sudo env \
-            "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
-            "NAZOAUTHCTL_STATE_ROOT=$state_root" \
-            "$binary" self rollback --yes
-          test "$(sha256sum "$binary" | cut -d' ' -f1)" = "$previous_sha"
-          sudo env \
-            "NAZOAUTHCTL_CONFIG_ROOT=$config_root" \
-            "NAZOAUTHCTL_STATE_ROOT=$state_root" \
-            "$binary" self check --to "$PREVIOUS_RELEASE"
+          actual_file=''
+          expected_file=''
+          download_dir=''
+          trap 'rm -f "$actual_file" "$expected_file"; test -z "$download_dir" || rm -rf "$download_dir"' EXIT
+
+          # A retry must resume the same immutable release, never create a
+          # second mutable publication attempt.  The release may legitimately
+          # be incomplete after a previous upload failure, but it may never
+          # contain an asset outside this closed current-only set.
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --generate-notes
+          fi
+
+          actual_file="$(mktemp)"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' | LC_ALL=C sort -u >"$actual_file"
+          while IFS= read -r asset; do
+            [ -z "$asset" ] && continue
+            if ! printf '%s\n' "${expected[@]}" | grep -Fqx -- "$asset"; then
+              echo "release $RELEASE_TAG contains an unexpected asset: $asset" >&2
+              exit 1
+            fi
+          done <"$actual_file"
+
+          download_dir="$(mktemp -d)"
+          for asset in "${expected[@]}"; do
+            if grep -Fqx -- "$asset" "$actual_file"; then
+              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --pattern "$asset" --dir "$download_dir"
+              if ! cmp --silent "release/$asset" "$download_dir/$asset"; then
+                echo "existing release asset differs from this immutable build: $asset" >&2
+                exit 1
+              fi
+              continue
+            fi
+
+            # Never overwrite an existing asset. If another resume won the race, fetch and
+            # compare its exact bytes; any mismatch remains a hard failure.
+            if ! gh release upload "$RELEASE_TAG" "release/$asset#$asset" --repo "$GITHUB_REPOSITORY"; then
+              rm -f "$download_dir/$asset"
+              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --pattern "$asset" --dir "$download_dir"
+              if ! cmp --silent "release/$asset" "$download_dir/$asset"; then
+                echo "concurrent release asset differs from this immutable build: $asset" >&2
+                exit 1
+              fi
+            fi
+          done
+
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' | LC_ALL=C sort -u >"$actual_file"
+          expected_file="$(mktemp)"
+          printf '%s\n' "${expected[@]}" | LC_ALL=C sort -u >"$expected_file"
+          if ! cmp --silent "$expected_file" "$actual_file"; then
+            echo "release $RELEASE_TAG asset set is not exactly the current controller set" >&2
+            diff -u "$expected_file" "$actual_file" >&2 || true
+            exit 1
+          fi

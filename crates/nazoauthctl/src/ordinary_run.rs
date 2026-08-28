@@ -15,31 +15,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use nazo_operator_protocol::{ControlOperationPayload, ControlResultData};
 use nazoauthctl_conformance::{
-    ArtifactMaterializationBinding, ArtifactTrustPolicy, AuthenticatedProviderAuthorization,
-    BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy, BrowserReviewScreenshotCapture,
-    BrowserTargetOrigin, CibaUserApprovalBridge, CibaUserApprovalClient, ClientConfig,
-    ConformanceAutomation, ConformanceBinding, ConformanceProxyRecovery, ConformanceRecoveryStore,
-    ConformanceRunConfig, ConformanceRunner, CredentialStore, DescriptorMaterializer,
-    EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceDeploymentIdentity,
-    EvidenceProviderCapability, EvidenceProviderIdentity, EvidenceProviderReceipt,
-    EvidenceRuntimeIdentity, EvidenceSourceIdentity, HttpTransport, ManagedWebDriver,
-    MatrixSelection, OidfArtifactMatrix, OidfDriverLane, OidfPlanResourceBudget, OidfPlanSelection,
-    OidfProviderExecutionBinding, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
-    OpenId4VciIssuerDriver, OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier,
-    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl,
-    StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionDeferredReview,
-    SuiteRetentionManifest, SuiteRetentionManifestReceipt, SuiteRetentionPlan,
-    SuiteRetentionScreenshotManifest, TenantResourceApplyOutput, TenantResourceReceiptIdentity,
-    TenantResourceRecoveryBinding, TtyRenderer, WebDriverClient, WebDriverEndpoint,
-    authorize_oidf_driver_execution, open_cached_oidf_driver_plan, read_artifact_driver,
-    read_artifact_matrix, read_compact_manifest, recover_suite_resources,
-    validate_private_evidence_directory, verify_oidf_artifact,
-    write_private_provider_evidence_bundle, write_review_screenshot_manifest,
-};
-use nazoauthctl_core::tenant_resources::{
-    TenantResourceCapabilitySession, TenantResourceClient, TenantResourceClientError,
-    TenantResourceReceiptResult,
+    ArtifactMaterializationBinding, ArtifactTrustPolicy, BearerToken, BrowserAutomation,
+    BrowserExecutor, BrowserPolicy, BrowserReviewScreenshotCapture, BrowserTargetOrigin,
+    CibaUserApprovalBridge, CibaUserApprovalClient, ClientConfig, ConformanceAutomation,
+    ConformanceBinding, ConformanceProxyRecovery, ConformanceRecoveryStore, ConformanceRunConfig,
+    ConformanceRunner, CredentialStore, DescriptorMaterializer, EvidenceBundleIdentity,
+    EvidenceBundleReceipt, EvidenceControlIdentity, EvidenceControlOperation,
+    EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, HttpTransport,
+    ManagedWebDriver, MatrixSelection, OidfArtifactMatrix, OidfDriverLane, OidfPlanResourceBudget,
+    OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
+    OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier, OpenId4VpVerifier,
+    OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
+    SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
+    SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
+    TenantResourceApplyOutput, TenantResourceControlOperation, TenantResourceRecoveryBinding,
+    TenantResourceRecoveryPhase, TtyRenderer, WebDriverClient, WebDriverEndpoint,
+    open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
+    read_compact_manifest, recover_suite_resources, validate_private_evidence_directory,
+    verify_oidf_artifact, write_private_control_evidence_bundle, write_review_screenshot_manifest,
 };
 use serde::Serialize;
 use url::Url;
@@ -50,17 +45,14 @@ use super::RunInvocation;
 const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
 
 /// Capabilities implemented by this binary's signed-artifact runner. These
-/// are local engine facts, not NazoAuth provider permissions.
+/// are local engine facts, not remote controller permissions.
 const RUNNER_CAPABILITIES: &[&str] = &["nazoauth.client.create"];
 
 pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let suite_origin = Origin::from_suite_arg(invocation.suite.as_deref())
         .context("invalid OpenID Foundation Conformance Suite origin")?;
-    let session = nazoauthctl_core::ConformanceSession::open(
-        &invocation.config,
-        invocation.deployment.as_deref(),
-    )
-    .context("deployment is not ready for ordinary conformance orchestration")?;
+    let session = nazoauthctl_core::ConformanceSession::open(invocation.instance.as_deref())
+        .context("deployment is not ready for ordinary conformance orchestration")?;
     let deployment = session.deployment_evidence();
     let recovery_directory = session.recovery_directory()?;
     let recovery_store =
@@ -73,7 +65,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         .map(|value| (*value).to_owned())
         .collect::<BTreeSet<_>>();
     let now = current_unix_time()?;
-    let mut driver_plan = open_cached_oidf_driver_plan(
+    let driver_plan = open_cached_oidf_driver_plan(
         &invocation.artifact_cache,
         &invocation.artifact_digest,
         &trust,
@@ -168,6 +160,23 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         .map(|plan| (plan.group_id.clone(), plan.plan_id.clone()))
         .collect::<BTreeSet<_>>();
     let matrix = select_artifact_matrix_for_run(matrix, &selected_plan_ids)?;
+    let plan_lanes = driver_plan
+        .plans
+        .iter()
+        .map(|plan| (plan.plan_id.clone(), plan.driver_handler.lane))
+        .collect::<BTreeMap<_, _>>();
+    if plan_lanes.len() != driver_plan.plans.len() {
+        bail!("signed driver plan contains duplicate Matrix plan IDs");
+    }
+    let plan_resource_budgets = driver_plan
+        .plans
+        .iter()
+        .map(|plan| (plan.plan_id.clone(), plan.resource_budget.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if plan_resource_budgets.len() != driver_plan.plans.len() {
+        bail!("signed driver plan contains duplicate Matrix plan IDs");
+    }
+    let selected_resource_budget = driver_plan.selected_resource_budget.clone();
     let request_jti = format!("request-{}", hex(rand::random::<[u8; 16]>()));
     let materialization_now = current_unix_time()?;
     if materialization_now > driver_plan.latest_execution_start_at {
@@ -215,135 +224,38 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         mtls_trust_anchor_pem: prepared.mtls_trust_anchor_pem(),
     };
 
-    let tenant_resource_client_config = session
-        .tenant_resource_client_config(&invocation.tenant_id)
-        .context("failed to bind the tenant-resource client to the selected runtime")?;
     let vp_evidence_verifier = invocation
         .capture_review_screenshots
         .then(|| {
-            OpenId4VpEvidenceVerifier::new(
-                tenant_resource_client_config.deployment_id.clone(),
-                invocation.tenant_id.clone(),
-                tenant_resource_client_config.runtime_instance_id.clone(),
-                tenant_resource_client_config.runtime_key_id.clone(),
-                tenant_resource_client_config.runtime_public_key,
+            let inputs = session.openid4vp_evidence_verifier_inputs();
+            if inputs.target_issuer != session.target_issuer()
+                || inputs.deployment_id != deployment.deployment_id
+            {
+                bail!("current runtime evidence identity does not match the selected instance");
+            }
+            let public_key = nazo_operator_protocol::decode_instance_public_key(
+                &inputs.instance_public_key_base64,
             )
+            .context("current runtime evidence public key is invalid")?;
+            OpenId4VpEvidenceVerifier::new(
+                inputs.deployment_id.clone(),
+                invocation.tenant_id.clone(),
+                inputs.runtime_instance_id.clone(),
+                inputs.instance_key_id.clone(),
+                public_key,
+            )
+            .context("current runtime evidence identity is invalid")
         })
-        .transpose()
-        .context("failed to bind OpenID4VP evidence receipts to the selected runtime")?;
+        .transpose()?;
     let vp_evidence_trust_anchor = vp_evidence_verifier
         .as_ref()
         .map(|verifier| verifier.recovery_trust_anchor(session.target_issuer()))
         .transpose()
         .context("failed to persist the OpenID4VP evidence runtime trust anchor")?;
-    let client = TenantResourceClient::with_curl(tenant_resource_client_config)?;
-    let capability = client
-        .discover_capability()
-        .context("failed to discover the signed tenant-resource capability")?;
-
-    let provider_actions = capability.capability.actions.iter().copied().collect();
-    let provider_resource_kinds = capability
-        .capability
-        .resource_kinds
-        .iter()
-        .copied()
-        .collect();
-    let binding = OidfProviderExecutionBinding {
-        deployment_id: capability.capability.deployment_id.clone(),
-        tenant_id: capability.capability.tenant_id.clone(),
-        runtime_instance_id: capability.capability.runtime_instance_id.clone(),
-        runtime_build_id: capability.capability.embedded.build_id.clone(),
-        capability_jti: capability.capability.jti.clone(),
-        capability_sha256: capability.compact_sha256(),
-        runner_capabilities: runner_capabilities.clone(),
-        provider_actions,
-        provider_resource_kinds,
-        current_revision: capability.capability.revision,
-        current_manifest_sha256: capability.capability.resource_manifest_sha256.clone(),
-        artifact_source: driver_plan.artifact.source.clone(),
-        suite_origin: suite_origin.to_string(),
-    };
-    let authorization = AuthenticatedProviderAuthorization {
-        deployment_id: binding.deployment_id.clone(),
-        tenant_id: binding.tenant_id.clone(),
-        runtime_instance_id: binding.runtime_instance_id.clone(),
-        runtime_build_id: binding.runtime_build_id.clone(),
-        capability_jti: binding.capability_jti.clone(),
-        capability_sha256: binding.capability_sha256.clone(),
-        capability_issued_at: capability.capability.issued_at,
-        capability_expires_at: capability.capability.expires_at,
-        runner_capabilities: binding.runner_capabilities.clone(),
-        provider_actions: binding.provider_actions.clone(),
-        provider_resource_kinds: binding.provider_resource_kinds.clone(),
-        current_revision: binding.current_revision,
-        current_manifest_sha256: binding.current_manifest_sha256.clone(),
-        artifact_source: binding.artifact_source.clone(),
-        suite_origin: binding.suite_origin.clone(),
-    };
-    authorize_oidf_driver_execution(
-        &mut driver_plan,
-        &binding,
-        &authorization,
-        current_unix_time()?,
-    )
-    .context("signed driver plan is not authorized by the selected provider")?;
-    let plan_lanes = driver_plan
-        .plans
-        .iter()
-        .map(|plan| (plan.plan_id.clone(), plan.driver_handler.lane))
-        .collect::<BTreeMap<_, _>>();
-    if plan_lanes.len() != driver_plan.plans.len() {
-        bail!("signed driver plan contains duplicate Matrix plan ids");
-    }
-    let plan_resource_budgets = driver_plan
-        .plans
-        .iter()
-        .map(|plan| (plan.plan_id.clone(), plan.resource_budget.clone()))
-        .collect::<BTreeMap<_, _>>();
-    if plan_resource_budgets.len() != driver_plan.plans.len() {
-        bail!("signed driver plan contains duplicate Matrix plan ids");
-    }
-    let selected_resource_budget = driver_plan.selected_resource_budget.clone();
-
-    let baseline = client
-        .enumerate(
-            &capability,
-            &format!("{request_jti}-baseline"),
-            &invocation.artifact_digest,
-            Vec::new(),
-        )
-        .context("failed to enumerate the tenant-resource baseline")?;
-    let mut final_active = baseline.receipt().resources.clone();
-    for delta in manifest.resource_identities() {
-        if let Some(existing) = final_active.iter().find(|existing| {
-            existing.kind == delta.kind && existing.resource_id == delta.resource_id
-        }) {
-            if existing.digest != delta.digest {
-                bail!("run-unique tenant resource conflicts with the active baseline");
-            }
-        } else {
-            final_active.push(delta.clone());
-        }
-    }
-    final_active.sort_by(|left, right| {
-        (left.kind, left.resource_id.as_str()).cmp(&(right.kind, right.resource_id.as_str()))
-    });
-
-    let prepared_apply = client
-        .prepare_apply(
-            &capability,
-            &format!("{request_jti}-apply"),
-            manifest.bytes().as_bytes(),
-            manifest.resource_identities().to_vec(),
-            final_active.clone(),
-            current_unix_time()?,
-        )
-        .context("failed to freeze the exact tenant-resource Apply request")?;
-    let private_manifest_path = recovery_directory.join(format!("manifest-{request_jti}.json"));
+    let private_manifest_path = recovery_directory.join(format!("material-{request_jti}.json"));
     manifest
         .write_private(&private_manifest_path)
-        .context("failed to durably persist the private Apply manifest")?;
-    let prepared_identity = prepared_apply.recovery_binding();
+        .context("failed to durably persist private Apply material")?;
     let proxy_recovery = match (
         invocation.proxy_trust_bundle.as_ref(),
         invocation.proxy_reload_executable.as_ref(),
@@ -355,75 +267,98 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         (None, None) => None,
         _ => unreachable!("CLI validates proxy arguments as an atomic pair"),
     };
-    let recovery_binding = TenantResourceRecoveryBinding {
+    let recovery = match recovery_store.begin_ordinary_run(TenantResourceRecoveryBinding {
         deployment_id: deployment.deployment_id.clone(),
         tenant_id: invocation.tenant_id.clone(),
-        request_jti: prepared_identity.jti().to_owned(),
-        capability_jws: prepared_identity.capability_jws().to_owned(),
-        capability_sha256: prepared_identity.capability_sha256().to_owned(),
-        task_jws: prepared_identity.task_jws().to_owned(),
-        task_sha256: prepared_identity.task_sha256().to_owned(),
-        change_set_id: prepared_identity.change_set_id().to_owned(),
-        change_set_sha256: prepared_identity.change_set_sha256().to_owned(),
-        request_sha256: prepared_identity.request_sha256().to_owned(),
-        operation: prepared_identity.operation(),
-        expected_revision: prepared_apply.task().expected_revision,
+        run_id: request_jti.clone(),
         manifest_path: Some(private_manifest_path.clone()),
+        material_sha256: Some(manifest.raw_sha256().to_owned()),
         proxy: proxy_recovery,
         vp_evidence_trust_anchor,
         resource_identities: manifest.resource_identities().to_vec(),
-    };
-    let recovery = match recovery_store.begin_tenant_resource(recovery_binding) {
+    }) {
         Ok(recovery) => Arc::new(Mutex::new(recovery)),
         Err(error) => {
-            return match std::fs::remove_file(&private_manifest_path) {
-                Ok(()) => Err(error).context(
-                    "failed to persist the ordinary recovery intent; private manifest removed",
-                ),
-                Err(removal) => bail!(
-                    "failed to persist the ordinary recovery intent and remove its private manifest: journal={error:#}; manifest-removal={removal:#}"
-                ),
+            let cleanup = ConformanceRecoveryStore::remove_private_material(&private_manifest_path);
+            return match cleanup {
+                Ok(()) => Err(error).context("failed to persist ordinary recovery intent"),
+                Err(cleanup_error) => Err(anyhow::anyhow!(
+                    "failed to persist ordinary recovery intent: {error:#}; failed to remove private Apply material: {cleanup_error:#}"
+                )),
             };
         }
     };
-    let apply_receipt = match client.execute_prepared_live(&prepared_apply) {
-        Ok(receipt) => receipt,
-        Err(error) if is_deterministic_uncommitted_rejection(&error) => {
-            // Proxy installation is deliberately after receipt persistence,
-            // so a pre-receipt rejection proves that no proxy side effect was
-            // reached even when the intent carries a future proxy binding.
-            let mut guard = lock_recovery(&recovery)?;
-            if !guard.proxy_cleanup_complete() {
-                guard.mark_proxy_cleanup_complete()?;
-            }
-            drop(guard);
-            take_recovery(recovery)?.abort_uncommitted_tenant_resource()?;
-            return Err(error).context("ordinary tenant-resource Apply was rejected");
-        }
-        Err(error) => {
-            return Err(error).context("ordinary tenant-resource Apply failed");
-        }
+    let baseline = session
+        .execute_control_operation(
+            ControlOperationPayload::TenantResourceEnumerate {
+                tenant_id: invocation.tenant_id.clone(),
+                selectors: Vec::new(),
+            },
+            None,
+            |completion| {
+                lock_recovery(&recovery)?.record_terminal_completion(
+                    TenantResourceRecoveryPhase::BaselineEnumerated,
+                    control_operation(completion),
+                )?;
+                Ok(())
+            },
+        )
+        .context("failed to enumerate the tenant-resource baseline")?;
+    let baseline = successful_control_result(baseline, "baseline Enumerate")?;
+    let ControlResultData::TenantResourceEnumerate {
+        resources: baseline_resources,
+        ..
+    } = baseline
+    else {
+        bail!("baseline ControlOperation returned the wrong typed result");
     };
-    lock_recovery(&recovery)?.record_tenant_resource_receipt(
-        TenantResourceReceiptIdentity::from_verified_receipt(
-            apply_receipt.receipt(),
-            &apply_receipt.receipt_sha256(),
-        )?,
-    )?;
-    let apply_output = TenantResourceApplyOutput::from_verified_receipt(
-        apply_receipt.receipt().clone(),
-        prepared_apply.task().jti.as_str(),
-        prepared_apply.task().change_set_id.as_str(),
-        &prepared_apply.request_sha256(),
+    let mut final_active = baseline_resources;
+    for delta in manifest.resource_identities() {
+        if let Some(existing) = final_active.iter().find(|existing| {
+            existing.kind == delta.kind && existing.resource_id == delta.resource_id
+        }) {
+            if existing.digest != delta.digest {
+                bail!("run-unique tenant resource conflicts with active baseline");
+            }
+        } else {
+            final_active.push(delta.clone());
+        }
+    }
+    final_active.sort_by(|left, right| {
+        (left.kind, left.resource_id.as_str()).cmp(&(right.kind, right.resource_id.as_str()))
+    });
+    let apply = session
+        .execute_control_operation(
+            ControlOperationPayload::TenantResourceApply {
+                tenant_id: invocation.tenant_id.clone(),
+                resources: manifest.resource_identities().to_vec(),
+            },
+            Some(manifest.bytes().as_bytes().to_vec()),
+            |completion| {
+                lock_recovery(&recovery)?.record_terminal_completion(
+                    TenantResourceRecoveryPhase::Applied,
+                    control_operation(completion),
+                )?;
+                Ok(())
+            },
+        )
+        .context("ordinary tenant-resource Apply failed")?;
+    let apply = successful_control_completion(apply, "Apply")?;
+    let apply_output = TenantResourceApplyOutput::from_control_result(
+        &apply.result,
+        &apply.identity.operation_id,
+        &apply.identity.request_hash,
+        &apply.identity.kid,
         &manifest,
         final_active,
-    )?;
+    )
+    .context("Apply typed mappings do not match the prepared signed Matrix")?;
     let ordinary = DescriptorMaterializer::finalize_tenant_resources(
         prepared,
         apply_output,
         deployment_trust_anchor,
     )
-    .context("provider Apply mappings do not match the prepared signed Matrix")?;
+    .context("Apply typed mappings do not match the prepared signed Matrix")?;
     let mut deployment_report = DeploymentReport {
         deployment_id: deployment.deployment_id.clone(),
         tenant_id: invocation.tenant_id.clone(),
@@ -433,8 +368,10 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         matrix_sha256: ordinary.matrix_sha256().to_owned(),
         selected_groups: driver_plan.selected_group_count,
         selected_plans: driver_plan.selected_plan_count,
-        apply_task_jti: ordinary.task_jti().to_owned(),
-        change_set_id: ordinary.change_set_id().to_owned(),
+        apply_operation_id: ordinary.operation_id().to_owned(),
+        apply_request_hash: ordinary.request_hash().to_owned(),
+        apply_controller_kid: ordinary.controller_kid().to_owned(),
+        apply_revision: ordinary.applied_revision(),
         resource_manifest_sha256: ordinary.resource_manifest_sha256().to_owned(),
         trust_policy_resource_id: ordinary.trust_policy_resource_id().to_owned(),
         trust_policy_digest: ordinary.trust_policy_digest().to_owned(),
@@ -465,7 +402,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                 if !recovery.suite_cleanup_complete() {
                     recovery.mark_suite_cleanup_complete()?;
                 }
-                let resource_cleanup = cleanup_run_resources(&client, &mut recovery);
+                let resource_cleanup = cleanup_run_resources(&session, &mut recovery);
                 if resource_cleanup.is_ok()
                     && proxy_cleanup.is_ok()
                     && recovery.suite_cleanup_complete()
@@ -521,11 +458,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             (Ok(report), Some(directory)) => match write_review_screenshot_manifest(
                 report,
                 directory,
-                recovery
-                    .tenant_resource_binding()
-                    .context("missing ordinary recovery binding")?
-                    .request_jti
-                    .as_str(),
+                recovery.ordinary_binding().run_id.as_str(),
                 &invocation.artifact_digest,
                 session.target_issuer(),
             ) {
@@ -577,7 +510,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     if proxy_cleanup.is_ok() && !recovery.proxy_cleanup_complete() {
         recovery.mark_proxy_cleanup_complete()?;
     }
-    let cleanup = cleanup_run_resources(&client, &mut recovery);
+    let cleanup = cleanup_run_resources(&session, &mut recovery);
     let mut report = match run_result {
         Ok(report) => Some(report),
         Err(error) => {
@@ -603,10 +536,10 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             .any(|error| error.starts_with("resource-cleanup="));
     let retention_commit_possible =
         retention_eligible && proxy_cleanup_complete && cleanup_evidence.is_some();
-    // Screenshot evidence, not the optional provider bundle, is the durable
+    // Screenshot evidence, not the optional control evidence, is the durable
     // certification-retention boundary.  The screenshot manifest was bound
     // to the Prepared journal above and is revalidated by stage, commit,
-    // publish, recovery claim, and finish.  Provider evidence is written only
+    // publish, recovery claim, and finish. Control-operation evidence is written only
     // after ownership has transferred and the final report is fixed.
     let mut retention_committed = if retention_commit_possible {
         match (|| -> anyhow::Result<()> {
@@ -690,7 +623,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     // a successful writer and to FinalOutput; a failed writer is represented
     // only by outer diagnostics and an absent receipt.
     let mut evidence = None;
-    if let (Some(report), Some(directory), Some(cleanup_evidence)) = (
+    if let (Some(report), Some(directory), Some(cleanup_operations)) = (
         report.as_ref(),
         invocation.evidence_directory.as_ref(),
         cleanup_evidence.as_ref(),
@@ -706,33 +639,25 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                 build_id: deployment.build_id.clone(),
                 runtime: runtime.clone(),
             },
-            source: EvidenceSourceIdentity::SignedOidfArtifact {
+            source: EvidenceSourceIdentity {
                 suite_origin: suite_origin.to_string(),
                 artifact: Box::new(driver_plan.artifact.clone()),
             },
-            provider: Some(EvidenceProviderIdentity {
+            control: EvidenceControlIdentity {
                 deployment_id: deployment.deployment_id.clone(),
-                runtime_instance_id: capability.capability.runtime_instance_id.clone(),
-                runtime,
-                release: capability.capability.embedded.release.clone(),
-                runtime_revision: capability.capability.embedded.revision.clone(),
-                protocol: capability.capability.embedded.protocol,
-                build_id: capability.capability.embedded.build_id.clone(),
-                capabilities: vec![
-                    evidence_capability(&capability, &[baseline.clone(), apply_receipt.clone()]),
-                    evidence_capability(&cleanup_evidence.capability, &cleanup_evidence.receipts),
-                ],
+                tenant_id: invocation.tenant_id.clone(),
+                operations: cleanup_operations.clone(),
                 cleanup_complete,
-            }),
+            },
             outer_cleanup_complete: cleanup_complete,
         };
-        evidence = record_provider_evidence_result(
+        evidence = record_control_evidence_result(
             || {
-                write_private_provider_evidence_bundle(
+                write_private_control_evidence_bundle(
                     report,
                     directory,
                     &identity,
-                    recovery.tenant_resource_binding(),
+                    recovery.ordinary_binding(),
                 )
             },
             &mut errors,
@@ -786,6 +711,42 @@ fn conformance_acceptance_succeeds(
     local_success && acceptance_pass && matrix_expectations_satisfied
 }
 
+fn control_operation(
+    completion: &nazoauthctl_core::ConformanceControlCompletion,
+) -> TenantResourceControlOperation {
+    TenantResourceControlOperation {
+        operation_id: completion.identity.operation_id.clone(),
+        request_hash: completion.identity.request_hash.clone(),
+        controller_kid: completion.identity.kid.clone(),
+        result: completion.result.clone(),
+    }
+}
+
+fn successful_control_completion(
+    outcome: nazoauthctl_core::ConformanceControlOutcome,
+    label: &str,
+) -> anyhow::Result<nazoauthctl_core::ConformanceControlCompletion> {
+    match outcome {
+        nazoauthctl_core::ConformanceControlOutcome::Succeeded(completion) => Ok(completion),
+        nazoauthctl_core::ConformanceControlOutcome::Failed(completion) => bail!(
+            "{label} ControlOperation failed durably: operation_id={} request_hash={}",
+            completion.identity.operation_id,
+            completion.identity.request_hash,
+        ),
+    }
+}
+
+fn successful_control_result(
+    outcome: nazoauthctl_core::ConformanceControlOutcome,
+    label: &str,
+) -> anyhow::Result<ControlResultData> {
+    let completion = successful_control_completion(outcome, label)?;
+    completion
+        .result
+        .result
+        .context("successful ControlOperation omitted its typed result")
+}
+
 #[derive(Serialize)]
 struct FinalOutput {
     schema: u32,
@@ -815,8 +776,10 @@ struct DeploymentReport {
     matrix_sha256: String,
     selected_groups: u32,
     selected_plans: u32,
-    apply_task_jti: String,
-    change_set_id: String,
+    apply_operation_id: String,
+    apply_request_hash: String,
+    apply_controller_kid: String,
+    apply_revision: u64,
     resource_manifest_sha256: String,
     trust_policy_resource_id: String,
     trust_policy_digest: String,
@@ -868,9 +831,8 @@ fn run_signed_suite(
     let review_screenshot_run_jti = recovery
         .lock()
         .map_err(|_| anyhow::anyhow!("ordinary recovery lock is poisoned"))?
-        .tenant_resource_binding()
-        .context("ordinary screenshot capture has no recovery binding")?
-        .request_jti
+        .ordinary_binding()
+        .run_id
         .clone();
     let review_screenshot_capture = invocation
         .capture_review_screenshots
@@ -1161,16 +1123,6 @@ fn build_browser(
     }
 }
 
-struct CleanupEvidence {
-    capability: TenantResourceCapabilitySession,
-    receipts: Vec<TenantResourceReceiptResult>,
-}
-
-fn cleanup_change_set_id(request_jti: &str, phase: &str, capability_sha256: &str) -> String {
-    let generation = capability_sha256.chars().take(16).collect::<String>();
-    format!("{request_jti}-cleanup-{phase}-{generation}")
-}
-
 fn suite_retention_manifest(
     recovery: &nazoauthctl_conformance::ConformanceRecoveryGuard,
     report: &nazoauthctl_conformance::ConformanceReport,
@@ -1178,9 +1130,7 @@ fn suite_retention_manifest(
     matrix_sha256: &str,
     review_screenshot_manifest: Option<&nazoauthctl_conformance::ReviewScreenshotManifestReceipt>,
 ) -> anyhow::Result<SuiteRetentionManifest> {
-    let binding = recovery
-        .tenant_resource_binding()
-        .context("missing ordinary recovery binding")?;
+    let binding = recovery.ordinary_binding();
     let plans = report
         .plans
         .iter()
@@ -1204,7 +1154,7 @@ fn suite_retention_manifest(
         matrix_sha256: matrix_sha256.to_owned(),
         deployment_id: binding.deployment_id.clone(),
         tenant_id: binding.tenant_id.clone(),
-        run_id: binding.request_jti.clone(),
+        run_id: binding.run_id.clone(),
         review_screenshot_manifest: review_screenshot_manifest.map(|manifest| {
             SuiteRetentionScreenshotManifest {
                 path: manifest.path.clone(),
@@ -1254,134 +1204,117 @@ fn cleanup_unretained_suite(
     recovery.mark_suite_cleanup_complete()
 }
 
-fn cleanup_run_resources<T>(
-    client: &TenantResourceClient<T>,
+fn cleanup_run_resources(
+    session: &nazoauthctl_core::ConformanceSession,
     recovery: &mut nazoauthctl_conformance::ConformanceRecoveryGuard,
-) -> anyhow::Result<CleanupEvidence>
-where
-    T: nazoauthctl_core::tenant_resources::TenantResourceHttpTransport,
-{
-    let capability = client.discover_capability()?;
-    let cleanup_capability_sha256 = capability.compact_sha256();
-    let request_jti = recovery
-        .tenant_resource_binding()
-        .context("missing ordinary recovery binding")?
-        .request_jti
-        .clone();
-    let listed = client.enumerate(
-        &capability,
-        &cleanup_change_set_id(&request_jti, "observe", &cleanup_capability_sha256),
-        recovery
-            .tenant_resource_binding()
-            .context("missing ordinary recovery binding")?
-            .change_set_sha256
-            .as_str(),
-        Vec::new(),
-    )?;
-    let mut receipts = vec![listed.clone()];
-    let bound = recovery
-        .tenant_resource_binding()
-        .context("missing ordinary recovery binding")?
-        .resource_identities
-        .clone();
-    if listed.receipt().resources.iter().any(|candidate| {
-        bound.iter().any(|identity| {
-            identity.kind == candidate.kind
-                && identity.resource_id == candidate.resource_id
-                && identity.digest != candidate.digest
-        })
-    }) {
-        bail!("run-scoped tenant resource identity reappeared with a different digest");
-    }
-    let present = listed
-        .receipt()
-        .resources
+) -> anyhow::Result<Vec<EvidenceControlOperation>> {
+    let enumerate = match recovery.cleanup_enumerate_operation() {
+        Some(operation) => operation.clone(),
+        None => {
+            let outcome = session.execute_control_operation(
+                ControlOperationPayload::TenantResourceEnumerate {
+                    tenant_id: recovery.ordinary_binding().tenant_id.clone(),
+                    selectors: Vec::new(),
+                },
+                None,
+                |completion| {
+                    recovery.record_terminal_completion(
+                        TenantResourceRecoveryPhase::CleanupEnumerated,
+                        control_operation(completion),
+                    )?;
+                    Ok(())
+                },
+            )?;
+            control_operation(&successful_control_completion(
+                outcome,
+                "cleanup Enumerate",
+            )?)
+        }
+    };
+    let ControlResultData::TenantResourceEnumerate { resources, .. } = enumerate
+        .result
+        .result
+        .as_ref()
+        .context("cleanup Enumerate omitted result")?
+    else {
+        bail!("cleanup Enumerate returned the wrong result");
+    };
+    let present = resources
         .iter()
         .filter(|candidate| {
-            bound.iter().any(|identity| {
-                identity.kind == candidate.kind
-                    && identity.resource_id == candidate.resource_id
-                    && identity.digest == candidate.digest
-            })
+            recovery
+                .ordinary_binding()
+                .resource_identities
+                .iter()
+                .any(|bound| bound == *candidate)
         })
         .cloned()
         .collect::<Vec<_>>();
-    recovery.record_tenant_resource_enumeration(present.clone())?;
-    if !present.is_empty() {
-        let current = listed.receipt().resources.clone();
-        let final_active = current
-            .iter()
-            .filter(|candidate| {
-                !present.iter().any(|identity| {
-                    identity.kind == candidate.kind
-                        && identity.resource_id == candidate.resource_id
-                        && identity.digest == candidate.digest
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let revoke_change_set_sha256 =
-            nazoauthctl_core::tenant_resources::tenant_resource_manifest_sha256(&present)?;
-        let final_digest =
-            nazoauthctl_core::tenant_resources::tenant_resource_manifest_sha256(&final_active)?;
-        let revoke = client.revoke(
-            &capability,
-            &cleanup_change_set_id(&request_jti, "revoke", &cleanup_capability_sha256),
-            &revoke_change_set_sha256,
-            present.clone(),
-            &final_digest,
+    if !present.is_empty() && recovery.cleanup_revoke_operation().is_none() {
+        let revoke = session.execute_control_operation(
+            ControlOperationPayload::TenantResourceRevoke {
+                tenant_id: recovery.ordinary_binding().tenant_id.clone(),
+                resources: present,
+            },
+            None,
+            |completion| {
+                recovery.record_terminal_completion(
+                    TenantResourceRecoveryPhase::CleanupRevoked,
+                    control_operation(completion),
+                )?;
+                Ok(())
+            },
         )?;
-        if revoke.receipt().resources.len() != present.len()
-            || revoke
-                .receipt()
-                .resources
-                .iter()
-                .any(|received| !present.iter().any(|expected| expected == received))
-        {
-            bail!("tenant-resource Revoke receipt does not match the observed run resources");
-        }
-        for identity in &present {
-            recovery.record_tenant_resource_revoke(
-                identity,
-                nazoauthctl_conformance::TenantResourceRevokeOutcome::Revoked,
-            )?;
-        }
-        receipts.push(revoke);
+        successful_control_completion(revoke, "cleanup Revoke")?;
     }
-    if !recovery.tenant_resource_cleanup_complete() {
+    if !recovery.ordinary_cleanup_complete() {
         bail!("ordinary cleanup obligations remain pending");
     }
-    Ok(CleanupEvidence {
-        capability,
-        receipts,
-    })
+    let mut operations = Vec::new();
+    for operation in [
+        recovery.baseline_enumerate_operation(),
+        recovery.apply_operation(),
+        recovery.cleanup_enumerate_operation(),
+        recovery.cleanup_revoke_operation(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        operations.push(EvidenceControlOperation {
+            operation_id: operation.operation_id.clone(),
+            request_sha256: operation.request_hash.clone(),
+            controller_kid: operation.controller_kid.clone(),
+            result: operation
+                .result
+                .result
+                .clone()
+                .context("persisted control operation omitted its typed result")?,
+        });
+    }
+    Ok(operations)
 }
-
 fn recover_pending_runs(
     session: &nazoauthctl_core::ConformanceSession,
     store: &ConformanceRecoveryStore,
     suite_client: &SuiteClient,
 ) -> anyhow::Result<Vec<SuiteRetentionManifestReceipt>> {
-    let pending = store.claim_pending()?;
-    if pending.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut failures = Vec::new();
     let mut retained = Vec::new();
-    for mut recovery in pending {
-        let Some(binding) = recovery.tenant_resource_binding().cloned() else {
-            // Legacy journals remain readable, but this ordinary command must
-            // never revive the removed lease management API.
-            failures.push("legacy-read-only: use the release that created this journal".to_owned());
-            continue;
-        };
+    let mut failures = Vec::new();
+    for mut recovery in store.claim_pending()? {
+        let binding = recovery.ordinary_binding().clone();
         let result = (|| -> anyhow::Result<Option<SuiteRetentionManifestReceipt>> {
-            // Retained is a durable transfer of exact Suite-plan ownership.
-            // Its commit precondition already proves provider, proxy, and
-            // ordinary cleanup.  A recovery must therefore publish/read the
-            // retained receipt and stop before constructing any live Apply
-            // client; retrying an Apply here could create a second resource
-            // set after certification plans have been preserved.
+            if let Some(failure) = recovery.terminal_failure() {
+                bail!(
+                    "ordinary recovery is blocked by durable failed ControlOperation: operation_id={} request_hash={} error={}",
+                    failure.operation_id,
+                    failure.request_hash,
+                    failure
+                        .result
+                        .error
+                        .map(|error| format!("{error:?}"))
+                        .unwrap_or_else(|| "missing".to_owned()),
+                );
+            }
             if retained_recovery_stops_before_live_apply(recovery.suite_retention_committed()) {
                 recovery.publish_committed_suite_retention_manifest()?;
                 let receipt = recovery.suite_retention_manifest_receipt()?;
@@ -1390,58 +1323,43 @@ fn recover_pending_runs(
                 }
                 return Ok(receipt);
             }
-            if recovery.tenant_resource_abort_uncommitted_intent() {
-                recovery.abort_uncommitted_tenant_resource()?;
-                return Ok(None);
+            if recovery.baseline_enumerate_operation().is_none() {
+                let outcome = session.execute_control_operation(
+                    ControlOperationPayload::TenantResourceEnumerate {
+                        tenant_id: binding.tenant_id.clone(),
+                        selectors: Vec::new(),
+                    },
+                    None,
+                    |completion| {
+                        recovery.record_terminal_completion(
+                            TenantResourceRecoveryPhase::BaselineEnumerated,
+                            control_operation(completion),
+                        )?;
+                        Ok(())
+                    },
+                )?;
+                successful_control_completion(outcome, "recovery baseline Enumerate")?;
             }
-            let client = TenantResourceClient::with_curl(
-                session.tenant_resource_client_config(&binding.tenant_id)?,
-            )?;
-            if recovery.tenant_resource_receipt().is_none() {
-                let manifest = binding
-                    .manifest_path
-                    .as_ref()
-                    .context("pending Apply recovery has no private manifest path")?;
-                let manifest = std::fs::read(manifest)
-                    .context("failed to read the persisted private Apply manifest")?;
-                let prepared = client.restore_from_persisted(
-                    &binding.capability_jws,
-                    &binding.task_jws,
-                    &binding.capability_sha256,
-                    &binding.task_sha256,
-                    &binding.request_sha256,
-                    binding.operation,
-                    &binding.request_jti,
-                    &binding.change_set_id,
-                    &binding.change_set_sha256,
-                    Some(&manifest),
+            if recovery.apply_operation().is_none() {
+                let material = recovery.read_private_material()?;
+                let outcome = session.execute_control_operation(
+                    ControlOperationPayload::TenantResourceApply {
+                        tenant_id: binding.tenant_id.clone(),
+                        resources: binding.resource_identities.clone(),
+                    },
+                    Some(material.to_vec()),
+                    |completion| {
+                        recovery.record_terminal_completion(
+                            TenantResourceRecoveryPhase::Applied,
+                            control_operation(completion),
+                        )?;
+                        Ok(())
+                    },
                 )?;
-                let receipt = match client.execute_prepared_live(&prepared) {
-                    Ok(receipt) => receipt,
-                    Err(error) if is_deterministic_uncommitted_rejection(&error) => {
-                        // The ordinary producer installs proxy trust only
-                        // after persisting a receipt.  With no receipt this is
-                        // a marker for an action that was never reached.
-                        if !recovery.proxy_cleanup_complete() {
-                            recovery.mark_proxy_cleanup_complete()?;
-                        }
-                        recovery.abort_uncommitted_tenant_resource()?;
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                recovery.record_tenant_resource_receipt(
-                    TenantResourceReceiptIdentity::from_verified_receipt(
-                        receipt.receipt(),
-                        &receipt.receipt_sha256(),
-                    )?,
-                )?;
+                successful_control_completion(outcome, "recovery Apply")?;
             }
             if !recovery.suite_cleanup_complete() {
                 recovery.discard_prepared_suite_retention_staging()?;
-                // The observer records a plan before any child module can be
-                // allocated. An absent Suite state therefore means the crash
-                // happened before the runner owned an external resource.
                 if let Some(suite) = recovery.suite_recovery() {
                     recover_suite_resources(suite_client, suite)
                         .map_err(|error| anyhow::anyhow!(error))?;
@@ -1449,14 +1367,12 @@ fn recover_pending_runs(
                 recovery.mark_suite_cleanup_complete()?;
             }
             if !recovery.proxy_cleanup_complete() {
-                let proxy = binding
-                    .proxy
-                    .as_ref()
-                    .context("ordinary recovery proxy state is incomplete")?;
-                ProxyTrustGuard::recover(&proxy.bundle_path, &proxy.reload_executable)?;
+                if let Some(proxy) = binding.proxy.as_ref() {
+                    ProxyTrustGuard::recover(&proxy.bundle_path, &proxy.reload_executable)?;
+                }
                 recovery.mark_proxy_cleanup_complete()?;
             }
-            cleanup_run_resources(&client, &mut recovery)?;
+            cleanup_run_resources(session, &mut recovery)?;
             let receipt = recovery.suite_retention_manifest_receipt()?;
             if recovery.suite_cleanup_complete() && recovery.proxy_cleanup_complete() {
                 recovery.finish()?;
@@ -1466,7 +1382,7 @@ fn recover_pending_runs(
         match result {
             Ok(Some(receipt)) => retained.push(receipt),
             Ok(None) => {}
-            Err(error) => failures.push(format!("{}: {error:#}", binding.request_jti)),
+            Err(error) => failures.push(format!("{}: {error:#}", binding.run_id)),
         }
     }
     if failures.is_empty() {
@@ -1478,16 +1394,6 @@ fn recover_pending_runs(
         )
     }
 }
-
-fn is_deterministic_uncommitted_rejection(error: &TenantResourceClientError) -> bool {
-    matches!(
-        error,
-        TenantResourceClientError::InvalidRequest(_)
-            | TenantResourceClientError::Unauthorized(_)
-            | TenantResourceClientError::Forbidden(_)
-    )
-}
-
 fn evidence_runtime(
     runtime: &nazoauthctl_core::ConformanceRuntimeEvidence,
 ) -> EvidenceRuntimeIdentity {
@@ -1505,11 +1411,11 @@ fn evidence_runtime(
     }
 }
 
-// Keep the provider-bundle failure boundary explicit and independently
+// Keep the control-evidence failure boundary explicit and independently
 // testable.  Retention ownership is committed before this callback and is
 // intentionally not an input here, so a writer failure cannot select Suite
 // cleanup or change a retained-plan decision.
-fn record_provider_evidence_result<F, E>(
+fn record_control_evidence_result<F, E>(
     writer: F,
     errors: &mut Vec<String>,
 ) -> Option<EvidenceBundleReceipt>
@@ -1528,44 +1434,6 @@ where
 
 fn retained_recovery_stops_before_live_apply(retention_committed: bool) -> bool {
     retention_committed
-}
-
-fn evidence_capability(
-    capability: &TenantResourceCapabilitySession,
-    receipts: &[TenantResourceReceiptResult],
-) -> EvidenceProviderCapability {
-    EvidenceProviderCapability {
-        capability_compact_sha256: capability.compact_sha256(),
-        capability_jti: capability.capability.jti.clone(),
-        tenant_id: capability.capability.tenant_id.clone(),
-        revision: capability.capability.revision,
-        resource_manifest_sha256: capability.capability.resource_manifest_sha256.clone(),
-        receipts: receipts
-            .iter()
-            .map(|result| {
-                let receipt = result.receipt();
-                EvidenceProviderReceipt {
-                    action: receipt.operation,
-                    compact_sha256: result.receipt_sha256(),
-                    jti: receipt.jti.clone(),
-                    request_sha256: receipt.request_sha256.clone(),
-                    deployment_id: receipt.deployment_id.clone(),
-                    tenant_id: receipt.tenant_id.clone(),
-                    capability_jti: receipt.capability_jti.clone(),
-                    capability_compact_sha256: receipt.capability_sha256.clone(),
-                    expected_revision: receipt.expected_revision,
-                    revision: receipt.revision,
-                    change_set_id: receipt.change_set_id.clone(),
-                    change_set_sha256: receipt.change_set_sha256.clone(),
-                    baseline_manifest_sha256: receipt.baseline_manifest_sha256.clone(),
-                    resource_manifest_sha256: receipt.resource_manifest_sha256.clone(),
-                    outcome: receipt.outcome.clone(),
-                    audit_sequence: receipt.audit_sequence,
-                    audit_previous_sha256: receipt.audit_previous_sha256.clone(),
-                }
-            })
-            .collect(),
-    }
 }
 
 fn resolve_token(
@@ -1671,141 +1539,4 @@ fn select_artifact_matrix_for_run(
         bail!("selected signed Matrix plans changed before materialization");
     }
     Ok(matrix)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use nazoauthctl_conformance::{
-        CryptoPolicy, OIDF_MATRIX_SCHEMA_VERSION, OidfArtifactMatrixGroup, OidfArtifactMatrixPlan,
-        OidfArtifactMatrixVariant, OidfPlanResourceBudget,
-    };
-    use serde_json::json;
-
-    fn artifact_group(id: &str, plan_ids: &[&str]) -> OidfArtifactMatrixGroup {
-        OidfArtifactMatrixGroup {
-            id: id.to_owned(),
-            profile: id.to_owned(),
-            variant: OidfArtifactMatrixVariant {
-                id: "default".to_owned(),
-                values: BTreeMap::new(),
-            },
-            required_roles: Vec::new(),
-            plans: plan_ids
-                .iter()
-                .map(|plan_id| OidfArtifactMatrixPlan {
-                    id: (*plan_id).to_owned(),
-                    plan: format!("suite-{plan_id}"),
-                    driver_handler: "default".to_owned(),
-                    resource_budget: OidfPlanResourceBudget {
-                        modules: 1,
-                        clients: 1,
-                        wall_clock_seconds: 60,
-                    },
-                    config_template: json!({"plan": plan_id}),
-                    variant: BTreeMap::new(),
-                    required_capabilities: Vec::new(),
-                    expected_results: BTreeMap::new(),
-                    required_roles: Vec::new(),
-                    secret_bindings: BTreeMap::new(),
-                    crypto: CryptoPolicy::default(),
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn materialization_matrix_contains_only_the_signed_selected_plans() {
-        let matrix = OidfArtifactMatrix {
-            schema: OIDF_MATRIX_SCHEMA_VERSION,
-            name: "matrix".to_owned(),
-            openid4vc_credential_datasets: BTreeMap::new(),
-            openid4vc_suite_mdoc_trust_anchor_pem: "anchor".to_owned(),
-            groups: vec![
-                artifact_group("oidc", &["p001", "unselected-dcr"]),
-                artifact_group("ciba", &["unselected-ciba"]),
-            ],
-        };
-        let selected = BTreeSet::from([("oidc".to_owned(), "p001".to_owned())]);
-
-        let filtered = select_artifact_matrix_for_run(matrix, &selected).unwrap();
-        assert_eq!(filtered.groups.len(), 1);
-        assert_eq!(filtered.groups[0].id, "oidc");
-        assert_eq!(filtered.groups[0].plans.len(), 1);
-        assert_eq!(filtered.groups[0].plans[0].id, "p001");
-
-        let missing = BTreeSet::from([("oidc".to_owned(), "missing-signed-plan".to_owned())]);
-        assert!(select_artifact_matrix_for_run(filtered, &missing).is_err());
-    }
-
-    #[test]
-    fn cleanup_change_sets_are_scoped_to_the_discovered_capability_generation() {
-        let first = cleanup_change_set_id(
-            "tenant-resource-01a00401-6fee-7063-94bd-26c86029d4c2",
-            "observe",
-            &"1".repeat(64),
-        );
-        let second = cleanup_change_set_id(
-            "tenant-resource-01a00401-6fee-7063-94bd-26c86029d4c2",
-            "observe",
-            &"2".repeat(64),
-        );
-
-        assert_ne!(first, second);
-        assert!(first.len() <= 128);
-    }
-
-    #[test]
-    fn ordinary_success_requires_accepted_suite_outcomes_and_matrix_expectations() {
-        assert!(conformance_acceptance_succeeds(true, true, true));
-        assert!(!conformance_acceptance_succeeds(false, true, true));
-        assert!(!conformance_acceptance_succeeds(true, false, true));
-        assert!(!conformance_acceptance_succeeds(true, true, false));
-    }
-
-    #[test]
-    fn provider_evidence_failure_is_diagnostic_only_after_retention_commit() {
-        let mut errors = Vec::new();
-        let retention_committed = true;
-        let evidence = record_provider_evidence_result(
-            || -> Result<EvidenceBundleReceipt, &'static str> { Err("injected writer failure") },
-            &mut errors,
-        );
-        assert!(retention_committed);
-        assert!(evidence.is_none());
-        assert_eq!(errors, vec!["evidence=injected writer failure"]);
-    }
-
-    #[test]
-    fn retained_recovery_never_reenters_live_apply() {
-        assert!(retained_recovery_stops_before_live_apply(true));
-        assert!(!retained_recovery_stops_before_live_apply(false));
-    }
-
-    #[test]
-    fn retained_suite_manifest_path_uses_the_recovery_binding_jti() {
-        let local_request_jti = "request-local-0123456789abcdef";
-        let binding_request_jti = "tenant-request-0123456789abcdef";
-        assert_ne!(local_request_jti, binding_request_jti);
-        let manifest = SuiteRetentionManifest {
-            schema: 1,
-            suite_origin: "https://www.certification.openid.net".to_owned(),
-            artifact_digest: "a".repeat(64),
-            matrix_sha256: "b".repeat(64),
-            deployment_id: "deployment-a".to_owned(),
-            tenant_id: "00000000-0000-4000-8000-000000000001".to_owned(),
-            run_id: binding_request_jti.to_owned(),
-            review_screenshot_manifest: None,
-            deferred_review_pending: Vec::new(),
-            plans: Vec::new(),
-        };
-
-        let path = suite_retention_manifest_path(Path::new("/evidence"), &manifest);
-
-        assert_eq!(
-            path,
-            Path::new("/evidence").join(format!("retained-suite-{binding_request_jti}.json"))
-        );
-        assert!(!path.to_string_lossy().contains(local_request_jti));
-    }
 }

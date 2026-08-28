@@ -30,7 +30,7 @@ impl Fixture {
         let temp = PrivateTempDir::new("nazauthctl-discover-adopt")?;
         let registry_root = temp.path().join("registry");
         let registry = RegistryStore::open(registry_root.clone())?;
-        let state_root = temp.path().join("state");
+        let state_root = registry_root.join("local-target-state");
         // The raw LocalTarget answers hello/ping/state-list natively; no
         // runtime override is needed because discovery never consumes
         // supported_runtimes.
@@ -60,7 +60,8 @@ impl Fixture {
     }
 
     fn seed_ssh_host(&self, alias: &str, profile: &str) -> anyhow::Result<HostRecord> {
-        let host = HostRecord::new_ssh(alias, profile, HostPrivilege::Direct)?;
+        let host =
+            HostRecord::new_ssh(alias, profile, HostPrivilege::Direct, uuid::Uuid::now_v7())?;
         self.context.registry.add_host(host)
     }
 
@@ -87,6 +88,7 @@ impl Fixture {
                 config_schema: CONFIG_SCHEMA.to_owned(),
                 resources,
                 current_build_identity: build_identity,
+                current_rollback_policy: crate::model::test_release_rollback_policy(),
             },
             &uuid::Uuid::now_v7().to_string(),
         )?;
@@ -182,11 +184,15 @@ fn discover_reports_every_declared_fact_per_deployment() -> anyhow::Result<()> {
         "{report}"
     );
 
-    // Multi-target display demands an exact id for follow-ups; adoption
+    // Multi-target display demands an exact id for follow-ups; registration
     // candidates are named per deployment.
-    assert_eq!(report.matches("adoption candidate").count(), 2, "{report}");
+    assert_eq!(
+        report.matches("registration candidate").count(),
+        2,
+        "{report}"
+    );
     assert!(
-        report.contains("adopt --host local --deployment-id deploy-alpha"),
+        report.contains("nazoauthctl instance register --host local --deployment-id deploy-alpha"),
         "{report}"
     );
     assert!(report.contains("strictly read-only"), "{report}");
@@ -329,7 +335,7 @@ fn adopt_registers_with_target_derived_evidence_and_classification() -> anyhow::
         "{report}"
     );
     assert!(
-        report.contains("controller bind --instance <alias>"),
+        report.contains("nazoauthctl bind --instance <alias>"),
         "{report}"
     );
     assert!(report.contains("signed nothing"), "{report}");
@@ -508,13 +514,19 @@ fn relocation_is_reported_by_discover_and_refused_by_adoption() -> anyhow::Resul
     )?;
     // The Registry believes this deployment lives on server-b (pre-existing
     // registration). The local target now reports the same id: a relocation.
-    fixture.context.registry.add_instance(InstanceRecord::new(
+    let mut hello = crate::target::wire::local_hello(vec!["podman".to_owned()]);
+    hello.target_id = elsewhere.host_id.to_string();
+    let evidence = DiscoveryEvidence::new(
+        &elsewhere,
+        hello,
         "deploy-roaming",
-        "roaming",
-        elsewhere.host_id,
         "https://roam.example.com",
-        "target-state/ref",
-    )?)?;
+    )?;
+    fixture.context.registry.register_instance(
+        &evidence,
+        Some("roaming"),
+        ObservationCache::now(true, "registered on server-b"),
+    )?;
 
     // Discover reports the candidate and never rewrites the record.
     let report = run_discover(
