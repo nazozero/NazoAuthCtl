@@ -345,7 +345,20 @@ pub(crate) fn claim_initial_admin(
     let normalized_email = credentials.email.trim().to_ascii_lowercase();
     let (status, response_bytes) = transport.post_initial_admin(&endpoint, &body)?;
     if status != 201 {
-        bail!("initial administrator endpoint returned HTTP {status}");
+        let code = serde_json::from_slice::<serde_json::Value>(&response_bytes)
+            .ok()
+            .and_then(|body| body.get("error")?.as_str().map(str::to_owned))
+            .filter(|code| {
+                !code.is_empty()
+                    && code.len() <= 64
+                    && code.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+            });
+        match code {
+            Some(code) => bail!("initial administrator endpoint returned HTTP {status} ({code})"),
+            None => bail!("initial administrator endpoint returned HTTP {status}"),
+        }
     }
     let response: BootstrapAdminResponse = serde_json::from_slice(&response_bytes)
         .context("initial administrator endpoint returned an invalid response")?;
@@ -558,6 +571,21 @@ mod tests {
         }
     }
 
+    struct ErrorTransport {
+        status: u16,
+        body: Vec<u8>,
+    }
+
+    impl InitialAdminTransport for ErrorTransport {
+        fn post_initial_admin(
+            &self,
+            _endpoint: &Url,
+            _body: &[u8],
+        ) -> anyhow::Result<(u16, Vec<u8>)> {
+            Ok((self.status, self.body.clone()))
+        }
+    }
+
     #[test]
     fn successful_claim_posts_the_server_token_then_closes_the_capability_forever()
     -> anyhow::Result<()> {
@@ -737,6 +765,28 @@ mod tests {
         // The capability stays open so the operator can retry after fixing.
         let context = fixture.material.load_open_context(&fixture.deployment_id)?;
         assert_eq!(context.install_operation_id, OP_ID);
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_error_code_is_preserved_without_echoing_arbitrary_body() -> anyhow::Result<()> {
+        let fixture = Fixture::new()?;
+        let transport = ErrorTransport {
+            status: 404,
+            body: br#"{"error":"invalid_bootstrap_token"}"#.to_vec(),
+        };
+        let error = claim_initial_admin(
+            &fixture.registry,
+            &fixture.material,
+            &transport,
+            Some("production"),
+            Fixture::credentials(),
+        )
+        .expect_err("404");
+        assert!(
+            format!("{error:#}").contains("HTTP 404 (invalid_bootstrap_token)"),
+            "{error:#}"
+        );
         Ok(())
     }
 
