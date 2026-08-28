@@ -55,8 +55,10 @@ pub const RUNTIME_START_FAILED: &str = "RUNTIME_START_FAILED";
 pub const TARGET_IDENTITY_MISMATCH: &str = "TARGET_IDENTITY_MISMATCH";
 pub const HEALTH_PROBE_FAILED: &str = "HEALTH_PROBE_FAILED";
 
-/// Closed vocabulary of target-generated secret files. The control side names
-/// paths only; values are minted on the target and never enter the wire.
+/// Closed vocabulary of secret files written on the target. External
+/// dependency credentials are supplied by the operator and cross a remote
+/// boundary only inside the encrypted host protocol; the MFA key is generated
+/// on the target.
 pub const SECRET_PURPOSES: &[&str] = &[
     "database-runtime-url",
     "database-lifecycle-url",
@@ -241,8 +243,8 @@ pub struct InstallOrder {
     /// is configured later; public reachability is never an install input).
     pub port: u16,
     /// External PostgreSQL endpoint facts supplied by the operator (G01 item
-    /// 3: real external facts are the only install inputs). The credential is
-    /// still minted on the target and never crosses the wire.
+    /// 3: real external facts are the only install inputs). Credentials live
+    /// in the matching planned secret entries, not in this public endpoint.
     pub database_runtime_endpoint: ExternalEndpoint,
     pub database_lifecycle_endpoint: ExternalEndpoint,
     /// External Valkey endpoint facts supplied by the operator.
