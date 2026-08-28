@@ -856,6 +856,13 @@ impl HostInstallExecutor {
 
         // 1. Official artifact: verify first, use afterwards (H01 single entry).
         let kind = job.runtime_kind;
+        for (label, endpoint) in [
+            ("database runtime", &job.order.database_runtime_endpoint),
+            ("database lifecycle", &job.order.database_lifecycle_endpoint),
+            ("Valkey", &job.order.valkey_endpoint),
+        ] {
+            validate_endpoint_reachability(kind, label, &endpoint.host)?;
+        }
         let release = VerifiedRelease::verify(ReleaseRequest {
             repository: &job.order.artifact.repository,
             requested_version: job.order.artifact.version.as_deref(),
@@ -1001,11 +1008,9 @@ impl HostInstallExecutor {
                 // so ctl must never invent one. An existing file keeps its
                 // original value: retries must not rotate what a failed
                 // attempt already handed to the external dependency.
-                //
-                // Operator endpoints address the target HOST; inside the
-                // container namespace loopback would be the container itself,
-                // so a loopback endpoint is rewritten to the engine's
-                // host-gateway name.
+                // Endpoint hosts are exact operator facts. Container-loopback
+                // inputs were rejected before any side effect instead of
+                // silently changing their network meaning here.
                 "database-runtime-url" | "database-lifecycle-url" | "valkey-url" => {
                     if !existed {
                         let credential = secret.value.as_ref().ok_or_else(|| {
@@ -1018,24 +1023,12 @@ impl HostInstallExecutor {
                                 ),
                             )
                         })?;
-                        let gateway = |host: &str| -> String {
-                            match host {
-                                "127.0.0.1" | "::1" | "localhost" => match kind {
-                                    RuntimeBackendKind::Docker => "host.docker.internal".to_owned(),
-                                    RuntimeBackendKind::Podman => {
-                                        "host.containers.internal".to_owned()
-                                    }
-                                    RuntimeBackendKind::Host => host.to_owned(),
-                                },
-                                other => other.to_owned(),
-                            }
-                        };
                         let value = match secret.purpose.as_str() {
                             "database-runtime-url" => format!(
                                 "postgresql://{}:{}@{}:{}/{}",
                                 job.order.database_runtime_endpoint.user,
                                 percent_encode_credential(credential.as_bytes()),
-                                gateway(&job.order.database_runtime_endpoint.host),
+                                job.order.database_runtime_endpoint.host,
                                 job.order.database_runtime_endpoint.port,
                                 job.order.database_runtime_endpoint.name,
                             ),
@@ -1043,14 +1036,14 @@ impl HostInstallExecutor {
                                 "postgresql://{}:{}@{}:{}/{}",
                                 job.order.database_lifecycle_endpoint.user,
                                 percent_encode_credential(credential.as_bytes()),
-                                gateway(&job.order.database_lifecycle_endpoint.host),
+                                job.order.database_lifecycle_endpoint.host,
                                 job.order.database_lifecycle_endpoint.port,
                                 job.order.database_lifecycle_endpoint.name,
                             ),
                             _ => format!(
                                 "valkey://:{}@{}:{}",
                                 percent_encode_credential(credential.as_bytes()),
-                                gateway(&job.order.valkey_endpoint.host),
+                                job.order.valkey_endpoint.host,
                                 job.order.valkey_endpoint.port,
                             ),
                         };
@@ -1150,6 +1143,26 @@ impl HostInstallExecutor {
             rollback_policy: release.rollback_policy(),
         })
     }
+}
+
+fn validate_endpoint_reachability(
+    kind: RuntimeBackendKind,
+    label: &str,
+    host: &str,
+) -> Result<(), Failure> {
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if kind.is_container() && loopback {
+        return Err(Failure::new(
+            CONFIG_INVALID,
+            format!(
+                "{label} endpoint '{host}' is container loopback, not the target host; provide the exact hostname or address reachable from the container"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_owned_directory(
@@ -1839,6 +1852,30 @@ fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::{RuntimeBackendKind, validate_endpoint_reachability};
+
+    #[test]
+    fn container_endpoints_keep_exact_network_semantics() {
+        for host in ["localhost", "127.0.0.1", "127.20.30.40", "::1"] {
+            assert!(
+                validate_endpoint_reachability(RuntimeBackendKind::Podman, "Valkey", host).is_err(),
+                "{host}"
+            );
+        }
+        for host in ["host.containers.internal", "database.internal", "10.88.0.1"] {
+            assert!(
+                validate_endpoint_reachability(RuntimeBackendKind::Podman, "Valkey", host).is_ok(),
+                "{host}"
+            );
+        }
+        assert!(
+            validate_endpoint_reachability(RuntimeBackendKind::Host, "Valkey", "127.0.0.1").is_ok()
+        );
+    }
 }
 
 #[cfg(test)]
