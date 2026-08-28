@@ -1874,7 +1874,29 @@ fn start_candidate(
     );
     let mut mounts = live.mounts.clone();
     replace_mount(&mut mounts, CONTAINER_DATA_DIR, data, false)?;
-    replace_mount(&mut mounts, CONTAINER_SECRETS_DIR, secrets, true)?;
+    // The runtime mounts each secret file individually (the install exposes
+    // only the three runtime secrets, never a directory); repoint every one
+    // of them into the restored secrets directory.
+    let mut secret_mounts = 0;
+    for mount in mounts.iter_mut() {
+        let relative = match mount
+            .destination
+            .strip_prefix(Path::new(CONTAINER_SECRETS_DIR))
+        {
+            Ok(relative) => relative,
+            Err(_) => continue,
+        };
+        let name = relative
+            .file_name()
+            .context("secret mount destination has no file name")?;
+        mount.source = secrets.join(name);
+        mount.read_only = true;
+        secret_mounts += 1;
+    }
+    ensure!(
+        secret_mounts > 0,
+        "runtime mounts no secrets under {CONTAINER_SECRETS_DIR}"
+    );
     replace_mount(&mut mounts, CONTAINER_CONFIG_FILE, config, true)?;
     let port = reserve_loopback_port()?;
     let mut environment = live.safe_environment.clone();
