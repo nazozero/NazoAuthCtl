@@ -200,10 +200,8 @@ impl RemoteBootstrapMaterial {
         deployment_id: &str,
     ) -> anyhow::Result<crate::target::FreshBootstrapMaterialView> {
         use crate::target::{HostCompletionBody, HostOperation, HostOutcome};
-        let operation = HostOperation::bootstrap_read(
-            format!("bootstrap-read-{:032x}", rand::random::<u128>()),
-            deployment_id,
-        );
+        let operation =
+            HostOperation::bootstrap_read(remote_bootstrap_operation_id(), deployment_id);
         if let Err(rejection) = operation.validate() {
             return Err(anyhow::anyhow!(
                 "internal error: bootstrap-read operation rejected: {}",
@@ -244,10 +242,8 @@ impl BootstrapMaterialSource for RemoteBootstrapMaterial {
 
     fn close(&self, deployment_id: &str) -> anyhow::Result<()> {
         use crate::target::{HostCompletionBody, HostOperation, HostOutcome};
-        let operation = HostOperation::bootstrap_close(
-            format!("bootstrap-close-{:032x}", rand::random::<u128>()),
-            deployment_id,
-        );
+        let operation =
+            HostOperation::bootstrap_close(remote_bootstrap_operation_id(), deployment_id);
         if let Err(rejection) = operation.validate() {
             return Err(anyhow::anyhow!(
                 "internal error: close operation rejected: {}",
@@ -272,6 +268,10 @@ impl BootstrapMaterialSource for RemoteBootstrapMaterial {
             HostOutcome::Failed { code, detail } => anyhow::bail!("{code}: {detail}"),
         }
     }
+}
+
+fn remote_bootstrap_operation_id() -> String {
+    Uuid::now_v7().to_string()
 }
 
 /// `{issuer}/auth/bootstrap-admin` with loopback-only plain HTTP.
@@ -783,5 +783,19 @@ mod tests {
         )
         .expect_err("weak password");
         assert!(format!("{error:#}").contains("12"), "{error:#}");
+    }
+
+    #[test]
+    fn remote_bootstrap_operations_use_the_protocol_operation_identity() {
+        let read = crate::target::HostOperation::bootstrap_read(
+            remote_bootstrap_operation_id(),
+            "deploy-test",
+        );
+        let close = crate::target::HostOperation::bootstrap_close(
+            remote_bootstrap_operation_id(),
+            "deploy-test",
+        );
+        read.validate().expect("bootstrap-read must use UUIDv7");
+        close.validate().expect("bootstrap-close must use UUIDv7");
     }
 }

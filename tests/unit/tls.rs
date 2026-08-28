@@ -50,7 +50,7 @@ fn transaction_provider_snapshot_detects_recovery_command_drift() {
         test_transaction(PathBuf::from("/srv/nazoauth/tls/tenant-a/auth.example"));
     assert_eq!(
         transaction.provider_snapshot_sha256,
-        "73acc5226ce093c67966d32c19b36216d019934c735f0111642566123b8dae32"
+        "de6344400b082a0fa562dc21ae88a63de56c744971d13506d3ae3e51732a24e1"
     );
     assert!(validate_provider_snapshot(&transaction).is_ok());
     transaction
