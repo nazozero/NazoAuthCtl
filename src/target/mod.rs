@@ -1379,9 +1379,10 @@ fn current_instance_identity(
         ));
     }
 
-    let encoded_public_key = read_runtime_identity_file(
+    let encoded_public_key = read_runtime_owned_file(
         &public_key_path,
         "runtime instance public key",
+        false,
         MAX_INSTANCE_PUBLIC_KEY_BYTES,
     )
     .and_then(|bytes| {
@@ -1403,9 +1404,10 @@ fn current_instance_identity(
             )
         })?;
     let instance_key_id = nazo_operator_protocol::instance_key_id(&public_key);
-    let deployment_statement = read_runtime_identity_file(
+    let deployment_statement = read_runtime_owned_file(
         &statement_path,
         "runtime deployment statement",
+        false,
         nazo_operator_protocol::MAX_COMPACT_JWS_BYTES as u64,
     )
     .and_then(|bytes| {
@@ -1457,9 +1459,10 @@ fn secure_path_exists(path: &std::path::Path) -> Result<bool, Failure> {
     }
 }
 
-fn read_runtime_identity_file(
+pub(super) fn read_runtime_owned_file(
     path: &std::path::Path,
     label: &str,
+    private: bool,
     max_bytes: u64,
 ) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
     #[cfg(unix)]
@@ -1471,14 +1474,14 @@ fn read_runtime_identity_file(
         crate::filesystem::read_secure_regular_file_for_uid(
             path,
             label,
-            false,
+            private,
             max_bytes,
             runtime_uid,
         )
     }
     #[cfg(not(unix))]
     {
-        crate::filesystem::read_secure_regular_file(path, label, false, max_bytes)
+        crate::filesystem::read_secure_regular_file(path, label, private, max_bytes)
     }
 }
 

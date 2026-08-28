@@ -165,12 +165,8 @@ fn valid_initial_admin_token(token: &str) -> bool {
 /// writes or regenerates it.
 pub(crate) fn read_server_token(context: &FreshBootstrapContext) -> anyhow::Result<String> {
     let path = server_token_path(context);
-    let bytes = filesystem::read_secure_regular_file(
-        &path,
-        "initial administrator bootstrap token",
-        true,
-        4096,
-    )?;
+    let bytes =
+        super::read_runtime_owned_file(&path, "initial administrator bootstrap token", true, 4096)?;
     let token = std::str::from_utf8(&bytes)
         .with_context(|| format!("{} is not valid UTF-8", path.display()))?
         .trim()

@@ -111,15 +111,13 @@ impl InitialAdminTransport for CurlInitialAdminTransport {
 /// Where the control side reads the capability material and live state from.
 ///
 /// The local implementation reads the formalized target state root directly.
-/// The remote implementation drives the read-only state-inspect (which
-/// surfaces the capability view) and the explicit `bootstrap-close` host
+/// The remote implementation drives one `bootstrap-read` operation (which
+/// surfaces the authorized capability view) and the explicit `bootstrap-close` host
 /// operation over the fixed SSH transport, so the token only ever rides the
 /// encrypted channel (P0-2).
 pub(crate) trait BootstrapMaterialSource {
-    /// Full G02 gate: allowlist, open capability, install-operation ownership,
-    /// exact artifact, unchanged config revision.
-    fn authorize(&self, deployment_id: &str) -> anyhow::Result<()>;
-    /// The server-generated bootstrap token, while the capability is open.
+    /// Run the full G02 gate and return the server-generated bootstrap token
+    /// while the capability is open.
     fn read_token(&self, deployment_id: &str) -> anyhow::Result<Zeroizing<String>>;
     fn close(&self, deployment_id: &str) -> anyhow::Result<()>;
 }
@@ -160,20 +158,16 @@ impl LocalBootstrapMaterial {
 }
 
 impl BootstrapMaterialSource for LocalBootstrapMaterial {
-    fn authorize(&self, deployment_id: &str) -> anyhow::Result<()> {
+    fn read_token(&self, deployment_id: &str) -> anyhow::Result<Zeroizing<String>> {
         let store = TargetStateStore::open(&self.state_root)?;
         let state = store
             .load_existing(deployment_id)
             .map_err(|failure| anyhow::anyhow!("{}: {}", failure.code, failure.detail))?;
         let context = self.load_open_context(deployment_id)?;
         bootstrap_authority::authorize_claim(Some(&context), "create-initial-admin", &state)
-            .map_err(|failure| anyhow::anyhow!("{}: {}", failure.code, failure.detail))
-    }
-
-    fn read_token(&self, deployment_id: &str) -> anyhow::Result<Zeroizing<String>> {
+            .map_err(|failure| anyhow::anyhow!("{}: {}", failure.code, failure.detail))?;
         // The token is the SERVER-generated one inside the deployment's data
         // root; ctl only reads it while the capability is open.
-        let context = self.load_open_context(deployment_id)?;
         Ok(Zeroizing::new(bootstrap_authority::read_server_token(
             &context,
         )?))
@@ -231,10 +225,6 @@ impl RemoteBootstrapMaterial {
 }
 
 impl BootstrapMaterialSource for RemoteBootstrapMaterial {
-    fn authorize(&self, deployment_id: &str) -> anyhow::Result<()> {
-        self.open_material(deployment_id).map(|_| ())
-    }
-
     fn read_token(&self, deployment_id: &str) -> anyhow::Result<Zeroizing<String>> {
         let view = self.open_material(deployment_id)?;
         Ok(Zeroizing::new(view.token))
@@ -339,9 +329,8 @@ pub(crate) fn claim_initial_admin(
         );
     }
 
-    // 2. Full gate first, then the token — both through the source that owns
-    // the transport (local files or the fixed SSH channel, P0-2).
-    material.authorize(&record.deployment_id)?;
+    // 2. One source-owned operation performs the full gate and returns the
+    // token. Remote execution must not request the sensitive view twice.
     let token = material.read_token(&record.deployment_id)?;
 
     // 3. Exact bootstrap endpoint contract.
