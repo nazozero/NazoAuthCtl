@@ -10,8 +10,7 @@
 //!
 //! Artifact transfer decision (recorded per the task brief): verified bytes
 //! are **obtained on the target** ("download-on-target"), reusing the same
-//! official-verification pipeline used on the target —
-//! `VerifiedRelease::verify` plus the runtime backend pull. The control side
+//! verified-artifact pipeline used by update on the target. The control side
 //! sends only reference facts (repository and optional version pin);
 //! multi-hundred-megabyte blobs never
 //! cross the 64 KiB HostOperation wire, and secrets are generated on the
@@ -35,7 +34,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     filesystem::{self, atomic_write},
     process::Process,
-    release::{ReleaseRequest, VerifiedRelease},
     runtime_backend::{self, RuntimeBackendKind},
 };
 
@@ -864,57 +862,13 @@ impl HostInstallExecutor {
         ] {
             validate_endpoint_reachability(kind, label, &endpoint.host)?;
         }
-        let release = VerifiedRelease::verify(ReleaseRequest {
-            repository: &job.order.artifact.repository,
-            requested_version: job.order.artifact.version.as_deref(),
-            container_backend: kind.is_container().then_some(kind),
-            trusted_version_floor: None,
-        })
-        .map_err(|error| Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string())))?;
-        let subject_digest = match kind {
-            RuntimeBackendKind::Host => {
-                let binary = release
-                    .artifact("binary", &job.order.artifact.repository)
-                    .map_err(|error| {
-                        Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string()))
-                    })?;
-                filesystem::sha256(&binary).map_err(|error| {
-                    Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string()))
-                })?
-            }
-            RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
-                // Container backends always run Linux images regardless of the
-                // control machine's OS (real-acceptance finding on Windows).
-                let digest = release
-                    .manifest
-                    .runtime_oci_digest_for(crate::model::container_oci_platform())
-                    .map_err(|error| {
-                        Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string()))
-                    })?;
-                let image = format!(
-                    "{}@{digest}",
-                    release.manifest.oci.repository.trim_end_matches('/')
-                );
-                let backend = runtime_backend::backend(kind);
-                if let Err(pull_error) = backend.pull_image(&image) {
-                    // Registry unreachable (restricted network, anonymous
-                    // rate-limiting): the signed platform digest is the
-                    // verification anchor, so an image already present locally
-                    // under the exact repo@digest reference is equally trustworthy.
-                    // Anything else (absent, or a different digest) fails.
-                    if !backend.local_image_matches_digest(&image) {
-                        return Err(Failure::new(
-                            ARTIFACT_UNVERIFIED,
-                            sanitize(format!(
-                                "{pull_error:#}; and no local image matches {image}"
-                            )),
-                        ));
-                    }
-                    // Local exact-digest match: proceed without network.
-                }
-                digest.trim_start_matches("sha256:").to_owned()
-            }
-        };
+        let verified = super::update_exec::verify_pinned_artifact_facts(
+            &job.order.artifact,
+            kind,
+            None,
+            job.order.runtime_root.as_deref(),
+        )?;
+        let subject_digest = verified.digest.clone();
 
         for directory in &managed_directories {
             prepare_owned_directory(directory, job.deployment_id, performed)?;
@@ -1095,10 +1049,10 @@ impl HostInstallExecutor {
         // 6. Start the runtime and confirm it serves the verified artifact.
         match kind {
             RuntimeBackendKind::Host => {
-                start_systemd_runtime(job, &release, &subject_digest, performed)?;
+                start_systemd_runtime(job, &verified, performed)?;
             }
             RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
-                start_container_runtime(job, &release, kind, performed)?;
+                start_container_runtime(job, &verified, kind, performed)?;
             }
         }
 
@@ -1108,17 +1062,8 @@ impl HostInstallExecutor {
 
         Ok(InstallFacts {
             artifact_reference: format!("sha256:{subject_digest}"),
-            build_identity: Some(
-                super::deployment_state::BuildIdentity::new(
-                    super::deployment_state::BUILD_IDENTITY_PRODUCT,
-                    &release.manifest.version,
-                    &release.manifest.backend_commit,
-                )
-                .map_err(|error| {
-                    Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
-                })?,
-            ),
-            rollback_policy: release.rollback_policy(),
+            build_identity: verified.build_identity,
+            rollback_policy: verified.rollback_policy,
         })
     }
 }
@@ -1190,52 +1135,31 @@ fn ownership_marker_matches(marker: &Path, deployment_id: &str) -> bool {
 
 fn start_container_runtime(
     job: &InstallJob<'_>,
-    release: &VerifiedRelease,
+    verified: &super::update_exec::VerifiedArtifactFacts,
     kind: RuntimeBackendKind,
     performed: &mut PerformedSteps,
 ) -> Result<(), Failure> {
-    let image = match kind {
-        RuntimeBackendKind::Host => release
-            .manifest
-            .image_ref()
-            .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?,
+    let runtime_artifact = match &verified.runtime_artifact {
+        runtime_backend::ArtifactReference::Oci { .. } => verified.runtime_artifact.clone(),
         _ => {
-            let digest = release
-                .manifest
-                .runtime_oci_digest_for(crate::model::container_oci_platform())
-                .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
-            format!(
-                "{}@{digest}",
-                release.manifest.oci.repository.trim_end_matches('/')
-            )
+            return Err(Failure::new(
+                RUNTIME_START_FAILED,
+                "container install requires a verified OCI artifact",
+            ));
         }
     };
-    // The runtime identity anchor is the digest embedded in `image` itself:
-    // the platform manifest digest for container backends (what the engine
-    // records in RepoDigests and what inspection resolves back) or the
-    // host-platform runtime digest for systemd. The manifest-list index
-    // digest is a separate verification anchor consumed upstream; asserting
-    // it against the running object would compare two different layers.
-    let digest = image
-        .rsplit_once('@')
-        .map(|(_, digest)| digest.trim_start_matches("sha256:").to_owned())
-        .ok_or_else(|| {
-            Failure::new(
-                RUNTIME_START_FAILED,
-                sanitize(format!("release image reference has no digest: {image}")),
-            )
-        })?;
     let backend = runtime_backend::backend(kind);
     // 5a. Initialize the database schema BEFORE activation: `nazauth server`
     // preflights the active tenant boundary, which requires the migrated and
     // seeded tables. The diesel migration ledger (deduplicated re-entry) plus
     // the advisory lock make this idempotent across crash-retry resumes.
-    run_schema_migration(job, backend.as_ref(), kind, &image)?;
+    run_schema_migration(job, backend.as_ref(), &runtime_artifact)?;
 
     let observation = backend.inspect(&job.runtime.object);
-    if observation.as_ref().is_ok_and(|observed| {
-        observed.running && observed.artifact == artifact_reference(&image, &digest)
-    }) {
+    if observation
+        .as_ref()
+        .is_ok_and(|observed| observed.running && observed.artifact == runtime_artifact)
+    {
         // Resume: the exact verified runtime is already up.
         performed.installed_runtime = true;
         performed.started_runtime = true;
@@ -1323,8 +1247,8 @@ fn start_container_runtime(
     }
     let replacement = runtime_backend::RuntimeReplacement {
         object_reference: job.runtime.object.clone(),
-        artifact: artifact_reference(&image, &digest),
-        local_artifact_id: None,
+        artifact: runtime_artifact.clone(),
+        local_artifact_id: verified.local_artifact_id.clone(),
         command: vec!["nazoauth".to_owned(), "server".to_owned()],
         mounts,
         environment,
@@ -1353,7 +1277,7 @@ fn start_container_runtime(
     let observed = backend
         .inspect(&job.runtime.object)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
-    let expected = artifact_reference(&image, &digest);
+    let expected = runtime_artifact;
     if !observed.running || observed.artifact != expected {
         return Err(Failure::new(
             TARGET_IDENTITY_MISMATCH,
@@ -1365,13 +1289,6 @@ fn start_container_runtime(
         ));
     }
     Ok(())
-}
-
-fn artifact_reference(image: &str, digest: &str) -> runtime_backend::ArtifactReference {
-    runtime_backend::ArtifactReference::Oci {
-        image_reference: image.to_owned(),
-        digest: format!("sha256:{digest}"),
-    }
 }
 
 /// Percent-encode an operator-provided credential for safe inclusion in a
@@ -1394,8 +1311,7 @@ pub fn percent_encode_credential(credential: impl AsRef<[u8]>) -> String {
 
 fn start_systemd_runtime(
     job: &InstallJob<'_>,
-    release: &VerifiedRelease,
-    digest: &str,
+    verified: &super::update_exec::VerifiedArtifactFacts,
     performed: &mut PerformedSteps,
 ) -> Result<(), Failure> {
     crate::instance_lifecycle::privilege::ensure_systemd_access()
@@ -1406,12 +1322,17 @@ fn start_systemd_runtime(
             "systemd install requires an explicit runtime_root",
         )
     })?;
-    let verified_source = release
-        .artifact("binary", &job.order.artifact.repository)
-        .map_err(|error| Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string())))?;
-    let source_binary =
-        cache_systemd_artifact(&verified_source, Path::new(runtime_root), digest)
-            .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
+    let (source_binary, digest) = match &verified.runtime_artifact {
+        runtime_backend::ArtifactReference::HostBinary { path, sha256 } => {
+            (path.clone(), sha256.clone())
+        }
+        _ => {
+            return Err(Failure::new(
+                RUNTIME_START_FAILED,
+                "systemd install requires a verified host binary",
+            ));
+        }
+    };
     let binary = PathBuf::from(runtime_root).join("nazoauth");
     let service_user = format!(
         "nazoauth-{}",
@@ -1464,7 +1385,7 @@ fn start_systemd_runtime(
     let task = runtime_backend::OneShotTask {
         artifact: runtime_backend::ArtifactReference::HostBinary {
             path: binary.clone(),
-            sha256: digest.to_owned(),
+            sha256: digest.clone(),
         },
         command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
         network: Some("host".to_owned()),
@@ -1493,7 +1414,7 @@ fn start_systemd_runtime(
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
     let expected = runtime_backend::ArtifactReference::HostBinary {
         path: binary,
-        sha256: digest.to_owned(),
+        sha256: digest,
     };
     if !observed.running || observed.artifact != expected {
         return Err(Failure::new(
@@ -1538,18 +1459,8 @@ pub(super) fn cache_systemd_artifact(
 fn run_schema_migration(
     job: &InstallJob<'_>,
     backend: &dyn runtime_backend::RuntimeBackend,
-    kind: RuntimeBackendKind,
-    image: &str,
+    artifact: &runtime_backend::ArtifactReference,
 ) -> Result<(), Failure> {
-    let digest = image
-        .rsplit_once('@')
-        .map(|(_, d)| d.trim_start_matches("sha256:").to_owned())
-        .ok_or_else(|| {
-            Failure::new(
-                HOST_ERR_OPERATION_INVALID,
-                sanitize(format!("release image reference has no digest: {image}")),
-            )
-        })?;
     let secrets_dir = job
         .order
         .secrets
@@ -1579,7 +1490,7 @@ fn run_schema_migration(
         );
     }
     let task = runtime_backend::OneShotTask {
-        artifact: artifact_reference(image, &digest),
+        artifact: artifact.clone(),
         command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
         network: None,
         mounts: vec![
@@ -1600,7 +1511,6 @@ fn run_schema_migration(
         private_mounts: false,
         stdin: Vec::new(),
     };
-    let _ = kind;
     backend
         .run_one_shot(&task)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;

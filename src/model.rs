@@ -179,21 +179,8 @@ impl ReleaseManifest {
         Ok(())
     }
 
-    pub(crate) fn image_ref(&self) -> anyhow::Result<String> {
-        Ok(format!(
-            "{}@{}",
-            self.oci.repository,
-            self.runtime_oci_digest()?
-        ))
-    }
-
     pub(crate) fn image_oci_digest(&self) -> &str {
         &self.oci.index_digest
-    }
-
-    pub(crate) fn runtime_oci_digest(&self) -> anyhow::Result<&str> {
-        let platform = runtime_oci_platform(std::env::consts::OS, std::env::consts::ARCH)?;
-        self.runtime_oci_digest_for(platform)
     }
 
     pub(crate) fn runtime_oci_digest_for(&self, platform: &str) -> anyhow::Result<&str> {
@@ -254,14 +241,6 @@ fn executable_suffix(target: &str) -> &'static str {
         ".exe"
     } else {
         ""
-    }
-}
-
-fn runtime_oci_platform(os: &str, arch: &str) -> anyhow::Result<&'static str> {
-    match (os, arch) {
-        ("linux", "x86_64") => Ok("linux/amd64"),
-        ("linux", "aarch64") => Ok("linux/arm64"),
-        _ => bail!("managed OCI runtime is supported only on Linux x86-64 and Arm64"),
     }
 }
 

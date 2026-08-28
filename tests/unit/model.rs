@@ -85,19 +85,6 @@ fn release_manifest_binds_every_binary_frontend_and_oci_identity() {
     );
     assert!(is_lower_hex(&manifest.frontend.commit, 40));
 
-    if cfg!(target_os = "linux") {
-        assert!(
-            manifest
-                .image_ref()
-                .unwrap()
-                .starts_with("ghcr.io/nazozero/nazoauth@sha256:")
-        );
-        assert!(manifest.runtime_oci_digest().is_ok());
-    } else {
-        assert!(manifest.image_ref().is_err());
-        assert!(manifest.runtime_oci_digest().is_err());
-    }
-
     let mut invalid = manifest.clone();
     invalid.schema = 4;
     assert!(invalid.validate("v0.2.0", "release-identity").is_err());
@@ -147,16 +134,6 @@ fn release_manifest_binds_every_binary_frontend_and_oci_identity() {
 fn platform_mapping_is_total_over_every_published_release_target() {
     assert_eq!(executable_suffix("x86_64-pc-windows-msvc"), ".exe");
     assert_eq!(executable_suffix("x86_64-unknown-linux-gnu"), "");
-    assert_eq!(
-        runtime_oci_platform("linux", "x86_64").unwrap(),
-        "linux/amd64"
-    );
-    assert_eq!(
-        runtime_oci_platform("linux", "aarch64").unwrap(),
-        "linux/arm64"
-    );
-    assert!(runtime_oci_platform("windows", "x86_64").is_err());
-
     for (arch, os, env, expected) in [
         ("x86_64", "linux", "musl", Some("x86_64-unknown-linux-musl")),
         (

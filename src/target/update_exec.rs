@@ -987,7 +987,7 @@ fn require_observation_serves(
     Ok(())
 }
 
-fn verify_pinned_artifact_facts(
+pub(crate) fn verify_pinned_artifact_facts(
     artifact: &OfficialArtifactRef,
     kind: RuntimeBackendKind,
     version_floor: Option<&str>,
@@ -1186,12 +1186,12 @@ fn verify_pinned_artifact_facts(
 
 /// The verified facts an update needs from its selected artifact: the OCI
 /// subject digest and the embedded build identity.
-struct VerifiedArtifactFacts {
-    digest: String,
-    runtime_artifact: runtime_backend::ArtifactReference,
-    local_artifact_id: Option<String>,
-    build_identity: Option<super::deployment_state::BuildIdentity>,
-    rollback_policy: crate::model::ReleaseRollbackPolicy,
+pub(crate) struct VerifiedArtifactFacts {
+    pub(crate) digest: String,
+    pub(crate) runtime_artifact: runtime_backend::ArtifactReference,
+    pub(crate) local_artifact_id: Option<String>,
+    pub(crate) build_identity: Option<super::deployment_state::BuildIdentity>,
+    pub(crate) rollback_policy: crate::model::ReleaseRollbackPolicy,
 }
 
 /// Rebuild the runtime replacement from the LIVE observation, changing only
