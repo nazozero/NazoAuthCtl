@@ -583,14 +583,6 @@ pub fn managed_dependency_identity(
 }
 
 #[derive(Clone, Debug)]
-pub struct RuntimeDatabasePrivilegeProbe {
-    pub network: String,
-    pub service_file: PathBuf,
-    pub password_file: PathBuf,
-    pub image: String,
-}
-
-#[derive(Clone, Debug)]
 pub struct HostServiceInstall {
     pub service_name: String,
     pub deployment_id: String,
@@ -674,10 +666,6 @@ pub trait RuntimeBackend {
     fn ensure_managed_network(&self, network: &ManagedNetwork) -> anyhow::Result<std::net::IpAddr>;
     fn ensure_managed_dependencies(&self, dependencies: &ManagedDependencies)
     -> anyhow::Result<()>;
-    fn verify_runtime_database_privileges(
-        &self,
-        probe: &RuntimeDatabasePrivilegeProbe,
-    ) -> anyhow::Result<()>;
     fn install_host_service(&self, install: &HostServiceInstall) -> anyhow::Result<()>;
     #[cfg(debug_assertions)]
     fn run_debug_artifact_task(&self, task: &DebugArtifactTask) -> anyhow::Result<()>;

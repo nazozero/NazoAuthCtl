@@ -1075,6 +1075,17 @@ fn answer_update(
         .iter()
         .find(|resource| resource.resource_id == "app-binary" && resource.kind == "directory")
         .map(|resource| resource.locator.clone());
+    let secrets_root = state
+        .resources
+        .iter()
+        .find(|resource| resource.resource_id == "app-secrets" && resource.kind == "directory")
+        .map(|resource| resource.locator.clone())
+        .ok_or_else(|| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                "deployment state has no app-secrets directory resource",
+            )
+        })?;
     let job = update_exec::UpdateJob {
         operation_id: &operation.operation_id,
         deployment_id: &deployment_id,
@@ -1083,6 +1094,7 @@ fn answer_update(
         config_reference: &state.config.reference.clone(),
         port: state.runtime.loopback_port,
         data_root: &data_root,
+        secrets_root: &secrets_root,
         runtime_root: runtime_root.as_deref(),
         config_schema: &state.config.schema.clone(),
         current_artifact: &current_artifact,

@@ -287,6 +287,15 @@ impl Fixture {
                 crate::target::ResourceOwnership::Managed,
                 crate::target::ResourceScope::Deployment,
             )?,
+            // A real install records the deployment-owned secrets directory;
+            // update derives the runtime database role from it.
+            crate::target::Resource::new(
+                "app-secrets",
+                "directory",
+                temp.path().join("secrets").to_string_lossy().as_ref(),
+                crate::target::ResourceOwnership::Managed,
+                crate::target::ResourceScope::Deployment,
+            )?,
             crate::target::Resource::new(
                 "shared-db",
                 "postgres",
@@ -564,7 +573,11 @@ fn rollback_restores_the_previous_verified_reference() -> anyhow::Result<()> {
 fn uninstall_plan_zero_deletes_external_resources() -> anyhow::Result<()> {
     let fixture = Fixture::new()?;
     let plan = plan_uninstall(&fixture.context, Some(&format!("inst-{DEPLOYMENT}")))?;
-    assert_eq!(plan.managed_deletions.len(), 1, "only the managed file");
+    assert_eq!(
+        plan.managed_deletions.len(),
+        2,
+        "the managed data and secrets directories"
+    );
     assert_eq!(plan.kept_external.len(), 1, "the shared database stays");
     let rendered = plan.render();
     assert!(rendered.contains("ZERO DELETE"), "{rendered}");
@@ -633,10 +646,14 @@ fn uninstall_plan_and_operation_log_keep_external_resources_listed() -> anyhow::
         "{report}"
     );
 
-    // The destructive path received ONLY the managed resource — the external
+    // The destructive path received ONLY the managed resources — the external
     // locator never enters a deletion order.
     let planned = fixture.deletion.planned.lock().unwrap().clone();
-    assert_eq!(planned, vec!["app-data".to_owned()], "{planned:?}");
+    assert_eq!(
+        planned,
+        vec!["app-data".to_owned(), "app-secrets".to_owned()],
+        "{planned:?}"
+    );
 
     // The journaled operation log records the uninstall as one terminal,
     // completed mutation beside the retained journal.

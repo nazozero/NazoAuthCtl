@@ -8,7 +8,7 @@ use crate::process::Process;
 
 use super::super::{
     ContainerRuntimePolicy, ManagedDependencies, ManagedDependencyBackup, ManagedPostgresCommand,
-    ManagedPostgresRestore, ManagedValkeyRestore, RuntimeDatabasePrivilegeProbe, container_shared,
+    ManagedPostgresRestore, ManagedValkeyRestore, container_shared,
 };
 
 pub(super) fn restore_postgres(
@@ -1046,37 +1046,4 @@ pub(super) fn ensure_dependencies(
         thread::sleep(Duration::from_secs(1));
     }
     bail!("managed PostgreSQL or Valkey did not become ready through Podman")
-}
-
-pub(super) fn verify_database_privileges(
-    command: &OsStr,
-    probe: &RuntimeDatabasePrivilegeProbe,
-) -> anyhow::Result<()> {
-    container_shared::build_identity_process(command)
-    .arg("--network")
-    .arg(&probe.network)
-        .args([
-            "--env",
-            "PGSERVICEFILE=/run/nazoauth-secrets/pg_service.conf",
-            "--env",
-            "PGPASSFILE=/run/nazoauth-secrets/pgpass",
-            "--volume",
-        ])
-        .arg(format!(
-            "{}:/run/nazoauth-secrets/pg_service.conf:ro,Z",
-            probe.service_file.display()
-        ))
-        .arg("--volume")
-        .arg(format!(
-            "{}:/run/nazoauth-secrets/pgpass:ro,Z",
-            probe.password_file.display()
-        ))
-        .arg(&probe.image)
-        .args([
-            "sh",
-            "-eu",
-            "-c",
-            "if psql --no-psqlrc --dbname='service=nazoauth' --set ON_ERROR_STOP=1 --command='BEGIN; CREATE TABLE nazoauth_runtime_ddl_probe(id integer); ROLLBACK;'; then echo 'runtime role unexpectedly has persistent DDL permission' >&2; exit 1; fi; if psql --no-psqlrc --dbname='service=nazoauth' --set ON_ERROR_STOP=1 --command='BEGIN; CREATE TEMPORARY TABLE nazoauth_runtime_temp_probe(id integer); ROLLBACK;'; then echo 'runtime role unexpectedly has temporary DDL permission' >&2; exit 1; fi; exit 0",
-        ])
-        .run_quiet()
 }

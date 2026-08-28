@@ -20,7 +20,7 @@ use super::{
     BlobAttestationVerification, HostServiceInstall, ManagedDependencies, ManagedDependencyBackup,
     ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount,
     OneShotTask, RecoveryCandidateEndpoint, RecoveryCandidateRequest, RuntimeBackend,
-    RuntimeDatabasePrivilegeProbe, RuntimeObservation, RuntimeReplacement,
+    RuntimeObservation, RuntimeReplacement,
 };
 
 pub struct DockerBackend {
@@ -169,13 +169,6 @@ impl RuntimeBackend for DockerBackend {
         dependencies: &ManagedDependencies,
     ) -> anyhow::Result<()> {
         managed_dependencies::ensure_dependencies(&self.command, dependencies)
-    }
-
-    fn verify_runtime_database_privileges(
-        &self,
-        probe: &RuntimeDatabasePrivilegeProbe,
-    ) -> anyhow::Result<()> {
-        managed_dependencies::verify_database_privileges(&self.command, probe)
     }
 
     fn install_host_service(&self, install: &HostServiceInstall) -> anyhow::Result<()> {

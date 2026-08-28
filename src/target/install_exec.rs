@@ -84,6 +84,7 @@ pub const CONTAINER_CONFIG_FILE: &str = "/app/.env.yaml";
 pub const CONTAINER_SECRETS_DIR: &str = "/run/secrets";
 /// Persistent data directory inside the container.
 pub const CONTAINER_DATA_DIR: &str = "/var/lib/nazo_oauth";
+pub(crate) const MIGRATION_RUNTIME_ROLE_ENV: &str = "NAZOAUTH_MIGRATION_RUNTIME_ROLE";
 /// NazoAuth environment key overriding the configuration file location.
 pub const SERVER_CONFIG_FILE_ENV: &str = "NAZOAUTH_SERVER_CONFIG_FILE";
 
@@ -1387,6 +1388,10 @@ fn start_systemd_runtime(
             )
         })?;
     environment.insert("DATABASE_URL_FILE".to_owned(), lifecycle_url.path.clone());
+    environment.insert(
+        MIGRATION_RUNTIME_ROLE_ENV.to_owned(),
+        job.order.database_runtime_endpoint.user.clone(),
+    );
     let task = runtime_backend::OneShotTask {
         artifact: runtime_backend::ArtifactReference::HostBinary {
             path: binary.clone(),
@@ -1482,6 +1487,10 @@ fn run_schema_migration(
     environment.insert(
         SERVER_CONFIG_FILE_ENV.to_owned(),
         CONTAINER_CONFIG_FILE.to_owned(),
+    );
+    environment.insert(
+        MIGRATION_RUNTIME_ROLE_ENV.to_owned(),
+        job.order.database_runtime_endpoint.user.clone(),
     );
     for secret in &job.order.secrets {
         let key = match secret.purpose.as_str() {

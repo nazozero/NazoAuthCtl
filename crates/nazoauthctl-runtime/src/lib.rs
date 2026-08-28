@@ -14,9 +14,8 @@ pub use runtime_backend::{
     ManagedNetwork, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore,
     MountReference, NeutralMount, NeutralTmpfs, OneShotTask, RecoveryCandidateEndpoint,
     RecoveryCandidateRequest, ResourceScope, Responsibility, RuntimeBackend, RuntimeBackendKind,
-    RuntimeDatabasePrivilegeProbe, RuntimeObservation, RuntimeReplacement, managed_config_digest,
-    managed_dependency_identity, managed_network_config_digest, normalize_local_image_id,
-    safe_systemd_path,
+    RuntimeObservation, RuntimeReplacement, managed_config_digest, managed_dependency_identity,
+    managed_network_config_digest, normalize_local_image_id, safe_systemd_path,
 };
 
 #[cfg(debug_assertions)]

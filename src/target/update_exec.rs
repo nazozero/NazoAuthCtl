@@ -34,7 +34,8 @@ use sha2::{Digest as _, Sha256};
 
 use super::deployment_state::{Failure, OBJECT_IDENTITY_MISMATCH, TargetStateStore};
 use super::install_exec::{
-    OfficialArtifactRef, StagedConfig, cache_systemd_artifact, probe_local_health,
+    CONTAINER_SECRETS_DIR, MIGRATION_RUNTIME_ROLE_ENV, OfficialArtifactRef, StagedConfig,
+    cache_systemd_artifact, probe_local_health,
 };
 use super::wire::{HOST_ERR_OPERATION_INVALID, sanitize};
 use crate::{
@@ -156,6 +157,10 @@ pub(crate) struct UpdateJob<'a> {
     /// The published loopback port for local health probes.
     pub port: u16,
     pub data_root: &'a str,
+    /// Deployment-owned directory containing the stable runtime and lifecycle
+    /// database URL files. The runtime role is derived from that authority at
+    /// execution time instead of being copied into DeploymentState.
+    pub secrets_root: &'a str,
     /// Managed systemd binary root. Container deployments do not have one.
     pub runtime_root: Option<&'a str>,
     /// The deployment's current config schema token (pre-update).
@@ -417,6 +422,9 @@ impl HostLifecycleExecutor {
             let mut environment = BTreeMap::new();
             let mut read_only_paths = Vec::new();
             let mut read_write_paths = Vec::new();
+            let mut transient_credentials = BTreeMap::new();
+            let runtime_role = runtime_database_role(job.secrets_root)?;
+            environment.insert(MIGRATION_RUNTIME_ROLE_ENV.to_owned(), runtime_role);
             super::inject_operator_oci_artifact_fence(&mut environment, &verified.runtime_artifact);
             if host {
                 environment.insert(
@@ -439,6 +447,19 @@ impl HostLifecycleExecutor {
                 );
                 read_only_paths.push(PathBuf::from(job.config_reference));
                 read_write_paths.push(PathBuf::from(job.data_root));
+                environment.insert(
+                    "DATABASE_URL_FILE".to_owned(),
+                    "%d/database-lifecycle-url".to_owned(),
+                );
+                transient_credentials.insert(
+                    "database-lifecycle-url".to_owned(),
+                    Path::new(job.secrets_root).join("database-lifecycle-url"),
+                );
+            } else {
+                environment.insert(
+                    "DATABASE_URL_FILE".to_owned(),
+                    format!("{CONTAINER_SECRETS_DIR}/database-lifecycle-url"),
+                );
             }
             let task = runtime_backend::OneShotTask {
                 artifact: verified.runtime_artifact.clone(),
@@ -454,7 +475,7 @@ impl HostLifecycleExecutor {
                 } else {
                     Some(crate::runtime_backend::NON_ROOT_ONE_SHOT_USER.to_owned())
                 },
-                transient_credentials: BTreeMap::new(),
+                transient_credentials,
                 read_only_paths,
                 read_write_paths,
                 inaccessible_paths: Vec::new(),
@@ -708,6 +729,40 @@ impl HostLifecycleExecutor {
     }
 }
 
+fn runtime_database_role(secrets_root: &str) -> Result<String, Failure> {
+    let path = Path::new(secrets_root).join("database-runtime-url");
+    let bytes =
+        filesystem::read_secure_regular_file(&path, "runtime database URL", false, 16 * 1024)
+            .map_err(|error| {
+                Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
+            })?;
+    let value = std::str::from_utf8(&bytes).map_err(|_| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "runtime database URL is not UTF-8",
+        )
+    })?;
+    let url = url::Url::parse(value.trim()).map_err(|error| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            sanitize(format!("runtime database URL is invalid: {error}")),
+        )
+    })?;
+    let role = url.username();
+    if role.is_empty()
+        || role.len() > 63
+        || !role
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "runtime database URL has an invalid PostgreSQL role",
+        ));
+    }
+    Ok(role.to_owned())
+}
+
 /// Target-side pre-activation gate for the nested MigrateApply.  This is only
 /// an adapter to the controller's one result-binding authority; it adds no
 /// second operation/result contract.
@@ -737,6 +792,37 @@ mod tests {
     use nazo_operator_protocol::{ControlOutcome, ControlResult, ControlResultData};
 
     const OPERATION_ID: &str = "01900000-0000-7000-8000-000000000001";
+
+    #[test]
+    fn migration_runtime_role_comes_from_the_existing_runtime_database_url() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("migration-runtime-role")?;
+        let path = temp.path().join("database-runtime-url");
+        crate::filesystem::atomic_write(
+            &path,
+            b"postgresql://nazo_runtime:secret@db.internal/oauth\n",
+            0o600,
+        )?;
+
+        assert_eq!(
+            runtime_database_role(temp.path().to_str().unwrap()).map_err(anyhow::Error::from)?,
+            "nazo_runtime"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_runtime_role_rejects_an_encoded_identifier() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("migration-runtime-role-invalid")?;
+        let path = temp.path().join("database-runtime-url");
+        crate::filesystem::atomic_write(
+            &path,
+            b"postgresql://nazo%22runtime:secret@db.internal/oauth",
+            0o600,
+        )?;
+
+        assert!(runtime_database_role(temp.path().to_str().unwrap()).is_err());
+        Ok(())
+    }
 
     fn terminal_result() -> ControlResult {
         ControlResult {

@@ -22,8 +22,7 @@ use super::{
     BlobAttestationVerification, HostServiceInstall, ManagedDependencies, ManagedDependencyBackup,
     ManagedNetwork, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore,
     OneShotTask, RecoveryCandidateEndpoint, RecoveryCandidateRequest, RuntimeBackend,
-    RuntimeDatabasePrivilegeProbe, RuntimeObservation, RuntimeReplacement, safe_environment,
-    safe_systemd_path,
+    RuntimeObservation, RuntimeReplacement, safe_environment, safe_systemd_path,
 };
 
 pub struct SystemdBackend;
@@ -473,13 +472,6 @@ impl RuntimeBackend for SystemdBackend {
         _dependencies: &ManagedDependencies,
     ) -> anyhow::Result<()> {
         bail!("systemd does not manage container dependencies")
-    }
-
-    fn verify_runtime_database_privileges(
-        &self,
-        _probe: &RuntimeDatabasePrivilegeProbe,
-    ) -> anyhow::Result<()> {
-        bail!("systemd does not run container database privilege probes")
     }
 
     fn install_host_service(&self, install: &HostServiceInstall) -> anyhow::Result<()> {
