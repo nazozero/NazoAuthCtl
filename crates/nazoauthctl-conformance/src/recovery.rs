@@ -299,10 +299,6 @@ pub struct ConformanceRecoveryGuard {
     lock_path: PathBuf,
     lock: Option<File>,
     retention_commit_resolution: SuiteRetentionCommitResolution,
-    // This is deliberately a test-only durability seam.  Production always
-    // persists through the same atomic journal writer.
-    #[cfg(test)]
-    persist_failpoint: std::sync::Arc<std::sync::Mutex<Option<PersistFailpoint>>>,
 }
 
 /// The only safe cleanup decision after attempting the durable ownership
@@ -315,13 +311,6 @@ pub enum SuiteRetentionCommitResolution {
     Prepared,
     Retained,
     Ambiguous,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PersistFailpoint {
-    BeforeWrite,
-    AfterRenameBeforeDirectoryFsync,
 }
 
 impl ConformanceRecoveryStore {
@@ -406,8 +395,6 @@ impl ConformanceRecoveryStore {
             lock_path,
             lock: Some(lock),
             retention_commit_resolution: SuiteRetentionCommitResolution::NotAttempted,
-            #[cfg(test)]
-            persist_failpoint: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -526,8 +513,6 @@ impl ConformanceRecoveryStore {
                 lock_path,
                 lock: Some(lock),
                 retention_commit_resolution,
-                #[cfg(test)]
-                persist_failpoint: std::sync::Arc::new(std::sync::Mutex::new(None)),
             });
         }
         Ok(pending)
@@ -551,24 +536,6 @@ impl Clone for ConformanceRecoveryStore {
 }
 
 impl ConformanceRecoveryGuard {
-    #[cfg(all(test, unix))]
-    fn fail_next_persist_for_test(&self) {
-        self.set_persist_failpoint_for_test(PersistFailpoint::BeforeWrite);
-    }
-
-    #[cfg(all(test, unix))]
-    fn fail_after_rename_before_directory_fsync_for_test(&self) {
-        self.set_persist_failpoint_for_test(PersistFailpoint::AfterRenameBeforeDirectoryFsync);
-    }
-
-    #[cfg(all(test, unix))]
-    fn set_persist_failpoint_for_test(&self, failpoint: PersistFailpoint) {
-        *self
-            .persist_failpoint
-            .lock()
-            .expect("test persist failpoint lock") = Some(failpoint);
-    }
-
     pub fn suite_retention_commit_resolution(&self) -> SuiteRetentionCommitResolution {
         self.retention_commit_resolution
     }
@@ -1169,16 +1136,6 @@ impl ConformanceRecoveryGuard {
     }
 
     fn persist_snapshot(&self, journal: &TenantResourceRecoveryJournal) -> anyhow::Result<()> {
-        #[cfg(test)]
-        let failpoint = self
-            .persist_failpoint
-            .lock()
-            .map_err(|_| anyhow::anyhow!("test persist failpoint lock poisoned"))?
-            .take();
-        #[cfg(test)]
-        if failpoint == Some(PersistFailpoint::BeforeWrite) {
-            bail!("injected recovery journal persistence failure before write");
-        }
         validate_journal(journal, &self.store.deployment_id, &journal.binding.run_id)?;
         if journal.binding.manifest_path.is_some() {
             let present = validate_tenant_resource_manifest_file(&journal.binding)?;
@@ -1190,12 +1147,6 @@ impl ConformanceRecoveryGuard {
             }
         }
         write_journal(&self.journal_path, journal)?;
-        #[cfg(test)]
-        if failpoint == Some(PersistFailpoint::AfterRenameBeforeDirectoryFsync) {
-            bail!(
-                "injected recovery journal persistence failure after rename before directory fsync"
-            );
-        }
         Ok(())
     }
 }

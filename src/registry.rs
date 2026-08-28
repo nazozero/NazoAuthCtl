@@ -1335,7 +1335,7 @@ mod tests {
 
         let (_temp, store) = test_store()?;
         let host = store.ensure_local_host()?;
-        let real = std::env::temp_dir().join(format!(
+        let real = store.root().join(format!(
             "nazoauthctl-registry-target-{}.json",
             uuid::Uuid::now_v7()
         ));

@@ -18,6 +18,10 @@ use crate::target::{
 
 const ISSUER: &str = "https://auth.example.com";
 
+fn test_target_os() -> &'static str {
+    if cfg!(windows) { "windows" } else { "linux" }
+}
+
 #[test]
 fn helper_runtime_announcement_is_a_closed_three_value_contract() {
     let rejected = select_runtime(&["podman".to_owned(), "systemd".to_owned()], None)
@@ -155,6 +159,7 @@ impl ExecutionTarget for HelloOverride {
             else {
                 unreachable!("LocalTarget must complete Hello")
             };
+            hello.os = test_target_os().to_owned();
             hello.supported_runtimes = vec!["podman".to_owned()];
             return Ok(HostResult::completed(
                 &operation.operation_id,
@@ -268,6 +273,7 @@ impl SshStub {
         let target_id = uuid::Uuid::now_v7();
         let mut identity = crate::target::wire::local_hello(vec!["podman".to_owned()]);
         identity.target_id = target_id.to_string();
+        identity.os = test_target_os().to_owned();
         let hello = serde_json::json!({
             "schema": crate::target::wire::HOST_PROTOCOL_SCHEMA,
             "operation_id": "__OPERATION_ID__",
