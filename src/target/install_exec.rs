@@ -812,7 +812,17 @@ impl HostInstallExecutor {
                 )
             })?
             .to_path_buf();
-        let mut managed_directories = vec![PathBuf::from(&job.order.data_root), secret_root];
+        let config_dir = config_path.parent().ok_or_else(|| {
+            Failure::new(
+                CONFIG_INVALID,
+                "clean-install configuration path requires a deployment directory",
+            )
+        })?;
+        let mut managed_directories = vec![
+            config_dir.to_path_buf(),
+            PathBuf::from(&job.order.data_root),
+            secret_root,
+        ];
         if let Some(runtime_root) = &job.order.runtime_root {
             managed_directories.push(PathBuf::from(runtime_root));
         }
@@ -830,13 +840,12 @@ impl HostInstallExecutor {
                     ),
                 ));
             }
-            if config_path.starts_with(path)
-                || managed_directories
-                    .iter()
-                    .enumerate()
-                    .any(|(other_index, other)| {
-                        index != other_index && (path.starts_with(other) || other.starts_with(path))
-                    })
+            if managed_directories
+                .iter()
+                .enumerate()
+                .any(|(other_index, other)| {
+                    index != other_index && (path.starts_with(other) || other.starts_with(path))
+                })
             {
                 return Err(Failure::new(
                     CONFIG_INVALID,
@@ -921,14 +930,6 @@ impl HostInstallExecutor {
                     "config content does not match its declared digest",
                 ));
             }
-        }
-        if let Some(parent) = config_path.parent()
-            && filesystem::ensure_directory_chain(parent).is_err()
-        {
-            return Err(Failure::new(
-                CONFIG_INVALID,
-                format!("failed to prepare {}", parent.display()),
-            ));
         }
         atomic_write(&config_path, content_bytes, 0o600)
             .map_err(|error| Failure::new(CONFIG_INVALID, sanitize(error.to_string())))?;
@@ -1341,10 +1342,10 @@ fn start_container_runtime(
     backend
         .replace(&replacement)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
+    performed.installed_runtime = true;
     backend
         .start(&job.runtime.object)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
-    performed.installed_runtime = true;
     performed.started_runtime = true;
 
     // Embedded identity check: the running object must report the verified

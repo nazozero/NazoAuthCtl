@@ -170,6 +170,17 @@ impl TargetOs {
         }
         Ok(value)
     }
+
+    fn parent(self, path: &str) -> anyhow::Result<String> {
+        let separator = match self {
+            Self::Linux => '/',
+            Self::Windows => '\\',
+        };
+        path.rsplit_once(separator)
+            .map(|(parent, _)| parent.to_owned())
+            .filter(|parent| !parent.is_empty())
+            .context("target configuration path requires a deployment directory")
+    }
 }
 
 fn validate_target_root(target_os: TargetOs, root: &str) -> anyhow::Result<()> {
@@ -648,6 +659,7 @@ fn prepare_install_operation_with_identity(
         loopback_port,
     )?;
     let resources = declare_resources(
+        &target_os.parent(&paths.config_reference)?,
         &paths.data_root,
         &paths.secrets_dir,
         (runtime_kind == RuntimeBackendKind::Host).then(|| paths.runtime_root.clone()),
@@ -679,6 +691,7 @@ fn prepare_install_operation_with_identity(
 /// locator for each external dependency comes from the operator-supplied
 /// endpoint facts, not a hardcoded loopback address.
 fn declare_resources(
+    config_dir: &str,
     data_root: &str,
     secrets_root: &str,
     runtime_root: Option<String>,
@@ -686,6 +699,13 @@ fn declare_resources(
     valkey_endpoint: &crate::target::install_exec::ExternalEndpoint,
 ) -> anyhow::Result<Vec<Resource>> {
     let mut resources = vec![
+        Resource::new(
+            "app-config",
+            "directory",
+            config_dir,
+            ResourceOwnership::Managed,
+            ResourceScope::Deployment,
+        )?,
         Resource::new(
             "app-data",
             "directory",

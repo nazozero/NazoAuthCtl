@@ -871,11 +871,21 @@ fn linux_target_paths_are_posix_even_when_constructed_on_windows() -> anyhow::Re
     hello.os = "linux".to_owned();
     let prepared = prepare_install_operation(&mut request, &hello)?;
     let order = install_order(&prepared.operation);
+    let StateMutationPayload::Bootstrap { resources, .. } = (match &prepared.operation.operation {
+        crate::target::HostOperationBody::StateMutate { mutation } => mutation,
+        _ => panic!("prepared install is not a state mutation"),
+    }) else {
+        panic!("prepared install is not a bootstrap mutation")
+    };
 
     assert_eq!(
         order.data_root,
         format!("/srv/nazoauth/data/{}", prepared.deployment_id)
     );
+    assert!(resources.iter().any(|resource| {
+        resource.resource_id == "app-config"
+            && resource.locator == format!("/srv/nazoauth/config/{}", prepared.deployment_id)
+    }));
     assert!(
         order
             .secrets
