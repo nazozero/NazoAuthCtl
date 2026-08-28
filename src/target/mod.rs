@@ -57,8 +57,8 @@ pub use crate::model::{DatabaseRestore, ReleaseRollbackPolicy};
 pub use backup::{BackupProjection, RestoreTestReceipt, SnapshotManifest, SnapshotProjection};
 pub use backup_exec::{BACKUP_EXECUTION_FAILED, RESTORE_TEST_FAILED};
 pub use bootstrap_authority::{
-    BOOTSTRAP_CLOSED, CONTEXT_FILE_NAME, FRESH_BOOTSTRAP_ALLOWLIST, FRESH_BOOTSTRAP_SCHEMA,
-    FreshBootstrapContext, FreshBootstrapMaterialView, SERVER_TOKEN_RELATIVE_PATH,
+    BOOTSTRAP_CLOSED, CONTEXT_FILE_NAME, FRESH_BOOTSTRAP_SCHEMA, FreshBootstrapContext,
+    FreshBootstrapMaterialView, SERVER_TOKEN_RELATIVE_PATH,
 };
 pub use control_exec::{
     CONTROL_EXECUTION_UNAVAILABLE, CONTROL_OUTCOME_UNKNOWN, CONTROL_TARGET_DRIFT,
@@ -771,7 +771,6 @@ pub(crate) fn dispatch_host_operation(
                         let job = install_exec::InstallJob {
                             operation_id: &operation.operation_id,
                             deployment_id: &deployment_id,
-                            issuer,
                             runtime_kind: runtime.kind,
                             runtime_object: &runtime.object,
                             config_reference,
@@ -1612,9 +1611,9 @@ fn answer_bootstrap_read(
     ))
 }
 
-/// P0-2: delete one fresh-install bootstrap capability file. The security
-/// boundary is the server's own token consumption; this explicit close keeps
-/// the target state tree clean so a stale capability can never resurface.
+/// P0-2: delete one fresh-install bootstrap token and capability context. The
+/// controller calls this only after the server's successful claim receipt;
+/// keeping the context until then preserves response-loss replay.
 fn answer_bootstrap_close(
     operation: &HostOperation,
     store: &TargetStateStore,

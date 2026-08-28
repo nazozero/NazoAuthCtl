@@ -9,13 +9,15 @@ fn every_public_help_topic_is_complete_without_runtime_state() {
         (cli::HelpTopic::Controller, "controller revoke"),
         (cli::HelpTopic::Install, "--public-url"),
         (cli::HelpTopic::BootstrapAdmin, "--credentials-stdin"),
-        (cli::HelpTopic::Update, "--artifact-sha256"),
+        (cli::HelpTopic::Update, "--to VERSION"),
         (cli::HelpTopic::SelfUpdate, "self update"),
     ] {
         let help = help_text(topic);
         assert!(help.starts_with("Usage:") || help.starts_with("nazoauthctl"));
         assert!(help.contains(expected));
     }
+    assert!(!help_text(cli::HelpTopic::Install).contains("--artifact-sha256"));
+    assert!(!help_text(cli::HelpTopic::Update).contains("--artifact-sha256"));
 }
 
 #[test]

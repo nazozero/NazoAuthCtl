@@ -1157,7 +1157,6 @@ fn run_install(args: InstallArgs) -> anyhow::Result<()> {
         instance_alias: args.name,
         issuer: args.public_url,
         version: args.version,
-        expected_artifact_sha256: args.artifact_sha256,
         runtime: args.runtime,
         install_root: args.install_root,
         database_runtime_endpoint: crate::target::install_exec::ExternalEndpoint {
@@ -1211,7 +1210,6 @@ fn run_update(args: UpdateArgs, global: Option<&str>) -> anyhow::Result<()> {
     let request = UpdateRequest {
         instance: merged,
         version: args.version,
-        expected_artifact_sha256: args.artifact_sha256,
         config_content,
         config_schema: args.config_schema,
     };

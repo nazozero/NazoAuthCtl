@@ -86,13 +86,6 @@ impl TargetArtifactResolver for ProductionTargetArtifactResolver {
             .image_oci_digest()
             .trim_start_matches("sha256:")
             .to_owned();
-        if let Some(expected) = &pinned.expected_subject_sha256
-            && *expected != subject
-        {
-            anyhow::bail!(
-                "verified subject digest sha256:{subject} differs from the requested pin sha256:{expected}"
-            );
-        }
         let digest = format!("sha256:{subject}");
         let identity = crate::target::BuildIdentity::new(
             nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT,

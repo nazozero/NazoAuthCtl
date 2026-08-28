@@ -6,9 +6,8 @@
 //! `DATA_DIR/bootstrap/initial-admin-token` and validates every claim against
 //! it. This module is the control-side half — and nothing more:
 //!
-//! 1. The allowlist is a compile-time constant: [`FRESH_BOOTSTRAP_ALLOWLIST`]
-//!    contains exactly `create-initial-admin`. No other operation can ever be
-//!    authorized through this path.
+//! 1. This path authorizes exactly one operation: creating the initial
+//!    administrator. It is a dedicated API, not a configurable capability set.
 //! 2. There is exactly ONE bootstrap token authority: the server. Ctl never
 //!    mints, stores, or mounts a second token; it only records the
 //!    install-binding context ([`FreshBootstrapContext`], including the data
@@ -19,16 +18,14 @@
 //!    operation id recorded in the context, carries the exact verified
 //!    artifact digest and the untouched config revision recorded then. Any
 //!    drift (tampered artifact/config, later operation) rejects.
-//! 4. Closure deletes the context durably. Because `bootstrap` state
-//!    mutations fail closed over existing state (`DEPLOYMENT_EXISTS`), a
-//!    deleted capability can never be regenerated: there is no permanent
-//!    unsigned operator and no `--force-bootstrap`. The token file itself is
-//!    owned — and consumed — by NazoAuth alone.
+//! 4. Closure deletes the server token and context durably. Because
+//!    `bootstrap` state mutations fail closed over existing state
+//!    (`DEPLOYMENT_EXISTS`), a deleted capability can never be regenerated:
+//!    there is no permanent unsigned operator and no `--force-bootstrap`.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::filesystem;
@@ -36,13 +33,7 @@ use crate::filesystem;
 use super::{
     deployment_state::{DeploymentState, Failure},
     install_exec::InstallJob,
-    wire::sanitize,
 };
-
-/// The complete hardcoded allowlist of fresh-install bootstrap operations.
-/// Extending this set requires changing this constant — deliberately not a
-/// configuration input.
-pub const FRESH_BOOTSTRAP_ALLOWLIST: &[&str] = &["create-initial-admin"];
 
 /// Stable rejection: any bootstrap attempt without an open, journal-bound,
 /// untampered fresh-install capability. Covers closed, consumed, absent, and
@@ -50,14 +41,15 @@ pub const FRESH_BOOTSTRAP_ALLOWLIST: &[&str] = &["create-initial-admin"];
 pub const BOOTSTRAP_CLOSED: &str = "BOOTSTRAP_CLOSED";
 
 /// Schema discriminator for the persisted context document.
-pub const FRESH_BOOTSTRAP_SCHEMA: u32 = 2;
+pub const FRESH_BOOTSTRAP_SCHEMA: u32 = 3;
 
 /// Context file name inside the deployment scope directory.
 pub const CONTEXT_FILE_NAME: &str = "fresh-bootstrap.json";
 
 /// Server-owned token location relative to the deployment data root
-/// (`DATA_DIR` inside the runtime). NazoAuth generates and consumes this file;
-/// ctl only reads it while the fresh-install capability is open.
+/// (`DATA_DIR` inside the runtime). NazoAuth generates this file; ctl only
+/// reads it while the fresh-install capability is open and removes it after
+/// the server's successful claim receipt has been confirmed.
 pub const SERVER_TOKEN_RELATIVE_PATH: &str = "bootstrap/initial-admin-token";
 
 /// Durable record binding the bootstrap capability to one exact fresh install.
@@ -65,14 +57,8 @@ pub const SERVER_TOKEN_RELATIVE_PATH: &str = "bootstrap/initial-admin-token";
 #[serde(deny_unknown_fields)]
 pub struct FreshBootstrapContext {
     pub schema: u32,
-    /// Copy of the allowlist valid at provisioning time; load-time equality
-    /// against the constant turns an allowlist change into a hard failure
-    /// instead of silently widening old capabilities.
-    pub allowlist: Vec<String>,
     /// The install operation whose journal produced the deployment.
     pub install_operation_id: String,
-    pub deployment_id: String,
-    pub issuer: String,
     pub artifact_subject_sha256: String,
     /// Config revision at install commit (fresh installs commit revision 1);
     /// claims after any config change reject.
@@ -80,16 +66,12 @@ pub struct FreshBootstrapContext {
     /// Host-side data root backing the runtime's `DATA_DIR`; the deployment
     /// fact that locates the server-generated bootstrap token.
     pub data_root: String,
-    pub created_at: DateTime<Utc>,
 }
 
 impl FreshBootstrapContext {
     fn validate(&self) -> anyhow::Result<()> {
         if self.schema != FRESH_BOOTSTRAP_SCHEMA {
             bail!("unsupported fresh-bootstrap context schema {}", self.schema);
-        }
-        if self.allowlist != FRESH_BOOTSTRAP_ALLOWLIST {
-            bail!("fresh-bootstrap context allowlist differs from the compiled allowlist");
         }
         Ok(())
     }
@@ -109,17 +91,10 @@ pub(crate) fn provision(
     }
     let context = FreshBootstrapContext {
         schema: FRESH_BOOTSTRAP_SCHEMA,
-        allowlist: FRESH_BOOTSTRAP_ALLOWLIST
-            .iter()
-            .map(|entry| (*entry).to_owned())
-            .collect(),
         install_operation_id: job.operation_id.to_owned(),
-        deployment_id: job.deployment_id.to_owned(),
-        issuer: job.issuer.to_owned(),
         artifact_subject_sha256: subject_digest.to_owned(),
         config_revision: 1,
         data_root: job.order.data_root.clone(),
-        created_at: Utc::now(),
     };
     filesystem::atomic_write(
         &scope_dir.join(CONTEXT_FILE_NAME),
@@ -161,8 +136,7 @@ fn valid_initial_admin_token(token: &str) -> bool {
 }
 
 /// Read the SERVER-generated one-time token from the deployment's data root.
-/// Exists exactly while NazoAuth keeps the bootstrap window open; ctl never
-/// writes or regenerates it.
+/// Ctl never writes or regenerates it.
 pub(crate) fn read_server_token(context: &FreshBootstrapContext) -> anyhow::Result<String> {
     let path = server_token_path(context);
     let bytes =
@@ -180,25 +154,29 @@ pub(crate) fn read_server_token(context: &FreshBootstrapContext) -> anyhow::Resu
     Ok(token)
 }
 
-/// Delete the capability context durably. Missing files are tolerated so
-/// rollback paths and claim paths can both call it unconditionally. The
-/// server-owned token file is deliberately left to NazoAuth's own lifecycle.
+/// Delete the server token and capability context durably. The context is
+/// loaded first so its data root remains the sole source for the token path.
+/// Missing files are tolerated so rollback paths and claim paths can both call
+/// this unconditionally. The token is removed before the context, and a token
+/// deletion failure leaves the context available for a later close attempt.
 pub(crate) fn delete_material(scope_dir: &Path) -> anyhow::Result<()> {
-    let path = scope_dir.join(CONTEXT_FILE_NAME);
-    match filesystem::remove_file_durable(&path) {
-        Ok(()) => {}
-        Err(error) if !path.exists() => {
-            let _ = error; // already gone — closure is idempotent
-        }
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to delete fresh-bootstrap material {}",
-                    path.display()
-                )
-            });
-        }
-    }
+    let Some(context) = load_context(scope_dir)? else {
+        return Ok(());
+    };
+    let token_path = server_token_path(&context);
+    filesystem::remove_file_durable(&token_path).with_context(|| {
+        format!(
+            "failed to delete server bootstrap token {}",
+            token_path.display()
+        )
+    })?;
+    let context_path = scope_dir.join(CONTEXT_FILE_NAME);
+    filesystem::remove_file_durable(&context_path).with_context(|| {
+        format!(
+            "failed to delete fresh-bootstrap context {}",
+            context_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -211,24 +189,14 @@ pub(crate) fn delete_material(scope_dir: &Path) -> anyhow::Result<()> {
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreshBootstrapMaterialView {
-    pub allowlist: Vec<String>,
     pub install_operation_id: String,
-    pub deployment_id: String,
-    pub issuer: String,
-    pub artifact_subject_sha256: String,
-    pub config_revision: u64,
     pub token: String,
 }
 
 impl std::fmt::Debug for FreshBootstrapMaterialView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FreshBootstrapMaterialView")
-            .field("allowlist", &self.allowlist)
             .field("install_operation_id", &self.install_operation_id)
-            .field("deployment_id", &self.deployment_id)
-            .field("issuer", &self.issuer)
-            .field("artifact_subject_sha256", &self.artifact_subject_sha256)
-            .field("config_revision", &self.config_revision)
             .field("token", &"<redacted>")
             .finish()
     }
@@ -242,38 +210,23 @@ pub(crate) fn surface_material_view(
     state: &DeploymentState,
 ) -> Option<FreshBootstrapMaterialView> {
     let context = load_context(scope_dir).ok()??;
-    authorize_claim(Some(&context), FRESH_BOOTSTRAP_ALLOWLIST[0], state).ok()?;
+    authorize_initial_admin_claim(Some(&context), state).ok()?;
     let token = read_server_token(&context).ok()?;
     Some(FreshBootstrapMaterialView {
-        allowlist: context.allowlist,
         install_operation_id: context.install_operation_id,
-        deployment_id: context.deployment_id,
-        issuer: context.issuer,
-        artifact_subject_sha256: context.artifact_subject_sha256,
-        config_revision: context.config_revision,
         token,
     })
 }
 
-/// The G02 gate: authorize one bootstrap request against the compiled
-/// allowlist, the open capability, and the live fresh-install facts.
+/// The G02 gate: authorize the initial-administrator request against the open
+/// capability and the live fresh-install facts.
 ///
 /// Every mismatch collapses into [`BOOTSTRAP_CLOSED`] — diagnostics stay
 /// bounded and never distinguish "closed" from "tampered" to callers.
-pub(crate) fn authorize_claim(
+pub(crate) fn authorize_initial_admin_claim(
     context: Option<&FreshBootstrapContext>,
-    request_operation: &str,
     state: &DeploymentState,
 ) -> Result<(), Failure> {
-    if !FRESH_BOOTSTRAP_ALLOWLIST.contains(&request_operation) {
-        return Err(Failure::new(
-            BOOTSTRAP_CLOSED,
-            format!(
-                "'{}' is not in the fresh-install bootstrap allowlist",
-                sanitize(request_operation.to_owned())
-            ),
-        ));
-    }
     let Some(context) = context else {
         return Err(Failure::new(
             BOOTSTRAP_CLOSED,

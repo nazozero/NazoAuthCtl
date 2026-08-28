@@ -375,7 +375,6 @@ impl Fixture {
         UpdateRequest {
             instance: Some(format!("inst-{DEPLOYMENT}")),
             version: Some("v9.9.9".to_owned()),
-            expected_artifact_sha256: None,
             config_content: None,
             config_schema: None,
         }
@@ -417,7 +416,6 @@ fn target_backup_gate_runs_before_lifecycle_and_update_replay_is_idempotent() ->
     let artifact = || crate::target::OfficialArtifactRef {
         repository: "nazozero/NazoAuth".to_owned(),
         version: Some("v9.9.9".to_owned()),
-        expected_subject_sha256: None,
     };
     let rejected = HostOperation::state_mutate(
         uuid::Uuid::now_v7().to_string(),
@@ -714,7 +712,6 @@ fn durable_failed_migration_terminates_update_before_activation() -> anyhow::Res
     let request = UpdateRequest {
         instance: Some(format!("inst-{DEPLOYMENT}")),
         version: None,
-        expected_artifact_sha256: None,
         config_content: None,
         config_schema: None,
     };
@@ -750,7 +747,6 @@ fn durable_failed_migration_clears_controller_slot_after_persistence() -> anyhow
     let request = UpdateRequest {
         instance: Some(format!("inst-{DEPLOYMENT}")),
         version: None,
-        expected_artifact_sha256: None,
         config_content: None,
         config_schema: None,
     };
@@ -780,7 +776,6 @@ fn release_verification_failure_fails_closed_without_touching_state() -> anyhow:
     let request = UpdateRequest {
         instance: Some(format!("inst-{DEPLOYMENT}")),
         version: Some("v9.9.9".to_owned()),
-        expected_artifact_sha256: None,
         config_content: None,
         config_schema: None,
     };

@@ -21,6 +21,7 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use crate::error_codes::INPUT_INVALID;
 use crate::fleet::resolve_instance;
 use crate::process::Process;
 use crate::registry::RegistryStore;
@@ -56,6 +57,14 @@ struct BootstrapAdminResponse {
     email: String,
     role: String,
     next: String,
+}
+
+/// The one-shot material needed for one initial-admin request. The token is
+/// kept zeroizing; the install operation identity is non-secret and supplies
+/// the stable request identity used for replay.
+pub(crate) struct BootstrapClaimMaterial {
+    pub(crate) token: Zeroizing<String>,
+    pub(crate) install_operation_id: String,
 }
 
 /// Transport seam so tests never touch a network. Production posts through
@@ -116,8 +125,8 @@ impl InitialAdminTransport for CurlInitialAdminTransport {
 /// encrypted channel (P0-2).
 pub(crate) trait BootstrapMaterialSource {
     /// Run the full G02 gate and return the server-generated bootstrap token
-    /// while the capability is open.
-    fn read_token(&self, deployment_id: &str) -> anyhow::Result<Zeroizing<String>>;
+    /// together with the install operation that owns this capability.
+    fn read_material(&self, deployment_id: &str) -> anyhow::Result<BootstrapClaimMaterial>;
     fn close(&self, deployment_id: &str) -> anyhow::Result<()>;
 }
 
@@ -157,19 +166,20 @@ impl LocalBootstrapMaterial {
 }
 
 impl BootstrapMaterialSource for LocalBootstrapMaterial {
-    fn read_token(&self, deployment_id: &str) -> anyhow::Result<Zeroizing<String>> {
+    fn read_material(&self, deployment_id: &str) -> anyhow::Result<BootstrapClaimMaterial> {
         let store = TargetStateStore::open(&self.state_root)?;
         let state = store
             .load_existing(deployment_id)
             .map_err(|failure| anyhow::anyhow!("{}: {}", failure.code, failure.detail))?;
         let context = self.load_open_context(deployment_id)?;
-        bootstrap_authority::authorize_claim(Some(&context), "create-initial-admin", &state)
+        bootstrap_authority::authorize_initial_admin_claim(Some(&context), &state)
             .map_err(|failure| anyhow::anyhow!("{}: {}", failure.code, failure.detail))?;
         // The token is the SERVER-generated one inside the deployment's data
         // root; ctl only reads it while the capability is open.
-        Ok(Zeroizing::new(bootstrap_authority::read_server_token(
-            &context,
-        )?))
+        Ok(BootstrapClaimMaterial {
+            token: Zeroizing::new(bootstrap_authority::read_server_token(&context)?),
+            install_operation_id: context.install_operation_id,
+        })
     }
 
     fn close(&self, deployment_id: &str) -> anyhow::Result<()> {
@@ -181,8 +191,8 @@ impl BootstrapMaterialSource for LocalBootstrapMaterial {
 /// The target-side state-inspect already runs the FULL authorization gate
 /// (allowlist, ownership, artifact/config binding) before it surfaces the
 /// material view — an absent view is exactly `BOOTSTRAP_CLOSED`. Closing
-/// drives the explicit `bootstrap-close` host operation; the security
-/// boundary remains the server's own token consumption.
+/// drives the explicit `bootstrap-close` host operation, which removes the
+/// server token and the install-binding context after a successful receipt.
 pub(crate) struct RemoteBootstrapMaterial {
     pub(crate) target: std::sync::Arc<std::sync::Mutex<Box<dyn ExecutionTarget + Send>>>,
 }
@@ -224,9 +234,12 @@ impl RemoteBootstrapMaterial {
 }
 
 impl BootstrapMaterialSource for RemoteBootstrapMaterial {
-    fn read_token(&self, deployment_id: &str) -> anyhow::Result<Zeroizing<String>> {
+    fn read_material(&self, deployment_id: &str) -> anyhow::Result<BootstrapClaimMaterial> {
         let view = self.open_material(deployment_id)?;
-        Ok(Zeroizing::new(view.token))
+        Ok(BootstrapClaimMaterial {
+            token: Zeroizing::new(view.token),
+            install_operation_id: view.install_operation_id,
+        })
     }
 
     fn close(&self, deployment_id: &str) -> anyhow::Result<()> {
@@ -263,6 +276,25 @@ fn remote_bootstrap_operation_id() -> String {
     Uuid::now_v7().to_string()
 }
 
+fn bootstrap_request_id(install_operation_id: &str) -> anyhow::Result<String> {
+    let operation_id = Uuid::parse_str(install_operation_id)
+        .with_context(|| "fresh-bootstrap context has an invalid install operation id")?;
+    Ok(format!("bootstrap-admin-{:032x}", operation_id.as_u128()))
+}
+
+fn stable_http_error_prefix(status: u16, code: Option<&str>) -> Option<&'static str> {
+    match code {
+        Some("bootstrap_closed" | "invalid_bootstrap_token" | "deployment_mismatch") => {
+            Some(BOOTSTRAP_CLOSED)
+        }
+        Some(
+            "invalid_email" | "invalid_password" | "email_conflict" | "bootstrap_request_conflict",
+        ) => Some(INPUT_INVALID),
+        _ if (400..500).contains(&status) => Some(INPUT_INVALID),
+        _ => None,
+    }
+}
+
 /// `{issuer}/auth/bootstrap-admin` with loopback-only plain HTTP.
 fn initial_admin_endpoint(issuer: &str) -> anyhow::Result<Url> {
     let mut endpoint =
@@ -297,10 +329,12 @@ fn validate_credentials(credentials: &AdminCredentials) -> anyhow::Result<()> {
         || !email.contains('@')
         || email.contains(['\n', '\r', '\0', ' '])
     {
-        bail!("administrator email is invalid");
+        bail!("{INPUT_INVALID}: administrator email is invalid");
     }
     if !(12..=1024).contains(&credentials.password.chars().count()) {
-        bail!("administrator password must contain between 12 and 1024 characters");
+        bail!(
+            "{INPUT_INVALID}: administrator password must contain between 12 and 1024 characters"
+        );
     }
     Ok(())
 }
@@ -330,14 +364,14 @@ pub(crate) fn claim_initial_admin(
 
     // 2. One source-owned operation performs the full gate and returns the
     // token. Remote execution must not request the sensitive view twice.
-    let token = material.read_token(&record.deployment_id)?;
+    let claim_material = material.read_material(&record.deployment_id)?;
 
     // 3. Exact bootstrap endpoint contract.
     let endpoint = initial_admin_endpoint(&record.issuer)?;
-    let request_id = format!("bootstrap-admin-{:032x}", rand::random::<u128>());
+    let request_id = bootstrap_request_id(&claim_material.install_operation_id)?;
     let body = serde_json::to_vec(&BootstrapAdminRequest {
         request_id: &request_id,
-        token: &token,
+        token: &claim_material.token,
         deployment_id: &record.deployment_id,
         email: &credentials.email,
         password: &credentials.password,
@@ -355,9 +389,17 @@ pub(crate) fn claim_initial_admin(
                         byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
                     })
             });
-        match code {
-            Some(code) => bail!("initial administrator endpoint returned HTTP {status} ({code})"),
-            None => bail!("initial administrator endpoint returned HTTP {status}"),
+        match (stable_http_error_prefix(status, code.as_deref()), code) {
+            (Some(prefix), Some(code)) => {
+                bail!("{prefix}: initial administrator endpoint returned HTTP {status} ({code})")
+            }
+            (Some(prefix), None) => {
+                bail!("{prefix}: initial administrator endpoint returned HTTP {status}")
+            }
+            (None, Some(code)) => {
+                bail!("initial administrator endpoint returned HTTP {status} ({code})")
+            }
+            (None, None) => bail!("initial administrator endpoint returned HTTP {status}"),
         }
     }
     let response: BootstrapAdminResponse = serde_json::from_slice(&response_bytes)
@@ -371,10 +413,10 @@ pub(crate) fn claim_initial_admin(
         bail!("initial administrator endpoint returned an unexpected response contract");
     }
 
-    // 4. Close permanently: delete the install-binding context. The
-    // server-owned token file is consumed by NazoAuth itself; regeneration of
-    // the capability is impossible because bootstrap mutations fail closed
-    // over existing state.
+    // 4. Close permanently: after the receipt is confirmed, delete the
+    // server-owned token and install-binding context. Regeneration of the
+    // capability is impossible because bootstrap mutations fail closed over
+    // existing state.
     material.close(&record.deployment_id)?;
 
     Ok(format!(
@@ -393,10 +435,7 @@ mod tests {
     use crate::filesystem;
     use crate::filesystem::PrivateTempDir;
     use crate::registry::{InstanceRecord, RegistryStore};
-    use crate::target::{
-        BOOTSTRAP_CLOSED, FreshBootstrapContext, TargetStateStore, bootstrap_authority,
-        install_exec,
-    };
+    use crate::target::{BOOTSTRAP_CLOSED, TargetStateStore, bootstrap_authority, install_exec};
 
     const ISSUER: &str = "https://auth.example.com";
     const OP_ID: &str = "018f0000-0000-7000-8000-000000000001";
@@ -452,7 +491,6 @@ mod tests {
                 &install_exec::InstallJob {
                     operation_id: OP_ID,
                     deployment_id: &deployment_id,
-                    issuer: ISSUER,
                     runtime_kind: crate::runtime_backend::RuntimeBackendKind::Podman,
                     runtime_object: "nazoauth-x",
                     config_reference: "/cfg/config.json",
@@ -504,7 +542,6 @@ mod tests {
             artifact: install_exec::OfficialArtifactRef {
                 repository: "nazozero/NazoAuth".to_owned(),
                 version: None,
-                expected_subject_sha256: None,
             },
             config_content: "BIND: \"0.0.0.0:8000\"".to_owned(),
             config_sha256: "0".repeat(64),
@@ -571,6 +608,33 @@ mod tests {
         }
     }
 
+    struct ResponseLossTransport {
+        requests: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl InitialAdminTransport for ResponseLossTransport {
+        fn post_initial_admin(
+            &self,
+            _endpoint: &Url,
+            body: &[u8],
+        ) -> anyhow::Result<(u16, Vec<u8>)> {
+            let request: serde_json::Value = serde_json::from_slice(body)?;
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.clone());
+            if requests.len() == 1 {
+                bail!("simulated lost bootstrap response");
+            }
+            let response = serde_json::json!({
+                "id": uuid::Uuid::now_v7(),
+                "request_id": request["request_id"],
+                "email": request["email"],
+                "role": "admin",
+                "next": "/ui/auth",
+            });
+            Ok((201, serde_json::to_vec(&response)?))
+        }
+    }
+
     struct ErrorTransport {
         status: u16,
         body: Vec<u8>,
@@ -617,8 +681,8 @@ mod tests {
         assert_eq!(request["token"], SERVER_TOKEN);
         assert_eq!(request["deployment_id"], fixture.deployment_id);
 
-        // Closure deleted the install-binding context; the token file itself
-        // stays under NazoAuth's exclusive ownership.
+        // Closure deletes both the server token and the install-binding
+        // context, but only after the successful receipt was confirmed.
         let scope = fixture
             ._temp
             .path()
@@ -627,11 +691,12 @@ mod tests {
             .join(&fixture.deployment_id);
         assert!(!scope.join(bootstrap_authority::CONTEXT_FILE_NAME).exists());
         assert!(
-            fixture
+            !fixture
                 .data_root
                 .join(bootstrap_authority::SERVER_TOKEN_RELATIVE_PATH)
                 .exists()
         );
+        fixture.material.close(&fixture.deployment_id)?;
 
         // Any retry — even with valid credentials — is refused forever.
         let error = claim_initial_admin(
@@ -643,6 +708,88 @@ mod tests {
         )
         .expect_err("capability closed");
         assert!(error.to_string().contains(BOOTSTRAP_CLOSED), "{error:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn previous_bootstrap_context_schema_is_rejected_without_compatibility() -> anyhow::Result<()> {
+        let fixture = Fixture::new()?;
+        let scope = fixture
+            ._temp
+            .path()
+            .join("state")
+            .join("deployments")
+            .join(&fixture.deployment_id);
+        let path = scope.join(bootstrap_authority::CONTEXT_FILE_NAME);
+        let mut context: serde_json::Value = serde_json::from_slice(
+            &filesystem::read_secure_regular_file(&path, "ctx", false, 16 * 1024)?,
+        )?;
+        context["schema"] = serde_json::Value::from(2);
+        filesystem::atomic_write(&path, &serde_json::to_vec(&context)?, 0o600)?;
+
+        let error = bootstrap_authority::load_context(&scope).expect_err("old schema");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported fresh-bootstrap context schema")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lost_response_replays_with_the_same_install_request_id_then_closes() -> anyhow::Result<()> {
+        let fixture = Fixture::new()?;
+        let transport = ResponseLossTransport {
+            requests: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let first = claim_initial_admin(
+            &fixture.registry,
+            &fixture.material,
+            &transport,
+            Some("production"),
+            Fixture::credentials(),
+        )
+        .expect_err("first response is lost");
+        assert!(first.to_string().contains("lost bootstrap response"));
+
+        let scope = fixture
+            ._temp
+            .path()
+            .join("state")
+            .join("deployments")
+            .join(&fixture.deployment_id);
+        assert!(scope.join(bootstrap_authority::CONTEXT_FILE_NAME).exists());
+        assert!(
+            fixture
+                .data_root
+                .join(bootstrap_authority::SERVER_TOKEN_RELATIVE_PATH)
+                .exists()
+        );
+
+        claim_initial_admin(
+            &fixture.registry,
+            &fixture.material,
+            &transport,
+            Some("production"),
+            Fixture::credentials(),
+        )?;
+
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["request_id"], requests[1]["request_id"]);
+        assert_eq!(
+            requests[0]["request_id"],
+            "bootstrap-admin-018f0000000070008000000000000001"
+        );
+        drop(requests);
+        assert!(!scope.join(bootstrap_authority::CONTEXT_FILE_NAME).exists());
+        assert!(
+            !fixture
+                .data_root
+                .join(bootstrap_authority::SERVER_TOKEN_RELATIVE_PATH)
+                .exists()
+        );
         Ok(())
     }
 
@@ -703,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_instance_can_never_bootstrap_and_unknown_ops_are_outside_the_allowlist() {
+    fn a_bound_instance_can_never_bootstrap() {
         let fixture = Fixture::new().unwrap();
         fixture
             .registry
@@ -718,30 +865,6 @@ mod tests {
         )
         .expect_err("bound instance");
         assert!(error.to_string().contains(BOOTSTRAP_CLOSED), "{error:#}");
-
-        // The allowlist itself rejects anything but create-initial-admin.
-        let store = TargetStateStore::open(fixture._temp.path().join("state")).unwrap();
-        let state = store.load_existing(&fixture.deployment_id).unwrap();
-        let context: FreshBootstrapContext = serde_json::from_slice(
-            &filesystem::read_secure_regular_file(
-                &fixture
-                    ._temp
-                    .path()
-                    .join("state/deployments")
-                    .join(&fixture.deployment_id)
-                    .join(bootstrap_authority::CONTEXT_FILE_NAME),
-                "ctx",
-                false,
-                16 * 1024,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        for operation in ["adopt", "rotate-keys", "arbitrary"] {
-            let failure = bootstrap_authority::authorize_claim(Some(&context), operation, &state)
-                .expect_err(operation);
-            assert_eq!(failure.code, BOOTSTRAP_CLOSED, "{operation}");
-        }
     }
 
     #[test]
@@ -760,7 +883,7 @@ mod tests {
             Fixture::credentials(),
         )
         .expect_err("409");
-        assert!(format!("{error:#}").contains("409"), "{error:#}");
+        assert!(format!("{error:#}").starts_with(INPUT_INVALID), "{error:#}");
 
         // The capability stays open so the operator can retry after fixing.
         let context = fixture.material.load_open_context(&fixture.deployment_id)?;
@@ -784,7 +907,7 @@ mod tests {
         )
         .expect_err("404");
         assert!(
-            format!("{error:#}").contains("HTTP 404 (invalid_bootstrap_token)"),
+            format!("{error:#}").starts_with(BOOTSTRAP_CLOSED),
             "{error:#}"
         );
         Ok(())
@@ -849,7 +972,49 @@ mod tests {
             weak,
         )
         .expect_err("weak password");
-        assert!(format!("{error:#}").contains("12"), "{error:#}");
+        assert!(format!("{error:#}").starts_with(INPUT_INVALID), "{error:#}");
+    }
+
+    #[test]
+    fn bootstrap_request_id_is_stable_lowercase_install_uuid_hex() -> anyhow::Result<()> {
+        assert_eq!(
+            bootstrap_request_id(OP_ID)?,
+            "bootstrap-admin-018f0000000070008000000000000001"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn http_rejections_have_their_domain_stable_prefix() {
+        assert_eq!(
+            stable_http_error_prefix(410, Some("bootstrap_closed")),
+            Some(BOOTSTRAP_CLOSED)
+        );
+        assert_eq!(
+            stable_http_error_prefix(404, Some("invalid_bootstrap_token")),
+            Some(BOOTSTRAP_CLOSED)
+        );
+        assert_eq!(
+            stable_http_error_prefix(400, Some("deployment_mismatch")),
+            Some(BOOTSTRAP_CLOSED)
+        );
+        for code in [
+            "invalid_email",
+            "invalid_password",
+            "email_conflict",
+            "bootstrap_request_conflict",
+        ] {
+            assert_eq!(
+                stable_http_error_prefix(409, Some(code)),
+                Some(INPUT_INVALID),
+                "{code}"
+            );
+        }
+        assert_eq!(
+            stable_http_error_prefix(422, Some("unknown_code")),
+            Some(INPUT_INVALID)
+        );
+        assert_eq!(stable_http_error_prefix(500, Some("server_error")), None);
     }
 
     #[test]

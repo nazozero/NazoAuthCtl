@@ -72,8 +72,6 @@ pub(crate) struct CleanInstallRequest {
     pub(crate) issuer: String,
     /// Optional immutable official Release tag pin.
     pub(crate) version: Option<String>,
-    /// Optional subject-digest pin closing the resolve/fetch gap.
-    pub(crate) expected_artifact_sha256: Option<String>,
     /// Optional runtime class override (`podman` | `docker` | `host`).
     pub(crate) runtime: Option<RuntimeBackendKind>,
     /// Optional custom installation root. Absent resolves to the platform
@@ -451,7 +449,6 @@ fn build_install_order(
             artifact: OfficialArtifactRef {
                 repository: SERVER_REPOSITORY.to_owned(),
                 version: request.version.clone(),
-                expected_subject_sha256: request.expected_artifact_sha256.clone(),
             },
             config_content,
             config_sha256,
@@ -518,7 +515,6 @@ struct CanonicalInstallRequest<'a> {
     host_id: String,
     issuer: &'a str,
     version: &'a Option<String>,
-    expected_artifact_sha256: &'a Option<String>,
     runtime: &'a Option<RuntimeBackendKind>,
     install_root: Option<&'a str>,
     database_runtime_endpoint: &'a crate::target::install_exec::ExternalEndpoint,
@@ -563,7 +559,6 @@ fn canonical_install_request_hash(
         host_id: host_id.to_string(),
         issuer: &request.issuer,
         version: &request.version,
-        expected_artifact_sha256: &request.expected_artifact_sha256,
         runtime: &request.runtime,
         install_root,
         database_runtime_endpoint: &request.database_runtime_endpoint,

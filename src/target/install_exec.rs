@@ -12,8 +12,8 @@
 //! are **obtained on the target** ("download-on-target"), reusing the same
 //! official-verification pipeline used on the target —
 //! `VerifiedRelease::verify` plus the runtime backend pull. The control side
-//! sends only reference/digest facts (repository, optional version pin,
-//! optional expected subject digest); multi-hundred-megabyte blobs never
+//! sends only reference facts (repository and optional version pin);
+//! multi-hundred-megabyte blobs never
 //! cross the 64 KiB HostOperation wire, and secrets are generated on the
 //! target so they never leave it.
 //!
@@ -98,11 +98,6 @@ pub struct OfficialArtifactRef {
     /// Immutable semantic tag; absent means "latest official Release".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// Optional pin: after on-target verification the subject digest must
-    /// equal this value, closing the gap between control-side resolve and
-    /// target-side fetch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_subject_sha256: Option<String>,
 }
 
 /// One target-local secret file: purpose token + absolute path. External
@@ -690,7 +685,6 @@ fn copy_import_file(source: &Path, destination: &Path, label: &str) -> Result<()
 pub(crate) struct InstallJob<'a> {
     pub operation_id: &'a str,
     pub deployment_id: &'a str,
-    pub issuer: &'a str,
     /// Runtime class from the validated Bootstrap surface.
     pub runtime_kind: RuntimeBackendKind,
     pub runtime_object: &'a str,
@@ -871,17 +865,16 @@ impl HostInstallExecutor {
             trusted_version_floor: None,
         })
         .map_err(|error| Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string())))?;
-        let (subject_digest, pin_digest) = match kind {
+        let subject_digest = match kind {
             RuntimeBackendKind::Host => {
                 let binary = release
                     .artifact("binary", &job.order.artifact.repository)
                     .map_err(|error| {
                         Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string()))
                     })?;
-                let digest = filesystem::sha256(&binary).map_err(|error| {
+                filesystem::sha256(&binary).map_err(|error| {
                     Failure::new(ARTIFACT_UNVERIFIED, sanitize(error.to_string()))
-                })?;
-                (digest.clone(), digest)
+                })?
             }
             RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
                 // Container backends always run Linux images regardless of the
@@ -899,9 +892,9 @@ impl HostInstallExecutor {
                 let backend = runtime_backend::backend(kind);
                 if let Err(pull_error) = backend.pull_image(&image) {
                     // Registry unreachable (restricted network, anonymous
-                    // rate-limiting): the digest pin IS the verification
-                    // anchor, so an image already present locally under the
-                    // exact repo@digest reference is equally trustworthy.
+                    // rate-limiting): the signed platform digest is the
+                    // verification anchor, so an image already present locally
+                    // under the exact repo@digest reference is equally trustworthy.
                     // Anything else (absent, or a different digest) fails.
                     if !backend.local_image_matches_digest(&image) {
                         return Err(Failure::new(
@@ -913,23 +906,9 @@ impl HostInstallExecutor {
                     }
                     // Local exact-digest match: proceed without network.
                 }
-                let platform_digest = digest.trim_start_matches("sha256:").to_owned();
-                let index_digest = release
-                    .manifest
-                    .image_oci_digest()
-                    .trim_start_matches("sha256:")
-                    .to_owned();
-                (platform_digest, index_digest)
+                digest.trim_start_matches("sha256:").to_owned()
             }
         };
-        if let Some(expected) = &job.order.artifact.expected_subject_sha256
-            && expected != &pin_digest
-        {
-            return Err(Failure::new(
-                ARTIFACT_UNVERIFIED,
-                "verified subject digest differs from the requested pin",
-            ));
-        }
 
         for directory in &managed_directories {
             prepare_owned_directory(directory, job.deployment_id, performed)?;

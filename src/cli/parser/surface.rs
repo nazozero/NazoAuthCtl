@@ -127,7 +127,7 @@ pub(super) fn parse_bind(values: Vec<String>) -> anyhow::Result<BindOptions> {
 }
 
 /// `nazoauthctl install [--host HOST] [--name ALIAS] --public-url URL
-/// [--to VERSION] [--artifact-sha256 SHA256] [--runtime CLASS] [--install-root PATH]`
+/// [--to VERSION] [--runtime CLASS] [--install-root PATH]`
 ///
 /// This is the G01 clean install; the retired per-deployment installer is gone.
 pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallArgs> {
@@ -138,7 +138,6 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
             "--name",
             "--public-url",
             "--to",
-            "--artifact-sha256",
             "--runtime",
             "--install-root",
             "--database-host",
@@ -175,19 +174,6 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
         Some(version) => {
             validate_version(version)?;
             Some(version.clone())
-        }
-        None => None,
-    };
-    let artifact_sha256 = match parsed.values.get("--artifact-sha256") {
-        Some(digest) => {
-            if digest.len() != 64
-                || !digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                bail!("--artifact-sha256 must be 64 lowercase hexadecimal characters");
-            }
-            Some(digest.clone())
         }
         None => None,
     };
@@ -297,7 +283,6 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
         name: parsed.values.get("--name").cloned(),
         public_url,
         version,
-        artifact_sha256,
         runtime,
         install_root,
         database_host,
@@ -316,17 +301,11 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
 }
 
 /// `nazoauthctl update [--instance SELECTOR] [--to VERSION]
-/// [--artifact-sha256 SHA256] [--config-file PATH --config-schema TOKEN] --yes`
+/// [--config-file PATH --config-schema TOKEN] --yes`
 pub(super) fn parse_update_args(values: Vec<String>) -> anyhow::Result<UpdateArgs> {
     let parsed = parse_options(
         values,
-        &[
-            "--instance",
-            "--to",
-            "--artifact-sha256",
-            "--config-file",
-            "--config-schema",
-        ],
+        &["--instance", "--to", "--config-file", "--config-schema"],
         &["--yes"],
         "update",
     )?;
@@ -347,19 +326,6 @@ pub(super) fn parse_update_args(values: Vec<String>) -> anyhow::Result<UpdateArg
         }
         None => None,
     };
-    let artifact_sha256 = match parsed.values.get("--artifact-sha256") {
-        Some(digest) => {
-            if digest.len() != 64
-                || !digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                bail!("--artifact-sha256 must be 64 lowercase hexadecimal characters");
-            }
-            Some(digest.clone())
-        }
-        None => None,
-    };
     let config_file = parsed.values.get("--config-file").map(PathBuf::from);
     let config_schema = parsed.values.get("--config-schema").cloned();
     match (&config_file, &config_schema) {
@@ -375,7 +341,6 @@ pub(super) fn parse_update_args(values: Vec<String>) -> anyhow::Result<UpdateArg
             named,
         },
         version,
-        artifact_sha256,
         config_file,
         config_schema,
         yes: parsed.flags.contains("--yes"),
@@ -586,5 +551,23 @@ mod install_tests {
         ]);
         assert!(parse_install_args(relative).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn artifact_digest_pin_is_not_a_supported_install_or_update_input() {
+        let digest = "a".repeat(64);
+
+        let mut install = current_args();
+        install.extend(["--artifact-sha256".to_owned(), digest.clone()]);
+        assert!(parse_install_args(install).is_err());
+
+        assert!(
+            parse_update_args(vec![
+                "--yes".to_owned(),
+                "--artifact-sha256".to_owned(),
+                digest,
+            ])
+            .is_err()
+        );
     }
 }

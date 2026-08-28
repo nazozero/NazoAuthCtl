@@ -336,7 +336,7 @@ impl HostLifecycleExecutor {
         let observation = live_observation(backend.as_ref(), job.runtime_object)?;
         require_observation_serves(&observation, job.current_artifact)?;
 
-        // 1. Verify + pull the pinned official artifact (download-on-target;
+        // 1. Verify + pull the selected official artifact (download-on-target;
         // re-running verify/pull is idempotent for interrupted resumes).
         // P1-11: the recorded current version is the signed anti-downgrade
         // floor — a verified-but-older Release is rejected before download.
@@ -967,7 +967,7 @@ fn verify_pinned_artifact_facts(
             sanitize(error.to_string()),
         )
     })?;
-    let (digest, pin_subject, runtime_artifact) = match kind {
+    let (digest, runtime_artifact) = match kind {
         RuntimeBackendKind::Host => {
             let runtime_root = runtime_root.ok_or_else(|| {
                 Failure::new(
@@ -994,7 +994,6 @@ fn verify_pinned_artifact_facts(
                     Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
                 })?;
             (
-                digest.clone(),
                 digest.clone(),
                 runtime_backend::ArtifactReference::HostBinary {
                     path: cached,
@@ -1027,11 +1026,6 @@ fn verify_pinned_artifact_facts(
             let digest = digest.trim_start_matches("sha256:").to_owned();
             (
                 digest.clone(),
-                release
-                    .manifest
-                    .image_oci_digest()
-                    .trim_start_matches("sha256:")
-                    .to_owned(),
                 runtime_backend::ArtifactReference::Oci {
                     image_reference: release.manifest.oci.repository.clone(),
                     digest: format!("sha256:{digest}"),
@@ -1039,14 +1033,6 @@ fn verify_pinned_artifact_facts(
             )
         }
     };
-    if let Some(expected) = &artifact.expected_subject_sha256
-        && *expected != pin_subject
-    {
-        return Err(Failure::new(
-            super::install_exec::ARTIFACT_UNVERIFIED,
-            "verified subject digest differs from the requested pin",
-        ));
-    }
     Ok(VerifiedArtifactFacts {
         digest,
         runtime_artifact,
@@ -1064,7 +1050,7 @@ fn verify_pinned_artifact_facts(
     })
 }
 
-/// The verified facts an update needs from its pinned artifact: the OCI
+/// The verified facts an update needs from its selected artifact: the OCI
 /// subject digest and the embedded build identity.
 struct VerifiedArtifactFacts {
     digest: String,

@@ -225,7 +225,7 @@ re-establishes the Controller Key from the offline Recovery Secret (or, with
                      --valkey-password-file PATH
                      [--import-data-root TARGET_PATH
                       --import-mfa-key-file TARGET_PATH]
-                     [--to VERSION] [--artifact-sha256 SHA256]
+                     [--to VERSION]
                      [--runtime podman|docker|host] [--install-root PATH]
 
 One verified handshake, one typed install order, one committed DeploymentState
@@ -240,7 +240,7 @@ Next steps after install:
         }
         cli::HelpTopic::Update => {
             "Usage:
-  nazoauthctl [--instance SEL] update --yes [--to VERSION] [--artifact-sha256 SHA256]
+  nazoauthctl [--instance SEL] update --yes [--to VERSION]
              [--config-file PATH --config-schema TOKEN]
   nazoauthctl [--instance SEL] rollback --yes
   nazoauthctl [--instance SEL] uninstall [--yes]

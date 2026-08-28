@@ -42,8 +42,6 @@ pub(crate) struct UpdateRequest {
     pub(crate) instance: Option<String>,
     /// Optional immutable official Release tag pin; absent = latest official.
     pub(crate) version: Option<String>,
-    /// Optional subject-digest pin closing the resolve/fetch gap.
-    pub(crate) expected_artifact_sha256: Option<String>,
     /// Optional new configuration content staged with this update; requires
     /// `config_schema`.
     pub(crate) config_content: Option<String>,
@@ -154,7 +152,6 @@ pub(crate) fn run_update(
     let pinned = OfficialArtifactRef {
         repository: super::SERVER_REPOSITORY.to_owned(),
         version: request.version.clone(),
-        expected_subject_sha256: request.expected_artifact_sha256.clone(),
     };
 
     let verified_target = context

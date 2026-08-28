@@ -244,7 +244,6 @@ impl LocalFixture {
             instance_alias: alias.map(str::to_owned),
             issuer: ISSUER.to_owned(),
             version: Some("v0.2.0".to_owned()),
-            expected_artifact_sha256: None,
             runtime: None,
             install_root: Some(self._temp.path().join("install")),
             database_runtime_endpoint: crate::target::install_exec::ExternalEndpoint {
@@ -374,18 +373,18 @@ case "$input" in
 esac
 case "$input" in
   *'"kind":"ping"'*)
-    printf '{"schema":3,"operation_id":"%s","outcome":{"status":"completed","body":{"completion":"ping","nonce":"%s"}}}' "${id:-none}" "${nonce:-none}"
+    printf '{"schema":4,"operation_id":"%s","outcome":{"status":"completed","body":{"completion":"ping","nonce":"%s"}}}' "${id:-none}" "${nonce:-none}"
     exit 0
     ;;
 esac
 case "$input" in
   *'"kind":"state-inspect"'*)
-    printf '{"schema":3,"operation_id":"%s","outcome":{"status":"failed","code":"DEPLOYMENT_UNKNOWN","detail":"stub fresh target"}}' "${id:-none}"
+    printf '{"schema":4,"operation_id":"%s","outcome":{"status":"failed","code":"DEPLOYMENT_UNKNOWN","detail":"stub fresh target"}}' "${id:-none}"
     exit 0
     ;;
 esac
 if printf '%s' "$input" | grep -q '"kind":"state-mutate"' && [ "$(cat "$(dirname "$0")/mode.txt")" = "fail" ]; then
-  printf '{"schema":3,"operation_id":"%s","outcome":{"status":"failed","code":"ARTIFACT_UNVERIFIED","detail":"stub refuses"}}' "${id:-none}"
+  printf '{"schema":4,"operation_id":"%s","outcome":{"status":"failed","code":"ARTIFACT_UNVERIFIED","detail":"stub refuses"}}' "${id:-none}"
   exit 0
 fi
 sed -e "s/__OPERATION_ID__/${id:-none}/g" -e "s/__DEPLOYMENT_ID__/${dep:-none}/g" \
@@ -422,13 +421,13 @@ fn windows_stub_ps1() -> String {
         "  [Console]::Out.Write($raw.Replace('__OPERATION_ID__', $callerId))",
         "} elseif ($stdinText -match '\"kind\":\"ping\"') {",
         "  $n = [regex]::Match($stdinText, '\"nonce\":\"([0-9A-Za-z._:+-]+)\"').Groups[1].Value",
-        "  $pong = '{\"schema\":3,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"completed\",\"body\":{\"completion\":\"ping\",\"nonce\":\"' + $n + '\"}}}'",
+        "  $pong = '{\"schema\":4,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"completed\",\"body\":{\"completion\":\"ping\",\"nonce\":\"' + $n + '\"}}}'",
         "  [Console]::Out.Write($pong)",
         "} elseif ($stdinText -match '\"kind\":\"state-inspect\"') {",
-        "  $missing = '{\"schema\":3,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"failed\",\"code\":\"DEPLOYMENT_UNKNOWN\",\"detail\":\"stub fresh target\"}}'",
+        "  $missing = '{\"schema\":4,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"failed\",\"code\":\"DEPLOYMENT_UNKNOWN\",\"detail\":\"stub fresh target\"}}'",
         "  [Console]::Out.Write($missing)",
         "} elseif ((Get-Content (Join-Path $here 'mode.txt')) -eq 'fail') {",
-        "  $failed = '{\"schema\":3,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"failed\",\"code\":\"ARTIFACT_UNVERIFIED\",\"detail\":\"stub refuses\"}}'",
+        "  $failed = '{\"schema\":4,\"operation_id\":\"' + $callerId + '\",\"outcome\":{\"status\":\"failed\",\"code\":\"ARTIFACT_UNVERIFIED\",\"detail\":\"stub refuses\"}}'",
         "  [Console]::Out.Write($failed)",
         "} else {",
         "  $raw = Get-Content -LiteralPath (Join-Path $here 'response-install.json') -Raw",
@@ -479,7 +478,6 @@ impl SshFixture {
             instance_alias: alias.map(str::to_owned),
             issuer: ISSUER.to_owned(),
             version: Some("v0.2.0".to_owned()),
-            expected_artifact_sha256: None,
             runtime: None,
             install_root: Some(self.stub._dir.path().join("install")),
             database_runtime_endpoint: crate::target::install_exec::ExternalEndpoint {
@@ -1012,7 +1010,6 @@ fn lost_install_response_resumes_exact_identity_without_a_second_instance() -> a
         instance_alias: Some("production".to_owned()),
         issuer: ISSUER.to_owned(),
         version: Some("v0.2.0".to_owned()),
-        expected_artifact_sha256: None,
         runtime: None,
         install_root: Some(temp.path().join("install")),
         database_runtime_endpoint: crate::target::install_exec::ExternalEndpoint {

@@ -30,7 +30,7 @@ use super::bootstrap_authority::FreshBootstrapMaterialView;
 use super::deployment_state::{ArtifactRefs, RuntimeSurface, StateMutationPayload};
 
 /// Wire schema discriminator for HostOperation and HostResult messages.
-pub const HOST_PROTOCOL_SCHEMA: u32 = 3;
+pub const HOST_PROTOCOL_SCHEMA: u32 = 4;
 
 /// Maximum serialized HostOperation accepted from stdin or a local caller.
 /// A tenant-resource Apply may carry one 4 MiB change set encoded as base64,
@@ -232,9 +232,8 @@ pub enum HostOperationBody {
     /// [`HostCompletionBody::StateListed`].
     StateList {},
     /// P0-2: close one fresh-install bootstrap capability on the target by
-    /// deleting its install-binding context file. Requires the instance
-    /// binding. The server consumes the bootstrap token itself, so this is
-    /// hygiene, not the security boundary — but it must be explicit.
+    /// deleting its server token and install-binding context. Requires the
+    /// instance binding and is issued only after a successful claim receipt.
     BootstrapClose {},
     /// Read the fresh-install bootstrap capability for one deployment.
     /// Requires the instance binding. Returns the material view while the
@@ -888,15 +887,6 @@ impl HostOperation {
                                 "update artifact repository must be 1-128 characters",
                             ));
                         }
-                        if let Some(pin) = &artifact.expected_subject_sha256
-                            && !valid_lower_hex_sha256(pin)
-                        {
-                            return Err(MessageRejection::new(
-                                RejectionCode::OperationMalformed,
-                                "update expected_subject_sha256 must be 64 lowercase \
-                                 hexadecimal characters",
-                            ));
-                        }
                         if let Some(config) = config
                             && let Err(rejection) = config.validate()
                         {
@@ -1452,9 +1442,8 @@ pub enum HostCompletionBody {
     StateListed {
         deployments: Vec<InstanceInspection>,
     },
-    /// P0-2: the fresh-install bootstrap capability file was deleted on the
-    /// target. Pure acknowledgement; the security boundary is the server's
-    /// own token consumption.
+    /// P0-2: the server token and fresh-install bootstrap capability context
+    /// were deleted on the target after a successful claim receipt.
     BootstrapClosed {},
     /// The fresh-install bootstrap material for one deployment. Returned by
     /// the `BootstrapRead` host operation while the capability is open; fails
@@ -1949,7 +1938,6 @@ mod tests {
             artifact: super::super::install_exec::OfficialArtifactRef {
                 repository: "nazozero/NazoAuth".to_owned(),
                 version: Some("v0.2.0".to_owned()),
-                expected_subject_sha256: Some("a".repeat(64)),
             },
             config_content: "{\"issuer\":\"https://auth.example.com\"}".to_owned(),
             config_sha256: "b".repeat(64),
@@ -2054,7 +2042,6 @@ mod tests {
                 artifact: super::super::install_exec::OfficialArtifactRef {
                     repository: "nazozero/NazoAuth".to_owned(),
                     version: Some("v0.3.0".to_owned()),
-                    expected_subject_sha256: Some("c".repeat(64)),
                 },
                 rollback_policy: crate::model::test_release_rollback_policy(),
                 backup_precondition:
@@ -2275,7 +2262,6 @@ mod tests {
                 artifact: super::super::install_exec::OfficialArtifactRef {
                     repository: "nazozero/NazoAuth".to_owned(),
                     version: None,
-                    expected_subject_sha256: None,
                 },
                 rollback_policy: crate::model::test_release_rollback_policy(),
                 backup_precondition:
@@ -2290,26 +2276,6 @@ mod tests {
             rejection.detail.contains("expected_revision"),
             "{rejection}"
         );
-
-        let bad_pin = HostOperation::state_mutate(
-            Uuid::now_v7().to_string(),
-            "deploy-a",
-            Some(1),
-            StateMutationPayload::Update {
-                artifact: super::super::install_exec::OfficialArtifactRef {
-                    repository: "nazozero/NazoAuth".to_owned(),
-                    version: None,
-                    expected_subject_sha256: Some("NOT-A-DIGEST".to_owned()),
-                },
-                rollback_policy: crate::model::test_release_rollback_policy(),
-                backup_precondition:
-                    super::super::deployment_state::UpdateBackupPrecondition::NotRequired,
-                config: None,
-                migration_jws: None,
-                migration_request_hash: None,
-            },
-        );
-        assert!(bad_pin.validate().is_err());
 
         let cas_free_rollback = HostOperation::state_mutate(
             Uuid::now_v7().to_string(),
@@ -2345,7 +2311,6 @@ mod tests {
                 artifact: super::super::install_exec::OfficialArtifactRef {
                     repository: "nazozero/NazoAuth".to_owned(),
                     version: None,
-                    expected_subject_sha256: None,
                 },
                 rollback_policy: crate::model::test_release_rollback_policy(),
                 backup_precondition:
@@ -2363,6 +2328,19 @@ mod tests {
             .remove("backup_precondition");
         let rejection = parse_host_operation(&serde_json::to_vec(&old_wire)?)
             .expect_err("an old update order without the hard-cut field must fail");
+        assert_eq!(rejection.code, RejectionCode::OperationMalformed);
+
+        let mut removed_pin_wire: serde_json::Value =
+            serde_json::from_slice(&encode_host_operation(&update)?)?;
+        removed_pin_wire["operation"]["mutation"]["artifact"]
+            .as_object_mut()
+            .expect("update artifact object")
+            .insert(
+                "expected_subject_sha256".to_owned(),
+                serde_json::Value::String("a".repeat(64)),
+            );
+        let rejection = parse_host_operation(&serde_json::to_vec(&removed_pin_wire)?)
+            .expect_err("removed artifact digest pins must not be accepted");
         assert_eq!(rejection.code, RejectionCode::OperationMalformed);
 
         let mut invalid = update;
@@ -2539,6 +2517,20 @@ mod tests {
             panic!("failed outcome expected");
         };
         assert_eq!(code, HOST_ERR_OPERATION_INVALID);
+
+        let bootstrap_read = HostResult::completed(
+            Uuid::now_v7().to_string(),
+            HostCompletionBody::BootstrapRead {
+                material: FreshBootstrapMaterialView {
+                    install_operation_id: "018f0000-0000-7000-8000-000000000001".to_owned(),
+                    token: "A".repeat(64),
+                },
+            },
+        );
+        assert_eq!(
+            parse_host_result(&encode_host_result(&bootstrap_read)?)?,
+            bootstrap_read
+        );
         Ok(())
     }
 

@@ -300,7 +300,6 @@ pub(crate) struct InstallArgs {
     pub(crate) name: Option<String>,
     pub(crate) public_url: String,
     pub(crate) version: Option<String>,
-    pub(crate) artifact_sha256: Option<String>,
     pub(crate) runtime: Option<crate::runtime_backend::RuntimeBackendKind>,
     pub(crate) install_root: Option<PathBuf>,
     pub(crate) database_host: String,
@@ -325,7 +324,6 @@ pub(crate) struct InstallArgs {
 pub(crate) struct UpdateArgs {
     pub(crate) selector: InstanceSelector,
     pub(crate) version: Option<String>,
-    pub(crate) artifact_sha256: Option<String>,
     pub(crate) config_file: Option<PathBuf>,
     pub(crate) config_schema: Option<String>,
     pub(crate) yes: bool,
