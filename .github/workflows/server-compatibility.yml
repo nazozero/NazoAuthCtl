@@ -23,7 +23,9 @@ on:
         type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # In a reusable workflow github.workflow is the caller's workflow name.
+  # A literal group keeps this child from cancelling its own release caller.
+  group: signed-server-compatibility-${{ github.ref }}-${{ inputs.controller_ref }}
   cancel-in-progress: true
 
 permissions:
