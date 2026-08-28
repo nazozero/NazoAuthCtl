@@ -92,6 +92,9 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
     assert!(workflow.contains("SERVER_PEELED_COMMIT"));
     assert!(workflow.contains("OPERATOR_PROTOCOL_REV"));
     assert!(workflow.contains("cosign verify \"$image\""));
+    assert!(
+        workflow.contains("sudo install -m 0755 \"$(command -v cosign)\" /usr/local/bin/cosign")
+    );
     assert!(!workflow.contains("controller/nazoauthctl --help"));
 
     let current_controller = workflow

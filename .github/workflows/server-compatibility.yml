@@ -196,6 +196,9 @@ jobs:
             echo "SERVER_OCI_INDEX_DIGEST=$index_digest"
             echo "SERVER_OCI_PLATFORM_DIGEST=$platform_digest"
           } >>"$GITHUB_ENV"
+      - name: Expose Cosign through the controller production command path
+        shell: bash
+        run: sudo install -m 0755 "$(command -v cosign)" /usr/local/bin/cosign
       - name: Execute VerifiedRelease current production verification
         shell: bash
         env:
