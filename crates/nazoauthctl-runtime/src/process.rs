@@ -85,7 +85,18 @@ impl Process {
             #[cfg(unix)]
             command.env("LC_ALL", "C");
             #[cfg(windows)]
-            for key in ["PATH", "PATHEXT", "SystemRoot", "ComSpec", "TEMP", "TMP"] {
+            // Windows OpenSSH needs both roots to resolve the user's
+            // `.ssh` directory and the system SSH configuration.
+            for key in [
+                "PATH",
+                "PATHEXT",
+                "SystemRoot",
+                "ComSpec",
+                "TEMP",
+                "TMP",
+                "USERPROFILE",
+                "ProgramData",
+            ] {
                 if let Some(value) = std::env::var_os(key) {
                     command.env(key, value);
                 }
@@ -466,6 +477,21 @@ mod descendant_tests {
 #[cfg(test)]
 mod process_tests {
     use super::Process;
+
+    #[cfg(windows)]
+    #[test]
+    fn preserves_windows_ssh_configuration_roots() {
+        for name in ["USERPROFILE", "ProgramData"] {
+            let expected = std::env::var(name).expect("Windows SSH configuration root");
+            let command = format!("echo %{name}%");
+            let observed = Process::new("cmd")
+                .args(["/D", "/C", &command])
+                .stdout()
+                .expect("read child environment");
+
+            assert_eq!(observed.trim(), expected);
+        }
+    }
 
     #[cfg(unix)]
     #[test]
