@@ -22,6 +22,12 @@ fn test_target_os() -> &'static str {
     if cfg!(windows) { "windows" } else { "linux" }
 }
 
+fn test_hello(supported_runtimes: Vec<String>) -> crate::target::wire::RemoteHello {
+    let mut hello = crate::target::wire::local_hello(supported_runtimes);
+    hello.os = test_target_os().to_owned();
+    hello
+}
+
 #[test]
 fn helper_runtime_announcement_is_a_closed_three_value_contract() {
     let rejected = select_runtime(&["podman".to_owned(), "systemd".to_owned()], None)
@@ -271,9 +277,8 @@ impl SshStub {
         let root = dir.path();
 
         let target_id = uuid::Uuid::now_v7();
-        let mut identity = crate::target::wire::local_hello(vec!["podman".to_owned()]);
+        let mut identity = test_hello(vec!["podman".to_owned()]);
         identity.target_id = target_id.to_string();
-        identity.os = test_target_os().to_owned();
         let hello = serde_json::json!({
             "schema": crate::target::wire::HOST_PROTOCOL_SCHEMA,
             "operation_id": "__OPERATION_ID__",
@@ -655,7 +660,7 @@ fn artifact_failure_over_ssh_reports_stable_code_without_registering() -> anyhow
 #[test]
 fn health_failure_rolls_back_config_secrets_and_bootstrap_material_locally() -> anyhow::Result<()> {
     let fixture = LocalFixture::new(Some(FailAt::Health))?;
-    let hello = crate::target::wire::local_hello(vec!["podman".to_owned()]);
+    let hello = test_hello(vec!["podman".to_owned()]);
     let mut request = fixture.request(Some("production"));
     let prepared = prepare_install_operation(&mut request, &hello)?;
     let install_root = request.install_root.clone().unwrap();
@@ -719,7 +724,7 @@ fn health_failure_rolls_back_config_secrets_and_bootstrap_material_locally() -> 
 fn interrupted_install_replays_identically_without_reexecution_on_local_target()
 -> anyhow::Result<()> {
     let fixture = LocalFixture::new(None)?;
-    let hello = crate::target::wire::local_hello(vec!["podman".to_owned()]);
+    let hello = test_hello(vec!["podman".to_owned()]);
     let prepared = prepare_install_operation(&mut fixture.request(None), &hello)?;
     let mut operation: HostOperation = serde_json::from_slice(
         &serde_json::to_vec(&prepared.operation).expect("serialize public test operation"),
@@ -750,7 +755,7 @@ fn interrupted_install_replays_identically_without_reexecution_on_local_target()
 #[test]
 fn every_prepared_deployment_has_one_distinct_non_nil_valkey_epoch() -> anyhow::Result<()> {
     let fixture = LocalFixture::new(None)?;
-    let hello = crate::target::wire::local_hello(vec!["podman".to_owned()]);
+    let hello = test_hello(vec!["podman".to_owned()]);
     let first = prepare_install_operation(&mut fixture.request(None), &hello)?;
     let second = prepare_install_operation(&mut fixture.request(None), &hello)?;
 
