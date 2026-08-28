@@ -77,7 +77,7 @@ pub const MAX_CONFIG_CONTENT_BYTES: usize = 32 * 1024;
 // the host facts onto exactly these destinations.
 /// Configuration file inside the container (`WORKDIR /app`).
 pub const CONTAINER_CONFIG_FILE: &str = "/app/.env.yaml";
-/// Read-only mount point for the target-generated secret files.
+/// Read-only mount point for the target-local secret files.
 pub const CONTAINER_SECRETS_DIR: &str = "/run/secrets";
 /// Persistent data directory inside the container.
 pub const CONTAINER_DATA_DIR: &str = "/var/lib/nazo_oauth";
@@ -100,9 +100,9 @@ pub struct OfficialArtifactRef {
     pub expected_subject_sha256: Option<String>,
 }
 
-/// One target-generated secret file: purpose token + absolute path. Values
-/// are generated in place by the target (`generate_secret`-class primitives)
-/// and referenced from the rendered config by path, never by value.
+/// One target-local secret file: purpose token + absolute path. External
+/// credentials come from the operator; the MFA key is generated on the
+/// target. The rendered server config references every secret by path.
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlannedSecret {
@@ -232,7 +232,7 @@ pub struct InstallOrder {
     /// container runtimes, whose executable lives inside the verified image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_root: Option<String>,
-    /// Target-generated secret files backing the config references.
+    /// Target-local secret files backing the config references.
     pub secrets: Vec<PlannedSecret>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_data_import: Option<CurrentDataImport>,
@@ -251,8 +251,8 @@ pub struct InstallOrder {
     pub valkey_endpoint: ExternalEndpoint,
 }
 
-/// Operator-supplied coordinates of one external dependency. No secret
-/// material: the password is minted target-side around these facts.
+/// Operator-supplied coordinates of one external dependency. Credential
+/// material is carried separately in the matching planned secret.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalEndpoint {
@@ -937,7 +937,8 @@ impl HostInstallExecutor {
         })?;
         performed.wrote_config_marker = true;
 
-        // 3. Target-local secrets (values are minted here, never shipped).
+        // 3. Target-local secrets. External dependency credentials were
+        // supplied by the operator; only the new MFA key is minted here.
         for secret in &job.order.secrets {
             let path = PathBuf::from(&secret.path);
             let existed = path.exists();
