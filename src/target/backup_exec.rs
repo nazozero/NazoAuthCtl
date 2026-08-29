@@ -1987,7 +1987,9 @@ fn start_candidate(
     let replacement = RuntimeReplacement {
         object_reference: candidate.to_owned(),
         artifact: manifest.runtime_artifact.clone(),
-        local_artifact_id: live.local_artifact_id.clone(),
+        // Start from the manifest's digest-bound reference, never the bare
+        // local image ID: the observed artifact must equal the recorded one.
+        local_artifact_id: None,
         command: vec!["nazoauth".to_owned(), "server".to_owned()],
         mounts,
         environment,
