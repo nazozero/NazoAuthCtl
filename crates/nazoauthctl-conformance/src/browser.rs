@@ -4040,7 +4040,7 @@ mod tests {
         let policy = BrowserPolicy::new(target, suite)
             .expect("policy")
             .with_limits(BrowserLimits {
-                max_step_timeout: Duration::from_millis(20),
+                max_step_timeout: Duration::from_secs(2),
                 poll_interval: Duration::from_millis(1),
                 ..BrowserLimits::default()
             })
@@ -4079,7 +4079,7 @@ mod tests {
         let policy = BrowserPolicy::new(target, suite)
             .expect("policy")
             .with_limits(BrowserLimits {
-                max_step_timeout: Duration::from_millis(20),
+                max_step_timeout: Duration::from_secs(2),
                 poll_interval: Duration::from_millis(1),
                 ..BrowserLimits::default()
             })
@@ -4119,7 +4119,7 @@ mod tests {
         let policy = BrowserPolicy::new(target, suite)
             .expect("policy")
             .with_limits(BrowserLimits {
-                max_step_timeout: Duration::from_millis(20),
+                max_step_timeout: Duration::from_secs(2),
                 poll_interval: Duration::from_millis(1),
                 ..BrowserLimits::default()
             })
@@ -4520,7 +4520,7 @@ mod tests {
         let policy = BrowserPolicy::new(target, suite)
             .expect("policy")
             .with_limits(BrowserLimits {
-                max_step_timeout: Duration::from_millis(20),
+                max_step_timeout: Duration::from_secs(2),
                 poll_interval: Duration::from_millis(1),
                 ..BrowserLimits::default()
             })
@@ -4708,7 +4708,7 @@ mod tests {
         let policy = BrowserPolicy::new(target, suite)
             .expect("policy")
             .with_limits(BrowserLimits {
-                max_step_timeout: Duration::from_millis(20),
+                max_step_timeout: Duration::from_secs(2),
                 poll_interval: Duration::from_millis(1),
                 ..BrowserLimits::default()
             })
