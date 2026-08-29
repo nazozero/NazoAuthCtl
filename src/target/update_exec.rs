@@ -34,8 +34,9 @@ use sha2::{Digest as _, Sha256};
 
 use super::deployment_state::{Failure, OBJECT_IDENTITY_MISMATCH, TargetStateStore};
 use super::install_exec::{
-    CONTAINER_SECRETS_DIR, MIGRATION_RUNTIME_ROLE_ENV, OfficialArtifactRef, StagedConfig,
-    cache_systemd_artifact, probe_local_health,
+    CONTAINER_CONFIG_FILE, CONTAINER_DATA_DIR, CONTAINER_SECRETS_DIR, MIGRATION_RUNTIME_ROLE_ENV,
+    OfficialArtifactRef, SERVER_CONFIG_FILE_ENV, StagedConfig, cache_systemd_artifact,
+    probe_local_health,
 };
 use super::wire::{HOST_ERR_OPERATION_INVALID, sanitize};
 use crate::{
@@ -457,6 +458,18 @@ impl HostLifecycleExecutor {
                     Path::new(job.secrets_root).join("database-lifecycle-url"),
                 );
             } else {
+                environment.insert(
+                    SERVER_CONFIG_FILE_ENV.to_owned(),
+                    CONTAINER_CONFIG_FILE.to_owned(),
+                );
+                environment.insert(
+                    "NAZOAUTH_OPERATOR_CONFIG_REVISION_FILE".to_owned(),
+                    super::install_exec::CONTAINER_OPERATOR_CONFIG_REVISION_FILE.to_owned(),
+                );
+                environment.insert(
+                    "NAZOAUTH_OPERATOR_STATE_DIRECTORY".to_owned(),
+                    format!("{CONTAINER_DATA_DIR}/operator-state"),
+                );
                 environment.insert(
                     "DATABASE_URL_FILE".to_owned(),
                     format!("{CONTAINER_SECRETS_DIR}/database-lifecycle-url"),

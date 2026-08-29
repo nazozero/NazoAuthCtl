@@ -80,6 +80,9 @@ pub const MAX_CONFIG_CONTENT_BYTES: usize = 32 * 1024;
 // the host facts onto exactly these destinations.
 /// Configuration file inside the container (`WORKDIR /app`).
 pub const CONTAINER_CONFIG_FILE: &str = "/app/.env.yaml";
+/// Container destination of the deployment-owned config-revision marker the
+/// operator fence compares signed operations against.
+pub const CONTAINER_OPERATOR_CONFIG_REVISION_FILE: &str = "/run/nazoauth-operator/config-revision";
 /// Read-only mount point for the target-local secret files.
 pub const CONTAINER_SECRETS_DIR: &str = "/run/secrets";
 /// Persistent data directory inside the container.
@@ -1222,7 +1225,7 @@ fn start_container_runtime(
     // Config-revision marker: the one-shot operator reads this file during
     // E04 admission step 5 to fence operations against stale configuration.
     let config_revision_host = job.scope_dir.join("config-revision");
-    let config_revision_container = "/run/nazoauth-operator/config-revision";
+    let config_revision_container = CONTAINER_OPERATOR_CONFIG_REVISION_FILE;
     mounts.push(mount(config_revision_host, config_revision_container, true));
     environment.insert(
         "NAZOAUTH_OPERATOR_CONFIG_REVISION_FILE".to_owned(),
