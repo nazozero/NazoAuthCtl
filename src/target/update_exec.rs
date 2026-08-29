@@ -1271,13 +1271,17 @@ pub(crate) fn verify_pinned_artifact_facts(
                     )
                 })?;
             let digest = digest.trim_start_matches("sha256:").to_owned();
+            // Run the container from the digest-bound reference, never a bare
+            // local image ID: a multi-arch index pull stores platform digest
+            // entries whose order must not decide the identity assertion.
+            drop(local_artifact_id);
             (
                 digest.clone(),
                 runtime_backend::ArtifactReference::Oci {
                     image_reference: release.manifest.oci.repository.clone(),
                     digest: format!("sha256:{digest}"),
                 },
-                Some(local_artifact_id),
+                None,
             )
         }
     };
