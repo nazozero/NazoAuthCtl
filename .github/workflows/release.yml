@@ -118,8 +118,27 @@ jobs:
       NAZOAUTHCTL_BUILD_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: cargo test --locked --workspace --all-targets --all-features --target ${{ matrix.target }}
-      - run: cargo build --locked --workspace --all-targets --all-features --release --target ${{ matrix.target }}
+      - name: Test and build Linux asset on the Debian 12 compatibility baseline
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker run --rm \
+            --env NAZOAUTHCTL_BUILD_COMMIT \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073 \
+            bash -euo pipefail -c '
+              umask 0022
+              cargo test --locked --workspace --all-targets --all-features --target "${{ matrix.target }}"
+              cargo build --locked --workspace --all-targets --all-features --release --target "${{ matrix.target }}"
+              "target/${{ matrix.target }}/release/nazoauthctl" --help >/dev/null
+            '
+      - name: Test non-Linux asset
+        if: runner.os != 'Linux'
+        run: cargo test --locked --workspace --all-targets --all-features --target ${{ matrix.target }}
+      - name: Build non-Linux asset
+        if: runner.os != 'Linux'
+        run: cargo build --locked --workspace --all-targets --all-features --release --target ${{ matrix.target }}
       - name: Stage controller binary
         shell: bash
         run: |
