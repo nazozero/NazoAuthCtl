@@ -1049,6 +1049,11 @@ impl HostInstallExecutor {
                 )
             },
         )?;
+        if kind.is_container() {
+            // The marker is bind-mounted into the container, whose tasks read
+            // it as the fixed non-root identity (see set_runtime_identity).
+            set_runtime_identity(&revision_marker, false)?;
+        }
 
         // 6. Start the runtime and confirm it serves the verified artifact.
         match kind {
