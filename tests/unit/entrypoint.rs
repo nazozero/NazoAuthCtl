@@ -238,7 +238,6 @@ fn compatibility_executes_verified_release_for_the_current_server() {
 
     assert_eq!(release.manifest.version, version);
     assert_eq!(release.manifest.backend_commit, peeled_commit);
-    assert_eq!(release.manifest.image_oci_digest(), oci_index_digest);
     assert_eq!(
         release
             .manifest

@@ -179,10 +179,6 @@ impl ReleaseManifest {
         Ok(())
     }
 
-    pub(crate) fn image_oci_digest(&self) -> &str {
-        &self.oci.index_digest
-    }
-
     pub(crate) fn runtime_oci_digest_for(&self, platform: &str) -> anyhow::Result<&str> {
         self.oci
             .platform_manifests

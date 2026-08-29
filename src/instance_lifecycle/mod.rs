@@ -95,9 +95,12 @@ impl TargetArtifactResolver for ProductionTargetArtifactResolver {
                 .as_ref()
                 .map(|id| id.version.as_str()),
         })?;
+        // Bind the signed operation to the digest the runtime actually
+        // executes: the platform manifest from the signed release, exactly
+        // what the install and the target-side artifact verification use.
         let subject = release
             .manifest
-            .image_oci_digest()
+            .runtime_oci_digest_for(crate::model::container_oci_platform())?
             .trim_start_matches("sha256:")
             .to_owned();
         let digest = format!("sha256:{subject}");

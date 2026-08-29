@@ -80,8 +80,10 @@ fn release_manifest_binds_every_binary_frontend_and_oci_identity() {
     let manifest = valid_manifest();
     manifest.validate("v0.2.0", "release-identity").unwrap();
     assert_eq!(
-        manifest.image_oci_digest(),
-        format!("sha256:{}", "e".repeat(64))
+        manifest
+            .runtime_oci_digest_for(crate::model::container_oci_platform())
+            .expect("the signed manifest must declare this runtime platform"),
+        format!("sha256:{}", "1".repeat(64))
     );
     assert!(is_lower_hex(&manifest.frontend.commit, 40));
 
