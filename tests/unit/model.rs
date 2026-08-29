@@ -79,11 +79,13 @@ fn semantic_versions_require_an_immutable_tag() {
 fn release_manifest_binds_every_binary_frontend_and_oci_identity() {
     let manifest = valid_manifest();
     manifest.validate("v0.2.0", "release-identity").unwrap();
+    let platform = crate::model::container_oci_platform();
     assert_eq!(
         manifest
-            .runtime_oci_digest_for(crate::model::container_oci_platform())
+            .runtime_oci_digest_for(platform)
             .expect("the signed manifest must declare this runtime platform"),
-        format!("sha256:{}", "1".repeat(64))
+        manifest.oci.platform_manifests[platform],
+        "the accessor must agree with the signed platform map"
     );
     assert!(is_lower_hex(&manifest.frontend.commit, 40));
 
