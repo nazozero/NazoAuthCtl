@@ -492,7 +492,7 @@ impl HostLifecycleExecutor {
                 artifact: verified.runtime_artifact.clone(),
                 command: vec!["nazoauth".to_owned(), "operator-task".to_owned()],
                 network: observation.networks.first().cloned(),
-                mounts: observation.mounts.clone(),
+                mounts,
                 environment,
                 working_directory: kind
                     .is_container()
