@@ -147,7 +147,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         Command::RemoteExec => crate::target::remote_exec::run_stdio(),
         Command::SelfCheck(version) => super::self_update::controller_check(version.as_deref()),
         Command::SelfUpdate { version, yes } => {
-            super::require_root()?;
+            super::require_self_update_privilege()?;
             super::require_confirmation(
                 yes,
                 "replace nazoauthctl with a signed controller Release",
@@ -155,7 +155,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             super::self_update::controller_update(version.as_deref())
         }
         Command::SelfRollback { yes } => {
-            super::require_root()?;
+            super::require_self_update_privilege()?;
             super::require_confirmation(yes, "restore the previous signed nazoauthctl binary")?;
             super::self_update::controller_rollback()
         }

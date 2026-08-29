@@ -4,6 +4,8 @@
 use crate::process::Process;
 use anyhow::bail;
 
+use crate::error_codes::{INPUT_INVALID, PRIVILEGE_REQUIRED};
+
 mod recovery_journal;
 mod recovery_transport;
 mod self_update;
@@ -18,15 +20,25 @@ pub(crate) fn require_root() -> anyhow::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        bail!("this command requires root on a Unix host");
+        bail!("{PRIVILEGE_REQUIRED}: this command requires root on a Unix host");
     }
     #[cfg(unix)]
     {
         if Process::new("id").arg("-u").stdout()?.trim() != "0" {
-            bail!("this command requires root");
+            bail!("{PRIVILEGE_REQUIRED}: this command requires root");
         }
         Ok(())
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn require_self_update_privilege() -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn require_self_update_privilege() -> anyhow::Result<()> {
+    require_root()
 }
 
 fn test_mode() -> bool {
@@ -36,6 +48,14 @@ fn test_mode() -> bool {
     false
 }
 
+#[cfg(all(test, windows))]
+mod tests {
+    #[test]
+    fn windows_self_update_uses_install_path_access_instead_of_unix_root() {
+        super::require_self_update_privilege().expect("Windows has no Unix root identity");
+    }
+}
+
 pub(crate) fn require_confirmation(yes: bool, action: &str) -> anyhow::Result<()> {
     use std::io::{IsTerminal as _, Write as _};
 
@@ -43,7 +63,7 @@ pub(crate) fn require_confirmation(yes: bool, action: &str) -> anyhow::Result<()
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
-        bail!("{action} requires --yes in non-interactive mode");
+        bail!("{INPUT_INVALID}: {action} requires --yes in non-interactive mode");
     }
     eprint!("Confirm: {action} [y/N]: ");
     std::io::stderr().flush()?;
@@ -52,6 +72,6 @@ pub(crate) fn require_confirmation(yes: bool, action: &str) -> anyhow::Result<()
     if answer.trim().eq_ignore_ascii_case("y") || answer.trim().eq_ignore_ascii_case("yes") {
         Ok(())
     } else {
-        bail!("operation cancelled")
+        bail!("{INPUT_INVALID}: operation cancelled")
     }
 }
