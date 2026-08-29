@@ -157,10 +157,21 @@ impl Process {
     pub fn stdin_stdout(&self, input: &[u8]) -> anyhow::Result<String> {
         let output = self.stdin_output(input)?;
         if !output.status.success() {
+            // Bounded stderr echo, matching run_quiet: one-shot container
+            // failures surface their application error on the engine's stderr.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            let stderr_note = if stderr.is_empty() {
+                String::new()
+            } else {
+                let bounded: String = stderr.chars().take(400).collect();
+                format!(": {bounded}")
+            };
             bail!(
-                "{} failed with status {}",
+                "{} failed with status {}{}",
                 self.display_name(),
-                output.status
+                output.status,
+                stderr_note
             );
         }
         String::from_utf8(output.stdout)
