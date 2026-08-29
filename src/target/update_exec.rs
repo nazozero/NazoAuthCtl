@@ -423,6 +423,7 @@ impl HostLifecycleExecutor {
             let mut read_only_paths = Vec::new();
             let mut read_write_paths = Vec::new();
             let mut transient_credentials = BTreeMap::new();
+            let mut mounts = observation.mounts.clone();
             let runtime_role = runtime_database_role(job.secrets_root)?;
             environment.insert(MIGRATION_RUNTIME_ROLE_ENV.to_owned(), runtime_role);
             super::inject_operator_oci_artifact_fence(&mut environment, &verified.runtime_artifact);
@@ -460,6 +461,19 @@ impl HostLifecycleExecutor {
                     "DATABASE_URL_FILE".to_owned(),
                     format!("{CONTAINER_SECRETS_DIR}/database-lifecycle-url"),
                 );
+                // The live runtime deliberately never receives the lifecycle
+                // secret, so its mount set cannot carry the one-shot input.
+                // Mount exactly that one file into the migration task.
+                mounts.push(crate::runtime_backend::NeutralMount {
+                    source: Path::new(job.secrets_root).join("database-lifecycle-url"),
+                    destination: PathBuf::from(format!(
+                        "{CONTAINER_SECRETS_DIR}/database-lifecycle-url"
+                    )),
+                    read_only: true,
+                    selinux_relabel: false,
+                    ownership: crate::runtime_backend::Responsibility::Managed,
+                    scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
+                });
             }
             let task = runtime_backend::OneShotTask {
                 artifact: verified.runtime_artifact.clone(),
