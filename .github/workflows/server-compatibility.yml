@@ -81,7 +81,7 @@ jobs:
           SERVER_RELEASE: ${{ inputs.server_release }}
         run: |
           set -euo pipefail
-          test "$SERVER_RELEASE" = v0.2.5
+          test "$SERVER_RELEASE" = v0.2.6
       - name: Execute the exact controller artifact through its production protocol path
         shell: bash
         run: |
