@@ -213,7 +213,7 @@ mod tests {
             .unwrap();
         let image = arguments
             .iter()
-            .position(|argument| argument.starts_with(&format!("{image}@sha256:")))
+            .position(|argument| *argument == image)
             .unwrap_or_else(|| panic!("one-shot image is absent from {arguments:?}"));
         assert!(policy < image);
         assert!(!arguments.contains(&"ALL"));

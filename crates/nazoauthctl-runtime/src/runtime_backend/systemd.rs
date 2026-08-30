@@ -779,7 +779,9 @@ fn ensure_service_path_ancestors_traversable<'a>(
             );
         }
         let mode = metadata.permissions().mode() & 0o7777;
-        set_mode(directory, mode | 0o111)?;
+        if mode & 0o111 != 0o111 {
+            set_mode(directory, mode | 0o111)?;
+        }
     }
     Ok(())
 }
