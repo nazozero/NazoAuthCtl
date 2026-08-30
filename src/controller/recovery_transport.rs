@@ -125,6 +125,7 @@ impl AdminApiTransport for RecoveryCeremonyTransport {
         Ok(AdminHttpResponse {
             status,
             body: output.stdout[..marker].to_vec(),
+            set_cookie_headers: Vec::new(),
         })
     }
 }

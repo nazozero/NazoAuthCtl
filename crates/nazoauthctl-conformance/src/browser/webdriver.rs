@@ -208,11 +208,13 @@ impl WebDriverClient {
         if timeout.is_zero() {
             return Err(BrowserError::InvalidLimits);
         }
-        let client = Client::builder()
-            .timeout(timeout)
-            .redirect(Policy::none())
-            .build()
-            .map_err(|_| BrowserError::Transport)?;
+        let builder = Client::builder().timeout(timeout).redirect(Policy::none());
+        let builder = if endpoint.url.host_str().is_some_and(is_loopback_host) {
+            builder.no_proxy()
+        } else {
+            builder
+        };
+        let client = builder.build().map_err(|_| BrowserError::Transport)?;
         Ok(Self {
             endpoint,
             client,
@@ -632,6 +634,7 @@ impl ManagedWebDriver {
         let health_client = Client::builder()
             .timeout(Duration::from_secs(1))
             .redirect(Policy::none())
+            .no_proxy()
             .build()
             .map_err(|_| BrowserError::Transport)?;
         let deadline = Instant::now() + timeout.min(Duration::from_secs(60));

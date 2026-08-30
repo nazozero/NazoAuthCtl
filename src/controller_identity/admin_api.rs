@@ -32,6 +32,7 @@
 //! echoed. Error rendering carries only status codes plus the server's public
 //! error/description fields.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -82,10 +83,24 @@ impl fmt::Debug for AdminHttpRequest {
 }
 
 /// One inbound admin API response.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AdminHttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    /// Exact Set-Cookie values. Only the administrator-session client reads
+    /// them; Debug intentionally reports only the count.
+    pub set_cookie_headers: Vec<String>,
+}
+
+impl fmt::Debug for AdminHttpResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdminHttpResponse")
+            .field("status", &self.status)
+            .field("body_bytes", &self.body.len())
+            .field("set_cookie_headers", &self.set_cookie_headers.len())
+            .finish()
+    }
 }
 
 /// Pluggable HTTP seam. Production wires [`HttpsAdminTransport`]; tests feed
@@ -163,6 +178,17 @@ impl AdminApiTransport for HttpsAdminTransport {
             })
             .context("admin API request failed")?;
         let status = response.status().as_u16();
+        let set_cookie_headers = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .context("admin API returned a non-text Set-Cookie header")
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let (_, body) = response.into_parts();
 
         let bytes = self
@@ -182,6 +208,7 @@ impl AdminApiTransport for HttpsAdminTransport {
         Ok(AdminHttpResponse {
             status,
             body: bytes,
+            set_cookie_headers,
         })
     }
 }
@@ -203,13 +230,9 @@ fn append_response_frame(output: &mut Vec<u8>, frame: &[u8]) -> anyhow::Result<(
 // operator-supplied access material
 // ---------------------------------------------------------------------------
 
-/// Operator-provided admin session material attached to every admin API call.
-///
-/// The NazoAuth admin surface authenticates with its existing cookie session
-/// plus the matching CSRF header; ctl never sees administrator passwords or
-/// MFA secrets. Automation provisions both values out of band (for example via
-/// `--admin-access-file`); interactive runs may omit them and receive the
-/// server's own rejection instead.
+/// In-memory administrator session material attached to admin API calls.
+/// It is produced only by the standard login and MFA endpoints and is never
+/// persisted by ctl.
 #[derive(Clone, Default)]
 pub struct AdminAccess {
     /// Raw `Cookie` header value carrying the admin session cookie.
@@ -254,16 +277,6 @@ impl fmt::Debug for AdminAccess {
             .field("csrf_token", &self.csrf_token.is_some())
             .finish()
     }
-}
-
-/// Strict schema of the optional `--admin-access-file` document.
-#[derive(Clone, Debug, Default, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AdminAccessFile {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_cookie: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub csrf_token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -612,7 +625,303 @@ pub fn short_kid(kid: &str) -> &str {
 }
 
 // ---------------------------------------------------------------------------
-// client trait + HTTPS implementation
+// administrator login + MFA session
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdminLogin {
+    pub mfa_required: bool,
+}
+
+pub struct TotpEnrollment {
+    pub secret_base32: zeroize::Zeroizing<String>,
+    pub otpauth_uri: zeroize::Zeroizing<String>,
+}
+
+pub struct TotpConfirmation {
+    pub backup_codes: Vec<zeroize::Zeroizing<String>>,
+}
+
+#[derive(Default)]
+struct AdminCookieJar {
+    values: BTreeMap<String, String>,
+    csrf_cookie_name: Option<String>,
+    csrf_token: Option<String>,
+}
+
+impl AdminCookieJar {
+    fn absorb(&mut self, headers: &[String]) -> anyhow::Result<()> {
+        for header in headers {
+            let pair = header
+                .split(';')
+                .next()
+                .context("Set-Cookie header has no cookie pair")?
+                .trim();
+            let (name, value) = pair
+                .split_once('=')
+                .context("Set-Cookie header has no name/value separator")?;
+            let name = name.trim();
+            if name.is_empty()
+                || name
+                    .chars()
+                    .any(|character| character.is_control() || matches!(character, ';' | ',' | ' '))
+            {
+                bail!("admin API returned an invalid cookie name");
+            }
+            let expires = header
+                .split(';')
+                .skip(1)
+                .any(|attribute| attribute.trim().eq_ignore_ascii_case("max-age=0"));
+            if expires {
+                self.values.remove(name);
+            } else {
+                self.values.insert(name.to_owned(), value.trim().to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn set_login_csrf(&mut self, token: String) -> anyhow::Result<()> {
+        let name = self
+            .values
+            .iter()
+            .find_map(|(name, value)| (value == &token).then(|| name.clone()))
+            .context("login response did not set the matching CSRF cookie")?;
+        self.csrf_cookie_name = Some(name);
+        self.csrf_token = Some(token);
+        Ok(())
+    }
+
+    fn refresh_rotated_csrf(&mut self) -> anyhow::Result<()> {
+        let name = self
+            .csrf_cookie_name
+            .as_ref()
+            .context("administrator session has no CSRF cookie name")?;
+        let token = self
+            .values
+            .get(name)
+            .cloned()
+            .context("administrator session rotation omitted the CSRF cookie")?;
+        self.csrf_token = Some(token);
+        Ok(())
+    }
+
+    fn request_headers(&self) -> anyhow::Result<Vec<(&'static str, String)>> {
+        let cookie = self.cookie_header()?;
+        let csrf = self
+            .csrf_token
+            .clone()
+            .context("administrator session has no CSRF token")?;
+        Ok(vec![("Cookie", cookie), ("x-csrf-token", csrf)])
+    }
+
+    fn cookie_header(&self) -> anyhow::Result<String> {
+        if self.values.is_empty() {
+            bail!("administrator login did not establish a cookie session");
+        }
+        Ok(self
+            .values
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; "))
+    }
+
+    fn into_access(self) -> anyhow::Result<AdminAccess> {
+        let cookie = self.cookie_header()?;
+        let csrf = self
+            .csrf_token
+            .context("administrator session has no CSRF token")?;
+        Ok(AdminAccess::new(Some(cookie), Some(csrf)))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginWire {
+    #[serde(rename = "expires_in")]
+    _expires_in: u64,
+    csrf_token: String,
+    mfa_required: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TotpEnrollmentWire {
+    secret_base32: String,
+    otpauth_uri: String,
+    #[serde(rename = "period")]
+    _period: u64,
+    #[serde(rename = "digits")]
+    _digits: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MfaSuccessWire {
+    success: bool,
+    #[serde(rename = "method")]
+    _method: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TotpConfirmationWire {
+    mfa_enabled: bool,
+    backup_codes: Vec<String>,
+}
+
+/// Owns one short-lived administrator cookie session from password login until
+/// the fresh-MFA session is handed to the controller-registry client.
+pub struct HttpAdminSessionApi {
+    issuer: Url,
+    cookies: AdminCookieJar,
+    transport: Box<dyn AdminApiTransport>,
+}
+
+impl HttpAdminSessionApi {
+    pub fn new(issuer: &str) -> anyhow::Result<Self> {
+        Self::with_transport(issuer, Box::new(HttpsAdminTransport::new()?))
+    }
+
+    pub fn with_transport(
+        issuer: &str,
+        transport: Box<dyn AdminApiTransport>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            issuer: parse_issuer(issuer)?,
+            cookies: AdminCookieJar::default(),
+            transport,
+        })
+    }
+
+    pub fn login(&mut self, email: &str, password: &str) -> Result<AdminLogin, AdminApiError> {
+        #[derive(Serialize)]
+        struct LoginBody<'a> {
+            email: &'a str,
+            password: &'a str,
+        }
+        let raw = self.send_json(
+            "/auth/login",
+            Some(serialize_body(&LoginBody { email, password })?),
+            false,
+        )?;
+        let wire: LoginWire = serde_json::from_slice(&raw)
+            .map_err(|error| AdminApiError::MalformedResponse(anyhow::Error::new(error)))?;
+        self.cookies
+            .set_login_csrf(wire.csrf_token)
+            .map_err(AdminApiError::MalformedResponse)?;
+        Ok(AdminLogin {
+            mfa_required: wire.mfa_required,
+        })
+    }
+
+    pub fn begin_totp(&mut self) -> Result<TotpEnrollment, AdminApiError> {
+        let raw = self.send_json("/auth/me/mfa/totp/begin", Some(b"{}".to_vec()), true)?;
+        let wire: TotpEnrollmentWire = serde_json::from_slice(&raw)
+            .map_err(|error| AdminApiError::MalformedResponse(anyhow::Error::new(error)))?;
+        Ok(TotpEnrollment {
+            secret_base32: zeroize::Zeroizing::new(wire.secret_base32),
+            otpauth_uri: zeroize::Zeroizing::new(wire.otpauth_uri),
+        })
+    }
+
+    pub fn verify_mfa(&mut self, code: &str) -> Result<(), AdminApiError> {
+        #[derive(Serialize)]
+        struct VerifyBody<'a> {
+            code: &'a str,
+            remember_device: bool,
+        }
+        let raw = self.send_json(
+            "/auth/mfa/verify",
+            Some(serialize_body(&VerifyBody {
+                code,
+                remember_device: false,
+            })?),
+            true,
+        )?;
+        let wire: MfaSuccessWire = serde_json::from_slice(&raw)
+            .map_err(|error| AdminApiError::MalformedResponse(anyhow::Error::new(error)))?;
+        if !wire.success {
+            return Err(AdminApiError::MalformedResponse(anyhow::anyhow!(
+                "MFA verification returned success=false"
+            )));
+        }
+        self.cookies
+            .refresh_rotated_csrf()
+            .map_err(AdminApiError::MalformedResponse)
+    }
+
+    pub fn confirm_totp(&mut self, code: &str) -> Result<TotpConfirmation, AdminApiError> {
+        #[derive(Serialize)]
+        struct ConfirmBody<'a> {
+            code: &'a str,
+        }
+        let raw = self.send_json(
+            "/auth/me/mfa/totp/confirm",
+            Some(serialize_body(&ConfirmBody { code })?),
+            true,
+        )?;
+        let wire: TotpConfirmationWire = serde_json::from_slice(&raw)
+            .map_err(|error| AdminApiError::MalformedResponse(anyhow::Error::new(error)))?;
+        if !wire.mfa_enabled {
+            return Err(AdminApiError::MalformedResponse(anyhow::anyhow!(
+                "TOTP confirmation returned mfa_enabled=false"
+            )));
+        }
+        self.cookies
+            .refresh_rotated_csrf()
+            .map_err(AdminApiError::MalformedResponse)?;
+        Ok(TotpConfirmation {
+            backup_codes: wire
+                .backup_codes
+                .into_iter()
+                .map(zeroize::Zeroizing::new)
+                .collect(),
+        })
+    }
+
+    pub fn into_controller_registry_api(self) -> anyhow::Result<HttpControllerRegistryApi> {
+        Ok(HttpControllerRegistryApi {
+            issuer: self.issuer,
+            access: self.cookies.into_access()?,
+            transport: self.transport,
+        })
+    }
+
+    fn send_json(
+        &mut self,
+        path: &str,
+        body: Option<Vec<u8>>,
+        authenticated: bool,
+    ) -> Result<Vec<u8>, AdminApiError> {
+        let mut headers = if authenticated {
+            self.cookies
+                .request_headers()
+                .map_err(AdminApiError::MalformedResponse)?
+        } else {
+            Vec::new()
+        };
+        headers.push(("Content-Type", "application/json".to_owned()));
+        headers.push(("Accept", "application/json".to_owned()));
+        let response = self
+            .transport
+            .send(AdminHttpRequest {
+                method: "POST",
+                url: endpoint_url(&self.issuer, path, None),
+                headers,
+                body,
+            })
+            .map_err(AdminApiError::Transport)?;
+        self.cookies
+            .absorb(&response.set_cookie_headers)
+            .map_err(AdminApiError::MalformedResponse)?;
+        decode_response(response)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// controller-registry client trait + HTTPS implementation
 // ---------------------------------------------------------------------------
 
 /// Synchronous seam consumed by the D04–D08 lifecycle flows. Sync on purpose:
@@ -668,6 +977,32 @@ impl fmt::Debug for HttpControllerRegistryApi {
     }
 }
 
+fn parse_issuer(issuer: &str) -> anyhow::Result<Url> {
+    let parsed = Url::parse(issuer).with_context(|| format!("issuer '{issuer}' is not a URL"))?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        bail!("the admin API requires a bare HTTPS issuer origin");
+    }
+    Ok(parsed)
+}
+
+fn endpoint_url(issuer: &Url, path: &str, query: Option<(&str, &str)>) -> String {
+    let mut url = format!("{}{}", issuer.as_str().trim_end_matches('/'), path);
+    if let Some((name, value)) = query {
+        url.push('?');
+        url.push_str(name);
+        url.push('=');
+        url.push_str(urlencoding::encode(value).as_ref());
+    }
+    url
+}
+
 impl HttpControllerRegistryApi {
     /// Pin the instance issuer origin. HTTPS is mandatory: the admin surface
     /// carries session credentials and must never cross plaintext origins.
@@ -681,34 +1016,15 @@ impl HttpControllerRegistryApi {
         access: AdminAccess,
         transport: Box<dyn AdminApiTransport>,
     ) -> anyhow::Result<Self> {
-        let parsed =
-            Url::parse(issuer).with_context(|| format!("issuer '{issuer}' is not a URL"))?;
-        if parsed.scheme() != "https"
-            || parsed.host_str().is_none()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-            || parsed.path() != "/"
-        {
-            bail!("the admin API requires a bare HTTPS issuer origin");
-        }
         Ok(Self {
-            issuer: parsed,
+            issuer: parse_issuer(issuer)?,
             access,
             transport,
         })
     }
 
     fn endpoint_url(&self, path: &str, query: Option<(&str, &str)>) -> String {
-        let mut url = format!("{}{}", self.issuer.as_str().trim_end_matches('/'), path);
-        if let Some((name, value)) = query {
-            url.push('?');
-            url.push_str(name);
-            url.push('=');
-            url.push_str(urlencoding::encode(value).as_ref());
-        }
-        url
+        endpoint_url(&self.issuer, path, query)
     }
 
     fn send_json(
@@ -1166,6 +1482,15 @@ mod tests {
 
     impl CannedTransport {
         fn push(&self, status: u16, body: &str) -> &Self {
+            self.push_with_cookies(status, body, Vec::new())
+        }
+
+        fn push_with_cookies(
+            &self,
+            status: u16,
+            body: &str,
+            set_cookie_headers: Vec<String>,
+        ) -> &Self {
             self.inner
                 .responses
                 .lock()
@@ -1173,6 +1498,7 @@ mod tests {
                 .push(Ok(AdminHttpResponse {
                     status,
                     body: body.as_bytes().to_vec(),
+                    set_cookie_headers,
                 }));
             self
         }
@@ -1201,6 +1527,113 @@ mod tests {
             Box::new(transport),
         )
         .expect("valid issuer")
+    }
+
+    #[test]
+    fn password_login_and_existing_mfa_use_the_rotated_session() {
+        let transport = CannedTransport::default();
+        transport.push_with_cookies(
+            200,
+            r#"{"success":true,"method":"otp"}"#,
+            vec![
+                "session=new-session; Path=/; HttpOnly; Secure".to_owned(),
+                "csrf=new-csrf; Path=/; Secure".to_owned(),
+            ],
+        );
+        transport.push_with_cookies(
+            200,
+            r#"{"expires_in":3600,"csrf_token":"login-csrf","mfa_required":true}"#,
+            vec![
+                "session=login-session; Path=/; HttpOnly; Secure".to_owned(),
+                "csrf=login-csrf; Path=/; Secure".to_owned(),
+            ],
+        );
+
+        let mut session = HttpAdminSessionApi::with_transport(
+            "https://auth.example.com",
+            Box::new(transport.clone()),
+        )
+        .expect("session client");
+        assert!(
+            session
+                .login("admin@example.com", "secret")
+                .unwrap()
+                .mfa_required
+        );
+        session.verify_mfa("123456").expect("MFA verification");
+        let client = session
+            .into_controller_registry_api()
+            .expect("registry client");
+        assert_eq!(client.access.csrf_token(), Some("new-csrf"));
+        let cookie = client.access.session_cookie().expect("cookie header");
+        assert!(cookie.contains("session=new-session"), "{cookie}");
+        assert!(cookie.contains("csrf=new-csrf"), "{cookie}");
+
+        let requests = transport.requests();
+        assert_eq!(requests[0].url, "https://auth.example.com/auth/login");
+        assert_eq!(requests[1].url, "https://auth.example.com/auth/mfa/verify");
+        assert!(
+            requests[1]
+                .headers
+                .iter()
+                .any(|(name, value)| { *name == "x-csrf-token" && value == "login-csrf" })
+        );
+    }
+
+    #[test]
+    fn first_totp_enrollment_returns_backup_codes_and_fresh_session() {
+        let transport = CannedTransport::default();
+        transport.push_with_cookies(
+            200,
+            r#"{"mfa_enabled":true,"backup_codes":["backup-one"]}"#,
+            vec![
+                "session=enrolled-session; Path=/; HttpOnly; Secure".to_owned(),
+                "csrf=enrolled-csrf; Path=/; Secure".to_owned(),
+            ],
+        );
+        transport.push(
+            200,
+            r#"{"secret_base32":"SECRET","otpauth_uri":"otpauth://totp/example","period":30,"digits":6}"#,
+        );
+        transport.push_with_cookies(
+            200,
+            r#"{"expires_in":3600,"csrf_token":"login-csrf","mfa_required":false}"#,
+            vec![
+                "session=login-session; Path=/; HttpOnly; Secure".to_owned(),
+                "csrf=login-csrf; Path=/; Secure".to_owned(),
+            ],
+        );
+
+        let mut session = HttpAdminSessionApi::with_transport(
+            "https://auth.example.com",
+            Box::new(transport.clone()),
+        )
+        .expect("session client");
+        assert!(
+            !session
+                .login("admin@example.com", "secret")
+                .unwrap()
+                .mfa_required
+        );
+        let enrollment = session.begin_totp().expect("begin TOTP");
+        assert_eq!(enrollment.secret_base32.as_str(), "SECRET");
+        let confirmation = session.confirm_totp("123456").expect("confirm TOTP");
+        assert_eq!(confirmation.backup_codes[0].as_str(), "backup-one");
+        let client = session
+            .into_controller_registry_api()
+            .expect("registry client");
+        assert_eq!(client.access.csrf_token(), Some("enrolled-csrf"));
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[1].url,
+            "https://auth.example.com/auth/me/mfa/totp/begin"
+        );
+        assert_eq!(
+            requests[2].url,
+            "https://auth.example.com/auth/me/mfa/totp/confirm"
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ mod public_verify;
 
 // CLI-surface re-exports (I wave): the dispatcher consumes these without the
 // private module paths.
-pub(crate) use admin::{AdminProvisionCredentials, admin_provision_password_material};
+pub(crate) use admin::admin_provision_password_material;
 pub(crate) use public_verify::{CurlPublicProber, verify_public};
 
 use anyhow::{Context as _, bail};

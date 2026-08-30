@@ -85,7 +85,11 @@ registered hosts.
 Controller Keys minted on the control machine; private keys never leave it.
 Every key expires after exactly 30 days and any lifecycle change needs a fresh
 administrator 2FA approval in NazoAuth. Expired keys fail admission;
-  `controller rotate` replaces them.
+`controller rotate` replaces them. For an interactive change, ctl performs the
+standard administrator password login and MFA flow itself, keeps the rotated
+cookie/CSRF session only in memory, and requests approval for the exact
+proposal. Use an owner-only `--credentials-file` to avoid retyping the email
+and password; use `--approval-token` instead for non-interactive automation.
 
 **Administrator creation.** `admin create` is the ctl deployment-root path for
 administrator provisioning. It sends one journaled, instance-bound

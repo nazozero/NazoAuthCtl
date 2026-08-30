@@ -602,6 +602,7 @@ mod tests {
                 .push(Ok(AdminHttpResponse {
                     status,
                     body: body.as_bytes().to_vec(),
+                    set_cookie_headers: Vec::new(),
                 }));
         }
 

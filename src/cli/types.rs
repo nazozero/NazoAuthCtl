@@ -147,19 +147,19 @@ pub(crate) enum ControllerCommand {
         selector: InstanceSelector,
         label: String,
         approval_token: Option<String>,
-        admin_access_file: Option<PathBuf>,
+        credentials_file: Option<PathBuf>,
     },
     Rotate {
         selector: InstanceSelector,
         label: Option<String>,
         approval_token: Option<String>,
-        admin_access_file: Option<PathBuf>,
+        credentials_file: Option<PathBuf>,
     },
     Revoke {
         selector: InstanceSelector,
         controller_id: String,
         approval_token: Option<String>,
-        admin_access_file: Option<PathBuf>,
+        credentials_file: Option<PathBuf>,
     },
     /// Recovery-Secret flows: default recovers the Controller Identity from
     /// the offline secret (D11); `--rotate-secret` issues a replacement
@@ -169,7 +169,7 @@ pub(crate) enum ControllerCommand {
         label: String,
         secret_file: Option<PathBuf>,
         rotate_secret: bool,
-        admin_access_file: Option<PathBuf>,
+        credentials_file: Option<PathBuf>,
         /// Delivery channel for the REPLACEMENT Recovery Secret. The secret
         /// is delivered BEFORE the irreversible commit; interactive runs
         /// confirm on the terminal, non-TTY runs must name a create-new,
@@ -184,7 +184,7 @@ pub(crate) struct BindOptions {
     pub(crate) selector: InstanceSelector,
     pub(crate) label: String,
     pub(crate) approval_token: Option<String>,
-    pub(crate) admin_access_file: Option<PathBuf>,
+    pub(crate) credentials_file: Option<PathBuf>,
     /// P0-3/P0-4 delivery channel for the Recovery Root minted with the
     /// first binding; interactive runs confirm on the terminal instead.
     pub(crate) output_secret_file: Option<PathBuf>,

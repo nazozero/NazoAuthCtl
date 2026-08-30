@@ -1,3 +1,4 @@
+mod admin_credentials;
 mod clean_install;
 mod cli;
 mod conformance;
@@ -128,7 +129,7 @@ Usage:
 Start here:
   nazoauthctl host add server-a --ssh prod-a --privilege sudo
   nazoauthctl install --host server-a --name production --public-url https://auth.example.com
-  nazoauthctl bind --instance production
+  nazoauthctl bind --instance production --label operations
   nazoauthctl status
   nazoauthctl update
   nazoauthctl instance list
@@ -206,8 +207,9 @@ a slot is `controller revoke`."
   nazoauthctl [--instance SEL] controller recover --rotate-secret
 
 Every identity change needs a single-use approval backed by fresh administrator
-2FA. With an owner-only `--admin-access-file`, ctl requests approval for its
-exact in-memory proposal; otherwise it accepts an explicit or hidden token.
+MFA. Without an explicit approval token, ctl authenticates the administrator,
+completes MFA, and requests approval for its exact in-memory proposal. An
+owner-only `--credentials-file` avoids retyping the email and password.
 Keys expire 30 days after enrollment. `controller revoke <id>` revokes exactly one
 NazoAuth Controller Slot; it never forgets the local instance record and
 never deletes artifacts or other resources. `controller recover`

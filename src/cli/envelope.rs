@@ -76,7 +76,7 @@ fn next_command(code: &str) -> Option<&'static str> {
             "nazoauthctl controller list --instance <alias>; then revoke one slot"
         }
         error_codes::ADMIN_ACCESS_REQUIRED => {
-            "provide --admin-access-file from a current admin session; then retry"
+            "authenticate interactively or provide --credentials-file; then retry"
         }
         error_codes::ADMIN_EMAIL_CONFLICT => "use a different administrator email, then retry",
         error_codes::OPERATION_ID_CONFLICT => {

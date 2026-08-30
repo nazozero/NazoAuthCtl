@@ -8,9 +8,9 @@
 //!   → crash reconciliation (D06: adopt a committed candidate; retire
 //!      material the server no longer lists)
 //!   → build proposal payload (public key/kid/deployment binding only)
-//!   → obtain a single-use approval token (the server enforces fresh 2FA;
-//!      ctl can issue the exact proposal through an owner-only admin session
-//!      or accept an explicitly supplied token)
+//!   → obtain a single-use approval token (the server enforces fresh MFA;
+//!      ctl establishes the standard admin session and completes MFA, or
+//!      accepts an explicitly supplied token)
 //!   → atomic server commit (approval consumption + registry mutation share
 //!      one transaction on the NazoAuth side)
 //!   → local activation (pointer switch / registry fields), ordered so the
@@ -36,14 +36,15 @@ use anyhow::{Context as _, bail};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize as _;
 
+use crate::admin_credentials::{AdminCredentialsInput, read_admin_credentials};
 use crate::cli::{BindOptions, ControllerCommand, InstanceSelector};
 use crate::file_lock::FileLock;
 use crate::filesystem;
 use crate::registry::{InstanceRecord, RegistryStore, validate_issuer};
 
 use super::admin_api::{
-    self, AdminAccess, AdminAccessFile, ApprovalRequestBody, ControllerRegistryApi,
-    ControllerSlotView, IssuedApproval, RevokeCommitBody, RotateCommitBody, SlotCommitBody,
+    self, AdminAccess, ApprovalRequestBody, ControllerRegistryApi, ControllerSlotView,
+    HttpAdminSessionApi, IssuedApproval, RevokeCommitBody, RotateCommitBody, SlotCommitBody,
     SlotStatus, SlotsSnapshot, short_kid,
 };
 use super::expiry;
@@ -948,25 +949,75 @@ fn obtain_approval_token(flag: Option<&str>, action: &str) -> anyhow::Result<Str
     }
 }
 
-fn access_from_file(path: &std::path::Path) -> anyhow::Result<AdminAccess> {
-    const MAX_ACCESS_BYTES: u64 = 8192;
-    let bytes =
-        filesystem::read_secure_regular_file(path, "admin access file", true, MAX_ACCESS_BYTES)?;
-    let parsed: AdminAccessFile = serde_json::from_slice(&bytes)
-        .with_context(|| format!("{} is not a valid admin access document", path.display()))?;
-    Ok(AdminAccess::new(parsed.session_cookie, parsed.csrf_token))
+fn make_public_api(issuer: &str) -> anyhow::Result<admin_api::HttpControllerRegistryApi> {
+    validate_issuer(issuer).context("registered issuer is invalid")?;
+    admin_api::HttpControllerRegistryApi::new(issuer, AdminAccess::default())
 }
 
-fn make_api(
+fn make_authenticated_api(
     issuer: &str,
-    admin_access_file: Option<&std::path::Path>,
+    credentials_file: Option<&std::path::Path>,
 ) -> anyhow::Result<admin_api::HttpControllerRegistryApi> {
-    let access = match admin_access_file {
-        Some(path) => access_from_file(path)?,
-        None => AdminAccess::default(),
-    };
+    use std::io::IsTerminal as _;
+
     validate_issuer(issuer).context("registered issuer is invalid")?;
-    admin_api::HttpControllerRegistryApi::new(issuer, access)
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "administrator MFA requires an interactive terminal; use --approval-token for non-interactive controller changes"
+        );
+    }
+    let credentials = read_admin_credentials(
+        credentials_file.map_or(
+            AdminCredentialsInput::Interactive,
+            AdminCredentialsInput::File,
+        ),
+        "controller approval",
+    )?;
+    let mut session = HttpAdminSessionApi::new(issuer)?;
+    let login = session.login(&credentials.email, credentials.password.as_str())?;
+    drop(credentials);
+
+    if login.mfa_required {
+        let code = prompt_mfa_code("Administrator MFA code: ")?;
+        session.verify_mfa(&code)?;
+    } else {
+        let enrollment = session.begin_totp()?;
+        print_totp_enrollment(&enrollment)?;
+        let code = prompt_mfa_code("Enter the current code from your authenticator: ")?;
+        let confirmation = session.confirm_totp(&code)?;
+        eprintln!("MFA enabled. Store these one-time backup codes now:");
+        for code in &confirmation.backup_codes {
+            eprintln!("  {}", code.as_str());
+        }
+    }
+    session.into_controller_registry_api()
+}
+
+fn prompt_mfa_code(prompt: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    let code = zeroize::Zeroizing::new(
+        rpassword::prompt_password(prompt).context("failed to read administrator MFA code")?,
+    );
+    let trimmed = code.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 || trimmed.chars().any(char::is_control) {
+        bail!("administrator MFA code is invalid");
+    }
+    Ok(zeroize::Zeroizing::new(trimmed.to_owned()))
+}
+
+fn print_totp_enrollment(enrollment: &admin_api::TotpEnrollment) -> anyhow::Result<()> {
+    let qr = qrcode::QrCode::new(enrollment.otpauth_uri.as_bytes())
+        .context("failed to render the TOTP enrollment QR code")?;
+    let rendered = qr
+        .render::<qrcode::render::unicode::Dense1x2>()
+        .quiet_zone(true)
+        .build();
+    eprintln!("This administrator has no MFA yet. Scan this QR code:");
+    eprintln!("{rendered}");
+    eprintln!(
+        "If scanning is unavailable, enter this secret manually: {}",
+        enrollment.secret_base32.as_str()
+    );
+    Ok(())
 }
 
 fn approval_request(presentation: &ProposalPresentation) -> anyhow::Result<ApprovalRequestBody> {
@@ -1038,7 +1089,7 @@ pub(crate) fn run_controller_command(
         ControllerCommand::List { selector } => {
             let explicit = merge_global(selector, global, "controller list")?;
             let record = resolve_record(&registry, explicit.as_deref())?;
-            let api = make_api(&record.issuer, None)?;
+            let api = make_public_api(&record.issuer)?;
             let report = slots_flow(&api, &registry, &keys, explicit.as_deref())?;
             println!("{report}");
         }
@@ -1046,12 +1097,16 @@ pub(crate) fn run_controller_command(
             selector,
             label,
             approval_token,
-            admin_access_file,
+            credentials_file,
         } => {
             let explicit = merge_global(selector, global, "controller add")?;
             let record = resolve_record(&registry, explicit.as_deref())?;
-            let api = make_api(&record.issuer, admin_access_file.as_deref())?;
-            let issue_approval = admin_access_file.is_some();
+            let issue_approval = approval_token.is_none();
+            let api = if issue_approval {
+                make_authenticated_api(&record.issuer, credentials_file.as_deref())?
+            } else {
+                make_public_api(&record.issuer)?
+            };
             let report = add_flow(
                 &api,
                 &registry,
@@ -1066,12 +1121,16 @@ pub(crate) fn run_controller_command(
             selector,
             label,
             approval_token,
-            admin_access_file,
+            credentials_file,
         } => {
             let explicit = merge_global(selector, global, "controller rotate")?;
             let record = resolve_record(&registry, explicit.as_deref())?;
-            let api = make_api(&record.issuer, admin_access_file.as_deref())?;
-            let issue_approval = admin_access_file.is_some();
+            let issue_approval = approval_token.is_none();
+            let api = if issue_approval {
+                make_authenticated_api(&record.issuer, credentials_file.as_deref())?
+            } else {
+                make_public_api(&record.issuer)?
+            };
             let report = rotate_flow(
                 &api,
                 &registry,
@@ -1086,12 +1145,16 @@ pub(crate) fn run_controller_command(
             selector,
             controller_id,
             approval_token,
-            admin_access_file,
+            credentials_file,
         } => {
             let explicit = merge_global(selector, global, "controller revoke")?;
             let record = resolve_record(&registry, explicit.as_deref())?;
-            let api = make_api(&record.issuer, admin_access_file.as_deref())?;
-            let issue_approval = admin_access_file.is_some();
+            let issue_approval = approval_token.is_none();
+            let api = if issue_approval {
+                make_authenticated_api(&record.issuer, credentials_file.as_deref())?
+            } else {
+                make_public_api(&record.issuer)?
+            };
             let report = revoke_flow(
                 &api,
                 &registry,
@@ -1107,12 +1170,16 @@ pub(crate) fn run_controller_command(
             label,
             secret_file,
             rotate_secret,
-            admin_access_file,
+            credentials_file,
             output_secret_file,
         } => {
             let explicit = merge_global(selector, global, "controller recover")?;
             let record = resolve_record(&registry, explicit.as_deref())?;
-            let api = make_api(&record.issuer, admin_access_file.as_deref())?;
+            let api = if rotate_secret {
+                make_authenticated_api(&record.issuer, credentials_file.as_deref())?
+            } else {
+                make_public_api(&record.issuer)?
+            };
             // P0-4 delivery channel: an explicit create-new owner-only file
             // for non-interactive runs; the terminal handshake everywhere
             // else. A missing channel fails closed instead of losing the
@@ -1157,15 +1224,19 @@ pub(crate) fn run_bind(options: BindOptions, global: Option<&str>) -> anyhow::Re
         selector,
         label,
         approval_token,
-        admin_access_file,
+        credentials_file,
         output_secret_file,
     } = options;
     let registry = RegistryStore::open_default()?;
     let keys = ControllerKeyStore::open_default()?;
     let explicit = merge_global(selector, global, "bind")?;
     let record = resolve_record(&registry, explicit.as_deref())?;
-    let api = make_api(&record.issuer, admin_access_file.as_deref())?;
-    let issue_approval = admin_access_file.is_some();
+    let issue_approval = approval_token.is_none();
+    let api = if issue_approval {
+        make_authenticated_api(&record.issuer, credentials_file.as_deref())?
+    } else {
+        make_public_api(&record.issuer)?
+    };
     // P0-4/P0-3: bind now also mints the Recovery Root, so its secret needs a
     // delivery channel with exactly the same fail-closed rules as recovery.
     let delivery: std::sync::Arc<dyn recovery::ReplacementSecretDelivery> =

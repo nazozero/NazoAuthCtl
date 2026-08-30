@@ -4,13 +4,14 @@
 //! logic of its own beyond selector merging, confirmation prompts, and the
 //! stable error rendering.
 
-use std::{io::IsTerminal as _, path::Path};
+use std::path::Path;
 
 use anyhow::{Context as _, bail};
 
+use crate::admin_credentials::{AdminCredentialsInput, read_admin_credentials};
 use crate::clean_install::{
-    AdminProvisionCredentials, CleanInstallContext, CleanInstallRequest, CurlPublicProber,
-    admin_provision_password_material, verify_public,
+    CleanInstallContext, CleanInstallRequest, CurlPublicProber, admin_provision_password_material,
+    verify_public,
 };
 use crate::cli::{
     AdminCommand, AdminCreateArgs, BackupArgs, BackupCommand, Cli, Command, InstallArgs,
@@ -1187,7 +1188,14 @@ fn run_admin_create(args: AdminCreateArgs, global: Option<&str>) -> anyhow::Resu
         merged.as_deref(),
         "admin create",
     )?;
-    let credentials = read_admin_credentials(args.credentials_stdin, "admin create")?;
+    let credentials = read_admin_credentials(
+        if args.credentials_stdin {
+            AdminCredentialsInput::Stdin
+        } else {
+            AdminCredentialsInput::Interactive
+        },
+        "admin create",
+    )?;
     let password = admin_provision_password_material(&credentials)?;
     let operation_id = admin_operation_id();
     let operation = crate::target::HostOperation::admin_create(
@@ -1254,49 +1262,6 @@ fn read_config_file(path: &std::path::Path) -> anyhow::Result<String> {
     .with_context(|| format!("failed to read {}", path.display()))?;
     String::from_utf8(bytes.to_vec())
         .with_context(|| format!("{} is not valid UTF-8", path.display()))
-}
-
-fn read_admin_credentials(
-    stdin_mode: bool,
-    command: &str,
-) -> anyhow::Result<AdminProvisionCredentials> {
-    use zeroize::Zeroizing;
-    if stdin_mode {
-        let mut line = Zeroizing::new(String::new());
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut line)
-            .context("failed to read the credentials JSON from stdin")?;
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Raw {
-            email: String,
-            password: String,
-        }
-        let raw: Raw = serde_json::from_str(line.trim())
-            .context("stdin credentials must be strict JSON with email and password")?;
-        return Ok(AdminProvisionCredentials {
-            email: raw.email,
-            password: Zeroizing::new(raw.password),
-        });
-    }
-    use std::io::Write as _;
-    if !std::io::stdin().is_terminal() {
-        bail!(
-            "{command} requires --credentials-stdin in non-interactive mode; passwords are \
-             never accepted on argv"
-        );
-    }
-    eprint!("Administrator email: ");
-    std::io::stderr().flush()?;
-    let mut email = String::new();
-    std::io::stdin()
-        .read_line(&mut email)
-        .context("failed to read administrator email")?;
-    let password = rpassword::prompt_password("Administrator password: ")
-        .context("failed to read administrator password")?;
-    Ok(AdminProvisionCredentials {
-        email: email.trim().to_owned(),
-        password: Zeroizing::new(password),
-    })
 }
 
 #[cfg(test)]

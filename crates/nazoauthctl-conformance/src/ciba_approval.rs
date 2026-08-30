@@ -838,6 +838,7 @@ mod tests {
         let response = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
             .expect("callback client")
             .get(callback_url)

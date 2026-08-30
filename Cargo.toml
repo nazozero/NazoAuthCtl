@@ -8,7 +8,7 @@ default-members = ["crates/nazoauthctl"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/nazozero/NazoAuthCtl"
@@ -50,6 +50,7 @@ libc = "0.2.189"
 nazo-operator-protocol.workspace = true
 nazoauthctl-runtime = { path = "crates/nazoauthctl-runtime" }
 rand = "0.10.1"
+qrcode = { version = "0.14.1", default-features = false }
 rcgen = { version = "0.14.9", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 rpassword = "7.4.0"
 rustls = { version = "0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }

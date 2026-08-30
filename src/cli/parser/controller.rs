@@ -31,7 +31,7 @@ pub(super) fn parse_controller(values: Vec<String>) -> anyhow::Result<Controller
 struct Common {
     selector: InstanceSelector,
     approval_token: Option<String>,
-    admin_access_file: Option<PathBuf>,
+    credentials_file: Option<PathBuf>,
     values: std::collections::BTreeMap<String, String>,
     flags: std::collections::BTreeSet<String>,
 }
@@ -43,7 +43,7 @@ fn parse_common(
     command: &str,
 ) -> anyhow::Result<Common> {
     let mut value_flags = extra_value_flags.to_vec();
-    value_flags.extend(["--instance", "--approval-token", "--admin-access-file"]);
+    value_flags.extend(["--instance", "--approval-token", "--credentials-file"]);
     let parsed = parse_options(values, &value_flags, extra_bool_flags, command)?;
     if parsed.positionals.len() > 1 {
         bail!("{command} accepts at most one selector argument");
@@ -66,18 +66,21 @@ fn parse_common(
         }
         None => None,
     };
-    let admin_access_file = match parsed.values.get("--admin-access-file") {
+    let credentials_file = match parsed.values.get("--credentials-file") {
         Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
-        Some(_) => bail!("--admin-access-file requires a file path"),
+        Some(_) => bail!("--credentials-file requires a file path"),
         None => None,
     };
+    if approval_token.is_some() && credentials_file.is_some() {
+        bail!("--approval-token and --credentials-file are alternative approval sources");
+    }
     Ok(Common {
         selector: InstanceSelector {
             positional: parsed.positionals.into_iter().next(),
             named,
         },
         approval_token,
-        admin_access_file,
+        credentials_file,
         values: parsed.values,
         flags: parsed.flags,
     })
@@ -114,7 +117,7 @@ fn parse_add(values: &[String]) -> anyhow::Result<ControllerCommand> {
         selector: common.selector,
         label,
         approval_token: common.approval_token,
-        admin_access_file: common.admin_access_file,
+        credentials_file: common.credentials_file,
     })
 }
 
@@ -125,7 +128,7 @@ fn parse_rotate(values: &[String]) -> anyhow::Result<ControllerCommand> {
         selector: common.selector,
         label,
         approval_token: common.approval_token,
-        admin_access_file: common.admin_access_file,
+        credentials_file: common.credentials_file,
     })
 }
 
@@ -133,7 +136,7 @@ fn parse_revoke(values: &[String]) -> anyhow::Result<ControllerCommand> {
     // Grammar per goal plan 09 §1: controller revoke <controller-id>.
     let parts = selector_parts(
         values,
-        &["--approval-token", "--admin-access-file"],
+        &["--approval-token", "--credentials-file"],
         &[],
         "controller revoke",
     )?;
@@ -149,7 +152,7 @@ fn parse_revoke(values: &[String]) -> anyhow::Result<ControllerCommand> {
         },
         controller_id,
         approval_token: parts.values.get("--approval-token").cloned(),
-        admin_access_file: parts.values.get("--admin-access-file").map(PathBuf::from),
+        credentials_file: parts.values.get("--credentials-file").map(PathBuf::from),
     })
 }
 
@@ -189,13 +192,16 @@ fn parse_recover(values: &[String]) -> anyhow::Result<ControllerCommand> {
             "--approval-token is not accepted on controller recover; break-glass recovery authenticates with the recovery secret, and --rotate-secret issues approval directly through the admin API"
         );
     }
+    if !rotate_secret && common.credentials_file.is_some() {
+        bail!("--credentials-file is used only with controller recover --rotate-secret");
+    }
     let label = require_label(&common.values, rotate_secret)?;
     Ok(ControllerCommand::Recover {
         selector: common.selector,
         label: label.unwrap_or_else(|| "recovered-controller".to_owned()),
         secret_file,
         rotate_secret,
-        admin_access_file: common.admin_access_file,
+        credentials_file: common.credentials_file,
         output_secret_file,
     })
 }
@@ -211,7 +217,7 @@ mod tests {
             parse_list(&[
                 "--instance".to_owned(),
                 "production".to_owned(),
-                "--admin-access-file".to_owned(),
+                "--credentials-file".to_owned(),
                 "access.json".to_owned(),
             ])
             .is_err()
