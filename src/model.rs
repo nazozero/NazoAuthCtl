@@ -3,23 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
-fn safe_protocol_identifier(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 256
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || ".:_/@+-".contains(character))
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReleaseManifest {
     pub(crate) schema: u32,
     pub(crate) version: String,
     pub(crate) target: String,
-    pub(crate) backend_commit: String,
     pub(crate) release_identity: String,
-    pub(crate) embedded: nazo_operator_protocol::EmbeddedIdentity,
     pub(crate) operator_protocol: OperatorProtocolCompatibility,
     pub(crate) artifacts: BTreeMap<String, Artifact>,
     pub(crate) frontend: FrontendRelease,
@@ -49,7 +39,6 @@ pub(crate) struct Artifact {
 pub(crate) struct FrontendRelease {
     pub(crate) repository: String,
     pub(crate) version: String,
-    pub(crate) commit: String,
     pub(crate) release_identity: String,
     pub(crate) artifact: Artifact,
 }
@@ -124,19 +113,14 @@ pub(crate) fn test_release_rollback_policy() -> ReleaseRollbackPolicy {
 impl ReleaseManifest {
     pub(crate) fn validate(&self, version: &str, expected_identity: &str) -> anyhow::Result<()> {
         let target = release_target().context("this platform has no official Release target")?;
-        if self.schema != 5
+        if self.schema != 6
             || self.version != version
             || self.target != target
             || self.release_identity != expected_identity
-            || self.embedded.release != self.version
-            || self.embedded.revision != self.backend_commit
-            || self.embedded.protocol != nazo_operator_protocol::PROTOCOL_VERSION
-            || !safe_protocol_identifier(&self.embedded.build_id)
-            || !is_lower_hex(&self.backend_commit, 40)
         {
             bail!("signed release manifest failed policy validation");
         }
-        if self.operator_protocol.version != self.embedded.protocol {
+        if self.operator_protocol.version != nazo_operator_protocol::PROTOCOL_VERSION {
             bail!("signed release manifest has an invalid operator protocol contract");
         }
         self.rollback.validate()?;
@@ -195,7 +179,6 @@ impl ReleaseManifest {
         );
         if frontend.repository != "nazozero/NazoAuthWeb"
             || !semantic_tag(&frontend.version)
-            || !is_lower_hex(&frontend.commit, 40)
             || frontend.release_identity != expected_identity
             || frontend.artifact.repository != frontend.repository
             || frontend.artifact.name != "nazoauth-web.tar.gz"

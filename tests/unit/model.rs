@@ -14,17 +14,10 @@ fn valid_manifest() -> ReleaseManifest {
         size: 1,
     };
     ReleaseManifest {
-        schema: 5,
+        schema: 6,
         version: "v0.2.0".to_owned(),
         target: target.clone(),
-        backend_commit: "b".repeat(40),
         release_identity: "release-identity".to_owned(),
-        embedded: nazo_operator_protocol::EmbeddedIdentity {
-            release: "v0.2.0".to_owned(),
-            revision: "b".repeat(40),
-            protocol: nazo_operator_protocol::PROTOCOL_VERSION,
-            build_id: "build:test".to_owned(),
-        },
         operator_protocol: OperatorProtocolCompatibility {
             version: nazo_operator_protocol::PROTOCOL_VERSION,
             minimum_ctl_version: "0.2.0".to_owned(),
@@ -37,7 +30,6 @@ fn valid_manifest() -> ReleaseManifest {
         frontend: FrontendRelease {
             repository: "nazozero/NazoAuthWeb".to_owned(),
             version: "v0.2.0".to_owned(),
-            commit: "c".repeat(40),
             release_identity: "https://github.com/nazozero/NazoAuthWeb/.github/workflows/release.yml@refs/tags/v0.2.0".to_owned(),
             artifact: Artifact {
                 repository: "nazozero/NazoAuthWeb".to_owned(),
@@ -87,8 +79,6 @@ fn release_manifest_binds_every_binary_frontend_and_oci_identity() {
         manifest.oci.platform_manifests[platform],
         "the accessor must agree with the signed platform map"
     );
-    assert!(is_lower_hex(&manifest.frontend.commit, 40));
-
     let mut invalid = manifest.clone();
     invalid.schema = 4;
     assert!(invalid.validate("v0.2.0", "release-identity").is_err());
@@ -98,10 +88,9 @@ fn release_manifest_binds_every_binary_frontend_and_oci_identity() {
         .unwrap()
         .remove("operator_protocol");
     assert!(serde_json::from_value::<ReleaseManifest>(missing_protocol).is_err());
-    assert_eq!(nazo_operator_protocol::PROTOCOL_VERSION, 2);
+    assert_eq!(nazo_operator_protocol::PROTOCOL_VERSION, 3);
     let mut invalid = manifest.clone();
-    invalid.embedded.protocol = 1;
-    invalid.operator_protocol.version = 1;
+    invalid.operator_protocol.version = 2;
     assert!(invalid.validate("v0.2.0", "release-identity").is_err());
     let mut invalid = manifest.clone();
     invalid.rollback.irreversible_migration = true;

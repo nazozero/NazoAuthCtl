@@ -56,7 +56,7 @@ fn next_command(code: &str) -> Option<&'static str> {
         error_codes::SSH_AUTH_FAILED => "fix the SSH profile credentials, then retry",
         error_codes::SSH_HOST_KEY_FAILED => "verify the host key change yourself, then retry",
         error_codes::REMOTE_HELPER_MISMATCH => {
-            "ssh <profile> -- nazoauthctl self update --yes; then retry"
+            "ssh <profile> -- nazoauthctl self update; then retry"
         }
         error_codes::PRIVILEGE_REQUIRED => "ssh -t <profile> sudo -v; then retry",
         error_codes::INSTANCE_NOT_REGISTERED => {
@@ -69,9 +69,14 @@ fn next_command(code: &str) -> Option<&'static str> {
         error_codes::CONTROL_BINDING_REQUIRED => {
             "nazoauthctl bind --instance <alias> --label <name>"
         }
-        error_codes::CONTROLLER_KEY_EXPIRED => "nazoauthctl controller rotate --instance <alias>",
+        error_codes::CONTROLLER_KEY_UNAUTHORIZED => {
+            "nazoauthctl controller list --instance <alias>; then rotate or recover as shown"
+        }
         error_codes::CONTROLLER_SLOT_LIMIT => {
             "nazoauthctl controller list --instance <alias>; then revoke one slot"
+        }
+        error_codes::ADMIN_ACCESS_REQUIRED => {
+            "provide --admin-access-file from a current admin session; then retry"
         }
         error_codes::OPERATION_ID_CONFLICT => {
             "inspect nazoauthctl operation --instance <alias>, then resume with the same command"
@@ -81,9 +86,6 @@ fn next_command(code: &str) -> Option<&'static str> {
         }
         error_codes::TARGET_IDENTITY_MISMATCH => {
             "nazoauthctl verify --instance <alias>, then re-check the artifact source"
-        }
-        error_codes::EXTERNAL_RESOURCE_PROTECTED => {
-            "the resource is external/shared; deletion is refused by design"
         }
         _ => return None,
     })

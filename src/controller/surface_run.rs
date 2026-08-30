@@ -101,12 +101,8 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             selector_scoped(&selector, instance_flag, "verify", run_verify)
         }
         Command::Update(args) => run_update(args, instance_flag),
-        Command::Rollback { selector, yes } => {
+        Command::Rollback { selector } => {
             let merged = merge(&selector, instance_flag, "rollback")?;
-            super::require_confirmation(
-                yes,
-                "roll back to the previous verified artifact reference saved on the target",
-            )?;
             let context = LifecycleContext::production()?;
             let report = crate::instance_lifecycle::run_rollback(&context, merged.as_deref())?;
             println!("{report}");
@@ -131,32 +127,23 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Uninstall { selector, yes } => {
             let merged = merge(&selector, instance_flag, "uninstall")?;
             let context = LifecycleContext::production()?;
+            let keys = ControllerKeyStore::open_default()?;
             let report =
-                crate::instance_lifecycle::run_uninstall(&context, merged.as_deref(), yes)?;
+                crate::instance_lifecycle::run_uninstall(&context, &keys, merged.as_deref(), yes)?;
             println!("{report}");
             Ok(())
         }
         // ---- final-model maintenance surface --------------------------------
         Command::BootstrapAdmin(args) => run_bootstrap_admin(args, instance_flag),
-        Command::Tls(command) => crate::tls::run(
-            instance_flag,
-            command,
-            super::require_root,
-            super::require_confirmation,
-        ),
+        Command::Tls(command) => crate::tls::run(instance_flag, command, super::require_root),
         Command::RemoteExec => crate::target::remote_exec::run_stdio(),
         Command::SelfCheck(version) => super::self_update::controller_check(version.as_deref()),
-        Command::SelfUpdate { version, yes } => {
+        Command::SelfUpdate { version } => {
             super::require_self_update_privilege()?;
-            super::require_confirmation(
-                yes,
-                "replace nazoauthctl with a signed controller Release",
-            )?;
             super::self_update::controller_update(version.as_deref())
         }
-        Command::SelfRollback { yes } => {
+        Command::SelfRollback => {
             super::require_self_update_privilege()?;
-            super::require_confirmation(yes, "restore the previous signed nazoauthctl binary")?;
             super::self_update::controller_rollback()
         }
     }
@@ -700,10 +687,6 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
     use nazo_operator_protocol::{ControlOutcome, ControlResultData};
 
     let merged = merge(&args.selector, global, "recover")?;
-    super::require_confirmation(
-        args.yes,
-        "restore a data snapshot after durable token invalidation",
-    )?;
     let context = LifecycleContext::production()?;
     let (record, host, target, inspection) =
         crate::instance_lifecycle::resolve_live_instance(&context, merged.as_deref(), "recover")?;
@@ -814,15 +797,6 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
         {
             bail!("recover: target state no longer proves the recorded recovery")
         }
-        let artifact = restored
-            .artifact
-            .current
-            .as_deref()
-            .context("recover: restored target has no artifact")?;
-        let identity = restored
-            .current_build_identity
-            .as_ref()
-            .context("recover: restored target has no build identity")?;
         let config_revision = restored
             .config_revision_marker
             .clone()
@@ -839,7 +813,6 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 operation: nazo_operator_protocol::ControlOperationPayload::RecoveryInvalidate {
                     state_epoch: plan.state_epoch.clone(),
                 },
-                artifact_target: crate::instance_lifecycle::control_target_for(artifact, identity),
                 config_revision,
             },
         )?;
@@ -1064,7 +1037,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
 }
 
 fn requires_controller_identity_recovery(code: &str) -> bool {
-    matches!(code, "CONTROLLER_KEY_UNTRUSTED" | "CONTROLLER_KEY_EXPIRED")
+    code == crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1199,10 +1172,6 @@ fn run_verify(merged: Option<String>) -> anyhow::Result<()> {
 
 fn run_update(args: UpdateArgs, global: Option<&str>) -> anyhow::Result<()> {
     let merged = merge(&args.selector, global, "update")?;
-    super::require_confirmation(
-        args.yes,
-        "update the instance to a verified official artifact (migration included)",
-    )?;
     let config_content = match &args.config_file {
         Some(path) => Some(read_config_file(path)?),
         None => None,
@@ -1346,10 +1315,7 @@ mod recover_tests {
     #[test]
     fn only_stable_identity_rejections_may_read_a_recovery_secret() {
         assert!(requires_controller_identity_recovery(
-            "CONTROLLER_KEY_UNTRUSTED"
-        ));
-        assert!(requires_controller_identity_recovery(
-            "CONTROLLER_KEY_EXPIRED"
+            crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED
         ));
         for code in [
             "CONTROL_OUTCOME_UNKNOWN",

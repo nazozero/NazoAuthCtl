@@ -31,7 +31,7 @@ mod tests;
 // CLI-surface re-exports (I wave).
 pub(crate) use rollback::run_rollback;
 pub(crate) use uninstall::run_uninstall;
-pub(crate) use update::{UpdateRequest, control_target_for, run_update};
+pub(crate) use update::{UpdateRequest, run_update};
 
 use anyhow::Context as _;
 
@@ -49,79 +49,9 @@ pub(crate) const SERVER_REPOSITORY: &str = "nazozero/NazoAuth";
 pub(crate) type TargetFactory =
     dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct VerifiedTargetArtifact {
-    pub digest: String,
-    pub identity: crate::target::BuildIdentity,
-    pub rollback_policy: crate::model::ReleaseRollbackPolicy,
-}
-
-pub(crate) trait TargetArtifactResolver: Send + Sync {
-    fn resolve_target_artifact(
-        &self,
-        pinned: &crate::target::OfficialArtifactRef,
-        inspection: &InstanceInspection,
-    ) -> anyhow::Result<VerifiedTargetArtifact>;
-}
-
-pub(crate) struct ProductionTargetArtifactResolver;
-
-impl TargetArtifactResolver for ProductionTargetArtifactResolver {
-    fn resolve_target_artifact(
-        &self,
-        pinned: &crate::target::OfficialArtifactRef,
-        inspection: &InstanceInspection,
-    ) -> anyhow::Result<VerifiedTargetArtifact> {
-        #[cfg(feature = "pre-release-validation")]
-        if let Some(candidate) = crate::pre_release::resolve(pinned)? {
-            candidate.enforce_floor(
-                inspection
-                    .current_build_identity
-                    .as_ref()
-                    .map(|identity| identity.version.as_str()),
-            )?;
-            return Ok(VerifiedTargetArtifact {
-                digest: candidate.oci_digest.clone(),
-                identity: candidate.identity()?,
-                rollback_policy: candidate.rollback,
-            });
-        }
-        let release = crate::release::VerifiedRelease::verify(crate::release::ReleaseRequest {
-            repository: &pinned.repository,
-            requested_version: pinned.version.as_deref(),
-            container_backend: None,
-            trusted_version_floor: inspection
-                .current_build_identity
-                .as_ref()
-                .map(|id| id.version.as_str()),
-        })?;
-        // Bind the signed operation to the digest the runtime actually
-        // executes: the platform manifest from the signed release, exactly
-        // what the install and the target-side artifact verification use.
-        let subject = release
-            .manifest
-            .runtime_oci_digest_for(crate::model::container_oci_platform())?
-            .trim_start_matches("sha256:")
-            .to_owned();
-        let digest = format!("sha256:{subject}");
-        let identity = crate::target::BuildIdentity::new(
-            nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT,
-            &release.manifest.version,
-            &release.manifest.backend_commit,
-        )?;
-        let rollback_policy = release.rollback_policy();
-        Ok(VerifiedTargetArtifact {
-            digest,
-            identity,
-            rollback_policy,
-        })
-    }
-}
-
 pub(crate) struct LifecycleContext {
     pub(crate) registry: RegistryStore,
     pub(crate) factory: Box<TargetFactory>,
-    pub(crate) resolver: std::sync::Arc<dyn TargetArtifactResolver>,
 }
 
 impl LifecycleContext {
@@ -129,7 +59,6 @@ impl LifecycleContext {
         Ok(Self {
             registry: RegistryStore::open_default()?,
             factory: Box::new(production_target),
-            resolver: std::sync::Arc::new(ProductionTargetArtifactResolver),
         })
     }
 

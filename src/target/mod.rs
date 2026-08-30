@@ -24,7 +24,6 @@ pub(crate) mod uninstall_exec;
 pub(crate) mod update_exec;
 pub mod wire;
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -34,22 +33,6 @@ use uuid::Uuid;
 
 use crate::error_codes::CONFIG_REVISION_MISMATCH;
 use crate::runtime_backend;
-
-/// The operator receives this only when its one-shot OCI artifact was already
-/// verified by the target. Host binaries have no OCI image identity.
-pub(crate) const OPERATOR_OCI_IMAGE_DIGEST_ENV: &str = "NAZOAUTH_OPERATOR_OCI_IMAGE_DIGEST";
-
-/// Bind a one-shot operator to the verified OCI digest through the existing
-/// task environment. This is intentionally the sole shared rule for the
-/// normal-control and update/recovery/backup operator paths.
-pub(crate) fn inject_operator_oci_artifact_fence(
-    environment: &mut BTreeMap<String, String>,
-    artifact: &runtime_backend::ArtifactReference,
-) {
-    if let runtime_backend::ArtifactReference::Oci { digest, .. } = artifact {
-        environment.insert(OPERATOR_OCI_IMAGE_DIGEST_ENV.to_owned(), digest.clone());
-    }
-}
 
 use self::wire::{local_hello_for_target, sanitize};
 
@@ -64,18 +47,16 @@ pub use control_exec::{
     CONTROL_EXECUTION_UNAVAILABLE, CONTROL_OUTCOME_UNKNOWN, CONTROL_TARGET_DRIFT,
 };
 pub use deployment_state::{
-    ActiveHostOperationRef, AppliedMigration, ArtifactRefs, BUILD_IDENTITY_PRODUCT,
-    BootstrapParams, BuildIdentity, ConfigState, DEPLOYMENT_EXISTS, DEPLOYMENT_LIMIT_EXCEEDED,
-    DEPLOYMENT_STATE_SCHEMA, DEPLOYMENT_UNKNOWN, DeploymentState, EXTERNAL_RESOURCE_PROTECTED,
-    Failure, HealthRecord, INSTALL_FAILED, MAX_LISTED_DEPLOYMENTS, MAX_RESOURCES,
-    OBJECT_IDENTITY_MISMATCH, RESOURCE_UNKNOWN, ROLLBACK_RECOVERY_REQUIRED, ROLLBACK_UNAVAILABLE,
-    Resource, ResourceOwnership, ResourceScope, RuntimeSurface, StateMutationPayload,
-    TargetStateStore, UpdateBackupPrecondition,
+    ActiveHostOperationRef, AppliedMigration, ArtifactRefs, BootstrapParams, ConfigState,
+    DEPLOYMENT_EXISTS, DEPLOYMENT_STATE_SCHEMA, DEPLOYMENT_UNKNOWN, DeploymentState, Failure,
+    HealthRecord, INSTALL_FAILED, OBJECT_IDENTITY_MISMATCH, ROLLBACK_RECOVERY_REQUIRED,
+    ROLLBACK_UNAVAILABLE, ReleaseVersion, Resource, ResourceOwnership, ResourceScope,
+    RuntimeSurface, StateMutationPayload, TargetStateStore, UpdateBackupPrecondition,
 };
 pub use install_exec::{
     ARTIFACT_UNVERIFIED, CONFIG_INVALID, CONFIG_PATH_OCCUPIED, HEALTH_PROBE_FAILED,
-    INSTALL_OUTCOME_UNKNOWN, InstallOrder, OfficialArtifactRef, PlannedResourceDeletion,
-    PlannedSecret, RUNTIME_START_FAILED, SECRET_PROVISION_FAILED, SECRET_PURPOSES, StagedConfig,
+    INSTALL_OUTCOME_UNKNOWN, InstallOrder, OfficialArtifactRef, PlannedSecret,
+    RUNTIME_START_FAILED, SECRET_PROVISION_FAILED, SECRET_PURPOSES, StagedConfig,
     TARGET_IDENTITY_MISMATCH,
 };
 pub use journal::{JournalStatus, OperationLogEntry, OperationOutcomeSummary, TargetJournal};
@@ -85,7 +66,7 @@ pub use wire::SecretMaterial;
 pub use wire::{
     HELLO_PRODUCT, HOST_ERR_OPERATION_INVALID, HOST_OPERATION_KINDS, HOST_PROTOCOL_SCHEMA,
     HostCompletionBody, HostOperation, HostOperationBody, HostOutcome, HostResult,
-    InstanceInspection, LOCAL_BUILD_COMMIT, MAX_CONTROL_CHANGE_SET_BYTES, MAX_HOST_OPERATION_BYTES,
+    InstanceInspection, MAX_CONTROL_CHANGE_SET_BYTES, MAX_HOST_OPERATION_BYTES,
     MAX_HOST_RESULT_BYTES, MessageRejection, RejectionCode, RemoteHello, RuntimeInstanceIdentity,
     canonical_operation_hash, encode_host_operation, encode_host_result, local_hello,
     parse_host_operation, parse_host_result, verify_remote_hello,
@@ -117,7 +98,7 @@ pub fn target_state_root() -> anyhow::Result<PathBuf> {
 
 /// Read-only facts about an execution host (goal plan 03 §6 fields that have
 /// producers today). The remote handshake wave (C08) extends this type with
-/// build identity and supported runtimes when their consumers exist.
+/// release version and supported runtimes when their consumers exist.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostOverview {
     pub product: String,
@@ -191,6 +172,38 @@ fn accepted_control_operation_receipt(
         result: Some(result),
         rejection_code: None,
     })
+}
+
+fn control_operation_receipt(
+    request_operation_id: String,
+    outcome: HostOutcome,
+) -> anyhow::Result<ControlOperationReceipt> {
+    match outcome {
+        HostOutcome::Completed {
+            body: HostCompletionBody::ControlOperationExecuted { result },
+        } => accepted_control_operation_receipt(request_operation_id, result),
+        HostOutcome::Completed { .. } => anyhow::bail!(
+            "{HOST_ERR_OPERATION_INVALID}: the target answered an unexpected completion instead of a ControlOperation result"
+        ),
+        HostOutcome::Failed { code, .. }
+            if matches!(
+                code.as_str(),
+                crate::error_codes::INPUT_INVALID
+                    | crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED
+                    | crate::error_codes::TARGET_IDENTITY_MISMATCH
+                    | crate::error_codes::CONFIG_REVISION_MISMATCH
+                    | crate::error_codes::OPERATION_ID_CONFLICT
+            ) =>
+        {
+            Ok(ControlOperationReceipt {
+                operation_id: request_operation_id,
+                accepted: false,
+                result: None,
+                rejection_code: Some(code),
+            })
+        }
+        HostOutcome::Failed { code, detail } => anyhow::bail!("{code}: {detail}"),
+    }
 }
 
 /// The complete surface a transport exposes to lifecycle use cases.
@@ -326,25 +339,29 @@ impl LocalTarget {
         }
     }
 
-    /// Execute with the target-side journal contract (task C07): a replay of
-    /// an accepted id returns the stored result, the same id with a different
-    /// payload conflicts, and fresh operations are journaled pending before
-    /// dispatch and finalized after. State mutations and delivered control
-    /// operations run under this contract like every other side-effecting kind.
-    pub fn execute_journaled(
+    /// Execute a previously validated operation with the target-side journal
+    /// contract (task C07): a replay of an accepted id returns the stored
+    /// result, the same id with a different payload conflicts, and fresh
+    /// side-effecting operations are journaled pending before dispatch and
+    /// finalized after. Pure reads dispatch directly because replay is
+    /// already harmless and retaining their results would only create journal
+    /// noise.
+    ///
+    /// Validation belongs to the public `ExecutionTarget`/remote wire
+    /// boundaries. Keeping that precondition here avoids re-running the full
+    /// wire validator after a caller has already admitted the operation.
+    pub(crate) fn execute_journaled_validated(
         &self,
         operation: &HostOperation,
         journal: &TargetJournal,
     ) -> anyhow::Result<HostResult> {
-        if let Err(rejection) = operation.validate() {
-            return Ok(HostResult::failed(
-                &operation.operation_id,
-                HOST_ERR_OPERATION_INVALID,
-                format!("{}: {}", rejection.code.as_str(), rejection.detail),
-            ));
-        }
         let store = TargetStateStore::open(journal.root())?;
         let executors = self.executors();
+        if !operation.operation.requires_journal() {
+            return Ok(dispatch_validated_host_operation(
+                operation, &store, &executors,
+            ));
+        }
         journal.run_journaled(operation, |operation| {
             if matches!(
                 &operation.operation,
@@ -371,7 +388,7 @@ impl LocalTarget {
                     );
                 }
             }
-            dispatch_host_operation(operation, &store, &executors)
+            dispatch_validated_host_operation(operation, &store, &executors)
         })
     }
 }
@@ -402,15 +419,11 @@ impl std::fmt::Debug for LocalTarget {
 /// Shared dispatch for validated host operations. [`LocalTarget`] answers
 /// natively with it and the remote exec helper answers through the identical
 /// function after parsing stdin, so both transports cannot drift apart.
-pub(crate) fn dispatch_host_operation(
+fn dispatch_validated_host_operation(
     operation: &HostOperation,
     store: &TargetStateStore,
     executors: &Executors<'_>,
 ) -> HostResult {
-    debug_assert!(
-        operation.validate().is_ok(),
-        "dispatch requires a validated operation"
-    );
     match &operation.operation {
         HostOperationBody::Ping { nonce } => HostResult::completed(
             &operation.operation_id,
@@ -784,7 +797,7 @@ pub(crate) fn dispatch_host_operation(
                                 config_reference: config_reference.clone(),
                                 config_schema: config_schema.clone(),
                                 resources: resources.clone(),
-                                current_build_identity: facts.build_identity.clone(),
+                                current_release: facts.release.clone(),
                                 current_rollback_policy: facts.rollback_policy.clone(),
                             };
                             commit_clean_install(store, &deployment_id, params, operation)
@@ -843,8 +856,8 @@ pub(crate) fn dispatch_host_operation(
                 answer_rollback(operation, store, executors.lifecycle)
                     .unwrap_or_else(|failure| state_failure(operation, &failure))
             }
-            StateMutationPayload::Uninstall { resources } => {
-                answer_uninstall(operation, store, resources, executors.deletion)
+            StateMutationPayload::Uninstall {} => {
+                answer_uninstall(operation, store, executors.deletion)
                     .unwrap_or_else(|failure| state_failure(operation, &failure))
             }
         },
@@ -1023,7 +1036,6 @@ fn answer_update(
 ) -> Result<HostResult, Failure> {
     let StateMutationPayload::Update {
         artifact,
-        rollback_policy,
         backup_precondition,
         config,
         migration_jws,
@@ -1053,10 +1065,10 @@ fn answer_update(
             "the deployment records no current artifact reference; adopt or install it first",
         ));
     };
-    // P1-11: the recorded build identity version is the signed
+    // P1-11: the recorded release version version is the signed
     // anti-downgrade floor for this update.
     let current_version = state
-        .current_build_identity
+        .current_release
         .as_ref()
         .map(|identity| identity.version.clone());
     let data_root = state
@@ -1101,7 +1113,6 @@ fn answer_update(
         current_version: current_version.as_deref(),
         expected_revision,
         artifact,
-        rollback_policy,
         config: config.as_ref(),
         migration_jws: migration_jws.as_deref(),
         migration_request_hash: migration_request_hash.as_deref(),
@@ -1109,6 +1120,10 @@ fn answer_update(
         store,
     };
     match lifecycle.execute_update(&job)? {
+        update_exec::UpdateExecution::Noop { revision } => Ok(HostResult::completed(
+            &operation.operation_id,
+            HostCompletionBody::StateMutateNoop { revision },
+        )),
         update_exec::UpdateExecution::Activated(facts) => Ok(HostResult::completed(
             &operation.operation_id,
             HostCompletionBody::StateMutateApplied {
@@ -1201,7 +1216,6 @@ fn answer_rollback(
 fn answer_uninstall(
     operation: &HostOperation,
     store: &TargetStateStore,
-    resources: &[PlannedResourceDeletion],
     deletion: &Arc<dyn uninstall_exec::DeletionExecutor>,
 ) -> Result<HostResult, Failure> {
     let Some(expected_revision) = operation.expected_revision else {
@@ -1212,20 +1226,14 @@ fn answer_uninstall(
     };
     let deployment_id = operation.deployment_id.clone().unwrap_or_default();
     let state = store.load_existing(&deployment_id)?;
-    for planned in resources {
-        state.exact_managed_deployment_resource(&planned.resource_id)?;
-    }
     let scope_dir = store.scope_dir(&deployment_id)?;
     ensure_scope_dir(&scope_dir)?;
-    let current_artifact = state.artifact.current.clone().unwrap_or_default();
     let job = uninstall_exec::DeletionJob {
         operation_id: &operation.operation_id,
         deployment_id: &deployment_id,
         runtime_kind: state.runtime.kind,
         runtime_object: &state.runtime.object,
-        current_artifact: &current_artifact,
         config_reference: &state.config.reference.clone(),
-        resources,
         declared: &state.resources,
         expected_revision,
         scope_dir: &scope_dir,
@@ -1388,6 +1396,7 @@ fn current_instance_identity(
         "runtime instance public key",
         false,
         MAX_INSTANCE_PUBLIC_KEY_BYTES,
+        state,
     )
     .and_then(|bytes| {
         std::str::from_utf8(bytes.trim_ascii())
@@ -1413,6 +1422,7 @@ fn current_instance_identity(
         "runtime deployment statement",
         false,
         nazo_operator_protocol::MAX_COMPACT_JWS_BYTES as u64,
+        state,
     )
     .and_then(|bytes| {
         std::str::from_utf8(bytes.trim_ascii())
@@ -1431,14 +1441,6 @@ fn current_instance_identity(
     })?;
     if deployment_statement.deployment_id != state.deployment_id
         || deployment_statement.issuer != state.issuer
-        || state
-            .current_build_identity
-            .as_ref()
-            .is_some_and(|identity| {
-                deployment_statement.product != identity.product
-                    || deployment_statement.release != identity.version
-                    || deployment_statement.revision != identity.commit
-            })
     {
         return Err(Failure::new(
             CONTROL_TARGET_DRIFT,
@@ -1468,13 +1470,22 @@ pub(super) fn read_runtime_owned_file(
     label: &str,
     private: bool,
     max_bytes: u64,
+    state: &DeploymentState,
 ) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
     #[cfg(unix)]
     {
-        let runtime_uid = runtime_backend::NON_ROOT_ONE_SHOT_USER
-            .split_once(':')
-            .and_then(|(uid, _)| uid.parse::<u32>().ok())
-            .ok_or_else(|| anyhow::anyhow!("runtime UID policy is invalid"))?;
+        let runtime_uid = match state.runtime.kind {
+            runtime_backend::RuntimeBackendKind::Host => {
+                runtime_backend::systemd_service_user_uid(&state.deployment_id)?
+            }
+            runtime_backend::RuntimeBackendKind::Podman
+            | runtime_backend::RuntimeBackendKind::Docker => {
+                runtime_backend::NON_ROOT_ONE_SHOT_USER
+                    .split_once(':')
+                    .and_then(|(uid, _)| uid.parse::<u32>().ok())
+                    .ok_or_else(|| anyhow::anyhow!("runtime UID policy is invalid"))?
+            }
+        };
         crate::filesystem::read_secure_regular_file_for_uid(
             path,
             label,
@@ -1485,6 +1496,7 @@ pub(super) fn read_runtime_owned_file(
     }
     #[cfg(not(unix))]
     {
+        let _ = state;
         crate::filesystem::read_secure_regular_file(path, label, private, max_bytes)
     }
 }
@@ -1519,7 +1531,7 @@ fn inspection_from_state(
         // The discovery sweep never reads the marker: it is a per-deployment
         // fact that only the dedicated inspect kind surfaces.
         config_revision_marker: None,
-        current_build_identity: state.current_build_identity,
+        current_release: state.current_release,
         current_instance_identity: None,
     })
 }
@@ -1582,7 +1594,7 @@ fn answer_inspect(
                     .as_ref()
                     .map(|active| active.operation_id.clone()),
                 config_revision_marker,
-                current_build_identity: state.current_build_identity.clone(),
+                current_release: state.current_release.clone(),
                 current_instance_identity,
             },
         },
@@ -1704,10 +1716,8 @@ impl ExecutionTarget for LocalTarget {
         // same validation the remote helper answers with — no cache, no
         // Registry shortcut (F01 boundary: the Registry cannot mutate or
         // impersonate target state).
-        let store = TargetStateStore::open(&self.state_root)?;
-        let executors = self.executors();
         let operation = HostOperation::state_inspect(Uuid::now_v7().to_string(), deployment_id);
-        match dispatch_host_operation(&operation, &store, &executors).outcome {
+        match self.execute_host_operation(&operation)?.outcome {
             HostOutcome::Completed {
                 body: HostCompletionBody::StateInspect { inspection },
             } => Ok(inspection),
@@ -1720,7 +1730,7 @@ impl ExecutionTarget for LocalTarget {
         // Mirror the remote executor's admission order (parse → validate →
         // dispatch) so local and remote targets accept the same inputs.
         // [`HostOperation::validate`] owns every semantic rule, including
-        // per-kind payload constraints; [`dispatch_host_operation`] stays
+        // per-kind payload constraints; [`dispatch_validated_host_operation`] stays
         // mechanical and shared with the remote helper.
         if let Err(rejection) = operation.validate() {
             return Ok(HostResult::failed(
@@ -1748,29 +1758,26 @@ impl ExecutionTarget for LocalTarget {
                 | HostOperationBody::BackupImportFinalize { .. }
                 | HostOperationBody::BackupOffHostRecord { .. }
                 | HostOperationBody::BackupTransferCleanup { .. }
+                | HostOperationBody::ControlOperation { .. }
         ) {
             let journal = TargetJournal::open(&self.state_root)?;
-            return self.execute_journaled(operation, &journal);
+            return self.execute_journaled_validated(operation, &journal);
         }
         let store = TargetStateStore::open(&self.state_root)?;
         let executors = self.executors();
-        Ok(dispatch_host_operation(operation, &store, &executors))
+        Ok(dispatch_validated_host_operation(
+            operation, &store, &executors,
+        ))
     }
 
     fn execute_control_operation(
         &self,
         request: ControlOperationRequest,
     ) -> anyhow::Result<ControlOperationReceipt> {
-        use control_exec::CONTROL_OUTCOME_UNKNOWN;
         // The delivered envelope rides the SAME frozen stdio/journal path as
         // every other kind (decision 1): validated, journaled, dispatched to
         // the local one-shot NazoAuth operator.  The JWS is public; the
         // optional Apply material remains an opaque, zeroizing carrier.
-        if request.deployment_id.is_empty() {
-            anyhow::bail!(
-                "{HOST_ERR_OPERATION_INVALID}: control operations require a deployment binding"
-            );
-        }
         let request_operation_id = request.operation_id.clone();
         let operation = HostOperation::control_operation(
             request.operation_id,
@@ -1778,37 +1785,8 @@ impl ExecutionTarget for LocalTarget {
             request.compact_jws,
             request.change_set,
         );
-        let journal = TargetJournal::open(&self.state_root)?;
-        let result = self.execute_journaled(&operation, &journal)?;
-        match result.outcome {
-            HostOutcome::Completed {
-                body:
-                    HostCompletionBody::ControlOperationExecuted {
-                        result: control_result,
-                    },
-            } => accepted_control_operation_receipt(request_operation_id, control_result),
-            HostOutcome::Completed { .. } => {
-                anyhow::bail!(
-                    "{HOST_ERR_OPERATION_INVALID}: the target answered an unexpected completion \
-                     instead of a ControlOperation result"
-                )
-            }
-            HostOutcome::Failed { code, detail } => {
-                if code == CONTROL_OUTCOME_UNKNOWN || detail.contains(CONTROL_OUTCOME_UNKNOWN) {
-                    // The operator may have executed; only a resumed resend of
-                    // the same envelope can resolve the outcome.
-                    anyhow::bail!("{code}: {detail}")
-                }
-                // Admission-grade refusal before acceptance: no side effect
-                // can have happened, so a corrected retry may mint a new id.
-                Ok(ControlOperationReceipt {
-                    operation_id: request_operation_id,
-                    accepted: false,
-                    result: None,
-                    rejection_code: Some(code),
-                })
-            }
-        }
+        let result = self.execute_host_operation(&operation)?;
+        control_operation_receipt(request_operation_id, result.outcome)
     }
 
     fn read_health(&self, deployment_id: &str) -> anyhow::Result<HealthSnapshot> {
@@ -1821,7 +1799,6 @@ impl ExecutionTarget for LocalTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error_codes::OPERATION_ID_CONFLICT;
     use crate::filesystem::PrivateTempDir;
 
     fn temp_target() -> anyhow::Result<(PrivateTempDir, LocalTarget, TargetJournal)> {
@@ -1912,7 +1889,7 @@ mod tests {
                         ResourceScope::Deployment,
                     )?,
                 ],
-                current_build_identity: None,
+                current_release: None,
                 current_rollback_policy: crate::model::test_release_rollback_policy(),
             },
             &Uuid::now_v7().to_string(),
@@ -2013,37 +1990,6 @@ mod tests {
     }
 
     #[test]
-    fn operator_oci_artifact_fence_is_exact_and_absent_for_host_binaries() {
-        let mut environment = BTreeMap::new();
-        inject_operator_oci_artifact_fence(
-            &mut environment,
-            &runtime_backend::ArtifactReference::Oci {
-                image_reference: "registry.example/nazoauth".to_owned(),
-                digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .to_owned(),
-            },
-        );
-        assert_eq!(
-            environment
-                .get(OPERATOR_OCI_IMAGE_DIGEST_ENV)
-                .map(String::as_str),
-            Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-        );
-        assert_eq!(environment.len(), 1);
-
-        let mut host_environment = BTreeMap::new();
-        inject_operator_oci_artifact_fence(
-            &mut host_environment,
-            &runtime_backend::ArtifactReference::HostBinary {
-                path: PathBuf::from("/opt/nazoauth"),
-                sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .to_owned(),
-            },
-        );
-        assert!(host_environment.is_empty());
-    }
-
-    #[test]
     fn backup_import_refuses_a_receipt_for_a_different_destination_target() -> anyhow::Result<()> {
         let (_temp, target, _) = temp_target()?;
         let operation = HostOperation::backup_import_finalize(
@@ -2063,28 +2009,38 @@ mod tests {
     }
 
     #[test]
-    fn journaled_execution_replays_and_conflicts_through_local_target() -> anyhow::Result<()> {
+    fn read_only_execution_does_not_use_the_local_journal() -> anyhow::Result<()> {
         let temp = crate::filesystem::PrivateTempDir::new("nazauthctl-local-journaled")?;
         let journal = TargetJournal::open(temp.path().join("state"))?;
         let target = LocalTarget::with_state_root(temp.path().join("state"));
 
         let operation = HostOperation::ping(Uuid::now_v7().to_string(), "journaled");
-        let first = target.execute_journaled(&operation, &journal)?;
-        let second = target.execute_journaled(&operation, &journal)?;
-        assert_eq!(first, second, "replay returns the stored result");
+        let first = target.execute_journaled_validated(&operation, &journal)?;
+        let second = target.execute_journaled_validated(&operation, &journal)?;
+        assert_eq!(first, second, "a repeated read returns the same answer");
 
-        let mut conflict: HostOperation = serde_json::from_slice(
+        let mut changed: HostOperation = serde_json::from_slice(
             &serde_json::to_vec(&operation).expect("serialize public test operation"),
         )
         .expect("deserialize public test operation");
-        conflict.operation = HostOperationBody::Ping {
+        changed.operation = HostOperationBody::Ping {
             nonce: "different".to_owned(),
         };
-        let result = target.execute_journaled(&conflict, &journal)?;
-        let HostOutcome::Failed { code, .. } = result.outcome else {
-            panic!("expected the conflict outcome");
-        };
-        assert_eq!(code, OPERATION_ID_CONFLICT);
+        let result = target.execute_journaled_validated(&changed, &journal)?;
+        assert_eq!(
+            result.outcome,
+            HostOutcome::Completed {
+                body: HostCompletionBody::Ping {
+                    nonce: "different".to_owned(),
+                },
+            }
+        );
+        assert!(
+            !journal
+                .root()
+                .join("deployments/host/operations.jsonl")
+                .exists()
+        );
         Ok(())
     }
 
@@ -2128,7 +2084,7 @@ mod tests {
                         ResourceOwnership::Managed,
                         ResourceScope::Deployment,
                     )?],
-                    current_build_identity: Some(BuildIdentity::new("nazoauth", "v1", "commit")?),
+                    current_release: Some(ReleaseVersion::new("v1")?),
                     current_rollback_policy: crate::model::test_release_rollback_policy(),
                 },
                 &Uuid::now_v7().to_string(),
@@ -2147,15 +2103,10 @@ mod tests {
             Uuid::now_v7().to_string(),
             "deploy-alpha",
             Some(1),
-            StateMutationPayload::Uninstall {
-                resources: vec![PlannedResourceDeletion {
-                    resource_id: "app-data".to_owned(),
-                    locator: "/var/lib/nazoauth/deploy-alpha".to_owned(),
-                }],
-            },
+            StateMutationPayload::Uninstall {},
         );
         let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = target.execute_journaled(&operation, &journal);
+            let _ = target.execute_journaled_validated(&operation, &journal);
         }));
         assert!(crashed.is_err());
 
@@ -2164,7 +2115,7 @@ mod tests {
         crate::filesystem::atomic_write(&state_path, &pre_uninstall_state, 0o600)
             .map_err(|error| anyhow::anyhow!("restore crash-window state: {error}"))?;
         let replay = target
-            .execute_journaled(&operation, &journal)
+            .execute_journaled_validated(&operation, &journal)
             .map_err(|error| anyhow::anyhow!("resume crash-window uninstall: {error}"))?;
         assert!(matches!(replay.outcome, HostOutcome::Completed { .. }));
         assert!(!state_path.exists());
@@ -2178,11 +2129,9 @@ mod tests {
             Uuid::now_v7().to_string(),
             "deploy-alpha",
             Some(1),
-            StateMutationPayload::Uninstall {
-                resources: Vec::new(),
-            },
+            StateMutationPayload::Uninstall {},
         );
-        let rejected = target.execute_journaled(&fresh_unknown, &journal)?;
+        let rejected = target.execute_journaled_validated(&fresh_unknown, &journal)?;
         assert!(matches!(
             rejected.outcome,
             HostOutcome::Failed { ref code, .. } if code == DEPLOYMENT_UNKNOWN
@@ -2200,7 +2149,7 @@ mod tests {
         )
         .map_err(|error| anyhow::anyhow!("remove bounded journal history: {error}"))?;
         let ancient_replay = target
-            .execute_journaled(&operation, &journal)
+            .execute_journaled_validated(&operation, &journal)
             .map_err(|error| anyhow::anyhow!("replay ancient uninstall: {error}"))?;
         assert!(matches!(
             ancient_replay.outcome,
@@ -2283,7 +2232,9 @@ mod tests {
                     schema: "nazauth-config-v2".to_owned(),
                 },
             );
-            target.execute_journaled(&operation, &journal).unwrap()
+            target
+                .execute_journaled_validated(&operation, &journal)
+                .unwrap()
         };
 
         // Stale expectation: never last-write-wins.
@@ -2320,36 +2271,13 @@ mod tests {
     #[test]
     fn artifact_only_adoption_fails_without_a_verified_release_policy() -> anyhow::Result<()> {
         let (_temp, target, journal) = temp_target()?;
-        let first = target.execute_journaled(&sample_bootstrap("deploy-alpha"), &journal)?;
+        let first =
+            target.execute_journaled_validated(&sample_bootstrap("deploy-alpha"), &journal)?;
         let HostOutcome::Failed { code, detail } = first.outcome else {
             panic!("artifact-only adoption unexpectedly succeeded");
         };
         assert_eq!(code, ARTIFACT_UNVERIFIED, "{detail}");
         assert!(detail.contains("rollback policy"), "{detail}");
-        Ok(())
-    }
-
-    #[test]
-    fn ownership_delete_guard_is_enforced_against_concrete_facts() -> anyhow::Result<()> {
-        let (_temp, _target, journal) = temp_target()?;
-        seed_sample_deployment(&journal, "deploy-alpha")?;
-        let store = TargetStateStore::open(journal.root())?;
-        let state = store.load_existing("deploy-alpha")?;
-
-        // managed + deployment: the only deletable classification.
-        let managed = state.exact_managed_deployment_resource("app-data")?;
-        assert_eq!(managed.locator, "/var/lib/nazoauth/deploy-alpha");
-
-        for (resource_id, expected_code) in [
-            ("shared-db", EXTERNAL_RESOURCE_PROTECTED),
-            ("backup-volume", EXTERNAL_RESOURCE_PROTECTED),
-            ("ghost-resource", RESOURCE_UNKNOWN),
-        ] {
-            let failure = state
-                .exact_managed_deployment_resource(resource_id)
-                .expect_err(resource_id);
-            assert_eq!(failure.code, expected_code, "{}: {failure:?}", resource_id);
-        }
         Ok(())
     }
 
@@ -2523,8 +2451,6 @@ mod tests {
             runtime_instance_id: "runtime-alpha".to_owned(),
             issuer: "https://auth.example.com".to_owned(),
             release: "1.0.0".to_owned(),
-            revision: "abcdef0".to_owned(),
-            build_id: "build-1".to_owned(),
             control_protocol_versions: vec![nazo_operator_protocol::CONTROL_DISCOVERY_SCHEMA],
             operator_protocol_versions: vec![nazo_operator_protocol::PROTOCOL_VERSION],
             instance_key_id: key_id.clone(),
@@ -2565,11 +2491,7 @@ mod tests {
                     ResourceOwnership::Managed,
                     ResourceScope::Deployment,
                 )?],
-                current_build_identity: Some(BuildIdentity::new(
-                    nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT,
-                    "1.0.0",
-                    "abcdef0",
-                )?),
+                current_release: Some(ReleaseVersion::new("1.0.0")?),
                 current_rollback_policy: crate::model::test_release_rollback_policy(),
             },
             "bootstrap-op",
@@ -2582,6 +2504,11 @@ mod tests {
             identity.instance_public_key_base64,
             nazo_operator_protocol::encode_instance_public_key(&public_key)
         );
+
+        state.current_release = Some(ReleaseVersion::new("2.0.0")?);
+        let after_update =
+            current_instance_identity(&state)?.expect("runtime identity after update");
+        assert_eq!(after_update, identity);
 
         let explicit_dir = temp.path().join("explicit-identity");
         crate::filesystem::ensure_private_directory(&explicit_dir, "explicit runtime identity")?;

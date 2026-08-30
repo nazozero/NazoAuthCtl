@@ -98,13 +98,12 @@ fn require_label(
 }
 
 fn parse_list(values: &[String]) -> anyhow::Result<ControllerCommand> {
-    let common = parse_common(values.to_vec(), &[], &[], "controller list")?;
-    if common.approval_token.is_some() {
-        bail!("controller list does not accept --approval-token");
-    }
+    let parts = selector_parts(values, &[], &[], "controller list")?;
     Ok(ControllerCommand::List {
-        selector: common.selector,
-        admin_access_file: common.admin_access_file,
+        selector: InstanceSelector {
+            positional: parts.positional,
+            named: parts.named,
+        },
     })
 }
 
@@ -135,7 +134,7 @@ fn parse_revoke(values: &[String]) -> anyhow::Result<ControllerCommand> {
     let parts = selector_parts(
         values,
         &["--approval-token", "--admin-access-file"],
-        &["--yes"],
+        &[],
         "controller revoke",
     )?;
     let controller_id = parts
@@ -143,16 +142,12 @@ fn parse_revoke(values: &[String]) -> anyhow::Result<ControllerCommand> {
         .clone()
         .with_context(|| "controller revoke requires the exact <controller-id>")?;
     checked_name("--controller-id", &controller_id)?;
-    if !parts.flags.contains("--yes") {
-        bail!("controller revoke is destructive and requires --yes");
-    }
     Ok(ControllerCommand::Revoke {
         selector: InstanceSelector {
             positional: None,
             named: parts.named,
         },
         controller_id,
-        yes: true,
         approval_token: parts.values.get("--approval-token").cloned(),
         admin_access_file: parts.values.get("--admin-access-file").map(PathBuf::from),
     })
@@ -203,4 +198,32 @@ fn parse_recover(values: &[String]) -> anyhow::Result<ControllerCommand> {
         admin_access_file: common.admin_access_file,
         output_secret_file,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_accepts_only_an_instance_selector() {
+        assert!(parse_list(&["production".to_owned()]).is_ok());
+        assert!(
+            parse_list(&[
+                "--instance".to_owned(),
+                "production".to_owned(),
+                "--admin-access-file".to_owned(),
+                "access.json".to_owned(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_list(&[
+                "--instance".to_owned(),
+                "production".to_owned(),
+                "--approval-token".to_owned(),
+                "token".to_owned(),
+            ])
+            .is_err()
+        );
+    }
 }

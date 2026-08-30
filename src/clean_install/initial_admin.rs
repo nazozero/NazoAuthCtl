@@ -177,7 +177,7 @@ impl BootstrapMaterialSource for LocalBootstrapMaterial {
         // The token is the SERVER-generated one inside the deployment's data
         // root; ctl only reads it while the capability is open.
         Ok(BootstrapClaimMaterial {
-            token: Zeroizing::new(bootstrap_authority::read_server_token(&context)?),
+            token: Zeroizing::new(bootstrap_authority::read_server_token(&context, &state)?),
             install_operation_id: context.install_operation_id,
         })
     }
@@ -466,7 +466,7 @@ mod tests {
                 .bootstrap(
                     &deployment_id,
                     crate::target::BootstrapParams {
-                        current_build_identity: None,
+                        current_release: None,
                         current_rollback_policy: crate::model::test_release_rollback_policy(),
                         issuer: ISSUER.to_owned(),
                         runtime: crate::target::RuntimeSurface::new("podman", "nazoauth-x", 8000)?,

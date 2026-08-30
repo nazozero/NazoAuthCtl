@@ -171,48 +171,6 @@ impl StagedConfig {
     }
 }
 
-/// One concrete resource deletion planned by an uninstall (G06). The pair is
-/// re-confirmed against the live DeploymentState on the target before any
-/// destructive step; a mismatch fails closed.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlannedResourceDeletion {
-    pub resource_id: String,
-    /// Exact locator copied from the plan; must equal the declared locator.
-    pub locator: String,
-}
-
-impl PlannedResourceDeletion {
-    pub fn validate(&self) -> Result<(), super::wire::MessageRejection> {
-        let token = |value: &str, max: usize| {
-            !value.is_empty()
-                && value.chars().count() <= max
-                && value
-                    .chars()
-                    .all(|character| character.is_ascii_graphic() && character != ' ')
-        };
-        if !token(&self.resource_id, 128) {
-            return Err(super::wire::MessageRejection::new(
-                super::wire::RejectionCode::OperationMalformed,
-                "uninstall resource_id must be a bounded single-line identifier",
-            ));
-        }
-        if self.locator.is_empty()
-            || self.locator.len() > 512
-            || self
-                .locator
-                .chars()
-                .any(|character| character.is_whitespace() || character.is_control())
-        {
-            return Err(super::wire::MessageRejection::new(
-                super::wire::RejectionCode::OperationMalformed,
-                "uninstall resource locator must be a single-line reference",
-            ));
-        }
-        Ok(())
-    }
-}
-
 /// The typed payload carrying everything the target needs to execute one
 /// clean install (G01). Rides inside the `Bootstrap` state mutation, so the
 /// C07 journal binds the exact order to the operation id via its canonical
@@ -695,12 +653,11 @@ pub(crate) struct InstallJob<'a> {
 
 /// What a completed install reports back to the dispatcher: the content-
 /// addressed digest handle recorded into `DeploymentState.artifact.current`
-/// plus the verified manifest's embedded build identity facts (the G03
-/// ControlOperation envelope binding source).
+/// plus the verified manifest's release version for update ordering.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InstallFacts {
     pub artifact_reference: String,
-    pub build_identity: Option<super::deployment_state::BuildIdentity>,
+    pub release: Option<super::deployment_state::ReleaseVersion>,
     pub rollback_policy: crate::model::ReleaseRollbackPolicy,
 }
 
@@ -892,10 +849,14 @@ impl HostInstallExecutor {
         atomic_write(&config_path, content_bytes, 0o600)
             .map_err(|error| Failure::new(CONFIG_INVALID, sanitize(error.to_string())))?;
         performed.wrote_config = true;
+        let rootless_podman = kind == RuntimeBackendKind::Podman
+            && path_is_owned_by_non_root(&config_path).map_err(|error| {
+                Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
+            })?;
         // The container reads this file as the image's fixed runtime UID;
         // bind mounts keep host ownership, so hand it over group-readable.
         if kind.is_container() {
-            set_runtime_identity(&config_path, false)?;
+            set_runtime_identity(&config_path, false, rootless_podman)?;
         }
         // P1-1: the deletion credential for the uninstall executor — proves
         // ctl created this exact file during install.
@@ -996,9 +957,9 @@ impl HostInstallExecutor {
                 }
             }
             if kind.is_container() {
-                set_runtime_identity(&path, false)?;
+                set_runtime_identity(&path, false, rootless_podman)?;
                 if let Some(parent) = path.parent() {
-                    set_runtime_identity_directory(parent)?;
+                    set_runtime_identity_directory(parent, rootless_podman)?;
                 }
             }
             performed.generated_secrets.push(secret.path.clone());
@@ -1022,7 +983,7 @@ impl HostInstallExecutor {
             import_current_data(Path::new(&import.source_data_root), &data_root)?;
         }
         if kind.is_container() {
-            set_runtime_identity_directory_data(&data_root)?;
+            set_runtime_identity_directory_data(&data_root, rootless_podman)?;
         }
 
         // 4. Fresh-install application setup (G02 hook): the install-binding
@@ -1052,7 +1013,7 @@ impl HostInstallExecutor {
         if kind.is_container() {
             // The marker is bind-mounted into the container, whose tasks read
             // it as the fixed non-root identity (see set_runtime_identity).
-            set_runtime_identity(&revision_marker, false)?;
+            set_runtime_identity(&revision_marker, false, rootless_podman)?;
         }
 
         // 6. Start the runtime and confirm it serves the verified artifact.
@@ -1071,7 +1032,7 @@ impl HostInstallExecutor {
 
         Ok(InstallFacts {
             artifact_reference: format!("sha256:{subject_digest}"),
-            build_identity: verified.build_identity,
+            release: verified.release,
             rollback_policy: verified.rollback_policy,
         })
     }
@@ -1348,14 +1309,7 @@ fn start_systemd_runtime(
         }
     };
     let binary = PathBuf::from(runtime_root).join("nazoauth");
-    let service_user = format!(
-        "nazoauth-{}",
-        job.deployment_id
-            .trim_start_matches("deploy-")
-            .chars()
-            .take(12)
-            .collect::<String>()
-    );
+    let service_user = runtime_backend::systemd_service_user(job.deployment_id);
     let secret_paths = job
         .order
         .secrets
@@ -1420,9 +1374,12 @@ fn start_systemd_runtime(
         private_mounts: false,
         stdin: Vec::new(),
     };
-    backend
-        .run_one_shot(&task)
-        .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
+    backend.run_one_shot(&task).map_err(|error| {
+        Failure::new(
+            RUNTIME_START_FAILED,
+            sanitize(format!("schema migration failed: {error}")),
+        )
+    })?;
     backend
         .start(&job.runtime.object)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
@@ -1533,22 +1490,43 @@ fn run_schema_migration(
         private_mounts: false,
         stdin: Vec::new(),
     };
-    backend
-        .run_one_shot(&task)
-        .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
+    backend.run_one_shot(&task).map_err(|error| {
+        Failure::new(
+            RUNTIME_START_FAILED,
+            sanitize(format!("schema migration failed: {error}")),
+        )
+    })?;
     Ok(())
 }
 
-/// The official NazoAuth image runs as the fixed non-root identity
-/// `10001:10001` (`NON_ROOT_ONE_SHOT_USER`). OCI bind mounts retain host
-/// ownership, so files handed to the runtime must be group-readable by that
-/// exact identity: `root:<uid>` mode 0440, matching the production layout.
 #[cfg(unix)]
-fn set_runtime_identity(path: &Path, _directory: bool) -> Result<(), Failure> {
+pub(super) fn path_is_owned_by_non_root(path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    Ok(fs::metadata(path)?.uid() != 0)
+}
+
+#[cfg(not(unix))]
+pub(super) fn path_is_owned_by_non_root(_path: &Path) -> std::io::Result<bool> {
+    Ok(false)
+}
+
+/// Rootful container deployments hand read-only files to `root:10001` mode
+/// 0440. Rootless Podman maps the calling host user to container UID 10001,
+/// so the same files remain caller-owned and mode 0400.
+#[cfg(unix)]
+pub(super) fn set_runtime_identity(
+    path: &Path,
+    _directory: bool,
+    preserve_owner: bool,
+) -> Result<(), Failure> {
     use std::os::unix::fs::{PermissionsExt as _, chown};
     let apply = || -> std::io::Result<()> {
-        chown(path, Some(0), Some(10_001))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o440))
+        if preserve_owner {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))
+        } else {
+            chown(path, Some(0), Some(10_001))?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o440))
+        }
     };
     apply().map_err(|error| {
         Failure::new(
@@ -1566,7 +1544,10 @@ fn set_runtime_identity(path: &Path, _directory: bool) -> Result<(), Failure> {
 /// and generated secret files. Recursive because ctl pre-creates nested
 /// directories (e.g. the secrets directory) as root.
 #[cfg(unix)]
-fn set_runtime_identity_directory_data(path: &Path) -> Result<(), Failure> {
+pub(super) fn set_runtime_identity_directory_data(
+    path: &Path,
+    preserve_owner: bool,
+) -> Result<(), Failure> {
     use std::os::unix::fs::{PermissionsExt as _, lchown};
     let mut stack = vec![path.to_path_buf()];
     while let Some(node) = stack.pop() {
@@ -1600,15 +1581,17 @@ fn set_runtime_identity_directory_data(path: &Path) -> Result<(), Failure> {
             ));
         }
 
-        lchown(&node, Some(10_001), Some(10_001)).map_err(|error| {
-            Failure::new(
-                HOST_ERR_OPERATION_INVALID,
-                sanitize(format!(
-                    "failed to grant runtime ownership of {}: {error}",
-                    node.display()
-                )),
-            )
-        })?;
+        if !preserve_owner {
+            lchown(&node, Some(10_001), Some(10_001)).map_err(|error| {
+                Failure::new(
+                    HOST_ERR_OPERATION_INVALID,
+                    sanitize(format!(
+                        "failed to grant runtime ownership of {}: {error}",
+                        node.display()
+                    )),
+                )
+            })?;
+        }
         if is_directory {
             fs::set_permissions(&node, fs::Permissions::from_mode(0o700)).map_err(|error| {
                 Failure::new(
@@ -1638,11 +1621,21 @@ fn set_runtime_identity_directory_data(path: &Path) -> Result<(), Failure> {
 /// Read-only secrets directory: the runtime UID needs traverse (`x`) to open
 /// the files beneath it, but never write access.
 #[cfg(unix)]
-fn set_runtime_identity_directory(path: &Path) -> Result<(), Failure> {
+pub(super) fn set_runtime_identity_directory(
+    path: &Path,
+    preserve_owner: bool,
+) -> Result<(), Failure> {
     use std::os::unix::fs::{PermissionsExt as _, chown};
     let apply = || -> std::io::Result<()> {
-        chown(path, Some(0), Some(10_001))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o750))
+        if preserve_owner {
+            // The bind mount is read-only inside the container. Keep host-side
+            // owner write permission so ctl can finish provisioning and roll
+            // back a later failure without elevated privileges.
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        } else {
+            chown(path, Some(0), Some(10_001))?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o750))
+        }
     };
     apply().map_err(|error| {
         Failure::new(
@@ -1656,17 +1649,27 @@ fn set_runtime_identity_directory(path: &Path) -> Result<(), Failure> {
 }
 
 #[cfg(not(unix))]
-fn set_runtime_identity(_path: &Path, _directory: bool) -> Result<(), Failure> {
+pub(super) fn set_runtime_identity(
+    _path: &Path,
+    _directory: bool,
+    _preserve_owner: bool,
+) -> Result<(), Failure> {
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_runtime_identity_directory_data(_path: &Path) -> Result<(), Failure> {
+pub(super) fn set_runtime_identity_directory_data(
+    _path: &Path,
+    _preserve_owner: bool,
+) -> Result<(), Failure> {
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_runtime_identity_directory(_path: &Path) -> Result<(), Failure> {
+pub(super) fn set_runtime_identity_directory(
+    _path: &Path,
+    _preserve_owner: bool,
+) -> Result<(), Failure> {
     Ok(())
 }
 
@@ -1918,6 +1921,34 @@ mod current_data_import_tests {
 
     #[cfg(unix)]
     #[test]
+    fn rootless_runtime_identity_preserves_owner_and_ctl_write_access() -> anyhow::Result<()> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let temp = crate::filesystem::PrivateTempDir::new("rootless-runtime-identity")?;
+        let directory = temp.path().join("secrets");
+        fs::create_dir(&directory)?;
+        let file = directory.join("secret");
+        fs::write(&file, b"secret")?;
+        let original_uid = fs::metadata(&file)?.uid();
+
+        set_runtime_identity(&file, false, true)
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        set_runtime_identity_directory(&directory, true)
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+
+        assert_eq!(fs::metadata(&file)?.uid(), original_uid);
+        assert_eq!(fs::metadata(&file)?.permissions().mode() & 0o7777, 0o400);
+        assert_eq!(
+            fs::metadata(&directory)?.permissions().mode() & 0o7777,
+            0o700
+        );
+        fs::write(directory.join("later-secret"), b"later")?;
+        fs::remove_file(&file)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn runtime_data_ownership_covers_nested_files_without_changing_file_modes() -> anyhow::Result<()>
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, chown, symlink};
@@ -1938,7 +1969,7 @@ mod current_data_import_tests {
             Err(error) => return Err(error.into()),
         }
 
-        set_runtime_identity_directory_data(&root)
+        set_runtime_identity_directory_data(&root, false)
             .map_err(|failure| anyhow::anyhow!(failure.detail))?;
 
         let root_metadata = fs::metadata(&root)?;
@@ -1959,7 +1990,7 @@ mod current_data_import_tests {
         let outside_before = fs::metadata(&outside)?;
         let link = nested.join("link");
         symlink(&outside, &link)?;
-        assert!(set_runtime_identity_directory_data(&root).is_err());
+        assert!(set_runtime_identity_directory_data(&root, false).is_err());
         let outside_after = fs::metadata(&outside)?;
         assert_eq!(outside_after.uid(), outside_before.uid());
         assert_eq!(outside_after.gid(), outside_before.gid());

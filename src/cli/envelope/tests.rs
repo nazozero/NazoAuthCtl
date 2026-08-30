@@ -27,12 +27,12 @@ fn text_envelope_covers_the_stable_codes() {
         crate::error_codes::INSTANCE_AMBIGUOUS,
         crate::error_codes::STATE_RESET_REQUIRED,
         crate::error_codes::CONTROL_BINDING_REQUIRED,
-        crate::error_codes::CONTROLLER_KEY_EXPIRED,
+        crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED,
         crate::error_codes::CONTROLLER_SLOT_LIMIT,
+        crate::error_codes::ADMIN_ACCESS_REQUIRED,
         crate::error_codes::OPERATION_ID_CONFLICT,
         crate::error_codes::CONFIG_REVISION_MISMATCH,
         crate::error_codes::TARGET_IDENTITY_MISMATCH,
-        crate::error_codes::EXTERNAL_RESOURCE_PROTECTED,
     ] {
         let rendered = render(code, false);
         assert!(rendered.starts_with("action:"), "{rendered}");
@@ -68,14 +68,14 @@ fn json_envelope_carries_every_field() {
         crate::error_codes::SSH_AUTH_FAILED,
         crate::error_codes::REMOTE_HELPER_MISMATCH,
         crate::error_codes::INSTANCE_AMBIGUOUS,
-        crate::error_codes::CONTROLLER_KEY_EXPIRED,
+        crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED,
         crate::error_codes::OPERATION_ID_CONFLICT,
         crate::error_codes::STATE_RESET_REQUIRED,
         crate::error_codes::CONTROL_BINDING_REQUIRED,
         crate::error_codes::CONTROLLER_SLOT_LIMIT,
+        crate::error_codes::ADMIN_ACCESS_REQUIRED,
         crate::error_codes::CONFIG_REVISION_MISMATCH,
         crate::error_codes::TARGET_IDENTITY_MISMATCH,
-        crate::error_codes::EXTERNAL_RESOURCE_PROTECTED,
     ] {
         let rendered = render(code, true);
         let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");

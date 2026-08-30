@@ -44,6 +44,16 @@ pub(crate) use recovery::{cleanup_recovery_candidate, stage_recovery_candidate};
 pub const NON_ROOT_ONE_SHOT_USER: &str = "10001:10001";
 pub(crate) const VALKEY_RESTORE_CHECK_RESOURCE_KIND: &str = "valkey-restore-check";
 
+pub(crate) fn append_cosign_sandbox(process: Process) -> Process {
+    process
+        .args(["--user", NON_ROOT_ONE_SHOT_USER])
+        .arg("--cap-drop=ALL")
+        .args(["--read-only", "--security-opt=no-new-privileges"])
+        .args(["--pids-limit", "64", "--memory", "256m", "--cpus", "1"])
+        .args(["--env", "HOME=/tmp/cosign-home", "--tmpfs"])
+        .arg("/tmp/cosign-home:rw,noexec,nosuid,nodev,size=16m")
+}
+
 pub(crate) fn valkey_restore_check_config_digest(
     restore: &ManagedValkeyRestore,
     volume: &str,
@@ -66,7 +76,9 @@ pub(crate) fn valkey_restore_check_config_digest(
 mod tests {
     use std::fs;
 
-    use crate::runtime_backend::{ManagedDependencyBackup, managed_dependency_identity};
+    use crate::runtime_backend::{
+        ArtifactReference, ManagedDependencyBackup, OneShotTask, managed_dependency_identity,
+    };
     use crate::{
         filesystem::PrivateTempDir, process::Process, runtime_backend::ManagedNetwork,
         test_support::write_shell_executable,
@@ -175,8 +187,8 @@ mod tests {
     }
 
     #[test]
-    fn build_identity_policy_is_closed_before_the_image_positional() {
-        let work = PrivateTempDir::new("runtime-build-identity-order").unwrap();
+    fn hardened_one_shot_policy_is_closed_before_the_image_positional() {
+        let work = PrivateTempDir::new("runtime-one-shot-order").unwrap();
         let engine = work.path().join("fake-engine");
         let arguments = work.path().join("arguments");
         write_shell_executable(
@@ -185,11 +197,11 @@ mod tests {
         );
         let image = "example.invalid/nazoauth@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-        super::build_identity_process(engine.as_os_str())
+        super::hardened_one_shot_process(engine.as_os_str())
             .args(["--network", "none"])
             .arg(image)
             .arg("nazoauth")
-            .arg("build-identity")
+            .arg("release-identity")
             .run_quiet()
             .unwrap();
 
@@ -201,10 +213,64 @@ mod tests {
             .unwrap();
         let image = arguments
             .iter()
-            .position(|argument| *argument == image)
-            .unwrap();
+            .position(|argument| argument.starts_with(&format!("{image}@sha256:")))
+            .unwrap_or_else(|| panic!("one-shot image is absent from {arguments:?}"));
         assert!(policy < image);
         assert!(!arguments.contains(&"ALL"));
+    }
+
+    #[test]
+    fn one_shot_host_gateway_mapping_precedes_the_image() {
+        let work = PrivateTempDir::new("runtime-one-shot-host-gateway").unwrap();
+        let engine = work.path().join("fake-engine");
+        let arguments = work.path().join("arguments");
+        write_shell_executable(
+            &engine,
+            &format!("printf '%s\\n' \"$@\" > '{}'", arguments.display()),
+        );
+        let image = format!("sha256:{}", "a".repeat(64));
+        let digest = image.clone();
+        let task = OneShotTask {
+            artifact: ArtifactReference::Oci {
+                image_reference: image.clone(),
+                digest,
+            },
+            command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
+            network: Some("bridge".to_owned()),
+            mounts: Vec::new(),
+            environment: std::collections::BTreeMap::new(),
+            working_directory: None,
+            service_user: Some(super::NON_ROOT_ONE_SHOT_USER.to_owned()),
+            transient_credentials: std::collections::BTreeMap::new(),
+            read_only_paths: Vec::new(),
+            read_write_paths: Vec::new(),
+            inaccessible_paths: Vec::new(),
+            private_mounts: false,
+            stdin: Vec::new(),
+        };
+
+        super::one_shot_process(
+            engine.as_os_str(),
+            &task,
+            "Docker",
+            false,
+            Some("host.docker.internal:host-gateway"),
+        )
+        .unwrap()
+        .run_quiet()
+        .unwrap();
+
+        let arguments = fs::read_to_string(arguments).unwrap();
+        let arguments = arguments.lines().collect::<Vec<_>>();
+        let mapping = arguments
+            .iter()
+            .position(|argument| *argument == "host.docker.internal:host-gateway")
+            .unwrap();
+        let image = arguments
+            .iter()
+            .position(|argument| *argument == image)
+            .unwrap_or_else(|| panic!("one-shot image is absent from {arguments:?}"));
+        assert!(mapping < image);
     }
 
     #[test]
@@ -559,6 +625,8 @@ pub(crate) fn one_shot_process(
     command: &OsStr,
     task: &OneShotTask,
     backend_name: &str,
+    rootless_user_namespace: bool,
+    host_gateway_mapping: Option<&str>,
 ) -> anyhow::Result<Process> {
     let super::ArtifactReference::Oci {
         image_reference,
@@ -567,13 +635,7 @@ pub(crate) fn one_shot_process(
     else {
         bail!("{backend_name} one-shot task requires a digest-bound OCI artifact");
     };
-    let image = normalize_local_image_id(image_reference, false).unwrap_or_else(|| {
-        format!(
-            "{}@{}",
-            image_reference.split('@').next().unwrap_or(image_reference),
-            digest
-        )
-    });
+    let image = runnable_oci_image(image_reference, digest, None);
     let user = task
         .service_user
         .as_deref()
@@ -581,16 +643,27 @@ pub(crate) fn one_shot_process(
     validate_non_root_user(user, backend_name)?;
     let mut policy = ContainerRuntimePolicy::managed_default();
     policy.restart = ContainerRestartPolicy::No;
-    let mut process = append_container_policy(
-        Process::new(command)
-            .timeout(Duration::from_secs(300))
-            .args(["run", "--rm", "--interactive"]),
-        &policy,
-    )
-    .arg("--user")
-    .arg(user)
-    .arg("--network")
-    .arg(task.network.as_deref().unwrap_or("none"));
+    let process = Process::new(command)
+        .timeout(Duration::from_secs(300))
+        .args(["run", "--rm", "--interactive"]);
+    let process = if rootless_user_namespace {
+        process.arg("--userns=keep-id:uid=10001,gid=10001")
+    } else {
+        process
+    };
+    let network = match task.network.as_deref() {
+        Some("bridge" | "pasta") if rootless_user_namespace => "pasta:--map-gw",
+        Some(network) => network,
+        None => "none",
+    };
+    let mut process = append_container_policy(process, &policy)
+        .arg("--user")
+        .arg(user)
+        .arg("--network")
+        .arg(network);
+    if let Some(mapping) = host_gateway_mapping {
+        process = process.args(["--add-host", mapping]);
+    }
     if let Some(directory) = &task.working_directory {
         process = process.arg("--workdir").arg(directory);
     }
@@ -607,7 +680,7 @@ pub(crate) fn one_shot_process(
 ///
 /// Taking the engine binary rather than a partially assembled `Process`
 /// makes it impossible to append policy flags after the image positional.
-pub(crate) fn build_identity_process(command: &OsStr) -> Process {
+pub(crate) fn hardened_one_shot_process(command: &OsStr) -> Process {
     let mut policy = ContainerRuntimePolicy::managed_default();
     policy.restart = ContainerRestartPolicy::No;
     append_container_policy(Process::new(command).args(["run", "--rm"]), &policy)
@@ -696,12 +769,48 @@ pub fn normalize_local_image_id(value: &str, allow_bare_digest: bool) -> Option<
     valid_digest(&normalized).then_some(normalized)
 }
 
+pub(crate) fn runnable_oci_image(
+    image_reference: &str,
+    digest: &str,
+    local_artifact_id: Option<&str>,
+) -> String {
+    local_artifact_id
+        .map(ToOwned::to_owned)
+        .or_else(|| normalize_local_image_id(image_reference, true))
+        .or_else(|| normalize_local_image_id(image_reference, false))
+        .unwrap_or_else(|| {
+            format!(
+                "{}@{}",
+                image_reference.split('@').next().unwrap_or(image_reference),
+                digest
+            )
+        })
+}
+
 #[cfg(test)]
 mod policy_tests {
     use super::{
         ContainerRestartPolicy, ContainerRuntimePolicy, NON_ROOT_ONE_SHOT_USER,
-        requested_digest_matches, validate_non_root_user,
+        requested_digest_matches, runnable_oci_image, validate_non_root_user,
     };
+
+    #[test]
+    fn runnable_oci_image_preserves_local_ids_and_pins_named_references() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(runnable_oci_image(&digest, &digest, None), digest);
+        assert_eq!(
+            runnable_oci_image("registry.example/nazoauth:candidate", &digest, None),
+            format!("registry.example/nazoauth:candidate@{digest}")
+        );
+        assert_eq!(
+            runnable_oci_image(
+                "registry.example/nazoauth:candidate",
+                &digest,
+                Some("sha256:local")
+            ),
+            "sha256:local"
+        );
+    }
 
     #[test]
     fn requested_digest_cannot_be_replaced_by_another_repo_digest() {

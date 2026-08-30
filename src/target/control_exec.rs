@@ -11,6 +11,7 @@
 //! Classification contract (mirrors NazoAuth's own exit semantics):
 //!
 //! * parsable terminal/in-progress result ⇒ authoritative answer;
+//! * the server's exact closed rejection marker ⇒ one stable ctl code;
 //! * no parsable result ⇒ [`CONTROL_OUTCOME_UNKNOWN`] — the operation may or
 //!   may not have been accepted, so the only safe retry is the resumed resend
 //!   of the SAME envelope (server dedupes by id + request hash);
@@ -32,6 +33,7 @@ use super::wire::{HOST_ERR_OPERATION_INVALID, sanitize};
 const CHANGE_SET_ENV: &str = "NAZOAUTH_OPERATOR_CHANGE_SET_FILE";
 const CHANGE_SET_CREDENTIAL: &str = "operator-change-set";
 const CONTAINER_CHANGE_SET_PATH: &str = "/run/nazoauth/operator-change-set";
+const OPERATOR_REJECTION_PREFIX: &str = "nazoauth-operator-rejection=";
 
 struct StagedChangeSet {
     _directory: crate::filesystem::PrivateTempDir,
@@ -177,7 +179,6 @@ impl ControlOperationExecutor for HostControlOperator {
         let mut read_write_paths = Vec::new();
         let mut transient_credentials = BTreeMap::new();
         let mut mounts = observation.mounts.clone();
-        super::inject_operator_oci_artifact_fence(&mut environment, &observation.artifact);
         if host {
             environment.insert(
                 super::install_exec::SERVER_CONFIG_FILE_ENV.to_owned(),
@@ -214,7 +215,11 @@ impl ControlOperationExecutor for HostControlOperator {
             // The frozen NazoAuth one-shot entry: compact JWS on stdin, the
             // durable ControlResult JSON on stdout.
             command: vec!["nazoauth".to_owned(), "operator-task".to_owned()],
-            network: observation.networks.first().cloned(),
+            network: if host {
+                Some("host".to_owned())
+            } else {
+                observation.networks.first().cloned()
+            },
             mounts,
             environment,
             working_directory: if host {
@@ -223,7 +228,7 @@ impl ControlOperationExecutor for HostControlOperator {
                 Some(PathBuf::from("/app"))
             },
             service_user: Some(if host {
-                super::update_exec::systemd_service_user(job.deployment_id)
+                crate::runtime_backend::systemd_service_user(job.deployment_id)
             } else {
                 crate::runtime_backend::NON_ROOT_ONE_SHOT_USER.to_owned()
             }),
@@ -234,11 +239,32 @@ impl ControlOperationExecutor for HostControlOperator {
             private_mounts: false,
             stdin: format!("{}\n", job.compact_jws).into_bytes(),
         };
-        let stdout = backend
-            .run_one_shot(&task)
-            .map_err(|error| Failure::new(CONTROL_OUTCOME_UNKNOWN, sanitize(error.to_string())))?;
+        let stdout = backend.run_one_shot(&task).map_err(|error| {
+            let detail = error.to_string();
+            let code = operator_rejection_code(&detail).unwrap_or(CONTROL_OUTCOME_UNKNOWN);
+            Failure::new(code, sanitize(detail))
+        })?;
         drop(change_set_temp);
         decode_operator_answer(&stdout, job.operation_id)
+    }
+}
+
+fn operator_rejection_code(detail: &str) -> Option<&'static str> {
+    let class = detail.lines().find_map(|line| {
+        let line = line.trim();
+        let marker = line.rsplit_once(": ").map_or(line, |(_, suffix)| suffix);
+        marker.strip_prefix(OPERATOR_REJECTION_PREFIX)
+    })?;
+    match class {
+        "request" => Some(crate::error_codes::INPUT_INVALID),
+        "authorization" => Some(crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED),
+        "deployment" => Some(crate::error_codes::TARGET_IDENTITY_MISMATCH),
+        "revision" => Some(crate::error_codes::CONFIG_REVISION_MISMATCH),
+        "conflict" => Some(crate::error_codes::OPERATION_ID_CONFLICT),
+        // Transient pre-acceptance unavailability keeps the prepared operation
+        // so an ordinary retry reuses the same id.
+        "unavailable" => None,
+        _ => None,
     }
 }
 
@@ -301,7 +327,7 @@ mod tests {
 
     use super::{
         CHANGE_SET_CREDENTIAL, CHANGE_SET_ENV, CONTAINER_CHANGE_SET_PATH,
-        configure_change_set_access, stage_change_set,
+        configure_change_set_access, operator_rejection_code, stage_change_set,
     };
 
     #[test]
@@ -359,5 +385,29 @@ mod tests {
             Some(source)
         );
         assert!(mounts.is_empty());
+    }
+
+    #[test]
+    fn exact_server_rejection_classes_map_once() {
+        assert_eq!(
+            operator_rejection_code(
+                "nazoauth failed with status 1: nazoauth-operator-rejection=authorization"
+            ),
+            Some(crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED)
+        );
+        assert_eq!(
+            operator_rejection_code("wrapper failed:\nnazoauth-operator-rejection=revision"),
+            Some(crate::error_codes::CONFIG_REVISION_MISMATCH)
+        );
+        assert_eq!(
+            operator_rejection_code(
+                "nazoauth failed: prefix-nazoauth-operator-rejection=authorization"
+            ),
+            None
+        );
+        assert_eq!(
+            operator_rejection_code("nazoauth-operator-rejection=unavailable"),
+            None
+        );
     }
 }

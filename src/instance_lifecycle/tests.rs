@@ -16,12 +16,13 @@ use super::privilege::{PrivilegeStep, ensure_engine_access};
 use super::uninstall::plan_uninstall;
 use super::update::{UpdateRequest, run_update};
 use super::{LifecycleContext, rollback::run_rollback, uninstall::run_uninstall};
+use crate::controller_identity::journal::OperationJournal;
 use crate::controller_identity::store::{ControllerKeyStore, controller_key_ref_for};
 use crate::filesystem::PrivateTempDir;
 use crate::registry::{DiscoveryEvidence, InstanceRecord, RegistryStore};
 use crate::target::{
-    ExecutionTarget, Failure, HostOperation, HostOutcome, InstanceInspection, LocalTarget,
-    StateMutationPayload, TargetStateStore, UpdateBackupPrecondition,
+    ExecutionTarget, Failure, HostOperation, HostOutcome, LocalTarget, StateMutationPayload,
+    TargetStateStore, UpdateBackupPrecondition,
     control_exec::{CONTROL_OUTCOME_UNKNOWN, ControlJob, ControlOperationExecutor},
     uninstall_exec::{DeletionExecutor, DeletionJob},
     update_exec::{
@@ -105,6 +106,7 @@ impl ControlOperationExecutor for ScriptedControl {
 struct ScriptedLifecycle {
     control: Arc<ScriptedControl>,
     fail_update_activation: Mutex<bool>,
+    no_op_update: Mutex<bool>,
     update_calls: Mutex<u32>,
     rollback_calls: Mutex<u32>,
 }
@@ -118,6 +120,11 @@ impl ScriptedLifecycle {
 impl LifecycleExecutor for ScriptedLifecycle {
     fn execute_update(&self, job: &UpdateJob<'_>) -> Result<UpdateExecution, Failure> {
         *self.update_calls.lock().unwrap() += 1;
+        if *self.no_op_update.lock().unwrap() {
+            return Ok(UpdateExecution::Noop {
+                revision: job.expected_revision,
+            });
+        }
         let mut migration_result = None;
         if let Some(jws) = job.migration_jws {
             let res = self.control.execute(&ControlJob {
@@ -159,20 +166,15 @@ impl LifecycleExecutor for ScriptedLifecycle {
             job.expected_revision,
             crate::target::deployment_state::UpdateCommit {
                 artifact: NEW_REF.to_owned(),
-                build_identity: Some(
-                    crate::target::BuildIdentity::new("nazoauth", "v9", "commit")
-                        .expect("identity"),
-                ),
-                rollback_policy: job.rollback_policy.clone(),
+                release: Some(crate::target::ReleaseVersion::new("v9").expect("identity")),
+                rollback_policy: crate::model::test_release_rollback_policy(),
                 config,
                 operation_id: job.operation_id.to_owned(),
             },
         )?;
         Ok(UpdateExecution::Activated(LifecycleFacts {
             revision: state.config.revision,
-            build_identity: Some(
-                crate::target::BuildIdentity::new("nazoauth", "v9", "commit").expect("identity"),
-            ),
+            release: Some(crate::target::ReleaseVersion::new("v9").expect("identity")),
             migration_result,
         }))
     }
@@ -187,7 +189,7 @@ impl LifecycleExecutor for ScriptedLifecycle {
         )?;
         Ok(LifecycleFacts {
             revision: state.config.revision,
-            build_identity: None,
+            release: None,
             migration_result: None,
         })
     }
@@ -204,33 +206,16 @@ impl DeletionExecutor for ScriptedDeletion {
     fn execute_deletion(&self, job: &DeletionJob<'_>) -> Result<(), Failure> {
         *self.calls.lock().unwrap() += 1;
         self.planned.lock().unwrap().extend(
-            job.resources
+            job.declared
                 .iter()
+                .filter(|resource| {
+                    resource.ownership == crate::target::ResourceOwnership::Managed
+                        && resource.scope == crate::target::ResourceScope::Deployment
+                        && resource.kind != "container"
+                })
                 .map(|resource| resource.resource_id.clone()),
         );
         Ok(())
-    }
-}
-
-struct ScriptedArtifactResolver {
-    target_digest: String,
-    fail_verify: Mutex<bool>,
-}
-
-impl super::TargetArtifactResolver for ScriptedArtifactResolver {
-    fn resolve_target_artifact(
-        &self,
-        _pinned: &crate::target::OfficialArtifactRef,
-        _inspection: &InstanceInspection,
-    ) -> anyhow::Result<super::VerifiedTargetArtifact> {
-        if *self.fail_verify.lock().unwrap() {
-            anyhow::bail!("simulated official release verification failure");
-        }
-        Ok(super::VerifiedTargetArtifact {
-            digest: self.target_digest.clone(),
-            identity: crate::target::BuildIdentity::new("nazoauth", "v9.9.9", "commit-new")?,
-            rollback_policy: crate::model::test_release_rollback_policy(),
-        })
     }
 }
 
@@ -242,11 +227,18 @@ struct Fixture {
     control: Arc<ScriptedControl>,
     lifecycle: Arc<ScriptedLifecycle>,
     deletion: Arc<ScriptedDeletion>,
-    resolver: Arc<ScriptedArtifactResolver>,
 }
 
 impl Fixture {
     fn new() -> anyhow::Result<Self> {
+        Self::with_current_release(Some(
+            crate::target::ReleaseVersion::new("v1").expect("release version"),
+        ))
+    }
+
+    fn with_current_release(
+        current_release: Option<crate::target::ReleaseVersion>,
+    ) -> anyhow::Result<Self> {
         let temp = PrivateTempDir::new("nazauthctl-instance-lifecycle")?;
         let registry = RegistryStore::open(temp.path().join("registry"))?;
         let host = registry.ensure_local_host()?;
@@ -313,9 +305,7 @@ impl Fixture {
                 config_reference: temp.path().join("config.yaml").to_string_lossy().into(),
                 config_schema: "nazauth-seed-v1".to_owned(),
                 resources,
-                current_build_identity: Some(
-                    crate::target::BuildIdentity::new("nazoauth", "v1", "base").expect("identity"),
-                ),
+                current_release,
                 current_rollback_policy: crate::model::test_release_rollback_policy(),
             },
             "bootstrap-op-0001",
@@ -345,6 +335,7 @@ impl Fixture {
         let lifecycle = Arc::new(ScriptedLifecycle {
             control: control.clone(),
             fail_update_activation: Mutex::new(false),
+            no_op_update: Mutex::new(false),
             update_calls: Mutex::new(0),
             rollback_calls: Mutex::new(0),
         });
@@ -353,16 +344,11 @@ impl Fixture {
             .with_control_executor(control.clone())
             .with_lifecycle_executor(lifecycle.clone())
             .with_deletion_executor(deletion.clone());
-        let resolver = Arc::new(ScriptedArtifactResolver {
-            target_digest: NEW_REF.to_owned(),
-            fail_verify: Mutex::new(false),
-        });
         let context = LifecycleContext {
             registry,
             factory: Box::new(move |_record| {
                 Ok(Box::new(target.clone()) as Box<dyn ExecutionTarget + Send>)
             }),
-            resolver: resolver.clone(),
         };
         Ok(Self {
             _temp: temp,
@@ -372,7 +358,6 @@ impl Fixture {
             control,
             lifecycle,
             deletion,
-            resolver,
         })
     }
 
@@ -417,6 +402,49 @@ fn update_dispatches_migration_once_and_commits_new_revision() -> anyhow::Result
 }
 
 #[test]
+fn target_noop_clears_prepared_migration_without_a_control_result() -> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    *fixture.lifecycle.no_op_update.lock().unwrap() = true;
+    let report = run_update(&fixture.context, &fixture.keys, &fixture.update_request())?;
+
+    assert!(
+        report.contains("target-verified artifact") && report.contains("no migration"),
+        "{report}"
+    );
+    assert_eq!(*fixture.lifecycle.update_calls.lock().unwrap(), 1);
+    assert!(fixture.control.presented.lock().unwrap().is_empty());
+    let journal = OperationJournal::open(fixture.keys.instance_dir(DEPLOYMENT)?)?;
+    assert!(
+        journal.load()?.is_none(),
+        "the unsubmitted migration is cleared"
+    );
+    let state = fixture.store()?.load_existing(DEPLOYMENT)?;
+    assert_eq!(state.artifact.current.as_deref(), Some(CURRENT_REF));
+    assert_eq!(state.artifact.previous, None);
+    Ok(())
+}
+
+#[test]
+fn adopted_artifact_without_release_version_can_update() -> anyhow::Result<()> {
+    let fixture = Fixture::with_current_release(None)?;
+
+    run_update(&fixture.context, &fixture.keys, &fixture.update_request())?;
+
+    let state = fixture.store()?.load_existing(DEPLOYMENT)?;
+    assert_eq!(state.artifact.current.as_deref(), Some(NEW_REF));
+    assert_eq!(state.artifact.previous.as_deref(), Some(CURRENT_REF));
+    assert_eq!(
+        state
+            .current_release
+            .as_ref()
+            .map(|release| release.version.as_str()),
+        Some("v9")
+    );
+    assert_eq!(state.previous_release, None);
+    Ok(())
+}
+
+#[test]
 fn target_backup_gate_runs_before_lifecycle_and_update_replay_is_idempotent() -> anyhow::Result<()>
 {
     let fixture = Fixture::new()?;
@@ -432,7 +460,6 @@ fn target_backup_gate_runs_before_lifecycle_and_update_replay_is_idempotent() ->
         Some(1),
         StateMutationPayload::Update {
             artifact: artifact(),
-            rollback_policy: crate::model::test_release_rollback_policy(),
             backup_precondition: UpdateBackupPrecondition::Require {
                 manifest_sha256: "a".repeat(64),
                 restore_tested_at: chrono::Utc::now(),
@@ -463,7 +490,6 @@ fn target_backup_gate_runs_before_lifecycle_and_update_replay_is_idempotent() ->
         Some(1),
         StateMutationPayload::Update {
             artifact: artifact(),
-            rollback_policy: crate::model::test_release_rollback_policy(),
             backup_precondition: UpdateBackupPrecondition::NotRequired,
             config: None,
             migration_jws: None,
@@ -551,7 +577,7 @@ fn rollback_restores_the_previous_verified_reference() -> anyhow::Result<()> {
         1,
         crate::target::deployment_state::UpdateCommit {
             artifact: NEW_REF.to_owned(),
-            build_identity: None,
+            release: None,
             rollback_policy: crate::model::test_release_rollback_policy(),
             config: None,
             operation_id: "prior-update-op".to_owned(),
@@ -584,17 +610,61 @@ fn uninstall_plan_zero_deletes_external_resources() -> anyhow::Result<()> {
     assert!(rendered.contains("sibling instances"), "{rendered}");
 
     // Plan-only mode executes nothing.
-    let preview = run_uninstall(&fixture.context, Some(&format!("inst-{DEPLOYMENT}")), false)?;
+    let preview = run_uninstall(
+        &fixture.context,
+        &fixture.keys,
+        Some(&format!("inst-{DEPLOYMENT}")),
+        false,
+    )?;
     assert!(preview.contains("--yes"), "{preview}");
     assert_eq!(*fixture.deletion.calls.lock().unwrap(), 0);
+    assert!(fixture.keys.load_active(DEPLOYMENT)?.is_some());
     Ok(())
 }
 
 #[test]
-fn uninstall_removes_only_the_instance_record_and_keeps_siblings() -> anyhow::Result<()> {
+fn uninstall_refuses_to_orphan_remote_recovery_or_transfer_staging() -> anyhow::Result<()> {
+    for journal in ["recovery-plan.json", "backup-transfer.json"] {
+        let fixture = Fixture::new()?;
+        std::fs::write(
+            fixture.keys.instance_dir(DEPLOYMENT)?.join(journal),
+            b"pending",
+        )?;
+
+        let error = run_uninstall(
+            &fixture.context,
+            &fixture.keys,
+            Some(&format!("inst-{DEPLOYMENT}")),
+            true,
+        )
+        .expect_err("pending remote cleanup must block uninstall");
+
+        assert!(error.to_string().contains("incomplete"), "{error}");
+        assert_eq!(*fixture.deletion.calls.lock().unwrap(), 0);
+        assert!(fixture.keys.load_active(DEPLOYMENT)?.is_some());
+        assert!(
+            fixture
+                .context
+                .registry
+                .instance_by_deployment(DEPLOYMENT)?
+                .is_some()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn uninstall_removes_local_instance_state_and_keeps_siblings() -> anyhow::Result<()> {
     let fixture = Fixture::new()?;
-    let report = run_uninstall(&fixture.context, Some(&format!("inst-{DEPLOYMENT}")), true)?;
+    let report = run_uninstall(
+        &fixture.context,
+        &fixture.keys,
+        Some(&format!("inst-{DEPLOYMENT}")),
+        true,
+    )?;
     assert!(report.contains("HostRecord"), "{report}");
+    assert!(report.contains("Controller Slots"), "{report}");
+    assert!(!report.contains("controller list --instance"), "{report}");
     assert_eq!(*fixture.deletion.calls.lock().unwrap(), 1);
 
     // Primary record gone...
@@ -604,6 +674,8 @@ fn uninstall_removes_only_the_instance_record_and_keeps_siblings() -> anyhow::Re
         .update_controller_binding(DEPLOYMENT, None, None)
         .expect_err("the uninstalled instance must be forgotten");
     assert!(error.to_string().contains("unknown instance"), "{error}");
+    assert!(fixture.keys.load_active(DEPLOYMENT)?.is_none());
+    assert!(fixture.keys.list_keys(DEPLOYMENT)?.is_empty());
     // ...while the sibling on the same host survives.
     fixture
         .context
@@ -640,7 +712,12 @@ fn uninstall_plan_and_operation_log_keep_external_resources_listed() -> anyhow::
     assert!(rendered.contains("shared-db"), "{rendered}");
     assert!(rendered.contains("ZERO DELETE"), "{rendered}");
 
-    let report = run_uninstall(&fixture.context, Some(&format!("inst-{DEPLOYMENT}")), true)?;
+    let report = run_uninstall(
+        &fixture.context,
+        &fixture.keys,
+        Some(&format!("inst-{DEPLOYMENT}")),
+        true,
+    )?;
     assert!(
         report.contains("external/shared resources were never touched"),
         "{report}"
@@ -782,35 +859,5 @@ fn durable_failed_migration_clears_controller_slot_after_persistence() -> anyhow
         2,
         "each post-terminal invocation receives a fresh operation identity"
     );
-    Ok(())
-}
-
-#[test]
-fn release_verification_failure_fails_closed_without_touching_state() -> anyhow::Result<()> {
-    let fixture = Fixture::new()?;
-    *fixture.resolver.fail_verify.lock().unwrap() = true;
-
-    let request = UpdateRequest {
-        instance: Some(format!("inst-{DEPLOYMENT}")),
-        version: Some("v9.9.9".to_owned()),
-        config_content: None,
-        config_schema: None,
-    };
-    let error = super::update::run_update(&fixture.context, &fixture.keys, &request)
-        .expect_err("verification failure must fail-closed immediately");
-
-    assert!(
-        error
-            .to_string()
-            .contains("official release verification failure"),
-        "{error}"
-    );
-
-    // Target state and control dispatch were never touched.
-    assert_eq!(*fixture.lifecycle.update_calls.lock().unwrap(), 0);
-    assert!(fixture.control.presented.lock().unwrap().is_empty());
-    let state = fixture.store()?.load_existing(DEPLOYMENT)?;
-    assert_eq!(state.artifact.current.as_deref(), Some(CURRENT_REF));
-    assert_eq!(state.config.revision, 1);
     Ok(())
 }

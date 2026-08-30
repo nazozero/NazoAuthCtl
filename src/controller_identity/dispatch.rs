@@ -29,7 +29,6 @@ use nazo_operator_protocol::{
 use crate::controller_identity::journal::{JournalState, OperationJournal, OperationJournalEntry};
 use crate::controller_identity::operation::{
     ControlOperationInput, SignedControlOperation, build_signed_control_operation_with_id,
-    deployment_from_key_ref,
 };
 use crate::registry::{InstanceRecord, RegistryStore};
 use crate::target::{
@@ -147,20 +146,6 @@ pub fn prepare_control_operation(
     input: ControlOperationInput,
 ) -> anyhow::Result<PreparedOperation> {
     let record = resolve_instance(registry, instance_selector)?;
-    if record.controller_key_ref.is_some() {
-        let ref_deployment =
-            deployment_from_key_ref(record.controller_key_ref.as_deref().with_context(|| {
-                format!("instance '{}' lost its controller key ref", record.alias)
-            })?)?;
-        if ref_deployment != record.deployment_id {
-            bail!(
-                "instance '{}' carries a mismatched controller key ref ('{ref_deployment}' vs \
-                 '{}'); refusing to sign",
-                record.alias,
-                record.deployment_id
-            );
-        }
-    }
 
     let journaled = journal.load()?;
     if let Some(entry) = &journaled {
@@ -168,9 +153,8 @@ pub fn prepare_control_operation(
         // same canonical payload. Any difference (rotated kid, changed
         // revision/payload) means the stored id must never be replayed.
         let rebuilt = build_signed_control_operation_with_id(
-            registry,
             keys,
-            &record.deployment_id,
+            &record,
             clone_input(&input),
             Some(&entry.operation_id),
         );
@@ -201,8 +185,7 @@ pub fn prepare_control_operation(
 
     // Display observations are deliberately absent here. The live server's
     // admission response is the sole controller-validity/expiry decision.
-    let signed =
-        build_signed_control_operation_with_id(registry, keys, &record.deployment_id, input, None)?;
+    let signed = build_signed_control_operation_with_id(keys, &record, input, None)?;
     let prepared = PreparedOperation {
         signed,
         kind: AttemptKind::Fresh,
@@ -214,7 +197,6 @@ pub fn prepare_control_operation(
 fn clone_input(input: &ControlOperationInput) -> ControlOperationInput {
     ControlOperationInput {
         operation: input.operation.clone(),
-        artifact_target: input.artifact_target.clone(),
         config_revision: input.config_revision.clone(),
     }
 }
@@ -401,9 +383,9 @@ mod tests {
         HealthSnapshot, HostOperation, HostOverview, HostResult, InstanceInspection,
     };
     use nazo_operator_protocol::{
-        CONTROL_RESULT_SCHEMA, ControlBuildIdentity, ControlErrorCode, ControlOperation,
-        ControlOperationPayload, ControlTarget, TenantResourceIdentity, TenantResourceKind,
-        control_operation_request_hash, verify_control_operation_signature,
+        CONTROL_RESULT_SCHEMA, ControlErrorCode, ControlOperation, ControlOperationPayload,
+        TenantResourceIdentity, TenantResourceKind, control_operation_request_hash,
+        verify_control_operation_signature,
     };
     use std::cell::RefCell;
 
@@ -444,14 +426,6 @@ mod tests {
     fn input(revision: &str) -> ControlOperationInput {
         ControlOperationInput {
             operation: ControlOperationPayload::MigrateApply,
-            artifact_target: ControlTarget::HostBinary {
-                sha256: "ab".repeat(32),
-                embedded: ControlBuildIdentity {
-                    product: nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT.to_owned(),
-                    version: "1.0.0".to_owned(),
-                    commit: "9f2c1a7".to_owned(),
-                },
-            },
             config_revision: revision.to_owned(),
         }
     }
@@ -923,13 +897,13 @@ mod tests {
                 operation_id: prepared.signed.operation_id.clone(),
                 accepted: false,
                 result: None,
-                rejection_code: Some(crate::error_codes::CONTROLLER_KEY_EXPIRED.to_owned()),
+                rejection_code: Some(crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED.to_owned()),
             },
         )?;
         assert_eq!(
             verdict,
             DispatchVerdict::DefinitivelyRejected {
-                code: crate::error_codes::CONTROLLER_KEY_EXPIRED.to_owned()
+                code: crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED.to_owned()
             }
         );
         settle_journal(&journal, &prepared, &verdict, |_| {

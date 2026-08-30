@@ -24,7 +24,7 @@ impl ScriptedTarget {
             anyhow::bail!("{text}");
         }
         Ok(InstanceInspection {
-            current_build_identity: None,
+            current_release: None,
             current_instance_identity: None,
             deployment_id: deployment_id.to_owned(),
             issuer: "https://auth.example.com".to_owned(),
@@ -69,13 +69,7 @@ impl ExecutionTarget for ScriptedTarget {
                     HostCompletionBody::Hello { hello },
                 ))
             }
-            crate::target::HostOperationBody::Ping { nonce } => Ok(HostResult::completed(
-                &operation.operation_id,
-                HostCompletionBody::Ping {
-                    nonce: nonce.clone(),
-                },
-            )),
-            _ => anyhow::bail!("scripted target only answers hello and ping here"),
+            _ => anyhow::bail!("scripted target only answers hello here"),
         }
     }
 
@@ -349,7 +343,7 @@ fn stable_code_maps_transport_tokens() {
 }
 
 #[test]
-fn stable_code_preserves_target_install_failures() {
+fn stable_code_preserves_target_failures() {
     for code in [
         crate::target::ARTIFACT_UNVERIFIED,
         crate::target::CONFIG_PATH_OCCUPIED,
@@ -359,6 +353,21 @@ fn stable_code_preserves_target_install_failures() {
         crate::target::HEALTH_PROBE_FAILED,
         crate::target::INSTALL_FAILED,
         crate::target::INSTALL_OUTCOME_UNKNOWN,
+        crate::target::BACKUP_EXECUTION_FAILED,
+        crate::target::RESTORE_TEST_FAILED,
+        crate::target::CONTROL_EXECUTION_UNAVAILABLE,
+        crate::target::CONTROL_OUTCOME_UNKNOWN,
+        crate::target::CONTROL_TARGET_DRIFT,
+        crate::target::DEPLOYMENT_UNKNOWN,
+        crate::target::DEPLOYMENT_EXISTS,
+        crate::target::ROLLBACK_UNAVAILABLE,
+        crate::target::ROLLBACK_RECOVERY_REQUIRED,
+        crate::target::OBJECT_IDENTITY_MISMATCH,
+        crate::target::ACTIVATION_FAILED,
+        crate::target::ROLLBACK_ARTIFACT_MISSING,
+        crate::target::update_exec::BACKUP_UPDATE_PRECONDITION_FAILED,
+        crate::target::HOST_ERR_OPERATION_INVALID,
+        crate::target::wire::HOST_ERR_UNSUPPORTED_OPERATION,
     ] {
         assert_eq!(
             stable_code(&format!("install failed: {code}: detail")),

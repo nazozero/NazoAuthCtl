@@ -115,7 +115,7 @@ pub(super) fn controller_check(version: Option<&str>) -> anyhow::Result<()> {
     ensure_private_directory(&directory, "controller self-update state")?;
     let _lock = FileLock::acquire(&directory.join(".lock"))?;
     recover_controller_self_operation()?;
-    let release = crate::release::VerifiedControllerRelease::verify(version, None)?;
+    let release = crate::release::VerifiedControllerRelease::verify(version)?;
     enforce_controller_trust(&release.version, &release.sha256)?;
     println!(
         "{}",
@@ -134,7 +134,7 @@ pub(super) fn controller_update(version: Option<&str>) -> anyhow::Result<()> {
     ensure_private_directory(&directory, "controller self-update state")?;
     let _lock = FileLock::acquire(&directory.join(".lock"))?;
     recover_controller_self_operation()?;
-    let release = crate::release::VerifiedControllerRelease::verify(version, None)?;
+    let release = crate::release::VerifiedControllerRelease::verify(version)?;
     enforce_controller_trust(&release.version, &release.sha256)?;
     release.persist_evidence(&directory.join("evidence").join(&release.version))?;
     let current = std::env::current_exe().context("failed to resolve the running controller")?;

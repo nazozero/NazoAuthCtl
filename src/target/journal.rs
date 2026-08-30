@@ -19,7 +19,9 @@
 //! There is exactly one operational-log story across both journals ctl owns:
 //!
 //! * this target-side JSONL is the full per-deployment/per-host operation log
-//!   and the resume authority for host operations;
+//!   and the resume authority for host operations; a target-verified update
+//!   no-op removes its temporary pending line because it had no side effect to
+//!   resume or audit;
 //! * the control-side dispatch journal
 //!   ([`crate::controller_identity::journal::OperationJournal`]) is a bounded
 //!   single-slot pointer that lets ctl reuse `operation_id + request_hash`
@@ -35,7 +37,7 @@
 //! ## Retention and bounding (H04)
 //!
 //! The journal is append-only within bounds and compacted in place beyond
-//! them. Every executed lifecycle mutation appends exactly ONE terminal line;
+//! them. Every effectful lifecycle mutation appends exactly ONE terminal line;
 //! interrupted attempts leave their `pending` line as the resume point. The
 //! bounds ([`JournalBounds::default`]) are:
 //!
@@ -299,6 +301,20 @@ impl TargetJournal {
             self.compact_if_needed(&path)?;
         }
         let result = execute(operation);
+        if matches!(
+            (&operation.operation, &result.outcome),
+            (
+                super::wire::HostOperationBody::StateMutate {
+                    mutation: super::deployment_state::StateMutationPayload::Update { .. }
+                },
+                super::wire::HostOutcome::Completed {
+                    body: super::wire::HostCompletionBody::StateMutateNoop { .. }
+                }
+            )
+        ) {
+            self.remove_operation(&path, &operation.operation_id)?;
+            return Ok(result);
+        }
         if let super::wire::HostOutcome::Failed { ref code, .. } = result.outcome
             && (code == "CONTROL_OUTCOME_UNKNOWN" || code == "OUTCOME_UNKNOWN")
         {
@@ -327,6 +343,26 @@ impl TargetJournal {
         )?;
         self.compact_if_needed(&path)?;
         Ok(result)
+    }
+
+    fn remove_operation(&self, path: &Path, operation_id: &str) -> anyhow::Result<()> {
+        let lines = read_lines_with(path, self.bounds.read_cap)?;
+        let mut bytes = Vec::new();
+        for line in lines
+            .into_iter()
+            .filter(|line| line.operation_id != operation_id)
+        {
+            serde_json::to_writer(&mut bytes, &line)
+                .with_context(|| format!("failed to re-encode the journal {}", path.display()))?;
+            bytes.push(b'\n');
+        }
+        filesystem::atomic_write(path, &bytes, 0o600).with_context(|| {
+            format!(
+                "failed to discard no-op operation '{}' from {}",
+                operation_id,
+                path.display()
+            )
+        })
     }
 
     /// Durably append one line: single write call on an O_APPEND handle,
@@ -619,6 +655,25 @@ mod tests {
         HostOperation::ping(Uuid::now_v7().to_string(), nonce)
     }
 
+    fn update_operation() -> HostOperation {
+        HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            Some(4),
+            super::super::deployment_state::StateMutationPayload::Update {
+                artifact: super::super::install_exec::OfficialArtifactRef {
+                    repository: "nazozero/NazoAuth".to_owned(),
+                    version: Some("v0.2.6".to_owned()),
+                },
+                backup_precondition:
+                    super::super::deployment_state::UpdateBackupPrecondition::NotRequired,
+                config: None,
+                migration_jws: None,
+                migration_request_hash: None,
+            },
+        )
+    }
+
     #[test]
     fn transfer_read_terminal_omits_archive_bytes_but_other_terminals_cannot() {
         let base = JournalLine {
@@ -712,6 +767,43 @@ mod tests {
         assert_eq!(last.status, JournalStatus::Completed);
         assert_eq!(last.result, Some(echo_result(&operation)));
         assert_eq!(last.action, "ping");
+        Ok(())
+    }
+
+    #[test]
+    fn target_verified_update_noop_leaves_no_journal_history() -> anyhow::Result<()> {
+        let temp = filesystem::PrivateTempDir::new("nazoauthctl-journal-noop-test")?;
+        let journal = TargetJournal::open(temp.path().join("state"))?;
+        let operation = update_operation();
+        let path = journal.path_for("deploy-alpha");
+
+        let result = journal.run_journaled(&operation, |operation| {
+            let pending = fs::read_to_string(&path).expect("pending line must exist during verify");
+            assert_eq!(pending.lines().count(), 1, "{pending}");
+            HostResult::completed(
+                operation.operation_id.clone(),
+                HostCompletionBody::StateMutateNoop { revision: 4 },
+            )
+        })?;
+        assert!(matches!(
+            result.outcome,
+            HostOutcome::Completed {
+                body: HostCompletionBody::StateMutateNoop { revision: 4 }
+            }
+        ));
+        assert_eq!(fs::read_to_string(&path)?, "");
+        assert!(journal.operation_log("deploy-alpha")?.is_empty());
+
+        let retried = std::cell::Cell::new(false);
+        journal.run_journaled(&operation, |operation| {
+            retried.set(true);
+            HostResult::completed(
+                operation.operation_id.clone(),
+                HostCompletionBody::StateMutateNoop { revision: 4 },
+            )
+        })?;
+        assert!(retried.get(), "a no-op has no replay authority to retain");
+        assert_eq!(fs::read_to_string(path)?, "");
         Ok(())
     }
 

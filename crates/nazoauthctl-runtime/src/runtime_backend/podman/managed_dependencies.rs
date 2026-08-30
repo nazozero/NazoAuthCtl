@@ -190,7 +190,7 @@ fn run_postgres_psql_with_credentials(
     credentials: &container_shared::TemporaryPostgresCredentials,
     sql: &str,
 ) -> anyhow::Result<()> {
-    container_shared::build_identity_process(command)
+    container_shared::hardened_one_shot_process(command)
         .arg("--network")
         .arg(&restore.network)
         .args([
@@ -227,7 +227,7 @@ fn run_postgres_restore(
     restore: &ManagedPostgresRestore,
     credentials: &container_shared::TemporaryPostgresCredentials,
 ) -> anyhow::Result<()> {
-    container_shared::build_identity_process(command)
+    container_shared::hardened_one_shot_process(command)
         .arg("--network")
         .arg(&restore.network)
         .args([
@@ -415,7 +415,7 @@ fn restore_valkey_into_temporary(
     restore: &ManagedValkeyRestore,
     volume: &str,
 ) -> anyhow::Result<()> {
-    container_shared::build_identity_process(command)
+    container_shared::hardened_one_shot_process(command)
     .args(["--network", "none"])
     .arg("--volume")
     .arg(format!("{volume}:/data:Z"))
@@ -450,7 +450,7 @@ fn validate_temporary_valkey(
         "Podman",
     )?;
     let create = container_shared::append_managed_labels(
-        container_shared::build_identity_process(command).args([
+        container_shared::hardened_one_shot_process(command).args([
             "-d",
             "--name",
             &container,
@@ -584,7 +584,7 @@ fn postgres_database_exists(
         &restore.password_file,
         "postgres",
     )?;
-    let output = container_shared::build_identity_process(command)
+    let output = container_shared::hardened_one_shot_process(command)
         .arg("--network")
         .arg(&restore.network)
         .args([

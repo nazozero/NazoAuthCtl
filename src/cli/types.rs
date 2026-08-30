@@ -93,7 +93,6 @@ pub(crate) enum Command {
     /// Explicit rollback to the previous verified artifact (G04).
     Rollback {
         selector: InstanceSelector,
-        yes: bool,
     },
     /// Read-only operation-log view over the two journals (H04).
     Operation {
@@ -126,11 +125,8 @@ pub(crate) enum Command {
     SelfCheck(Option<String>),
     SelfUpdate {
         version: Option<String>,
-        yes: bool,
     },
-    SelfRollback {
-        yes: bool,
-    },
+    SelfRollback,
 }
 
 /// `controller` family (goal plan 09 §1): everything runs against the
@@ -139,10 +135,7 @@ pub(crate) enum Command {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ControllerCommand {
     /// Authoritative slots view (the D09 read-only surface).
-    List {
-        selector: InstanceSelector,
-        admin_access_file: Option<PathBuf>,
-    },
+    List { selector: InstanceSelector },
     Add {
         selector: InstanceSelector,
         label: String,
@@ -158,7 +151,6 @@ pub(crate) enum ControllerCommand {
     Revoke {
         selector: InstanceSelector,
         controller_id: String,
-        yes: bool,
         approval_token: Option<String>,
         admin_access_file: Option<PathBuf>,
     },
@@ -326,7 +318,6 @@ pub(crate) struct UpdateArgs {
     pub(crate) version: Option<String>,
     pub(crate) config_file: Option<PathBuf>,
     pub(crate) config_schema: Option<String>,
-    pub(crate) yes: bool,
 }
 
 /// Backup maturity display arguments (H05).
@@ -353,7 +344,6 @@ pub(crate) struct PolicyArgs {
 #[derive(Debug)]
 pub(crate) struct RecoverArgs {
     pub(crate) selector: InstanceSelector,
-    pub(crate) yes: bool,
     /// Optional owner-only file containing the offline Recovery Secret.  It
     /// is read only if the restored registry rejects the current controller
     /// identity; the value is never an argv token or target payload.
@@ -409,12 +399,10 @@ pub(crate) enum AcmeCommand {
     Issue {
         input: AcmeCertificateInput,
         agree_terms: bool,
-        yes: bool,
     },
     Recover {
         tenant: String,
         hostname: String,
-        yes: bool,
     },
     Show {
         tenant: String,
@@ -426,18 +414,8 @@ pub(crate) enum AcmeCommand {
 pub(crate) enum TlsCommand {
     Check(TlsCertificateCheckInput),
     Plan(TlsCertificateInput),
-    Apply {
-        input: TlsCertificateInput,
-        yes: bool,
-    },
-    Recover {
-        tenant: String,
-        hostname: String,
-        yes: bool,
-    },
-    Show {
-        tenant: String,
-        hostname: String,
-    },
+    Apply(TlsCertificateInput),
+    Recover { tenant: String, hostname: String },
+    Show { tenant: String, hostname: String },
     Acme(AcmeCommand),
 }

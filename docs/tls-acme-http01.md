@@ -77,10 +77,10 @@ nazoauthctl tls acme plan \
 nazoauthctl tls acme issue \
   --acme-config /etc/nazoauth/acme.json \
   --provider-config /etc/nazoauth/tls-provider.json \
-  --tenant tenant-a --hostname auth.example --agree-terms --yes
+  --tenant tenant-a --hostname auth.example --agree-terms
 
 nazoauthctl tls acme recover \
-  --tenant tenant-a --hostname auth.example --yes
+  --tenant tenant-a --hostname auth.example
 ```
 
 `--agree-terms` is mandatory and refers to the exact configured TOS URL. Issue:
@@ -121,7 +121,7 @@ nazoauthctl tls certificate plan \
 
 nazoauthctl tls certificate apply \
   --provider-config /etc/nazoauth/tls-provider.json \
-  --tenant tenant-a --hostname auth.example --from-acme-current --yes
+  --tenant tenant-a --hostname auth.example --from-acme-current
 ```
 
 The certificate transaction refuses a pending issuance, a stale declaration

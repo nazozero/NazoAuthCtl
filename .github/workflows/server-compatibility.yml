@@ -31,9 +31,6 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  NAZOAUTHCTL_BUILD_COMMIT: ${{ inputs.controller_ref }}
-
 jobs:
   current-controller:
     permissions:
@@ -84,45 +81,9 @@ jobs:
           SERVER_RELEASE: ${{ inputs.server_release }}
         run: |
           set -euo pipefail
-          test "$SERVER_RELEASE" = v0.2.3
-      - name: Resolve one immutable current server identity
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SERVER_RELEASE: ${{ inputs.server_release }}
-        run: |
-          set -euo pipefail
-          test "$SERVER_RELEASE" = v0.2.3
-          ref_type="$(gh api "/repos/nazozero/NazoAuth/git/ref/tags/$SERVER_RELEASE" --jq '.object.type')"
-          ref_sha="$(gh api "/repos/nazozero/NazoAuth/git/ref/tags/$SERVER_RELEASE" --jq '.object.sha')"
-          for _ in 1 2 3 4; do
-            case "$ref_type" in
-              commit) break ;;
-              tag)
-                tag_json="$(gh api "/repos/nazozero/NazoAuth/git/tags/$ref_sha")"
-                ref_type="$(jq -er '.object.type' <<<"$tag_json")"
-                ref_sha="$(jq -er '.object.sha' <<<"$tag_json")"
-                ;;
-              *) echo "server tag resolves to unsupported git object type: $ref_type" >&2; exit 1 ;;
-            esac
-          done
-          test "$ref_type" = commit
-          [[ "$ref_sha" =~ ^[0-9a-f]{40}$ ]]
-
-          lock_line="$(grep -A4 '^name = "nazo-operator-protocol"$' Cargo.lock | grep '^source = ' || true)"
-          test -n "$lock_line"
-          protocol_rev="$(sed -n 's#.*git+https://github.com/nazozero/NazoAuth\.git?rev=\([0-9a-f]\{40\}\).*#\1#p' <<<"$lock_line")"
-          [[ "$protocol_rev" =~ ^[0-9a-f]{40}$ ]]
-          test "$protocol_rev" = "$ref_sha"
-
-          {
-            echo "SERVER_PEELED_COMMIT=$ref_sha"
-            echo "OPERATOR_PROTOCOL_REV=$protocol_rev"
-          } >>"$GITHUB_ENV"
+          test "$SERVER_RELEASE" = v0.2.5
       - name: Execute the exact controller artifact through its production protocol path
         shell: bash
-        env:
-          EXPECTED_CONTROLLER_REF: ${{ inputs.controller_ref }}
         run: |
           set -euo pipefail
           chmod 0755 controller/nazoauthctl
@@ -132,14 +93,13 @@ jobs:
             '{"schema":5,"operation_id":"019018c0-0000-7000-8000-000000000001","operation":{"kind":"hello"}}' \
             | NAZOAUTHCTL_TARGET_STATE_ROOT="$state_root" controller/nazoauthctl remote exec \
             >controller-hello.json
-          jq -e --arg commit "$EXPECTED_CONTROLLER_REF" '
+          jq -e '
             .schema == 5
             and .operation_id == "019018c0-0000-7000-8000-000000000001"
             and .outcome.status == "completed"
             and .outcome.body.completion == "hello"
             and .outcome.body.hello.product == "nazoauthctl"
             and .outcome.body.hello.remote_exec_schema == 5
-            and .outcome.body.hello.commit == $commit
           ' controller-hello.json
       - name: Download and verify the signed host server
         shell: bash
@@ -155,7 +115,7 @@ jobs:
             --signer-workflow nazozero/NazoAuth/.github/workflows/release-security.yml \
             --source-ref "refs/tags/$SERVER_RELEASE" \
             --deny-self-hosted-runners
-      - name: Verify the protocol-2 host identity
+      - name: Verify the protocol-3 host release identity
         shell: bash
         env:
           SERVER_RELEASE: ${{ inputs.server_release }}
@@ -163,10 +123,9 @@ jobs:
           set -euo pipefail
           server=signed-server/nazoauth-x86_64-unknown-linux-gnu
           chmod 0755 "$server"
-          "$server" build-identity >host-identity.json
-          jq -e --arg release "$SERVER_RELEASE" --arg revision "$SERVER_PEELED_COMMIT" \
-            '.release == $release and .protocol == 2 and .revision == $revision' \
-            host-identity.json
+          "$server" release-identity >host-identity.json
+          jq -e --arg release "$SERVER_RELEASE" \
+            '.release == $release and .protocol == 3' host-identity.json
       - name: Verify the signed OCI identity at its immutable digest
         shell: bash
         env:
@@ -192,9 +151,8 @@ jobs:
           ')"
           [[ "$platform_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           docker pull "$image"
-          docker run --rm --network none "$image" nazoauth build-identity >oci-identity.json
+          docker run --rm --network none "$image" nazoauth release-identity >oci-identity.json
           diff -u host-identity.json oci-identity.json
-          jq -e --arg revision "$SERVER_PEELED_COMMIT" '.revision == $revision' oci-identity.json
           {
             echo "SERVER_OCI_INDEX_DIGEST=$index_digest"
             echo "SERVER_OCI_PLATFORM_DIGEST=$platform_digest"
@@ -209,8 +167,6 @@ jobs:
           EXPECTED_SERVER_RELEASE: ${{ inputs.server_release }}
         run: |
           set -euo pipefail
-          export EXPECTED_SERVER_PEELED_COMMIT="$SERVER_PEELED_COMMIT"
-          export EXPECTED_OPERATOR_PROTOCOL_REV="$OPERATOR_PROTOCOL_REV"
           export EXPECTED_OCI_INDEX_DIGEST="$SERVER_OCI_INDEX_DIGEST"
           export EXPECTED_OCI_PLATFORM_DIGEST="$SERVER_OCI_PLATFORM_DIGEST"
           # This selected test calls VerifiedRelease::verify directly; the

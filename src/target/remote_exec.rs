@@ -52,7 +52,9 @@ pub(crate) fn serve(
 
     let journal = TargetJournal::open(state_root)?;
     let target = LocalTarget::with_state_root(state_root);
-    let result = target.execute_journaled(&operation, &journal)?;
+    // `parse_host_operation` is the remote wire admission boundary; the
+    // target-side journal path therefore receives an already validated value.
+    let result = target.execute_journaled_validated(&operation, &journal)?;
 
     output.write_all(&encode_host_result(&result)?)?;
     output.write_all(b"\n")?;
@@ -73,7 +75,7 @@ fn read_bounded_stdin() -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error_codes::{CONFIG_REVISION_MISMATCH, OPERATION_ID_CONFLICT};
+    use crate::error_codes::CONFIG_REVISION_MISMATCH;
     use crate::filesystem::PrivateTempDir;
     use crate::target::wire::{MAX_HOST_OPERATION_BYTES, parse_host_result};
     use uuid::Uuid;
@@ -141,17 +143,17 @@ mod tests {
     }
 
     #[test]
-    fn replays_answer_identically_through_the_journal() -> anyhow::Result<()> {
+    fn read_only_requests_execute_without_journal_state() -> anyhow::Result<()> {
         let (_temp, root) = temp_state()?;
         let input = ping_input("retry");
         let mut first = Vec::new();
         serve(&input, &mut first, &root)?;
         let mut second = Vec::new();
         serve(&input, &mut second, &root)?;
-        assert_eq!(first, second, "the stored result is replayed byte-for-byte");
+        assert_eq!(first, second, "a repeated read returns the same answer");
 
-        // A different payload reusing the id is answered with the stable
-        // conflict code instead of executing again.
+        // Read operations are safe to execute again, so their ids do not
+        // reserve journal state or create artificial payload conflicts.
         let mut operation: crate::target::HostOperation = serde_json::from_slice(&input)?;
         operation.operation = crate::target::wire::HostOperationBody::Ping {
             nonce: "tampered".to_owned(),
@@ -159,12 +161,15 @@ mod tests {
         let mut output = Vec::new();
         serve(&serde_json::to_vec(&operation)?, &mut output, &root)?;
         let result = parse_host_result(&output)?;
-        match result.outcome {
-            crate::target::HostOutcome::Failed { code, .. } => {
-                assert_eq!(code, OPERATION_ID_CONFLICT);
+        assert_eq!(
+            result.outcome,
+            crate::target::HostOutcome::Completed {
+                body: crate::target::HostCompletionBody::Ping {
+                    nonce: "tampered".to_owned(),
+                },
             }
-            _ => panic!("expected the conflict outcome"),
-        }
+        );
+        assert!(!root.join("deployments/host/operations.jsonl").exists());
         Ok(())
     }
 
@@ -259,7 +264,7 @@ mod tests {
                         ResourceScope::Shared,
                     )?,
                 ],
-                current_build_identity: None,
+                current_release: None,
                 current_rollback_policy: crate::model::test_release_rollback_policy(),
             },
             &Uuid::now_v7().to_string(),

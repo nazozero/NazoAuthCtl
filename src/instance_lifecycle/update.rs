@@ -3,7 +3,7 @@
 //! Control-side flow, exactly the plan's seven steps:
 //!
 //! 1. live read of current state + expected config revision;
-//! 2. digest-pinned verified target artifact (verified on the target);
+//! 2. digest-pinned official artifact (verified on the target);
 //! 3. lifecycle journal: ONE operation id shared by both journals —
 //!    `previous` is preserved in the target state swap, never deleted;
 //! 4. application migration through exactly one pre-signed ControlOperation
@@ -19,7 +19,7 @@
 
 use anyhow::{Context as _, bail};
 use chrono::Utc;
-use nazo_operator_protocol::{ControlBuildIdentity, ControlOperationPayload, ControlTarget};
+use nazo_operator_protocol::ControlOperationPayload;
 use sha2::{Digest as _, Sha256};
 
 use super::{LifecycleContext, record_observation, resolve_live_instance};
@@ -31,8 +31,8 @@ use crate::controller_identity::operation::ControlOperationInput;
 use crate::controller_identity::store::ControllerKeyStore;
 use crate::registry::BackupBeforeUpdatePolicy;
 use crate::target::{
-    BuildIdentity, HostCompletionBody, HostOperation, HostOutcome, OfficialArtifactRef,
-    StagedConfig, StateMutationPayload, UpdateBackupPrecondition,
+    HostCompletionBody, HostOperation, HostOutcome, OfficialArtifactRef, StagedConfig,
+    StateMutationPayload, UpdateBackupPrecondition,
 };
 
 /// One update invocation. Defaults are minimal: only facts that cannot be
@@ -97,12 +97,6 @@ pub(crate) fn run_update(
              adopt or install it first"
         );
     }
-    if inspection.current_build_identity.is_none() {
-        bail!(
-            "{action}: deployment '{deployment_id}' carries no recorded build identity for its \
-             current artifact; re-register the instance with verified facts or reinstall"
-        );
-    }
     let backup_precondition = match &record.backup_before_update {
         BackupBeforeUpdatePolicy::Off => UpdateBackupPrecondition::NotRequired,
         BackupBeforeUpdatePolicy::Warn => {
@@ -154,13 +148,7 @@ pub(crate) fn run_update(
         version: request.version.clone(),
     };
 
-    let verified_target = context
-        .resolver
-        .resolve_target_artifact(&pinned, &inspection)?;
-    let target_artifact = verified_target.digest;
-    let target_build_identity = verified_target.identity;
-    let rollback_policy = verified_target.rollback_policy;
-    let artifact_rollback_allowed = rollback_policy.artifact_rollback_allowed_after_migration();
+    let staged_config = request.staged_config()?;
 
     // 3.+4. Application migration: exactly ONE pre-signed ControlOperation.
     // Its operation id IS the lifecycle id of this attempt — the HostOperation
@@ -187,7 +175,6 @@ pub(crate) fn run_update(
         &record.deployment_id,
         ControlOperationInput {
             operation: ControlOperationPayload::MigrateApply,
-            artifact_target: control_target_for(&target_artifact, &target_build_identity),
             config_revision,
         },
     )
@@ -202,15 +189,29 @@ pub(crate) fn run_update(
         Some(revision),
         StateMutationPayload::Update {
             artifact: pinned,
-            rollback_policy,
             backup_precondition,
-            config: request.staged_config()?,
+            config: staged_config,
             migration_jws: Some(prepared.signed.compact_jws.clone()),
             migration_request_hash: Some(prepared.signed.request_hash.clone()),
         },
     );
     let result = target.execute_host_operation(&operation)?;
     let applied_revision = match &result.outcome {
+        HostOutcome::Completed {
+            body: HostCompletionBody::StateMutateNoop { revision },
+        } => {
+            // The target verified the selected artifact and proved that no
+            // config change was requested.  The prepared ControlOperation was
+            // never delivered, so there is no ControlResult to settle; clear
+            // its write-ahead slot directly and report the target's explicit
+            // no-op.
+            journal.clear()?;
+            record_observation(context, &deployment_id, &inspection);
+            return Ok(format!(
+                "instance '{}' already runs the target-verified artifact; no migration or target mutation was needed (revision {})\n",
+                record.alias, revision
+            ));
+        }
         HostOutcome::Completed { body } => match body {
             HostCompletionBody::StateMutateApplied {
                 revision,
@@ -311,11 +312,7 @@ pub(crate) fn run_update(
             .current
             .clone()
             .unwrap_or_else(|| "-".to_owned()),
-        if artifact_rollback_allowed {
-            "previous artifact preserved for explicit rollback"
-        } else {
-            "previous artifact retained as evidence; verified Release policy forbids rollback after migration"
-        },
+        "previous artifact preserved; the target's verified Release policy governs explicit rollback",
         record.alias,
     ))
 }
@@ -324,17 +321,4 @@ fn restore_test_age_seconds(inspection: &crate::target::InstanceInspection) -> O
     let restored_at = inspection.backup.snapshot.as_ref()?.restore_tested_at?;
     let age = Utc::now().signed_duration_since(restored_at).num_seconds();
     u64::try_from(age).ok()
-}
-
-/// Build the artifact identity binding for the ControlOperation envelope from
-/// the facts recorded at install/update time on the target.
-pub(crate) fn control_target_for(target_artifact: &str, identity: &BuildIdentity) -> ControlTarget {
-    ControlTarget::OciImage {
-        image_digest: target_artifact.to_owned(),
-        embedded: ControlBuildIdentity {
-            product: identity.product.clone(),
-            version: identity.version.clone(),
-            commit: identity.commit.clone(),
-        },
-    }
 }

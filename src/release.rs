@@ -117,7 +117,6 @@ pub(crate) struct VerifiedControllerRelease {
 pub(crate) struct ReleaseRequest<'a> {
     pub(crate) repository: &'a str,
     pub(crate) requested_version: Option<&'a str>,
-    pub(crate) container_backend: Option<RuntimeBackendKind>,
     pub(crate) trusted_version_floor: Option<&'a str>,
 }
 
@@ -158,10 +157,8 @@ impl VerifiedRelease {
             work.path(),
             &blob,
             &identity,
-            request.container_backend,
             cache.as_deref(),
         )?;
-        manifest.validate(&version, &identity)?;
         manifest.validate_controller_compatibility()?;
         if let Some(floor) = request.trusted_version_floor {
             enforce_release_trust_floor(floor, &manifest)?;
@@ -209,10 +206,7 @@ impl VerifiedControllerRelease {
     /// download, digest check, bounded attestation query, cosign verification
     /// pinned to the controller release-workflow identity, and provenance
     /// subject binding happen exactly once here.
-    pub(crate) fn verify(
-        requested_version: Option<&str>,
-        container_backend: Option<RuntimeBackendKind>,
-    ) -> anyhow::Result<Self> {
+    pub(crate) fn verify(requested_version: Option<&str>) -> anyhow::Result<Self> {
         let version = resolve_version(CONTROLLER_REPOSITORY, requested_version)?;
         let target = release_target().context("this platform has no official controller target")?;
         let suffix = if target.contains("windows") {
@@ -265,7 +259,6 @@ impl VerifiedControllerRelease {
                 &artifact_name,
                 &identity,
                 CONTROLLER_PROVENANCE_PREDICATE,
-                container_backend,
             )?;
             accepted += 1;
         }
@@ -359,7 +352,6 @@ fn verified_release_candidate(
     work: &Path,
     blob: &str,
     identity: &str,
-    container_backend: Option<RuntimeBackendKind>,
     cache: Option<&Path>,
 ) -> anyhow::Result<ReleaseManifest> {
     let cached = cache.and_then(|root| {
@@ -391,14 +383,7 @@ fn verified_release_candidate(
         &digest,
         identity,
         |work, bundle, blob, identity| {
-            verify_blob_attestation(
-                work,
-                bundle,
-                blob,
-                identity,
-                RELEASE_PREDICATE,
-                container_backend,
-            )
+            verify_blob_attestation(work, bundle, blob, identity, RELEASE_PREDICATE)
         },
     );
     let manifest = match (first_verification, cached.as_ref()) {
@@ -435,7 +420,6 @@ fn verified_release_candidate(
                         blob,
                         identity,
                         RELEASE_PREDICATE,
-                        container_backend,
                     )
                 },
             )
@@ -708,7 +692,6 @@ fn verify_blob_attestation(
     blob: &str,
     identity: &str,
     predicate: &str,
-    container_backend: Option<RuntimeBackendKind>,
 ) -> anyhow::Result<()> {
     if command_exists("cosign") {
         return Process::new("cosign")
@@ -725,7 +708,10 @@ fn verify_blob_attestation(
             .arg(work.join(blob))
             .run_quiet();
     }
-    let kind = container_backend.context("Cosign is required when no container backend exists")?;
+    let kind = [RuntimeBackendKind::Podman, RuntimeBackendKind::Docker]
+        .into_iter()
+        .find(|kind| command_exists(kind.as_str()))
+        .context("Cosign verification requires cosign, Podman, or Docker")?;
     backend(kind).verify_blob_attestation(&BlobAttestationVerification {
         work: work.to_path_buf(),
         bundle: bundle.to_owned(),

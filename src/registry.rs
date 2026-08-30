@@ -69,25 +69,6 @@ pub(crate) fn verify_registered_target_identity(
     Ok(())
 }
 
-fn check_obsolete_paths_absent() -> anyhow::Result<()> {
-    let obsolete_paths = [
-        PathBuf::from("/etc/nazoauthctl/registry.json"),
-        PathBuf::from("/var/lib/nazoauthctl/deployments"),
-        #[cfg(windows)]
-        PathBuf::from(r"C:\ProgramData\nazoauthctl\registry.json"),
-    ];
-    for path in obsolete_paths {
-        if path.exists() {
-            anyhow::bail!(
-                "{STATE_RESET_REQUIRED}: obsolete ctl state detected at {}; back up application \
-                 data, remove the obsolete ctl state, then discover or adopt the deployment again",
-                path.display()
-            );
-        }
-    }
-    Ok(())
-}
-
 /// Maximum length of a user-facing selector or reference string.
 const MAX_KEY_CHARS: usize = 128;
 
@@ -148,10 +129,6 @@ pub struct HostRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_profile: Option<String>,
     pub privilege: HostPrivilege,
-    /// Remote executor basename only (`nazoauthctl remote exec` helper).
-    /// Path components are rejected; transports build the fixed command.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_exec_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_observation: Option<ObservationCache>,
 }
@@ -165,7 +142,6 @@ impl HostRecord {
             transport: HostTransport::Local,
             ssh_profile: None,
             privilege: HostPrivilege::Direct,
-            remote_exec_path: None,
             last_observation: None,
         }
     }
@@ -201,7 +177,6 @@ impl HostRecord {
             transport: HostTransport::Ssh,
             ssh_profile: Some(ssh_profile.into()),
             privilege,
-            remote_exec_path: None,
             last_observation: None,
         }
     }
@@ -232,9 +207,6 @@ impl HostRecord {
             if self.alias == LOCAL_HOST_ALIAS {
                 bail!("the '{LOCAL_HOST_ALIAS}' alias is reserved for the built-in local host");
             }
-        }
-        if let Some(exec) = self.remote_exec_path.as_deref() {
-            validate_key(exec, "remote exec path")?;
         }
         Ok(())
     }
@@ -583,7 +555,6 @@ impl RegistryStore {
 
     /// Open the store at the platform default location.
     pub fn open_default() -> anyhow::Result<Self> {
-        check_obsolete_paths_absent()?;
         Self::open(Self::default_root()?)
     }
 
@@ -752,16 +723,6 @@ impl RegistryStore {
                 host.alias
             );
         }
-        let observed_target_id = Uuid::parse_str(&evidence.hello.target_id)
-            .context("evidence target identity is not a UUID")?;
-        if observed_target_id != host.host_id {
-            bail!(
-                "evidence target identity {} does not match registered host '{}' ({})",
-                observed_target_id,
-                host.alias,
-                host.host_id
-            );
-        }
         if self
             .find_instance_by_deployment_locked(&evidence.deployment.deployment_id)?
             .is_some()
@@ -784,7 +745,6 @@ impl RegistryStore {
             &evidence.deployment.issuer,
         )?;
         record.last_observation = Some(observation);
-        record.validate()?;
         let path = self.instance_path(&record.deployment_id);
         write_record(&path, "instance record", &record)?;
         Ok(record)
@@ -1414,16 +1374,6 @@ mod tests {
         local.ssh_profile = None;
         assert!(local.validate().is_ok());
 
-        let mut local = HostRecord::new_local(Uuid::now_v7());
-        local.remote_exec_path = Some("/usr/bin/nazoauthctl".to_owned());
-        assert!(
-            local.validate().is_err(),
-            "remote exec path must be a basename"
-        );
-        local.remote_exec_path = Some("..".to_owned());
-        assert!(local.validate().is_err());
-        local.remote_exec_path = Some("nazoauthctl.exe".to_owned());
-        assert!(local.validate().is_ok());
         Ok(())
     }
 
@@ -1613,7 +1563,7 @@ mod tests {
                 e.evidence = "hand-typed".to_owned();
             },
             |e: &mut DiscoveryEvidence| {
-                e.hello.version = "0.0.1-old".to_owned();
+                e.hello.product = "other-helper".to_owned();
             },
             |e: &mut DiscoveryEvidence| {
                 e.deployment.deployment_id = String::new();

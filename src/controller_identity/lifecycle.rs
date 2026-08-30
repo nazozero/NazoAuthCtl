@@ -1035,13 +1035,10 @@ pub(crate) fn run_controller_command(
     let registry = RegistryStore::open_default()?;
     let keys = ControllerKeyStore::open_default()?;
     match command {
-        ControllerCommand::List {
-            selector,
-            admin_access_file,
-        } => {
+        ControllerCommand::List { selector } => {
             let explicit = merge_global(selector, global, "controller list")?;
             let record = resolve_record(&registry, explicit.as_deref())?;
-            let api = make_api(&record.issuer, admin_access_file.as_deref())?;
+            let api = make_api(&record.issuer, None)?;
             let report = slots_flow(&api, &registry, &keys, explicit.as_deref())?;
             println!("{report}");
         }
@@ -1088,16 +1085,9 @@ pub(crate) fn run_controller_command(
         ControllerCommand::Revoke {
             selector,
             controller_id,
-            yes,
             approval_token,
             admin_access_file,
         } => {
-            if !yes {
-                bail!(
-                    "revocation is destructive: re-run with --yes after confirming the exact \
-                     controller id"
-                );
-            }
             let explicit = merge_global(selector, global, "controller revoke")?;
             let record = resolve_record(&registry, explicit.as_deref())?;
             let api = make_api(&record.issuer, admin_access_file.as_deref())?;

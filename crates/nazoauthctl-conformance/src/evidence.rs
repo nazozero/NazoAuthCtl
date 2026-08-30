@@ -35,8 +35,6 @@ pub struct EvidenceDeploymentIdentity {
     pub deployment_id: String,
     pub target_issuer: String,
     pub release: String,
-    pub revision: String,
-    pub build_id: String,
     pub runtime: EvidenceRuntimeIdentity,
 }
 
@@ -936,8 +934,6 @@ fn validate_identity(
     if crate::artifact::validate_identifier(&identity.run_jti, 128).is_err()
         || crate::artifact::validate_identifier(&identity.deployment.deployment_id, 128).is_err()
         || !bounded(&identity.deployment.release, 128)
-        || !lower_hex(&identity.deployment.revision, 40)
-        || !bounded(&identity.deployment.build_id, 256)
         || identity.deployment.target_issuer.ends_with('/')
     {
         return Err(EvidenceError::Identity);

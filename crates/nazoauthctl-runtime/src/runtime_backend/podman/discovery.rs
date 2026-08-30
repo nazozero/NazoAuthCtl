@@ -394,35 +394,6 @@ pub(super) fn resolve_local_image_id(
         .context("Podman image has no immutable local content identity")
 }
 
-pub(super) fn read_build_identity(
-    command: &OsStr,
-    artifact: &ArtifactReference,
-    local_artifact_id: Option<&str>,
-) -> anyhow::Result<Option<nazo_operator_protocol::EmbeddedIdentity>> {
-    let ArtifactReference::Oci {
-        image_reference,
-        digest,
-    } = artifact
-    else {
-        bail!("Podman build identity requires a digest-bound OCI artifact");
-    };
-    let image = local_artifact_id.map(ToOwned::to_owned).unwrap_or_else(|| {
-        format!(
-            "{}@{}",
-            image_reference.split('@').next().unwrap_or(image_reference),
-            digest
-        )
-    });
-    let output = container_shared::build_identity_process(command)
-        .args(["--network", "none"])
-        .arg(image)
-        .args(["nazoauth", "build-identity"])
-        .stdout()?;
-    Ok(Some(serde_json::from_str(output.trim()).context(
-        "Podman image returned an invalid build identity",
-    )?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

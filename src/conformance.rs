@@ -1,9 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
-use nazo_operator_protocol::{
-    ControlBuildIdentity, ControlOperationPayload, ControlOutcome, ControlResult, ControlTarget,
-};
+use nazo_operator_protocol::{ControlOperationPayload, ControlOutcome, ControlResult};
 
 use crate::{
     controller_identity::{
@@ -26,8 +24,6 @@ pub struct ConformanceDeploymentEvidence {
     pub deployment_id: String,
     pub target_issuer: String,
     pub release: String,
-    pub revision: String,
-    pub build_id: String,
     pub runtime: ConformanceRuntimeEvidence,
 }
 
@@ -46,7 +42,6 @@ pub struct ConformanceSession {
     registry: RegistryStore,
     target: Box<dyn ExecutionTarget>,
     controller_keys: ControllerKeyStore,
-    control_target: ControlTarget,
     config_revision: String,
     openid4vp_evidence_verifier_inputs: OpenId4VpEvidenceVerifierInputs,
 }
@@ -142,47 +137,27 @@ impl ConformanceSession {
             "conformance requires a verified current artifact in target DeploymentState",
         )?;
         let identity = inspection
-            .current_build_identity
+            .current_release
             .as_ref()
-            .context("conformance requires verified build identity in target DeploymentState")?;
-        let embedded = ControlBuildIdentity {
-            product: identity.product.clone(),
-            version: identity.version.clone(),
-            commit: identity.commit.clone(),
-        };
-        let (runtime, control_target) = match inspection.runtime.kind {
-            RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => (
-                ConformanceRuntimeEvidence::OciImage {
-                    digest: artifact.clone(),
-                },
-                ControlTarget::OciImage {
-                    image_digest: artifact,
-                    embedded,
-                },
-            ),
+            .context("conformance requires verified release version in target DeploymentState")?;
+        let runtime = match inspection.runtime.kind {
+            RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
+                ConformanceRuntimeEvidence::OciImage { digest: artifact }
+            }
             RuntimeBackendKind::Host => {
                 let sha256 = artifact
                     .strip_prefix("sha256:")
                     .unwrap_or(&artifact)
                     .to_owned();
-                (
-                    ConformanceRuntimeEvidence::HostBinary {
-                        sha256: sha256.clone(),
-                    },
-                    ControlTarget::HostBinary { sha256, embedded },
-                )
+                ConformanceRuntimeEvidence::HostBinary { sha256 }
             }
         };
         let release = identity.version.clone();
-        let revision = identity.commit.clone();
-        let build_id = format!("{}:{}", identity.product, identity.version);
 
         let evidence = ConformanceDeploymentEvidence {
             deployment_id: record.deployment_id.clone(),
             target_issuer: inspection.issuer.clone(),
             release,
-            revision,
-            build_id,
             runtime,
         };
 
@@ -207,7 +182,6 @@ impl ConformanceSession {
             registry,
             target,
             controller_keys,
-            control_target,
             config_revision,
             openid4vp_evidence_verifier_inputs,
         })
@@ -226,8 +200,6 @@ impl ConformanceSession {
             deployment_id: self.evidence.deployment_id.clone(),
             target_issuer: self.evidence.target_issuer.clone(),
             release: self.evidence.release.clone(),
-            revision: self.evidence.revision.clone(),
-            build_id: self.evidence.build_id.clone(),
             runtime: match &self.evidence.runtime {
                 ConformanceRuntimeEvidence::OciImage { digest } => {
                     ConformanceRuntimeEvidence::OciImage {
@@ -273,7 +245,6 @@ impl ConformanceSession {
             &self.deployment_id,
             ControlOperationInput {
                 operation,
-                artifact_target: self.control_target.clone(),
                 config_revision: self.config_revision.clone(),
             },
         )?;
@@ -541,8 +512,6 @@ mod tests {
                 deployment_id: deployment_id.to_owned(),
                 target_issuer: "https://auth.example.com".to_owned(),
                 release: "1.0.0".to_owned(),
-                revision: "abcdef0".to_owned(),
-                build_id: "nazoauth:1.0.0".to_owned(),
                 runtime: ConformanceRuntimeEvidence::HostBinary {
                     sha256: "ab".repeat(32),
                 },
@@ -556,14 +525,6 @@ mod tests {
                 result_data: result_data.clone(),
             }),
             controller_keys,
-            control_target: ControlTarget::HostBinary {
-                sha256: "ab".repeat(32),
-                embedded: ControlBuildIdentity {
-                    product: nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT.to_owned(),
-                    version: "1.0.0".to_owned(),
-                    commit: "abcdef0".to_owned(),
-                },
-            },
             config_revision: "revision-1".to_owned(),
             openid4vp_evidence_verifier_inputs: OpenId4VpEvidenceVerifierInputs {
                 target_issuer: "https://auth.example.com".to_owned(),

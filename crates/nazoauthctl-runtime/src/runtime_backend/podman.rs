@@ -12,7 +12,8 @@ mod operations;
 
 use std::ffi::OsString;
 
-use crate::{ArtifactReference, RuntimeBackendKind};
+use crate::RuntimeBackendKind;
+use crate::process::Process;
 
 #[cfg(debug_assertions)]
 use super::DebugArtifactTask;
@@ -41,6 +42,24 @@ impl PodmanBackend {
             command: command.into(),
         }
     }
+}
+
+fn append_rootless_user_namespace(process: Process) -> Process {
+    if !is_rootless() {
+        process
+    } else {
+        process.arg("--userns=keep-id:uid=10001,gid=10001")
+    }
+}
+
+#[cfg(unix)]
+fn is_rootless() -> bool {
+    rustix::process::geteuid().as_raw() != 0
+}
+
+#[cfg(not(unix))]
+fn is_rootless() -> bool {
+    false
 }
 
 impl RuntimeBackend for PodmanBackend {
@@ -111,6 +130,7 @@ impl RuntimeBackend for PodmanBackend {
             &discovery::inspect(&self.command, &request.source_object_reference)?,
             request,
             false,
+            is_rootless(),
         )
     }
 
@@ -123,10 +143,6 @@ impl RuntimeBackend for PodmanBackend {
 
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String> {
         one_shot::run(&self.command, task)
-    }
-
-    fn run_one_shot_authorization_probe(&self, task: &OneShotTask) -> anyhow::Result<bool> {
-        one_shot::run_authorization_probe(&self.command, task)
     }
 
     fn pull_image(&self, image_reference: &str) -> anyhow::Result<()> {
@@ -197,14 +213,6 @@ impl RuntimeBackend for PodmanBackend {
 
     fn resolve_local_image_id(&self, image_reference: &str) -> anyhow::Result<String> {
         discovery::resolve_local_image_id(&self.command, image_reference)
-    }
-
-    fn read_build_identity(
-        &self,
-        artifact: &ArtifactReference,
-        local_artifact_id: Option<&str>,
-    ) -> anyhow::Result<Option<nazo_operator_protocol::EmbeddedIdentity>> {
-        discovery::read_build_identity(&self.command, artifact, local_artifact_id)
     }
 
     fn describe_mounts(&self, object_reference: &str) -> anyhow::Result<Vec<NeutralMount>> {

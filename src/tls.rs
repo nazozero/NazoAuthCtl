@@ -370,11 +370,10 @@ pub(crate) fn run(
     selector: Option<&str>,
     command: TlsCommand,
     require_root: impl Fn() -> anyhow::Result<()>,
-    confirm: impl Fn(bool, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let store = TlsStore::system()?;
     match command {
-        TlsCommand::Acme(command) => acme::run(selector, command, require_root, confirm),
+        TlsCommand::Acme(command) => acme::run(selector, command, require_root),
         TlsCommand::Check(input) => {
             require_root()?;
             check(&store, selector, &input)
@@ -417,21 +416,12 @@ pub(crate) fn run(
             println!("{}", serde_json::to_string_pretty(&plan)?);
             Ok(())
         }
-        TlsCommand::Apply { input, yes } => {
+        TlsCommand::Apply(input) => {
             require_root()?;
-            confirm(
-                yes,
-                "install and activate deployment-owned TLS certificate material",
-            )?;
             apply(&store, selector, &input)
         }
-        TlsCommand::Recover {
-            tenant,
-            hostname,
-            yes,
-        } => {
+        TlsCommand::Recover { tenant, hostname } => {
             require_root()?;
-            confirm(yes, "roll back the pending TLS certificate transaction")?;
             recover(&store, selector, &tenant, &hostname)
         }
         TlsCommand::Show { tenant, hostname } => {

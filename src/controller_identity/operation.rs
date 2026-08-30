@@ -1,18 +1,20 @@
 //! Client-side ControlOperation construction (goal plan 05 §2, frozen
 //! contract in `nazo-operator-protocol::control_operation`).
 //!
-//! [`build_signed_control_operation`] is the only place in ctl that signs a
-//! ControlOperation: it resolves the instance selector through the Registry,
-//! loads the active private key via the instance's `controller_key_ref`,
-//! fills the envelope (`deployment_id` from the registry record; target,
-//! config revision, and operation payload supplied by the caller), mints one
-//! UUIDv7 `operation_id`, canonicalizes, computes the request hash, and
-//! signs exactly once. The returned id/hash pair is what the journaling
-//! layer (E06) records before dispatch.
+//! [`build_signed_control_operation`] is the selector-facing entry point for
+//! the only place in ctl that signs a ControlOperation. The dispatch path
+//! resolves its selector before reaching the signer and passes the resulting
+//! [`InstanceRecord`] directly, so the record is read only once. The signer
+//! loads the active private key via the instance's `controller_key_ref`, fills
+//! the envelope (`deployment_id` from the record; config revision and
+//! operation payload supplied by the caller), mints one UUIDv7
+//! `operation_id`, canonicalizes, computes the request hash, and signs
+//! exactly once. The returned id/hash pair is what the journaling layer (E06)
+//! records before dispatch.
 
 use anyhow::{Context, bail};
 use nazo_operator_protocol::{
-    CONTROL_OPERATION_SCHEMA, ControlOperation, ControlOperationPayload, ControlTarget,
+    CONTROL_OPERATION_SCHEMA, ControlOperation, ControlOperationPayload,
     control_operation_request_hash, sign_control_operation,
 };
 use uuid::Uuid;
@@ -29,7 +31,6 @@ pub const CONTROLLER_KEY_REF_PREFIX: &str = "controller-keys/";
 /// fields (`operation_id`, `kid`, `deployment_id`) are owned by this module.
 pub struct ControlOperationInput {
     pub operation: ControlOperationPayload,
-    pub artifact_target: ControlTarget,
     pub config_revision: String,
 }
 
@@ -92,7 +93,8 @@ pub fn build_signed_control_operation(
     instance_selector: &str,
     input: ControlOperationInput,
 ) -> anyhow::Result<SignedControlOperation> {
-    build_signed_control_operation_with_id(registry, keys, instance_selector, input, None)
+    let record = resolve_instance(registry, instance_selector)?;
+    build_signed_control_operation_with_id(keys, &record, input, None)
 }
 
 /// Same as [`build_signed_control_operation`] with an explicit operation id.
@@ -100,15 +102,14 @@ pub fn build_signed_control_operation(
 /// journaled resume (E06): combined with deterministic Ed25519 this yields a
 /// byte-identical compact JWS, so the server sees one operation, never a new
 /// identity. The caller owns resume-safety checks (hash equality); this
-/// function performs no gating of its own.
-pub fn build_signed_control_operation_with_id(
-    registry: &RegistryStore,
+/// function performs no gating of its own. The caller must pass the already
+/// resolved record so selector lookup is not repeated inside a dispatch.
+pub(crate) fn build_signed_control_operation_with_id(
     keys: &ControllerKeyStore,
-    instance_selector: &str,
+    record: &InstanceRecord,
     input: ControlOperationInput,
     operation_id: Option<&str>,
 ) -> anyhow::Result<SignedControlOperation> {
-    let record = resolve_instance(registry, instance_selector)?;
     let key_ref = record.controller_key_ref.as_deref().with_context(|| {
         format!(
             "{}: instance '{}' has no bound controller key; run `nazoauthctl bind --instance {}` first",
@@ -143,7 +144,6 @@ pub fn build_signed_control_operation_with_id(
         },
         kid: loaded.kid().to_owned(),
         deployment_id: record.deployment_id.clone(),
-        target: input.artifact_target,
         config_revision: input.config_revision,
         operation: input.operation,
     };
@@ -152,7 +152,7 @@ pub fn build_signed_control_operation_with_id(
     Ok(SignedControlOperation {
         operation_id: operation.operation_id.clone(),
         kid: loaded.kid().to_owned(),
-        deployment_id: record.deployment_id,
+        deployment_id: record.deployment_id.clone(),
         request_hash,
         compact_jws,
         operation,
@@ -162,9 +162,7 @@ pub fn build_signed_control_operation_with_id(
 #[cfg(test)]
 mod tests {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use nazo_operator_protocol::{
-        ControlBuildIdentity, ProtocolError, verify_control_operation_signature,
-    };
+    use nazo_operator_protocol::{ProtocolError, verify_control_operation_signature};
 
     use super::*;
     use crate::controller_identity::store::controller_key_ref_for;
@@ -208,14 +206,6 @@ mod tests {
     fn sample_input() -> ControlOperationInput {
         ControlOperationInput {
             operation: ControlOperationPayload::MigrateApply,
-            artifact_target: ControlTarget::HostBinary {
-                sha256: "ab".repeat(32),
-                embedded: ControlBuildIdentity {
-                    product: "nazoauth".to_owned(),
-                    version: "1.0.0".to_owned(),
-                    commit: "9f2c1a7".to_owned(),
-                },
-            },
             config_revision: "rev-1".to_owned(),
         }
     }
@@ -331,14 +321,6 @@ mod tests {
             operation_id: "01900000-0000-7000-8000-000000000001".to_owned(),
             kid: store_key.kid().to_owned(),
             deployment_id: "deploy-alpha".to_owned(),
-            target: ControlTarget::HostBinary {
-                sha256: "ab".repeat(32),
-                embedded: ControlBuildIdentity {
-                    product: nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT.to_owned(),
-                    version: "1.0.0".to_owned(),
-                    commit: "9f2c1a7".to_owned(),
-                },
-            },
             config_revision: revision.to_owned(),
             operation: ControlOperationPayload::MigrateApply,
         };

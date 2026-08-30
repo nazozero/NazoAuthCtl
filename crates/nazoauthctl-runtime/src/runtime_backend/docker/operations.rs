@@ -1,6 +1,6 @@
 //! Docker lifecycle, artifact transfer, and replacement operations.
 
-use std::ffi::OsStr;
+use std::{ffi::OsStr, path::Path};
 
 use anyhow::{Context as _, bail};
 
@@ -24,25 +24,11 @@ pub(super) fn verify_blob_attestation(
     command: &OsStr,
     verification: &BlobAttestationVerification,
 ) -> anyhow::Result<()> {
-    Process::new(command)
-        .args(["run", "--rm", "--user"])
-        .arg(container_shared::NON_ROOT_ONE_SHOT_USER)
-        .arg("--cap-drop=ALL")
-        .args(["--read-only", "--security-opt=no-new-privileges"])
-        .args([
-            "--pids-limit",
-            "64",
-            "--memory",
-            "256m",
-            "--cpus",
-            "1",
-            "--tmpfs",
-        ])
-        .arg("/root/.sigstore:rw,noexec,nosuid,nodev,size=16m")
+    container_shared::append_cosign_sandbox(Process::new(command).args(["run", "--rm"]))
         .arg("--mount")
         .arg(format!(
             "type=bind,src={},dst=/work,readonly",
-            verification.work.display()
+            docker_bind_source(&verification.work)
         ))
         .arg(&verification.cosign_image)
         .args(["verify-blob-attestation", "--bundle"])
@@ -56,6 +42,20 @@ pub(super) fn verify_blob_attestation(
         ])
         .arg(format!("/work/{}", verification.blob))
         .run_quiet()
+}
+
+fn docker_bind_source(path: &Path) -> String {
+    let rendered = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(path) = rendered.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{path}");
+        }
+        if let Some(path) = rendered.strip_prefix(r"\\?\") {
+            return path.to_owned();
+        }
+    }
+    rendered.into_owned()
 }
 
 pub(super) fn start(command: &OsStr, object_reference: &str) -> anyhow::Result<()> {
@@ -110,13 +110,11 @@ pub(super) fn replace(command: &OsStr, replacement: &RuntimeReplacement) -> anyh
     else {
         bail!("Docker replacement requires a digest-bound OCI artifact");
     };
-    let image = replacement.local_artifact_id.clone().unwrap_or_else(|| {
-        format!(
-            "{}@{}",
-            image_reference.split('@').next().unwrap_or(image_reference),
-            digest
-        )
-    });
+    let image = container_shared::runnable_oci_image(
+        image_reference,
+        digest,
+        replacement.local_artifact_id.as_deref(),
+    );
     let policy = replacement
         .container_policy
         .as_ref()
@@ -191,4 +189,32 @@ pub(super) fn run_debug_artifact_task(
         .arg("nazoauth")
         .args(&task.arguments)
         .run_quiet()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    #[test]
+    fn docker_bind_source_preserves_ordinary_paths() {
+        let path = if cfg!(windows) {
+            Path::new(r"C:\work\release")
+        } else {
+            Path::new("/work/release")
+        };
+        assert_eq!(super::docker_bind_source(path), path.to_string_lossy());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn docker_bind_source_removes_windows_verbatim_prefixes() {
+        assert_eq!(
+            super::docker_bind_source(Path::new(r"\\?\C:\work\release")),
+            r"C:\work\release"
+        );
+        assert_eq!(
+            super::docker_bind_source(Path::new(r"\\?\UNC\server\share\release")),
+            r"\\server\share\release"
+        );
+    }
 }

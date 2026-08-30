@@ -6,7 +6,8 @@
 //! `/admin/controller-registry`:
 //!
 //! ```text
-//! GET  /slots?deployment_id=…            authoritative slot snapshot
+//! GET  /controller-registry/slots?deployment_id=…
+//!                                        public read-only slot snapshot
 //! POST /approvals                        single-use approval token issuance
 //!                                        (the server enforces fresh admin MFA)
 //! POST /slots                            bind/add commit
@@ -579,10 +580,21 @@ impl fmt::Display for AdminApiError {
                 status,
                 error,
                 description,
-            } => write!(
-                formatter,
-                "admin API rejected the request (HTTP {status}, error {error}): {description}"
-            ),
+            } => {
+                if matches!(status, 401 | 403) {
+                    write!(
+                        formatter,
+                        "{}: the admin API rejected the request (HTTP {status}, error {error}): \
+                         {description}",
+                        crate::error_codes::ADMIN_ACCESS_REQUIRED
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "admin API rejected the request (HTTP {status}, error {error}): {description}"
+                    )
+                }
+            }
             Self::MalformedResponse(error) => write!(
                 formatter,
                 "admin API response violated the frozen contract: {error:#}"
@@ -711,7 +723,9 @@ impl HttpControllerRegistryApi {
         // normal `controller recover` command cannot send Cookie/CSRF there.
         let mut headers = if matches!(
             path,
-            "/controller-recovery/challenges" | "/controller-recovery/recover"
+            "/controller-recovery/challenges"
+                | "/controller-recovery/recover"
+                | "/controller-registry/slots"
         ) {
             Vec::new()
         } else {
@@ -773,7 +787,7 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
     fn list_slots(&self, deployment_id: &str) -> Result<SlotsSnapshot, AdminApiError> {
         let raw = self.send_json(
             "GET",
-            "/admin/controller-registry/slots",
+            "/controller-registry/slots",
             Some(("deployment_id", deployment_id)),
             None,
         )?;
@@ -1216,7 +1230,15 @@ mod tests {
             r#"{{"deployment_id":"deploy-alpha","total":1,"max_active_slots":3,"items":[{SLOT_JSON}]}}"#
         );
         transport.push(200, &list_body);
-        let client = https_client(transport.clone());
+        let client = HttpControllerRegistryApi::with_transport(
+            "https://auth.example.com",
+            AdminAccess::new(
+                Some("must-not-be-sent=1".to_owned()),
+                Some("csrf-no".to_owned()),
+            ),
+            Box::new(transport.clone()),
+        )
+        .unwrap();
         let snapshot = client.list_slots("deploy alpha?x").expect("snapshot");
         assert_eq!(snapshot.deployment_id, "deploy-alpha");
         assert_eq!(snapshot.max_active_slots, 3);
@@ -1230,10 +1252,14 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].url,
-            "https://auth.example.com/admin/controller-registry/slots?deployment_id=deploy%20alpha%3Fx"
+            "https://auth.example.com/controller-registry/slots?deployment_id=deploy%20alpha%3Fx"
         );
         assert_eq!(requests[0].method, "GET");
         assert!(requests[0].body.is_none());
+        assert!(
+            requests[0].headers.is_empty(),
+            "the public read-only query must not carry admin credentials"
+        );
     }
 
     #[test]

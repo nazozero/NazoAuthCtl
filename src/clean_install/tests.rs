@@ -132,7 +132,7 @@ impl install_exec::InstallExecutor for ScriptedInstall {
                 .expect("block the scripted state commit");
         }
         let facts = install_exec::InstallFacts {
-            build_identity: None,
+            release: None,
             artifact_reference: format!("sha256:{}", digest()),
             rollback_policy: crate::model::test_release_rollback_policy(),
         };

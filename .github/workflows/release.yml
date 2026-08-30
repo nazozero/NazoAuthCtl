@@ -92,7 +92,7 @@ jobs:
     uses: ./.github/workflows/server-compatibility.yml
     with:
       controller_ref: ${{ github.sha }}
-      server_release: v0.2.3
+      server_release: v0.2.5
     permissions:
       actions: read
       contents: read
@@ -112,10 +112,6 @@ jobs:
           - { runner: macos-15-intel, target: x86_64-apple-darwin, extension: '' }
           - { runner: macos-15, target: aarch64-apple-darwin, extension: '' }
     runs-on: ${{ matrix.runner }}
-    env:
-      # P1-9: release binaries embed their exact tag commit so the C08
-      # handshake compares real build identities, never empty dev strings.
-      NAZOAUTHCTL_BUILD_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Test and build Linux asset on the Debian 12 compatibility baseline
@@ -123,7 +119,6 @@ jobs:
         shell: bash
         run: |
           docker run --rm \
-            --env NAZOAUTHCTL_BUILD_COMMIT \
             --volume "$GITHUB_WORKSPACE:/workspace" \
             --workdir /workspace \
             rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073 \

@@ -466,6 +466,59 @@ impl ControllerKeyStore {
             .with_context(|| format!("failed to retire controller key {}", path.display()))
     }
 
+    /// Remove every local controller artifact for an instance after its
+    /// deployment has been uninstalled. The instance directory and lock
+    /// anchors remain empty so deletion is serialized on every platform;
+    /// they contain no identity, key, journal, or recovery material.
+    pub fn remove_instance(&self, deployment_id: &str) -> anyhow::Result<()> {
+        validate_instance_identifier(deployment_id)?;
+        let dir = self.instance_dir_unchecked(deployment_id);
+        match fs::symlink_metadata(&dir) {
+            Ok(_) => filesystem::validate_secure_directory(
+                &dir,
+                "controller key instance directory",
+                true,
+            )?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect controller key directory {}",
+                        dir.display()
+                    )
+                });
+            }
+        }
+        let _lock = InstanceKeyLock::acquire(&Self::lock_path(&dir))?;
+        for entry in
+            fs::read_dir(&dir).with_context(|| format!("failed to enumerate {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "lock")
+            {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("failed to inspect {}", path.display()))?;
+            if metadata.file_type().is_symlink() || metadata.is_file() {
+                filesystem::remove_file_durable(&path)?;
+            } else if metadata.is_dir() {
+                fs::remove_dir_all(&path)
+                    .with_context(|| format!("failed to remove {}", path.display()))?;
+                filesystem::sync_parent(&path)?;
+            } else {
+                bail!(
+                    "refusing to remove unsupported local artifact {}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn read_active_pointer(&self, dir: &std::path::Path) -> anyhow::Result<Option<ActivePointer>> {
         let path = Self::active_path(dir);
         match fs::symlink_metadata(&path) {
@@ -892,6 +945,39 @@ mod tests {
         );
         // Retiring an unknown kid fails instead of silently succeeding.
         assert!(store.retire_kid("deploy-alpha", &candidate.kid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn removing_an_instance_deletes_only_its_local_controller_artifacts() -> anyhow::Result<()> {
+        let (_temp, store) = test_store()?;
+        store.get_or_create_active("deploy-alpha")?;
+        store.generate_candidate("deploy-alpha")?;
+        store.get_or_create_active("deploy-beta")?;
+        let alpha_dir = store.instance_dir("deploy-alpha")?;
+        for file in [
+            "operation-journal.json",
+            "recovery-pending.json",
+            "recovery-plan.json",
+            "backup-transfer.json",
+        ] {
+            fs::write(alpha_dir.join(file), b"local state")?;
+        }
+
+        store.remove_instance("deploy-alpha")?;
+
+        let cleaned = store.instance_dir("deploy-alpha")?;
+        assert!(cleaned.exists(), "the cross-process lock anchor remains");
+        assert_eq!(
+            fs::read_dir(&cleaned)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<Result<Vec<_>, _>>()?,
+            vec![std::ffi::OsString::from("keys.lock")]
+        );
+        assert!(store.load_active("deploy-beta")?.is_some());
+        store.remove_instance("deploy-alpha")?;
+        assert!(store.remove_instance("../deploy-beta").is_err());
+        assert!(store.load_active("deploy-beta")?.is_some());
         Ok(())
     }
 

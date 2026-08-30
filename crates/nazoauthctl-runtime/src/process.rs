@@ -193,29 +193,6 @@ impl Process {
         self.collect_output(child, Some(input))
     }
 
-    /// Returns only a closed classification.  Diagnostic output is deliberately
-    /// consumed in-process and is never propagated to the caller, logs, or
-    /// audit chain because it may contain deployment details.
-    pub fn stdin_authorization_rejected(&self, input: &[u8]) -> anyhow::Result<bool> {
-        let mut command = self.command();
-        command
-            .stdin(Stdio::piped())
-            // `collect_output` drains both pipes to avoid deadlock. The bytes
-            // are discarded below and never cross the process boundary.
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = command
-            .spawn()
-            .with_context(|| format!("failed to execute {}", self.display_name()))?;
-        let output = self.collect_output(child, Some(input))?;
-        if output.status.success() {
-            return Ok(false);
-        }
-        Ok(String::from_utf8_lossy(&output.stderr)
-            .lines()
-            .any(|line| line.trim() == "nazoauth-operator-rejection=authorization"))
-    }
-
     pub fn stdout_file(&self, path: &Path) -> anyhow::Result<()> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);

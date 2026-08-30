@@ -25,7 +25,7 @@
 //! instructions instead of ever reading a password.
 //!
 //! C08 gates host-level mutations behind a verified [`RemoteHello`]; any
-//! product/schema/version/commit drift fails closed with
+//! product/schema drift fails closed with
 //! `REMOTE_HELPER_MISMATCH` and names the exact upgrade command.
 
 use std::{
@@ -49,7 +49,7 @@ use crate::registry::{HostPrivilege, HostRecord, HostTransport};
 
 use super::{
     ControlOperationReceipt, ExecutionTarget, HealthSnapshot, HostOverview, InstanceInspection,
-    accepted_control_operation_receipt,
+    control_operation_receipt,
     wire::{
         HOST_ERR_OPERATION_INVALID, HostCompletionBody, HostOperation, HostOutcome, HostResult,
         RemoteHello, encode_host_operation, parse_host_result, sanitize, verify_remote_hello,
@@ -59,7 +59,7 @@ use super::{
 /// Production OpenSSH client binary name.
 pub const SSH_PROGRAM: &str = "ssh";
 
-/// Helper basename used when a HostRecord does not override it.
+/// Fixed helper basename used by every SSH target.
 pub const DEFAULT_REMOTE_EXEC_BASENAME: &str = "nazoauthctl";
 
 /// Monotonic per-operation deadline for one SSH round trip.
@@ -177,7 +177,6 @@ pub struct SshTarget {
     registered_host_id: Option<Uuid>,
     host_alias: String,
     privilege: HostPrivilege,
-    remote_exec_basename: String,
     /// Test seam only. Production value: [`SSH_PROGRAM`].
     program: PathBuf,
     timeout: Duration,
@@ -185,6 +184,25 @@ pub struct SshTarget {
 }
 
 impl SshTarget {
+    fn helper_mismatch(&self, detail: impl std::fmt::Display) -> anyhow::Error {
+        anyhow::anyhow!(
+            "{REMOTE_HELPER_MISMATCH}: the helper on '{}' does not speak the \
+             current remote exec contract ({detail}). Upgrade the target helper first: \
+             `ssh {0} -- {} self update`, then retry; no fallback exists.",
+            self.profile,
+            DEFAULT_REMOTE_EXEC_BASENAME
+        )
+    }
+
+    fn cache_verified_hello(&self, hello: RemoteHello) -> anyhow::Result<RemoteHello> {
+        verify_remote_hello(&hello).map_err(|reason| self.helper_mismatch(reason))?;
+        if let Some(host_id) = self.registered_host_id {
+            crate::registry::verify_registered_target_identity(host_id, &self.host_alias, &hello)?;
+        }
+        *self.handshake.borrow_mut() = Some(hello.clone());
+        Ok(hello)
+    }
+
     /// Build the transport for one registered SSH host record.
     pub fn from_record(record: &HostRecord) -> anyhow::Result<Self> {
         if record.transport != HostTransport::Ssh {
@@ -198,10 +216,6 @@ impl SshTarget {
             registered_host_id: (!record.host_id.is_nil()).then_some(record.host_id),
             host_alias: record.alias.clone(),
             privilege: record.privilege,
-            remote_exec_basename: record
-                .remote_exec_path
-                .clone()
-                .unwrap_or_else(|| DEFAULT_REMOTE_EXEC_BASENAME.to_owned()),
             program: PathBuf::from(SSH_PROGRAM),
             profile,
             timeout: DEFAULT_EXEC_TIMEOUT,
@@ -224,15 +238,14 @@ impl SshTarget {
         &self.profile
     }
 
-    /// The fixed remote command tokens. User input never joins this vector;
-    /// the helper basename comes from the validated registry record.
+    /// The fixed remote command tokens. User input never joins this vector.
     pub(crate) fn remote_command_argv(&self) -> Vec<String> {
         let mut command = Vec::with_capacity(5);
         if self.privilege == HostPrivilege::Sudo {
             command.push("sudo".to_owned());
             command.push("-n".to_owned());
         }
-        command.push(self.remote_exec_basename.clone());
+        command.push(DEFAULT_REMOTE_EXEC_BASENAME.to_owned());
         command.push("remote".to_owned());
         command.push("exec".to_owned());
         command
@@ -362,28 +375,7 @@ impl SshTarget {
                 }
             }
         })();
-        let hello = answered.map_err(|error| {
-            anyhow::anyhow!(
-                "{REMOTE_HELPER_MISMATCH}: the helper on '{}' does not speak the \
-                 current remote exec contract ({error}). Upgrade the target helper first: \
-                 `ssh {0} -- {} self update --yes`, then retry; no fallback exists.",
-                self.profile,
-                self.remote_exec_basename
-            )
-        })?;
-        if let Err(reason) = verify_remote_hello(&hello) {
-            bail!(
-                "{REMOTE_HELPER_MISMATCH}: {reason}. Upgrade the target helper first: \
-                 `ssh {} -- {} self update --yes`, then retry; no fallback exists.",
-                self.profile,
-                self.remote_exec_basename
-            );
-        }
-        if let Some(host_id) = self.registered_host_id {
-            crate::registry::verify_registered_target_identity(host_id, &self.host_alias, &hello)?;
-        }
-        *self.handshake.borrow_mut() = Some(hello.clone());
-        Ok(hello)
+        self.cache_verified_hello(answered.map_err(|error| self.helper_mismatch(error))?)
     }
 
     /// Non-interactive sudo probe over the same fixed argv pattern.
@@ -524,18 +516,26 @@ impl ExecutionTarget for SshTarget {
                 format!("{}: {}", rejection.code.as_str(), rejection.detail),
             ));
         }
-        if requires_handshake(operation.operation.kind()) {
+        let kind = operation.operation.kind();
+        if requires_handshake(kind) {
             // C08: mutations confirm the remote helper identity first.
             self.handshake()?;
         }
-        self.transmit(operation)
+        let result = self.transmit(operation)?;
+        if kind == "hello"
+            && let HostOutcome::Completed {
+                body: HostCompletionBody::Hello { hello },
+            } = &result.outcome
+        {
+            self.cache_verified_hello(hello.clone())?;
+        }
+        Ok(result)
     }
 
     fn execute_control_operation(
         &self,
         request: super::ControlOperationRequest,
     ) -> anyhow::Result<ControlOperationReceipt> {
-        use super::control_exec::CONTROL_OUTCOME_UNKNOWN;
         // The signed envelope is public data (no secret material), so it
         // rides the handshake-gated stdio contract like every other kind and
         // the target journals the delivery under its C07 contract.
@@ -546,41 +546,8 @@ impl ExecutionTarget for SshTarget {
             request.compact_jws,
             request.change_set,
         );
-        operation.validate().map_err(|rejection| {
-            anyhow::anyhow!(
-                "{HOST_ERR_OPERATION_INVALID}: {}: {}",
-                rejection.code.as_str(),
-                rejection.detail
-            )
-        })?;
         let result = self.execute_host_operation(&operation)?;
-        match result.outcome {
-            HostOutcome::Completed {
-                body:
-                    HostCompletionBody::ControlOperationExecuted {
-                        result: control_result,
-                    },
-            } => accepted_control_operation_receipt(request_operation_id.clone(), control_result),
-            HostOutcome::Completed { .. } => bail!(
-                "{HOST_ERR_OPERATION_INVALID}: the helper on '{}' answered an unexpected \
-                 completion instead of a ControlOperation result",
-                self.profile
-            ),
-            HostOutcome::Failed { code, detail } => {
-                if code == CONTROL_OUTCOME_UNKNOWN || detail.contains(CONTROL_OUTCOME_UNKNOWN) {
-                    // The operator may have executed; only a resumed resend of
-                    // the same envelope can resolve the outcome.
-                    bail!("{code}: {detail}")
-                }
-                // Admission-grade refusal before acceptance.
-                Ok(ControlOperationReceipt {
-                    operation_id: request_operation_id,
-                    accepted: false,
-                    result: None,
-                    rejection_code: Some(code),
-                })
-            }
-        }
+        control_operation_receipt(request_operation_id, result.outcome)
     }
 
     fn read_health(&self, deployment_id: &str) -> anyhow::Result<HealthSnapshot> {
@@ -607,14 +574,12 @@ mod tests {
     use crate::filesystem;
     use crate::registry::HostRecord;
     use crate::target::wire::{
-        HELLO_PRODUCT, HOST_PROTOCOL_SCHEMA, HostOperationBody, LOCAL_BUILD_COMMIT, local_hello,
-        parse_host_operation,
+        HELLO_PRODUCT, HOST_PROTOCOL_SCHEMA, HostOperationBody, local_hello, parse_host_operation,
     };
     use std::fs;
 
     const PROFILE: &str = "prod-a";
     const TEST_TARGET_ID: &str = "019d0000-0000-7000-8000-000000000001";
-    const CUSTOM_BASENAME: &str = "nazoauthctl.test";
 
     #[test]
     fn recovery_forward_is_loopback_only_and_exit_on_forward_failure() {
@@ -685,11 +650,8 @@ mod tests {
             )?;
             #[cfg(unix)]
             let program = {
-                use std::os::unix::fs::PermissionsExt;
-
                 let script = root.join("ssh");
-                fs::write(&script, unix_stub_script().as_bytes())?;
-                fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+                filesystem::atomic_write(&script, unix_stub_script().as_bytes(), 0o700)?;
                 script
             };
             #[cfg(windows)]
@@ -787,7 +749,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
 
     // ---------- canned responses built from live constants ----------
 
-    fn hello_response_json(version: &str, commit: &str) -> String {
+    fn hello_response_json(version: &str) -> String {
         let identity = local_hello(Vec::new());
         serde_json::json!({
             "schema": HOST_PROTOCOL_SCHEMA,
@@ -797,7 +759,6 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
                 "target_id": TEST_TARGET_ID,
                 "remote_exec_schema": identity.remote_exec_schema,
                 "version": version,
-                "commit": commit,
                 "os": identity.os,
                 "arch": identity.arch,
                 "supported_runtimes": ["podman"],
@@ -848,18 +809,8 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             [PROFILE, "--", "sudo", "-n", "nazoauthctl", "remote", "exec"]
         );
 
-        let mut custom =
-            HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Direct, Uuid::now_v7())
-                .unwrap();
-        custom.remote_exec_path = Some(CUSTOM_BASENAME.to_owned());
-        let custom = SshTarget::from_record(&custom).unwrap();
-        assert_eq!(
-            custom.exec_args(),
-            [PROFILE, "--", CUSTOM_BASENAME, "remote", "exec"]
-        );
-
         // Delegation by construction: no option overrides of any kind, ever.
-        for argv in [direct.exec_args(), sudo.exec_args(), custom.exec_args()] {
+        for argv in [direct.exec_args(), sudo.exec_args()] {
             for token in argv {
                 let token = token.to_string_lossy();
                 assert!(!token.contains("StrictHostKeyChecking"), "{token}");
@@ -889,7 +840,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     #[test]
     fn handshake_verifies_and_inspect_host_maps_the_announcement() {
         let stub = SshStub::install(&StubScenario {
-            response_json: &hello_response_json(env!("CARGO_PKG_VERSION"), LOCAL_BUILD_COMMIT),
+            response_json: &hello_response_json(env!("CARGO_PKG_VERSION")),
             stderr_text: None,
             exit_code: 0,
         })
@@ -945,7 +896,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
 
     fn sample_inspection() -> InstanceInspection {
         InstanceInspection {
-            current_build_identity: None,
+            current_release: None,
             current_instance_identity: None,
             deployment_id: "deploy-alpha".to_owned(),
             issuer: "https://auth.example.com".to_owned(),
@@ -990,10 +941,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
                 stderr_text: None,
                 exit_code: 0,
             },
-            Some(&hello_response_json(
-                env!("CARGO_PKG_VERSION"),
-                LOCAL_BUILD_COMMIT,
-            )),
+            Some(&hello_response_json(env!("CARGO_PKG_VERSION"))),
         )?;
         let target = ssh_target(HostPrivilege::Direct, &stub)?;
 
@@ -1014,14 +962,44 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     }
 
     #[test]
+    fn an_explicit_hello_is_reused_by_the_following_operation() -> anyhow::Result<()> {
+        let inspection = sample_inspection();
+        let stub = SshStub::install_with_hello(
+            &StubScenario {
+                response_json: &inspection_response_json(&inspection),
+                stderr_text: None,
+                exit_code: 0,
+            },
+            Some(&hello_response_json(env!("CARGO_PKG_VERSION"))),
+        )?;
+        let target = ssh_target(HostPrivilege::Direct, &stub)?;
+
+        let hello = HostOperation::hello(Uuid::now_v7().to_string());
+        target.execute_host_operation(&hello)?;
+        assert_eq!(target.inspect_instance("deploy-alpha")?, inspection);
+
+        let invocations = stub.argv_invocations();
+        assert_eq!(
+            invocations.len(),
+            2,
+            "hello must not run twice: {invocations:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_mismatched_helper_is_never_asked_about_deployments() -> anyhow::Result<()> {
+        let mismatched_hello = hello_response_json(env!("CARGO_PKG_VERSION")).replace(
+            "\"product\":\"nazoauthctl\"",
+            "\"product\":\"other-helper\"",
+        );
         let stub = SshStub::install_with_hello(
             &StubScenario {
                 response_json: &inspection_response_json(&sample_inspection()),
                 stderr_text: None,
                 exit_code: 0,
             },
-            Some(&hello_response_json("0.0.1-old", LOCAL_BUILD_COMMIT)),
+            Some(&mismatched_hello),
         )?;
         let target = ssh_target(HostPrivilege::Direct, &stub)?;
 
@@ -1039,7 +1017,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     #[test]
     fn another_current_physical_helper_is_never_asked_about_deployments() -> anyhow::Result<()> {
         let other_target = Uuid::now_v7();
-        let foreign_hello = hello_response_json(env!("CARGO_PKG_VERSION"), LOCAL_BUILD_COMMIT)
+        let foreign_hello = hello_response_json(env!("CARGO_PKG_VERSION"))
             .replace(TEST_TARGET_ID, &other_target.to_string());
         let stub = SshStub::install_with_hello(
             &StubScenario {
@@ -1070,29 +1048,17 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     }
 
     #[test]
-    fn stale_helper_identity_fails_closed_naming_the_upgrade_command() {
+    fn same_schema_helper_release_does_not_require_an_upgrade() {
         let stub = SshStub::install(&StubScenario {
-            response_json: &hello_response_json("0.0.1-old", LOCAL_BUILD_COMMIT),
+            response_json: &hello_response_json("0.0.1-old"),
             stderr_text: None,
             exit_code: 0,
         })
         .unwrap();
         let target = ssh_target(HostPrivilege::Direct, &stub).unwrap();
 
-        let error = target.inspect_host().expect_err("version drift rejected");
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains(REMOTE_HELPER_MISMATCH), "{rendered}");
-        assert!(
-            rendered.contains(&format!(
-                "ssh {PROFILE} -- {DEFAULT_REMOTE_EXEC_BASENAME} self update --yes"
-            )),
-            "must name the exact upgrade command: {rendered}"
-        );
-        assert!(rendered.contains("no fallback"), "{rendered}");
-
-        // The same mismatch blocks the ping path once a mutation arrives;
-        // until F01 introduces mutation kinds the gate itself is pinned by
-        // mutation_kinds_default_to_handshake_gating above.
+        let hello = target.handshake().expect("same schema is compatible");
+        assert_eq!(hello.version, "0.0.1-old");
     }
 
     #[test]
@@ -1111,7 +1077,8 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
         let error = target.inspect_host().expect_err("old helper");
         let rendered = format!("{error:#}");
         assert!(rendered.contains(REMOTE_HELPER_MISMATCH), "{rendered}");
-        assert!(rendered.contains("self update --yes"), "{rendered}");
+        assert!(rendered.contains("self update"), "{rendered}");
+        assert!(!rendered.contains("--yes"), "{rendered}");
     }
 
     #[test]
@@ -1356,7 +1323,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             }}
         })
         .to_string();
-        let hello = hello_response_json(env!("CARGO_PKG_VERSION"), LOCAL_BUILD_COMMIT);
+        let hello = hello_response_json(env!("CARGO_PKG_VERSION"));
         let stub = SshStub::install_with_hello(
             &StubScenario {
                 response_json: &response,

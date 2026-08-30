@@ -26,9 +26,8 @@
 //! rules enforced at construction *and* load time:
 //!
 //! - `managed + shared` is unrepresentable — rejected as a schema violation;
-//! - destructive paths may touch exactly `managed + deployment` resources;
-//!   external and shared resources have zero-delete paths ([`Failure`] with
-//!   [`EXTERNAL_RESOURCE_PROTECTED`]);
+//! - destructive paths iterate exactly `managed + deployment` resources;
+//!   external and shared resources are never passed to a deletion adapter;
 //! - admin identity never changes ownership.
 //!
 //! External/shared PostgreSQL, Valkey, proxy, DNS, or KMS objects are owned by
@@ -74,7 +73,7 @@ use super::install_exec::InstallOrder;
 use super::journal;
 
 /// Schema discriminator carried by the persisted DeploymentState document.
-pub const DEPLOYMENT_STATE_SCHEMA: u32 = 6;
+pub const DEPLOYMENT_STATE_SCHEMA: u32 = 7;
 
 /// Upper bound for one persisted DeploymentState document (~1 MiB).
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
@@ -91,18 +90,6 @@ struct UninstallCompletion {
     state_sha256: String,
 }
 
-/// Maximum number of concrete resources one deployment may declare.
-pub const MAX_RESOURCES: usize = 64;
-
-/// Upper bound for one discovery sweep (task G05): a target holding more
-/// deployments than this fails the listing closed instead of silently
-/// truncating discovery output.
-pub const MAX_LISTED_DEPLOYMENTS: usize = 256;
-
-/// Stable failure code: a discovery sweep exceeded
-/// [`MAX_LISTED_DEPLOYMENTS`]; nothing is truncated away silently.
-pub const DEPLOYMENT_LIMIT_EXCEEDED: &str = "DEPLOYMENT_LIMIT_EXCEEDED";
-
 /// Stable failure code: no DeploymentState exists for the addressed
 /// deployment id on this target.
 pub const DEPLOYMENT_UNKNOWN: &str = "DEPLOYMENT_UNKNOWN";
@@ -110,14 +97,6 @@ pub const DEPLOYMENT_UNKNOWN: &str = "DEPLOYMENT_UNKNOWN";
 /// Stable failure code: a DeploymentState already exists where bootstrap
 /// tried to create one. Existing state is never silently overwritten.
 pub const DEPLOYMENT_EXISTS: &str = "DEPLOYMENT_EXISTS";
-
-/// Stable failure code: the named resource is not part of the deployment's
-/// declared resources.
-pub const RESOURCE_UNKNOWN: &str = "RESOURCE_UNKNOWN";
-
-/// Stable failure code: the resource exists but has zero-delete protection
-/// (external ownership, or a shared resource of any kind).
-pub const EXTERNAL_RESOURCE_PROTECTED: &str = "EXTERNAL_RESOURCE_PROTECTED";
 
 /// Stable failure code: a clean-install execution order failed on the target
 /// and the target rolled its own partial work back. The DeploymentState was
@@ -354,37 +333,28 @@ pub struct HealthRecord {
     pub checked_at: DateTime<Utc>,
 }
 
-/// Embedded build identity of one deployed artifact, recorded by whoever
-/// performed the on-target official verification (goal plan 07 G03): the
-/// ControlOperation envelope's J1 binding needs these facts, so they live in
-/// the target lifecycle authority next to the artifact references they
-/// belong to. Optional because adopted deployments may not know them yet.
+/// Release version attached to one content-addressed deployed artifact.
+///
+/// The artifact digest is the sole content identity. This value only carries
+/// version ordering and rollback semantics. It is optional because adopted
+/// deployments may not have a verified release version yet.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BuildIdentity {
-    pub product: String,
+pub struct ReleaseVersion {
     pub version: String,
-    pub commit: String,
 }
 
-/// The server product token every NazoAuth build identity carries.
-pub const BUILD_IDENTITY_PRODUCT: &str = nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT;
-
-impl BuildIdentity {
-    pub fn new(product: &str, version: &str, commit: &str) -> anyhow::Result<Self> {
+impl ReleaseVersion {
+    pub fn new(version: &str) -> anyhow::Result<Self> {
         let identity = Self {
-            product: product.to_owned(),
             version: version.to_owned(),
-            commit: commit.to_owned(),
         };
         identity.validate()?;
         Ok(identity)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        crate::registry::validate_identifier(&self.product, 64, "build identity product")?;
-        crate::registry::validate_identifier(&self.version, 64, "build identity version")?;
-        crate::registry::validate_identifier(&self.commit, 128, "build identity commit")?;
+        crate::registry::validate_identifier(&self.version, 64, "release version")?;
         Ok(())
     }
 }
@@ -434,12 +404,12 @@ pub struct DeploymentState {
     pub applied_migration: Option<AppliedMigration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_host_operation: Option<ActiveHostOperationRef>,
-    /// Embedded build identity of `artifact.current`, when known.
+    /// Verified release version of `artifact.current`, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_build_identity: Option<BuildIdentity>,
-    /// Embedded build identity of `artifact.previous`, when known.
+    pub current_release: Option<ReleaseVersion>,
+    /// Verified release version of `artifact.previous`, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous_build_identity: Option<BuildIdentity>,
+    pub previous_release: Option<ReleaseVersion>,
 }
 
 impl DeploymentState {
@@ -487,12 +457,6 @@ impl DeploymentState {
         if self.config.revision == 0 {
             bail!("config revision is monotonic from 1");
         }
-        if self.resources.len() > MAX_RESOURCES {
-            bail!(
-                "a deployment declares at most {MAX_RESOURCES} resources (found {})",
-                self.resources.len()
-            );
-        }
         let mut seen = Vec::with_capacity(self.resources.len());
         for resource in &self.resources {
             resource.validate()?;
@@ -509,51 +473,13 @@ impl DeploymentState {
         {
             bail!("active_host_operation.operation_id is not a valid token");
         }
-        for identity in [&self.current_build_identity, &self.previous_build_identity]
+        for identity in [&self.current_release, &self.previous_release]
             .into_iter()
             .flatten()
         {
             identity.validate()?;
         }
         Ok(())
-    }
-
-    /// Resolve the exact resource a destructive action names. Only
-    /// `managed + deployment` passes; everything else fails closed with the
-    /// stable zero-delete codes (goal plan 06 F03). Object-identity
-    /// reconfirmation against the runtime remains the caller's next step.
-    pub fn exact_managed_deployment_resource(
-        &self,
-        resource_id: &str,
-    ) -> Result<&Resource, Failure> {
-        let Some(resource) = self
-            .resources
-            .iter()
-            .find(|resource| resource.resource_id == resource_id)
-        else {
-            return Err(Failure::new(
-                RESOURCE_UNKNOWN,
-                format!("no resource '{resource_id}' is declared by this deployment"),
-            ));
-        };
-        match (resource.ownership, resource.scope) {
-            (ResourceOwnership::Managed, ResourceScope::Deployment) => Ok(resource),
-            (ResourceOwnership::External, _) => Err(Failure::new(
-                EXTERNAL_RESOURCE_PROTECTED,
-                format!(
-                    "resource '{}' is external; external resources have zero-delete paths",
-                    resource.resource_id
-                ),
-            )),
-            // Unreachable through the schema, but fail closed rather than trust it.
-            (ResourceOwnership::Managed, ResourceScope::Shared) => Err(Failure::new(
-                EXTERNAL_RESOURCE_PROTECTED,
-                format!(
-                    "resource '{}' is shared; shared resources have zero-delete paths",
-                    resource.resource_id
-                ),
-            )),
-        }
     }
 }
 
@@ -596,13 +522,12 @@ pub enum StateMutationPayload {
     /// swap `previous=current`, optionally apply a staged config, activate,
     /// probe local health, then commit — all inside this one journaled
     /// operation so an interrupted attempt resumes without repeating side
-    /// effects. The ControlOperation for the application migration is
-    /// dispatched separately by the control side (one pre-signed envelope).
+    /// effects. The target independently verifies the selected Release and
+    /// derives its rollback policy before dispatching the optional migration.
+    /// The ControlOperation for the application migration is carried by this
+    /// same host operation as one pre-signed envelope.
     Update {
         artifact: super::install_exec::OfficialArtifactRef,
-        /// Exact rollback contract from the independently verified target
-        /// Release. The target re-verifies equality before migration.
-        rollback_policy: crate::model::ReleaseRollbackPolicy,
         /// Target-side backup gate bound to the exact evidence inspected by
         /// the controller. This field is mandatory on the wire: omitting it
         /// is an obsolete update order, not an implicit opt-out.
@@ -620,13 +545,11 @@ pub enum StateMutationPayload {
     /// Explicit rollback to the previous verified artifact reference (G04).
     /// Never runs application mutations and never touches data restore.
     Rollback {},
-    /// Uninstall (G06): delete exactly the planned managed+deployment
-    /// resources after target-side identity re-confirmation, remove the
-    /// runtime object and config file, and drop the state document.
-    /// External/shared resources have zero-delete paths by construction.
-    Uninstall {
-        resources: Vec<super::install_exec::PlannedResourceDeletion>,
-    },
+    /// Uninstall (G06): the target deletes exactly the managed+deployment
+    /// resources in its authoritative DeploymentState, removes the runtime
+    /// object and config file, and drops the state document. External/shared
+    /// resources have zero-delete paths by construction.
+    Uninstall {},
 }
 
 /// The only backup fact an Update order may authorize against. `NotRequired`
@@ -678,9 +601,8 @@ pub struct BootstrapParams {
     pub config_reference: String,
     pub config_schema: String,
     pub resources: Vec<Resource>,
-    /// Embedded build identity of the verified artifact when its official
-    /// verification already produced these facts on the target (G01).
-    pub current_build_identity: Option<BuildIdentity>,
+    /// Verified release version of the content-addressed artifact, when known.
+    pub current_release: Option<ReleaseVersion>,
     pub current_rollback_policy: crate::model::ReleaseRollbackPolicy,
 }
 
@@ -692,11 +614,11 @@ pub struct TargetStateStore {
 }
 
 /// Facts committed together when one verified update generation becomes
-/// current. Keeping them as one value prevents artifact, build identity,
+/// current. Keeping them as one value prevents artifact, release version,
 /// rollback policy, and optional config from drifting across call sites.
 pub(crate) struct UpdateCommit {
     pub(crate) artifact: String,
-    pub(crate) build_identity: Option<BuildIdentity>,
+    pub(crate) release: Option<ReleaseVersion>,
     pub(crate) rollback_policy: crate::model::ReleaseRollbackPolicy,
     pub(crate) config: Option<(String, String)>,
     pub(crate) operation_id: String,
@@ -796,15 +718,6 @@ impl TargetStateStore {
         scopes.sort();
         let mut states = Vec::with_capacity(scopes.len());
         for scope in scopes {
-            if states.len() >= MAX_LISTED_DEPLOYMENTS {
-                return Err(Failure::new(
-                    DEPLOYMENT_LIMIT_EXCEEDED,
-                    format!(
-                        "this target holds more than {MAX_LISTED_DEPLOYMENTS} deployments; \
-                         split or retire hosts instead of truncating discovery output"
-                    ),
-                ));
-            }
             states.push(self.load_existing(&scope)?);
         }
         Ok(states)
@@ -868,7 +781,7 @@ impl TargetStateStore {
             config_reference,
             config_schema,
             resources,
-            current_build_identity,
+            current_release,
             current_rollback_policy,
         } = params;
         let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
@@ -917,8 +830,8 @@ impl TargetStateStore {
             config,
             resources,
             local_health,
-            current_build_identity,
-            previous_build_identity: None,
+            current_release,
+            previous_release: None,
             current_rollback_policy,
             previous_rollback_policy: None,
             applied_migration: None,
@@ -1064,7 +977,7 @@ impl TargetStateStore {
     ) -> Result<DeploymentState, Failure> {
         let UpdateCommit {
             artifact: new_current,
-            build_identity: new_build,
+            release: new_release,
             rollback_policy: new_rollback_policy,
             config,
             operation_id,
@@ -1091,7 +1004,7 @@ impl TargetStateStore {
         crate::registry::validate_identifier(&new_current, 256, "artifact reference").map_err(
             |error| Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string()),
         )?;
-        if let Some(identity) = &new_build {
+        if let Some(identity) = &new_release {
             identity.validate().map_err(|error| {
                 Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
             })?;
@@ -1099,13 +1012,16 @@ impl TargetStateStore {
         new_rollback_policy.validate().map_err(|error| {
             Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
         })?;
-        state.artifact.previous = state.artifact.current.take();
-        state.artifact.current = Some(new_current);
-        // The build identity swap mirrors the artifact reference swap so the
-        // envelope facts stay attached to the right generation.
-        state.previous_build_identity = state.current_build_identity.take();
-        state.current_build_identity = new_build;
-        state.previous_rollback_policy = Some(state.current_rollback_policy.clone());
+        let artifact_changed = state.artifact.current.as_deref() != Some(new_current.as_str());
+        if artifact_changed {
+            state.artifact.previous = state.artifact.current.take();
+            state.artifact.current = Some(new_current);
+            // The release version swap mirrors the artifact reference swap so
+            // the envelope facts stay attached to the right generation.
+            state.previous_release = state.current_release.take();
+            state.previous_rollback_policy = Some(state.current_rollback_policy.clone());
+        }
+        state.current_release = new_release;
         state.current_rollback_policy = new_rollback_policy;
         state.applied_migration = None;
         if let Some((reference, schema)) = config {
@@ -1165,7 +1081,7 @@ impl TargetStateStore {
                 "recovery facts do not belong to the active host operation",
             ));
         }
-        facts.build_identity.validate().map_err(|error| {
+        facts.release.validate().map_err(|error| {
             Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
         })?;
         facts.rollback_policy.validate().map_err(|error| {
@@ -1174,11 +1090,11 @@ impl TargetStateStore {
         let new_current = canonical_recovery_artifact(&facts.artifact)?;
 
         // The old generation remains available as the explicit rollback
-        // history. The build identities move with their artifact generations.
+        // history. The release versions move with their artifact generations.
         state.artifact.previous = state.artifact.current.take();
         state.artifact.current = Some(new_current);
-        state.previous_build_identity = state.current_build_identity.take();
-        state.current_build_identity = Some(facts.build_identity.clone());
+        state.previous_release = state.current_release.take();
+        state.current_release = Some(facts.release.clone());
         state.previous_rollback_policy = Some(state.current_rollback_policy.clone());
         state.current_rollback_policy = facts.rollback_policy.clone();
         state.applied_migration = None;
@@ -1255,14 +1171,14 @@ impl TargetStateStore {
         };
         // Exact swap: current <- old previous, previous <- old current, so a
         // follow-up rollback can always reverse the reversal (goal plan 07 §5
-        // item 5: atomically update current/previous). The build identity
+        // item 5: atomically update current/previous). The release version
         // pairs follow their artifact references.
         let old_current = state.artifact.current.take();
         state.artifact.current = Some(previous);
         state.artifact.previous = old_current;
-        let old_build = state.current_build_identity.take();
-        state.current_build_identity = state.previous_build_identity.take();
-        state.previous_build_identity = old_build;
+        let old_release = state.current_release.take();
+        state.current_release = state.previous_release.take();
+        state.previous_release = old_release;
         let old_policy = state.current_rollback_policy.clone();
         let Some(previous_policy) = state.previous_rollback_policy.take() else {
             return Err(Failure::new(
@@ -1704,7 +1620,7 @@ mod tests {
             config_reference: "/etc/nazauth/config.toml".to_owned(),
             config_schema: "nazauth-config-v1".to_owned(),
             resources: Vec::new(),
-            current_build_identity: None,
+            current_release: None,
             current_rollback_policy: crate::model::test_release_rollback_policy(),
         }
     }
@@ -1745,7 +1661,7 @@ mod tests {
             1,
             UpdateCommit {
                 artifact: format!("sha256:{}", "b".repeat(64)),
-                build_identity: None,
+                release: None,
                 rollback_policy: irreversible_policy(),
                 config: None,
                 operation_id: "update-op".to_owned(),
@@ -1755,6 +1671,50 @@ mod tests {
             .apply_rollback_healthy("deploy-fence", 1, None, "rollback-op-2")
             .expect_err("irreversible release policy must refuse rollback");
         assert_eq!(irreversible.code, ROLLBACK_RECOVERY_REQUIRED);
+        Ok(())
+    }
+
+    #[test]
+    fn same_artifact_update_preserves_the_rollback_generation() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("nazoauthctl-same-artifact-update")?;
+        let store = TargetStateStore::open(temp.path().join("state"))?;
+        let current = format!("sha256:{}", "a".repeat(64));
+        let previous = format!("sha256:{}", "b".repeat(64));
+        let previous_release = ReleaseVersion::new("v0")?;
+        let current_release = ReleaseVersion::new("v1")?;
+        let mut params = sample_params("https://auth.example.com", "nazoauth-main");
+        params.artifact = ArtifactRefs {
+            current: Some(current.clone()),
+            previous: Some(previous.clone()),
+        };
+        params.current_release = Some(current_release.clone());
+        let previous_policy = crate::model::test_release_rollback_policy();
+        let state = store.bootstrap("deploy-same", params, "bootstrap")?;
+        let mut state = state;
+        state.previous_release = Some(previous_release.clone());
+        state.previous_rollback_policy = Some(previous_policy.clone());
+        let scope = journal::deployment_scope("deploy-same")?;
+        persist(&scope_path(&store.root, &scope), &state)?;
+
+        let updated = store.apply_update_healthy(
+            "deploy-same",
+            1,
+            UpdateCommit {
+                artifact: current.clone(),
+                release: Some(current_release),
+                rollback_policy: crate::model::test_release_rollback_policy(),
+                config: None,
+                operation_id: "same-artifact".to_owned(),
+            },
+        )?;
+
+        assert_eq!(updated.artifact.current.as_deref(), Some(current.as_str()));
+        assert_eq!(
+            updated.artifact.previous.as_deref(),
+            Some(previous.as_str())
+        );
+        assert_eq!(updated.previous_release, Some(previous_release));
+        assert_eq!(updated.previous_rollback_policy, Some(previous_policy));
         Ok(())
     }
 
@@ -1827,8 +1787,7 @@ mod tests {
             manifest_sha256: "a".repeat(64),
             restored_database: "nazo_recovered".to_owned(),
             artifact,
-            build_identity: BuildIdentity::new(BUILD_IDENTITY_PRODUCT, "v2", "recovered")
-                .expect("build identity"),
+            release: ReleaseVersion::new("v2").expect("release version"),
             rollback_policy: crate::model::test_release_rollback_policy(),
             config_schema: config_schema.to_owned(),
         }
@@ -1840,13 +1799,13 @@ mod tests {
         let store = TargetStateStore::open(temp.path().join("state"))?;
         let old_current = format!("sha256:{}", "b".repeat(64));
         let old_previous = format!("sha256:{}", "c".repeat(64));
-        let old_build = BuildIdentity::new(BUILD_IDENTITY_PRODUCT, "v1", "previous")?;
+        let old_release = ReleaseVersion::new("v1")?;
         let mut params = sample_params("https://a.example", "nz-a");
         params.artifact = ArtifactRefs {
             current: Some(old_current.clone()),
             previous: Some(old_previous),
         };
-        params.current_build_identity = Some(old_build.clone());
+        params.current_release = Some(old_release.clone());
         params.current_rollback_policy.rationale = "old generation policy".to_owned();
         let old_policy = params.current_rollback_policy.clone();
         store.bootstrap("deploy-alpha", params, "bootstrap")?;
@@ -1869,12 +1828,12 @@ mod tests {
             Some(format!("sha256:{}", "d".repeat(64)))
         );
         assert_eq!(state.artifact.previous, Some(old_current));
-        assert_eq!(state.previous_build_identity, Some(old_build));
+        assert_eq!(state.previous_release, Some(old_release));
         assert_eq!(state.current_rollback_policy, facts.rollback_policy);
         assert_eq!(state.previous_rollback_policy, Some(old_policy));
         assert_eq!(
             state
-                .current_build_identity
+                .current_release
                 .as_ref()
                 .map(|build| build.version.as_str()),
             Some("v2")
@@ -1992,19 +1951,6 @@ mod tests {
         crate::filesystem::atomic_write(&broken_dir.join("state.json"), b"{ not json", 0o600)?;
         let error = store.list_deployments().expect_err("corrupt document");
         assert_eq!(error.code, crate::error_codes::STATE_RESET_REQUIRED);
-        Ok(())
-    }
-
-    #[test]
-    fn list_deployments_refuses_to_truncate_beyond_the_cap() -> anyhow::Result<()> {
-        let temp = crate::filesystem::PrivateTempDir::new("nazauthctl-state-list-cap")?;
-        let store = TargetStateStore::open(temp.path().join("state"))?;
-        for index in 0..=MAX_LISTED_DEPLOYMENTS {
-            let id = format!("deploy-{index:03}");
-            store.bootstrap(&id, sample_params("https://x.example", &id), "op")?;
-        }
-        let failure = store.list_deployments().expect_err("over the cap");
-        assert_eq!(failure.code, DEPLOYMENT_LIMIT_EXCEEDED, "{failure:?}");
         Ok(())
     }
 }

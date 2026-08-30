@@ -75,12 +75,12 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
     assert!(!top_level.contains("pull_request:"));
     assert!(top_level.contains("server_release:"));
     assert!(top_level.contains("description: Exact supported NazoAuth release tag"));
-    assert!(top_level.contains("NAZOAUTHCTL_BUILD_COMMIT: ${{ inputs.controller_ref }}"));
+    assert!(!workflow.contains("NAZOAUTHCTL_BUILD_COMMIT"));
     assert_eq!(
         workflow
-            .matches("test \"$SERVER_RELEASE\" = v0.2.3")
+            .matches("test \"$SERVER_RELEASE\" = v0.2.5")
             .count(),
-        2
+        1
     );
     assert!(!workflow.contains("v0.2.2"));
     assert!(!workflow.contains("previous-v"));
@@ -88,11 +88,11 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
     assert!(!workflow.contains("- name: Recover"));
     assert!(!workflow.contains("provider"));
     assert!(!workflow.contains("rollback"));
-    assert!(workflow.contains(".protocol == 2"));
+    assert!(workflow.contains(".protocol == 3"));
     assert!(workflow.contains("Execute VerifiedRelease current production verification"));
     assert!(workflow.contains("VerifiedRelease::verify"));
-    assert!(workflow.contains("SERVER_PEELED_COMMIT"));
-    assert!(workflow.contains("OPERATOR_PROTOCOL_REV"));
+    assert!(!workflow.contains("SERVER_PEELED_COMMIT"));
+    assert!(!workflow.contains("OPERATOR_PROTOCOL_REV"));
     assert!(workflow.contains("cosign verify \"$tagged_image\""));
     assert!(
         workflow.contains("sudo install -m 0755 \"$(command -v cosign)\" /usr/local/bin/cosign")
@@ -118,7 +118,7 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
 
     for step in [
         "Execute the exact controller artifact through its production protocol path",
-        "Verify the protocol-2 host identity",
+        "Verify the protocol-3 host release identity",
         "Verify the signed OCI identity at its immutable digest",
         "Execute VerifiedRelease current production verification",
     ] {
@@ -134,7 +134,7 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
 }
 
 #[test]
-fn release_compatibility_gate_pins_the_current_protocol_two_server() {
+fn release_compatibility_gate_pins_the_current_protocol_three_server() {
     let workflow = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/.github/workflows/release.yml"
@@ -148,7 +148,7 @@ fn release_compatibility_gate_pins_the_current_protocol_two_server() {
         .unwrap()
         .0;
     assert!(gate.contains("controller_ref: ${{ github.sha }}"));
-    assert!(gate.contains("server_release: v0.2.3"));
+    assert!(gate.contains("server_release: v0.2.5"));
     assert!(!gate.contains("previous"));
 }
 
@@ -192,7 +192,7 @@ fn release_publish_is_resume_safe_and_accepts_only_the_current_asset_set() {
 /// This is deliberately an ignored network test: the release workflow opts
 /// into it for the one current supported pair.  It invokes the production
 /// `VerifiedRelease::verify` entry point, rather than inferring compatibility
-/// from CLI help or an unauthenticated build-identity command.
+/// from CLI help or an unauthenticated release-identity command.
 #[test]
 #[ignore = "requires the signed official NazoAuth Release and Sigstore/GitHub attestation services"]
 fn compatibility_executes_verified_release_for_the_current_server() {
@@ -203,14 +203,10 @@ fn compatibility_executes_verified_release_for_the_current_server() {
 
     assert_eq!(required("NAZOAUTHCTL_COMPAT_VERIFY_RELEASE"), "1");
     let version = required("EXPECTED_SERVER_RELEASE");
-    let peeled_commit = required("EXPECTED_SERVER_PEELED_COMMIT");
-    let protocol_revision = required("EXPECTED_OPERATOR_PROTOCOL_REV");
     let oci_index_digest = required("EXPECTED_OCI_INDEX_DIGEST");
     let oci_platform_digest = required("EXPECTED_OCI_PLATFORM_DIGEST");
 
     for (label, value, prefix, length) in [
-        ("server peeled commit", &peeled_commit, "", 40),
-        ("operator protocol revision", &protocol_revision, "", 40),
         ("OCI index digest", &oci_index_digest, "sha256:", 64),
         ("OCI platform digest", &oci_platform_digest, "sha256:", 64),
     ] {
@@ -223,21 +219,14 @@ fn compatibility_executes_verified_release_for_the_current_server() {
             "{label} must be a lowercase hexadecimal identity"
         );
     }
-    assert_eq!(
-        protocol_revision, peeled_commit,
-        "the controller's locked operator protocol must come from the exact peeled server tag commit"
-    );
-
     let release = crate::release::VerifiedRelease::verify(crate::release::ReleaseRequest {
         repository: crate::instance_lifecycle::SERVER_REPOSITORY,
         requested_version: Some(&version),
-        container_backend: None,
         trusted_version_floor: None,
     })
     .expect("the official current server release must pass VerifiedRelease::verify");
 
     assert_eq!(release.manifest.version, version);
-    assert_eq!(release.manifest.backend_commit, peeled_commit);
     assert_eq!(
         release
             .manifest

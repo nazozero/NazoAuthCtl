@@ -169,11 +169,10 @@ pub(crate) struct UpdateJob<'a> {
     /// The deployment's recorded current artifact reference (`sha256:<hex>`).
     pub current_artifact: &'a str,
     /// P1-11 anti-downgrade floor: the version embedded in the current
-    /// build identity, when the target recorded one.
+    /// release version, when the target recorded one.
     pub current_version: Option<&'a str>,
     pub expected_revision: u64,
     pub artifact: &'a OfficialArtifactRef,
-    pub rollback_policy: &'a crate::model::ReleaseRollbackPolicy,
     pub config: Option<&'a StagedConfig>,
     pub migration_jws: Option<&'a str>,
     pub migration_request_hash: Option<&'a str>,
@@ -207,9 +206,9 @@ pub(crate) struct RollbackJob<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LifecycleFacts {
     pub revision: u64,
-    /// The verified artifact's embedded build identity, committed alongside
-    /// the new current reference (G03 envelope binding source).
-    pub build_identity: Option<super::deployment_state::BuildIdentity>,
+    /// The verified manifest's release version, committed alongside the new
+    /// current reference for update ordering and rollback history.
+    pub release: Option<super::deployment_state::ReleaseVersion>,
     pub migration_result: Option<nazo_operator_protocol::ControlResult>,
 }
 
@@ -219,6 +218,11 @@ pub(crate) struct LifecycleFacts {
 /// an untyped host error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum UpdateExecution {
+    /// The selected artifact was independently verified on the target and is
+    /// already current; with no staged config there is no mutation to run.
+    Noop {
+        revision: u64,
+    },
     Activated(LifecycleFacts),
     MigrationFailed(nazo_operator_protocol::ControlResult),
     RecoveryRequired {
@@ -246,6 +250,7 @@ pub(crate) struct PerformedSteps {
     pub(crate) migration_applied: bool,
     pub(crate) migration_outcome_unknown: bool,
     pub(crate) migration_result: Option<nazo_operator_protocol::ControlResult>,
+    pub(crate) verified_rollback_policy: Option<crate::model::ReleaseRollbackPolicy>,
 }
 
 /// Production executor backed by the real adapters.
@@ -256,6 +261,7 @@ impl LifecycleExecutor for HostLifecycleExecutor {
     fn execute_update(&self, job: &UpdateJob<'_>) -> Result<UpdateExecution, Failure> {
         let mut performed = PerformedSteps::default();
         match self.run_update(job, &mut performed) {
+            Ok(UpdateExecution::Noop { revision }) => Ok(UpdateExecution::Noop { revision }),
             Ok(UpdateExecution::Activated(facts)) => Ok(UpdateExecution::Activated(facts)),
             Ok(UpdateExecution::RecoveryRequired { result, detail }) => {
                 Ok(UpdateExecution::RecoveryRequired { result, detail })
@@ -274,9 +280,12 @@ impl LifecycleExecutor for HostLifecycleExecutor {
             }
             Err(failure)
                 if performed.migration_applied
-                    && !job
-                        .rollback_policy
-                        .artifact_rollback_allowed_after_migration() =>
+                    && performed
+                        .verified_rollback_policy
+                        .as_ref()
+                        .is_some_and(|policy| {
+                            !policy.artifact_rollback_allowed_after_migration()
+                        }) =>
             {
                 let failure = stop_writer_for_recovery(job, failure);
                 match performed.migration_result {
@@ -352,13 +361,23 @@ impl HostLifecycleExecutor {
             job.current_version,
             job.runtime_root,
         )?;
-        if verified.rollback_policy != *job.rollback_policy {
-            return Err(Failure::new(
-                super::install_exec::ARTIFACT_UNVERIFIED,
-                "update rollback policy does not match the verified target Release",
-            ));
-        }
+        performed.verified_rollback_policy = Some(verified.rollback_policy.clone());
         let new_digest = verified.digest.clone();
+
+        // Verification is the target's authority. Once it proves that the
+        // selected digest is already current and no config was staged, the
+        // update is complete: do not snapshot, dispatch migration, rotate the
+        // rollback generation, or advance the config revision.
+        if job.config.is_none()
+            && job
+                .current_artifact
+                .strip_prefix("sha256:")
+                .is_some_and(|current| current == new_digest)
+        {
+            return Ok(UpdateExecution::Noop {
+                revision: job.expected_revision,
+            });
+        }
         // Build and validate the executable replacement before any migration
         // can mutate external state. Activation consumes this exact plan.
         let replacement = (observation_digest(&observation).as_deref()
@@ -419,7 +438,8 @@ impl HostLifecycleExecutor {
                 )
             })?;
             let host = kind == RuntimeBackendKind::Host;
-            let service_user = host.then(|| systemd_service_user(job.deployment_id));
+            let service_user =
+                host.then(|| runtime_backend::systemd_service_user(job.deployment_id));
             let mut environment = BTreeMap::new();
             let mut read_only_paths = Vec::new();
             let mut read_write_paths = Vec::new();
@@ -427,7 +447,6 @@ impl HostLifecycleExecutor {
             let mut mounts = observation.mounts.clone();
             let runtime_role = runtime_database_role(job.secrets_root)?;
             environment.insert(MIGRATION_RUNTIME_ROLE_ENV.to_owned(), runtime_role);
-            super::inject_operator_oci_artifact_fence(&mut environment, &verified.runtime_artifact);
             if host {
                 environment.insert(
                     super::install_exec::SERVER_CONFIG_FILE_ENV.to_owned(),
@@ -491,7 +510,11 @@ impl HostLifecycleExecutor {
             let task = runtime_backend::OneShotTask {
                 artifact: verified.runtime_artifact.clone(),
                 command: vec!["nazoauth".to_owned(), "operator-task".to_owned()],
-                network: observation.networks.first().cloned(),
+                network: if host {
+                    Some("host".to_owned())
+                } else {
+                    observation.networks.first().cloned()
+                },
                 mounts,
                 environment,
                 working_directory: kind
@@ -526,7 +549,7 @@ impl HostLifecycleExecutor {
                         job.expected_revision,
                         job.operation_id,
                         &format!("sha256:{new_digest}"),
-                        job.rollback_policy,
+                        &verified.rollback_policy,
                     )?;
                     migration_result = Some(control_result);
                 }
@@ -570,23 +593,23 @@ impl HostLifecycleExecutor {
         // 6. Local readiness gate (G08 boundary: loopback only).
         probe_local_health(job.port)?;
 
-        // 7. Commit: previous <- old current, current <- new (+ its build
-        // identity), optional config CAS advance — replay-safe under this
+        // 7. Commit: previous <- old current, current <- new (+ its release
+        // version), optional config CAS advance — replay-safe under this
         // operation id.
         let state = job.store.apply_update_healthy(
             job.deployment_id,
             job.expected_revision,
             super::deployment_state::UpdateCommit {
                 artifact: format!("sha256:{new_digest}"),
-                build_identity: verified.build_identity.clone(),
-                rollback_policy: job.rollback_policy.clone(),
+                release: verified.release.clone(),
+                rollback_policy: verified.rollback_policy.clone(),
                 config: staged_config_change(job.config_reference, job.config),
                 operation_id: job.operation_id.to_owned(),
             },
         )?;
         Ok(UpdateExecution::Activated(LifecycleFacts {
             revision: state.config.revision,
-            build_identity: verified.build_identity,
+            release: verified.release,
             migration_result,
         }))
     }
@@ -750,7 +773,7 @@ impl HostLifecycleExecutor {
         )?;
         Ok(LifecycleFacts {
             revision: state.config.revision,
-            build_identity: None,
+            release: None,
             migration_result: None,
         })
     }
@@ -1022,17 +1045,6 @@ mod tests {
     }
 }
 
-pub(super) fn systemd_service_user(deployment_id: &str) -> String {
-    format!(
-        "nazoauth-{}",
-        deployment_id
-            .trim_start_matches("deploy-")
-            .chars()
-            .take(12)
-            .collect::<String>()
-    )
-}
-
 fn privilege_gate(runtime_kind: RuntimeBackendKind) -> Result<(), Failure> {
     if runtime_kind.is_container() {
         crate::instance_lifecycle::privilege::ensure_engine_access(
@@ -1121,82 +1133,80 @@ pub(crate) fn verify_pinned_artifact_facts(
                 sanitize(error.to_string()),
             )
         })?;
-        if !kind.is_container() {
-            return Err(Failure::new(
-                super::install_exec::ARTIFACT_UNVERIFIED,
-                "pre-release candidate validation requires a container runtime",
-            ));
-        }
         let backend = runtime_backend::backend(kind);
-        let observed_digest =
-            backend
-                .resolve_image_digest(&candidate.oci_image)
-                .map_err(|error| {
+        let (digest, runtime_artifact, local_artifact_id) = match kind {
+            RuntimeBackendKind::Host => {
+                let runtime_root = runtime_root.ok_or_else(|| {
+                    Failure::new(
+                        HOST_ERR_OPERATION_INVALID,
+                        "systemd deployment state has no app-binary directory resource",
+                    )
+                })?;
+                let source = Path::new(&candidate.host_binary_path);
+                let observed_digest = filesystem::sha256(source).map_err(|error| {
                     Failure::new(
                         super::install_exec::ARTIFACT_UNVERIFIED,
                         sanitize(error.to_string()),
                     )
                 })?;
-        if observed_digest != candidate.oci_digest {
-            return Err(Failure::new(
-                super::install_exec::ARTIFACT_UNVERIFIED,
-                "local pre-release candidate digest does not match its embedded manifest",
-            ));
-        }
-        let local_artifact_id = backend
-            .resolve_local_image_id(&candidate.oci_image)
-            .map_err(|error| {
-                Failure::new(
-                    super::install_exec::ARTIFACT_UNVERIFIED,
-                    sanitize(error.to_string()),
+                if observed_digest != candidate.host_binary_sha256 {
+                    return Err(Failure::new(
+                        super::install_exec::ARTIFACT_UNVERIFIED,
+                        "local pre-release host binary does not match its content digest",
+                    ));
+                }
+                let cached =
+                    cache_systemd_artifact(source, Path::new(runtime_root), &observed_digest)
+                        .map_err(|error| {
+                            Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
+                        })?;
+                (
+                    observed_digest.clone(),
+                    runtime_backend::ArtifactReference::HostBinary {
+                        path: cached,
+                        sha256: observed_digest,
+                    },
+                    None,
                 )
-            })?;
-        let runtime_artifact = runtime_backend::ArtifactReference::Oci {
-            image_reference: candidate.oci_image.clone(),
-            digest: candidate.oci_digest.clone(),
+            }
+            RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
+                let image = format!("{}@{}", candidate.oci_image, candidate.oci_digest);
+                backend.pull_image(&image).map_err(|error| {
+                    Failure::new(
+                        super::install_exec::ARTIFACT_UNVERIFIED,
+                        sanitize(error.to_string()),
+                    )
+                })?;
+                (
+                    candidate
+                        .oci_digest
+                        .trim_start_matches("sha256:")
+                        .to_owned(),
+                    runtime_backend::ArtifactReference::Oci {
+                        image_reference: candidate.oci_image.clone(),
+                        digest: candidate.oci_digest.clone(),
+                    },
+                    None,
+                )
+            }
         };
-        let embedded = backend
-            .read_build_identity(&runtime_artifact, Some(&local_artifact_id))
-            .map_err(|error| {
-                Failure::new(
-                    super::install_exec::ARTIFACT_UNVERIFIED,
-                    sanitize(error.to_string()),
-                )
-            })?
-            .ok_or_else(|| {
-                Failure::new(
-                    super::install_exec::ARTIFACT_UNVERIFIED,
-                    "local pre-release candidate has no embedded build identity",
-                )
-            })?;
-        let build_identity = candidate.identity().map_err(|error| {
+        let release = candidate.release_version().map_err(|error| {
             Failure::new(
                 super::install_exec::ARTIFACT_UNVERIFIED,
                 sanitize(error.to_string()),
             )
         })?;
-        if embedded.release != build_identity.version || embedded.revision != build_identity.commit
-        {
-            return Err(Failure::new(
-                super::install_exec::ARTIFACT_UNVERIFIED,
-                "local pre-release candidate identity does not match its embedded manifest",
-            ));
-        }
         return Ok(VerifiedArtifactFacts {
-            digest: candidate
-                .oci_digest
-                .trim_start_matches("sha256:")
-                .to_owned(),
+            digest,
             runtime_artifact,
-            local_artifact_id: Some(local_artifact_id),
-            build_identity: Some(build_identity),
+            local_artifact_id,
+            release: Some(release),
             rollback_policy: candidate.rollback,
         });
     }
     let release = VerifiedRelease::verify(ReleaseRequest {
         repository: &artifact.repository,
         requested_version: artifact.version.as_deref(),
-        container_backend: kind.is_container().then_some(kind),
         trusted_version_floor: version_floor,
     })
     .map_err(|error| {
@@ -1262,19 +1272,10 @@ pub(crate) fn verify_pinned_artifact_facts(
                         sanitize(error.to_string()),
                     )
                 })?;
-            let local_artifact_id = runtime_backend::backend(kind)
-                .resolve_local_image_id(&image)
-                .map_err(|error| {
-                    Failure::new(
-                        super::install_exec::ARTIFACT_UNVERIFIED,
-                        sanitize(error.to_string()),
-                    )
-                })?;
             let digest = digest.trim_start_matches("sha256:").to_owned();
             // Run the container from the digest-bound reference, never a bare
             // local image ID: a multi-arch index pull stores platform digest
             // entries whose order must not decide the identity assertion.
-            drop(local_artifact_id);
             (
                 digest.clone(),
                 runtime_backend::ArtifactReference::Oci {
@@ -1290,26 +1291,21 @@ pub(crate) fn verify_pinned_artifact_facts(
         runtime_artifact,
         local_artifact_id,
         rollback_policy: release.rollback_policy(),
-        build_identity: Some(
-            super::deployment_state::BuildIdentity::new(
-                super::deployment_state::BUILD_IDENTITY_PRODUCT,
-                &release.manifest.version,
-                &release.manifest.backend_commit,
-            )
-            .map_err(|error| {
-                Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
-            })?,
+        release: Some(
+            super::deployment_state::ReleaseVersion::new(&release.manifest.version).map_err(
+                |error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())),
+            )?,
         ),
     })
 }
 
-/// The verified facts an update needs from its selected artifact: the OCI
-/// subject digest and the embedded build identity.
+/// The verified facts an update needs from its selected artifact: its sole
+/// content identity plus the release version used for ordering and rollback.
 pub(crate) struct VerifiedArtifactFacts {
     pub(crate) digest: String,
     pub(crate) runtime_artifact: runtime_backend::ArtifactReference,
     pub(crate) local_artifact_id: Option<String>,
-    pub(crate) build_identity: Option<super::deployment_state::BuildIdentity>,
+    pub(crate) release: Option<super::deployment_state::ReleaseVersion>,
     pub(crate) rollback_policy: crate::model::ReleaseRollbackPolicy,
 }
 

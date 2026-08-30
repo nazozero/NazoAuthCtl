@@ -134,8 +134,9 @@ pub(crate) fn run_instance(command: InstanceCommand) -> anyhow::Result<()> {
 
 // ------------------------------------------------------------- live probes
 
-/// One full live contact: verified hello identity plus a nonce-echoed ping.
-/// Both transports answer through the identical [`ExecutionTarget`] contract.
+/// One full live contact: verify the helper hello and, when applicable, the
+/// target UUID bound to the registry host. Both transports answer through the
+/// identical [`ExecutionTarget`] contract.
 fn probe_target(
     target: &dyn ExecutionTarget,
     expected_host: Option<&HostRecord>,
@@ -156,37 +157,19 @@ fn probe_target(
     verify_remote_hello(&hello).map_err(|reason| {
         anyhow::anyhow!(
             "{REMOTE_HELPER_MISMATCH}: {reason}. Upgrade the target helper first \
-             (`nazoauthctl self update --yes` on the host), then retry; no fallback exists."
+             (`nazoauthctl self update` on the host), then retry; no fallback exists."
         )
     })?;
     if let Some(host) = expected_host {
         verify_registered_target_identity(host.host_id, &host.alias, &hello)?;
     }
 
-    let nonce = Uuid::now_v7().to_string();
-    let echoed = target.execute_host_operation(&HostOperation::ping(
-        Uuid::now_v7().to_string(),
-        nonce.clone(),
-    ))?;
-    match echoed.outcome {
-        HostOutcome::Completed {
-            body: HostCompletionBody::Ping { nonce: returned },
-        } if returned == nonce => Ok(hello),
-        HostOutcome::Completed {
-            body: HostCompletionBody::Ping { .. },
-        } => bail!("the ping reply did not echo the probe nonce"),
-        HostOutcome::Completed { .. } => {
-            bail!("the target answered an unexpected completion instead of a ping reply")
-        }
-        HostOutcome::Failed { code, detail } => {
-            bail!("the target helper answered failure {code}: {detail}")
-        }
-    }
+    Ok(hello)
 }
 
 /// Verify one already-registered physical target before any read or mutation.
-/// The helper contract and ping prove liveness; the target-owned UUID proves
-/// that the selected registry alias still reaches the physical host it names.
+/// The helper contract and target-owned UUID prove that the selected registry
+/// alias still reaches the physical host it names.
 pub(crate) fn live_probe(
     target: &dyn ExecutionTarget,
     host: &HostRecord,
@@ -197,18 +180,13 @@ pub(crate) fn live_probe(
 /// Compact single-line identity string stored in the observation cache. Drift
 /// reporting compares these summaries verbatim.
 pub(crate) fn summarize_hello(hello: &RemoteHello) -> String {
-    let commit = if hello.commit.is_empty() {
-        "-"
-    } else {
-        hello.commit.as_str()
-    };
     let runtimes = if hello.supported_runtimes.is_empty() {
         "-".to_owned()
     } else {
         hello.supported_runtimes.join(",")
     };
     format!(
-        "helper={} commit={commit} os={} arch={} runtimes={runtimes}",
+        "helper={} os={} arch={} runtimes={runtimes}",
         hello.version, hello.os, hello.arch
     )
 }
@@ -499,7 +477,7 @@ fn host_check(context: &FleetContext, alias: &str) -> anyhow::Result<String> {
                 .store
                 .set_host_observation(host.host_id, ObservationCache::now(true, summary.clone()))?;
             let mut report = format!(
-                "checked host '{alias}' against the live target\nhelper identity: {summary}\nping echo verified\nobservation updated\n"
+                "checked host '{alias}' against the live target\nhelper identity: {summary}\ntarget identity verified\nobservation updated\n"
             );
             if drifted {
                 report.push_str("drift detected against the cached observation:\n");
@@ -855,14 +833,14 @@ mod tests {
 
     #[derive(Clone)]
     enum Scenario {
-        /// Verified helper answering hello and ping correctly.
+        /// Verified helper answering a valid hello.
         Online,
         /// Two configured aliases can resolve to the same physical target.
         FixedTargetId(Uuid),
         /// Verified helper whose target reports a different deployment id
         /// than the one asked about (relocation must refuse).
         ForeignDeployment,
-        /// Answers hello with a drifted version (handshake must reject).
+        /// Answers hello with a drifted protocol schema (handshake must reject).
         HelperDrift,
         /// Transport-level failure with this diagnostic.
         Offline(&'static str),
@@ -886,7 +864,7 @@ mod tests {
             }
             .to_string();
             if matches!(self.scenario, Scenario::HelperDrift) {
-                hello.version = "0.0.9-drift".to_owned();
+                hello.remote_exec_schema += 1;
             }
             hello
         }
@@ -895,7 +873,7 @@ mod tests {
             match self.scenario {
                 Scenario::Offline(text) => bail!("{text}"),
                 Scenario::ForeignDeployment => Ok(InstanceInspection {
-                    current_build_identity: None,
+                    current_release: None,
                     current_instance_identity: None,
                     deployment_id: format!("elsewhere-{deployment_id}"),
                     issuer: "https://auth.example.com".to_owned(),
@@ -916,7 +894,7 @@ mod tests {
                     config_revision_marker: None,
                 }),
                 _ => Ok(InstanceInspection {
-                    current_build_identity: None,
+                    current_release: None,
                     current_instance_identity: None,
                     deployment_id: deployment_id.to_owned(),
                     issuer: "https://auth.example.com".to_owned(),
@@ -977,13 +955,7 @@ mod tests {
                         hello: self.hello(),
                     },
                 )),
-                crate::target::HostOperationBody::Ping { nonce } => Ok(HostResult::completed(
-                    &operation.operation_id,
-                    HostCompletionBody::Ping {
-                        nonce: nonce.clone(),
-                    },
-                )),
-                _ => bail!("fleet doubles only answer hello and ping"),
+                _ => bail!("fleet doubles only answer hello"),
             }
         }
 
@@ -1082,8 +1054,8 @@ mod tests {
         );
         assert_eq!(
             fixture.calls.load(Ordering::Relaxed),
-            2,
-            "one hello plus one ping"
+            1,
+            "one verified hello"
         );
         Ok(())
     }
@@ -1206,7 +1178,7 @@ mod tests {
             host.host_id,
             ObservationCache::now(
                 true,
-                "helper=0.0.1-old commit=- os=linux arch=x86_64 runtimes=docker",
+                "helper=0.0.1-old os=linux arch=x86_64 runtimes=docker",
             ),
         )?;
         let report = host_check(&fixture.context, "server-a")?;
@@ -1254,7 +1226,7 @@ mod tests {
         assert_eq!(
             fixture.calls.load(Ordering::Relaxed),
             1,
-            "identity mismatch must stop after hello, before ping or any target read/mutation"
+            "identity mismatch must stop after hello, before any target read or mutation"
         );
         let observation = fixture
             .store()
@@ -1293,7 +1265,7 @@ mod tests {
             }),
         );
         let report = host_check(&context, "local")?;
-        assert!(report.contains("ping echo verified"), "{report}");
+        assert!(report.contains("target identity verified"), "{report}");
         assert!(*factory_called.borrow());
         let updated = context.store.host_by_id(local.host_id)?.unwrap();
         assert!(updated.last_observation.unwrap().reachable);

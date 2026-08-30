@@ -1,21 +1,17 @@
 //! Target-side execution of the uninstall deletion plan (goal plan 07 §7,
 //! task G06).
 //!
-//! The control side generates the exact deletion plan from the live
-//! DeploymentState and sends it inside the one journaled Uninstall mutation.
-//! The target then re-confirms every fact before any destructive step:
+//! The control side shows the live DeploymentState as a deletion preview.
+//! The target then uses that same authoritative state for the one journaled
+//! Uninstall mutation:
 //!
-//! * each planned resource id must resolve through
-//!   [`TargetStateStore::load_existing`] + `exact_managed_deployment_resource`
-//!   — external or shared resources fail closed with the stable zero-delete
-//!   codes before this executor ever runs;
-//! * each planned locator must equal the declared locator byte-for-byte
-//!   (plan-vs-state drift fails closed with [`OBJECT_IDENTITY_MISMATCH`]);
+//! * only resources declared `managed + deployment` are deleted; external or
+//!   shared resources have no deletion path;
 //! * the runtime object is removed only when its deployment-id label proves
 //!   it belongs to THIS deployment — a foreign object under the managed name
 //!   is never touched;
-//! * only physically understood managed kinds are deleted (`container`,
-//!   `directory`, `file`); anything else fails closed.
+//! * the runtime uses its dedicated adapter; only physically understood
+//!   managed filesystem kinds (`directory`, `file`) are deleted.
 //!
 //! Completion removes the state document (the operation journal survives so
 //! retries replay the stored terminal result), deletes the config file and
@@ -35,10 +31,8 @@ pub(crate) struct DeletionJob<'a> {
     pub deployment_id: &'a str,
     pub runtime_kind: crate::runtime_backend::RuntimeBackendKind,
     pub runtime_object: &'a str,
-    pub current_artifact: &'a str,
     pub config_reference: &'a str,
-    pub resources: &'a [super::install_exec::PlannedResourceDeletion],
-    /// Live declared resources from the DeploymentState (identity source).
+    /// Live resources from the target-owned DeploymentState.
     pub declared: &'a [Resource],
     pub expected_revision: u64,
     pub scope_dir: &'a Path,
@@ -113,33 +107,6 @@ impl HostDeletionExecutor {
                     ),
                 ));
             }
-            // Second confirmation: a labeled object must still serve exactly
-            // the artifact the deployment state records before deletion.
-            let observed_digest = match &observation.artifact {
-                crate::runtime_backend::ArtifactReference::Oci { digest, .. }
-                | crate::runtime_backend::ArtifactReference::HostBinary {
-                    sha256: digest, ..
-                } => digest.trim_start_matches("sha256:"),
-                crate::runtime_backend::ArtifactReference::Unknown => {
-                    return Err(Failure::new(
-                        super::deployment_state::OBJECT_IDENTITY_MISMATCH,
-                        "runtime object has no verifiable artifact identity",
-                    ));
-                }
-            };
-            let expected = job.current_artifact.trim_start_matches("sha256:");
-            if observed_digest != expected {
-                return Err(Failure::new(
-                    super::deployment_state::OBJECT_IDENTITY_MISMATCH,
-                    format!(
-                        "runtime object '{}' serves '{}' while the deployment state records \
-                         '{}'; refusing to delete drifted state",
-                        sanitize(job.runtime_object.to_owned()),
-                        sanitize(observed_digest.to_owned()),
-                        sanitize(expected.to_owned())
-                    ),
-                ));
-            }
             if kind.is_container() {
                 backend.stop(job.runtime_object).map_err(|error| {
                     Failure::new(
@@ -159,40 +126,15 @@ impl HostDeletionExecutor {
                 .push(job.runtime_object.to_owned());
         }
 
-        // 2. Planned resources: identity re-confirmed against the live
-        // declaration, then deleted by their concrete kind.
-        for planned in job.resources {
-            let declared = job
-                .declared
-                .iter()
-                .find(|resource| resource.resource_id == planned.resource_id)
-                .ok_or_else(|| {
-                    Failure::new(
-                        super::deployment_state::RESOURCE_UNKNOWN,
-                        format!(
-                            "planned resource '{}' is not declared by the live deployment state",
-                            sanitize(planned.resource_id.clone())
-                        ),
-                    )
-                })?;
-            if declared.locator != planned.locator {
-                return Err(Failure::new(
-                    super::deployment_state::OBJECT_IDENTITY_MISMATCH,
-                    format!(
-                        "resource '{}' drifted: plan names '{}' while the live state declares '{}'; \
-                         regenerate the plan",
-                        sanitize(planned.resource_id.clone()),
-                        sanitize(planned.locator.clone()),
-                        sanitize(declared.locator.clone())
-                    ),
-                ));
-            }
-            delete_managed_resource(
-                &declared.kind,
-                &declared.locator,
-                job.deployment_id,
-                performed,
-            )?;
+        // 2. Delete only resources the authoritative target state classifies
+        // as managed and deployment-scoped. The runtime object has its own
+        // adapter above and must not be deleted twice.
+        for resource in job.declared.iter().filter(|resource| {
+            resource.ownership == super::deployment_state::ResourceOwnership::Managed
+                && resource.scope == super::deployment_state::ResourceScope::Deployment
+                && resource.kind != "container"
+        }) {
+            delete_managed_resource(&resource.kind, &resource.locator, performed)?;
         }
 
         // 3. The configuration file created by install/managed by the update
@@ -241,18 +183,12 @@ impl HostDeletionExecutor {
 fn delete_managed_resource(
     kind: &str,
     locator: &str,
-    deployment_id: &str,
     performed: &mut PerformedDeletions,
 ) -> Result<(), Failure> {
     match kind {
         "directory" => {
             let path = Path::new(locator);
-            let safe = path.is_absolute()
-                && path.components().count() > 2
-                && !path
-                    .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir));
-            if !safe {
+            if !safe_managed_path(path) {
                 return Err(Failure::new(
                     super::deployment_state::OBJECT_IDENTITY_MISMATCH,
                     format!(
@@ -268,85 +204,63 @@ fn delete_managed_resource(
             if !path.exists() {
                 return Ok(());
             }
-            // W2.4/P1-1: the ownership marker is the deletion credential. A
-            // missing marker means ctl did not create this directory (or the
-            // state tree was tampered with); either way fail closed.
-            let marker = path.join(".nazoauth-owned");
-            if !marker.exists() {
+            let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+                Failure::new(
+                    HOST_ERR_OPERATION_INVALID,
+                    format!("failed to inspect managed directory: {error}"),
+                )
+            })?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(Failure::new(
                     super::deployment_state::OBJECT_IDENTITY_MISMATCH,
                     format!(
-                        "refusing to delete directory '{}': no .nazoauth-owned marker; ctl did \
-                         not create it",
+                        "refusing to delete directory '{}': locator is not a real directory",
                         sanitize(locator.to_owned())
                     ),
                 ));
             }
-            let owned_by = std::fs::read_to_string(&marker).map_err(|error| {
+            make_tree_removable(path)?;
+            std::fs::remove_dir_all(path).map_err(|error| {
                 Failure::new(
                     HOST_ERR_OPERATION_INVALID,
-                    format!("failed to read ownership marker: {error}"),
+                    format!("failed to delete directory {}: {error}", path.display()),
                 )
             })?;
-            if owned_by.trim() != deployment_id {
-                return Err(Failure::new(
-                    super::deployment_state::OBJECT_IDENTITY_MISMATCH,
-                    format!(
-                        "directory '{}' is owned by '{}', not '{}'",
-                        sanitize(locator.to_owned()),
-                        sanitize(owned_by.trim().to_owned()),
-                        sanitize(deployment_id.to_owned())
-                    ),
-                ));
-            }
-            if path.exists() {
-                std::fs::remove_dir_all(path).map_err(|error| {
-                    Failure::new(
-                        HOST_ERR_OPERATION_INVALID,
-                        format!("failed to delete directory {}: {error}", path.display()),
-                    )
-                })?;
-                performed.removed_paths.push(locator.to_owned());
-            }
+            performed.removed_paths.push(locator.to_owned());
             Ok(())
         }
         "file" => {
             let path = Path::new(locator);
-            // P1-1: config files carry the same ownership proof as
-            // directories — a sibling marker file named `<path>.nazoauth-owned`
-            // written at install time must exist and match.
+            if !safe_managed_path(path) {
+                return Err(Failure::new(
+                    super::deployment_state::OBJECT_IDENTITY_MISMATCH,
+                    format!(
+                        "refusing to delete file '{}': not a deep absolute path",
+                        sanitize(locator.to_owned())
+                    ),
+                ));
+            }
             let marker_path = format!("{locator}.nazoauth-owned");
             let marker = Path::new(marker_path.as_str());
             if !path.exists() && !marker.exists() {
                 return Ok(());
             }
-            if !marker.exists() {
-                return Err(Failure::new(
-                    super::deployment_state::OBJECT_IDENTITY_MISMATCH,
-                    format!(
-                        "refusing to delete file '{}': no .nazoauth-owned proof marker",
-                        sanitize(locator.to_owned())
-                    ),
-                ));
-            }
-            let owned_by = std::fs::read_to_string(marker).map_err(|error| {
-                Failure::new(
-                    HOST_ERR_OPERATION_INVALID,
-                    format!("failed to read ownership marker: {error}"),
-                )
-            })?;
-            if owned_by.trim() != deployment_id {
-                return Err(Failure::new(
-                    super::deployment_state::OBJECT_IDENTITY_MISMATCH,
-                    format!(
-                        "file '{}' is owned by '{}', not '{}'",
-                        sanitize(locator.to_owned()),
-                        sanitize(owned_by.trim().to_owned()),
-                        sanitize(deployment_id.to_owned())
-                    ),
-                ));
-            }
             if path.exists() {
+                let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+                    Failure::new(
+                        HOST_ERR_OPERATION_INVALID,
+                        format!("failed to inspect managed file: {error}"),
+                    )
+                })?;
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return Err(Failure::new(
+                        super::deployment_state::OBJECT_IDENTITY_MISMATCH,
+                        format!(
+                            "refusing to delete file '{}': locator is not a real file",
+                            sanitize(locator.to_owned())
+                        ),
+                    ));
+                }
                 filesystem::remove_file_durable(path).map_err(|error| {
                     Failure::new(
                         HOST_ERR_OPERATION_INVALID,
@@ -376,6 +290,92 @@ fn delete_managed_resource(
     }
 }
 
+fn safe_managed_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().count() > 2
+        && !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+/// Applications may make immutable release subdirectories inside their
+/// writable data root. The rootless installer still owns those directories,
+/// so restore owner write/traverse permission before removing the exact
+/// target-state-owned tree. Symlinks are never followed.
+fn make_tree_removable(path: &Path) -> Result<(), Failure> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            format!("failed to inspect managed path {}: {error}", path.display()),
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    if metadata.is_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = metadata.permissions().mode();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o700)).map_err(
+            |error| {
+                Failure::new(
+                    HOST_ERR_OPERATION_INVALID,
+                    format!(
+                        "failed to make managed directory {} removable: {error}",
+                        path.display()
+                    ),
+                )
+            },
+        )?;
+    }
+
+    #[cfg(windows)]
+    if metadata.permissions().readonly() {
+        clear_windows_readonly(path, &metadata)?;
+    }
+
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path).map_err(|error| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                format!(
+                    "failed to enumerate managed directory {}: {error}",
+                    path.display()
+                ),
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                Failure::new(
+                    HOST_ERR_OPERATION_INVALID,
+                    format!("failed to enumerate managed directory entry: {error}"),
+                )
+            })?;
+            make_tree_removable(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::permissions_set_readonly_false,
+    reason = "Windows readonly is a file attribute, not a Unix permission mask"
+)]
+fn clear_windows_readonly(path: &Path, metadata: &std::fs::Metadata) -> Result<(), Failure> {
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions).map_err(|error| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            format!(
+                "failed to make managed path {} removable: {error}",
+                path.display()
+            ),
+        )
+    })
+}
+
 fn privilege_gate(runtime_kind: crate::runtime_backend::RuntimeBackendKind) -> Result<(), Failure> {
     let result = if runtime_kind.is_container() {
         crate::instance_lifecycle::privilege::ensure_engine_access(
@@ -393,34 +393,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn managed_directory_deletion_is_resume_safe_but_still_requires_initial_proof()
-    -> anyhow::Result<()> {
+    fn managed_directory_deletion_uses_target_state_and_is_resume_safe() -> anyhow::Result<()> {
         let temp = crate::filesystem::PrivateTempDir::new("uninstall-directory-replay")?;
         let path = temp.path().join("managed").join("data");
         std::fs::create_dir_all(&path)?;
-        std::fs::write(path.join(".nazoauth-owned"), "deploy-alpha")?;
         std::fs::write(path.join("value"), b"data")?;
+        let release = path.join("ui-releases").join("immutable");
+        std::fs::create_dir_all(&release)?;
+        std::fs::write(release.join("asset"), b"asset")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&release, std::fs::Permissions::from_mode(0o555))?;
+        }
+        #[cfg(windows)]
+        {
+            let mut permissions = std::fs::metadata(&release)?.permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&release, permissions)?;
+        }
         let locator = path.to_string_lossy().into_owned();
         let mut performed = PerformedDeletions::default();
 
-        delete_managed_resource("directory", &locator, "deploy-alpha", &mut performed)?;
+        delete_managed_resource("directory", &locator, &mut performed)?;
         assert!(!path.exists());
-        delete_managed_resource("directory", &locator, "deploy-alpha", &mut performed)?;
+        delete_managed_resource("directory", &locator, &mut performed)?;
 
-        let foreign = temp.path().join("managed").join("foreign");
-        std::fs::create_dir_all(&foreign)?;
-        let error = delete_managed_resource(
-            "directory",
-            &foreign.to_string_lossy(),
-            "deploy-alpha",
-            &mut performed,
-        )
-        .expect_err("an existing directory without its proof remains protected");
+        let error = delete_managed_resource("directory", "relative/path", &mut performed)
+            .expect_err("a non-absolute locator remains protected");
         assert_eq!(
             error.code,
             super::super::deployment_state::OBJECT_IDENTITY_MISMATCH
         );
-        assert!(foreign.exists());
         Ok(())
     }
 
@@ -435,18 +439,13 @@ mod tests {
 
         // This is the exact crash window after the file was removed but
         // before its sibling ownership marker was removed.
-        delete_managed_resource("file", &locator, "deploy-alpha", &mut performed)?;
+        delete_managed_resource("file", &locator, &mut performed)?;
         assert!(!marker.exists());
-        delete_managed_resource("file", &locator, "deploy-alpha", &mut performed)?;
+        delete_managed_resource("file", &locator, &mut performed)?;
 
-        std::fs::write(&path, b"foreign")?;
-        let error = delete_managed_resource("file", &locator, "deploy-alpha", &mut performed)
-            .expect_err("an existing file without its proof remains protected");
-        assert_eq!(
-            error.code,
-            super::super::deployment_state::OBJECT_IDENTITY_MISMATCH
-        );
-        assert!(path.exists());
+        std::fs::write(&path, b"managed by authoritative target state")?;
+        delete_managed_resource("file", &locator, &mut performed)?;
+        assert!(!path.exists());
         Ok(())
     }
 }

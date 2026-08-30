@@ -9,7 +9,7 @@ use super::*;
 use crate::filesystem::PrivateTempDir;
 use crate::registry::{HostPrivilege, HostRecord};
 use crate::target::{
-    ArtifactRefs, BootstrapParams, BuildIdentity, RuntimeSurface, TargetStateStore,
+    ArtifactRefs, BootstrapParams, ReleaseVersion, RuntimeSurface, TargetStateStore,
 };
 
 const ARTIFACT: &str = "sha256:c0ffee0000000000000000000000000000000000000000000000000000000055";
@@ -73,7 +73,7 @@ impl Fixture {
         issuer: &str,
         runtime_object: &str,
         resources: Vec<crate::target::Resource>,
-        build_identity: Option<BuildIdentity>,
+        release: Option<ReleaseVersion>,
     ) -> anyhow::Result<()> {
         self.target_store()?.bootstrap(
             deployment_id,
@@ -87,7 +87,7 @@ impl Fixture {
                 config_reference: CONFIG_REFERENCE.to_owned(),
                 config_schema: CONFIG_SCHEMA.to_owned(),
                 resources,
-                current_build_identity: build_identity,
+                current_release: release,
                 current_rollback_policy: crate::model::test_release_rollback_policy(),
             },
             &uuid::Uuid::now_v7().to_string(),
@@ -135,7 +135,7 @@ fn discover_reports_every_declared_fact_per_deployment() -> anyhow::Result<()> {
         "https://alpha.example.com",
         "nz-alpha",
         managed_runtime("nz-alpha")?,
-        Some(BuildIdentity::new("nazoauth", "0.2.0", "abc1234")?),
+        Some(ReleaseVersion::new("0.2.0")?),
     )?;
     fixture.seed_deployment(
         "deploy-beta",
@@ -161,13 +161,10 @@ fn discover_reports_every_declared_fact_per_deployment() -> anyhow::Result<()> {
     assert!(report.contains("revision 1"), "{report}");
     assert!(report.contains(CONFIG_SCHEMA), "{report}");
     assert!(report.contains(ARTIFACT), "{report}");
+    assert!(report.contains("release version: 0.2.0"), "{report}");
     assert!(
-        report.contains("build identity: nazoauth v0.2.0 (commit abc1234)"),
-        "{report}"
-    );
-    assert!(
-        report.contains("build identity: not recorded"),
-        "deploy-beta has no build identity: {report}"
+        report.contains("release version: not recorded"),
+        "deploy-beta has no release version: {report}"
     );
     assert!(
         report.contains(
@@ -281,7 +278,7 @@ fn adopt_registers_with_target_derived_evidence_and_classification() -> anyhow::
         "https://alpha.example.com",
         "nz-alpha",
         managed_runtime("nz-alpha")?,
-        Some(BuildIdentity::new("nazoauth", "0.2.0", "abc1234")?),
+        Some(ReleaseVersion::new("0.2.0")?),
     )?;
     let state_path = fixture
         .state_root

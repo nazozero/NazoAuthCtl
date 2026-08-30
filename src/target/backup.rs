@@ -16,9 +16,9 @@ use uuid::Uuid;
 use crate::filesystem;
 use crate::runtime_backend::ArtifactReference;
 
-use super::deployment_state::{BuildIdentity, DeploymentState};
+use super::deployment_state::{DeploymentState, ReleaseVersion};
 
-pub const BACKUP_MANIFEST_SCHEMA: u32 = 3;
+pub const BACKUP_MANIFEST_SCHEMA: u32 = 4;
 pub const RESTORE_TEST_RECEIPT_SCHEMA: u32 = 2;
 pub const OFF_HOST_COPY_RECEIPT_SCHEMA: u32 = 1;
 const MAX_BACKUP_EVIDENCE_BYTES: u64 = 4 * 1024 * 1024;
@@ -67,8 +67,8 @@ pub struct SnapshotManifest {
     /// Exact artifact observed from the live runtime, not reconstructed from
     /// a release tag or controller cache.
     pub runtime_artifact: ArtifactReference,
-    /// Embedded identity bound to the current artifact in DeploymentState.
-    pub build_identity: BuildIdentity,
+    /// Verified release version paired with the current artifact.
+    pub release: ReleaseVersion,
     /// Verified Release rollback contract belonging to this exact artifact
     /// generation. Recovery restores it together with the artifact.
     pub rollback_policy: crate::model::ReleaseRollbackPolicy,
@@ -103,7 +103,7 @@ impl SnapshotManifest {
         }
         crate::registry::validate_identifier(&self.deployment_id, 128, "backup deployment id")?;
         Uuid::parse_str(&self.snapshot_id).context("backup snapshot id is not a UUID")?;
-        self.build_identity.validate()?;
+        self.release.validate()?;
         self.rollback_policy.validate()?;
         crate::registry::validate_identifier(&self.config_schema, 64, "backup config schema")?;
         validate_runtime_artifact(&self.runtime_artifact)?;

@@ -5,7 +5,7 @@
 //! the read-only host-level [`crate::target::HostOperation`] kind
 //! `state-list`, handshake-gated like every inspection kind. It reports the
 //! authoritative facts per deployment (deployment id, issuer, runtime surface,
-//! artifact/config revisions, build identity, resource facts), cross-references
+//! artifact/config revisions, release version, resource facts), cross-references
 //! the Registry as display-only candidate status, and writes nothing — no
 //! registry record, no observation cache, no target-side change, no privilege
 //! or controller-key prerequisite. It works on unbound deployments by
@@ -242,12 +242,9 @@ pub(crate) fn run_discover(
     Ok(report)
 }
 
-fn build_identity_line(inspection: &InstanceInspection) -> String {
-    match &inspection.current_build_identity {
-        Some(identity) => format!(
-            "{} v{} (commit {})",
-            identity.product, identity.version, identity.commit
-        ),
+fn release_line(inspection: &InstanceInspection) -> String {
+    match &inspection.current_release {
+        Some(identity) => identity.version.clone(),
         None => "not recorded".to_owned(),
     }
 }
@@ -273,7 +270,7 @@ fn render_discovery_block(
     };
     let health = if inspection.healthy { "ok" } else { "down" };
     let mut block = format!(
-        "[{index}] {}\n    issuer: {}\n    runtime: {}/{}\n    config: revision {} (schema {}, {})\n    artifacts: {artifacts}\n    build identity: {}\n    health: {health} — {}\n",
+        "[{index}] {}\n    issuer: {}\n    runtime: {}/{}\n    config: revision {} (schema {}, {})\n    artifacts: {artifacts}\n    release version: {}\n    health: {health} — {}\n",
         inspection.deployment_id,
         inspection.issuer,
         inspection.runtime.kind,
@@ -281,7 +278,7 @@ fn render_discovery_block(
         inspection.revision,
         inspection.config_schema,
         inspection.config_reference,
-        build_identity_line(inspection),
+        release_line(inspection),
         inspection.health_summary,
     );
     if classified.is_empty() {

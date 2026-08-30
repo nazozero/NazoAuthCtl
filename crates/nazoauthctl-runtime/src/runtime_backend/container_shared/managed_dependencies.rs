@@ -584,11 +584,11 @@ pub(crate) fn backup_managed_dependencies(
     prepare_oci_backup_output(&postgres)?;
 
     let validation = if selinux_relabel {
-        super::build_identity_process(command)
+        super::hardened_one_shot_process(command)
             .arg("-v")
             .arg(format!("{}:/backup:ro,Z", backup.destination.display()))
     } else {
-        super::build_identity_process(command)
+        super::hardened_one_shot_process(command)
             .arg("--mount")
             .arg(format!(
                 "type=bind,src={},dst=/backup,readonly",

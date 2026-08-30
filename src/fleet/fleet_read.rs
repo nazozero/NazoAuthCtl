@@ -672,7 +672,7 @@ pub(crate) fn run_backup_view(
 /// Stable-code classifier shared with the error envelope: scan the rendered
 /// error chain for known stable tokens.
 pub(crate) fn stable_code(rendered: &str) -> String {
-    const ORDERED: [(&str, &str); 24] = [
+    const ORDERED: [(&str, &str); 25] = [
         (error_codes::INPUT_INVALID, error_codes::INPUT_INVALID),
         (
             crate::target::BOOTSTRAP_CLOSED,
@@ -712,8 +712,8 @@ pub(crate) fn stable_code(rendered: &str) -> String {
             error_codes::CONTROL_BINDING_REQUIRED,
         ),
         (
-            error_codes::CONTROLLER_KEY_EXPIRED,
-            error_codes::CONTROLLER_KEY_EXPIRED,
+            error_codes::CONTROLLER_KEY_UNAUTHORIZED,
+            error_codes::CONTROLLER_KEY_UNAUTHORIZED,
         ),
         (
             error_codes::CONTROLLER_SLOT_LIMIT,
@@ -760,22 +760,52 @@ pub(crate) fn stable_code(rendered: &str) -> String {
             crate::target::INSTALL_OUTCOME_UNKNOWN,
             crate::target::INSTALL_OUTCOME_UNKNOWN,
         ),
+        (
+            error_codes::ADMIN_ACCESS_REQUIRED,
+            error_codes::ADMIN_ACCESS_REQUIRED,
+        ),
     ];
     for (token, code) in ORDERED {
-        if rendered.contains(token) {
+        if contains_stable_token(rendered, token) {
             return code.to_owned();
         }
     }
-    if rendered.contains(error_codes::EXTERNAL_RESOURCE_PROTECTED) {
-        return error_codes::EXTERNAL_RESOURCE_PROTECTED.to_owned();
-    }
-    if rendered.contains(error_codes::HOST_NOT_REGISTERED) {
+    if contains_stable_token(rendered, error_codes::HOST_NOT_REGISTERED) {
         return error_codes::HOST_NOT_REGISTERED.to_owned();
+    }
+    for code in [
+        crate::target::BACKUP_EXECUTION_FAILED,
+        crate::target::RESTORE_TEST_FAILED,
+        crate::target::CONTROL_EXECUTION_UNAVAILABLE,
+        crate::target::CONTROL_OUTCOME_UNKNOWN,
+        crate::target::CONTROL_TARGET_DRIFT,
+        crate::target::DEPLOYMENT_UNKNOWN,
+        crate::target::DEPLOYMENT_EXISTS,
+        crate::target::ROLLBACK_UNAVAILABLE,
+        crate::target::ROLLBACK_RECOVERY_REQUIRED,
+        crate::target::OBJECT_IDENTITY_MISMATCH,
+        crate::target::ACTIVATION_FAILED,
+        crate::target::ROLLBACK_ARTIFACT_MISSING,
+        crate::target::update_exec::BACKUP_UPDATE_PRECONDITION_FAILED,
+        crate::target::HOST_ERR_OPERATION_INVALID,
+        crate::target::wire::HOST_ERR_UNSUPPORTED_OPERATION,
+    ] {
+        if contains_stable_token(rendered, code) {
+            return code.to_owned();
+        }
     }
     if rendered.contains("did not answer within") || rendered.contains("timed out") {
         return error_codes::HOST_UNREACHABLE.to_owned();
     }
     error_codes::HOST_UNREACHABLE.to_owned()
+}
+
+fn contains_stable_token(rendered: &str, expected: &str) -> bool {
+    rendered
+        .split(|character: char| {
+            !(character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_')
+        })
+        .any(|token| token == expected)
 }
 
 #[cfg(test)]

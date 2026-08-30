@@ -635,8 +635,6 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                 deployment_id: deployment.deployment_id.clone(),
                 target_issuer: deployment.target_issuer.clone(),
                 release: deployment.release.clone(),
-                revision: deployment.revision.clone(),
-                build_id: deployment.build_id.clone(),
                 runtime: runtime.clone(),
             },
             source: EvidenceSourceIdentity {

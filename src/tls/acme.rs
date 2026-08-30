@@ -215,34 +215,18 @@ pub(super) fn run(
     selector: Option<&str>,
     command: AcmeCommand,
     require_root: impl Fn() -> anyhow::Result<()>,
-    confirm: impl Fn(bool, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     require_root()?;
     let store = TlsStore::system()?;
     match command {
         AcmeCommand::Plan(input) => plan(&store, selector, &input),
-        AcmeCommand::Issue {
-            input,
-            agree_terms,
-            yes,
-        } => {
+        AcmeCommand::Issue { input, agree_terms } => {
             if !agree_terms {
                 bail!("tls acme issue requires explicit --agree-terms");
             }
-            confirm(
-                yes,
-                "create or reuse an ACME account and issue a public TLS certificate",
-            )?;
             issue(&store, selector, &input)
         }
-        AcmeCommand::Recover {
-            tenant,
-            hostname,
-            yes,
-        } => {
-            confirm(yes, "resume or safely retire the pending ACME issuance")?;
-            recover(&store, selector, &tenant, &hostname)
-        }
+        AcmeCommand::Recover { tenant, hostname } => recover(&store, selector, &tenant, &hostname),
         AcmeCommand::Show { tenant, hostname } => show(&store, selector, &tenant, &hostname),
     }
 }

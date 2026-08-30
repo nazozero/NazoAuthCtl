@@ -23,7 +23,7 @@ pub const SSH_AUTH_FAILED: &str = "SSH_AUTH_FAILED";
 /// owns the decision and disabling StrictHostKeyChecking is never an option.
 pub const SSH_HOST_KEY_FAILED: &str = "SSH_HOST_KEY_FAILED";
 
-/// The remote helper's product/schema/build identity failed the C08 handshake.
+/// The remote helper's product/schema/release version failed the C08 handshake.
 pub const REMOTE_HELPER_MISMATCH: &str = "REMOTE_HELPER_MISMATCH";
 
 /// A step requires elevated privileges that the current session cannot
@@ -45,12 +45,16 @@ pub const STATE_RESET_REQUIRED: &str = "STATE_RESET_REQUIRED";
 /// instance does not have yet (`bind` first).
 pub const CONTROL_BINDING_REQUIRED: &str = "CONTROL_BINDING_REQUIRED";
 
-/// The instance's controller key is expired; rotation is required before any
-/// new signed operation.
-pub const CONTROLLER_KEY_EXPIRED: &str = "CONTROLLER_KEY_EXPIRED";
+/// NazoAuth did not authorize the presented Controller Key. The public slot
+/// list is the authority for whether the key is unknown, revoked, or expired.
+pub const CONTROLLER_KEY_UNAUTHORIZED: &str = "CONTROLLER_KEY_UNAUTHORIZED";
 
 /// The deployment already holds the maximum number of controller slots.
 pub const CONTROLLER_SLOT_LIMIT: &str = "CONTROLLER_SLOT_LIMIT";
+
+/// An identity-changing controller command needs an authenticated admin
+/// session (and the server may additionally require fresh MFA).
+pub const ADMIN_ACCESS_REQUIRED: &str = "ADMIN_ACCESS_REQUIRED";
 
 /// The same operation id arrived with a different canonical request hash; the
 /// original intent is authoritative and must never be overwritten.
@@ -60,11 +64,8 @@ pub const OPERATION_ID_CONFLICT: &str = "OPERATION_ID_CONFLICT";
 /// rebuild the intent.
 pub const CONFIG_REVISION_MISMATCH: &str = "CONFIG_REVISION_MISMATCH";
 
-/// The target's recorded build identity disagrees with the verified artifact.
+/// The target's recorded release version disagrees with the verified artifact.
 pub const TARGET_IDENTITY_MISMATCH: &str = "TARGET_IDENTITY_MISMATCH";
-
-/// External/shared resources have zero-delete protection on every path.
-pub const EXTERNAL_RESOURCE_PROTECTED: &str = "EXTERNAL_RESOURCE_PROTECTED";
 
 /// Transport-level sudo refusal code (C06). Not part of the 16-code CLI set:
 /// the envelope maps it onto [`PRIVILEGE_REQUIRED`] because the remedy is the

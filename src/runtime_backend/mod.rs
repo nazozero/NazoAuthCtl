@@ -4,11 +4,14 @@
 //! concrete adapters, process runner, and filesystem primitives live in the
 //! runtime crate.
 
+#[cfg(unix)]
+pub(crate) use nazoauthctl_runtime::runtime_backend::systemd_service_user_uid;
 pub(crate) use nazoauthctl_runtime::runtime_backend::{
     ArtifactReference, BlobAttestationVerification, ContainerRuntimePolicy, HostServiceInstall,
     NON_ROOT_ONE_SHOT_USER, NeutralMount, OneShotTask, RecoveryCandidateEndpoint,
     RecoveryCandidateRequest, ResourceScope as RuntimeResourceScope, Responsibility,
     RuntimeBackend, RuntimeBackendKind, RuntimeObservation, RuntimeReplacement, SystemdBackend,
+    systemd_service_user,
 };
 
 pub(crate) fn backend(kind: RuntimeBackendKind) -> Box<dyn RuntimeBackend> {

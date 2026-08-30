@@ -29,7 +29,7 @@ nazoauthctl install --host server-a --name production \
 nazoauthctl bind --instance production --label operations \
   --output-secret-file ./production-recovery-secret
 nazoauthctl status
-nazoauthctl update --yes
+nazoauthctl update
 nazoauthctl instance list
 nazoauthctl status --all
 ```

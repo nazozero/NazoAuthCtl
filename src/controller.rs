@@ -4,7 +4,7 @@
 use crate::process::Process;
 use anyhow::bail;
 
-use crate::error_codes::{INPUT_INVALID, PRIVILEGE_REQUIRED};
+use crate::error_codes::PRIVILEGE_REQUIRED;
 
 mod recovery_journal;
 mod recovery_transport;
@@ -53,25 +53,5 @@ mod tests {
     #[test]
     fn windows_self_update_uses_install_path_access_instead_of_unix_root() {
         super::require_self_update_privilege().expect("Windows has no Unix root identity");
-    }
-}
-
-pub(crate) fn require_confirmation(yes: bool, action: &str) -> anyhow::Result<()> {
-    use std::io::{IsTerminal as _, Write as _};
-
-    if yes {
-        return Ok(());
-    }
-    if !std::io::stdin().is_terminal() {
-        bail!("{INPUT_INVALID}: {action} requires --yes in non-interactive mode");
-    }
-    eprint!("Confirm: {action} [y/N]: ");
-    std::io::stderr().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    if answer.trim().eq_ignore_ascii_case("y") || answer.trim().eq_ignore_ascii_case("yes") {
-        Ok(())
-    } else {
-        bail!("{INPUT_INVALID}: operation cancelled")
     }
 }

@@ -12,9 +12,9 @@ pub use runtime_backend::{
     ArtifactReference, BlobAttestationVerification, ContainerRestartPolicy, ContainerRuntimePolicy,
     HostServiceInstall, ManagedDependencies, ManagedDependencyBackup, ManagedDependencyIdentity,
     ManagedNetwork, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore,
-    MountReference, NeutralMount, NeutralTmpfs, OneShotTask, RecoveryCandidateEndpoint,
-    RecoveryCandidateRequest, ResourceScope, Responsibility, RuntimeBackend, RuntimeBackendKind,
-    RuntimeObservation, RuntimeReplacement, managed_config_digest, managed_dependency_identity,
+    NeutralMount, NeutralTmpfs, OneShotTask, RecoveryCandidateEndpoint, RecoveryCandidateRequest,
+    ResourceScope, Responsibility, RuntimeBackend, RuntimeBackendKind, RuntimeObservation,
+    RuntimeReplacement, managed_config_digest, managed_dependency_identity,
     managed_network_config_digest, normalize_local_image_id, safe_systemd_path,
 };
 

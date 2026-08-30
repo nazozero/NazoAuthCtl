@@ -7,21 +7,22 @@
 //!   exactly the managed+deployment resources plus the runtime object and
 //!   config file; external/shared resources are printed as kept — they have
 //!   zero-delete paths by construction;
-//! * execution requires the operator's explicit confirmation AND target-side
-//!   re-confirmation of every fact (resource locator equality, runtime object
-//!   ownership label); any drift fails closed with `OBJECT_IDENTITY_MISMATCH`;
+//! * execution requires explicit confirmation; the target derives deletions
+//!   from its own authoritative state rather than trusting a duplicated plan;
+//!   container runtime identity remains bound by the deployment label;
 //! * completion removes ONLY this instance's InstanceRecord — never the
 //!   HostRecord and never sibling instances on the same host;
-//! * Controller binding removal is an independent NazoAuth-side step
-//!   (`controller revoke`, D08): it is printed as follow-up guidance and
-//!   deliberately not conflated with uninstall.
+//! * local Controller Key material is deleted with the local InstanceRecord;
+//!   Controller Slot rows remain inside any external database the plan keeps.
 
 use anyhow::{Context as _, bail};
 
 use super::{LifecycleContext, resolve_live_instance};
+use crate::controller_identity::store::ControllerKeyStore;
+use crate::file_lock::FileLock;
 use crate::target::{
-    HostOperation, HostOutcome, OBJECT_IDENTITY_MISMATCH, PlannedResourceDeletion,
-    ResourceOwnership, ResourceScope, StateMutationPayload,
+    ExecutionTarget, HostOperation, HostOutcome, ResourceOwnership, ResourceScope,
+    StateMutationPayload,
 };
 
 /// One uninstall plan: exact deletions plus everything deliberately kept.
@@ -46,7 +47,7 @@ impl UninstallPlan {
         );
         text.push_str("deletions (managed + deployment-scoped only):\n");
         text.push_str(&format!(
-            "  - runtime object '{}' (identity re-confirmed by ownership label)\n",
+            "  - runtime object '{}' (target-owned runtime identity)\n",
             self.runtime_object
         ));
         for (id, kind, locator) in &self.managed_deletions {
@@ -64,20 +65,31 @@ impl UninstallPlan {
                 text.push_str(&format!("  - {id} ({kind}): {locator}\n"));
             }
         }
+        text.push_str("untouched: HostRecord and sibling instances on this host\n");
         text.push_str(
-            "untouched: HostRecord, sibling instances on this host, controller slots at NazoAuth\n",
+            "Controller Slots in kept external data are unchanged; revoke them before uninstall if required\n",
+        );
+        text.push_str(
+            "local cleanup after target success: InstanceRecord and this deployment's controller key material\n",
         );
         text
     }
 }
 
 /// Generate the exact deletion plan from live facts (read-only).
+#[cfg(test)]
 pub(crate) fn plan_uninstall(
     context: &LifecycleContext,
     selector: Option<&str>,
 ) -> anyhow::Result<UninstallPlan> {
-    let (record, host, _target, inspection) =
-        resolve_live_instance(context, selector, "uninstall")?;
+    Ok(prepare_uninstall(context, selector)?.0)
+}
+
+fn prepare_uninstall(
+    context: &LifecycleContext,
+    selector: Option<&str>,
+) -> anyhow::Result<(UninstallPlan, Box<dyn ExecutionTarget + Send>)> {
+    let (record, host, target, inspection) = resolve_live_instance(context, selector, "uninstall")?;
     let mut managed_deletions = Vec::new();
     let mut kept_external = Vec::new();
     for resource in &inspection.resources {
@@ -99,61 +111,58 @@ pub(crate) fn plan_uninstall(
             _ => kept_external.push(entry),
         }
     }
-    Ok(UninstallPlan {
-        deployment_id: inspection.deployment_id.clone(),
-        alias: record.alias.clone(),
-        host_alias: host.alias.clone(),
-        revision: inspection.revision,
-        managed_deletions,
-        runtime_object: inspection.runtime.object.clone(),
-        config_reference: inspection.config_reference.clone(),
-        kept_external,
-    })
+    Ok((
+        UninstallPlan {
+            deployment_id: inspection.deployment_id.clone(),
+            alias: record.alias.clone(),
+            host_alias: host.alias.clone(),
+            revision: inspection.revision,
+            managed_deletions,
+            runtime_object: inspection.runtime.object.clone(),
+            config_reference: inspection.config_reference.clone(),
+            kept_external,
+        },
+        target,
+    ))
 }
 
 /// Execute a previously shown plan. `confirmed` must be an explicit operator
-/// decision; without it only the plan is rendered. The plan is regenerated
-/// from live facts immediately before execution so drift between show-time
-/// and execution fails closed on the target's identity re-confirmation.
+/// decision; without it only the plan is rendered. Confirmed execution reuses
+/// the same live read and relies on the target-side revision CAS for drift.
 pub(crate) fn run_uninstall(
     context: &LifecycleContext,
+    controller_keys: &ControllerKeyStore,
     selector: Option<&str>,
     confirmed: bool,
 ) -> anyhow::Result<String> {
     let action = "uninstall";
-    let plan = plan_uninstall(context, selector)?;
+    let (plan, target) = prepare_uninstall(context, selector)?;
     if !confirmed {
         return Ok(format!(
             "{}\nre-run with explicit confirmation (--yes at the CLI boundary) to execute",
             plan.render()
         ));
     }
-
-    // Live facts again: the destructive operation is built from THIS moment's
-    // state, and its expected_revision CAS makes concurrent drift fail closed.
-    let (_record, host, target, inspection) =
-        resolve_live_instance(context, Some(&plan.deployment_id), action)?;
-    if host.alias != plan.host_alias || inspection.revision != plan.revision {
-        bail!(
-            "{OBJECT_IDENTITY_MISMATCH}: the deployment changed since the plan was generated; \
-             regenerate the plan before executing"
-        );
-    }
-
-    let planned = plan
-        .managed_deletions
-        .iter()
-        .map(|(id, _, locator)| PlannedResourceDeletion {
-            resource_id: id.clone(),
-            locator: locator.clone(),
-        })
-        .collect::<Vec<_>>();
+    let instance_dir = controller_keys.instance_dir(&plan.deployment_id)?;
+    crate::filesystem::ensure_private_directory(
+        &instance_dir,
+        "controller instance lifecycle directory",
+    )?;
+    // All instance-scoped long-running flows take one of these outer locks
+    // before entering the shared key/journal lock. Holding them in that same
+    // order makes uninstall a single linearized lifecycle action without a
+    // second recovery framework.
+    let _bind_lock = FileLock::acquire(&instance_dir.join("bind.lock"))?;
+    let _controller_recovery_lock = FileLock::acquire(&instance_dir.join("recovery.lock"))?;
+    let _data_recovery_lock = FileLock::acquire(&instance_dir.join("recovery-plan.lock"))?;
+    let _transfer_lock = FileLock::acquire(&instance_dir.join("backup-transfer.lock"))?;
+    ensure_no_pending_remote_cleanup(controller_keys, &plan.deployment_id)?;
 
     let operation = HostOperation::state_mutate(
         uuid::Uuid::now_v7().to_string(),
         plan.deployment_id.clone(),
-        Some(inspection.revision),
-        StateMutationPayload::Uninstall { resources: planned },
+        Some(plan.revision),
+        StateMutationPayload::Uninstall {},
     );
     let result = target.execute_host_operation(&operation)?;
     match result.outcome {
@@ -163,25 +172,57 @@ pub(crate) fn run_uninstall(
         }
     }
 
-    // Completion removes ONLY the InstanceRecord. HostRecord and siblings
-    // stay; controller slots stay (independent revoke step).
+    // Completion removes this instance's two local ownership records. HostRecord
+    // and siblings stay. Controller Slot rows are part of an external database
+    // and therefore follow the plan's explicit keep decision.
+    controller_keys
+        .remove_instance(&plan.deployment_id)
+        .with_context(|| {
+            format!(
+                "instance '{}' was uninstalled, but its local controller key cleanup failed; the InstanceRecord was retained so cleanup can be retried",
+                plan.alias
+            )
+        })?;
     context
         .registry
         .forget_instance_by_deployment(&plan.deployment_id)
-        .with_context(|| format!("failed to forget instance {}", plan.alias))?;
+        .with_context(|| {
+            format!(
+                "instance '{}' was uninstalled and its local controller keys were removed, but its stale InstanceRecord could not be forgotten",
+                plan.alias
+            )
+        })?;
 
     Ok(format!(
         "uninstalled instance '{}' (deployment {})\n\
          managed resources removed per plan; external/shared resources were never touched\n\
-         InstanceRecord removed from the registry; HostRecord '{}' and sibling instances remain\n\
-         \n\
-         independent follow-ups (NOT part of uninstall):\n\
-         - revoke the Controller Slot at NazoAuth if one exists:\n\
-             nazoauthctl controller list --instance {alias}\n\
-         - local controller key material stays until the revoke flow cleans it up\n",
-        plan.alias,
-        plan.deployment_id,
-        plan.host_alias,
-        alias = plan.alias,
+         Controller Slots in kept external data were unchanged\n\
+         InstanceRecord and local controller key material removed; HostRecord '{}' and sibling instances remain\n",
+        plan.alias, plan.deployment_id, plan.host_alias,
     ))
+}
+
+fn ensure_no_pending_remote_cleanup(
+    controller_keys: &ControllerKeyStore,
+    deployment_id: &str,
+) -> anyhow::Result<()> {
+    let instance_dir = controller_keys.instance_dir(deployment_id)?;
+    for (file, operation) in [
+        ("recovery-plan.json", "disaster recovery"),
+        ("backup-transfer.json", "off-host backup transfer"),
+    ] {
+        let path = instance_dir.join(file);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                bail!(
+                    "cannot uninstall while this instance has an incomplete {operation}; resume that operation so its remote staging is cleaned first"
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+            }
+        }
+    }
+    Ok(())
 }

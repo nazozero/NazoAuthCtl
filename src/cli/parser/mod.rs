@@ -12,7 +12,7 @@ mod tls;
 use anyhow::{Context as _, bail};
 
 use super::types::{Cli, Command, InstanceSelector};
-use common::{no_arguments, parse_version_option, parse_yes, take_yes};
+use common::{no_arguments, parse_version_option};
 use controller::parse_controller;
 use fleet::{parse_host, parse_instance};
 use surface::{
@@ -65,14 +65,20 @@ impl Cli {
                 let (selector, all) = parse_read_view_selector(values, "doctor")?;
                 Command::Doctor { selector, all }
             }
-            "verify" => Command::Verify {
-                selector: parse_read_view_selector(values, "verify")?.0,
-            },
+            "verify" => {
+                let (selector, all) = parse_read_view_selector(values, "verify")?;
+                if all {
+                    bail!("verify does not accept --all");
+                }
+                Command::Verify { selector }
+            }
             "update" => Command::Update(parse_update_args(values)?),
             "rollback" => {
-                let (selector, yes) =
-                    surface::parse_confirm_scoped(values, &["--yes"], "rollback")?;
-                Command::Rollback { selector, yes }
+                let (selector, all) = parse_read_view_selector(values, "rollback")?;
+                if all {
+                    bail!("rollback does not accept --all");
+                }
+                Command::Rollback { selector }
             }
             "operation" => {
                 let (parts, limit) = parse_limited_selector(values, "operation", 20, 1000)?;
@@ -103,17 +109,14 @@ impl Cli {
             }
             "self" if values.first().is_some_and(|value| value == "update") => {
                 values.remove(0);
-                let (values, yes) = take_yes(values)?;
                 Command::SelfUpdate {
                     version: parse_version_option(values)?,
-                    yes,
                 }
             }
             "self" if values.first().is_some_and(|value| value == "rollback") => {
                 values.remove(0);
-                Command::SelfRollback {
-                    yes: parse_yes(values, "self rollback")?,
-                }
+                no_arguments(&values, "self rollback")?;
+                Command::SelfRollback
             }
             other => bail!(
                 "unknown command {other}; run `nazoauthctl --help` to see the current surface"
@@ -145,4 +148,67 @@ fn parse_limited_selector(
         bail!("{command} --limit must be between 1 and {maximum}");
     }
     Ok((selector, limit))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_rejects_all_instead_of_ignoring_it() {
+        let error = Cli::parse(["nazoauthctl", "verify", "--all"].map(str::to_owned))
+            .expect_err("verify --all must not be silently narrowed");
+        assert!(error.to_string().contains("does not accept --all"));
+    }
+
+    #[test]
+    fn explicit_mutation_commands_do_not_require_a_second_confirmation_flag() {
+        for command in [
+            vec!["nazoauthctl", "update"],
+            vec!["nazoauthctl", "rollback"],
+            vec!["nazoauthctl", "recover"],
+            vec!["nazoauthctl", "self", "update"],
+            vec!["nazoauthctl", "self", "rollback"],
+            vec!["nazoauthctl", "controller", "revoke", "controller-a"],
+        ] {
+            assert!(
+                Cli::parse(command.into_iter().map(str::to_owned)).is_ok(),
+                "the command itself is the operator intent"
+            );
+        }
+
+        for command in [
+            vec!["nazoauthctl", "update", "--yes"],
+            vec!["nazoauthctl", "rollback", "--yes"],
+            vec!["nazoauthctl", "recover", "--yes"],
+            vec!["nazoauthctl", "self", "update", "--yes"],
+            vec!["nazoauthctl", "self", "rollback", "--yes"],
+            vec!["nazoauthctl", "tls", "certificate", "apply", "--yes"],
+            vec!["nazoauthctl", "tls", "certificate", "recover", "--yes"],
+            vec!["nazoauthctl", "tls", "acme", "issue", "--yes"],
+            vec!["nazoauthctl", "tls", "acme", "recover", "--yes"],
+            vec![
+                "nazoauthctl",
+                "controller",
+                "revoke",
+                "controller-a",
+                "--yes",
+            ],
+        ] {
+            assert!(
+                Cli::parse(command.into_iter().map(str::to_owned)).is_err(),
+                "the removed compatibility flag must not remain accepted"
+            );
+        }
+
+        assert!(
+            Cli::parse(
+                ["nazoauthctl", "uninstall", "--yes"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .is_ok(),
+            "permanent deployment deletion keeps the explicit confirmation boundary"
+        );
+    }
 }

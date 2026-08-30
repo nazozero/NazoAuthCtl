@@ -301,12 +301,12 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
 }
 
 /// `nazoauthctl update [--instance SELECTOR] [--to VERSION]
-/// [--config-file PATH --config-schema TOKEN] --yes`
+/// [--config-file PATH --config-schema TOKEN]`
 pub(super) fn parse_update_args(values: Vec<String>) -> anyhow::Result<UpdateArgs> {
     let parsed = parse_options(
         values,
         &["--instance", "--to", "--config-file", "--config-schema"],
-        &["--yes"],
+        &[],
         "update",
     )?;
     if parsed.positionals.len() > 1 {
@@ -343,7 +343,6 @@ pub(super) fn parse_update_args(values: Vec<String>) -> anyhow::Result<UpdateArg
         version,
         config_file,
         config_schema,
-        yes: parsed.flags.contains("--yes"),
     })
 }
 
@@ -357,6 +356,9 @@ pub(super) fn parse_backup(values: Vec<String>) -> anyhow::Result<BackupArgs> {
             "restore-test" => (BackupCommand::RestoreTest, rest),
             "copy" => {
                 let parts = selector_parts(rest, &["--to-host"], &[], "backup copy")?;
+                if parts.positional.is_some() {
+                    bail!("backup copy does not accept a positional selector; use --instance");
+                }
                 let to_host = parts
                     .values
                     .get("--to-host")
@@ -439,7 +441,7 @@ pub(super) fn parse_policy(values: Vec<String>) -> anyhow::Result<PolicyArgs> {
 }
 
 pub(super) fn parse_recover(values: Vec<String>) -> anyhow::Result<RecoverArgs> {
-    let parts = selector_parts(&values, &["--recovery-secret-file"], &["--yes"], "recover")?;
+    let parts = selector_parts(&values, &["--recovery-secret-file"], &[], "recover")?;
     let recovery_secret_file = parts
         .values
         .get("--recovery-secret-file")
@@ -450,7 +452,6 @@ pub(super) fn parse_recover(values: Vec<String>) -> anyhow::Result<RecoverArgs> 
             positional: parts.positional,
             named: parts.named,
         },
-        yes: parts.flags.contains("--yes"),
         recovery_secret_file,
     })
 }
@@ -561,13 +562,23 @@ mod install_tests {
         install.extend(["--artifact-sha256".to_owned(), digest.clone()]);
         assert!(parse_install_args(install).is_err());
 
-        assert!(
-            parse_update_args(vec![
-                "--yes".to_owned(),
-                "--artifact-sha256".to_owned(),
-                digest,
-            ])
-            .is_err()
-        );
+        assert!(parse_update_args(vec!["--artifact-sha256".to_owned(), digest,]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[test]
+    fn backup_copy_rejects_a_positional_selector() {
+        let error = parse_backup(
+            ["copy", "unexpected", "--to-host", "other"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        )
+        .expect_err("a positional selector must not be ignored");
+        assert!(error.to_string().contains("does not accept a positional"));
     }
 }

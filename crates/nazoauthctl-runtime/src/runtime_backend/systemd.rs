@@ -57,8 +57,7 @@ impl RuntimeBackend for SystemdBackend {
         Process::new("systemctl")
             .args(["show", "--property=Version", "--value"])
             .succeeds()
-            && Process::new("systemd-run").arg("--version").succeeds()
-            && Process::new("systemd")
+            && Process::new("systemd-run")
                 .arg("--version")
                 .stdout()
                 .ok()
@@ -336,9 +335,6 @@ impl RuntimeBackend for SystemdBackend {
                 .run_quiet()?;
             remove_file_durable(&fragment_path)?;
             Process::new("systemctl").arg("daemon-reload").run_quiet()?;
-            Process::new("systemctl")
-                .args(["reset-failed", object_reference])
-                .run_quiet()?;
         }
         remove_managed_service_user(object_reference)
     }
@@ -424,10 +420,6 @@ impl RuntimeBackend for SystemdBackend {
         systemd_one_shot_process(task)?.stdin_stdout(&task.stdin)
     }
 
-    fn run_one_shot_authorization_probe(&self, task: &OneShotTask) -> anyhow::Result<bool> {
-        systemd_one_shot_process(task)?.stdin_authorization_rejected(&task.stdin)
-    }
-
     fn pull_image(&self, _image_reference: &str) -> anyhow::Result<()> {
         bail!("systemd backend does not manage OCI images")
     }
@@ -486,7 +478,7 @@ impl RuntimeBackend for SystemdBackend {
                 .args(["--system", "--home"])
                 .arg(&install.data_root)
                 .arg("--comment")
-                .arg(format!("nazoauthctl:{}", install.service_name))
+                .arg(managed_service_user_comment(&install.service_name))
                 .args([
                     "--shell",
                     "/usr/sbin/nologin",
@@ -501,6 +493,12 @@ impl RuntimeBackend for SystemdBackend {
             .parent()
             .context("systemd binary has no parent directory")?;
         ensure_directory_chain(binary_directory)?;
+        ensure_service_path_ancestors_traversable(
+            std::iter::once(install.data_root.as_path())
+                .chain(std::iter::once(binary_directory))
+                .chain(install.config.parent())
+                .chain(install.secret_paths.iter().filter_map(|path| path.parent())),
+        )?;
         set_mode(binary_directory, 0o755)?;
         Process::new("chown")
             .arg("-R")
@@ -590,27 +588,6 @@ impl RuntimeBackend for SystemdBackend {
 
     fn resolve_local_image_id(&self, _image_reference: &str) -> anyhow::Result<String> {
         bail!("systemd backend does not manage OCI images")
-    }
-
-    fn read_build_identity(
-        &self,
-        artifact: &ArtifactReference,
-        _local_artifact_id: Option<&str>,
-    ) -> anyhow::Result<Option<nazo_operator_protocol::EmbeddedIdentity>> {
-        let ArtifactReference::HostBinary {
-            path,
-            sha256: expected,
-        } = artifact
-        else {
-            bail!("systemd build identity requires a digest-bound host binary");
-        };
-        if sha256(path)? != *expected {
-            bail!("host binary no longer matches its trusted digest");
-        }
-        let output = Process::new(path).arg("build-identity").stdout()?;
-        Ok(Some(serde_json::from_str(output.trim()).context(
-            "host binary returned an invalid build identity",
-        )?))
     }
 }
 
@@ -721,6 +698,21 @@ fn require_non_root_service_user(user: &str) -> anyhow::Result<u32> {
     validate_non_root_service_uid(&output)
 }
 
+pub fn systemd_service_user(deployment_id: &str) -> String {
+    format!(
+        "nazoauth-{}",
+        deployment_id
+            .trim_start_matches("deploy-")
+            .chars()
+            .take(12)
+            .collect::<String>()
+    )
+}
+
+pub fn systemd_service_user_uid(deployment_id: &str) -> anyhow::Result<u32> {
+    require_non_root_service_user(&systemd_service_user(deployment_id))
+}
+
 fn remove_managed_service_user(service_name: &str) -> anyhow::Result<()> {
     let Some(stem) = service_name.strip_suffix(".service") else {
         bail!("managed NazoAuth unit name has no .service suffix");
@@ -739,7 +731,7 @@ fn remove_managed_service_user(service_name: &str) -> anyhow::Result<()> {
         .split(':')
         .nth(4)
         .context("passwd entry has no comment field")?;
-    if comment != format!("nazoauthctl:{service_name}") {
+    if comment != managed_service_user_comment(service_name) {
         bail!("refusing to remove a systemd service user without nazoauthctl ownership proof");
     }
     Process::new("userdel").arg(&user).run_quiet()
@@ -756,10 +748,47 @@ fn require_managed_service_user(user: &str, service_name: &str) -> anyhow::Resul
         .split(':')
         .nth(4)
         .context("passwd entry has no comment field")?;
-    if comment != format!("nazoauthctl:{service_name}") {
+    if comment != managed_service_user_comment(service_name) {
         bail!("refusing to reuse a systemd service user without nazoauthctl ownership proof");
     }
     Ok(())
+}
+
+fn managed_service_user_comment(service_name: &str) -> String {
+    format!("nazoauthctl {service_name}")
+}
+
+#[cfg(unix)]
+fn ensure_service_path_ancestors_traversable<'a>(
+    directories: impl IntoIterator<Item = &'a Path>,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let ancestors = directories
+        .into_iter()
+        .flat_map(|directory| directory.ancestors().skip(1))
+        .filter(|directory| directory.parent().is_some())
+        .collect::<BTreeSet<_>>();
+    for directory in ancestors {
+        let metadata = fs::symlink_metadata(directory)
+            .with_context(|| format!("failed to inspect {}", directory.display()))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            bail!(
+                "systemd service path ancestor is not a real directory: {}",
+                directory.display()
+            );
+        }
+        let mode = metadata.permissions().mode() & 0o7777;
+        set_mode(directory, mode | 0o111)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_service_path_ancestors_traversable<'a>(
+    _directories: impl IntoIterator<Item = &'a Path>,
+) -> anyhow::Result<()> {
+    bail!("systemd services are supported only on Unix targets")
 }
 
 fn validate_systemd_scalar(name: &str, value: &str) -> anyhow::Result<()> {
@@ -798,7 +827,7 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
     if sha256(path)? != *expected {
         bail!("host one-shot binary does not match the authorized digest");
     }
-    let unit = format!("nazoauthctl-task-{}", uuid::Uuid::now_v7());
+    let unit = format!("nazoauthctl-task-{}.service", uuid::Uuid::now_v7());
     let process = Process::new("systemd-run")
         .timeout(std::time::Duration::from_secs(300))
         .args([
@@ -826,7 +855,7 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
             "--property=AmbientCapabilities=",
         ])
         .arg(format!("--unit={unit}"));
-    let (mut process, credential_environment) = add_operator_credentials(process, task)?;
+    let (mut process, credential_environment) = add_operator_credentials(process, task, &unit)?;
     if task.private_mounts {
         process = process.arg("--property=PrivateMounts=yes");
     }
@@ -846,6 +875,14 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
         if credential_environment.contains(name.as_str()) {
             continue;
         }
+        let value = if let Some(credential) = value.strip_prefix("%d/") {
+            if !task.transient_credentials.contains_key(credential) {
+                bail!("{name} has an unbound systemd credential locator");
+            }
+            systemd_credential_path(&unit, credential)?
+        } else {
+            value.to_owned()
+        };
         process = process.arg(format!("--setenv={name}={value}"));
     }
     for (name, source) in &task.transient_credentials {
@@ -892,6 +929,7 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
 fn add_operator_credentials(
     mut process: Process,
     task: &OneShotTask,
+    unit: &str,
 ) -> anyhow::Result<(Process, BTreeSet<String>)> {
     let mut credential_environment = BTreeSet::new();
     for (environment, _) in OPERATOR_CREDENTIAL_ENVIRONMENT {
@@ -908,6 +946,11 @@ fn add_operator_credentials(
             if source.as_str() != expected || !task.transient_credentials.contains_key(credential) {
                 bail!("{environment} has an unbound systemd credential locator");
             }
+            process = process.arg(format!(
+                "--setenv={environment}={}",
+                systemd_credential_path(unit, credential)?
+            ));
+            credential_environment.insert(environment.to_owned());
             continue;
         }
         safe_systemd_path(Path::new(source))
@@ -917,10 +960,26 @@ fn add_operator_credentials(
         }
         process = process
             .arg(format!("--property=LoadCredential={credential}:{source}"))
-            .arg(format!("--setenv={environment}=%d/{credential}"));
+            .arg(format!(
+                "--setenv={environment}={}",
+                systemd_credential_path(unit, credential)?
+            ));
         credential_environment.insert(environment.to_owned());
     }
     Ok((process, credential_environment))
+}
+
+fn systemd_credential_path(unit: &str, credential: &str) -> anyhow::Result<String> {
+    validate_unit_name(unit)?;
+    if credential.is_empty()
+        || credential.len() > 128
+        || !credential
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+    {
+        bail!("invalid systemd credential name");
+    }
+    Ok(format!("/run/credentials/{unit}/{credential}"))
 }
 
 fn operator_credential_name(environment: &str) -> Option<&'static str> {
@@ -1255,10 +1314,37 @@ fn validate_mutable_unit(object_reference: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::ensure_service_path_ancestors_traversable;
     use super::{
         command_is_nazoauth_server, operator_credential_name, parse_systemd_exec_start,
-        systemd_property_matches, validate_non_root_service_uid,
+        systemd_credential_path, systemd_property_matches, validate_non_root_service_uid,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_service_can_traverse_managed_parent_directories() {
+        use std::{fs, os::unix::fs::PermissionsExt as _};
+
+        let work = crate::filesystem::PrivateTempDir::new("nazoauthctl-systemd-path").unwrap();
+        let install_root = work.path().join("private-install-root");
+        let data_parent = install_root.join("data");
+        let data_root = data_parent.join("deploy-test");
+        fs::create_dir_all(&data_root).unwrap();
+        fs::set_permissions(&install_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&data_parent, fs::Permissions::from_mode(0o700)).unwrap();
+
+        ensure_service_path_ancestors_traversable([data_root.as_path()]).unwrap();
+
+        assert_eq!(
+            fs::metadata(&install_root).unwrap().permissions().mode() & 0o777,
+            0o711
+        );
+        assert_eq!(
+            fs::metadata(&data_parent).unwrap().permissions().mode() & 0o777,
+            0o711
+        );
+    }
 
     #[test]
     fn operator_identity_files_use_transient_systemd_credentials() {
@@ -1275,6 +1361,17 @@ mod tests {
             Some("operator-config-manifest")
         );
         assert_eq!(operator_credential_name("DATABASE_URL_FILE"), None);
+    }
+
+    #[test]
+    fn transient_credential_paths_match_systemd_runtime_layout() {
+        assert_eq!(
+            systemd_credential_path("nazoauthctl-task-test.service", "database-lifecycle-url")
+                .unwrap(),
+            "/run/credentials/nazoauthctl-task-test.service/database-lifecycle-url"
+        );
+        assert!(systemd_credential_path("nazoauthctl-task-test", "credential").is_err());
+        assert!(systemd_credential_path("nazoauthctl-task-test.service", "../credential").is_err());
     }
 
     #[test]

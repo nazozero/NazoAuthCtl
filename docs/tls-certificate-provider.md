@@ -98,7 +98,7 @@ nazoauthctl tls certificate apply \
   --provider-config /etc/nazoauth/tls-provider.json \
   --tenant tenant-a --hostname auth.example \
   --certificate /run/cert-import/fullchain.pem \
-  --private-key /run/cert-import/private-key.pem --yes
+  --private-key /run/cert-import/private-key.pem
 ```
 
 For the exact current ctl-managed ACME issuance receipt, replace the two material
@@ -152,7 +152,7 @@ finishing audit/journal finalization:
 
 ```text
 nazoauthctl tls certificate recover \
-  --tenant tenant-a --hostname auth.example --yes
+  --tenant tenant-a --hostname auth.example
 ```
 
 Recovery accepts only the exact deployment declaration revision and the exact

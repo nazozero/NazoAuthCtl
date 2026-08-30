@@ -3,7 +3,7 @@ use serde::Deserialize;
 
 use crate::{
     model::ReleaseRollbackPolicy,
-    target::{BuildIdentity, OfficialArtifactRef},
+    target::{OfficialArtifactRef, ReleaseVersion},
 };
 
 const EMBEDDED_CANDIDATE: Option<&str> = option_env!("NAZOAUTHCTL_PRE_RELEASE_CANDIDATE_JSON");
@@ -15,17 +15,14 @@ pub(crate) struct CandidateRelease {
     pub(crate) version: String,
     pub(crate) oci_image: String,
     pub(crate) oci_digest: String,
-    pub(crate) backend_commit: String,
+    pub(crate) host_binary_path: String,
+    pub(crate) host_binary_sha256: String,
     pub(crate) rollback: ReleaseRollbackPolicy,
 }
 
 impl CandidateRelease {
-    pub(crate) fn identity(&self) -> anyhow::Result<BuildIdentity> {
-        BuildIdentity::new(
-            nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT,
-            &self.version,
-            &self.backend_commit,
-        )
+    pub(crate) fn release_version(&self) -> anyhow::Result<ReleaseVersion> {
+        ReleaseVersion::new(&self.version)
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -37,18 +34,19 @@ impl CandidateRelease {
             !self.oci_image.trim().is_empty() && !self.oci_image.chars().any(char::is_control),
             "pre-release candidate OCI image is invalid"
         );
-        let digest = self
-            .oci_digest
-            .strip_prefix("sha256:")
-            .context("pre-release candidate OCI digest must use sha256")?;
+        validate_sha256(
+            self.oci_digest
+                .strip_prefix("sha256:")
+                .context("pre-release candidate OCI digest must use sha256")?,
+            "OCI digest",
+        )?;
         ensure!(
-            digest.len() == 64
-                && digest
-                    .chars()
-                    .all(|character| character.is_ascii_hexdigit()),
-            "pre-release candidate OCI digest is invalid"
+            !self.host_binary_path.trim().is_empty()
+                && !self.host_binary_path.chars().any(char::is_control),
+            "pre-release candidate host binary path is invalid"
         );
-        self.identity()?;
+        validate_sha256(&self.host_binary_sha256, "host binary digest")?;
+        self.release_version()?;
         self.rollback.validate()
     }
 
@@ -62,6 +60,14 @@ impl CandidateRelease {
         }
         Ok(())
     }
+}
+
+fn validate_sha256(value: &str, label: &str) -> anyhow::Result<()> {
+    ensure!(
+        value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit()),
+        "pre-release candidate {label} is invalid"
+    );
+    Ok(())
 }
 
 pub(crate) fn resolve(pinned: &OfficialArtifactRef) -> anyhow::Result<Option<CandidateRelease>> {
@@ -91,7 +97,8 @@ mod tests {
                 "version":"v0.2.4-candidate",
                 "oci_image":"localhost/nazoauth:candidate",
                 "oci_digest":"sha256:{}",
-                "backend_commit":"{}",
+                "host_binary_path":"/opt/nazoauth-candidate",
+                "host_binary_sha256":"{}",
                 "rollback":{{
                     "artifact":true,
                     "schema_compatible":false,
@@ -103,7 +110,7 @@ mod tests {
                 }}
             }}"#,
             "a".repeat(64),
-            "b".repeat(40),
+            "b".repeat(64),
         );
         let candidate: CandidateRelease = serde_json::from_str(&encoded)?;
         candidate.validate()?;

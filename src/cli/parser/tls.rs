@@ -28,26 +28,14 @@ fn parse_certificate(mut values: Vec<String>) -> anyhow::Result<TlsCommand> {
     values.remove(0);
     match operation.as_str() {
         "check" => parse_check_input(values).map(TlsCommand::Check),
-        "plan" => {
-            let (input, yes) = parse_material_input(values, false)?;
-            debug_assert!(!yes);
-            Ok(TlsCommand::Plan(input))
-        }
-        "apply" => {
-            let (input, yes) = parse_material_input(values, true)?;
-            Ok(TlsCommand::Apply { input, yes })
-        }
+        "plan" => parse_material_input(values).map(TlsCommand::Plan),
+        "apply" => parse_material_input(values).map(TlsCommand::Apply),
         "recover" => {
-            let (tenant, hostname, yes) = parse_binding(values, true, "tls certificate")?;
-            Ok(TlsCommand::Recover {
-                tenant,
-                hostname,
-                yes,
-            })
+            let (tenant, hostname) = parse_binding(values, "tls certificate")?;
+            Ok(TlsCommand::Recover { tenant, hostname })
         }
         "show" => {
-            let (tenant, hostname, yes) = parse_binding(values, false, "tls certificate")?;
-            debug_assert!(!yes);
+            let (tenant, hostname) = parse_binding(values, "tls certificate")?;
             Ok(TlsCommand::Show { tenant, hostname })
         }
         other => bail!("unknown tls certificate operation {other}"),
@@ -101,29 +89,20 @@ fn parse_acme(mut values: Vec<String>) -> anyhow::Result<AcmeCommand> {
     values.remove(0);
     match operation.as_str() {
         "plan" => {
-            let (input, agree_terms, yes) = parse_acme_input(values, false)?;
-            debug_assert!(!agree_terms && !yes);
+            let (input, agree_terms) = parse_acme_input(values, false)?;
+            debug_assert!(!agree_terms);
             Ok(AcmeCommand::Plan(input))
         }
         "issue" => {
-            let (input, agree_terms, yes) = parse_acme_input(values, true)?;
-            Ok(AcmeCommand::Issue {
-                input,
-                agree_terms,
-                yes,
-            })
+            let (input, agree_terms) = parse_acme_input(values, true)?;
+            Ok(AcmeCommand::Issue { input, agree_terms })
         }
         "recover" => {
-            let (tenant, hostname, yes) = parse_binding(values, true, "tls acme")?;
-            Ok(AcmeCommand::Recover {
-                tenant,
-                hostname,
-                yes,
-            })
+            let (tenant, hostname) = parse_binding(values, "tls acme")?;
+            Ok(AcmeCommand::Recover { tenant, hostname })
         }
         "show" => {
-            let (tenant, hostname, yes) = parse_binding(values, false, "tls acme")?;
-            debug_assert!(!yes);
+            let (tenant, hostname) = parse_binding(values, "tls acme")?;
             Ok(AcmeCommand::Show { tenant, hostname })
         }
         other => bail!("unknown tls acme operation {other}"),
@@ -133,29 +112,23 @@ fn parse_acme(mut values: Vec<String>) -> anyhow::Result<AcmeCommand> {
 fn parse_acme_input(
     values: Vec<String>,
     allow_mutation_flags: bool,
-) -> anyhow::Result<(AcmeCertificateInput, bool, bool)> {
+) -> anyhow::Result<(AcmeCertificateInput, bool)> {
     let mut acme_config = None;
     let mut provider_config = None;
     let mut tenant = None;
     let mut hostname = None;
     let mut agree_terms = false;
-    let mut yes = false;
     let mut index = 0;
     while index < values.len() {
         let option = values[index].as_str();
-        if matches!(option, "--agree-terms" | "--yes") {
+        if option == "--agree-terms" {
             if !allow_mutation_flags {
                 bail!("tls acme plan does not accept {option}");
             }
-            let flag = if option == "--agree-terms" {
-                &mut agree_terms
-            } else {
-                &mut yes
-            };
-            if *flag {
+            if agree_terms {
                 bail!("{option} may be specified only once");
             }
-            *flag = true;
+            agree_terms = true;
             index += 1;
             continue;
         }
@@ -184,37 +157,24 @@ fn parse_acme_input(
             hostname: hostname.context("--hostname is required")?,
         },
         agree_terms,
-        yes,
     ))
 }
 
-fn parse_material_input(
-    values: Vec<String>,
-    allow_yes: bool,
-) -> anyhow::Result<(TlsCertificateInput, bool)> {
+fn parse_material_input(values: Vec<String>) -> anyhow::Result<TlsCertificateInput> {
     let mut provider_config = None;
     let mut tenant = None;
     let mut hostname = None;
     let mut certificate = None;
     let mut private_key = None;
     let mut from_acme_current = false;
-    let mut yes = false;
     let mut index = 0;
     while index < values.len() {
         let option = values[index].as_str();
-        if matches!(option, "--yes" | "--from-acme-current") {
-            let flag = if option == "--yes" {
-                if !allow_yes {
-                    bail!("tls certificate plan does not accept --yes");
-                }
-                &mut yes
-            } else {
-                &mut from_acme_current
-            };
-            if *flag {
+        if option == "--from-acme-current" {
+            if from_acme_current {
                 bail!("{option} may be specified only once");
             }
-            *flag = true;
+            from_acme_current = true;
             index += 1;
             continue;
         }
@@ -250,35 +210,20 @@ fn parse_material_input(
         }
         _ => bail!("--certificate and --private-key must be supplied together"),
     };
-    Ok((
-        TlsCertificateInput {
-            provider_config: provider_config.context("--provider-config is required")?,
-            tenant: tenant.context("--tenant is required")?,
-            hostname: hostname.context("--hostname is required")?,
-            source,
-        },
-        yes,
-    ))
+    Ok(TlsCertificateInput {
+        provider_config: provider_config.context("--provider-config is required")?,
+        tenant: tenant.context("--tenant is required")?,
+        hostname: hostname.context("--hostname is required")?,
+        source,
+    })
 }
 
-fn parse_binding(
-    values: Vec<String>,
-    allow_yes: bool,
-    command: &str,
-) -> anyhow::Result<(String, String, bool)> {
+fn parse_binding(values: Vec<String>, command: &str) -> anyhow::Result<(String, String)> {
     let mut tenant = None;
     let mut hostname = None;
-    let mut yes = false;
     let mut index = 0;
     while index < values.len() {
         match values[index].as_str() {
-            "--yes" if allow_yes => {
-                if yes {
-                    bail!("--yes may be specified only once");
-                }
-                yes = true;
-                index += 1;
-            }
             option @ ("--tenant" | "--hostname") => {
                 let value = values
                     .get(index + 1)
@@ -297,7 +242,6 @@ fn parse_binding(
     Ok((
         tenant.context("--tenant is required")?,
         hostname.context("--hostname is required")?,
-        yes,
     ))
 }
 

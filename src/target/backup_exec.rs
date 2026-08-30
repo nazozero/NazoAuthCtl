@@ -23,7 +23,9 @@ use uuid::Uuid;
 
 use super::{
     backup::{self, RestoreTestEnvironment, RestoreTestReceipt, SnapshotFile, SnapshotManifest},
-    deployment_state::{BuildIdentity, DeploymentState, Failure, ResourceOwnership, ResourceScope},
+    deployment_state::{
+        DeploymentState, Failure, ReleaseVersion, ResourceOwnership, ResourceScope,
+    },
     install_exec::{
         CONTAINER_CONFIG_FILE, CONTAINER_DATA_DIR, CONTAINER_SECRETS_DIR, LOCAL_READINESS_PATH,
         MIGRATION_RUNTIME_ROLE_ENV, SERVER_CONFIG_FILE_ENV,
@@ -74,7 +76,7 @@ pub(crate) struct RecoveryFacts {
     pub manifest_sha256: String,
     pub restored_database: String,
     pub artifact: ArtifactReference,
-    pub build_identity: BuildIdentity,
+    pub release: ReleaseVersion,
     pub rollback_policy: crate::model::ReleaseRollbackPolicy,
     pub config_schema: String,
 }
@@ -152,13 +154,13 @@ fn create_snapshot(
         "lifecycle database URL",
     )?;
     let mfa_key = secure_regular_path(&secrets.join("mfa-totp-key"), "MFA key")?;
-    let build_identity = state
-        .current_build_identity
+    let release = state
+        .current_release
         .clone()
-        .context("deployment has no current build identity")?;
-    let runtime_artifact = observe_exact_runtime_artifact(state, &build_identity)?;
+        .context("deployment has no current release version")?;
+    let runtime_artifact = observe_exact_runtime_artifact(state)?;
     let oidc_signing_key_ids = source_oidc_signing_key_ids(state)?;
-    let runtime_instance_key_id = verify_runtime_identity(&data, state, &build_identity)?;
+    let runtime_instance_key_id = verify_runtime_identity(&data, state)?;
     let mfa_key_sha256 = crate::filesystem::sha256(&mfa_key)?;
     let database_sentinel_sha256 = database_sentinel(&database_url)?;
     let dump_path = staging.join("postgresql.dump");
@@ -181,7 +183,7 @@ fn create_snapshot(
         snapshot_id: snapshot_id.to_string(),
         created_at: Utc::now(),
         runtime_artifact,
-        build_identity,
+        release,
         rollback_policy: state.current_rollback_policy.clone(),
         config_schema: state.config.schema.clone(),
         files,
@@ -697,7 +699,7 @@ pub(crate) fn recover(
             || facts.snapshot_id != manifest.snapshot_id
             || facts.manifest_sha256 != manifest.manifest_sha256
             || facts.artifact != manifest.runtime_artifact
-            || facts.build_identity != manifest.build_identity
+            || facts.release != manifest.release
             || facts.rollback_policy != manifest.rollback_policy
             || facts.config_schema != manifest.config_schema
         {
@@ -750,8 +752,7 @@ pub(crate) fn recover(
     if crate::filesystem::sha256(&extracted_secrets.join("mfa-totp-key"))
         .map_err(restore_failure)?
         != manifest.mfa_key_sha256
-        || verify_runtime_identity(&extracted_data, state, &manifest.build_identity)
-            .map_err(restore_failure)?
+        || verify_runtime_identity(&extracted_data, state).map_err(restore_failure)?
             != manifest.runtime_instance_key_id
     {
         return Err(Failure::new(
@@ -876,8 +877,13 @@ pub(crate) fn recover(
         fs::copy(&extracted_config, &staged_config)
             .map_err(|error| restore_failure(error.into()))?;
     }
-    prepare_stage_ownership_if_present(&staged_data, &staged_secrets, &staged_config)
-        .map_err(restore_failure)?;
+    prepare_stage_ownership_if_present(
+        state.runtime.kind,
+        &staged_data,
+        &staged_secrets,
+        &staged_config,
+    )
+    .map_err(restore_failure)?;
     switch_recovery_path(&target_data, &staged_data, operation, "data").map_err(restore_failure)?;
     switch_recovery_path(&target_secrets, &staged_secrets, operation, "secrets")
         .map_err(restore_failure)?;
@@ -889,7 +895,7 @@ pub(crate) fn recover(
         manifest_sha256: manifest.manifest_sha256,
         restored_database: database,
         artifact: manifest.runtime_artifact,
-        build_identity: manifest.build_identity,
+        release: manifest.release,
         rollback_policy: manifest.rollback_policy,
         config_schema: manifest.config_schema,
     };
@@ -955,7 +961,7 @@ pub(crate) fn stage_recovery_candidate(
     if facts.operation_id != recovery_operation_id
         || facts.manifest_sha256 != manifest.manifest_sha256
         || facts.artifact != manifest.runtime_artifact
-        || facts.build_identity != manifest.build_identity
+        || facts.release != manifest.release
         || facts.rollback_policy != manifest.rollback_policy
         || facts.config_schema != manifest.config_schema
         || state.current_rollback_policy != facts.rollback_policy
@@ -1090,9 +1096,9 @@ pub(crate) fn activate_recovered_runtime(
         serde_json::from_slice(&completed).map_err(|error| restore_failure(error.into()))?;
     if facts.operation_id != recovery_operation_id
         || facts.artifact != manifest.runtime_artifact
-        || facts.build_identity != manifest.build_identity
+        || facts.release != manifest.release
         || facts.rollback_policy != manifest.rollback_policy
-        || state.current_build_identity.as_ref() != Some(&facts.build_identity)
+        || state.current_release.as_ref() != Some(&facts.release)
         || state.current_rollback_policy != facts.rollback_policy
     {
         return Err(Failure::new(
@@ -1160,8 +1166,7 @@ fn run_restore_rehearsal(
         "restored MFA key does not match the snapshot"
     );
     ensure!(
-        verify_runtime_identity(&data, state, &manifest.build_identity)?
-            == manifest.runtime_instance_key_id,
+        verify_runtime_identity(&data, state)? == manifest.runtime_instance_key_id,
         "restored runtime identity does not match the snapshot"
     );
     let lifecycle_url_path = secrets.join("database-lifecycle-url");
@@ -1179,7 +1184,7 @@ fn run_restore_rehearsal(
             .with_database(database)
             .with_password_url()?,
     )?;
-    prepare_runtime_ownership(&data, &secrets, &config)?;
+    prepare_runtime_ownership(state.runtime.kind, &data, &secrets, &config)?;
     create_database(&original_connection, database)?;
     let backend_kind = state.runtime.kind;
     let backend = runtime_backend::backend(backend_kind);
@@ -1592,25 +1597,12 @@ fn collect_regular_files(
     Ok(())
 }
 
-fn observe_exact_runtime_artifact(
-    state: &DeploymentState,
-    build_identity: &BuildIdentity,
-) -> anyhow::Result<ArtifactReference> {
+fn observe_exact_runtime_artifact(state: &DeploymentState) -> anyhow::Result<ArtifactReference> {
     let kind = state.runtime.kind;
     let backend = runtime_backend::backend(kind);
     let observation = backend.inspect(&state.runtime.object)?;
     ensure!(observation.running, "deployment runtime is not running");
     artifact_matches_state(&observation.artifact, state)?;
-    let embedded = backend
-        .read_build_identity(
-            &observation.artifact,
-            observation.local_artifact_id.as_deref(),
-        )?
-        .context("runtime artifact has no embedded build identity")?;
-    ensure!(
-        embedded.release == build_identity.version && embedded.revision == build_identity.commit,
-        "runtime embedded build identity does not match DeploymentState"
-    );
     Ok(observation.artifact)
 }
 
@@ -1641,17 +1633,14 @@ fn artifact_matches_state(
     Ok(())
 }
 
-fn verify_runtime_identity(
-    data: &Path,
-    state: &DeploymentState,
-    build: &BuildIdentity,
-) -> anyhow::Result<String> {
+fn verify_runtime_identity(data: &Path, state: &DeploymentState) -> anyhow::Result<String> {
     let identity_dir = data.join("instance");
     let public_bytes = super::read_runtime_owned_file(
         &identity_dir.join("identity.pub"),
         "runtime instance public key",
         false,
         MAX_KEY_BYTES,
+        state,
     )?;
     let encoded = std::str::from_utf8(public_bytes.trim_ascii())?;
     let public_key = nazo_operator_protocol::decode_instance_public_key(encoded)?;
@@ -1661,6 +1650,7 @@ fn verify_runtime_identity(
         "runtime deployment statement",
         false,
         nazo_operator_protocol::MAX_COMPACT_JWS_BYTES as u64,
+        state,
     )?;
     let statement = nazo_operator_protocol::verify_deployment_statement(
         std::str::from_utf8(statement_bytes.trim_ascii())?,
@@ -1670,9 +1660,7 @@ fn verify_runtime_identity(
     ensure!(
         statement.deployment_id == state.deployment_id
             && statement.issuer == state.issuer
-            && statement.product == build.product
-            && statement.release == build.version
-            && statement.revision == build.commit,
+            && statement.product == nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT,
         "runtime deployment statement does not match DeploymentState"
     );
     Ok(key_id)
@@ -2153,81 +2141,85 @@ fn write_secret(path: &Path, value: &str) -> anyhow::Result<()> {
 }
 
 fn prepare_stage_ownership_if_present(
+    kind: RuntimeBackendKind,
     data: &Path,
     secrets: &Path,
     config: &Path,
 ) -> anyhow::Result<()> {
+    if !data.exists() && !secrets.exists() && !config.exists() {
+        return Ok(());
+    }
+    let preserve_owner = preserve_runtime_owner(kind, [data, secrets, config])?;
     if data.exists() {
-        prepare_data_ownership(data)?;
+        runtime_ownership(super::install_exec::set_runtime_identity_directory_data(
+            data,
+            preserve_owner,
+        ))?;
     }
     if secrets.exists() {
-        prepare_secrets_ownership(secrets)?;
+        prepare_secrets_ownership(secrets, preserve_owner)?;
     }
     if config.exists() {
-        prepare_config_ownership(config)?;
+        runtime_ownership(super::install_exec::set_runtime_identity(
+            config,
+            false,
+            preserve_owner,
+        ))?;
     }
     Ok(())
 }
 
-#[cfg(unix)]
-fn prepare_runtime_ownership(data: &Path, secrets: &Path, config: &Path) -> anyhow::Result<()> {
-    prepare_data_ownership(data)?;
-    prepare_secrets_ownership(secrets)?;
-    prepare_config_ownership(config)
+fn prepare_runtime_ownership(
+    kind: RuntimeBackendKind,
+    data: &Path,
+    secrets: &Path,
+    config: &Path,
+) -> anyhow::Result<()> {
+    let preserve_owner = preserve_runtime_owner(kind, [data, secrets, config])?;
+    runtime_ownership(super::install_exec::set_runtime_identity_directory_data(
+        data,
+        preserve_owner,
+    ))?;
+    prepare_secrets_ownership(secrets, preserve_owner)?;
+    runtime_ownership(super::install_exec::set_runtime_identity(
+        config,
+        false,
+        preserve_owner,
+    ))
 }
 
-#[cfg(unix)]
-fn prepare_data_ownership(data: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::{PermissionsExt as _, chown};
-    let mut stack = vec![data.to_path_buf()];
-    while let Some(path) = stack.pop() {
-        chown(&path, Some(10_001), Some(10_001))?;
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.is_dir() {
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
-            for entry in fs::read_dir(&path)? {
-                stack.push(entry?.path());
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn prepare_secrets_ownership(secrets: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::{PermissionsExt as _, chown};
-    chown(secrets, Some(0), Some(10_001))?;
-    fs::set_permissions(secrets, fs::Permissions::from_mode(0o750))?;
+fn prepare_secrets_ownership(secrets: &Path, preserve_owner: bool) -> anyhow::Result<()> {
+    runtime_ownership(super::install_exec::set_runtime_identity_directory(
+        secrets,
+        preserve_owner,
+    ))?;
     for entry in fs::read_dir(secrets)? {
         let path = entry?.path();
-        chown(&path, Some(0), Some(10_001))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o440))?;
+        runtime_ownership(super::install_exec::set_runtime_identity(
+            &path,
+            false,
+            preserve_owner,
+        ))?;
     }
     Ok(())
 }
 
-#[cfg(unix)]
-fn prepare_config_ownership(config: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::{PermissionsExt as _, chown};
-    chown(config, Some(0), Some(10_001))?;
-    fs::set_permissions(config, fs::Permissions::from_mode(0o440))?;
-    Ok(())
+fn preserve_runtime_owner<'a>(
+    kind: RuntimeBackendKind,
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> anyhow::Result<bool> {
+    if kind != RuntimeBackendKind::Podman {
+        return Ok(false);
+    }
+    let path = paths
+        .into_iter()
+        .find(|path| path.exists())
+        .context("runtime ownership has no existing path")?;
+    Ok(super::install_exec::path_is_owned_by_non_root(path)?)
 }
-#[cfg(not(unix))]
-fn prepare_runtime_ownership(_data: &Path, _secrets: &Path, _config: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-#[cfg(not(unix))]
-fn prepare_data_ownership(_data: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-#[cfg(not(unix))]
-fn prepare_secrets_ownership(_secrets: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-#[cfg(not(unix))]
-fn prepare_config_ownership(_config: &Path) -> anyhow::Result<()> {
-    Ok(())
+
+fn runtime_ownership(result: Result<(), Failure>) -> anyhow::Result<()> {
+    result.map_err(|failure| anyhow::anyhow!(failure.detail))
 }
 
 fn cleanup_valkey_namespace(
@@ -2368,7 +2360,7 @@ mod tests {
                     .into_owned(),
                 config_schema: "nazoauth-config-v1".to_owned(),
                 resources: Vec::new(),
-                current_build_identity: Some(BuildIdentity::new("nazoauth", "v1", "commit")?),
+                current_release: Some(ReleaseVersion::new("v1")?),
                 current_rollback_policy: crate::model::test_release_rollback_policy(),
             },
             "bootstrap-op",
@@ -2394,7 +2386,7 @@ mod tests {
                 path: temp.path().join("nazoauth"),
                 sha256: artifact_digest,
             },
-            build_identity: BuildIdentity::new("nazoauth", "v1", "commit")?,
+            release: ReleaseVersion::new("v1")?,
             rollback_policy: crate::model::test_release_rollback_policy(),
             config_schema: "nazoauth-config-v1".to_owned(),
             files,

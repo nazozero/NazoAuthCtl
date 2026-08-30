@@ -94,15 +94,6 @@ pub const HOST_OPERATION_KINDS: &[&str] = &[
 /// handshake. Anything else is a different program and must never be mutated.
 pub const HELLO_PRODUCT: &str = "nazoauthctl";
 
-/// Build commit embedded by release builds through the
-/// `NAZOAUTHCTL_BUILD_COMMIT` environment variable at compile time. Empty on
-/// both sides means two dev builds of the same source tree; mixed presence or
-/// any differing value fails the handshake closed (goal plan 03 §6).
-pub const LOCAL_BUILD_COMMIT: &str = match option_env!("NAZOAUTHCTL_BUILD_COMMIT") {
-    Some(commit) => commit,
-    None => "",
-};
-
 /// Stable failure code: the operation is well-formed but not valid for its
 /// kind (e.g. a host-level ping carrying an instance binding).
 pub const HOST_ERR_OPERATION_INVALID: &str = "OPERATION_INVALID";
@@ -327,6 +318,20 @@ pub enum HostOperationBody {
 }
 
 impl HostOperationBody {
+    pub(crate) fn requires_journal(&self) -> bool {
+        !matches!(
+            self,
+            Self::Ping { .. }
+                | Self::Hello {}
+                | Self::StateInspect {}
+                | Self::StateList {}
+                | Self::BootstrapRead {}
+                | Self::RuntimeLogs { .. }
+                | Self::JournalRead { .. }
+                | Self::BackupTransferRead { .. }
+        )
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Ping { .. } => "ping",
@@ -876,7 +881,6 @@ impl HostOperation {
                     }
                     StateMutationPayload::Update {
                         artifact,
-                        rollback_policy,
                         backup_precondition,
                         config,
                         ..
@@ -901,12 +905,6 @@ impl HostOperation {
                         {
                             return Err(rejection);
                         }
-                        if let Err(error) = rollback_policy.validate() {
-                            return Err(MessageRejection::new(
-                                RejectionCode::OperationMalformed,
-                                error.to_string(),
-                            ));
-                        }
                         if let Err(error) = backup_precondition.validate() {
                             return Err(MessageRejection::new(
                                 RejectionCode::OperationMalformed,
@@ -922,21 +920,12 @@ impl HostOperation {
                             ));
                         }
                     }
-                    StateMutationPayload::Uninstall { resources } => {
+                    StateMutationPayload::Uninstall {} => {
                         if self.expected_revision.is_none() {
                             return Err(MessageRejection::new(
                                 RejectionCode::OperationMalformed,
                                 "uninstall requires expected_revision",
                             ));
-                        }
-                        if resources.len() > super::deployment_state::MAX_RESOURCES {
-                            return Err(MessageRejection::new(
-                                RejectionCode::OperationMalformed,
-                                "uninstall plans more deletions than any deployment declares",
-                            ));
-                        }
-                        for resource in resources {
-                            resource.validate()?;
                         }
                     }
                 }
@@ -1419,6 +1408,12 @@ pub enum HostCompletionBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         control_result: Option<ControlResult>,
     },
+    /// The target independently verified that the selected artifact is
+    /// already current and no config was staged. No migration ran and no
+    /// DeploymentState generation changed, so no ControlResult exists.
+    StateMutateNoop {
+        revision: u64,
+    },
     /// The nested MigrateApply completed durably as Failed.  The host order
     /// intentionally did not activate artifact/config; ctl must validate and
     /// settle the exact result before reporting the business failure.
@@ -1531,10 +1526,10 @@ pub struct InstanceInspection {
     /// closed instead of guessing a revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_revision_marker: Option<String>,
-    /// Embedded build identity facts of `artifact.current`, when the target's
+    /// Embedded release version facts of `artifact.current`, when the target's
     /// verification recorded them (G03 ControlOperation envelope source).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_build_identity: Option<super::deployment_state::BuildIdentity>,
+    pub current_release: Option<super::deployment_state::ReleaseVersion>,
     /// Runtime-owned public identity that signs current control-discovery and
     /// OpenID4VP verification receipts. It is read from the exact managed
     /// identity directory on the target, never inferred from the public issuer
@@ -1557,8 +1552,9 @@ pub struct RuntimeInstanceIdentity {
 
 /// Identity a target helper announces about itself (goal plan 03 §6).
 ///
-/// The control side compares `product`, `remote_exec_schema`, `version`, and
-/// `commit` against its own constants before any host-level mutation
+/// The control side compares `product` and `remote_exec_schema` against its
+/// own constants before any host-level mutation. The release version remains
+/// an inventory fact: the schema is the wire-compatibility authority.
 /// ([`verify_remote_hello`]). `os`, `arch`, and `supported_runtimes` are
 /// informational inventory facts.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1571,7 +1567,6 @@ pub struct RemoteHello {
     /// Highest HostOperation/HostResult wire schema the helper answers.
     pub remote_exec_schema: u32,
     pub version: String,
-    pub commit: String,
     pub os: String,
     pub arch: String,
     pub supported_runtimes: Vec<String>,
@@ -1595,7 +1590,6 @@ pub(crate) fn local_hello_for_target(
         target_id: target_id.to_string(),
         remote_exec_schema: HOST_PROTOCOL_SCHEMA,
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        commit: LOCAL_BUILD_COMMIT.to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
         supported_runtimes,
@@ -1614,9 +1608,6 @@ pub fn verify_remote_hello(hello: &RemoteHello) -> Result<(), String> {
     }
     if !valid_token(&hello.version, 64) {
         return Err("hello version is not a valid token".to_owned());
-    }
-    if !(hello.commit.is_empty() || valid_token(&hello.commit, 128)) {
-        return Err("hello commit is not a valid token".to_owned());
     }
     for fact in [&hello.os, &hello.arch] {
         if !valid_token(fact, 32) {
@@ -1641,20 +1632,6 @@ pub fn verify_remote_hello(hello: &RemoteHello) -> Result<(), String> {
         return Err(format!(
             "remote exec schema {} does not match controller schema {HOST_PROTOCOL_SCHEMA}",
             hello.remote_exec_schema
-        ));
-    }
-    let expected_version = env!("CARGO_PKG_VERSION");
-    if hello.version != expected_version {
-        return Err(format!(
-            "helper version '{}' does not match controller version '{expected_version}'",
-            sanitize(hello.version.clone())
-        ));
-    }
-    if hello.commit != LOCAL_BUILD_COMMIT {
-        return Err(format!(
-            "helper build commit '{}' does not match controller commit '{}'",
-            sanitize(hello.commit.clone()),
-            LOCAL_BUILD_COMMIT
         ));
     }
     Ok(())
@@ -2085,7 +2062,6 @@ mod tests {
                     repository: "nazozero/NazoAuth".to_owned(),
                     version: Some("v0.3.0".to_owned()),
                 },
-                rollback_policy: crate::model::test_release_rollback_policy(),
                 backup_precondition:
                     super::super::deployment_state::UpdateBackupPrecondition::NotRequired,
                 config: Some(super::super::install_exec::StagedConfig {
@@ -2117,12 +2093,7 @@ mod tests {
             Uuid::now_v7().to_string(),
             "deploy-alpha",
             Some(5),
-            StateMutationPayload::Uninstall {
-                resources: vec![super::super::install_exec::PlannedResourceDeletion {
-                    resource_id: "app-runtime".to_owned(),
-                    locator: "nazoauth-main".to_owned(),
-                }],
-            },
+            StateMutationPayload::Uninstall {},
         );
         assert_eq!(
             parse_host_operation(&encode_host_operation(&uninstall)?)?,
@@ -2273,7 +2244,7 @@ mod tests {
             health_summary: "runtime healthy".to_owned(),
             active_host_operation: None,
             config_revision_marker: None,
-            current_build_identity: None,
+            current_release: None,
             current_instance_identity: Some(RuntimeInstanceIdentity {
                 runtime_instance_id: "runtime-alpha".to_owned(),
                 instance_key_id: "instance-key-alpha".to_owned(),
@@ -2305,7 +2276,6 @@ mod tests {
                     repository: "nazozero/NazoAuth".to_owned(),
                     version: None,
                 },
-                rollback_policy: crate::model::test_release_rollback_policy(),
                 backup_precondition:
                     super::super::deployment_state::UpdateBackupPrecondition::NotRequired,
                 config: None,
@@ -2331,7 +2301,7 @@ mod tests {
             Uuid::now_v7().to_string(),
             "deploy-a",
             None,
-            StateMutationPayload::Uninstall { resources: vec![] },
+            StateMutationPayload::Uninstall {},
         );
         let rejection = cas_free_uninstall
             .validate()
@@ -2354,7 +2324,6 @@ mod tests {
                     repository: "nazozero/NazoAuth".to_owned(),
                     version: None,
                 },
-                rollback_policy: crate::model::test_release_rollback_policy(),
                 backup_precondition:
                     super::super::deployment_state::UpdateBackupPrecondition::NotRequired,
                 config: None,
@@ -2513,19 +2482,15 @@ mod tests {
         verify_remote_hello(&hello).expect("a helper answers its own handshake");
         assert_eq!(hello.remote_exec_schema, HOST_PROTOCOL_SCHEMA);
 
-        let mut drift = hello.clone();
-        drift.version = "9.9.9".to_owned();
-        let reason = verify_remote_hello(&drift).expect_err("version drift");
-        assert!(reason.contains("version"), "{reason}");
+        let mut other_release = hello.clone();
+        other_release.version = "9.9.9".to_owned();
+        verify_remote_hello(&other_release)
+            .expect("the protocol schema, not the release version, defines compatibility");
 
         let mut drift = hello.clone();
         drift.product = "other-helper".to_owned();
         assert!(verify_remote_hello(&drift).is_err());
 
-        let mut drift = hello;
-        drift.commit = "deadbeef".to_owned();
-        let reason = verify_remote_hello(&drift).expect_err("commit drift");
-        assert!(reason.contains("commit"), "{reason}");
         Ok(())
     }
 

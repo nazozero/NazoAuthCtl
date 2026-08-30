@@ -37,6 +37,7 @@ pub(crate) fn stage_recovery_candidate(
     source: &RuntimeObservation,
     request: &RecoveryCandidateRequest,
     add_docker_host_gateway: bool,
+    rootless_podman: bool,
 ) -> anyhow::Result<RecoveryCandidateEndpoint> {
     validate_request(request)?;
     ensure!(
@@ -122,12 +123,15 @@ pub(crate) fn stage_recovery_candidate(
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .context("failed to reserve a recovery loopback port")?;
     let loopback_port = listener.local_addr()?.port();
-    let mut process = append_container_policy(
-        Process::new(command)
-            .args(["run", "-d", "--name"])
-            .arg(&request.candidate_object_reference),
-        &policy,
-    );
+    let process = Process::new(command)
+        .args(["run", "-d", "--name"])
+        .arg(&request.candidate_object_reference);
+    let process = if rootless_podman {
+        process.arg("--userns=keep-id:uid=10001,gid=10001")
+    } else {
+        process
+    };
+    let mut process = append_container_policy(process, &policy);
     if add_docker_host_gateway {
         process = process.args(["--add-host", "host.docker.internal:host-gateway"]);
     }
@@ -142,9 +146,14 @@ pub(crate) fn stage_recovery_candidate(
     for (name, value) in &environment {
         process = process.arg("--env").arg(format!("{name}={value}"));
     }
+    let runtime_network = if rootless_podman && network == "pasta" {
+        "pasta:--map-gw"
+    } else {
+        network
+    };
     process = process
         .arg("--network")
-        .arg(network)
+        .arg(runtime_network)
         .arg("--publish")
         .arg(format!("127.0.0.1:{loopback_port}:{CANDIDATE_PORT}"));
     // Keep the reservation until the fully constrained engine argv exists.

@@ -104,7 +104,7 @@ fn command_action(command: &cli::Command) -> &'static str {
         cli::Command::RemoteExec => "remote exec",
         cli::Command::SelfCheck(_) => "self check",
         cli::Command::SelfUpdate { .. } => "self update",
-        cli::Command::SelfRollback { .. } => "self rollback",
+        cli::Command::SelfRollback => "self rollback",
     }
 }
 
@@ -130,7 +130,7 @@ Start here:
   nazoauthctl install --host server-a --name production --public-url https://auth.example.com
   nazoauthctl bind --instance production
   nazoauthctl status
-  nazoauthctl update --yes
+  nazoauthctl update
   nazoauthctl instance list
   nazoauthctl status --all
 
@@ -201,7 +201,7 @@ a slot is `controller revoke`."
   nazoauthctl [--instance SEL] controller list
   nazoauthctl [--instance SEL] controller add --label NAME
   nazoauthctl [--instance SEL] controller rotate [--label NAME]
-  nazoauthctl [--instance SEL] controller revoke <controller-id> --yes
+  nazoauthctl [--instance SEL] controller revoke <controller-id>
   nazoauthctl [--instance SEL] controller recover [--label NAME]
   nazoauthctl [--instance SEL] controller recover --rotate-secret
 
@@ -242,9 +242,9 @@ Next steps after install:
         }
         cli::HelpTopic::Update => {
             "Usage:
-  nazoauthctl [--instance SEL] update --yes [--to VERSION]
+  nazoauthctl [--instance SEL] update [--to VERSION]
              [--config-file PATH --config-schema TOKEN]
-  nazoauthctl [--instance SEL] rollback --yes
+  nazoauthctl [--instance SEL] rollback
   nazoauthctl [--instance SEL] uninstall [--yes]
   nazoauthctl [--instance SEL] verify
 
@@ -257,8 +257,8 @@ changes nothing; external/shared resources always have zero-delete protection."
         cli::HelpTopic::SelfUpdate => {
             "Usage:
   nazoauthctl self check [--to VERSION]
-  nazoauthctl self update [--to VERSION] --yes
-  nazoauthctl self rollback --yes
+  nazoauthctl self update [--to VERSION]
+  nazoauthctl self rollback
 
 Controller updates consume only signed NazoAuthCtl Release binaries and
 provenance. They never select keys or state from a NazoAuth deployment."
@@ -269,10 +269,10 @@ provenance. They never select keys or state from a NazoAuth deployment."
                                     [--warning-window-seconds S]
   nazoauthctl tls certificate plan   --provider-config PATH --tenant T --hostname H
                                      (--certificate F --private-key F | --from-acme-current)
-  nazoauthctl tls certificate apply  ...same inputs... [--yes]
-  nazoauthctl tls certificate recover --tenant T --hostname H --yes
+  nazoauthctl tls certificate apply  ...same inputs...
+  nazoauthctl tls certificate recover --tenant T --hostname H
   nazoauthctl tls certificate show   --tenant T --hostname H
-  nazoauthctl tls acme plan|issue|recover|show ... (issue requires --agree-terms [--yes])
+  nazoauthctl tls acme plan|issue|recover|show ... (issue requires --agree-terms)
 
 Installs deployment-owned public TLS material through the external file-provider
 contract: offline chain/SAN/key validation, an atomic generation switch, a

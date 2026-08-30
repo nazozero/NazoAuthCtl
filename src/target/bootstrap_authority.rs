@@ -137,10 +137,18 @@ fn valid_initial_admin_token(token: &str) -> bool {
 
 /// Read the SERVER-generated one-time token from the deployment's data root.
 /// Ctl never writes or regenerates it.
-pub(crate) fn read_server_token(context: &FreshBootstrapContext) -> anyhow::Result<String> {
+pub(crate) fn read_server_token(
+    context: &FreshBootstrapContext,
+    state: &DeploymentState,
+) -> anyhow::Result<String> {
     let path = server_token_path(context);
-    let bytes =
-        super::read_runtime_owned_file(&path, "initial administrator bootstrap token", true, 4096)?;
+    let bytes = super::read_runtime_owned_file(
+        &path,
+        "initial administrator bootstrap token",
+        true,
+        4096,
+        state,
+    )?;
     let token = std::str::from_utf8(&bytes)
         .with_context(|| format!("{} is not valid UTF-8", path.display()))?
         .trim()
@@ -211,7 +219,7 @@ pub(crate) fn surface_material_view(
 ) -> Option<FreshBootstrapMaterialView> {
     let context = load_context(scope_dir).ok()??;
     authorize_initial_admin_claim(Some(&context), state).ok()?;
-    let token = read_server_token(&context).ok()?;
+    let token = read_server_token(&context, state).ok()?;
     Some(FreshBootstrapMaterialView {
         install_operation_id: context.install_operation_id,
         token,

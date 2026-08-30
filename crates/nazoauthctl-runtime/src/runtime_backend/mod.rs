@@ -62,19 +62,16 @@ pub use container_shared::normalize_local_image_id;
 pub use container_shared::oci_backup_digests;
 pub use docker::DockerBackend;
 pub use podman::PodmanBackend;
-pub use systemd::{SystemdBackend, parse_systemd_version, render_host_service_unit};
+pub use systemd::{
+    SystemdBackend, parse_systemd_version, render_host_service_unit, systemd_service_user,
+    systemd_service_user_uid,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Responsibility {
     External,
     Managed,
-}
-
-impl Responsibility {
-    pub fn permits_mutation(self) -> bool {
-        matches!(self, Self::Managed)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -139,17 +136,6 @@ pub enum ArtifactReference {
         sha256: String,
     },
     Unknown,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct MountReference {
-    pub source: PathBuf,
-    pub destination: PathBuf,
-    pub read_only: bool,
-    pub selinux_relabel: bool,
-    pub scope: ResourceScope,
-    pub ownership: Responsibility,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -649,7 +635,6 @@ pub trait RuntimeBackend {
         endpoint: &RecoveryCandidateEndpoint,
     ) -> anyhow::Result<()>;
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String>;
-    fn run_one_shot_authorization_probe(&self, task: &OneShotTask) -> anyhow::Result<bool>;
     fn pull_image(&self, image_reference: &str) -> anyhow::Result<()>;
     /// Whether the local image store already holds an image whose repository
     /// digests contain exactly the digest embedded in `image_reference`.
@@ -675,11 +660,6 @@ pub trait RuntimeBackend {
     ) -> anyhow::Result<()>;
     fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String>;
     fn resolve_local_image_id(&self, image_reference: &str) -> anyhow::Result<String>;
-    fn read_build_identity(
-        &self,
-        artifact: &ArtifactReference,
-        local_artifact_id: Option<&str>,
-    ) -> anyhow::Result<Option<nazo_operator_protocol::EmbeddedIdentity>>;
     fn describe_mounts(&self, object_reference: &str) -> anyhow::Result<Vec<NeutralMount>> {
         Ok(self.inspect(object_reference)?.mounts)
     }

@@ -23,21 +23,7 @@ pub(super) fn verify_blob_attestation(
     command: &OsStr,
     verification: &BlobAttestationVerification,
 ) -> anyhow::Result<()> {
-    Process::new(command)
-        .args(["run", "--rm", "--user"])
-        .arg(container_shared::NON_ROOT_ONE_SHOT_USER)
-        .arg("--cap-drop=ALL")
-        .args(["--read-only", "--security-opt=no-new-privileges"])
-        .args([
-            "--pids-limit",
-            "64",
-            "--memory",
-            "256m",
-            "--cpus",
-            "1",
-            "--tmpfs",
-        ])
-        .arg("/root/.sigstore:rw,noexec,nosuid,nodev,size=16m")
+    container_shared::append_cosign_sandbox(Process::new(command).args(["run", "--rm"]))
         .arg("-v")
         .arg(format!("{}:/work:ro,Z", verification.work.display()))
         .arg(&verification.cosign_image)
@@ -121,9 +107,11 @@ pub(super) fn replace(command: &OsStr, replacement: &RuntimeReplacement) -> anyh
         .as_ref()
         .context("Podman replacement has no explicit container policy")?;
     let mut command = container_shared::append_container_policy(
-        Process::new(command)
-            .args(["run", "-d", "--name"])
-            .arg(&replacement.object_reference),
+        super::append_rootless_user_namespace(
+            Process::new(command)
+                .args(["run", "-d", "--name"])
+                .arg(&replacement.object_reference),
+        ),
         policy,
     );
     for (name, value) in &replacement.labels {
@@ -132,8 +120,15 @@ pub(super) fn replace(command: &OsStr, replacement: &RuntimeReplacement) -> anyh
     for (name, value) in &replacement.environment {
         command = command.arg("--env").arg(format!("{name}={value}"));
     }
-    for network in &replacement.networks {
-        command = command.arg("--network").arg(network);
+    if super::is_rootless()
+        && (replacement.networks.is_empty()
+            || matches!(replacement.networks.as_slice(), [network] if network == "pasta"))
+    {
+        command = command.arg("--network").arg("pasta:--map-gw");
+    } else {
+        for network in &replacement.networks {
+            command = command.arg("--network").arg(network);
+        }
     }
     if let Some(ip_address) = &replacement.ip_address {
         command = command.arg("--ip").arg(ip_address);
