@@ -25,6 +25,7 @@
 
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -394,6 +395,11 @@ fn safe_absolute_install_path(value: &str) -> bool {
 const MAX_IMPORT_FILES: usize = 100_000;
 const MAX_IMPORT_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_IMPORT_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// NazoAuth's fixed non-root identity in the official rootful container.
+/// Imported material is allowed to be owned by this UID in addition to the
+/// controller and root; no arbitrary service account is accepted.
+#[cfg(unix)]
+const NAZOAUTH_RUNTIME_UID: u32 = 10_001;
 const IMPORT_APP_SECRETS: &[&str] = &[
     "client-secret-pepper",
     "dynamic-client-registration-initial-access-token",
@@ -585,17 +591,29 @@ fn copy_import_regular(
         filesystem::ensure_directory_chain(parent)
             .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
     }
+    // The source may be owned by NazoAuth's fixed container UID.  Open it
+    // through the descriptor primitive before comparing or copying so the
+    // owner, ancestor, link-count, mode, and no-follow checks apply to every
+    // imported file.
+    let mut source_file = open_import_source(source)?;
+
     if destination.exists() {
         let destination_metadata = fs::symlink_metadata(destination)
             .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
         if !destination_metadata.is_file()
             || destination_metadata.file_type().is_symlink()
             || destination_metadata.len() != metadata.len()
-            || filesystem::sha256(destination).map_err(|error| {
-                Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string()))
-            })? != filesystem::sha256(source).map_err(|error| {
-                Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string()))
-            })?
+            || {
+                let mut destination_file =
+                    open_import_file(destination, "current data import destination")?;
+                filesystem::sha256_file(&mut destination_file, "current data import destination")
+                    .map_err(|error| {
+                        Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string()))
+                    })?
+                    != filesystem::sha256_file(&mut source_file, "current data import").map_err(
+                        |error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())),
+                    )?
+            }
         {
             return Err(Failure::new(
                 SECRET_PROVISION_FAILED,
@@ -607,16 +625,36 @@ fn copy_import_regular(
         }
         return Ok(());
     }
-    let mut source_file =
-        filesystem::open_secure_regular_file(source, "current data import", false)
-            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
     filesystem::copy_atomic_from_file(&mut source_file, destination, mode)
         .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))
 }
 
+fn open_import_file(path: &Path, label: &str) -> Result<std::fs::File, Failure> {
+    #[cfg(unix)]
+    let opened =
+        filesystem::open_secure_regular_file_for_uid(path, label, false, NAZOAUTH_RUNTIME_UID);
+    #[cfg(not(unix))]
+    let opened = filesystem::open_secure_regular_file(path, label, false);
+    opened.map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))
+}
+
+fn open_import_source(source: &Path) -> Result<std::fs::File, Failure> {
+    open_import_file(source, "current data import")
+}
+
 fn copy_import_file(source: &Path, destination: &Path, label: &str) -> Result<(), Failure> {
-    let bytes = filesystem::read_secure_regular_file(source, label, false, 128)
+    let mut source_file = open_import_source(source)?;
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    (&mut source_file)
+        .take(129)
+        .read_to_end(&mut bytes)
         .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
+    if bytes.len() > 128 {
+        return Err(Failure::new(
+            SECRET_PROVISION_FAILED,
+            format!("{label} exceeds the 128-byte limit"),
+        ));
+    }
     let mut end = bytes.len();
     while end > 0 && matches!(bytes[end - 1], b'\r' | b'\n') {
         end -= 1;
@@ -1881,6 +1919,67 @@ mod current_data_import_tests {
             .map_err(|failure| anyhow::anyhow!(failure.detail))?;
         fs::write(&mfa_source, b"invalid")?;
         assert!(copy_import_file(&mfa_source, &mfa_destination, "MFA").is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_reads_runtime_uid_owned_material_without_staging() -> anyhow::Result<()> {
+        use std::os::unix::fs::chown;
+
+        let temp = crate::filesystem::PrivateTempDir::new("current-data-import-runtime-uid")?;
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source)?;
+        fs::create_dir(&destination)?;
+        source_fixture(&source)?;
+
+        let runtime_material = [
+            source.join("keys"),
+            source.join("keys/signing.pem"),
+            source.join("avatars"),
+            source.join("avatars/user.jpg"),
+            source.join("secrets"),
+            source.join("secrets/client-secret-pepper"),
+            source.join("secrets/dynamic-client-registration-initial-access-token"),
+            source.join("secrets/token-issuance-response-encryption-key"),
+        ];
+        for path in runtime_material {
+            match chown(
+                &path,
+                Some(NAZOAUTH_RUNTIME_UID),
+                Some(NAZOAUTH_RUNTIME_UID),
+            ) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let mfa_source = temp.path().join("mfa-source");
+        let mfa_destination = temp.path().join("mfa-destination");
+        use base64::Engine as _;
+        fs::write(
+            &mfa_source,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9u8; 32]),
+        )?;
+        match chown(
+            &mfa_source,
+            Some(NAZOAUTH_RUNTIME_UID),
+            Some(NAZOAUTH_RUNTIME_UID),
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+
+        import_current_data(&source, &destination)
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        copy_import_file(&mfa_source, &mfa_destination, "MFA")
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        assert_eq!(fs::read(destination.join("keys/signing.pem"))?, b"key");
+        assert_eq!(fs::read(destination.join("avatars/user.jpg"))?, b"avatar");
+        assert_eq!(fs::read(mfa_destination)?, fs::read(mfa_source)?);
         Ok(())
     }
 

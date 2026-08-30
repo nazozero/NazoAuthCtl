@@ -459,6 +459,16 @@ fn build_install_order(
     let config_content = render_config_yaml(&request.issuer, deployment_id, state_epoch, &runtime)?;
     let config_sha256 = hex_digest(config_content.as_bytes());
 
+    let current_data_import = match (&request.import_data_root, &request.import_mfa_key_file) {
+        (Some(data), Some(mfa)) => Some(crate::target::install_exec::CurrentDataImport {
+            source_data_root: target_path(data, "--import-data-root")?,
+            source_mfa_key_file: target_path(mfa, "--import-mfa-key-file")?,
+        }),
+        (None, None) => None,
+        _ => bail!("current data import requires both target-local source paths"),
+    };
+
+    let fresh_bootstrap = current_data_import.is_none();
     let order =
         InstallOrder {
             artifact: OfficialArtifactRef {
@@ -498,20 +508,13 @@ fn build_install_order(
                 value: None,
             },
         ],
-            current_data_import: match (&request.import_data_root, &request.import_mfa_key_file) {
-                (Some(data), Some(mfa)) => Some(crate::target::install_exec::CurrentDataImport {
-                    source_data_root: target_path(data, "--import-data-root")?,
-                    source_mfa_key_file: target_path(mfa, "--import-mfa-key-file")?,
-                }),
-                (None, None) => None,
-                _ => bail!("current data import requires both target-local source paths"),
-            },
+            current_data_import,
             database_runtime_endpoint: request.database_runtime_endpoint.clone(),
             database_lifecycle_endpoint: request.database_lifecycle_endpoint.clone(),
             valkey_endpoint: request.valkey_endpoint.clone(),
-            // G02 hook: provision the single-use initial-admin capability bound
-            // to this exact install operation.
-            fresh_bootstrap: true,
+            // An import carries an existing NazoAuth data/database state, so
+            // the fresh-install bootstrap authority must not be created.
+            fresh_bootstrap,
         };
     Ok(order)
 }
@@ -851,7 +854,11 @@ pub(crate) fn run_clean_install(
             bail!("prepared install registry record drifted from target DeploymentState");
         }
         lease.clear()?;
-        return Ok(render_success_report(&record.alias, &inspection));
+        return Ok(render_success_report(
+            &record.alias,
+            &inspection,
+            request.import_data_root.is_none(),
+        ));
     }
 
     if let Some(alias) = request.instance_alias.as_deref()
@@ -910,7 +917,11 @@ pub(crate) fn run_clean_install(
     lease.clear()?;
 
     // 7. Report committed facts plus the exact next steps.
-    Ok(render_success_report(&record.alias, inspection))
+    Ok(render_success_report(
+        &record.alias,
+        inspection,
+        request.import_data_root.is_none(),
+    ))
 }
 
 fn interpret_result(result: &HostResult) -> anyhow::Result<&crate::target::InstanceInspection> {
@@ -930,28 +941,46 @@ fn interpret_result(result: &HostResult) -> anyhow::Result<&crate::target::Insta
     }
 }
 
-fn render_success_report(alias: &str, inspection: &crate::target::InstanceInspection) -> String {
+fn render_success_report(
+    alias: &str,
+    inspection: &crate::target::InstanceInspection,
+    fresh_bootstrap: bool,
+) -> String {
     let artifact = inspection
         .artifact
         .current
         .clone()
         .unwrap_or_else(|| "-".to_owned());
+    let next_steps = if fresh_bootstrap {
+        format!(
+            "next steps:\n\
+             1. create the initial administrator (single-use capability; closes on first success):\n\
+                nazoauthctl bootstrap-admin --instance {alias}\n\
+                then enroll MFA at {}/ui/auth — ctl never receives passwords or TOTP secrets\n\
+             2. establish the controller binding after MFA enrollment:\n\
+                nazoauthctl bind --instance {alias} --label production\n\
+             3. public DNS/TLS/OIDC checks are independent of this install; verify separately:\n\
+                nazoauthctl verify --instance {alias}\n",
+            inspection.issuer.trim_end_matches('/'),
+        )
+    } else {
+        format!(
+            "next steps:\n\
+             1. sign in as the existing instance administrator; complete a fresh 2FA approval when bind requests it at {}/ui/auth\n\
+             2. establish the controller binding after fresh 2FA approval:\n\
+                nazoauthctl bind --instance {alias} --label production\n\
+             3. public DNS/TLS/OIDC checks are independent of this install; verify separately:\n\
+                nazoauthctl verify --instance {alias}\n",
+            inspection.issuer.trim_end_matches('/'),
+        )
+    };
     format!(
         "installed NazoAuth instance '{alias}' (deployment {}) on the target\n\
          issuer: {}\nartifact: {artifact}\nstate committed: local=healthy control_binding=unbound public=unknown\n\
          InstanceRecord written to the registry (`nazoauthctl instance list`)\n\
          \n\
-         next steps:\n\
-         1. create the initial administrator (single-use capability; closes on first success):\n\
-            nazoauthctl bootstrap-admin --instance {alias}\n\
-            then enroll MFA at {}/ui/auth — ctl never receives passwords or TOTP secrets\n\
-         2. establish the controller binding after MFA enrollment:\n\
-            nazoauthctl bind --instance {alias} --label production\n\
-         3. public DNS/TLS/OIDC checks are independent of this install; verify separately:\n\
-            nazoauthctl verify --instance {alias}\n",
-        inspection.deployment_id,
-        inspection.issuer,
-        inspection.issuer.trim_end_matches('/'),
+         {next_steps}",
+        inspection.deployment_id, inspection.issuer,
     )
 }
 

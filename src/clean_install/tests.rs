@@ -271,6 +271,13 @@ impl LocalFixture {
             import_mfa_key_file: None,
         }
     }
+
+    fn imported_request(&self, alias: Option<&str>) -> CleanInstallRequest {
+        let mut request = self.request(alias);
+        request.import_data_root = Some(self._temp.path().join("imported-data"));
+        request.import_mfa_key_file = Some(self._temp.path().join("imported-mfa-key"));
+        request
+    }
 }
 
 /// OpenSSH-shaped stub answering hello plus the install completion over the
@@ -512,6 +519,11 @@ impl SshFixture {
 #[test]
 fn local_happy_path_commits_state_and_writes_instance_record() -> anyhow::Result<()> {
     let fixture = LocalFixture::new(None)?;
+    let hello = test_hello(vec!["podman".to_owned()]);
+    let mut fresh_request = fixture.request(Some("fresh-order"));
+    let fresh_order = prepare_install_operation(&mut fresh_request, &hello)?;
+    assert!(install_order(&fresh_order.operation).fresh_bootstrap);
+
     let text = run_clean_install(&fixture.context, fixture.request(Some("production")))?;
 
     // Report: committed facts plus exact next steps (G01 items 10/11, G02/G08 wording).
@@ -576,6 +588,47 @@ fn local_happy_path_commits_state_and_writes_instance_record() -> anyhow::Result
     assert_eq!(
         fixture.executor.steps.lock().unwrap().clone(),
         vec!["verify", "start"]
+    );
+    Ok(())
+}
+
+#[test]
+fn current_data_import_skips_bootstrap_and_reports_existing_admin_flow() -> anyhow::Result<()> {
+    let fixture = LocalFixture::new(None)?;
+    let hello = test_hello(vec!["podman".to_owned()]);
+    let mut order_request = fixture.imported_request(Some("production"));
+    let prepared = prepare_install_operation(&mut order_request, &hello)?;
+    let order = install_order(&prepared.operation);
+    assert!(order.current_data_import.is_some());
+    assert!(!order.fresh_bootstrap);
+
+    let report = run_clean_install(
+        &fixture.context,
+        fixture.imported_request(Some("production")),
+    )?;
+    assert!(
+        report.contains("existing instance administrator"),
+        "{report}"
+    );
+    assert!(report.contains("fresh 2FA approval"), "{report}");
+    assert!(
+        report.contains("nazoauthctl bind --instance production"),
+        "{report}"
+    );
+    assert!(!report.contains("bootstrap-admin"), "{report}");
+
+    let record = fixture
+        .context
+        .registry
+        .instance_by_alias("production")?
+        .expect("imported instance registered");
+    let scope = fixture
+        .state_root
+        .join("deployments")
+        .join(record.deployment_id);
+    assert!(
+        !scope.join(bootstrap_authority::CONTEXT_FILE_NAME).exists(),
+        "current-format import must not create fresh-bootstrap context"
     );
     Ok(())
 }
