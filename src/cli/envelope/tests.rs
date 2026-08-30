@@ -30,6 +30,7 @@ fn text_envelope_covers_the_stable_codes() {
         crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED,
         crate::error_codes::CONTROLLER_SLOT_LIMIT,
         crate::error_codes::ADMIN_ACCESS_REQUIRED,
+        crate::error_codes::ADMIN_EMAIL_CONFLICT,
         crate::error_codes::OPERATION_ID_CONFLICT,
         crate::error_codes::CONFIG_REVISION_MISMATCH,
         crate::error_codes::TARGET_IDENTITY_MISMATCH,
@@ -74,6 +75,7 @@ fn json_envelope_carries_every_field() {
         crate::error_codes::CONTROL_BINDING_REQUIRED,
         crate::error_codes::CONTROLLER_SLOT_LIMIT,
         crate::error_codes::ADMIN_ACCESS_REQUIRED,
+        crate::error_codes::ADMIN_EMAIL_CONFLICT,
         crate::error_codes::CONFIG_REVISION_MISMATCH,
         crate::error_codes::TARGET_IDENTITY_MISMATCH,
     ] {

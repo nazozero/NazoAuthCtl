@@ -2,8 +2,8 @@
 //!
 //! The parser can only ever produce the commands in [`Command`] plus the
 //! small set of maintenance commands that the final model itself requires
-//! (`remote exec` transport boundary, controller self-updates, the G02
-//! fresh-install bootstrap claim, and the TLS certificate-provider family).
+//! (`remote exec` transport boundary, controller self-updates, and the TLS
+//! certificate-provider family).
 
 use std::path::PathBuf;
 
@@ -21,7 +21,7 @@ pub(crate) enum HelpTopic {
     Update,
     Tls,
     SelfUpdate,
-    BootstrapAdmin,
+    Admin,
 }
 
 /// Global options shared by every invocation (I02). `--instance` is accepted
@@ -46,8 +46,8 @@ pub(crate) struct Cli {
 ///
 /// `oidf` is parsed by the binary entrypoint (`crates/nazoauthctl`) before
 /// this library parser runs, so it has no variant here. `RemoteExec`,
-/// `SelfCheck`, `SelfUpdate`, `SelfRollback`, and `BootstrapAdmin` are part
-/// of the final model's own machinery, not legacy surface.
+/// `SelfCheck`, `SelfUpdate`, and `SelfRollback` are part of the final model's
+/// own machinery, not legacy surface.
 // Install carries the complete one-shot external dependency fact set. Command
 // values are parsed once and immediately consumed; boxing this sole large
 // variant would add allocation and indirection without reducing retained state.
@@ -112,8 +112,8 @@ pub(crate) enum Command {
         selector: InstanceSelector,
         yes: bool,
     },
-    /// Fresh-install bootstrap authority claim (G02).
-    BootstrapAdmin(BootstrapAdminArgs),
+    /// Create an administrator through the target deployment root.
+    Admin(AdminCommand),
     /// Deployment-owned TLS certificate material via the external
     /// file-provider contract (`tls certificate|acme ...`).
     Tls(TlsCommand),
@@ -127,6 +127,13 @@ pub(crate) enum Command {
         version: Option<String>,
     },
     SelfRollback,
+}
+
+/// Deployment-root administrator management. The current surface exposes one
+/// operation: creating an administrator through the fixed target provisioner.
+#[derive(Debug)]
+pub(crate) enum AdminCommand {
+    Create(AdminCreateArgs),
 }
 
 /// `controller` family (goal plan 09 §1): everything runs against the
@@ -350,9 +357,10 @@ pub(crate) struct RecoverArgs {
     pub(crate) recovery_secret_file: Option<std::path::PathBuf>,
 }
 
-/// Bootstrap claim arguments (G02).
+/// Administrator creation arguments. Credentials are read after parsing and
+/// are never represented in this command value.
 #[derive(Debug)]
-pub(crate) struct BootstrapAdminArgs {
+pub(crate) struct AdminCreateArgs {
     pub(crate) selector: InstanceSelector,
     pub(crate) credentials_stdin: bool,
 }

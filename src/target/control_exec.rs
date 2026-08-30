@@ -34,24 +34,117 @@ const CHANGE_SET_ENV: &str = "NAZOAUTH_OPERATOR_CHANGE_SET_FILE";
 const CHANGE_SET_CREDENTIAL: &str = "operator-change-set";
 const CONTAINER_CHANGE_SET_PATH: &str = "/run/nazoauth/operator-change-set";
 const OPERATOR_REJECTION_PREFIX: &str = "nazoauth-operator-rejection=";
+const ADMIN_PROVISION_REJECTION_PREFIX: &str = "nazoauth-admin-provision-rejection=";
 
+/// The only fixed one-shot commands the target may launch. Keeping the
+/// command choice closed here makes it impossible for a HostOperation field
+/// to become a shell/argv injection point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FixedOneShotKind {
+    ControlOperation,
+    AdminProvision,
+}
+
+impl FixedOneShotKind {
+    fn command(self) -> &'static [&'static str] {
+        match self {
+            Self::ControlOperation => &["nazoauth", "operator-task"],
+            Self::AdminProvision => &["nazoauth", "admin-provision"],
+        }
+    }
+}
+
+/// Runtime facts captured from the target's live DeploymentState. This is
+/// deliberately the shared input to both fixed one-shot operations.
+pub(crate) struct FixedOneShotJob<'a> {
+    pub(crate) deployment_id: &'a str,
+    pub(crate) artifact_reference: &'a str,
+    pub(crate) runtime_kind: crate::runtime_backend::RuntimeBackendKind,
+    pub(crate) runtime_object: &'a str,
+    pub(crate) config_reference: &'a str,
+    pub(crate) data_root: &'a str,
+    pub(crate) scope_dir: &'a Path,
+}
+
+/// The single secret input file for a fixed one-shot command. The name and
+/// destination are constants owned by the caller; credential bytes never
+/// appear in a command, environment value, journal result, or diagnostic.
+pub(crate) struct FixedSecretFile<'a> {
+    pub(crate) credential_name: &'static str,
+    pub(crate) container_path: &'static str,
+    pub(crate) environment_name: &'static str,
+    pub(crate) bytes: &'a [u8],
+}
+
+struct StagedSecretFile {
+    _directory: crate::filesystem::PrivateTempDir,
+    path: PathBuf,
+}
+
+#[cfg(test)]
 struct StagedChangeSet {
     _directory: crate::filesystem::PrivateTempDir,
     path: PathBuf,
 }
 
-fn stage_change_set(bytes: &[u8]) -> anyhow::Result<StagedChangeSet> {
-    let directory = crate::filesystem::PrivateTempDir::new("nazoauthctl-change-set")?;
-    let path = directory.path().join(CHANGE_SET_CREDENTIAL);
-    // The 0700 parent is the host-side privacy boundary. The file itself is
-    // read-only so the non-root OCI task can read its direct bind mount.
-    crate::filesystem::atomic_write(&path, bytes, 0o444)?;
-    Ok(StagedChangeSet {
+fn stage_secret_file(file: &FixedSecretFile<'_>) -> anyhow::Result<StagedSecretFile> {
+    let directory = crate::filesystem::PrivateTempDir::new("nazoauthctl-one-shot")?;
+    let path = directory.path().join(file.credential_name);
+    // The 0700 parent is the host-side privacy boundary. The file itself
+    // is read-only so the non-root OCI task can read its direct bind mount.
+    crate::filesystem::atomic_write(&path, file.bytes, 0o444)?;
+    Ok(StagedSecretFile {
         _directory: directory,
         path,
     })
 }
 
+#[cfg(test)]
+fn stage_change_set(bytes: &[u8]) -> anyhow::Result<StagedChangeSet> {
+    let file = FixedSecretFile {
+        credential_name: CHANGE_SET_CREDENTIAL,
+        container_path: CONTAINER_CHANGE_SET_PATH,
+        environment_name: CHANGE_SET_ENV,
+        bytes,
+    };
+    let staged = stage_secret_file(&file)?;
+    Ok(StagedChangeSet {
+        path: staged.path,
+        _directory: staged._directory,
+    })
+}
+
+fn configure_secret_file_access(
+    host: bool,
+    path: &Path,
+    file: &FixedSecretFile<'_>,
+    environment: &mut BTreeMap<String, String>,
+    transient_credentials: &mut BTreeMap<String, PathBuf>,
+    mounts: &mut Vec<crate::runtime_backend::NeutralMount>,
+) {
+    if host {
+        transient_credentials.insert(file.credential_name.to_owned(), path.to_owned());
+        environment.insert(
+            file.environment_name.to_owned(),
+            format!("%d/{}", file.credential_name),
+        );
+    } else {
+        mounts.push(crate::runtime_backend::NeutralMount {
+            source: path.to_owned(),
+            destination: PathBuf::from(file.container_path),
+            read_only: true,
+            selinux_relabel: false,
+            ownership: crate::runtime_backend::Responsibility::Managed,
+            scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
+        });
+        environment.insert(
+            file.environment_name.to_owned(),
+            file.container_path.to_owned(),
+        );
+    }
+}
+
+#[cfg(test)]
 fn configure_change_set_access(
     host: bool,
     path: &Path,
@@ -59,26 +152,150 @@ fn configure_change_set_access(
     transient_credentials: &mut BTreeMap<String, PathBuf>,
     mounts: &mut Vec<crate::runtime_backend::NeutralMount>,
 ) {
+    let file = FixedSecretFile {
+        credential_name: CHANGE_SET_CREDENTIAL,
+        container_path: CONTAINER_CHANGE_SET_PATH,
+        environment_name: CHANGE_SET_ENV,
+        bytes: &[],
+    };
+    configure_secret_file_access(
+        host,
+        path,
+        &file,
+        environment,
+        transient_credentials,
+        mounts,
+    );
+}
+
+/// Execute one closed-set NazoAuth one-shot command after proving the live
+/// runtime object still serves the artifact recorded by DeploymentState.
+/// ControlOperation and administrator provisioning share this exact runtime,
+/// privilege, temporary-file, mount, and output plumbing.
+pub(crate) fn execute_fixed_one_shot(
+    job: &FixedOneShotJob<'_>,
+    kind: FixedOneShotKind,
+    mut environment: BTreeMap<String, String>,
+    secret_file: Option<&FixedSecretFile<'_>>,
+    stdin: Vec<u8>,
+) -> Result<String, Failure> {
+    let runtime_kind = job.runtime_kind;
+    let backend = crate::runtime_backend::backend(runtime_kind);
+    if runtime_kind.is_container() {
+        if let Err(error) = crate::instance_lifecycle::privilege::ensure_engine_access(
+            runtime_kind.as_str(),
+            &crate::instance_lifecycle::privilege::ProcessPrivilegeProbe,
+        ) {
+            return Err(Failure::new(error.code(), sanitize(error.to_string())));
+        }
+    } else if let Err(error) = crate::instance_lifecycle::privilege::ensure_systemd_access() {
+        return Err(Failure::new(error.code(), sanitize(error.to_string())));
+    }
+    let observation = backend
+        .inspect(job.runtime_object)
+        .map_err(|error| Failure::new(CONTROL_TARGET_DRIFT, sanitize(error.to_string())))?;
+    let digest = super::update_exec::observation_digest(&observation).ok_or_else(|| {
+        Failure::new(
+            CONTROL_TARGET_DRIFT,
+            "the running runtime object does not report a digest-bound artifact",
+        )
+    })?;
+    let expected = job
+        .artifact_reference
+        .trim_start_matches("sha256:")
+        .to_owned();
+    if digest != expected {
+        return Err(Failure::new(
+            CONTROL_TARGET_DRIFT,
+            format!(
+                "runtime object '{}' serves {} while the deployment state records {}",
+                job.runtime_object,
+                sanitize(digest),
+                sanitize(expected)
+            ),
+        ));
+    }
+
+    let staged = secret_file
+        .map(|file| {
+            stage_secret_file(file).map_err(|error| {
+                Failure::new(CONTROL_EXECUTION_UNAVAILABLE, sanitize(error.to_string()))
+            })
+        })
+        .transpose()?;
+    let host = runtime_kind == crate::runtime_backend::RuntimeBackendKind::Host;
+    let mut read_only_paths = Vec::new();
+    let mut read_write_paths = Vec::new();
+    let mut transient_credentials = BTreeMap::new();
+    let mut mounts = observation.mounts.clone();
     if host {
-        transient_credentials.insert(CHANGE_SET_CREDENTIAL.to_owned(), path.to_owned());
         environment.insert(
-            CHANGE_SET_ENV.to_owned(),
-            format!("%d/{CHANGE_SET_CREDENTIAL}"),
+            super::install_exec::SERVER_CONFIG_FILE_ENV.to_owned(),
+            job.config_reference.to_owned(),
         );
-    } else {
-        mounts.push(crate::runtime_backend::NeutralMount {
-            source: path.to_owned(),
-            destination: PathBuf::from(CONTAINER_CHANGE_SET_PATH),
-            read_only: true,
-            selinux_relabel: false,
-            ownership: crate::runtime_backend::Responsibility::Managed,
-            scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
-        });
         environment.insert(
-            CHANGE_SET_ENV.to_owned(),
-            CONTAINER_CHANGE_SET_PATH.to_owned(),
+            "NAZOAUTH_OPERATOR_CONFIG_REVISION_FILE".to_owned(),
+            job.scope_dir
+                .join("config-revision")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        environment.insert(
+            "NAZOAUTH_OPERATOR_STATE_DIRECTORY".to_owned(),
+            Path::new(job.data_root)
+                .join("operator-state")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        read_only_paths.push(PathBuf::from(job.config_reference));
+        read_write_paths.push(PathBuf::from(job.data_root));
+    }
+    if let (Some(file), Some(staged)) = (secret_file, &staged) {
+        configure_secret_file_access(
+            host,
+            &staged.path,
+            file,
+            &mut environment,
+            &mut transient_credentials,
+            &mut mounts,
         );
     }
+    let task = crate::runtime_backend::OneShotTask {
+        artifact: observation.artifact,
+        command: kind
+            .command()
+            .iter()
+            .map(|part| (*part).to_owned())
+            .collect(),
+        network: if host {
+            Some("host".to_owned())
+        } else {
+            observation.networks.first().cloned()
+        },
+        mounts,
+        environment,
+        working_directory: if host {
+            Some(PathBuf::from(job.data_root))
+        } else {
+            Some(PathBuf::from("/app"))
+        },
+        service_user: Some(if host {
+            crate::runtime_backend::systemd_service_user(job.deployment_id)
+        } else {
+            crate::runtime_backend::NON_ROOT_ONE_SHOT_USER.to_owned()
+        }),
+        transient_credentials,
+        read_only_paths,
+        read_write_paths,
+        inaccessible_paths: Vec::new(),
+        private_mounts: false,
+        stdin,
+    };
+    backend.run_one_shot(&task).map_err(|error| {
+        let detail = error.to_string();
+        let code = fixed_one_shot_rejection_code(kind, &detail).unwrap_or(CONTROL_OUTCOME_UNKNOWN);
+        Failure::new(code, sanitize(detail))
+    })
 }
 
 /// Stable failure code: the operator ran (or may have run) but produced no
@@ -125,126 +342,28 @@ pub(crate) struct HostControlOperator;
 
 impl ControlOperationExecutor for HostControlOperator {
     fn execute(&self, job: &ControlJob<'_>) -> Result<ControlResult, Failure> {
-        let kind = job.runtime_kind;
-        let backend = crate::runtime_backend::backend(kind);
-        if kind.is_container() {
-            if let Err(error) = crate::instance_lifecycle::privilege::ensure_engine_access(
-                kind.as_str(),
-                &crate::instance_lifecycle::privilege::ProcessPrivilegeProbe,
-            ) {
-                return Err(Failure::new(error.code(), sanitize(error.to_string())));
-            }
-        } else if let Err(error) = crate::instance_lifecycle::privilege::ensure_systemd_access() {
-            return Err(Failure::new(error.code(), sanitize(error.to_string())));
-        }
-        let observation = backend
-            .inspect(job.runtime_object)
-            .map_err(|error| Failure::new(CONTROL_TARGET_DRIFT, sanitize(error.to_string())))?;
-        let digest = match &observation.artifact {
-            crate::runtime_backend::ArtifactReference::Oci { digest, .. } => digest,
-            crate::runtime_backend::ArtifactReference::HostBinary { sha256, .. } => sha256,
-            crate::runtime_backend::ArtifactReference::Unknown => {
-                return Err(Failure::new(
-                    CONTROL_TARGET_DRIFT,
-                    "the running runtime object does not report a digest-bound artifact",
-                ));
-            }
+        let secret_file = job.change_set.map(|bytes| FixedSecretFile {
+            credential_name: CHANGE_SET_CREDENTIAL,
+            container_path: CONTAINER_CHANGE_SET_PATH,
+            environment_name: CHANGE_SET_ENV,
+            bytes,
+        });
+        let fixed_job = FixedOneShotJob {
+            deployment_id: job.deployment_id,
+            artifact_reference: job.artifact_reference,
+            runtime_kind: job.runtime_kind,
+            runtime_object: job.runtime_object,
+            config_reference: job.config_reference,
+            data_root: job.data_root,
+            scope_dir: job.scope_dir,
         };
-        let expected = job
-            .artifact_reference
-            .trim_start_matches("sha256:")
-            .to_owned();
-        if *digest != expected {
-            return Err(Failure::new(
-                CONTROL_TARGET_DRIFT,
-                format!(
-                    "runtime object '{}' serves {} while the deployment state records {}",
-                    job.runtime_object,
-                    sanitize(digest.clone()),
-                    sanitize(expected)
-                ),
-            ));
-        }
-
-        let host = kind == crate::runtime_backend::RuntimeBackendKind::Host;
-        let change_set_temp = if let Some(bytes) = job.change_set {
-            Some(stage_change_set(bytes).map_err(|error| {
-                Failure::new(CONTROL_EXECUTION_UNAVAILABLE, sanitize(error.to_string()))
-            })?)
-        } else {
-            None
-        };
-        let mut environment = BTreeMap::new();
-        let mut read_only_paths = Vec::new();
-        let mut read_write_paths = Vec::new();
-        let mut transient_credentials = BTreeMap::new();
-        let mut mounts = observation.mounts.clone();
-        if host {
-            environment.insert(
-                super::install_exec::SERVER_CONFIG_FILE_ENV.to_owned(),
-                job.config_reference.to_owned(),
-            );
-            environment.insert(
-                "NAZOAUTH_OPERATOR_CONFIG_REVISION_FILE".to_owned(),
-                job.scope_dir
-                    .join("config-revision")
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-            environment.insert(
-                "NAZOAUTH_OPERATOR_STATE_DIRECTORY".to_owned(),
-                Path::new(job.data_root)
-                    .join("operator-state")
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-            read_only_paths.push(PathBuf::from(job.config_reference));
-            read_write_paths.push(PathBuf::from(job.data_root));
-        }
-        if let Some(staged) = &change_set_temp {
-            configure_change_set_access(
-                host,
-                &staged.path,
-                &mut environment,
-                &mut transient_credentials,
-                &mut mounts,
-            );
-        }
-        let task = crate::runtime_backend::OneShotTask {
-            artifact: observation.artifact.clone(),
-            // The frozen NazoAuth one-shot entry: compact JWS on stdin, the
-            // durable ControlResult JSON on stdout.
-            command: vec!["nazoauth".to_owned(), "operator-task".to_owned()],
-            network: if host {
-                Some("host".to_owned())
-            } else {
-                observation.networks.first().cloned()
-            },
-            mounts,
-            environment,
-            working_directory: if host {
-                Some(PathBuf::from(job.data_root))
-            } else {
-                Some(PathBuf::from("/app"))
-            },
-            service_user: Some(if host {
-                crate::runtime_backend::systemd_service_user(job.deployment_id)
-            } else {
-                crate::runtime_backend::NON_ROOT_ONE_SHOT_USER.to_owned()
-            }),
-            transient_credentials,
-            read_only_paths,
-            read_write_paths,
-            inaccessible_paths: Vec::new(),
-            private_mounts: false,
-            stdin: format!("{}\n", job.compact_jws).into_bytes(),
-        };
-        let stdout = backend.run_one_shot(&task).map_err(|error| {
-            let detail = error.to_string();
-            let code = operator_rejection_code(&detail).unwrap_or(CONTROL_OUTCOME_UNKNOWN);
-            Failure::new(code, sanitize(detail))
-        })?;
-        drop(change_set_temp);
+        let stdout = execute_fixed_one_shot(
+            &fixed_job,
+            FixedOneShotKind::ControlOperation,
+            BTreeMap::new(),
+            secret_file.as_ref(),
+            format!("{}\n", job.compact_jws).into_bytes(),
+        )?;
         decode_operator_answer(&stdout, job.operation_id)
     }
 }
@@ -266,6 +385,25 @@ fn operator_rejection_code(detail: &str) -> Option<&'static str> {
         "unavailable" => None,
         _ => None,
     }
+}
+
+fn fixed_one_shot_rejection_code(kind: FixedOneShotKind, detail: &str) -> Option<&'static str> {
+    match kind {
+        FixedOneShotKind::ControlOperation => operator_rejection_code(detail),
+        FixedOneShotKind::AdminProvision => admin_provision_rejection_code(detail),
+    }
+}
+
+fn admin_provision_rejection_code(detail: &str) -> Option<&'static str> {
+    detail.lines().map(str::trim).find_map(|line| {
+        let marker = line.rsplit_once(": ").map_or(line, |(_, suffix)| suffix);
+        match marker.strip_prefix(ADMIN_PROVISION_REJECTION_PREFIX)? {
+            "input" => Some(crate::error_codes::INPUT_INVALID),
+            "email-conflict" => Some(crate::error_codes::ADMIN_EMAIL_CONFLICT),
+            "operation-conflict" => Some(crate::error_codes::OPERATION_ID_CONFLICT),
+            _ => None,
+        }
+    })
 }
 
 /// Decode the operator's single-line answer and pin it to the presented
@@ -326,8 +464,9 @@ mod tests {
     };
 
     use super::{
-        CHANGE_SET_CREDENTIAL, CHANGE_SET_ENV, CONTAINER_CHANGE_SET_PATH,
-        configure_change_set_access, operator_rejection_code, stage_change_set,
+        CHANGE_SET_CREDENTIAL, CHANGE_SET_ENV, CONTAINER_CHANGE_SET_PATH, FixedOneShotKind,
+        admin_provision_rejection_code, configure_change_set_access, fixed_one_shot_rejection_code,
+        operator_rejection_code, stage_change_set,
     };
 
     #[test]
@@ -409,5 +548,41 @@ mod tests {
             operator_rejection_code("nazoauth-operator-rejection=unavailable"),
             None
         );
+    }
+
+    #[test]
+    fn admin_rejection_markers_are_closed_and_kind_specific() {
+        assert_eq!(
+            admin_provision_rejection_code("nazoauth-admin-provision-rejection=input"),
+            Some(crate::error_codes::INPUT_INVALID)
+        );
+        assert_eq!(
+            admin_provision_rejection_code(
+                "nazoauth failed with status 1: nazoauth-admin-provision-rejection=email-conflict",
+            ),
+            Some(crate::error_codes::ADMIN_EMAIL_CONFLICT)
+        );
+        assert_eq!(
+            fixed_one_shot_rejection_code(
+                FixedOneShotKind::AdminProvision,
+                "nazoauth-admin-provision-rejection=operation-conflict",
+            ),
+            Some(crate::error_codes::OPERATION_ID_CONFLICT)
+        );
+        assert_eq!(
+            fixed_one_shot_rejection_code(
+                FixedOneShotKind::ControlOperation,
+                "nazoauth-admin-provision-rejection=input",
+            ),
+            None
+        );
+        assert_eq!(
+            fixed_one_shot_rejection_code(
+                FixedOneShotKind::AdminProvision,
+                "nazoauth-operator-rejection=authorization",
+            ),
+            None
+        );
+        assert_eq!(admin_provision_rejection_code("database hash failed"), None);
     }
 }

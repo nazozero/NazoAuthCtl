@@ -5,8 +5,8 @@
 //! control side serializes one bounded [`HostOperation`] to stdin, and the
 //! target answers with exactly one bounded [`HostResult`] on stdout. A remote
 //! executor can answer every message from this module alone — user input
-//! never crosses a shell, no secret material has a field to live in, and
-//! unknown content is rejected instead of interpreted.
+//! never crosses a shell, secret fields are redacted and bounded, and unknown
+//! content is rejected instead of interpreted.
 //!
 //! Contract rules (goal plan 03 / task C03):
 //!
@@ -26,7 +26,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::bootstrap_authority::FreshBootstrapMaterialView;
 use super::deployment_state::{ArtifactRefs, RuntimeSurface, StateMutationPayload};
 
 /// Wire schema discriminator for HostOperation and HostResult messages.
@@ -62,8 +61,6 @@ pub const MAX_BACKUP_TRANSFER_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// one-shot NazoAuth operator (goal plan 03 §3.3; no secret material, no
 /// signing on the target), and adds the read-only host-level enumeration
 /// kind `state-list` for discovery (goal plan 07 §6, task G05).
-/// `bootstrap-close` and `bootstrap-read` are the two fresh-install
-/// capability operations (P0-2).
 pub const HOST_OPERATION_KINDS: &[&str] = &[
     "hello",
     "ping",
@@ -71,8 +68,7 @@ pub const HOST_OPERATION_KINDS: &[&str] = &[
     "state-mutate",
     "control-operation",
     "state-list",
-    "bootstrap-close",
-    "bootstrap-read",
+    "admin-create",
     "runtime-logs",
     "journal-read",
     "backup-snapshot",
@@ -222,17 +218,13 @@ pub enum HostOperationBody {
     /// no revision expectation, no side effect. Answered with
     /// [`HostCompletionBody::StateListed`].
     StateList {},
-    /// P0-2: close one fresh-install bootstrap capability on the target by
-    /// deleting its server token and install-binding context. Requires the
-    /// instance binding and is issued only after a successful claim receipt.
-    BootstrapClose {},
-    /// Read the fresh-install bootstrap capability for one deployment.
-    /// Requires the instance binding. Returns the material view while the
-    /// capability is open and the live state matches its install journal
-    /// binding; fails closed in every other state (closed, consumed, drifted).
-    /// Separated from `StateInspect` so bootstrap material never travels in
-    /// the generic inspection path.
-    BootstrapRead {},
+    /// Create one administrator through the deployment's fixed local
+    /// provisioning entry point. The email is a public identity fact; only
+    /// the password is carried as redacted [`SecretMaterial`].
+    AdminCreate {
+        email: String,
+        password: SecretMaterial,
+    },
     /// Read a bounded tail of application logs from the deployment's live
     /// runtime. The target resolves the runtime object from DeploymentState;
     /// callers cannot supply an arbitrary container or systemd unit name.
@@ -325,7 +317,6 @@ impl HostOperationBody {
                 | Self::Hello {}
                 | Self::StateInspect {}
                 | Self::StateList {}
-                | Self::BootstrapRead {}
                 | Self::RuntimeLogs { .. }
                 | Self::JournalRead { .. }
                 | Self::BackupTransferRead { .. }
@@ -340,8 +331,7 @@ impl HostOperationBody {
             Self::StateMutate { .. } => "state-mutate",
             Self::ControlOperation { .. } => "control-operation",
             Self::StateList {} => "state-list",
-            Self::BootstrapClose {} => "bootstrap-close",
-            Self::BootstrapRead {} => "bootstrap-read",
+            Self::AdminCreate { .. } => "admin-create",
             Self::RuntimeLogs { .. } => "runtime-logs",
             Self::JournalRead { .. } => "journal-read",
             Self::BackupSnapshot {} => "backup-snapshot",
@@ -413,6 +403,26 @@ impl HostOperation {
             deployment_id: None,
             expected_revision: None,
             operation: HostOperationBody::StateList {},
+        }
+    }
+
+    /// Create one administrator through the target deployment's fixed
+    /// `nazoauth admin-provision` one-shot command.
+    pub fn admin_create(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        email: impl Into<String>,
+        password: SecretMaterial,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: None,
+            operation: HostOperationBody::AdminCreate {
+                email: email.into(),
+                password,
+            },
         }
     }
 
@@ -675,34 +685,6 @@ impl HostOperation {
         }
     }
 
-    /// P0-2: close one fresh-install bootstrap capability on the target.
-    pub fn bootstrap_close(
-        operation_id: impl Into<String>,
-        deployment_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            schema: HOST_PROTOCOL_SCHEMA,
-            operation_id: operation_id.into(),
-            deployment_id: Some(deployment_id.into()),
-            expected_revision: None,
-            operation: HostOperationBody::BootstrapClose {},
-        }
-    }
-
-    /// Read the fresh-install bootstrap capability for one deployment.
-    pub fn bootstrap_read(
-        operation_id: impl Into<String>,
-        deployment_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            schema: HOST_PROTOCOL_SCHEMA,
-            operation_id: operation_id.into(),
-            deployment_id: Some(deployment_id.into()),
-            expected_revision: None,
-            operation: HostOperationBody::BootstrapRead {},
-        }
-    }
-
     pub fn runtime_logs(
         operation_id: impl Into<String>,
         deployment_id: impl Into<String>,
@@ -793,29 +775,6 @@ impl HostOperation {
                     ));
                 }
             }
-            HostOperationBody::BootstrapClose {} => {
-                // Closing addresses exactly one registered deployment,
-                // destroys only the capability file, and never races a CAS
-                // revision.
-                if self.deployment_id.is_none() || self.expected_revision.is_some() {
-                    return Err(MessageRejection::new(
-                        RejectionCode::OperationMalformed,
-                        "bootstrap-close requires deployment_id and must not carry \
-                         expected_revision",
-                    ));
-                }
-            }
-            HostOperationBody::BootstrapRead {} => {
-                // Reading the bootstrap capability addresses exactly one
-                // registered deployment and is strictly read-only.
-                if self.deployment_id.is_none() || self.expected_revision.is_some() {
-                    return Err(MessageRejection::new(
-                        RejectionCode::OperationMalformed,
-                        "bootstrap-read requires deployment_id and must not carry \
-                         expected_revision",
-                    ));
-                }
-            }
             HostOperationBody::StateList {} => {
                 // Enumeration is host-level and read-only: instance bindings
                 // and revision expectations are meaningless against it.
@@ -823,6 +782,30 @@ impl HostOperation {
                     return Err(MessageRejection::new(
                         RejectionCode::OperationMalformed,
                         "state-list must not carry deployment_id or expected_revision",
+                    ));
+                }
+            }
+            HostOperationBody::AdminCreate { email, password } => {
+                // Administrator provisioning is an instance-bound target
+                // mutation. It deliberately has no DeploymentState CAS: the
+                // server's own database transaction is the authority for
+                // creating the user, while the target journal supplies
+                // exactly-once/replay semantics for delivery.
+                if self.deployment_id.is_none() || self.expected_revision.is_some() {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "admin-create requires deployment_id and must not carry expected_revision",
+                    ));
+                }
+                if email.is_empty()
+                    || email.len() > 254
+                    || email.chars().any(char::is_control)
+                    || password.as_bytes().is_empty()
+                    || password.as_bytes().len() > MAX_CONTROL_CHANGE_SET_BYTES
+                {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "admin-create email/password is malformed",
                     ));
                 }
             }
@@ -1240,9 +1223,9 @@ pub struct BackupTransferChunk {
     pub bytes: BackupTransferBytes,
 }
 
-/// Raw Apply material with a compact base64 JSON representation. It is the
-/// one opaque secret carrier for this protocol: never Debug or Clone it.
-/// Construction and deserialization enforce the server's fixed 4 MiB ceiling.
+/// Opaque secret material with a compact base64 JSON representation. It is the
+/// secret carrier for this protocol: never Debug or Clone it. Construction
+/// and deserialization enforce the fixed 4 MiB ceiling.
 #[derive(Eq, PartialEq)]
 pub struct SecretMaterial(Vec<u8>);
 
@@ -1440,20 +1423,14 @@ pub enum HostCompletionBody {
         result: ControlResult,
     },
     /// Every NazoAuth DeploymentState found on this target (task G05),
-    /// sorted by deployment id. Read-only discovery output; never carries
-    /// fresh-install bootstrap material — that surfaces only through the
-    /// per-deployment state-inspect kind.
+    /// sorted by deployment id. Read-only discovery output.
     StateListed {
         deployments: Vec<InstanceInspection>,
     },
-    /// P0-2: the server token and fresh-install bootstrap capability context
-    /// were deleted on the target after a successful claim receipt.
-    BootstrapClosed {},
-    /// The fresh-install bootstrap material for one deployment. Returned by
-    /// the `BootstrapRead` host operation while the capability is open; fails
-    /// closed in every other state.
-    BootstrapRead {
-        material: FreshBootstrapMaterialView,
+    /// The target deployment created one administrator and returned the
+    /// server's operation/deployment-bound receipt.
+    AdminCreated {
+        receipt: AdminProvisionReceipt,
     },
     RuntimeLogs {
         lines: Vec<String>,
@@ -1493,6 +1470,20 @@ pub enum HostCompletionBody {
     },
     BackupOffHostRecorded {},
     BackupTransferCleaned {},
+}
+
+/// Receipt emitted by the fixed NazoAuth `admin-provision` command.
+///
+/// The receipt is deliberately separate from [`SecretMaterial`]: it contains
+/// only public identity facts and never echoes the submitted password.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminProvisionReceipt {
+    pub schema: u32,
+    pub operation_id: String,
+    pub deployment_id: String,
+    pub user_id: Uuid,
+    pub email: String,
 }
 
 /// Live inspection of one registered instance read from the target-side
@@ -1739,10 +1730,37 @@ fn canonical_bytes(value: &impl Serialize) -> anyhow::Result<Vec<u8>> {
     serde_json::to_vec(&json).map_err(std::convert::Into::into)
 }
 
-/// Canonical SHA-256 over the full operation. The target-side journal (C07)
-/// uses `operation_id + hash` to distinguish replays from conflicts.
+const ADMIN_CREATE_CREDENTIALS_REDACTED: &str = "<redacted>";
+
+fn canonical_operation_value(operation: &HostOperation) -> anyhow::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(operation)?;
+    if matches!(&operation.operation, HostOperationBody::AdminCreate { .. }) {
+        let payload = value
+            .get_mut("operation")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| {
+                anyhow::anyhow!("host operation payload did not serialize as an object")
+            })?;
+        // The password is intentionally not part of the target journal's
+        // replay hash: hashing it would create an offline verifier. The email
+        // remains in this view as the non-secret operation identity.
+        payload.insert(
+            "password".to_owned(),
+            serde_json::Value::String(ADMIN_CREATE_CREDENTIALS_REDACTED.to_owned()),
+        );
+    }
+    Ok(value)
+}
+
+/// Canonical SHA-256 over the operation. AdminCreate uses a redacted
+/// credential view so the target journal cannot become a password verifier;
+/// all other operation kinds hash their complete wire value. The target-side
+/// journal (C07) uses `operation_id + hash` to distinguish replays from
+/// conflicts.
 pub fn canonical_operation_hash(operation: &HostOperation) -> anyhow::Result<String> {
-    Ok(hex_sha256(&canonical_bytes(operation)?))
+    Ok(hex_sha256(&canonical_bytes(&canonical_operation_value(
+        operation,
+    )?)?))
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -1862,8 +1880,7 @@ mod tests {
                 "state-mutate",
                 "control-operation",
                 "state-list",
-                "bootstrap-close",
-                "bootstrap-read",
+                "admin-create",
                 "runtime-logs",
                 "journal-read",
                 "backup-snapshot",
@@ -1996,8 +2013,6 @@ mod tests {
                 name: String::new(),
                 user: String::new(),
             },
-
-            fresh_bootstrap: true,
         };
         let mut broken_order: super::super::install_exec::InstallOrder =
             serde_json::from_slice(&serde_json::to_vec(&order)?)?;
@@ -2112,17 +2127,17 @@ mod tests {
         assert_eq!(parsed, control);
         assert_eq!(parsed.operation.kind(), "control-operation");
 
-        // bootstrap-close and bootstrap-read require a deployment binding and
-        // no revision expectation.
-        let close = HostOperation::bootstrap_close(Uuid::now_v7().to_string(), "deploy-alpha");
-        let parsed = parse_host_operation(&encode_host_operation(&close)?)?;
-        assert_eq!(parsed, close);
-        assert_eq!(parsed.operation.kind(), "bootstrap-close");
+        let password = SecretMaterial::try_new(b"correct horse battery staple".to_vec())?;
+        let admin = HostOperation::admin_create(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            "admin@example.com",
+            password,
+        );
+        let parsed = parse_host_operation(&encode_host_operation(&admin)?)?;
+        assert_eq!(parsed, admin);
+        assert_eq!(parsed.operation.kind(), "admin-create");
 
-        let read = HostOperation::bootstrap_read(Uuid::now_v7().to_string(), "deploy-alpha");
-        let parsed = parse_host_operation(&encode_host_operation(&read)?)?;
-        assert_eq!(parsed, read);
-        assert_eq!(parsed.operation.kind(), "bootstrap-read");
         Ok(())
     }
 
@@ -2525,19 +2540,6 @@ mod tests {
         };
         assert_eq!(code, HOST_ERR_OPERATION_INVALID);
 
-        let bootstrap_read = HostResult::completed(
-            Uuid::now_v7().to_string(),
-            HostCompletionBody::BootstrapRead {
-                material: FreshBootstrapMaterialView {
-                    install_operation_id: "018f0000-0000-7000-8000-000000000001".to_owned(),
-                    token: "A".repeat(64),
-                },
-            },
-        );
-        assert_eq!(
-            parse_host_result(&encode_host_result(&bootstrap_read)?)?,
-            bootstrap_read
-        );
         Ok(())
     }
 
@@ -2662,6 +2664,47 @@ mod tests {
 
         let other = ping_operation("other-nonce");
         assert_ne!(canonical_operation_hash(&other)?, direct);
+        Ok(())
+    }
+
+    #[test]
+    fn admin_create_hash_redacts_credentials() -> anyhow::Result<()> {
+        let operation_id = Uuid::now_v7().to_string();
+        let first = HostOperation::admin_create(
+            operation_id.clone(),
+            "deploy-alpha",
+            "admin@example.com",
+            SecretMaterial::try_new(b"first-secret".to_vec())?,
+        );
+        let second = HostOperation::admin_create(
+            operation_id,
+            "deploy-alpha",
+            "admin@example.com",
+            SecretMaterial::try_new(b"second-secret".to_vec())?,
+        );
+
+        assert_eq!(
+            canonical_operation_hash(&first)?,
+            canonical_operation_hash(&second)?,
+            "password changes must not change the admin-create journal hash"
+        );
+        let canonical = String::from_utf8(canonical_bytes(&canonical_operation_value(&first)?)?)?;
+        assert!(canonical.contains(ADMIN_CREATE_CREDENTIALS_REDACTED));
+        assert!(canonical.contains("admin@example.com"));
+        assert!(!canonical.contains("first-secret"));
+        assert!(!canonical.contains("second-secret"));
+
+        let different_email = HostOperation::admin_create(
+            first.operation_id.clone(),
+            "deploy-alpha",
+            "other@example.com",
+            SecretMaterial::try_new(b"first-secret".to_vec())?,
+        );
+        assert_ne!(
+            canonical_operation_hash(&first)?,
+            canonical_operation_hash(&different_email)?,
+            "the non-secret email remains part of the admin-create hash"
+        );
         Ok(())
     }
 

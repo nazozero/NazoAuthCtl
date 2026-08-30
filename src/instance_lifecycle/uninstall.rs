@@ -54,7 +54,7 @@ impl UninstallPlan {
             text.push_str(&format!("  - {id} ({kind}): {locator}\n"));
         }
         text.push_str(&format!(
-            "  - config file {}\n  - ctl state document + bootstrap material (journal retained)\n",
+            "  - config file {}\n  - ctl state document (journal retained)\n",
             self.config_reference
         ));
         if self.kept_external.is_empty() {

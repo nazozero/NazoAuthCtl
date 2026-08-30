@@ -9,12 +9,12 @@ use std::{io::IsTerminal as _, path::Path};
 use anyhow::{Context as _, bail};
 
 use crate::clean_install::{
-    CleanInstallContext, CleanInstallRequest, CurlInitialAdminTransport, CurlPublicProber,
-    LocalBootstrapMaterial, RemoteBootstrapMaterial, claim_initial_admin, verify_public,
+    AdminProvisionCredentials, CleanInstallContext, CleanInstallRequest, CurlPublicProber,
+    admin_provision_password_material, verify_public,
 };
 use crate::cli::{
-    BackupArgs, BackupCommand, Cli, Command, InstallArgs, InstanceCommand, InstanceSelector,
-    PolicyArgs, RecoverArgs, UpdateArgs,
+    AdminCommand, AdminCreateArgs, BackupArgs, BackupCommand, Cli, Command, InstallArgs,
+    InstanceCommand, InstanceSelector, PolicyArgs, RecoverArgs, UpdateArgs,
 };
 use crate::controller::recovery_journal::{self, CandidatePointer, RecoveryJournal, RecoveryPhase};
 use crate::controller::recovery_transport::RecoveryCeremonyTransport;
@@ -134,7 +134,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         // ---- final-model maintenance surface --------------------------------
-        Command::BootstrapAdmin(args) => run_bootstrap_admin(args, instance_flag),
+        Command::Admin(command) => run_admin(command, instance_flag),
         Command::Tls(command) => crate::tls::run(instance_flag, command, super::require_root),
         Command::RemoteExec => crate::target::remote_exec::run_stdio(),
         Command::SelfCheck(version) => super::self_update::controller_check(version.as_deref()),
@@ -1170,6 +1170,60 @@ fn run_verify(merged: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_admin(command: AdminCommand, global: Option<&str>) -> anyhow::Result<()> {
+    match command {
+        AdminCommand::Create(args) => run_admin_create(args, global),
+    }
+}
+
+/// Create one administrator through the target's deployment-root HostOperation.
+/// The target resolves runtime/config paths from its live DeploymentState and
+/// invokes only the fixed `nazoauth admin-provision` entry point.
+fn run_admin_create(args: AdminCreateArgs, global: Option<&str>) -> anyhow::Result<()> {
+    let merged = merge(&args.selector, global, "admin create")?;
+    let context = LifecycleContext::production()?;
+    let (record, _host, target, inspection) = crate::instance_lifecycle::resolve_live_instance(
+        &context,
+        merged.as_deref(),
+        "admin create",
+    )?;
+    let credentials = read_admin_credentials(args.credentials_stdin, "admin create")?;
+    let password = admin_provision_password_material(&credentials)?;
+    let operation_id = admin_operation_id();
+    let operation = crate::target::HostOperation::admin_create(
+        operation_id,
+        inspection.deployment_id.clone(),
+        credentials.email.clone(),
+        password,
+    );
+    let result = target.execute_host_operation(&operation)?;
+    match result.outcome {
+        crate::target::HostOutcome::Completed {
+            body: crate::target::HostCompletionBody::AdminCreated { receipt },
+        } => {
+            println!(
+                "administrator '{}' created for instance '{}' (user id: {})",
+                receipt.email, record.alias, receipt.user_id
+            );
+            Ok(())
+        }
+        crate::target::HostOutcome::Completed { .. } => {
+            bail!("admin create: target returned an unexpected completion")
+        }
+        crate::target::HostOutcome::Failed { code, detail } => {
+            bail!("admin create failed: {code}: {detail}")
+        }
+    }
+}
+
+/// One user invocation owns one operation identity. Transport retries reuse
+/// the constructed operation, while a later invocation must be able to retry
+/// after a corrected target failure. Database uniqueness and the provisioning
+/// receipt remain the authoritative administrator idempotency boundary.
+fn admin_operation_id() -> uuid::Uuid {
+    uuid::Uuid::now_v7()
+}
+
 fn run_update(args: UpdateArgs, global: Option<&str>) -> anyhow::Result<()> {
     let merged = merge(&args.selector, global, "update")?;
     let config_content = match &args.config_file {
@@ -1202,65 +1256,24 @@ fn read_config_file(path: &std::path::Path) -> anyhow::Result<String> {
         .with_context(|| format!("{} is not valid UTF-8", path.display()))
 }
 
-fn run_bootstrap_admin(
-    args: crate::cli::BootstrapAdminArgs,
-    global: Option<&str>,
-) -> anyhow::Result<()> {
-    let merged = merge(&args.selector, global, "bootstrap-admin")?;
-    let registry = RegistryStore::open_default()?;
-    let credentials = read_admin_credentials(args.credentials_stdin)?;
-    // P0-2: resolve the instance's HOST and pick the material source that
-    // owns its transport. Local hosts read the state root directly; SSH
-    // hosts drive inspect/bootstrap-close over the fixed stdio executor so
-    // the token only rides the encrypted channel.
-    let record = crate::fleet::resolve_instance(&registry, merged.as_deref(), "bootstrap-admin")?;
-    let host = registry
-        .host_by_id(record.host_id)?
-        .with_context(|| format!("instance '{}' references a missing host", record.alias))?;
-
-    let report = if host.transport == crate::registry::HostTransport::Local {
-        let material = LocalBootstrapMaterial::production()?;
-        claim_initial_admin(
-            &registry,
-            &material,
-            &CurlInitialAdminTransport,
-            merged.as_deref(),
-            credentials,
-        )?
-    } else {
-        let context = crate::clean_install::CleanInstallContext::production()?;
-        let target = (context.factory)(&host)?;
-        let material = RemoteBootstrapMaterial {
-            target: std::sync::Arc::new(std::sync::Mutex::new(target)),
-        };
-        claim_initial_admin(
-            &registry,
-            &material,
-            &CurlInitialAdminTransport,
-            merged.as_deref(),
-            credentials,
-        )?
-    };
-    println!("{report}");
-    Ok(())
-}
-
 fn read_admin_credentials(
     stdin_mode: bool,
-) -> anyhow::Result<crate::clean_install::AdminCredentials> {
+    command: &str,
+) -> anyhow::Result<AdminProvisionCredentials> {
     use zeroize::Zeroizing;
     if stdin_mode {
-        let mut line = String::new();
+        let mut line = Zeroizing::new(String::new());
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut line)
             .context("failed to read the credentials JSON from stdin")?;
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Raw {
             email: String,
             password: String,
         }
         let raw: Raw = serde_json::from_str(line.trim())
             .context("stdin credentials must be strict JSON with email and password")?;
-        return Ok(crate::clean_install::AdminCredentials {
+        return Ok(AdminProvisionCredentials {
             email: raw.email,
             password: Zeroizing::new(raw.password),
         });
@@ -1268,7 +1281,7 @@ fn read_admin_credentials(
     use std::io::Write as _;
     if !std::io::stdin().is_terminal() {
         bail!(
-            "bootstrap-admin requires --credentials-stdin in non-interactive mode; passwords are \
+            "{command} requires --credentials-stdin in non-interactive mode; passwords are \
              never accepted on argv"
         );
     }
@@ -1280,10 +1293,24 @@ fn read_admin_credentials(
         .context("failed to read administrator email")?;
     let password = rpassword::prompt_password("Administrator password: ")
         .context("failed to read administrator password")?;
-    Ok(crate::clean_install::AdminCredentials {
+    Ok(AdminProvisionCredentials {
         email: email.trim().to_owned(),
         password: Zeroizing::new(password),
     })
+}
+
+#[cfg(test)]
+mod admin_create_tests {
+    use super::admin_operation_id;
+
+    #[test]
+    fn each_user_invocation_gets_a_fresh_operation_id() {
+        let first = admin_operation_id();
+        let second = admin_operation_id();
+        assert_eq!(first.get_version_num(), 7);
+        assert_eq!(second.get_version_num(), 7);
+        assert_ne!(first, second);
+    }
 }
 
 #[cfg(test)]

@@ -13,10 +13,10 @@ use anyhow::{Context as _, bail};
 
 pub(crate) use help::help_topic;
 pub(crate) use types::{
-    AcmeCertificateInput, AcmeCommand, BackupArgs, BackupCommand, BindOptions, BootstrapAdminArgs,
-    Cli, Command, ControllerCommand, HelpTopic, HostCommand, InstallArgs, InstanceCommand,
-    InstanceSelector, PolicyArgs, RecoverArgs, TlsCertificateCheckInput, TlsCertificateInput,
-    TlsCertificateSource, TlsCommand, UpdateArgs,
+    AcmeCertificateInput, AcmeCommand, AdminCommand, AdminCreateArgs, BackupArgs, BackupCommand,
+    BindOptions, Cli, Command, ControllerCommand, HelpTopic, HostCommand, InstallArgs,
+    InstanceCommand, InstanceSelector, PolicyArgs, RecoverArgs, TlsCertificateCheckInput,
+    TlsCertificateInput, TlsCertificateSource, TlsCommand, UpdateArgs,
 };
 
 /// Consume the leading options which are shared by every command.

@@ -16,7 +16,7 @@ use common::{no_arguments, parse_version_option};
 use controller::parse_controller;
 use fleet::{parse_host, parse_instance};
 use surface::{
-    parse_backup, parse_bind, parse_bootstrap_admin_args, parse_install_args, parse_policy,
+    parse_admin, parse_backup, parse_bind, parse_install_args, parse_policy,
     parse_read_view_selector, parse_recover, parse_update_args,
 };
 use tls::parse_tls;
@@ -96,7 +96,7 @@ impl Cli {
                 Command::Uninstall { selector, yes }
             }
             // ---- final-model maintenance surface ---------------------------
-            "bootstrap-admin" => Command::BootstrapAdmin(parse_bootstrap_admin_args(values)?),
+            "admin" => Command::Admin(parse_admin(values)?),
             "tls" => Command::Tls(parse_tls(values)?),
             "remote" if values.first().is_some_and(|value| value == "exec") => {
                 values.remove(0);
@@ -153,12 +153,45 @@ fn parse_limited_selector(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::types::{AdminCommand, Command};
 
     #[test]
     fn verify_rejects_all_instead_of_ignoring_it() {
         let error = Cli::parse(["nazoauthctl", "verify", "--all"].map(str::to_owned))
             .expect_err("verify --all must not be silently narrowed");
         assert!(error.to_string().contains("does not accept --all"));
+    }
+
+    #[test]
+    fn admin_create_accepts_only_the_fixed_credentials_input_shape() {
+        let parsed = Cli::parse(
+            [
+                "nazoauthctl",
+                "admin",
+                "create",
+                "--instance",
+                "production",
+                "--credentials-stdin",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("admin create parses")
+        .expect("command");
+        assert!(matches!(
+            parsed.command,
+            Command::Admin(AdminCommand::Create(args))
+                if args.selector.named.as_deref() == Some("production")
+                    && args.credentials_stdin
+        ));
+        assert!(
+            Cli::parse(
+                ["nazoauthctl", "admin", "delete"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .is_err()
+        );
     }
 
     #[test]

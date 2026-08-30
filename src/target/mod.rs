@@ -11,9 +11,9 @@
 //! from [`wire`] through system OpenSSH into the fixed `remote exec` helper
 //! ([`remote_exec`], task C04). No HTTP/Kubernetes/agent targets exist.
 
+pub(crate) mod admin_exec;
 pub(crate) mod backup;
 pub(crate) mod backup_exec;
-pub(crate) mod bootstrap_authority;
 pub(crate) mod control_exec;
 pub mod deployment_state;
 pub(crate) mod install_exec;
@@ -39,10 +39,6 @@ use self::wire::{local_hello_for_target, sanitize};
 pub use crate::model::{DatabaseRestore, ReleaseRollbackPolicy};
 pub use backup::{BackupProjection, RestoreTestReceipt, SnapshotManifest, SnapshotProjection};
 pub use backup_exec::{BACKUP_EXECUTION_FAILED, RESTORE_TEST_FAILED};
-pub use bootstrap_authority::{
-    BOOTSTRAP_CLOSED, CONTEXT_FILE_NAME, FRESH_BOOTSTRAP_SCHEMA, FreshBootstrapContext,
-    FreshBootstrapMaterialView, SERVER_TOKEN_RELATIVE_PATH,
-};
 pub use control_exec::{
     CONTROL_EXECUTION_UNAVAILABLE, CONTROL_OUTCOME_UNKNOWN, CONTROL_TARGET_DRIFT,
 };
@@ -64,9 +60,9 @@ pub use ssh::SshTarget;
 pub use update_exec::{ACTIVATION_FAILED, ROLLBACK_ARTIFACT_MISSING};
 pub use wire::SecretMaterial;
 pub use wire::{
-    HELLO_PRODUCT, HOST_ERR_OPERATION_INVALID, HOST_OPERATION_KINDS, HOST_PROTOCOL_SCHEMA,
-    HostCompletionBody, HostOperation, HostOperationBody, HostOutcome, HostResult,
-    InstanceInspection, MAX_CONTROL_CHANGE_SET_BYTES, MAX_HOST_OPERATION_BYTES,
+    AdminProvisionReceipt, HELLO_PRODUCT, HOST_ERR_OPERATION_INVALID, HOST_OPERATION_KINDS,
+    HOST_PROTOCOL_SCHEMA, HostCompletionBody, HostOperation, HostOperationBody, HostOutcome,
+    HostResult, InstanceInspection, MAX_CONTROL_CHANGE_SET_BYTES, MAX_HOST_OPERATION_BYTES,
     MAX_HOST_RESULT_BYTES, MessageRejection, RejectionCode, RemoteHello, RuntimeInstanceIdentity,
     canonical_operation_hash, encode_host_operation, encode_host_result, local_hello,
     parse_host_operation, parse_host_result, verify_remote_hello,
@@ -261,6 +257,8 @@ pub struct LocalTarget {
     executor: Arc<dyn install_exec::InstallExecutor>,
     /// Delivered-ControlOperation seam (G-wave decision 1).
     control: Arc<dyn control_exec::ControlOperationExecutor>,
+    /// Target-side administrator provisioning seam.
+    admin: Arc<dyn admin_exec::AdminProvisionExecutor>,
     /// Update/rollback order seam (G03/G04).
     lifecycle: Arc<dyn update_exec::LifecycleExecutor>,
     /// Uninstall deletion seam (G06).
@@ -274,6 +272,7 @@ impl LocalTarget {
             state_root: target_state_root()?,
             executor: Arc::new(install_exec::HostInstallExecutor),
             control: Arc::new(control_exec::HostControlOperator),
+            admin: Arc::new(admin_exec::HostAdminProvisioner),
             lifecycle: Arc::new(update_exec::HostLifecycleExecutor),
             deletion: Arc::new(uninstall_exec::HostDeletionExecutor),
         })
@@ -285,6 +284,7 @@ impl LocalTarget {
             state_root: root.into(),
             executor: Arc::new(install_exec::HostInstallExecutor),
             control: Arc::new(control_exec::HostControlOperator),
+            admin: Arc::new(admin_exec::HostAdminProvisioner),
             lifecycle: Arc::new(update_exec::HostLifecycleExecutor),
             deletion: Arc::new(uninstall_exec::HostDeletionExecutor),
         }
@@ -307,6 +307,17 @@ impl LocalTarget {
         control: Arc<dyn control_exec::ControlOperationExecutor>,
     ) -> Self {
         self.control = control;
+        self
+    }
+
+    /// Test seam: substitute administrator provisioning without spawning a
+    /// runtime one-shot process.
+    #[cfg(test)]
+    pub(crate) fn with_admin_provision_executor(
+        mut self,
+        admin: Arc<dyn admin_exec::AdminProvisionExecutor>,
+    ) -> Self {
+        self.admin = admin;
         self
     }
 
@@ -334,6 +345,7 @@ impl LocalTarget {
         Executors {
             install: &self.executor,
             control: &self.control,
+            admin: &self.admin,
             lifecycle: &self.lifecycle,
             deletion: &self.deletion,
         }
@@ -397,6 +409,7 @@ impl LocalTarget {
 pub(crate) struct Executors<'a> {
     pub(crate) install: &'a Arc<dyn install_exec::InstallExecutor>,
     pub(crate) control: &'a Arc<dyn control_exec::ControlOperationExecutor>,
+    pub(crate) admin: &'a Arc<dyn admin_exec::AdminProvisionExecutor>,
     pub(crate) lifecycle: &'a Arc<dyn update_exec::LifecycleExecutor>,
     pub(crate) deletion: &'a Arc<dyn uninstall_exec::DeletionExecutor>,
 }
@@ -437,10 +450,14 @@ fn dispatch_validated_host_operation(
             .unwrap_or_else(|failure| state_failure(operation, &failure)),
         HostOperationBody::StateList {} => answer_state_list(operation, store)
             .unwrap_or_else(|failure| state_failure(operation, &failure)),
-        HostOperationBody::BootstrapClose {} => answer_bootstrap_close(operation, store)
-            .unwrap_or_else(|failure| state_failure(operation, &failure)),
-        HostOperationBody::BootstrapRead {} => answer_bootstrap_read(operation, store)
-            .unwrap_or_else(|failure| state_failure(operation, &failure)),
+        HostOperationBody::AdminCreate { email, password } => answer_admin_create(
+            operation,
+            store,
+            email,
+            password.as_bytes(),
+            executors.admin,
+        )
+        .unwrap_or_else(|failure| state_failure(operation, &failure)),
         HostOperationBody::RuntimeLogs { limit } => answer_runtime_logs(operation, store, *limit)
             .unwrap_or_else(|failure| state_failure(operation, &failure)),
         HostOperationBody::JournalRead { limit } => answer_journal_read(operation, store, *limit)
@@ -776,7 +793,6 @@ fn dispatch_validated_host_operation(
                             return state_failure(operation, &failure);
                         }
                         let job = install_exec::InstallJob {
-                            operation_id: &operation.operation_id,
                             deployment_id: &deployment_id,
                             runtime,
                             config_reference,
@@ -1226,8 +1242,6 @@ fn answer_uninstall(
     };
     let deployment_id = operation.deployment_id.clone().unwrap_or_default();
     let state = store.load_existing(&deployment_id)?;
-    let scope_dir = store.scope_dir(&deployment_id)?;
-    ensure_scope_dir(&scope_dir)?;
     let job = uninstall_exec::DeletionJob {
         operation_id: &operation.operation_id,
         deployment_id: &deployment_id,
@@ -1236,7 +1250,6 @@ fn answer_uninstall(
         config_reference: &state.config.reference.clone(),
         declared: &state.resources,
         expected_revision,
-        scope_dir: &scope_dir,
         store,
     };
     deletion.execute_deletion(&job)?;
@@ -1274,6 +1287,61 @@ fn answer_control_operation(
     Ok(HostResult::completed(
         &operation.operation_id,
         HostCompletionBody::ControlOperationExecuted { result },
+    ))
+}
+
+/// Create an administrator through the target deployment's fixed local
+/// provisioner. The live DeploymentState supplies every runtime/config/path
+/// fact; the HostOperation contributes the non-secret email and redacted
+/// password material.
+fn answer_admin_create(
+    operation: &HostOperation,
+    store: &TargetStateStore,
+    email: &str,
+    password: &[u8],
+    admin: &Arc<dyn admin_exec::AdminProvisionExecutor>,
+) -> Result<HostResult, Failure> {
+    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
+    let state = store.load_existing(&deployment_id)?;
+    let current_artifact = state.artifact.current.clone().ok_or_else(|| {
+        Failure::new(
+            CONTROL_TARGET_DRIFT,
+            "the deployment records no current artifact reference",
+        )
+    })?;
+    let data_root = state
+        .resources
+        .iter()
+        .find(|resource| resource.resource_id == "app-data" && resource.kind == "directory")
+        .map(|resource| resource.locator.clone())
+        .ok_or_else(|| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                "deployment state has no app-data directory resource",
+            )
+        })?;
+    let scope_dir = store.scope_dir(&deployment_id)?;
+    let job = admin_exec::AdminProvisionJob {
+        operation_id: &operation.operation_id,
+        deployment_id: &deployment_id,
+        artifact_reference: &current_artifact,
+        runtime_kind: state.runtime.kind,
+        runtime_object: &state.runtime.object,
+        config_reference: &state.config.reference,
+        data_root: &data_root,
+        scope_dir: &scope_dir,
+        email,
+        password,
+    };
+    let receipt = admin.execute(&job)?;
+    admin_exec::validate_admin_provision_receipt(
+        &receipt,
+        &operation.operation_id,
+        &deployment_id,
+    )?;
+    Ok(HostResult::completed(
+        &operation.operation_id,
+        HostCompletionBody::AdminCreated { receipt },
     ))
 }
 
@@ -1601,61 +1669,9 @@ fn answer_inspect(
     ))
 }
 
-/// Read the fresh-install bootstrap capability for one deployment. The
-/// material view is surfaced ONLY while the capability is open and the live
-/// state still matches its install journal binding (goal plan 07 G-A
-/// decision). Every other state — closed, consumed, drifted — fails closed.
-/// Separated from state-inspect so bootstrap material never travels in the
-/// generic inspection path.
-fn answer_bootstrap_read(
-    operation: &HostOperation,
-    store: &TargetStateStore,
-) -> Result<HostResult, Failure> {
-    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
-    let state = store.load_existing(&deployment_id)?;
-    let scope = store
-        .scope_dir(&deployment_id)
-        .map_err(|failure| Failure::new(failure.code, failure.detail))?;
-    let material = bootstrap_authority::surface_material_view(&scope, &state).ok_or_else(|| {
-        Failure::new(
-            crate::target::HOST_ERR_OPERATION_INVALID,
-            "no fresh-install bootstrap capability exists for this deployment".to_owned(),
-        )
-    })?;
-    Ok(HostResult::completed(
-        &operation.operation_id,
-        HostCompletionBody::BootstrapRead { material },
-    ))
-}
-
-/// P0-2: delete one fresh-install bootstrap token and capability context. The
-/// controller calls this only after the server's successful claim receipt;
-/// keeping the context until then preserves response-loss replay.
-fn answer_bootstrap_close(
-    operation: &HostOperation,
-    store: &TargetStateStore,
-) -> Result<HostResult, Failure> {
-    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
-    // Load-first proves the deployment exists; deleting an already-absent
-    // capability stays idempotent (the goal is "closed", however reached).
-    let _state = store.load_existing(&deployment_id)?;
-    let scope = store
-        .scope_dir(&deployment_id)
-        .map_err(|failure| Failure::new(failure.code, failure.detail))?;
-    bootstrap_authority::delete_material(&scope).map_err(|error| {
-        Failure::new(crate::target::HOST_ERR_OPERATION_INVALID, error.to_string())
-    })?;
-    Ok(HostResult::completed(
-        &operation.operation_id,
-        HostCompletionBody::BootstrapClosed {},
-    ))
-}
-
 /// Answer one G05 discovery sweep: every DeploymentState on this target,
 /// projected through the same inspection shape as state-inspect and sorted by
-/// deployment id. Strictly read-only — no journal line, no state write, and
-/// never any fresh-install bootstrap material (that surfaces only through the
-/// dedicated bootstrap-read kind).
+/// deployment id. Strictly read-only — no journal line and no state write.
 fn answer_state_list(
     operation: &HostOperation,
     store: &TargetStateStore,
@@ -1759,6 +1775,7 @@ impl ExecutionTarget for LocalTarget {
                 | HostOperationBody::BackupOffHostRecord { .. }
                 | HostOperationBody::BackupTransferCleanup { .. }
                 | HostOperationBody::ControlOperation { .. }
+                | HostOperationBody::AdminCreate { .. }
         ) {
             let journal = TargetJournal::open(&self.state_root)?;
             return self.execute_journaled_validated(operation, &journal);
@@ -2350,6 +2367,101 @@ mod tests {
                 result: None,
             })
         }
+    }
+
+    struct ScriptedAdmin {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl admin_exec::AdminProvisionExecutor for ScriptedAdmin {
+        fn execute(
+            &self,
+            job: &admin_exec::AdminProvisionJob<'_>,
+        ) -> Result<AdminProvisionReceipt, Failure> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(job.deployment_id, "deploy-alpha");
+            assert_eq!(job.email, "admin@example.com");
+            assert!(job.password.ends_with(b"-secret"));
+            Ok(AdminProvisionReceipt {
+                schema: 1,
+                operation_id: job.operation_id.to_owned(),
+                deployment_id: job.deployment_id.to_owned(),
+                user_id: "019d0000-0000-7000-8000-000000000002"
+                    .parse()
+                    .expect("valid test user id"),
+                email: "admin@example.com".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn admin_create_is_instance_bound_journaled_and_replayable() -> anyhow::Result<()> {
+        let (_temp, base_target, journal) = temp_target()?;
+        seed_sample_deployment(&journal, "deploy-alpha")?;
+        let scripted = Arc::new(ScriptedAdmin {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let target = base_target.with_admin_provision_executor(scripted.clone());
+        let operation_id = Uuid::now_v7().to_string();
+        let operation = HostOperation::admin_create(
+            operation_id.clone(),
+            "deploy-alpha",
+            "admin@example.com",
+            SecretMaterial::try_new(b"first-secret".to_vec())?,
+        );
+
+        let first = target.execute_host_operation(&operation)?;
+        assert!(matches!(
+            &first.outcome,
+            HostOutcome::Completed {
+                body: HostCompletionBody::AdminCreated { .. }
+            }
+        ));
+        let second = target.execute_host_operation(&operation)?;
+        assert_eq!(
+            first, second,
+            "same operation id replays the stored receipt"
+        );
+        assert_eq!(
+            scripted.calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "journal replay must not provision twice"
+        );
+
+        let retry = HostOperation::admin_create(
+            operation_id,
+            "deploy-alpha",
+            "admin@example.com",
+            SecretMaterial::try_new(b"second-secret".to_vec())?,
+        );
+        assert_eq!(
+            crate::target::canonical_operation_hash(&operation)?,
+            crate::target::canonical_operation_hash(&retry)?,
+            "password changes must preserve the admin-create journal hash"
+        );
+        assert_eq!(
+            target.execute_host_operation(&retry)?,
+            first,
+            "same email retry replays the existing journal result"
+        );
+        assert_eq!(
+            scripted.calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a password-only retry must not provision twice"
+        );
+
+        let journal_text = std::fs::read_to_string(
+            journal
+                .root()
+                .join("deployments/deploy-alpha/operations.jsonl"),
+        )?;
+        assert!(journal_text.contains("admin-create"), "{journal_text}");
+        assert!(
+            !journal_text.contains("first-secret") && !journal_text.contains("second-secret"),
+            "credential bytes must not be persisted in the journal"
+        );
+        Ok(())
     }
 
     const CONTROL_JWS_OP_ID: &str = "018f0000-0000-7000-8000-00000000c001";

@@ -15,12 +15,11 @@
 //!
 //! Completion removes the state document (the operation journal survives so
 //! retries replay the stored terminal result), deletes the config file and
-//! fresh-bootstrap material, and leaves external/shared resources, sibling
-//! deployments, and host-level facts untouched.
+//! and leaves external/shared resources, sibling deployments, and host-level
+//! facts untouched.
 
 use std::path::Path;
 
-use super::bootstrap_authority;
 use super::deployment_state::{Failure, Resource, TargetStateStore};
 use super::wire::{HOST_ERR_OPERATION_INVALID, sanitize};
 use crate::filesystem;
@@ -35,7 +34,6 @@ pub(crate) struct DeletionJob<'a> {
     /// Live resources from the target-owned DeploymentState.
     pub declared: &'a [Resource],
     pub expected_revision: u64,
-    pub scope_dir: &'a Path,
     pub store: &'a TargetStateStore,
 }
 
@@ -163,12 +161,7 @@ impl HostDeletionExecutor {
             })?;
         }
 
-        // 4. Fresh-install bootstrap material, whatever its state.
-        bootstrap_authority::delete_material(job.scope_dir).map_err(|error| {
-            Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
-        })?;
-
-        // 5. Drop the state document last; the operation journal survives so
+        // 4. Drop the state document last; the operation journal survives so
         // a retried uninstall replays instead of re-executing.
         job.store
             .remove_deployment(job.deployment_id, job.expected_revision, job.operation_id)?;

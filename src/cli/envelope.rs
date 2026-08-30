@@ -78,6 +78,7 @@ fn next_command(code: &str) -> Option<&'static str> {
         error_codes::ADMIN_ACCESS_REQUIRED => {
             "provide --admin-access-file from a current admin session; then retry"
         }
+        error_codes::ADMIN_EMAIL_CONFLICT => "use a different administrator email, then retry",
         error_codes::OPERATION_ID_CONFLICT => {
             "inspect nazoauthctl operation --instance <alias>, then resume with the same command"
         }

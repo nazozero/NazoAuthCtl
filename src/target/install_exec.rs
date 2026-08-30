@@ -3,9 +3,9 @@
 //! A [`HostOperation`] of kind `state-mutate` whose [`Bootstrap`] mutation
 //! carries an [`InstallOrder`] makes the target perform the complete fresh
 //! install inside the one journaled operation: verify the official artifact,
-//! write the configuration atomically, provision target-local secrets and the
-//! fresh-install bootstrap capability, start the runtime, confirm it serves
-//! exactly the verified artifact, and probe local health. Only then does the
+//! write the configuration atomically, provision target-local secrets, start
+//! the runtime, confirm it serves exactly the verified artifact, and probe
+//! local health. Only then does the
 //! dispatcher commit the DeploymentState as `local healthy / control unbound`.
 //!
 //! Artifact transfer decision (recorded per the task brief): verified bytes
@@ -39,7 +39,6 @@ use crate::{
 };
 
 use super::{
-    bootstrap_authority,
     deployment_state::{Failure, INSTALL_FAILED, RuntimeSurface},
     wire::{HOST_ERR_OPERATION_INVALID, InstanceInspection, sanitize},
 };
@@ -197,9 +196,6 @@ pub struct InstallOrder {
     pub secrets: Vec<PlannedSecret>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_data_import: Option<CurrentDataImport>,
-    /// G02 hook: provision the single-use initial-admin bootstrap capability
-    /// bound to this exact install operation id.
-    pub fresh_bootstrap: bool,
     /// External PostgreSQL endpoint facts supplied by the operator (G01 item
     /// 3: real external facts are the only install inputs). Credentials live
     /// in the matching planned secret entries, not in this public endpoint.
@@ -678,13 +674,12 @@ fn copy_import_file(source: &Path, destination: &Path, label: &str) -> Result<()
 /// Everything the executor needs besides the order itself. Built by dispatch
 /// from the accepted operation; never serialized.
 pub(crate) struct InstallJob<'a> {
-    pub operation_id: &'a str,
     pub deployment_id: &'a str,
     /// The single validated runtime fact source from the Bootstrap surface.
     pub runtime: &'a RuntimeSurface,
     pub config_reference: &'a str,
-    /// `<state root>/deployments/<deployment id>/` — where the fresh-install
-    /// bootstrap context and token live beside the journal.
+    /// `<state root>/deployments/<deployment id>/` — the deployment scope
+    /// containing its journal and config-revision marker.
     pub scope_dir: &'a Path,
     pub order: &'a InstallOrder,
 }
@@ -715,8 +710,8 @@ pub(crate) trait InstallExecutor: Send + Sync {
 }
 
 /// Production executor backed by the real adapters: the H01/H02 official
-/// verification pipeline, the runtime backend trait, the shared filesystem
-/// primitives, and the fresh-bootstrap authority.
+/// verification pipeline, the runtime backend trait, and the shared
+/// filesystem primitives.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HostInstallExecutor;
 
@@ -760,7 +755,6 @@ pub(crate) struct PerformedSteps {
     pub(crate) wrote_config: bool,
     pub(crate) wrote_config_marker: bool,
     pub(crate) generated_secrets: Vec<String>,
-    pub(crate) provisioned_bootstrap: bool,
     pub(crate) installed_runtime: bool,
     pub(crate) started_runtime: bool,
     pub(crate) created_directories: Vec<PathBuf>,
@@ -867,8 +861,6 @@ impl HostInstallExecutor {
             None,
             job.order.runtime_root.as_deref(),
         )?;
-        let subject_digest = verified.digest.clone();
-
         for directory in &managed_directories {
             prepare_owned_directory(directory, job.deployment_id, performed)?;
         }
@@ -1024,18 +1016,7 @@ impl HostInstallExecutor {
             set_runtime_identity_directory_data(&data_root, rootless_podman)?;
         }
 
-        // 4. Fresh-install application setup (G02 hook): the install-binding
-        // capability record. The bootstrap token has exactly one authority —
-        // NazoAuth itself generates it inside DATA_DIR at startup; nothing is
-        // provisioned or mounted here.
-        if job.order.fresh_bootstrap {
-            bootstrap_authority::provision(job.scope_dir, job, &subject_digest).map_err(
-                |error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())),
-            )?;
-            performed.provisioned_bootstrap = true;
-        }
-
-        // 5. Write the operator's config-revision marker BEFORE the runtime
+        // 4. Write the operator's config-revision marker BEFORE the runtime
         // starts: the container backend bind-mounts this exact file, and a
         // missing mount source fails the run with exit 125 (E04 admission
         // step 5 reads it back through the mount).
@@ -1069,7 +1050,7 @@ impl HostInstallExecutor {
         probe_local_health(job.runtime.loopback_port)?;
 
         Ok(InstallFacts {
-            artifact_reference: format!("sha256:{subject_digest}"),
+            artifact_reference: format!("sha256:{}", verified.digest),
             release: verified.release,
             rollback_policy: verified.rollback_policy,
         })
@@ -1773,11 +1754,6 @@ pub(crate) fn rollback(job: &InstallJob<'_>, performed: &PerformedSteps) -> Resu
         if let Err(error) = backend.remove(&job.runtime.object) {
             errors.push(format!("removing runtime failed: {error}"));
         }
-    }
-    if performed.provisioned_bootstrap
-        && let Err(error) = bootstrap_authority::delete_material(job.scope_dir)
-    {
-        errors.push(format!("removing bootstrap material failed: {error}"));
     }
     for path in &performed.generated_secrets {
         if let Err(error) = filesystem::remove_file_durable(Path::new(path)) {

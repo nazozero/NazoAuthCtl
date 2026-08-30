@@ -99,7 +99,7 @@ fn command_action(command: &cli::Command) -> &'static str {
         cli::Command::Policy(_) => "policy",
         cli::Command::Recover(_) => "recover",
         cli::Command::Uninstall { .. } => "uninstall",
-        cli::Command::BootstrapAdmin(_) => "bootstrap-admin",
+        cli::Command::Admin(_) => "admin",
         cli::Command::Tls(_) => "tls",
         cli::Command::RemoteExec => "remote exec",
         cli::Command::SelfCheck(_) => "self check",
@@ -160,7 +160,7 @@ Selectors:
 
 Maintenance:
   self check|update|rollback   Update nazoauthctl itself (signed releases)
-  bootstrap-admin              Claim the fresh-install initial administrator
+  admin create                 Create an administrator through the deployment root
   tls certificate|acme ...     Deployment-owned TLS material via the
                                external file-provider contract
   remote exec                  Internal stdio executor used over OpenSSH
@@ -236,7 +236,7 @@ runtime/lifecycle PostgreSQL roles and Valkey credentials are operator-provided 
 invents a credential the external system does not know; password files are
 read once and never logged. No backups, no public checks, no recovery media.
 Next steps after install:
-  nazoauthctl bootstrap-admin --instance ALIAS
+  nazoauthctl admin create --instance ALIAS
   nazoauthctl bind --instance ALIAS --label NAME --output-secret-file PATH
   nazoauthctl verify --instance ALIAS"
         }
@@ -280,14 +280,8 @@ provider validate/reload pair, independent public verification, and a committed
 receipt bound to the declaration revision. `recover` restores the exact previous
 or committed generation; nothing else deletes provider material."
         }
-        cli::HelpTopic::BootstrapAdmin => {
-            "Usage:
-  nazoauthctl bootstrap-admin [--instance SELECTOR] [--credentials-stdin]
-
-Creates the first administrator through the fresh-install authority while it
-is still open. Interactive mode prompts for email and password without echo;
-non-interactive mode accepts strict JSON on stdin. The one-time capability is
-closed permanently on first success."
+        cli::HelpTopic::Admin => {
+            "Usage:\n  nazoauthctl admin create [--instance SELECTOR] [--credentials-stdin]\n\nCreates an administrator through the target deployment's fixed local\nprovisioner. Credentials are supplied interactively or as strict JSON on\nstdin; they never enter argv, logs, or persistent ctl state. Each invocation\nis journaled as one target operation; rerun the command after a known failure."
         }
     }
 }

@@ -56,6 +56,10 @@ pub const CONTROLLER_SLOT_LIMIT: &str = "CONTROLLER_SLOT_LIMIT";
 /// session (and the server may additionally require fresh MFA).
 pub const ADMIN_ACCESS_REQUIRED: &str = "ADMIN_ACCESS_REQUIRED";
 
+/// The requested administrator email already exists in the deployment's
+/// database; retrying the same identity cannot create another account.
+pub const ADMIN_EMAIL_CONFLICT: &str = "ADMIN_EMAIL_CONFLICT";
+
 /// The same operation id arrived with a different canonical request hash; the
 /// original intent is authoritative and must never be overwritten.
 pub const OPERATION_ID_CONFLICT: &str = "OPERATION_ID_CONFLICT";

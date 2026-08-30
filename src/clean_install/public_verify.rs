@@ -153,7 +153,7 @@ pub(crate) fn verify_public(prober: &dyn PublicProber, issuer: &str) -> PublicVe
 }
 
 /// Production prober: bounded curl for both checks, matching the transport
-/// precedent of the bootstrap claim. A TLS/transport failure surfaces as a
+/// precedent of administrator provisioning. A TLS/transport failure surfaces as a
 /// nonzero curl exit; any HTTP answer counts for the handshake half because
 /// this check owns reachability, not application semantics.
 pub(crate) struct CurlPublicProber;

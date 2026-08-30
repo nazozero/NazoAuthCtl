@@ -635,9 +635,9 @@ impl TargetStateStore {
         &self.root
     }
 
-    /// The per-deployment scope directory (state document + journal +
-    /// fresh-install bootstrap material). Path construction stays inside the
-    /// target modules.
+    /// The per-deployment scope directory (state document, journal, and
+    /// deployment-owned markers). Path construction stays inside the target
+    /// modules.
     pub(crate) fn scope_dir(&self, deployment_id: &str) -> Result<PathBuf, Failure> {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))

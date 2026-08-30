@@ -1,6 +1,6 @@
 //! Token parsers for the instance-scoped surface commands of the final
 //! 18-command model (goal plan 09 §1/§2, I01/I02): bind, install, the
-//! read-only views, update, backup, and bootstrap-admin.
+//! read-only views, update, and backup.
 //!
 //! Every parser here shares two rules:
 //!
@@ -16,8 +16,8 @@ use anyhow::{Context as _, bail};
 use crate::runtime_backend::RuntimeBackendKind;
 
 use super::super::types::{
-    BackupArgs, BackupCommand, BindOptions, BootstrapAdminArgs, InstallArgs, InstanceSelector,
-    PolicyArgs, RecoverArgs, UpdateArgs,
+    AdminCommand, AdminCreateArgs, BackupArgs, BackupCommand, BindOptions, InstallArgs,
+    InstanceSelector, PolicyArgs, RecoverArgs, UpdateArgs,
 };
 use super::common::validate_version;
 use super::fleet::{checked_name, parse_options, selector_parts};
@@ -456,18 +456,22 @@ pub(super) fn parse_recover(values: Vec<String>) -> anyhow::Result<RecoverArgs> 
     })
 }
 
-/// `nazoauthctl bootstrap-admin [--instance SELECTOR] [--credentials-stdin]`
-pub(super) fn parse_bootstrap_admin_args(
-    values: Vec<String>,
-) -> anyhow::Result<BootstrapAdminArgs> {
-    let parts = selector_parts(&values, &[], &["--credentials-stdin"], "bootstrap-admin")?;
-    Ok(BootstrapAdminArgs {
+/// `nazoauthctl admin create [--instance SELECTOR] [--credentials-stdin]`
+pub(super) fn parse_admin(values: Vec<String>) -> anyhow::Result<AdminCommand> {
+    let (subcommand, rest) = values
+        .split_first()
+        .with_context(|| "expected admin create")?;
+    if *subcommand != "create" {
+        bail!("unknown admin subcommand '{subcommand}'");
+    }
+    let parts = selector_parts(rest, &[], &["--credentials-stdin"], "admin create")?;
+    Ok(AdminCommand::Create(AdminCreateArgs {
         selector: InstanceSelector {
             positional: parts.positional,
             named: parts.named,
         },
         credentials_stdin: parts.flags.contains("--credentials-stdin"),
-    })
+    }))
 }
 
 #[cfg(test)]

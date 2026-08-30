@@ -18,7 +18,7 @@ pub(crate) fn help_topic(args: &[String]) -> Option<HelpTopic> {
         Some("update" | "rollback" | "uninstall" | "verify") => HelpTopic::Update,
         Some("tls") => HelpTopic::Tls,
         Some("self") => HelpTopic::SelfUpdate,
-        Some("bootstrap-admin") => HelpTopic::BootstrapAdmin,
+        Some("admin") => HelpTopic::Admin,
         _ => HelpTopic::TopLevel,
     })
 }

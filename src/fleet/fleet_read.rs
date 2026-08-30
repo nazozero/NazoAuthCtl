@@ -675,10 +675,6 @@ pub(crate) fn stable_code(rendered: &str) -> String {
     const ORDERED: [(&str, &str); 25] = [
         (error_codes::INPUT_INVALID, error_codes::INPUT_INVALID),
         (
-            crate::target::BOOTSTRAP_CLOSED,
-            crate::target::BOOTSTRAP_CLOSED,
-        ),
-        (
             error_codes::REMOTE_HELPER_MISMATCH,
             error_codes::REMOTE_HELPER_MISMATCH,
         ),
@@ -763,6 +759,10 @@ pub(crate) fn stable_code(rendered: &str) -> String {
         (
             error_codes::ADMIN_ACCESS_REQUIRED,
             error_codes::ADMIN_ACCESS_REQUIRED,
+        ),
+        (
+            error_codes::ADMIN_EMAIL_CONFLICT,
+            error_codes::ADMIN_EMAIL_CONFLICT,
         ),
     ];
     for (token, code) in ORDERED {

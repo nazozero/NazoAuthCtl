@@ -1,8 +1,8 @@
 //! Clean install: the shortest supported deployment path (goal plan 07 §1-§3,
-//! tasks G01/G02/G08).
+//! tasks G01/G08).
 //!
 //! One command resolves the host, builds a single typed HostOperation, lets
-//! the target execute and journal the whole fresh install, commits the target
+//! the target execute and journal the whole install, commits the target
 //! DeploymentState as `local healthy / control unbound / public unknown`, and
 //! writes the InstanceRecord through the B04 register evidence path. No
 //! recovery device, provider evidence, rehearsal, backup, or public gate
@@ -10,8 +10,8 @@
 //!
 //! Module map:
 //!
-//! * [`initial_admin`] — G02: the closed fresh-install bootstrap authority on
-//!   the control side: claim flow, closure, rejection semantics.
+//! * [`admin`] — deployment-root administrator provisioning credentials and
+//!   validation shared by the CLI and target operation builder.
 //! * [`public_verify`] — G08: the explicit, separate public verification
 //!   report. It consumes no lifecycle state and can never roll one back.
 //!
@@ -19,16 +19,13 @@
 //! [`ExecutionTarget`], so local and SSH installs share this exact code and
 //! this exact test suite.
 
-mod initial_admin;
+mod admin;
 mod install_journal;
 mod public_verify;
 
 // CLI-surface re-exports (I wave): the dispatcher consumes these without the
 // private module paths.
-pub(crate) use initial_admin::{
-    AdminCredentials, CurlInitialAdminTransport, LocalBootstrapMaterial, RemoteBootstrapMaterial,
-    claim_initial_admin,
-};
+pub(crate) use admin::{AdminProvisionCredentials, admin_provision_password_material};
 pub(crate) use public_verify::{CurlPublicProber, verify_public};
 
 use anyhow::{Context as _, bail};
@@ -468,7 +465,6 @@ fn build_install_order(
         _ => bail!("current data import requires both target-local source paths"),
     };
 
-    let fresh_bootstrap = current_data_import.is_none();
     let order =
         InstallOrder {
             artifact: OfficialArtifactRef {
@@ -512,9 +508,6 @@ fn build_install_order(
             database_runtime_endpoint: request.database_runtime_endpoint.clone(),
             database_lifecycle_endpoint: request.database_lifecycle_endpoint.clone(),
             valkey_endpoint: request.valkey_endpoint.clone(),
-            // An import carries an existing NazoAuth data/database state, so
-            // the fresh-install bootstrap authority must not be created.
-            fresh_bootstrap,
         };
     Ok(order)
 }
@@ -760,7 +753,7 @@ fn declare_resources(
 }
 
 /// The G01 entry point. Returns the full human report including the precise
-/// next-step instructions (bootstrap/MFA, bind, verify).
+/// next-step instructions (admin create/MFA, bind, verify).
 ///
 /// Delivery boundary: the I-wave wires this into the CLI parser; until then
 /// the use case and its shared test suite are the contract.
@@ -854,11 +847,7 @@ pub(crate) fn run_clean_install(
             bail!("prepared install registry record drifted from target DeploymentState");
         }
         lease.clear()?;
-        return Ok(render_success_report(
-            &record.alias,
-            &inspection,
-            request.import_data_root.is_none(),
-        ));
+        return Ok(render_success_report(&record.alias, &inspection));
     }
 
     if let Some(alias) = request.instance_alias.as_deref()
@@ -917,11 +906,7 @@ pub(crate) fn run_clean_install(
     lease.clear()?;
 
     // 7. Report committed facts plus the exact next steps.
-    Ok(render_success_report(
-        &record.alias,
-        inspection,
-        request.import_data_root.is_none(),
-    ))
+    Ok(render_success_report(&record.alias, inspection))
 }
 
 fn interpret_result(result: &HostResult) -> anyhow::Result<&crate::target::InstanceInspection> {
@@ -941,39 +926,23 @@ fn interpret_result(result: &HostResult) -> anyhow::Result<&crate::target::Insta
     }
 }
 
-fn render_success_report(
-    alias: &str,
-    inspection: &crate::target::InstanceInspection,
-    fresh_bootstrap: bool,
-) -> String {
+fn render_success_report(alias: &str, inspection: &crate::target::InstanceInspection) -> String {
     let artifact = inspection
         .artifact
         .current
         .clone()
         .unwrap_or_else(|| "-".to_owned());
-    let next_steps = if fresh_bootstrap {
-        format!(
-            "next steps:\n\
-             1. create the initial administrator (single-use capability; closes on first success):\n\
-                nazoauthctl bootstrap-admin --instance {alias}\n\
-                then enroll MFA at {}/ui/auth — ctl never receives passwords or TOTP secrets\n\
-             2. establish the controller binding after MFA enrollment:\n\
-                nazoauthctl bind --instance {alias} --label production\n\
-             3. public DNS/TLS/OIDC checks are independent of this install; verify separately:\n\
-                nazoauthctl verify --instance {alias}\n",
-            inspection.issuer.trim_end_matches('/'),
-        )
-    } else {
-        format!(
-            "next steps:\n\
-             1. sign in as the existing instance administrator; complete a fresh 2FA approval when bind requests it at {}/ui/auth\n\
-             2. establish the controller binding after fresh 2FA approval:\n\
-                nazoauthctl bind --instance {alias} --label production\n\
-             3. public DNS/TLS/OIDC checks are independent of this install; verify separately:\n\
-                nazoauthctl verify --instance {alias}\n",
-            inspection.issuer.trim_end_matches('/'),
-        )
-    };
+    let next_steps = format!(
+        "next steps:\n\
+         1. create an administrator through the deployed instance:\n\
+            nazoauthctl admin create --instance {alias}\n\
+            then enroll MFA at {}/ui/auth — ctl never receives TOTP secrets\n\
+         2. establish the controller binding after MFA enrollment:\n\
+            nazoauthctl bind --instance {alias} --label production\n\
+         3. public DNS/TLS/OIDC checks are independent of this install; verify separately:\n\
+            nazoauthctl verify --instance {alias}\n",
+        inspection.issuer.trim_end_matches('/'),
+    );
     format!(
         "installed NazoAuth instance '{alias}' (deployment {}) on the target\n\
          issuer: {}\nartifact: {artifact}\nstate committed: local=healthy control_binding=unbound public=unknown\n\

@@ -26,6 +26,7 @@ nazoauthctl install --host server-a --name production \
   --database-lifecycle-password-file ./database-lifecycle-password \
   --valkey-host cache.internal --valkey-port 6379 \
   --valkey-password-file ./valkey-password
+nazoauthctl admin create --instance production
 nazoauthctl bind --instance production --label operations \
   --output-secret-file ./production-recovery-secret
 nazoauthctl status
@@ -34,9 +35,9 @@ nazoauthctl instance list
 nazoauthctl status --all
 ```
 
-That is the whole deployment story: register the host, install, bind a
-Controller Key, operate. `install` commits as soon as the target reports local
-health - public DNS/TLS verification (`verify`) and backup setup are separate
+That is the whole deployment story: register the host, install, create an
+administrator through the deployment root, bind a Controller Key, operate.
+`install` commits as soon as the target reports local health - public DNS/TLS verification (`verify`) and backup setup are separate
 next steps, never hidden gates.
 
 For a clean install from stopped current-format material already on the target,
@@ -55,6 +56,7 @@ state, and UI cache.
 | `install` | Clean install onto a registered host |
 | `discover` | Read-only sweep for existing NazoAuth deployments |
 | `bind` | Attach this console's Controller Key to an instance |
+| `admin create` | Create an administrator through the instance's fixed target-local provisioner |
 | `status` / `doctor` | Live or cached fleet views (`--all`, `--json`) |
 | `verify` | Public TLS + issuer discovery report |
 | `update` / `rollback` | Crash-safe artifact/config lifecycle with one signed migration |
@@ -64,7 +66,7 @@ state, and UI cache.
 | `recover` | Restore a verified snapshot and complete token invalidation |
 | `uninstall` | Remove exactly the resources this deployment owns |
 | `self check/update/rollback` | Maintain the current ctl release; unknown self-state schemas fail closed and must be reset from a backup, never migrated |
-| `bootstrap-admin`, `tls certificate/acme`, `remote exec` | Current-model maintenance for initial access, target TLS, and the fixed remote protocol |
+| `tls certificate/acme`, `remote exec` | Target TLS and the fixed remote protocol |
 
 ## Concepts you actually need
 
@@ -83,7 +85,18 @@ registered hosts.
 Controller Keys minted on the control machine; private keys never leave it.
 Every key expires after exactly 30 days and any lifecycle change needs a fresh
 administrator 2FA approval in NazoAuth. Expired keys fail admission;
-`controller rotate` replaces them.
+  `controller rotate` replaces them.
+
+**Administrator creation.** `admin create` is the ctl deployment-root path for
+administrator provisioning. It sends one journaled, instance-bound
+HostOperation to the live target, which runs only the fixed
+`nazoauth admin-provision` command from the DeploymentState artifact. The
+credential JSON is supplied interactively or with `--credentials-stdin`; the
+password is never an argv token, environment value, log, or persistent ctl
+file; the target journal stores only the operation's canonical hash and public
+receipt, never the credential JSON. The current target runtime and config are
+checked before the one-shot run, and a retry reuses the target journal's
+operation result.
 
 **Recovery Secret.** On first enrollment you receive a one-time offline secret
 (shown once, stored nowhere). If every Controller Key slot is lost,

@@ -3,7 +3,7 @@
 //! The identical scenario functions run twice per case: once through a real
 //! [`LocalTarget`] backed by a temp target-state root and a scripted install
 //! executor (proving the full target-side semantics: journal, state commit,
-//! rollback, bootstrap material), and once through an [`SshTarget`] driven by
+//! rollback), and once through an [`SshTarget`] driven by
 //! an OpenSSH-shaped stub answering the frozen wire contract (proving the
 //! control side behaves identically over remote exec). Container engines are
 //! never spawned; every engine call lives behind the executor seam.
@@ -12,8 +12,7 @@ use super::*;
 use crate::filesystem::{self, PrivateTempDir};
 use crate::registry::{HostPrivilege, HostRecord};
 use crate::target::{
-    ARTIFACT_UNVERIFIED, HEALTH_PROBE_FAILED, TargetStateStore, bootstrap_authority,
-    encode_host_result, install_exec,
+    ARTIFACT_UNVERIFIED, HEALTH_PROBE_FAILED, TargetStateStore, encode_host_result, install_exec,
 };
 
 const ISSUER: &str = "https://auth.example.com";
@@ -110,11 +109,6 @@ impl install_exec::InstallExecutor for ScriptedInstall {
                 .expect("secret parent");
             filesystem::atomic_write(&path, b"generated", 0o600).expect("secret write");
             performed.generated_secrets.push(secret.path.clone());
-        }
-
-        if job.order.fresh_bootstrap {
-            bootstrap_authority::provision(job.scope_dir, job, &digest()).expect("provision");
-            performed.provisioned_bootstrap = true;
         }
 
         self.steps.lock().unwrap().push("start");
@@ -522,17 +516,21 @@ fn local_happy_path_commits_state_and_writes_instance_record() -> anyhow::Result
     let hello = test_hello(vec!["podman".to_owned()]);
     let mut fresh_request = fixture.request(Some("fresh-order"));
     let fresh_order = prepare_install_operation(&mut fresh_request, &hello)?;
-    assert!(install_order(&fresh_order.operation).fresh_bootstrap);
+    assert!(
+        install_order(&fresh_order.operation)
+            .current_data_import
+            .is_none()
+    );
 
     let text = run_clean_install(&fixture.context, fixture.request(Some("production")))?;
 
-    // Report: committed facts plus exact next steps (G01 items 10/11, G02/G08 wording).
+    // Report: committed facts plus exact next steps (G01/G08 wording).
     assert!(
         text.contains("local=healthy control_binding=unbound public=unknown"),
         "{text}"
     );
     assert!(
-        text.contains("bootstrap-admin --instance production"),
+        text.contains("admin create --instance production"),
         "{text}"
     );
     assert!(
@@ -575,15 +573,6 @@ fn local_happy_path_commits_state_and_writes_instance_record() -> anyhow::Result
     assert!(raw.contains("\"pending\""), "{raw}");
     assert!(raw.contains("\"completed\""), "{raw}");
 
-    // Fresh-install bootstrap capability is OPEN after install (G02 hook):
-    // the install-binding context exists, and NO ctl-side token was minted
-    // (the bootstrap token is NazoAuth's own, inside its data root).
-    let scope = fixture
-        .state_root
-        .join("deployments")
-        .join(&record.deployment_id);
-    assert!(scope.join(bootstrap_authority::CONTEXT_FILE_NAME).is_file());
-
     // Ordering pin: verification strictly precedes runtime start.
     assert_eq!(
         fixture.executor.steps.lock().unwrap().clone(),
@@ -593,42 +582,39 @@ fn local_happy_path_commits_state_and_writes_instance_record() -> anyhow::Result
 }
 
 #[test]
-fn current_data_import_skips_bootstrap_and_reports_existing_admin_flow() -> anyhow::Result<()> {
+fn current_data_import_uses_the_same_admin_provisioning_flow() -> anyhow::Result<()> {
     let fixture = LocalFixture::new(None)?;
     let hello = test_hello(vec!["podman".to_owned()]);
     let mut order_request = fixture.imported_request(Some("production"));
     let prepared = prepare_install_operation(&mut order_request, &hello)?;
     let order = install_order(&prepared.operation);
     assert!(order.current_data_import.is_some());
-    assert!(!order.fresh_bootstrap);
 
     let report = run_clean_install(
         &fixture.context,
         fixture.imported_request(Some("production")),
     )?;
     assert!(
-        report.contains("existing instance administrator"),
+        report.contains("admin create --instance production"),
         "{report}"
     );
-    assert!(report.contains("fresh 2FA approval"), "{report}");
+    assert!(report.contains("then enroll MFA"), "{report}");
     assert!(
         report.contains("nazoauthctl bind --instance production"),
         "{report}"
     );
-    assert!(!report.contains("bootstrap-admin"), "{report}");
-
     let record = fixture
         .context
         .registry
         .instance_by_alias("production")?
         .expect("imported instance registered");
-    let scope = fixture
-        .state_root
-        .join("deployments")
-        .join(record.deployment_id);
     assert!(
-        !scope.join(bootstrap_authority::CONTEXT_FILE_NAME).exists(),
-        "current-format import must not create fresh-bootstrap context"
+        fixture
+            .state_root
+            .join("deployments")
+            .join(record.deployment_id)
+            .join("state.json")
+            .is_file()
     );
     Ok(())
 }
@@ -644,7 +630,7 @@ fn ssh_happy_path_registers_through_the_wire_contract() -> anyhow::Result<()> {
     );
     assert!(text.contains("local=healthy"), "{text}");
     assert!(
-        text.contains("bootstrap-admin --instance production"),
+        text.contains("admin create --instance production"),
         "{text}"
     );
     let record = fixture
@@ -720,7 +706,7 @@ fn artifact_failure_over_ssh_reports_stable_code_without_registering() -> anyhow
 // ------------------------------------------------ shared scenario: rollback
 
 #[test]
-fn health_failure_rolls_back_config_secrets_and_bootstrap_material_locally() -> anyhow::Result<()> {
+fn health_failure_rolls_back_config_and_secrets_locally() -> anyhow::Result<()> {
     let fixture = LocalFixture::new(Some(FailAt::Health))?;
     let hello = test_hello(vec!["podman".to_owned()]);
     let mut request = fixture.request(Some("production"));
@@ -760,10 +746,6 @@ fn health_failure_rolls_back_config_secrets_and_bootstrap_material_locally() -> 
     }
     let scope = fixture.state_root.join("deployments").join(&deployment_id);
     assert!(
-        !scope.join(bootstrap_authority::CONTEXT_FILE_NAME).exists(),
-        "bootstrap context must be deleted on rollback"
-    );
-    assert!(
         !scope.join("state.json").exists(),
         "no DeploymentState may exist after a rolled-back install"
     );
@@ -800,10 +782,6 @@ fn state_commit_failure_rolls_back_the_completed_install() -> anyhow::Result<()>
         .join("config.json");
     assert!(!config.exists(), "state failure must roll the config back");
     let scope = fixture.state_root.join("deployments").join(deployment_id);
-    assert!(
-        !scope.join(bootstrap_authority::CONTEXT_FILE_NAME).exists(),
-        "state failure must close the bootstrap capability"
-    );
     assert!(
         !scope.join("state.json").is_file(),
         "a failed commit must not publish DeploymentState"
