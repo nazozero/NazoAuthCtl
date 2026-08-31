@@ -1138,11 +1138,9 @@ fn start_container_runtime(
         }
     };
     let backend = runtime_backend::backend(kind);
-    // 5a. Initialize the database schema BEFORE activation: `nazauth server`
-    // preflights the active tenant boundary, which requires the migrated and
-    // seeded tables. The diesel migration ledger (deduplicated re-entry) plus
-    // the advisory lock make this idempotent across crash-retry resumes.
-    run_schema_migration(job, backend.as_ref(), &runtime_artifact)?;
+    // 5a. Initialize schema and the authoritative system-tenant binding before
+    // activation. Both one-shots are idempotent across crash-retry resumes.
+    run_prestart_database_tasks(job, backend.as_ref(), &runtime_artifact)?;
 
     let observation = backend.inspect(&job.runtime.object);
     if let Ok(observed) = &observation {
@@ -1373,7 +1371,7 @@ fn start_systemd_runtime(
         MIGRATION_RUNTIME_ROLE_ENV.to_owned(),
         job.order.database_runtime_endpoint.user.clone(),
     );
-    let task = runtime_backend::OneShotTask {
+    let mut task = runtime_backend::OneShotTask {
         artifact: runtime_backend::ArtifactReference::HostBinary {
             path: binary.clone(),
             sha256: digest.clone(),
@@ -1397,6 +1395,13 @@ fn start_systemd_runtime(
         Failure::new(
             RUNTIME_START_FAILED,
             sanitize(format!("schema migration failed: {error}")),
+        )
+    })?;
+    task.command = vec!["nazoauth".to_owned(), "tenant-bootstrap".to_owned()];
+    backend.run_one_shot(&task).map_err(|error| {
+        Failure::new(
+            RUNTIME_START_FAILED,
+            sanitize(format!("tenant bootstrap failed: {error}")),
         )
     })?;
     backend
@@ -1447,10 +1452,10 @@ pub(super) fn cache_systemd_artifact(
     Ok(cached)
 }
 
-/// One-shot `nazauth migrate` against the verified image, sharing the exact
-/// secret mounts the runtime receives. Runs before the long-lived container
-/// so its tenant-boundary preflight sees a migrated database.
-fn run_schema_migration(
+/// Run the fixed pre-start database one-shots against the verified image.
+/// Migration remains schema-only; tenant bootstrap writes the first
+/// authoritative system binding before the long-lived runtime can listen.
+fn run_prestart_database_tasks(
     job: &InstallJob<'_>,
     backend: &dyn runtime_backend::RuntimeBackend,
     artifact: &runtime_backend::ArtifactReference,
@@ -1487,7 +1492,7 @@ fn run_schema_migration(
             format!("{CONTAINER_SECRETS_DIR}/{}", secret.purpose),
         );
     }
-    let task = runtime_backend::OneShotTask {
+    let mut task = runtime_backend::OneShotTask {
         artifact: artifact.clone(),
         command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
         network: Some("bridge".to_owned()),
@@ -1513,6 +1518,13 @@ fn run_schema_migration(
         Failure::new(
             RUNTIME_START_FAILED,
             sanitize(format!("schema migration failed: {error}")),
+        )
+    })?;
+    task.command = vec!["nazoauth".to_owned(), "tenant-bootstrap".to_owned()];
+    backend.run_one_shot(&task).map_err(|error| {
+        Failure::new(
+            RUNTIME_START_FAILED,
+            sanitize(format!("tenant bootstrap failed: {error}")),
         )
     })?;
     Ok(())
