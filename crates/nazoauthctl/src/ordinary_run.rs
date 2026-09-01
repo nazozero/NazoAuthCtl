@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use nazo_operator_protocol::{ControlOperationPayload, ControlResultData};
+use nazo_operator_protocol::{ControlOperationPayload, ControlResultData, ControlTenantBoundary};
 use nazoauthctl_conformance::{
     ArtifactMaterializationBinding, ArtifactTrustPolicy, BearerToken, BrowserAutomation,
     BrowserExecutor, BrowserPolicy, BrowserReviewScreenshotCapture, BrowserTargetOrigin,
@@ -23,18 +23,19 @@ use nazoauthctl_conformance::{
     ConformanceBinding, ConformanceProxyRecovery, ConformanceRecoveryStore, ConformanceRunConfig,
     ConformanceRunner, CredentialStore, DescriptorMaterializer, EvidenceBundleIdentity,
     EvidenceBundleReceipt, EvidenceControlIdentity, EvidenceControlOperation,
-    EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, HttpTransport,
-    ManagedWebDriver, MatrixSelection, OidfArtifactMatrix, OidfDriverLane, OidfPlanResourceBudget,
-    OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
-    OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier, OpenId4VpVerifier,
-    OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
-    SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
-    SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
-    TenantResourceApplyOutput, TenantResourceControlOperation, TenantResourceRecoveryBinding,
-    TenantResourceRecoveryPhase, TtyRenderer, WebDriverClient, WebDriverEndpoint,
-    open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
-    read_compact_manifest, recover_suite_resources, validate_private_evidence_directory,
-    verify_oidf_artifact, write_private_control_evidence_bundle, write_review_screenshot_manifest,
+    EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, HttpRequest,
+    HttpTransport, ManagedWebDriver, MatrixSelection, OidfArtifactMatrix, OidfDriverLane,
+    OidfPlanResourceBudget, OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
+    OpenId4VciIssuerDriver, OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier,
+    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl,
+    StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionDeferredReview,
+    SuiteRetentionManifest, SuiteRetentionManifestReceipt, SuiteRetentionPlan,
+    SuiteRetentionScreenshotManifest, TenantResourceApplyOutput, TenantResourceControlOperation,
+    TenantResourceRecoveryBinding, TenantResourceRecoveryPhase, Transport, TtyRenderer,
+    WebDriverClient, WebDriverEndpoint, open_cached_oidf_driver_plan, read_artifact_driver,
+    read_artifact_matrix, read_compact_manifest, recover_suite_resources,
+    validate_private_evidence_directory, verify_oidf_artifact,
+    write_private_control_evidence_bundle, write_review_screenshot_manifest,
 };
 use serde::Serialize;
 use url::Url;
@@ -43,6 +44,7 @@ use zeroize::{Zeroize as _, Zeroizing};
 use super::RunInvocation;
 
 const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
+const OIDF_TENANT_DOMAIN: &str = "oidf.nazoauth.com";
 
 /// Capabilities implemented by this binary's signed-artifact runner. These
 /// are local engine facts, not remote controller permissions.
@@ -178,6 +180,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     }
     let selected_resource_budget = driver_plan.selected_resource_budget.clone();
     let request_jti = format!("request-{}", hex(rand::random::<[u8; 16]>()));
+    let ephemeral_tenant = EphemeralTenant::new(&invocation.tenant_id)?;
     let materialization_now = current_unix_time()?;
     if materialization_now > driver_plan.latest_execution_start_at {
         bail!("signed artifact no longer has enough validity remaining for the selected run");
@@ -189,22 +192,18 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             .iter()
             .any(|entry| entry.driver_handler.lane == OidfDriverLane::Ciba),
     )?;
-    let deployment_trust_anchor = session
-        .openid4vc_request_object_trust_anchor_pem()
-        .context("failed to load the deployment OpenID4VC trust anchor")?;
     let dynamic_registration_initial_access_token = session
-        .dynamic_registration_initial_access_token()
-        .context("failed to load the deployment RFC 7591 initial access token")?;
+        .dynamic_registration_initial_access_token(&invocation.tenant_id)
+        .context("failed to derive the run tenant RFC 7591 initial access token")?;
     let prepared = DescriptorMaterializer::prepare_tenant_resources_from_artifact_matrix(
         &matrix,
         ArtifactMaterializationBinding {
             artifact_source_release: &driver_plan.artifact.revision,
             artifact_source_digest: &invocation.artifact_digest,
             raw_matrix_sha256: &driver_plan.artifact.matrix_sha256,
-            target_issuer: session.target_issuer(),
+            target_issuer: &ephemeral_tenant.issuer,
             suite_origin: &suite_origin,
             request_jti: &request_jti,
-            credential_trust_anchor_pem: &deployment_trust_anchor,
             dynamic_registration_initial_access_token: Some(
                 dynamic_registration_initial_access_token.as_str(),
             ),
@@ -249,7 +248,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         .transpose()?;
     let vp_evidence_trust_anchor = vp_evidence_verifier
         .as_ref()
-        .map(|verifier| verifier.recovery_trust_anchor(session.target_issuer()))
+        .map(|verifier| verifier.recovery_trust_anchor(&ephemeral_tenant.issuer))
         .transpose()
         .context("failed to persist the OpenID4VP evidence runtime trust anchor")?;
     let private_manifest_path = recovery_directory.join(format!("material-{request_jti}.json"));
@@ -267,10 +266,14 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         (None, None) => None,
         _ => unreachable!("CLI validates proxy arguments as an atomic pair"),
     };
+    let tenant_create_expected_revision = directory_revision(&session)?;
     let recovery = match recovery_store.begin_ordinary_run(TenantResourceRecoveryBinding {
         deployment_id: deployment.deployment_id.clone(),
         tenant_id: invocation.tenant_id.clone(),
+        realm_id: ephemeral_tenant.realm_id.clone(),
+        organization_id: ephemeral_tenant.organization_id.clone(),
         run_id: request_jti.clone(),
+        tenant_create_expected_revision,
         manifest_path: Some(private_manifest_path.clone()),
         material_sha256: Some(manifest.raw_sha256().to_owned()),
         proxy: proxy_recovery,
@@ -288,6 +291,12 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             };
         }
     };
+    let deployment_trust_anchor =
+        provision_ephemeral_tenant(&session, &ephemeral_tenant, &recovery)
+            .context("failed to provision the run-scoped OIDF tenant")?;
+    probe_ephemeral_tenant(&ephemeral_tenant.issuer).context(
+        "the temporary tenant is not publicly reachable; verify wildcard TLS and host routing for *.oidf.nazoauth.com",
+    )?;
     let baseline = session
         .execute_control_operation(
             ControlOperationPayload::TenantResourceEnumerate {
@@ -362,7 +371,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let mut deployment_report = DeploymentReport {
         deployment_id: deployment.deployment_id.clone(),
         tenant_id: invocation.tenant_id.clone(),
-        target_issuer: deployment.target_issuer.clone(),
+        target_issuer: ephemeral_tenant.issuer.clone(),
         artifact_digest: invocation.artifact_digest.clone(),
         artifact_revision: driver_plan.artifact.revision.clone(),
         matrix_sha256: ordinary.matrix_sha256().to_owned(),
@@ -427,7 +436,8 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     // The OpenID4VP client and runner are being generalized in the adjacent
     // slice. Keep this typed boundary ordinary-only: a lease-shaped adapter is
     // deliberately impossible here.
-    let ciba_bridge = start_ciba_user_approval_bridge(ciba_callback, &session, &run_secrets)?;
+    let ciba_bridge =
+        start_ciba_user_approval_bridge(ciba_callback, &ephemeral_tenant.issuer, &run_secrets)?;
     let run_result = run_signed_suite(
         ordinary,
         suite_client.clone(),
@@ -435,6 +445,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         run_secrets,
         &session,
         &invocation,
+        &ephemeral_tenant.issuer,
         &suite_origin,
         plan_lanes,
         plan_resource_budgets,
@@ -460,7 +471,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                 directory,
                 recovery.ordinary_binding().run_id.as_str(),
                 &invocation.artifact_digest,
-                session.target_issuer(),
+                &ephemeral_tenant.issuer,
             ) {
                 Ok(manifest) => Some(manifest),
                 Err(error) => {
@@ -745,6 +756,178 @@ fn successful_control_result(
         .context("successful ControlOperation omitted its typed result")
 }
 
+struct EphemeralTenant {
+    tenant_id: String,
+    realm_id: String,
+    organization_id: String,
+    issuer: String,
+    external_host: String,
+    slug: String,
+}
+
+impl EphemeralTenant {
+    fn new(tenant_id: &str) -> anyhow::Result<Self> {
+        let tenant_id = uuid::Uuid::parse_str(tenant_id)
+            .context("generated OIDF tenant ID is invalid")?
+            .to_string();
+        let realm_id = uuid::Uuid::now_v7().to_string();
+        let organization_id = uuid::Uuid::now_v7().to_string();
+        Self::from_ids(&tenant_id, &realm_id, &organization_id)
+    }
+
+    fn from_ids(tenant_id: &str, realm_id: &str, organization_id: &str) -> anyhow::Result<Self> {
+        let tenant_id = uuid::Uuid::parse_str(tenant_id)
+            .context("OIDF tenant ID is invalid")?
+            .to_string();
+        let realm_id = uuid::Uuid::parse_str(realm_id)
+            .context("OIDF realm ID is invalid")?
+            .to_string();
+        let organization_id = uuid::Uuid::parse_str(organization_id)
+            .context("OIDF organization ID is invalid")?
+            .to_string();
+        if tenant_id == realm_id || tenant_id == organization_id || realm_id == organization_id {
+            bail!("OIDF tenant boundaries must use distinct IDs");
+        }
+        let external_host = format!("{tenant_id}.{OIDF_TENANT_DOMAIN}");
+        Ok(Self {
+            slug: format!("oidf-{}", tenant_id.replace('-', "")),
+            issuer: format!("https://{external_host}"),
+            external_host,
+            tenant_id,
+            realm_id,
+            organization_id,
+        })
+    }
+
+    fn create_operation(&self, expected_revision: u64) -> ControlOperationPayload {
+        let boundary = |kind: &str, id: &str| ControlTenantBoundary {
+            id: id.to_owned(),
+            slug: format!("{}-{kind}", self.slug),
+            display_name: format!("OIDF temporary {kind} {}", self.tenant_id),
+        };
+        ControlOperationPayload::TenantDirectoryCreate {
+            expected_revision,
+            tenant: boundary("tenant", &self.tenant_id),
+            realm: boundary("realm", &self.realm_id),
+            organization: boundary("organization", &self.organization_id),
+            issuer: self.issuer.clone(),
+            external_host: self.external_host.clone(),
+        }
+    }
+}
+
+fn directory_revision(session: &nazoauthctl_core::ConformanceSession) -> anyhow::Result<u64> {
+    let result = session.execute_control_operation(
+        ControlOperationPayload::TenantDirectoryDescribe,
+        None,
+        |_| Ok(()),
+    )?;
+    let ControlResultData::TenantDirectoryDescribe { revision, .. } =
+        successful_control_result(result, "tenant directory Describe")?
+    else {
+        bail!("tenant directory Describe returned the wrong typed result");
+    };
+    Ok(revision)
+}
+
+fn probe_ephemeral_tenant(issuer: &str) -> anyhow::Result<()> {
+    let mut metadata_url = Url::parse(issuer).context("temporary tenant issuer is invalid")?;
+    metadata_url.set_path("/.well-known/openid-configuration");
+    let transport = HttpTransport::new(Duration::from_secs(15))?;
+    let response = transport.send(HttpRequest::get(metadata_url), 128 * 1024)?;
+    if response.status != 200 {
+        bail!(
+            "temporary tenant discovery returned HTTP {}",
+            response.status
+        );
+    }
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&response.body).context("temporary tenant discovery is not JSON")?;
+    if metadata.get("issuer").and_then(serde_json::Value::as_str) != Some(issuer) {
+        bail!("temporary tenant discovery issuer does not match its routed issuer");
+    }
+    Ok(())
+}
+
+fn provision_ephemeral_tenant(
+    session: &nazoauthctl_core::ConformanceSession,
+    tenant: &EphemeralTenant,
+    recovery: &Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
+) -> anyhow::Result<String> {
+    let (created, expected_revision) = {
+        let recovery = lock_recovery(recovery)?;
+        (
+            recovery.tenant_created(),
+            recovery.ordinary_binding().tenant_create_expected_revision,
+        )
+    };
+    if !created {
+        let outcome = session.execute_control_operation(
+            tenant.create_operation(expected_revision),
+            None,
+            |completion| {
+                if completion.result.outcome == nazo_operator_protocol::ControlOutcome::Succeeded {
+                    lock_recovery(recovery)?.mark_tenant_created()?;
+                }
+                Ok(())
+            },
+        )?;
+        successful_control_completion(outcome, "temporary tenant Create")?;
+    }
+
+    let key = session.execute_control_operation(
+        ControlOperationPayload::TenantKeysGenerateLocal {
+            tenant_id: tenant.tenant_id.clone(),
+            alg: "ES256".to_owned(),
+            purposes: vec!["credential".to_owned(), "presentation_request".to_owned()],
+        },
+        None,
+        |completion| {
+            if completion.result.outcome == nazo_operator_protocol::ControlOutcome::Succeeded {
+                lock_recovery(recovery)?.mark_tenant_key_generated()?;
+            }
+            Ok(())
+        },
+    )?;
+    let ControlResultData::TenantKeyGenerated {
+        tenant_id,
+        certificate_chain_pem,
+        ..
+    } = successful_control_result(key, "temporary tenant key generation")?
+    else {
+        bail!("temporary tenant key generation returned the wrong typed result");
+    };
+    if tenant_id != tenant.tenant_id {
+        bail!("temporary tenant key generation returned another tenant");
+    }
+
+    if !lock_recovery(recovery)?.tenant_reloaded() {
+        let expected_revision = match lock_recovery(recovery)?.tenant_reload_expected_revision() {
+            Some(revision) => revision,
+            None => {
+                let revision = directory_revision(session)?;
+                lock_recovery(recovery)?.prepare_tenant_reload(revision)?;
+                revision
+            }
+        };
+        let outcome = session.execute_control_operation(
+            ControlOperationPayload::TenantDirectoryReload {
+                expected_revision,
+                tenant_id: tenant.tenant_id.clone(),
+            },
+            None,
+            |completion| {
+                if completion.result.outcome == nazo_operator_protocol::ControlOutcome::Succeeded {
+                    lock_recovery(recovery)?.mark_tenant_reloaded()?;
+                }
+                Ok(())
+            },
+        )?;
+        successful_control_completion(outcome, "temporary tenant Reload")?;
+    }
+    Ok(certificate_chain_pem)
+}
+
 #[derive(Serialize)]
 struct FinalOutput {
     schema: u32,
@@ -801,6 +984,7 @@ fn run_signed_suite(
     secrets: RunSecrets,
     session: &nazoauthctl_core::ConformanceSession,
     invocation: &RunInvocation,
+    target_issuer: &str,
     suite_origin: &Origin,
     plan_lanes: BTreeMap<String, OidfDriverLane>,
     plan_resource_budgets: BTreeMap<String, OidfPlanResourceBudget>,
@@ -818,14 +1002,14 @@ fn run_signed_suite(
         materialized.trust_policy_resource_id(),
         materialized.trust_policy_digest(),
     )?;
-    let target_origin = BrowserTargetOrigin::parse(session.target_issuer())?;
+    let target_origin = BrowserTargetOrigin::parse(target_issuer)?;
     let applicant_id = *materialized.applicant_id();
     let openid4vci_management_token = session
-        .openid4vci_management_token()
-        .context("failed to load the deployment OpenID4VCI management token")?;
+        .openid4vci_management_token(&invocation.tenant_id)
+        .context("failed to derive the run tenant OpenID4VCI management token")?;
     let openid4vp_management_token = session
-        .openid4vp_management_token()
-        .context("failed to load the deployment OpenID4VP management token")?;
+        .openid4vp_management_token(&invocation.tenant_id)
+        .context("failed to derive the run tenant OpenID4VP management token")?;
     let review_screenshot_run_jti = recovery
         .lock()
         .map_err(|_| anyhow::anyhow!("ordinary recovery lock is poisoned"))?
@@ -870,7 +1054,7 @@ fn run_signed_suite(
     for worker_index in 0..invocation.jobs {
         let browser = build_browser(
             invocation.webdriver.get(worker_index).map(String::as_str),
-            session.target_issuer(),
+            target_issuer,
             suite_origin,
         )?;
         let issuer: Arc<Mutex<dyn OpenId4VciIssuerDriver>> =
@@ -997,13 +1181,13 @@ fn prepare_ciba_user_approval_callback(
 
 fn start_ciba_user_approval_bridge(
     callback: Option<CibaUserApprovalCallback>,
-    session: &nazoauthctl_core::ConformanceSession,
+    target_issuer: &str,
     secrets: &RunSecrets,
 ) -> anyhow::Result<Option<CibaUserApprovalBridge>> {
     let Some(callback) = callback else {
         return Ok(None);
     };
-    let issuer = Url::parse(session.target_issuer())
+    let issuer = Url::parse(target_issuer)
         .context("deployment target issuer is not a valid CIBA approval URL")?;
     let transport = Arc::new(
         HttpTransport::new(Duration::from_secs(30))
@@ -1289,7 +1473,65 @@ fn cleanup_run_resources(
                 .context("persisted control operation omitted its typed result")?,
         });
     }
+    cleanup_ephemeral_tenant(session, recovery)?;
     Ok(operations)
+}
+
+fn cleanup_ephemeral_tenant(
+    session: &nazoauthctl_core::ConformanceSession,
+    recovery: &mut nazoauthctl_conformance::ConformanceRecoveryGuard,
+) -> anyhow::Result<()> {
+    if recovery.tenant_cleanup_complete() {
+        return Ok(());
+    }
+    let tenant_id = recovery.ordinary_binding().tenant_id.clone();
+    if !recovery.tenant_disabled() {
+        let expected_revision = match recovery.tenant_disable_expected_revision() {
+            Some(revision) => revision,
+            None => {
+                let revision = directory_revision(session)?;
+                recovery.prepare_tenant_disable(revision)?;
+                revision
+            }
+        };
+        let outcome = session.execute_control_operation(
+            ControlOperationPayload::TenantDirectoryDisable {
+                expected_revision,
+                tenant_id: tenant_id.clone(),
+            },
+            None,
+            |completion| {
+                if completion.result.outcome == nazo_operator_protocol::ControlOutcome::Succeeded {
+                    recovery.mark_tenant_disabled()?;
+                }
+                Ok(())
+            },
+        )?;
+        successful_control_completion(outcome, "temporary tenant Disable")?;
+    }
+    let expected_revision = match recovery.tenant_finalize_expected_revision() {
+        Some(revision) => revision,
+        None => {
+            let revision = directory_revision(session)?;
+            recovery.prepare_tenant_finalize(revision)?;
+            revision
+        }
+    };
+    let outcome = session.execute_control_operation(
+        ControlOperationPayload::TenantDirectoryFinalize {
+            expected_revision,
+            tenant_id,
+        },
+        None,
+        |completion| {
+            if completion.result.outcome == nazo_operator_protocol::ControlOutcome::Succeeded {
+                recovery.mark_tenant_cleanup_complete()?;
+            }
+            Ok(())
+        },
+    )?;
+    successful_control_completion(outcome, "temporary tenant Finalize")?;
+    Ok(())
 }
 fn recover_pending_runs(
     session: &nazoauthctl_core::ConformanceSession,
@@ -1301,9 +1543,11 @@ fn recover_pending_runs(
     for mut recovery in store.claim_pending()? {
         let binding = recovery.ordinary_binding().clone();
         let result = (|| -> anyhow::Result<Option<SuiteRetentionManifestReceipt>> {
-            if let Some(failure) = recovery.terminal_failure() {
+            recover_ephemeral_tenant(session, &mut recovery)?;
+            if let Some(failure) = recovery.terminal_failure().cloned() {
+                let tenant_cleanup = cleanup_ephemeral_tenant(session, &mut recovery);
                 bail!(
-                    "ordinary recovery is blocked by durable failed ControlOperation: operation_id={} request_hash={} error={}",
+                    "ordinary recovery is blocked by durable failed ControlOperation: operation_id={} request_hash={} error={}; tenant_cleanup={}",
                     failure.operation_id,
                     failure.request_hash,
                     failure
@@ -1311,11 +1555,15 @@ fn recover_pending_runs(
                         .error
                         .map(|error| format!("{error:?}"))
                         .unwrap_or_else(|| "missing".to_owned()),
+                    tenant_cleanup
+                        .err()
+                        .map_or_else(|| "ok".to_owned(), |error| format!("{error:#}")),
                 );
             }
             if retained_recovery_stops_before_live_apply(recovery.suite_retention_committed()) {
                 recovery.publish_committed_suite_retention_manifest()?;
                 let receipt = recovery.suite_retention_manifest_receipt()?;
+                cleanup_ephemeral_tenant(session, &mut recovery)?;
                 if recovery.suite_cleanup_complete() && recovery.proxy_cleanup_complete() {
                     recovery.finish()?;
                 }
@@ -1391,6 +1639,73 @@ fn recover_pending_runs(
             failures.join("; ")
         )
     }
+}
+
+fn recover_ephemeral_tenant(
+    session: &nazoauthctl_core::ConformanceSession,
+    recovery: &mut nazoauthctl_conformance::ConformanceRecoveryGuard,
+) -> anyhow::Result<()> {
+    let tenant = EphemeralTenant::from_ids(
+        &recovery.ordinary_binding().tenant_id,
+        &recovery.ordinary_binding().realm_id,
+        &recovery.ordinary_binding().organization_id,
+    )?;
+    if !recovery.tenant_created() {
+        let expected_revision = recovery.ordinary_binding().tenant_create_expected_revision;
+        let outcome = session.execute_control_operation(
+            tenant.create_operation(expected_revision),
+            None,
+            |completion| {
+                if completion.result.outcome == nazo_operator_protocol::ControlOutcome::Succeeded {
+                    recovery.mark_tenant_created()?;
+                }
+                Ok(())
+            },
+        )?;
+        successful_control_completion(outcome, "recovery temporary tenant Create")?;
+    }
+    if !recovery.tenant_key_generated() {
+        let outcome = session.execute_control_operation(
+            ControlOperationPayload::TenantKeysGenerateLocal {
+                tenant_id: tenant.tenant_id.clone(),
+                alg: "ES256".to_owned(),
+                purposes: vec!["credential".to_owned(), "presentation_request".to_owned()],
+            },
+            None,
+            |completion| {
+                if completion.result.outcome == nazo_operator_protocol::ControlOutcome::Succeeded {
+                    recovery.mark_tenant_key_generated()?;
+                }
+                Ok(())
+            },
+        )?;
+        successful_control_completion(outcome, "recovery tenant key generation")?;
+    }
+    if !recovery.tenant_reloaded() {
+        let expected_revision = match recovery.tenant_reload_expected_revision() {
+            Some(revision) => revision,
+            None => {
+                let revision = directory_revision(session)?;
+                recovery.prepare_tenant_reload(revision)?;
+                revision
+            }
+        };
+        let outcome = session.execute_control_operation(
+            ControlOperationPayload::TenantDirectoryReload {
+                expected_revision,
+                tenant_id: tenant.tenant_id,
+            },
+            None,
+            |completion| {
+                if completion.result.outcome == nazo_operator_protocol::ControlOutcome::Succeeded {
+                    recovery.mark_tenant_reloaded()?;
+                }
+                Ok(())
+            },
+        )?;
+        successful_control_completion(outcome, "recovery temporary tenant Reload")?;
+    }
+    Ok(())
 }
 fn evidence_runtime(
     runtime: &nazoauthctl_core::ConformanceRuntimeEvidence,

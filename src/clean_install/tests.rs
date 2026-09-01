@@ -392,7 +392,13 @@ sed -e "s/__OPERATION_ID__/${id:-none}/g" -e "s/__DEPLOYMENT_ID__/${dep:-none}/g
     "$(dirname "$0")/response-install.json"
 exit 0
 "#
-    .to_owned()
+    .replace(
+        "\"schema\":5",
+        &format!(
+            "\"schema\":{}",
+            crate::target::wire::HOST_PROTOCOL_SCHEMA
+        ),
+    )
 }
 
 #[cfg(windows)]
@@ -405,6 +411,10 @@ fn windows_stub_cmd() -> String {
         "",
     ]
     .join("\r\n")
+    .replace(
+        "\"schema\":5",
+        &format!("\"schema\":{}", crate::target::wire::HOST_PROTOCOL_SCHEMA),
+    )
 }
 
 #[cfg(windows)]
@@ -438,6 +448,13 @@ fn windows_stub_ps1() -> String {
         "",
     ]
     .join("\r\n")
+    .replace(
+        "\"schema\":5",
+        &format!(
+            "\"schema\":{}",
+            crate::target::wire::HOST_PROTOCOL_SCHEMA
+        ),
+    )
 }
 
 struct SshFixture {
@@ -937,6 +954,25 @@ fn linux_target_paths_are_posix_even_when_constructed_on_windows() -> anyhow::Re
     assert!(!order.config_content.contains("DATABASE_URL_FILE"));
     assert!(!order.config_content.contains("VALKEY_URL_FILE"));
     assert!(!order.config_content.contains("database-lifecycle-url"));
+    assert!(
+        order
+            .config_content
+            .contains("ENABLE_DIRECTORY_OPENID4VCI_ISSUER: \"true\"")
+    );
+    assert!(
+        order
+            .config_content
+            .contains("ENABLE_DIRECTORY_OPENID4VP_VERIFIER: \"true\"")
+    );
+    for file_setting in [
+        "CLIENT_SECRET_PEPPER_FILE",
+        "DYNAMIC_CLIENT_REGISTRATION_INITIAL_ACCESS_TOKEN_FILE",
+        "OPENID4VC_DATA_ENCRYPTION_KEY_FILE",
+        "OPENID4VCI_ISSUER_MANAGEMENT_TOKEN_FILE",
+        "OPENID4VP_VERIFIER_MANAGEMENT_TOKEN_FILE",
+    ] {
+        assert!(order.config_content.contains(file_setting));
+    }
     assert_eq!(
         order
             .secrets
@@ -948,6 +984,11 @@ fn linux_target_paths_are_posix_even_when_constructed_on_windows() -> anyhow::Re
             "database-lifecycle-url",
             "valkey-url",
             "mfa-totp-key",
+            "client-secret-pepper",
+            "dynamic-registration-token",
+            "openid4vc-data-encryption-key",
+            "openid4vci-management-token",
+            "openid4vp-management-token",
         ])
     );
     assert!(!format!("{order:?}").contains("db-runtime-secret"));

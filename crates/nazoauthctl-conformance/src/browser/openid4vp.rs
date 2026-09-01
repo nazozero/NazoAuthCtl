@@ -18,6 +18,8 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use crate::oidf_protocol as nazo_operator_protocol;
+
 use super::{
     BrowserTargetOrigin,
     validation::{MAX_STEP_TIMEOUT, redacted_origin},

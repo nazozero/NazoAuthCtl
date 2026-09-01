@@ -59,14 +59,19 @@ pub(crate) const LOCAL_READINESS_PATH: &str = "/health";
 pub const INSTALL_OUTCOME_UNKNOWN: &str = "OUTCOME_UNKNOWN";
 
 /// Closed vocabulary of secret files written on the target. External
-/// dependency credentials are supplied by the operator and cross a remote
-/// boundary only inside the encrypted host protocol; the MFA key is generated
-/// on the target.
+/// dependency credentials and deployment security roots are supplied by the
+/// controller and cross a remote boundary only inside the encrypted host
+/// protocol; the MFA key is generated on the target.
 pub const SECRET_PURPOSES: &[&str] = &[
     "database-runtime-url",
     "database-lifecycle-url",
     "valkey-url",
     "mfa-totp-key",
+    "client-secret-pepper",
+    "dynamic-registration-token",
+    "openid4vc-data-encryption-key",
+    "openid4vci-management-token",
+    "openid4vp-management-token",
 ];
 
 /// Hard cap for the rendered config content riding inside one HostOperation
@@ -111,11 +116,8 @@ pub struct PlannedSecret {
     /// One of [`SECRET_PURPOSES`].
     pub purpose: String,
     pub path: String,
-    /// P0-1: operator-provided credential content for external-dependency
-    /// URLs (the two PostgreSQL roles and Valkey). The external roles and
-    /// Valkey ACL already know these values — ctl never invents them. Absent
-    /// for target-minted material (`mfa-totp-key`). Rides the encrypted
-    /// transport exactly once; the journal directory is root-only 0700.
+    /// Operator-provided external-dependency credentials and deployment
+    /// security roots. Absent only for target-minted `mfa-totp-key`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<super::wire::SecretMaterial>,
 }
@@ -376,7 +378,7 @@ impl InstallOrder {
             if secret.value.is_some() != should_carry_value {
                 return Err(super::wire::MessageRejection::new(
                     super::wire::RejectionCode::OperationMalformed,
-                    "only external dependency URL secrets carry operator material",
+                    "every secret except the target-minted MFA key must carry material",
                 ));
             }
             seen.push(secret.purpose.clone());
@@ -1011,6 +1013,23 @@ impl HostInstallExecutor {
                         })?;
                     }
                 }
+                "client-secret-pepper"
+                | "dynamic-registration-token"
+                | "openid4vc-data-encryption-key"
+                | "openid4vci-management-token"
+                | "openid4vp-management-token" => {
+                    if !existed {
+                        let value = secret.value.as_ref().ok_or_else(|| {
+                            Failure::new(
+                                SECRET_PROVISION_FAILED,
+                                format!("deployment security root '{}' is missing", secret.purpose),
+                            )
+                        })?;
+                        atomic_write(&path, value.as_bytes(), 0o440).map_err(|error| {
+                            Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string()))
+                        })?;
+                    }
+                }
                 other => {
                     return Err(Failure::new(
                         SECRET_PROVISION_FAILED,
@@ -1211,11 +1230,14 @@ fn start_container_runtime(
             false,
         ),
     ];
-    // The long-lived runtime receives only key material. Database and Valkey
-    // URLs are direct values in the mounted configuration; lifecycle
-    // credentials remain ctl-owned and never enter the server container.
+    // Database and Valkey URLs are direct values in the mounted configuration;
+    // lifecycle credentials remain ctl-owned. Runtime key roots are mounted as
+    // individual read-only files.
     for secret in &job.order.secrets {
-        if secret.purpose != "mfa-totp-key" {
+        if matches!(
+            secret.purpose.as_str(),
+            "database-runtime-url" | "database-lifecycle-url" | "valkey-url"
+        ) {
             continue;
         }
         mounts.push(mount(
@@ -1250,6 +1272,11 @@ fn start_container_runtime(
         let key = match secret.purpose.as_str() {
             "mfa-totp-key" => "MFA_TOTP_ENCRYPTION_KEY_FILE",
             "database-runtime-url" | "database-lifecycle-url" | "valkey-url" => continue,
+            "client-secret-pepper" => "CLIENT_SECRET_PEPPER_FILE",
+            "dynamic-registration-token" => "DYNAMIC_CLIENT_REGISTRATION_INITIAL_ACCESS_TOKEN_FILE",
+            "openid4vc-data-encryption-key" => "OPENID4VC_DATA_ENCRYPTION_KEY_FILE",
+            "openid4vci-management-token" => "OPENID4VCI_ISSUER_MANAGEMENT_TOKEN_FILE",
+            "openid4vp-management-token" => "OPENID4VP_VERIFIER_MANAGEMENT_TOKEN_FILE",
             other => {
                 return Err(Failure::new(
                     HOST_ERR_OPERATION_INVALID,
@@ -1361,7 +1388,12 @@ fn start_systemd_runtime(
         .order
         .secrets
         .iter()
-        .filter(|secret| secret.purpose == "mfa-totp-key")
+        .filter(|secret| {
+            !matches!(
+                secret.purpose.as_str(),
+                "database-runtime-url" | "database-lifecycle-url" | "valkey-url"
+            )
+        })
         .map(|secret| PathBuf::from(&secret.path))
         .collect::<Vec<_>>();
     let backend = runtime_backend::backend(RuntimeBackendKind::Host);

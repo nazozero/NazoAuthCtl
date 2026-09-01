@@ -29,9 +29,11 @@ pub(crate) use admin::admin_provision_password_material;
 pub(crate) use public_verify::{CurlPublicProber, verify_public};
 
 use anyhow::{Context as _, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error_codes::REMOTE_HELPER_MISMATCH;
 use crate::fleet::{live_probe, production_target, resolve_host_selector, summarize_inspection};
@@ -58,6 +60,7 @@ const LOOPBACK_PORT_COUNT: u16 = 20_000;
 
 /// Config schema token recorded in the DeploymentState for seed documents.
 pub(crate) const CONFIG_SCHEMA_SEED: &str = "nazauth-seed-v2";
+const DIRECTORY_OPENID4VC_CREDENTIAL_CONFIGURATIONS: &str = r#"{"eu.example.pid":{"format":"dc+sd-jwt","scope":"eu.example.pid","cryptographic_binding_methods_supported":["jwk"],"credential_signing_alg_values_supported":["ES256"],"proof_types_supported":{"jwt":{"proof_signing_alg_values_supported":["ES256"]},"attestation":{"proof_signing_alg_values_supported":["ES256"],"key_attestations_required":{"key_storage":["iso_18045_moderate"]}}},"vct":"urn:eudi:pid:1"},"org.iso.18013.5.1.mDL":{"format":"mso_mdoc","scope":"org.iso.18013.5.1.mDL","cryptographic_binding_methods_supported":["jwk"],"credential_signing_alg_values_supported":["ES256"],"proof_types_supported":{"jwt":{"proof_signing_alg_values_supported":["ES256"]},"attestation":{"proof_signing_alg_values_supported":["ES256"],"key_attestations_required":{"key_storage":["iso_18045_moderate"]}}},"doctype":"org.iso.18013.5.1.mDL"}}"#;
 
 /// One clean-install invocation. Defaults are deliberately minimal: only the
 /// issuer is mandatory because it is a real external fact that cannot be
@@ -322,6 +325,68 @@ struct RuntimeSeedConfig {
     database_url: String,
     valkey_url: String,
     mfa_totp_key_file: String,
+    client_secret_pepper_file: String,
+    dynamic_registration_token_file: String,
+    openid4vc_data_encryption_key_file: String,
+    openid4vci_management_token_file: String,
+    openid4vp_management_token_file: String,
+}
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct DeploymentSecurityRoots {
+    client_secret_pepper: Vec<u8>,
+    dynamic_registration_token: Vec<u8>,
+    openid4vc_data_encryption_key: Vec<u8>,
+    openid4vci_management_token: Vec<u8>,
+    openid4vp_management_token: Vec<u8>,
+}
+
+impl DeploymentSecurityRoots {
+    #[cfg(test)]
+    fn generate() -> Self {
+        let token = || {
+            URL_SAFE_NO_PAD
+                .encode(rand::random::<[u8; 32]>())
+                .into_bytes()
+        };
+        Self {
+            client_secret_pepper: token(),
+            dynamic_registration_token: token(),
+            openid4vc_data_encryption_key: token(),
+            openid4vci_management_token: token(),
+            openid4vp_management_token: token(),
+        }
+    }
+}
+
+fn load_or_create_deployment_security_roots(
+    registry_root: &std::path::Path,
+    deployment_id: &str,
+) -> anyhow::Result<DeploymentSecurityRoots> {
+    let directory = registry_root.join("secrets").join(deployment_id);
+    crate::filesystem::ensure_private_directory(&directory, "deployment secret directory")?;
+    let value = |name: &str| -> anyhow::Result<Vec<u8>> {
+        let path = directory.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => crate::filesystem::read_secure_secret_file(&path, name, 4 * 1024)
+                .map(|value| value.to_vec()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let generated = URL_SAFE_NO_PAD
+                    .encode(rand::random::<[u8; 32]>())
+                    .into_bytes();
+                crate::filesystem::atomic_write(&path, &generated, 0o600)?;
+                Ok(generated)
+            }
+            Err(error) => Err(error).with_context(|| format!("failed to inspect {name}")),
+        }
+    };
+    Ok(DeploymentSecurityRoots {
+        client_secret_pepper: value("client-secret-pepper")?,
+        dynamic_registration_token: value("dynamic-registration-token")?,
+        openid4vc_data_encryption_key: value("openid4vc-data-encryption-key")?,
+        openid4vci_management_token: value("openid4vci-management-token")?,
+        openid4vp_management_token: value("openid4vp-management-token")?,
+    })
 }
 
 fn render_config_yaml(
@@ -356,14 +421,28 @@ fn render_config_yaml(
          VALKEY_STATE_EPOCH: \"{state_epoch}\"\n\
          {transport_mode}\
          SECURITY_AUDIT_REQUIRE_LEAST_PRIVILEGE: \"true\"\n\
+         ENABLE_DIRECTORY_OPENID4VCI_ISSUER: \"true\"\n\
+         ENABLE_DIRECTORY_OPENID4VP_VERIFIER: \"true\"\n\
+         OPENID4VC_REVOCATION_POLICY: \"required\"\n\
+         OPENID4VCI_CREDENTIAL_CONFIGURATIONS_JSON: '{DIRECTORY_OPENID4VC_CREDENTIAL_CONFIGURATIONS}'\n\
          DATABASE_URL: \"{}\"\n\
          VALKEY_URL: \"{}\"\n\
          MFA_TOTP_ENCRYPTION_KEY_FILE: \"{}\"\n\
+         CLIENT_SECRET_PEPPER_FILE: \"{}\"\n\
+         DYNAMIC_CLIENT_REGISTRATION_INITIAL_ACCESS_TOKEN_FILE: \"{}\"\n\
+         OPENID4VC_DATA_ENCRYPTION_KEY_FILE: \"{}\"\n\
+         OPENID4VCI_ISSUER_MANAGEMENT_TOKEN_FILE: \"{}\"\n\
+         OPENID4VP_VERIFIER_MANAGEMENT_TOKEN_FILE: \"{}\"\n\
          DATA_DIR: \"{}\"\n",
         runtime.bind,
         runtime.database_url,
         runtime.valkey_url,
         runtime.mfa_totp_key_file,
+        runtime.client_secret_pepper_file,
+        runtime.dynamic_registration_token_file,
+        runtime.openid4vc_data_encryption_key_file,
+        runtime.openid4vci_management_token_file,
+        runtime.openid4vp_management_token_file,
         runtime.data_dir,
     ))
 }
@@ -409,6 +488,7 @@ fn select_runtime(
 }
 
 /// Build everything the target needs for one clean-install operation.
+#[allow(clippy::too_many_arguments)]
 fn build_install_order(
     request: &mut CleanInstallRequest,
     paths: &InstallPaths,
@@ -417,6 +497,7 @@ fn build_install_order(
     deployment_id: &str,
     state_epoch: &str,
     loopback_port: u16,
+    security_roots: &DeploymentSecurityRoots,
 ) -> anyhow::Result<InstallOrder> {
     let database_runtime_url_file =
         target_os.join(&paths.secrets_dir, &["database-runtime-url"])?;
@@ -424,6 +505,16 @@ fn build_install_order(
         target_os.join(&paths.secrets_dir, &["database-lifecycle-url"])?;
     let valkey_url_file = target_os.join(&paths.secrets_dir, &["valkey-url"])?;
     let mfa_totp_key_file = target_os.join(&paths.secrets_dir, &["mfa-totp-key"])?;
+    let client_secret_pepper_file =
+        target_os.join(&paths.secrets_dir, &["client-secret-pepper"])?;
+    let dynamic_registration_token_file =
+        target_os.join(&paths.secrets_dir, &["dynamic-registration-token"])?;
+    let openid4vc_data_encryption_key_file =
+        target_os.join(&paths.secrets_dir, &["openid4vc-data-encryption-key"])?;
+    let openid4vci_management_token_file =
+        target_os.join(&paths.secrets_dir, &["openid4vci-management-token"])?;
+    let openid4vp_management_token_file =
+        target_os.join(&paths.secrets_dir, &["openid4vp-management-token"])?;
 
     let database_runtime_url = format!(
         "postgresql://{}:{}@{}:{}/{}",
@@ -458,6 +549,23 @@ fn build_install_order(
             database_url: database_runtime_url.clone(),
             valkey_url: valkey_url.clone(),
             mfa_totp_key_file: config_path(target_os, &mfa_totp_key_file),
+            client_secret_pepper_file: config_path(target_os, &client_secret_pepper_file),
+            dynamic_registration_token_file: config_path(
+                target_os,
+                &dynamic_registration_token_file,
+            ),
+            openid4vc_data_encryption_key_file: config_path(
+                target_os,
+                &openid4vc_data_encryption_key_file,
+            ),
+            openid4vci_management_token_file: config_path(
+                target_os,
+                &openid4vci_management_token_file,
+            ),
+            openid4vp_management_token_file: config_path(
+                target_os,
+                &openid4vp_management_token_file,
+            ),
             bind: format!("127.0.0.1:{loopback_port}"),
             trusted_proxy_cidrs: "127.0.0.0/8,::1/128".to_owned(),
         }
@@ -468,6 +576,26 @@ fn build_install_order(
             valkey_url,
             mfa_totp_key_file: format!(
                 "{}/mfa-totp-key",
+                crate::target::install_exec::CONTAINER_SECRETS_DIR
+            ),
+            client_secret_pepper_file: format!(
+                "{}/client-secret-pepper",
+                crate::target::install_exec::CONTAINER_SECRETS_DIR
+            ),
+            dynamic_registration_token_file: format!(
+                "{}/dynamic-registration-token",
+                crate::target::install_exec::CONTAINER_SECRETS_DIR
+            ),
+            openid4vc_data_encryption_key_file: format!(
+                "{}/openid4vc-data-encryption-key",
+                crate::target::install_exec::CONTAINER_SECRETS_DIR
+            ),
+            openid4vci_management_token_file: format!(
+                "{}/openid4vci-management-token",
+                crate::target::install_exec::CONTAINER_SECRETS_DIR
+            ),
+            openid4vp_management_token_file: format!(
+                "{}/openid4vp-management-token",
                 crate::target::install_exec::CONTAINER_SECRETS_DIR
             ),
             bind: format!("0.0.0.0:{CONTAINER_PORT}"),
@@ -486,18 +614,17 @@ fn build_install_order(
         _ => bail!("current data import requires both target-local source paths"),
     };
 
-    let order =
-        InstallOrder {
-            artifact: OfficialArtifactRef {
-                repository: SERVER_REPOSITORY.to_owned(),
-                version: request.version.clone(),
-            },
-            config_content,
-            config_sha256,
-            data_root: paths.data_root.clone(),
-            runtime_root: (runtime_kind == RuntimeBackendKind::Host)
-                .then(|| paths.runtime_root.clone()),
-            secrets: vec![
+    let order = InstallOrder {
+        artifact: OfficialArtifactRef {
+            repository: SERVER_REPOSITORY.to_owned(),
+            version: request.version.clone(),
+        },
+        config_content,
+        config_sha256,
+        data_root: paths.data_root.clone(),
+        runtime_root: (runtime_kind == RuntimeBackendKind::Host)
+            .then(|| paths.runtime_root.clone()),
+        secrets: vec![
             PlannedSecret {
                 purpose: "database-runtime-url".to_owned(),
                 path: database_runtime_url_file,
@@ -515,21 +642,59 @@ fn build_install_order(
             PlannedSecret {
                 purpose: "valkey-url".to_owned(),
                 path: valkey_url_file,
-                value: Some(request.valkey_password.take().context(
-                    "Valkey password was already consumed by this install attempt",
-                )?),
+                value: Some(
+                    request
+                        .valkey_password
+                        .take()
+                        .context("Valkey password was already consumed by this install attempt")?,
+                ),
             },
             PlannedSecret {
                 purpose: "mfa-totp-key".to_owned(),
                 path: mfa_totp_key_file,
                 value: None,
             },
+            PlannedSecret {
+                purpose: "client-secret-pepper".to_owned(),
+                path: target_os.join(&paths.secrets_dir, &["client-secret-pepper"])?,
+                value: Some(SecretMaterial::try_new(
+                    security_roots.client_secret_pepper.clone(),
+                )?),
+            },
+            PlannedSecret {
+                purpose: "dynamic-registration-token".to_owned(),
+                path: target_os.join(&paths.secrets_dir, &["dynamic-registration-token"])?,
+                value: Some(SecretMaterial::try_new(
+                    security_roots.dynamic_registration_token.clone(),
+                )?),
+            },
+            PlannedSecret {
+                purpose: "openid4vc-data-encryption-key".to_owned(),
+                path: target_os.join(&paths.secrets_dir, &["openid4vc-data-encryption-key"])?,
+                value: Some(SecretMaterial::try_new(
+                    security_roots.openid4vc_data_encryption_key.clone(),
+                )?),
+            },
+            PlannedSecret {
+                purpose: "openid4vci-management-token".to_owned(),
+                path: target_os.join(&paths.secrets_dir, &["openid4vci-management-token"])?,
+                value: Some(SecretMaterial::try_new(
+                    security_roots.openid4vci_management_token.clone(),
+                )?),
+            },
+            PlannedSecret {
+                purpose: "openid4vp-management-token".to_owned(),
+                path: target_os.join(&paths.secrets_dir, &["openid4vp-management-token"])?,
+                value: Some(SecretMaterial::try_new(
+                    security_roots.openid4vp_management_token.clone(),
+                )?),
+            },
         ],
-            current_data_import,
-            database_runtime_endpoint: request.database_runtime_endpoint.clone(),
-            database_lifecycle_endpoint: request.database_lifecycle_endpoint.clone(),
-            valkey_endpoint: request.valkey_endpoint.clone(),
-        };
+        current_data_import,
+        database_runtime_endpoint: request.database_runtime_endpoint.clone(),
+        database_lifecycle_endpoint: request.database_lifecycle_endpoint.clone(),
+        valkey_endpoint: request.valkey_endpoint.clone(),
+    };
     Ok(order)
 }
 
@@ -631,6 +796,7 @@ fn prepare_install_operation(
         operation_id,
         state_epoch,
         None,
+        &DeploymentSecurityRoots::generate(),
     )
 }
 
@@ -641,6 +807,7 @@ fn prepare_install_operation_with_identity(
     operation_id: Uuid,
     state_epoch: Uuid,
     resumed_runtime_kind: Option<RuntimeBackendKind>,
+    security_roots: &DeploymentSecurityRoots,
 ) -> anyhow::Result<PreparedInstallOperation> {
     validate_key(deployment_id, "generated deployment id")?;
     if state_epoch.is_nil() {
@@ -674,6 +841,7 @@ fn prepare_install_operation_with_identity(
         deployment_id,
         &state_epoch.to_string(),
         loopback_port,
+        security_roots,
     )?;
     let resources = declare_resources(
         &target_os.parent(&paths.config_reference)?,
@@ -814,6 +982,10 @@ pub(crate) fn run_clean_install(
                 .context("prepared install operation id is invalid")?;
             let state_epoch = Uuid::parse_str(&plan.state_epoch)
                 .context("prepared install state epoch is invalid")?;
+            let security_roots = load_or_create_deployment_security_roots(
+                context.registry.root(),
+                &plan.deployment_id,
+            )?;
             prepare_install_operation_with_identity(
                 &mut request,
                 &hello,
@@ -827,6 +999,7 @@ pub(crate) fn run_clean_install(
                             || "prepared install journal contains an unsupported runtime kind",
                         )?,
                 ),
+                &security_roots,
             )?
         }
         None => {
@@ -834,6 +1007,8 @@ pub(crate) fn run_clean_install(
             let operation_id = Uuid::now_v7();
             let state_epoch = Uuid::now_v7();
             let runtime_kind = select_runtime(&hello.supported_runtimes, request.runtime)?;
+            let security_roots =
+                load_or_create_deployment_security_roots(context.registry.root(), &deployment_id)?;
             let prepared = prepare_install_operation_with_identity(
                 &mut request,
                 &hello,
@@ -841,6 +1016,7 @@ pub(crate) fn run_clean_install(
                 operation_id,
                 state_epoch,
                 Some(runtime_kind),
+                &security_roots,
             )?;
             let plan = install_journal::PreparedInstallPlan::new(
                 request_hash.clone(),

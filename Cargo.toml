@@ -15,7 +15,7 @@ repository = "https://github.com/nazozero/NazoAuthCtl"
 rust-version = "1.97"
 
 [workspace.dependencies]
-nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", tag = "v0.2.6", version = "0.2.6", package = "nazo-operator-protocol" }
+nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", rev = "379174a8a7519a2dfd32a2bde48ab272f0a7b1cb", version = "0.2.7", package = "nazo-operator-protocol" }
 
 [package]
 name = "nazoauthctl-core"

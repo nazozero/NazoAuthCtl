@@ -18,6 +18,7 @@ mod credentials;
 mod evidence;
 mod materializer;
 mod matrix;
+mod oidf_protocol;
 mod orchestrator;
 mod origin;
 mod progress;

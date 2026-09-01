@@ -302,6 +302,9 @@ fn validate_result_contract(
             ControlOperationPayload::TenantResourceApply { .. },
             Some(ControlResultData::TenantResourceApply { .. }),
         ) | (
+            ControlOperationPayload::TenantKeysGenerateLocal { .. },
+            Some(ControlResultData::TenantKeyGenerated { .. }),
+        ) | (
             ControlOperationPayload::TenantResourceEnumerate { .. },
             Some(ControlResultData::TenantResourceEnumerate { .. }),
         ) | (
@@ -314,7 +317,6 @@ fn validate_result_contract(
             ControlOperationPayload::MigrateApply
                 | ControlOperationPayload::KeysList
                 | ControlOperationPayload::KeysValidate
-                | ControlOperationPayload::KeysGenerateLocal { .. }
                 | ControlOperationPayload::KeysRegisterExternal { .. },
             None,
         )

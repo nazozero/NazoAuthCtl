@@ -23,6 +23,8 @@ use thiserror::Error;
 use url::Url;
 use zeroize::Zeroizing;
 
+use crate::oidf_protocol as nazo_operator_protocol;
+
 #[cfg(test)]
 use crate::origin::Origin;
 

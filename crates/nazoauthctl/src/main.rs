@@ -490,7 +490,6 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
     let mut trust_policy = None;
     let mut artifact_cache = None;
     let mut artifact_digest = None;
-    let mut tenant_id = None;
     let mut suite = None;
     let mut token = None;
     let mut token_file = None;
@@ -516,7 +515,6 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
             "--trust-policy"
             | "--artifact-cache"
             | "--artifact-digest"
-            | "--tenant-id"
             | "--suite"
             | "--token"
             | "--token-file"
@@ -543,7 +541,6 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
                         set_once(&mut artifact_cache, PathBuf::from(value), option)?;
                     }
                     "--artifact-digest" => set_once(&mut artifact_digest, value, option)?,
-                    "--tenant-id" => set_once(&mut tenant_id, value, option)?,
                     "--suite" => set_once(&mut suite, value, option)?,
                     "--token" => set_once(&mut token, Zeroizing::new(value), option)?,
                     "--token-file" => set_once(&mut token_file, PathBuf::from(value), option)?,
@@ -656,12 +653,7 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
     {
         bail!("--artifact-digest must be 64 lowercase hexadecimal characters");
     }
-    let tenant_id = tenant_id.context("--tenant-id is required")?;
-    let parsed_tenant =
-        uuid::Uuid::parse_str(&tenant_id).context("--tenant-id must be a canonical UUID")?;
-    if parsed_tenant.hyphenated().to_string() != tenant_id {
-        bail!("--tenant-id must be a canonical UUID");
-    }
+    let tenant_id = uuid::Uuid::now_v7().to_string();
     let distinct_webdrivers = webdriver.iter().collect::<std::collections::BTreeSet<_>>();
     if poll_timeout.is_zero()
         || poll_timeout > Duration::from_secs(MAX_POLL_TIMEOUT_SECONDS)
@@ -728,7 +720,7 @@ fn push_unique_vec(values: &mut Vec<String>, value: String, option: &str) -> any
 
 fn print_run_help() {
     println!(
-        "Usage:\n  nazoauthctl [--instance SELECTOR] [--json] oidf run --trust-policy PATH --artifact-cache PATH --artifact-digest SHA256 --tenant-id UUID [options]\n\nRequired:\n  --trust-policy PATH            Signed-artifact trust policy\n  --artifact-cache PATH          Private immutable artifact cache root\n  --artifact-digest SHA256       Exact cached compact-manifest digest (64 lowercase hex)\n  --tenant-id UUID               Canonical target tenant UUID\n\nOptions:\n  --suite URL                    OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN                  API token; visible in argv/shell history\n  --token-file PATH              Read token from a private regular file\n  --token-stdin                  Read token from stdin\n  --token-fd FD                  Read token from an inherited private descriptor\n  --webdriver URL                Dedicated W3C endpoint; repeat exactly once per job\n  --evidence-dir PATH            Commit a unique controller-operation-bound private evidence bundle\n  --capture-review-screenshots   Capture signed review placeholders locally into --evidence-dir\n  --upload-review-screenshots    Upload each captured PNG to its exact Suite placeholder and wait for REVIEW\n  --retain-suite-plans-for-certification\n                               Retain terminal plans, or an audited deferred OIDF review boundary, at the official Suite\n  --proxy-trust-bundle PATH      Atomically install this run's public client CAs\n  --proxy-reload-executable PATH Root-owned executable that validates/reloads the proxy\n  --group ID                     Run one signed Matrix group; repeat to select more\n  --plan ID                      Run one signed Matrix plan; repeat to select more\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
+        "Usage:\n  nazoauthctl [--instance SELECTOR] [--json] oidf run --trust-policy PATH --artifact-cache PATH --artifact-digest SHA256 [options]\n\nRequired:\n  --trust-policy PATH            Signed-artifact trust policy\n  --artifact-cache PATH          Private immutable artifact cache root\n  --artifact-digest SHA256       Exact cached compact-manifest digest (64 lowercase hex)\n\nEach run creates a fresh temporary tenant at <uuid>.oidf.nazoauth.com and generates new client, mTLS, attestation, credential and tenant signing material.\n\nOptions:\n  --suite URL                    OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN                  API token; visible in argv/shell history\n  --token-file PATH              Read token from a private regular file\n  --token-stdin                  Read token from stdin\n  --token-fd FD                  Read token from an inherited private descriptor\n  --webdriver URL                Dedicated W3C endpoint; repeat exactly once per job\n  --evidence-dir PATH            Commit a unique controller-operation-bound private evidence bundle\n  --capture-review-screenshots   Capture signed review placeholders locally into --evidence-dir\n  --upload-review-screenshots    Upload each captured PNG to its exact Suite placeholder and wait for REVIEW\n  --retain-suite-plans-for-certification\n                               Retain terminal plans, or an audited deferred OIDF review boundary, at the official Suite\n  --proxy-trust-bundle PATH      Atomically install this run's public client CAs\n  --proxy-reload-executable PATH Root-owned executable that validates/reloads the proxy\n  --group ID                     Run one signed Matrix group; repeat to select more\n  --plan ID                      Run one signed Matrix plan; repeat to select more\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
     );
     println!(
         "  --ciba-user-approval-callback-url URL  Public HTTPS callback forwarded only to the local Ctl listener\n  --ciba-user-approval-listen ADDR       Loopback IP:port for that callback"
@@ -1059,8 +1051,6 @@ mod tests {
             "/x/cache",
             "--artifact-digest",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--tenant-id",
-            "00000000-0000-0000-0000-000000000000",
             "--suite",
             "https://suite.example",
             "--token-fd",
@@ -1083,7 +1073,7 @@ mod tests {
         assert_eq!(parsed.trust_policy, PathBuf::from("/x/trust.json"));
         assert_eq!(parsed.artifact_cache, PathBuf::from("/x/cache"));
         assert_eq!(parsed.artifact_digest, "a".repeat(64));
-        assert_eq!(parsed.tenant_id, uuid::Uuid::nil().to_string());
+        assert!(uuid::Uuid::parse_str(&parsed.tenant_id).is_ok());
         assert_eq!(parsed.token_fd, Some(7));
         assert_eq!(parsed.groups, ["oidc"]);
         assert!(parsed.retain_suite_plans_for_certification);
@@ -1105,8 +1095,6 @@ mod tests {
             "/x/cache",
             "--artifact-digest",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--tenant-id",
-            "00000000-0000-0000-0000-000000000000",
             "--capture-review-screenshots",
         ]))
         .err()
@@ -1126,8 +1114,6 @@ mod tests {
             "/x/cache",
             "--artifact-digest",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--tenant-id",
-            "00000000-0000-0000-0000-000000000000",
             "--upload-review-screenshots",
         ]))
         .err()
@@ -1152,8 +1138,6 @@ mod tests {
                 "/x/cache",
                 "--artifact-digest",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "--tenant-id",
-                "00000000-0000-0000-0000-000000000000",
                 "--jobs",
                 jobs,
             ])) {
@@ -1176,8 +1160,6 @@ mod tests {
             "/x/cache",
             "--artifact-digest",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--tenant-id",
-            "00000000-0000-0000-0000-000000000000",
             "--poll-timeout",
             "86401",
         ])) {
@@ -1210,8 +1192,6 @@ mod tests {
             "/x/cache",
             "--artifact-digest",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--tenant-id",
-            "00000000-0000-0000-0000-000000000000",
             "--lease-ttl",
             "14400",
         ]));
@@ -1235,8 +1215,6 @@ mod tests {
             "/x/cache",
             "--artifact-digest",
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "--tenant-id",
-            "00000000-0000-0000-0000-000000000000",
         ]));
         let uppercase_digest = match uppercase_digest {
             Err(error) => error,
@@ -1248,7 +1226,7 @@ mod tests {
                 .contains("64 lowercase hexadecimal characters")
         );
 
-        let noncanonical_tenant = routed_run(&args(&[
+        let caller_supplied_tenant = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",
@@ -1259,13 +1237,17 @@ mod tests {
             "--artifact-digest",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--tenant-id",
-            "00000000000000000000000000000000",
+            "00000000-0000-0000-0000-000000000000",
         ]));
-        let noncanonical_tenant = match noncanonical_tenant {
+        let caller_supplied_tenant = match caller_supplied_tenant {
             Err(error) => error,
-            Ok(_) => panic!("noncanonical tenant UUID must fail"),
+            Ok(_) => panic!("caller-supplied tenant identity must fail"),
         };
-        assert!(noncanonical_tenant.to_string().contains("canonical UUID"));
+        assert!(
+            caller_supplied_tenant
+                .to_string()
+                .contains("unknown oidf run option: --tenant-id")
+        );
     }
 
     #[test]
@@ -1280,8 +1262,6 @@ mod tests {
             "/x/cache",
             "--artifact-digest",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--tenant-id",
-            "00000000-0000-0000-0000-000000000000",
             "--proxy-trust-bundle",
             "/run/proxy/client-cas.pem",
         ]));
@@ -1297,8 +1277,6 @@ mod tests {
             "/x/cache",
             "--artifact-digest",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--tenant-id",
-            "00000000-0000-0000-0000-000000000000",
             "--proxy-trust-bundle",
             "/run/proxy/client-cas.pem",
             "--proxy-reload-executable",
@@ -1328,8 +1306,6 @@ mod tests {
             "/x/cache",
             "--artifact-digest",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--tenant-id",
-            "00000000-0000-0000-0000-000000000000",
             "--jobs",
             "2",
             "--webdriver",
@@ -1347,8 +1323,6 @@ mod tests {
             "/x/cache",
             "--artifact-digest",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--tenant-id",
-            "00000000-0000-0000-0000-000000000000",
             "--jobs",
             "2",
             "--webdriver",
@@ -1368,8 +1342,6 @@ mod tests {
             "/x/cache",
             "--artifact-digest",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--tenant-id",
-            "00000000-0000-0000-0000-000000000000",
             "--jobs",
             "2",
             "--webdriver",

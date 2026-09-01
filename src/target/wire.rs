@@ -29,7 +29,7 @@ use uuid::Uuid;
 use super::deployment_state::{ArtifactRefs, RuntimeSurface, StateMutationPayload};
 
 /// Wire schema discriminator for HostOperation and HostResult messages.
-pub const HOST_PROTOCOL_SCHEMA: u32 = 5;
+pub const HOST_PROTOCOL_SCHEMA: u32 = 6;
 
 /// Maximum serialized HostOperation accepted from stdin or a local caller.
 /// A tenant-resource Apply may carry one 4 MiB change set encoded as base64,
@@ -1984,6 +1984,11 @@ mod tests {
                 ("database-lifecycle-url", true),
                 ("valkey-url", true),
                 ("mfa-totp-key", false),
+                ("client-secret-pepper", true),
+                ("dynamic-registration-token", true),
+                ("openid4vc-data-encryption-key", true),
+                ("openid4vci-management-token", true),
+                ("openid4vp-management-token", true),
             ]
             .into_iter()
             .map(

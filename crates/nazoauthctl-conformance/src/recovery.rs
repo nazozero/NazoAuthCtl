@@ -4,16 +4,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context as _, bail};
-use fs2::FileExt as _;
-use nazo_operator_protocol::{
+use crate::oidf_protocol as nazo_operator_protocol;
+use crate::oidf_protocol::{
     ControlOutcome, ControlResult, ControlResultData, MAX_TENANT_RESOURCE_IDENTITIES,
     TenantResourceIdentity, TenantResourceKind, validate_file_identifier_value,
 };
+use anyhow::{Context as _, bail};
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-const TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 2;
+const TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA: u32 = 3;
 const TENANT_RESOURCE_RECOVERY_KIND: &str = "tenant-resource";
 const MAX_RECOVERY_JOURNAL_BYTES: usize = 128 * 1024;
 const MAX_PENDING_RUNS: usize = 64;
@@ -38,7 +39,10 @@ pub struct ConformanceProxyRecovery {
 pub struct TenantResourceRecoveryBinding {
     pub deployment_id: String,
     pub tenant_id: String,
+    pub realm_id: String,
+    pub organization_id: String,
     pub run_id: String,
+    pub tenant_create_expected_revision: u64,
     pub manifest_path: Option<PathBuf>,
     /// SHA-256 of the private Apply material. The ControlOperation request
     /// binds its public identity set; this digest makes resume reject a local
@@ -267,6 +271,14 @@ struct TenantResourceRecoveryJournal {
     kind: String,
     binding: TenantResourceRecoveryBinding,
     phase: TenantResourceRecoveryPhase,
+    tenant_created: bool,
+    tenant_key_generated: bool,
+    tenant_reload_expected_revision: Option<u64>,
+    tenant_reloaded: bool,
+    tenant_disable_expected_revision: Option<u64>,
+    tenant_disabled: bool,
+    tenant_finalize_expected_revision: Option<u64>,
+    tenant_cleanup_complete: bool,
     baseline_enumerate: Option<TenantResourceControlOperation>,
     apply: Option<TenantResourceControlOperation>,
     cleanup_enumerate: Option<TenantResourceControlOperation>,
@@ -344,6 +356,14 @@ impl ConformanceRecoveryStore {
                 kind: TENANT_RESOURCE_RECOVERY_KIND.to_owned(),
                 binding,
                 phase: TenantResourceRecoveryPhase::Intent,
+                tenant_created: false,
+                tenant_key_generated: false,
+                tenant_reload_expected_revision: None,
+                tenant_reloaded: false,
+                tenant_disable_expected_revision: None,
+                tenant_disabled: false,
+                tenant_finalize_expected_revision: None,
+                tenant_cleanup_complete: false,
                 baseline_enumerate: None,
                 apply: None,
                 cleanup_enumerate: None,
@@ -546,6 +566,106 @@ impl ConformanceRecoveryGuard {
 
     pub fn ordinary_phase(&self) -> TenantResourceRecoveryPhase {
         self.journal.phase
+    }
+
+    pub fn tenant_created(&self) -> bool {
+        self.journal.tenant_created
+    }
+
+    pub fn mark_tenant_created(&mut self) -> anyhow::Result<()> {
+        self.journal.tenant_created = true;
+        self.persist()
+    }
+
+    pub fn tenant_key_generated(&self) -> bool {
+        self.journal.tenant_key_generated
+    }
+
+    pub fn mark_tenant_key_generated(&mut self) -> anyhow::Result<()> {
+        if !self.journal.tenant_created {
+            bail!("tenant key generation requires a persisted tenant create result");
+        }
+        self.journal.tenant_key_generated = true;
+        self.persist()
+    }
+
+    pub fn tenant_reload_expected_revision(&self) -> Option<u64> {
+        self.journal.tenant_reload_expected_revision
+    }
+
+    pub fn prepare_tenant_reload(&mut self, revision: u64) -> anyhow::Result<()> {
+        if !self.journal.tenant_key_generated {
+            bail!("tenant reload requires persisted key generation");
+        }
+        match self.journal.tenant_reload_expected_revision {
+            Some(existing) if existing != revision => bail!("tenant reload revision conflicts"),
+            _ => self.journal.tenant_reload_expected_revision = Some(revision),
+        }
+        self.persist()
+    }
+
+    pub fn tenant_reloaded(&self) -> bool {
+        self.journal.tenant_reloaded
+    }
+
+    pub fn mark_tenant_reloaded(&mut self) -> anyhow::Result<()> {
+        if self.journal.tenant_reload_expected_revision.is_none() {
+            bail!("tenant reload has no persisted revision");
+        }
+        self.journal.tenant_reloaded = true;
+        self.persist()
+    }
+
+    pub fn tenant_disable_expected_revision(&self) -> Option<u64> {
+        self.journal.tenant_disable_expected_revision
+    }
+
+    pub fn prepare_tenant_disable(&mut self, revision: u64) -> anyhow::Result<()> {
+        match self.journal.tenant_disable_expected_revision {
+            Some(existing) if existing != revision => bail!("tenant disable revision conflicts"),
+            _ => self.journal.tenant_disable_expected_revision = Some(revision),
+        }
+        self.persist()
+    }
+
+    pub fn tenant_disabled(&self) -> bool {
+        self.journal.tenant_disabled
+    }
+
+    pub fn mark_tenant_disabled(&mut self) -> anyhow::Result<()> {
+        if self.journal.tenant_disable_expected_revision.is_none() {
+            bail!("tenant disable has no persisted revision");
+        }
+        self.journal.tenant_disabled = true;
+        self.persist()
+    }
+
+    pub fn tenant_finalize_expected_revision(&self) -> Option<u64> {
+        self.journal.tenant_finalize_expected_revision
+    }
+
+    pub fn prepare_tenant_finalize(&mut self, revision: u64) -> anyhow::Result<()> {
+        if !self.journal.tenant_disabled {
+            bail!("tenant finalize requires a persisted disable result");
+        }
+        match self.journal.tenant_finalize_expected_revision {
+            Some(existing) if existing != revision => bail!("tenant finalize revision conflicts"),
+            _ => self.journal.tenant_finalize_expected_revision = Some(revision),
+        }
+        self.persist()
+    }
+
+    pub fn tenant_cleanup_complete(&self) -> bool {
+        self.journal.tenant_cleanup_complete
+    }
+
+    pub fn mark_tenant_cleanup_complete(&mut self) -> anyhow::Result<()> {
+        if !self.journal.tenant_disabled || self.journal.tenant_finalize_expected_revision.is_none()
+        {
+            bail!("temporary tenant cleanup requires persisted disable and finalize intent");
+        }
+        self.journal.tenant_cleanup_complete = true;
+        self.persist()
     }
 
     pub fn apply_operation(&self) -> Option<&TenantResourceControlOperation> {
@@ -957,6 +1077,7 @@ impl ConformanceRecoveryGuard {
 
     pub fn commit_suite_plan_retention(&mut self) -> anyhow::Result<()> {
         if !tenant_resource_obligations_complete(&self.journal)
+            || !self.journal.tenant_cleanup_complete
             || !self.journal.proxy_cleanup_complete
         {
             bail!("Suite retention cannot commit before ordinary and proxy cleanup complete");
@@ -1227,6 +1348,19 @@ fn validate_tenant_resource_journal(
     }
     if journal.cleanup_complete && !tenant_resource_obligations_complete(journal) {
         bail!("tenant-resource cleanup marker is ahead of its obligations");
+    }
+    if journal.tenant_cleanup_complete && !journal.tenant_created {
+        bail!("temporary tenant cleanup is ahead of tenant creation");
+    }
+    if journal.tenant_key_generated && !journal.tenant_created
+        || journal.tenant_reload_expected_revision.is_some() && !journal.tenant_key_generated
+        || journal.tenant_reloaded && journal.tenant_reload_expected_revision.is_none()
+        || journal.tenant_disable_expected_revision.is_some() && !journal.tenant_created
+        || journal.tenant_disabled && journal.tenant_disable_expected_revision.is_none()
+        || journal.tenant_finalize_expected_revision.is_some() && !journal.tenant_disabled
+        || journal.tenant_cleanup_complete && journal.tenant_finalize_expected_revision.is_none()
+    {
+        bail!("temporary tenant lifecycle state is inconsistent");
     }
     if journal.manifest_removal_intent
         && (!journal.cleanup_complete || journal.binding.manifest_path.is_none())
@@ -2212,8 +2346,17 @@ fn validate_ordinary_binding(
     validate_component(&binding.run_id, "run ID")?;
     let tenant_id = uuid::Uuid::parse_str(&binding.tenant_id)
         .map_err(|_| anyhow::anyhow!("tenant-resource tenant ID is invalid"))?;
+    let realm_id = uuid::Uuid::parse_str(&binding.realm_id)
+        .map_err(|_| anyhow::anyhow!("tenant-resource realm ID is invalid"))?;
+    let organization_id = uuid::Uuid::parse_str(&binding.organization_id)
+        .map_err(|_| anyhow::anyhow!("tenant-resource organization ID is invalid"))?;
     if binding.deployment_id != deployment_id
         || tenant_id.to_string() != binding.tenant_id
+        || realm_id.to_string() != binding.realm_id
+        || organization_id.to_string() != binding.organization_id
+        || tenant_id == realm_id
+        || tenant_id == organization_id
+        || realm_id == organization_id
         || binding.manifest_path.is_some() != binding.material_sha256.is_some()
         || binding
             .manifest_path
@@ -2356,7 +2499,7 @@ fn lower_hex(value: &str, length: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nazo_operator_protocol::{ControlOutcome, TenantResourceMapping};
+    use ::nazo_operator_protocol::{ControlOutcome, TenantResourceMapping};
 
     fn identity() -> TenantResourceIdentity {
         TenantResourceIdentity {
@@ -2370,7 +2513,10 @@ mod tests {
         TenantResourceRecoveryBinding {
             deployment_id: "deployment-1".to_owned(),
             tenant_id: "00000000-0000-0000-0000-000000000000".to_owned(),
+            realm_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            organization_id: "00000000-0000-0000-0000-000000000002".to_owned(),
             run_id: "run-1".to_owned(),
+            tenant_create_expected_revision: 0,
             manifest_path: None,
             material_sha256: None,
             proxy: None,
@@ -2386,7 +2532,7 @@ mod tests {
             request_hash: "b".repeat(64),
             controller_kid: "c".repeat(43),
             result: ControlResult {
-                schema: 1,
+                schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
                 operation_id,
                 request_hash: "b".repeat(64),
                 outcome: ControlOutcome::Succeeded,

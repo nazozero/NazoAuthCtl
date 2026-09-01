@@ -1214,8 +1214,8 @@ dependencies = [
 
 [[package]]
 name = "nazo-operator-protocol"
-version = "0.2.6"
-source = "git+https://github.com/nazozero/NazoAuth.git?tag=v0.2.6#1428c614f9c5009ab26ce0fcb1109ace106b8b28"
+version = "0.2.7"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=379174a8a7519a2dfd32a2bde48ab272f0a7b1cb#379174a8a7519a2dfd32a2bde48ab272f0a7b1cb"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1253,6 +1253,7 @@ dependencies = [
  "anyhow",
  "aws-lc-rs",
  "base64 0.23.1",
+ "chrono",
  "ed25519-dalek",
  "fs2",
  "keyring",

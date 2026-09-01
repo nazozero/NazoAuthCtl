@@ -68,6 +68,7 @@ use template::{
 
 struct MaterializationBindings {
     applicant_id: String,
+    openid4vc_credential_trust_anchor_pem: String,
     openid4vc_request_object_trust_anchor_pem: String,
     clients: BTreeMap<String, String>,
 }
@@ -81,7 +82,6 @@ pub struct PreparedMaterialization {
     suite_base_url: String,
     request_jti: String,
     matrix_sha256: String,
-    deployment_credential_trust_anchor_pem: String,
     applicant_email: Zeroizing<String>,
     applicant_password: Zeroizing<String>,
     tx_code: Option<Zeroizing<String>>,
@@ -1124,10 +1124,9 @@ pub struct ArtifactMaterializationBinding<'a> {
     pub target_issuer: &'a str,
     pub suite_origin: &'a Origin,
     pub request_jti: &'a str,
-    pub credential_trust_anchor_pem: &'a str,
-    /// Deployment-owned RFC 7591 initial access token.  Ordinary runs may
-    /// expose this existing standards profile credential to a signed plan,
-    /// but must never mint a replacement for it.
+    /// Run-tenant RFC 7591 initial access token derived from the deployment
+    /// root. Ordinary runs may expose it to a signed plan, but never persist it
+    /// in the recovery journal.
     pub dynamic_registration_initial_access_token: Option<&'a str>,
     /// Controller-owned HTTPS callback used only by the external driver for
     /// a normal user CIBA decision. Ordinary materialization rejects removed
@@ -1172,7 +1171,6 @@ impl DescriptorMaterializer {
             binding.target_issuer,
             binding.suite_origin,
             binding.request_jti,
-            binding.credential_trust_anchor_pem,
             binding.dynamic_registration_initial_access_token,
             binding.ciba_user_approval_callback_url,
         )
@@ -1237,30 +1235,12 @@ impl DescriptorMaterializer {
         target_issuer: &str,
         suite_origin: &Origin,
         request_jti: &str,
-        credential_trust_anchor_pem: &str,
         dynamic_registration_initial_access_token: Option<&str>,
         ciba_user_approval_callback_url: Option<&str>,
     ) -> Result<PreparedMaterialization, MaterializerError> {
         validate_descriptor(&descriptor)?;
         validate_target_issuer(target_issuer)?;
         validate_request_jti(request_jti)?;
-        // The deployment issuer root and the Suite mdoc root are independent
-        // trust domains. The deployment root is used only by Suite VCI plans;
-        // the target VP verifier instead receives the fresh run CA that signs
-        // the Suite credential issuer plus the pinned Suite mdoc root.
-        let deployment_der = validate_single_mdoc_trust_anchor(
-            credential_trust_anchor_pem,
-            "credential_trust_anchor_pem",
-        )?;
-        let suite_der = validate_single_mdoc_trust_anchor(
-            &descriptor.openid4vc_suite_mdoc_trust_anchor_pem,
-            "openid4vc_suite_mdoc_trust_anchor_pem",
-        )?;
-        if deployment_der == suite_der {
-            return Err(MaterializerError::InvalidField(
-                "credential_trust_anchor_pem",
-            ));
-        }
         let matrix_sha256 = descriptor
             .raw_sha256
             .clone()
@@ -1348,7 +1328,6 @@ impl DescriptorMaterializer {
             suite_base_url: suite_origin.as_str().to_owned(),
             request_jti: request_jti.to_owned(),
             matrix_sha256,
-            deployment_credential_trust_anchor_pem: credential_trust_anchor_pem.to_owned(),
             applicant_email,
             applicant_password,
             tx_code,
@@ -1364,11 +1343,23 @@ impl DescriptorMaterializer {
     pub fn finalize_tenant_resources(
         prepared: PreparedMaterialization,
         apply_output: TenantResourceApplyOutput,
-        deployment_request_object_trust_anchor_pem: impl Into<String>,
+        tenant_signing_certificate_chain_pem: impl Into<String>,
     ) -> Result<TenantResourceMaterializedMatrix, MaterializerError> {
-        let deployment_request_object_trust_anchor_pem =
-            deployment_request_object_trust_anchor_pem.into();
-        validate_public_certificate_bundle(&deployment_request_object_trust_anchor_pem)?;
+        let tenant_signing_certificate_chain_pem = tenant_signing_certificate_chain_pem.into();
+        validate_public_certificate_bundle(&tenant_signing_certificate_chain_pem)?;
+        let deployment_der = validate_single_mdoc_trust_anchor(
+            &tenant_signing_certificate_chain_pem,
+            "credential_trust_anchor_pem",
+        )?;
+        let suite_der = validate_single_mdoc_trust_anchor(
+            &prepared.descriptor.openid4vc_suite_mdoc_trust_anchor_pem,
+            "openid4vc_suite_mdoc_trust_anchor_pem",
+        )?;
+        if deployment_der == suite_der {
+            return Err(MaterializerError::InvalidField(
+                "credential_trust_anchor_pem",
+            ));
+        }
 
         let expected_manifest = prepared.tenant_resource_manifest(prepared.request_jti())?;
         if expected_manifest.resource_identities() != apply_output.delta_resources() {
@@ -1422,7 +1413,8 @@ impl DescriptorMaterializer {
 
         let bindings = MaterializationBindings {
             applicant_id,
-            openid4vc_request_object_trust_anchor_pem: deployment_request_object_trust_anchor_pem,
+            openid4vc_credential_trust_anchor_pem: tenant_signing_certificate_chain_pem.clone(),
+            openid4vc_request_object_trust_anchor_pem: tenant_signing_certificate_chain_pem,
             clients,
         };
         let matrix = materialize_matrix_document(&prepared, &bindings)?;
@@ -1632,7 +1624,7 @@ fn materialize_matrix_document(
                 &prepared.suite_base_url,
                 prepared.tx_code.as_ref().map(|value| value.as_str()),
                 prepared.attestation.as_ref(),
-                &prepared.deployment_credential_trust_anchor_pem,
+                &bindings.openid4vc_credential_trust_anchor_pem,
             )?;
             let config = materialize_vp_config(
                 &plan.plan,
@@ -2055,7 +2047,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
-            test_trust_anchor(),
         )
         .expect("prepare");
         let anchors = prepared.mtls_trust_anchor_pem();
@@ -2164,7 +2155,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
-            test_trust_anchor(),
         )
         .expect("prepare");
         let first = prepared
@@ -2282,7 +2272,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
-            test_trust_anchor(),
         )
         .expect("prepare");
         let manifest = prepared
@@ -2384,7 +2373,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             first_namespace,
-            test_trust_anchor(),
         )
         .expect("first preparation");
         let second_prepared = prepare_for_test(
@@ -2392,7 +2380,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             second_namespace,
-            test_trust_anchor(),
         )
         .expect("second preparation");
 
@@ -2483,7 +2470,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
-            test_trust_anchor(),
         )
         .expect("prepare");
         let manifest = prepared
@@ -2527,7 +2513,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
-            test_trust_anchor(),
         )
         .expect("prepare");
         let manifest = prepared
@@ -2550,7 +2535,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
-            test_trust_anchor(),
         )
         .expect("prepare");
         let manifest = prepared
@@ -2574,7 +2558,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
-            test_trust_anchor(),
         )
         .expect("prepare");
         let manifest = prepared
@@ -2604,7 +2587,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
-            test_trust_anchor(),
         )
         .expect("prepare");
         let manifest = prepared
@@ -2712,7 +2694,6 @@ mod tests {
             target_issuer: "https://issuer.example",
             suite_origin: &suite_origin,
             request_jti: request_jti(),
-            credential_trust_anchor_pem: test_trust_anchor(),
             dynamic_registration_initial_access_token: None,
             ciba_user_approval_callback_url: None,
         };
@@ -2786,7 +2767,6 @@ mod tests {
                 target_issuer: "https://issuer.example",
                 suite_origin: &suite_origin,
                 request_jti: request_jti(),
-                credential_trust_anchor_pem: test_trust_anchor(),
                 dynamic_registration_initial_access_token: None,
                 ciba_user_approval_callback_url: None,
             },
@@ -2807,7 +2787,6 @@ mod tests {
                 target_issuer: "https://issuer.example",
                 suite_origin: &suite_origin,
                 request_jti: request_jti(),
-                credential_trust_anchor_pem: test_trust_anchor(),
                 dynamic_registration_initial_access_token: Some("deployment-dcr-token"),
                 ciba_user_approval_callback_url: None,
             },
@@ -2864,14 +2843,12 @@ mod tests {
         target_issuer: &str,
         suite_origin: &Origin,
         request_jti: &str,
-        credential_trust_anchor_pem: &str,
     ) -> Result<PreparedMaterialization, MaterializerError> {
         DescriptorMaterializer::prepare_materialization(
             descriptor,
             target_issuer,
             suite_origin,
             request_jti,
-            credential_trust_anchor_pem,
             None,
             None,
         )
@@ -3042,32 +3019,40 @@ mod tests {
     #[test]
     fn deployment_and_suite_mdoc_roots_must_be_distinct_and_complete() {
         let descriptor = descriptor();
-        let duplicate = prepare_for_test(
-            descriptor.clone(),
-            "https://issuer.example",
-            &suite(),
-            request_jti(),
+        let prepare = || {
+            let prepared = prepare_for_test(
+                descriptor.clone(),
+                "https://issuer.example",
+                &suite(),
+                request_jti(),
+            )
+            .expect("prepare");
+            let manifest = prepared
+                .tenant_resource_manifest(prepared.request_jti())
+                .expect("manifest");
+            let result = tenant_resource_apply_result(&manifest);
+            let output = tenant_resource_apply_output(result, &manifest).expect("apply output");
+            (prepared, output)
+        };
+
+        let (prepared, output) = prepare();
+        let duplicate = DescriptorMaterializer::finalize_tenant_resources(
+            prepared,
+            output,
             test_suite_mdoc_trust_anchor(),
         )
-        .err()
-        .expect("duplicate roots must fail closed");
+        .expect_err("duplicate roots must fail closed");
         assert!(matches!(
             duplicate,
             MaterializerError::InvalidField("credential_trust_anchor_pem")
         ));
 
-        let missing = prepare_for_test(
-            descriptor.clone(),
-            "https://issuer.example",
-            &suite(),
-            request_jti(),
-            "",
-        )
-        .err()
-        .expect("missing deployment root must fail closed");
+        let (prepared, output) = prepare();
+        let missing = DescriptorMaterializer::finalize_tenant_resources(prepared, output, "")
+            .expect_err("missing deployment root must fail closed");
         assert!(matches!(
             missing,
-            MaterializerError::InvalidField("credential_trust_anchor_pem")
+            MaterializerError::InvalidField("openid4vc_request_object_trust_anchor_pem")
         ));
 
         let expired = generated_test_anchor(
@@ -3076,15 +3061,9 @@ mod tests {
             2,
             -1,
         );
-        let expired = prepare_for_test(
-            descriptor,
-            "https://issuer.example",
-            &suite(),
-            request_jti(),
-            &expired,
-        )
-        .err()
-        .expect("expired deployment root must fail closed");
+        let (prepared, output) = prepare();
+        let expired = DescriptorMaterializer::finalize_tenant_resources(prepared, output, expired)
+            .expect_err("expired deployment root must fail closed");
         assert!(matches!(
             expired,
             MaterializerError::InvalidField("credential_trust_anchor_pem")
@@ -3315,15 +3294,9 @@ mod tests {
         let mut missing = make_descriptor();
         missing.openid4vc_credential_datasets.clear();
         assert_eq!(
-            prepare_for_test(
-                missing,
-                "https://issuer.example",
-                &suite(),
-                request_jti(),
-                test_trust_anchor()
-            )
-            .err()
-            .expect("missing dataset must fail"),
+            prepare_for_test(missing, "https://issuer.example", &suite(), request_jti(),)
+                .err()
+                .expect("missing dataset must fail"),
             MaterializerError::InvalidField("openid4vc_credential_datasets")
         );
 
@@ -3333,15 +3306,9 @@ mod tests {
             serde_json::json!({"given_name":"Unused"}),
         );
         assert_eq!(
-            prepare_for_test(
-                extra,
-                "https://issuer.example",
-                &suite(),
-                request_jti(),
-                test_trust_anchor()
-            )
-            .err()
-            .expect("extra dataset must fail"),
+            prepare_for_test(extra, "https://issuer.example", &suite(), request_jti(),)
+                .err()
+                .expect("extra dataset must fail"),
             MaterializerError::InvalidField("openid4vc_credential_datasets")
         );
 
@@ -3356,7 +3323,6 @@ mod tests {
                 "https://issuer.example",
                 &suite(),
                 request_jti(),
-                test_trust_anchor()
             )
             .err()
             .expect("conflicting dataset must fail"),
@@ -3381,15 +3347,9 @@ mod tests {
             serde_json::json!({"private_key": "not-a-public-claim"}),
         );
         assert_eq!(
-            prepare_for_test(
-                private,
-                "https://issuer.example",
-                &suite(),
-                request_jti(),
-                test_trust_anchor()
-            )
-            .err()
-            .expect("private dataset must fail"),
+            prepare_for_test(private, "https://issuer.example", &suite(), request_jti(),)
+                .err()
+                .expect("private dataset must fail"),
             MaterializerError::EmbeddedSecret
         );
 
@@ -3402,15 +3362,9 @@ mod tests {
             .openid4vc_credential_datasets
             .insert("eu.example.pid".to_owned(), serde_json::json!({}));
         assert_eq!(
-            prepare_for_test(
-                empty,
-                "https://issuer.example",
-                &suite(),
-                request_jti(),
-                test_trust_anchor()
-            )
-            .err()
-            .expect("empty dataset must fail"),
+            prepare_for_test(empty, "https://issuer.example", &suite(), request_jti(),)
+                .err()
+                .expect("empty dataset must fail"),
             MaterializerError::InvalidField("openid4vc_credential_datasets")
         );
     }
@@ -3439,7 +3393,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
-            test_trust_anchor(),
         )
         .err()
         .expect("static tx code must fail");
@@ -3458,7 +3411,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
-            test_trust_anchor(),
         )
         .err()
         .expect("descriptor-supplied proof key must fail");
@@ -3565,7 +3517,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
-            test_trust_anchor(),
             None,
             Some(
                 "https://callback.example/ciba/approve?approval_token=0123456789abcdef0123456789abcdef",
@@ -3618,7 +3569,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
-            test_trust_anchor(),
             None,
             None,
         );
@@ -3679,7 +3629,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
-            test_trust_anchor(),
             None,
             None,
         );
@@ -3709,7 +3658,6 @@ mod tests {
             "https://issuer.example",
             &suite(),
             request_jti(),
-            test_trust_anchor(),
             None,
             Some(
                 "https://callback.example/ciba/approve?approval_token=0123456789abcdef0123456789abcdef",

@@ -298,26 +298,39 @@ impl ConformanceSession {
         Ok(outcome)
     }
 
-    pub fn openid4vp_management_token(&self) -> anyhow::Result<zeroize::Zeroizing<String>> {
-        self.read_profile_secret(
+    pub fn openid4vp_management_token(
+        &self,
+        tenant_id: &str,
+    ) -> anyhow::Result<zeroize::Zeroizing<String>> {
+        self.derive_tenant_token(
             OPENID4VP_MANAGEMENT_TOKEN_NAME,
             "OpenID4VP management token",
+            tenant_id,
+            b"nazoauth/openid4vp/management/v1",
         )
     }
 
-    pub fn openid4vci_management_token(&self) -> anyhow::Result<zeroize::Zeroizing<String>> {
-        self.read_profile_secret(
+    pub fn openid4vci_management_token(
+        &self,
+        tenant_id: &str,
+    ) -> anyhow::Result<zeroize::Zeroizing<String>> {
+        self.derive_tenant_token(
             OPENID4VCI_MANAGEMENT_TOKEN_NAME,
             "OpenID4VCI management token",
+            tenant_id,
+            b"nazoauth/openid4vci/management/v1",
         )
     }
 
     pub fn dynamic_registration_initial_access_token(
         &self,
+        tenant_id: &str,
     ) -> anyhow::Result<zeroize::Zeroizing<String>> {
-        self.read_profile_secret(
+        self.derive_tenant_token(
             DYNAMIC_REGISTRATION_TOKEN_NAME,
             "dynamic-registration initial access token",
+            tenant_id,
+            b"nazoauth/dynamic-client-registration/initial-access/v1",
         )
     }
 
@@ -345,14 +358,27 @@ impl ConformanceSession {
         Ok(zeroize::Zeroizing::new(value.to_owned()))
     }
 
-    pub fn openid4vc_request_object_trust_anchor_pem(&self) -> anyhow::Result<String> {
-        let bundle = self.secrets_dir.join("openid4vc-bundle.pem");
-        let bytes = crate::filesystem::read_secure_secret_file(
-            &bundle,
-            "managed OpenID4VC certificate bundle",
-            128 * 1024,
-        )?;
-        String::from_utf8(bytes.to_vec()).context("managed OpenID4VC trust anchor is not UTF-8 PEM")
+    fn derive_tenant_token(
+        &self,
+        name: &str,
+        label: &str,
+        tenant_id: &str,
+        purpose: &'static [u8],
+    ) -> anyhow::Result<zeroize::Zeroizing<String>> {
+        use base64::Engine as _;
+
+        let root = self.read_profile_secret(name, label)?;
+        let tenant_id = uuid::Uuid::parse_str(tenant_id)
+            .with_context(|| format!("{label} tenant ID is invalid"))?;
+        let token = nazo_operator_protocol::hkdf_sha256_v1(
+            root.as_bytes(),
+            tenant_id.as_bytes(),
+            purpose,
+            32,
+        );
+        Ok(zeroize::Zeroizing::new(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token),
+        ))
     }
 }
 

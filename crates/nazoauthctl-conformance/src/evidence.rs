@@ -4,10 +4,12 @@ use std::collections::BTreeSet;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
-use nazo_operator_protocol::{ControlResultData, TenantResourceIdentity};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use sha2::{Digest as _, Sha256};
+
+use crate::oidf_protocol as nazo_operator_protocol;
+use crate::oidf_protocol::{ControlResultData, TenantResourceIdentity};
 use uuid::Uuid;
 #[cfg(unix)]
 use zeroize::Zeroizing;

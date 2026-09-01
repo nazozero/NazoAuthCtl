@@ -32,6 +32,15 @@ pub struct HttpRequest {
 }
 
 impl HttpRequest {
+    pub fn get(url: Url) -> Self {
+        Self {
+            method: HttpMethod::Get,
+            url,
+            headers: Vec::new(),
+            body: None,
+        }
+    }
+
     pub fn method(&self) -> HttpMethod {
         self.method
     }
