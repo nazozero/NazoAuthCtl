@@ -1286,18 +1286,31 @@ fn run_restore_migration(
         !lifecycle_url.is_empty(),
         "restore lifecycle database URL is empty"
     );
+    let mut mounts = vec![NeutralMount {
+        source: config.to_path_buf(),
+        destination: PathBuf::from(CONTAINER_CONFIG_FILE),
+        read_only: true,
+        selinux_relabel: false,
+        ownership: Responsibility::Managed,
+        scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
+    }];
+    mounts.extend(
+        crate::target::install_exec::SECRET_PURPOSES
+            .iter()
+            .map(|name| NeutralMount {
+                source: secrets.join(name),
+                destination: Path::new(CONTAINER_SECRETS_DIR).join(name),
+                read_only: true,
+                selinux_relabel: false,
+                ownership: Responsibility::Managed,
+                scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
+            }),
+    );
     let task = runtime_backend::OneShotTask {
         artifact: artifact.clone(),
         command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
         network: Some("bridge".to_owned()),
-        mounts: vec![NeutralMount {
-            source: config.to_path_buf(),
-            destination: PathBuf::from(CONTAINER_CONFIG_FILE),
-            read_only: true,
-            selinux_relabel: false,
-            ownership: Responsibility::Managed,
-            scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
-        }],
+        mounts,
         environment: BTreeMap::from([
             (
                 SERVER_CONFIG_FILE_ENV.to_owned(),

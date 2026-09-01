@@ -34,8 +34,9 @@ use sha2::{Digest as _, Sha256};
 
 use super::deployment_state::{Failure, OBJECT_IDENTITY_MISMATCH, TargetStateStore};
 use super::install_exec::{
-    CONTAINER_CONFIG_FILE, CONTAINER_DATA_DIR, MIGRATION_RUNTIME_ROLE_ENV, OfficialArtifactRef,
-    SERVER_CONFIG_FILE_ENV, StagedConfig, cache_systemd_artifact, probe_local_health,
+    CONTAINER_CONFIG_FILE, CONTAINER_DATA_DIR, CONTAINER_SECRETS_DIR, MIGRATION_RUNTIME_ROLE_ENV,
+    OfficialArtifactRef, SERVER_CONFIG_FILE_ENV, StagedConfig, cache_systemd_artifact,
+    probe_local_health,
 };
 use super::wire::{HOST_ERR_OPERATION_INVALID, sanitize};
 use crate::{
@@ -454,7 +455,15 @@ impl HostLifecycleExecutor {
                         Some(CONTAINER_CONFIG_FILE)
                             | Some(CONTAINER_DATA_DIR)
                             | Some(super::install_exec::CONTAINER_OPERATOR_CONFIG_REVISION_FILE)
-                    )
+                    ) || mount
+                        .destination
+                        .parent()
+                        .is_some_and(|parent| parent == Path::new(CONTAINER_SECRETS_DIR))
+                        && mount.destination.file_name().is_some_and(|name| {
+                            super::install_exec::SECRET_PURPOSES
+                                .iter()
+                                .any(|purpose| name == *purpose)
+                        })
                 })
                 .cloned()
                 .collect();
