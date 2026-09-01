@@ -1100,13 +1100,16 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 not_before,
             ),
         )?;
-        if !matches!(
-            result.outcome,
+        match result.outcome {
             crate::target::HostOutcome::Completed {
-                body: crate::target::HostCompletionBody::BackupRecoveryActivated {}
+                body: crate::target::HostCompletionBody::BackupRecoveryActivated {},
+            } => {}
+            crate::target::HostOutcome::Failed { code, detail } => {
+                bail!("recover activation failed: {code}: {detail}")
             }
-        ) {
-            bail!("recover: target did not confirm activation after the deadline")
+            crate::target::HostOutcome::Completed { .. } => {
+                bail!("recover: target returned an unexpected activation completion")
+            }
         }
         plan.phase = RecoveryPhase::CleanupPending;
         journal.store(&plan)?;
@@ -1136,13 +1139,16 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 endpoint,
             ),
         )?;
-        if !matches!(
-            result.outcome,
+        match result.outcome {
             crate::target::HostOutcome::Completed {
-                body: crate::target::HostCompletionBody::BackupRecoveryCandidateCleaned {}
+                body: crate::target::HostCompletionBody::BackupRecoveryCandidateCleaned {},
+            } => {}
+            crate::target::HostOutcome::Failed { code, detail } => {
+                bail!("recover candidate cleanup failed: {code}: {detail}")
             }
-        ) {
-            bail!("recover: target did not confirm exact candidate cleanup")
+            crate::target::HostOutcome::Completed { .. } => {
+                bail!("recover: target returned an unexpected candidate cleanup completion")
+            }
         }
         journal.clear()?;
         println!("recovery completed for '{}'", record.alias);

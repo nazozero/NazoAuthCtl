@@ -38,7 +38,7 @@ use super::{
 use crate::runtime_backend::{
     self, ArtifactReference, ContainerRuntimePolicy, NeutralMount, RecoveryCandidateEndpoint,
     RecoveryCandidateRequest, Responsibility, RuntimeBackend, RuntimeBackendKind,
-    RuntimeReplacement,
+    RuntimeObservation, RuntimeReplacement,
 };
 
 pub const BACKUP_EXECUTION_FAILED: &str = "BACKUP_EXECUTION_FAILED";
@@ -1285,30 +1285,33 @@ pub(crate) fn activate_recovered_runtime(
     let observed = backend
         .inspect(&state.runtime.object)
         .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
-    if observed.running {
+    if observed.running && !same_recovery_runtime(&observed, &candidate_facts.artifact, state_epoch)
+    {
         return Err(Failure::new(
             RESTORE_TEST_FAILED,
-            "recovery activation refuses a runtime that is already running",
+            "recovery activation found a running runtime with a different artifact or state epoch",
         ));
     }
-    let mut replacement = super::update_exec::replacement_from_observation(
-        &observed,
-        &state.runtime.object,
-        &candidate_facts.artifact,
-    )?;
-    replacement
-        .environment
-        .insert("VALKEY_STATE_EPOCH".to_owned(), state_epoch.to_owned());
-    backend
-        .replace(&replacement)
-        .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
-    backend
-        .start(&state.runtime.object)
-        .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
+    if !observed.running {
+        let mut replacement = super::update_exec::replacement_from_observation(
+            &observed,
+            &state.runtime.object,
+            &candidate_facts.artifact,
+        )?;
+        replacement
+            .environment
+            .insert("VALKEY_STATE_EPOCH".to_owned(), state_epoch.to_owned());
+        backend
+            .replace(&replacement)
+            .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
+        backend
+            .start(&state.runtime.object)
+            .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
+    }
     let activated = backend
         .inspect(&state.runtime.object)
         .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
-    if !activated.running || activated.artifact != candidate_facts.artifact {
+    if !same_recovery_runtime(&activated, &candidate_facts.artifact, state_epoch) {
         return Err(Failure::new(
             RESTORE_TEST_FAILED,
             "recovery activation did not start the verified target Release",
@@ -1335,6 +1338,33 @@ pub(crate) fn activate_recovered_runtime(
         },
     )?;
     Ok(())
+}
+
+fn same_artifact_identity(left: &ArtifactReference, right: &ArtifactReference) -> bool {
+    match (left, right) {
+        (
+            ArtifactReference::Oci { digest: left, .. },
+            ArtifactReference::Oci { digest: right, .. },
+        ) => left.eq_ignore_ascii_case(right),
+        (
+            ArtifactReference::HostBinary { sha256: left, .. },
+            ArtifactReference::HostBinary { sha256: right, .. },
+        ) => left.eq_ignore_ascii_case(right),
+        _ => false,
+    }
+}
+
+fn same_recovery_runtime(
+    observed: &RuntimeObservation,
+    artifact: &ArtifactReference,
+    state_epoch: &str,
+) -> bool {
+    observed.running
+        && same_artifact_identity(&observed.artifact, artifact)
+        && observed
+            .safe_environment
+            .get("VALKEY_STATE_EPOCH")
+            .is_some_and(|observed| observed == state_epoch)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2575,6 +2605,27 @@ fn restore_failure(error: anyhow::Error) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_identity_is_content_based_not_reference_spelling() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let named = ArtifactReference::Oci {
+            image_reference: "registry.example/nazoauth".to_owned(),
+            digest: digest.clone(),
+        };
+        let pinned = ArtifactReference::Oci {
+            image_reference: format!("registry.example/nazoauth@{digest}"),
+            digest: digest.to_ascii_uppercase(),
+        };
+        let different = ArtifactReference::Oci {
+            image_reference: "registry.example/nazoauth".to_owned(),
+            digest: format!("sha256:{}", "b".repeat(64)),
+        };
+
+        assert!(same_artifact_identity(&named, &pinned));
+        assert!(!same_artifact_identity(&named, &different));
+        assert!(!same_artifact_identity(&named, &ArtifactReference::Unknown));
+    }
 
     #[test]
     fn replay_of_published_snapshot_finishes_receipt_cleanup() -> anyhow::Result<()> {
