@@ -1744,10 +1744,9 @@ fn postgres_connection(path: &Path) -> anyhow::Result<PostgresConnection> {
     if !matches!(url.scheme(), "postgres" | "postgresql") {
         bail!("database URL is not PostgreSQL");
     }
-    let password = url
-        .password()
-        .context("database URL has no password")?
-        .to_owned();
+    let password = urlencoding::decode(url.password().context("database URL has no password")?)
+        .context("database URL password is not valid percent-encoding")?
+        .into_owned();
     ensure!(
         !password.contains(['\r', '\n', '\0']),
         "database password is invalid"
@@ -2513,8 +2512,9 @@ mod tests {
     fn postgres_database_urls_use_maintenance_database_for_create_and_drop() -> anyhow::Result<()> {
         let temp = crate::filesystem::PrivateTempDir::new("backup-postgres-url-test")?;
         let path = temp.path().join("database-lifecycle-url");
-        fs::write(&path, "postgresql://user:secret@db.example/app")?;
+        fs::write(&path, "postgresql://user:s%2Be%3Dcret@db.example/app")?;
         let connection = postgres_connection(&path)?;
+        assert_eq!(connection.password, "s+e=cret");
         assert_eq!(
             connection.maintenance().url_without_password.path(),
             "/postgres"
@@ -2526,7 +2526,7 @@ mod tests {
                 .path(),
             "/restore"
         );
-        assert!(!connection.url_without_password.as_str().contains("secret"));
+        assert!(!connection.url_without_password.as_str().contains("cret"));
         Ok(())
     }
     #[test]
