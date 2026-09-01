@@ -1212,6 +1212,7 @@ fn run_restore_rehearsal(
         run_restore_migration(
             backend.as_ref(),
             &manifest.runtime_artifact,
+            &data,
             &config,
             &secrets,
             &runtime_role,
@@ -1267,6 +1268,7 @@ fn run_restore_rehearsal(
 fn run_restore_migration(
     backend: &dyn RuntimeBackend,
     artifact: &crate::runtime_backend::ArtifactReference,
+    data: &Path,
     config: &Path,
     secrets: &Path,
     runtime_role: &str,
@@ -1286,14 +1288,24 @@ fn run_restore_migration(
         !lifecycle_url.is_empty(),
         "restore lifecycle database URL is empty"
     );
-    let mut mounts = vec![NeutralMount {
-        source: config.to_path_buf(),
-        destination: PathBuf::from(CONTAINER_CONFIG_FILE),
-        read_only: true,
-        selinux_relabel: false,
-        ownership: Responsibility::Managed,
-        scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
-    }];
+    let mut mounts = vec![
+        NeutralMount {
+            source: config.to_path_buf(),
+            destination: PathBuf::from(CONTAINER_CONFIG_FILE),
+            read_only: true,
+            selinux_relabel: false,
+            ownership: Responsibility::Managed,
+            scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
+        },
+        NeutralMount {
+            source: data.to_path_buf(),
+            destination: PathBuf::from(CONTAINER_DATA_DIR),
+            read_only: false,
+            selinux_relabel: false,
+            ownership: Responsibility::Managed,
+            scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
+        },
+    ];
     mounts.extend(
         crate::target::install_exec::SECRET_PURPOSES
             .iter()
