@@ -600,6 +600,7 @@ impl ConformanceRunner {
                 reviewed: 0,
                 skipped: 0,
                 failed: 0,
+                incomplete: 0,
                 running: 0,
                 remaining: 0,
             })
@@ -1547,16 +1548,18 @@ impl ConformanceRunner {
                                 groups[group_index].reviewed += 1
                             }
                             Some(ModuleOutcome::Skipped) => groups[group_index].skipped += 1,
-                            Some(ModuleOutcome::Failed | ModuleOutcome::Incomplete) | None => {
-                                groups[group_index].failed += 1;
+                            Some(ModuleOutcome::Failed) => groups[group_index].failed += 1,
+                            Some(ModuleOutcome::Incomplete) | None => {
+                                groups[group_index].incomplete += 1;
                             }
                         }
                     }
-                    if matches!(
-                        module_outcome,
-                        Some(ModuleOutcome::Failed | ModuleOutcome::Incomplete) | None
-                    ) {
+                    if matches!(module_outcome, Some(ModuleOutcome::Failed)) {
                         groups[group_index].status = GroupStatus::Failed;
+                    } else if matches!(module_outcome, Some(ModuleOutcome::Incomplete) | None)
+                        && groups[group_index].status != GroupStatus::Failed
+                    {
+                        groups[group_index].status = GroupStatus::Incomplete;
                     }
                     emit_progress(
                         sink,
@@ -1863,10 +1866,20 @@ fn snapshot(
     current_variant: Option<BTreeMap<String, String>>,
     current_test: Option<String>,
 ) -> ProgressSnapshot {
+    let groups = groups
+        .iter()
+        .cloned()
+        .map(|mut group| {
+            if group.status == GroupStatus::Failed && group.failed == 0 {
+                group.status = GroupStatus::Incomplete;
+            }
+            group
+        })
+        .collect::<Vec<_>>();
     ProgressSnapshot {
         completed: groups.iter().map(|group| group.completed).sum(),
         total: groups.iter().map(|group| group.total).sum(),
-        groups: groups.to_vec(),
+        groups: groups.clone(),
         passed_groups: groups
             .iter()
             .filter(|group| group.status == GroupStatus::Passed)
@@ -1883,6 +1896,10 @@ fn snapshot(
             .iter()
             .filter(|group| group.status == GroupStatus::Failed)
             .count(),
+        incomplete_groups: groups
+            .iter()
+            .filter(|group| group.status == GroupStatus::Incomplete)
+            .count(),
         running_groups: groups
             .iter()
             .filter(|group| group.status == GroupStatus::Running)
@@ -1895,6 +1912,7 @@ fn snapshot(
         reviewed: groups.iter().map(|group| group.reviewed).sum(),
         skipped: groups.iter().map(|group| group.skipped).sum(),
         failed: groups.iter().map(|group| group.failed).sum(),
+        incomplete: groups.iter().map(|group| group.incomplete).sum(),
         running: groups.iter().map(|group| group.running).sum(),
         remaining: groups.iter().map(|group| group.remaining).sum(),
         current_profile,
@@ -2237,6 +2255,32 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn progress_does_not_report_orchestration_gaps_as_failed_tests() {
+        let progress = snapshot(
+            &[GroupProgress {
+                id: "vp".to_owned(),
+                profile: "openid4vc".to_owned(),
+                completed: 0,
+                total: 1,
+                status: GroupStatus::Failed,
+                passed: 0,
+                reviewed: 0,
+                skipped: 0,
+                failed: 0,
+                incomplete: 0,
+                running: 1,
+                remaining: 0,
+            }],
+            None,
+            None,
+            None,
+        );
+        assert_eq!(progress.failed_groups, 0);
+        assert_eq!(progress.incomplete_groups, 1);
+        assert_eq!(progress.groups[0].status, GroupStatus::Incomplete);
+    }
 
     #[test]
     fn vp_receipt_issuance_retries_only_bounded_transient_failures() {
@@ -3249,7 +3293,7 @@ mod tests {
             report.errors,
             vec!["Suite module allocation exceeds the artifact-wide resource bound".to_owned()]
         );
-        assert_eq!(report.progress.groups[0].status, GroupStatus::Failed);
+        assert_eq!(report.progress.groups[0].status, GroupStatus::Incomplete);
         assert_eq!(report.plans.len(), 1);
         assert_eq!(report.plans[0].defined_modules, 2);
         assert_eq!(report.plans[0].created_instances, 0);
