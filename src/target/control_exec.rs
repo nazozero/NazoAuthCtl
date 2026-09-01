@@ -144,6 +144,22 @@ fn configure_secret_file_access(
     }
 }
 
+fn bind_config_revision_marker(
+    scope_dir: &Path,
+    mounts: &mut Vec<crate::runtime_backend::NeutralMount>,
+) {
+    let destination = Path::new(super::install_exec::CONTAINER_OPERATOR_CONFIG_REVISION_FILE);
+    mounts.retain(|mount| mount.destination != destination);
+    mounts.push(crate::runtime_backend::NeutralMount {
+        source: scope_dir.join("config-revision"),
+        destination: destination.to_path_buf(),
+        read_only: true,
+        selinux_relabel: false,
+        ownership: crate::runtime_backend::Responsibility::Managed,
+        scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
+    });
+}
+
 #[cfg(test)]
 fn configure_change_set_access(
     host: bool,
@@ -250,6 +266,7 @@ pub(crate) fn execute_fixed_one_shot(
         read_only_paths.push(PathBuf::from(job.config_reference));
         read_write_paths.push(PathBuf::from(job.data_root));
     } else if kind == FixedOneShotKind::ControlOperation {
+        bind_config_revision_marker(job.scope_dir, &mut mounts);
         environment.insert(
             "NAZOAUTH_OPERATOR_CONFIG_REVISION_FILE".to_owned(),
             super::install_exec::CONTAINER_OPERATOR_CONFIG_REVISION_FILE.to_owned(),
@@ -484,8 +501,8 @@ mod tests {
 
     use super::{
         CHANGE_SET_CREDENTIAL, CHANGE_SET_ENV, CONTAINER_CHANGE_SET_PATH, FixedOneShotKind,
-        admin_provision_rejection_code, configure_change_set_access, fixed_one_shot_rejection_code,
-        operator_rejection_code, stage_change_set,
+        admin_provision_rejection_code, bind_config_revision_marker, configure_change_set_access,
+        fixed_one_shot_rejection_code, operator_rejection_code, stage_change_set,
     };
 
     #[test]
@@ -543,6 +560,30 @@ mod tests {
             Some(source)
         );
         assert!(mounts.is_empty());
+    }
+
+    #[test]
+    fn control_one_shot_binds_the_authoritative_revision_marker() {
+        let mut mounts = Vec::new();
+        bind_config_revision_marker(Path::new("/state/deploy-alpha"), &mut mounts);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(
+            mounts[0].source,
+            Path::new("/state/deploy-alpha/config-revision")
+        );
+        assert_eq!(
+            mounts[0].destination,
+            Path::new(super::super::install_exec::CONTAINER_OPERATOR_CONFIG_REVISION_FILE)
+        );
+        assert!(mounts[0].read_only);
+
+        mounts[0].source = PathBuf::from("/stale/config-revision");
+        bind_config_revision_marker(Path::new("/state/deploy-alpha"), &mut mounts);
+        assert_eq!(mounts.len(), 1, "the destination must not be mounted twice");
+        assert_eq!(
+            mounts[0].source,
+            Path::new("/state/deploy-alpha/config-revision")
+        );
     }
 
     #[test]
