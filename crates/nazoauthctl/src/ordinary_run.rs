@@ -902,7 +902,8 @@ fn provision_ephemeral_tenant(
     }
 
     if !lock_recovery(recovery)?.tenant_reloaded() {
-        let expected_revision = match lock_recovery(recovery)?.tenant_reload_expected_revision() {
+        let prepared_revision = { lock_recovery(recovery)?.tenant_reload_expected_revision() };
+        let expected_revision = match prepared_revision {
             Some(revision) => revision,
             None => {
                 let revision = directory_revision(session)?;
