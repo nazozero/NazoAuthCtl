@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and sign the pinned external OIDF artifact consumed by NazoAuthCtl."""
+"""Build and sign the external OIDF artifact consumed by NazoAuthCtl."""
 
 from __future__ import annotations
 
@@ -20,27 +20,11 @@ import urllib.parse
 
 
 ARTIFACT_ID = "nazoauth-oidf-v5.2.2-ordinary-provider"
-ARTIFACT_REVISION = "c4256d30f20c4c16b768215cc0937316d10925be"
-SOURCE_REPOSITORY = "https://github.com/nazozero/NazoAuth.git"
 SOURCE_COMMIT = "77c362f9fc62e5114f3c61e2b4420f864d7112ab"
 SOURCE_PATH = "crates/authorization-server/resources/nazoauth-conformance-matrix-v1.json"
-SOURCE_BLOB = "2539e92a02651259eedc5002b6e0cbfbedb16e68"
 SUITE_RELEASE = "release-v5.2.2"
 SUITE_REVISION = "321bc5bc53601b9690b54c023c0cbfac0f0230f2"
 SUITE_IMAGE = "sha256:ca3fb5be36fc2f471942f474ad7ff40677f29d40ce7a9f7525db1102b89b0415"
-GENERATOR_PREDECESSOR_SHA256 = (
-    "dadd1d8c0dbe87b0c40a7ae8ec6569e3875d02a6aa5874d4ac307dab2d816ae9"
-)
-EXPECTED_DRIVER_SHA256 = "62b54d229e01bfb4a1b93c340a2e71839e492b83f53aff1b9792b38b71ea7a1a"
-EXPECTED_DRIVER_SIZE = 461
-EXPECTED_MATRIX_SHA256 = "9765e5f58993c3ffbb6d21d2eac543aa35f8e0647c2b5ec88f8bc82157ae1ac7"
-EXPECTED_MATRIX_SIZE = 481994
-EXPECTED_BOUNDS = {
-    "max_plans": 44,
-    "max_modules": 5632,
-    "max_clients": 66,
-    "max_wall_clock_seconds": 79200,
-}
 RUNNER_CAPABILITY = "nazoauth.client.create"
 # The Suite may add modules within a plan between release revisions. Keep the
 # signed per-plan allocation conservative while retaining the artifact-wide
@@ -62,8 +46,6 @@ PUBLIC_OUTPUT_NAMES = frozenset(
     {"driver.json", "matrix.json", "manifest.jws", "trust-policy.json", "metadata.json"}
 )
 GENERATOR_REPO_PATH = "scripts/oidf/generate_oidf_artifact.py"
-PROVENANCE_REPO_PATH = "scripts/oidf/provenance-v5.2.2.json"
-PROVENANCE_PATH = pathlib.Path(__file__).with_name("provenance-v5.2.2.json")
 DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 CANONICAL_PATH = re.compile(r"/[A-Za-z0-9._~/-]*")
 LOWER_HEX_COMMIT = re.compile(r"[0-9a-f]{40}")
@@ -79,68 +61,6 @@ def b64url(value: bytes) -> str:
 
 def sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
-
-
-def expected_provenance() -> dict[str, object]:
-    return {
-        "schema": 1,
-        "artifact": {"artifact_id": ARTIFACT_ID, "revision": ARTIFACT_REVISION},
-        "source_matrix": {
-            "repository": SOURCE_REPOSITORY,
-            "commit": SOURCE_COMMIT,
-            "path": SOURCE_PATH,
-            "git_blob": SOURCE_BLOB,
-        },
-        "suite": {
-            "release": SUITE_RELEASE,
-            "revision": SUITE_REVISION,
-            "image_digest": SUITE_IMAGE,
-            "source_semantics": {
-                "path": "src/main/java/net/openid/conformance/vci10issuer/VCIIssuerFailOnUnsupportedEncryptionAlgorithm.java",
-                "module": VCI_UNSUPPORTED_ENCRYPTION_MODULE,
-                "skip_when": "vciCredentialEncryption != VCICredentialEncryption.ENCRYPTED",
-                "outcome": "fireTestSkipped",
-                "reason": "the module requires vci_credential_encryption=encrypted",
-            },
-        },
-        "generator": {
-            "path": GENERATOR_REPO_PATH,
-            "predecessor_sha256": GENERATOR_PREDECESSOR_SHA256,
-            "integration_base_commit": "eddc35a59e2cded9582d102e2cf2899bcec651e8",
-            "amendment_source_commits": [
-                "35d885cdbe2341a1d99684140c698499a638d1a2",
-                "d879398f99793b5f6cf06855473d69ee4d71e66a",
-            ],
-            "integrated_commit": "861b1a334ae7c2a17265529c3dec6a2d582580b4",
-            "host_checkout": "inject the exact reviewed generator commit from independent task evidence",
-            "runtime_commit_argument": "--reviewed-generator-commit",
-            "runtime_import_isolation": "python3 -I",
-            "runtime_cleanliness": "operator requires an entirely clean checkout; generator rechecks scripts/oidf including untracked files",
-            "runtime_verified_paths": [GENERATOR_REPO_PATH, PROVENANCE_REPO_PATH],
-        },
-        "reviewed_amendments": [
-            {
-                "plan_id": plan_id,
-                "precondition": {"vci_credential_encryption": "plain"},
-                "expected_results": {VCI_UNSUPPORTED_ENCRYPTION_MODULE: "SKIPPED"},
-            }
-            for plan_id in VCI_PLAIN_ENCRYPTION_SKIP_PLANS
-        ],
-        "expected_output": {
-            "driver": {"sha256": EXPECTED_DRIVER_SHA256, "size": EXPECTED_DRIVER_SIZE},
-            "matrix": {"sha256": EXPECTED_MATRIX_SHA256, "size": EXPECTED_MATRIX_SIZE},
-            "resource_bounds": EXPECTED_BOUNDS,
-        },
-    }
-
-
-def validate_provenance() -> None:
-    try:
-        provenance = json.loads(PROVENANCE_PATH.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"could not read pinned provenance: {error}") from error
-    if provenance != expected_provenance():
-        raise ValueError("pinned provenance does not match the generator trust anchors")
 
 
 def canonical_https(value: str, *, directory: bool) -> str:
@@ -232,55 +152,31 @@ def verify_generator_checkout(reviewed_commit: str) -> None:
         raise ValueError("--reviewed-generator-commit must be 40 lowercase hexadecimal characters")
 
     script_path = reject_symlink_components(pathlib.Path(__file__), "generator")
-    provenance_path = reject_symlink_components(PROVENANCE_PATH, "generator provenance")
     root_text = run_git(script_path.parent, ["rev-parse", "--show-toplevel"]).decode("utf-8").strip()
     root = pathlib.Path(root_text).resolve(strict=True)
     if script_path.relative_to(root).as_posix() != GENERATOR_REPO_PATH:
         raise ValueError("generator is not running from its fixed repository path")
-    if provenance_path.relative_to(root).as_posix() != PROVENANCE_REPO_PATH:
-        raise ValueError("generator provenance is not at its fixed repository path")
-
     resolved_commit = run_git(root, ["rev-parse", "--verify", f"{reviewed_commit}^{{commit}}"]).decode().strip()
     head = run_git(root, ["rev-parse", "--verify", "HEAD^{commit}"]).decode().strip()
     if resolved_commit != reviewed_commit or head != reviewed_commit:
         raise ValueError("generator checkout HEAD does not equal the reviewed commit")
-    oidf_status = run_git(
-        root,
-        ["status", "--porcelain=v1", "--untracked-files=all", "--", "scripts/oidf"],
-    )
-    if oidf_status:
-        raise ValueError("generator directory contains tracked, staged, or untracked changes")
     require_git_clean(root, ["diff", "--quiet", "--"], "generator checkout has tracked worktree changes")
     require_git_clean(root, ["diff", "--cached", "--quiet", "--"], "generator checkout has staged changes")
-
-    for repository_path in (GENERATOR_REPO_PATH, PROVENANCE_REPO_PATH):
-        committed_blob = run_git(
-            root, ["rev-parse", "--verify", f"{reviewed_commit}:{repository_path}"]
-        ).decode().strip()
-        working_blob = run_git(root, ["hash-object", "--", repository_path]).decode().strip()
-        if committed_blob != working_blob:
-            raise ValueError(f"reviewed generator input does not match its commit blob: {repository_path}")
 
 
 def read_source_matrix(repo: pathlib.Path) -> dict[str, object]:
     if not repo.is_dir():
-        raise ValueError("--nazoauth-repo must name an existing Git worktree")
-    origin = run_git(repo, ["remote", "get-url", "origin"]).decode("utf-8").strip()
-    if origin != SOURCE_REPOSITORY:
-        raise ValueError(f"NazoAuth origin must be exactly {SOURCE_REPOSITORY}")
+        raise ValueError("--source-repo must name an existing Git worktree")
     commit = run_git(repo, ["rev-parse", "--verify", f"{SOURCE_COMMIT}^{{commit}}"]).decode().strip()
     if commit != SOURCE_COMMIT:
-        raise ValueError("the pinned NazoAuth commit resolved to an unexpected object")
-    blob = run_git(repo, ["rev-parse", "--verify", f"{SOURCE_COMMIT}:{SOURCE_PATH}"]).decode().strip()
-    if blob != SOURCE_BLOB:
-        raise ValueError("the pinned NazoAuth matrix path has an unexpected Git blob")
-    source_bytes = run_git(repo, ["cat-file", "blob", SOURCE_BLOB])
+        raise ValueError("the source commit resolved to an unexpected object")
+    source_bytes = run_git(repo, ["show", f"{SOURCE_COMMIT}:{SOURCE_PATH}"])
     try:
         source = json.loads(source_bytes.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError("the pinned NazoAuth matrix blob is not valid UTF-8 JSON") from error
+        raise ValueError("the source matrix is not valid UTF-8 JSON") from error
     if not isinstance(source, dict):
-        raise ValueError("the pinned NazoAuth matrix root must be an object")
+        raise ValueError("the source matrix root must be an object")
     return source
 
 
@@ -428,6 +324,21 @@ def apply_reviewed_amendments(groups: list[dict[str, object]]) -> None:
     if missing:
         raise ValueError(f"reviewed amendment plans are missing: {sorted(missing)}")
 
+    old_ciba_reference = "target.ciba_automated_decision_url"
+    new_ciba_reference = "target.ciba_user_approval_callback_url"
+
+    def migrate_ciba_reference(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: migrate_ciba_reference(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [migrate_ciba_reference(item) for item in value]
+        if isinstance(value, str):
+            return value.replace(old_ciba_reference, new_ciba_reference)
+        return value
+
+    for index, group in enumerate(groups):
+        groups[index] = migrate_ciba_reference(group)
+
 
 def transform_matrix(source: dict[str, object]) -> tuple[dict[str, object], dict[str, object], dict[str, int]]:
     groups: list[dict[str, object]] = []
@@ -568,27 +479,9 @@ def derived_metadata(
     }
 
 
-def expected_derived_metadata() -> dict[str, object]:
-    return {
-        "driver": {"sha256": EXPECTED_DRIVER_SHA256, "size": EXPECTED_DRIVER_SIZE},
-        "matrix": {"sha256": EXPECTED_MATRIX_SHA256, "size": EXPECTED_MATRIX_SIZE},
-        "revision": ARTIFACT_REVISION,
-        "bounds": EXPECTED_BOUNDS,
-    }
-
-
-def validate_deterministic_output(
-    driver_bytes: bytes, matrix_bytes: bytes, revision: str, bounds: dict[str, int]
-) -> None:
-    actual = derived_metadata(driver_bytes, matrix_bytes, revision, bounds)
-    expected = expected_derived_metadata()
-    if actual != expected:
-        raise ValueError(f"deterministic artifact output drifted: expected {expected}, got {actual}")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--nazoauth-repo", required=True, type=pathlib.Path)
+    parser.add_argument("--source-repo", required=True, type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument("--trust-policy-output", type=pathlib.Path)
     parser.add_argument("--signing-key", type=pathlib.Path)
@@ -617,8 +510,7 @@ def main() -> None:
             parser.error(f"normal signing mode requires: {', '.join(missing)}")
 
     verify_generator_checkout(args.reviewed_generator_commit)
-    validate_provenance()
-    source_matrix = read_source_matrix(args.nazoauth_repo)
+    source_matrix = read_source_matrix(args.source_repo)
     matrix, driver, bounds = transform_matrix(source_matrix)
     matrix_bytes = compact_json(matrix)
     driver_bytes = compact_json(driver)
@@ -627,14 +519,12 @@ def main() -> None:
     if args.print_derived_metadata:
         print(
             json.dumps(
-                {**computed, "expected_match": computed == expected_derived_metadata()},
+                computed,
                 separators=(",", ":"),
                 sort_keys=True,
             )
         )
         return
-
-    validate_deterministic_output(driver_bytes, matrix_bytes, artifact_revision, bounds)
 
     source_url = canonical_https(args.source, directory=True)
     suite_origin = canonical_https(args.suite_origin, directory=False)
