@@ -1296,13 +1296,14 @@ pub(crate) fn verify_pinned_artifact_facts(
                 )
             }
             RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
-                let (oci_image, oci_digest) = candidate.oci_artifact().ok_or_else(|| {
-                    Failure::new(
-                        super::install_exec::ARTIFACT_UNVERIFIED,
-                        "pre-release candidate has no OCI artifact",
-                    )
-                })?;
-                let image = format!("{oci_image}@{oci_digest}");
+                let (oci_image, oci_pull_digest, oci_runtime_digest) =
+                    candidate.oci_artifact().ok_or_else(|| {
+                        Failure::new(
+                            super::install_exec::ARTIFACT_UNVERIFIED,
+                            "pre-release candidate has no OCI artifact",
+                        )
+                    })?;
+                let image = format!("{oci_image}@{oci_pull_digest}");
                 backend.pull_image(&image).map_err(|error| {
                     Failure::new(
                         super::install_exec::ARTIFACT_UNVERIFIED,
@@ -1310,10 +1311,10 @@ pub(crate) fn verify_pinned_artifact_facts(
                     )
                 })?;
                 (
-                    oci_digest.trim_start_matches("sha256:").to_owned(),
+                    oci_runtime_digest.trim_start_matches("sha256:").to_owned(),
                     runtime_backend::ArtifactReference::Oci {
                         image_reference: oci_image.to_owned(),
-                        digest: oci_digest.to_owned(),
+                        digest: oci_runtime_digest.to_owned(),
                     },
                     None,
                 )
