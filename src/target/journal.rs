@@ -279,6 +279,7 @@ impl TargetJournal {
                     operation.operation,
                     super::wire::HostOperationBody::BackupRecover { .. }
                         | super::wire::HostOperationBody::BackupRecoveryCandidateStage { .. }
+                        | super::wire::HostOperationBody::BackupRecoveryCandidateControl { .. }
                         | super::wire::HostOperationBody::BackupRecoveryCandidateCleanup { .. }
                         | super::wire::HostOperationBody::BackupRecoveryActivate { .. }
                 )

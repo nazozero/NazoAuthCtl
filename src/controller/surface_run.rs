@@ -841,8 +841,36 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 "recover: control-operation journal does not match the recorded recovery invalidation"
             ),
         }
-        let verdict =
-            crate::controller_identity::dispatch_via_target(target.as_ref(), &prepared, None)?;
+        let candidate = plan
+            .candidate
+            .clone()
+            .context("recover: recovery journal has no candidate pointer")?;
+        let wrapper_operation_id = plan
+            .candidate_control_operation_id
+            .get_or_insert_with(|| uuid::Uuid::now_v7().to_string())
+            .clone();
+        journal.store(&plan)?;
+        let host_result = target.execute_host_operation(
+            &crate::target::HostOperation::backup_recovery_candidate_control(
+                wrapper_operation_id,
+                record.deployment_id.clone(),
+                revision,
+                crate::runtime_backend::RecoveryCandidateEndpoint {
+                    object_reference: candidate.object_reference.clone(),
+                    object_id: candidate.object_id.clone(),
+                    deployment_id: record.deployment_id.clone(),
+                    operation_id: plan.recover_operation_id.clone(),
+                    loopback_port: candidate.loopback_port,
+                },
+                prepared.signed.operation_id.clone(),
+                prepared.signed.compact_jws.clone(),
+            ),
+        )?;
+        let receipt = crate::target::control_operation_receipt(
+            prepared.signed.operation_id.clone(),
+            host_result.outcome,
+        )?;
+        let verdict = crate::controller_identity::classify_control_receipt(&prepared, receipt)?;
         match &verdict {
             crate::controller_identity::DispatchVerdict::DefinitivelyRejected { code }
                 if requires_controller_identity_recovery(code) =>
@@ -864,6 +892,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 // after the new key lands necessarily prepares a fresh JWS.
                 plan.invalidation_operation_id = None;
                 plan.invalidation_request_hash = None;
+                plan.candidate_control_operation_id = None;
                 journal.store(&plan)?;
 
                 let candidate = plan
@@ -972,10 +1001,14 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
         let not_before = plan
             .not_before
             .context("recovery journal has no invalidation deadline")?;
-        if chrono::Utc::now().timestamp() <= not_before {
-            bail!(
-                "recover: invalidation is durable but the deadline has not elapsed; runtime and public ingress remain closed; rerun after {not_before}"
-            )
+        while chrono::Utc::now().timestamp() <= not_before {
+            let remaining = not_before
+                .saturating_sub(chrono::Utc::now().timestamp())
+                .saturating_add(1);
+            eprintln!(
+                "recover: invalidation is durable; waiting {remaining}s before activating the recovered runtime"
+            );
+            std::thread::sleep(std::time::Duration::from_secs(remaining.min(60) as u64));
         }
         let revision = plan
             .restored_revision

@@ -54,6 +54,8 @@ pub(crate) struct RecoveryPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalidation_request_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_control_operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activate_operation_id: Option<String>,
@@ -113,6 +115,7 @@ fn validate(plan: &RecoveryPlan) -> anyhow::Result<()> {
         Some(plan.recover_operation_id.as_str()),
         plan.candidate_stage_operation_id.as_deref(),
         plan.invalidation_operation_id.as_deref(),
+        plan.candidate_control_operation_id.as_deref(),
         plan.activate_operation_id.as_deref(),
         plan.cleanup_operation_id.as_deref(),
         Some(plan.state_epoch.as_str()),
@@ -186,6 +189,7 @@ pub(crate) fn new_plan(
         candidate: None,
         invalidation_operation_id: None,
         invalidation_request_hash: None,
+        candidate_control_operation_id: None,
         not_before: None,
         activate_operation_id: None,
         cleanup_operation_id: None,

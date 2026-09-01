@@ -75,6 +75,7 @@ pub const HOST_OPERATION_KINDS: &[&str] = &[
     "backup-restore-test",
     "backup-recover",
     "backup-recovery-candidate-stage",
+    "backup-recovery-candidate-control",
     "backup-recovery-candidate-cleanup",
     "backup-recovery-activate",
     "backup-export-prepare",
@@ -251,6 +252,14 @@ pub enum HostOperationBody {
         recovery_operation_id: String,
         state_epoch: String,
     },
+    /// Deliver the signed recovery invalidation to the exact isolated
+    /// candidate returned by the stage operation. The original deployment
+    /// runtime remains stopped throughout this operation.
+    BackupRecoveryCandidateControl {
+        endpoint: crate::runtime_backend::RecoveryCandidateEndpoint,
+        control_operation_id: String,
+        compact_jws: String,
+    },
     /// Remove precisely the candidate returned by a prior stage operation.
     BackupRecoveryCandidateCleanup {
         endpoint: crate::runtime_backend::RecoveryCandidateEndpoint,
@@ -338,6 +347,7 @@ impl HostOperationBody {
             Self::BackupRestoreTest {} => "backup-restore-test",
             Self::BackupRecover { .. } => "backup-recover",
             Self::BackupRecoveryCandidateStage { .. } => "backup-recovery-candidate-stage",
+            Self::BackupRecoveryCandidateControl { .. } => "backup-recovery-candidate-control",
             Self::BackupRecoveryCandidateCleanup { .. } => "backup-recovery-candidate-cleanup",
             Self::BackupRecoveryActivate { .. } => "backup-recovery-activate",
             Self::BackupExportPrepare {} => "backup-export-prepare",
@@ -517,6 +527,27 @@ impl HostOperation {
             deployment_id: Some(deployment_id.into()),
             expected_revision: None,
             operation: HostOperationBody::BackupRecoveryCandidateCleanup { endpoint },
+        }
+    }
+
+    pub fn backup_recovery_candidate_control(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        expected_revision: u64,
+        endpoint: crate::runtime_backend::RecoveryCandidateEndpoint,
+        control_operation_id: impl Into<String>,
+        compact_jws: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: Some(expected_revision),
+            operation: HostOperationBody::BackupRecoveryCandidateControl {
+                endpoint,
+                control_operation_id: control_operation_id.into(),
+                compact_jws: compact_jws.into(),
+            },
         }
     }
 
@@ -1011,6 +1042,26 @@ impl HostOperation {
                     ));
                 }
             }
+            HostOperationBody::BackupRecoveryCandidateControl {
+                endpoint,
+                control_operation_id,
+                compact_jws,
+            } => {
+                if self.deployment_id.as_deref() != Some(endpoint.deployment_id.as_str())
+                    || self.expected_revision.is_none()
+                    || !is_uuid_v7(&endpoint.operation_id)
+                    || endpoint.object_reference.is_empty()
+                    || endpoint.object_id.is_empty()
+                    || endpoint.loopback_port == 0
+                    || !is_uuid_v7(control_operation_id)
+                    || !valid_compact_jws(compact_jws)
+                {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "backup recovery candidate control has invalid immutable endpoint or JWS binding",
+                    ));
+                }
+            }
             HostOperationBody::BackupRecoveryActivate {
                 recovery_operation_id,
                 state_epoch,
@@ -1075,21 +1126,10 @@ impl HostOperation {
                          expected_revision",
                     ));
                 }
-                if compact_jws.is_empty()
-                    || compact_jws.len() > MAX_CONTROL_JWS_BYTES
-                    || !compact_jws.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-                    })
-                {
+                if !valid_compact_jws(compact_jws) {
                     return Err(MessageRejection::new(
                         RejectionCode::OperationMalformed,
                         "control-operation compact_jws must be a bounded base64url JWS",
-                    ));
-                }
-                if compact_jws.split('.').count() != 3 {
-                    return Err(MessageRejection::new(
-                        RejectionCode::OperationMalformed,
-                        "control-operation compact_jws must have exactly three segments",
                     ));
                 }
                 if expected_deployment_id != self.deployment_id.as_deref().unwrap_or_default() {
@@ -1304,6 +1344,15 @@ fn valid_lower_hex_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+fn valid_compact_jws(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_CONTROL_JWS_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && value.split('.').count() == 3
+}
+
 /// The single answer a target returns for one HostOperation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1455,6 +1504,9 @@ pub enum HostCompletionBody {
     },
     BackupRecoveryCandidateStaged {
         endpoint: crate::runtime_backend::RecoveryCandidateEndpoint,
+    },
+    BackupRecoveryCandidateControlExecuted {
+        result: ControlResult,
     },
     BackupRecoveryCandidateCleaned {},
     BackupRecoveryActivated {},
@@ -1887,6 +1939,7 @@ mod tests {
                 "backup-restore-test",
                 "backup-recover",
                 "backup-recovery-candidate-stage",
+                "backup-recovery-candidate-control",
                 "backup-recovery-candidate-cleanup",
                 "backup-recovery-activate",
                 "backup-export-prepare",

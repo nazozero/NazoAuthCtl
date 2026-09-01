@@ -170,13 +170,16 @@ fn accepted_control_operation_receipt(
     })
 }
 
-fn control_operation_receipt(
+pub(crate) fn control_operation_receipt(
     request_operation_id: String,
     outcome: HostOutcome,
 ) -> anyhow::Result<ControlOperationReceipt> {
     match outcome {
         HostOutcome::Completed {
             body: HostCompletionBody::ControlOperationExecuted { result },
+        }
+        | HostOutcome::Completed {
+            body: HostCompletionBody::BackupRecoveryCandidateControlExecuted { result },
         } => accepted_control_operation_receipt(request_operation_id, result),
         HostOutcome::Completed { .. } => anyhow::bail!(
             "{HOST_ERR_OPERATION_INVALID}: the target answered an unexpected completion instead of a ControlOperation result"
@@ -591,6 +594,19 @@ fn dispatch_validated_host_operation(
             })()
             .unwrap_or_else(|failure| state_failure(operation, &failure))
         }
+        HostOperationBody::BackupRecoveryCandidateControl {
+            endpoint,
+            control_operation_id,
+            compact_jws,
+        } => answer_recovery_candidate_control(
+            operation,
+            store,
+            endpoint,
+            control_operation_id,
+            compact_jws,
+            executors.control,
+        )
+        .unwrap_or_else(|failure| state_failure(operation, &failure)),
         HostOperationBody::BackupRecoveryCandidateCleanup { endpoint } => {
             let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
             (|| -> Result<HostResult, Failure> {
@@ -1308,16 +1324,60 @@ fn answer_control_operation(
     let state = store.load_existing(&deployment_id)?;
     let result = execute_bound_control_operation(
         &operation.operation_id,
-        &deployment_id,
         &state,
         store,
         compact_jws,
         change_set,
+        &state.runtime.object,
         control,
     )?;
     Ok(HostResult::completed(
         &operation.operation_id,
         HostCompletionBody::ControlOperationExecuted { result },
+    ))
+}
+
+fn answer_recovery_candidate_control(
+    operation: &HostOperation,
+    store: &TargetStateStore,
+    endpoint: &crate::runtime_backend::RecoveryCandidateEndpoint,
+    control_operation_id: &str,
+    compact_jws: &str,
+    control: &Arc<dyn control_exec::ControlOperationExecutor>,
+) -> Result<HostResult, Failure> {
+    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
+    let expected_revision = operation.expected_revision.ok_or_else(|| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "recovery candidate control requires expected_revision",
+        )
+    })?;
+    let state = store.load_existing(&deployment_id)?;
+    if state.config.revision != expected_revision
+        || endpoint.deployment_id != deployment_id
+        || state
+            .active_host_operation
+            .as_ref()
+            .map(|active| active.operation_id.as_str())
+            != Some(endpoint.operation_id.as_str())
+    {
+        return Err(Failure::new(
+            CONTROL_TARGET_DRIFT,
+            "recovery candidate no longer matches the restored deployment state",
+        ));
+    }
+    let result = execute_bound_control_operation(
+        control_operation_id,
+        &state,
+        store,
+        compact_jws,
+        None,
+        &endpoint.object_id,
+        control,
+    )?;
+    Ok(HostResult::completed(
+        &operation.operation_id,
+        HostCompletionBody::BackupRecoveryCandidateControlExecuted { result },
     ))
 }
 
@@ -1381,11 +1441,11 @@ fn answer_admin_create(
 /// function so they cannot drift on runtime identity, mount, or stdout rules.
 fn execute_bound_control_operation(
     operation_id: &str,
-    deployment_id: &str,
     state: &DeploymentState,
     store: &TargetStateStore,
     compact_jws: &str,
     change_set: Option<&[u8]>,
+    runtime_object: &str,
     control: &Arc<dyn control_exec::ControlOperationExecutor>,
 ) -> Result<ControlResult, Failure> {
     let Some(current_artifact) = state.artifact.current.clone() else {
@@ -1416,13 +1476,13 @@ fn execute_bound_control_operation(
                 "deployment state has no app-secrets directory resource",
             )
         })?;
-    let scope_dir = store.scope_dir(deployment_id)?;
+    let scope_dir = store.scope_dir(&state.deployment_id)?;
     let job = control_exec::ControlJob {
         operation_id,
-        deployment_id,
+        deployment_id: &state.deployment_id,
         artifact_reference: &current_artifact,
         runtime_kind: state.runtime.kind,
-        runtime_object: &state.runtime.object,
+        runtime_object,
         config_reference: &state.config.reference,
         data_root: &data_root,
         secrets_root: &secrets_root,
@@ -1806,6 +1866,7 @@ impl ExecutionTarget for LocalTarget {
             HostOperationBody::StateMutate { .. }
                 | HostOperationBody::BackupRecover { .. }
                 | HostOperationBody::BackupRecoveryCandidateStage { .. }
+                | HostOperationBody::BackupRecoveryCandidateControl { .. }
                 | HostOperationBody::BackupRecoveryCandidateCleanup { .. }
                 | HostOperationBody::BackupRecoveryActivate { .. }
                 | HostOperationBody::BackupSnapshot {}
@@ -2393,6 +2454,7 @@ mod tests {
         outcome: nazo_operator_protocol::ControlOutcome,
         calls: std::sync::atomic::AtomicUsize,
         change_set_size: std::sync::atomic::AtomicUsize,
+        runtime_object: std::sync::Mutex<Option<String>>,
     }
 
     impl control_exec::ControlOperationExecutor for ScriptedControl {
@@ -2406,6 +2468,10 @@ mod tests {
                 job.change_set.map_or(0, <[u8]>::len),
                 std::sync::atomic::Ordering::Relaxed,
             );
+            self.runtime_object
+                .lock()
+                .expect("runtime object lock")
+                .replace(job.runtime_object.to_owned());
             Ok(nazo_operator_protocol::ControlResult {
                 schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
                 operation_id: job.operation_id.to_owned(),
@@ -2782,6 +2848,7 @@ mod tests {
             outcome: nazo_operator_protocol::ControlOutcome::Succeeded,
             calls: std::sync::atomic::AtomicUsize::new(0),
             change_set_size: std::sync::atomic::AtomicUsize::new(0),
+            runtime_object: std::sync::Mutex::new(None),
         });
         let target = plain_target.with_control_executor(scripted.clone());
 
@@ -2814,6 +2881,60 @@ mod tests {
                 .join("operations.jsonl"),
         )?;
         assert!(raw.contains("control-operation"), "{raw}");
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_control_targets_the_staged_candidate_not_the_original_runtime() -> anyhow::Result<()>
+    {
+        let (_temp, plain_target, journal) = temp_target()?;
+        seed_sample_deployment(&journal, "deploy-alpha")?;
+        let state = TargetStateStore::open(journal.root())?.load_existing("deploy-alpha")?;
+        let recovery_operation_id = state
+            .active_host_operation
+            .expect("bootstrap operation")
+            .operation_id;
+        let scripted = Arc::new(ScriptedControl {
+            outcome: nazo_operator_protocol::ControlOutcome::Succeeded,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            change_set_size: std::sync::atomic::AtomicUsize::new(0),
+            runtime_object: std::sync::Mutex::new(None),
+        });
+        let target = plain_target.with_control_executor(scripted.clone());
+        let operation = HostOperation::backup_recovery_candidate_control(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            1,
+            crate::runtime_backend::RecoveryCandidateEndpoint {
+                object_reference: "nazoauth-recovery-candidate".to_owned(),
+                object_id: "immutable-candidate-id".to_owned(),
+                deployment_id: "deploy-alpha".to_owned(),
+                operation_id: recovery_operation_id,
+                loopback_port: 49123,
+            },
+            CONTROL_JWS_OP_ID,
+            sample_control_jws(),
+        );
+        operation.validate().expect("valid candidate control");
+        assert_eq!(
+            parse_host_operation(&encode_host_operation(&operation)?)?,
+            operation
+        );
+        let result = target.execute_host_operation(&operation)?;
+        assert!(matches!(
+            result.outcome,
+            HostOutcome::Completed {
+                body: HostCompletionBody::BackupRecoveryCandidateControlExecuted { .. }
+            }
+        ));
+        assert_eq!(
+            scripted
+                .runtime_object
+                .lock()
+                .expect("runtime object lock")
+                .as_deref(),
+            Some("immutable-candidate-id")
+        );
         Ok(())
     }
 }

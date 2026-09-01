@@ -213,6 +213,13 @@ pub fn dispatch_via_target(
     classify_receipt(prepared, receipt)
 }
 
+pub fn classify_control_receipt(
+    prepared: &PreparedOperation,
+    receipt: ControlOperationReceipt,
+) -> anyhow::Result<DispatchVerdict> {
+    classify_receipt(prepared, receipt)
+}
+
 fn classify_receipt(
     prepared: &PreparedOperation,
     receipt: ControlOperationReceipt,

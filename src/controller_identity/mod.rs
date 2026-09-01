@@ -65,7 +65,7 @@ pub(crate) mod recovery;
 pub mod store;
 
 pub use dispatch::{
-    AttemptKind, DispatchVerdict, PreparedOperation, dispatch_via_target,
+    AttemptKind, DispatchVerdict, PreparedOperation, classify_control_receipt, dispatch_via_target,
     prepare_control_operation, settle_journal, validate_control_change_set,
     validate_control_result_binding,
 };
