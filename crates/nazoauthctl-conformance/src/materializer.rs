@@ -57,9 +57,10 @@ pub use descriptor::{
     DescriptorVariant, MAX_DESCRIPTOR_BYTES, MatrixDescriptor, RoleRequirement,
 };
 use descriptor::{
-    collect_client_policies, collect_registrations, descriptor_requires_reference, is_placeholder,
-    parse_placeholder, referenced_openid4vc_credential_dataset_ids, validate_binding_reference,
-    validate_descriptor, validate_digest, validate_single_mdoc_trust_anchor,
+    collect_client_policies, collect_registrations, descriptor_requires_reference,
+    extract_single_mdoc_trust_anchor_from_bundle, is_placeholder, parse_placeholder,
+    referenced_openid4vc_credential_dataset_ids, validate_binding_reference, validate_descriptor,
+    validate_digest, validate_single_mdoc_trust_anchor,
 };
 use template::{
     materialize_registration_template, materialize_value, materialize_vci_config,
@@ -1346,9 +1347,12 @@ impl DescriptorMaterializer {
         tenant_signing_certificate_chain_pem: impl Into<String>,
     ) -> Result<TenantResourceMaterializedMatrix, MaterializerError> {
         let tenant_signing_certificate_chain_pem = tenant_signing_certificate_chain_pem.into();
-        validate_public_certificate_bundle(&tenant_signing_certificate_chain_pem)?;
-        let deployment_der = validate_single_mdoc_trust_anchor(
+        let tenant_trust_anchor_pem = extract_single_mdoc_trust_anchor_from_bundle(
             &tenant_signing_certificate_chain_pem,
+            "openid4vc_request_object_trust_anchor_pem",
+        )?;
+        let deployment_der = validate_single_mdoc_trust_anchor(
+            &tenant_trust_anchor_pem,
             "credential_trust_anchor_pem",
         )?;
         let suite_der = validate_single_mdoc_trust_anchor(
@@ -1413,8 +1417,8 @@ impl DescriptorMaterializer {
 
         let bindings = MaterializationBindings {
             applicant_id,
-            openid4vc_credential_trust_anchor_pem: tenant_signing_certificate_chain_pem.clone(),
-            openid4vc_request_object_trust_anchor_pem: tenant_signing_certificate_chain_pem,
+            openid4vc_credential_trust_anchor_pem: tenant_trust_anchor_pem.clone(),
+            openid4vc_request_object_trust_anchor_pem: tenant_trust_anchor_pem,
             clients,
         };
         let matrix = materialize_matrix_document(&prepared, &bindings)?;
@@ -1842,21 +1846,6 @@ fn canonicalize_registration_string_sets(request: &mut Value) -> Result<(), Mate
     Ok(())
 }
 
-fn validate_public_certificate_bundle(value: &str) -> Result<(), MaterializerError> {
-    if value.is_empty()
-        || value.len() > 256 * 1024
-        || value.contains('\0')
-        || value.contains("PRIVATE KEY")
-        || !value.contains("-----BEGIN CERTIFICATE-----")
-        || !value.contains("-----END CERTIFICATE-----")
-    {
-        return Err(MaterializerError::InvalidField(
-            "openid4vc_request_object_trust_anchor_pem",
-        ));
-    }
-    Ok(())
-}
-
 fn combine_openid4vc_credential_trust_anchors(
     run_anchor_pem: &str,
     suite_anchor_pem: &str,
@@ -1927,7 +1916,10 @@ mod tests {
     use base64::{
         Engine as _, engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD,
     };
-    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
     use x509_parser::{extensions::GeneralName, parse_x509_certificate, pem::parse_x509_pem};
 
     use super::*;
@@ -2881,6 +2873,35 @@ mod tests {
             .replace("\r\n", "\n")
     }
 
+    fn generated_test_certificate_bundle() -> (String, String) {
+        let now = time::OffsetDateTime::now_utc();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "nazoauthctl-deployment");
+        ca_params.not_before = now - time::Duration::days(1);
+        ca_params.not_after = now + time::Duration::days(30);
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().expect("CA key"))
+            .expect("CA certificate");
+
+        let mut leaf_params = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "tenant signing leaf");
+        leaf_params.not_before = now - time::Duration::days(1);
+        leaf_params.not_after = now + time::Duration::days(2);
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let leaf = leaf_params
+            .signed_by(&KeyPair::generate().expect("leaf key"), &ca)
+            .expect("leaf certificate")
+            .pem()
+            .replace("\r\n", "\n");
+        let root = ca.pem().replace("\r\n", "\n");
+        (format!("{leaf}{root}"), root)
+    }
+
     fn assert_vp_credential_signer(config: &Value, suite_host: &str) {
         let credential = config["credential"]
             .as_object()
@@ -3068,6 +3089,19 @@ mod tests {
             expired,
             MaterializerError::InvalidField("credential_trust_anchor_pem")
         ));
+
+        let (bundle, root) = generated_test_certificate_bundle();
+        assert_eq!(
+            extract_single_mdoc_trust_anchor_from_bundle(
+                &bundle,
+                "openid4vc_request_object_trust_anchor_pem"
+            )
+            .expect("deployment root from signing chain"),
+            root
+        );
+        let (prepared, output) = prepare();
+        DescriptorMaterializer::finalize_tenant_resources(prepared, output, bundle)
+            .expect("leaf plus root certificate chain must materialize");
     }
 
     #[test]

@@ -243,6 +243,61 @@ pub(super) fn validate_single_mdoc_trust_anchor(
     Ok(pem.contents)
 }
 
+pub(super) fn extract_single_mdoc_trust_anchor_from_bundle(
+    value: &str,
+    field: &'static str,
+) -> Result<String, MaterializerError> {
+    if value.is_empty()
+        || value.len() > 256 * 1024
+        || value.contains('\0')
+        || value.to_ascii_uppercase().contains("PRIVATE KEY")
+    {
+        return Err(MaterializerError::InvalidField(field));
+    }
+
+    let mut remaining = value.as_bytes();
+    let mut trust_anchor = None;
+    loop {
+        let offset = remaining
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .unwrap_or(remaining.len());
+        remaining = &remaining[offset..];
+        if remaining.is_empty() {
+            break;
+        }
+
+        let source = remaining;
+        let (next, pem) =
+            parse_x509_pem(source).map_err(|_| MaterializerError::InvalidField(field))?;
+        if pem.label != "CERTIFICATE" || next.len() >= source.len() {
+            return Err(MaterializerError::InvalidField(field));
+        }
+        let (der_remaining, certificate) = parse_x509_certificate(&pem.contents)
+            .map_err(|_| MaterializerError::InvalidField(field))?;
+        if !der_remaining.is_empty() {
+            return Err(MaterializerError::InvalidField(field));
+        }
+        if certificate.is_ca()
+            && certificate.issuer() == certificate.subject()
+            && certificate
+                .verify_signature(Some(certificate.public_key()))
+                .is_ok()
+        {
+            if trust_anchor.is_some() {
+                return Err(MaterializerError::InvalidField(field));
+            }
+            let consumed = source.len() - next.len();
+            let encoded = std::str::from_utf8(&source[..consumed])
+                .map_err(|_| MaterializerError::InvalidField(field))?;
+            trust_anchor = Some(format!("{}\n", encoded.trim_end()));
+        }
+        remaining = next;
+    }
+
+    trust_anchor.ok_or(MaterializerError::InvalidField(field))
+}
+
 const MAX_OPENID4VC_DATASETS: usize = 16;
 const MAX_OPENID4VC_DATASET_BYTES: usize = 64 * 1024;
 const MAX_OPENID4VC_DATASET_TOTAL_BYTES: usize = 512 * 1024;
