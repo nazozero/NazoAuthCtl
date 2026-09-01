@@ -1250,14 +1250,21 @@ pub(crate) fn verify_pinned_artifact_facts(
                         "systemd deployment state has no app-binary directory resource",
                     )
                 })?;
-                let source = Path::new(&candidate.host_binary_path);
+                let (host_binary_path, host_binary_sha256) =
+                    candidate.host_binary_artifact().ok_or_else(|| {
+                        Failure::new(
+                            super::install_exec::ARTIFACT_UNVERIFIED,
+                            "pre-release candidate has no host binary artifact",
+                        )
+                    })?;
+                let source = Path::new(host_binary_path);
                 let observed_digest = filesystem::sha256(source).map_err(|error| {
                     Failure::new(
                         super::install_exec::ARTIFACT_UNVERIFIED,
                         sanitize(error.to_string()),
                     )
                 })?;
-                if observed_digest != candidate.host_binary_sha256 {
+                if observed_digest != host_binary_sha256 {
                     return Err(Failure::new(
                         super::install_exec::ARTIFACT_UNVERIFIED,
                         "local pre-release host binary does not match its content digest",
@@ -1278,7 +1285,13 @@ pub(crate) fn verify_pinned_artifact_facts(
                 )
             }
             RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
-                let image = format!("{}@{}", candidate.oci_image, candidate.oci_digest);
+                let (oci_image, oci_digest) = candidate.oci_artifact().ok_or_else(|| {
+                    Failure::new(
+                        super::install_exec::ARTIFACT_UNVERIFIED,
+                        "pre-release candidate has no OCI artifact",
+                    )
+                })?;
+                let image = format!("{oci_image}@{oci_digest}");
                 backend.pull_image(&image).map_err(|error| {
                     Failure::new(
                         super::install_exec::ARTIFACT_UNVERIFIED,
@@ -1286,13 +1299,10 @@ pub(crate) fn verify_pinned_artifact_facts(
                     )
                 })?;
                 (
-                    candidate
-                        .oci_digest
-                        .trim_start_matches("sha256:")
-                        .to_owned(),
+                    oci_digest.trim_start_matches("sha256:").to_owned(),
                     runtime_backend::ArtifactReference::Oci {
-                        image_reference: candidate.oci_image.clone(),
-                        digest: candidate.oci_digest.clone(),
+                        image_reference: oci_image.to_owned(),
+                        digest: oci_digest.to_owned(),
                     },
                     None,
                 )

@@ -13,10 +13,10 @@ const EMBEDDED_CANDIDATE: Option<&str> = option_env!("NAZOAUTHCTL_PRE_RELEASE_CA
 pub(crate) struct CandidateRelease {
     pub(crate) repository: String,
     pub(crate) version: String,
-    pub(crate) oci_image: String,
-    pub(crate) oci_digest: String,
-    pub(crate) host_binary_path: String,
-    pub(crate) host_binary_sha256: String,
+    oci_image: Option<String>,
+    oci_digest: Option<String>,
+    host_binary_path: Option<String>,
+    host_binary_sha256: Option<String>,
     pub(crate) rollback: ReleaseRollbackPolicy,
 }
 
@@ -31,23 +31,48 @@ impl CandidateRelease {
             "pre-release candidate repository is not NazoAuth"
         );
         ensure!(
-            !self.oci_image.trim().is_empty() && !self.oci_image.chars().any(char::is_control),
-            "pre-release candidate OCI image is invalid"
+            self.oci_image.is_some() || self.host_binary_path.is_some(),
+            "pre-release candidate has no runtime artifact"
         );
-        validate_sha256(
-            self.oci_digest
-                .strip_prefix("sha256:")
-                .context("pre-release candidate OCI digest must use sha256")?,
-            "OCI digest",
-        )?;
         ensure!(
-            !self.host_binary_path.trim().is_empty()
-                && !self.host_binary_path.chars().any(char::is_control),
-            "pre-release candidate host binary path is invalid"
+            self.oci_image.is_some() == self.oci_digest.is_some(),
+            "pre-release candidate OCI artifact is incomplete"
         );
-        validate_sha256(&self.host_binary_sha256, "host binary digest")?;
+        ensure!(
+            self.host_binary_path.is_some() == self.host_binary_sha256.is_some(),
+            "pre-release candidate host binary artifact is incomplete"
+        );
+        if let Some((image, digest)) = self.oci_artifact() {
+            ensure!(
+                !image.trim().is_empty() && !image.chars().any(char::is_control),
+                "pre-release candidate OCI image is invalid"
+            );
+            validate_sha256(
+                digest
+                    .strip_prefix("sha256:")
+                    .context("pre-release candidate OCI digest must use sha256")?,
+                "OCI digest",
+            )?;
+        }
+        if let Some((path, digest)) = self.host_binary_artifact() {
+            ensure!(
+                !path.trim().is_empty() && !path.chars().any(char::is_control),
+                "pre-release candidate host binary path is invalid"
+            );
+            validate_sha256(digest, "host binary digest")?;
+        }
         self.release_version()?;
         self.rollback.validate()
+    }
+
+    pub(crate) fn oci_artifact(&self) -> Option<(&str, &str)> {
+        self.oci_image.as_deref().zip(self.oci_digest.as_deref())
+    }
+
+    pub(crate) fn host_binary_artifact(&self) -> Option<(&str, &str)> {
+        self.host_binary_path
+            .as_deref()
+            .zip(self.host_binary_sha256.as_deref())
     }
 
     pub(crate) fn enforce_floor(&self, trusted_version: Option<&str>) -> anyhow::Result<()> {
@@ -117,6 +142,38 @@ mod tests {
 
         let unknown = encoded.replacen("\"repository\"", "\"unknown\":true,\"repository\"", 1);
         assert!(serde_json::from_str::<CandidateRelease>(&unknown).is_err());
+
+        let container_only = format!(
+            r#"{{
+                "repository":"nazozero/NazoAuth",
+                "version":"v0.2.4-candidate",
+                "oci_image":"localhost/nazoauth:candidate",
+                "oci_digest":"sha256:{}",
+                "rollback":{{
+                    "artifact":true,
+                    "schema_compatible":false,
+                    "database_restore":"backup",
+                    "irreversible_migration":true,
+                    "minimum_supported_version":"0.2.2",
+                    "migration_floor":"20260828000700",
+                    "rationale":"candidate migration requires verified backup recovery"
+                }}
+            }}"#,
+            "a".repeat(64),
+        );
+        let candidate: CandidateRelease = serde_json::from_str(&container_only)?;
+        candidate.validate()?;
+
+        let mut incomplete: serde_json::Value = serde_json::from_str(&container_only)?;
+        incomplete
+            .as_object_mut()
+            .expect("candidate object")
+            .remove("oci_digest");
+        assert!(
+            serde_json::from_value::<CandidateRelease>(incomplete)?
+                .validate()
+                .is_err()
+        );
         Ok(())
     }
 }
