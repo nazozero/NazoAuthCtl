@@ -261,18 +261,19 @@ impl ModuleReport {
         );
         let blocking_log_results = blocking_log_results.into_iter().collect::<Vec<_>>();
         let advisory_log_results = advisory_log_results.into_iter().collect::<Vec<_>>();
-        let outcome = if !context.terminal || official_status.as_deref() != Some("FINISHED") {
-            ModuleOutcome::Incomplete
-        } else if !blocking_log_results.is_empty() {
-            ModuleOutcome::Failed
-        } else {
-            match official_result.as_deref() {
-                Some("PASSED") if advisory_log_results.is_empty() => ModuleOutcome::Passed,
-                Some("PASSED" | "REVIEW" | "WARNING") => ModuleOutcome::Review,
-                Some("SKIPPED") => ModuleOutcome::Skipped,
-                _ => ModuleOutcome::Failed,
-            }
-        };
+        let outcome =
+            if !blocking_log_results.is_empty() || official_result.as_deref() == Some("FAILED") {
+                ModuleOutcome::Failed
+            } else if !context.terminal || official_status.as_deref() != Some("FINISHED") {
+                ModuleOutcome::Incomplete
+            } else {
+                match official_result.as_deref() {
+                    Some("PASSED") if advisory_log_results.is_empty() => ModuleOutcome::Passed,
+                    Some("PASSED" | "REVIEW" | "WARNING") => ModuleOutcome::Review,
+                    Some("SKIPPED") => ModuleOutcome::Skipped,
+                    _ => ModuleOutcome::Failed,
+                }
+            };
         let human_review_required = matches!(
             outcome,
             ModuleOutcome::Review | ModuleOutcome::DeferredReviewPending
@@ -598,6 +599,35 @@ mod tests {
             )])
             .all_passed
         );
+    }
+
+    #[test]
+    fn interrupted_official_failures_are_not_downgraded_to_incomplete() {
+        let failed_result = module(
+            "failed-result",
+            true,
+            "INTERRUPTED",
+            "FAILED",
+            serde_json::json!([]),
+        );
+        let blocking_log = module(
+            "blocking-log",
+            true,
+            "INTERRUPTED",
+            "PASSED",
+            serde_json::json!([{"result":"FAILURE"}]),
+        );
+        let interrupted = module(
+            "interrupted",
+            true,
+            "INTERRUPTED",
+            "PASSED",
+            serde_json::json!([]),
+        );
+
+        assert_eq!(failed_result.outcome, ModuleOutcome::Failed);
+        assert_eq!(blocking_log.outcome, ModuleOutcome::Failed);
+        assert_eq!(interrupted.outcome, ModuleOutcome::Incomplete);
     }
 
     #[test]
