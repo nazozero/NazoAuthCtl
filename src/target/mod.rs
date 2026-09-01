@@ -794,6 +794,7 @@ fn dispatch_validated_host_operation(
                         }
                         let job = install_exec::InstallJob {
                             deployment_id: &deployment_id,
+                            issuer,
                             runtime,
                             config_reference,
                             scope_dir: &scope_dir,
@@ -1117,6 +1118,7 @@ fn answer_update(
     let job = update_exec::UpdateJob {
         operation_id: &operation.operation_id,
         deployment_id: &deployment_id,
+        issuer: &state.issuer,
         runtime_kind: state.runtime.kind,
         runtime_object: &state.runtime.object,
         config_reference: &state.config.reference.clone(),
@@ -1203,6 +1205,7 @@ fn answer_rollback(
     let job = update_exec::RollbackJob {
         operation_id: &operation.operation_id,
         deployment_id: &deployment_id,
+        issuer: &state.issuer,
         runtime_kind: state.runtime.kind,
         runtime_object: &state.runtime.object,
         config_reference: &state.config.reference.clone(),

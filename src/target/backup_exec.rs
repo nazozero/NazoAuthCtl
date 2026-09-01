@@ -1262,7 +1262,7 @@ fn run_restore_rehearsal(
 /// Run the product's one-shot `nazoauth migrate` against the isolated restore
 /// database so `configure_runtime_role` re-converges the runtime grant the
 /// privilege-free dump dropped. Mirrors the install one-shot contract: the
-/// lifecycle URL travels only through the read-only secret mount.
+/// lifecycle URL is supplied directly to the bounded one-shot environment.
 fn run_restore_migration(
     backend: &dyn RuntimeBackend,
     artifact: &crate::runtime_backend::ArtifactReference,
@@ -1270,37 +1270,39 @@ fn run_restore_migration(
     secrets: &Path,
     runtime_role: &str,
 ) -> anyhow::Result<()> {
+    let lifecycle_url_path = secrets.join("database-lifecycle-url");
+    let lifecycle_url = crate::filesystem::read_secure_regular_file(
+        &lifecycle_url_path,
+        "restore lifecycle database URL",
+        false,
+        16 * 1024,
+    )?;
+    let lifecycle_url = std::str::from_utf8(&lifecycle_url)
+        .context("restore lifecycle database URL is not UTF-8")?
+        .trim()
+        .to_owned();
+    ensure!(
+        !lifecycle_url.is_empty(),
+        "restore lifecycle database URL is empty"
+    );
     let task = runtime_backend::OneShotTask {
         artifact: artifact.clone(),
         command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
         network: Some("bridge".to_owned()),
-        mounts: vec![
-            NeutralMount {
-                source: config.to_path_buf(),
-                destination: PathBuf::from(CONTAINER_CONFIG_FILE),
-                read_only: true,
-                selinux_relabel: false,
-                ownership: Responsibility::Managed,
-                scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
-            },
-            NeutralMount {
-                source: secrets.to_path_buf(),
-                destination: PathBuf::from(CONTAINER_SECRETS_DIR),
-                read_only: true,
-                selinux_relabel: false,
-                ownership: Responsibility::Managed,
-                scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
-            },
-        ],
+        mounts: vec![NeutralMount {
+            source: config.to_path_buf(),
+            destination: PathBuf::from(CONTAINER_CONFIG_FILE),
+            read_only: true,
+            selinux_relabel: false,
+            ownership: Responsibility::Managed,
+            scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
+        }],
         environment: BTreeMap::from([
             (
                 SERVER_CONFIG_FILE_ENV.to_owned(),
                 CONTAINER_CONFIG_FILE.to_owned(),
             ),
-            (
-                "DATABASE_URL_FILE".to_owned(),
-                format!("{CONTAINER_SECRETS_DIR}/database-lifecycle-url"),
-            ),
+            ("DATABASE_URL".to_owned(), lifecycle_url),
             (
                 MIGRATION_RUNTIME_ROLE_ENV.to_owned(),
                 runtime_role.to_owned(),

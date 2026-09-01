@@ -307,9 +307,9 @@ fn target_path(path: &std::path::Path, flag: &str) -> anyhow::Result<String> {
 }
 
 /// Render the server configuration seed as the exact `.env.yaml` document
-/// NazoAuth's single loader accepts: uppercase allowlisted keys, secret values
-/// only as container-internal file references, LF endings. The container-side
-/// paths are the frozen mount contract in `target::install_exec`.
+/// NazoAuth's single loader accepts: uppercase allowlisted keys and LF endings.
+/// External connection URLs are direct configuration values; only key
+/// material uses the file-provider contract.
 ///
 /// TRANSPORT_MODE is `trusted-proxy`: the container terminates plain HTTP on
 /// a loopback-published port and the public TLS endpoint is an external
@@ -319,8 +319,8 @@ struct RuntimeSeedConfig {
     bind: String,
     trusted_proxy_cidrs: String,
     data_dir: String,
-    database_url_file: String,
-    valkey_url_file: String,
+    database_url: String,
+    valkey_url: String,
     mfa_totp_key_file: String,
 }
 
@@ -356,13 +356,13 @@ fn render_config_yaml(
          VALKEY_STATE_EPOCH: \"{state_epoch}\"\n\
          {transport_mode}\
          SECURITY_AUDIT_REQUIRE_LEAST_PRIVILEGE: \"true\"\n\
-         DATABASE_URL_FILE: \"{}\"\n\
-         VALKEY_URL_FILE: \"{}\"\n\
+         DATABASE_URL: \"{}\"\n\
+         VALKEY_URL: \"{}\"\n\
          MFA_TOTP_ENCRYPTION_KEY_FILE: \"{}\"\n\
          DATA_DIR: \"{}\"\n",
         runtime.bind,
-        runtime.database_url_file,
-        runtime.valkey_url_file,
+        runtime.database_url,
+        runtime.valkey_url,
         runtime.mfa_totp_key_file,
         runtime.data_dir,
     ))
@@ -425,11 +425,38 @@ fn build_install_order(
     let valkey_url_file = target_os.join(&paths.secrets_dir, &["valkey-url"])?;
     let mfa_totp_key_file = target_os.join(&paths.secrets_dir, &["mfa-totp-key"])?;
 
+    let database_runtime_url = format!(
+        "postgresql://{}:{}@{}:{}/{}",
+        request.database_runtime_endpoint.user,
+        crate::target::install_exec::percent_encode_credential(
+            request
+                .database_runtime_password
+                .as_ref()
+                .context("runtime PostgreSQL password is missing")?
+                .as_bytes(),
+        ),
+        request.database_runtime_endpoint.host,
+        request.database_runtime_endpoint.port,
+        request.database_runtime_endpoint.name,
+    );
+    let valkey_url = format!(
+        "valkey://:{}@{}:{}",
+        crate::target::install_exec::percent_encode_credential(
+            request
+                .valkey_password
+                .as_ref()
+                .context("Valkey password is missing")?
+                .as_bytes(),
+        ),
+        request.valkey_endpoint.host,
+        request.valkey_endpoint.port,
+    );
+
     let runtime = if runtime_kind == RuntimeBackendKind::Host {
         RuntimeSeedConfig {
             data_dir: config_path(target_os, &paths.data_root),
-            database_url_file: config_path(target_os, &database_runtime_url_file),
-            valkey_url_file: config_path(target_os, &valkey_url_file),
+            database_url: database_runtime_url.clone(),
+            valkey_url: valkey_url.clone(),
             mfa_totp_key_file: config_path(target_os, &mfa_totp_key_file),
             bind: format!("127.0.0.1:{loopback_port}"),
             trusted_proxy_cidrs: "127.0.0.0/8,::1/128".to_owned(),
@@ -437,14 +464,8 @@ fn build_install_order(
     } else {
         RuntimeSeedConfig {
             data_dir: crate::target::install_exec::CONTAINER_DATA_DIR.to_owned(),
-            database_url_file: format!(
-                "{}/database-runtime-url",
-                crate::target::install_exec::CONTAINER_SECRETS_DIR
-            ),
-            valkey_url_file: format!(
-                "{}/valkey-url",
-                crate::target::install_exec::CONTAINER_SECRETS_DIR
-            ),
+            database_url: database_runtime_url,
+            valkey_url,
             mfa_totp_key_file: format!(
                 "{}/mfa-totp-key",
                 crate::target::install_exec::CONTAINER_SECRETS_DIR

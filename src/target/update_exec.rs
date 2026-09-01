@@ -34,9 +34,8 @@ use sha2::{Digest as _, Sha256};
 
 use super::deployment_state::{Failure, OBJECT_IDENTITY_MISMATCH, TargetStateStore};
 use super::install_exec::{
-    CONTAINER_CONFIG_FILE, CONTAINER_DATA_DIR, CONTAINER_SECRETS_DIR, MIGRATION_RUNTIME_ROLE_ENV,
-    OfficialArtifactRef, SERVER_CONFIG_FILE_ENV, StagedConfig, cache_systemd_artifact,
-    probe_local_health,
+    CONTAINER_CONFIG_FILE, CONTAINER_DATA_DIR, MIGRATION_RUNTIME_ROLE_ENV, OfficialArtifactRef,
+    SERVER_CONFIG_FILE_ENV, StagedConfig, cache_systemd_artifact, probe_local_health,
 };
 use super::wire::{HOST_ERR_OPERATION_INVALID, sanitize};
 use crate::{
@@ -150,6 +149,7 @@ fn validate_loaded_backup_projection(
 pub(crate) struct UpdateJob<'a> {
     pub operation_id: &'a str,
     pub deployment_id: &'a str,
+    pub issuer: &'a str,
     /// Runtime class token from the live DeploymentState surface.
     pub runtime_kind: RuntimeBackendKind,
     pub runtime_object: &'a str,
@@ -186,6 +186,7 @@ pub(crate) struct UpdateJob<'a> {
 pub(crate) struct RollbackJob<'a> {
     pub operation_id: &'a str,
     pub deployment_id: &'a str,
+    pub issuer: &'a str,
     pub runtime_kind: RuntimeBackendKind,
     pub runtime_object: &'a str,
     pub config_reference: &'a str,
@@ -443,10 +444,24 @@ impl HostLifecycleExecutor {
             let mut environment = BTreeMap::new();
             let mut read_only_paths = Vec::new();
             let mut read_write_paths = Vec::new();
-            let mut transient_credentials = BTreeMap::new();
-            let mut mounts = observation.mounts.clone();
+            let transient_credentials = BTreeMap::new();
+            let mounts = observation
+                .mounts
+                .iter()
+                .filter(|mount| {
+                    matches!(
+                        mount.destination.to_str(),
+                        Some(CONTAINER_CONFIG_FILE)
+                            | Some(CONTAINER_DATA_DIR)
+                            | Some(super::install_exec::CONTAINER_OPERATOR_CONFIG_REVISION_FILE)
+                    )
+                })
+                .cloned()
+                .collect();
             let runtime_role = runtime_database_role(job.secrets_root)?;
+            let lifecycle_url = lifecycle_database_url(job.secrets_root)?;
             environment.insert(MIGRATION_RUNTIME_ROLE_ENV.to_owned(), runtime_role);
+            environment.insert("DATABASE_URL".to_owned(), lifecycle_url);
             if host {
                 environment.insert(
                     super::install_exec::SERVER_CONFIG_FILE_ENV.to_owned(),
@@ -468,14 +483,6 @@ impl HostLifecycleExecutor {
                 );
                 read_only_paths.push(PathBuf::from(job.config_reference));
                 read_write_paths.push(PathBuf::from(job.data_root));
-                environment.insert(
-                    "DATABASE_URL_FILE".to_owned(),
-                    "%d/database-lifecycle-url".to_owned(),
-                );
-                transient_credentials.insert(
-                    "database-lifecycle-url".to_owned(),
-                    Path::new(job.secrets_root).join("database-lifecycle-url"),
-                );
             } else {
                 environment.insert(
                     SERVER_CONFIG_FILE_ENV.to_owned(),
@@ -489,23 +496,6 @@ impl HostLifecycleExecutor {
                     "NAZOAUTH_OPERATOR_STATE_DIRECTORY".to_owned(),
                     format!("{CONTAINER_DATA_DIR}/operator-state"),
                 );
-                environment.insert(
-                    "DATABASE_URL_FILE".to_owned(),
-                    format!("{CONTAINER_SECRETS_DIR}/database-lifecycle-url"),
-                );
-                // The live runtime deliberately never receives the lifecycle
-                // secret, so its mount set cannot carry the one-shot input.
-                // Mount exactly that one file into the migration task.
-                mounts.push(crate::runtime_backend::NeutralMount {
-                    source: Path::new(job.secrets_root).join("database-lifecycle-url"),
-                    destination: PathBuf::from(format!(
-                        "{CONTAINER_SECRETS_DIR}/database-lifecycle-url"
-                    )),
-                    read_only: true,
-                    selinux_relabel: false,
-                    ownership: crate::runtime_backend::Responsibility::Managed,
-                    scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
-                });
             }
             let task = runtime_backend::OneShotTask {
                 artifact: verified.runtime_artifact.clone(),
@@ -591,7 +581,7 @@ impl HostLifecycleExecutor {
         }
 
         // 6. Local readiness gate (G08 boundary: loopback only).
-        probe_local_health(job.port)?;
+        probe_local_health(job.port, job.issuer)?;
 
         // 7. Commit: previous <- old current, current <- new (+ its release
         // version), optional config CAS advance — replay-safe under this
@@ -730,7 +720,7 @@ impl HostLifecycleExecutor {
                 "the rolled-back runtime does not serve the previous verified artifact",
             ));
         }
-        probe_local_health(job.port)?;
+        probe_local_health(job.port, job.issuer)?;
 
         // 5. Restore the snapshot bytes when the decision said so.
         if let Some((bytes, _)) = &restored_config {
@@ -813,6 +803,35 @@ fn runtime_database_role(secrets_root: &str) -> Result<String, Failure> {
     Ok(role.to_owned())
 }
 
+fn lifecycle_database_url(secrets_root: &str) -> Result<String, Failure> {
+    let path = Path::new(secrets_root).join("database-lifecycle-url");
+    let bytes =
+        filesystem::read_secure_regular_file(&path, "lifecycle database URL", false, 16 * 1024)
+            .map_err(|error| {
+                Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
+            })?;
+    let value = std::str::from_utf8(&bytes).map_err(|_| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "lifecycle database URL is not UTF-8",
+        )
+    })?;
+    let value = value.trim();
+    let url = url::Url::parse(value).map_err(|error| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            sanitize(format!("lifecycle database URL is invalid: {error}")),
+        )
+    })?;
+    if !matches!(url.scheme(), "postgres" | "postgresql") || url.username().is_empty() {
+        return Err(Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "lifecycle database URL is not a PostgreSQL credential URL",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
 /// Target-side pre-activation gate for the nested MigrateApply.  This is only
 /// an adapter to the controller's one result-binding authority; it adds no
 /// second operation/result contract.
@@ -871,6 +890,35 @@ mod tests {
         )?;
 
         assert!(runtime_database_role(temp.path().to_str().unwrap()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn migration_lifecycle_url_is_loaded_as_a_direct_postgresql_value() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("migration-lifecycle-url")?;
+        let path = temp.path().join("database-lifecycle-url");
+        crate::filesystem::atomic_write(
+            &path,
+            b"postgresql://nazo_lifecycle:secret@db.internal/oauth\n",
+            0o600,
+        )?;
+
+        assert_eq!(
+            lifecycle_database_url(temp.path().to_str().unwrap()).map_err(anyhow::Error::from)?,
+            "postgresql://nazo_lifecycle:secret@db.internal/oauth"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_lifecycle_url_rejects_non_postgresql_inputs() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("migration-lifecycle-url-invalid")?;
+        let path = temp.path().join("database-lifecycle-url");
+        crate::filesystem::atomic_write(&path, b"https://db.internal/oauth", 0o600)?;
+
+        let error = lifecycle_database_url(temp.path().to_str().unwrap())
+            .expect_err("non-PostgreSQL lifecycle URL must fail closed");
+        assert_eq!(error.code, HOST_ERR_OPERATION_INVALID);
         Ok(())
     }
 

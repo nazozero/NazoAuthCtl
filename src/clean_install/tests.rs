@@ -928,7 +928,14 @@ fn linux_target_paths_are_posix_even_when_constructed_on_windows() -> anyhow::Re
             .config_content
             .contains("SECURITY_AUDIT_REQUIRE_LEAST_PRIVILEGE: \"true\"")
     );
-    assert!(order.config_content.contains("database-runtime-url"));
+    assert!(
+        order
+            .config_content
+            .contains("DATABASE_URL: \"postgresql://")
+    );
+    assert!(order.config_content.contains("VALKEY_URL: \"valkey://"));
+    assert!(!order.config_content.contains("DATABASE_URL_FILE"));
+    assert!(!order.config_content.contains("VALKEY_URL_FILE"));
     assert!(!order.config_content.contains("database-lifecycle-url"));
     assert_eq!(
         order
@@ -973,10 +980,12 @@ fn windows_host_seed_uses_yaml_safe_target_paths() -> anyhow::Result<()> {
         "{}",
         order.config_content
     );
-    assert!(order.config_content.contains(&format!(
-        "DATABASE_URL_FILE: \"C:/NazoAuth/secrets/{}/database-runtime-url\"",
-        prepared.deployment_id
-    )));
+    assert!(
+        order
+            .config_content
+            .contains("DATABASE_URL: \"postgresql://")
+    );
+    assert!(!order.config_content.contains("DATABASE_URL_FILE"));
     assert!(
         order
             .secrets

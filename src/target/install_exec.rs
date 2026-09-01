@@ -136,12 +136,23 @@ pub struct CurrentDataImport {
 /// the update's config snapshot records both the replaced and the replacing
 /// schema, and rollback restores the snapshot only while the deployment still
 /// runs the replacing schema (goal plan 07 §5).
-#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StagedConfig {
     pub content: String,
     pub sha256: String,
     pub schema: String,
+}
+
+impl std::fmt::Debug for StagedConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StagedConfig")
+            .field("content", &"[redacted]")
+            .field("sha256", &self.sha256)
+            .field("schema", &self.schema)
+            .finish()
+    }
 }
 
 impl StagedConfig {
@@ -175,13 +186,12 @@ impl StagedConfig {
 /// clean install (G01). Rides inside the `Bootstrap` state mutation, so the
 /// C07 journal binds the exact order to the operation id via its canonical
 /// hash — a tampered order is a conflict, not a retry.
-#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallOrder {
     pub artifact: OfficialArtifactRef,
-    /// Complete rendered server configuration. Secret *values* appear only
-    /// as file references; written atomically at the Bootstrap mutation's
-    /// `config_reference` path.
+    /// Complete rendered server configuration, written atomically at the
+    /// Bootstrap mutation's `config_reference` path. Debug output redacts it.
     pub config_content: String,
     /// SHA-256 over the exact `config_content` bytes; checked before the
     /// atomic write so a wire-level corruption can never reach disk.
@@ -203,6 +213,27 @@ pub struct InstallOrder {
     pub database_lifecycle_endpoint: ExternalEndpoint,
     /// External Valkey endpoint facts supplied by the operator.
     pub valkey_endpoint: ExternalEndpoint,
+}
+
+impl std::fmt::Debug for InstallOrder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InstallOrder")
+            .field("artifact", &self.artifact)
+            .field("config_content", &"[redacted]")
+            .field("config_sha256", &self.config_sha256)
+            .field("data_root", &self.data_root)
+            .field("runtime_root", &self.runtime_root)
+            .field("secrets", &self.secrets)
+            .field("current_data_import", &self.current_data_import)
+            .field("database_runtime_endpoint", &self.database_runtime_endpoint)
+            .field(
+                "database_lifecycle_endpoint",
+                &self.database_lifecycle_endpoint,
+            )
+            .field("valkey_endpoint", &self.valkey_endpoint)
+            .finish()
+    }
 }
 
 /// Operator-supplied coordinates of one external dependency. Credential
@@ -675,6 +706,7 @@ fn copy_import_file(source: &Path, destination: &Path, label: &str) -> Result<()
 /// from the accepted operation; never serialized.
 pub(crate) struct InstallJob<'a> {
     pub deployment_id: &'a str,
+    pub issuer: &'a str,
     /// The single validated runtime fact source from the Bootstrap surface.
     pub runtime: &'a RuntimeSurface,
     pub config_reference: &'a str,
@@ -1047,7 +1079,7 @@ impl HostInstallExecutor {
 
         // 7. Local health/readiness probe. Public reachability is deliberately
         // absent here (G08): loopback readiness is the only install gate.
-        probe_local_health(job.runtime.loopback_port)?;
+        probe_local_health(job.runtime.loopback_port, job.issuer)?;
 
         Ok(InstallFacts {
             artifact_reference: format!("sha256:{}", verified.digest),
@@ -1179,11 +1211,11 @@ fn start_container_runtime(
             false,
         ),
     ];
-    // The long-lived runtime receives only its three runtime secrets. The
-    // lifecycle PostgreSQL URL is mounted solely into one-shot lifecycle
-    // tasks and is therefore unreachable from the server process.
+    // The long-lived runtime receives only key material. Database and Valkey
+    // URLs are direct values in the mounted configuration; lifecycle
+    // credentials remain ctl-owned and never enter the server container.
     for secret in &job.order.secrets {
-        if secret.purpose == "database-lifecycle-url" {
+        if secret.purpose != "mfa-totp-key" {
             continue;
         }
         mounts.push(mount(
@@ -1216,10 +1248,8 @@ fn start_container_runtime(
     );
     for secret in &job.order.secrets {
         let key = match secret.purpose.as_str() {
-            "database-runtime-url" => "DATABASE_URL_FILE",
-            "database-lifecycle-url" => continue,
-            "valkey-url" => "VALKEY_URL_FILE",
             "mfa-totp-key" => "MFA_TOTP_ENCRYPTION_KEY_FILE",
+            "database-runtime-url" | "database-lifecycle-url" | "valkey-url" => continue,
             other => {
                 return Err(Failure::new(
                     HOST_ERR_OPERATION_INVALID,
@@ -1331,7 +1361,7 @@ fn start_systemd_runtime(
         .order
         .secrets
         .iter()
-        .filter(|secret| secret.purpose != "database-lifecycle-url")
+        .filter(|secret| secret.purpose == "mfa-totp-key")
         .map(|secret| PathBuf::from(&secret.path))
         .collect::<Vec<_>>();
     let backend = runtime_backend::backend(RuntimeBackendKind::Host);
@@ -1355,23 +1385,15 @@ fn start_systemd_runtime(
         SERVER_CONFIG_FILE_ENV.to_owned(),
         job.config_reference.to_owned(),
     );
-    let lifecycle_url = job
-        .order
-        .secrets
-        .iter()
-        .find(|secret| secret.purpose == "database-lifecycle-url")
-        .ok_or_else(|| {
-            Failure::new(
-                HOST_ERR_OPERATION_INVALID,
-                "systemd migration requires the lifecycle PostgreSQL URL",
-            )
-        })?;
-    environment.insert("DATABASE_URL_FILE".to_owned(), lifecycle_url.path.clone());
+    environment.insert(
+        "DATABASE_URL".to_owned(),
+        install_secret_value(job, "database-lifecycle-url")?,
+    );
     environment.insert(
         MIGRATION_RUNTIME_ROLE_ENV.to_owned(),
         job.order.database_runtime_endpoint.user.clone(),
     );
-    let mut task = runtime_backend::OneShotTask {
+    let task = runtime_backend::OneShotTask {
         artifact: runtime_backend::ArtifactReference::HostBinary {
             path: binary.clone(),
             sha256: digest.clone(),
@@ -1395,13 +1417,6 @@ fn start_systemd_runtime(
         Failure::new(
             RUNTIME_START_FAILED,
             sanitize(format!("schema migration failed: {error}")),
-        )
-    })?;
-    task.command = vec!["nazoauth".to_owned(), "tenant-bootstrap".to_owned()];
-    backend.run_one_shot(&task).map_err(|error| {
-        Failure::new(
-            RUNTIME_START_FAILED,
-            sanitize(format!("tenant bootstrap failed: {error}")),
         )
     })?;
     backend
@@ -1452,26 +1467,13 @@ pub(super) fn cache_systemd_artifact(
     Ok(cached)
 }
 
-/// Run the fixed pre-start database one-shots against the verified image.
-/// Migration remains schema-only; tenant bootstrap writes the first
-/// authoritative system binding before the long-lived runtime can listen.
+/// Apply the complete idempotent persistence transition against the verified
+/// image before the long-lived runtime can listen.
 fn run_prestart_database_tasks(
     job: &InstallJob<'_>,
     backend: &dyn runtime_backend::RuntimeBackend,
     artifact: &runtime_backend::ArtifactReference,
 ) -> Result<(), Failure> {
-    let secrets_dir = job
-        .order
-        .secrets
-        .first()
-        .and_then(|secret| Path::new(&secret.path).parent())
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            Failure::new(
-                HOST_ERR_OPERATION_INVALID,
-                "install order carries no secrets; the database URL is required".to_owned(),
-            )
-        })?;
     let mut environment = std::collections::BTreeMap::new();
     environment.insert(
         SERVER_CONFIG_FILE_ENV.to_owned(),
@@ -1481,29 +1483,19 @@ fn run_prestart_database_tasks(
         MIGRATION_RUNTIME_ROLE_ENV.to_owned(),
         job.order.database_runtime_endpoint.user.clone(),
     );
-    for secret in &job.order.secrets {
-        let key = match secret.purpose.as_str() {
-            "database-lifecycle-url" => "DATABASE_URL_FILE",
-            "valkey-url" => "VALKEY_URL_FILE",
-            _ => continue,
-        };
-        environment.insert(
-            key.to_owned(),
-            format!("{CONTAINER_SECRETS_DIR}/{}", secret.purpose),
-        );
-    }
-    let mut task = runtime_backend::OneShotTask {
+    environment.insert(
+        "DATABASE_URL".to_owned(),
+        install_secret_value(job, "database-lifecycle-url")?,
+    );
+    let task = runtime_backend::OneShotTask {
         artifact: artifact.clone(),
         command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
         network: Some("bridge".to_owned()),
-        mounts: vec![
-            mount(
-                PathBuf::from(job.config_reference),
-                CONTAINER_CONFIG_FILE,
-                true,
-            ),
-            mount(secrets_dir, CONTAINER_SECRETS_DIR, true),
-        ],
+        mounts: vec![mount(
+            PathBuf::from(job.config_reference),
+            CONTAINER_CONFIG_FILE,
+            true,
+        )],
         environment,
         working_directory: Some(std::path::PathBuf::from("/app")),
         service_user: Some(runtime_backend::NON_ROOT_ONE_SHOT_USER.to_owned()),
@@ -1520,14 +1512,38 @@ fn run_prestart_database_tasks(
             sanitize(format!("schema migration failed: {error}")),
         )
     })?;
-    task.command = vec!["nazoauth".to_owned(), "tenant-bootstrap".to_owned()];
-    backend.run_one_shot(&task).map_err(|error| {
+    Ok(())
+}
+
+fn install_secret_value(job: &InstallJob<'_>, purpose: &str) -> Result<String, Failure> {
+    let path = job
+        .order
+        .secrets
+        .iter()
+        .find(|secret| secret.purpose == purpose)
+        .map(|secret| PathBuf::from(&secret.path))
+        .ok_or_else(|| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                format!("install order has no {purpose} secret"),
+            )
+        })?;
+    let bytes = filesystem::read_secure_regular_file(&path, purpose, false, 16 * 1024)
+        .map_err(|error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())))?;
+    let value = std::str::from_utf8(&bytes).map_err(|_| {
         Failure::new(
-            RUNTIME_START_FAILED,
-            sanitize(format!("tenant bootstrap failed: {error}")),
+            HOST_ERR_OPERATION_INVALID,
+            format!("{purpose} secret is not UTF-8"),
         )
     })?;
-    Ok(())
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            format!("{purpose} secret is empty"),
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 #[cfg(unix)]
@@ -1719,8 +1735,25 @@ fn mount(source: PathBuf, destination: &str, read_only: bool) -> runtime_backend
 /// Shared with the update/rollback executors (G03/G04): activation is only
 /// ever gated by the same local readiness fact. This is a LOOPBACK probe —
 /// it must never depend on public DNS, TLS, or any external boundary (G08).
-pub(crate) fn probe_local_health(port: u16) -> Result<(), Failure> {
+pub(crate) fn probe_local_health(port: u16, issuer: &str) -> Result<(), Failure> {
     let endpoint = format!("http://127.0.0.1:{port}{LOCAL_READINESS_PATH}");
+    let issuer = url::Url::parse(issuer).map_err(|error| {
+        Failure::new(
+            HEALTH_PROBE_FAILED,
+            sanitize(format!("issuer is invalid for local readiness: {error}")),
+        )
+    })?;
+    let mut authority = issuer.host().map(|host| host.to_string()).ok_or_else(|| {
+        Failure::new(
+            HEALTH_PROBE_FAILED,
+            "issuer has no host for local readiness",
+        )
+    })?;
+    if let Some(port) = issuer.port() {
+        authority.push(':');
+        authority.push_str(&port.to_string());
+    }
+    let host_header = format!("Host: {authority}");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut last: Option<Failure> = None;
     while std::time::Instant::now() < deadline {
@@ -1733,6 +1766,8 @@ pub(crate) fn probe_local_health(port: u16) -> Result<(), Failure> {
                 "3",
                 "--max-time",
                 "5",
+                "--header",
+                &host_header,
                 &endpoint,
             ])
             .run_quiet();
