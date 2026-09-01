@@ -884,6 +884,12 @@ pub(crate) fn recover(
         &staged_config,
     )
     .map_err(restore_failure)?;
+    crate::filesystem::atomic_write(
+        &recovery_root.join("paths-switching"),
+        operation_id.as_bytes(),
+        0o600,
+    )
+    .map_err(restore_failure)?;
     switch_recovery_path(&target_data, &staged_data, operation, "data").map_err(restore_failure)?;
     switch_recovery_path(&target_secrets, &staged_secrets, operation, "secrets")
         .map_err(restore_failure)?;
@@ -1854,19 +1860,33 @@ fn database_sentinel_with_connection(connection: &PostgresConnection) -> anyhow:
 }
 
 fn database_exists(connection: &PostgresConnection, database: &str) -> anyhow::Result<bool> {
+    let query = database_exists_query(database)?;
     let output = run_postgres_command(
         "psql",
         &connection.maintenance(),
-        [
-            "--no-align",
-            "--tuples-only",
-            "--set",
-            &format!("database={database}"),
-            "--command",
-            "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = :'database')",
-        ],
+        ["--no-align", "--tuples-only", "--command", &query],
     )?;
     Ok(std::str::from_utf8(&output.stdout)?.trim() == "t")
+}
+
+fn database_exists_query(database: &str) -> anyhow::Result<String> {
+    crate::registry::validate_identifier(database, 128, "database name")?;
+    Ok(format!(
+        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = '{database}')"
+    ))
+}
+
+pub(crate) fn recovery_path_switch_started(
+    scope_dir: &Path,
+    operation_id: &str,
+) -> anyhow::Result<bool> {
+    let operation = Uuid::parse_str(operation_id).context("recovery operation id is not a UUID")?;
+    Ok(scope_dir
+        .join("backup")
+        .join("recoveries")
+        .join(operation.to_string())
+        .join("paths-switching")
+        .try_exists()?)
 }
 
 fn sibling_operation_path(target: &Path, operation: Uuid, suffix: &str) -> anyhow::Result<PathBuf> {
@@ -2552,6 +2572,39 @@ mod tests {
             "/restore"
         );
         assert!(!connection.url_without_password.as_str().contains("cret"));
+        Ok(())
+    }
+
+    #[test]
+    fn database_existence_query_is_a_complete_validated_psql_command() -> anyhow::Result<()> {
+        let query = database_exists_query("nazoauth_restore_01")?;
+        assert_eq!(
+            query,
+            "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'nazoauth_restore_01')"
+        );
+        assert!(!query.contains(":"));
+        assert!(database_exists_query("unsafe'database").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_switch_marker_distinguishes_safe_abort_from_path_mutation() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-recovery-marker-test")?;
+        let operation = Uuid::now_v7();
+        assert!(!recovery_path_switch_started(
+            temp.path(),
+            &operation.to_string()
+        )?);
+        let recovery = temp
+            .path()
+            .join("backup/recoveries")
+            .join(operation.to_string());
+        fs::create_dir_all(&recovery)?;
+        fs::write(recovery.join("paths-switching"), operation.to_string())?;
+        assert!(recovery_path_switch_started(
+            temp.path(),
+            &operation.to_string()
+        )?);
         Ok(())
     }
     #[test]

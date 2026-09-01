@@ -501,18 +501,46 @@ fn dispatch_validated_host_operation(
                 })?;
                 let state = store.load_existing(deployment_id)?;
                 let backend = runtime_backend::backend(state.runtime.kind);
+                let runtime_was_running = backend
+                    .inspect_optional(&state.runtime.object)
+                    .map_err(|error| {
+                        Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string()))
+                    })?
+                    .is_some_and(|runtime| runtime.running);
                 backend
                     .quiesce_for_recovery(&state.runtime.object)
                     .map_err(|error| {
                         Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string()))
                     })?;
                 let scope_dir = store.scope_dir(deployment_id)?;
-                let facts = backup_exec::recover(
+                let facts = match backup_exec::recover(
                     &scope_dir,
                     &state,
                     expected_manifest_sha256,
                     &operation.operation_id,
-                )?;
+                ) {
+                    Ok(facts) => facts,
+                    Err(mut failure) => {
+                        let safe_to_restart = runtime_was_running
+                            && backup_exec::recovery_path_switch_started(
+                                &scope_dir,
+                                &operation.operation_id,
+                            )
+                            .is_ok_and(|started| !started);
+                        if safe_to_restart {
+                            match backend.start(&state.runtime.object) {
+                                Ok(()) => failure.detail.push_str(
+                                    "; original runtime restarted after safe recovery abort",
+                                ),
+                                Err(error) => failure.detail.push_str(&format!(
+                                    "; original runtime restart failed: {}",
+                                    sanitize(error.to_string())
+                                )),
+                            }
+                        }
+                        return Err(failure);
+                    }
+                };
                 let committed = store.apply_recovery(
                     deployment_id,
                     expected_revision,

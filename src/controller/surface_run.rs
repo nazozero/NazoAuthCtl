@@ -725,16 +725,21 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 plan.source_revision,
                 plan.manifest_sha256.clone(),
             ))?;
-        let crate::target::HostOutcome::Completed {
-            body:
-                crate::target::HostCompletionBody::BackupRecovered {
-                    manifest_sha256,
-                    revision,
-                    ..
-                },
-        } = result.outcome
-        else {
-            bail!("recover: target did not confirm the exact restored snapshot")
+        let (manifest_sha256, revision) = match result.outcome {
+            crate::target::HostOutcome::Completed {
+                body:
+                    crate::target::HostCompletionBody::BackupRecovered {
+                        manifest_sha256,
+                        revision,
+                        ..
+                    },
+            } => (manifest_sha256, revision),
+            crate::target::HostOutcome::Failed { code, detail } => {
+                bail!("recover target failed: {code}: {detail}")
+            }
+            crate::target::HostOutcome::Completed { .. } => {
+                bail!("recover: target returned an unexpected completion")
+            }
         };
         if manifest_sha256 != plan.manifest_sha256 || revision != plan.source_revision + 1 {
             bail!(
