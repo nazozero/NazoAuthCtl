@@ -564,6 +564,7 @@ fn dispatch_validated_host_operation(
         HostOperationBody::BackupRecoveryCandidateStage {
             recovery_operation_id,
             state_epoch,
+            artifact,
         } => {
             let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
             (|| -> Result<HostResult, Failure> {
@@ -586,6 +587,7 @@ fn dispatch_validated_host_operation(
                     &state,
                     recovery_operation_id,
                     state_epoch,
+                    artifact,
                 )?;
                 Ok(HostResult::completed(
                     &operation.operation_id,
@@ -643,6 +645,8 @@ fn dispatch_validated_host_operation(
                 backup_exec::activate_recovered_runtime(
                     &scope_dir,
                     &state,
+                    store,
+                    &operation.operation_id,
                     recovery_operation_id,
                     state_epoch,
                     *not_before,
@@ -1328,7 +1332,10 @@ fn answer_control_operation(
         store,
         compact_jws,
         change_set,
-        &state.runtime.object,
+        ControlRuntimeBinding {
+            object: &state.runtime.object,
+            artifact: None,
+        },
         control,
     )?;
     Ok(HostResult::completed(
@@ -1366,13 +1373,19 @@ fn answer_recovery_candidate_control(
             "recovery candidate no longer matches the restored deployment state",
         ));
     }
+    let scope_dir = store.scope_dir(&deployment_id)?;
+    let candidate_artifact =
+        backup_exec::recovery_candidate_artifact_reference(&scope_dir, &endpoint.operation_id)?;
     let result = execute_bound_control_operation(
         control_operation_id,
         &state,
         store,
         compact_jws,
         None,
-        &endpoint.object_id,
+        ControlRuntimeBinding {
+            object: &endpoint.object_id,
+            artifact: Some(&candidate_artifact),
+        },
         control,
     )?;
     Ok(HostResult::completed(
@@ -1439,16 +1452,25 @@ fn answer_admin_create(
 /// One target-side implementation of the signed ControlOperation runtime
 /// contract.  Direct delivery and Update's nested MigrateApply both call this
 /// function so they cannot drift on runtime identity, mount, or stdout rules.
+struct ControlRuntimeBinding<'a> {
+    object: &'a str,
+    artifact: Option<&'a str>,
+}
+
 fn execute_bound_control_operation(
     operation_id: &str,
     state: &DeploymentState,
     store: &TargetStateStore,
     compact_jws: &str,
     change_set: Option<&[u8]>,
-    runtime_object: &str,
+    runtime: ControlRuntimeBinding<'_>,
     control: &Arc<dyn control_exec::ControlOperationExecutor>,
 ) -> Result<ControlResult, Failure> {
-    let Some(current_artifact) = state.artifact.current.clone() else {
+    let current_artifact = runtime
+        .artifact
+        .map(str::to_owned)
+        .or_else(|| state.artifact.current.clone());
+    let Some(current_artifact) = current_artifact else {
         return Err(Failure::new(
             CONTROL_TARGET_DRIFT,
             "the deployment records no current artifact reference",
@@ -1482,7 +1504,7 @@ fn execute_bound_control_operation(
         deployment_id: &state.deployment_id,
         artifact_reference: &current_artifact,
         runtime_kind: state.runtime.kind,
-        runtime_object,
+        runtime_object: runtime.object,
         config_reference: &state.config.reference,
         data_root: &data_root,
         secrets_root: &secrets_root,
@@ -2894,6 +2916,15 @@ mod tests {
             .active_host_operation
             .expect("bootstrap operation")
             .operation_id;
+        let scope_dir = TargetStateStore::open(journal.root())?.scope_dir("deploy-alpha")?;
+        backup_exec::seed_recovery_candidate_facts(
+            &scope_dir,
+            &recovery_operation_id,
+            crate::runtime_backend::ArtifactReference::Oci {
+                image_reference: "ghcr.io/nazozero/nazoauth".to_owned(),
+                digest: format!("sha256:{}", "a".repeat(64)),
+            },
+        )?;
         let scripted = Arc::new(ScriptedControl {
             outcome: nazo_operator_protocol::ControlOutcome::Succeeded,
             calls: std::sync::atomic::AtomicUsize::new(0),

@@ -29,7 +29,7 @@ use uuid::Uuid;
 use super::deployment_state::{ArtifactRefs, RuntimeSurface, StateMutationPayload};
 
 /// Wire schema discriminator for HostOperation and HostResult messages.
-pub const HOST_PROTOCOL_SCHEMA: u32 = 6;
+pub const HOST_PROTOCOL_SCHEMA: u32 = 7;
 
 /// Maximum serialized HostOperation accepted from stdin or a local caller.
 /// A tenant-resource Apply may carry one 4 MiB change set encoded as base64,
@@ -251,6 +251,7 @@ pub enum HostOperationBody {
     BackupRecoveryCandidateStage {
         recovery_operation_id: String,
         state_epoch: String,
+        artifact: super::install_exec::OfficialArtifactRef,
     },
     /// Deliver the signed recovery invalidation to the exact isolated
     /// candidate returned by the stage operation. The original deployment
@@ -503,6 +504,7 @@ impl HostOperation {
         expected_revision: u64,
         recovery_operation_id: impl Into<String>,
         state_epoch: impl Into<String>,
+        artifact: super::install_exec::OfficialArtifactRef,
     ) -> Self {
         Self {
             schema: HOST_PROTOCOL_SCHEMA,
@@ -512,6 +514,7 @@ impl HostOperation {
             operation: HostOperationBody::BackupRecoveryCandidateStage {
                 recovery_operation_id: recovery_operation_id.into(),
                 state_epoch: state_epoch.into(),
+                artifact,
             },
         }
     }
@@ -1016,11 +1019,14 @@ impl HostOperation {
             HostOperationBody::BackupRecoveryCandidateStage {
                 recovery_operation_id,
                 state_epoch,
+                artifact,
             } => {
                 if self.deployment_id.is_none()
                     || self.expected_revision.is_none()
                     || !is_uuid_v7(recovery_operation_id)
                     || !is_uuid_v7(state_epoch)
+                    || artifact.repository.is_empty()
+                    || artifact.repository.len() > 128
                 {
                     return Err(MessageRejection::new(
                         RejectionCode::OperationMalformed,

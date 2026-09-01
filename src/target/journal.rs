@@ -884,6 +884,10 @@ mod tests {
             3,
             Uuid::now_v7().to_string(),
             Uuid::now_v7().to_string(),
+            crate::target::install_exec::OfficialArtifactRef {
+                repository: "nazozero/NazoAuth".to_owned(),
+                version: Some("v1".to_owned()),
+            },
         );
         journal.run_journaled(&operation, |operation| {
             HostResult::failed(&operation.operation_id, "RESTORE_TEST_FAILED", "first")

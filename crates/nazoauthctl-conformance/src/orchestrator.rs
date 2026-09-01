@@ -211,6 +211,34 @@ struct PreparedRun {
     current_variant: Option<BTreeMap<String, String>>,
 }
 
+struct RunErrors {
+    values: Vec<String>,
+    control: RunControl,
+}
+
+impl RunErrors {
+    fn new(values: Vec<String>, control: RunControl) -> Self {
+        Self { values, control }
+    }
+
+    fn push(&mut self, error: String) {
+        self.control.interrupt();
+        self.values.push(error);
+    }
+
+    fn into_inner(self) -> Vec<String> {
+        self.values
+    }
+}
+
+impl std::ops::Deref for RunErrors {
+    type Target = Vec<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
 impl ConformanceRunner {
     pub fn new(config: ConformanceRunConfig) -> Result<Self, OrchestrationError> {
         if config.poll_timeout.is_zero()
@@ -818,7 +846,7 @@ impl ConformanceRunner {
             mut plans,
             mut planned,
             suite_plan_ids,
-            mut errors,
+            errors,
             unknown_declared_skip_modules,
             matrix_expectations_satisfied,
             all_selected_plan_definitions_enumerated,
@@ -826,6 +854,7 @@ impl ConformanceRunner {
             mut current_profile,
             mut current_variant,
         } = prepared;
+        let mut errors = RunErrors::new(errors, self.config.control.clone());
         let mut modules = Vec::new();
         let mut cleanup = CleanupReport::default();
         let mut module_ids = Vec::<String>::new();
@@ -1568,6 +1597,9 @@ impl ConformanceRunner {
                         current_variant.clone(),
                         current_test.clone(),
                     );
+                    if matches!(module_outcome, Some(ModuleOutcome::Failed)) {
+                        break 'execute;
+                    }
                     if deferred_blocks_remaining_modules {
                         errors.push(
                             "nonterminal deferred review blocks later modules that share the Suite plan alias; upload the captured review screenshot explicitly or stop at this incomplete plan boundary"
@@ -1676,7 +1708,7 @@ impl ConformanceRunner {
             matrix_digest: self.config.matrix.digest.clone(),
             suite_origin: self.config.client.origin().to_string(),
             auth_probe,
-            errors,
+            errors: errors.into_inner(),
             local_success,
             suite_pass,
             acceptance_pass: outcomes.acceptance_pass && matrix_expectations_satisfied,

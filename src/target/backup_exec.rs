@@ -81,6 +81,16 @@ pub(crate) struct RecoveryFacts {
     pub config_schema: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryCandidateFacts {
+    schema: u32,
+    operation_id: String,
+    artifact: ArtifactReference,
+    release: ReleaseVersion,
+    rollback_policy: crate::model::ReleaseRollbackPolicy,
+}
+
 pub(crate) fn snapshot(
     scope_dir: &Path,
     state: &DeploymentState,
@@ -918,6 +928,7 @@ pub(crate) fn stage_recovery_candidate(
     state: &DeploymentState,
     recovery_operation_id: &str,
     state_epoch: &str,
+    target: &super::install_exec::OfficialArtifactRef,
 ) -> Result<RecoveryCandidateEndpoint, Failure> {
     let operation = Uuid::parse_str(recovery_operation_id).map_err(|_| {
         Failure::new(
@@ -992,12 +1003,94 @@ pub(crate) fn stage_recovery_candidate(
     let config = secure_regular_path(Path::new(&state.config.reference), "deployment config")
         .map_err(restore_failure)?;
     let backend = runtime_backend::backend(kind);
+    let candidate_facts_path = scope_dir
+        .join("backup")
+        .join("recoveries")
+        .join(operation.to_string())
+        .join("candidate-release.json");
+    let materialize_target = || -> Result<RecoveryCandidateFacts, Failure> {
+        let runtime_root = state
+            .resources
+            .iter()
+            .find(|resource| resource.resource_id == "app-binary" && resource.kind == "directory")
+            .map(|resource| resource.locator.as_str());
+        let version_floor = state
+            .current_release
+            .as_ref()
+            .map(|release| release.version.as_str());
+        let verified = super::update_exec::verify_pinned_artifact_facts(
+            target,
+            state.runtime.kind,
+            version_floor,
+            runtime_root,
+        )?;
+        let release = verified.release.ok_or_else(|| {
+            Failure::new(
+                RESTORE_TEST_FAILED,
+                "recovery target Release has no verified release identity",
+            )
+        })?;
+        if let Some(requested) = target.version.as_deref()
+            && release.version != requested
+        {
+            return Err(Failure::new(
+                RESTORE_TEST_FAILED,
+                "recovery target Release differs from the requested version",
+            ));
+        }
+        let runtime_role = super::update_exec::runtime_database_role(&secrets)?;
+        run_restore_migration(
+            backend.as_ref(),
+            &verified.runtime_artifact,
+            &data,
+            &config,
+            &secrets,
+            &runtime_role,
+        )
+        .map_err(restore_failure)?;
+        let facts = RecoveryCandidateFacts {
+            schema: 1,
+            operation_id: recovery_operation_id.to_owned(),
+            artifact: verified.runtime_artifact,
+            release,
+            rollback_policy: verified.rollback_policy,
+        };
+        crate::filesystem::atomic_write(
+            &candidate_facts_path,
+            &serde_json::to_vec_pretty(&facts).map_err(|error| restore_failure(error.into()))?,
+            0o600,
+        )
+        .map_err(restore_failure)?;
+        Ok(facts)
+    };
+    let candidate_facts = if candidate_facts_path.exists() {
+        let recorded = load_recovery_candidate_facts(&candidate_facts_path, recovery_operation_id)?;
+        if target
+            .version
+            .as_deref()
+            .is_none_or(|requested| recorded.release.version == requested)
+        {
+            recorded
+        } else {
+            materialize_target()?
+        }
+    } else {
+        materialize_target()?
+    };
+    if let Some(requested) = target.version.as_deref()
+        && candidate_facts.release.version != requested
+    {
+        return Err(Failure::new(
+            RESTORE_TEST_FAILED,
+            "recorded recovery candidate Release differs from the requested version",
+        ));
+    }
     let request = RecoveryCandidateRequest {
         source_object_reference: state.runtime.object.clone(),
         candidate_object_reference: format!("nazoauth-recovery-{operation}"),
         deployment_id: state.deployment_id.clone(),
         operation_id: recovery_operation_id.to_owned(),
-        artifact: facts.artifact,
+        artifact: candidate_facts.artifact,
         data_source: data,
         secrets_source: secrets,
         config_source: config,
@@ -1027,6 +1120,76 @@ pub(crate) fn stage_recovery_candidate(
     Ok(endpoint)
 }
 
+fn load_recovery_candidate_facts(
+    path: &Path,
+    recovery_operation_id: &str,
+) -> Result<RecoveryCandidateFacts, Failure> {
+    let bytes = crate::filesystem::read_secure_regular_file(
+        path,
+        "recovery candidate release facts",
+        false,
+        64 * 1024,
+    )
+    .map_err(restore_failure)?;
+    let facts: RecoveryCandidateFacts =
+        serde_json::from_slice(&bytes).map_err(|error| restore_failure(error.into()))?;
+    if facts.schema != 1 || facts.operation_id != recovery_operation_id {
+        return Err(Failure::new(
+            RESTORE_TEST_FAILED,
+            "recovery candidate release facts do not bind this recovery",
+        ));
+    }
+    facts.release.validate().map_err(restore_failure)?;
+    facts.rollback_policy.validate().map_err(restore_failure)?;
+    Ok(facts)
+}
+
+#[cfg(test)]
+pub(super) fn seed_recovery_candidate_facts(
+    scope_dir: &Path,
+    recovery_operation_id: &str,
+    artifact: ArtifactReference,
+) -> anyhow::Result<()> {
+    let directory = scope_dir
+        .join("backup")
+        .join("recoveries")
+        .join(recovery_operation_id);
+    crate::filesystem::ensure_private_directory(&directory, "test recovery directory")?;
+    let facts = RecoveryCandidateFacts {
+        schema: 1,
+        operation_id: recovery_operation_id.to_owned(),
+        artifact,
+        release: ReleaseVersion::new("v1")?,
+        rollback_policy: crate::model::test_release_rollback_policy(),
+    };
+    crate::filesystem::atomic_write(
+        &directory.join("candidate-release.json"),
+        &serde_json::to_vec_pretty(&facts)?,
+        0o600,
+    )
+}
+
+pub(crate) fn recovery_candidate_artifact_reference(
+    scope_dir: &Path,
+    recovery_operation_id: &str,
+) -> Result<String, Failure> {
+    let operation = Uuid::parse_str(recovery_operation_id).map_err(|_| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "recovery candidate operation id must be a UUID",
+        )
+    })?;
+    let facts = load_recovery_candidate_facts(
+        &scope_dir
+            .join("backup")
+            .join("recoveries")
+            .join(operation.to_string())
+            .join("candidate-release.json"),
+        recovery_operation_id,
+    )?;
+    super::deployment_state::canonical_recovery_artifact(&facts.artifact)
+}
+
 /// Remove only the candidate whose immutable backend identity was returned by
 /// [`stage_recovery_candidate`].
 pub(crate) fn cleanup_recovery_candidate(
@@ -1045,12 +1208,14 @@ pub(crate) fn cleanup_recovery_candidate(
         .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))
 }
 
-/// Start the original runtime only after the controller has waited past the
-/// server-issued invalidation deadline.  It reuses the update replacement
-/// constructor so recovery cannot invent a second activation policy.
+/// Start the recovered deployment on the exact verified target Release only
+/// after the controller has waited past the server-issued invalidation
+/// deadline. The snapshot supplies data; it does not pin an obsolete runtime.
 pub(crate) fn activate_recovered_runtime(
     scope_dir: &Path,
     state: &DeploymentState,
+    store: &super::deployment_state::TargetStateStore,
+    activation_operation_id: &str,
     recovery_operation_id: &str,
     state_epoch: &str,
     not_before: i64,
@@ -1084,9 +1249,6 @@ pub(crate) fn activate_recovered_runtime(
             "recovery activation is not bound to the restored deployment and UUIDv7 epoch",
         ));
     }
-    let manifest = backup::load_manifest(scope_dir)
-        .map_err(restore_failure)?
-        .ok_or_else(|| Failure::new(RESTORE_TEST_FAILED, "no snapshot manifest exists"))?;
     let completed_path = scope_dir
         .join("backup")
         .join("recoveries")
@@ -1099,20 +1261,25 @@ pub(crate) fn activate_recovered_runtime(
         64 * 1024,
     )
     .map_err(restore_failure)?;
-    let facts: RecoveryFacts =
+    let recovery_facts: RecoveryFacts =
         serde_json::from_slice(&completed).map_err(|error| restore_failure(error.into()))?;
-    if facts.operation_id != recovery_operation_id
-        || facts.artifact != manifest.runtime_artifact
-        || facts.release != manifest.release
-        || facts.rollback_policy != manifest.rollback_policy
-        || state.current_release.as_ref() != Some(&facts.release)
-        || state.current_rollback_policy != facts.rollback_policy
+    if recovery_facts.operation_id != recovery_operation_id
+        || state.current_release.as_ref() != Some(&recovery_facts.release)
+        || state.current_rollback_policy != recovery_facts.rollback_policy
     {
         return Err(Failure::new(
             RESTORE_TEST_FAILED,
             "recovery activation facts do not bind the restored runtime",
         ));
     }
+    let candidate_facts = load_recovery_candidate_facts(
+        &scope_dir
+            .join("backup")
+            .join("recoveries")
+            .join(operation.to_string())
+            .join("candidate-release.json"),
+        recovery_operation_id,
+    )?;
     let kind = state.runtime.kind;
     let backend = runtime_backend::backend(kind);
     let observed = backend
@@ -1127,7 +1294,7 @@ pub(crate) fn activate_recovered_runtime(
     let mut replacement = super::update_exec::replacement_from_observation(
         &observed,
         &state.runtime.object,
-        &facts.artifact,
+        &candidate_facts.artifact,
     )?;
     replacement
         .environment
@@ -1141,12 +1308,32 @@ pub(crate) fn activate_recovered_runtime(
     let activated = backend
         .inspect(&state.runtime.object)
         .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
-    if !activated.running || activated.artifact != facts.artifact {
+    if !activated.running || activated.artifact != candidate_facts.artifact {
         return Err(Failure::new(
             RESTORE_TEST_FAILED,
-            "recovery activation did not start the exact snapshot artifact",
+            "recovery activation did not start the verified target Release",
         ));
     }
+    let authority = issuer_authority(&state.issuer).map_err(restore_failure)?;
+    fetch_http(
+        state.runtime.loopback_port,
+        LOCAL_READINESS_PATH,
+        &authority,
+    )
+    .map_err(restore_failure)?;
+    store.apply_update_healthy(
+        &state.deployment_id,
+        state.config.revision,
+        super::deployment_state::UpdateCommit {
+            artifact: super::deployment_state::canonical_recovery_artifact(
+                &candidate_facts.artifact,
+            )?,
+            release: Some(candidate_facts.release),
+            rollback_policy: candidate_facts.rollback_policy,
+            config: None,
+            operation_id: activation_operation_id.to_owned(),
+        },
+    )?;
     Ok(())
 }
 

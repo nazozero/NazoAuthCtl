@@ -43,6 +43,8 @@ pub(crate) struct RecoveryPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restored_revision: Option<u64>,
     pub manifest_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_version: Option<String>,
     pub state_epoch: String,
     pub recover_operation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,6 +185,7 @@ pub(crate) fn new_plan(
         source_revision,
         restored_revision: None,
         manifest_sha256,
+        target_version: None,
         state_epoch: uuid::Uuid::now_v7().to_string(),
         recover_operation_id: uuid::Uuid::now_v7().to_string(),
         candidate_stage_operation_id: None,

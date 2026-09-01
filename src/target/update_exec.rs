@@ -780,8 +780,8 @@ impl HostLifecycleExecutor {
     }
 }
 
-pub(crate) fn runtime_database_role(secrets_root: &str) -> Result<String, Failure> {
-    let path = Path::new(secrets_root).join("database-runtime-url");
+pub(crate) fn runtime_database_role(secrets_root: impl AsRef<Path>) -> Result<String, Failure> {
+    let path = secrets_root.as_ref().join("database-runtime-url");
     let bytes =
         filesystem::read_secure_regular_file(&path, "runtime database URL", false, 16 * 1024)
             .map_err(|error| {

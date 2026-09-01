@@ -71,6 +71,10 @@ pub const CONFIG_REVISION_MISMATCH: &str = "CONFIG_REVISION_MISMATCH";
 /// The target's recorded release version disagrees with the verified artifact.
 pub const TARGET_IDENTITY_MISMATCH: &str = "TARGET_IDENTITY_MISMATCH";
 
+/// The target and server completed a control operation with a durable failed
+/// business outcome. Connectivity is proven; retry only after fixing cause.
+pub const CONTROL_OPERATION_FAILED: &str = "CONTROL_OPERATION_FAILED";
+
 /// Transport-level sudo refusal code (C06). Not part of the 16-code CLI set:
 /// the envelope maps it onto [`PRIVILEGE_REQUIRED`] because the remedy is the
 /// same one-time interactive credential establishment.

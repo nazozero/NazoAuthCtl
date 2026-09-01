@@ -716,6 +716,53 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
             plan
         }
     };
+    if let Some(requested) = args.version.as_ref()
+        && plan.target_version.as_ref() != Some(requested)
+    {
+        if let Some(candidate) = plan.candidate.clone() {
+            let operation_id = plan
+                .cleanup_operation_id
+                .get_or_insert_with(|| uuid::Uuid::now_v7().to_string())
+                .clone();
+            journal.store(&plan)?;
+            let endpoint = crate::runtime_backend::RecoveryCandidateEndpoint {
+                object_reference: candidate.object_reference,
+                object_id: candidate.object_id,
+                deployment_id: record.deployment_id.clone(),
+                operation_id: plan.recover_operation_id.clone(),
+                loopback_port: candidate.loopback_port,
+            };
+            let result = target.execute_host_operation(
+                &crate::target::HostOperation::backup_recovery_candidate_cleanup(
+                    operation_id,
+                    record.deployment_id.clone(),
+                    endpoint,
+                ),
+            )?;
+            match result.outcome {
+                crate::target::HostOutcome::Completed {
+                    body: crate::target::HostCompletionBody::BackupRecoveryCandidateCleaned {},
+                } => {}
+                crate::target::HostOutcome::Failed { code, detail } => {
+                    bail!("recover candidate cleanup failed: {code}: {detail}")
+                }
+                crate::target::HostOutcome::Completed { .. } => {
+                    bail!("recover: target returned an unexpected candidate cleanup")
+                }
+            }
+        }
+        plan.phase = RecoveryPhase::Restoring;
+        plan.target_version = Some(requested.clone());
+        plan.candidate_stage_operation_id = None;
+        plan.candidate = None;
+        plan.invalidation_operation_id = None;
+        plan.invalidation_request_hash = None;
+        plan.candidate_control_operation_id = None;
+        plan.not_before = None;
+        plan.activate_operation_id = None;
+        plan.cleanup_operation_id = None;
+        journal.store(&plan)?;
+    }
 
     if matches!(plan.phase, RecoveryPhase::Restoring) && plan.restored_revision.is_none() {
         let result =
@@ -766,6 +813,10 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 revision,
                 plan.recover_operation_id.clone(),
                 plan.state_epoch.clone(),
+                crate::target::OfficialArtifactRef {
+                    repository: crate::clean_install::SERVER_REPOSITORY.to_owned(),
+                    version: plan.target_version.clone(),
+                },
             ),
         )?;
         let endpoint = match result.outcome {
@@ -976,13 +1027,20 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
             }
             crate::controller_identity::DispatchVerdict::Terminal(result) => {
                 if result.outcome != ControlOutcome::Succeeded {
+                    plan.invalidation_operation_id = None;
+                    plan.invalidation_request_hash = None;
+                    plan.candidate_control_operation_id = None;
+                    journal.store(&plan)?;
                     crate::controller_identity::settle_journal(
                         &control_journal,
                         &prepared,
                         &verdict,
                         |_| Ok(()),
                     )?;
-                    bail!("recover: server completed invalidation unsuccessfully")
+                    bail!(
+                        "{}: recover: server completed invalidation unsuccessfully",
+                        crate::error_codes::CONTROL_OPERATION_FAILED
+                    )
                 }
                 let Some(ControlResultData::RecoveryInvalidation {
                     state_epoch,

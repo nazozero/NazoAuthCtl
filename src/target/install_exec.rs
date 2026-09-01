@@ -97,7 +97,7 @@ pub(crate) const MIGRATION_RUNTIME_ROLE_ENV: &str = "NAZOAUTH_MIGRATION_RUNTIME_
 pub const SERVER_CONFIG_FILE_ENV: &str = "NAZOAUTH_SERVER_CONFIG_FILE";
 
 /// The official artifact a fresh install obtains and verifies on the target.
-#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OfficialArtifactRef {
     /// Signed-release repository, e.g. `nazozero/NazoAuth`.

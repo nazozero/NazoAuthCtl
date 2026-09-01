@@ -34,10 +34,21 @@ enum WorkerMessage {
 struct ChannelSink {
     index: usize,
     sender: mpsc::Sender<WorkerMessage>,
+    stop_launching: Arc<AtomicBool>,
+    control: RunControl,
 }
 
 impl ProgressSink for ChannelSink {
     fn update(&mut self, event: &ProgressEvent) {
+        if event
+            .snapshot
+            .groups
+            .iter()
+            .any(|group| group.status == GroupStatus::Failed)
+        {
+            self.stop_launching.store(true, Ordering::SeqCst);
+            self.control.interrupt();
+        }
         let _ = self.sender.send(WorkerMessage::Progress {
             index: self.index,
             snapshot: Box::new(event.snapshot.clone()),
@@ -131,6 +142,8 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                         let mut progress = ChannelSink {
                             index: next_index,
                             sender: sender.clone(),
+                            stop_launching: Arc::clone(&stop_launching),
+                            control: runner.config.control.clone(),
                         };
                         let _ciba_guard = if work_ref[next_index].lane == OidfDriverLane::Ciba {
                             Some(ciba_lane.lock().map_err(|_| ()).expect("CIBA lane lock"))
