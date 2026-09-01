@@ -840,6 +840,26 @@ fn directory_revision(session: &nazoauthctl_core::ConformanceSession) -> anyhow:
     Ok(revision)
 }
 
+fn tenant_directory_presence(
+    session: &nazoauthctl_core::ConformanceSession,
+    tenant_id: &str,
+) -> anyhow::Result<(u64, bool)> {
+    let result = session.execute_control_operation(
+        ControlOperationPayload::TenantDirectoryDescribe,
+        None,
+        |_| Ok(()),
+    )?;
+    let ControlResultData::TenantDirectoryDescribe { revision, tenants } =
+        successful_control_result(result, "tenant directory Describe")?
+    else {
+        bail!("tenant directory Describe returned the wrong typed result");
+    };
+    Ok((
+        revision,
+        tenants.iter().any(|tenant| tenant.tenant_id == tenant_id),
+    ))
+}
+
 fn probe_ephemeral_tenant(issuer: &str) -> anyhow::Result<()> {
     let mut metadata_url = Url::parse(issuer).context("temporary tenant issuer is invalid")?;
     metadata_url.set_path("/.well-known/openid-configuration");
@@ -1457,6 +1477,10 @@ fn cleanup_run_resources(
     session: &nazoauthctl_core::ConformanceSession,
     recovery: &mut nazoauthctl_conformance::ConformanceRecoveryGuard,
 ) -> anyhow::Result<Vec<EvidenceControlOperation>> {
+    if recovery.tenant_absent() {
+        cleanup_ephemeral_tenant(session, recovery)?;
+        return Ok(Vec::new());
+    }
     let enumerate = match recovery.cleanup_enumerate_operation() {
         Some(operation) => operation.clone(),
         None => {
@@ -1610,7 +1634,13 @@ fn recover_pending_runs(
     for mut recovery in store.claim_pending()? {
         let binding = recovery.ordinary_binding().clone();
         let result = (|| -> anyhow::Result<Option<SuiteRetentionManifestReceipt>> {
-            recover_ephemeral_tenant(session, &mut recovery)?;
+            let (directory_revision, tenant_present) =
+                tenant_directory_presence(session, &binding.tenant_id)?;
+            if tenant_present {
+                recover_ephemeral_tenant(session, &mut recovery)?;
+            } else {
+                recovery.mark_tenant_absent(directory_revision)?;
+            }
             if let Some(failure) = recovery.terminal_failure().cloned() {
                 let tenant_cleanup = cleanup_ephemeral_tenant(session, &mut recovery);
                 bail!(
@@ -1636,7 +1666,7 @@ fn recover_pending_runs(
                 }
                 return Ok(receipt);
             }
-            if recovery.baseline_enumerate_operation().is_none() {
+            if !recovery.tenant_absent() && recovery.baseline_enumerate_operation().is_none() {
                 let outcome = session.execute_control_operation(
                     ControlOperationPayload::TenantResourceEnumerate {
                         tenant_id: binding.tenant_id.clone(),
@@ -1653,7 +1683,7 @@ fn recover_pending_runs(
                 )?;
                 successful_control_completion(outcome, "recovery baseline Enumerate")?;
             }
-            if recovery.apply_operation().is_none() {
+            if !recovery.tenant_absent() && recovery.apply_operation().is_none() {
                 let material = recovery.read_private_material()?;
                 let outcome = session.execute_control_operation(
                     ControlOperationPayload::TenantResourceApply {

@@ -279,6 +279,8 @@ struct TenantResourceRecoveryJournal {
     tenant_disabled: bool,
     tenant_finalize_expected_revision: Option<u64>,
     tenant_cleanup_complete: bool,
+    #[serde(default)]
+    tenant_absence_revision: Option<u64>,
     baseline_enumerate: Option<TenantResourceControlOperation>,
     apply: Option<TenantResourceControlOperation>,
     cleanup_enumerate: Option<TenantResourceControlOperation>,
@@ -364,6 +366,7 @@ impl ConformanceRecoveryStore {
                 tenant_disabled: false,
                 tenant_finalize_expected_revision: None,
                 tenant_cleanup_complete: false,
+                tenant_absence_revision: None,
                 baseline_enumerate: None,
                 apply: None,
                 cleanup_enumerate: None,
@@ -657,6 +660,21 @@ impl ConformanceRecoveryGuard {
 
     pub fn tenant_cleanup_complete(&self) -> bool {
         self.journal.tenant_cleanup_complete
+    }
+
+    pub fn tenant_absent(&self) -> bool {
+        self.journal.tenant_absence_revision.is_some()
+    }
+
+    pub fn mark_tenant_absent(&mut self, directory_revision: u64) -> anyhow::Result<()> {
+        self.journal.tenant_absence_revision = Some(directory_revision);
+        self.journal.terminal_failure = None;
+        self.journal.tenant_disable_expected_revision = None;
+        self.journal.tenant_disabled = false;
+        self.journal.tenant_finalize_expected_revision = None;
+        self.journal.tenant_cleanup_complete = true;
+        self.journal.cleanup_complete = true;
+        self.persist()
     }
 
     pub fn mark_tenant_cleanup_complete(&mut self) -> anyhow::Result<()> {
@@ -1349,16 +1367,30 @@ fn validate_tenant_resource_journal(
     if journal.cleanup_complete && !tenant_resource_obligations_complete(journal) {
         bail!("tenant-resource cleanup marker is ahead of its obligations");
     }
-    if journal.tenant_cleanup_complete && !journal.tenant_created {
+    if journal.tenant_cleanup_complete
+        && !journal.tenant_created
+        && journal.tenant_absence_revision.is_none()
+    {
         bail!("temporary tenant cleanup is ahead of tenant creation");
     }
-    if journal.tenant_key_generated && !journal.tenant_created
-        || journal.tenant_reload_expected_revision.is_some() && !journal.tenant_key_generated
-        || journal.tenant_reloaded && journal.tenant_reload_expected_revision.is_none()
-        || journal.tenant_disable_expected_revision.is_some() && !journal.tenant_created
-        || journal.tenant_disabled && journal.tenant_disable_expected_revision.is_none()
-        || journal.tenant_finalize_expected_revision.is_some() && !journal.tenant_disabled
-        || journal.tenant_cleanup_complete && journal.tenant_finalize_expected_revision.is_none()
+    if journal.tenant_absence_revision.is_some()
+        && (!journal.tenant_cleanup_complete
+            || !journal.cleanup_complete
+            || journal.tenant_disable_expected_revision.is_some()
+            || journal.tenant_disabled
+            || journal.tenant_finalize_expected_revision.is_some())
+    {
+        bail!("temporary tenant absence state is inconsistent");
+    }
+    if journal.tenant_absence_revision.is_none()
+        && (journal.tenant_key_generated && !journal.tenant_created
+            || journal.tenant_reload_expected_revision.is_some() && !journal.tenant_key_generated
+            || journal.tenant_reloaded && journal.tenant_reload_expected_revision.is_none()
+            || journal.tenant_disable_expected_revision.is_some() && !journal.tenant_created
+            || journal.tenant_disabled && journal.tenant_disable_expected_revision.is_none()
+            || journal.tenant_finalize_expected_revision.is_some() && !journal.tenant_disabled
+            || journal.tenant_cleanup_complete
+                && journal.tenant_finalize_expected_revision.is_none())
     {
         bail!("temporary tenant lifecycle state is inconsistent");
     }
@@ -2153,6 +2185,9 @@ fn tenant_resource_obligations_complete(journal: &TenantResourceRecoveryJournal)
     if journal.terminal_failure.is_some() {
         return false;
     }
+    if journal.tenant_absence_revision.is_some() {
+        return true;
+    }
     let Some(enumerate) = &journal.cleanup_enumerate else {
         return false;
     };
@@ -2570,5 +2605,39 @@ mod tests {
             resource_manifest_sha256: "e".repeat(64),
         });
         validate_revoke_operation(&binding, &enumerate, &revoke).expect("typed revoke");
+    }
+
+    #[test]
+    fn authoritative_tenant_absence_settles_rewound_run_resources() {
+        let journal = TenantResourceRecoveryJournal {
+            schema: TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA,
+            kind: TENANT_RESOURCE_RECOVERY_KIND.to_owned(),
+            binding: binding(),
+            phase: TenantResourceRecoveryPhase::Intent,
+            tenant_created: true,
+            tenant_key_generated: true,
+            tenant_reload_expected_revision: Some(48),
+            tenant_reloaded: true,
+            tenant_disable_expected_revision: None,
+            tenant_disabled: false,
+            tenant_finalize_expected_revision: None,
+            tenant_cleanup_complete: true,
+            tenant_absence_revision: Some(49),
+            baseline_enumerate: None,
+            apply: None,
+            cleanup_enumerate: None,
+            cleanup_revoke: None,
+            terminal_failure: None,
+            cleanup_complete: true,
+            manifest_removal_intent: false,
+            manifest_cleanup_complete: false,
+            proxy_cleanup_complete: true,
+            suite: None,
+            suite_retention: SuiteRetentionDisposition::default(),
+        };
+
+        validate_tenant_resource_journal(&journal, "deployment-1")
+            .expect("authoritative absence did not settle the rewound tenant");
+        assert!(tenant_resource_obligations_complete(&journal));
     }
 }
