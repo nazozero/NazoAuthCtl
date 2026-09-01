@@ -251,6 +251,10 @@ pub(crate) fn execute_fixed_one_shot(
         read_write_paths.push(PathBuf::from(job.data_root));
     } else if kind == FixedOneShotKind::ControlOperation {
         environment.insert(
+            "NAZOAUTH_OPERATOR_CONFIG_REVISION_FILE".to_owned(),
+            super::install_exec::CONTAINER_OPERATOR_CONFIG_REVISION_FILE.to_owned(),
+        );
+        environment.insert(
             "NAZOAUTH_OPERATOR_STATE_DIRECTORY".to_owned(),
             format!("{}/operator-state", super::install_exec::CONTAINER_DATA_DIR),
         );
