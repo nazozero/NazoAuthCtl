@@ -1001,7 +1001,7 @@ pub(crate) fn stage_recovery_candidate(
         .stage_recovery_candidate(&request)
         .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
     let checked = (|| -> anyhow::Result<()> {
-        fetch_http(endpoint.loopback_port, LOCAL_READINESS_PATH)?;
+        fetch_http(endpoint.loopback_port, LOCAL_READINESS_PATH, None)?;
         ensure!(
             oidc_signing_key_ids(endpoint.loopback_port, &state.issuer)?
                 == manifest.oidc_signing_key_ids,
@@ -1996,7 +1996,7 @@ fn start_candidate(
         container_policy: Some(ContainerRuntimePolicy::managed_app()),
     };
     backend.replace(&replacement)?;
-    fetch_http(port, LOCAL_READINESS_PATH)?;
+    fetch_http(port, LOCAL_READINESS_PATH, None)?;
     ensure!(
         oidc_signing_key_ids(port, &state.issuer)? == manifest.oidc_signing_key_ids,
         "candidate OIDC signing keys differ from the snapshot"
@@ -2033,23 +2033,25 @@ fn reserve_loopback_port() -> anyhow::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     Ok(listener.local_addr()?.port())
 }
-fn fetch_http(port: u16, path: &str) -> anyhow::Result<Vec<u8>> {
+fn fetch_http(port: u16, path: &str, host: Option<&str>) -> anyhow::Result<Vec<u8>> {
     let endpoint = format!("http://127.0.0.1:{port}{path}");
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut last = String::from("probe did not run");
     while Instant::now() < deadline {
-        let output = Command::new("curl")
-            .args([
-                "--silent",
-                "--show-error",
-                "--fail",
-                "--connect-timeout",
-                "2",
-                "--max-time",
-                "5",
-                &endpoint,
-            ])
-            .output();
+        let mut command = Command::new("curl");
+        command.args([
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--connect-timeout",
+            "2",
+            "--max-time",
+            "5",
+        ]);
+        if let Some(host) = host {
+            command.args(["--header", &format!("Host: {host}")]);
+        }
+        let output = command.arg(&endpoint).output();
         match output {
             Ok(output) if output.status.success() => {
                 ensure!(
@@ -2087,13 +2089,21 @@ fn host_port_for_container_8000(binding: &str) -> Option<u16> {
 }
 
 fn oidc_signing_key_ids(port: u16, expected_issuer: &str) -> anyhow::Result<Vec<String>> {
-    let discovery: serde_json::Value =
-        serde_json::from_slice(&fetch_http(port, "/.well-known/openid-configuration")?)?;
+    let issuer = Url::parse(expected_issuer)?;
+    let issuer_host = issuer.host_str().context("deployment issuer has no host")?;
+    let authority = match issuer.port() {
+        Some(port) => format!("{issuer_host}:{port}"),
+        None => issuer_host.to_owned(),
+    };
+    let discovery: serde_json::Value = serde_json::from_slice(&fetch_http(
+        port,
+        "/.well-known/openid-configuration",
+        Some(&authority),
+    )?)?;
     ensure!(
         discovery.get("issuer").and_then(serde_json::Value::as_str) == Some(expected_issuer),
         "OIDC discovery issuer differs from DeploymentState"
     );
-    let issuer = Url::parse(expected_issuer)?;
     let jwks = Url::parse(
         discovery
             .get("jwks_uri")
@@ -2110,7 +2120,8 @@ fn oidc_signing_key_ids(port: u16, expected_issuer: &str) -> anyhow::Result<Vec<
         Some(query) => format!("{}?{query}", jwks.path()),
         None => jwks.path().to_owned(),
     };
-    let document: serde_json::Value = serde_json::from_slice(&fetch_http(port, &path)?)?;
+    let document: serde_json::Value =
+        serde_json::from_slice(&fetch_http(port, &path, Some(&authority))?)?;
     let mut key_ids = document
         .get("keys")
         .and_then(serde_json::Value::as_array)
