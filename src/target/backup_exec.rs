@@ -1422,12 +1422,7 @@ fn create_deployment_archive(
     let mut files = Vec::new();
     append_tree(&mut archive, data, Path::new("app-data"), &mut files)?;
     append_directory(&mut archive, Path::new("app-secrets"))?;
-    for name in [
-        "database-runtime-url",
-        "database-lifecycle-url",
-        "valkey-url",
-        "mfa-totp-key",
-    ] {
+    for name in crate::target::install_exec::SECRET_PURPOSES {
         append_regular(
             &mut archive,
             &secrets.join(name),
@@ -1942,9 +1937,8 @@ fn start_candidate(
     );
     let mut mounts = live.mounts.clone();
     replace_mount(&mut mounts, CONTAINER_DATA_DIR, data, false)?;
-    // The runtime mounts each secret file individually (the install exposes
-    // only the three runtime secrets, never a directory); repoint every one
-    // of them into the restored secrets directory.
+    // The runtime mounts each allowlisted secret file individually, never the
+    // directory; repoint every one into the restored secrets directory.
     let mut secret_mounts = 0;
     for mount in mounts.iter_mut() {
         let relative = match mount
@@ -2486,13 +2480,8 @@ mod tests {
         fs::create_dir_all(data.join("instance"))?;
         fs::create_dir_all(&secrets)?;
         fs::write(data.join("instance/identity.pub"), b"identity")?;
-        for (name, value) in [
-            ("database-runtime-url", b"runtime".as_slice()),
-            ("database-lifecycle-url", b"lifecycle".as_slice()),
-            ("valkey-url", b"valkey".as_slice()),
-            ("mfa-totp-key", b"mfa".as_slice()),
-        ] {
-            fs::write(secrets.join(name), value)?;
+        for name in crate::target::install_exec::SECRET_PURPOSES {
+            fs::write(secrets.join(name), name.as_bytes())?;
         }
         fs::write(secrets.join("unknown-legacy-secret"), b"excluded")?;
         let config = temp.path().join("config.yaml");
@@ -2502,6 +2491,12 @@ mod tests {
         let restored = temp.path().join("restored");
         fs::create_dir(&restored)?;
         extract_deployment_archive(&archive, &restored, &files)?;
+        for name in crate::target::install_exec::SECRET_PURPOSES {
+            assert_eq!(
+                fs::read(restored.join("app-secrets").join(name))?,
+                name.as_bytes()
+            );
+        }
         assert!(!restored.join("app-secrets/unknown-legacy-secret").exists());
         fs::write(restored.join("extra"), b"not in manifest")?;
         let second = temp.path().join("second");
