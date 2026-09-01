@@ -598,12 +598,14 @@ fn dispatch_validated_host_operation(
         }
         HostOperationBody::BackupRecoveryCandidateControl {
             endpoint,
+            state_epoch,
             control_operation_id,
             compact_jws,
         } => answer_recovery_candidate_control(
             operation,
             store,
             endpoint,
+            state_epoch,
             control_operation_id,
             compact_jws,
             executors.control,
@@ -1335,6 +1337,7 @@ fn answer_control_operation(
         ControlRuntimeBinding {
             object: &state.runtime.object,
             artifact: None,
+            transient_state_epoch: None,
         },
         control,
     )?;
@@ -1348,6 +1351,7 @@ fn answer_recovery_candidate_control(
     operation: &HostOperation,
     store: &TargetStateStore,
     endpoint: &crate::runtime_backend::RecoveryCandidateEndpoint,
+    state_epoch: &str,
     control_operation_id: &str,
     compact_jws: &str,
     control: &Arc<dyn control_exec::ControlOperationExecutor>,
@@ -1385,6 +1389,7 @@ fn answer_recovery_candidate_control(
         ControlRuntimeBinding {
             object: &endpoint.object_id,
             artifact: Some(&candidate_artifact),
+            transient_state_epoch: Some(state_epoch),
         },
         control,
     )?;
@@ -1455,6 +1460,7 @@ fn answer_admin_create(
 struct ControlRuntimeBinding<'a> {
     object: &'a str,
     artifact: Option<&'a str>,
+    transient_state_epoch: Option<&'a str>,
 }
 
 fn execute_bound_control_operation(
@@ -1509,6 +1515,7 @@ fn execute_bound_control_operation(
         data_root: &data_root,
         secrets_root: &secrets_root,
         scope_dir: &scope_dir,
+        transient_state_epoch: runtime.transient_state_epoch,
         compact_jws,
         change_set,
     };
@@ -2477,6 +2484,7 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
         change_set_size: std::sync::atomic::AtomicUsize,
         runtime_object: std::sync::Mutex<Option<String>>,
+        transient_state_epoch: std::sync::Mutex<Option<String>>,
     }
 
     impl control_exec::ControlOperationExecutor for ScriptedControl {
@@ -2494,6 +2502,11 @@ mod tests {
                 .lock()
                 .expect("runtime object lock")
                 .replace(job.runtime_object.to_owned());
+            *self
+                .transient_state_epoch
+                .lock()
+                .expect("transient state epoch lock") =
+                job.transient_state_epoch.map(str::to_owned);
             Ok(nazo_operator_protocol::ControlResult {
                 schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
                 operation_id: job.operation_id.to_owned(),
@@ -2871,6 +2884,7 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
             change_set_size: std::sync::atomic::AtomicUsize::new(0),
             runtime_object: std::sync::Mutex::new(None),
+            transient_state_epoch: std::sync::Mutex::new(None),
         });
         let target = plain_target.with_control_executor(scripted.clone());
 
@@ -2930,8 +2944,10 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
             change_set_size: std::sync::atomic::AtomicUsize::new(0),
             runtime_object: std::sync::Mutex::new(None),
+            transient_state_epoch: std::sync::Mutex::new(None),
         });
         let target = plain_target.with_control_executor(scripted.clone());
+        let state_epoch = Uuid::now_v7().to_string();
         let operation = HostOperation::backup_recovery_candidate_control(
             Uuid::now_v7().to_string(),
             "deploy-alpha",
@@ -2943,6 +2959,7 @@ mod tests {
                 operation_id: recovery_operation_id,
                 loopback_port: 49123,
             },
+            state_epoch.clone(),
             CONTROL_JWS_OP_ID,
             sample_control_jws(),
         );
@@ -2965,6 +2982,14 @@ mod tests {
                 .expect("runtime object lock")
                 .as_deref(),
             Some("immutable-candidate-id")
+        );
+        assert_eq!(
+            scripted
+                .transient_state_epoch
+                .lock()
+                .expect("transient state epoch lock")
+                .as_deref(),
+            Some(state_epoch.as_str())
         );
         Ok(())
     }

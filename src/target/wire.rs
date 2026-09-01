@@ -29,7 +29,7 @@ use uuid::Uuid;
 use super::deployment_state::{ArtifactRefs, RuntimeSurface, StateMutationPayload};
 
 /// Wire schema discriminator for HostOperation and HostResult messages.
-pub const HOST_PROTOCOL_SCHEMA: u32 = 7;
+pub const HOST_PROTOCOL_SCHEMA: u32 = 8;
 
 /// Maximum serialized HostOperation accepted from stdin or a local caller.
 /// A tenant-resource Apply may carry one 4 MiB change set encoded as base64,
@@ -258,6 +258,7 @@ pub enum HostOperationBody {
     /// runtime remains stopped throughout this operation.
     BackupRecoveryCandidateControl {
         endpoint: crate::runtime_backend::RecoveryCandidateEndpoint,
+        state_epoch: String,
         control_operation_id: String,
         compact_jws: String,
     },
@@ -538,6 +539,7 @@ impl HostOperation {
         deployment_id: impl Into<String>,
         expected_revision: u64,
         endpoint: crate::runtime_backend::RecoveryCandidateEndpoint,
+        state_epoch: impl Into<String>,
         control_operation_id: impl Into<String>,
         compact_jws: impl Into<String>,
     ) -> Self {
@@ -548,6 +550,7 @@ impl HostOperation {
             expected_revision: Some(expected_revision),
             operation: HostOperationBody::BackupRecoveryCandidateControl {
                 endpoint,
+                state_epoch: state_epoch.into(),
                 control_operation_id: control_operation_id.into(),
                 compact_jws: compact_jws.into(),
             },
@@ -1050,6 +1053,7 @@ impl HostOperation {
             }
             HostOperationBody::BackupRecoveryCandidateControl {
                 endpoint,
+                state_epoch,
                 control_operation_id,
                 compact_jws,
             } => {
@@ -1059,6 +1063,7 @@ impl HostOperation {
                     || endpoint.object_reference.is_empty()
                     || endpoint.object_id.is_empty()
                     || endpoint.loopback_port == 0
+                    || !is_uuid_v7(state_epoch)
                     || !is_uuid_v7(control_operation_id)
                     || !valid_compact_jws(compact_jws)
                 {

@@ -35,6 +35,7 @@ const CHANGE_SET_CREDENTIAL: &str = "operator-change-set";
 const CONTAINER_CHANGE_SET_PATH: &str = "/run/nazoauth/operator-change-set";
 const OPERATOR_REJECTION_PREFIX: &str = "nazoauth-operator-rejection=";
 const ADMIN_PROVISION_REJECTION_PREFIX: &str = "nazoauth-admin-provision-rejection=";
+const TRANSIENT_STATE_EPOCH_ENV: &str = "VALKEY_STATE_EPOCH";
 
 /// The only fixed one-shot commands the target may launch. Keeping the
 /// command choice closed here makes it impossible for a HostOperation field
@@ -352,6 +353,7 @@ pub(crate) struct ControlJob<'a> {
     pub data_root: &'a str,
     pub secrets_root: &'a str,
     pub scope_dir: &'a Path,
+    pub transient_state_epoch: Option<&'a str>,
     pub compact_jws: &'a str,
     pub change_set: Option<&'a [u8]>,
 }
@@ -393,6 +395,9 @@ impl ControlOperationExecutor for HostControlOperator {
             "DATABASE_URL".to_owned(),
             super::update_exec::lifecycle_database_url(job.secrets_root)?,
         );
+        if let Some(state_epoch) = job.transient_state_epoch {
+            environment.insert(TRANSIENT_STATE_EPOCH_ENV.to_owned(), state_epoch.to_owned());
+        }
         let stdout = execute_fixed_one_shot(
             &fixed_job,
             FixedOneShotKind::ControlOperation,

@@ -922,6 +922,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                     operation_id: plan.recover_operation_id.clone(),
                     loopback_port: candidate.loopback_port,
                 },
+                plan.state_epoch.clone(),
                 prepared.signed.operation_id.clone(),
                 prepared.signed.compact_jws.clone(),
             ),
