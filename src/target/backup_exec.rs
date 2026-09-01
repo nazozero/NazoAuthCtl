@@ -654,6 +654,7 @@ pub(crate) fn recover(
     scope_dir: &Path,
     state: &DeploymentState,
     expected_manifest_sha256: &str,
+    state_epoch: &str,
     operation_id: &str,
 ) -> Result<RecoveryFacts, Failure> {
     let operation = Uuid::parse_str(operation_id).map_err(|_| {
@@ -662,6 +663,18 @@ pub(crate) fn recover(
             "recovery operation id must be a UUID",
         )
     })?;
+    let epoch = Uuid::parse_str(state_epoch).map_err(|_| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "recovery state epoch must be a UUID",
+        )
+    })?;
+    if epoch.get_version_num() != 7 {
+        return Err(Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "recovery state epoch must be UUIDv7",
+        ));
+    }
     let manifest = backup::load_manifest(scope_dir)
         .map_err(restore_failure)?
         .ok_or_else(|| Failure::new(RESTORE_TEST_FAILED, "no snapshot manifest exists"))?;
@@ -851,14 +864,18 @@ pub(crate) fn recover(
     .map_err(restore_failure)?;
     let runtime_connection = postgres_connection(&extracted_secrets.join("database-runtime-url"))
         .map_err(restore_failure)?;
+    let runtime_database_url = runtime_connection
+        .with_database(&database)
+        .with_password_url()
+        .map_err(restore_failure)?;
     write_secret(
         &extracted_secrets.join("database-runtime-url"),
-        &runtime_connection
-            .with_database(&database)
-            .with_password_url()
-            .map_err(restore_failure)?,
+        &runtime_database_url,
     )
     .map_err(restore_failure)?;
+    let restored_config =
+        rewrite_recovery_config(&extracted_config, &runtime_database_url, state_epoch)
+            .map_err(restore_failure)?;
 
     let target_data = managed_directory_locator(state, "app-data").map_err(restore_failure)?;
     let target_secrets =
@@ -884,8 +901,8 @@ pub(crate) fn recover(
     if !staged_config.exists()
         && !recovery_path_switched(&target_config, operation, "config").map_err(restore_failure)?
     {
-        fs::copy(&extracted_config, &staged_config)
-            .map_err(|error| restore_failure(error.into()))?;
+        crate::filesystem::atomic_write(&staged_config, &restored_config, 0o600)
+            .map_err(restore_failure)?;
     }
     prepare_stage_ownership_if_present(
         state.runtime.kind,
@@ -2413,6 +2430,53 @@ fn write_secret(path: &Path, value: &str) -> anyhow::Result<()> {
     crate::filesystem::atomic_write(path, value.as_bytes(), 0o440)
 }
 
+fn rewrite_recovery_config(
+    path: &Path,
+    database_url: &str,
+    state_epoch: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let bytes = crate::filesystem::read_secure_regular_file(
+        path,
+        "restored application configuration",
+        false,
+        super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
+    )?;
+    let config =
+        std::str::from_utf8(&bytes).context("restored application configuration is not UTF-8")?;
+    let database_url = serde_json::to_string(database_url)?;
+    let state_epoch = serde_json::to_string(state_epoch)?;
+    let mut database_url_count = 0;
+    let mut state_epoch_count = 0;
+    let mut rewritten = String::with_capacity(config.len() + database_url.len());
+
+    for line in config.split_inclusive('\n') {
+        let (content, ending) = line.strip_suffix("\r\n").map_or_else(
+            || {
+                line.strip_suffix('\n')
+                    .map_or((line, ""), |content| (content, "\n"))
+            },
+            |content| (content, "\r\n"),
+        );
+        if content.starts_with("DATABASE_URL:") {
+            database_url_count += 1;
+            rewritten.push_str("DATABASE_URL: ");
+            rewritten.push_str(&database_url);
+        } else if content.starts_with("VALKEY_STATE_EPOCH:") {
+            state_epoch_count += 1;
+            rewritten.push_str("VALKEY_STATE_EPOCH: ");
+            rewritten.push_str(&state_epoch);
+        } else {
+            rewritten.push_str(content);
+        }
+        rewritten.push_str(ending);
+    }
+    ensure!(
+        database_url_count == 1 && state_epoch_count == 1,
+        "restored application configuration must contain exactly one DATABASE_URL and VALKEY_STATE_EPOCH"
+    );
+    Ok(rewritten.into_bytes())
+}
+
 fn prepare_stage_ownership_if_present(
     kind: RuntimeBackendKind,
     data: &Path,
@@ -2605,6 +2669,49 @@ fn restore_failure(error: anyhow::Error) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_config_replaces_runtime_database_and_state_epoch() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-recovery-config")?;
+        let config = temp.path().join("config.yaml");
+        fs::write(
+            &config,
+            "BIND: 0.0.0.0:8000\r\nDATABASE_URL: \"postgresql://old/old\"\r\nVALKEY_STATE_EPOCH: \"old\"\r\nISSUER: \"https://auth.example\"\r\n",
+        )?;
+        let epoch = Uuid::now_v7().to_string();
+
+        let rewritten = rewrite_recovery_config(
+            &config,
+            "postgresql://runtime:new-password@db.example/recovered",
+            &epoch,
+        )?;
+        let rewritten = String::from_utf8(rewritten)?;
+
+        assert!(rewritten.contains(
+            "DATABASE_URL: \"postgresql://runtime:new-password@db.example/recovered\"\r\n"
+        ));
+        assert!(rewritten.contains(&format!("VALKEY_STATE_EPOCH: \"{epoch}\"\r\n")));
+        assert!(rewritten.contains("ISSUER: \"https://auth.example\"\r\n"));
+        assert!(!rewritten.contains("postgresql://old/old"));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_config_requires_single_authoritative_runtime_values() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-recovery-config-invalid")?;
+        let config = temp.path().join("config.yaml");
+        fs::write(&config, "DATABASE_URL: \"postgresql://old/old\"\n")?;
+
+        let error = rewrite_recovery_config(
+            &config,
+            "postgresql://runtime@db.example/recovered",
+            &Uuid::now_v7().to_string(),
+        )
+        .expect_err("missing state epoch was accepted");
+
+        assert!(error.to_string().contains("exactly one"));
+        Ok(())
+    }
 
     #[test]
     fn artifact_identity_is_content_based_not_reference_spelling() {

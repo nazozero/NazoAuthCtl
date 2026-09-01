@@ -295,83 +295,89 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             };
         }
     };
-    let deployment_trust_anchor =
-        provision_ephemeral_tenant(&session, &ephemeral_tenant, &recovery)
-            .context("failed to provision the run-scoped OIDF tenant")?;
-    probe_ephemeral_tenant(&ephemeral_tenant.issuer).context(
-        "the temporary tenant is not publicly reachable; verify wildcard TLS and host routing for *.oidf.nazoauth.com",
-    )?;
-    let baseline = session
-        .execute_control_operation(
-            ControlOperationPayload::TenantResourceEnumerate {
-                tenant_id: invocation.tenant_id.clone(),
-                selectors: Vec::new(),
-            },
-            None,
-            |completion| {
-                lock_recovery(&recovery)?.record_terminal_completion(
-                    TenantResourceRecoveryPhase::BaselineEnumerated,
-                    control_operation(completion),
-                )?;
-                Ok(())
-            },
-        )
-        .context("failed to enumerate the tenant-resource baseline")?;
-    let baseline = successful_control_result(baseline, "baseline Enumerate")?;
-    let ControlResultData::TenantResourceEnumerate {
-        resources: baseline_resources,
-        ..
-    } = baseline
-    else {
-        bail!("baseline ControlOperation returned the wrong typed result");
-    };
-    let mut final_active = baseline_resources;
-    for delta in manifest.resource_identities() {
-        if let Some(existing) = final_active.iter().find(|existing| {
-            existing.kind == delta.kind && existing.resource_id == delta.resource_id
-        }) {
-            if existing.digest != delta.digest {
-                bail!("run-unique tenant resource conflicts with active baseline");
+    let setup_result = (|| -> anyhow::Result<_> {
+        let deployment_trust_anchor =
+            provision_ephemeral_tenant(&session, &ephemeral_tenant, &recovery)
+                .context("failed to provision the run-scoped OIDF tenant")?;
+        probe_ephemeral_tenant(&ephemeral_tenant.issuer).context(
+            "the temporary tenant is not publicly reachable; verify wildcard TLS and host routing for *.oidf.nazoauth.com",
+        )?;
+        let baseline = session
+            .execute_control_operation(
+                ControlOperationPayload::TenantResourceEnumerate {
+                    tenant_id: invocation.tenant_id.clone(),
+                    selectors: Vec::new(),
+                },
+                None,
+                |completion| {
+                    lock_recovery(&recovery)?.record_terminal_completion(
+                        TenantResourceRecoveryPhase::BaselineEnumerated,
+                        control_operation(completion),
+                    )?;
+                    Ok(())
+                },
+            )
+            .context("failed to enumerate the tenant-resource baseline")?;
+        let baseline = successful_control_result(baseline, "baseline Enumerate")?;
+        let ControlResultData::TenantResourceEnumerate {
+            resources: baseline_resources,
+            ..
+        } = baseline
+        else {
+            bail!("baseline ControlOperation returned the wrong typed result");
+        };
+        let mut final_active = baseline_resources;
+        for delta in manifest.resource_identities() {
+            if let Some(existing) = final_active.iter().find(|existing| {
+                existing.kind == delta.kind && existing.resource_id == delta.resource_id
+            }) {
+                if existing.digest != delta.digest {
+                    bail!("run-unique tenant resource conflicts with active baseline");
+                }
+            } else {
+                final_active.push(delta.clone());
             }
-        } else {
-            final_active.push(delta.clone());
         }
-    }
-    final_active.sort_by(|left, right| {
-        (left.kind, left.resource_id.as_str()).cmp(&(right.kind, right.resource_id.as_str()))
-    });
-    let apply = session
-        .execute_control_operation(
-            ControlOperationPayload::TenantResourceApply {
-                tenant_id: invocation.tenant_id.clone(),
-                resources: manifest.resource_identities().to_vec(),
-            },
-            Some(manifest.bytes().as_bytes().to_vec()),
-            |completion| {
-                lock_recovery(&recovery)?.record_terminal_completion(
-                    TenantResourceRecoveryPhase::Applied,
-                    control_operation(completion),
-                )?;
-                Ok(())
-            },
+        final_active.sort_by(|left, right| {
+            (left.kind, left.resource_id.as_str()).cmp(&(right.kind, right.resource_id.as_str()))
+        });
+        let apply = session
+            .execute_control_operation(
+                ControlOperationPayload::TenantResourceApply {
+                    tenant_id: invocation.tenant_id.clone(),
+                    resources: manifest.resource_identities().to_vec(),
+                },
+                Some(manifest.bytes().as_bytes().to_vec()),
+                |completion| {
+                    lock_recovery(&recovery)?.record_terminal_completion(
+                        TenantResourceRecoveryPhase::Applied,
+                        control_operation(completion),
+                    )?;
+                    Ok(())
+                },
+            )
+            .context("ordinary tenant-resource Apply failed")?;
+        let apply = successful_control_completion(apply, "Apply")?;
+        let apply_output = TenantResourceApplyOutput::from_control_result(
+            &apply.result,
+            &apply.identity.operation_id,
+            &apply.identity.request_hash,
+            &apply.identity.kid,
+            &manifest,
+            final_active,
         )
-        .context("ordinary tenant-resource Apply failed")?;
-    let apply = successful_control_completion(apply, "Apply")?;
-    let apply_output = TenantResourceApplyOutput::from_control_result(
-        &apply.result,
-        &apply.identity.operation_id,
-        &apply.identity.request_hash,
-        &apply.identity.kid,
-        &manifest,
-        final_active,
-    )
-    .context("Apply typed mappings do not match the prepared signed Matrix")?;
-    let ordinary = DescriptorMaterializer::finalize_tenant_resources(
-        prepared,
-        apply_output,
-        deployment_trust_anchor,
-    )
-    .context("Apply typed mappings do not match the prepared signed Matrix")?;
+        .context("Apply typed mappings do not match the prepared signed Matrix")?;
+        DescriptorMaterializer::finalize_tenant_resources(
+            prepared,
+            apply_output,
+            deployment_trust_anchor,
+        )
+        .context("Apply typed mappings do not match the prepared signed Matrix")
+    })();
+    let ordinary = match setup_result {
+        Ok(ordinary) => ordinary,
+        Err(error) => return cleanup_failed_pre_suite_setup(&session, recovery, error),
+    };
     let mut deployment_report = DeploymentReport {
         deployment_id: deployment.deployment_id.clone(),
         tenant_id: invocation.tenant_id.clone(),
@@ -1302,6 +1308,50 @@ fn take_recovery(
     recovery
         .into_inner()
         .map_err(|_| anyhow::anyhow!("ordinary recovery lock is poisoned"))
+}
+
+fn cleanup_failed_pre_suite_setup<T>(
+    session: &nazoauthctl_core::ConformanceSession,
+    recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
+    setup_error: anyhow::Error,
+) -> anyhow::Result<T> {
+    let mut recovery = match take_recovery(recovery) {
+        Ok(recovery) => recovery,
+        Err(cleanup_error) => {
+            bail!("pre-Suite setup failed: {setup_error:#}; cleanup-state={cleanup_error:#}")
+        }
+    };
+    let mut cleanup_errors = Vec::new();
+    if !recovery.suite_cleanup_complete()
+        && let Err(error) = recovery.mark_suite_cleanup_complete()
+    {
+        cleanup_errors.push(format!("suite={error:#}"));
+    }
+    if !recovery.proxy_cleanup_complete()
+        && let Err(error) = recovery.mark_proxy_cleanup_complete()
+    {
+        cleanup_errors.push(format!("proxy={error:#}"));
+    }
+    let resources_clean = match cleanup_run_resources(session, &mut recovery) {
+        Ok(_) => true,
+        Err(error) => {
+            cleanup_errors.push(format!("resources={error:#}"));
+            false
+        }
+    };
+    if resources_clean
+        && recovery.suite_cleanup_complete()
+        && recovery.proxy_cleanup_complete()
+        && let Err(error) = recovery.finish()
+    {
+        cleanup_errors.push(format!("journal={error:#}"));
+    }
+    let cleanup = if cleanup_errors.is_empty() {
+        "ok".to_owned()
+    } else {
+        cleanup_errors.join("; ")
+    };
+    bail!("pre-Suite setup failed: {setup_error:#}; cleanup={cleanup}")
 }
 
 fn build_browser(

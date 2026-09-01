@@ -854,6 +854,7 @@ mod tests {
             "deploy-alpha",
             2,
             "a".repeat(64),
+            Uuid::now_v7().to_string(),
         );
         let first = journal.run_journaled(&operation, |operation| {
             HostResult::failed(&operation.operation_id, "RESTORE_TEST_FAILED", "first")

@@ -493,6 +493,7 @@ fn dispatch_validated_host_operation(
         }
         HostOperationBody::BackupRecover {
             expected_manifest_sha256,
+            state_epoch,
         } => {
             let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
             (|| -> Result<HostResult, Failure> {
@@ -520,6 +521,7 @@ fn dispatch_validated_host_operation(
                     &scope_dir,
                     &state,
                     expected_manifest_sha256,
+                    state_epoch,
                     &operation.operation_id,
                 ) {
                     Ok(facts) => facts,

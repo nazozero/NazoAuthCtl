@@ -29,7 +29,7 @@ use uuid::Uuid;
 use super::deployment_state::{ArtifactRefs, RuntimeSurface, StateMutationPayload};
 
 /// Wire schema discriminator for HostOperation and HostResult messages.
-pub const HOST_PROTOCOL_SCHEMA: u32 = 8;
+pub const HOST_PROTOCOL_SCHEMA: u32 = 9;
 
 /// Maximum serialized HostOperation accepted from stdin or a local caller.
 /// A tenant-resource Apply may carry one 4 MiB change set encoded as base64,
@@ -244,7 +244,10 @@ pub enum HostOperationBody {
     /// Restore one immutable snapshot while the target keeps the deployment
     /// runtime quiesced.  This is a state mutation: its revision CAS prevents
     /// a restored filesystem from being presented as a newer deployment.
-    BackupRecover { expected_manifest_sha256: String },
+    BackupRecover {
+        expected_manifest_sha256: String,
+        state_epoch: String,
+    },
     /// Start the already-restored deployment as its one loopback-only
     /// candidate.  This does not open public ingress or start the original
     /// runtime.
@@ -487,6 +490,7 @@ impl HostOperation {
         deployment_id: impl Into<String>,
         expected_revision: u64,
         expected_manifest_sha256: String,
+        state_epoch: impl Into<String>,
     ) -> Self {
         Self {
             schema: HOST_PROTOCOL_SCHEMA,
@@ -495,6 +499,7 @@ impl HostOperation {
             expected_revision: Some(expected_revision),
             operation: HostOperationBody::BackupRecover {
                 expected_manifest_sha256,
+                state_epoch: state_epoch.into(),
             },
         }
     }
@@ -1008,14 +1013,16 @@ impl HostOperation {
             }
             HostOperationBody::BackupRecover {
                 expected_manifest_sha256,
+                state_epoch,
             } => {
                 if self.deployment_id.is_none()
                     || self.expected_revision.is_none()
                     || !valid_lower_hex_sha256(expected_manifest_sha256)
+                    || !is_uuid_v7(state_epoch)
                 {
                     return Err(MessageRejection::new(
                         RejectionCode::OperationMalformed,
-                        "backup recover requires a deployment revision and manifest hash",
+                        "backup recover requires a deployment revision, manifest hash, and UUIDv7 state epoch",
                     ));
                 }
             }
@@ -1933,6 +1940,22 @@ mod tests {
     }
 
     #[test]
+    fn backup_recovery_requires_a_uuidv7_state_epoch() {
+        let operation = HostOperation::backup_recover(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            2,
+            "a".repeat(64),
+            "not-an-epoch",
+        );
+
+        let rejection = operation
+            .validate()
+            .expect_err("invalid state epoch accepted");
+        assert_eq!(rejection.code, RejectionCode::OperationMalformed);
+    }
+
+    #[test]
     fn every_registered_kind_round_trips() -> anyhow::Result<()> {
         assert_eq!(
             HOST_OPERATION_KINDS,
@@ -2705,8 +2728,9 @@ mod tests {
 
     #[test]
     fn result_schema_mismatch_is_reported_separately() {
+        let unsupported_schema = HOST_PROTOCOL_SCHEMA + 1;
         let raw = format!(
-            r#"{{"schema":9,"operation_id":"{}","outcome":{{"status":"completed","body":{{"completion":"ping","nonce":"n"}}}}}}"#,
+            r#"{{"schema":{unsupported_schema},"operation_id":"{}","outcome":{{"status":"completed","body":{{"completion":"ping","nonce":"n"}}}}}}"#,
             Uuid::now_v7()
         );
         let rejection = parse_host_result(raw.as_bytes()).expect_err("schema");

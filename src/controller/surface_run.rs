@@ -771,6 +771,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 record.deployment_id.clone(),
                 plan.source_revision,
                 plan.manifest_sha256.clone(),
+                plan.state_epoch.clone(),
             ))?;
         let (manifest_sha256, revision) = match result.outcome {
             crate::target::HostOutcome::Completed {
