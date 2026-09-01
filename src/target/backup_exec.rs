@@ -1001,7 +1001,8 @@ pub(crate) fn stage_recovery_candidate(
         .stage_recovery_candidate(&request)
         .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
     let checked = (|| -> anyhow::Result<()> {
-        fetch_http(endpoint.loopback_port, LOCAL_READINESS_PATH, None)?;
+        let authority = issuer_authority(&state.issuer)?;
+        fetch_http(endpoint.loopback_port, LOCAL_READINESS_PATH, &authority)?;
         ensure!(
             oidc_signing_key_ids(endpoint.loopback_port, &state.issuer)?
                 == manifest.oidc_signing_key_ids,
@@ -1995,7 +1996,8 @@ fn start_candidate(
         container_policy: Some(ContainerRuntimePolicy::managed_app()),
     };
     backend.replace(&replacement)?;
-    fetch_http(port, LOCAL_READINESS_PATH, None)?;
+    let authority = issuer_authority(&state.issuer)?;
+    fetch_http(port, LOCAL_READINESS_PATH, &authority)?;
     ensure!(
         oidc_signing_key_ids(port, &state.issuer)? == manifest.oidc_signing_key_ids,
         "candidate OIDC signing keys differ from the snapshot"
@@ -2032,7 +2034,7 @@ fn reserve_loopback_port() -> anyhow::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     Ok(listener.local_addr()?.port())
 }
-fn fetch_http(port: u16, path: &str, host: Option<&str>) -> anyhow::Result<Vec<u8>> {
+fn fetch_http(port: u16, path: &str, host: &str) -> anyhow::Result<Vec<u8>> {
     let endpoint = format!("http://127.0.0.1:{port}{path}");
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut last = String::from("probe did not run");
@@ -2047,9 +2049,7 @@ fn fetch_http(port: u16, path: &str, host: Option<&str>) -> anyhow::Result<Vec<u
             "--max-time",
             "5",
         ]);
-        if let Some(host) = host {
-            command.args(["--header", &format!("Host: {host}")]);
-        }
+        command.args(["--header", &format!("Host: {host}")]);
         let output = command.arg(&endpoint).output();
         match output {
             Ok(output) if output.status.success() => {
@@ -2089,15 +2089,11 @@ fn host_port_for_container_8000(binding: &str) -> Option<u16> {
 
 fn oidc_signing_key_ids(port: u16, expected_issuer: &str) -> anyhow::Result<Vec<String>> {
     let issuer = Url::parse(expected_issuer)?;
-    let issuer_host = issuer.host_str().context("deployment issuer has no host")?;
-    let authority = match issuer.port() {
-        Some(port) => format!("{issuer_host}:{port}"),
-        None => issuer_host.to_owned(),
-    };
+    let authority = issuer_authority(expected_issuer)?;
     let discovery: serde_json::Value = serde_json::from_slice(&fetch_http(
         port,
         "/.well-known/openid-configuration",
-        Some(&authority),
+        &authority,
     )?)?;
     ensure!(
         discovery.get("issuer").and_then(serde_json::Value::as_str) == Some(expected_issuer),
@@ -2120,7 +2116,7 @@ fn oidc_signing_key_ids(port: u16, expected_issuer: &str) -> anyhow::Result<Vec<
         None => jwks.path().to_owned(),
     };
     let document: serde_json::Value =
-        serde_json::from_slice(&fetch_http(port, &path, Some(&authority))?)?;
+        serde_json::from_slice(&fetch_http(port, &path, &authority)?)?;
     let mut key_ids = document
         .get("keys")
         .and_then(serde_json::Value::as_array)
@@ -2140,6 +2136,15 @@ fn oidc_signing_key_ids(port: u16, expected_issuer: &str) -> anyhow::Result<Vec<
         "JWKS key set is empty or too large"
     );
     Ok(key_ids)
+}
+
+fn issuer_authority(expected_issuer: &str) -> anyhow::Result<String> {
+    let issuer = Url::parse(expected_issuer)?;
+    let host = issuer.host_str().context("deployment issuer has no host")?;
+    Ok(match issuer.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    })
 }
 fn candidate_name(source: &str, id: Uuid) -> String {
     format!(
