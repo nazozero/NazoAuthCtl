@@ -135,6 +135,7 @@ impl LifecycleExecutor for ScriptedLifecycle {
                 artifact_reference: job.current_artifact,
                 config_reference: job.config_reference,
                 data_root: job.data_root,
+                secrets_root: job.secrets_root,
                 scope_dir: job.scope_dir,
                 compact_jws: jws,
                 change_set: None,

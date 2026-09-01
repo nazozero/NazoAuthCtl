@@ -1377,6 +1377,17 @@ fn execute_bound_control_operation(
                 "deployment state has no app-data directory resource",
             )
         })?;
+    let secrets_root = state
+        .resources
+        .iter()
+        .find(|resource| resource.resource_id == "app-secrets" && resource.kind == "directory")
+        .map(|resource| resource.locator.clone())
+        .ok_or_else(|| {
+            Failure::new(
+                HOST_ERR_OPERATION_INVALID,
+                "deployment state has no app-secrets directory resource",
+            )
+        })?;
     let scope_dir = store.scope_dir(deployment_id)?;
     let job = control_exec::ControlJob {
         operation_id,
@@ -1386,6 +1397,7 @@ fn execute_bound_control_operation(
         runtime_object: &state.runtime.object,
         config_reference: &state.config.reference,
         data_root: &data_root,
+        secrets_root: &secrets_root,
         scope_dir: &scope_dir,
         compact_jws,
         change_set,
@@ -1895,6 +1907,13 @@ mod tests {
                         ResourceScope::Deployment,
                     )?,
                     Resource::new(
+                        "app-secrets",
+                        "directory",
+                        "/var/lib/nazoauth/deploy-alpha-secrets",
+                        ResourceOwnership::Managed,
+                        ResourceScope::Deployment,
+                    )?,
+                    Resource::new(
                         "shared-db",
                         "postgres",
                         "pg-main.example.internal:5432",
@@ -2210,7 +2229,7 @@ mod tests {
         let raw = std::fs::read_to_string(&state_path)?;
         let persisted: DeploymentState = serde_json::from_str(&raw)?;
         assert_eq!(persisted.deployment_id, "deploy-alpha");
-        assert_eq!(persisted.resources.len(), 3);
+        assert_eq!(persisted.resources.len(), 4);
 
         let inspection = target.inspect_instance("deploy-alpha")?;
         assert_eq!(inspection.deployment_id, "deploy-alpha");
@@ -2224,7 +2243,7 @@ mod tests {
             inspection.artifact.current.as_deref(),
             Some("sha256:abcdef0123456789")
         );
-        assert_eq!(inspection.resources.len(), 3);
+        assert_eq!(inspection.resources.len(), 4);
         assert!(!inspection.healthy);
 
         let health = target.read_health("deploy-alpha")?;

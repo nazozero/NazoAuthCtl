@@ -769,7 +769,7 @@ impl HostLifecycleExecutor {
     }
 }
 
-fn runtime_database_role(secrets_root: &str) -> Result<String, Failure> {
+pub(crate) fn runtime_database_role(secrets_root: &str) -> Result<String, Failure> {
     let path = Path::new(secrets_root).join("database-runtime-url");
     let bytes =
         filesystem::read_secure_regular_file(&path, "runtime database URL", false, 16 * 1024)
@@ -803,7 +803,7 @@ fn runtime_database_role(secrets_root: &str) -> Result<String, Failure> {
     Ok(role.to_owned())
 }
 
-fn lifecycle_database_url(secrets_root: &str) -> Result<String, Failure> {
+pub(crate) fn lifecycle_database_url(secrets_root: &str) -> Result<String, Failure> {
     let path = Path::new(secrets_root).join("database-lifecycle-url");
     let bytes =
         filesystem::read_secure_regular_file(&path, "lifecycle database URL", false, 16 * 1024)

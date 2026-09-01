@@ -333,6 +333,7 @@ pub(crate) struct ControlJob<'a> {
     pub runtime_object: &'a str,
     pub config_reference: &'a str,
     pub data_root: &'a str,
+    pub secrets_root: &'a str,
     pub scope_dir: &'a Path,
     pub compact_jws: &'a str,
     pub change_set: Option<&'a [u8]>,
@@ -366,10 +367,19 @@ impl ControlOperationExecutor for HostControlOperator {
             data_root: job.data_root,
             scope_dir: job.scope_dir,
         };
+        let mut environment = BTreeMap::new();
+        environment.insert(
+            super::install_exec::MIGRATION_RUNTIME_ROLE_ENV.to_owned(),
+            super::update_exec::runtime_database_role(job.secrets_root)?,
+        );
+        environment.insert(
+            "DATABASE_URL".to_owned(),
+            super::update_exec::lifecycle_database_url(job.secrets_root)?,
+        );
         let stdout = execute_fixed_one_shot(
             &fixed_job,
             FixedOneShotKind::ControlOperation,
-            BTreeMap::new(),
+            environment,
             secret_file.as_ref(),
             format!("{}\n", job.compact_jws).into_bytes(),
         )?;
