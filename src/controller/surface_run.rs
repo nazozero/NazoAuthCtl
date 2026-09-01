@@ -813,6 +813,15 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
         let control_journal = crate::controller_identity::journal::OperationJournal::open(
             keys.instance_dir(&record.deployment_id)?,
         )?;
+        if control_journal.load()?.is_none()
+            && (plan.invalidation_operation_id.is_some()
+                || plan.invalidation_request_hash.is_some())
+        {
+            plan.invalidation_operation_id = None;
+            plan.invalidation_request_hash = None;
+            plan.candidate_control_operation_id = None;
+            journal.store(&plan)?;
+        }
         let prepared = crate::controller_identity::prepare_control_operation(
             &context.registry,
             &keys,
@@ -941,6 +950,10 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 continue;
             }
             crate::controller_identity::DispatchVerdict::DefinitivelyRejected { code } => {
+                plan.invalidation_operation_id = None;
+                plan.invalidation_request_hash = None;
+                plan.candidate_control_operation_id = None;
+                journal.store(&plan)?;
                 crate::controller_identity::settle_journal(
                     &control_journal,
                     &prepared,
