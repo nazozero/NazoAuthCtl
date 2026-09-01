@@ -646,7 +646,9 @@ fn assert_no_dangerous_runtime_attributes(
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         ensure!(
-            mode.is_empty() || mode.eq_ignore_ascii_case("private"),
+            mode.is_empty()
+                || mode.eq_ignore_ascii_case("private")
+                || (field == "IpcMode" && mode.eq_ignore_ascii_case("shareable")),
             "{backend_name} recovery runtime has an extra {field} namespace"
         );
     }
@@ -754,6 +756,12 @@ mod tests {
     fn recovery_runtime_rejects_privilege_capability_device_and_host_namespaces() {
         let mut document = safe_document("127.0.0.1", "48123");
         assert_no_dangerous_runtime_attributes(&document, "test").unwrap();
+        *document.pointer_mut("/HostConfig/IpcMode").unwrap() = serde_json::json!("shareable");
+        assert_no_dangerous_runtime_attributes(&document, "test").unwrap();
+        *document.pointer_mut("/HostConfig/IpcMode").unwrap() = serde_json::json!("host");
+        assert!(assert_no_dangerous_runtime_attributes(&document, "test").is_err());
+
+        let mut document = safe_document("127.0.0.1", "48123");
         *document.pointer_mut("/HostConfig/Privileged").unwrap() = serde_json::json!(true);
         assert!(assert_no_dangerous_runtime_attributes(&document, "test").is_err());
 
