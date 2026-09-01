@@ -296,31 +296,42 @@ fn validate_result_contract(
         return Ok(());
     }
 
-    let matches_operation = matches!(
-        (operation, result.result.as_ref()),
-        (
-            ControlOperationPayload::TenantResourceApply { .. },
-            Some(ControlResultData::TenantResourceApply { .. }),
-        ) | (
-            ControlOperationPayload::TenantKeysGenerateLocal { .. },
-            Some(ControlResultData::TenantKeyGenerated { .. }),
-        ) | (
-            ControlOperationPayload::TenantResourceEnumerate { .. },
-            Some(ControlResultData::TenantResourceEnumerate { .. }),
-        ) | (
-            ControlOperationPayload::TenantResourceRevoke { .. },
-            Some(ControlResultData::TenantResourceRevoke { .. }),
-        ) | (
-            ControlOperationPayload::RecoveryInvalidate { .. },
-            Some(ControlResultData::RecoveryInvalidation { .. }),
-        ) | (
-            ControlOperationPayload::MigrateApply
-                | ControlOperationPayload::KeysList
-                | ControlOperationPayload::KeysValidate
-                | ControlOperationPayload::KeysRegisterExternal { .. },
-            None,
-        )
-    );
+    let data = result.result.as_ref();
+    let matches_operation = match operation {
+        ControlOperationPayload::MigrateApply
+        | ControlOperationPayload::KeysList
+        | ControlOperationPayload::KeysValidate
+        | ControlOperationPayload::KeysGenerateLocal { .. }
+        | ControlOperationPayload::KeysRegisterExternal { .. } => data.is_none(),
+        ControlOperationPayload::TenantKeysGenerateLocal { .. } => {
+            matches!(data, Some(ControlResultData::TenantKeyGenerated { .. }))
+        }
+        ControlOperationPayload::TenantResourceApply { .. } => {
+            matches!(data, Some(ControlResultData::TenantResourceApply { .. }))
+        }
+        ControlOperationPayload::TenantResourceEnumerate { .. } => matches!(
+            data,
+            Some(ControlResultData::TenantResourceEnumerate { .. })
+        ),
+        ControlOperationPayload::TenantResourceRevoke { .. } => {
+            matches!(data, Some(ControlResultData::TenantResourceRevoke { .. }))
+        }
+        ControlOperationPayload::RecoveryInvalidate { .. } => {
+            matches!(data, Some(ControlResultData::RecoveryInvalidation { .. }))
+        }
+        ControlOperationPayload::TenantDirectoryCreate { .. }
+        | ControlOperationPayload::TenantDirectoryUpdate { .. }
+        | ControlOperationPayload::TenantDirectoryDisable { .. }
+        | ControlOperationPayload::TenantDirectoryReload { .. }
+        | ControlOperationPayload::TenantDirectoryFinalize { .. } => matches!(
+            data,
+            Some(ControlResultData::TenantDirectoryMutation { .. })
+        ),
+        ControlOperationPayload::TenantDirectoryDescribe => matches!(
+            data,
+            Some(ControlResultData::TenantDirectoryDescribe { .. })
+        ),
+    };
     if !matches_operation {
         bail!("ControlResult data does not match the prepared operation contract");
     }
@@ -532,6 +543,48 @@ mod tests {
             completed_at: (outcome != ControlOutcome::InProgress).then_some(101),
             result: None,
         }
+    }
+
+    #[test]
+    fn dynamic_tenant_results_match_their_operation_contracts() {
+        let mut result = ControlResult {
+            schema: CONTROL_RESULT_SCHEMA,
+            operation_id: "01a05c08-1fc8-72d2-a05e-480753f2b01b".to_owned(),
+            request_hash: "ab".repeat(32),
+            outcome: ControlOutcome::Succeeded,
+            error: None,
+            accepted_at: 100,
+            completed_at: Some(101),
+            result: Some(ControlResultData::TenantDirectoryDescribe {
+                revision: 1,
+                tenants: Vec::new(),
+            }),
+        };
+        assert!(
+            validate_result_contract(&ControlOperationPayload::TenantDirectoryDescribe, &result)
+                .is_ok()
+        );
+
+        result.result = Some(ControlResultData::TenantDirectoryMutation {
+            action: "disable".to_owned(),
+            tenant_id: "018f0000-0000-7000-8000-000000000001".to_owned(),
+            previous_revision: 1,
+            revision: 2,
+        });
+        assert!(
+            validate_result_contract(
+                &ControlOperationPayload::TenantDirectoryDisable {
+                    expected_revision: 1,
+                    tenant_id: "018f0000-0000-7000-8000-000000000001".to_owned(),
+                },
+                &result,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_result_contract(&ControlOperationPayload::TenantDirectoryDescribe, &result)
+                .is_err()
+        );
     }
 
     fn valid_receipt(
