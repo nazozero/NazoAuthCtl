@@ -249,6 +249,11 @@ pub(crate) fn execute_fixed_one_shot(
         );
         read_only_paths.push(PathBuf::from(job.config_reference));
         read_write_paths.push(PathBuf::from(job.data_root));
+    } else if kind == FixedOneShotKind::ControlOperation {
+        environment.insert(
+            "NAZOAUTH_OPERATOR_STATE_DIRECTORY".to_owned(),
+            format!("{}/operator-state", super::install_exec::CONTAINER_DATA_DIR),
+        );
     }
     if let (Some(file), Some(staged)) = (secret_file, &staged) {
         configure_secret_file_access(
