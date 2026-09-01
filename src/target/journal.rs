@@ -7,7 +7,8 @@
 //! dropped SSH session resolve through this journal alone:
 //!
 //! - same id + same canonical hash ⇒ replay; the stored result is returned
-//!   verbatim (idempotent);
+//!   verbatim (idempotent), except a failed `backup-recover`, whose own
+//!   operation-bound checkpoints require the same id for forward resumption;
 //! - same id + different hash ⇒ stable `OPERATION_ID_CONFLICT`; the original
 //!   intent is never overwritten;
 //! - an interrupted operation stays `pending` and is resumed by re-execution —
@@ -272,13 +273,25 @@ impl TargetJournal {
             .as_ref()
             .is_some_and(|line| matches!(line.status, JournalStatus::Pending));
 
+        let retry_failed_backup_recover = latest.as_ref().is_some_and(|line| {
+            matches!(line.status, JournalStatus::Failed)
+                && matches!(
+                    operation.operation,
+                    super::wire::HostOperationBody::BackupRecover { .. }
+                )
+        });
+
         // A terminal stored result is the authoritative idempotent answer.
         // A completed transfer-read intentionally stores no result bytes:
         // the immutable export can reproduce the same offset/hash response,
         // while retaining archive chunks here would turn the journal into a
         // second backup store. A pending line likewise resumes by execution.
+        // Failed backup recovery is the one exception: its filesystem stages
+        // are bound to this operation id, so retrying under a new id would
+        // abandon the only forward-resumable state.
         if let Some(line) = latest
             && !matches!(line.status, JournalStatus::Pending)
+            && !retry_failed_backup_recover
             && let Some(result) = line.result
         {
             return Ok(result);
@@ -825,6 +838,34 @@ mod tests {
         })?;
         assert_eq!(second, first);
         assert_eq!(serde_json::to_vec(&first)?, serde_json::to_vec(&second)?);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_backup_recovery_reexecutes_with_the_same_operation_id() -> anyhow::Result<()> {
+        let temp = filesystem::PrivateTempDir::new("nazoauthctl-journal-recovery-retry")?;
+        let journal = TargetJournal::open(temp.path().join("state"))?;
+        let operation = HostOperation::backup_recover(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            2,
+            "a".repeat(64),
+        );
+        let first = journal.run_journaled(&operation, |operation| {
+            HostResult::failed(&operation.operation_id, "RESTORE_TEST_FAILED", "first")
+        })?;
+        assert!(matches!(first.outcome, HostOutcome::Failed { .. }));
+
+        let reexecuted = std::cell::Cell::new(false);
+        let second = journal.run_journaled(&operation, |operation| {
+            reexecuted.set(true);
+            HostResult::failed(&operation.operation_id, "RETRY_EXECUTED", "second")
+        })?;
+        assert!(reexecuted.get());
+        assert!(matches!(
+            second.outcome,
+            HostOutcome::Failed { ref code, .. } if code == "RETRY_EXECUTED"
+        ));
         Ok(())
     }
 
