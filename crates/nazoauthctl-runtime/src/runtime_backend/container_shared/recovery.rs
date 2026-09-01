@@ -396,12 +396,17 @@ fn recovery_mounts(
             true,
         ),
     ];
-    for name in ["database-runtime-url", "valkey-url", "mfa-totp-key"] {
-        replacements.push((
-            format!("{CONTAINER_SECRETS_DIR}/{name}"),
-            request.secrets_source.join(name),
-            true,
-        ));
+    for mount in source
+        .mounts
+        .iter()
+        .filter(|mount| mount.destination.parent() == Some(Path::new(CONTAINER_SECRETS_DIR)))
+    {
+        let name = mount
+            .destination
+            .file_name()
+            .context("recovery source secret mount has no file name")?;
+        let destination = mount.destination.to_string_lossy().into_owned();
+        replacements.push((destination, request.secrets_source.join(name), true));
     }
     replacements
         .into_iter()
@@ -826,5 +831,76 @@ mod tests {
         invalid = request;
         invalid.artifact = ArtifactReference::Unknown;
         assert!(validate_request(&invalid).is_err());
+    }
+
+    #[test]
+    fn recovery_mounts_follow_the_current_secret_file_surface() -> anyhow::Result<()> {
+        let root = std::env::current_dir()?.join("recovery-mount-test");
+        let mount = |destination: &str| NeutralMount {
+            source: root.join("live").join(destination.trim_start_matches('/')),
+            destination: PathBuf::from(destination),
+            read_only: destination != CONTAINER_DATA_DIR,
+            selinux_relabel: false,
+            ownership: Responsibility::Managed,
+            scope: ResourceScope::Deployment,
+        };
+        let source = RuntimeObservation {
+            backend: crate::runtime_backend::RuntimeBackendKind::Podman,
+            object_reference: "nazo-live".to_owned(),
+            display_name: "nazo-live".to_owned(),
+            running: false,
+            server_command_verified: true,
+            artifact: ArtifactReference::Unknown,
+            local_artifact_id: None,
+            ports: Vec::new(),
+            networks: vec!["nazo-internal".to_owned()],
+            mounts: vec![
+                mount(CONTAINER_DATA_DIR),
+                mount(CONTAINER_CONFIG_FILE),
+                mount("/run/secrets/client-secret-pepper"),
+                mount("/run/nazoauth-operator/config-revision"),
+            ],
+            safe_environment: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            evidence: Vec::new(),
+            missing: Vec::new(),
+        };
+        let request = RecoveryCandidateRequest {
+            source_object_reference: "nazo-live".to_owned(),
+            candidate_object_reference: "nazo-recovery".to_owned(),
+            deployment_id: "deploy-a".to_owned(),
+            operation_id: Uuid::now_v7().to_string(),
+            artifact: ArtifactReference::Oci {
+                image_reference: "example/nazo".to_owned(),
+                digest: format!("sha256:{}", "a".repeat(64)),
+            },
+            data_source: root.join("restored-data"),
+            secrets_source: root.join("restored-secrets"),
+            config_source: root.join("restored-config.yaml"),
+            valkey_state_epoch: Uuid::now_v7().to_string(),
+        };
+
+        let mounts = recovery_mounts(&source, &request)?;
+        let destinations = mounts
+            .iter()
+            .map(|mount| mount.destination.as_path())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            destinations,
+            BTreeSet::from([
+                Path::new(CONTAINER_DATA_DIR),
+                Path::new(CONTAINER_CONFIG_FILE),
+                Path::new("/run/secrets/client-secret-pepper"),
+            ])
+        );
+        assert_eq!(
+            mounts
+                .iter()
+                .find(|mount| mount.destination == Path::new("/run/secrets/client-secret-pepper"))
+                .expect("current secret mount")
+                .source,
+            request.secrets_source.join("client-secret-pepper")
+        );
+        Ok(())
     }
 }

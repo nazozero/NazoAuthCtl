@@ -190,8 +190,9 @@ pub struct RuntimeReplacement {
 ///
 /// This is deliberately not a general clone specification. The backend
 /// inspects one stopped deployment runtime, copies only its safe environment
-/// and single non-host network, replaces exactly the three recovery mounts,
-/// and publishes one application port on IPv4 loopback.
+/// and single non-host network, replaces its data/config and current secret
+/// file mounts from the restored snapshot, and publishes one application port
+/// on IPv4 loopback.
 #[derive(Clone, Debug)]
 pub struct RecoveryCandidateRequest {
     pub source_object_reference: String,
