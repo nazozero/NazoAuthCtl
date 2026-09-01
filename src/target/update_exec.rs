@@ -382,8 +382,11 @@ impl HostLifecycleExecutor {
         }
         // Build and validate the executable replacement before any migration
         // can mutate external state. Activation consumes this exact plan.
-        let replacement = (observation_digest(&observation).as_deref()
-            != Some(new_digest.as_str()))
+        let replacement = runtime_replacement_required(
+            observation_digest(&observation).as_deref(),
+            &new_digest,
+            job.config.is_some(),
+        )
         .then(|| {
             let mut replacement = replacement_from_observation(
                 &observation,
@@ -1136,6 +1139,18 @@ mod tests {
     }
 
     #[test]
+    fn staged_config_replaces_runtime_even_when_artifact_is_unchanged() {
+        let digest = "a".repeat(64);
+        assert!(!runtime_replacement_required(Some(&digest), &digest, false));
+        assert!(runtime_replacement_required(Some(&digest), &digest, true));
+        assert!(runtime_replacement_required(
+            Some(&"b".repeat(64)),
+            &digest,
+            false
+        ));
+    }
+
+    #[test]
     fn replacement_rejects_a_non_neutral_port_binding() {
         let artifact = runtime_backend::ArtifactReference::Oci {
             image_reference: "registry.example/nazoauth".to_owned(),
@@ -1197,6 +1212,14 @@ pub(crate) fn observation_digest(
         runtime_backend::ArtifactReference::HostBinary { sha256, .. } => Some(sha256.clone()),
         runtime_backend::ArtifactReference::Unknown => None,
     }
+}
+
+fn runtime_replacement_required(
+    current_digest: Option<&str>,
+    selected_digest: &str,
+    has_staged_config: bool,
+) -> bool {
+    has_staged_config || current_digest != Some(selected_digest)
 }
 
 fn observation_image_reference(
