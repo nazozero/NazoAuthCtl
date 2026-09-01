@@ -143,34 +143,19 @@ mod tests {
         let unknown = encoded.replacen("\"repository\"", "\"unknown\":true,\"repository\"", 1);
         assert!(serde_json::from_str::<CandidateRelease>(&unknown).is_err());
 
-        let container_only = format!(
-            r#"{{
-                "repository":"nazozero/NazoAuth",
-                "version":"v0.2.4-candidate",
-                "oci_image":"localhost/nazoauth:candidate",
-                "oci_digest":"sha256:{}",
-                "rollback":{{
-                    "artifact":true,
-                    "schema_compatible":false,
-                    "database_restore":"backup",
-                    "irreversible_migration":true,
-                    "minimum_supported_version":"0.2.2",
-                    "migration_floor":"20260828000700",
-                    "rationale":"candidate migration requires verified backup recovery"
-                }}
-            }}"#,
-            "a".repeat(64),
-        );
-        let candidate: CandidateRelease = serde_json::from_str(&container_only)?;
+        let mut container_only: serde_json::Value = serde_json::from_str(&encoded)?;
+        let container_only_object = container_only.as_object_mut().expect("candidate object");
+        container_only_object.remove("host_binary_path");
+        container_only_object.remove("host_binary_sha256");
+        let candidate: CandidateRelease = serde_json::from_value(container_only.clone())?;
         candidate.validate()?;
 
-        let mut incomplete: serde_json::Value = serde_json::from_str(&container_only)?;
-        incomplete
+        container_only
             .as_object_mut()
             .expect("candidate object")
             .remove("oci_digest");
         assert!(
-            serde_json::from_value::<CandidateRelease>(incomplete)?
+            serde_json::from_value::<CandidateRelease>(container_only)?
                 .validate()
                 .is_err()
         );
