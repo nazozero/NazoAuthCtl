@@ -696,9 +696,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
         .snapshot
         .as_ref()
         .context("recover requires an existing immutable snapshot")?;
-    if snapshot.restore_tested_at.is_none() || snapshot.off_host_verified_at.is_none() {
-        bail!("recover requires a restore-tested, off-host-verified snapshot")
-    }
+    validate_recovery_snapshot(snapshot)?;
     let keys = ControllerKeyStore::open_default()?;
     let journal = RecoveryJournal::open(&keys.instance_dir(&record.deployment_id)?)?;
     let mut plan = match journal.load()? {
@@ -1037,6 +1035,15 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_recovery_snapshot(
+    snapshot: &crate::target::backup::SnapshotProjection,
+) -> anyhow::Result<()> {
+    if snapshot.restore_tested_at.is_none() {
+        bail!("recover requires a restore-tested snapshot")
+    }
+    Ok(())
+}
+
 fn requires_controller_identity_recovery(code: &str) -> bool {
     code == crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED
 }
@@ -1300,9 +1307,37 @@ mod install_input_tests {
 mod recover_tests {
     use super::{
         RecoveryCeremonyRoute, requires_controller_identity_recovery,
-        select_recovery_ceremony_route,
+        select_recovery_ceremony_route, validate_recovery_snapshot,
     };
     use crate::registry::HostTransport;
+    use crate::target::backup::SnapshotProjection;
+    use chrono::Utc;
+
+    fn snapshot(restore_tested: bool, off_host_verified: bool) -> SnapshotProjection {
+        SnapshotProjection {
+            snapshot_id: uuid::Uuid::now_v7().to_string(),
+            created_at: Utc::now(),
+            manifest_sha256: "a".repeat(64),
+            restore_tested_at: restore_tested.then(Utc::now),
+            off_host_verified_at: off_host_verified.then(Utc::now),
+        }
+    }
+
+    #[test]
+    fn restore_tested_local_snapshot_is_recoverable_without_an_off_host_copy() {
+        validate_recovery_snapshot(&snapshot(true, false))
+            .expect("off-host redundancy must not block a usable local recovery");
+    }
+
+    #[test]
+    fn untested_snapshot_cannot_be_recovered_even_with_an_off_host_copy() {
+        let error = validate_recovery_snapshot(&snapshot(false, true))
+            .expect_err("an untested snapshot must not be restored");
+        assert_eq!(
+            error.to_string(),
+            "recover requires a restore-tested snapshot"
+        );
+    }
 
     #[test]
     fn only_stable_identity_rejections_may_read_a_recovery_secret() {
