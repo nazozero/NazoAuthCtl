@@ -1519,15 +1519,34 @@ fn run_prestart_database_tasks(
         "DATABASE_URL".to_owned(),
         install_secret_value(job, "database-lifecycle-url")?,
     );
+    let mut mounts = vec![mount(
+        PathBuf::from(job.config_reference),
+        CONTAINER_CONFIG_FILE,
+        true,
+    )];
+    mounts.extend(
+        job.order
+            .secrets
+            .iter()
+            .filter(|secret| {
+                !matches!(
+                    secret.purpose.as_str(),
+                    "database-runtime-url" | "database-lifecycle-url" | "valkey-url"
+                )
+            })
+            .map(|secret| {
+                mount(
+                    PathBuf::from(&secret.path),
+                    &format!("{CONTAINER_SECRETS_DIR}/{}", secret.purpose),
+                    true,
+                )
+            }),
+    );
     let task = runtime_backend::OneShotTask {
         artifact: artifact.clone(),
         command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
         network: Some("bridge".to_owned()),
-        mounts: vec![mount(
-            PathBuf::from(job.config_reference),
-            CONTAINER_CONFIG_FILE,
-            true,
-        )],
+        mounts,
         environment,
         working_directory: Some(std::path::PathBuf::from("/app")),
         service_user: Some(runtime_backend::NON_ROOT_ONE_SHOT_USER.to_owned()),
