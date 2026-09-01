@@ -139,7 +139,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                         };
                         let summary = child
                             .run_prepared(&mut progress, worker_prepared(&work_ref[next_index]));
-                        if has_fatal_orchestration_failure(&summary.report) {
+                        if has_unsettled_suite_resources(&summary.report) {
                             stop_launching.store(true, Ordering::SeqCst);
                         }
                         if sender
@@ -497,10 +497,9 @@ fn merge_reports(
     }
 }
 
-fn has_fatal_orchestration_failure(report: &ConformanceReport) -> bool {
-    (!report.orchestration_integrity.cleanup_complete
-        && !report.orchestration_integrity.retention_eligible)
-        || !report.errors.is_empty()
+fn has_unsettled_suite_resources(report: &ConformanceReport) -> bool {
+    !report.orchestration_integrity.cleanup_complete
+        && !report.orchestration_integrity.retention_eligible
 }
 
 #[cfg(test)]

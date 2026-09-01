@@ -677,7 +677,7 @@ fn mutable_suite_plan_names_cannot_select_the_ciba_lane() {
 }
 
 #[test]
-fn orchestration_error_stops_queued_plans_and_drains_in_flight_cleanup() {
+fn plan_error_does_not_stop_independent_queued_plans() {
     let (runner, transport) = parallel_fixture(
         serde_json::json!({}),
         &["plan-a", "plan-b", "plan-c"],
@@ -699,7 +699,7 @@ fn orchestration_error_stops_queued_plans_and_drains_in_flight_cleanup() {
             .report
             .errors
             .iter()
-            .any(|error| error.contains("scheduler stopped before every selected"))
+            .all(|error| !error.contains("scheduler stopped before every selected"))
     );
     let created_plans = transport.created_plans.lock().expect("plans").clone();
     assert_eq!(created_plans, ["plan-a", "plan-b", "plan-c"]);
@@ -711,8 +711,8 @@ fn orchestration_error_stops_queued_plans_and_drains_in_flight_cleanup() {
             .find(|plan| plan.matrix_plan_id == "plan-c")
             .expect("queued plan report")
             .created_instances,
-        0,
-        "phase 1 creates every plan, but a fatal worker error must stop the queued plan before module execution"
+        1,
+        "a plan-scoped failure must not prevent an independent queued plan from running"
     );
     assert!(summary.report.cleanup.failures.is_empty());
     assert!(created_plans.iter().all(|plan| {
