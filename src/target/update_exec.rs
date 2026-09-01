@@ -427,6 +427,7 @@ impl HostLifecycleExecutor {
                         sanitize(error.to_string()),
                     )
                 })?;
+            grant_runtime_config_read(Path::new(job.config_reference))?;
             performed.wrote_config = true;
         }
 
@@ -756,6 +757,7 @@ impl HostLifecycleExecutor {
                     )
                 },
             )?;
+            grant_runtime_config_read(Path::new(job.config_reference))?;
             performed.wrote_config = true;
         }
 
@@ -1765,6 +1767,10 @@ fn restore_current_after_failed_rollback(
                     errors.push(format!(
                         "restoring the pre-rollback configuration failed: {error}"
                     ));
+                } else if let Err(error) =
+                    grant_runtime_config_read(Path::new(job.config_reference))
+                {
+                    errors.push(error.detail);
                 }
             }
             None => errors.push(
@@ -1807,7 +1813,20 @@ fn restore_snapshot_bytes(scope_dir: &Path, config_reference: &str) -> Result<()
             super::install_exec::CONFIG_INVALID,
             sanitize(format!("restoring the config snapshot failed: {error}")),
         )
-    })
+    })?;
+    grant_runtime_config_read(Path::new(config_reference))
+}
+
+fn grant_runtime_config_read(path: &Path) -> Result<(), Failure> {
+    let preserve_owner = super::install_exec::path_is_owned_by_non_root(path).map_err(|error| {
+        Failure::new(
+            super::install_exec::CONFIG_INVALID,
+            sanitize(format!(
+                "inspecting staged configuration ownership failed: {error}"
+            )),
+        )
+    })?;
+    super::install_exec::set_runtime_identity(path, false, preserve_owner)
 }
 
 fn rollback_result(errors: Vec<String>) -> Result<(), Failure> {
