@@ -1026,7 +1026,7 @@ mod tests {
             server_command_verified: true,
             artifact: current.clone(),
             local_artifact_id: Some(format!("sha256:{}", "c".repeat(64))),
-            ports: Vec::new(),
+            ports: vec!["127.0.0.1:29892->8000/tcp".to_owned()],
             networks: Vec::new(),
             mounts: Vec::new(),
             safe_environment: BTreeMap::new(),
@@ -1038,10 +1038,39 @@ mod tests {
         let unchanged = replacement_from_observation(&observation, "nazoauth", &current)
             .expect("same artifact replacement");
         assert_eq!(unchanged.local_artifact_id, observation.local_artifact_id);
+        assert_eq!(unchanged.ports, ["127.0.0.1:29892:8000/tcp"]);
 
         let changed = replacement_from_observation(&observation, "nazoauth", &next)
             .expect("changed artifact replacement");
         assert_eq!(changed.local_artifact_id, None);
+    }
+
+    #[test]
+    fn replacement_rejects_a_non_neutral_port_binding() {
+        let artifact = runtime_backend::ArtifactReference::Oci {
+            image_reference: "registry.example/nazoauth".to_owned(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+        };
+        let observation = runtime_backend::RuntimeObservation {
+            backend: RuntimeBackendKind::Podman,
+            object_reference: "nazoauth".to_owned(),
+            display_name: "nazoauth".to_owned(),
+            running: true,
+            server_command_verified: true,
+            artifact: artifact.clone(),
+            local_artifact_id: None,
+            ports: vec!["127.0.0.1:29892:8000/tcp".to_owned()],
+            networks: Vec::new(),
+            mounts: Vec::new(),
+            safe_environment: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            evidence: Vec::new(),
+            missing: Vec::new(),
+        };
+
+        let error = replacement_from_observation(&observation, "nazoauth", &artifact)
+            .expect_err("replacement must not pass through an ambiguous port binding");
+        assert_eq!(error.code, OBJECT_IDENTITY_MISMATCH);
     }
 }
 
@@ -1347,6 +1376,26 @@ pub(crate) fn replacement_from_observation(
             ));
         }
     };
+    let ports = observation
+        .ports
+        .iter()
+        .map(|binding| {
+            let (host, container) = binding.split_once("->").ok_or_else(|| {
+                Failure::new(
+                    OBJECT_IDENTITY_MISMATCH,
+                    format!("runtime observation has an invalid port binding '{binding}'"),
+                )
+            })?;
+            if host.is_empty() || container.is_empty() || container.contains("->") {
+                return Err(Failure::new(
+                    OBJECT_IDENTITY_MISMATCH,
+                    format!("runtime observation has an invalid port binding '{binding}'"),
+                ));
+            }
+            Ok(format!("{host}:{container}"))
+        })
+        .collect::<Result<Vec<_>, Failure>>()?;
+
     Ok(runtime_backend::RuntimeReplacement {
         object_reference: object.to_owned(),
         artifact: artifact.clone(),
@@ -1360,7 +1409,7 @@ pub(crate) fn replacement_from_observation(
         environment: observation.safe_environment.clone(),
         networks: observation.networks.clone(),
         ip_address: None,
-        ports: observation.ports.clone(),
+        ports,
         labels: observation.labels.clone(),
         container_policy,
     })
