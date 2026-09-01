@@ -11,7 +11,7 @@ use std::io::{self, IsTerminal as _, Read as _, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -834,19 +834,31 @@ fn probe_ephemeral_tenant(issuer: &str) -> anyhow::Result<()> {
     let mut metadata_url = Url::parse(issuer).context("temporary tenant issuer is invalid")?;
     metadata_url.set_path("/.well-known/openid-configuration");
     let transport = HttpTransport::new(Duration::from_secs(15))?;
-    let response = transport.send(HttpRequest::get(metadata_url), 128 * 1024)?;
-    if response.status != 200 {
-        bail!(
-            "temporary tenant discovery returned HTTP {}",
-            response.status
-        );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match transport.send(HttpRequest::get(metadata_url.clone()), 128 * 1024) {
+            Ok(response) if response.status == 200 => {
+                let metadata: serde_json::Value = serde_json::from_slice(&response.body)
+                    .context("temporary tenant discovery is not JSON")?;
+                if metadata.get("issuer").and_then(serde_json::Value::as_str) != Some(issuer) {
+                    bail!("temporary tenant discovery issuer does not match its routed issuer");
+                }
+                return Ok(());
+            }
+            Ok(response) if Instant::now() >= deadline => {
+                bail!(
+                    "temporary tenant discovery returned HTTP {} after directory reload",
+                    response.status
+                );
+            }
+            Err(error) if Instant::now() >= deadline => {
+                return Err(error).context(
+                    "temporary tenant discovery remained unreachable after directory reload",
+                );
+            }
+            Ok(_) | Err(_) => std::thread::sleep(Duration::from_millis(500)),
+        }
     }
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&response.body).context("temporary tenant discovery is not JSON")?;
-    if metadata.get("issuer").and_then(serde_json::Value::as_str) != Some(issuer) {
-        bail!("temporary tenant discovery issuer does not match its routed issuer");
-    }
-    Ok(())
 }
 
 fn provision_ephemeral_tenant(
