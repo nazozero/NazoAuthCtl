@@ -118,10 +118,11 @@ pub struct ConformanceRunConfig {
     /// required to match the selected plan ids one-for-one; the runner never
     /// derives CIBA semantics from mutable Suite plan names.
     pub plan_lanes: BTreeMap<String, OidfDriverLane>,
-    /// Exact signed resource budget for every selected Matrix plan. The map
-    /// must cover the selected plan ids one-for-one.
+    /// Signed client/time budget for every selected Matrix plan. The map must
+    /// cover the selected plan ids one-for-one; live module counts remain
+    /// Suite-owned and are bounded only by the aggregate module ceiling.
     pub plan_resource_budgets: BTreeMap<String, OidfPlanResourceBudget>,
-    /// Signed aggregate budget for exactly the selected Matrix plans.
+    /// Signed aggregate client/time budget plus the artifact-wide module ceiling.
     pub selected_resource_budget: OidfPlanResourceBudget,
     /// Maximum number of independent Suite plans executed at once. Modules
     /// inside one plan remain strictly ordered. Browser, verifier, and issuer
@@ -745,20 +746,13 @@ impl ConformanceRunner {
                     }
                     enumerated_plan_count += 1;
                     let actual_modules = u32::try_from(defined_modules).ok();
-                    let plan_budget =
-                        self.config.plan_resource_budgets.get(&plan.id).expect(
-                            "selected plan resource budgets were validated at construction",
-                        );
                     let next_observed_modules =
                         actual_modules.and_then(|count| observed_modules.checked_add(count));
-                    let over_budget = actual_modules
-                        .is_none_or(|count| count > plan_budget.modules)
-                        || next_observed_modules.is_none_or(|count| {
-                            count > self.config.selected_resource_budget.modules
-                        });
+                    let over_budget = next_observed_modules
+                        .is_none_or(|count| count > self.config.selected_resource_budget.modules);
                     if over_budget {
                         errors.push(
-                            "Suite plan module allocation exceeds signed resource budget"
+                            "Suite module allocation exceeds the artifact-wide resource bound"
                                 .to_owned(),
                         );
                     }
@@ -1831,7 +1825,11 @@ fn resource_budgets_match_selected(
             })
         },
     );
-    summed.as_ref() == Some(selected_resource_budget)
+    summed.as_ref().is_some_and(|summed| {
+        summed.modules <= selected_resource_budget.modules
+            && summed.clients == selected_resource_budget.clients
+            && summed.wall_clock_seconds == selected_resource_budget.wall_clock_seconds
+    })
 }
 
 #[derive(Clone)]
@@ -3048,7 +3046,7 @@ mod tests {
     }
 
     #[test]
-    fn runner_construction_rejects_inexact_signed_resource_budgets() {
+    fn runner_construction_accepts_module_ceiling_and_rejects_inexact_client_or_time_budgets() {
         let selected = one_plan_matrix(serde_json::json!({}));
         let client = SuiteClient::with_transport(
             Origin::parse("https://suite.example").expect("origin"),
@@ -3076,7 +3074,8 @@ mod tests {
         };
 
         assert!(ConformanceRunner::new(make_config(BTreeMap::new(), budget(0, 0, 0))).is_err());
-        for inexact_total in [budget(2, 1, 60), budget(1, 2, 60), budget(1, 1, 61)] {
+        assert!(ConformanceRunner::new(make_config(one_plan_budgets(), budget(2, 1, 60))).is_ok());
+        for inexact_total in [budget(1, 2, 60), budget(1, 1, 61)] {
             assert!(
                 ConformanceRunner::new(make_config(one_plan_budgets(), inexact_total)).is_err()
             );
@@ -3244,7 +3243,7 @@ mod tests {
 
         assert_eq!(
             report.errors,
-            vec!["Suite plan module allocation exceeds signed resource budget".to_owned()]
+            vec!["Suite module allocation exceeds the artifact-wide resource bound".to_owned()]
         );
         assert_eq!(report.progress.groups[0].status, GroupStatus::Failed);
         assert_eq!(report.plans.len(), 1);

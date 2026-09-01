@@ -178,7 +178,11 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     if plan_resource_budgets.len() != driver_plan.plans.len() {
         bail!("signed driver plan contains duplicate Matrix plan IDs");
     }
-    let selected_resource_budget = driver_plan.selected_resource_budget.clone();
+    let mut selected_resource_budget = driver_plan.selected_resource_budget.clone();
+    // The official Suite owns each plan's live module list and may add tests
+    // without changing the plan identity. Bound the run by the artifact-wide
+    // module ceiling instead of treating an old per-plan count as immutable.
+    selected_resource_budget.modules = driver_plan.artifact.resource_bounds.max_modules;
     let request_jti = format!("request-{}", hex(rand::random::<[u8; 16]>()));
     let ephemeral_tenant = EphemeralTenant::new(&invocation.tenant_id)?;
     let materialization_now = current_unix_time()?;
