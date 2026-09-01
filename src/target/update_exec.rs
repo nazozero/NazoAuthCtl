@@ -1066,6 +1066,14 @@ mod tests {
             image_reference: "registry.example/nazoauth".to_owned(),
             digest: format!("sha256:{}", "b".repeat(64)),
         };
+        let mount = |destination: &str| runtime_backend::NeutralMount {
+            source: PathBuf::from(format!("/srv/nazoauth{}", destination)),
+            destination: PathBuf::from(destination),
+            read_only: true,
+            selinux_relabel: false,
+            ownership: runtime_backend::Responsibility::Managed,
+            scope: runtime_backend::RuntimeResourceScope::Deployment,
+        };
         let observation = runtime_backend::RuntimeObservation {
             backend: RuntimeBackendKind::Podman,
             object_reference: "nazoauth".to_owned(),
@@ -1076,8 +1084,22 @@ mod tests {
             local_artifact_id: Some(format!("sha256:{}", "c".repeat(64))),
             ports: vec!["127.0.0.1:29892->8000/tcp".to_owned()],
             networks: Vec::new(),
-            mounts: Vec::new(),
-            safe_environment: BTreeMap::new(),
+            mounts: vec![
+                mount("/run/secrets/database-runtime-url"),
+                mount("/run/secrets/valkey-url"),
+                mount("/run/secrets/mfa-key"),
+            ],
+            safe_environment: BTreeMap::from([
+                (
+                    "DATABASE_URL_FILE".to_owned(),
+                    "/run/secrets/database-runtime-url".to_owned(),
+                ),
+                (
+                    "VALKEY_URL_FILE".to_owned(),
+                    "/run/secrets/valkey-url".to_owned(),
+                ),
+                ("DATA_DIR".to_owned(), "/var/lib/nazoauth".to_owned()),
+            ]),
             labels: BTreeMap::new(),
             evidence: Vec::new(),
             missing: Vec::new(),
@@ -1087,6 +1109,15 @@ mod tests {
             .expect("same artifact replacement");
         assert_eq!(unchanged.local_artifact_id, observation.local_artifact_id);
         assert_eq!(unchanged.ports, ["127.0.0.1:29892:8000/tcp"]);
+        assert_eq!(unchanged.mounts.len(), 1);
+        assert_eq!(
+            unchanged.mounts[0].destination,
+            PathBuf::from("/run/secrets/mfa-key")
+        );
+        assert_eq!(
+            unchanged.environment,
+            BTreeMap::from([("DATA_DIR".to_owned(), "/var/lib/nazoauth".to_owned())])
+        );
 
         let changed = replacement_from_observation(&observation, "nazoauth", &next)
             .expect("changed artifact replacement");
@@ -1444,6 +1475,25 @@ pub(crate) fn replacement_from_observation(
         })
         .collect::<Result<Vec<_>, Failure>>()?;
 
+    let legacy_url_mounts = [
+        Path::new(super::install_exec::CONTAINER_SECRETS_DIR).join("database-runtime-url"),
+        Path::new(super::install_exec::CONTAINER_SECRETS_DIR).join("valkey-url"),
+    ];
+    let mounts = observation
+        .mounts
+        .iter()
+        .filter(|mount| !legacy_url_mounts.contains(&mount.destination))
+        .cloned()
+        .collect();
+    let environment = observation
+        .safe_environment
+        .iter()
+        .filter(|(name, _)| {
+            name.as_str() != "DATABASE_URL_FILE" && name.as_str() != "VALKEY_URL_FILE"
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+
     Ok(runtime_backend::RuntimeReplacement {
         object_reference: object.to_owned(),
         artifact: artifact.clone(),
@@ -1453,8 +1503,8 @@ pub(crate) fn replacement_from_observation(
             None
         },
         command,
-        mounts: observation.mounts.clone(),
-        environment: observation.safe_environment.clone(),
+        mounts,
+        environment,
         networks: observation.networks.clone(),
         ip_address: None,
         ports,
