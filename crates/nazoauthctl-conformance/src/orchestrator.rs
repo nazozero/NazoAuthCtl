@@ -2180,8 +2180,12 @@ fn validate_value_origins(
                 return Err(());
             }
             let same_suite = same_url_origin(suite, &parsed);
-            let explicit_external =
-                key.is_some_and(|key| matches!(key, "issuer" | "request_object_trust_anchor_uri"));
+            let explicit_external = key.is_some_and(|key| {
+                matches!(
+                    key,
+                    "issuer" | "request_object_trust_anchor_uri" | "automated_ciba_approval_url"
+                )
+            });
             if !(same_suite || same_target || explicit_external) {
                 return Err(());
             }
@@ -3645,6 +3649,30 @@ mod tests {
             }]
         });
         assert_eq!(validate_value_origins(&config, &suite, None, None), Ok(()));
+    }
+
+    #[test]
+    fn origin_validation_accepts_only_the_named_external_ciba_callback() {
+        let suite = Origin::parse("https://suite.example").expect("origin");
+        let callback = "https://callback.oidf.example/approval";
+        assert_eq!(
+            validate_value_origins(
+                &serde_json::json!({"automated_ciba_approval_url": callback}),
+                &suite,
+                None,
+                None,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_value_origins(
+                &serde_json::json!({"untrusted_url": callback}),
+                &suite,
+                None,
+                None,
+            ),
+            Err(())
+        );
     }
 
     #[test]
