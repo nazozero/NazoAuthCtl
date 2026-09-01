@@ -1519,11 +1519,18 @@ fn run_prestart_database_tasks(
         "DATABASE_URL".to_owned(),
         install_secret_value(job, "database-lifecycle-url")?,
     );
-    let mut mounts = vec![mount(
-        PathBuf::from(job.config_reference),
-        CONTAINER_CONFIG_FILE,
-        true,
-    )];
+    let mut mounts = vec![
+        mount(
+            PathBuf::from(job.config_reference),
+            CONTAINER_CONFIG_FILE,
+            true,
+        ),
+        mount(
+            PathBuf::from(&job.order.data_root),
+            CONTAINER_DATA_DIR,
+            false,
+        ),
+    ];
     mounts.extend(
         job.order
             .secrets
