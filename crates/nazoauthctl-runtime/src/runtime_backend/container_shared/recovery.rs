@@ -52,10 +52,10 @@ pub(crate) fn stage_recovery_candidate(
         source.server_command_verified,
         "{backend_name} recovery source is not a NazoAuth server"
     );
-    ensure!(
-        source.artifact == request.artifact,
-        "{backend_name} recovery source artifact differs from RecoveryFacts"
-    );
+    // The stopped source object describes the deployment's network and
+    // identity surface. Its image is expected to differ when recovering an
+    // earlier snapshot; the digest-bound RecoveryFacts artifact below owns
+    // the candidate image.
     ensure!(
         source.labels.get(DEPLOYMENT_LABEL) == Some(&request.deployment_id),
         "{backend_name} recovery source deployment identity differs"

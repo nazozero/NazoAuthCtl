@@ -768,11 +768,16 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 plan.state_epoch.clone(),
             ),
         )?;
-        let crate::target::HostOutcome::Completed {
-            body: crate::target::HostCompletionBody::BackupRecoveryCandidateStaged { endpoint },
-        } = result.outcome
-        else {
-            bail!("recover: target did not confirm the closed recovery candidate")
+        let endpoint = match result.outcome {
+            crate::target::HostOutcome::Completed {
+                body: crate::target::HostCompletionBody::BackupRecoveryCandidateStaged { endpoint },
+            } => endpoint,
+            crate::target::HostOutcome::Failed { code, detail } => {
+                bail!("recover candidate stage failed: {code}: {detail}")
+            }
+            crate::target::HostOutcome::Completed { .. } => {
+                bail!("recover: target returned an unexpected candidate completion")
+            }
         };
         if endpoint.deployment_id != record.deployment_id
             || endpoint.operation_id != plan.recover_operation_id

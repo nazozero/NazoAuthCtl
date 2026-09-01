@@ -7,7 +7,7 @@
 //! dropped SSH session resolve through this journal alone:
 //!
 //! - same id + same canonical hash ⇒ replay; the stored result is returned
-//!   verbatim (idempotent), except a failed `backup-recover`, whose own
+//!   verbatim (idempotent), except failed recovery-phase operations, whose own
 //!   operation-bound checkpoints require the same id for forward resumption;
 //! - same id + different hash ⇒ stable `OPERATION_ID_CONFLICT`; the original
 //!   intent is never overwritten;
@@ -273,11 +273,14 @@ impl TargetJournal {
             .as_ref()
             .is_some_and(|line| matches!(line.status, JournalStatus::Pending));
 
-        let retry_failed_backup_recover = latest.as_ref().is_some_and(|line| {
+        let retry_failed_recovery_phase = latest.as_ref().is_some_and(|line| {
             matches!(line.status, JournalStatus::Failed)
                 && matches!(
                     operation.operation,
                     super::wire::HostOperationBody::BackupRecover { .. }
+                        | super::wire::HostOperationBody::BackupRecoveryCandidateStage { .. }
+                        | super::wire::HostOperationBody::BackupRecoveryCandidateCleanup { .. }
+                        | super::wire::HostOperationBody::BackupRecoveryActivate { .. }
                 )
         });
 
@@ -291,7 +294,7 @@ impl TargetJournal {
         // abandon the only forward-resumable state.
         if let Some(line) = latest
             && !matches!(line.status, JournalStatus::Pending)
-            && !retry_failed_backup_recover
+            && !retry_failed_recovery_phase
             && let Some(result) = line.result
         {
             return Ok(result);
@@ -855,6 +858,35 @@ mod tests {
             HostResult::failed(&operation.operation_id, "RESTORE_TEST_FAILED", "first")
         })?;
         assert!(matches!(first.outcome, HostOutcome::Failed { .. }));
+
+        let reexecuted = std::cell::Cell::new(false);
+        let second = journal.run_journaled(&operation, |operation| {
+            reexecuted.set(true);
+            HostResult::failed(&operation.operation_id, "RETRY_EXECUTED", "second")
+        })?;
+        assert!(reexecuted.get());
+        assert!(matches!(
+            second.outcome,
+            HostOutcome::Failed { ref code, .. } if code == "RETRY_EXECUTED"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_recovery_candidate_stage_reexecutes_with_the_same_operation_id() -> anyhow::Result<()>
+    {
+        let temp = filesystem::PrivateTempDir::new("nazoauthctl-journal-candidate-retry")?;
+        let journal = TargetJournal::open(temp.path().join("state"))?;
+        let operation = HostOperation::backup_recovery_candidate_stage(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            3,
+            Uuid::now_v7().to_string(),
+            Uuid::now_v7().to_string(),
+        );
+        journal.run_journaled(&operation, |operation| {
+            HostResult::failed(&operation.operation_id, "RESTORE_TEST_FAILED", "first")
+        })?;
 
         let reexecuted = std::cell::Cell::new(false);
         let second = journal.run_journaled(&operation, |operation| {
