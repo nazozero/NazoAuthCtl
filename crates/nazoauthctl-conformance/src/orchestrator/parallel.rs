@@ -19,6 +19,7 @@ struct PlanWork {
 }
 
 enum WorkerMessage {
+    Activity(ProgressActivity),
     Progress {
         index: usize,
         snapshot: Box<ProgressSnapshot>,
@@ -39,6 +40,10 @@ struct ChannelSink {
 }
 
 impl ProgressSink for ChannelSink {
+    fn activity(&mut self, activity: &ProgressActivity) {
+        let _ = self.sender.send(WorkerMessage::Activity(activity.clone()));
+    }
+
     fn update(&mut self, event: &ProgressEvent) {
         if event
             .snapshot
@@ -61,7 +66,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
     // This freezes the complete denominator and gives cleanup one inventory
     // containing every Suite plan, including plans never dequeued after a
     // later worker failure or interruption.
-    let prepared = runner.prepare_run();
+    let prepared = runner.prepare_run(sink);
     sink.update(&ProgressEvent {
         snapshot: snapshot(
             &prepared.groups,
@@ -178,6 +183,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
         let mut stopped_workers = 0usize;
         while stopped_workers < worker_count {
             match receiver.recv() {
+                Ok(WorkerMessage::Activity(activity)) => sink.activity(&activity),
                 Ok(WorkerMessage::Progress { index, snapshot }) => {
                     snapshots[index] = Some(*snapshot);
                     sink.update(&ProgressEvent {

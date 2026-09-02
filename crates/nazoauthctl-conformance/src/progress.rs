@@ -45,6 +45,72 @@ pub enum GroupStatus {
     Remaining,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OutputLanguage {
+    Chinese,
+    #[default]
+    English,
+}
+
+impl OutputLanguage {
+    pub fn from_locale(locale: Option<&str>) -> Self {
+        let language = locale
+            .unwrap_or_default()
+            .split(['-', '_', '.', '@', ':'])
+            .next()
+            .unwrap_or_default();
+        if language.eq_ignore_ascii_case("zh") {
+            Self::Chinese
+        } else {
+            Self::English
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProgressActivity {
+    OpeningDeployment,
+    LoadingMatrix,
+    AuthenticatingSuite,
+    RecoveringPreviousRun,
+    PreparingTenant {
+        issuer: String,
+    },
+    CreatingTenant {
+        issuer: String,
+    },
+    CheckingTenant {
+        issuer: String,
+    },
+    ApplyingResources,
+    StartingBrowser {
+        current: usize,
+        total: usize,
+    },
+    CreatingSuitePlan {
+        current: usize,
+        total: usize,
+        plan: String,
+    },
+    CreatingSuiteModule {
+        test: String,
+    },
+    WaitingForSuite {
+        test: String,
+        elapsed_seconds: u64,
+    },
+    InspectingCibaRequest {
+        test: String,
+    },
+    SubmittingCibaDecision {
+        test: String,
+        approve: bool,
+    },
+    CleaningUp,
+    WritingEvidence,
+    Finished,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GroupProgress {
     pub id: String,
@@ -112,6 +178,8 @@ pub struct ProgressEvent {
 
 pub trait ProgressSink {
     fn update(&mut self, event: &ProgressEvent);
+
+    fn activity(&mut self, _activity: &ProgressActivity) {}
 }
 
 impl ProgressSink for () {
@@ -120,11 +188,16 @@ impl ProgressSink for () {
 
 pub struct StableRenderer<W: Write> {
     writer: W,
+    language: OutputLanguage,
 }
 
 impl<W: Write> StableRenderer<W> {
     pub fn new(writer: W) -> Self {
-        Self { writer }
+        Self::localized(writer, OutputLanguage::English)
+    }
+
+    pub fn localized(writer: W, language: OutputLanguage) -> Self {
+        Self { writer, language }
     }
 
     pub fn into_inner(self) -> W {
@@ -134,20 +207,39 @@ impl<W: Write> StableRenderer<W> {
 
 impl<W: Write> ProgressSink for StableRenderer<W> {
     fn update(&mut self, event: &ProgressEvent) {
+        let labels = labels(self.language);
         let _ = writeln!(
             self.writer,
-            "NazoAuth OIDF Conformance: {}/{} ({:>3}%) Passed {} · Review {} · Skipped {} · Failed {} · Incomplete {} · Running {} · Remaining {}{}",
+            "{}: {}/{} ({:>3}%) {} {} · {} {} · {} {} · {} {} · {} {} · {} {} · {} {}{}",
+            labels.title,
             event.snapshot.completed,
             event.snapshot.total,
             percent(event.snapshot.completed, event.snapshot.total),
+            labels.passed,
             event.snapshot.passed,
+            labels.review,
             event.snapshot.reviewed,
+            labels.skipped,
             event.snapshot.skipped,
+            labels.failed,
             event.snapshot.failed,
+            labels.incomplete,
             event.snapshot.incomplete,
+            labels.running,
             event.snapshot.running,
+            labels.remaining,
             event.snapshot.remaining,
-            current_label(&event.snapshot)
+            current_label(&event.snapshot, self.language)
+        );
+        let _ = self.writer.flush();
+    }
+
+    fn activity(&mut self, activity: &ProgressActivity) {
+        let _ = writeln!(
+            self.writer,
+            "{}: {}",
+            labels(self.language).status,
+            activity_label(activity, self.language)
         );
         let _ = self.writer.flush();
     }
@@ -155,11 +247,23 @@ impl<W: Write> ProgressSink for StableRenderer<W> {
 
 pub struct TtyRenderer<W: Write> {
     writer: W,
+    language: OutputLanguage,
+    snapshot: Option<ProgressSnapshot>,
+    activity: Option<ProgressActivity>,
 }
 
 impl<W: Write> TtyRenderer<W> {
     pub fn new(writer: W) -> Self {
-        Self { writer }
+        Self::localized(writer, OutputLanguage::English)
+    }
+
+    pub fn localized(writer: W, language: OutputLanguage) -> Self {
+        Self {
+            writer,
+            language,
+            snapshot: None,
+            activity: None,
+        }
     }
 
     pub fn into_inner(self) -> W {
@@ -169,25 +273,52 @@ impl<W: Write> TtyRenderer<W> {
 
 impl<W: Write> ProgressSink for TtyRenderer<W> {
     fn update(&mut self, event: &ProgressEvent) {
+        self.snapshot = Some(event.snapshot.clone());
+        self.render();
+    }
+
+    fn activity(&mut self, activity: &ProgressActivity) {
+        self.activity = Some(activity.clone());
+        self.render();
+    }
+}
+
+impl<W: Write> TtyRenderer<W> {
+    fn render(&mut self) {
         // Clear the previous compact frame. Progress is item based and never
         // estimates duration, so no ETA is printed.
         let _ = write!(self.writer, "\x1b[2J\x1b[H");
-        let (filled, empty) = bar(event.snapshot.completed, event.snapshot.total, 20);
-        let _ = writeln!(self.writer, "NazoAuth OIDF Conformance");
+        let labels = labels(self.language);
+        let _ = writeln!(self.writer, "{}", labels.title);
+        if let Some(activity) = &self.activity {
+            let _ = writeln!(
+                self.writer,
+                "{}: {}",
+                labels.status,
+                activity_label(activity, self.language)
+            );
+        }
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            let _ = self.writer.flush();
+            return;
+        };
+        let _ = writeln!(self.writer);
+        let (filled, empty) = bar(snapshot.completed, snapshot.total, 20);
         let _ = writeln!(
             self.writer,
-            "Overall  {}{}  {:>3}%",
+            "{}  {}{}  {:>3}%",
+            labels.overall,
             "█".repeat(filled),
             "░".repeat(empty),
-            percent(event.snapshot.completed, event.snapshot.total)
+            percent(snapshot.completed, snapshot.total)
         );
         let _ = writeln!(
             self.writer,
             "         {} / {}",
-            event.snapshot.completed, event.snapshot.total
+            snapshot.completed, snapshot.total
         );
         let _ = writeln!(self.writer);
-        for group in &event.snapshot.groups {
+        for group in &snapshot.groups {
             let symbol = match group.status {
                 GroupStatus::Passed => '✓',
                 GroupStatus::Review => '!',
@@ -207,39 +338,219 @@ impl<W: Write> ProgressSink for TtyRenderer<W> {
             );
         }
         let _ = writeln!(self.writer);
-        let _ = writeln!(self.writer, "Current:");
+        let _ = writeln!(self.writer, "{}:", labels.current);
         let _ = writeln!(
             self.writer,
             "  {}",
             current_matrix_label(
-                event.snapshot.current_profile.as_deref(),
-                event.snapshot.current_variant.as_ref()
+                snapshot.current_profile.as_deref(),
+                snapshot.current_variant.as_ref()
             )
         );
         let _ = writeln!(
             self.writer,
             "  {}",
-            event.snapshot.current_test.as_deref().unwrap_or("-")
+            snapshot.current_test.as_deref().unwrap_or("-")
         );
         let _ = writeln!(self.writer);
         let _ = writeln!(
             self.writer,
-            "Passed {} · Review {} · Skipped {} · Failed {} · Incomplete {} · Running {} · Remaining {}",
-            event.snapshot.passed,
-            event.snapshot.reviewed,
-            event.snapshot.skipped,
-            event.snapshot.failed,
-            event.snapshot.incomplete,
-            event.snapshot.running,
-            event.snapshot.remaining
+            "{} {} · {} {} · {} {} · {} {} · {} {} · {} {} · {} {}",
+            labels.passed,
+            snapshot.passed,
+            labels.review,
+            snapshot.reviewed,
+            labels.skipped,
+            snapshot.skipped,
+            labels.failed,
+            snapshot.failed,
+            labels.incomplete,
+            snapshot.incomplete,
+            labels.running,
+            snapshot.running,
+            labels.remaining,
+            snapshot.remaining
         );
         let _ = self.writer.flush();
     }
 }
 
-fn current_label(snapshot: &ProgressSnapshot) -> String {
+struct Labels {
+    title: &'static str,
+    status: &'static str,
+    overall: &'static str,
+    current: &'static str,
+    passed: &'static str,
+    review: &'static str,
+    skipped: &'static str,
+    failed: &'static str,
+    incomplete: &'static str,
+    running: &'static str,
+    remaining: &'static str,
+}
+
+fn labels(language: OutputLanguage) -> Labels {
+    match language {
+        OutputLanguage::Chinese => Labels {
+            title: "NazoAuth OIDF 一致性测试",
+            status: "状态",
+            overall: "总进度",
+            current: "当前",
+            passed: "通过",
+            review: "待复核",
+            skipped: "跳过",
+            failed: "失败",
+            incomplete: "未完成",
+            running: "运行中",
+            remaining: "剩余",
+        },
+        OutputLanguage::English => Labels {
+            title: "NazoAuth OIDF Conformance",
+            status: "Status",
+            overall: "Overall",
+            current: "Current",
+            passed: "Passed",
+            review: "Review",
+            skipped: "Skipped",
+            failed: "Failed",
+            incomplete: "Incomplete",
+            running: "Running",
+            remaining: "Remaining",
+        },
+    }
+}
+
+fn activity_label(activity: &ProgressActivity, language: OutputLanguage) -> String {
+    match (language, activity) {
+        (OutputLanguage::Chinese, ProgressActivity::OpeningDeployment) => {
+            "正在读取实例配置".to_owned()
+        }
+        (OutputLanguage::English, ProgressActivity::OpeningDeployment) => {
+            "Reading instance configuration".to_owned()
+        }
+        (OutputLanguage::Chinese, ProgressActivity::LoadingMatrix) => {
+            "正在加载 OIDF 测试计划".to_owned()
+        }
+        (OutputLanguage::English, ProgressActivity::LoadingMatrix) => {
+            "Loading OIDF test plan".to_owned()
+        }
+        (OutputLanguage::Chinese, ProgressActivity::AuthenticatingSuite) => {
+            "正在连接并认证 OIDF Suite".to_owned()
+        }
+        (OutputLanguage::English, ProgressActivity::AuthenticatingSuite) => {
+            "Connecting to and authenticating with OIDF Suite".to_owned()
+        }
+        (OutputLanguage::Chinese, ProgressActivity::RecoveringPreviousRun) => {
+            "正在检查并恢复上次未完成的运行".to_owned()
+        }
+        (OutputLanguage::English, ProgressActivity::RecoveringPreviousRun) => {
+            "Checking and recovering an unfinished run".to_owned()
+        }
+        (OutputLanguage::Chinese, ProgressActivity::PreparingTenant { issuer }) => {
+            format!("正在准备临时租户 {issuer}")
+        }
+        (OutputLanguage::English, ProgressActivity::PreparingTenant { issuer }) => {
+            format!("Preparing temporary tenant {issuer}")
+        }
+        (OutputLanguage::Chinese, ProgressActivity::CreatingTenant { issuer }) => {
+            format!("正在创建临时租户 {issuer}")
+        }
+        (OutputLanguage::English, ProgressActivity::CreatingTenant { issuer }) => {
+            format!("Creating temporary tenant {issuer}")
+        }
+        (OutputLanguage::Chinese, ProgressActivity::CheckingTenant { issuer }) => {
+            format!("正在检查临时租户公网可达性 {issuer}")
+        }
+        (OutputLanguage::English, ProgressActivity::CheckingTenant { issuer }) => {
+            format!("Checking public reachability for temporary tenant {issuer}")
+        }
+        (OutputLanguage::Chinese, ProgressActivity::ApplyingResources) => {
+            "正在写入租户测试资源".to_owned()
+        }
+        (OutputLanguage::English, ProgressActivity::ApplyingResources) => {
+            "Applying tenant test resources".to_owned()
+        }
+        (OutputLanguage::Chinese, ProgressActivity::StartingBrowser { current, total }) => {
+            format!("正在启动浏览器 {current}/{total}")
+        }
+        (OutputLanguage::English, ProgressActivity::StartingBrowser { current, total }) => {
+            format!("Starting browser {current}/{total}")
+        }
+        (
+            OutputLanguage::Chinese,
+            ProgressActivity::CreatingSuitePlan {
+                current,
+                total,
+                plan,
+            },
+        ) => format!("正在创建 Suite 计划 {current}/{total}: {plan}"),
+        (
+            OutputLanguage::English,
+            ProgressActivity::CreatingSuitePlan {
+                current,
+                total,
+                plan,
+            },
+        ) => format!("Creating Suite plan {current}/{total}: {plan}"),
+        (OutputLanguage::Chinese, ProgressActivity::CreatingSuiteModule { test }) => {
+            format!("正在创建测试模块: {test}")
+        }
+        (OutputLanguage::English, ProgressActivity::CreatingSuiteModule { test }) => {
+            format!("Creating test module: {test}")
+        }
+        (
+            OutputLanguage::Chinese,
+            ProgressActivity::WaitingForSuite {
+                test,
+                elapsed_seconds,
+            },
+        ) => format!("正在等待 Suite: {test}（已等待 {elapsed_seconds} 秒）"),
+        (
+            OutputLanguage::English,
+            ProgressActivity::WaitingForSuite {
+                test,
+                elapsed_seconds,
+            },
+        ) => format!("Waiting for Suite: {test} ({elapsed_seconds}s)"),
+        (OutputLanguage::Chinese, ProgressActivity::InspectingCibaRequest { test }) => {
+            format!("正在读取 CIBA 用户请求: {test}")
+        }
+        (OutputLanguage::English, ProgressActivity::InspectingCibaRequest { test }) => {
+            format!("Reading CIBA user request: {test}")
+        }
+        (OutputLanguage::Chinese, ProgressActivity::SubmittingCibaDecision { test, approve }) => {
+            format!(
+                "正在{} CIBA 用户请求: {test}",
+                if *approve { "批准" } else { "拒绝" }
+            )
+        }
+        (OutputLanguage::English, ProgressActivity::SubmittingCibaDecision { test, approve }) => {
+            format!(
+                "{} CIBA user request: {test}",
+                if *approve { "Approving" } else { "Rejecting" }
+            )
+        }
+        (OutputLanguage::Chinese, ProgressActivity::CleaningUp) => {
+            "正在清理临时租户和未保留的 Suite 资源".to_owned()
+        }
+        (OutputLanguage::English, ProgressActivity::CleaningUp) => {
+            "Cleaning up the temporary tenant and unretained Suite resources".to_owned()
+        }
+        (OutputLanguage::Chinese, ProgressActivity::WritingEvidence) => {
+            "正在写入测试证据".to_owned()
+        }
+        (OutputLanguage::English, ProgressActivity::WritingEvidence) => {
+            "Writing test evidence".to_owned()
+        }
+        (OutputLanguage::Chinese, ProgressActivity::Finished) => "运行结束".to_owned(),
+        (OutputLanguage::English, ProgressActivity::Finished) => "Run finished".to_owned(),
+    }
+}
+
+fn current_label(snapshot: &ProgressSnapshot, language: OutputLanguage) -> String {
     format!(
-        " current={}/{}",
+        " {}={}/{}",
+        labels(language).current,
         current_matrix_label(
             snapshot.current_profile.as_deref(),
             snapshot.current_variant.as_ref()
@@ -288,6 +599,38 @@ fn bar(completed: usize, total: usize, width: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locale_selects_chinese_only_for_zh() {
+        assert_eq!(
+            OutputLanguage::from_locale(Some("zh_CN.UTF-8")),
+            OutputLanguage::Chinese
+        );
+        assert_eq!(
+            OutputLanguage::from_locale(Some("zh-Hant-TW")),
+            OutputLanguage::Chinese
+        );
+        assert_eq!(
+            OutputLanguage::from_locale(Some("en_US.UTF-8")),
+            OutputLanguage::English
+        );
+        assert_eq!(OutputLanguage::from_locale(None), OutputLanguage::English);
+    }
+
+    #[test]
+    fn chinese_activity_reports_waiting_test_and_elapsed_time() {
+        let mut output = Vec::new();
+        let mut renderer = StableRenderer::localized(&mut output, OutputLanguage::Chinese);
+        renderer.activity(&ProgressActivity::WaitingForSuite {
+            test: "fapi-ciba-test".to_owned(),
+            elapsed_seconds: 15,
+        });
+        let text = String::from_utf8(output).expect("utf8");
+        assert_eq!(
+            text,
+            "状态: 正在等待 Suite: fapi-ciba-test（已等待 15 秒）\n"
+        );
+    }
 
     #[test]
     fn stable_renderer_has_no_escape_sequences() {

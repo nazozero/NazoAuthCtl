@@ -24,13 +24,14 @@ use nazoauthctl_conformance::{
     EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, HttpRequest,
     HttpTransport, ManagedWebDriver, MatrixSelection, OidfArtifactMatrix, OidfDriverLane,
     OidfPlanResourceBudget, OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
-    OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard,
-    RunControl, StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionDeferredReview,
-    SuiteRetentionManifest, SuiteRetentionManifestReceipt, SuiteRetentionPlan,
-    SuiteRetentionScreenshotManifest, TenantResourceApplyOutput, TenantResourceControlOperation,
-    TenantResourceRecoveryBinding, TenantResourceRecoveryPhase, Transport, TtyRenderer,
-    bundled_oidf_matrix, open_bundled_oidf_driver_plan, recover_suite_resources,
-    write_private_control_evidence_bundle, write_review_screenshot_manifest,
+    OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, OutputLanguage,
+    ProgressActivity, ProgressSink, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
+    SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
+    SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
+    TenantResourceApplyOutput, TenantResourceControlOperation, TenantResourceRecoveryBinding,
+    TenantResourceRecoveryPhase, Transport, TtyRenderer, bundled_oidf_matrix,
+    open_bundled_oidf_driver_plan, recover_suite_resources, write_private_control_evidence_bundle,
+    write_review_screenshot_manifest,
 };
 use serde::Serialize;
 use url::Url;
@@ -40,6 +41,30 @@ use super::RunInvocation;
 
 const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
 pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
+    let language = OutputLanguage::from_locale(
+        ["LC_ALL", "LC_MESSAGES", "LANG"]
+            .into_iter()
+            .find_map(|name| env::var(name).ok().filter(|value| !value.is_empty()))
+            .as_deref(),
+    );
+    if io::stderr().is_terminal() {
+        execute_with_progress(
+            invocation,
+            &mut TtyRenderer::localized(io::stderr(), language),
+        )
+    } else {
+        execute_with_progress(
+            invocation,
+            &mut StableRenderer::localized(io::stderr(), language),
+        )
+    }
+}
+
+fn execute_with_progress<S: ProgressSink>(
+    invocation: RunInvocation,
+    progress: &mut S,
+) -> anyhow::Result<i32> {
+    progress.activity(&ProgressActivity::OpeningDeployment);
     let session = nazoauthctl_core::ConformanceSession::open(invocation.instance.as_deref())
         .context("deployment is not ready for ordinary conformance orchestration")?;
     let suite_origin = Origin::parse_public_suite(session.oidf_suite_origin())
@@ -49,6 +74,7 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
     let recovery_store =
         ConformanceRecoveryStore::open(&recovery_directory, &deployment.deployment_id)?;
 
+    progress.activity(&ProgressActivity::LoadingMatrix);
     let now = current_unix_time()?;
     let driver_plan = open_bundled_oidf_driver_plan(
         OidfPlanSelection {
@@ -61,6 +87,7 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
     .context("bundled OIDF Matrix cannot be opened")?;
     let artifact_digest = driver_plan.artifact.driver_manifest_sha256.clone();
 
+    progress.activity(&ProgressActivity::AuthenticatingSuite);
     let (token, prompted) = resolve_token(&invocation, &suite_origin)?;
     let suite_client =
         SuiteClient::new(suite_origin.clone(), token.clone(), ClientConfig::default())
@@ -71,6 +98,7 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
     if prompted {
         CredentialStore::new(credential_root()?)?.save(&suite_origin, &token)?;
     }
+    progress.activity(&ProgressActivity::RecoveringPreviousRun);
     let recovered_retention = recover_pending_runs(&session, &recovery_store, &suite_client)?;
     if !recovered_retention.is_empty() {
         serde_json::to_writer_pretty(
@@ -83,6 +111,7 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
         )
         .context("failed to write recovered retention report")?;
         writeln!(io::stdout()).context("failed to finish recovered retention report")?;
+        progress.activity(&ProgressActivity::Finished);
         return Ok(0);
     }
     let matrix: OidfArtifactMatrix =
@@ -118,6 +147,9 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
     let evidence_directory = create_evidence_directory(&recovery_directory, &request_jti)?;
     let ephemeral_tenant =
         EphemeralTenant::new(&invocation.tenant_id, session.oidf_tenant_domain())?;
+    progress.activity(&ProgressActivity::PreparingTenant {
+        issuer: ephemeral_tenant.issuer.clone(),
+    });
     let materialization_now = current_unix_time()?;
     if materialization_now > driver_plan.latest_execution_start_at {
         bail!("signed artifact no longer has enough validity remaining for the selected run");
@@ -184,12 +216,19 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
         }
     };
     let setup_result = (|| -> anyhow::Result<_> {
+        progress.activity(&ProgressActivity::CreatingTenant {
+            issuer: ephemeral_tenant.issuer.clone(),
+        });
         let deployment_trust_anchor =
             provision_ephemeral_tenant(&session, &ephemeral_tenant, &recovery)
                 .context("failed to provision the run-scoped OIDF tenant")?;
+        progress.activity(&ProgressActivity::CheckingTenant {
+            issuer: ephemeral_tenant.issuer.clone(),
+        });
         probe_ephemeral_tenant(&ephemeral_tenant.issuer).context(
             "the temporary tenant is not publicly reachable; verify wildcard DNS, TLS, and host routing for the configured OIDF tenant domain",
         )?;
+        progress.activity(&ProgressActivity::ApplyingResources);
         let baseline = session
             .execute_control_operation(
                 ControlOperationPayload::TenantResourceEnumerate {
@@ -264,7 +303,10 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
     })();
     let ordinary = match setup_result {
         Ok(ordinary) => ordinary,
-        Err(error) => return cleanup_failed_pre_suite_setup(&session, recovery, error),
+        Err(error) => {
+            progress.activity(&ProgressActivity::CleaningUp);
+            return cleanup_failed_pre_suite_setup(&session, recovery, error);
+        }
     };
     let mut deployment_report = DeploymentReport {
         deployment_id: deployment.deployment_id.clone(),
@@ -308,8 +350,10 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
         recovery.clone(),
         ciba_approver,
         &evidence_directory,
+        progress,
     );
 
+    progress.activity(&ProgressActivity::CleaningUp);
     let mut recovery = take_recovery(recovery)?;
     let mut retention_eligible = run_result
         .as_ref()
@@ -489,6 +533,7 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
     // only by outer diagnostics and an absent receipt.
     let mut evidence = None;
     if let (Some(report), Some(cleanup_operations)) = (report.as_ref(), cleanup_evidence.as_ref()) {
+        progress.activity(&ProgressActivity::WritingEvidence);
         let runtime = evidence_runtime(&deployment.runtime);
         let identity = EvidenceBundleIdentity {
             run_jti: request_jti.clone(),
@@ -556,6 +601,7 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
         evidence,
         deployment: deployment_report,
     };
+    progress.activity(&ProgressActivity::Finished);
     serde_json::to_writer_pretty(io::stdout().lock(), &output)
         .context("failed to write the structured ordinary conformance report")?;
     writeln!(io::stdout()).context("failed to finish the structured conformance report")?;
@@ -892,7 +938,7 @@ struct RunSecrets {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_signed_suite(
+fn run_signed_suite<S: ProgressSink>(
     mut materialized: nazoauthctl_conformance::TenantResourceMaterializedMatrix,
     suite_client: SuiteClient,
     token: BearerToken,
@@ -907,6 +953,7 @@ fn run_signed_suite(
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
     ciba_approver: Option<Arc<CibaUserApprovalClient>>,
     evidence_directory: &Path,
+    progress: &mut S,
 ) -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
     let binding = ConformanceBinding::openid4vc_trust_policy(
         materialized.trust_policy_resource_id(),
@@ -946,7 +993,11 @@ fn run_signed_suite(
         })
         .context("requested selection is outside the signed artifact Matrix")?;
     let mut automation = Vec::with_capacity(invocation.jobs);
-    for _ in 0..invocation.jobs {
+    for index in 0..invocation.jobs {
+        progress.activity(&ProgressActivity::StartingBrowser {
+            current: index + 1,
+            total: invocation.jobs,
+        });
         let browser = build_browser(target_issuer, suite_origin)?;
         let issuer: Arc<Mutex<dyn OpenId4VciIssuerDriver>> =
             Arc::new(Mutex::new(OpenId4VciIssuerClient::new(
@@ -1000,13 +1051,7 @@ fn run_signed_suite(
             retain_suite_plans_for_certification: invocation.retain_suite_plans_for_certification,
         })),
     })?;
-    let summary = if io::stderr().is_terminal() {
-        let mut renderer = TtyRenderer::new(io::stderr().lock());
-        runner.run(&mut renderer)
-    } else {
-        let mut renderer = StableRenderer::new(io::stderr().lock());
-        runner.run(&mut renderer)
-    };
+    let summary = runner.run(progress);
     Ok(summary.report)
 }
 

@@ -441,7 +441,7 @@ fn merge_terminal_and_deferred_review_workers(
         parallel_fixture(serde_json::json!({}), &["plan-a", "plan-b"], None);
     runner.config.suite_resource_observer = Some(Arc::new(RetainSuiteObserver));
 
-    let mut prepared = runner.prepare_run();
+    let mut prepared = runner.prepare_run(&mut ());
     let work = plan_work(&mut prepared);
     let terminal = runner.run_prepared(&mut (), worker_prepared(&work[0]));
     let mut deferred = runner.run_prepared(&mut (), worker_prepared(&work[1]));

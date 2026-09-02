@@ -98,8 +98,8 @@ pub use orchestrator::{
 };
 pub use origin::{Origin, OriginError};
 pub use progress::{
-    GroupProgress, GroupStatus, ProgressEvent, ProgressSink, ProgressSnapshot, StableRenderer,
-    TtyRenderer, redacted_variant,
+    GroupProgress, GroupStatus, OutputLanguage, ProgressActivity, ProgressEvent, ProgressSink,
+    ProgressSnapshot, StableRenderer, TtyRenderer, redacted_variant,
 };
 pub use proxy_trust::ProxyTrustGuard;
 pub use recovery::{

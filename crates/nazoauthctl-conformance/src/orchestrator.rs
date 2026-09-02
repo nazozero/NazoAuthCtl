@@ -23,7 +23,8 @@ use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientErr
 use crate::matrix::{MatrixError, SelectedMatrix, zeroize_json_value};
 use crate::origin::Origin;
 use crate::progress::{
-    GroupProgress, GroupStatus, ProgressEvent, ProgressSink, ProgressSnapshot, redacted_variant,
+    GroupProgress, GroupStatus, ProgressActivity, ProgressEvent, ProgressSink, ProgressSnapshot,
+    redacted_variant,
 };
 use crate::report::{
     CleanupFailure, CleanupReport, ConformanceReport, DeferredReviewPending, ModuleOutcome,
@@ -285,15 +286,18 @@ impl ConformanceRunner {
         Ok(Self { config })
     }
 
-    fn wait_for_state_interruptible(
+    fn wait_for_state_interruptible<S: ProgressSink>(
         &self,
+        sink: &mut S,
+        test: &str,
         module_id: &str,
         states: &[&str],
     ) -> Result<Value, String> {
+        let started = Instant::now();
         let deadline = Instant::now()
             .checked_add(self.config.poll_timeout)
             .ok_or_else(|| "Suite poll timeout is out of range".to_owned())?;
-        self.wait_for_state_until(module_id, states, deadline)
+        self.wait_for_state_until(sink, test, module_id, states, deadline, started)
     }
 
     fn reset_browser_session(&self) -> Result<(), String> {
@@ -312,11 +316,14 @@ impl ConformanceRunner {
             .map_err(|error| error.to_string())
     }
 
-    fn wait_for_state_until(
+    fn wait_for_state_until<S: ProgressSink>(
         &self,
+        sink: &mut S,
+        test: &str,
         module_id: &str,
         states: &[&str],
         deadline: Instant,
+        started: Instant,
     ) -> Result<Value, String> {
         loop {
             if self.config.control.is_interrupted() {
@@ -326,6 +333,10 @@ impl ConformanceRunner {
             if remaining.is_zero() {
                 return Err(SuiteClientError::Timeout.to_string());
             }
+            sink.activity(&ProgressActivity::WaitingForSuite {
+                test: test.to_owned(),
+                elapsed_seconds: started.elapsed().as_secs(),
+            });
             let slice = remaining.min(Duration::from_secs(5));
             match self.config.client.wait_for_state(module_id, states, slice) {
                 Ok(state) => return Ok(state),
@@ -347,8 +358,9 @@ impl ConformanceRunner {
         Ok(())
     }
 
-    fn drive_ciba_waiting_interruptible(
+    fn drive_ciba_waiting_interruptible<S: ProgressSink>(
         &self,
+        sink: &mut S,
         approver: &Arc<CibaUserApprovalClient>,
         module: &ModuleDefinition,
         module_id: &str,
@@ -356,12 +368,15 @@ impl ConformanceRunner {
     ) -> Result<(Value, bool), String> {
         const USER_REJECTS_AUTHENTICATION: &str = "fapi-ciba-id1-user-rejects-authentication";
 
-        let deadline = Instant::now()
+        let started = Instant::now();
+        let deadline = started
             .checked_add(self.config.poll_timeout)
             .ok_or_else(|| "CIBA poll timeout is out of range".to_owned())?;
         let approve = module.test_name != USER_REJECTS_AUTHENTICATION;
         let mut decided = BTreeSet::new();
         let mut observed = initial;
+        let mut announced_log_inspection = false;
+        let mut last_wait_report = None;
         loop {
             if self.config.control.is_interrupted() {
                 return Err("run interrupted".to_owned());
@@ -374,13 +389,22 @@ impl ConformanceRunner {
             }
             if !is_waiting(&observed) {
                 observed = self.wait_for_state_until(
+                    sink,
+                    &module.test_name,
                     module_id,
                     &["WAITING", "FINISHED", "INTERRUPTED"],
                     deadline,
+                    started,
                 )?;
                 continue;
             }
 
+            if !announced_log_inspection {
+                sink.activity(&ProgressActivity::InspectingCibaRequest {
+                    test: module.test_name.clone(),
+                });
+                announced_log_inspection = true;
+            }
             let log = self
                 .config
                 .client
@@ -391,6 +415,10 @@ impl ConformanceRunner {
                 if decided.contains(&auth_req_id) {
                     continue;
                 }
+                sink.activity(&ProgressActivity::SubmittingCibaDecision {
+                    test: module.test_name.clone(),
+                    approve,
+                });
                 approver.decide(&auth_req_id, approve).map_err(|error| {
                     format!(
                         "CIBA user decision failed during {}",
@@ -408,11 +436,15 @@ impl ConformanceRunner {
             }
             if made_decision || !decided.is_empty() {
                 observed = self.wait_for_state_until(
+                    sink,
+                    &module.test_name,
                     module_id,
                     &["RUNNING", "FINISHED", "INTERRUPTED"],
                     deadline,
+                    started,
                 )?;
             } else {
+                emit_waiting_activity(sink, &module.test_name, started, &mut last_wait_report);
                 self.wait_for_runner_refresh(deadline, "CIBA")?;
                 observed = self
                     .config
@@ -423,19 +455,22 @@ impl ConformanceRunner {
         }
     }
 
-    fn drive_vci_waiting_interruptible(
+    fn drive_vci_waiting_interruptible<S: ProgressSink>(
         &self,
+        sink: &mut S,
         issuer: &Arc<Mutex<dyn OpenId4VciIssuerDriver>>,
         plan: &PlannedPlan,
         module: &ModuleDefinition,
         module_id: &str,
         initial: Value,
     ) -> Result<Value, String> {
-        let deadline = Instant::now()
+        let started = Instant::now();
+        let deadline = started
             .checked_add(self.config.poll_timeout)
             .ok_or_else(|| "OpenID4VCI poll timeout is out of range".to_owned())?;
         let mut observed = initial;
         let mut first_round = true;
+        let mut last_wait_report = None;
         loop {
             if self.config.control.is_interrupted() {
                 return Err("run interrupted".to_owned());
@@ -454,9 +489,12 @@ impl ConformanceRunner {
                 }
                 if !is_waiting(&observed) {
                     observed = self.wait_for_state_until(
+                        sink,
+                        &module.test_name,
                         module_id,
                         &["WAITING", "FINISHED", "INTERRUPTED"],
                         deadline,
+                        started,
                     )?;
                     if is_terminal_state(&observed) {
                         return Ok(observed);
@@ -467,6 +505,7 @@ impl ConformanceRunner {
             if !is_waiting(&observed) {
                 return Ok(observed);
             }
+            emit_waiting_activity(sink, &module.test_name, started, &mut last_wait_report);
 
             let runner = match self.config.client.runner_info(module_id) {
                 Ok(runner) => runner,
@@ -498,8 +537,9 @@ impl ConformanceRunner {
         }
     }
 
-    fn drive_browser_waiting_interruptible(
+    fn drive_browser_waiting_interruptible<S: ProgressSink>(
         &self,
+        sink: &mut S,
         browser: &Arc<Mutex<dyn BrowserAutomation>>,
         plan: &PlannedPlan,
         module: &ModuleDefinition,
@@ -515,13 +555,15 @@ impl ConformanceRunner {
         })?;
         let policy = BrowserPolicy::new(target_origin, self.config.client.origin().clone())
             .map_err(|error| error.to_string())?;
-        let deadline = Instant::now()
+        let started = Instant::now();
+        let deadline = started
             .checked_add(self.config.poll_timeout)
             .ok_or_else(|| "browser poll timeout is out of range".to_owned())?;
         let mut observed = initial;
         let mut first_round = true;
         let mut completed_url_digests = BTreeSet::<[u8; 32]>::new();
         let mut review_evidence = BrowserReviewEvidence::default();
+        let mut last_wait_report = None;
 
         loop {
             if self.config.control.is_interrupted() {
@@ -541,9 +583,12 @@ impl ConformanceRunner {
                 }
                 if !is_waiting(&observed) {
                     observed = self.wait_for_state_until(
+                        sink,
+                        &module.test_name,
                         module_id,
                         &["WAITING", "FINISHED", "INTERRUPTED"],
                         deadline,
+                        started,
                     )?;
                     if is_terminal_state(&observed) {
                         return Ok((observed, review_evidence));
@@ -554,6 +599,7 @@ impl ConformanceRunner {
             if !is_waiting(&observed) {
                 return Ok((observed, review_evidence));
             }
+            emit_waiting_activity(sink, &module.test_name, started, &mut last_wait_report);
 
             let runner = match self.config.client.runner_info(module_id) {
                 Ok(runner) => runner,
@@ -673,7 +719,7 @@ impl ConformanceRunner {
         parallel::run(self, sink)
     }
 
-    fn prepare_run(&self) -> PreparedRun {
+    fn prepare_run<S: ProgressSink>(&self, sink: &mut S) -> PreparedRun {
         let mut groups = self
             .config
             .matrix
@@ -715,6 +761,7 @@ impl ConformanceRunner {
         let mut current_variant = None;
         let mut observed_modules = 0u32;
 
+        sink.activity(&ProgressActivity::AuthenticatingSuite);
         match self.config.client.probe_auth() {
             Ok(probe) => auth_probe = Some(probe),
             Err(error) => errors.push(safe_error(&error)),
@@ -740,6 +787,11 @@ impl ConformanceRunner {
                     let variant = group.effective_variant(plan);
                     let runtime_variant = group.effective_runtime_variant(plan);
                     current_variant = Some(redacted_variant(&variant));
+                    sink.activity(&ProgressActivity::CreatingSuitePlan {
+                        current: enumerated_plan_count + 1,
+                        total: selected_plan_count,
+                        plan: plan.id.clone(),
+                    });
                     let plan_create_intent =
                         if let Some(observer) = &self.config.suite_resource_observer {
                             let intent_id = uuid::Uuid::now_v7().to_string();
@@ -899,7 +951,8 @@ impl ConformanceRunner {
     }
 
     fn run_serial<S: ProgressSink>(&self, sink: &mut S) -> RunSummary {
-        self.run_prepared(sink, self.prepare_run())
+        let prepared = self.prepare_run(sink);
+        self.run_prepared(sink, prepared)
     }
 
     fn run_prepared<S: ProgressSink>(&self, sink: &mut S, prepared: PreparedRun) -> RunSummary {
@@ -976,6 +1029,9 @@ impl ConformanceRunner {
                         current_variant.clone(),
                         current_test.clone(),
                     );
+                    sink.activity(&ProgressActivity::CreatingSuiteModule {
+                        test: module.test_name.clone(),
+                    });
                     let module_create_intent =
                         if let Some(observer) = &self.config.suite_resource_observer {
                             let intent_id = uuid::Uuid::now_v7().to_string();
@@ -1074,6 +1130,8 @@ impl ConformanceRunner {
                     // actionable here.
                     if needs_interactive_or_terminal_wait(observed.as_ref()) {
                         observed = match self.wait_for_state_interruptible(
+                            sink,
+                            &module.test_name,
                             &instance.id,
                             &["WAITING", "FINISHED", "INTERRUPTED"],
                         ) {
@@ -1099,6 +1157,7 @@ impl ConformanceRunner {
                                 break 'execute;
                             };
                             match self.drive_ciba_waiting_interruptible(
+                                sink,
                                 approver,
                                 module,
                                 &instance.id,
@@ -1127,6 +1186,7 @@ impl ConformanceRunner {
                                 break 'execute;
                             };
                             match self.drive_vci_waiting_interruptible(
+                                sink,
                                 issuer,
                                 plan,
                                 module,
@@ -1417,6 +1477,8 @@ impl ConformanceRunner {
                                             break 'execute;
                                         }
                                         let pending_wait = match self.wait_for_state_interruptible(
+                                            sink,
+                                            &module.test_name,
                                             &instance.id,
                                             &["WAITING", "FINISHED", "INTERRUPTED"],
                                         ) {
@@ -1446,6 +1508,8 @@ impl ConformanceRunner {
                                                 break 'execute;
                                             }
                                             observed = match self.wait_for_state_interruptible(
+                                                sink,
+                                                &module.test_name,
                                                 &instance.id,
                                                 &["FINISHED", "INTERRUPTED"],
                                             ) {
@@ -1492,6 +1556,7 @@ impl ConformanceRunner {
                                     break 'execute;
                                 };
                                 match self.drive_browser_waiting_interruptible(
+                                    sink,
                                     browser,
                                     plan,
                                     module,
@@ -1524,6 +1589,7 @@ impl ConformanceRunner {
                                 break 'execute;
                             };
                             match self.drive_browser_waiting_interruptible(
+                                sink,
                                 browser,
                                 plan,
                                 module,
@@ -1546,6 +1612,8 @@ impl ConformanceRunner {
                     if deferred_review_pending.is_none()
                         && !observed.as_ref().is_some_and(is_terminal_state)
                         && let Err(error) = self.wait_for_state_interruptible(
+                            sink,
+                            &module.test_name,
                             &instance.id,
                             &["FINISHED", "INTERRUPTED"],
                         )
@@ -1993,6 +2061,22 @@ pub enum OrchestrationError {
     InvalidInput,
     #[error("matrix validation failed")]
     Matrix(#[from] MatrixError),
+}
+
+fn emit_waiting_activity<S: ProgressSink>(
+    sink: &mut S,
+    test: &str,
+    started: Instant,
+    last_reported: &mut Option<u64>,
+) {
+    let elapsed_seconds = started.elapsed().as_secs();
+    if elapsed_seconds.is_multiple_of(5) && *last_reported != Some(elapsed_seconds) {
+        sink.activity(&ProgressActivity::WaitingForSuite {
+            test: test.to_owned(),
+            elapsed_seconds,
+        });
+        *last_reported = Some(elapsed_seconds);
+    }
 }
 
 fn emit_progress(
@@ -4001,7 +4085,7 @@ mod tests {
 
         assert_eq!(
             runner
-                .wait_for_state_interruptible("module", &["FINISHED"])
+                .wait_for_state_interruptible(&mut (), "test", "module", &["FINISHED"])
                 .expect_err("interrupt must stop the wait"),
             "run interrupted"
         );
@@ -4115,6 +4199,7 @@ mod tests {
         let issuer_driver: Arc<Mutex<dyn OpenId4VciIssuerDriver>> = issuer.clone();
         let error = runner
             .drive_vci_waiting_interruptible(
+                &mut (),
                 &issuer_driver,
                 &plan,
                 &module,
@@ -4261,6 +4346,7 @@ mod tests {
 
         let (observed, review_evidence) = runner
             .drive_browser_waiting_interruptible(
+                &mut (),
                 &browser,
                 &plan,
                 &module,
