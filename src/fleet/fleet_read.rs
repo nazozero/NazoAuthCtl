@@ -138,7 +138,7 @@ impl FleetReadRunner {
                     instance: instance.clone(),
                     host_alias: host.alias.clone(),
                     result: Err((
-                        error_codes::HOST_UNREACHABLE.to_owned(),
+                        error_codes::INTERNAL_ERROR.to_owned(),
                         "the runner produced no outcome for this target".to_owned(),
                     )),
                 })
@@ -160,10 +160,8 @@ fn execute_one(
     let target = match factory(host) {
         Ok(target) => target,
         Err(error) => {
-            return Err((
-                error_codes::HOST_UNREACHABLE.to_owned(),
-                format!("transport for host '{}' failed: {error:#}", host.alias),
-            ));
+            let detail = format!("transport for host '{}' failed: {error:#}", host.alias);
+            return Err((stable_code(&detail), detail));
         }
     };
     job(instance, host, target.as_ref())
@@ -672,8 +670,17 @@ pub(crate) fn run_backup_view(
 /// Stable-code classifier shared with the error envelope: scan the rendered
 /// error chain for known stable tokens.
 pub(crate) fn stable_code(rendered: &str) -> String {
-    const ORDERED: [(&str, &str); 26] = [
+    const ORDERED: [(&str, &str); 29] = [
         (error_codes::INPUT_INVALID, error_codes::INPUT_INVALID),
+        (
+            error_codes::RELEASE_NOT_FOUND,
+            error_codes::RELEASE_NOT_FOUND,
+        ),
+        (
+            error_codes::RELEASE_DOWNLOAD_FAILED,
+            error_codes::RELEASE_DOWNLOAD_FAILED,
+        ),
+        (error_codes::HOST_UNREACHABLE, error_codes::HOST_UNREACHABLE),
         (
             error_codes::REMOTE_HELPER_MISMATCH,
             error_codes::REMOTE_HELPER_MISMATCH,
@@ -798,10 +805,10 @@ pub(crate) fn stable_code(rendered: &str) -> String {
             return code.to_owned();
         }
     }
-    if rendered.contains("did not answer within") || rendered.contains("timed out") {
-        return error_codes::HOST_UNREACHABLE.to_owned();
+    if contains_stable_token(rendered, error_codes::INTERNAL_ERROR) {
+        return error_codes::INTERNAL_ERROR.to_owned();
     }
-    error_codes::HOST_UNREACHABLE.to_owned()
+    error_codes::INTERNAL_ERROR.to_owned()
 }
 
 fn contains_stable_token(rendered: &str, expected: &str) -> bool {

@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::fs;
 use std::io::{self, IsTerminal as _, Read as _, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -17,41 +18,34 @@ use anyhow::{Context as _, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nazo_operator_protocol::{ControlOperationPayload, ControlResultData, ControlTenantBoundary};
 use nazoauthctl_conformance::{
-    ArtifactMaterializationBinding, ArtifactTrustPolicy, BearerToken, BrowserAutomation,
-    BrowserExecutor, BrowserPolicy, BrowserReviewScreenshotCapture, BrowserTargetOrigin,
-    CibaUserApprovalBridge, CibaUserApprovalClient, ClientConfig, ConformanceAutomation,
-    ConformanceBinding, ConformanceProxyRecovery, ConformanceRecoveryStore, ConformanceRunConfig,
-    ConformanceRunner, CredentialStore, DescriptorMaterializer, EvidenceBundleIdentity,
-    EvidenceBundleReceipt, EvidenceControlIdentity, EvidenceControlOperation,
-    EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, HttpRequest,
-    HttpTransport, ManagedWebDriver, MatrixSelection, OidfArtifactMatrix, OidfDriverLane,
-    OidfPlanResourceBudget, OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
-    OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard,
-    RunControl, StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionDeferredReview,
-    SuiteRetentionManifest, SuiteRetentionManifestReceipt, SuiteRetentionPlan,
-    SuiteRetentionScreenshotManifest, TenantResourceApplyOutput, TenantResourceControlOperation,
-    TenantResourceRecoveryBinding, TenantResourceRecoveryPhase, Transport, TtyRenderer,
-    WebDriverClient, WebDriverEndpoint, open_cached_oidf_driver_plan, read_artifact_driver,
-    read_artifact_matrix, read_compact_manifest, recover_suite_resources,
-    validate_private_evidence_directory, verify_oidf_artifact,
-    write_private_control_evidence_bundle, write_review_screenshot_manifest,
+    ArtifactMaterializationBinding, BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy,
+    BrowserReviewScreenshotCapture, BrowserTargetOrigin, CibaUserApprovalBridge,
+    CibaUserApprovalClient, ClientConfig, ConformanceAutomation, ConformanceBinding,
+    ConformanceRecoveryStore, ConformanceRunConfig, ConformanceRunner, CredentialStore,
+    DescriptorMaterializer, EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceControlIdentity,
+    EvidenceControlOperation, EvidenceDeploymentIdentity, EvidenceRuntimeIdentity,
+    EvidenceSourceIdentity, HttpRequest, HttpTransport, ManagedWebDriver, MatrixSelection,
+    OidfArtifactMatrix, OidfDriverLane, OidfPlanResourceBudget, OidfPlanSelection,
+    OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
+    OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
+    SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
+    SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
+    TenantResourceApplyOutput, TenantResourceControlOperation, TenantResourceRecoveryBinding,
+    TenantResourceRecoveryPhase, Transport, TtyRenderer, bundled_oidf_matrix,
+    open_bundled_oidf_driver_plan, recover_suite_resources, write_private_control_evidence_bundle,
+    write_review_screenshot_manifest,
 };
 use serde::Serialize;
 use url::Url;
-use zeroize::{Zeroize as _, Zeroizing};
+use zeroize::Zeroizing;
 
 use super::RunInvocation;
 
 const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
 const OIDF_TENANT_DOMAIN: &str = "oidf.nazoauth.com";
 
-/// Capabilities implemented by this binary's signed-artifact runner. These
-/// are local engine facts, not remote controller permissions.
-const RUNNER_CAPABILITIES: &[&str] = &["nazoauth.client.create"];
-
-pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
-    let suite_origin = Origin::from_suite_arg(invocation.suite.as_deref())
-        .context("invalid OpenID Foundation Conformance Suite origin")?;
+pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
+    let suite_origin = Origin::official();
     let session = nazoauthctl_core::ConformanceSession::open(invocation.instance.as_deref())
         .context("deployment is not ready for ordinary conformance orchestration")?;
     let deployment = session.deployment_evidence();
@@ -59,58 +53,27 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     let recovery_store =
         ConformanceRecoveryStore::open(&recovery_directory, &deployment.deployment_id)?;
 
-    let trust = ArtifactTrustPolicy::from_path(&invocation.trust_policy)
-        .context("signed-artifact trust policy is invalid")?;
-    let runner_capabilities = RUNNER_CAPABILITIES
-        .iter()
-        .map(|value| (*value).to_owned())
-        .collect::<BTreeSet<_>>();
     let now = current_unix_time()?;
-    let driver_plan = open_cached_oidf_driver_plan(
-        &invocation.artifact_cache,
-        &invocation.artifact_digest,
-        &trust,
-        &runner_capabilities,
+    let driver_plan = open_bundled_oidf_driver_plan(
         OidfPlanSelection {
             groups: invocation.groups.clone(),
             plans: invocation.plans.clone(),
         },
         now,
     )
-    .context("exact cached signed OIDF artifact cannot be opened")?;
-    if driver_plan.artifact.suite.origin != suite_origin.as_str() {
-        bail!("--suite does not match the origin signed by the OIDF artifact");
-    }
-    if invocation.retain_suite_plans_for_certification {
-        if suite_origin != Origin::official() {
-            bail!(
-                "--retain-suite-plans-for-certification is restricted to the canonical official Suite origin"
-            );
-        }
-        let evidence_directory = invocation
-            .evidence_directory
-            .as_deref()
-            .context("--retain-suite-plans-for-certification requires --evidence-dir")?;
-        validate_private_evidence_directory(evidence_directory).context(
-            "retention evidence directory must be an existing root-owned private directory",
-        )?;
-    }
-    if invocation.capture_review_screenshots {
-        let evidence_directory = invocation
-            .evidence_directory
-            .as_ref()
-            .expect("CLI requires --evidence-dir for review screenshots");
-        validate_private_evidence_directory(evidence_directory)
-            .context("review screenshot evidence directory must be root-owned and private")?;
-    }
+    .context("bundled OIDF Matrix cannot be opened")?;
+    let artifact_digest = driver_plan.artifact.driver_manifest_sha256.clone();
 
-    let (token, prompted) = resolve_token(&mut invocation, &suite_origin)?;
+    let (token, prompted) = resolve_token(&invocation, &suite_origin)?;
     let suite_client =
         SuiteClient::new(suite_origin.clone(), token.clone(), ClientConfig::default())
             .context("failed to initialize the Suite client")?;
     suite_client
         .probe_auth()
         .context("Suite API token authentication failed")?;
+    if prompted {
+        CredentialStore::new(credential_root()?)?.save(&suite_origin, &token)?;
+    }
     let recovered_retention = recover_pending_runs(&session, &recovery_store, &suite_client)?;
     if !recovered_retention.is_empty() {
         serde_json::to_writer_pretty(
@@ -125,31 +88,8 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         writeln!(io::stdout()).context("failed to finish recovered retention report")?;
         return Ok(0);
     }
-    if prompted {
-        offer_credential_persistence(&suite_origin, &token)?;
-    }
-
-    let compact_manifest =
-        read_compact_manifest(&driver_plan.artifact_cache_entry.join("manifest.jws"))
-            .context("failed to reread the cached signed artifact manifest")?;
-    let driver_bytes = read_artifact_driver(&driver_plan.artifact_cache_entry.join("driver.json"))
-        .context("failed to reread the cached artifact driver")?;
-    let matrix_bytes = read_artifact_matrix(&driver_plan.artifact_cache_entry.join("matrix.json"))
-        .context("failed to reread the cached artifact Matrix")?;
-    let consumed_artifact = verify_oidf_artifact(
-        &compact_manifest,
-        &driver_bytes,
-        &matrix_bytes,
-        &trust,
-        &runner_capabilities,
-        current_unix_time()?,
-    )
-    .context("cached signed artifact changed before materialization")?;
-    if consumed_artifact != driver_plan.artifact {
-        bail!("cached signed artifact identity changed before materialization");
-    }
-    let matrix: OidfArtifactMatrix = serde_json::from_slice(&matrix_bytes)
-        .context("verified cached artifact Matrix is malformed")?;
+    let matrix: OidfArtifactMatrix =
+        bundled_oidf_matrix().context("bundled OIDF Matrix is malformed")?;
     let selected_plan_ids = driver_plan
         .plans
         .iter()
@@ -178,13 +118,14 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     // module ceiling instead of treating an old per-plan count as immutable.
     selected_resource_budget.modules = driver_plan.artifact.resource_bounds.max_modules;
     let request_jti = format!("request-{}", hex(rand::random::<[u8; 16]>()));
+    let evidence_directory = create_evidence_directory(&recovery_directory, &request_jti)?;
     let ephemeral_tenant = EphemeralTenant::new(&invocation.tenant_id)?;
     let materialization_now = current_unix_time()?;
     if materialization_now > driver_plan.latest_execution_start_at {
         bail!("signed artifact no longer has enough validity remaining for the selected run");
     }
     let ciba_callback = prepare_ciba_user_approval_callback(
-        &invocation,
+        &ephemeral_tenant.issuer,
         driver_plan
             .plans
             .iter()
@@ -197,7 +138,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         &matrix,
         ArtifactMaterializationBinding {
             artifact_source_release: &driver_plan.artifact.revision,
-            artifact_source_digest: &invocation.artifact_digest,
+            artifact_source_digest: &artifact_digest,
             raw_matrix_sha256: &driver_plan.artifact.matrix_sha256,
             target_issuer: &ephemeral_tenant.issuer,
             suite_origin: &suite_origin,
@@ -218,24 +159,12 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         tx_code: prepared.tx_code(),
         applicant_email: Zeroizing::new(prepared.applicant_email().to_owned()),
         applicant_password: prepared.applicant_password(),
-        mtls_trust_anchor_pem: prepared.mtls_trust_anchor_pem(),
     };
 
     let private_manifest_path = recovery_directory.join(format!("material-{request_jti}.json"));
     manifest
         .write_private(&private_manifest_path)
         .context("failed to durably persist private Apply material")?;
-    let proxy_recovery = match (
-        invocation.proxy_trust_bundle.as_ref(),
-        invocation.proxy_reload_executable.as_ref(),
-    ) {
-        (Some(bundle_path), Some(reload_executable)) => Some(ConformanceProxyRecovery {
-            bundle_path: bundle_path.clone(),
-            reload_executable: reload_executable.clone(),
-        }),
-        (None, None) => None,
-        _ => unreachable!("CLI validates proxy arguments as an atomic pair"),
-    };
     let tenant_create_expected_revision = directory_revision(&session)?;
     let recovery = match recovery_store.begin_ordinary_run(TenantResourceRecoveryBinding {
         deployment_id: deployment.deployment_id.clone(),
@@ -246,7 +175,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         tenant_create_expected_revision,
         manifest_path: Some(private_manifest_path.clone()),
         material_sha256: Some(manifest.raw_sha256().to_owned()),
-        proxy: proxy_recovery,
+        proxy: None,
         vp_evidence_trust_anchor: None,
         resource_identities: manifest.resource_identities().to_vec(),
     }) {
@@ -348,7 +277,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         deployment_id: deployment.deployment_id.clone(),
         tenant_id: invocation.tenant_id.clone(),
         target_issuer: ephemeral_tenant.issuer.clone(),
-        artifact_digest: invocation.artifact_digest.clone(),
+        artifact_digest: artifact_digest.clone(),
         artifact_revision: driver_plan.artifact.revision.clone(),
         matrix_sha256: ordinary.matrix_sha256().to_owned(),
         selected_groups: driver_plan.selected_group_count,
@@ -364,49 +293,6 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         client_count: u32::try_from(ordinary.clients().len())
             .context("ordinary client mapping count exceeds the report bound")?,
         cleanup_complete: false,
-    };
-
-    let mut proxy = match (
-        invocation.proxy_trust_bundle.as_deref(),
-        invocation.proxy_reload_executable.as_deref(),
-    ) {
-        (Some(bundle_path), Some(reload_executable)) => match ProxyTrustGuard::install(
-            bundle_path,
-            reload_executable,
-            run_secrets.mtls_trust_anchor_pem.as_bytes(),
-        ) {
-            Ok(proxy) => Some(proxy),
-            Err(install) => {
-                let proxy_cleanup = ProxyTrustGuard::recover(bundle_path, reload_executable);
-                if proxy_cleanup.is_ok() {
-                    lock_recovery(&recovery)?.mark_proxy_cleanup_complete()?;
-                }
-                let mut recovery = take_recovery(recovery)?;
-                // The external Suite runner has not been constructed, so this
-                // failure cannot own a Suite plan or module.
-                if !recovery.suite_cleanup_complete() {
-                    recovery.mark_suite_cleanup_complete()?;
-                }
-                let resource_cleanup = cleanup_run_resources(&session, &mut recovery);
-                if resource_cleanup.is_ok()
-                    && proxy_cleanup.is_ok()
-                    && recovery.suite_cleanup_complete()
-                {
-                    recovery.finish()?;
-                }
-                bail!(
-                    "proxy-install={install:#}; proxy-recovery={}; resource-cleanup={}",
-                    proxy_cleanup
-                        .err()
-                        .map_or_else(|| "ok".to_owned(), |error| format!("{error:#}")),
-                    resource_cleanup
-                        .err()
-                        .map_or_else(|| "ok".to_owned(), |error| format!("{error:#}"))
-                );
-            }
-        },
-        (None, None) => None,
-        _ => unreachable!("CLI validates proxy arguments as an atomic pair"),
     };
 
     // The OpenID4VP client and runner are being generalized in the adjacent
@@ -428,6 +314,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         selected_resource_budget,
         recovery.clone(),
         ciba_bridge,
+        &evidence_directory,
     );
 
     let mut recovery = take_recovery(recovery)?;
@@ -440,12 +327,12 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     // produced even when retention was not requested; only a later retention
     // transition binds its digest into the Suite journal.
     let review_screenshot_manifest = if invocation.capture_review_screenshots {
-        match (run_result.as_ref(), invocation.evidence_directory.as_ref()) {
-            (Ok(report), Some(directory)) => match write_review_screenshot_manifest(
+        match run_result.as_ref() {
+            Ok(report) => match write_review_screenshot_manifest(
                 report,
-                directory,
+                &evidence_directory,
                 recovery.ordinary_binding().run_id.as_str(),
-                &invocation.artifact_digest,
+                &artifact_digest,
                 &ephemeral_tenant.issuer,
             ) {
                 Ok(manifest) => Some(manifest),
@@ -455,7 +342,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                     None
                 }
             },
-            _ => {
+            Err(_) => {
                 retention_eligible = false;
                 errors.push("review-screenshot-manifest=identity".to_owned());
                 None
@@ -476,15 +363,11 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
                 run_result
                     .as_ref()
                     .expect("retention eligibility requires report"),
-                &invocation.artifact_digest,
+                &artifact_digest,
                 &deployment_report.matrix_sha256,
                 review_screenshot_manifest.as_ref(),
             )?;
-            let evidence_directory = invocation
-                .evidence_directory
-                .as_ref()
-                .expect("retention preflight requires evidence directory");
-            let manifest_path = suite_retention_manifest_path(evidence_directory, &manifest);
+            let manifest_path = suite_retention_manifest_path(&evidence_directory, &manifest);
             recovery.prepare_suite_plan_retention(manifest, manifest_path)
         })();
         if let Err(error) = prepared {
@@ -492,8 +375,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             errors.push(format!("suite-retention-prepare={error:#}"));
         }
     }
-    let proxy_cleanup = proxy.as_mut().map(ProxyTrustGuard::restore).transpose();
-    if proxy_cleanup.is_ok() && !recovery.proxy_cleanup_complete() {
+    if !recovery.proxy_cleanup_complete() {
         recovery.mark_proxy_cleanup_complete()?;
     }
     let cleanup = cleanup_run_resources(&session, &mut recovery);
@@ -504,10 +386,6 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             None
         }
     };
-    let proxy_cleanup_complete = proxy_cleanup.is_ok();
-    if let Err(error) = proxy_cleanup {
-        errors.push(format!("proxy-cleanup={error:#}"));
-    }
     let cleanup_evidence = match cleanup {
         Ok(evidence) => Some(evidence),
         Err(error) => {
@@ -516,12 +394,10 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         }
     };
     let cleanup_complete = cleanup_evidence.is_some()
-        && proxy_cleanup_complete
         && !errors
             .iter()
             .any(|error| error.starts_with("resource-cleanup="));
-    let retention_commit_possible =
-        retention_eligible && proxy_cleanup_complete && cleanup_evidence.is_some();
+    let retention_commit_possible = retention_eligible && cleanup_evidence.is_some();
     // Screenshot evidence, not the optional control evidence, is the durable
     // certification-retention boundary.  The screenshot manifest was bound
     // to the Prepared journal above and is revalidated by stage, commit,
@@ -609,11 +485,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     // a successful writer and to FinalOutput; a failed writer is represented
     // only by outer diagnostics and an absent receipt.
     let mut evidence = None;
-    if let (Some(report), Some(directory), Some(cleanup_operations)) = (
-        report.as_ref(),
-        invocation.evidence_directory.as_ref(),
-        cleanup_evidence.as_ref(),
-    ) {
+    if let (Some(report), Some(cleanup_operations)) = (report.as_ref(), cleanup_evidence.as_ref()) {
         let runtime = evidence_runtime(&deployment.runtime);
         let identity = EvidenceBundleIdentity {
             run_jti: request_jti.clone(),
@@ -639,7 +511,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             || {
                 write_private_control_evidence_bundle(
                     report,
-                    directory,
+                    &evidence_directory,
                     &identity,
                     recovery.ordinary_binding(),
                 )
@@ -653,7 +525,6 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         None
     };
     if cleanup_evidence.is_some()
-        && proxy_cleanup_complete
         && recovery.suite_cleanup_complete()
         && let Err(error) = recovery.finish()
     {
@@ -699,7 +570,7 @@ fn conformance_run_succeeds(
 
 #[cfg(test)]
 mod acceptance_tests {
-    use super::conformance_run_succeeds;
+    use super::{conformance_run_succeeds, prepare_ciba_user_approval_callback};
 
     #[test]
     fn review_only_run_is_successful() {
@@ -710,6 +581,34 @@ mod acceptance_tests {
     fn failed_or_incomplete_module_fails_the_run() {
         assert!(!conformance_run_succeeds(true, true, 1, 0));
         assert!(!conformance_run_succeeds(true, true, 0, 1));
+    }
+
+    #[test]
+    fn ciba_callback_is_derived_from_the_temporary_tenant() {
+        let callback = prepare_ciba_user_approval_callback(
+            "https://00000000-0000-0000-0000-000000000001.oidf.nazoauth.com",
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            callback
+                .public_url
+                .starts_with("https://00000000-0000-0000-0000-000000000001.oidf.nazoauth.com/__nazoauthctl/ciba-approval?approval_token=")
+        );
+        assert_eq!(callback.callback_path, "/__nazoauthctl/ciba-approval");
+        assert_eq!(
+            callback.listen_addr,
+            std::net::SocketAddr::from(([127, 0, 0, 1], 19046))
+        );
+        assert!(
+            prepare_ciba_user_approval_callback(
+                "https://00000000-0000-0000-0000-000000000001.oidf.nazoauth.com",
+                false,
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 }
 
@@ -999,7 +898,6 @@ struct RunSecrets {
     tx_code: Option<Zeroizing<String>>,
     applicant_email: Zeroizing<String>,
     applicant_password: Zeroizing<String>,
-    mtls_trust_anchor_pem: Zeroizing<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1017,6 +915,7 @@ fn run_signed_suite(
     selected_resource_budget: OidfPlanResourceBudget,
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
     ciba_bridge: Option<CibaUserApprovalBridge>,
+    evidence_directory: &Path,
 ) -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
     if let Some(bridge) = &ciba_bridge {
         bridge
@@ -1045,11 +944,7 @@ fn run_signed_suite(
         .capture_review_screenshots
         .then(|| {
             BrowserReviewScreenshotCapture::new(
-                invocation
-                    .evidence_directory
-                    .as_ref()
-                    .expect("CLI requires --evidence-dir for review screenshots")
-                    .clone(),
+                evidence_directory.to_path_buf(),
                 &review_screenshot_run_jti,
             )
         })
@@ -1065,12 +960,8 @@ fn run_signed_suite(
         })
         .context("requested selection is outside the signed artifact Matrix")?;
     let mut automation = Vec::with_capacity(invocation.jobs);
-    for worker_index in 0..invocation.jobs {
-        let browser = build_browser(
-            invocation.webdriver.get(worker_index).map(String::as_str),
-            target_issuer,
-            suite_origin,
-        )?;
+    for _ in 0..invocation.jobs {
+        let browser = build_browser(target_issuer, suite_origin)?;
         let issuer: Arc<Mutex<dyn OpenId4VciIssuerDriver>> =
             Arc::new(Mutex::new(OpenId4VciIssuerClient::new(
                 OpenId4VciIssuerConfig::new(
@@ -1145,34 +1036,15 @@ struct CibaUserApprovalCallback {
 }
 
 fn prepare_ciba_user_approval_callback(
-    invocation: &RunInvocation,
+    target_issuer: &str,
     requires_ciba: bool,
 ) -> anyhow::Result<Option<CibaUserApprovalCallback>> {
-    let (Some(url), Some(listen_addr)) = (
-        invocation.ciba_user_approval_callback_url.as_deref(),
-        invocation.ciba_user_approval_listen,
-    ) else {
-        if requires_ciba {
-            bail!(
-                "selected CIBA plans require --ciba-user-approval-callback-url and --ciba-user-approval-listen"
-            );
-        }
+    if !requires_ciba {
         return Ok(None);
-    };
-    let public_url =
-        Url::parse(url).context("--ciba-user-approval-callback-url must be a valid HTTPS URL")?;
-    if public_url.scheme() != "https"
-        || public_url.host_str().is_none()
-        || public_url.path() == "/"
-        || public_url.query().is_some()
-        || public_url.fragment().is_some()
-        || !public_url.username().is_empty()
-        || public_url.password().is_some()
-    {
-        bail!(
-            "--ciba-user-approval-callback-url must be an HTTPS URL with a non-root path and no query, fragment, or credentials"
-        );
     }
+    let mut public_url = Url::parse(target_issuer)
+        .context("temporary tenant issuer is not a valid CIBA callback origin")?;
+    public_url.set_path("/__nazoauthctl/ciba-approval");
     let callback_path = public_url.path().to_owned();
     let approval_token = Zeroizing::new(random_urlsafe_token(32));
     Ok(Some(CibaUserApprovalCallback {
@@ -1181,7 +1053,7 @@ fn prepare_ciba_user_approval_callback(
             approval_token.as_str()
         )),
         callback_path,
-        listen_addr,
+        listen_addr: SocketAddr::from(([127, 0, 0, 1], 19046)),
         approval_token,
     }))
 }
@@ -1339,21 +1211,13 @@ fn cleanup_failed_pre_suite_setup<T>(
 }
 
 fn build_browser(
-    endpoint: Option<&str>,
     target_issuer: &str,
     suite_origin: &Origin,
 ) -> anyhow::Result<Arc<Mutex<dyn BrowserAutomation>>> {
     let target = BrowserTargetOrigin::parse(target_issuer)?;
     let policy = BrowserPolicy::new(target, suite_origin.clone())?;
-    if let Some(endpoint) = endpoint {
-        let endpoint = WebDriverEndpoint::parse(endpoint)?;
-        let mut driver = WebDriverClient::connect(endpoint, Duration::from_secs(30))?;
-        driver.start_chrome()?;
-        Ok(Arc::new(Mutex::new(BrowserExecutor::new(driver, policy))))
-    } else {
-        let driver = ManagedWebDriver::start_default(Duration::from_secs(30))?;
-        Ok(Arc::new(Mutex::new(BrowserExecutor::new(driver, policy))))
-    }
+    let driver = ManagedWebDriver::start_default(Duration::from_secs(30))?;
+    Ok(Arc::new(Mutex::new(BrowserExecutor::new(driver, policy))))
 }
 
 fn suite_retention_manifest(
@@ -1811,18 +1675,9 @@ fn retained_recovery_stops_before_live_apply(retention_committed: bool) -> bool 
 }
 
 fn resolve_token(
-    invocation: &mut RunInvocation,
+    invocation: &RunInvocation,
     origin: &Origin,
 ) -> anyhow::Result<(BearerToken, bool)> {
-    if let Some(mut value) = invocation.token.take() {
-        eprintln!("warning: --token is visible in argv and may be retained by shell history");
-        let token = BearerToken::new(value.as_str().to_owned())?;
-        value.zeroize();
-        return Ok((token, false));
-    }
-    if let Some(path) = &invocation.token_file {
-        return Ok((BearerToken::read_file(path)?, false));
-    }
     if invocation.token_stdin {
         let mut bytes = Zeroizing::new(Vec::new());
         io::stdin()
@@ -1835,34 +1690,16 @@ fn resolve_token(
         let value = std::str::from_utf8(&bytes).context("Suite token from stdin is not UTF-8")?;
         return Ok((BearerToken::new(value.to_owned())?, false));
     }
-    if let Some(fd) = invocation.token_fd {
-        return Ok((CredentialStore::read_descriptor(fd)?, false));
-    }
     let store = CredentialStore::new(credential_root()?)?;
     if let Some(token) = store.load(origin)? {
         return Ok((token, false));
     }
     if !io::stdin().is_terminal() {
-        bail!("no Suite API token is available; use a token option in non-TTY environments");
+        bail!("no official Suite API token is stored; pipe it with --token-stdin once");
     }
     let value = rpassword::prompt_password("OpenID Foundation Conformance Suite API Token:")?;
-    Ok((BearerToken::new(value)?, true))
-}
-
-fn offer_credential_persistence(origin: &Origin, token: &BearerToken) -> anyhow::Result<()> {
-    if !io::stdin().is_terminal() {
-        return Ok(());
-    }
-    eprint!("Save this token securely for {}? [y/N] ", origin.as_str());
-    io::stderr().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    let save = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
-    answer.zeroize();
-    if save {
-        CredentialStore::new(credential_root()?)?.save(origin, token)?;
-    }
-    Ok(())
+    let token = BearerToken::new(value)?;
+    Ok((token, true))
 }
 
 fn credential_root() -> anyhow::Result<PathBuf> {
@@ -1876,6 +1713,32 @@ fn credential_root() -> anyhow::Result<PathBuf> {
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .context("neither XDG_CONFIG_HOME nor HOME is set")?;
     Ok(root.join("nazoauthctl").join("conformance-credentials"))
+}
+
+fn create_evidence_directory(recovery_directory: &Path, run_id: &str) -> anyhow::Result<PathBuf> {
+    let root = recovery_directory.join("evidence");
+    fs::create_dir_all(&root).context("failed to create the OIDF evidence root")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .context("failed to make the OIDF evidence root private")?;
+        let directory = root.join(run_id);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .context("failed to create the run evidence directory")?;
+        nazoauthctl_conformance::validate_private_evidence_directory(&directory)
+            .context("automatic evidence directory is not root-owned and private")?;
+        return Ok(directory);
+    }
+    #[cfg(not(unix))]
+    {
+        let directory = root.join(run_id);
+        fs::create_dir(&directory).context("failed to create the run evidence directory")?;
+        Ok(directory)
+    }
 }
 
 fn current_unix_time() -> anyhow::Result<i64> {

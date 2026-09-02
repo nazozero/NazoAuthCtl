@@ -40,11 +40,13 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 
 use crate::{
+    error_codes::{RELEASE_DOWNLOAD_FAILED, RELEASE_NOT_FOUND},
     filesystem::{PrivateTempDir, atomic_write, read_secure_regular_file, sha256},
     model::{Artifact, ReleaseManifest, release_target, semantic_tag},
     process::{Process, command_exists},
     runtime_backend::RuntimeBackendKind,
     runtime_backend::{BlobAttestationVerification, backend},
+    target::ARTIFACT_UNVERIFIED,
 };
 
 const COSIGN_IMAGE: &str = "ghcr.io/sigstore/cosign/cosign@sha256:de9c65609e6bde17e6b48de485ee788407c9502fa08b8f4459f595b21f56cd00";
@@ -229,10 +231,11 @@ impl VerifiedControllerRelease {
             &digest,
             CONTROLLER_PROVENANCE_PREDICATE,
         )?;
-        let response: AttestationResponse = serde_json::from_str(&response)
-            .context("GitHub controller attestation response is invalid")?;
+        let response: AttestationResponse = serde_json::from_str(&response).context(format!(
+            "{ARTIFACT_UNVERIFIED}: GitHub controller attestation response is invalid"
+        ))?;
         if response.attestations.is_empty() || response.attestations.len() > MAX_ATTESTATIONS {
-            bail!("GitHub returned no bounded controller attestation set");
+            bail!("{ARTIFACT_UNVERIFIED}: GitHub returned no bounded controller attestation set");
         }
         let identity = format!(
             "https://github.com/{CONTROLLER_REPOSITORY}/.github/workflows/release.yml@refs/tags/{version}"
@@ -259,11 +262,16 @@ impl VerifiedControllerRelease {
                 &artifact_name,
                 &identity,
                 CONTROLLER_PROVENANCE_PREDICATE,
-            )?;
+            )
+            .context(format!(
+                "{ARTIFACT_UNVERIFIED}: controller provenance verification failed"
+            ))?;
             accepted += 1;
         }
         if accepted == 0 {
-            bail!("no verified controller provenance matched the requested target");
+            bail!(
+                "{ARTIFACT_UNVERIFIED}: no verified controller provenance matched the requested target"
+            );
         }
         Ok(Self {
             work,
@@ -487,13 +495,44 @@ fn bounded_https_curl_arguments(max_time: u64, max_filesize: u64) -> Vec<String>
     ]
 }
 
+fn release_download_error(error: anyhow::Error, subject: &str) -> anyhow::Error {
+    let rendered = format!("{error:#}");
+    let code = if rendered.contains("error: 404") || rendered.contains("HTTP 404") {
+        RELEASE_NOT_FOUND
+    } else {
+        RELEASE_DOWNLOAD_FAILED
+    };
+    anyhow::anyhow!("{code}: failed to fetch {subject}: {rendered}")
+}
+
+fn release_fetch_stdout(process: &Process, subject: &str) -> anyhow::Result<String> {
+    let output = process
+        .output()
+        .map_err(|error| release_download_error(error, subject))?;
+    if !output.status.success() {
+        let stderr: String = String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(400)
+            .collect();
+        return Err(release_download_error(
+            anyhow::anyhow!(
+                "curl failed with status {}: {}",
+                output.status,
+                stderr.trim()
+            ),
+            subject,
+        ));
+    }
+    String::from_utf8(output.stdout).context("GitHub returned non-UTF-8 release metadata")
+}
+
 /// The single bounded GitHub attestation query used by both entry points.
 fn fetch_github_attestation_response(
     repository: &str,
     digest: &str,
     predicate_type: &str,
 ) -> anyhow::Result<String> {
-    Process::new("curl")
+    let process = Process::new("curl")
         .args(bounded_https_curl_arguments(
             GITHUB_REQUEST_SECONDS,
             MAX_GITHUB_JSON_BYTES,
@@ -507,14 +546,14 @@ fn fetch_github_attestation_response(
                 "https://api.github.com/repos/{repository}/attestations/sha256%3A{digest}?per_page={ATTESTATION_PAGE_SIZE}&predicate_type={}",
                 urlencoding::encode(predicate_type)
             ),
-        ])
-        .stdout()
+        ]);
+    release_fetch_stdout(&process, "GitHub attestation metadata")
 }
 
 /// Metadata and Sigstore media-type checks shared by both entry points.
 fn check_attestation_envelope(kind_label: &str, attestation: &Attestation) -> anyhow::Result<()> {
     if attestation.repository_id == 0 || attestation.initiator.trim().is_empty() {
-        bail!("GitHub returned invalid {kind_label} attestation metadata");
+        bail!("{ARTIFACT_UNVERIFIED}: GitHub returned invalid {kind_label} attestation metadata");
     }
     if attestation
         .bundle
@@ -522,7 +561,7 @@ fn check_attestation_envelope(kind_label: &str, attestation: &Attestation) -> an
         .and_then(serde_json::Value::as_str)
         != Some(SIGSTORE_BUNDLE_MEDIA_TYPE)
     {
-        bail!("GitHub returned an unsupported {kind_label} Sigstore bundle");
+        bail!("{ARTIFACT_UNVERIFIED}: GitHub returned an unsupported {kind_label} Sigstore bundle");
     }
     Ok(())
 }
@@ -540,7 +579,7 @@ fn require_subject_binding(
                 .get("sha256")
                 .is_some_and(|value| value == digest)
     }) {
-        bail!("{label} does not bind the downloaded artifact bytes");
+        bail!("{ARTIFACT_UNVERIFIED}: {label} does not bind the downloaded artifact bytes");
     }
     Ok(())
 }
@@ -554,10 +593,11 @@ fn verified_manifest_from_attestations(
     identity: &str,
     mut verify_attestation: impl FnMut(&Path, &str, &str, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<ReleaseManifest> {
-    let response: AttestationResponse =
-        serde_json::from_str(response).context("GitHub attestation response is invalid")?;
+    let response: AttestationResponse = serde_json::from_str(response).context(format!(
+        "{ARTIFACT_UNVERIFIED}: GitHub attestation response is invalid"
+    ))?;
     if response.attestations.is_empty() || response.attestations.len() > MAX_ATTESTATIONS {
-        bail!("GitHub returned no bounded Release attestation set");
+        bail!("{ARTIFACT_UNVERIFIED}: GitHub returned no bounded Release attestation set");
     }
     let mut verified: Option<ReleaseManifest> = None;
     for (index, attestation) in response.attestations.into_iter().enumerate() {
@@ -574,19 +614,29 @@ fn verified_manifest_from_attestations(
         if candidate.version != version || candidate.release_identity != identity {
             continue;
         }
-        verify_attestation(work, &bundle_name, blob, identity)?;
-        candidate.validate(version, identity)?;
+        verify_attestation(work, &bundle_name, blob, identity).context(format!(
+            "{ARTIFACT_UNVERIFIED}: Release provenance verification failed"
+        ))?;
+        candidate.validate(version, identity).context(format!(
+            "{ARTIFACT_UNVERIFIED}: Release manifest policy validation failed"
+        ))?;
         let subject = candidate
             .artifacts
             .values()
             .find(|artifact| artifact.name == blob)
-            .context("Release attestation subject is not a declared server artifact")?;
+            .context(format!(
+                "{ARTIFACT_UNVERIFIED}: Release attestation subject is not a declared server artifact"
+            ))?;
         if subject.sha256 != digest || subject.size != fs::metadata(work.join(blob))?.len() {
-            bail!("Release attestation does not bind the downloaded server artifact");
+            bail!(
+                "{ARTIFACT_UNVERIFIED}: Release attestation does not bind the downloaded server artifact"
+            );
         }
         accept_verified_manifest(&mut verified, candidate)?;
     }
-    verified.context("no verified Release attestation matched the requested target")
+    verified.context(format!(
+        "{ARTIFACT_UNVERIFIED}: no verified Release attestation matched the requested target"
+    ))
 }
 
 fn accept_verified_manifest(
@@ -597,7 +647,9 @@ fn accept_verified_manifest(
         if existing == &candidate {
             return Ok(());
         }
-        bail!("matching Release attestations contain conflicting predicates");
+        bail!(
+            "{ARTIFACT_UNVERIFIED}: matching Release attestations contain conflicting predicates"
+        );
     }
     *verified = Some(candidate);
     Ok(())
@@ -613,8 +665,9 @@ fn manifest_from_bundle(
         return Ok(None);
     }
     require_subject_binding(&statement, blob, digest, "Release attestation subject")?;
-    let manifest = serde_json::from_value(statement.predicate)
-        .context("Release attestation predicate is not a closed manifest")?;
+    let manifest = serde_json::from_value(statement.predicate).context(format!(
+        "{ARTIFACT_UNVERIFIED}: Release attestation predicate is not a closed manifest"
+    ))?;
     Ok(Some(manifest))
 }
 
@@ -623,13 +676,15 @@ fn statement_from_bundle(bundle: &serde_json::Value) -> anyhow::Result<InTotoSta
         .get("dsseEnvelope")
         .and_then(|envelope| envelope.get("payload"))
         .and_then(serde_json::Value::as_str)
-        .context("Release attestation has no DSSE payload")?;
-    let statement: InTotoStatement = serde_json::from_slice(
-        &STANDARD
-            .decode(payload)
-            .context("Release attestation payload is not base64")?,
-    )
-    .context("Release attestation statement is invalid")?;
+        .context(format!(
+            "{ARTIFACT_UNVERIFIED}: Release attestation has no DSSE payload"
+        ))?;
+    let statement: InTotoStatement = serde_json::from_slice(&STANDARD.decode(payload).context(
+        format!("{ARTIFACT_UNVERIFIED}: Release attestation payload is not base64"),
+    )?)
+    .context(format!(
+        "{ARTIFACT_UNVERIFIED}: Release attestation statement is invalid"
+    ))?;
     Ok(statement)
 }
 
@@ -640,7 +695,7 @@ fn resolve_version(repository: &str, requested: Option<&str>) -> anyhow::Result<
         }
         return Ok(version.to_owned());
     }
-    let response = Process::new("curl")
+    let process = Process::new("curl")
         .args(bounded_https_curl_arguments(
             GITHUB_REQUEST_SECONDS,
             MAX_GITHUB_JSON_BYTES,
@@ -649,8 +704,8 @@ fn resolve_version(repository: &str, requested: Option<&str>) -> anyhow::Result<
             "-H",
             "Accept: application/vnd.github+json",
             &format!("https://api.github.com/repos/{repository}/releases/latest"),
-        ])
-        .stdout()?;
+        ]);
+    let response = release_fetch_stdout(&process, "the latest GitHub Release")?;
     let value: serde_json::Value =
         serde_json::from_str(&response).context("GitHub latest release response is invalid")?;
     let version = value
@@ -684,6 +739,7 @@ fn download(
             "https://github.com/{repository}/releases/download/{version}/{name}"
         ))
         .run_quiet()
+        .map_err(|error| release_download_error(error, &format!("Release asset '{name}'")))
 }
 
 fn verify_blob_attestation(
@@ -726,10 +782,16 @@ fn verify_artifact(path: &Path, artifact: &Artifact) -> anyhow::Result<()> {
     let metadata =
         fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
     if metadata.len() != artifact.size {
-        bail!("artifact size mismatch: {}", artifact.name);
+        bail!(
+            "{ARTIFACT_UNVERIFIED}: artifact size mismatch: {}",
+            artifact.name
+        );
     }
     if sha256(path)? != artifact.sha256 {
-        bail!("artifact digest mismatch: {}", artifact.name);
+        bail!(
+            "{ARTIFACT_UNVERIFIED}: artifact digest mismatch: {}",
+            artifact.name
+        );
     }
     Ok(())
 }
@@ -737,6 +799,48 @@ fn verify_artifact(path: &Path, artifact: &Artifact) -> anyhow::Result<()> {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    #[test]
+    fn release_fetch_failures_distinguish_missing_from_transport() {
+        let missing = release_download_error(
+            anyhow::anyhow!("curl failed: The requested URL returned error: 404"),
+            "Release asset",
+        );
+        assert!(
+            format!("{missing:#}").contains(RELEASE_NOT_FOUND),
+            "{missing:#}"
+        );
+
+        let unavailable = release_download_error(
+            anyhow::anyhow!("curl failed: Could not resolve host github.com"),
+            "Release asset",
+        );
+        assert!(
+            format!("{unavailable:#}").contains(RELEASE_DOWNLOAD_FAILED),
+            "{unavailable:#}"
+        );
+        assert!(
+            !format!("{unavailable:#}").contains(crate::error_codes::HOST_UNREACHABLE),
+            "{unavailable:#}"
+        );
+    }
+
+    #[test]
+    fn invalid_attestation_keeps_artifact_verification_code() {
+        let statement = InTotoStatement {
+            kind: IN_TOTO_STATEMENT_V1.to_owned(),
+            subject: Vec::new(),
+            predicate_type: RELEASE_PREDICATE.to_owned(),
+            predicate: serde_json::Value::Null,
+        };
+        let error =
+            require_subject_binding(&statement, "nazoauth-linux-x86_64", "deadbeef", "Release")
+                .expect_err("unbound bytes must fail");
+        assert!(
+            format!("{error:#}").contains(ARTIFACT_UNVERIFIED),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn cache_root_is_absolute_and_scoped_when_a_base_exists() {

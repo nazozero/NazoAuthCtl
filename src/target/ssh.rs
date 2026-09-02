@@ -184,6 +184,19 @@ pub struct SshTarget {
 }
 
 impl SshTarget {
+    fn process_failure(&self, error: anyhow::Error, context: &str) -> anyhow::Error {
+        let rendered = format!("{error:#}");
+        if rendered.contains("did not answer within") || rendered.contains("timed out") {
+            anyhow::anyhow!(
+                "{}: {context} for profile '{}' timed out: {rendered}",
+                crate::error_codes::HOST_UNREACHABLE,
+                self.profile
+            )
+        } else {
+            anyhow::anyhow!("{context} for profile '{}': {rendered}", self.profile)
+        }
+    }
+
     fn helper_mismatch(&self, detail: impl std::fmt::Display) -> anyhow::Error {
         anyhow::anyhow!(
             "{REMOTE_HELPER_MISMATCH}: the helper on '{}' does not speak the \
@@ -289,11 +302,12 @@ impl SshTarget {
             .args(self.exec_args())
             .timeout(self.timeout)
             .stdin_output(&payload)
-            .context(format!(
-                "failed to start the OpenSSH client ({}) for profile '{}'",
-                self.program.display(),
-                self.profile
-            ))?;
+            .map_err(|error| {
+                self.process_failure(
+                    error,
+                    &format!("OpenSSH client ({}) failed", self.program.display()),
+                )
+            })?;
         if !output.status.success() {
             bail!("{}", self.transport_failure(output.status, &output.stderr));
         }
@@ -321,7 +335,8 @@ impl SshTarget {
     fn transport_failure(&self, status: std::process::ExitStatus, stderr: &[u8]) -> String {
         let lossy = String::from_utf8_lossy(stderr);
         let excerpt = sanitize(lossy.trim().to_owned());
-        if lossy.contains("sudo:") {
+        let lowercase = lossy.to_ascii_lowercase();
+        if sudo_password_required(&lowercase) {
             format!(
                 "{HOST_ERR_SUDO_PASSWORD_REQUIRED}: sudo refused the non-interactive request \
                  on '{0}' ({excerpt}); establish credentials once with \
@@ -343,6 +358,24 @@ impl SshTarget {
                 "{}: OpenSSH authentication failed for '{profile}' ({excerpt}); fix the \
                  credentials or key setup for this profile in your own SSH configuration",
                 crate::error_codes::SSH_AUTH_FAILED,
+            )
+        } else if [
+            "connection refused",
+            "connection timed out",
+            "could not resolve hostname",
+            "network is unreachable",
+            "no route to host",
+            "connection reset by peer",
+            "connection closed by",
+            "connection to ",
+        ]
+        .iter()
+        .any(|needle| lowercase.contains(needle))
+        {
+            format!(
+                "{}: ssh to '{}' exited with {status} ({excerpt})",
+                crate::error_codes::HOST_UNREACHABLE,
+                self.profile
             )
         } else {
             format!("ssh to '{}' exited with {status} ({excerpt})", self.profile)
@@ -375,7 +408,22 @@ impl SshTarget {
                 }
             }
         })();
-        self.cache_verified_hello(answered.map_err(|error| self.helper_mismatch(error))?)
+        let hello = answered.map_err(|error| {
+            let rendered = format!("{error:#}");
+            if [
+                crate::error_codes::HOST_UNREACHABLE,
+                crate::error_codes::SSH_AUTH_FAILED,
+                crate::error_codes::SSH_HOST_KEY_FAILED,
+            ]
+            .iter()
+            .any(|code| rendered.contains(code))
+            {
+                error
+            } else {
+                self.helper_mismatch(error)
+            }
+        })?;
+        self.cache_verified_hello(hello)
     }
 
     /// Non-interactive sudo probe over the same fixed argv pattern.
@@ -393,30 +441,15 @@ impl SshTarget {
             .args(self.sudo_probe_args())
             .timeout(self.timeout)
             .stdin_output(b"")
-            .context("failed to start the OpenSSH client for the sudo probe")?;
+            .map_err(|error| self.process_failure(error, "OpenSSH sudo probe failed"))?;
         if output.status.success() {
             return Ok(SudoPreflight::Ready);
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let transport_failed = [
-            "permission denied (publickey",
-            "host key verification failed",
-            "connection refused",
-            "connection timed out",
-            "could not resolve hostname",
-            "network is unreachable",
-            "port 22: connection",
-        ]
-        .iter()
-        .any(|needle| stderr.to_ascii_lowercase().contains(needle));
-        if transport_failed {
-            bail!(
-                "HOST_UNREACHABLE: the sudo probe failed inside the SSH transport, not at \
-                 sudo: {}",
-                stderr.trim().chars().take(200).collect::<String>()
-            );
+        if sudo_password_required(&stderr.to_ascii_lowercase()) {
+            return Ok(SudoPreflight::PasswordRequired);
         }
-        Ok(SudoPreflight::PasswordRequired)
+        bail!("{}", self.transport_failure(output.status, &output.stderr))
     }
 
     /// Establish a sudo timestamp interactively — at most one real
@@ -464,6 +497,18 @@ impl SshTarget {
         }
         Ok(())
     }
+}
+
+fn sudo_password_required(stderr: &str) -> bool {
+    stderr.contains("sudo:")
+        && [
+            "a password is required",
+            "no password was provided",
+            "a terminal is required",
+            "no tty present",
+        ]
+        .iter()
+        .any(|needle| stderr.contains(needle))
 }
 
 /// Result of probing non-interactive sudo availability.
@@ -1122,6 +1167,25 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     }
 
     #[test]
+    fn connection_refusal_is_reachability_not_helper_mismatch() {
+        let stub = SshStub::install(&StubScenario {
+            response_json: "{}",
+            stderr_text: Some("ssh: connect to host example.test port 22: Connection refused\r\n"),
+            exit_code: 255,
+        })
+        .unwrap();
+        let target = ssh_target(HostPrivilege::Direct, &stub).unwrap();
+
+        let error = target.inspect_host().expect_err("unreachable host");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(crate::error_codes::HOST_UNREACHABLE),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(REMOTE_HELPER_MISMATCH), "{rendered}");
+    }
+
+    #[test]
     fn corrupt_helper_stdout_is_a_transport_error_not_a_result() {
         let stub = SshStub::install(&StubScenario {
             response_json: "{\"schema\":1,\"operation_id\":\"__OPERATION_ID__\",\"outcome\":{\"status\":\"completed\",\"body\":{\"result\":\"ping\",\"nonce\":\"ok\"}}} trailing garbage",
@@ -1248,6 +1312,25 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
                 .iter()
                 .all(|line| line.ends_with("-- sudo -n true"))
         );
+    }
+
+    #[test]
+    fn sudo_probe_preserves_ssh_authentication_failure() {
+        let stub = SshStub::install(&StubScenario {
+            response_json: "{}",
+            stderr_text: Some("Permission denied (publickey,password).\r\n"),
+            exit_code: 255,
+        })
+        .unwrap();
+        let target = ssh_target(HostPrivilege::Sudo, &stub).unwrap();
+
+        let error = target.probe_sudo().expect_err("authentication failure");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(crate::error_codes::SSH_AUTH_FAILED),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(crate::error_codes::HOST_UNREACHABLE));
     }
 
     #[test]

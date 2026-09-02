@@ -139,9 +139,28 @@ fn unknown_failures_fall_back_to_a_conservative_code() {
     assert!(
         rendered
             .lines()
-            .any(|line| line.contains(crate::error_codes::HOST_UNREACHABLE)),
+            .any(|line| line.contains(crate::error_codes::INTERNAL_ERROR)),
         "{rendered}"
     );
+    assert!(!rendered.contains("host check"), "{rendered}");
+}
+
+#[test]
+fn release_failures_are_not_reported_as_target_connectivity() {
+    for code in [
+        crate::error_codes::RELEASE_NOT_FOUND,
+        crate::error_codes::RELEASE_DOWNLOAD_FAILED,
+        crate::target::ARTIFACT_UNVERIFIED,
+    ] {
+        let rendered = render(code, true);
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert_eq!(value["code"], code, "{rendered}");
+        assert_ne!(
+            value["code"],
+            crate::error_codes::HOST_UNREACHABLE,
+            "{rendered}"
+        );
+    }
 }
 
 #[test]

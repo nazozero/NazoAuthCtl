@@ -5,8 +5,9 @@ use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::Client;
 use reqwest::redirect::Policy;
@@ -33,6 +34,12 @@ const MAX_RUNTIME_RECEIPT_RESOURCES: usize = 4;
 const MAX_RUNTIME_RECEIPT_STATUSES: usize = 4;
 const MAX_BROWSER_LOG_ENTRIES: usize = 128;
 const MAX_BROWSER_LOG_MESSAGE_BYTES: usize = 16 * 1024;
+const SELENIUM_CONTAINER_IMAGE: &str = "docker.io/selenium/standalone-chromium@sha256:81c80050126f610675e40eeac529a821dc5a0d38acf26c6d44f792a6e7ea8ac5";
+const SELENIUM_CONTAINER_PORT: &str = "4444/tcp";
+const CONTAINER_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(600);
+const CONTAINER_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+static SELENIUM_CONTAINER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const PAGE_RUNTIME_DIAGNOSTIC_SCRIPT: &str = r#"return (() => {
   const cap = (value, maximum) => Math.min(Math.max(0, Number(value) || 0), maximum);
   const root = document.getElementById('root');
@@ -573,13 +580,111 @@ impl Drop for WebDriverClient {
     }
 }
 
-/// A managed local chromedriver session used by the ordinary CLI path.  It
-/// owns both the driver process and the WebDriver session, so an interrupted
-/// conformance run cannot leave a browser process behind.  CI may instead
-/// supply an explicitly managed endpoint through [`WebDriverClient`].
+/// A managed local WebDriver session used by the ordinary CLI path. It prefers
+/// an installed chromedriver and otherwise owns an ephemeral Selenium
+/// container, so callers do not need to configure browser infrastructure.
 pub struct ManagedWebDriver {
     client: WebDriverClient,
-    child: Child,
+    process: ManagedDriverProcess,
+}
+
+enum ManagedDriverProcess {
+    Native(Child),
+    Container(ManagedSeleniumContainer),
+}
+
+impl ManagedDriverProcess {
+    fn is_running(&mut self) -> Result<bool, BrowserError> {
+        match self {
+            Self::Native(child) => child
+                .try_wait()
+                .map(|status| status.is_none())
+                .map_err(|_| BrowserError::DriverStartFailed),
+            Self::Container(container) => container.is_running(),
+        }
+    }
+
+    fn stop(&mut self) {
+        match self {
+            Self::Native(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Self::Container(container) => container.remove(),
+        }
+    }
+}
+
+struct ManagedSeleniumContainer {
+    runtime: PathBuf,
+    name: String,
+    removed: bool,
+}
+
+impl ManagedSeleniumContainer {
+    fn start(runtime: &Path) -> Result<(Self, u16), BrowserError> {
+        validate_driver_binary(runtime)?;
+        if !container_runtime_is_ready(runtime) {
+            return Err(BrowserError::DriverStartFailed);
+        }
+        let name = selenium_container_name();
+        let container = Self {
+            runtime: runtime.to_owned(),
+            name,
+            removed: false,
+        };
+        let mut command = container_command(&container.runtime);
+        command.args([
+            "run",
+            "--detach",
+            "--rm",
+            "--name",
+            &container.name,
+            "--publish",
+            "127.0.0.1::4444",
+            "--shm-size",
+            "2g",
+            SELENIUM_CONTAINER_IMAGE,
+        ]);
+        let output = command_output_with_timeout(&mut command, CONTAINER_START_TIMEOUT)?;
+        if !output.status.success() {
+            return Err(BrowserError::DriverStartFailed);
+        }
+
+        let mut command = container_command(&container.runtime);
+        command.args(["port", &container.name, SELENIUM_CONTAINER_PORT]);
+        let output = command_output_with_timeout(&mut command, CONTAINER_COMMAND_TIMEOUT)?;
+        if !output.status.success() {
+            return Err(BrowserError::DriverStartFailed);
+        }
+        let port =
+            parse_loopback_container_port(&output.stdout).ok_or(BrowserError::DriverStartFailed)?;
+        Ok((container, port))
+    }
+
+    fn is_running(&self) -> Result<bool, BrowserError> {
+        let mut command = container_command(&self.runtime);
+        command.args(["inspect", "--format", "{{.State.Running}}", &self.name]);
+        let output = command_output_with_timeout(&mut command, CONTAINER_COMMAND_TIMEOUT)?;
+        Ok(output.status.success()
+            && std::str::from_utf8(&output.stdout).is_ok_and(|value| value.trim() == "true"))
+    }
+
+    fn remove(&mut self) {
+        if self.removed {
+            return;
+        }
+        self.removed = true;
+        let mut command = container_command(&self.runtime);
+        command.args(["rm", "--force", &self.name]);
+        let _ = command_output_with_timeout(&mut command, CONTAINER_COMMAND_TIMEOUT);
+    }
+}
+
+impl Drop for ManagedSeleniumContainer {
+    fn drop(&mut self) {
+        self.remove();
+    }
 }
 
 impl fmt::Debug for ManagedWebDriver {
@@ -590,8 +695,24 @@ impl fmt::Debug for ManagedWebDriver {
 
 impl ManagedWebDriver {
     pub fn start_default(timeout: Duration) -> Result<Self, BrowserError> {
-        let binary = find_driver_binary().ok_or(BrowserError::DriverUnavailable)?;
-        Self::start_with_binary(&binary, timeout)
+        if timeout.is_zero() {
+            return Err(BrowserError::InvalidLimits);
+        }
+        if let Some(binary) = find_driver_binary() {
+            return Self::start_with_binary(&binary, timeout);
+        }
+
+        let runtimes = find_container_runtimes();
+        for runtime in &runtimes {
+            if let Ok(driver) = Self::start_with_container_runtime(runtime, timeout) {
+                return Ok(driver);
+            }
+        }
+        Err(if runtimes.is_empty() {
+            BrowserError::DriverUnavailable
+        } else {
+            BrowserError::DriverStartFailed
+        })
     }
 
     pub fn start_with_binary(path: &Path, timeout: Duration) -> Result<Self, BrowserError> {
@@ -631,60 +752,24 @@ impl ManagedWebDriver {
             .map_err(|_| BrowserError::DriverStartFailed)?;
 
         let endpoint = WebDriverEndpoint::parse(&format!("http://127.0.0.1:{port}"))?;
-        let health_client = Client::builder()
-            .timeout(Duration::from_secs(1))
-            .redirect(Policy::none())
-            .no_proxy()
-            .build()
-            .map_err(|_| BrowserError::Transport)?;
-        let deadline = Instant::now() + timeout.min(Duration::from_secs(60));
-        let mut child = child;
-        let ready = loop {
-            if let Some(_status) = child
-                .try_wait()
-                .map_err(|_| BrowserError::DriverStartFailed)?
-            {
-                return Err(BrowserError::DriverStartFailed);
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(BrowserError::DriverStartFailed);
-            }
-            let health_url = endpoint.endpoint_url("/status")?;
-            if let Ok(response) = health_client.get(health_url).send()
-                && response.status().is_success()
-            {
-                let mut body = Vec::new();
-                let _ = response.take(64 * 1024).read_to_end(&mut body);
-                let ready = serde_json::from_slice::<Value>(&body)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("value")
-                            .and_then(|item| item.get("ready"))
-                            .and_then(Value::as_bool)
-                    })
-                    .unwrap_or(false);
-                if ready {
-                    break true;
-                }
-            }
-            thread::sleep(Duration::from_millis(100));
-        };
-        if !ready {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(BrowserError::DriverStartFailed);
-        }
-
+        let mut process = ManagedDriverProcess::Native(child);
+        wait_for_webdriver(&endpoint, timeout, &mut process)?;
         let mut client = WebDriverClient::connect(endpoint, timeout)?;
-        if let Err(error) = client.start_chrome() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-        Ok(Self { client, child })
+        client.start_chrome()?;
+        Ok(Self { client, process })
+    }
+
+    fn start_with_container_runtime(
+        runtime: &Path,
+        timeout: Duration,
+    ) -> Result<Self, BrowserError> {
+        let (container, port) = ManagedSeleniumContainer::start(runtime)?;
+        let endpoint = WebDriverEndpoint::parse(&format!("http://127.0.0.1:{port}"))?;
+        let mut process = ManagedDriverProcess::Container(container);
+        wait_for_webdriver(&endpoint, timeout, &mut process)?;
+        let mut client = WebDriverClient::connect(endpoint, timeout)?;
+        client.start_chrome()?;
+        Ok(Self { client, process })
     }
 
     pub fn driver_mut(&mut self) -> &mut WebDriverClient {
@@ -772,8 +857,111 @@ impl BrowserDriver for ManagedWebDriver {
 impl Drop for ManagedWebDriver {
     fn drop(&mut self) {
         let _ = self.client.quit();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.process.stop();
+    }
+}
+
+fn wait_for_webdriver(
+    endpoint: &WebDriverEndpoint,
+    timeout: Duration,
+    process: &mut ManagedDriverProcess,
+) -> Result<(), BrowserError> {
+    let health_client = Client::builder()
+        .timeout(Duration::from_secs(1))
+        .redirect(Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|_| BrowserError::Transport)?;
+    let deadline = Instant::now() + timeout.min(Duration::from_secs(60));
+    loop {
+        if !process.is_running()? || Instant::now() >= deadline {
+            return Err(BrowserError::DriverStartFailed);
+        }
+        let health_url = endpoint.endpoint_url("/status")?;
+        if let Ok(response) = health_client.get(health_url).send()
+            && response.status().is_success()
+        {
+            let mut body = Vec::new();
+            let _ = response.take(64 * 1024).read_to_end(&mut body);
+            if serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("value")
+                        .and_then(|item| item.get("ready"))
+                        .and_then(Value::as_bool)
+                })
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn selenium_container_name() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let sequence = SELENIUM_CONTAINER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "nazoauthctl-oidf-{}-{timestamp}-{sequence}",
+        std::process::id()
+    )
+}
+
+fn parse_loopback_container_port(output: &[u8]) -> Option<u16> {
+    let value = std::str::from_utf8(output).ok()?.trim();
+    let (host, port) = value.rsplit_once(':')?;
+    if host != "127.0.0.1" {
+        return None;
+    }
+    port.parse::<u16>().ok().filter(|port| *port != 0)
+}
+
+fn container_command(runtime: &Path) -> Command {
+    let mut command = Command::new(runtime);
+    command
+        .env_clear()
+        .env("PATH", safe_driver_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    configure_driver_process(&mut command);
+    command
+}
+
+fn container_runtime_is_ready(runtime: &Path) -> bool {
+    let mut command = container_command(runtime);
+    command.arg("info").stdout(Stdio::null());
+    command_output_with_timeout(&mut command, CONTAINER_RUNTIME_PROBE_TIMEOUT)
+        .is_ok_and(|output| output.status.success())
+}
+
+fn command_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::Output, BrowserError> {
+    let mut child = command
+        .spawn()
+        .map_err(|_| BrowserError::DriverStartFailed)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|_| BrowserError::DriverStartFailed);
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(BrowserError::DriverStartFailed);
+            }
+        }
     }
 }
 
@@ -827,6 +1015,37 @@ fn find_driver_binary() -> Option<PathBuf> {
         .into_iter()
         .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
         .find(|path| validate_driver_binary(path).is_ok())
+}
+
+fn find_container_runtimes() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    #[cfg(unix)]
+    {
+        candidates.extend([
+            PathBuf::from("/usr/local/bin/podman"),
+            PathBuf::from("/usr/bin/podman"),
+            PathBuf::from("/opt/homebrew/bin/podman"),
+            PathBuf::from("/usr/local/bin/docker"),
+            PathBuf::from("/usr/bin/docker"),
+            PathBuf::from("/opt/homebrew/bin/docker"),
+        ]);
+    }
+    #[cfg(windows)]
+    {
+        candidates.extend([
+            PathBuf::from(r"C:\Program Files\RedHat\Podman\podman.exe"),
+            PathBuf::from(r"C:\Program Files\Podman\podman.exe"),
+            PathBuf::from(r"C:\Program Files\Docker\Docker\resources\bin\docker.exe"),
+        ]);
+    }
+    candidates
+        .into_iter()
+        .filter_map(|path| {
+            let canonical = std::fs::canonicalize(path).ok()?;
+            validate_driver_binary(&canonical).ok()?;
+            Some(canonical)
+        })
+        .collect()
 }
 
 fn safe_driver_path() -> &'static str {
@@ -1415,6 +1634,38 @@ mod tests {
             .expect("one opaque pixel");
         drop(writer);
         bytes
+    }
+
+    #[test]
+    fn container_port_accepts_only_an_explicit_ipv4_loopback_mapping() {
+        assert_eq!(
+            parse_loopback_container_port(b"127.0.0.1:49153\n"),
+            Some(49_153)
+        );
+        assert_eq!(
+            parse_loopback_container_port(b"127.0.0.1:49153\r\n"),
+            Some(49_153)
+        );
+        assert_eq!(parse_loopback_container_port(b"0.0.0.0:49153\n"), None);
+        assert_eq!(parse_loopback_container_port(b"[::1]:49153\n"), None);
+        assert_eq!(parse_loopback_container_port(b"127.0.0.1:0\n"), None);
+        assert_eq!(
+            parse_loopback_container_port(b"127.0.0.1:not-a-port\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn managed_selenium_container_names_are_unique_and_runtime_safe() {
+        let first = selenium_container_name();
+        let second = selenium_container_name();
+        assert_ne!(first, second);
+        assert!(first.starts_with("nazoauthctl-oidf-"));
+        assert!(
+            first
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        );
     }
 
     #[test]
