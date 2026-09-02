@@ -608,7 +608,9 @@ pub fn write_review_screenshot_manifest(
     }
     #[cfg(unix)]
     {
-        if report.suite_origin != "https://www.certification.openid.net" {
+        let suite_origin = crate::Origin::parse_suite(&report.suite_origin)
+            .map_err(|_| EvidenceError::Identity)?;
+        if suite_origin.as_str() != report.suite_origin {
             return Err(EvidenceError::Identity);
         }
         validate_review_screenshot_run_limit(report)?;
@@ -1190,3 +1192,47 @@ impl std::fmt::Display for EvidenceError {
 }
 
 impl std::error::Error for EvidenceError {}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_evidence_is_bound_to_the_dynamic_tenant_issuer() {
+        let tenant_issuer = "https://01a06016-43e0-7cf1-9633-b9c6124823cb.oidf.nazoauth.com";
+        let trigger_path = "/openid4vp/complete/01a06016-71d4-7181-b275-be8f5ade62a0";
+        let trigger_url =
+            url::Url::parse(&format!("{tenant_issuer}{trigger_path}")).expect("completion URL");
+        let audit = ReviewScreenshotAudit {
+            suite_plan_id: "suite-plan".to_owned(),
+            module_id: "suite-module".to_owned(),
+            test_name: "oid4vp-1final-verifier-happy-flow".to_owned(),
+            variant: std::collections::BTreeMap::new(),
+            marker: crate::ReviewScreenshotMarker::Required,
+            obligation_index: 0,
+            path: PathBuf::from("review-screenshots/run/module.png"),
+            sha256: "a".repeat(64),
+            size: 1,
+            trigger_origin: tenant_issuer.to_owned(),
+            trigger_path: trigger_path.to_owned(),
+            trigger_url_sha256: sha256(trigger_url.as_str().as_bytes()),
+            source: crate::BrowserReviewScreenshotSource::NazoVpCompletionLiveWebdriver,
+            verification_receipt: None,
+        };
+
+        assert!(valid_review_screenshot_trigger(
+            &audit,
+            &trigger_url,
+            "https://auth.nazo.run:18544",
+            tenant_issuer,
+            "suite-module",
+        ));
+        assert!(!valid_review_screenshot_trigger(
+            &audit,
+            &trigger_url,
+            "https://auth.nazo.run:18544",
+            "https://auth.nazo.run",
+            "suite-module",
+        ));
+    }
+}

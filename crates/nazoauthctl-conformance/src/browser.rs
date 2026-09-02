@@ -1333,6 +1333,7 @@ const MAX_REVIEW_SCREENSHOT_BYTES: usize = 500 * 1024;
 pub(crate) const MAX_REVIEW_SCREENSHOTS_PER_MODULE: usize = 2;
 pub(crate) const MAX_REVIEW_SCREENSHOTS_PER_RUN: usize = 64;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+#[cfg(test)]
 const OFFICIAL_SUITE_ORIGIN: &str = "https://www.certification.openid.net";
 
 pub(crate) fn decode_webdriver_png(value: &str) -> Result<Zeroizing<Vec<u8>>, BrowserError> {
@@ -1688,8 +1689,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         marker: ReviewScreenshotMarker,
         report: &mut BrowserRunReport,
     ) -> Result<(), BrowserError> {
-        if self.policy.suite_origin.as_str() != OFFICIAL_SUITE_ORIGIN
-            || !self.policy.suite_origin.same_origin_url(trigger_url)
+        if !self.policy.suite_origin.same_origin_url(trigger_url)
             || !review_screenshot_path_binds_module(trigger_url, &capture.module_id)
         {
             return Err(self.navigation_violation(self.last_url.as_ref(), trigger_url));

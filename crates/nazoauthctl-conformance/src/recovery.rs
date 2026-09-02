@@ -1560,11 +1560,10 @@ fn validate_suite_retention_manifest(
     binding: &TenantResourceRecoveryBinding,
     suite: Option<&SuiteRecoveryState>,
 ) -> anyhow::Result<()> {
+    let suite_origin = crate::Origin::parse_suite(&manifest.suite_origin)
+        .map_err(|_| anyhow::anyhow!("retained Suite origin is invalid"))?;
     if manifest.schema != SUITE_RETENTION_MANIFEST_SCHEMA
-        || crate::Origin::parse_suite(&manifest.suite_origin)
-            .map_err(|_| anyhow::anyhow!("retained Suite origin is invalid"))?
-            .as_str()
-            != "https://www.certification.openid.net"
+        || suite_origin.as_str() != manifest.suite_origin
         || manifest.deployment_id != binding.deployment_id
         || manifest.tenant_id != binding.tenant_id
         || manifest.run_id != binding.run_id
@@ -1790,7 +1789,7 @@ fn validate_review_screenshot_manifest_binding(
         let source_valid = match image.source {
             crate::BrowserReviewScreenshotSource::SuiteVerificationEvidence => {
                 image.verification_receipt.is_none()
-                    && image.trigger_origin == "https://www.certification.openid.net"
+                    && image.trigger_origin == document.suite_origin
                     && image.trigger_path
                         == format!("/test/a/{}/verification-evidence", image.module_id)
                     && sha256_hex(
@@ -2663,5 +2662,31 @@ mod tests {
         validate_tenant_resource_journal(&journal, "deployment-1")
             .expect("authoritative absence did not settle the rewound tenant");
         assert!(tenant_resource_obligations_complete(&journal));
+    }
+
+    #[test]
+    fn retention_accepts_the_explicit_configured_suite_origin() {
+        let binding = binding();
+        let matrix_plan_id = "openid4vc-vp-p038".to_owned();
+        let manifest = SuiteRetentionManifest {
+            schema: SUITE_RETENTION_MANIFEST_SCHEMA,
+            suite_origin: "https://auth.nazo.run:18544".to_owned(),
+            artifact_digest: "a".repeat(64),
+            matrix_sha256: "b".repeat(64),
+            deployment_id: binding.deployment_id.clone(),
+            tenant_id: binding.tenant_id.clone(),
+            run_id: binding.run_id.clone(),
+            review_screenshot_manifest: None,
+            deferred_review_pending: Vec::new(),
+            plans: vec![SuiteRetentionPlan {
+                plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256(&matrix_plan_id),
+                matrix_plan_id,
+                suite_plan_id: "suite-plan-1".to_owned(),
+                plan_name: "oid4vp-1final-verifier-test-plan".to_owned(),
+            }],
+        };
+
+        validate_suite_retention_manifest(&manifest, &binding, None)
+            .expect("explicit configured Suite origin");
     }
 }

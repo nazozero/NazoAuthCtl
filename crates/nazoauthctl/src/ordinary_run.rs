@@ -619,7 +619,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             run_jti: request_jti.clone(),
             deployment: EvidenceDeploymentIdentity {
                 deployment_id: deployment.deployment_id.clone(),
-                target_issuer: deployment.target_issuer.clone(),
+                target_issuer: ephemeral_tenant.issuer.clone(),
                 release: deployment.release.clone(),
                 runtime: runtime.clone(),
             },
