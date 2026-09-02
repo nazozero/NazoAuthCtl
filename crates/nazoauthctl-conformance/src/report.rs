@@ -156,8 +156,10 @@ pub struct OrchestrationIntegrity {
     pub cleanup_complete: bool,
     /// A requested certification retention path is deliberately not cleanup.
     pub retention_requested: bool,
-    /// Every created module reached an exact terminal or deferred-review
-    /// settlement state with no orchestration error.
+    /// Exact Suite plan ownership is eligible for durable review retention.
+    /// This is either a fully settled requested certification run or the
+    /// already-started portion of a run containing an official failure,
+    /// automation error, or external review boundary.
     pub retention_eligible: bool,
     /// All exact Suite allocations are covered by a locally verified
     /// retention candidate, but ownership has not yet moved to its durable
@@ -220,6 +222,10 @@ pub struct ConformanceReport {
     /// Signed `SKIPPED` declarations whose test name was absent from, or was
     /// duplicated in, the Suite's definition of that Matrix plan.
     pub unknown_declared_skip_modules: Vec<String>,
+    /// Exact configured-Suite plan IDs retained for certification or failure
+    /// diagnosis. An empty list means every plan was cleaned up.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub retained_suite_plan_ids: Vec<String>,
     /// Whether every declared Matrix skip was unambiguously enumerated by the
     /// Suite and no module unexpectedly finished `SKIPPED`. This is separate
     /// from local orchestration success so evidence can distinguish a clean
@@ -309,6 +315,12 @@ impl ModuleReport {
         debug_assert!(!self.terminal);
         self.deferred_review_pending = Some(pending);
         self.outcome = ModuleOutcome::DeferredReviewPending;
+        self.human_review_required = true;
+    }
+
+    pub(crate) fn mark_external_review_pending(&mut self) {
+        debug_assert!(!self.terminal);
+        self.outcome = ModuleOutcome::Review;
         self.human_review_required = true;
     }
 }

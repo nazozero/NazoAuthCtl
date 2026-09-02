@@ -841,7 +841,6 @@ fn is_builtin_reference(name: &str) -> bool {
             | "generated.mtls.client_key"
             | "generated.mtls.cert_sha256"
             | "generated.dynamic_registration_initial_access_token"
-            | "generated.ciba_automated_decision_token"
             | "generated.applicant_email"
             | "generated.credential_holder_email_sha256"
             | "onboarding.applicant_id"
@@ -850,8 +849,6 @@ fn is_builtin_reference(name: &str) -> bool {
             | "onboarding.client_secret"
             | "target.issuer"
             | "target.host"
-            | "target.ciba_automated_decision_url"
-            | "target.ciba_user_approval_callback_url"
             | "target.suite"
             | "suite.origin"
     ) || name.starts_with("client.")

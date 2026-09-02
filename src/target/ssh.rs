@@ -695,8 +695,15 @@ mod tests {
             )?;
             #[cfg(unix)]
             let program = {
+                use std::os::unix::fs::PermissionsExt as _;
+
                 let script = root.join("ssh");
-                filesystem::atomic_write(&script, unix_stub_script().as_bytes(), 0o700)?;
+                // This is a disposable test executable, not durable state.
+                // Close its write handle before Command::spawn; executing an
+                // atomically renamed, still-open script can race with Linux
+                // overlay filesystems and fail with ETXTBSY.
+                fs::write(&script, unix_stub_script().as_bytes())?;
+                fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
                 script
             };
             #[cfg(windows)]

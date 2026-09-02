@@ -55,20 +55,6 @@ impl Origin {
         Ok(origin)
     }
 
-    pub fn official() -> Self {
-        // This literal is parsed from a constant under our control and cannot
-        // fail; keeping the parser in one place prevents origin drift.
-        Self::parse("https://www.certification.openid.net")
-            .expect("official conformance suite origin is valid")
-    }
-
-    pub fn from_suite_arg(value: Option<&str>) -> Result<Self, OriginError> {
-        match value {
-            Some(value) => Self::parse_suite(value),
-            None => Ok(Self::official()),
-        }
-    }
-
     pub fn as_str(&self) -> &str {
         &self.0
     }

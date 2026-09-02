@@ -66,7 +66,7 @@ pub use browser::{
     parse_browser_entries, parse_browser_entries_owned,
 };
 pub use ciba_approval::{
-    CibaApprovalFailureStage, CibaUserApprovalBridge, CibaUserApprovalClient, CibaUserApprovalError,
+    CibaApprovalFailureStage, CibaUserApprovalClient, CibaUserApprovalError, ciba_approval_requests,
 };
 pub use client::{
     AuthProbe, CancelOutcome, ClientConfig, DeleteOutcome, ModuleDefinition, ModuleInstance,

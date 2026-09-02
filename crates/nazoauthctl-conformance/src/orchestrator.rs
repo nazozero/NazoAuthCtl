@@ -18,6 +18,7 @@ use crate::browser::{
     OpenId4VpStartRequest, OpenId4VpVerifier, browser_config_for_module,
     parse_browser_entries_owned, required_review_screenshot_count,
 };
+use crate::ciba_approval::{CibaUserApprovalClient, ciba_approval_requests};
 use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
 use crate::matrix::{MatrixError, SelectedMatrix, zeroize_json_value};
 use crate::origin::Origin;
@@ -48,6 +49,7 @@ pub struct ConformanceAutomation {
     pub review_screenshot_capture: Option<BrowserReviewScreenshotCapture>,
     pub verifier: Option<Arc<Mutex<dyn OpenId4VpVerifier>>>,
     pub issuer: Option<Arc<Mutex<dyn OpenId4VciIssuerDriver>>>,
+    pub ciba_approver: Option<Arc<CibaUserApprovalClient>>,
 }
 
 #[derive(Default)]
@@ -136,10 +138,22 @@ pub trait SuiteResourceObserver: Send + Sync {
         false
     }
 
+    /// Keep already-started plans when an official Suite module fails so the
+    /// operator can inspect the same record in the configured Suite UI.
+    fn retain_failed_suite_plans_for_diagnosis(&self) -> bool {
+        false
+    }
+
     fn plan_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String>;
     fn plan_created(&self, origin: &Origin, intent_id: &str, plan_id: &str) -> Result<(), String>;
     fn module_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String>;
     fn module_created(&self, intent_id: &str, module_id: &str) -> Result<(), String>;
+
+    /// Shrink durable recovery ownership only after the Suite confirms that
+    /// the exact plan is deleted or already absent.
+    fn plan_deleted(&self, _plan_id: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub struct ConformanceRunner {
@@ -331,6 +345,82 @@ impl ConformanceRunner {
         }
         thread::sleep(remaining.min(Duration::from_millis(200)));
         Ok(())
+    }
+
+    fn drive_ciba_waiting_interruptible(
+        &self,
+        approver: &Arc<CibaUserApprovalClient>,
+        module: &ModuleDefinition,
+        module_id: &str,
+        initial: Value,
+    ) -> Result<(Value, bool), String> {
+        const USER_REJECTS_AUTHENTICATION: &str = "fapi-ciba-id1-user-rejects-authentication";
+
+        let deadline = Instant::now()
+            .checked_add(self.config.poll_timeout)
+            .ok_or_else(|| "CIBA poll timeout is out of range".to_owned())?;
+        let approve = module.test_name != USER_REJECTS_AUTHENTICATION;
+        let mut decided = BTreeSet::new();
+        let mut observed = initial;
+        loop {
+            if self.config.control.is_interrupted() {
+                return Err("run interrupted".to_owned());
+            }
+            if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                return Err("CIBA user decision timed out".to_owned());
+            }
+            if is_terminal_state(&observed) {
+                return Ok((observed, false));
+            }
+            if !is_waiting(&observed) {
+                observed = self.wait_for_state_until(
+                    module_id,
+                    &["WAITING", "FINISHED", "INTERRUPTED"],
+                    deadline,
+                )?;
+                continue;
+            }
+
+            let log = self
+                .config
+                .client
+                .module_log(module_id)
+                .map_err(|error| safe_error(&error))?;
+            let mut made_decision = false;
+            for auth_req_id in ciba_approval_requests(&log).map_err(|error| error.to_string())? {
+                if decided.contains(&auth_req_id) {
+                    continue;
+                }
+                approver.decide(&auth_req_id, approve).map_err(|error| {
+                    format!(
+                        "CIBA user decision failed during {}",
+                        error.approval_failure_stage()
+                    )
+                })?;
+                decided.insert(auth_req_id);
+                made_decision = true;
+            }
+            if !made_decision && !decided.is_empty() && suite_log_has_upload_placeholder(&log) {
+                // A later WAITING state with no new CIBA request belongs to a
+                // different Suite interaction, such as review evidence. Let
+                // the normal interactive driver handle that boundary.
+                return Ok((observed, true));
+            }
+            if made_decision || !decided.is_empty() {
+                observed = self.wait_for_state_until(
+                    module_id,
+                    &["RUNNING", "FINISHED", "INTERRUPTED"],
+                    deadline,
+                )?;
+            } else {
+                self.wait_for_runner_refresh(deadline, "CIBA")?;
+                observed = self
+                    .config
+                    .client
+                    .module_info(module_id)
+                    .map_err(|error| safe_error(&error))?;
+            }
+        }
     }
 
     fn drive_vci_waiting_interruptible(
@@ -951,6 +1041,7 @@ impl ConformanceRunner {
                     let mut observed = initial;
                     let mut browser_review_evidence = BrowserReviewEvidence::default();
                     let mut deferred_review_pending = None;
+                    let mut external_review_pending = false;
                     let has_browser_config =
                         match module_has_browser_config(&plan.config, &module.test_name) {
                             Ok(value) => value,
@@ -996,7 +1087,34 @@ impl ConformanceRunner {
                     }
 
                     if observed.as_ref().is_some_and(is_waiting) {
-                        if plan.plan_name.starts_with("oid4vci-") {
+                        if plan.lane == OidfDriverLane::Ciba {
+                            let Some(approver) = self
+                                .config
+                                .automation
+                                .first()
+                                .and_then(|automation| automation.ciba_approver.as_ref())
+                            else {
+                                errors.push("CIBA user automation is unavailable".to_owned());
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            };
+                            match self.drive_ciba_waiting_interruptible(
+                                approver,
+                                module,
+                                &instance.id,
+                                observed.clone().expect("waiting runner state"),
+                            ) {
+                                Ok((state, review_pending)) => {
+                                    observed = Some(state);
+                                    external_review_pending = review_pending;
+                                }
+                                Err(error) => {
+                                    errors.push(error);
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                }
+                            }
+                        } else if plan.plan_name.starts_with("oid4vci-") {
                             let Some(issuer) = self
                                 .config
                                 .automation
@@ -1459,7 +1577,10 @@ impl ConformanceRunner {
                                 .to_owned(),
                         );
                         groups[group_index].status = GroupStatus::Failed;
-                    } else if !terminal && deferred_review_pending.is_none() {
+                    } else if !terminal
+                        && deferred_review_pending.is_none()
+                        && !external_review_pending
+                    {
                         errors.push("Suite module did not reach a terminal status".to_owned());
                         groups[group_index].status = GroupStatus::Failed;
                     } else if has_browser_config {
@@ -1510,9 +1631,13 @@ impl ConformanceRunner {
                     if let Some(pending) = deferred_review_pending {
                         module_report.mark_deferred_review_pending(pending);
                     }
+                    if external_review_pending {
+                        module_report.mark_external_review_pending();
+                    }
                     modules.push(module_report);
                     let module_outcome = modules.last().map(|module| module.outcome);
                     if terminal
+                        || external_review_pending
                         || modules
                             .last()
                             .is_some_and(|module| module.deferred_review_pending.is_some())
@@ -1546,6 +1671,10 @@ impl ConformanceRunner {
                         current_test.clone(),
                     );
                     if matches!(module_outcome, Some(ModuleOutcome::Failed)) {
+                        break 'execute;
+                    }
+                    if external_review_pending {
+                        groups[group_index].status = GroupStatus::Review;
                         break 'execute;
                     }
                     if deferred_blocks_remaining_modules {
@@ -1595,6 +1724,9 @@ impl ConformanceRunner {
             .iter()
             .filter(|module| module.deferred_review_pending.is_some())
             .count();
+        let external_review_pending = modules
+            .iter()
+            .any(|module| !module.terminal && module.outcome == ModuleOutcome::Review);
         let all_modules_settled = all_modules_instantiated
             && terminal_modules
                 .checked_add(deferred_review_modules)
@@ -1602,23 +1734,57 @@ impl ConformanceRunner {
         if let Err(error) = validate_review_screenshot_run_limit(&modules) {
             errors.push(error);
         }
-        let retain_suite_plans = retention_requested
+        let outcomes = summarize_module_outcomes(&modules);
+        let certification_retention = retention_requested
             && errors.is_empty()
             && all_selected_plan_definitions_enumerated
             && defined_modules > 0
             && all_modules_settled;
-        if !retain_suite_plans {
+        let diagnostic_retention = self
+            .config
+            .suite_resource_observer
+            .as_ref()
+            .is_some_and(|observer| observer.retain_failed_suite_plans_for_diagnosis())
+            && (!outcomes.failed_modules.is_empty()
+                || external_review_pending
+                || errors.iter().any(|error| error != "run interrupted"));
+        let retained_suite_plan_ids = if certification_retention {
+            suite_plan_ids.clone()
+        } else if diagnostic_retention {
+            plans
+                .iter()
+                .filter(|plan| plan.created_instances > 0)
+                .filter_map(|plan| plan.suite_plan_id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let cleanup_plan_ids = suite_plan_ids
+            .iter()
+            .filter(|plan_id| !retained_suite_plan_ids.contains(plan_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if retained_suite_plan_ids.is_empty() {
             let cancellable_module_ids = cancellable_module_ids(&module_ids, &modules);
             cleanup_all(
                 &self.config.client,
                 &cancellable_module_ids,
-                &suite_plan_ids,
+                &cleanup_plan_ids,
+                self.config.suite_resource_observer.as_ref(),
+                &mut cleanup,
+            );
+        } else {
+            cleanup_all(
+                &self.config.client,
+                &[],
+                &cleanup_plan_ids,
+                self.config.suite_resource_observer.as_ref(),
                 &mut cleanup,
             );
         }
-        let cleanup_complete = !retain_suite_plans && cleanup.failures.is_empty();
-        let retention_candidate_settled = retain_suite_plans;
-        let outcomes = summarize_module_outcomes(&modules);
+        let retention_candidate_settled =
+            !retained_suite_plan_ids.is_empty() && cleanup.failures.is_empty();
+        let cleanup_complete = retained_suite_plan_ids.is_empty() && cleanup.failures.is_empty();
         let matrix_expectations = summarize_matrix_expectations(&modules);
         let matrix_expectations_satisfied = matrix_expectations_satisfied
             && all_selected_plan_definitions_enumerated
@@ -1635,7 +1801,7 @@ impl ConformanceRunner {
             deferred_review_modules,
             cleanup_complete,
             retention_requested,
-            retention_eligible: retain_suite_plans,
+            retention_eligible: retention_candidate_settled,
             retention_candidate_settled,
             retention_committed: false,
             suite_resources_settled: suite_resources_settled(
@@ -1660,7 +1826,7 @@ impl ConformanceRunner {
             local_success,
             suite_pass,
             acceptance_pass: outcomes.acceptance_pass && matrix_expectations_satisfied,
-            review_pending: deferred_review_modules > 0,
+            review_pending: deferred_review_modules > 0 || external_review_pending,
             human_review_required,
             human_review_modules: outcomes.human_review_modules,
             deferred_review_modules: outcomes.deferred_review_modules,
@@ -1668,6 +1834,7 @@ impl ConformanceRunner {
             expected_skipped_modules: matrix_expectations.expected_skipped_modules,
             unexpected_skipped_modules: matrix_expectations.unexpected_skipped_modules,
             unknown_declared_skip_modules,
+            retained_suite_plan_ids,
             matrix_expectations_satisfied,
             failed_modules: outcomes.failed_modules,
             incomplete_modules: outcomes.incomplete_modules,
@@ -1905,6 +2072,7 @@ fn cleanup_all(
     client: &SuiteClient,
     module_ids: &[String],
     plan_ids: &[String],
+    observer: Option<&Arc<dyn SuiteResourceObserver>>,
     report: &mut CleanupReport,
 ) {
     // Cancellation is attempted before every plan deletion. A finalisation
@@ -1918,6 +2086,7 @@ fn cleanup_all(
                 crate::client::DeleteOutcome::Deleted | crate::client::DeleteOutcome::AlreadyGone,
             ) => {
                 report.deleted_plans.push(plan_id.clone());
+                record_deleted_plan(observer, plan_id, report);
             }
             Ok(DeleteOutcome::Immutable) => {
                 report.immutable_plans.push(plan_id.clone());
@@ -1941,6 +2110,7 @@ fn cleanup_all(
                         | crate::client::DeleteOutcome::AlreadyGone,
                     ) => {
                         report.deleted_plans.push(plan_id.clone());
+                        record_deleted_plan(observer, plan_id, report);
                     }
                     Ok(DeleteOutcome::Immutable) => {
                         report.immutable_plans.push(plan_id.clone());
@@ -1963,6 +2133,22 @@ fn cleanup_all(
                 }
             }
         }
+    }
+}
+
+fn record_deleted_plan(
+    observer: Option<&Arc<dyn SuiteResourceObserver>>,
+    plan_id: &str,
+    report: &mut CleanupReport,
+) {
+    if let Some(observer) = observer
+        && let Err(error) = observer.plan_deleted(plan_id)
+    {
+        report.failures.push(CleanupFailure {
+            operation: "release-plan".to_owned(),
+            target: plan_id.to_owned(),
+            error,
+        });
     }
 }
 
@@ -2019,6 +2205,7 @@ pub fn recover_suite_resources(
         client,
         &cancellable_module_ids,
         &state.plan_ids,
+        None,
         &mut report,
     );
     if report.failures.is_empty() {
@@ -2108,6 +2295,14 @@ fn is_deferred_review_waiting(value: &Value) -> bool {
     status(value) == Some("WAITING")
 }
 
+fn suite_log_has_upload_placeholder(value: &Value) -> bool {
+    value.as_array().is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|entry| entry.get("upload").and_then(Value::as_str).is_some())
+    })
+}
+
 fn deferred_review_blocks_remaining_modules(
     review_is_nonterminal: bool,
     module_index: usize,
@@ -2178,12 +2373,8 @@ fn validate_value_origins(
                 return Err(());
             }
             let same_suite = same_url_origin(suite, &parsed);
-            let explicit_external = key.is_some_and(|key| {
-                matches!(
-                    key,
-                    "issuer" | "request_object_trust_anchor_uri" | "automated_ciba_approval_url"
-                )
-            });
+            let explicit_external =
+                key.is_some_and(|key| matches!(key, "issuer" | "request_object_trust_anchor_uri"));
             if !(same_suite || same_target || explicit_external) {
                 return Err(());
             }
@@ -3625,18 +3816,9 @@ mod tests {
     }
 
     #[test]
-    fn origin_validation_accepts_only_the_named_external_ciba_callback() {
+    fn origin_validation_rejects_untrusted_external_urls() {
         let suite = Origin::parse("https://suite.example").expect("origin");
         let callback = "https://callback.oidf.example/approval";
-        assert_eq!(
-            validate_value_origins(
-                &serde_json::json!({"automated_ciba_approval_url": callback}),
-                &suite,
-                None,
-                None,
-            ),
-            Ok(())
-        );
         assert_eq!(
             validate_value_origins(
                 &serde_json::json!({"untrusted_url": callback}),
@@ -4256,6 +4438,7 @@ mod tests {
                 review_screenshot_capture: Some(capture),
                 verifier: Some(verifier.clone()),
                 issuer: None,
+                ciba_approver: None,
             }],
             suite_resource_observer: None,
         })
@@ -4447,6 +4630,7 @@ mod tests {
                 review_screenshot_capture: Some(capture),
                 verifier: Some(verifier),
                 issuer: None,
+                ciba_approver: None,
             }],
             suite_resource_observer: Some(Arc::new(RetainingObserver)),
         })
@@ -4648,6 +4832,7 @@ mod tests {
                     review_screenshot_capture: capture,
                     verifier: Some(verifier),
                     issuer: None,
+                    ciba_approver: None,
                 }],
                 suite_resource_observer: (!matches!(case, Case::RetentionDisabled))
                     .then(|| Arc::new(RetainingObserver) as Arc<dyn SuiteResourceObserver>),
