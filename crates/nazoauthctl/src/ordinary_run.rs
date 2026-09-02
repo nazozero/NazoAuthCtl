@@ -666,10 +666,11 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     deployment_report.cleanup_complete = cleanup_complete;
     let success = errors.is_empty()
         && report.as_ref().is_some_and(|report| {
-            conformance_acceptance_succeeds(
+            conformance_run_succeeds(
                 report.local_success,
-                report.acceptance_pass,
                 report.matrix_expectations_satisfied,
+                report.failed_modules.len(),
+                report.incomplete_modules.len(),
             )
         });
     let output = FinalOutput {
@@ -687,12 +688,29 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     Ok(if success { 0 } else { 1 })
 }
 
-fn conformance_acceptance_succeeds(
+fn conformance_run_succeeds(
     local_success: bool,
-    acceptance_pass: bool,
     matrix_expectations_satisfied: bool,
+    failed_modules: usize,
+    incomplete_modules: usize,
 ) -> bool {
-    local_success && acceptance_pass && matrix_expectations_satisfied
+    local_success && matrix_expectations_satisfied && failed_modules == 0 && incomplete_modules == 0
+}
+
+#[cfg(test)]
+mod acceptance_tests {
+    use super::conformance_run_succeeds;
+
+    #[test]
+    fn review_only_run_is_successful() {
+        assert!(conformance_run_succeeds(true, true, 0, 0));
+    }
+
+    #[test]
+    fn failed_or_incomplete_module_fails_the_run() {
+        assert!(!conformance_run_succeeds(true, true, 1, 0));
+        assert!(!conformance_run_succeeds(true, true, 0, 1));
+    }
 }
 
 fn control_operation(
