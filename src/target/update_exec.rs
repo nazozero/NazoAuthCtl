@@ -1266,7 +1266,7 @@ pub(crate) fn verify_pinned_artifact_facts(
     if let Some(candidate) = crate::pre_release::resolve(artifact).map_err(|error| {
         Failure::new(
             super::install_exec::ARTIFACT_UNVERIFIED,
-            sanitize(error.to_string()),
+            sanitize(format!("{error:#}")),
         )
     })? {
         candidate.enforce_floor(version_floor).map_err(|error| {
