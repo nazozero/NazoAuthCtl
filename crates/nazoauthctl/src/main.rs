@@ -636,12 +636,8 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
     if capture_review_screenshots && evidence_directory.is_none() {
         bail!("--capture-review-screenshots requires --evidence-dir");
     }
-    if upload_review_screenshots
-        && (!capture_review_screenshots || !retain_suite_plans_for_certification)
-    {
-        bail!(
-            "--upload-review-screenshots requires --capture-review-screenshots and --retain-suite-plans-for-certification"
-        );
+    if upload_review_screenshots && !capture_review_screenshots {
+        bail!("--upload-review-screenshots requires --capture-review-screenshots");
     }
     let trust_policy = trust_policy.context("--trust-policy is required")?;
     let artifact_cache = artifact_cache.context("--artifact-cache is required")?;
@@ -1038,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn run_parses_global_and_automation_options() {
+    fn run_parses_automatic_review_upload_without_retention() {
         let parsed = routed_run(&args(&[
             "nazoauthctl",
             "--instance",
@@ -1065,7 +1061,6 @@ mod tests {
             "/x/evidence",
             "--capture-review-screenshots",
             "--upload-review-screenshots",
-            "--retain-suite-plans-for-certification",
         ]))
         .expect("parse")
         .expect("run");
@@ -1076,7 +1071,7 @@ mod tests {
         assert!(uuid::Uuid::parse_str(&parsed.tenant_id).is_ok());
         assert_eq!(parsed.token_fd, Some(7));
         assert_eq!(parsed.groups, ["oidc"]);
-        assert!(parsed.retain_suite_plans_for_certification);
+        assert!(!parsed.retain_suite_plans_for_certification);
         assert!(parsed.capture_review_screenshots);
         assert!(parsed.upload_review_screenshots);
         assert_eq!(parsed.plans, ["oidc-core-p001"]);
@@ -1103,7 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn review_screenshot_upload_requires_capture_and_certification_retention() {
+    fn review_screenshot_upload_requires_capture() {
         let error = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
@@ -1117,7 +1112,7 @@ mod tests {
             "--upload-review-screenshots",
         ]))
         .err()
-        .expect("upload needs capture and retention");
+        .expect("upload needs capture");
         assert!(
             error
                 .to_string()

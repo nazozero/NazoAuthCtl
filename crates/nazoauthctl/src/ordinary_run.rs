@@ -97,11 +97,6 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         )?;
     }
     if invocation.capture_review_screenshots {
-        if suite_origin != Origin::official() {
-            bail!(
-                "--capture-review-screenshots is restricted to the canonical official Suite origin"
-            );
-        }
         let evidence_directory = invocation
             .evidence_directory
             .as_ref()

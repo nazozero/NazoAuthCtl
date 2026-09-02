@@ -867,7 +867,6 @@ impl ConformanceRunner {
         let review_capture_requested = self.config.automation.first().is_some_and(|automation| {
             automation.review_screenshot_capture.is_some() && automation.vp_evidence.is_some()
         });
-        let deferred_review_enabled = retention_requested && review_capture_requested;
 
         // The denominator is now frozen. A plan-creation failure leaves the
         // successfully created subset visible, but no execution is attempted.
@@ -1050,9 +1049,12 @@ impl ConformanceRunner {
                                 }
                             }
                         } else if is_openid4vp_verifier_plan(plan) {
-                            if review_capture_requested && !retention_requested {
+                            if review_capture_requested
+                                && !self.config.upload_review_screenshots
+                                && !retention_requested
+                            {
                                 errors.push(
-                                    "OpenID4VP deferred review requires explicit Suite plan retention"
+                                    "OpenID4VP review capture without Suite upload requires explicit Suite plan retention"
                                         .to_owned(),
                                 );
                                 groups[group_index].status = GroupStatus::Failed;
@@ -1161,11 +1163,6 @@ impl ConformanceRunner {
                                 if !has_browser_config {
                                     return Ok(false);
                                 }
-                                if self.config.client.origin().as_str()
-                                    != "https://www.certification.openid.net"
-                                {
-                                    return Ok(false);
-                                }
                                 let config =
                                     browser_config_for_module(&plan.config, &module.test_name)
                                         .map_err(|error| error.to_string())?;
@@ -1230,7 +1227,7 @@ impl ConformanceRunner {
                                 }
                             };
                             if completion_outcome == OpenId4VpCompletionOutcome::Completed
-                                && deferred_review_enabled
+                                && review_capture_requested
                                 && !evidence_requested
                             {
                                 errors.push(
@@ -1361,13 +1358,11 @@ impl ConformanceRunner {
                                         browser_review_evidence.attempts = 1;
                                         browser_review_evidence.decoded_bytes = screenshot.size;
                                         browser_review_evidence.screenshots.push(screenshot);
-                                        // OIDF v5.2.2 MR !2100 deliberately leaves the
-                                        // verifier runner WAITING while the operator later
-                                        // supplies review evidence. See
+                                        // OIDF v5.2.2 MR !2100 leaves the verifier runner
+                                        // WAITING until review evidence is supplied. See
                                         // https://gitlab.com/openid/conformance-suite/-/merge_requests/2100.
-                                        // We never upload or mark
-                                        // that Suite placeholder visited. A fresh exact state
-                                        // read is the only admissible local settlement proof.
+                                        // Confirm the exact state before either uploading now
+                                        // or retaining the plan for later submission.
                                         let pending_info =
                                             match self.config.client.module_info(&instance.id) {
                                                 Ok(info) => info,
@@ -4328,7 +4323,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn serial_vp_review_upload_reaches_the_terminal_suite_review_boundary() {
+    fn serial_vp_review_upload_reaches_review_and_cleans_up_on_a_configured_suite() {
         let root = std::env::temp_dir()
             .canonicalize()
             .expect("temporary root")
@@ -4351,7 +4346,7 @@ mod tests {
             uploaded: AtomicBool::new(false),
         });
         let client = SuiteClient::with_transport(
-            Origin::parse("https://www.certification.openid.net").expect("official Suite"),
+            Origin::parse("https://suite.example").expect("configured Suite"),
             Some(BearerToken::new("suite-token").expect("token")),
             transport.clone(),
             ClientConfig::default(),
@@ -4362,7 +4357,7 @@ mod tests {
             "browser":[{
                 "match":"https://issuer.example/authorize*",
                 "tasks":[{
-                    "match":"https://www.certification.openid.net/test/a/module-a/verification-evidence",
+                    "match":"https://suite.example/test/a/module-a/verification-evidence",
                     "commands":[["wait","xpath","//*",1,"review","update-image-placeholder"]]
                 }]
             }]
@@ -4424,7 +4419,7 @@ mod tests {
                 verifier: Some(verifier.clone()),
                 issuer: None,
             }],
-            suite_resource_observer: Some(Arc::new(RetainingObserver)),
+            suite_resource_observer: None,
         })
         .expect("runner");
 
@@ -4473,14 +4468,10 @@ mod tests {
         assert_eq!(integrity.deferred_review_modules, 0, "{fixture_diagnostic}");
         assert!(integrity.all_modules_instantiated, "{fixture_diagnostic}");
         assert!(integrity.all_modules_settled, "{fixture_diagnostic}");
-        assert!(integrity.retention_requested, "{fixture_diagnostic}");
-        assert!(integrity.retention_eligible, "{fixture_diagnostic}");
-        assert!(
-            integrity.retention_candidate_settled,
-            "{fixture_diagnostic}"
-        );
+        assert!(!integrity.retention_requested, "{fixture_diagnostic}");
+        assert!(!integrity.retention_eligible, "{fixture_diagnostic}");
         assert!(!integrity.retention_committed, "{fixture_diagnostic}");
-        assert!(!integrity.cleanup_complete, "{fixture_diagnostic}");
+        assert!(integrity.cleanup_complete, "{fixture_diagnostic}");
         assert!(integrity.suite_resources_settled, "{fixture_diagnostic}");
         assert!(!report.suite_pass);
         assert!(!report.acceptance_pass);
@@ -4538,7 +4529,7 @@ mod tests {
         assert!(
             requests
                 .iter()
-                .all(|(method, _)| *method != HttpMethod::Delete)
+                .any(|(method, _)| *method == HttpMethod::Delete)
         );
         assert_eq!(
             requests
