@@ -92,7 +92,7 @@ jobs:
     uses: ./.github/workflows/server-compatibility.yml
     with:
       controller_ref: ${{ github.sha }}
-      server_release: v0.2.7
+      server_release: v0.2.8
     permissions:
       actions: read
       contents: read

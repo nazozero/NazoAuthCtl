@@ -1214,8 +1214,8 @@ dependencies = [
 
 [[package]]
 name = "nazo-operator-protocol"
-version = "0.2.7"
-source = "git+https://github.com/nazozero/NazoAuth.git?rev=379174a8a7519a2dfd32a2bde48ab272f0a7b1cb#379174a8a7519a2dfd32a2bde48ab272f0a7b1cb"
+version = "0.2.8"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=1d3549e09eaa04d7a0d11ccbf928c26c420753bf#1d3549e09eaa04d7a0d11ccbf928c26c420753bf"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl-conformance"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -1282,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl-core"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1319,7 +1319,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl-runtime"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "atomic-write-file",
