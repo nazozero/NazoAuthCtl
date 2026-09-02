@@ -351,6 +351,9 @@ pub(crate) struct PolicyArgs {
 #[derive(Debug)]
 pub(crate) struct RecoverArgs {
     pub(crate) selector: InstanceSelector,
+    /// Exact target Release for the recovered runtime; absent resolves the
+    /// latest official Release once at candidate staging.
+    pub(crate) version: Option<String>,
     /// Optional owner-only file containing the offline Recovery Secret.  It
     /// is read only if the restored registry rejects the current controller
     /// identity; the value is never an argv token or target payload.

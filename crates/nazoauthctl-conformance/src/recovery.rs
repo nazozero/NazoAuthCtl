@@ -279,6 +279,8 @@ struct TenantResourceRecoveryJournal {
     tenant_disabled: bool,
     tenant_finalize_expected_revision: Option<u64>,
     tenant_cleanup_complete: bool,
+    #[serde(default)]
+    tenant_absence_revision: Option<u64>,
     baseline_enumerate: Option<TenantResourceControlOperation>,
     apply: Option<TenantResourceControlOperation>,
     cleanup_enumerate: Option<TenantResourceControlOperation>,
@@ -364,6 +366,7 @@ impl ConformanceRecoveryStore {
                 tenant_disabled: false,
                 tenant_finalize_expected_revision: None,
                 tenant_cleanup_complete: false,
+                tenant_absence_revision: None,
                 baseline_enumerate: None,
                 apply: None,
                 cleanup_enumerate: None,
@@ -657,6 +660,21 @@ impl ConformanceRecoveryGuard {
 
     pub fn tenant_cleanup_complete(&self) -> bool {
         self.journal.tenant_cleanup_complete
+    }
+
+    pub fn tenant_absent(&self) -> bool {
+        self.journal.tenant_absence_revision.is_some()
+    }
+
+    pub fn mark_tenant_absent(&mut self, directory_revision: u64) -> anyhow::Result<()> {
+        self.journal.tenant_absence_revision = Some(directory_revision);
+        self.journal.terminal_failure = None;
+        self.journal.tenant_disable_expected_revision = None;
+        self.journal.tenant_disabled = false;
+        self.journal.tenant_finalize_expected_revision = None;
+        self.journal.tenant_cleanup_complete = true;
+        self.journal.cleanup_complete = true;
+        self.persist()
     }
 
     pub fn mark_tenant_cleanup_complete(&mut self) -> anyhow::Result<()> {
@@ -1349,16 +1367,30 @@ fn validate_tenant_resource_journal(
     if journal.cleanup_complete && !tenant_resource_obligations_complete(journal) {
         bail!("tenant-resource cleanup marker is ahead of its obligations");
     }
-    if journal.tenant_cleanup_complete && !journal.tenant_created {
+    if journal.tenant_cleanup_complete
+        && !journal.tenant_created
+        && journal.tenant_absence_revision.is_none()
+    {
         bail!("temporary tenant cleanup is ahead of tenant creation");
     }
-    if journal.tenant_key_generated && !journal.tenant_created
-        || journal.tenant_reload_expected_revision.is_some() && !journal.tenant_key_generated
-        || journal.tenant_reloaded && journal.tenant_reload_expected_revision.is_none()
-        || journal.tenant_disable_expected_revision.is_some() && !journal.tenant_created
-        || journal.tenant_disabled && journal.tenant_disable_expected_revision.is_none()
-        || journal.tenant_finalize_expected_revision.is_some() && !journal.tenant_disabled
-        || journal.tenant_cleanup_complete && journal.tenant_finalize_expected_revision.is_none()
+    if journal.tenant_absence_revision.is_some()
+        && (!journal.tenant_cleanup_complete
+            || !journal.cleanup_complete
+            || journal.tenant_disable_expected_revision.is_some()
+            || journal.tenant_disabled
+            || journal.tenant_finalize_expected_revision.is_some())
+    {
+        bail!("temporary tenant absence state is inconsistent");
+    }
+    if journal.tenant_absence_revision.is_none()
+        && (journal.tenant_key_generated && !journal.tenant_created
+            || journal.tenant_reload_expected_revision.is_some() && !journal.tenant_key_generated
+            || journal.tenant_reloaded && journal.tenant_reload_expected_revision.is_none()
+            || journal.tenant_disable_expected_revision.is_some() && !journal.tenant_created
+            || journal.tenant_disabled && journal.tenant_disable_expected_revision.is_none()
+            || journal.tenant_finalize_expected_revision.is_some() && !journal.tenant_disabled
+            || journal.tenant_cleanup_complete
+                && journal.tenant_finalize_expected_revision.is_none())
     {
         bail!("temporary tenant lifecycle state is inconsistent");
     }
@@ -1528,11 +1560,10 @@ fn validate_suite_retention_manifest(
     binding: &TenantResourceRecoveryBinding,
     suite: Option<&SuiteRecoveryState>,
 ) -> anyhow::Result<()> {
+    let suite_origin = crate::Origin::parse_suite(&manifest.suite_origin)
+        .map_err(|_| anyhow::anyhow!("retained Suite origin is invalid"))?;
     if manifest.schema != SUITE_RETENTION_MANIFEST_SCHEMA
-        || crate::Origin::parse_suite(&manifest.suite_origin)
-            .map_err(|_| anyhow::anyhow!("retained Suite origin is invalid"))?
-            .as_str()
-            != "https://www.certification.openid.net"
+        || suite_origin.as_str() != manifest.suite_origin
         || manifest.deployment_id != binding.deployment_id
         || manifest.tenant_id != binding.tenant_id
         || manifest.run_id != binding.run_id
@@ -1653,8 +1684,11 @@ fn validate_deferred_review_screenshot_binding(
                 && image.marker == pending.marker
                 && image.obligation_index == pending.obligation_index
                 && image.source
-                    == crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver
-                && image.trigger_path == "/ui/verification-result"
+                    == crate::BrowserReviewScreenshotSource::NazoVpCompletionLiveWebdriver
+                && image
+                    .trigger_path
+                    .strip_prefix("/openid4vp/complete/")
+                    .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
         });
         if !module_matches || !screenshot_matches {
             bail!("deferred review screenshot manifest does not bind the retained module");
@@ -1755,7 +1789,7 @@ fn validate_review_screenshot_manifest_binding(
         let source_valid = match image.source {
             crate::BrowserReviewScreenshotSource::SuiteVerificationEvidence => {
                 image.verification_receipt.is_none()
-                    && image.trigger_origin == "https://www.certification.openid.net"
+                    && image.trigger_origin == document.suite_origin
                     && image.trigger_path
                         == format!("/test/a/{}/verification-evidence", image.module_id)
                     && sha256_hex(
@@ -1783,6 +1817,27 @@ fn validate_review_screenshot_manifest_binding(
                                 })
                         })
                     && image.trigger_path == "/ui/verification-result"
+                    && sha256_hex(
+                        format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes(),
+                    ) == image.trigger_url_sha256
+            }
+            crate::BrowserReviewScreenshotSource::NazoVpCompletionLiveWebdriver => {
+                url::Url::parse(&format!("{}{}", image.trigger_origin, image.trigger_path))
+                    .is_ok_and(|url| {
+                        url.scheme() == "https"
+                            && url.host_str().is_some()
+                            && url.username().is_empty()
+                            && url.password().is_none()
+                            && url.query().is_none()
+                            && url.fragment().is_none()
+                    })
+                    && image.verification_receipt.is_none()
+                    && target_issuer
+                        .is_some_and(|target_issuer| target_issuer == image.trigger_origin)
+                    && image
+                        .trigger_path
+                        .strip_prefix("/openid4vp/complete/")
+                        .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
                     && sha256_hex(
                         format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes(),
                     ) == image.trigger_url_sha256
@@ -2152,6 +2207,9 @@ fn retention_manifest_owner_is_allowed(uid: u32) -> bool {
 fn tenant_resource_obligations_complete(journal: &TenantResourceRecoveryJournal) -> bool {
     if journal.terminal_failure.is_some() {
         return false;
+    }
+    if journal.tenant_absence_revision.is_some() {
+        return true;
     }
     let Some(enumerate) = &journal.cleanup_enumerate else {
         return false;
@@ -2570,5 +2628,65 @@ mod tests {
             resource_manifest_sha256: "e".repeat(64),
         });
         validate_revoke_operation(&binding, &enumerate, &revoke).expect("typed revoke");
+    }
+
+    #[test]
+    fn authoritative_tenant_absence_settles_rewound_run_resources() {
+        let journal = TenantResourceRecoveryJournal {
+            schema: TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA,
+            kind: TENANT_RESOURCE_RECOVERY_KIND.to_owned(),
+            binding: binding(),
+            phase: TenantResourceRecoveryPhase::Intent,
+            tenant_created: true,
+            tenant_key_generated: true,
+            tenant_reload_expected_revision: Some(48),
+            tenant_reloaded: true,
+            tenant_disable_expected_revision: None,
+            tenant_disabled: false,
+            tenant_finalize_expected_revision: None,
+            tenant_cleanup_complete: true,
+            tenant_absence_revision: Some(49),
+            baseline_enumerate: None,
+            apply: None,
+            cleanup_enumerate: None,
+            cleanup_revoke: None,
+            terminal_failure: None,
+            cleanup_complete: true,
+            manifest_removal_intent: false,
+            manifest_cleanup_complete: false,
+            proxy_cleanup_complete: true,
+            suite: None,
+            suite_retention: SuiteRetentionDisposition::default(),
+        };
+
+        validate_tenant_resource_journal(&journal, "deployment-1")
+            .expect("authoritative absence did not settle the rewound tenant");
+        assert!(tenant_resource_obligations_complete(&journal));
+    }
+
+    #[test]
+    fn retention_accepts_the_explicit_configured_suite_origin() {
+        let binding = binding();
+        let matrix_plan_id = "openid4vc-vp-p038".to_owned();
+        let manifest = SuiteRetentionManifest {
+            schema: SUITE_RETENTION_MANIFEST_SCHEMA,
+            suite_origin: "https://auth.nazo.run:18544".to_owned(),
+            artifact_digest: "a".repeat(64),
+            matrix_sha256: "b".repeat(64),
+            deployment_id: binding.deployment_id.clone(),
+            tenant_id: binding.tenant_id.clone(),
+            run_id: binding.run_id.clone(),
+            review_screenshot_manifest: None,
+            deferred_review_pending: Vec::new(),
+            plans: vec![SuiteRetentionPlan {
+                plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256(&matrix_plan_id),
+                matrix_plan_id,
+                suite_plan_id: "suite-plan-1".to_owned(),
+                plan_name: "oid4vp-1final-verifier-test-plan".to_owned(),
+            }],
+        };
+
+        validate_suite_retention_manifest(&manifest, &binding, None)
+            .expect("explicit configured Suite origin");
     }
 }

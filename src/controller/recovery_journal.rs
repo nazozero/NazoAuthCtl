@@ -43,6 +43,8 @@ pub(crate) struct RecoveryPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restored_revision: Option<u64>,
     pub manifest_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_version: Option<String>,
     pub state_epoch: String,
     pub recover_operation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,6 +55,8 @@ pub(crate) struct RecoveryPlan {
     pub invalidation_operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalidation_request_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_control_operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,6 +117,7 @@ fn validate(plan: &RecoveryPlan) -> anyhow::Result<()> {
         Some(plan.recover_operation_id.as_str()),
         plan.candidate_stage_operation_id.as_deref(),
         plan.invalidation_operation_id.as_deref(),
+        plan.candidate_control_operation_id.as_deref(),
         plan.activate_operation_id.as_deref(),
         plan.cleanup_operation_id.as_deref(),
         Some(plan.state_epoch.as_str()),
@@ -180,12 +185,14 @@ pub(crate) fn new_plan(
         source_revision,
         restored_revision: None,
         manifest_sha256,
+        target_version: None,
         state_epoch: uuid::Uuid::now_v7().to_string(),
         recover_operation_id: uuid::Uuid::now_v7().to_string(),
         candidate_stage_operation_id: None,
         candidate: None,
         invalidation_operation_id: None,
         invalidation_request_hash: None,
+        candidate_control_operation_id: None,
         not_before: None,
         activate_operation_id: None,
         cleanup_operation_id: None,

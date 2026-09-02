@@ -137,6 +137,7 @@ impl LifecycleExecutor for ScriptedLifecycle {
                 data_root: job.data_root,
                 secrets_root: job.secrets_root,
                 scope_dir: job.scope_dir,
+                transient_state_epoch: None,
                 compact_jws: jws,
                 change_set: None,
             })?;

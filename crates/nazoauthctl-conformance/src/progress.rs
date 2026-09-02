@@ -40,6 +40,7 @@ pub enum GroupStatus {
     Review,
     Skipped,
     Failed,
+    Incomplete,
     Running,
     Remaining,
 }
@@ -52,7 +53,7 @@ pub struct GroupProgress {
     pub total: usize,
     pub status: GroupStatus,
     /// Item-level counters. `completed == passed + reviewed + skipped +
-    /// failed`; `running` is the currently instantiated Suite module.
+    /// failed + incomplete`; `running` is the currently instantiated Suite module.
     #[serde(default)]
     pub passed: usize,
     #[serde(default)]
@@ -61,6 +62,8 @@ pub struct GroupProgress {
     pub skipped: usize,
     #[serde(default)]
     pub failed: usize,
+    #[serde(default)]
+    pub incomplete: usize,
     #[serde(default)]
     pub running: usize,
     #[serde(default)]
@@ -76,6 +79,7 @@ pub struct ProgressSnapshot {
     pub review_groups: usize,
     pub skipped_groups: usize,
     pub failed_groups: usize,
+    pub incomplete_groups: usize,
     pub running_groups: usize,
     pub remaining_groups: usize,
     /// Item-level counters used for the overall progress contract. The
@@ -88,6 +92,8 @@ pub struct ProgressSnapshot {
     pub skipped: usize,
     #[serde(default)]
     pub failed: usize,
+    #[serde(default)]
+    pub incomplete: usize,
     #[serde(default)]
     pub running: usize,
     #[serde(default)]
@@ -130,7 +136,7 @@ impl<W: Write> ProgressSink for StableRenderer<W> {
     fn update(&mut self, event: &ProgressEvent) {
         let _ = writeln!(
             self.writer,
-            "NazoAuth OIDF Conformance: {}/{} ({:>3}%) Passed {} · Review {} · Skipped {} · Failed {} · Running {} · Remaining {}{}",
+            "NazoAuth OIDF Conformance: {}/{} ({:>3}%) Passed {} · Review {} · Skipped {} · Failed {} · Incomplete {} · Running {} · Remaining {}{}",
             event.snapshot.completed,
             event.snapshot.total,
             percent(event.snapshot.completed, event.snapshot.total),
@@ -138,6 +144,7 @@ impl<W: Write> ProgressSink for StableRenderer<W> {
             event.snapshot.reviewed,
             event.snapshot.skipped,
             event.snapshot.failed,
+            event.snapshot.incomplete,
             event.snapshot.running,
             event.snapshot.remaining,
             current_label(&event.snapshot)
@@ -186,6 +193,7 @@ impl<W: Write> ProgressSink for TtyRenderer<W> {
                 GroupStatus::Review => '!',
                 GroupStatus::Skipped => '↷',
                 GroupStatus::Failed => '✗',
+                GroupStatus::Incomplete => '…',
                 GroupStatus::Running => '●',
                 GroupStatus::Remaining => '○',
             };
@@ -216,11 +224,12 @@ impl<W: Write> ProgressSink for TtyRenderer<W> {
         let _ = writeln!(self.writer);
         let _ = writeln!(
             self.writer,
-            "Passed {} · Review {} · Skipped {} · Failed {} · Running {} · Remaining {}",
+            "Passed {} · Review {} · Skipped {} · Failed {} · Incomplete {} · Running {} · Remaining {}",
             event.snapshot.passed,
             event.snapshot.reviewed,
             event.snapshot.skipped,
             event.snapshot.failed,
+            event.snapshot.incomplete,
             event.snapshot.running,
             event.snapshot.remaining
         );
@@ -293,12 +302,14 @@ mod tests {
                 review_groups: 0,
                 skipped_groups: 0,
                 failed_groups: 0,
+                incomplete_groups: 0,
                 running_groups: 0,
                 remaining_groups: 0,
                 passed: 1,
                 reviewed: 0,
                 skipped: 0,
                 failed: 0,
+                incomplete: 0,
                 running: 0,
                 remaining: 1,
                 current_profile: None,
@@ -329,6 +340,7 @@ mod tests {
                     reviewed: 0,
                     skipped: 0,
                     failed: 0,
+                    incomplete: 0,
                     running: 1,
                     remaining: 0,
                 }],
@@ -336,12 +348,14 @@ mod tests {
                 review_groups: 0,
                 skipped_groups: 0,
                 failed_groups: 0,
+                incomplete_groups: 0,
                 running_groups: 1,
                 remaining_groups: 0,
                 passed: 0,
                 reviewed: 0,
                 skipped: 0,
                 failed: 0,
+                incomplete: 0,
                 running: 1,
                 remaining: 0,
                 current_profile: Some("oidc".to_owned()),
@@ -372,6 +386,7 @@ mod tests {
                     reviewed: 0,
                     skipped: 0,
                     failed: 0,
+                    incomplete: 0,
                     running: 1,
                     remaining: 0,
                 }],
@@ -379,12 +394,14 @@ mod tests {
                 review_groups: 0,
                 skipped_groups: 0,
                 failed_groups: 0,
+                incomplete_groups: 0,
                 running_groups: 1,
                 remaining_groups: 0,
                 passed: 2,
                 reviewed: 0,
                 skipped: 0,
                 failed: 0,
+                incomplete: 0,
                 running: 1,
                 remaining: 0,
                 current_profile: Some("FAPI 2.0".to_owned()),
@@ -395,9 +412,9 @@ mod tests {
         let text = String::from_utf8(output).expect("utf8");
         assert!(text.contains("NazoAuth OIDF Conformance"));
         assert!(text.contains("Overall"));
-        assert!(
-            text.contains("Passed 2 · Review 0 · Skipped 0 · Failed 0 · Running 1 · Remaining 0")
-        );
+        assert!(text.contains(
+            "Passed 2 · Review 0 · Skipped 0 · Failed 0 · Incomplete 0 · Running 1 · Remaining 0"
+        ));
         assert!(text.contains("FAPI 2.0/mode=mTLS"));
         assert!(!text.contains("ETA"));
     }

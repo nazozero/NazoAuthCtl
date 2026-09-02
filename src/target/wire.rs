@@ -29,7 +29,7 @@ use uuid::Uuid;
 use super::deployment_state::{ArtifactRefs, RuntimeSurface, StateMutationPayload};
 
 /// Wire schema discriminator for HostOperation and HostResult messages.
-pub const HOST_PROTOCOL_SCHEMA: u32 = 6;
+pub const HOST_PROTOCOL_SCHEMA: u32 = 9;
 
 /// Maximum serialized HostOperation accepted from stdin or a local caller.
 /// A tenant-resource Apply may carry one 4 MiB change set encoded as base64,
@@ -75,6 +75,7 @@ pub const HOST_OPERATION_KINDS: &[&str] = &[
     "backup-restore-test",
     "backup-recover",
     "backup-recovery-candidate-stage",
+    "backup-recovery-candidate-control",
     "backup-recovery-candidate-cleanup",
     "backup-recovery-activate",
     "backup-export-prepare",
@@ -243,13 +244,26 @@ pub enum HostOperationBody {
     /// Restore one immutable snapshot while the target keeps the deployment
     /// runtime quiesced.  This is a state mutation: its revision CAS prevents
     /// a restored filesystem from being presented as a newer deployment.
-    BackupRecover { expected_manifest_sha256: String },
+    BackupRecover {
+        expected_manifest_sha256: String,
+        state_epoch: String,
+    },
     /// Start the already-restored deployment as its one loopback-only
     /// candidate.  This does not open public ingress or start the original
     /// runtime.
     BackupRecoveryCandidateStage {
         recovery_operation_id: String,
         state_epoch: String,
+        artifact: super::install_exec::OfficialArtifactRef,
+    },
+    /// Deliver the signed recovery invalidation to the exact isolated
+    /// candidate returned by the stage operation. The original deployment
+    /// runtime remains stopped throughout this operation.
+    BackupRecoveryCandidateControl {
+        endpoint: crate::runtime_backend::RecoveryCandidateEndpoint,
+        state_epoch: String,
+        control_operation_id: String,
+        compact_jws: String,
     },
     /// Remove precisely the candidate returned by a prior stage operation.
     BackupRecoveryCandidateCleanup {
@@ -338,6 +352,7 @@ impl HostOperationBody {
             Self::BackupRestoreTest {} => "backup-restore-test",
             Self::BackupRecover { .. } => "backup-recover",
             Self::BackupRecoveryCandidateStage { .. } => "backup-recovery-candidate-stage",
+            Self::BackupRecoveryCandidateControl { .. } => "backup-recovery-candidate-control",
             Self::BackupRecoveryCandidateCleanup { .. } => "backup-recovery-candidate-cleanup",
             Self::BackupRecoveryActivate { .. } => "backup-recovery-activate",
             Self::BackupExportPrepare {} => "backup-export-prepare",
@@ -475,6 +490,7 @@ impl HostOperation {
         deployment_id: impl Into<String>,
         expected_revision: u64,
         expected_manifest_sha256: String,
+        state_epoch: impl Into<String>,
     ) -> Self {
         Self {
             schema: HOST_PROTOCOL_SCHEMA,
@@ -483,6 +499,7 @@ impl HostOperation {
             expected_revision: Some(expected_revision),
             operation: HostOperationBody::BackupRecover {
                 expected_manifest_sha256,
+                state_epoch: state_epoch.into(),
             },
         }
     }
@@ -493,6 +510,7 @@ impl HostOperation {
         expected_revision: u64,
         recovery_operation_id: impl Into<String>,
         state_epoch: impl Into<String>,
+        artifact: super::install_exec::OfficialArtifactRef,
     ) -> Self {
         Self {
             schema: HOST_PROTOCOL_SCHEMA,
@@ -502,6 +520,7 @@ impl HostOperation {
             operation: HostOperationBody::BackupRecoveryCandidateStage {
                 recovery_operation_id: recovery_operation_id.into(),
                 state_epoch: state_epoch.into(),
+                artifact,
             },
         }
     }
@@ -517,6 +536,29 @@ impl HostOperation {
             deployment_id: Some(deployment_id.into()),
             expected_revision: None,
             operation: HostOperationBody::BackupRecoveryCandidateCleanup { endpoint },
+        }
+    }
+
+    pub fn backup_recovery_candidate_control(
+        operation_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        expected_revision: u64,
+        endpoint: crate::runtime_backend::RecoveryCandidateEndpoint,
+        state_epoch: impl Into<String>,
+        control_operation_id: impl Into<String>,
+        compact_jws: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: HOST_PROTOCOL_SCHEMA,
+            operation_id: operation_id.into(),
+            deployment_id: Some(deployment_id.into()),
+            expected_revision: Some(expected_revision),
+            operation: HostOperationBody::BackupRecoveryCandidateControl {
+                endpoint,
+                state_epoch: state_epoch.into(),
+                control_operation_id: control_operation_id.into(),
+                compact_jws: compact_jws.into(),
+            },
         }
     }
 
@@ -971,25 +1013,30 @@ impl HostOperation {
             }
             HostOperationBody::BackupRecover {
                 expected_manifest_sha256,
+                state_epoch,
             } => {
                 if self.deployment_id.is_none()
                     || self.expected_revision.is_none()
                     || !valid_lower_hex_sha256(expected_manifest_sha256)
+                    || !is_uuid_v7(state_epoch)
                 {
                     return Err(MessageRejection::new(
                         RejectionCode::OperationMalformed,
-                        "backup recover requires a deployment revision and manifest hash",
+                        "backup recover requires a deployment revision, manifest hash, and UUIDv7 state epoch",
                     ));
                 }
             }
             HostOperationBody::BackupRecoveryCandidateStage {
                 recovery_operation_id,
                 state_epoch,
+                artifact,
             } => {
                 if self.deployment_id.is_none()
                     || self.expected_revision.is_none()
                     || !is_uuid_v7(recovery_operation_id)
                     || !is_uuid_v7(state_epoch)
+                    || artifact.repository.is_empty()
+                    || artifact.repository.len() > 128
                 {
                     return Err(MessageRejection::new(
                         RejectionCode::OperationMalformed,
@@ -1008,6 +1055,28 @@ impl HostOperation {
                     return Err(MessageRejection::new(
                         RejectionCode::OperationMalformed,
                         "backup recovery candidate cleanup has invalid immutable endpoint binding",
+                    ));
+                }
+            }
+            HostOperationBody::BackupRecoveryCandidateControl {
+                endpoint,
+                state_epoch,
+                control_operation_id,
+                compact_jws,
+            } => {
+                if self.deployment_id.as_deref() != Some(endpoint.deployment_id.as_str())
+                    || self.expected_revision.is_none()
+                    || !is_uuid_v7(&endpoint.operation_id)
+                    || endpoint.object_reference.is_empty()
+                    || endpoint.object_id.is_empty()
+                    || endpoint.loopback_port == 0
+                    || !is_uuid_v7(state_epoch)
+                    || !is_uuid_v7(control_operation_id)
+                    || !valid_compact_jws(compact_jws)
+                {
+                    return Err(MessageRejection::new(
+                        RejectionCode::OperationMalformed,
+                        "backup recovery candidate control has invalid immutable endpoint or JWS binding",
                     ));
                 }
             }
@@ -1075,21 +1144,10 @@ impl HostOperation {
                          expected_revision",
                     ));
                 }
-                if compact_jws.is_empty()
-                    || compact_jws.len() > MAX_CONTROL_JWS_BYTES
-                    || !compact_jws.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-                    })
-                {
+                if !valid_compact_jws(compact_jws) {
                     return Err(MessageRejection::new(
                         RejectionCode::OperationMalformed,
                         "control-operation compact_jws must be a bounded base64url JWS",
-                    ));
-                }
-                if compact_jws.split('.').count() != 3 {
-                    return Err(MessageRejection::new(
-                        RejectionCode::OperationMalformed,
-                        "control-operation compact_jws must have exactly three segments",
                     ));
                 }
                 if expected_deployment_id != self.deployment_id.as_deref().unwrap_or_default() {
@@ -1304,6 +1362,15 @@ fn valid_lower_hex_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+fn valid_compact_jws(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_CONTROL_JWS_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && value.split('.').count() == 3
+}
+
 /// The single answer a target returns for one HostOperation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1455,6 +1522,9 @@ pub enum HostCompletionBody {
     },
     BackupRecoveryCandidateStaged {
         endpoint: crate::runtime_backend::RecoveryCandidateEndpoint,
+    },
+    BackupRecoveryCandidateControlExecuted {
+        result: ControlResult,
     },
     BackupRecoveryCandidateCleaned {},
     BackupRecoveryActivated {},
@@ -1870,6 +1940,22 @@ mod tests {
     }
 
     #[test]
+    fn backup_recovery_requires_a_uuidv7_state_epoch() {
+        let operation = HostOperation::backup_recover(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            2,
+            "a".repeat(64),
+            "not-an-epoch",
+        );
+
+        let rejection = operation
+            .validate()
+            .expect_err("invalid state epoch accepted");
+        assert_eq!(rejection.code, RejectionCode::OperationMalformed);
+    }
+
+    #[test]
     fn every_registered_kind_round_trips() -> anyhow::Result<()> {
         assert_eq!(
             HOST_OPERATION_KINDS,
@@ -1887,6 +1973,7 @@ mod tests {
                 "backup-restore-test",
                 "backup-recover",
                 "backup-recovery-candidate-stage",
+                "backup-recovery-candidate-control",
                 "backup-recovery-candidate-cleanup",
                 "backup-recovery-activate",
                 "backup-export-prepare",
@@ -2641,8 +2728,9 @@ mod tests {
 
     #[test]
     fn result_schema_mismatch_is_reported_separately() {
+        let unsupported_schema = HOST_PROTOCOL_SCHEMA + 1;
         let raw = format!(
-            r#"{{"schema":9,"operation_id":"{}","outcome":{{"status":"completed","body":{{"completion":"ping","nonce":"n"}}}}}}"#,
+            r#"{{"schema":{unsupported_schema},"operation_id":"{}","outcome":{{"status":"completed","body":{{"completion":"ping","nonce":"n"}}}}}}"#,
             Uuid::now_v7()
         );
         let rejection = parse_host_result(raw.as_bytes()).expect_err("schema");

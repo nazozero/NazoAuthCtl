@@ -672,7 +672,7 @@ pub(crate) fn run_backup_view(
 /// Stable-code classifier shared with the error envelope: scan the rendered
 /// error chain for known stable tokens.
 pub(crate) fn stable_code(rendered: &str) -> String {
-    const ORDERED: [(&str, &str); 25] = [
+    const ORDERED: [(&str, &str); 26] = [
         (error_codes::INPUT_INVALID, error_codes::INPUT_INVALID),
         (
             error_codes::REMOTE_HELPER_MISMATCH,
@@ -726,6 +726,10 @@ pub(crate) fn stable_code(rendered: &str) -> String {
         (
             error_codes::TARGET_IDENTITY_MISMATCH,
             error_codes::TARGET_IDENTITY_MISMATCH,
+        ),
+        (
+            error_codes::CONTROL_OPERATION_FAILED,
+            error_codes::CONTROL_OPERATION_FAILED,
         ),
         // Target-side clean-install failures are already stable wire codes.
         // Preserve them at the CLI boundary instead of treating a valid

@@ -34,8 +34,9 @@ use sha2::{Digest as _, Sha256};
 
 use super::deployment_state::{Failure, OBJECT_IDENTITY_MISMATCH, TargetStateStore};
 use super::install_exec::{
-    CONTAINER_CONFIG_FILE, CONTAINER_DATA_DIR, MIGRATION_RUNTIME_ROLE_ENV, OfficialArtifactRef,
-    SERVER_CONFIG_FILE_ENV, StagedConfig, cache_systemd_artifact, probe_local_health,
+    CONTAINER_CONFIG_FILE, CONTAINER_DATA_DIR, CONTAINER_SECRETS_DIR, MIGRATION_RUNTIME_ROLE_ENV,
+    OfficialArtifactRef, SERVER_CONFIG_FILE_ENV, StagedConfig, cache_systemd_artifact,
+    probe_local_health,
 };
 use super::wire::{HOST_ERR_OPERATION_INVALID, sanitize};
 use crate::{
@@ -381,8 +382,11 @@ impl HostLifecycleExecutor {
         }
         // Build and validate the executable replacement before any migration
         // can mutate external state. Activation consumes this exact plan.
-        let replacement = (observation_digest(&observation).as_deref()
-            != Some(new_digest.as_str()))
+        let replacement = runtime_replacement_required(
+            observation_digest(&observation).as_deref(),
+            &new_digest,
+            job.config.is_some(),
+        )
         .then(|| {
             let mut replacement = replacement_from_observation(
                 &observation,
@@ -426,6 +430,7 @@ impl HostLifecycleExecutor {
                         sanitize(error.to_string()),
                     )
                 })?;
+            grant_runtime_config_read(Path::new(job.config_reference))?;
             performed.wrote_config = true;
         }
 
@@ -454,7 +459,15 @@ impl HostLifecycleExecutor {
                         Some(CONTAINER_CONFIG_FILE)
                             | Some(CONTAINER_DATA_DIR)
                             | Some(super::install_exec::CONTAINER_OPERATOR_CONFIG_REVISION_FILE)
-                    )
+                    ) || mount
+                        .destination
+                        .parent()
+                        .is_some_and(|parent| parent == Path::new(CONTAINER_SECRETS_DIR))
+                        && mount.destination.file_name().is_some_and(|name| {
+                            super::install_exec::SECRET_PURPOSES
+                                .iter()
+                                .any(|purpose| name == *purpose)
+                        })
                 })
                 .cloned()
                 .collect();
@@ -747,6 +760,7 @@ impl HostLifecycleExecutor {
                     )
                 },
             )?;
+            grant_runtime_config_read(Path::new(job.config_reference))?;
             performed.wrote_config = true;
         }
 
@@ -769,8 +783,8 @@ impl HostLifecycleExecutor {
     }
 }
 
-pub(crate) fn runtime_database_role(secrets_root: &str) -> Result<String, Failure> {
-    let path = Path::new(secrets_root).join("database-runtime-url");
+pub(crate) fn runtime_database_role(secrets_root: impl AsRef<Path>) -> Result<String, Failure> {
+    let path = secrets_root.as_ref().join("database-runtime-url");
     let bytes =
         filesystem::read_secure_regular_file(&path, "runtime database URL", false, 16 * 1024)
             .map_err(|error| {
@@ -1125,6 +1139,18 @@ mod tests {
     }
 
     #[test]
+    fn staged_config_replaces_runtime_even_when_artifact_is_unchanged() {
+        let digest = "a".repeat(64);
+        assert!(!runtime_replacement_required(Some(&digest), &digest, false));
+        assert!(runtime_replacement_required(Some(&digest), &digest, true));
+        assert!(runtime_replacement_required(
+            Some(&"b".repeat(64)),
+            &digest,
+            false
+        ));
+    }
+
+    #[test]
     fn replacement_rejects_a_non_neutral_port_binding() {
         let artifact = runtime_backend::ArtifactReference::Oci {
             image_reference: "registry.example/nazoauth".to_owned(),
@@ -1188,6 +1214,14 @@ pub(crate) fn observation_digest(
     }
 }
 
+fn runtime_replacement_required(
+    current_digest: Option<&str>,
+    selected_digest: &str,
+    has_staged_config: bool,
+) -> bool {
+    has_staged_config || current_digest != Some(selected_digest)
+}
+
 fn observation_image_reference(
     observation: &runtime_backend::RuntimeObservation,
 ) -> Option<String> {
@@ -1232,7 +1266,7 @@ pub(crate) fn verify_pinned_artifact_facts(
     if let Some(candidate) = crate::pre_release::resolve(artifact).map_err(|error| {
         Failure::new(
             super::install_exec::ARTIFACT_UNVERIFIED,
-            sanitize(error.to_string()),
+            sanitize(format!("{error:#}")),
         )
     })? {
         candidate.enforce_floor(version_floor).map_err(|error| {
@@ -1285,13 +1319,14 @@ pub(crate) fn verify_pinned_artifact_facts(
                 )
             }
             RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
-                let (oci_image, oci_digest) = candidate.oci_artifact().ok_or_else(|| {
-                    Failure::new(
-                        super::install_exec::ARTIFACT_UNVERIFIED,
-                        "pre-release candidate has no OCI artifact",
-                    )
-                })?;
-                let image = format!("{oci_image}@{oci_digest}");
+                let (oci_image, oci_pull_digest, oci_runtime_digest) =
+                    candidate.oci_artifact().ok_or_else(|| {
+                        Failure::new(
+                            super::install_exec::ARTIFACT_UNVERIFIED,
+                            "pre-release candidate has no OCI artifact",
+                        )
+                    })?;
+                let image = format!("{oci_image}@{oci_pull_digest}");
                 backend.pull_image(&image).map_err(|error| {
                     Failure::new(
                         super::install_exec::ARTIFACT_UNVERIFIED,
@@ -1299,10 +1334,10 @@ pub(crate) fn verify_pinned_artifact_facts(
                     )
                 })?;
                 (
-                    oci_digest.trim_start_matches("sha256:").to_owned(),
+                    oci_runtime_digest.trim_start_matches("sha256:").to_owned(),
                     runtime_backend::ArtifactReference::Oci {
                         image_reference: oci_image.to_owned(),
-                        digest: oci_digest.to_owned(),
+                        digest: oci_runtime_digest.to_owned(),
                     },
                     None,
                 )
@@ -1756,6 +1791,10 @@ fn restore_current_after_failed_rollback(
                     errors.push(format!(
                         "restoring the pre-rollback configuration failed: {error}"
                     ));
+                } else if let Err(error) =
+                    grant_runtime_config_read(Path::new(job.config_reference))
+                {
+                    errors.push(error.detail);
                 }
             }
             None => errors.push(
@@ -1798,7 +1837,20 @@ fn restore_snapshot_bytes(scope_dir: &Path, config_reference: &str) -> Result<()
             super::install_exec::CONFIG_INVALID,
             sanitize(format!("restoring the config snapshot failed: {error}")),
         )
-    })
+    })?;
+    grant_runtime_config_read(Path::new(config_reference))
+}
+
+fn grant_runtime_config_read(path: &Path) -> Result<(), Failure> {
+    let preserve_owner = super::install_exec::path_is_owned_by_non_root(path).map_err(|error| {
+        Failure::new(
+            super::install_exec::CONFIG_INVALID,
+            sanitize(format!(
+                "inspecting staged configuration ownership failed: {error}"
+            )),
+        )
+    })?;
+    super::install_exec::set_runtime_identity(path, false, preserve_owner)
 }
 
 fn rollback_result(errors: Vec<String>) -> Result<(), Failure> {

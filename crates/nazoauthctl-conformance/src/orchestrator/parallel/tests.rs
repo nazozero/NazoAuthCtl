@@ -604,17 +604,33 @@ fn parallel_non_pass_outcomes_complete_locally_without_claiming_suite_pass() {
     assert_eq!(skipped.progress.skipped, 2);
     assert_eq!(skipped.progress.skipped_groups, 1);
     assert_eq!(skipped.progress.groups[0].status, GroupStatus::Skipped);
+}
 
-    let (failed_runner, _) =
-        parallel_fixture_with_result(serde_json::json!({}), &["plan-a", "plan-b"], None, "FAILED");
-    let failed = failed_runner.run(&mut ()).report;
-    assert!(failed.local_success);
-    assert!(!failed.suite_pass);
-    assert!(failed.errors.is_empty());
-    assert_eq!(failed.failed_modules.len(), 2);
-    assert_eq!(failed.progress.failed, 2);
-    assert_eq!(failed.progress.failed_groups, 1);
-    assert_eq!(failed.progress.groups[0].status, GroupStatus::Failed);
+#[test]
+fn failed_outcome_stops_queued_plans_immediately() {
+    let (runner, _) = parallel_fixture_with_result(
+        serde_json::json!({}),
+        &["plan-a", "plan-b", "plan-c"],
+        None,
+        "FAILED",
+    );
+
+    let report = runner.run(&mut ()).report;
+
+    assert!(!report.suite_pass);
+    assert!(!report.failed_modules.is_empty());
+    assert_eq!(report.progress.failed_groups, 1);
+    assert_eq!(report.progress.groups[0].status, GroupStatus::Failed);
+    assert_eq!(
+        report
+            .plans
+            .iter()
+            .find(|plan| plan.matrix_plan_id == "plan-c")
+            .expect("queued plan report")
+            .created_instances,
+        0,
+        "the first FAILED outcome must stop queued Suite work"
+    );
 }
 
 #[test]
@@ -677,7 +693,7 @@ fn mutable_suite_plan_names_cannot_select_the_ciba_lane() {
 }
 
 #[test]
-fn plan_error_does_not_stop_independent_queued_plans() {
+fn plan_error_stops_independent_queued_plans() {
     let (runner, transport) = parallel_fixture(
         serde_json::json!({}),
         &["plan-a", "plan-b", "plan-c"],
@@ -694,13 +710,6 @@ fn plan_error_does_not_stop_independent_queued_plans() {
             .iter()
             .any(|error| error.contains("plan-a: HTTP response status 500"))
     );
-    assert!(
-        summary
-            .report
-            .errors
-            .iter()
-            .all(|error| !error.contains("scheduler stopped before every selected"))
-    );
     let created_plans = transport.created_plans.lock().expect("plans").clone();
     assert_eq!(created_plans, ["plan-a", "plan-b", "plan-c"]);
     assert_eq!(
@@ -711,8 +720,8 @@ fn plan_error_does_not_stop_independent_queued_plans() {
             .find(|plan| plan.matrix_plan_id == "plan-c")
             .expect("queued plan report")
             .created_instances,
-        1,
-        "a plan-scoped failure must not prevent an independent queued plan from running"
+        0,
+        "the first failed plan must stop independent queued work"
     );
     assert!(summary.report.cleanup.failures.is_empty());
     assert!(created_plans.iter().all(|plan| {

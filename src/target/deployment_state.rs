@@ -1571,7 +1571,7 @@ fn sanitize_detail(text: &str) -> String {
         .collect()
 }
 
-fn canonical_recovery_artifact(
+pub(crate) fn canonical_recovery_artifact(
     artifact: &crate::runtime_backend::ArtifactReference,
 ) -> Result<String, Failure> {
     let digest = match artifact {

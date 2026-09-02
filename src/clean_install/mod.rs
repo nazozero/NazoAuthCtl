@@ -60,7 +60,7 @@ const LOOPBACK_PORT_COUNT: u16 = 20_000;
 
 /// Config schema token recorded in the DeploymentState for seed documents.
 pub(crate) const CONFIG_SCHEMA_SEED: &str = "nazauth-seed-v2";
-const DIRECTORY_OPENID4VC_CREDENTIAL_CONFIGURATIONS: &str = r#"{"eu.example.pid":{"format":"dc+sd-jwt","scope":"eu.example.pid","cryptographic_binding_methods_supported":["jwk"],"credential_signing_alg_values_supported":["ES256"],"proof_types_supported":{"jwt":{"proof_signing_alg_values_supported":["ES256"]},"attestation":{"proof_signing_alg_values_supported":["ES256"],"key_attestations_required":{"key_storage":["iso_18045_moderate"]}}},"vct":"urn:eudi:pid:1"},"org.iso.18013.5.1.mDL":{"format":"mso_mdoc","scope":"org.iso.18013.5.1.mDL","cryptographic_binding_methods_supported":["jwk"],"credential_signing_alg_values_supported":["ES256"],"proof_types_supported":{"jwt":{"proof_signing_alg_values_supported":["ES256"]},"attestation":{"proof_signing_alg_values_supported":["ES256"],"key_attestations_required":{"key_storage":["iso_18045_moderate"]}}},"doctype":"org.iso.18013.5.1.mDL"}}"#;
+const DIRECTORY_OPENID4VC_CREDENTIAL_CONFIGURATIONS: &str = r#"{"eu.example.pid":{"format":"dc+sd-jwt","scope":"eu.example.pid","cryptographic_binding_methods_supported":["jwk"],"credential_signing_alg_values_supported":["ES256"],"proof_types_supported":{"jwt":{"proof_signing_alg_values_supported":["ES256"]},"attestation":{"proof_signing_alg_values_supported":["ES256"],"key_attestations_required":{"key_storage":["iso_18045_moderate"]}}},"vct":"urn:eudi:pid:1"},"eu.europa.ec.eudi.pid.1":{"format":"dc+sd-jwt","scope":"eu.europa.ec.eudi.pid.1","cryptographic_binding_methods_supported":["jwk"],"credential_signing_alg_values_supported":["ES256"],"proof_types_supported":{"jwt":{"proof_signing_alg_values_supported":["ES256"]},"attestation":{"proof_signing_alg_values_supported":["ES256"],"key_attestations_required":{"key_storage":["iso_18045_moderate"]}}},"vct":"urn:eudi:pid:1"},"org.iso.18013.5.1.mDL":{"format":"mso_mdoc","scope":"org.iso.18013.5.1.mDL","cryptographic_binding_methods_supported":["jwk"],"credential_signing_alg_values_supported":["ES256"],"proof_types_supported":{"jwt":{"proof_signing_alg_values_supported":["ES256"]},"attestation":{"proof_signing_alg_values_supported":["ES256"],"key_attestations_required":{"key_storage":["iso_18045_moderate"]}}},"doctype":"org.iso.18013.5.1.mDL"}}"#;
 
 /// One clean-install invocation. Defaults are deliberately minimal: only the
 /// issuer is mandatory because it is a real external fact that cannot be
@@ -404,12 +404,8 @@ fn render_config_yaml(
         // Operators with a dedicated proxy network tighten this via
         // `update --config-file`.
         let cidrs = format!("TRUSTED_PROXY_CIDRS: \"{}\"\n", runtime.trusted_proxy_cidrs);
-        // trusted-proxy requires an explicit mTLS certificate source; a
-        // fresh install has no client-certificate proxy contract yet, so it
-        // starts disabled instead of claiming an mTLS capability the edge
-        // does not provide. Enable rfc9440 explicitly once the proxy forwards
-        // `Client-Cert`.
-        let mtls = "MTLS_CERTIFICATE_SOURCE: \"disabled\"\n";
+        // The managed Angie edge forwards the RFC 9440 Client-Cert field.
+        let mtls = "MTLS_CERTIFICATE_SOURCE: \"rfc9440\"\n";
         format!("TRANSPORT_MODE: \"trusted-proxy\"\n{cidrs}{mtls}")
     } else {
         String::new()

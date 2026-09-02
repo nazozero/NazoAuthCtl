@@ -14,7 +14,8 @@ pub(crate) struct CandidateRelease {
     pub(crate) repository: String,
     pub(crate) version: String,
     oci_image: Option<String>,
-    oci_digest: Option<String>,
+    oci_pull_digest: Option<String>,
+    oci_runtime_digest: Option<String>,
     host_binary_path: Option<String>,
     host_binary_sha256: Option<String>,
     pub(crate) rollback: ReleaseRollbackPolicy,
@@ -35,23 +36,30 @@ impl CandidateRelease {
             "pre-release candidate has no runtime artifact"
         );
         ensure!(
-            self.oci_image.is_some() == self.oci_digest.is_some(),
+            self.oci_image.is_some() == self.oci_pull_digest.is_some()
+                && self.oci_image.is_some() == self.oci_runtime_digest.is_some(),
             "pre-release candidate OCI artifact is incomplete"
         );
         ensure!(
             self.host_binary_path.is_some() == self.host_binary_sha256.is_some(),
             "pre-release candidate host binary artifact is incomplete"
         );
-        if let Some((image, digest)) = self.oci_artifact() {
+        if let Some((image, pull_digest, runtime_digest)) = self.oci_artifact() {
             ensure!(
                 !image.trim().is_empty() && !image.chars().any(char::is_control),
                 "pre-release candidate OCI image is invalid"
             );
             validate_sha256(
-                digest
+                pull_digest
                     .strip_prefix("sha256:")
-                    .context("pre-release candidate OCI digest must use sha256")?,
-                "OCI digest",
+                    .context("pre-release candidate OCI pull digest must use sha256")?,
+                "OCI pull digest",
+            )?;
+            validate_sha256(
+                runtime_digest
+                    .strip_prefix("sha256:")
+                    .context("pre-release candidate OCI runtime digest must use sha256")?,
+                "OCI runtime digest",
             )?;
         }
         if let Some((path, digest)) = self.host_binary_artifact() {
@@ -65,8 +73,12 @@ impl CandidateRelease {
         self.rollback.validate()
     }
 
-    pub(crate) fn oci_artifact(&self) -> Option<(&str, &str)> {
-        self.oci_image.as_deref().zip(self.oci_digest.as_deref())
+    pub(crate) fn oci_artifact(&self) -> Option<(&str, &str, &str)> {
+        self.oci_image
+            .as_deref()
+            .zip(self.oci_pull_digest.as_deref())
+            .zip(self.oci_runtime_digest.as_deref())
+            .map(|((image, pull_digest), runtime_digest)| (image, pull_digest, runtime_digest))
     }
 
     pub(crate) fn host_binary_artifact(&self) -> Option<(&str, &str)> {
@@ -121,7 +133,8 @@ mod tests {
                 "repository":"nazozero/NazoAuth",
                 "version":"v0.2.4-candidate",
                 "oci_image":"localhost/nazoauth:candidate",
-                "oci_digest":"sha256:{}",
+                "oci_pull_digest":"sha256:{}",
+                "oci_runtime_digest":"sha256:{}",
                 "host_binary_path":"/opt/nazoauth-candidate",
                 "host_binary_sha256":"{}",
                 "rollback":{{
@@ -135,6 +148,7 @@ mod tests {
                 }}
             }}"#,
             "a".repeat(64),
+            "c".repeat(64),
             "b".repeat(64),
         );
         let candidate: CandidateRelease = serde_json::from_str(&encoded)?;
@@ -153,7 +167,7 @@ mod tests {
         container_only
             .as_object_mut()
             .expect("candidate object")
-            .remove("oci_digest");
+            .remove("oci_runtime_digest");
         assert!(
             serde_json::from_value::<CandidateRelease>(container_only)?
                 .validate()

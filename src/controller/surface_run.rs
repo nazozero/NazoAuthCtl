@@ -696,9 +696,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
         .snapshot
         .as_ref()
         .context("recover requires an existing immutable snapshot")?;
-    if snapshot.restore_tested_at.is_none() || snapshot.off_host_verified_at.is_none() {
-        bail!("recover requires a restore-tested, off-host-verified snapshot")
-    }
+    validate_recovery_snapshot(snapshot)?;
     let keys = ControllerKeyStore::open_default()?;
     let journal = RecoveryJournal::open(&keys.instance_dir(&record.deployment_id)?)?;
     let mut plan = match journal.load()? {
@@ -718,6 +716,53 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
             plan
         }
     };
+    if let Some(requested) = args.version.as_ref()
+        && plan.target_version.as_ref() != Some(requested)
+    {
+        if let Some(candidate) = plan.candidate.clone() {
+            let operation_id = plan
+                .cleanup_operation_id
+                .get_or_insert_with(|| uuid::Uuid::now_v7().to_string())
+                .clone();
+            journal.store(&plan)?;
+            let endpoint = crate::runtime_backend::RecoveryCandidateEndpoint {
+                object_reference: candidate.object_reference,
+                object_id: candidate.object_id,
+                deployment_id: record.deployment_id.clone(),
+                operation_id: plan.recover_operation_id.clone(),
+                loopback_port: candidate.loopback_port,
+            };
+            let result = target.execute_host_operation(
+                &crate::target::HostOperation::backup_recovery_candidate_cleanup(
+                    operation_id,
+                    record.deployment_id.clone(),
+                    endpoint,
+                ),
+            )?;
+            match result.outcome {
+                crate::target::HostOutcome::Completed {
+                    body: crate::target::HostCompletionBody::BackupRecoveryCandidateCleaned {},
+                } => {}
+                crate::target::HostOutcome::Failed { code, detail } => {
+                    bail!("recover candidate cleanup failed: {code}: {detail}")
+                }
+                crate::target::HostOutcome::Completed { .. } => {
+                    bail!("recover: target returned an unexpected candidate cleanup")
+                }
+            }
+        }
+        plan.phase = RecoveryPhase::Restoring;
+        plan.target_version = Some(requested.clone());
+        plan.candidate_stage_operation_id = None;
+        plan.candidate = None;
+        plan.invalidation_operation_id = None;
+        plan.invalidation_request_hash = None;
+        plan.candidate_control_operation_id = None;
+        plan.not_before = None;
+        plan.activate_operation_id = None;
+        plan.cleanup_operation_id = None;
+        journal.store(&plan)?;
+    }
 
     if matches!(plan.phase, RecoveryPhase::Restoring) && plan.restored_revision.is_none() {
         let result =
@@ -726,17 +771,23 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 record.deployment_id.clone(),
                 plan.source_revision,
                 plan.manifest_sha256.clone(),
+                plan.state_epoch.clone(),
             ))?;
-        let crate::target::HostOutcome::Completed {
-            body:
-                crate::target::HostCompletionBody::BackupRecovered {
-                    manifest_sha256,
-                    revision,
-                    ..
-                },
-        } = result.outcome
-        else {
-            bail!("recover: target did not confirm the exact restored snapshot")
+        let (manifest_sha256, revision) = match result.outcome {
+            crate::target::HostOutcome::Completed {
+                body:
+                    crate::target::HostCompletionBody::BackupRecovered {
+                        manifest_sha256,
+                        revision,
+                        ..
+                    },
+            } => (manifest_sha256, revision),
+            crate::target::HostOutcome::Failed { code, detail } => {
+                bail!("recover target failed: {code}: {detail}")
+            }
+            crate::target::HostOutcome::Completed { .. } => {
+                bail!("recover: target returned an unexpected completion")
+            }
         };
         if manifest_sha256 != plan.manifest_sha256 || revision != plan.source_revision + 1 {
             bail!(
@@ -763,13 +814,22 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 revision,
                 plan.recover_operation_id.clone(),
                 plan.state_epoch.clone(),
+                crate::target::OfficialArtifactRef {
+                    repository: crate::clean_install::SERVER_REPOSITORY.to_owned(),
+                    version: plan.target_version.clone(),
+                },
             ),
         )?;
-        let crate::target::HostOutcome::Completed {
-            body: crate::target::HostCompletionBody::BackupRecoveryCandidateStaged { endpoint },
-        } = result.outcome
-        else {
-            bail!("recover: target did not confirm the closed recovery candidate")
+        let endpoint = match result.outcome {
+            crate::target::HostOutcome::Completed {
+                body: crate::target::HostCompletionBody::BackupRecoveryCandidateStaged { endpoint },
+            } => endpoint,
+            crate::target::HostOutcome::Failed { code, detail } => {
+                bail!("recover candidate stage failed: {code}: {detail}")
+            }
+            crate::target::HostOutcome::Completed { .. } => {
+                bail!("recover: target returned an unexpected candidate completion")
+            }
         };
         if endpoint.deployment_id != record.deployment_id
             || endpoint.operation_id != plan.recover_operation_id
@@ -805,6 +865,15 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
         let control_journal = crate::controller_identity::journal::OperationJournal::open(
             keys.instance_dir(&record.deployment_id)?,
         )?;
+        if control_journal.load()?.is_none()
+            && (plan.invalidation_operation_id.is_some()
+                || plan.invalidation_request_hash.is_some())
+        {
+            plan.invalidation_operation_id = None;
+            plan.invalidation_request_hash = None;
+            plan.candidate_control_operation_id = None;
+            journal.store(&plan)?;
+        }
         let prepared = crate::controller_identity::prepare_control_operation(
             &context.registry,
             &keys,
@@ -833,8 +902,37 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 "recover: control-operation journal does not match the recorded recovery invalidation"
             ),
         }
-        let verdict =
-            crate::controller_identity::dispatch_via_target(target.as_ref(), &prepared, None)?;
+        let candidate = plan
+            .candidate
+            .clone()
+            .context("recover: recovery journal has no candidate pointer")?;
+        let wrapper_operation_id = plan
+            .candidate_control_operation_id
+            .get_or_insert_with(|| uuid::Uuid::now_v7().to_string())
+            .clone();
+        journal.store(&plan)?;
+        let host_result = target.execute_host_operation(
+            &crate::target::HostOperation::backup_recovery_candidate_control(
+                wrapper_operation_id,
+                record.deployment_id.clone(),
+                revision,
+                crate::runtime_backend::RecoveryCandidateEndpoint {
+                    object_reference: candidate.object_reference.clone(),
+                    object_id: candidate.object_id.clone(),
+                    deployment_id: record.deployment_id.clone(),
+                    operation_id: plan.recover_operation_id.clone(),
+                    loopback_port: candidate.loopback_port,
+                },
+                plan.state_epoch.clone(),
+                prepared.signed.operation_id.clone(),
+                prepared.signed.compact_jws.clone(),
+            ),
+        )?;
+        let receipt = crate::target::control_operation_receipt(
+            prepared.signed.operation_id.clone(),
+            host_result.outcome,
+        )?;
+        let verdict = crate::controller_identity::classify_control_receipt(&prepared, receipt)?;
         match &verdict {
             crate::controller_identity::DispatchVerdict::DefinitivelyRejected { code }
                 if requires_controller_identity_recovery(code) =>
@@ -856,6 +954,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 // after the new key lands necessarily prepares a fresh JWS.
                 plan.invalidation_operation_id = None;
                 plan.invalidation_request_hash = None;
+                plan.candidate_control_operation_id = None;
                 journal.store(&plan)?;
 
                 let candidate = plan
@@ -904,6 +1003,10 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 continue;
             }
             crate::controller_identity::DispatchVerdict::DefinitivelyRejected { code } => {
+                plan.invalidation_operation_id = None;
+                plan.invalidation_request_hash = None;
+                plan.candidate_control_operation_id = None;
+                journal.store(&plan)?;
                 crate::controller_identity::settle_journal(
                     &control_journal,
                     &prepared,
@@ -926,13 +1029,20 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
             }
             crate::controller_identity::DispatchVerdict::Terminal(result) => {
                 if result.outcome != ControlOutcome::Succeeded {
+                    plan.invalidation_operation_id = None;
+                    plan.invalidation_request_hash = None;
+                    plan.candidate_control_operation_id = None;
+                    journal.store(&plan)?;
                     crate::controller_identity::settle_journal(
                         &control_journal,
                         &prepared,
                         &verdict,
                         |_| Ok(()),
                     )?;
-                    bail!("recover: server completed invalidation unsuccessfully")
+                    bail!(
+                        "{}: recover: server completed invalidation unsuccessfully",
+                        crate::error_codes::CONTROL_OPERATION_FAILED
+                    )
                 }
                 let Some(ControlResultData::RecoveryInvalidation {
                     state_epoch,
@@ -964,10 +1074,14 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
         let not_before = plan
             .not_before
             .context("recovery journal has no invalidation deadline")?;
-        if chrono::Utc::now().timestamp() <= not_before {
-            bail!(
-                "recover: invalidation is durable but the deadline has not elapsed; runtime and public ingress remain closed; rerun after {not_before}"
-            )
+        while chrono::Utc::now().timestamp() <= not_before {
+            let remaining = not_before
+                .saturating_sub(chrono::Utc::now().timestamp())
+                .saturating_add(1);
+            eprintln!(
+                "recover: invalidation is durable; waiting {remaining}s before activating the recovered runtime"
+            );
+            std::thread::sleep(std::time::Duration::from_secs(remaining.min(60) as u64));
         }
         let revision = plan
             .restored_revision
@@ -987,13 +1101,16 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 not_before,
             ),
         )?;
-        if !matches!(
-            result.outcome,
+        match result.outcome {
             crate::target::HostOutcome::Completed {
-                body: crate::target::HostCompletionBody::BackupRecoveryActivated {}
+                body: crate::target::HostCompletionBody::BackupRecoveryActivated {},
+            } => {}
+            crate::target::HostOutcome::Failed { code, detail } => {
+                bail!("recover activation failed: {code}: {detail}")
             }
-        ) {
-            bail!("recover: target did not confirm activation after the deadline")
+            crate::target::HostOutcome::Completed { .. } => {
+                bail!("recover: target returned an unexpected activation completion")
+            }
         }
         plan.phase = RecoveryPhase::CleanupPending;
         journal.store(&plan)?;
@@ -1023,16 +1140,28 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 endpoint,
             ),
         )?;
-        if !matches!(
-            result.outcome,
+        match result.outcome {
             crate::target::HostOutcome::Completed {
-                body: crate::target::HostCompletionBody::BackupRecoveryCandidateCleaned {}
+                body: crate::target::HostCompletionBody::BackupRecoveryCandidateCleaned {},
+            } => {}
+            crate::target::HostOutcome::Failed { code, detail } => {
+                bail!("recover candidate cleanup failed: {code}: {detail}")
             }
-        ) {
-            bail!("recover: target did not confirm exact candidate cleanup")
+            crate::target::HostOutcome::Completed { .. } => {
+                bail!("recover: target returned an unexpected candidate cleanup completion")
+            }
         }
         journal.clear()?;
         println!("recovery completed for '{}'", record.alias);
+    }
+    Ok(())
+}
+
+fn validate_recovery_snapshot(
+    snapshot: &crate::target::backup::SnapshotProjection,
+) -> anyhow::Result<()> {
+    if snapshot.restore_tested_at.is_none() {
+        bail!("recover requires a restore-tested snapshot")
     }
     Ok(())
 }
@@ -1300,9 +1429,37 @@ mod install_input_tests {
 mod recover_tests {
     use super::{
         RecoveryCeremonyRoute, requires_controller_identity_recovery,
-        select_recovery_ceremony_route,
+        select_recovery_ceremony_route, validate_recovery_snapshot,
     };
     use crate::registry::HostTransport;
+    use crate::target::backup::SnapshotProjection;
+    use chrono::Utc;
+
+    fn snapshot(restore_tested: bool, off_host_verified: bool) -> SnapshotProjection {
+        SnapshotProjection {
+            snapshot_id: uuid::Uuid::now_v7().to_string(),
+            created_at: Utc::now(),
+            manifest_sha256: "a".repeat(64),
+            restore_tested_at: restore_tested.then(Utc::now),
+            off_host_verified_at: off_host_verified.then(Utc::now),
+        }
+    }
+
+    #[test]
+    fn restore_tested_local_snapshot_is_recoverable_without_an_off_host_copy() {
+        validate_recovery_snapshot(&snapshot(true, false))
+            .expect("off-host redundancy must not block a usable local recovery");
+    }
+
+    #[test]
+    fn untested_snapshot_cannot_be_recovered_even_with_an_off_host_copy() {
+        let error = validate_recovery_snapshot(&snapshot(false, true))
+            .expect_err("an untested snapshot must not be restored");
+        assert_eq!(
+            error.to_string(),
+            "recover requires a restore-tested snapshot"
+        );
+    }
 
     #[test]
     fn only_stable_identity_rejections_may_read_a_recovery_secret() {

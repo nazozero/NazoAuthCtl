@@ -190,8 +190,9 @@ pub struct RuntimeReplacement {
 ///
 /// This is deliberately not a general clone specification. The backend
 /// inspects one stopped deployment runtime, copies only its safe environment
-/// and single non-host network, replaces exactly the three recovery mounts,
-/// and publishes one application port on IPv4 loopback.
+/// and single non-host network, replaces its data/config and current secret
+/// file mounts from the restored snapshot, and publishes one application port
+/// on IPv4 loopback.
 #[derive(Clone, Debug)]
 pub struct RecoveryCandidateRequest {
     pub source_object_reference: String,
@@ -666,7 +667,7 @@ pub trait RuntimeBackend {
 }
 
 pub fn safe_environment(values: &[serde_json::Value]) -> BTreeMap<String, String> {
-    const ALLOWED: [&str; 7] = [
+    const ALLOWED: [&str; 8] = [
         "ISSUER",
         "PUBLIC_BASE_URL",
         "DATA_DIR",
@@ -674,6 +675,7 @@ pub fn safe_environment(values: &[serde_json::Value]) -> BTreeMap<String, String
         "RUNTIME_INSTANCE_ID",
         "CONTROL_AUTHORITY",
         "INSTANCE_IDENTITY_DIR",
+        "VALKEY_STATE_EPOCH",
     ];
     values
         .iter()
@@ -707,7 +709,23 @@ pub fn labels(value: Option<&serde_json::Value>) -> BTreeMap<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::RuntimeBackendKind;
+    use super::{RuntimeBackendKind, safe_environment};
+
+    #[test]
+    fn state_epoch_is_observable_without_exposing_secrets() {
+        let environment = safe_environment(&[
+            serde_json::Value::String(
+                "VALKEY_STATE_EPOCH=01900000-0000-7000-8000-000000000001".to_owned(),
+            ),
+            serde_json::Value::String("DATABASE_URL=secret".to_owned()),
+        ]);
+
+        assert_eq!(
+            environment.get("VALKEY_STATE_EPOCH").map(String::as_str),
+            Some("01900000-0000-7000-8000-000000000001")
+        );
+        assert!(!environment.contains_key("DATABASE_URL"));
+    }
 
     #[test]
     fn runtime_kind_has_exactly_three_wire_tokens() -> anyhow::Result<()> {

@@ -26,9 +26,8 @@ use nazoauthctl_conformance::{
     EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, HttpRequest,
     HttpTransport, ManagedWebDriver, MatrixSelection, OidfArtifactMatrix, OidfDriverLane,
     OidfPlanResourceBudget, OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
-    OpenId4VciIssuerDriver, OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier,
-    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl,
-    StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionDeferredReview,
+    OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard,
+    RunControl, StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionDeferredReview,
     SuiteRetentionManifest, SuiteRetentionManifestReceipt, SuiteRetentionPlan,
     SuiteRetentionScreenshotManifest, TenantResourceApplyOutput, TenantResourceControlOperation,
     TenantResourceRecoveryBinding, TenantResourceRecoveryPhase, Transport, TtyRenderer,
@@ -97,11 +96,6 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         )?;
     }
     if invocation.capture_review_screenshots {
-        if suite_origin != Origin::official() {
-            bail!(
-                "--capture-review-screenshots is restricted to the canonical official Suite origin"
-            );
-        }
         let evidence_directory = invocation
             .evidence_directory
             .as_ref()
@@ -227,34 +221,6 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         mtls_trust_anchor_pem: prepared.mtls_trust_anchor_pem(),
     };
 
-    let vp_evidence_verifier = invocation
-        .capture_review_screenshots
-        .then(|| {
-            let inputs = session.openid4vp_evidence_verifier_inputs();
-            if inputs.target_issuer != session.target_issuer()
-                || inputs.deployment_id != deployment.deployment_id
-            {
-                bail!("current runtime evidence identity does not match the selected instance");
-            }
-            let public_key = nazo_operator_protocol::decode_instance_public_key(
-                &inputs.instance_public_key_base64,
-            )
-            .context("current runtime evidence public key is invalid")?;
-            OpenId4VpEvidenceVerifier::new(
-                inputs.deployment_id.clone(),
-                invocation.tenant_id.clone(),
-                inputs.runtime_instance_id.clone(),
-                inputs.instance_key_id.clone(),
-                public_key,
-            )
-            .context("current runtime evidence identity is invalid")
-        })
-        .transpose()?;
-    let vp_evidence_trust_anchor = vp_evidence_verifier
-        .as_ref()
-        .map(|verifier| verifier.recovery_trust_anchor(&ephemeral_tenant.issuer))
-        .transpose()
-        .context("failed to persist the OpenID4VP evidence runtime trust anchor")?;
     let private_manifest_path = recovery_directory.join(format!("material-{request_jti}.json"));
     manifest
         .write_private(&private_manifest_path)
@@ -281,7 +247,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         manifest_path: Some(private_manifest_path.clone()),
         material_sha256: Some(manifest.raw_sha256().to_owned()),
         proxy: proxy_recovery,
-        vp_evidence_trust_anchor,
+        vp_evidence_trust_anchor: None,
         resource_identities: manifest.resource_identities().to_vec(),
     }) {
         Ok(recovery) => Arc::new(Mutex::new(recovery)),
@@ -295,83 +261,89 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             };
         }
     };
-    let deployment_trust_anchor =
-        provision_ephemeral_tenant(&session, &ephemeral_tenant, &recovery)
-            .context("failed to provision the run-scoped OIDF tenant")?;
-    probe_ephemeral_tenant(&ephemeral_tenant.issuer).context(
-        "the temporary tenant is not publicly reachable; verify wildcard TLS and host routing for *.oidf.nazoauth.com",
-    )?;
-    let baseline = session
-        .execute_control_operation(
-            ControlOperationPayload::TenantResourceEnumerate {
-                tenant_id: invocation.tenant_id.clone(),
-                selectors: Vec::new(),
-            },
-            None,
-            |completion| {
-                lock_recovery(&recovery)?.record_terminal_completion(
-                    TenantResourceRecoveryPhase::BaselineEnumerated,
-                    control_operation(completion),
-                )?;
-                Ok(())
-            },
-        )
-        .context("failed to enumerate the tenant-resource baseline")?;
-    let baseline = successful_control_result(baseline, "baseline Enumerate")?;
-    let ControlResultData::TenantResourceEnumerate {
-        resources: baseline_resources,
-        ..
-    } = baseline
-    else {
-        bail!("baseline ControlOperation returned the wrong typed result");
-    };
-    let mut final_active = baseline_resources;
-    for delta in manifest.resource_identities() {
-        if let Some(existing) = final_active.iter().find(|existing| {
-            existing.kind == delta.kind && existing.resource_id == delta.resource_id
-        }) {
-            if existing.digest != delta.digest {
-                bail!("run-unique tenant resource conflicts with active baseline");
+    let setup_result = (|| -> anyhow::Result<_> {
+        let deployment_trust_anchor =
+            provision_ephemeral_tenant(&session, &ephemeral_tenant, &recovery)
+                .context("failed to provision the run-scoped OIDF tenant")?;
+        probe_ephemeral_tenant(&ephemeral_tenant.issuer).context(
+            "the temporary tenant is not publicly reachable; verify wildcard TLS and host routing for *.oidf.nazoauth.com",
+        )?;
+        let baseline = session
+            .execute_control_operation(
+                ControlOperationPayload::TenantResourceEnumerate {
+                    tenant_id: invocation.tenant_id.clone(),
+                    selectors: Vec::new(),
+                },
+                None,
+                |completion| {
+                    lock_recovery(&recovery)?.record_terminal_completion(
+                        TenantResourceRecoveryPhase::BaselineEnumerated,
+                        control_operation(completion),
+                    )?;
+                    Ok(())
+                },
+            )
+            .context("failed to enumerate the tenant-resource baseline")?;
+        let baseline = successful_control_result(baseline, "baseline Enumerate")?;
+        let ControlResultData::TenantResourceEnumerate {
+            resources: baseline_resources,
+            ..
+        } = baseline
+        else {
+            bail!("baseline ControlOperation returned the wrong typed result");
+        };
+        let mut final_active = baseline_resources;
+        for delta in manifest.resource_identities() {
+            if let Some(existing) = final_active.iter().find(|existing| {
+                existing.kind == delta.kind && existing.resource_id == delta.resource_id
+            }) {
+                if existing.digest != delta.digest {
+                    bail!("run-unique tenant resource conflicts with active baseline");
+                }
+            } else {
+                final_active.push(delta.clone());
             }
-        } else {
-            final_active.push(delta.clone());
         }
-    }
-    final_active.sort_by(|left, right| {
-        (left.kind, left.resource_id.as_str()).cmp(&(right.kind, right.resource_id.as_str()))
-    });
-    let apply = session
-        .execute_control_operation(
-            ControlOperationPayload::TenantResourceApply {
-                tenant_id: invocation.tenant_id.clone(),
-                resources: manifest.resource_identities().to_vec(),
-            },
-            Some(manifest.bytes().as_bytes().to_vec()),
-            |completion| {
-                lock_recovery(&recovery)?.record_terminal_completion(
-                    TenantResourceRecoveryPhase::Applied,
-                    control_operation(completion),
-                )?;
-                Ok(())
-            },
+        final_active.sort_by(|left, right| {
+            (left.kind, left.resource_id.as_str()).cmp(&(right.kind, right.resource_id.as_str()))
+        });
+        let apply = session
+            .execute_control_operation(
+                ControlOperationPayload::TenantResourceApply {
+                    tenant_id: invocation.tenant_id.clone(),
+                    resources: manifest.resource_identities().to_vec(),
+                },
+                Some(manifest.bytes().as_bytes().to_vec()),
+                |completion| {
+                    lock_recovery(&recovery)?.record_terminal_completion(
+                        TenantResourceRecoveryPhase::Applied,
+                        control_operation(completion),
+                    )?;
+                    Ok(())
+                },
+            )
+            .context("ordinary tenant-resource Apply failed")?;
+        let apply = successful_control_completion(apply, "Apply")?;
+        let apply_output = TenantResourceApplyOutput::from_control_result(
+            &apply.result,
+            &apply.identity.operation_id,
+            &apply.identity.request_hash,
+            &apply.identity.kid,
+            &manifest,
+            final_active,
         )
-        .context("ordinary tenant-resource Apply failed")?;
-    let apply = successful_control_completion(apply, "Apply")?;
-    let apply_output = TenantResourceApplyOutput::from_control_result(
-        &apply.result,
-        &apply.identity.operation_id,
-        &apply.identity.request_hash,
-        &apply.identity.kid,
-        &manifest,
-        final_active,
-    )
-    .context("Apply typed mappings do not match the prepared signed Matrix")?;
-    let ordinary = DescriptorMaterializer::finalize_tenant_resources(
-        prepared,
-        apply_output,
-        deployment_trust_anchor,
-    )
-    .context("Apply typed mappings do not match the prepared signed Matrix")?;
+        .context("Apply typed mappings do not match the prepared signed Matrix")?;
+        DescriptorMaterializer::finalize_tenant_resources(
+            prepared,
+            apply_output,
+            deployment_trust_anchor,
+        )
+        .context("Apply typed mappings do not match the prepared signed Matrix")
+    })();
+    let ordinary = match setup_result {
+        Ok(ordinary) => ordinary,
+        Err(error) => return cleanup_failed_pre_suite_setup(&session, recovery, error),
+    };
     let mut deployment_report = DeploymentReport {
         deployment_id: deployment.deployment_id.clone(),
         tenant_id: invocation.tenant_id.clone(),
@@ -456,7 +428,6 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         selected_resource_budget,
         recovery.clone(),
         ciba_bridge,
-        vp_evidence_verifier,
     );
 
     let mut recovery = take_recovery(recovery)?;
@@ -648,7 +619,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
             run_jti: request_jti.clone(),
             deployment: EvidenceDeploymentIdentity {
                 deployment_id: deployment.deployment_id.clone(),
-                target_issuer: deployment.target_issuer.clone(),
+                target_issuer: ephemeral_tenant.issuer.clone(),
                 release: deployment.release.clone(),
                 runtime: runtime.clone(),
             },
@@ -695,10 +666,11 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     deployment_report.cleanup_complete = cleanup_complete;
     let success = errors.is_empty()
         && report.as_ref().is_some_and(|report| {
-            conformance_acceptance_succeeds(
+            conformance_run_succeeds(
                 report.local_success,
-                report.acceptance_pass,
                 report.matrix_expectations_satisfied,
+                report.failed_modules.len(),
+                report.incomplete_modules.len(),
             )
         });
     let output = FinalOutput {
@@ -716,12 +688,29 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
     Ok(if success { 0 } else { 1 })
 }
 
-fn conformance_acceptance_succeeds(
+fn conformance_run_succeeds(
     local_success: bool,
-    acceptance_pass: bool,
     matrix_expectations_satisfied: bool,
+    failed_modules: usize,
+    incomplete_modules: usize,
 ) -> bool {
-    local_success && acceptance_pass && matrix_expectations_satisfied
+    local_success && matrix_expectations_satisfied && failed_modules == 0 && incomplete_modules == 0
+}
+
+#[cfg(test)]
+mod acceptance_tests {
+    use super::conformance_run_succeeds;
+
+    #[test]
+    fn review_only_run_is_successful() {
+        assert!(conformance_run_succeeds(true, true, 0, 0));
+    }
+
+    #[test]
+    fn failed_or_incomplete_module_fails_the_run() {
+        assert!(!conformance_run_succeeds(true, true, 1, 0));
+        assert!(!conformance_run_succeeds(true, true, 0, 1));
+    }
 }
 
 fn control_operation(
@@ -832,6 +821,26 @@ fn directory_revision(session: &nazoauthctl_core::ConformanceSession) -> anyhow:
         bail!("tenant directory Describe returned the wrong typed result");
     };
     Ok(revision)
+}
+
+fn tenant_directory_presence(
+    session: &nazoauthctl_core::ConformanceSession,
+    tenant_id: &str,
+) -> anyhow::Result<(u64, bool)> {
+    let result = session.execute_control_operation(
+        ControlOperationPayload::TenantDirectoryDescribe,
+        None,
+        |_| Ok(()),
+    )?;
+    let ControlResultData::TenantDirectoryDescribe { revision, tenants } =
+        successful_control_result(result, "tenant directory Describe")?
+    else {
+        bail!("tenant directory Describe returned the wrong typed result");
+    };
+    Ok((
+        revision,
+        tenants.iter().any(|tenant| tenant.tenant_id == tenant_id),
+    ))
 }
 
 fn probe_ephemeral_tenant(issuer: &str) -> anyhow::Result<()> {
@@ -1008,7 +1017,6 @@ fn run_signed_suite(
     selected_resource_budget: OidfPlanResourceBudget,
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
     ciba_bridge: Option<CibaUserApprovalBridge>,
-    vp_evidence_verifier: Option<OpenId4VpEvidenceVerifier>,
 ) -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
     if let Some(bridge) = &ciba_bridge {
         bridge
@@ -1056,17 +1064,6 @@ fn run_signed_suite(
             plans: invocation.plans.clone(),
         })
         .context("requested selection is outside the signed artifact Matrix")?;
-    let vp_evidence = invocation
-        .capture_review_screenshots
-        .then(|| {
-            OpenId4VpEvidenceRunContext::new(
-                &review_screenshot_run_jti,
-                invocation.artifact_digest.as_str(),
-                selected.digest.as_str(),
-            )
-        })
-        .transpose()
-        .context("OpenID4VP review evidence binding is invalid")?;
     let mut automation = Vec::with_capacity(invocation.jobs);
     for worker_index in 0..invocation.jobs {
         let browser = build_browser(
@@ -1095,17 +1092,10 @@ fn run_signed_suite(
             Duration::from_secs(30),
             binding.clone(),
         )?;
-        let verifier_client = match &vp_evidence_verifier {
-            Some(evidence_verifier) => {
-                verifier_client.with_evidence_verifier(evidence_verifier.clone())
-            }
-            None => verifier_client,
-        };
         let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = Arc::new(Mutex::new(verifier_client));
         automation.push(ConformanceAutomation {
             browser: Some(browser),
             review_screenshot_capture: review_screenshot_capture.clone(),
-            vp_evidence: vp_evidence.clone(),
             verifier: Some(verifier),
             issuer: Some(issuer),
         });
@@ -1304,6 +1294,50 @@ fn take_recovery(
         .map_err(|_| anyhow::anyhow!("ordinary recovery lock is poisoned"))
 }
 
+fn cleanup_failed_pre_suite_setup<T>(
+    session: &nazoauthctl_core::ConformanceSession,
+    recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
+    setup_error: anyhow::Error,
+) -> anyhow::Result<T> {
+    let mut recovery = match take_recovery(recovery) {
+        Ok(recovery) => recovery,
+        Err(cleanup_error) => {
+            bail!("pre-Suite setup failed: {setup_error:#}; cleanup-state={cleanup_error:#}")
+        }
+    };
+    let mut cleanup_errors = Vec::new();
+    if !recovery.suite_cleanup_complete()
+        && let Err(error) = recovery.mark_suite_cleanup_complete()
+    {
+        cleanup_errors.push(format!("suite={error:#}"));
+    }
+    if !recovery.proxy_cleanup_complete()
+        && let Err(error) = recovery.mark_proxy_cleanup_complete()
+    {
+        cleanup_errors.push(format!("proxy={error:#}"));
+    }
+    let resources_clean = match cleanup_run_resources(session, &mut recovery) {
+        Ok(_) => true,
+        Err(error) => {
+            cleanup_errors.push(format!("resources={error:#}"));
+            false
+        }
+    };
+    if resources_clean
+        && recovery.suite_cleanup_complete()
+        && recovery.proxy_cleanup_complete()
+        && let Err(error) = recovery.finish()
+    {
+        cleanup_errors.push(format!("journal={error:#}"));
+    }
+    let cleanup = if cleanup_errors.is_empty() {
+        "ok".to_owned()
+    } else {
+        cleanup_errors.join("; ")
+    };
+    bail!("pre-Suite setup failed: {setup_error:#}; cleanup={cleanup}")
+}
+
 fn build_browser(
     endpoint: Option<&str>,
     target_issuer: &str,
@@ -1407,6 +1441,10 @@ fn cleanup_run_resources(
     session: &nazoauthctl_core::ConformanceSession,
     recovery: &mut nazoauthctl_conformance::ConformanceRecoveryGuard,
 ) -> anyhow::Result<Vec<EvidenceControlOperation>> {
+    if recovery.tenant_absent() {
+        cleanup_ephemeral_tenant(session, recovery)?;
+        return Ok(Vec::new());
+    }
     let enumerate = match recovery.cleanup_enumerate_operation() {
         Some(operation) => operation.clone(),
         None => {
@@ -1560,7 +1598,13 @@ fn recover_pending_runs(
     for mut recovery in store.claim_pending()? {
         let binding = recovery.ordinary_binding().clone();
         let result = (|| -> anyhow::Result<Option<SuiteRetentionManifestReceipt>> {
-            recover_ephemeral_tenant(session, &mut recovery)?;
+            let (directory_revision, tenant_present) =
+                tenant_directory_presence(session, &binding.tenant_id)?;
+            if tenant_present {
+                recover_ephemeral_tenant(session, &mut recovery)?;
+            } else {
+                recovery.mark_tenant_absent(directory_revision)?;
+            }
             if let Some(failure) = recovery.terminal_failure().cloned() {
                 let tenant_cleanup = cleanup_ephemeral_tenant(session, &mut recovery);
                 bail!(
@@ -1586,7 +1630,7 @@ fn recover_pending_runs(
                 }
                 return Ok(receipt);
             }
-            if recovery.baseline_enumerate_operation().is_none() {
+            if !recovery.tenant_absent() && recovery.baseline_enumerate_operation().is_none() {
                 let outcome = session.execute_control_operation(
                     ControlOperationPayload::TenantResourceEnumerate {
                         tenant_id: binding.tenant_id.clone(),
@@ -1603,7 +1647,7 @@ fn recover_pending_runs(
                 )?;
                 successful_control_completion(outcome, "recovery baseline Enumerate")?;
             }
-            if recovery.apply_operation().is_none() {
+            if !recovery.tenant_absent() && recovery.apply_operation().is_none() {
                 let material = recovery.read_private_material()?;
                 let outcome = session.execute_control_operation(
                     ControlOperationPayload::TenantResourceApply {

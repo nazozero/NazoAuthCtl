@@ -38,7 +38,7 @@ use super::{
 use crate::runtime_backend::{
     self, ArtifactReference, ContainerRuntimePolicy, NeutralMount, RecoveryCandidateEndpoint,
     RecoveryCandidateRequest, Responsibility, RuntimeBackend, RuntimeBackendKind,
-    RuntimeReplacement,
+    RuntimeObservation, RuntimeReplacement,
 };
 
 pub const BACKUP_EXECUTION_FAILED: &str = "BACKUP_EXECUTION_FAILED";
@@ -79,6 +79,16 @@ pub(crate) struct RecoveryFacts {
     pub release: ReleaseVersion,
     pub rollback_policy: crate::model::ReleaseRollbackPolicy,
     pub config_schema: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryCandidateFacts {
+    schema: u32,
+    operation_id: String,
+    artifact: ArtifactReference,
+    release: ReleaseVersion,
+    rollback_policy: crate::model::ReleaseRollbackPolicy,
 }
 
 pub(crate) fn snapshot(
@@ -644,6 +654,7 @@ pub(crate) fn recover(
     scope_dir: &Path,
     state: &DeploymentState,
     expected_manifest_sha256: &str,
+    state_epoch: &str,
     operation_id: &str,
 ) -> Result<RecoveryFacts, Failure> {
     let operation = Uuid::parse_str(operation_id).map_err(|_| {
@@ -652,6 +663,18 @@ pub(crate) fn recover(
             "recovery operation id must be a UUID",
         )
     })?;
+    let epoch = Uuid::parse_str(state_epoch).map_err(|_| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "recovery state epoch must be a UUID",
+        )
+    })?;
+    if epoch.get_version_num() != 7 {
+        return Err(Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "recovery state epoch must be UUIDv7",
+        ));
+    }
     let manifest = backup::load_manifest(scope_dir)
         .map_err(restore_failure)?
         .ok_or_else(|| Failure::new(RESTORE_TEST_FAILED, "no snapshot manifest exists"))?;
@@ -841,14 +864,18 @@ pub(crate) fn recover(
     .map_err(restore_failure)?;
     let runtime_connection = postgres_connection(&extracted_secrets.join("database-runtime-url"))
         .map_err(restore_failure)?;
+    let runtime_database_url = runtime_connection
+        .with_database(&database)
+        .with_password_url()
+        .map_err(restore_failure)?;
     write_secret(
         &extracted_secrets.join("database-runtime-url"),
-        &runtime_connection
-            .with_database(&database)
-            .with_password_url()
-            .map_err(restore_failure)?,
+        &runtime_database_url,
     )
     .map_err(restore_failure)?;
+    let restored_config =
+        rewrite_recovery_config(&extracted_config, &runtime_database_url, state_epoch)
+            .map_err(restore_failure)?;
 
     let target_data = managed_directory_locator(state, "app-data").map_err(restore_failure)?;
     let target_secrets =
@@ -874,14 +901,20 @@ pub(crate) fn recover(
     if !staged_config.exists()
         && !recovery_path_switched(&target_config, operation, "config").map_err(restore_failure)?
     {
-        fs::copy(&extracted_config, &staged_config)
-            .map_err(|error| restore_failure(error.into()))?;
+        crate::filesystem::atomic_write(&staged_config, &restored_config, 0o600)
+            .map_err(restore_failure)?;
     }
     prepare_stage_ownership_if_present(
         state.runtime.kind,
         &staged_data,
         &staged_secrets,
         &staged_config,
+    )
+    .map_err(restore_failure)?;
+    crate::filesystem::atomic_write(
+        &recovery_root.join("paths-switching"),
+        operation_id.as_bytes(),
+        0o600,
     )
     .map_err(restore_failure)?;
     switch_recovery_path(&target_data, &staged_data, operation, "data").map_err(restore_failure)?;
@@ -912,6 +945,7 @@ pub(crate) fn stage_recovery_candidate(
     state: &DeploymentState,
     recovery_operation_id: &str,
     state_epoch: &str,
+    target: &super::install_exec::OfficialArtifactRef,
 ) -> Result<RecoveryCandidateEndpoint, Failure> {
     let operation = Uuid::parse_str(recovery_operation_id).map_err(|_| {
         Failure::new(
@@ -986,12 +1020,94 @@ pub(crate) fn stage_recovery_candidate(
     let config = secure_regular_path(Path::new(&state.config.reference), "deployment config")
         .map_err(restore_failure)?;
     let backend = runtime_backend::backend(kind);
+    let candidate_facts_path = scope_dir
+        .join("backup")
+        .join("recoveries")
+        .join(operation.to_string())
+        .join("candidate-release.json");
+    let materialize_target = || -> Result<RecoveryCandidateFacts, Failure> {
+        let runtime_root = state
+            .resources
+            .iter()
+            .find(|resource| resource.resource_id == "app-binary" && resource.kind == "directory")
+            .map(|resource| resource.locator.as_str());
+        let version_floor = state
+            .current_release
+            .as_ref()
+            .map(|release| release.version.as_str());
+        let verified = super::update_exec::verify_pinned_artifact_facts(
+            target,
+            state.runtime.kind,
+            version_floor,
+            runtime_root,
+        )?;
+        let release = verified.release.ok_or_else(|| {
+            Failure::new(
+                RESTORE_TEST_FAILED,
+                "recovery target Release has no verified release identity",
+            )
+        })?;
+        if let Some(requested) = target.version.as_deref()
+            && release.version != requested
+        {
+            return Err(Failure::new(
+                RESTORE_TEST_FAILED,
+                "recovery target Release differs from the requested version",
+            ));
+        }
+        let runtime_role = super::update_exec::runtime_database_role(&secrets)?;
+        run_restore_migration(
+            backend.as_ref(),
+            &verified.runtime_artifact,
+            &data,
+            &config,
+            &secrets,
+            &runtime_role,
+        )
+        .map_err(restore_failure)?;
+        let facts = RecoveryCandidateFacts {
+            schema: 1,
+            operation_id: recovery_operation_id.to_owned(),
+            artifact: verified.runtime_artifact,
+            release,
+            rollback_policy: verified.rollback_policy,
+        };
+        crate::filesystem::atomic_write(
+            &candidate_facts_path,
+            &serde_json::to_vec_pretty(&facts).map_err(|error| restore_failure(error.into()))?,
+            0o600,
+        )
+        .map_err(restore_failure)?;
+        Ok(facts)
+    };
+    let candidate_facts = if candidate_facts_path.exists() {
+        let recorded = load_recovery_candidate_facts(&candidate_facts_path, recovery_operation_id)?;
+        if target
+            .version
+            .as_deref()
+            .is_none_or(|requested| recorded.release.version == requested)
+        {
+            recorded
+        } else {
+            materialize_target()?
+        }
+    } else {
+        materialize_target()?
+    };
+    if let Some(requested) = target.version.as_deref()
+        && candidate_facts.release.version != requested
+    {
+        return Err(Failure::new(
+            RESTORE_TEST_FAILED,
+            "recorded recovery candidate Release differs from the requested version",
+        ));
+    }
     let request = RecoveryCandidateRequest {
         source_object_reference: state.runtime.object.clone(),
         candidate_object_reference: format!("nazoauth-recovery-{operation}"),
         deployment_id: state.deployment_id.clone(),
         operation_id: recovery_operation_id.to_owned(),
-        artifact: facts.artifact,
+        artifact: candidate_facts.artifact,
         data_source: data,
         secrets_source: secrets,
         config_source: config,
@@ -1021,6 +1137,76 @@ pub(crate) fn stage_recovery_candidate(
     Ok(endpoint)
 }
 
+fn load_recovery_candidate_facts(
+    path: &Path,
+    recovery_operation_id: &str,
+) -> Result<RecoveryCandidateFacts, Failure> {
+    let bytes = crate::filesystem::read_secure_regular_file(
+        path,
+        "recovery candidate release facts",
+        false,
+        64 * 1024,
+    )
+    .map_err(restore_failure)?;
+    let facts: RecoveryCandidateFacts =
+        serde_json::from_slice(&bytes).map_err(|error| restore_failure(error.into()))?;
+    if facts.schema != 1 || facts.operation_id != recovery_operation_id {
+        return Err(Failure::new(
+            RESTORE_TEST_FAILED,
+            "recovery candidate release facts do not bind this recovery",
+        ));
+    }
+    facts.release.validate().map_err(restore_failure)?;
+    facts.rollback_policy.validate().map_err(restore_failure)?;
+    Ok(facts)
+}
+
+#[cfg(test)]
+pub(super) fn seed_recovery_candidate_facts(
+    scope_dir: &Path,
+    recovery_operation_id: &str,
+    artifact: ArtifactReference,
+) -> anyhow::Result<()> {
+    let directory = scope_dir
+        .join("backup")
+        .join("recoveries")
+        .join(recovery_operation_id);
+    crate::filesystem::ensure_private_directory(&directory, "test recovery directory")?;
+    let facts = RecoveryCandidateFacts {
+        schema: 1,
+        operation_id: recovery_operation_id.to_owned(),
+        artifact,
+        release: ReleaseVersion::new("v1")?,
+        rollback_policy: crate::model::test_release_rollback_policy(),
+    };
+    crate::filesystem::atomic_write(
+        &directory.join("candidate-release.json"),
+        &serde_json::to_vec_pretty(&facts)?,
+        0o600,
+    )
+}
+
+pub(crate) fn recovery_candidate_artifact_reference(
+    scope_dir: &Path,
+    recovery_operation_id: &str,
+) -> Result<String, Failure> {
+    let operation = Uuid::parse_str(recovery_operation_id).map_err(|_| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "recovery candidate operation id must be a UUID",
+        )
+    })?;
+    let facts = load_recovery_candidate_facts(
+        &scope_dir
+            .join("backup")
+            .join("recoveries")
+            .join(operation.to_string())
+            .join("candidate-release.json"),
+        recovery_operation_id,
+    )?;
+    super::deployment_state::canonical_recovery_artifact(&facts.artifact)
+}
+
 /// Remove only the candidate whose immutable backend identity was returned by
 /// [`stage_recovery_candidate`].
 pub(crate) fn cleanup_recovery_candidate(
@@ -1039,12 +1225,14 @@ pub(crate) fn cleanup_recovery_candidate(
         .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))
 }
 
-/// Start the original runtime only after the controller has waited past the
-/// server-issued invalidation deadline.  It reuses the update replacement
-/// constructor so recovery cannot invent a second activation policy.
+/// Start the recovered deployment on the exact verified target Release only
+/// after the controller has waited past the server-issued invalidation
+/// deadline. The snapshot supplies data; it does not pin an obsolete runtime.
 pub(crate) fn activate_recovered_runtime(
     scope_dir: &Path,
     state: &DeploymentState,
+    store: &super::deployment_state::TargetStateStore,
+    activation_operation_id: &str,
     recovery_operation_id: &str,
     state_epoch: &str,
     not_before: i64,
@@ -1078,9 +1266,6 @@ pub(crate) fn activate_recovered_runtime(
             "recovery activation is not bound to the restored deployment and UUIDv7 epoch",
         ));
     }
-    let manifest = backup::load_manifest(scope_dir)
-        .map_err(restore_failure)?
-        .ok_or_else(|| Failure::new(RESTORE_TEST_FAILED, "no snapshot manifest exists"))?;
     let completed_path = scope_dir
         .join("backup")
         .join("recoveries")
@@ -1093,55 +1278,110 @@ pub(crate) fn activate_recovered_runtime(
         64 * 1024,
     )
     .map_err(restore_failure)?;
-    let facts: RecoveryFacts =
+    let recovery_facts: RecoveryFacts =
         serde_json::from_slice(&completed).map_err(|error| restore_failure(error.into()))?;
-    if facts.operation_id != recovery_operation_id
-        || facts.artifact != manifest.runtime_artifact
-        || facts.release != manifest.release
-        || facts.rollback_policy != manifest.rollback_policy
-        || state.current_release.as_ref() != Some(&facts.release)
-        || state.current_rollback_policy != facts.rollback_policy
+    if recovery_facts.operation_id != recovery_operation_id
+        || state.current_release.as_ref() != Some(&recovery_facts.release)
+        || state.current_rollback_policy != recovery_facts.rollback_policy
     {
         return Err(Failure::new(
             RESTORE_TEST_FAILED,
             "recovery activation facts do not bind the restored runtime",
         ));
     }
+    let candidate_facts = load_recovery_candidate_facts(
+        &scope_dir
+            .join("backup")
+            .join("recoveries")
+            .join(operation.to_string())
+            .join("candidate-release.json"),
+        recovery_operation_id,
+    )?;
     let kind = state.runtime.kind;
     let backend = runtime_backend::backend(kind);
     let observed = backend
         .inspect(&state.runtime.object)
         .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
-    if observed.running {
+    if observed.running && !same_recovery_runtime(&observed, &candidate_facts.artifact, state_epoch)
+    {
         return Err(Failure::new(
             RESTORE_TEST_FAILED,
-            "recovery activation refuses a runtime that is already running",
+            "recovery activation found a running runtime with a different artifact or state epoch",
         ));
     }
-    let mut replacement = super::update_exec::replacement_from_observation(
-        &observed,
-        &state.runtime.object,
-        &facts.artifact,
-    )?;
-    replacement
-        .environment
-        .insert("VALKEY_STATE_EPOCH".to_owned(), state_epoch.to_owned());
-    backend
-        .replace(&replacement)
-        .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
-    backend
-        .start(&state.runtime.object)
-        .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
+    if !observed.running {
+        let mut replacement = super::update_exec::replacement_from_observation(
+            &observed,
+            &state.runtime.object,
+            &candidate_facts.artifact,
+        )?;
+        replacement
+            .environment
+            .insert("VALKEY_STATE_EPOCH".to_owned(), state_epoch.to_owned());
+        backend
+            .replace(&replacement)
+            .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
+        backend
+            .start(&state.runtime.object)
+            .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
+    }
     let activated = backend
         .inspect(&state.runtime.object)
         .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
-    if !activated.running || activated.artifact != facts.artifact {
+    if !same_recovery_runtime(&activated, &candidate_facts.artifact, state_epoch) {
         return Err(Failure::new(
             RESTORE_TEST_FAILED,
-            "recovery activation did not start the exact snapshot artifact",
+            "recovery activation did not start the verified target Release",
         ));
     }
+    let authority = issuer_authority(&state.issuer).map_err(restore_failure)?;
+    fetch_http(
+        state.runtime.loopback_port,
+        LOCAL_READINESS_PATH,
+        &authority,
+    )
+    .map_err(restore_failure)?;
+    store.apply_update_healthy(
+        &state.deployment_id,
+        state.config.revision,
+        super::deployment_state::UpdateCommit {
+            artifact: super::deployment_state::canonical_recovery_artifact(
+                &candidate_facts.artifact,
+            )?,
+            release: Some(candidate_facts.release),
+            rollback_policy: candidate_facts.rollback_policy,
+            config: None,
+            operation_id: activation_operation_id.to_owned(),
+        },
+    )?;
     Ok(())
+}
+
+fn same_artifact_identity(left: &ArtifactReference, right: &ArtifactReference) -> bool {
+    match (left, right) {
+        (
+            ArtifactReference::Oci { digest: left, .. },
+            ArtifactReference::Oci { digest: right, .. },
+        ) => left.eq_ignore_ascii_case(right),
+        (
+            ArtifactReference::HostBinary { sha256: left, .. },
+            ArtifactReference::HostBinary { sha256: right, .. },
+        ) => left.eq_ignore_ascii_case(right),
+        _ => false,
+    }
+}
+
+fn same_recovery_runtime(
+    observed: &RuntimeObservation,
+    artifact: &ArtifactReference,
+    state_epoch: &str,
+) -> bool {
+    observed.running
+        && same_artifact_identity(&observed.artifact, artifact)
+        && observed
+            .safe_environment
+            .get("VALKEY_STATE_EPOCH")
+            .is_some_and(|observed| observed == state_epoch)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1212,6 +1452,7 @@ fn run_restore_rehearsal(
         run_restore_migration(
             backend.as_ref(),
             &manifest.runtime_artifact,
+            &data,
             &config,
             &secrets,
             &runtime_role,
@@ -1267,6 +1508,7 @@ fn run_restore_rehearsal(
 fn run_restore_migration(
     backend: &dyn RuntimeBackend,
     artifact: &crate::runtime_backend::ArtifactReference,
+    data: &Path,
     config: &Path,
     secrets: &Path,
     runtime_role: &str,
@@ -1286,18 +1528,41 @@ fn run_restore_migration(
         !lifecycle_url.is_empty(),
         "restore lifecycle database URL is empty"
     );
-    let task = runtime_backend::OneShotTask {
-        artifact: artifact.clone(),
-        command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
-        network: Some("bridge".to_owned()),
-        mounts: vec![NeutralMount {
+    let mut mounts = vec![
+        NeutralMount {
             source: config.to_path_buf(),
             destination: PathBuf::from(CONTAINER_CONFIG_FILE),
             read_only: true,
             selinux_relabel: false,
             ownership: Responsibility::Managed,
             scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
-        }],
+        },
+        NeutralMount {
+            source: data.to_path_buf(),
+            destination: PathBuf::from(CONTAINER_DATA_DIR),
+            read_only: false,
+            selinux_relabel: false,
+            ownership: Responsibility::Managed,
+            scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
+        },
+    ];
+    mounts.extend(
+        crate::target::install_exec::SECRET_PURPOSES
+            .iter()
+            .map(|name| NeutralMount {
+                source: secrets.join(name),
+                destination: Path::new(CONTAINER_SECRETS_DIR).join(name),
+                read_only: true,
+                selinux_relabel: false,
+                ownership: Responsibility::Managed,
+                scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
+            }),
+    );
+    let task = runtime_backend::OneShotTask {
+        artifact: artifact.clone(),
+        command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
+        network: Some("bridge".to_owned()),
+        mounts,
         environment: BTreeMap::from([
             (
                 SERVER_CONFIG_FILE_ENV.to_owned(),
@@ -1422,12 +1687,7 @@ fn create_deployment_archive(
     let mut files = Vec::new();
     append_tree(&mut archive, data, Path::new("app-data"), &mut files)?;
     append_directory(&mut archive, Path::new("app-secrets"))?;
-    for name in [
-        "database-runtime-url",
-        "database-lifecycle-url",
-        "valkey-url",
-        "mfa-totp-key",
-    ] {
+    for name in crate::target::install_exec::SECRET_PURPOSES {
         append_regular(
             &mut archive,
             &secrets.join(name),
@@ -1834,19 +2094,33 @@ fn database_sentinel_with_connection(connection: &PostgresConnection) -> anyhow:
 }
 
 fn database_exists(connection: &PostgresConnection, database: &str) -> anyhow::Result<bool> {
+    let query = database_exists_query(database)?;
     let output = run_postgres_command(
         "psql",
         &connection.maintenance(),
-        [
-            "--no-align",
-            "--tuples-only",
-            "--set",
-            &format!("database={database}"),
-            "--command",
-            "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = :'database')",
-        ],
+        ["--no-align", "--tuples-only", "--command", &query],
     )?;
     Ok(std::str::from_utf8(&output.stdout)?.trim() == "t")
+}
+
+fn database_exists_query(database: &str) -> anyhow::Result<String> {
+    crate::registry::validate_identifier(database, 128, "database name")?;
+    Ok(format!(
+        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = '{database}')"
+    ))
+}
+
+pub(crate) fn recovery_path_switch_started(
+    scope_dir: &Path,
+    operation_id: &str,
+) -> anyhow::Result<bool> {
+    let operation = Uuid::parse_str(operation_id).context("recovery operation id is not a UUID")?;
+    Ok(scope_dir
+        .join("backup")
+        .join("recoveries")
+        .join(operation.to_string())
+        .join("paths-switching")
+        .try_exists()?)
 }
 
 fn sibling_operation_path(target: &Path, operation: Uuid, suffix: &str) -> anyhow::Result<PathBuf> {
@@ -1942,9 +2216,8 @@ fn start_candidate(
     );
     let mut mounts = live.mounts.clone();
     replace_mount(&mut mounts, CONTAINER_DATA_DIR, data, false)?;
-    // The runtime mounts each secret file individually (the install exposes
-    // only the three runtime secrets, never a directory); repoint every one
-    // of them into the restored secrets directory.
+    // The runtime mounts each allowlisted secret file individually, never the
+    // directory; repoint every one into the restored secrets directory.
     let mut secret_mounts = 0;
     for mount in mounts.iter_mut() {
         let relative = match mount
@@ -2157,6 +2430,53 @@ fn write_secret(path: &Path, value: &str) -> anyhow::Result<()> {
     crate::filesystem::atomic_write(path, value.as_bytes(), 0o440)
 }
 
+fn rewrite_recovery_config(
+    path: &Path,
+    database_url: &str,
+    state_epoch: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let bytes = crate::filesystem::read_secure_regular_file(
+        path,
+        "restored application configuration",
+        false,
+        super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
+    )?;
+    let config =
+        std::str::from_utf8(&bytes).context("restored application configuration is not UTF-8")?;
+    let database_url = serde_json::to_string(database_url)?;
+    let state_epoch = serde_json::to_string(state_epoch)?;
+    let mut database_url_count = 0;
+    let mut state_epoch_count = 0;
+    let mut rewritten = String::with_capacity(config.len() + database_url.len());
+
+    for line in config.split_inclusive('\n') {
+        let (content, ending) = line.strip_suffix("\r\n").map_or_else(
+            || {
+                line.strip_suffix('\n')
+                    .map_or((line, ""), |content| (content, "\n"))
+            },
+            |content| (content, "\r\n"),
+        );
+        if content.starts_with("DATABASE_URL:") {
+            database_url_count += 1;
+            rewritten.push_str("DATABASE_URL: ");
+            rewritten.push_str(&database_url);
+        } else if content.starts_with("VALKEY_STATE_EPOCH:") {
+            state_epoch_count += 1;
+            rewritten.push_str("VALKEY_STATE_EPOCH: ");
+            rewritten.push_str(&state_epoch);
+        } else {
+            rewritten.push_str(content);
+        }
+        rewritten.push_str(ending);
+    }
+    ensure!(
+        database_url_count == 1 && state_epoch_count == 1,
+        "restored application configuration must contain exactly one DATABASE_URL and VALKEY_STATE_EPOCH"
+    );
+    Ok(rewritten.into_bytes())
+}
+
 fn prepare_stage_ownership_if_present(
     kind: RuntimeBackendKind,
     data: &Path,
@@ -2351,6 +2671,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recovery_config_replaces_runtime_database_and_state_epoch() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-recovery-config")?;
+        let config = temp.path().join("config.yaml");
+        fs::write(
+            &config,
+            "BIND: 0.0.0.0:8000\r\nDATABASE_URL: \"postgresql://old/old\"\r\nVALKEY_STATE_EPOCH: \"old\"\r\nISSUER: \"https://auth.example\"\r\n",
+        )?;
+        let epoch = Uuid::now_v7().to_string();
+
+        let rewritten = rewrite_recovery_config(
+            &config,
+            "postgresql://runtime:new-password@db.example/recovered",
+            &epoch,
+        )?;
+        let rewritten = String::from_utf8(rewritten)?;
+
+        assert!(rewritten.contains(
+            "DATABASE_URL: \"postgresql://runtime:new-password@db.example/recovered\"\r\n"
+        ));
+        assert!(rewritten.contains(&format!("VALKEY_STATE_EPOCH: \"{epoch}\"\r\n")));
+        assert!(rewritten.contains("ISSUER: \"https://auth.example\"\r\n"));
+        assert!(!rewritten.contains("postgresql://old/old"));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_config_requires_single_authoritative_runtime_values() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-recovery-config-invalid")?;
+        let config = temp.path().join("config.yaml");
+        fs::write(&config, "DATABASE_URL: \"postgresql://old/old\"\n")?;
+
+        let error = rewrite_recovery_config(
+            &config,
+            "postgresql://runtime@db.example/recovered",
+            &Uuid::now_v7().to_string(),
+        )
+        .expect_err("missing state epoch was accepted");
+
+        assert!(error.to_string().contains("exactly one"));
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_identity_is_content_based_not_reference_spelling() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let named = ArtifactReference::Oci {
+            image_reference: "registry.example/nazoauth".to_owned(),
+            digest: digest.clone(),
+        };
+        let pinned = ArtifactReference::Oci {
+            image_reference: format!("registry.example/nazoauth@{digest}"),
+            digest: digest.to_ascii_uppercase(),
+        };
+        let different = ArtifactReference::Oci {
+            image_reference: "registry.example/nazoauth".to_owned(),
+            digest: format!("sha256:{}", "b".repeat(64)),
+        };
+
+        assert!(same_artifact_identity(&named, &pinned));
+        assert!(!same_artifact_identity(&named, &different));
+        assert!(!same_artifact_identity(&named, &ArtifactReference::Unknown));
+    }
+
+    #[test]
     fn replay_of_published_snapshot_finishes_receipt_cleanup() -> anyhow::Result<()> {
         let temp = crate::filesystem::PrivateTempDir::new("backup-published-replay")?;
         let store = super::super::deployment_state::TargetStateStore::open(temp.path())?;
@@ -2486,13 +2870,8 @@ mod tests {
         fs::create_dir_all(data.join("instance"))?;
         fs::create_dir_all(&secrets)?;
         fs::write(data.join("instance/identity.pub"), b"identity")?;
-        for (name, value) in [
-            ("database-runtime-url", b"runtime".as_slice()),
-            ("database-lifecycle-url", b"lifecycle".as_slice()),
-            ("valkey-url", b"valkey".as_slice()),
-            ("mfa-totp-key", b"mfa".as_slice()),
-        ] {
-            fs::write(secrets.join(name), value)?;
+        for name in crate::target::install_exec::SECRET_PURPOSES {
+            fs::write(secrets.join(name), name.as_bytes())?;
         }
         fs::write(secrets.join("unknown-legacy-secret"), b"excluded")?;
         let config = temp.path().join("config.yaml");
@@ -2502,6 +2881,12 @@ mod tests {
         let restored = temp.path().join("restored");
         fs::create_dir(&restored)?;
         extract_deployment_archive(&archive, &restored, &files)?;
+        for name in crate::target::install_exec::SECRET_PURPOSES {
+            assert_eq!(
+                fs::read(restored.join("app-secrets").join(name))?,
+                name.as_bytes()
+            );
+        }
         assert!(!restored.join("app-secrets/unknown-legacy-secret").exists());
         fs::write(restored.join("extra"), b"not in manifest")?;
         let second = temp.path().join("second");
@@ -2532,6 +2917,39 @@ mod tests {
             "/restore"
         );
         assert!(!connection.url_without_password.as_str().contains("cret"));
+        Ok(())
+    }
+
+    #[test]
+    fn database_existence_query_is_a_complete_validated_psql_command() -> anyhow::Result<()> {
+        let query = database_exists_query("nazoauth_restore_01")?;
+        assert_eq!(
+            query,
+            "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'nazoauth_restore_01')"
+        );
+        assert!(!query.contains(":"));
+        assert!(database_exists_query("unsafe'database").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_switch_marker_distinguishes_safe_abort_from_path_mutation() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-recovery-marker-test")?;
+        let operation = Uuid::now_v7();
+        assert!(!recovery_path_switch_started(
+            temp.path(),
+            &operation.to_string()
+        )?);
+        let recovery = temp
+            .path()
+            .join("backup/recoveries")
+            .join(operation.to_string());
+        fs::create_dir_all(&recovery)?;
+        fs::write(recovery.join("paths-switching"), operation.to_string())?;
+        assert!(recovery_path_switch_started(
+            temp.path(),
+            &operation.to_string()
+        )?);
         Ok(())
     }
     #[test]

@@ -319,7 +319,7 @@ impl PreparedMaterialization {
                 serde_json::json!({
                     "user_resource_id": user_resource_id,
                     "configuration_id": configuration_id,
-                    "claims": claims,
+                    "claims": materialize_openid4vc_dataset_claims(configuration_id, claims),
                 }),
             )?;
         }
@@ -355,6 +355,25 @@ impl PreparedMaterialization {
 
         TenantResourceManifest::from_resources(resources)
     }
+}
+
+fn materialize_openid4vc_dataset_claims(configuration_id: &str, claims: &Value) -> Value {
+    let mut claims = claims.clone();
+    if configuration_id != "org.iso.18013.5.1.mDL" {
+        return claims;
+    }
+    let Some(elements) = claims
+        .get_mut("org.iso.18013.5.1")
+        .and_then(Value::as_object_mut)
+    else {
+        return claims;
+    };
+    for name in ["portrait", "signature_usual_mark"] {
+        if let Some(Value::String(value)) = elements.get_mut(name) {
+            *value = URL_SAFE_NO_PAD.encode(value.as_bytes());
+        }
+    }
+    claims
 }
 
 fn strict_openid4vc_trust_jwks(encoded: &str) -> Result<Value, MaterializerError> {
@@ -1924,6 +1943,26 @@ mod tests {
 
     use super::*;
     use crate::materializer::crypto::generate_mtls;
+
+    #[test]
+    fn mdoc_dataset_binary_elements_are_materialized_as_base64url() {
+        let claims = serde_json::json!({
+            "org.iso.18013.5.1": {
+                "portrait": "portrait-bytes",
+                "family_name": "Specimen"
+            }
+        });
+        let materialized = materialize_openid4vc_dataset_claims("org.iso.18013.5.1.mDL", &claims);
+        assert_eq!(
+            materialized["org.iso.18013.5.1"]["portrait"],
+            URL_SAFE_NO_PAD.encode(b"portrait-bytes")
+        );
+        assert_eq!(materialized["org.iso.18013.5.1"]["family_name"], "Specimen");
+        assert_eq!(
+            materialize_openid4vc_dataset_claims("other", &claims),
+            claims
+        );
+    }
 
     #[test]
     fn registration_template_rejects_forbidden_control_fields() {

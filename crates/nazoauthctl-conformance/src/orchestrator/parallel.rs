@@ -34,10 +34,21 @@ enum WorkerMessage {
 struct ChannelSink {
     index: usize,
     sender: mpsc::Sender<WorkerMessage>,
+    stop_launching: Arc<AtomicBool>,
+    control: RunControl,
 }
 
 impl ProgressSink for ChannelSink {
     fn update(&mut self, event: &ProgressEvent) {
+        if event
+            .snapshot
+            .groups
+            .iter()
+            .any(|group| group.status == GroupStatus::Failed)
+        {
+            self.stop_launching.store(true, Ordering::SeqCst);
+            self.control.interrupt();
+        }
         let _ = self.sender.send(WorkerMessage::Progress {
             index: self.index,
             snapshot: Box::new(event.snapshot.clone()),
@@ -131,6 +142,8 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                         let mut progress = ChannelSink {
                             index: next_index,
                             sender: sender.clone(),
+                            stop_launching: Arc::clone(&stop_launching),
+                            control: runner.config.control.clone(),
                         };
                         let _ciba_guard = if work_ref[next_index].lane == OidfDriverLane::Ciba {
                             Some(ciba_lane.lock().map_err(|_| ()).expect("CIBA lane lock"))
@@ -238,6 +251,7 @@ fn worker_prepared(work: &PlanWork) -> PreparedRun {
     group.reviewed = 0;
     group.skipped = 0;
     group.failed = 0;
+    group.incomplete = 0;
     group.running = 0;
     group.remaining = group.total;
     let mut plan = work.plan.clone();
@@ -276,6 +290,7 @@ fn aggregate_progress(
         group.reviewed = 0;
         group.skipped = 0;
         group.failed = 0;
+        group.incomplete = 0;
         group.running = 0;
         group.remaining = group.total;
     }
@@ -292,6 +307,7 @@ fn aggregate_progress(
         target.reviewed += source.reviewed;
         target.skipped += source.skipped;
         target.failed += source.failed;
+        target.incomplete += source.incomplete;
         target.running += source.running;
     }
     for (group_index, group) in groups.iter_mut().enumerate() {
@@ -309,6 +325,12 @@ fn aggregate_progress(
                 .and_then(|snapshot| snapshot.groups.first())
                 .is_some_and(|group| group.status == GroupStatus::Failed)
         });
+        let any_incomplete = indices.iter().any(|index| {
+            snapshots[*index]
+                .as_ref()
+                .and_then(|snapshot| snapshot.groups.first())
+                .is_some_and(|group| group.status == GroupStatus::Incomplete)
+        });
         let any_review = indices.iter().any(|index| {
             snapshots[*index]
                 .as_ref()
@@ -323,6 +345,8 @@ fn aggregate_progress(
         });
         group.status = if any_failed {
             GroupStatus::Failed
+        } else if any_incomplete {
+            GroupStatus::Incomplete
         } else if indices.iter().all(|index| finished[*index]) {
             if any_review {
                 GroupStatus::Review

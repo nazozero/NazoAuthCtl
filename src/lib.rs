@@ -159,6 +159,11 @@ Selectors:
   One registered instance is selected automatically; several instances demand
   exactly one of the global or per-command --instance flags.
 
+Recovery:
+  nazoauthctl recover [SELECTOR] [--to VERSION] [--recovery-secret-file PATH]
+  The snapshot supplies data and keys. The selected current Release supplies
+  the migrated runtime; omitting --to resolves the latest official Release.
+
 Maintenance:
   self check|update|rollback   Update nazoauthctl itself (signed releases)
   admin create                 Create an administrator through the deployment root

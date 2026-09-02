@@ -170,13 +170,16 @@ fn accepted_control_operation_receipt(
     })
 }
 
-fn control_operation_receipt(
+pub(crate) fn control_operation_receipt(
     request_operation_id: String,
     outcome: HostOutcome,
 ) -> anyhow::Result<ControlOperationReceipt> {
     match outcome {
         HostOutcome::Completed {
             body: HostCompletionBody::ControlOperationExecuted { result },
+        }
+        | HostOutcome::Completed {
+            body: HostCompletionBody::BackupRecoveryCandidateControlExecuted { result },
         } => accepted_control_operation_receipt(request_operation_id, result),
         HostOutcome::Completed { .. } => anyhow::bail!(
             "{HOST_ERR_OPERATION_INVALID}: the target answered an unexpected completion instead of a ControlOperation result"
@@ -490,6 +493,7 @@ fn dispatch_validated_host_operation(
         }
         HostOperationBody::BackupRecover {
             expected_manifest_sha256,
+            state_epoch,
         } => {
             let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
             (|| -> Result<HostResult, Failure> {
@@ -501,18 +505,47 @@ fn dispatch_validated_host_operation(
                 })?;
                 let state = store.load_existing(deployment_id)?;
                 let backend = runtime_backend::backend(state.runtime.kind);
+                let runtime_was_running = backend
+                    .inspect_optional(&state.runtime.object)
+                    .map_err(|error| {
+                        Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string()))
+                    })?
+                    .is_some_and(|runtime| runtime.running);
                 backend
                     .quiesce_for_recovery(&state.runtime.object)
                     .map_err(|error| {
                         Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string()))
                     })?;
                 let scope_dir = store.scope_dir(deployment_id)?;
-                let facts = backup_exec::recover(
+                let facts = match backup_exec::recover(
                     &scope_dir,
                     &state,
                     expected_manifest_sha256,
+                    state_epoch,
                     &operation.operation_id,
-                )?;
+                ) {
+                    Ok(facts) => facts,
+                    Err(mut failure) => {
+                        let safe_to_restart = runtime_was_running
+                            && backup_exec::recovery_path_switch_started(
+                                &scope_dir,
+                                &operation.operation_id,
+                            )
+                            .is_ok_and(|started| !started);
+                        if safe_to_restart {
+                            match backend.start(&state.runtime.object) {
+                                Ok(()) => failure.detail.push_str(
+                                    "; original runtime restarted after safe recovery abort",
+                                ),
+                                Err(error) => failure.detail.push_str(&format!(
+                                    "; original runtime restart failed: {}",
+                                    sanitize(error.to_string())
+                                )),
+                            }
+                        }
+                        return Err(failure);
+                    }
+                };
                 let committed = store.apply_recovery(
                     deployment_id,
                     expected_revision,
@@ -533,6 +566,7 @@ fn dispatch_validated_host_operation(
         HostOperationBody::BackupRecoveryCandidateStage {
             recovery_operation_id,
             state_epoch,
+            artifact,
         } => {
             let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
             (|| -> Result<HostResult, Failure> {
@@ -555,6 +589,7 @@ fn dispatch_validated_host_operation(
                     &state,
                     recovery_operation_id,
                     state_epoch,
+                    artifact,
                 )?;
                 Ok(HostResult::completed(
                     &operation.operation_id,
@@ -563,6 +598,21 @@ fn dispatch_validated_host_operation(
             })()
             .unwrap_or_else(|failure| state_failure(operation, &failure))
         }
+        HostOperationBody::BackupRecoveryCandidateControl {
+            endpoint,
+            state_epoch,
+            control_operation_id,
+            compact_jws,
+        } => answer_recovery_candidate_control(
+            operation,
+            store,
+            endpoint,
+            state_epoch,
+            control_operation_id,
+            compact_jws,
+            executors.control,
+        )
+        .unwrap_or_else(|failure| state_failure(operation, &failure)),
         HostOperationBody::BackupRecoveryCandidateCleanup { endpoint } => {
             let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
             (|| -> Result<HostResult, Failure> {
@@ -599,6 +649,8 @@ fn dispatch_validated_host_operation(
                 backup_exec::activate_recovered_runtime(
                     &scope_dir,
                     &state,
+                    store,
+                    &operation.operation_id,
                     recovery_operation_id,
                     state_epoch,
                     *not_before,
@@ -1280,16 +1332,72 @@ fn answer_control_operation(
     let state = store.load_existing(&deployment_id)?;
     let result = execute_bound_control_operation(
         &operation.operation_id,
-        &deployment_id,
         &state,
         store,
         compact_jws,
         change_set,
+        ControlRuntimeBinding {
+            object: &state.runtime.object,
+            artifact: None,
+            transient_state_epoch: None,
+        },
         control,
     )?;
     Ok(HostResult::completed(
         &operation.operation_id,
         HostCompletionBody::ControlOperationExecuted { result },
+    ))
+}
+
+fn answer_recovery_candidate_control(
+    operation: &HostOperation,
+    store: &TargetStateStore,
+    endpoint: &crate::runtime_backend::RecoveryCandidateEndpoint,
+    state_epoch: &str,
+    control_operation_id: &str,
+    compact_jws: &str,
+    control: &Arc<dyn control_exec::ControlOperationExecutor>,
+) -> Result<HostResult, Failure> {
+    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
+    let expected_revision = operation.expected_revision.ok_or_else(|| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            "recovery candidate control requires expected_revision",
+        )
+    })?;
+    let state = store.load_existing(&deployment_id)?;
+    if state.config.revision != expected_revision
+        || endpoint.deployment_id != deployment_id
+        || state
+            .active_host_operation
+            .as_ref()
+            .map(|active| active.operation_id.as_str())
+            != Some(endpoint.operation_id.as_str())
+    {
+        return Err(Failure::new(
+            CONTROL_TARGET_DRIFT,
+            "recovery candidate no longer matches the restored deployment state",
+        ));
+    }
+    let scope_dir = store.scope_dir(&deployment_id)?;
+    let candidate_artifact =
+        backup_exec::recovery_candidate_artifact_reference(&scope_dir, &endpoint.operation_id)?;
+    let result = execute_bound_control_operation(
+        control_operation_id,
+        &state,
+        store,
+        compact_jws,
+        None,
+        ControlRuntimeBinding {
+            object: &endpoint.object_id,
+            artifact: Some(&candidate_artifact),
+            transient_state_epoch: Some(state_epoch),
+        },
+        control,
+    )?;
+    Ok(HostResult::completed(
+        &operation.operation_id,
+        HostCompletionBody::BackupRecoveryCandidateControlExecuted { result },
     ))
 }
 
@@ -1351,16 +1459,26 @@ fn answer_admin_create(
 /// One target-side implementation of the signed ControlOperation runtime
 /// contract.  Direct delivery and Update's nested MigrateApply both call this
 /// function so they cannot drift on runtime identity, mount, or stdout rules.
+struct ControlRuntimeBinding<'a> {
+    object: &'a str,
+    artifact: Option<&'a str>,
+    transient_state_epoch: Option<&'a str>,
+}
+
 fn execute_bound_control_operation(
     operation_id: &str,
-    deployment_id: &str,
     state: &DeploymentState,
     store: &TargetStateStore,
     compact_jws: &str,
     change_set: Option<&[u8]>,
+    runtime: ControlRuntimeBinding<'_>,
     control: &Arc<dyn control_exec::ControlOperationExecutor>,
 ) -> Result<ControlResult, Failure> {
-    let Some(current_artifact) = state.artifact.current.clone() else {
+    let current_artifact = runtime
+        .artifact
+        .map(str::to_owned)
+        .or_else(|| state.artifact.current.clone());
+    let Some(current_artifact) = current_artifact else {
         return Err(Failure::new(
             CONTROL_TARGET_DRIFT,
             "the deployment records no current artifact reference",
@@ -1388,17 +1506,18 @@ fn execute_bound_control_operation(
                 "deployment state has no app-secrets directory resource",
             )
         })?;
-    let scope_dir = store.scope_dir(deployment_id)?;
+    let scope_dir = store.scope_dir(&state.deployment_id)?;
     let job = control_exec::ControlJob {
         operation_id,
-        deployment_id,
+        deployment_id: &state.deployment_id,
         artifact_reference: &current_artifact,
         runtime_kind: state.runtime.kind,
-        runtime_object: &state.runtime.object,
+        runtime_object: runtime.object,
         config_reference: &state.config.reference,
         data_root: &data_root,
         secrets_root: &secrets_root,
         scope_dir: &scope_dir,
+        transient_state_epoch: runtime.transient_state_epoch,
         compact_jws,
         change_set,
     };
@@ -1778,6 +1897,7 @@ impl ExecutionTarget for LocalTarget {
             HostOperationBody::StateMutate { .. }
                 | HostOperationBody::BackupRecover { .. }
                 | HostOperationBody::BackupRecoveryCandidateStage { .. }
+                | HostOperationBody::BackupRecoveryCandidateControl { .. }
                 | HostOperationBody::BackupRecoveryCandidateCleanup { .. }
                 | HostOperationBody::BackupRecoveryActivate { .. }
                 | HostOperationBody::BackupSnapshot {}
@@ -2365,6 +2485,8 @@ mod tests {
         outcome: nazo_operator_protocol::ControlOutcome,
         calls: std::sync::atomic::AtomicUsize,
         change_set_size: std::sync::atomic::AtomicUsize,
+        runtime_object: std::sync::Mutex<Option<String>>,
+        transient_state_epoch: std::sync::Mutex<Option<String>>,
     }
 
     impl control_exec::ControlOperationExecutor for ScriptedControl {
@@ -2378,6 +2500,15 @@ mod tests {
                 job.change_set.map_or(0, <[u8]>::len),
                 std::sync::atomic::Ordering::Relaxed,
             );
+            self.runtime_object
+                .lock()
+                .expect("runtime object lock")
+                .replace(job.runtime_object.to_owned());
+            *self
+                .transient_state_epoch
+                .lock()
+                .expect("transient state epoch lock") =
+                job.transient_state_epoch.map(str::to_owned);
             Ok(nazo_operator_protocol::ControlResult {
                 schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
                 operation_id: job.operation_id.to_owned(),
@@ -2754,6 +2885,8 @@ mod tests {
             outcome: nazo_operator_protocol::ControlOutcome::Succeeded,
             calls: std::sync::atomic::AtomicUsize::new(0),
             change_set_size: std::sync::atomic::AtomicUsize::new(0),
+            runtime_object: std::sync::Mutex::new(None),
+            transient_state_epoch: std::sync::Mutex::new(None),
         });
         let target = plain_target.with_control_executor(scripted.clone());
 
@@ -2786,6 +2919,80 @@ mod tests {
                 .join("operations.jsonl"),
         )?;
         assert!(raw.contains("control-operation"), "{raw}");
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_control_targets_the_staged_candidate_not_the_original_runtime() -> anyhow::Result<()>
+    {
+        let (_temp, plain_target, journal) = temp_target()?;
+        seed_sample_deployment(&journal, "deploy-alpha")?;
+        let state = TargetStateStore::open(journal.root())?.load_existing("deploy-alpha")?;
+        let recovery_operation_id = state
+            .active_host_operation
+            .expect("bootstrap operation")
+            .operation_id;
+        let scope_dir = TargetStateStore::open(journal.root())?.scope_dir("deploy-alpha")?;
+        backup_exec::seed_recovery_candidate_facts(
+            &scope_dir,
+            &recovery_operation_id,
+            crate::runtime_backend::ArtifactReference::Oci {
+                image_reference: "ghcr.io/nazozero/nazoauth".to_owned(),
+                digest: format!("sha256:{}", "a".repeat(64)),
+            },
+        )?;
+        let scripted = Arc::new(ScriptedControl {
+            outcome: nazo_operator_protocol::ControlOutcome::Succeeded,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            change_set_size: std::sync::atomic::AtomicUsize::new(0),
+            runtime_object: std::sync::Mutex::new(None),
+            transient_state_epoch: std::sync::Mutex::new(None),
+        });
+        let target = plain_target.with_control_executor(scripted.clone());
+        let state_epoch = Uuid::now_v7().to_string();
+        let operation = HostOperation::backup_recovery_candidate_control(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            1,
+            crate::runtime_backend::RecoveryCandidateEndpoint {
+                object_reference: "nazoauth-recovery-candidate".to_owned(),
+                object_id: "immutable-candidate-id".to_owned(),
+                deployment_id: "deploy-alpha".to_owned(),
+                operation_id: recovery_operation_id,
+                loopback_port: 49123,
+            },
+            state_epoch.clone(),
+            CONTROL_JWS_OP_ID,
+            sample_control_jws(),
+        );
+        operation.validate().expect("valid candidate control");
+        assert_eq!(
+            parse_host_operation(&encode_host_operation(&operation)?)?,
+            operation
+        );
+        let result = target.execute_host_operation(&operation)?;
+        assert!(matches!(
+            result.outcome,
+            HostOutcome::Completed {
+                body: HostCompletionBody::BackupRecoveryCandidateControlExecuted { .. }
+            }
+        ));
+        assert_eq!(
+            scripted
+                .runtime_object
+                .lock()
+                .expect("runtime object lock")
+                .as_deref(),
+            Some("immutable-candidate-id")
+        );
+        assert_eq!(
+            scripted
+                .transient_state_epoch
+                .lock()
+                .expect("transient state epoch lock")
+                .as_deref(),
+            Some(state_epoch.as_str())
+        );
         Ok(())
     }
 }

@@ -444,7 +444,11 @@ pub(super) fn parse_policy(values: Vec<String>) -> anyhow::Result<PolicyArgs> {
 }
 
 pub(super) fn parse_recover(values: Vec<String>) -> anyhow::Result<RecoverArgs> {
-    let parts = selector_parts(&values, &["--recovery-secret-file"], &[], "recover")?;
+    let parts = selector_parts(&values, &["--to", "--recovery-secret-file"], &[], "recover")?;
+    let version = parts.values.get("--to").cloned();
+    if let Some(version) = &version {
+        validate_version(version)?;
+    }
     let recovery_secret_file = parts
         .values
         .get("--recovery-secret-file")
@@ -455,6 +459,7 @@ pub(super) fn parse_recover(values: Vec<String>) -> anyhow::Result<RecoverArgs> 
             positional: parts.positional,
             named: parts.named,
         },
+        version,
         recovery_secret_file,
     })
 }
@@ -587,5 +592,17 @@ mod boundary_tests {
         )
         .expect_err("a positional selector must not be ignored");
         assert!(error.to_string().contains("does not accept a positional"));
+    }
+
+    #[test]
+    fn recover_binds_an_exact_target_release() -> anyhow::Result<()> {
+        let parsed = parse_recover(vec![
+            "production".to_owned(),
+            "--to".to_owned(),
+            "v0.2.9-candidate.ae1d409".to_owned(),
+        ])?;
+        assert_eq!(parsed.selector.positional.as_deref(), Some("production"));
+        assert_eq!(parsed.version.as_deref(), Some("v0.2.9-candidate.ae1d409"));
+        Ok(())
     }
 }
