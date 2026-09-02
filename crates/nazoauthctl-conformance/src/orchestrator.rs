@@ -2392,6 +2392,7 @@ mod tests {
     #[cfg(unix)]
     struct DeferredReviewTransport {
         requests: Mutex<Vec<(HttpMethod, String)>>,
+        suite_origin: &'static str,
         test_name: &'static str,
         module_variant: BTreeMap<String, String>,
         info_after_capture: Value,
@@ -2404,6 +2405,7 @@ mod tests {
     #[cfg(unix)]
     struct DeferredReviewVerifier {
         attached: Option<crate::browser::OpenId4VpEvidenceContext>,
+        expected_delivery_host: &'static str,
         starts: usize,
         completes: usize,
         issuances: usize,
@@ -2616,7 +2618,10 @@ mod tests {
                             "visited": [],
                             "uriInputRequests": [{
                                 "description": "Paste the verifier authorization request",
-                                "submitUrl": "https://www.certification.openid.net/test/a/module-a/authorize"
+                                "submitUrl": format!(
+                                    "{}/test/a/module-a/authorize",
+                                    self.suite_origin
+                                )
                             }]
                         }
                     }),
@@ -2669,10 +2674,7 @@ mod tests {
             _presentation: &crate::browser::OpenId4VpPresentation,
             delivery_url: &Url,
         ) -> Result<OpenId4VpCompletionOutcome, OpenId4VpError> {
-            assert_eq!(
-                delivery_url.host_str(),
-                Some("www.certification.openid.net")
-            );
+            assert_eq!(delivery_url.host_str(), Some(self.expected_delivery_host));
             assert_eq!(delivery_url.path(), "/test/a/module-a/authorize");
             assert_eq!(delivery_url.query(), Some("request=opaque"));
             self.completes += 1;
@@ -4334,6 +4336,7 @@ mod tests {
         crate::secure_file::ensure_directory(&root, true).expect("private evidence root");
         let transport = Arc::new(DeferredReviewTransport {
             requests: Mutex::new(Vec::new()),
+            suite_origin: "https://suite.example",
             test_name: "happy-flow",
             module_variant: BTreeMap::from([(
                 "response_mode".to_owned(),
@@ -4380,6 +4383,7 @@ mod tests {
         let browser: Arc<Mutex<dyn BrowserAutomation>> = browser_state.clone();
         let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
             attached: None,
+            expected_delivery_host: "suite.example",
             starts: 0,
             completes: 0,
             issuances: 0,
@@ -4558,6 +4562,7 @@ mod tests {
         crate::secure_file::ensure_directory(&root, true).expect("private evidence root");
         let transport = Arc::new(DeferredReviewTransport {
             requests: Mutex::new(Vec::new()),
+            suite_origin: "https://www.certification.openid.net",
             test_name: "oid4vp-1final-verifier-invalid-kb-jwt-signature",
             module_variant: BTreeMap::new(),
             info_after_capture: serde_json::json!({"status":"FINISHED","result":"PASSED"}),
@@ -4591,6 +4596,7 @@ mod tests {
         let browser: Arc<Mutex<dyn BrowserAutomation>> = browser_state.clone();
         let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
             attached: None,
+            expected_delivery_host: "www.certification.openid.net",
             starts: 0,
             completes: 0,
             issuances: 0,
@@ -4760,6 +4766,7 @@ mod tests {
             crate::secure_file::ensure_directory(&root, true).expect("private evidence root");
             let transport = Arc::new(DeferredReviewTransport {
                 requests: Mutex::new(Vec::new()),
+                suite_origin: "https://www.certification.openid.net",
                 test_name: "happy-flow",
                 module_variant: BTreeMap::new(),
                 info_after_capture: if matches!(case, Case::PostCaptureInfoNotWaiting) {
@@ -4799,6 +4806,7 @@ mod tests {
             let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
                 Arc::new(Mutex::new(DeferredReviewVerifier {
                     attached: None,
+                    expected_delivery_host: "www.certification.openid.net",
                     starts: 0,
                     completes: 0,
                     issuances: 0,
