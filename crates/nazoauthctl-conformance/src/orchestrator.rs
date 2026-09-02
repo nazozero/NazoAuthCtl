@@ -1111,6 +1111,40 @@ impl ConformanceRunner {
                                     break 'execute;
                                 }
                             };
+                            let submission_url = (|| -> Result<Url, String> {
+                                let target_origin =
+                                    self.config.target_origin.clone().ok_or_else(|| {
+                                        "OpenID4VP target browser origin is unavailable".to_owned()
+                                    })?;
+                                let policy = BrowserPolicy::new(
+                                    target_origin,
+                                    self.config.client.origin().clone(),
+                                )
+                                .map_err(|error| error.to_string())?;
+                                let runner = self
+                                    .config
+                                    .client
+                                    .runner_info(&instance.id)
+                                    .map_err(|error| safe_error(&error))?;
+                                let browser = runner.get("browser").ok_or_else(|| {
+                                    "OpenID4VP runner has no URI-input request".to_owned()
+                                })?;
+                                BrowserRunnerState::parse(browser, &policy)
+                                    .and_then(|state| {
+                                        state.verifier_submission_url(
+                                            &presentation.authorization_url,
+                                        )
+                                    })
+                                    .map_err(|error| error.to_string())
+                            })();
+                            let presentation_delivery_url = match submission_url {
+                                Ok(url) => url,
+                                Err(error) => {
+                                    errors.push(error);
+                                    groups[group_index].status = GroupStatus::Failed;
+                                    break 'execute;
+                                }
+                            };
                             // NazoAuth now accepts evidence context only after it created
                             // the presentation. Query the same lane's actual matching-entry
                             // state before attaching, so a different browser alternative can
@@ -1185,7 +1219,9 @@ impl ConformanceRunner {
                                     break 'execute;
                                 }
                             };
-                            let completion_outcome = match verifier.complete(&presentation) {
+                            let completion_outcome = match verifier
+                                .complete(&presentation, &presentation_delivery_url)
+                            {
                                 Ok(outcome) => outcome,
                                 Err(error) => {
                                     errors.push(error.to_string());
@@ -2577,6 +2613,19 @@ mod tests {
                         (200, self.info_after_capture.clone())
                     }
                 }
+                (HttpMethod::Get, "/api/runner/module-a") => (
+                    200,
+                    serde_json::json!({
+                        "browser": {
+                            "urls": [],
+                            "visited": [],
+                            "uriInputRequests": [{
+                                "description": "Paste the verifier authorization request",
+                                "submitUrl": "https://www.certification.openid.net/test/a/module-a/authorize"
+                            }]
+                        }
+                    }),
+                ),
                 (HttpMethod::Get, "/api/runner/module-a/wait-state") => {
                     if self.uploaded.load(Ordering::SeqCst) {
                         (200, serde_json::json!({"state":"FINISHED"}))
@@ -2623,7 +2672,14 @@ mod tests {
         fn complete(
             &mut self,
             _presentation: &crate::browser::OpenId4VpPresentation,
+            delivery_url: &Url,
         ) -> Result<OpenId4VpCompletionOutcome, OpenId4VpError> {
+            assert_eq!(
+                delivery_url.host_str(),
+                Some("www.certification.openid.net")
+            );
+            assert_eq!(delivery_url.path(), "/test/a/module-a/authorize");
+            assert_eq!(delivery_url.query(), Some("request=opaque"));
             self.completes += 1;
             Ok(self.completion_outcome)
         }

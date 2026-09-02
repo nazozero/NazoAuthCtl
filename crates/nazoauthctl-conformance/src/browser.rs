@@ -3027,6 +3027,59 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn suite_uri_input_retargets_the_verifier_authorization_query() {
+        let policy = BrowserPolicy::new(
+            BrowserTargetOrigin::parse("https://target.example").expect("target"),
+            Origin::parse("https://suite.example").expect("suite"),
+        )
+        .expect("policy");
+        let state = BrowserRunnerState::parse(
+            &json!({
+                "urls": [],
+                "visited": [],
+                "uriInputRequests": [{
+                    "description": "Paste the verifier authorization request",
+                    "submitUrl": "https://suite.example/test/a/module/authorize"
+                }]
+            }),
+            &policy,
+        )
+        .expect("URI-input runner state");
+        let authorization_url = Url::parse(
+            "https://suite.example/test/a/alias/authorize?client_id=redirect_uri%3Ahttps%3A%2F%2Ftarget.example&nonce=opaque",
+        )
+        .expect("authorization URL");
+        let submission = state
+            .verifier_submission_url(&authorization_url)
+            .expect("submission URL");
+        assert_eq!(submission.path(), "/test/a/module/authorize");
+        assert_eq!(submission.query(), authorization_url.query());
+
+        let cross_origin = BrowserRunnerState::parse(
+            &json!({
+                "urls": [],
+                "visited": [],
+                "uriInputRequests": [{
+                    "submitUrl": "https://attacker.example/collect"
+                }]
+            }),
+            &policy,
+        );
+        assert!(matches!(
+            cross_origin,
+            Err(BrowserError::CrossOriginNavigation)
+        ));
+        assert!(
+            state
+                .verifier_submission_url(
+                    &Url::parse("https://suite.example/test/a/alias/authorize")
+                        .expect("queryless authorization URL")
+                )
+                .is_err()
+        );
+    }
+
     struct MockDriver {
         current: Url,
         source: String,

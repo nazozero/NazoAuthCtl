@@ -402,6 +402,7 @@ pub trait OpenId4VpVerifier: Send {
     fn complete(
         &mut self,
         presentation: &OpenId4VpPresentation,
+        delivery_url: &Url,
     ) -> Result<OpenId4VpCompletionOutcome, OpenId4VpError>;
 
     /// Fetch a completed, runtime-signed evidence receipt for a presentation
@@ -892,13 +893,21 @@ impl OpenId4VpVerifierClient {
     fn complete_presentation(
         &self,
         presentation: &OpenId4VpPresentation,
+        delivery_url: &Url,
     ) -> Result<OpenId4VpCompletionOutcome, OpenId4VpError> {
+        if !self.suite_origin.same_origin_url(delivery_url)
+            || !delivery_url.username().is_empty()
+            || delivery_url.password().is_some()
+            || delivery_url.fragment().is_some()
+        {
+            return Err(OpenId4VpError::InvalidInput);
+        }
         let response = self
             .transport
             .send(
                 HttpRequest {
                     method: HttpMethod::Get,
-                    url: presentation.authorization_url.clone(),
+                    url: delivery_url.clone(),
                     headers: vec![(
                         "Accept".to_owned(),
                         "text/html,application/xhtml+xml".to_owned(),
@@ -923,8 +932,7 @@ impl OpenId4VpVerifierClient {
         let location = response
             .header("Location")
             .ok_or(OpenId4VpError::UnexpectedAuthorizationRedirect)?;
-        let redirected = presentation
-            .authorization_url
+        let redirected = delivery_url
             .join(location)
             .map_err(|_| OpenId4VpError::UnexpectedAuthorizationRedirect)?;
         if redirected != presentation.completion_url {
@@ -1164,8 +1172,9 @@ impl OpenId4VpVerifier for OpenId4VpVerifierClient {
     fn complete(
         &mut self,
         presentation: &OpenId4VpPresentation,
+        delivery_url: &Url,
     ) -> Result<OpenId4VpCompletionOutcome, OpenId4VpError> {
-        self.complete_presentation(presentation)
+        self.complete_presentation(presentation, delivery_url)
     }
 
     fn verification_evidence(
@@ -2780,15 +2789,20 @@ mod tests {
             immediate_rejection_allowed: false,
         };
 
+        let delivery_url =
+            Url::parse("https://suite.example/test/a/module/authorize?request_uri=urn%3Aexample")
+                .expect("delivery URL");
         assert_eq!(
-            client.complete(&presentation).expect("completion"),
+            client
+                .complete(&presentation, &delivery_url)
+                .expect("completion"),
             OpenId4VpCompletionOutcome::Completed
         );
 
         let requests = transport.requests.lock().expect("request lock");
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].method(), HttpMethod::Get);
-        assert_eq!(requests[0].url(), &presentation.authorization_url);
+        assert_eq!(requests[0].url(), &delivery_url);
         assert_eq!(requests[1].url(), &completion_url);
         assert_eq!(
             requests[0].header("Accept"),
@@ -2840,7 +2854,7 @@ mod tests {
 
         assert_eq!(
             client
-                .complete(&presentation)
+                .complete(&presentation, &presentation.authorization_url)
                 .expect("immediate rejection is an expected negative outcome"),
             OpenId4VpCompletionOutcome::ExpectedImmediateRejection
         );
@@ -2887,7 +2901,9 @@ mod tests {
         };
 
         assert_eq!(
-            client.complete(&presentation).expect_err("positive 4xx"),
+            client
+                .complete(&presentation, &presentation.authorization_url)
+                .expect_err("positive 4xx"),
             OpenId4VpError::UnexpectedAuthorizationRedirect
         );
     }
@@ -2932,7 +2948,9 @@ mod tests {
         };
 
         assert_eq!(
-            client.complete(&presentation).expect_err("Suite 4xx"),
+            client
+                .complete(&presentation, &presentation.authorization_url)
+                .expect_err("Suite 4xx"),
             OpenId4VpError::UnexpectedAuthorizationRedirect
         );
     }
@@ -2982,7 +3000,7 @@ mod tests {
 
         assert_eq!(
             client
-                .complete(&presentation)
+                .complete(&presentation, &presentation.authorization_url)
                 .expect_err("redirect mismatch"),
             OpenId4VpError::UnexpectedAuthorizationRedirect
         );
