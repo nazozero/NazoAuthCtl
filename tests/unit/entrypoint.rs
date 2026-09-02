@@ -98,6 +98,14 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
         workflow.contains("sudo install -m 0755 \"$(command -v cosign)\" /usr/local/bin/cosign")
     );
     assert!(!workflow.contains("controller/nazoauthctl --help"));
+    let protocol_schema = target::HOST_PROTOCOL_SCHEMA;
+    assert!(workflow.contains(&format!(
+        r#"{{"schema":{protocol_schema},"operation_id":"019018c0-0000-7000-8000-000000000001""#
+    )));
+    assert!(workflow.contains(&format!(".schema == {protocol_schema}")));
+    assert!(workflow.contains(&format!(
+        ".outcome.body.hello.remote_exec_schema == {protocol_schema}"
+    )));
 
     let current_controller = workflow
         .split_once("\n  current-controller:")

@@ -90,16 +90,16 @@ jobs:
           state_root="$(mktemp -d)"
           trap 'rm -rf "$state_root"' EXIT
           printf '%s' \
-            '{"schema":5,"operation_id":"019018c0-0000-7000-8000-000000000001","operation":{"kind":"hello"}}' \
+            '{"schema":9,"operation_id":"019018c0-0000-7000-8000-000000000001","operation":{"kind":"hello"}}' \
             | NAZOAUTHCTL_TARGET_STATE_ROOT="$state_root" controller/nazoauthctl remote exec \
             >controller-hello.json
           jq -e '
-            .schema == 5
+            .schema == 9
             and .operation_id == "019018c0-0000-7000-8000-000000000001"
             and .outcome.status == "completed"
             and .outcome.body.completion == "hello"
             and .outcome.body.hello.product == "nazoauthctl"
-            and .outcome.body.hello.remote_exec_schema == 5
+            and .outcome.body.hello.remote_exec_schema == 9
           ' controller-hello.json
       - name: Download and verify the signed host server
         shell: bash
